@@ -76,6 +76,14 @@ If hook-based context measurement is impossible AND proxy is too noisy:
 - Drop: 50%/75% thresholds, context-pct column in the TUI (or show "?"), `fleet-guard`'s automatic handoff trigger (skill becomes optional / advisory).
 - Re-record demo gif emphasizing parallelism + clean handoffs rather than self-healing.
 
+## Week 1 implementation pre-decisions (from eng review)
+
+These are not part of the spike itself but are pinned here so they're not lost:
+
+- **Env injection:** `fleet deploy` must use `tmux new-session -e FLEET_AGENT_ID=... -e FLEET_EXTRA_CLAUDE_MD=...` explicitly. Do not rely on shell env inheritance — tmux has its own per-session env, and user `.zshrc` can override.
+- **Handoff filename collision:** use `handoffs/<id>-<utc-iso>-<short-uuid>.md`. UTC + UUID suffix prevents same-second collision and is portable across machines.
+- **fsnotify on macOS:** measure rename-event reliability on darwin during the spike. If unreliable on macOS for `~/.fleet/queue/`, default to always-poll on darwin and use fsnotify on linux only.
+
 ## Final Decision
 
 **TBD** — fill this in once questions 1-3 are answered.
