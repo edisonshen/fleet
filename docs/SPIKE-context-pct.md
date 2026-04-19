@@ -76,13 +76,27 @@ If hook-based context measurement is impossible AND proxy is too noisy:
 - Drop: 50%/75% thresholds, context-pct column in the TUI (or show "?"), `fleet-guard`'s automatic handoff trigger (skill becomes optional / advisory).
 - Re-record demo gif emphasizing parallelism + clean handoffs rather than self-healing.
 
+## Framing note — Fleet is a supervisor, not a host
+
+The spike answers whether Fleet can *observe* context %. It does not answer
+whether Fleet can *control* context compaction — that's the host's job and
+out of scope. If all three spike questions fail (no usable context signal
+and proxy too noisy), Fleet still ships; it pivots to operator-triggered
+handoffs. See the pivot path below. This framing affects interpretation:
+"spike failed" ≠ "product failed." The supervisor posture is load-bearing.
+
+See `docs/STATE.md` "Scope constraints" for the full statement and
+`docs/DESIGN.md` "Reliability Invariants" for the short version.
+
 ## Week 1 implementation pre-decisions (from eng review)
 
 These are not part of the spike itself but are pinned here so they're not lost:
 
-- **Env injection:** `fleet deploy` must use `tmux new-session -e FLEET_AGENT_ID=... -e FLEET_EXTRA_CLAUDE_MD=...` explicitly. Do not rely on shell env inheritance — tmux has its own per-session env, and user `.zshrc` can override.
+- **Env injection:** `fleet deploy` must use `tmux new-session -e FLEET_AGENT_ID=... -e FLEET_EXTRA_CLAUDE_MD=... -e FLEET_TASK_ID=... -e FLEET_PROJECT=...` explicitly. Do not rely on shell env inheritance — tmux has its own per-session env, and user `.zshrc` can override.
 - **Handoff filename collision:** use `handoffs/<id>-<utc-iso>-<short-uuid>.md`. UTC + UUID suffix prevents same-second collision and is portable across machines.
-- **fsnotify on macOS:** measure rename-event reliability on darwin during the spike. If unreliable on macOS for `~/.fleet/queue/`, default to always-poll on darwin and use fsnotify on linux only.
+- **fsnotify on macOS:** measure rename-event reliability on darwin during the spike. Always pair fsnotify with a 1s polling fallback — fsnotify is latency optimization, not a correctness primitive.
+- **Hook payload shape (spike deliverable):** the spike's Stop-hook payload dump feeds directly into the reference payload shape documented in `docs/STATE.md`. Commit an anonymized sample payload to `docs/HOOK-PAYLOAD-SAMPLES.md` so future implementers don't have to re-run the spike.
+- **`fleet init` mechanics (deferred to Week 1 PR):** skill install copies/symlinks `skills/fleet-guard/` to `~/.claude/skills/fleet-guard/` AND merges hook registrations into `~/.claude/settings.json` (Stop, PreCompact, SessionStart). Both steps, atomic where possible.
 
 ## Final Decision
 

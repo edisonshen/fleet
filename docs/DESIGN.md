@@ -303,6 +303,65 @@ The spike's deliverable is a 1-page decision doc committed to the repo at `docs/
     └── a1-20260415.log              # tmux pane capture
 ```
 
+## Reliability Invariants
+
+Fleet's filesystem-state contract. Implementers consult `docs/STATE.md` for
+the full detail (schemas, shell/Go patterns, examples). The rules that must
+hold at all times:
+
+**Scope.** v1 is single-machine, single-operator. No cross-machine sync, no
+network protocols. Multi-machine is v2+.
+
+**Architecture posture.** Fleet is a supervisor, not a host. It watches
+Claude Code instances and orchestrates their lifecycle via files + tmux. It
+does NOT edit running agents' conversation history, make LLM calls on their
+behalf, or reach inside Claude Code's process memory. Compression is the
+host's job (Claude Code's own `/compact`); Fleet's lever is kill-and-respawn
+with a handoff doc.
+
+**A1 — Atomic file publish.** Every state file is published via `.tmp` +
+`rename(2)`. Never truncate-and-write-in-place. Durable events (handoff
+docs) additionally `fsync` file data and parent directory before rename.
+Startup runs a reconcile pass that archives orphaned agents and discards
+stale queue triggers.
+
+**A2 — Concurrent CLI.** Per-project `flock(2)` on
+`~/.fleet/projects/.locks/<name>.lock` during any deploy/mutation critical
+section. Non-mutating reads are lock-free.
+
+**A3 — Handoff signal.** Fleet watches `~/.fleet/handoffs/` via fsnotify.
+The atomic rename of the handoff doc IS the completion signal. No separate
+sentinel file, no tmux pane grep. Control decisions are never derived from
+Claude's free-form output.
+
+**A4 — Auto-spawn rate limit.** When `auto_spawn: true`: max 3 spawns/task
+per rolling hour, min 30s between same-task spawns. On budget exhaustion,
+task marked `status: unhealthy` in the manifest and operator must clear it
+with `fleet tasks unblock` before auto-spawn resumes.
+
+**A5 — Schema versioning.** Every JSON shape carries `schema_version`.
+`fleet` binary embeds the versions it knows and checks the skill's declared
+version at startup: MAJOR mismatch refuses to run (`fleet init` needed);
+MINOR warns. Migration functions from v1 are scaffolded day-one.
+
+**F1 — Depth limit.** Supervised agents cannot deploy children. `fleet
+deploy` refuses when `FLEET_AGENT_ID` env is set. Fleet's thesis is
+horizontal parallelism, not hierarchy.
+
+**F2 — Supervised-agent guardrails.** Two layers. (1) The fleet-guard
+skill injects a CLAUDE.md guidance block instructing the agent not to run
+mutating `fleet` subcommands. (2) The `fleet` binary, when it detects
+`FLEET_AGENT_ID` is set, allowlists only read-only subcommands (`status`,
+`peek`, `version`, `--help`) and refuses mutations with a clear error.
+
+**Derivation note on the 50%/75% thresholds (Premise 4).** Independent
+evidence from Hermes Agent (`ContextCompressor` auto-compacts at 50%) and
+OpenClaw (auto-compaction triggers at similar-order thresholds) validates
+Fleet's Yellow/Red thresholds. They are not guesses.
+
+See `docs/STATE.md` for the full schemas, shell patterns, and crash-
+recovery details.
+
 ## Operator-Agent Communication
 
 A manager doesn't attach to every employee's desk to check status. They peek at dashboards, send Slack messages, and only sit down when it's a real conversation. Fleet mirrors this with three communication modes:
