@@ -1,6 +1,6 @@
 ---
 name: fleet-guard
-description: Watches the host Claude Code agent's context window. Writes health JSON to ~/.fleet/agents/<id>.json, triggers structured handoffs at 50%/75% thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md.
+description: Watches the host Claude Code agent's context window. Writes health JSON to ~/.fleet/agents/<id>.json, triggers structured handoffs at 50%/70% thresholds, delivers operator messages from ~/.fleet/inbox/<id>.md.
 version: 0.0.1
 ---
 
