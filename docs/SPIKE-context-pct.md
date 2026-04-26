@@ -5,7 +5,7 @@
 **Started:** 2026-04-16
 **Decision deadline:** Before Week 1 begins
 
-The entire Fleet thesis depends on whether a Claude Code skill can read the host agent's `context_pct` reliably enough to drive Yellow (50%) and Red (75%) handoff thresholds. This spike answers that question before any `fleet` binary code is written.
+The entire Fleet thesis depends on whether a Claude Code skill can read the host agent's `context_pct` reliably enough to drive Yellow (50%) and Red (70%) handoff thresholds. This spike answers that question before any `fleet` binary code is written.
 
 > **Heads-up from design review:** the design referenced a `PostResponse` hook. Claude Code's actual hook surface is `Stop`, `PostToolUse`, `PreCompact`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`, `Notification`. The spike's first job is to map the design's intent onto the real hook names — most likely `Stop` (fires when Claude finishes its response).
 
@@ -72,8 +72,8 @@ If hook-based context measurement is impossible AND proxy is too noisy:
 
 - Drop automatic Yellow/Red triggers. The handoff system becomes entirely operator-triggered (TUI `h` key or `fleet handoff <id>`).
 - Reframe the thesis from "self-healing fleet" to "parallelism dashboard with one-key handoff."
-- Keep: TUI, deploy, attach, peek, message, broadcast, manual handoff, structured handoff doc format, lifecycle probe.
-- Drop: 50%/75% thresholds, context-pct column in the TUI (or show "?"), `fleet-guard`'s automatic handoff trigger (skill becomes optional / advisory).
+- Keep: TUI, plan, dispatch, attach, peek, message, broadcast, manual handoff, structured handoff doc format, lifecycle probe.
+- Drop: 50%/70% thresholds, context-pct column in the TUI (or show "?"), `fleet-guard`'s automatic handoff trigger (skill becomes optional / advisory).
 - Re-record demo gif emphasizing parallelism + clean handoffs rather than self-healing.
 
 ## Framing note — Fleet is a supervisor, not a host
@@ -92,7 +92,7 @@ See `docs/STATE.md` "Scope constraints" for the full statement and
 
 These are not part of the spike itself but are pinned here so they're not lost:
 
-- **Env injection:** `fleet deploy` must use `tmux new-session -e FLEET_AGENT_ID=... -e FLEET_EXTRA_CLAUDE_MD=... -e FLEET_TASK_ID=... -e FLEET_PROJECT=...` explicitly. Do not rely on shell env inheritance — tmux has its own per-session env, and user `.zshrc` can override.
+- **Env injection:** `fleet dispatch` must use `tmux new-session -e FLEET_AGENT_ID=... -e FLEET_EXTRA_CLAUDE_MD=... -e FLEET_TASK_ID=... -e FLEET_PROJECT=...` explicitly. Do not rely on shell env inheritance — tmux has its own per-session env, and user `.zshrc` can override.
 - **Handoff filename collision:** use `handoffs/<id>-<utc-iso>-<short-uuid>.md`. UTC + UUID suffix prevents same-second collision and is portable across machines.
 - **fsnotify on macOS:** measure rename-event reliability on darwin during the spike. Always pair fsnotify with a 1s polling fallback — fsnotify is latency optimization, not a correctness primitive.
 - **Hook payload shape (spike deliverable):** the spike's Stop-hook payload dump feeds directly into the reference payload shape documented in `docs/STATE.md`. Commit an anonymized sample payload to `docs/HOOK-PAYLOAD-SAMPLES.md` so future implementers don't have to re-run the spike.

@@ -24,7 +24,7 @@ Fleet is an open-source command console that treats the one-person-operator as t
 
 - **Terminal-first.** TUI is the launch surface. Web dashboard is explicitly v2.
 - **Single-binary distribution.** Homebrew + GitHub Releases. No runtime deps.
-- **Big-bang launch.** All three pillars (fleet view + deploy-agent + context-guard) ship together. No partial rollout.
+- **Big-bang launch.** All three pillars (fleet view + dispatch-agent + context-guard) ship together. No partial rollout.
 - **Solo-operator scale.** v1 optimizes for 1-20 concurrent agents on one laptop. Multi-machine fleets are v2+.
 - **Claude Code native.** Agents are Claude Code instances. Fleet wraps and watches them; doesn't replace them.
 
@@ -68,8 +68,11 @@ Memorable, but repo pollution and opinionated review workflow will lose more use
 
 Commands:
 - `fleet` or `fleet tui` — open the dashboard
-- `fleet deploy <project>/<task>` — spawn a new Claude Code agent in detached tmux session
-- `fleet deploy <project>` — spawn agent on highest-priority `todo` task
+- `fleet chat <project>` — spawn a **planner session** (Claude + `fleet-planner` skill) for project-level planning. Operator uses `/office-hours`, `/plan-eng-review`, etc., then `/fleet-sync` to propose tasks.
+- `fleet plan <project>/<task>` — spawn a plan-mode agent; writes the task's `## Plan` section and stops
+- `fleet plan <project>/<task> --redo` — re-plan when the existing plan is stale
+- `fleet dispatch <project>/<task>` — spawn an execute-mode agent; requires `## Plan` unless `--skip-plan`
+- `fleet dispatch <project>` — dispatch on highest-priority `planned` task
 - `fleet attach <agent-id>` — re-attach to a running agent's tmux session (full interactive)
 - `fleet peek <agent-id>` — read-only status: health, recent actions, last output (non-disruptive)
 - `fleet msg <agent-id> "text"` — send async message to agent's inbox
@@ -77,6 +80,28 @@ Commands:
 - `fleet status` — non-TUI JSON/plain summary for scripting
 - `fleet handoff <agent-id>` — force-save handoff doc and restart fresh agent
 - `fleet projects add <path>` — register a project directory
+- `fleet tasks add <project> "<title>"` — create a task file + add to manifest
+- `fleet tasks unblock <project>/<task>` — clear an unhealthy task (A4)
+
+**Task lifecycle (plan-first).**
+
+```
+  todo ── fleet plan ──▶ planning ──▶ planned ── fleet dispatch ──▶ doing ──▶ done
+                                         │            │               │
+                                         │            └─[cap]─▶ queued ──▶ doing
+                                         │                            │
+                                         │                            ├──▶ blocked
+                                         │                            │
+                                         │                            └──▶ unhealthy (A4)
+                                         │
+                                         └── fleet plan --redo ──▶ planning
+```
+
+- A new task lands in `todo`. `fleet plan` promotes it through `planning` (agent is writing) → `planned` (plan saved, awaiting operator review).
+- `fleet dispatch` requires `planned`. Error on `todo`: `fleet dispatch: no plan for <task>. Run \`fleet plan <task>\` first, or pass --skip-plan to execute ad-hoc.`
+- `--skip-plan` escape hatch covers trivial tasks (typo fix, version bump) where planning is overhead.
+- `--redo` on `plan` is for stale plans — clears the old `## Plan` section and re-runs plan mode.
+- The plan lives in the task file as the `## Plan` section, directly after `## Context`. Operator can edit it in `$EDITOR` before dispatching — same file the agent wrote it to.
 
 **TUI layout (rough ASCII):**
 
@@ -84,42 +109,86 @@ Commands:
 ┌─ Fleet ──────────────────────────────────── edisonshen ──┐
 │ [p]rojects  [t]asks  [a]gents                  All ▾     │
 ├─────────────────────────────────────────────────────────┤
-│ rainier (2 tasks, 1 active)                              │
+│ rainier (2 tasks, 1 active, 1 queued)                    │
 │   ● a4  auth-token-refresh     ●31%  2s   doing  #4     │
-│   ○     add-rate-limiting       —    —    todo   queued  │
+│   ⏸     add-rate-limiting       —    —    queued #0     │
 │                                                          │
 │ gift-finder (1 task, 1 active)                           │
 │   ● a2  rec-engine-v2          ●47%  4m   doing  #1     │
 │                                                          │
 │ caching (1 task, 1 active)                               │
-│   ● a3  redis-migration        ●21%  blocked ⚠   #2     │
+│   ⏸ a3  redis-migration        ●21%  12m   blocked #2   │
 │                                                          │
 │ spark (1 task, 1 active)                                 │
 │   ● a5  fleet-self-host        ●61%  14s  doing  #1     │
 ├─────────────────────────────────────────────────────────┤
 │ 4 projects · 5 tasks · 4 agents active · 1 queued        │
-│ [d]eploy  [a]ttach  [h]andoff  [Enter] detail   [q]uit  │
+│ [c]hat [p]lan [d]ispatch [a]ttach [h]andoff [n]ew [q]uit│
 └─────────────────────────────────────────────────────────┘
 ```
 
-TUI navigation:
-- **Default view:** all projects, grouped. Shows active agents + queued tasks.
-- **`p`** — project focus: filter to one project, see all its tasks and agent history.
-- **`t`** — task detail: select a task, see the handoff chain timeline + progress log.
-- **`a`** — agent detail: see one agent's health, files modified, time active.
-- **`Enter`** — drill into whatever row is selected.
-- **`d`** — deploy: spawn agent on selected task (or next `todo` if on a project row).
-- `#N` column shows handoff count — higher number = task has seen more agents.
+TUI navigation. Action keys are context-sensitive: the key's effect
+depends on whether a project row or a task/agent row is selected.
 
-Health thresholds (single source of truth — used by both colors and the handoff trigger):
+- **Default view:** all projects, grouped. Shows active agents + queued
+  tasks. Header strip (`[p]rojects [t]asks [a]gents`) are view labels;
+  the primary action keys are in the bottom strip.
+- **`Enter`** — drill into the selected row (project → its tasks;
+  task → detail pane; agent → health + recent actions).
+- **`c`** (project row) — chat: spawn a planner session on the selected
+  project. Attaches operator to a tmux Claude Code session with the
+  `fleet-planner` skill loaded; `/fleet-sync` proposes tasks for
+  operator approval.
+- **`p`** (task row) — plan: spawn plan-mode agent on the selected
+  task. Writes the task's `## Plan` section and stops.
+- **`d`** (task row) — dispatch: spawn execute-mode agent on selected
+  task (requires `planned` unless `--skip-plan`).
+- **`a`** (agent row) — attach to the agent's tmux session (full
+  interactive).
+- **`h`** (agent row) — handoff: save doc + 3s grace + fresh successor.
+- **`n`** — new: create a project (on empty dashboard or header) or a
+  new task (on selected project row).
+- **`e`** (task row) — edit task file in `$EDITOR`.
+- **`q`** — quit.
+- Alert-specific keys (context-sensitive in detail panes): **`[u]nblock`**
+  for A4 unhealthy, **`[k]` acknowledge** for emergency-handoff banner,
+  **`[l]` tail logs** from detail panes.
+- `#N` column shows handoff count — higher number = task has seen more
+  agents.
 
-- **Green:** context < 50% AND active within 60s AND not blocked. Safe to ignore.
-- **Yellow:** context 50-75% OR idle 1-10min. Handoff *recommended* — `fleet-guard` prompts the agent to offer a handoff on next turn.
-- **Red:** context > 75% OR blocked OR idle > 10min OR needs-input flag set. Handoff *enforced* on next agent turn.
+Health thresholds (single source of truth — used by colors and the
+handoff trigger). **Threshold effects are mode-aware.**
 
-Premise 4 ("act at 50%") aligns with the Yellow band: the handoff prompt fires at 50%, and handoff becomes mandatory at 75%.
+Modes split into two families:
 
-Drop `[r]eview` from v1 keybinds — review queues are a v1.1 feature tracked separately. Replace with `[t]asks` (jump to task list).
+- **Doing modes** (`execute`, `fix`) — graceful handoff at 50% fires at
+  the next `MILESTONE`; emergency kill-and-respawn at 70% if agent
+  ignored the queued handoff.
+- **Thinking modes** (`plan`, `review`) — reminder-only; operator
+  decides when to handoff. Claude Code's own `/compact` at ~95% is the
+  backstop.
+
+| Band        | Doing (execute, fix)                                    | Thinking (plan, review)               |
+|-------------|---------------------------------------------------------|---------------------------------------|
+| Green       | < 50%, active ≤ 60s, not blocked                        | same                                  |
+| Yellow      | **≥ 50% — handoff queued; fires at next `MILESTONE`**   | 50-70% — `⚡` reminder in TUI        |
+| Red         | ≥ 70% — **hard kill-and-respawn** (safety net)          | ≥ 70% — `⚠` urgent reminder         |
+| Backstop    | —                                                       | ~95% — Claude Code's own `/compact`   |
+
+In doing modes, one token (`MILESTONE`) serves double duty: progress
+signal in normal operation; exit trigger when `HANDOFF REQUESTED` has
+been injected into the agent's context. Clean CLAUDE.md snippet, no
+special-case handoff token.
+
+Premise 4 ("act at 50%") holds exactly: 50% is the action threshold in
+both mode families. Doing modes queue a graceful handoff at 50% (agent
+finishes current milestone, then hands off); thinking modes fire a `⚡`
+reminder. Hard kill-and-respawn sits at 70% as the safety net for doing
+modes — 20% runway from graceful queue to emergency kill is the
+design's bet that any bounded work unit wraps in under 20% of context.
+Same 50/70 numbers across mode families; only the enforcement differs.
+
+Note: `[r]eview` (as in "review queues — operator's TODO review") was dropped from v1 keybinds. The post-execute *code* review loop (Phase 4 §4.7 in FLOW.md) is a different concept, orchestrated by Fleet itself and requires no operator keybind.
 
 **2. Data Model — Operator → Projects → Tasks → Agents**
 
@@ -148,7 +217,7 @@ auto_spawn: true          # when agent hands off, auto-start fresh agent
 max_concurrent_agents: 2  # cap parallel agents on this project
 tasks:
   - id: auth-token-refresh
-    status: doing           # todo | doing | blocked | done
+    status: doing           # todo | planning | planned | queued | doing | blocked | unhealthy | done
     priority: 1
     current_agent: a4
     handoff_count: 3
@@ -188,7 +257,7 @@ Fleet reads all project manifests on startup to build the TUI dashboard. Changes
 When `auto_spawn: true`, Fleet also picks up the *next task* if the current one finishes:
 - Agent completes `auth-token-refresh` → marks `status: done` in manifest.
 - Fleet checks: any `todo` tasks for rainier? `add-rate-limiting` is `priority: 2`, `status: todo`.
-- Fleet auto-deploys an agent on `add-rate-limiting` (respecting `max_concurrent_agents`).
+- Fleet auto-dispatches an agent on `add-rate-limiting` (respecting `max_concurrent_agents`). If the task has no `## Plan`, Fleet auto-runs `fleet plan` first, then pauses at `planned` for operator review before dispatching. `auto_plan_and_dispatch: true` in the manifest skips the review gate.
 - Operator wakes up, checks TUI: "rainier: auth-fix done, rate-limiting in progress."
 
 **CLI for managing the hierarchy:**
@@ -196,8 +265,8 @@ When `auto_spawn: true`, Fleet also picks up the *next task* if the current one 
 - `fleet projects list` — show all projects with task counts and active agents
 - `fleet tasks add <project> "<title>"` — create a task file + add to manifest
 - `fleet tasks list <project>` — show tasks for a project
-- `fleet deploy <project>/<task>` — spawn agent on a specific task
-- `fleet deploy <project>` — spawn agent on the highest-priority `todo` task
+- `fleet dispatch <project>/<task>` — spawn agent on a specific task
+- `fleet dispatch <project>` — spawn agent on the highest-priority `todo` task
 
 **2b. Task file (per-project, lives with the code)**
 
@@ -240,8 +309,8 @@ A Claude Code skill installed at `~/.claude/skills/fleet-guard/SKILL.md`. Runs v
 
 - Reads `context_pct` from Claude Code's hook payload if available. If the hook does not expose token counts, falls back to a proxy: `messages_since_spawn × avg_tokens_per_turn / model_context_limit`. The spike determines which mode is used; both write the same health JSON shape.
 - Writes `~/.fleet/agents/<id>.json` with `{id, pid, tmux_session, task_id, context_pct, context_source: "hook"|"proxy", last_activity_ts, blocked, needs_input}`.
-- At context_pct ≥ 50% (Yellow): appends a handoff-recommended note to the task file's Progress section. Agent sees it on next turn and decides.
-- At context_pct ≥ 75% (Red): writes a trigger file to `~/.fleet/queue/handoff-<id>.json` with the handoff doc path. Fleet's TUI watches the queue and surfaces the handoff action to the operator (or auto-executes if `auto_handoff: true` in config).
+- At context_pct ≥ 50% (Yellow, doing modes): injects `HANDOFF REQUESTED` into the agent's next turn. Agent wraps the current bounded work unit and emits `MILESTONE`; fleet-guard writes the handoff doc and enters the 3s grace window. Thinking modes (plan, review) get a `⚡` reminder only — operator decides.
+- At context_pct ≥ 70% (Red, doing modes only): emergency kill-and-respawn without grace. Thinking modes get a `⚠` reminder — still no enforcement; Claude Code's own `/compact` at ~95% is the backstop.
 - "Signals Fleet" = writes to `~/.fleet/queue/` directory. Fleet watches this via fsnotify. No sockets, no IPC beyond the filesystem.
 
 Skill lives in this same repo under `skills/fleet-guard/` and is copied into `~/.claude/skills/` by `fleet init`.
@@ -249,17 +318,17 @@ Skill lives in this same repo under `skills/fleet-guard/` and is copied into `~/
 **Spawn & Lifecycle**
 
 - **tmux session naming:** `fleet-<agent_id>` where `agent_id` is a short random slug (`a1b2`). One Claude Code process per tmux session, one session per agent.
-- **Skill injection:** `fleet deploy` writes a per-agent `CLAUDE.md` snippet into a temp dir that forces `fleet-guard` to load, then launches `claude` with cwd set to the project repo and env var `FLEET_AGENT_ID=<id>` so the skill knows which health file to write.
+- **Skill injection:** `fleet dispatch` writes a per-agent `CLAUDE.md` snippet into a temp dir that forces `fleet-guard` to load, then launches `claude` with cwd set to the project repo and env var `FLEET_AGENT_ID=<id>` so the skill knows which health file to write.
 - **Liveness probe:** Fleet checks tmux session existence + PID every 5s. If tmux session gone but health file still present → mark agent `crashed`, move health file to `~/.fleet/agents/archive/`. User can see crashed agents in the TUI under a separate "Recent" section.
 - **Stale detection:** If health file's `last_activity_ts` is older than 30 minutes AND tmux session is gone, auto-archive. If tmux session is alive but `last_activity_ts` is old, show as idle (not crashed) — agent is just waiting on user input.
 - **Reconciliation:** Task file frontmatter `assigned: <agent_id>` is the source of truth for *who owns* the task; `~/.fleet/agents/<id>.json` is the source of truth for *agent health*. On conflict (task file says assigned to `a1` but no health file exists), Fleet shows the task as "assigned but agent missing" and offers `fleet recover <task>`. On crash, Fleet clears the `assigned` field from the task file after archival.
 - **Restart on handoff (no race, no mid-response kill):** Flow is cooperative, not coercive:
-  1. `fleet-guard` PostResponse hook detects Red threshold (or Yellow + user-confirmed).
-  2. Skill writes the handoff doc to `~/.fleet/handoffs/<id>-<ts>.md`. Only after fsync succeeds does it write the trigger `~/.fleet/queue/handoff-<id>.json` with `{handoff_path, agent_id, task_id}`.
-  3. Skill injects a final message into the agent's context: *"Handoff doc saved at <path>. End your response with `HANDOFF COMPLETE` and stop."* Claude finishes its current response normally.
-  4. Fleet's TUI watches `~/.fleet/queue/` via fsnotify. On `handoff-<id>.json`, it shows the agent row as `handoff: saving...` (amber) → `handoff: ready` once the agent emits `HANDOFF COMPLETE` in its output (tmux pane capture grep).
+  1. `fleet-guard` PostResponse hook detects Yellow threshold (50%, doing modes) OR operator-initiated handoff (`[h]` key). Injects `HANDOFF REQUESTED` into the agent's context. For emergency (70%, doing modes), skips the injection and goes straight to step 2.
+  2. Agent finishes the current bounded work unit (commit, test pass, sub-step), emits `MILESTONE` on its own line. Skill greps the tmux pane capture for `MILESTONE` while `HANDOFF REQUESTED` is pending. On match, skill writes the handoff doc to `~/.fleet/handoffs/<id>-<ts>.md`. Only after fsync succeeds does it write the trigger `~/.fleet/queue/handoff-<id>.json` with `{handoff_path, agent_id, task_id}`.
+  3. Fleet's TUI watches `~/.fleet/queue/` via fsnotify. On `handoff-<id>.json`, it shows the agent row as `handoff: saving...` (amber) → `handoff: 3s` countdown. `[c]` during the countdown cancels (doc moves to `~/.fleet/handoffs/archive/.cancelled-<ts>.md`, agent resumes).
+  4. After the 3s grace, Fleet sends `/exit` to the Claude session. Emergency handoffs skip the grace entirely — immediate `/exit` on the 70% trigger.
   5. Fleet sends tmux `send-keys` with `/exit` to the Claude session — a graceful shutdown, not SIGKILL. 3-second grace window in the TUI where operator can press `c` to cancel before the fresh spawn starts.
-  6. Fleet spawns the fresh agent via `fleet deploy --from-handoff <path>`. This is mechanically a regular spawn with two extras: (a) a temp `CLAUDE.md` snippet added via env var `FLEET_EXTRA_CLAUDE_MD=<tmpfile>` that says *"You are resuming work. Read the handoff doc at <path> first before responding."*, and (b) the first user-message prefill is piped in via `claude --initial-prompt "Read and continue from <handoff_path>"`. No mid-response termination, no lost state.
+  6. Fleet spawns the fresh agent via `fleet dispatch --from-handoff <path>`. This is mechanically a regular spawn with two extras: (a) a temp `CLAUDE.md` snippet added via env var `FLEET_EXTRA_CLAUDE_MD=<tmpfile>` that says *"You are resuming work. Read the handoff doc at <path> first before responding."*, and (b) the first user-message prefill is piped in via `claude --initial-prompt "Read and continue from <handoff_path>"`. No mid-response termination, no lost state.
 - **Agent ID changes on handoff; task `assigned` field updates atomically.** TUI shows the handoff as a single transition, not two separate agents, to preserve the "fleet never dies" narrative.
 
 **Feasibility Spike (Week 0 — GATING)**
@@ -280,7 +349,7 @@ The spike's deliverable is a 1-page decision doc committed to the repo at `docs/
 **State directory:**
 ```
 ~/.fleet/
-├── config.yaml                      # global preferences, defaults
+├── config.yaml                      # global preferences, defaults, engines map
 ├── projects/
 │   ├── rainier.yaml                 # project manifest: tasks, auto_spawn, max_agents
 │   ├── gift-finder.yaml
@@ -302,6 +371,23 @@ The spike's deliverable is a 1-page decision doc committed to the repo at `docs/
 └── logs/
     └── a1-20260415.log              # tmux pane capture
 ```
+
+**`config.yaml` engines map.** `fleet dispatch` looks up the spawn command
+by engine name rather than inlining `claude` in source. v1 ships one entry:
+
+```yaml
+engines:
+  claude-code:
+    cmd: claude
+    initial_prompt_flag: --initial-prompt
+```
+
+v1 only writes and reads `claude-code`. The map exists from day one so v1.1
+can add a `codex:` entry (or whatever second engine wins) without touching
+the dispatch code path or migrating the manifest. Per-agent engine is
+recorded in `agents/<id>.json:engine`; per-project default in
+`projects/<name>.yaml:engine`. See `docs/DECISIONS.md` 2026-04-26 entry
+"v1.1 engine adapter — minimal v1 hooks" for the full constraint.
 
 ## Reliability Invariants
 
@@ -326,7 +412,7 @@ Startup runs a reconcile pass that archives orphaned agents and discards
 stale queue triggers.
 
 **A2 — Concurrent CLI.** Per-project `flock(2)` on
-`~/.fleet/projects/.locks/<name>.lock` during any deploy/mutation critical
+`~/.fleet/projects/.locks/<name>.lock` during any dispatch/mutation critical
 section. Non-mutating reads are lock-free.
 
 **A3 — Handoff signal.** Fleet watches `~/.fleet/handoffs/` via fsnotify.
@@ -344,9 +430,9 @@ with `fleet tasks unblock` before auto-spawn resumes.
 version at startup: MAJOR mismatch refuses to run (`fleet init` needed);
 MINOR warns. Migration functions from v1 are scaffolded day-one.
 
-**F1 — Depth limit.** Supervised agents cannot deploy children. `fleet
-deploy` refuses when `FLEET_AGENT_ID` env is set. Fleet's thesis is
-horizontal parallelism, not hierarchy.
+**F1 — Depth limit.** Supervised agents cannot dispatch children. `fleet
+dispatch` (and `fleet plan`) refuse when `FLEET_AGENT_ID` env is set.
+Fleet's thesis is horizontal parallelism, not hierarchy.
 
 **F2 — Supervised-agent guardrails.** Two layers. (1) The fleet-guard
 skill injects a CLAUDE.md guidance block instructing the agent not to run
@@ -354,13 +440,128 @@ mutating `fleet` subcommands. (2) The `fleet` binary, when it detects
 `FLEET_AGENT_ID` is set, allowlists only read-only subcommands (`status`,
 `peek`, `version`, `--help`) and refuses mutations with a clear error.
 
-**Derivation note on the 50%/75% thresholds (Premise 4).** Independent
+**Derivation note on the 50%/70% thresholds (Premise 4).** Independent
 evidence from Hermes Agent (`ContextCompressor` auto-compacts at 50%) and
 OpenClaw (auto-compaction triggers at similar-order thresholds) validates
-Fleet's Yellow/Red thresholds. They are not guesses.
+Fleet's Yellow threshold at 50%. Red at 70% is Fleet's own design bet —
+20% runway from graceful queue (50%) to emergency kill (70%) accommodates
+a bounded work unit wrapping up. They are not guesses.
 
 See `docs/STATE.md` for the full schemas, shell patterns, and crash-
 recovery details.
+
+## TUI Alert Surface
+
+The operator-attention states above (A4 unhealthy, blocked agents, version
+warnings, needs-input) render in a unified alerts surface. Three layers:
+
+**1. Sticky alerts banner** — one-line strip directly under the title row,
+shown only when at least one alert exists. Four severity-ordered categories,
+each with a distinct glyph and color:
+
+```
+┌─ Fleet ─────────────────────────────── edisonshen ──┐
+│ ⚠ 2 unhealthy  ⏸ 1 blocked  ✏ 1 needs input         │
+├─────────────────────────────────────────────────────┤
+```
+
+- `⚠ N unhealthy` — red. A4 auto-spawn budget exhausted.
+- `⏸ N blocked` — amber. Agent JSON has `blocked: true`.
+- `⚡ N warning` — yellow. A5 MINOR version mismatch, schema drift notices.
+- `✏ N needs input` — cyan. Agent JSON has `needs_input: true`.
+
+Order is fixed (severity high → low). Zero-count categories are omitted.
+If every count is zero the banner row disappears entirely.
+
+**2. Inline row marker** — the leading glyph on each task/agent row
+matches the alert category firing for that row. Replaces the default
+`●`/`○` status dot. Example:
+
+```
+│   ⚠     add-rate-limiting    3×/1h  UNHEALTHY        │
+│   ⏸ a3  redis-migration      ●21%  12m  blocked  #2  │
+│   ✏ a5  session-repro        ●44%   1m  ask → yes?   │
+```
+
+**3. Detail drill-in** — pressing `Enter` or the alert's action key
+(e.g. `u` for unhealthy) on a flagged row opens a detail pane. For A4:
+
+```
+┌─ Detail: rainier/add-rate-limiting ───────────────┐
+│ ⚠ UNHEALTHY — auto-spawn paused                   │
+│                                                   │
+│ Budget:  3 of 3 spawns in last hour               │
+│ Crashes: all 3 exited in <5s                      │
+│          (health JSON never written)              │
+│                                                   │
+│ Next auto-spawn: paused until operator clears     │
+│                                                   │
+│ [u] unblock   [l] tail logs   [Esc] back          │
+└───────────────────────────────────────────────────┘
+```
+
+Detail pane content rules:
+- Show the budget state (`N of M spawns in last hour`) from manifest
+  `spawn_history`.
+- Dedupe crashes by signal: "all 3 exited in <5s" when identical, or
+  "2× exited in <5s · 1× tmux session not found" when different. No
+  individual timestamps — they don't help the operator decide.
+- `[u] unblock` is mandatory in v1 (keyboard equivalent of
+  `fleet tasks unblock <project>/<task>`).
+- `[l] tail logs` is mandatory in v1 — opens the tmux pane capture log
+  (`~/.fleet/logs/<id>-<date>.log`) in a pager. Bounded to last 200 lines
+  on open.
+- `[Esc]` returns to the dashboard.
+
+Detail panes for `⏸ blocked`, `⚡ warning`, and `✏ needs input` follow the
+same three-part shape (state summary, relevant data from the schema, action
+keys) but with category-appropriate actions.
+
+### Error and glyph conventions
+
+Scoped to what the reliability invariants above (A4, A5, F1, F2) need.
+Broader CLI/TUI conventions are deferred to TUI implementation (Weeks 2-3).
+
+**Error message format.** stderr for errors, stdout reserved for
+machine-readable output (`fleet status --json`).
+
+- Pre-dispatch errors (version checks, env guards): `fleet: <message>`
+- Subcommand errors (bad args, runtime failures): `fleet <subcmd>: <message>`
+
+**Exit codes.**
+
+| Code | Meaning                                    | Examples              |
+|------|--------------------------------------------|-----------------------|
+| 0    | success                                    |                       |
+| 1    | usage error                                | bad flags, unknown subcmd |
+| 2    | policy refusal                             | F1, F2, unblock needed |
+| 3    | version mismatch (MAJOR, startup-fatal)    | A5 MAJOR              |
+| 4    | state error                                | manifest missing, flock timeout |
+
+**Glyph vocabulary** (used by banner, inline row markers, detail panes):
+
+| Glyph | Meaning              | Color   | Source field                       |
+|-------|----------------------|---------|------------------------------------|
+| `●`   | active agent         | green   | `agents/<id>.json` live, context < 50% |
+| `○`   | todo task            | dim     | manifest `tasks[].status == todo`  |
+| `⚠`   | unhealthy task       | red     | manifest `tasks[].status == unhealthy` |
+| `⏸`   | blocked / queued     | amber   | `agents/<id>.json blocked == true` OR `tasks[].status == queued` (status column disambiguates) |
+| `⚡`   | warning (non-block)  | yellow  | runtime (A5 MINOR, per-file skip)  |
+| `✏`   | needs operator input | cyan    | `agents/<id>.json needs_input == true` |
+
+When a row has an alert firing, the alert glyph replaces the default
+`●`/`○` status dot. The banner uses the same glyphs with counts.
+
+**Accessibility.**
+
+- `NO_COLOR=1` respected: colors strip, glyphs remain (Unicode carries
+  severity even without color — meets WCAG-style non-color-only rule).
+- `FLEET_ASCII=1` for terminals without reliable Unicode rendering:
+  ASCII fallback (`!` unhealthy, `-` blocked, `*` warning, `?` needs-input).
+- Minimum terminal size: 80×24. Below that the TUI refuses to start with
+  `fleet: terminal too small (got <w>×<h>, need 80×24)`. Non-TUI
+  subcommands (`status`, `peek`, `dispatch`, ...) have no size requirement.
+- All actions reachable by keyboard. No mouse-only paths.
 
 ## Operator-Agent Communication
 
@@ -589,8 +790,9 @@ Feeds the TUI's aggregate views:
 
 | Trigger | Source | Behavior |
 |---------|--------|----------|
-| Context ≥ 50% (Yellow) | `fleet-guard` PostResponse | Recommend handoff, append note to task file |
-| Context ≥ 75% (Red) | `fleet-guard` PostResponse | Enforce handoff, block agent until doc written |
+| Context ≥ 50% (Yellow, doing modes) | `fleet-guard` PostResponse | Inject `HANDOFF REQUESTED`; next `MILESTONE` triggers graceful handoff |
+| Context ≥ 70% (Red, doing modes)   | `fleet-guard` PostResponse | Emergency kill-and-respawn; no grace window |
+| Context ≥ 50% / ≥ 70% (thinking modes) | `fleet-guard` PostResponse | Reminder only (`⚡` / `⚠`) in TUI alerts banner |
 | PreCompact hook | Claude Code auto-compaction | Emergency handoff — fire before compaction, save state even if context measurement is unavailable |
 | Human-triggered | TUI `h` key or `fleet handoff <id>` | Immediate handoff, same flow as Red |
 | Idle timeout (>30min) | Fleet liveness probe | Mark agent stale, prompt operator: handoff or kill? |
@@ -599,7 +801,7 @@ The PreCompact trigger is critical insurance: even if the context-% measurement 
 
 ### Context Recovery on Spawn
 
-When Fleet spawns a fresh agent (via `fleet deploy` or handoff restart):
+When Fleet spawns a fresh agent (via `fleet dispatch` or handoff restart):
 
 1. Fleet writes a temp CLAUDE.md snippet injected via `FLEET_EXTRA_CLAUDE_MD` env var:
    ```
@@ -615,7 +817,7 @@ When Fleet spawns a fresh agent (via `fleet deploy` or handoff restart):
 
 ## Open Questions
 
-- **Health metric calibration.** The 50%/75% thresholds are guesses. v1 ships with them, instruments usage, and adjusts in v1.1 based on real data.
+- **Health metric calibration.** The 50%/70% thresholds are the current design bet (50% validated against Hermes/OpenClaw; 70% is Fleet's own choice for the emergency runway). v1 ships with them, instruments usage, and adjusts in v1.1 based on real data.
 - **tmux requirement.** Users who don't have tmux installed get a clear error + install hint. Alternative spawn modes (screen, new terminal window) are deferred.
 - **Multi-user future.** `~/.fleet/` is single-user. Shared team dashboards are explicitly out of scope for v1.
 - **Cost tracking.** Should Fleet surface token cost per agent? Useful but adds API integration. Defer to v1.1.
@@ -654,7 +856,7 @@ When Fleet spawns a fresh agent (via `fleet deploy` or handoff restart):
 In order (total 7 weeks, realistic 6-8):
 
 1. **Week 0 — Feasibility Spike (GATING):** Write the `fleet-guard` skill in isolation. Answer the three spike questions (hook-exposes-context-pct, latency, proxy-accuracy). Use it yourself for 3-5 days on real sessions. Decision: full-spec, proxy-mode, or pivot. Do not start Week 1 until this is resolved.
-2. **Week 1:** Scaffold Go repo at `github.com/edisonshen/fleet`. Basic CLI with cobra: `fleet deploy`, `fleet attach`, `fleet status`. `fleet deploy` spawns Claude in tmux and registers an agent. No TUI yet.
+2. **Week 1:** Scaffold Go repo at `github.com/edisonshen/fleet`. Basic CLI with cobra: `fleet dispatch`, `fleet attach`, `fleet status`. `fleet dispatch` spawns Claude in tmux and registers an agent. No TUI yet.
 3. **Weeks 2-3:** Build the bubbletea TUI reading from `~/.fleet/agents/*.json` via fsnotify. Polling fallback at 1s. Lifecycle probe + stale-agent detection.
 4. **Week 4:** Integrate `fleet-guard` skill into the spawn flow. Handoff command + trigger queue + restart-on-handoff flow. Reconciliation logic for orphaned tasks.
 5. **Week 5:** Record the demo gif. Write the README. GoReleaser + homebrew tap. Cross-compile for the four targets.

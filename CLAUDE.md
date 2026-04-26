@@ -19,7 +19,7 @@ You are likely Claude Code working in this repo. Read these before touching anyt
 In order:
 
 1. **Week 0 spike** (gating). Fill in `docs/SPIKE-context-pct.md` by writing a real Stop-hook handler, dumping payloads, and answering the three questions. Commit the decision doc before any other work.
-2. **Week 1 — CLI scaffold.** `fleet deploy`, `fleet attach`, `fleet status`. Add cobra. Spawn Claude in a detached tmux session and write a stub agent record to `~/.fleet/agents/`.
+2. **Week 1 — CLI scaffold.** `fleet dispatch`, `fleet attach`, `fleet status`. Add cobra. Spawn Claude in a detached tmux session and write a stub agent record to `~/.fleet/agents/`.
 3. **Weeks 2-3 — TUI.** bubbletea + lipgloss. Read agent JSON via fsnotify. Polling fallback at 1s.
 4. **Week 4 — Handoffs.** Integrate `fleet-guard` into the spawn flow. Trigger queue + restart-on-handoff. Reconciliation for orphaned tasks.
 5. **Week 5 — Release.** GoReleaser, brew tap, demo gif.

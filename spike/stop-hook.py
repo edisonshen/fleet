@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+Stop-hook probe for Fleet's Week-0 feasibility spike.
+
+Reads a Claude Code Stop hook payload on stdin. Walks transcript_path's JSONL
+to compute context_pct from `usage` objects. Records metrics and raw payloads
+under ~/.fleet/spike/ for later analysis.
+
+Spike answers it feeds:
+  Q1 (availability): lines_with_usage / assistant_turns ratio per fire
+  Q2 (latency):      latency_ms per fire (p95 against 500ms bar)
+  Q3 (accuracy):     computed_pct vs. /context ground truth (manual compare)
+
+The script is intentionally defensive — never raises, never blocks the host.
+On any error, writes an `error` field into metrics.jsonl and exits 0.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Model name -> context-window size in tokens.
+# Defaults to 200_000 for unknown models. Update as needed.
+CONTEXT_LIMITS = {
+    "claude-opus-4-7":   1_000_000,
+    "claude-opus-4-6":     200_000,
+    "claude-opus-4-5":     200_000,
+    "claude-sonnet-4-6":   200_000,
+    "claude-sonnet-4-5":   200_000,
+    "claude-haiku-4-5":    200_000,
+}
+DEFAULT_LIMIT = 200_000
+
+SPIKE_DIR = Path.home() / ".fleet" / "spike"
+PAYLOAD_DIR = SPIKE_DIR / "payloads"
+SNIPPET_DIR = SPIKE_DIR / "transcript-snippets"
+METRICS_FILE = SPIKE_DIR / "metrics.jsonl"
+
+
+def main() -> int:
+    t0 = time.perf_counter()
+    fire_id = uuid.uuid4().hex[:8]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    SPIKE_DIR.mkdir(parents=True, exist_ok=True)
+    PAYLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    SNIPPET_DIR.mkdir(parents=True, exist_ok=True)
+
+    raw = sys.stdin.read()
+    record: dict = {"ts": now, "fire_id": fire_id}
+
+    try:
+        payload = json.loads(raw)
+    except Exception as e:
+        record["error"] = f"payload_parse: {e}"
+        record["raw_payload_len"] = len(raw)
+        _append(METRICS_FILE, record)
+        return 0
+
+    record["session_id"] = payload.get("session_id", "")
+    record["model"] = payload.get("model", "")
+    record["stop_reason"] = payload.get("stop_reason", "")
+    record["hook_event_name"] = payload.get("hook_event_name", "")
+
+    # Save the raw payload once per session_id (first fire wins).
+    sid = record["session_id"] or "unknown"
+    sample_path = PAYLOAD_DIR / f"{sid}.json"
+    if not sample_path.exists():
+        try:
+            sample_path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
+    transcript_path = payload.get("transcript_path", "")
+    record["transcript_path"] = transcript_path
+
+    if not transcript_path or not Path(transcript_path).exists():
+        record["error"] = "transcript_path_missing"
+        _append(METRICS_FILE, record)
+        return 0
+
+    tp = Path(transcript_path)
+    try:
+        record["transcript_size_bytes"] = tp.stat().st_size
+    except Exception:
+        record["transcript_size_bytes"] = -1
+
+    # Walk the JSONL once. Count lines, count assistant turns, count usage objects,
+    # capture the most recent usage object.
+    total_lines = 0
+    assistant_lines = 0
+    usage_lines = 0
+    last_usage: dict | None = None
+    last_usage_line_index = -1
+
+    try:
+        with tp.open("r", encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                total_lines += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "assistant":
+                    assistant_lines += 1
+                # `usage` may sit at top level or under `message.usage`.
+                u = obj.get("usage") or (obj.get("message") or {}).get("usage")
+                if isinstance(u, dict):
+                    usage_lines += 1
+                    last_usage = u
+                    last_usage_line_index = i
+    except Exception as e:
+        record["error"] = f"transcript_walk: {e}"
+        _append(METRICS_FILE, record)
+        return 0
+
+    record["transcript_total_lines"] = total_lines
+    record["transcript_assistant_lines"] = assistant_lines
+    record["transcript_lines_with_usage"] = usage_lines
+    record["last_usage_line_index"] = last_usage_line_index
+
+    if not last_usage:
+        record["error"] = "no_usage_lines_in_transcript"
+        record["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+        _append(METRICS_FILE, record)
+        return 0
+
+    # Save the last usage object for cross-checking with /context output.
+    snippet_path = SNIPPET_DIR / f"{sid}-{fire_id}.json"
+    try:
+        snippet_path.write_text(json.dumps({
+            "fire_id": fire_id,
+            "ts": now,
+            "session_id": sid,
+            "last_usage_line_index": last_usage_line_index,
+            "usage": last_usage,
+        }, indent=2))
+    except Exception:
+        pass
+
+    # Compute context_pct.
+    in_t = int(last_usage.get("input_tokens", 0) or 0)
+    out_t = int(last_usage.get("output_tokens", 0) or 0)
+    cr_t = int(last_usage.get("cache_read_input_tokens", 0) or 0)
+    cc_t = int(last_usage.get("cache_creation_input_tokens", 0) or 0)
+    total = in_t + cr_t + cc_t  # output_tokens excluded — they're not in next-turn context
+
+    limit = CONTEXT_LIMITS.get(record["model"], DEFAULT_LIMIT)
+    record["context_limit"] = limit
+    record["context_limit_known"] = record["model"] in CONTEXT_LIMITS
+    pct = (total * 100.0 / limit) if limit > 0 else 0.0
+
+    record["tokens"] = {
+        "input": in_t,
+        "output": out_t,
+        "cache_read": cr_t,
+        "cache_creation": cc_t,
+        "context_total": total,
+    }
+    record["computed_pct"] = round(pct, 2)
+    record["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+    _append(METRICS_FILE, record)
+    return 0
+
+
+def _append(path: Path, obj: dict) -> None:
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, separators=(",", ":")) + "\n")
+    except Exception:
+        # Last-resort: don't take down the host on a write failure.
+        pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
