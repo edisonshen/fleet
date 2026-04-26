@@ -165,7 +165,7 @@ regressions ship silently.
 
 ---
 
-### [ ] T2 — CI workflow for `go test ./...` on PRs (separate from release-on-tag)
+### [x] T2 — CI workflow for `go test ./...` on PRs (separate from release-on-tag)
 
 **What.** Add `.github/workflows/test.yml` that runs `go test ./...`,
 `go vet ./...`, and `gofmt -l` on every PR and push to main. Currently
@@ -176,6 +176,14 @@ get caught until release. The bar is "no red tests on main."
 
 **Depends on.** Week 1 cobra scaffold landing (needs actual Go code to
 test).
+
+**Done 2026-04-26.** Shipped as `.github/workflows/ci.yml`: runs `go
+build ./...`, `go test ./...`, and `golangci-lint run ./...` on every
+PR and push to main. golangci-lint config at `.golangci.yml` enables
+the standard set (errcheck, govet, ineffassign, staticcheck, unused)
+plus misspell, with gofmt and goimports as formatters. Doesn't wait
+for the cobra scaffold — current stub passes cleanly and the workflow
+will catch the next wave.
 
 ---
 
