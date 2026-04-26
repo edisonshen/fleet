@@ -67,7 +67,7 @@ in-place compression (the pattern Hermes / OpenClaw use — they are hosts).
 
 "One writer per aggregate" is the key simplifier. Cross-file transactions
 are avoided by design. Where two files must stay in sync (manifest ↔
-agent JSON on deploy), the manifest is the leader and updated last under
+agent JSON on dispatch), the manifest is the leader and updated last under
 flock.
 
 ## Atomicity contracts
@@ -154,7 +154,7 @@ reconcile command. Idempotent; safe to re-run.
 
 ## A2 — Concurrent CLI serialization
 
-Two concurrent `fleet deploy rainier` invocations would race to pick the
+Two concurrent `fleet dispatch rainier` invocations would race to pick the
 top-priority `todo` task. Serialization via `flock(2)` on the project's lock
 file.
 
@@ -175,8 +175,8 @@ func withProjectLock(project string, fn func() error) error {
 }
 ```
 
-Lock scope: per-project. Two operators running `fleet deploy rainier` in
-different shells serialize; `fleet deploy rainier` and `fleet deploy
+Lock scope: per-project. Two operators running `fleet dispatch rainier` in
+different shells serialize; `fleet dispatch rainier` and `fleet dispatch
 gift-finder` run in parallel. Global locking is not needed; no mutation
 touches more than one project manifest at a time.
 
@@ -196,7 +196,7 @@ proceeds with the handoff sequence (mark agent departing, spawn
 replacement if `auto_spawn: true`, etc.).
 
 **The filename IS the signal.** No separate sentinel file in `queue/`. No
-tmux pane grep for "HANDOFF COMPLETE" strings. No control decisions derived
+tmux pane grep for `MILESTONE` strings (absent `HANDOFF REQUESTED` context). No control decisions derived
 from Claude's free-form output.
 
 **Rationale:** atomic rename is a well-understood Unix IPC pattern. Adding a
@@ -216,14 +216,52 @@ indefinitely, filling `archive/` and burning API credits.
 
 - **Hard ceiling:** ≤3 spawns per task per rolling 1-hour window.
 - **Cooldown:** ≥30 seconds between same-task spawns.
-- **On budget exhaustion:** set task `status: unhealthy` in the manifest.
-  TUI surfaces `⚠ Task X unhealthy: 3 crashes in 1h`. Operator must clear
-  via `fleet tasks unblock <project>/<task>` before auto-spawn resumes.
+- **On budget exhaustion:** set task `status: unhealthy` in the manifest,
+  populate `unhealthy_reason: <string>` (e.g.,
+  `"3 crashes in 1h · last: skill load fail"`). TUI surfaces
+  `⚠ Task X unhealthy: 3 crashes in 1h`. Operator must clear via
+  `fleet tasks unblock <project>/<task>` before auto-spawn resumes.
+  Unblock clears both `spawn_history` and `unhealthy_reason`, sets
+  `status: todo`.
 - **State lives** in the manifest itself: per-task `spawn_history: [<ts>,
   <ts>, ...]`, pruned to the last hour on each read.
 
 **Observed crash signals:** agent exits within 60s of spawn OR tmux session
-not found 30s after `fleet deploy` returned OR health JSON never written.
+not found 30s after `fleet dispatch` returned OR health JSON never written.
+
+## A4b — Retention and pruning
+
+Every operational file has a retention window. Pruning runs at startup
+(after the A1c reconcile pass) and hourly during a TUI session;
+`fleet prune` and `fleet prune --dry-run` are explicit CLI invocations.
+
+| Path | Retention | Reason |
+|------|-----------|--------|
+| `agents/archive/<id>-<ts>.json` | 7 days | operational debris (recent crash forensics) |
+| `logs/<id>-<date>.log` | 7 days | tmux pane capture |
+| `inbox/archive/<id>-<ts>-<uuid>.md` | 7 days | already-consumed messages |
+| `handoffs/<agent-id>-<utc-iso>-<uuid>.md` | 30 days from `timestamp:` | task history, outlives agents |
+| `progress/<task-id>.jsonl` | 30 days from last write | audit trail |
+| `projects/<name>.yaml` | never auto-pruned | source of truth for project state |
+| `config.yaml` | never auto-pruned | user config |
+
+**7d vs 30d split:** agent JSONs and tmux logs are operational debris —
+they exist to debug recent crashes, not keep a permanent record. Handoff
+docs and progress logs are part of the *task's* history and should
+outlive the agents that wrote them. 30 days is enough to debug "what
+happened to X last month?" without growing unbounded.
+
+**Why deletion, not compaction:** compacting a JSONL file in place needs
+locking, tempfiles, atomic-rename. Deleting a whole archived file is one
+syscall. Files within their retention window stay as-is; we don't trim
+line-by-line. Manifests and config never auto-prune.
+
+**Pruning as one-shot, not daemon:** Fleet doesn't run a background
+sweeper thread. Two trigger points are enough — startup catches the case
+where Fleet was off for a week, the hourly tick catches the case where
+Fleet runs continuously. CLI-only runs (no TUI) skip the hourly tick;
+operators in CLI-only mode rely on startup pruning or explicit
+`fleet prune`.
 
 ## A5 — Schema versioning
 
@@ -256,31 +294,234 @@ On `fleet` binary start, read the skill's declared version from
 
 When reading any JSON state file, inspect `schema_version`:
 
-- If `> max-known`: error, refuse to process that file.
+- If `> max-known`: skip that file (do not crash the binary). Log an error.
+  Increment the TUI `⚡ warning` counter; the warning detail pane lists
+  affected file paths and recommends `fleet init`. Exception: if the skipped
+  file is a project manifest, the entire project's tasks are hidden from the
+  dashboard but the TUI stays up — the operator sees the project name
+  greyed out with a `⚡ manifest schema ahead of binary` note.
 - If `< max-known`: run the migration chain (`migrateV1ToV2`,
   `migrateV2ToV3`, ...) before using.
 
 Migration functions are scaffolded from v1 day-one even when empty, so
 adding v2 later is mechanical, not architectural.
 
-## F1 — Deploy depth limit
+Rationale for skip-not-crash: one future-schema file should not take down
+the whole dashboard. Isolating blast radius keeps other agents visible and
+gives the operator a clear action (`fleet init`) rather than a panic.
 
-Recursive `fleet deploy` is blocked. When `fleet deploy` runs, it checks
-`FLEET_AGENT_ID` env:
+## F1 — Dispatch depth limit
 
-- **Unset:** deploying from operator's shell — allowed.
-- **Set:** deploying from inside a supervised Claude Code instance — refused
+Recursive `fleet dispatch` and `fleet plan` are blocked. When either runs,
+it checks `FLEET_AGENT_ID` env:
+
+- **Unset:** dispatching from operator's shell — allowed.
+- **Set:** dispatching from inside a supervised Claude Code instance — refused
   with clear message:
-  `fleet deploy: supervised agents cannot spawn children. Use the handoff doc to pass task state to the next agent.`
+  `fleet dispatch: supervised agents cannot spawn children. Use the handoff doc to pass task state to the next agent.`
 
 Rationale: Fleet's thesis is horizontal parallelism (N equivalent agents),
 not hierarchy (org chart with delegation). Allowing recursion would make
 lineage tracking required and pull Fleet toward SwarmClaw's shape. Easier
 to refuse than to do it right.
 
+## F3 — Mode-aware handoff thresholds
+
+Threshold effects depend on `FLEET_MODE`. Modes split into two families:
+
+- **Doing modes** (`execute`, `fix`) — graceful handoff at 50% via
+  `MILESTONE` boundary; emergency kill at 70%.
+- **Thinking modes** (`plan`, `review`) — reminder-only at 50/70;
+  operator decides. Claude Code's own `/compact` at ~95% is the
+  backstop.
+
+The 50/70 numbers are shared across mode families for operator sanity
+(one pair of numbers to remember). Only the enforcement differs.
+
+**Schema.** Every `agents/<id>.json` carries `mode: "plan" | "execute"
+| "fix" | "review"` (plus `role: "executor" | "planner"`; the `planner`
+role is for project-level chat sessions, which have no thresholds at
+all). The fleet binary inspects `mode` when deciding what the Red
+threshold does.
+
+### F3a — Graceful handoff at 50% (doing modes)
+
+At 50% context, fleet-guard injects into the agent's next turn:
+
+```
+HANDOFF REQUESTED — finalize current milestone (commit if stable),
+then the next `MILESTONE` token is your exit.
+```
+
+The agent wraps its current bounded work unit (commit, test pass,
+sub-task of the plan), emits `MILESTONE` on its own line. fleet-guard
+detects the token and triggers the existing handoff sequence
+(DESIGN.md "Restart on handoff"): save handoff doc, 3s operator grace,
+spawn replacement with handoff pre-loaded.
+
+One token serves two purposes: `MILESTONE` is a progress signal in
+normal operation; when `HANDOFF REQUESTED` has been injected, the next
+`MILESTONE` is the exit trigger. Same token, context-dependent meaning.
+Keeps the CLAUDE.md snippet minimal.
+
+**Rationale for 50% (not 60% or 75%).** Cutting mid-work unit loses
+coherent progress. 50% is early enough that the agent has roughly half
+its context budget still available to finish a milestone (commit, pass
+tests, finish a sub-step) before handing off. Aligns with Premise 4's
+"act at 50%" and with Hermes/OpenClaw's auto-compact threshold.
+
+### F3b — Emergency threshold at 70% (doing modes)
+
+If context exceeds 70% without `MILESTONE` firing (agent ignored the
+queued handoff or couldn't reach a stable boundary), fleet-guard
+triggers immediate kill-and-respawn. Same mechanics as the existing
+handoff flow, re-purposed as the safety net.
+
+20% runway between graceful queue (50%) and emergency kill (70%) is
+the design's bet that any bounded work unit wraps in under 20% of
+context. Larger wraps indicate the task's mini-tasks are too coarse —
+operator should re-plan with finer steps.
+
+### F3c — Plan and review: reminder-only at 50/70
+
+`FLEET_MODE=plan` and `FLEET_MODE=review` are thinking modes. The
+thresholds fire as operator-facing reminders only:
+
+- 50%: `⚡` warning in the TUI alerts banner
+- 70%: `⚠` urgent reminder
+- No automatic handoff at any threshold
+
+**Rationale.** Plan-mode sessions accumulate reasoning about a specific
+task; review-mode sessions accumulate judgment about a diff. Killing
+either mid-thought destroys the thinking we're trying to produce. The
+operator is in a better position to decide: handoff the draft, attach
+and push to completion, or let Claude Code's own `/compact` handle it.
+
+**Hard backstop.** Fleet cannot prevent Claude Code's internal
+compression; `/compact` applies inside any mode. Fleet's guarantee is
+only that Fleet itself doesn't force the kill-and-respawn in thinking
+modes. The mode-aware TUI reminders give the operator enough warning
+to act before Claude's own limit.
+
+## F5 — Post-execute review loop
+
+Every task passes through a two-round review loop between executor
+completion and `done` status. The loop is Fleet-orchestrated (not
+agent-initiated) because F1 depth limits prevent agents from spawning
+agents.
+
+**Phases within `status: doing`.** Manifest task field `phase`:
+
+- `execute` — initial work (exits with `READY FOR REVIEW`)
+- `review-1` — fresh Claude reviews diff (exits with `REVIEW COMPLETE`)
+- `fix-1` — only if review-1 had comments; addresses them (exits with `FIXES COMPLETE`)
+- `review-2` — second pass on updated diff
+- `fix-2` — only if review-2 had comments
+- `done` — after round 2 completes (with or without fix-2)
+
+Status stays `doing` throughout the loop. Only `phase` changes.
+
+**Review scope.** Full diff against `main`:
+`git fetch origin main && git diff origin/main..HEAD`. Reviewer sees
+the task's complete change against the merge base, not just the
+executor's commits. Catches interactions with prior commits.
+
+**Reviewer skill selection.** The reviewer's CLAUDE.md snippet detects
+whether `codex` is installed:
+
+```bash
+if command -v codex >/dev/null 2>&1; then
+    # Invoke /codex review — independent model, second opinion
+else
+    # Invoke /review — Claude Code's built-in review skill
+fi
+```
+
+`codex` gives adversarial independent-model review where available.
+`/review` is the fallback.
+
+**Reviewers and fix agents: role + mode split.**
+
+| Phase    | `FLEET_ROLE` | `FLEET_MODE` | Threshold family |
+|----------|--------------|--------------|------------------|
+| execute  | executor     | execute      | doing (50%/70%)  |
+| review-N | executor     | review       | thinking (50/70 reminder) |
+| fix-N    | executor     | fix          | doing (50%/70%)  |
+
+Review is "thinking" (reminder-only); fix is "doing" (graceful + emergency).
+
+**Reviewers do NOT count against `max_concurrent_agents`.** Review is
+a serial follow-on to execute, not parallel execution. Counting them
+would starve other project slots during review.
+
+**Task file accumulates review sections.** In-repo task file grows:
+
+```markdown
+## Context
+## Plan
+## Progress
+## Review Round 1  (written by review agent)
+## Review Round 2  (written by review agent)
+```
+
+Fix agents append summaries to `## Progress`, not a separate section.
+
+**Escape hatch.** `--review-rounds=N` flag on `fleet dispatch`. Default
+`2`. `0` skips the loop for trivial changes (typos, version bumps).
+
+## F4 — Plan-mode Q&A loop
+
+Plan-mode agents may pause and ask the operator questions when `##
+Context` is insufficient. Mechanics:
+
+1. Agent writes a `## Planner Questions` section to
+   `<repo>/tasks/<slug>.md`, appending after `## Context`.
+2. Agent sets `needs_input: true` in its `agents/<id>.json`.
+3. Agent stops active processing (no `PLAN COMPLETE`, no further writes
+   to `## Plan`). The tmux session stays alive; the Claude process is
+   idle waiting for the next user turn.
+
+The TUI surfaces the pause as `✏ needs input` in the alerts banner and
+on the task row, using the same channel designed for A4-style attention
+states.
+
+**Answer paths (two, operator's choice):**
+
+- **Attach.** `[a]ttach <agent>` drops the operator into the tmux
+  session. Operator types answers directly. Claude consumes the next
+  user turn and resumes planning. `needs_input` clears on the next
+  health JSON write.
+- **Edit the task file.** Operator edits `## Planner Questions` in
+  `$EDITOR`, writes answers inline under each question, saves. The
+  fleet-guard skill watches `<repo>/tasks/` via fsnotify. On detected
+  write, it injects into the agent's next turn: *"Operator answered
+  your questions in the task file. Re-read it and continue the plan."*
+
+**Explicit wake fallback.** `fleet plan --continue <task>` writes a
+trigger to `~/.fleet/queue/resume-<agent-id>.json` that fleet-guard
+reads on next poll; same effect as fsnotify delivery. Use when fsnotify
+misses (macOS rename-event flakiness).
+
+**State machine.** `needs_input` is a sub-state of `planning`, not a
+new top-level task status. The status flag on the manifest stays
+`planning` throughout; only `needs_input` in the agent JSON toggles.
+
 ## F2 — Supervised-agent guardrails
 
-Two layers:
+Two layers, with a role-aware exception for planner sessions.
+
+**Role env.** Fleet spawns every tmux session with `FLEET_ROLE` set:
+
+- `FLEET_ROLE=executor` — default for `fleet dispatch`. The fleet-guard
+  skill is loaded. F2 refuses all mutating subcommands.
+- `FLEET_ROLE=planner` — set by `fleet chat`. The fleet-planner skill
+  is loaded instead of fleet-guard. The binary allows `fleet-sync`
+  writes to `~/.fleet/queue/` via the skill, but still refuses `fleet
+  dispatch`, `fleet handoff`, `fleet msg`, `fleet broadcast`,
+  `fleet plan`. Planner sessions propose; they do not dispatch.
+
+Both roles set `FLEET_AGENT_ID`, so F1 (depth limit) applies to both:
+neither role can spawn children.
 
 ### L1 — Prompt guardrail (fleet-guard skill)
 
@@ -288,9 +529,9 @@ The skill's injected CLAUDE.md snippet includes:
 
 ```
 You are working inside Fleet-supervised Claude Code session.
-Do NOT run `fleet deploy`, `fleet handoff`, `fleet msg`, `fleet broadcast`,
-`fleet tasks`, or any other mutating Fleet subcommand. Those commands
-belong to the operator, not to you.
+Do NOT run `fleet plan`, `fleet dispatch`, `fleet handoff`, `fleet msg`,
+`fleet broadcast`, `fleet tasks`, or any other mutating Fleet subcommand.
+Those commands belong to the operator, not to you.
 
 If you need to communicate state to your successor, write it into the task
 file's Progress section or into the handoff doc (fleet-guard handles
@@ -307,7 +548,7 @@ the doc mechanics when context fills).
 if os.Getenv("FLEET_AGENT_ID") != "" {
     if !isReadOnlySubcommand(subcmd) {
         fmt.Fprintf(os.Stderr,
-            "fleet: supervised agents cannot run `%s`. Allowed: status, peek.\n",
+            "fleet: supervised agents cannot run `%s`. Allowed: status, peek, version.\n",
             subcmd)
         os.Exit(2)
     }
@@ -329,8 +570,11 @@ binary stops mis-behaving ones from succeeding.
   "id": "a1b2",
   "pid": 84217,
   "tmux_session": "fleet-a1b2",
+  "role": "executor",
+  "mode": "execute",
   "task_id": "auth-token-refresh",
   "project": "rainier",
+  "review_round": null,
   "context_pct": 43,
   "context_source": "hook",
   "last_activity_ts": "2026-04-18T19:22:14Z",
@@ -344,6 +588,14 @@ binary stops mis-behaving ones from succeeding.
 }
 ```
 
+- `role`: `"executor" | "planner"`. Planner is for project-level chat
+  sessions (Phase 2 FLOW.md); executor covers execute/plan/fix/review.
+- `mode`: `"execute" | "plan" | "fix" | "review"` when `role=executor`;
+  `null` when `role=planner`. Drives the threshold family (doing vs
+  thinking) per F3.
+- `review_round`: `1 | 2 | null`. Populated when `mode` is `review` or
+  `fix`; `null` otherwise.
+
 ### projects/<name>.yaml
 
 ```yaml
@@ -352,29 +604,86 @@ name: rainier
 repo: /Users/edison/projects/rainier
 auto_spawn: true
 max_concurrent_agents: 2
+review_rounds: 2                          # default; per-task override allowed
 tasks:
   - id: auth-token-refresh
-    status: doing
+    status: doing                         # todo | planning | planned | queued | doing | blocked | unhealthy | done
+    phase: execute                        # execute | review-1 | fix-1 | review-2 | fix-2 (only when status=doing)
     priority: 1
     current_agent: a4
     handoff_count: 3
+    review_rounds: 2                      # optional per-task override; inherits project default
+    review_rounds_completed: 0            # incremented on REVIEW COMPLETE
     created: 2026-04-15
     task_file: tasks/auth-token-refresh.md
     spawn_history:
       - 2026-04-15T10:00:00Z
       - 2026-04-15T12:15:00Z
       - 2026-04-15T14:32:00Z
+  # Completed task — fields present after agent emits REVIEW COMPLETE
+  - id: fix-logging-format
+    status: done
+    priority: 3
+    current_agent: null
+    handoff_count: 0                      # resets on completion (live count, not historical)
+    review_rounds_completed: 2
+    created: 2026-04-14
+    completed: 2026-04-15                 # UTC date
+    last_commit: 4f8a2c1                  # short SHA from `git rev-parse HEAD` at done
+    # completion_source: operator         # only present if marked done via [shift]+[d]
+    # previous_last_commit: <sha>         # only present after revert via [shift]+[u]
+    task_file: tasks/fix-logging-format.md
+  # Unhealthy task — fields present when A4 budget exhausted
+  - id: cleanup-task
+    status: unhealthy
+    priority: 4
+    current_agent: null
+    handoff_count: 0
+    unhealthy_reason: "3 crashes in 1h · last: skill load fail"
+    spawn_history: [...]                  # operator clears via `fleet tasks unblock`
+  # Queued task — capacity exceeded, dispatch deferred
+  - id: refactor-storage
+    status: queued                        # cap reached; will auto-promote when slot frees
+    priority: 5
+    current_agent: null
+    queued_at: 2026-04-19T14:08:33Z       # tracks how long it's been waiting
 ```
+
+**Status state machine:**
+
+```
+todo ──[plan]──▶ planning ──▶ planned
+                                │
+                                ▼
+                              [dispatch]
+                                │
+   queued ◀──[cap reached]──────┤
+     │                          │
+     └──[slot frees]──▶ doing ──▶ done
+                          │
+              ┌───────────┼──────────┐
+              ▼           ▼          ▼
+           blocked    unhealthy    (any state can be reverted to todo)
+```
+
+`queued` is a real persisted status, not a transient flag — it must
+survive TUI restart. Auto-promotion happens when an active agent in the
+project completes, hands off, or is archived, freeing a
+`max_concurrent_agents` slot.
 
 ### handoffs/<agent-id>-<utc-iso>-<uuid>.md frontmatter
 
 ```yaml
 schema_version: 1
 agent_id: a1
+successor_hint: a2                    # pre-assigned; null if unknown at write time
 task_id: auth-token-refresh
 project: rainier
-context_pct_at_handoff: 72
-handoff_type: normal                  # normal | emergency_precompact | operator_triggered
+role: executor
+mode: execute                         # execute | plan | fix | review (role=executor); null for planner role
+phase: execute                        # matches manifest task `phase` at handoff time
+context_pct_at_handoff: 52
+handoff_type: graceful                # graceful | emergency | operator
 previous_handoff: ~/.fleet/handoffs/a1-20260415T140000Z-abc12345.md
 handoff_number: 3
 timestamp: 2026-04-15T14:32:00Z
@@ -412,9 +721,10 @@ Not in vault yet; hardcode for now.
   a separate mechanism.
 - Don't hold flock while calling out to tmux; tmux can block and a held
   flock blocks everyone else. Read manifest, release lock, then spawn.
-- The 50% / 75% thresholds are not guesses — Hermes Agent's
-  `ContextCompressor` independently picks 50% for auto-compaction, OpenClaw
-  auto-compacts at similar-order thresholds. Prior art validates the call.
+- The 50% / 70% thresholds: 50% is validated against prior art —
+  Hermes Agent's `ContextCompressor` auto-compacts at 50%, OpenClaw
+  auto-compacts at similar-order thresholds. 70% is Fleet's own choice
+  for the emergency runway (20% from graceful queue to hard kill).
 - Agents are peers, not children. No ID parent/child tracking in v1.
   `previous_handoff` in frontmatter is enough to reconstruct a task's agent
   chain for human-readable timelines.
