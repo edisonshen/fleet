@@ -570,6 +570,7 @@ binary stops mis-behaving ones from succeeding.
   "id": "a1b2",
   "pid": 84217,
   "tmux_session": "fleet-a1b2",
+  "engine": "claude-code",
   "role": "executor",
   "mode": "execute",
   "task_id": "auth-token-refresh",
@@ -595,6 +596,15 @@ binary stops mis-behaving ones from succeeding.
   thinking) per F3.
 - `review_round`: `1 | 2 | null`. Populated when `mode` is `review` or
   `fix`; `null` otherwise.
+- `engine`: which agent runtime spawned this process. v1 only writes
+  `"claude-code"`. Field exists from day one so v1.1 can add a second
+  engine (e.g. `"codex"`) without a schema migration. Forward-compat
+  rule: a missing `engine` field defaults to `"claude-code"` so v1.1
+  readers handle v1-era archived records without touching them. The
+  Fleet binary reads this only to look up the spawn command in
+  `config.yaml:engines.<engine>` and to route engine-specific behavior
+  (currently none). See `docs/DECISIONS.md` 2026-04-26 entry "v1.1
+  engine adapter — minimal v1 hooks".
 
 ### projects/<name>.yaml
 
@@ -605,6 +615,7 @@ repo: /Users/edison/projects/rainier
 auto_spawn: true
 max_concurrent_agents: 2
 review_rounds: 2                          # default; per-task override allowed
+engine: claude-code                       # default engine for new agents in this project; v1 only writes claude-code
 tasks:
   - id: auth-token-refresh
     status: doing                         # todo | planning | planned | queued | doing | blocked | unhealthy | done

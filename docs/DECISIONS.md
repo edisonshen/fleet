@@ -9,6 +9,51 @@ For the full context behind a decision, see the referenced doc section.
 
 ## 2026-04-26
 
+### v1.1 engine adapter — minimal v1 hooks
+
+v1 ships Claude-Code-only as planned. v1.1 will add a second engine
+(Codex CLI is the leading candidate). To avoid a painful migration, v1
+carries the *minimum* hooks for engine pluggability — and explicitly
+nothing more. No Go `Engine` interface, no plugin system, no multi-engine
+TUI affordances. Three concrete v1 changes:
+
+1. **`agents/<id>.json:engine`** — new field, value `"claude-code"` in
+   v1. v1.1 writes `"codex"` (or similar) without bumping
+   `schema_version`. Reader policy: missing field defaults to
+   `"claude-code"` for forward-compatibility on archived records.
+
+2. **`projects/<name>.yaml:engine`** — per-project default. Same
+   forward-compat rule: missing → `claude-code`.
+
+3. **`config.yaml:engines.<name>`** — spawn command lookup table.
+   v1 has one entry; `fleet dispatch` reads `engines.<engine>.cmd`
+   instead of inlining `claude`. v1.1 adds a second entry.
+
+What this explicitly does NOT include:
+- No engine interface in Go. Three lines of `if engine == "claude-code"`
+  beats a premature abstraction. The shape of the abstraction should be
+  informed by the *second* engine's actual surface.
+- No `codex-guard` skill design. fleet-guard stays Claude-Code-specific
+  by name and implementation. v1.1 ships a sibling skill that writes the
+  same `agents/<id>.json` contract — same data, different producer.
+- No Codex spike. v1's spike (`docs/SPIKE-context-pct.md`) answers v1's
+  question only.
+
+**Why now, not in v1.1:** schema additions cost zero in v1 because no
+manifests exist yet. Same change in v1.1 would require migrating live
+operator state. The forward-compat default rule (`missing → claude-code`)
+also lets v1.1 read v1-era archived records without touching them.
+
+**Why not more:** premature abstraction risk. The right `Engine`
+interface depends on what Codex actually exposes for hooks and
+transcript-token data — both unknowns until a Codex spike runs. Locking
+an interface in now would almost certainly be wrong. v1.1 designs the
+interface against a real second engine.
+
+**Where:** `docs/STATE.md` agents/projects schemas (engine field +
+forward-compat note); `docs/DESIGN.md` state-directory section
+(engines map in config.yaml).
+
 ### Phase 6/7/8 walkthroughs — five committed decisions
 
 Phase 6, 7, 8 of `docs/FLOW.md` were sketched in this session. Five

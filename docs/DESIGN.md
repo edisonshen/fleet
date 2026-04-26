@@ -349,7 +349,7 @@ The spike's deliverable is a 1-page decision doc committed to the repo at `docs/
 **State directory:**
 ```
 ~/.fleet/
-├── config.yaml                      # global preferences, defaults
+├── config.yaml                      # global preferences, defaults, engines map
 ├── projects/
 │   ├── rainier.yaml                 # project manifest: tasks, auto_spawn, max_agents
 │   ├── gift-finder.yaml
@@ -371,6 +371,23 @@ The spike's deliverable is a 1-page decision doc committed to the repo at `docs/
 └── logs/
     └── a1-20260415.log              # tmux pane capture
 ```
+
+**`config.yaml` engines map.** `fleet dispatch` looks up the spawn command
+by engine name rather than inlining `claude` in source. v1 ships one entry:
+
+```yaml
+engines:
+  claude-code:
+    cmd: claude
+    initial_prompt_flag: --initial-prompt
+```
+
+v1 only writes and reads `claude-code`. The map exists from day one so v1.1
+can add a `codex:` entry (or whatever second engine wins) without touching
+the dispatch code path or migrating the manifest. Per-agent engine is
+recorded in `agents/<id>.json:engine`; per-project default in
+`projects/<name>.yaml:engine`. See `docs/DECISIONS.md` 2026-04-26 entry
+"v1.1 engine adapter — minimal v1 hooks" for the full constraint.
 
 ## Reliability Invariants
 
