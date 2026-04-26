@@ -25,7 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Model name -> context-window size in tokens.
-# Defaults to 200_000 for unknown models. Update as needed.
+# Update as Anthropic ships new model IDs. Unknown models do NOT silently
+# fall back to a guessed limit — see the model-resolution block below for
+# why null + context_limit_known=False is preferable to a wrong percentage.
 CONTEXT_LIMITS = {
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
@@ -34,7 +36,6 @@ CONTEXT_LIMITS = {
     "claude-sonnet-4-5":   200_000,
     "claude-haiku-4-5":    200_000,
 }
-DEFAULT_LIMIT = 200_000
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
 PAYLOAD_DIR = SPIKE_DIR / "payloads"
@@ -91,12 +92,14 @@ def main() -> int:
         record["transcript_size_bytes"] = -1
 
     # Walk the JSONL once. Count lines, count assistant turns, count usage objects,
-    # capture the most recent usage object.
+    # capture the most recent usage object and the most recent assistant model
+    # (the Stop payload doesn't carry `model`, so the transcript is the source).
     total_lines = 0
     assistant_lines = 0
     usage_lines = 0
     last_usage: dict | None = None
     last_usage_line_index = -1
+    last_message_model = ""
 
     try:
         with tp.open("r", encoding="utf-8", errors="replace") as f:
@@ -109,10 +112,14 @@ def main() -> int:
                     obj = json.loads(line)
                 except Exception:
                     continue
+                msg = obj.get("message") or {}
                 if obj.get("type") == "assistant":
                     assistant_lines += 1
+                    m = msg.get("model")
+                    if isinstance(m, str) and m:
+                        last_message_model = m
                 # `usage` may sit at top level or under `message.usage`.
-                u = obj.get("usage") or (obj.get("message") or {}).get("usage")
+                u = obj.get("usage") or msg.get("usage")
                 if isinstance(u, dict):
                     usage_lines += 1
                     last_usage = u
@@ -121,6 +128,17 @@ def main() -> int:
         record["error"] = f"transcript_walk: {e}"
         _append(METRICS_FILE, record)
         return 0
+
+    # Resolve model: prefer transcript (where it actually lives), fall back to
+    # payload (in case future Claude Code versions populate Stop's `model`).
+    payload_model = record["model"]
+    if last_message_model:
+        record["model"] = last_message_model
+        record["model_source"] = "transcript"
+    elif payload_model:
+        record["model_source"] = "payload"
+    else:
+        record["model_source"] = ""
 
     record["transcript_total_lines"] = total_lines
     record["transcript_assistant_lines"] = assistant_lines
@@ -153,11 +171,6 @@ def main() -> int:
     cc_t = int(last_usage.get("cache_creation_input_tokens", 0) or 0)
     total = in_t + cr_t + cc_t  # output_tokens excluded — they're not in next-turn context
 
-    limit = CONTEXT_LIMITS.get(record["model"], DEFAULT_LIMIT)
-    record["context_limit"] = limit
-    record["context_limit_known"] = record["model"] in CONTEXT_LIMITS
-    pct = (total * 100.0 / limit) if limit > 0 else 0.0
-
     record["tokens"] = {
         "input": in_t,
         "output": out_t,
@@ -165,7 +178,21 @@ def main() -> int:
         "cache_creation": cc_t,
         "context_total": total,
     }
-    record["computed_pct"] = round(pct, 2)
+
+    # If the model isn't in our table, do NOT guess a limit — that produces
+    # plausible-looking but wrong percentages that poison Q3 (accuracy). The
+    # fire still counts for Q1 (we have tokens), but pct stays null until
+    # the model is added to CONTEXT_LIMITS.
+    known = record["model"] in CONTEXT_LIMITS
+    record["context_limit_known"] = known
+    if known:
+        limit = CONTEXT_LIMITS[record["model"]]
+        record["context_limit"] = limit
+        record["computed_pct"] = round(total * 100.0 / limit, 2)
+    else:
+        record["context_limit"] = None
+        record["computed_pct"] = None
+
     record["latency_ms"] = int((time.perf_counter() - t0) * 1000)
     _append(METRICS_FILE, record)
     return 0

@@ -137,15 +137,18 @@ def main() -> int:
     print("=== Q3: Accuracy (manual check) ===")
     print("Compare the values below against /context output at the same time.")
     print("The most recent fires are most useful for this comparison.\n")
-    print(f"{'time (UTC)':<22} {'session':<14} {'tokens':>10} {'limit':>10} {'pct':>6}")
-    print("-" * 70)
+    print(f"{'time (UTC)':<22} {'session':<14} {'model':<22} {'tokens':>10} {'limit':>10} {'pct':>7}")
+    print("-" * 95)
     for r in ok[-10:]:
         ts = r.get("ts", "")
         sid = (r.get("session_id") or "")[:12]
+        model = (r.get("model") or "?")[:22]
         tok = r.get("tokens", {}).get("context_total", 0)
-        lim = r.get("context_limit", 0)
-        pct = r.get("computed_pct", 0)
-        print(f"{ts:<22} {sid:<14} {tok:>10} {lim:>10} {pct:>5.1f}%")
+        lim = r.get("context_limit")
+        pct = r.get("computed_pct")
+        lim_str = f"{lim:>10}" if lim is not None else f"{'unknown':>10}"
+        pct_str = f"{pct:>6.1f}%" if pct is not None else f"{'n/a':>7}"
+        print(f"{ts:<22} {sid:<14} {model:<22} {tok:>10} {lim_str} {pct_str}")
     print()
     print("=== verdict ===")
     print("Open spike/HOOK-PAYLOAD-SAMPLES.md for raw payloads.")
