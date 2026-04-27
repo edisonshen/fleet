@@ -11,7 +11,7 @@ You are likely Claude Code working in this repo. Read these before touching anyt
 ## Current state
 
 - v0.0.0 stub. `cmd/fleet/main.go` prints version and exits.
-- Module: `github.com/edisonshen/fleet`. Go 1.22+.
+- Module: `github.com/edisonshen/fleet`. Go 1.25+.
 - No dependencies yet. `go build ./...` should pass with stdlib only.
 
 ## What to work on next
