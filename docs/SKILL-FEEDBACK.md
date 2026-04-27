@@ -255,18 +255,18 @@ per cycle on Opus.
 
 ```
 ~/.fleet/
-├── skill-events/
-│   ├── fleet-guard-2026-04-26.jsonl      # event records (append-only)
-│   ├── fleet-guard-2026-04-26.outcomes.jsonl  # outcome backfill (append-only)
-│   ├── fleet-planner-2026-04-26.jsonl
-│   └── fleet-planner-2026-04-26.outcomes.jsonl
-└── skill-events/archive/
-    └── fleet-guard-2026-03-01.jsonl       # rotated past retention window
+└── skill-events/
+    ├── fleet-guard-2026-04-26.jsonl      # event records (append-only)
+    ├── fleet-guard-2026-04-26.outcomes.jsonl  # outcome backfill (append-only)
+    ├── fleet-planner-2026-04-26.jsonl
+    └── fleet-planner-2026-04-26.outcomes.jsonl
 ```
 
-One file per skill per UTC date. Rotation happens at midnight UTC by the
-hourly maintenance tick. Files older than retention window move to
-`archive/` (or are deleted at user discretion via `fleet prune --skill-events`).
+One file per skill per UTC date. New files open at midnight UTC by the
+hourly maintenance tick. Files older than the retention window are
+deleted by the same prune pass that handles `progress/*.jsonl` — no
+archive tier (matches Fleet's existing retention pattern: keep what's
+useful, drop the rest).
 
 ---
 
@@ -291,14 +291,13 @@ Add to the retention table in `docs/STATE.md` A4b:
 
 | Path | Retention | Reason |
 |------|-----------|--------|
-| `skill-events/<skill>-<date>.jsonl` | 90 days | aggregator needs multi-week windows for trend detection |
-| `skill-events/<skill>-<date>.outcomes.jsonl` | 90 days | paired with events |
-| `skill-events/archive/*` | 1 year | post-rotation, kept for long-window analysis |
+| `skill-events/<skill>-<date>.jsonl` | 30 days from last write | matches `progress/*.jsonl`; one writer per file, simple uniform window |
+| `skill-events/<skill>-<date>.outcomes.jsonl` | 30 days from last write | paired with events |
 
-90 days vs the 30 days that `progress/*.jsonl` gets: handoff
-calibration data takes longer to accumulate enough fires to be
-statistically meaningful, and operator-confidence in proposed prompt
-edits comes from seeing trends across many task lifecycles.
+Same 30-day window as `progress/*.jsonl`. One uniform retention rule
+across all per-task / per-skill audit trails is cheaper to reason about
+than a tiered scheme. If aggregation later proves it needs longer
+windows for trend detection, raise the number — but don't pre-optimize.
 
 ---
 
@@ -355,9 +354,9 @@ launching v0.1 without the data we need to tune v0.2.
       (operator manually canceled the dispatched task vs let it run)?
       That's a richer signal but requires more TUI plumbing
       (`[shift]+[c]` keypress logged as event).
-- [ ] Retention 90 days is a guess. Validate against real aggregator
-      runs in v1.1 dogfood — may need shorter for storage, longer for
-      trend detection.
+- [ ] Retention 30 days matches `progress/*.jsonl` for uniformity. If
+      v1.1 aggregator runs show trend detection needs more history,
+      raise the window per-skill. Don't pre-optimize.
 - [ ] Cross-skill correlations (fleet-planner produces tasks that get
       dispatched and then immediately churn through fleet-guard
       handoffs — is the plan or the threshold to blame?). Defer to
