@@ -146,6 +146,28 @@ issue" costs the next agent a search they shouldn't have to run.
 
 ---
 
+### [ ] F9 — Skill closed-loop feedback (fleet-guard, fleet-planner)
+
+**What.** Each Fleet skill writes a per-execution event to
+`~/.fleet/skill-events/<skill>-<date>.jsonl`. Fleet binary backfills
+outcome attribution (did the next agent succeed? did the planned task
+complete?). Aggregator (`fleet skills feedback`) surfaces patterns.
+Tier 4 (deferred to v1.2) proposes SKILL.md edits as auto-opened PRs
+the operator reviews — never auto-commits.
+
+**Full design:** `docs/SKILL-FEEDBACK.md`. Includes event schema,
+outcome attribution mechanism, retention, phasing (Tier 1 + 2 in v1
+alongside skill landing, Tier 3 + 4 in v1.1+), STATE.md writer-table
+and retention-table extensions, open questions.
+
+**Depends on.** fleet-guard skill landing (Week 4 structural code, not
+the auto-handoff trigger). fleet-planner landing (Phase 2 of FLOW.md).
+
+**Decision.** Tiers 1 + 2 in v1 — instrument from day one is cheaper
+than retrofit. Tiers 3 + 4 ride later releases.
+
+---
+
 ### [ ] T1 — Prompt/LLM change eval scope (from prior review's test plan)
 
 **What.** Claude Code hook behavior and fleet-guard prompt changes are both
