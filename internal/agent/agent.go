@@ -1,0 +1,157 @@
+// Package agent owns the agent record (~/.fleet/agents/<id>.json).
+//
+// Schema mirrors docs/STATE.md "agents/<id>.json" canonical shape.
+// Writes go through state.WriteAtomic so readers (TUI, CLI, fsnotify)
+// never see torn JSON.
+package agent
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/state"
+)
+
+// SchemaVersion is bumped when Record's on-disk shape changes
+// incompatibly. Readers compare and refuse newer versions.
+const SchemaVersion = 1
+
+// DefaultEngine is the agent runtime spawned for new dispatches.
+// v1 only writes "claude-code"; v1.1 adds "codex" (or similar)
+// without a schema migration. See docs/DECISIONS.md 2026-04-26
+// "v1.1 engine adapter — minimal v1 hooks".
+const DefaultEngine = "claude-code"
+
+// Record matches docs/STATE.md "agents/<id>.json" canonical schema.
+//
+// One writer per file (fleet-guard in the agent's own process post-
+// Week-4; the fleet binary today). Readers tolerate missing optional
+// fields by treating them as null — never crash on absence.
+type Record struct {
+	SchemaVersion  int        `json:"schema_version"`
+	ID             string     `json:"id"`
+	PID            int        `json:"pid"`
+	TmuxSession    string     `json:"tmux_session"`
+	Engine         string     `json:"engine"`
+	Role           string     `json:"role"`           // "executor" | "planner"
+	Mode           string     `json:"mode,omitempty"` // "execute" | "plan" | "fix" | "review"
+	TaskID         string     `json:"task_id,omitempty"`
+	Project        string     `json:"project,omitempty"`
+	ReviewRound    *int       `json:"review_round"`
+	ContextPct     *float64   `json:"context_pct"`
+	ContextSource  string     `json:"context_source,omitempty"` // "hook" | "proxy" (per DESIGN.md)
+	LastActivityTS time.Time  `json:"last_activity_ts"`
+	Blocked        bool       `json:"blocked"`
+	BlockedReason  *string    `json:"blocked_reason"`
+	BlockedSince   *time.Time `json:"blocked_since"`
+	NeedsInput     bool       `json:"needs_input"`
+	InboxPending   bool       `json:"inbox_pending"`
+	HandoffType    *string    `json:"handoff_type"`
+	SpawnedAt      time.Time  `json:"spawned_at"`
+}
+
+// NewID generates a short hex agent identifier (8 chars from 4 random
+// bytes). Collision probability is negligible at v1's 1-20 concurrent
+// agent ceiling. Examples: "a1b2c3d4", "7f3a92e1".
+//
+// We do NOT use a sequential counter (a1, a2, ...) because that would
+// require a per-machine state file and a flock to serialize allocation.
+// Random hex sidesteps that entirely. The TUI can still display short
+// labels by truncating to the first 4 chars if desired.
+func NewID() string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is exceptional; fall back to time-based
+		// to keep dispatch from crashing on a transient kernel hiccup.
+		return fmt.Sprintf("t%07x", time.Now().UnixNano()&0xffffffff)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// New builds a Record with required defaults filled in. Caller sets
+// task-specific fields before Write.
+func New(id string) *Record {
+	now := time.Now().UTC()
+	return &Record{
+		SchemaVersion:  SchemaVersion,
+		ID:             id,
+		Engine:         DefaultEngine,
+		Role:           "executor",
+		Mode:           "execute",
+		LastActivityTS: now,
+		SpawnedAt:      now,
+	}
+}
+
+// Write atomically publishes the record to ~/.fleet/agents/<id>.json.
+func (r *Record) Write() error {
+	path, err := state.AgentPath(r.ID)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal agent record: %w", err)
+	}
+	// Pretty-printed JSON ends without a trailing newline; add one
+	// so cat/grep behave nicely.
+	data = append(data, '\n')
+	return state.WriteAtomic(path, data)
+}
+
+// Load reads an agent record by ID from disk.
+func Load(id string) (*Record, error) {
+	path, err := state.AgentPath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("agent %s: %w", id, state.ErrNotFound)
+		}
+		return nil, fmt.Errorf("read agent %s: %w", id, err)
+	}
+	var r Record
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("parse agent %s: %w", id, err)
+	}
+	return &r, nil
+}
+
+// List returns every live agent record under ~/.fleet/agents/.
+// Archived records (under agents/archive/) are not included.
+func List() ([]*Record, error) {
+	dir, err := state.AgentDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("readdir agents: %w", err)
+	}
+	var out []*Record
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		id := e.Name()[:len(e.Name())-len(".json")]
+		r, err := Load(id)
+		if err != nil {
+			// Skip records we can't parse rather than failing the
+			// whole list — partial results beat zero results when
+			// the operator is trying to triage.
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
