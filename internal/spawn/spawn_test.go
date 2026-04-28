@@ -146,6 +146,46 @@ func TestSpawn_CapturesCwdAndCommandOnRecord(t *testing.T) {
 	}
 }
 
+func TestSpawn_AbsolutizesRelativeCwd(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pick an existing absolute path, then derive a RELATIVE form by
+	// chdir'ing to its parent. spawn must canonicalize back to the
+	// absolute path when storing on the record.
+	abs := t.TempDir()
+	parent := filepath.Dir(abs)
+	rel := filepath.Base(abs)
+
+	origWd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origWd) })
+	if err := os.Chdir(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Cwd:     rel, // relative
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if !filepath.IsAbs(rec.Cwd) {
+		t.Errorf("Cwd not absolutized: got %q", rec.Cwd)
+	}
+	// Compare via EvalSymlinks because macOS resolves /var → /private/var
+	// during filepath.Abs; t.TempDir returns the unfollowed form.
+	got, _ := filepath.EvalSymlinks(rec.Cwd)
+	want, _ := filepath.EvalSymlinks(abs)
+	if got != want {
+		t.Errorf("Cwd absolutization wrong: got %q want %q", got, want)
+	}
+}
+
 func TestSpawn_FromHandoffInheritsAndIncrements(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

@@ -39,14 +39,26 @@ const SpawnFreshPrefix = "spawn-fresh-"
 // just handed off, please spawn its replacement using the doc at
 // HandoffDoc." Read by the consumer in cmd/fleet/handoff.go (4a) and
 // by the TUI background drain (4b+).
+//
+// Crash-recovery contract: NewAgentID and NewSession are populated
+// AFTER spawn.Spawn succeeds, by re-writing the queue file. A retry
+// that finds an existing queue file with NewAgentID set knows the
+// replacement already exists and must NOT spawn a second one — it
+// should complete the in-flight handoff (kill old, archive, delete
+// queue) instead.
 type SpawnFresh struct {
 	SchemaVersion int    `json:"schema_version"`
 	OldAgentID    string `json:"old_agent_id"`
 	// HandoffDoc is the absolute path to the doc the new agent will
 	// be told to read on startup (via FLEET_EXTRA_CLAUDE_MD).
-	HandoffDoc string    `json:"handoff_doc"`
-	Project    string    `json:"project"`
-	TaskID     string    `json:"task_id"`
+	HandoffDoc string `json:"handoff_doc"`
+	Project    string `json:"project"`
+	TaskID     string `json:"task_id"`
+	// NewAgentID and NewSession are empty before spawn, populated
+	// after. Their presence in a re-read queue file is the signal
+	// "replacement already exists; do not re-spawn."
+	NewAgentID string    `json:"new_agent_id,omitempty"`
+	NewSession string    `json:"new_session,omitempty"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 }
 

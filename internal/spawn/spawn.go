@@ -15,6 +15,7 @@ package spawn
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
@@ -77,12 +78,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// Capture the resolved cwd so `fleet handoff` can place the
 	// replacement in the same project checkout even when invoked
 	// from a different shell. Empty opts.Cwd means "inherit caller"
-	// — resolve via os.Getwd() so the record stores the absolute
-	// path, not "" (which would force the next handoff to guess).
+	// — resolve via os.Getwd(). Relative paths from --cwd get
+	// canonicalized via filepath.Abs so the record always stores
+	// an absolute path, immune to "next handoff invoked from a
+	// different shell" wrong-tree spawns.
 	cwd := opts.Cwd
 	if cwd == "" {
 		if wd, err := os.Getwd(); err == nil {
 			cwd = wd
+		}
+	} else if !filepath.IsAbs(cwd) {
+		if abs, err := filepath.Abs(cwd); err == nil {
+			cwd = abs
 		}
 	}
 	rec.Cwd = cwd

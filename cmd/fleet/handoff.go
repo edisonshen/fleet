@@ -99,7 +99,32 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 	defer release()
 
-	// 2. Load the agent record under the flock. If a concurrent
+	// 2. Crash-recovery probe: if a previous handoff for this agent
+	//    crashed AFTER spawning the replacement but BEFORE deleting
+	//    the queue file, the queue file's NewAgentID will be set.
+	//    Resume by completing kill+archive+delete with the existing
+	//    replacement instead of spawning a second one.
+	pendingPath, _ := state.QueuePath(queue.SpawnFreshName(opts.oldID))
+	if pending, perr := queue.ReadSpawnFresh(pendingPath); perr == nil && pending.NewAgentID != "" {
+		oldRec, lerr := agent.Load(opts.oldID)
+		if lerr != nil {
+			// Old record gone but queue file references it — partial
+			// state from a previous crash. Clean up the queue file
+			// and bail; nothing more to do for this oldID.
+			_ = queue.Delete(pendingPath)
+			return fmt.Errorf("agent %s already archived; cleaned stale queue file referencing replacement %s", opts.oldID, pending.NewAgentID)
+		}
+		newRec, nerr := agent.Load(pending.NewAgentID)
+		if nerr != nil {
+			// Replacement record vanished — orphan queue file. Delete
+			// and proceed normally so a fresh spawn can happen.
+			_ = queue.Delete(pendingPath)
+		} else {
+			return resumeHandoff(opts, stdout, stderr, oldRec, newRec, pending.HandoffDoc, pendingPath)
+		}
+	}
+
+	// 3. Load the agent record under the flock. If a concurrent
 	//    handoff already archived it, agent.Load returns ErrNotFound
 	//    and we bail without double-spawning. This is the only Load
 	//    — the per-agent lock makes the pre-lock Load redundant.
@@ -173,6 +198,26 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// Spawn failed — leave the queue file in place so a later
 		// drain can retry. The old agent is still alive and untouched.
 		return fmt.Errorf("spawn replacement: %w", err)
+	}
+
+	// 7b. Record the successor on the queue file. Crash recovery
+	//     contract (queue.SpawnFresh): if this process dies between
+	//     here and step 12 (queue.Delete), a retry of `fleet handoff
+	//     <oldID>` finds the queue file with NewAgentID set and
+	//     resumes via resumeHandoff (kill+archive+delete) instead of
+	//     spawning another replacement.
+	if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: oldRec.ID,
+		HandoffDoc: docPath,
+		Project:    oldRec.Project,
+		TaskID:     oldRec.TaskID,
+		NewAgentID: newRec.ID,
+		NewSession: newRec.TmuxSession,
+	}); werr != nil {
+		// Couldn't update the journal. Best-effort — continue with
+		// the handoff; if we crash the retry will double-spawn (the
+		// pre-fix behavior). Surface a warning.
+		_, _ = fmt.Fprintf(stderr, "warning: queue successor update: %v\n", werr)
 	}
 
 	// 8. Send "/exit" to the old session. ErrNoSession means it
@@ -262,5 +307,56 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
 	_, _ = fmt.Fprintf(stdout, "then say: read the handoff doc at %s and continue\n", docPath)
+	return nil
+}
+
+// resumeHandoff finishes a handoff that crashed AFTER spawn but
+// BEFORE archive (the recovery branch in step 2 of runHandoff).
+// Same kill+archive+delete sequence as the tail of runHandoff, no
+// spawn — the new agent already exists.
+//
+// Caller holds the per-agent flock.
+func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
+	oldRec, newRec *agent.Record, docPath, queuePath string) error {
+
+	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
+		!errors.Is(err, tmux.ErrNoSession) {
+		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
+	}
+	if opts.graceMillis > 0 {
+		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
+	}
+	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
+		if tmux.HasSession(oldRec.TmuxSession) {
+			return fmt.Errorf(
+				"resume handoff: old session %s still alive after kill: %w (replacement %s exists; investigate)",
+				oldRec.TmuxSession, err, newRec.ID)
+		}
+		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
+			oldRec.TmuxSession, err)
+	}
+	if err := oldRec.Archive(); err != nil {
+		path, perr := state.AgentPath(oldRec.ID)
+		if perr == nil {
+			if rmErr := os.Remove(path); rmErr == nil {
+				_, _ = fmt.Fprintf(stderr, "warning: archive %s: %v (live record removed instead)\n",
+					oldRec.ID, err)
+			} else {
+				return fmt.Errorf("resume handoff: archive %s failed (%w) AND remove failed (%w)",
+					oldRec.ID, err, rmErr)
+			}
+		}
+	}
+	if err := queue.Delete(queuePath); err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	}
+
+	_, _ = fmt.Fprintf(stdout, "resumed crashed handoff: %s → %s (replacement was already spawned)\n",
+		oldRec.ID, newRec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", newRec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", newRec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
+	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
+	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
 	return nil
 }

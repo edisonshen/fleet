@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -321,6 +322,66 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 		Cwd:     cwd,
 		Command: command,
 	})
+}
+
+func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {
+	// Codex iter-6 P1: simulate the crash window between spawn (step
+	// 7b) and queue.Delete (step 12). A retry must NOT spawn a
+	// second replacement; it must complete kill+archive+delete via
+	// resumeHandoff.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Manually construct the post-crash state:
+	//   - old still in agents/, old session still alive
+	//   - replacement record + tmux session exist
+	//   - queue file exists with NewAgentID populated
+	repCwd := t.TempDir()
+	replacement, err := agentSpawnForTest(t, repCwd, []string{"sleep", "120"}, old.Project, old.TaskID)
+	if err != nil {
+		t.Fatalf("seed replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
+
+	docPath := "/some/handoffs/" + old.ID + "-stub.md"
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: docPath,
+		Project:    old.Project,
+		TaskID:     old.TaskID,
+		NewAgentID: replacement.ID,
+		NewSession: replacement.TmuxSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	// Run handoff for the same oldID. Should detect the journal
+	// entry, resume (no spawn), kill old, archive old, delete queue.
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("resumed handoff: %v\n%s", err, out.String())
+	}
+
+	// Exactly one live agent remains: the replacement, NOT a third
+	// double-spawn.
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent post-resume, got %d", len(live))
+	}
+	if live[0].ID != replacement.ID {
+		t.Errorf("expected resumed-into replacement %s, got %s", replacement.ID, live[0].ID)
+	}
+	// Output should signal the resume path so operator knows what
+	// happened (vs a fresh handoff).
+	if !strings.Contains(out.String(), "resumed") {
+		t.Errorf("expected output to mention 'resumed':\n%s", out.String())
+	}
 }
 
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
