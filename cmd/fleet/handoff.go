@@ -173,6 +173,25 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
 		default:
+			// Record exists. If the session is ALSO alive, the
+			// previous handoff just needs its tail completed —
+			// dispatch to resumeHandoff. If the session is dead
+			// (replacement command crashed at startup before the
+			// original process reached step 8a's rollback), clean
+			// up the stale replacement and fall through to normal
+			// spawn — the old agent is still alive, so a fresh
+			// replacement is the correct recovery action.
+			if !tmux.HasSession(newRec.TmuxSession) {
+				if path, perr := state.AgentPath(newRec.ID); perr == nil {
+					_ = os.Remove(path)
+				}
+				_ = queue.Delete(pendingPath)
+				_, _ = fmt.Fprintf(stderr,
+					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
+					newRec.ID, newRec.TmuxSession)
+				// Fall through to normal spawn flow.
+				break
+			}
 			return resumeHandoff(opts, stdout, stderr, oldRec, newRec, pending.HandoffDoc, pendingPath)
 		}
 	}
