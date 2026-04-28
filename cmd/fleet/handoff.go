@@ -110,15 +110,39 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    silently cleaning up the journal on a corrupted-record read
 	//    would either mask broken state or trigger a double-spawn.
 	pendingPath, _ := state.QueuePath(queue.SpawnFreshName(opts.oldID))
-	if pending, perr := queue.ReadSpawnFresh(pendingPath); perr == nil && pending.NewAgentID != "" {
+	pending, perr := queue.ReadSpawnFresh(pendingPath)
+	switch {
+	case errors.Is(perr, state.ErrNotFound):
+		// No queue file — normal flow.
+	case perr != nil:
+		// Corrupted journal / newer schema / permission error. Don't
+		// silently fall through to the spawn path — that's a
+		// double-spawn risk. Abort so the operator can investigate.
+		return fmt.Errorf("recovery probe: read queue file %s failed: %w", pendingPath, perr)
+	case pending.NewAgentID != "":
 		oldRec, lerr := agent.Load(opts.oldID)
 		switch {
 		case errors.Is(lerr, state.ErrNotFound):
-			// Old record already archived — handoff completed
-			// successfully and only the queue.Delete tail crashed.
-			// Cleanup is the right action AND the right success
-			// signal for retry scripts: exit 0 so `until fleet
-			// handoff X; do sleep; done`-style loops stop.
+			// Old record gone. Verify the replacement is actually
+			// alive before declaring "already handed off"; if the
+			// replacement also vanished, the task currently has NO
+			// live agent and we must not silently exit success.
+			newRec, nerr := agent.Load(pending.NewAgentID)
+			switch {
+			case errors.Is(nerr, state.ErrNotFound):
+				return fmt.Errorf(
+					"agent %s already archived BUT replacement %s record is gone — task has no live agent; clean up queue file %s manually after starting a new agent",
+					opts.oldID, pending.NewAgentID, pendingPath)
+			case nerr != nil:
+				return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
+			}
+			if !tmux.HasSession(newRec.TmuxSession) {
+				return fmt.Errorf(
+					"agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
+					opts.oldID, pending.NewAgentID, newRec.TmuxSession, pendingPath)
+			}
+			// Old archived, replacement live — handoff truly
+			// completed. Clean up the journal and report success.
 			_ = queue.Delete(pendingPath)
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
@@ -291,14 +315,27 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    why kill failed.
 	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
 		if tmux.HasSession(oldRec.TmuxSession) {
+			// Try to roll back the new agent. ONLY delete its record
+			// after confirming the new tmux session is also gone —
+			// otherwise we'd leave a live tmux session with no
+			// fleet record (untracked successor that a later retry
+			// would not see, leading to multiple replacements).
 			_ = tmux.Kill(newRec.TmuxSession)
-			if path, perr := state.AgentPath(newRec.ID); perr == nil {
-				_ = os.Remove(path)
+			if !tmux.HasSession(newRec.TmuxSession) {
+				if path, perr := state.AgentPath(newRec.ID); perr == nil {
+					_ = os.Remove(path)
+				}
+				_ = queue.Delete(queuePath)
+				return fmt.Errorf(
+					"old session %s still alive after kill failure: %w (replacement %s rolled back; investigate before retrying)",
+					oldRec.TmuxSession, err, newRec.ID)
 			}
-			_ = queue.Delete(queuePath)
+			// Both kills failed. Don't touch the new record — it
+			// still points at a live tmux session. Operator must
+			// investigate both stuck sessions.
 			return fmt.Errorf(
-				"old session %s still alive after kill failure: %w (replacement %s rolled back; investigate before retrying)",
-				oldRec.TmuxSession, err, newRec.ID)
+				"old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved to track the live session; clean up both manually)",
+				oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID)
 		}
 		// Session vanished concurrently with our Kill attempt
 		// (race with operator's manual kill, OS shutdown, etc.).
