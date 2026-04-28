@@ -134,6 +134,11 @@ func TestSpawn_RollsBackTmuxOnRecordWriteFailure(t *testing.T) {
 	requireTmux(t)
 	tmp := setupFleetHome(t)
 
+	// Snapshot tmux sessions BEFORE the failing spawn so we can detect
+	// any new ones after. (Listing all fleet-* sessions globally is
+	// racy when other test packages share the tmux server.)
+	before := liveFleetSessions(t)
+
 	// Sabotage the agents/ directory: replace it with a regular file
 	// so any record write fails.
 	agentsDir := filepath.Join(tmp, "agents")
@@ -153,21 +158,33 @@ func TestSpawn_RollsBackTmuxOnRecordWriteFailure(t *testing.T) {
 		t.Fatal("expected Spawn to fail on record write")
 	}
 
-	// No tmux sessions should be left behind. List all fleet-* sessions
-	// and assert none exist (rollback killed the orphan).
-	out, lerr := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
-	if lerr != nil {
-		// "no server running" is expected if no other tests are running
-		// concurrently — that's the success case.
-		if !strings.Contains(string(out), "no server") {
-			return
+	// No NEW fleet-* session should exist after the failing spawn.
+	after := liveFleetSessions(t)
+	for s := range after {
+		if !before[s] {
+			t.Errorf("orphan tmux session not cleaned up: %s", s)
+			_ = tmux.Kill(s) // belt-and-suspenders cleanup
 		}
 	}
-	for _, name := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(name, "fleet-") && !strings.HasPrefix(name, "fleet-test-") {
-			t.Errorf("orphan tmux session not cleaned up: %s", name)
+}
+
+// liveFleetSessions returns the set of currently-live tmux sessions
+// whose name starts with "fleet-". Used to diff before/after a spawn
+// without cross-package races.
+func liveFleetSessions(t *testing.T) map[string]bool {
+	t.Helper()
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").Output()
+	if err != nil {
+		// "no server running" = empty set, not an error.
+		return map[string]bool{}
+	}
+	set := map[string]bool{}
+	for _, name := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.HasPrefix(name, "fleet-") {
+			set[name] = true
 		}
 	}
+	return set
 }
 
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
