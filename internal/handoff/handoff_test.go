@@ -94,8 +94,36 @@ func TestRender_ContextPctRendersAsNumber(t *testing.T) {
 	if !strings.Contains(got, "context_pct_at_handoff: 72.5\n") {
 		t.Errorf("expected context_pct_at_handoff: 72.5 in:\n%s", got)
 	}
-	if !strings.Contains(got, "handoff_type: auto-yellow\n") {
-		t.Errorf("expected handoff_type: auto-yellow in:\n%s", got)
+	if !strings.Contains(got, `handoff_type: "auto-yellow"`+"\n") {
+		t.Errorf("expected quoted handoff_type in:\n%s", got)
+	}
+}
+
+func TestRender_QuotesYAMLMetacharsInOperatorFields(t *testing.T) {
+	// Operator-supplied --project / --task may contain colons,
+	// newlines, or other YAML metacharacters. %q on every string
+	// field neutralizes these — without quoting, a project name like
+	// "foo: bar" would corrupt the frontmatter (parsed as
+	// `project: foo, then a stray "bar" key).
+	d := NewManualStub("a1b2c3d4", "task: with colon", "proj\nbroken", 1, nil,
+		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
+	got := string(Render(d))
+	if !strings.Contains(got, `task_id: "task: with colon"`+"\n") {
+		t.Errorf("task_id not quoted to preserve colon literal:\n%s", got)
+	}
+	// %q escapes \n as the literal sequence backslash-n inside the
+	// quotes — the raw newline never reaches the YAML.
+	if !strings.Contains(got, `project: "proj\nbroken"`+"\n") {
+		t.Errorf("project not quoted to escape newline:\n%s", got)
+	}
+}
+
+func TestRender_TimestampQuoted(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil,
+		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
+	got := string(Render(d))
+	if !strings.Contains(got, `timestamp: "2026-04-27T18:48:07Z"`+"\n") {
+		t.Errorf("expected quoted timestamp in:\n%s", got)
 	}
 }
 
@@ -109,7 +137,7 @@ func TestRender_TimestampNormalizedToUTC(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, ts)
 
 	got := string(Render(d))
-	if !strings.Contains(got, "timestamp: 2026-04-27T14:32:00Z\n") {
+	if !strings.Contains(got, `timestamp: "2026-04-27T14:32:00Z"`+"\n") {
 		t.Errorf("expected UTC RFC3339 timestamp in:\n%s", got)
 	}
 }

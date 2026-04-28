@@ -84,17 +84,20 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // Render produces the markdown+frontmatter bytes for d.
 //
 // Frontmatter is hand-rolled YAML so we avoid pulling in a YAML
-// dependency just to write 8 key:value pairs. Strings that may contain
-// path separators or special chars (PreviousPath) use Go's %q which
-// emits a double-quoted form compatible with YAML's flow scalar.
+// dependency just to write 8 key:value pairs. All string fields are
+// quoted via Go's %q (double-quoted form, YAML-compatible flow scalar)
+// so operator-supplied values containing colons, newlines, or other
+// YAML metacharacters cannot corrupt or inject into the frontmatter.
+// agent_id is hex from agent.NewID and would never need quoting in
+// practice, but consistency beats minimizing bytes.
 //
 // Pure function — no I/O, no globals. Use Write to persist.
 func Render(d *Doc) []byte {
 	var b bytes.Buffer
 	b.WriteString("---\n")
-	fmt.Fprintf(&b, "agent_id: %s\n", d.AgentID)
-	fmt.Fprintf(&b, "task_id: %s\n", d.TaskID)
-	fmt.Fprintf(&b, "project: %s\n", d.Project)
+	fmt.Fprintf(&b, "agent_id: %q\n", d.AgentID)
+	fmt.Fprintf(&b, "task_id: %q\n", d.TaskID)
+	fmt.Fprintf(&b, "project: %q\n", d.Project)
 	if d.ContextPctAtHandoff != nil {
 		fmt.Fprintf(&b, "context_pct_at_handoff: %s\n",
 			strconv.FormatFloat(*d.ContextPctAtHandoff, 'f', -1, 64))
@@ -107,8 +110,8 @@ func Render(d *Doc) []byte {
 		b.WriteString("previous_handoff: null\n")
 	}
 	fmt.Fprintf(&b, "handoff_number: %d\n", d.Number)
-	fmt.Fprintf(&b, "timestamp: %s\n", d.Timestamp.UTC().Format(time.RFC3339))
-	fmt.Fprintf(&b, "handoff_type: %s\n", d.Type)
+	fmt.Fprintf(&b, "timestamp: %q\n", d.Timestamp.UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "handoff_type: %q\n", d.Type)
 	b.WriteString("---\n\n")
 
 	fmt.Fprintf(&b, "## Completed\n%s\n\n", d.Completed)

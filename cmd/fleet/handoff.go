@@ -44,7 +44,7 @@ outgoing record and increments handoff_number by 1.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.oldID = args[0]
-			return runHandoff(opts, cmd.OutOrStdout())
+			return runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
@@ -68,7 +68,7 @@ outgoing record and increments handoff_number by 1.`,
 // we ever add a `fleet drain` subcommand) sees the queue file and
 // finishes the handoff. Spawning is idempotent in practice — the new
 // agent's ID is generated fresh each attempt.
-func runHandoff(opts *handoffOpts, stdout io.Writer) error {
+func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
@@ -79,13 +79,40 @@ func runHandoff(opts *handoffOpts, stdout io.Writer) error {
 		return errors.New("--command must not be empty")
 	}
 
-	// 1. Load the outgoing agent record.
+	// 1. Load the outgoing agent record (used only to pick the lock
+	//    project — re-loaded under the flock below to detect a
+	//    concurrent handoff that already archived the agent).
 	oldRec, err := agent.Load(opts.oldID)
 	if err != nil {
 		return fmt.Errorf("load agent %s: %w", opts.oldID, err)
 	}
 
-	// 2. Write the handoff doc. The doc represents "agent oldID
+	// 2. Per-project flock — acquired BEFORE any side effects so
+	//    concurrent `fleet handoff X` invocations serialize from the
+	//    earliest possible point. Without this, two callers race the
+	//    queue write + spawn and both spawn replacements (only one
+	//    gets to archive the old record; the other's archive fails
+	//    after spawning). project may be "" for legacy records.
+	lockProject := oldRec.Project
+	if lockProject == "" {
+		lockProject = "default"
+	}
+	release, err := state.LockProject(lockProject)
+	if err != nil {
+		return fmt.Errorf("lock project %s: %w", lockProject, err)
+	}
+	defer release()
+
+	// 3. Re-load under the flock. If a concurrent handoff already
+	//    archived this record, agent.Load returns ErrNotFound and we
+	//    bail without double-spawning. The first-loaded oldRec is
+	//    discarded — the under-flock copy is the source of truth.
+	oldRec, err = agent.Load(opts.oldID)
+	if err != nil {
+		return fmt.Errorf("load agent %s under lock: %w (concurrent handoff?)", opts.oldID, err)
+	}
+
+	// 4. Write the handoff doc. The doc represents "agent oldID
 	//    handed off"; its handoff_number is the OLD agent's number,
 	//    its previous_handoff chains back to whatever the old agent
 	//    itself inherited from. The next handoff increments by 1
@@ -103,9 +130,12 @@ func runHandoff(opts *handoffOpts, stdout io.Writer) error {
 		return fmt.Errorf("write handoff doc: %w", err)
 	}
 
-	// 3. Commit point: write the queue file. Anything before this is
-	//    "preparing"; anything after is "in progress, recoverable on
-	//    crash."
+	// 5. Write the queue file. With flock acquired, this is no longer
+	//    a race-prone commit point but a journal entry — if we crash
+	//    before queue.Delete (step 10), a future drainer (4b TUI
+	//    background loop) sees a stale queue file pointing at an
+	//    archived agent and skips it. In 4a there's no drainer; the
+	//    file lingers as harmless residue until 4b ships.
 	queuePath, err := queue.WriteSpawnFresh(queue.SpawnFresh{
 		OldAgentID: oldRec.ID,
 		HandoffDoc: docPath,
@@ -116,21 +146,7 @@ func runHandoff(opts *handoffOpts, stdout io.Writer) error {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
-	// 4. Per-project flock so concurrent handoffs on the same project
-	//    serialize their drain. Different projects proceed in parallel.
-	//    project may be "" for legacy records — fall back to a default
-	//    lock name so flock still works.
-	lockProject := oldRec.Project
-	if lockProject == "" {
-		lockProject = "default"
-	}
-	release, err := state.LockProject(lockProject)
-	if err != nil {
-		return fmt.Errorf("lock project %s: %w", lockProject, err)
-	}
-	defer release()
-
-	// 5. Drain: spawn the replacement.
+	// 6. Drain: spawn the replacement.
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:  oldRec,
 		NewDocPath: docPath,
@@ -143,39 +159,39 @@ func runHandoff(opts *handoffOpts, stdout io.Writer) error {
 		return fmt.Errorf("spawn replacement: %w", err)
 	}
 
-	// 6. Send "/exit" to the old session. ErrNoSession means it
+	// 7. Send "/exit" to the old session. ErrNoSession means it
 	//    already died (operator killed manually, crash, etc.) — fine,
 	//    fall through to Kill which is also idempotent.
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {
 		// Treat anything else as a warning, not a fatal — we still
 		// want to archive and clean up.
-		_, _ = fmt.Fprintf(stdout, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
+		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
 	}
 
-	// 7. Grace window so Claude can flush its own state on /exit.
+	// 8. Grace window so Claude can flush its own state on /exit.
 	if opts.graceMillis > 0 {
 		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
 	}
 
-	// 8. Kill is idempotent. Either /exit already wound the session
+	// 9. Kill is idempotent. Either /exit already wound the session
 	//    down (no-op) or we forcibly close it now.
 	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
-		_, _ = fmt.Fprintf(stdout, "warning: kill %s: %v\n", oldRec.TmuxSession, err)
+		_, _ = fmt.Fprintf(stderr, "warning: kill %s: %v\n", oldRec.TmuxSession, err)
 	}
 
-	// 9. Archive the old record. After this, `fleet status` no longer
-	//    shows the outgoing agent.
+	// 10. Archive the old record. After this, `fleet status` no longer
+	//     shows the outgoing agent.
 	if err := oldRec.Archive(); err != nil {
 		// Best-effort — the operator can clean up agents/<id>.json by
 		// hand if this fails. The replacement is up and registered.
-		_, _ = fmt.Fprintf(stdout, "warning: archive %s: %v\n", oldRec.ID, err)
+		_, _ = fmt.Fprintf(stderr, "warning: archive %s: %v\n", oldRec.ID, err)
 	}
 
-	// 10. Delete the queue file. Work is durable on disk; the journal
+	// 11. Delete the queue file. Work is durable on disk; the journal
 	//     entry is no longer needed.
 	if err := queue.Delete(queuePath); err != nil {
-		_, _ = fmt.Fprintf(stdout, "warning: delete queue file: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 	}
 
 	_, _ = fmt.Fprintf(stdout, "agent %s handed off → %s\n", oldRec.ID, newRec.ID)

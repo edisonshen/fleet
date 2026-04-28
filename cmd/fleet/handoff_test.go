@@ -66,7 +66,7 @@ func TestHandoff_FailsClearlyOnUnknownAgent(t *testing.T) {
 		oldID:       "ghostbas",
 		command:     []string{"sleep", "60"},
 		graceMillis: 0,
-	}, out)
+	}, out, out)
 	if err == nil {
 		t.Error("expected error for unknown agent")
 	}
@@ -84,7 +84,7 @@ func TestHandoff_HappyPath(t *testing.T) {
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
 		graceMillis: 0, // no sleep in tests
-	}, out); err != nil {
+	}, out, out); err != nil {
 		t.Fatalf("handoff: %v\n%s", err, out.String())
 	}
 
@@ -168,7 +168,7 @@ func TestHandoff_ChainGrowsAcrossSequentialHandoffs(t *testing.T) {
 			oldID:       currentID,
 			command:     []string{"sleep", "60"},
 			graceMillis: 0,
-		}, out); err != nil {
+		}, out, out); err != nil {
 			t.Fatalf("handoff #%d: %v\n%s", i+1, err, out.String())
 		}
 		live, err := agent.List()
@@ -198,6 +198,64 @@ func TestHandoff_ChainGrowsAcrossSequentialHandoffs(t *testing.T) {
 	}
 }
 
+func TestHandoff_ConcurrentHandoffDetectedAfterArchive(t *testing.T) {
+	// Simulates the race the flock-first ordering prevents: handoff
+	// runs once, archives the agent. A second handoff invocation for
+	// the same ID then loads the agent (succeeds — caller just read
+	// from disk before lock), acquires the flock, re-loads under the
+	// lock, sees ErrNotFound, bails. This test exercises the second
+	// invocation against an already-archived record.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// First handoff: succeeds, archives the agent.
+	out1 := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out1, out1); err != nil {
+		t.Fatalf("first handoff: %v\n%s", err, out1.String())
+	}
+	for _, l := range listLive(t) {
+		t.Cleanup(func() { _ = tmux.Kill(l.TmuxSession) })
+	}
+
+	// Second handoff for the same OLD ID: should fail at the
+	// re-load-under-lock step. The agent is gone from agents/.
+	out2 := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out2, out2)
+	if err == nil {
+		t.Fatalf("expected second handoff to fail (record archived), got success:\n%s", out2.String())
+	}
+	if !strings.Contains(err.Error(), "concurrent handoff") &&
+		!strings.Contains(err.Error(), "not found") {
+		t.Errorf("expected error to mention concurrent handoff or not found, got: %v", err)
+	}
+
+	// Live count should still be 1 (only the first handoff's
+	// replacement, no second double-spawn).
+	if n := len(listLive(t)); n != 1 {
+		t.Errorf("expected 1 live agent after blocked second handoff, got %d", n)
+	}
+}
+
+func listLive(t *testing.T) []*agent.Record {
+	t.Helper()
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	return live
+}
+
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -210,7 +268,7 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 		oldID:       old.ID,
 		command:     []string{"sleep", "60"},
 		graceMillis: 0,
-	}, out); err != nil {
+	}, out, out); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
 
@@ -231,7 +289,7 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 		"## Open Questions",
 		"## Next Steps (prioritized)",
 		"_(operator-triggered handoff",
-		"handoff_type: manual",
+		`handoff_type: "manual"`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("doc missing %q:\n%s", want, string(body))
