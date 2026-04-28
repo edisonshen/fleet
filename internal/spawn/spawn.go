@@ -132,7 +132,13 @@ func Spawn(opts Options) (*agent.Record, error) {
 		rec.Project = opts.Project
 	}
 
-	if err := tmux.Spawn(session, opts.Cwd, opts.Command, extraEnv); err != nil {
+	// Pass the canonicalized cwd (not opts.Cwd) so the tmux session
+	// actually starts in the directory we recorded on rec.Cwd.
+	// Otherwise a relative --cwd resolved to one path here could
+	// resolve to a different one inside tmux (especially with an
+	// existing tmux server), and a future handoff would land the
+	// replacement in the wrong checkout.
+	if err := tmux.Spawn(session, cwd, opts.Command, extraEnv); err != nil {
 		return nil, err
 	}
 	if err := rec.Write(); err != nil {
