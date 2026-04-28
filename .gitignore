@@ -17,3 +17,9 @@ go.work.sum
 
 # Local fleet state (never commit user state)
 .fleet/
+
+# Secrets — block all .env files but keep .env.example / .env.sample committable
+.env
+.env.*
+!.env.example
+!.env.sample
