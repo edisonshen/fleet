@@ -134,25 +134,62 @@ func QueuePath(name string) (string, error) {
 	return filepath.Join(root, "queue", name+".json"), nil
 }
 
-// ProjectLockPath returns ~/.fleet/projects/.locks/<project>.lock.
+// ProjectLockPath returns ~/.fleet/projects/.locks/<safe-name>.lock.
 //
 // Used as a flock target so handoff/spawn flows for the same project
 // serialize while different projects proceed in parallel. The .locks
 // subdirectory is created by Bootstrap.
 //
-// The project name is validated against ValidateProjectName: rejects
-// path separators, "..", and other path-component-unsafe inputs that
-// would either escape the .locks/ directory or land at a path inside
-// a not-yet-created subdir (which would fail the flock open).
+// Project names are passed through SafeLockComponent so legacy records
+// (written before ValidateProjectName existed at the dispatch CLI)
+// continue to lock and hand off correctly. SafeLockComponent maps any
+// unsafe character to "_"; same-project still serializes (same string
+// → same sanitized form), different projects still don't collide
+// (collisions only on names that were already aliases of each other).
+//
+// Validation at the dispatch CLI (ValidateProjectName) prevents NEW
+// agents from getting weird names. This function is the safety net
+// for OLD agents that exist on disk with weird names.
 func ProjectLockPath(project string) (string, error) {
-	if err := ValidateProjectName(project); err != nil {
-		return "", err
-	}
 	root, err := Root()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "projects", ".locks", project+".lock"), nil
+	return filepath.Join(root, "projects", ".locks", SafeLockComponent(project)+".lock"), nil
+}
+
+// SafeLockComponent returns a path-safe transformation of name for use
+// as a single filesystem component. Any character outside
+// [a-zA-Z0-9_.-] is replaced with "_". Empty input becomes "_default".
+//
+// Used by ProjectLockPath so legacy records with names like "owner/repo"
+// or "gift finder" still serialize their handoffs. The mapping is
+// non-injective (collisions possible), but two records that ALREADY
+// shared the same project name remain in the same lock partition,
+// which is the only invariant ProjectLockPath needs to preserve.
+func SafeLockComponent(name string) string {
+	if name == "" {
+		return "_default"
+	}
+	out := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.':
+			out = append(out, c)
+		default:
+			out = append(out, '_')
+		}
+	}
+	// Reject "." / ".." which would resolve to the parent dir.
+	s := string(out)
+	if s == "." || s == ".." {
+		return "_" + s
+	}
+	return s
 }
 
 // ValidateProjectName rejects strings that would be unsafe to use as

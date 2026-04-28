@@ -82,6 +82,13 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 	if err != nil {
 		return fmt.Errorf("tmux new-session %s: %w (%s)", session, err, string(out))
 	}
+	// `tmux new-session` can exit 0 even when it failed to create the
+	// session (unusable socket path, sandbox restriction, oversized
+	// UNIX-socket path). Verify with has-session so spawn.Spawn
+	// doesn't write an agent record for a session that never existed.
+	if !HasSession(session) {
+		return fmt.Errorf("tmux new-session %s: exit 0 but session not created (%s)", session, string(out))
+	}
 	return nil
 }
 

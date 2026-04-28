@@ -123,6 +123,30 @@ func TestSpawn_ExtraEnvPropagatesToCommand(t *testing.T) {
 	t.Errorf("extra env did not reach the command within deadline:\n%s", string(lastOut))
 }
 
+func TestSpawn_FailsWhenSocketUnusable(t *testing.T) {
+	// If FLEET_TMUX_SOCKET points at an unwritable path, tmux can
+	// print errors but exit 0 — the post-spawn HasSession check
+	// catches that case so spawn.Spawn doesn't write a record for a
+	// session that never existed.
+	requireTmux(t)
+	// Override to a deeply nested path that exceeds macOS's 104-byte
+	// UNIX socket limit. tmux either fails to bind (socket too long)
+	// or the surrounding dir doesn't exist.
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/"+strings.Repeat("a", 200)+".sock")
+
+	session := "fleet-test-" + randHex(t)
+	err := Spawn(session, "", []string{"sleep", "30"}, nil)
+	if err == nil {
+		_ = Kill(session)
+		t.Fatal("expected Spawn to fail with unusable socket path")
+	}
+	// Error message should mention either creation failure or the
+	// post-spawn HasSession safety net.
+	if !strings.Contains(err.Error(), "tmux") {
+		t.Errorf("expected tmux-related error, got: %v", err)
+	}
+}
+
 func TestSpawn_ExtraEnvWorksAgainstExistingServer(t *testing.T) {
 	// Codex P1 (2026-04-27): cmd.Env doesn't propagate when the tmux
 	// client connects to an existing server. The fix is to pass env

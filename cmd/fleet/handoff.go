@@ -179,14 +179,28 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
 	}
 
-	// 9. Kill is idempotent. Either /exit already wound the session
-	//    down (no-op) or we forcibly close it now.
+	// 9. Kill the old session. Idempotent — returns nil if already
+	//    gone. If Kill fails AND HasSession still reports the session
+	//    alive, the old agent is still running and we MUST NOT
+	//    archive its record (that would hide a live agent from
+	//    `fleet status` while the task continued in two sessions).
+	//    Operator must investigate manually.
 	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
-		_, _ = fmt.Fprintf(stderr, "warning: kill %s: %v\n", oldRec.TmuxSession, err)
+		if tmux.HasSession(oldRec.TmuxSession) {
+			return fmt.Errorf(
+				"old session %s still alive after kill failure: %w (replacement %s spawned; investigate before re-running)",
+				oldRec.TmuxSession, err, newRec.ID)
+		}
+		// Session vanished concurrently with our Kill attempt
+		// (race with operator's manual kill, OS shutdown, etc.).
+		// Safe to proceed.
+		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
+			oldRec.TmuxSession, err)
 	}
 
 	// 10. Archive the old record. After this, `fleet status` no longer
-	//     shows the outgoing agent.
+	//     shows the outgoing agent. We've confirmed the old session is
+	//     dead in step 9, so this can't hide a live agent.
 	if err := oldRec.Archive(); err != nil {
 		// Best-effort — the operator can clean up agents/<id>.json by
 		// hand if this fails. The replacement is up and registered.

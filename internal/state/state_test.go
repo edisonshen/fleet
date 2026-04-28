@@ -219,23 +219,41 @@ func TestProjectLockPath(t *testing.T) {
 	}
 }
 
-func TestProjectLockPath_RejectsUnsafeNames(t *testing.T) {
+func TestProjectLockPath_SanitizesLegacyNames(t *testing.T) {
+	// ProjectLockPath must NOT reject legacy project names — that
+	// would break handoff for any agent dispatched before
+	// ValidateProjectName landed at the CLI. SafeLockComponent maps
+	// unsafe chars to "_" so the lock file path is always valid.
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
-	for _, name := range []string{
-		"",
-		".",
-		"..",
-		"owner/repo",       // would land in non-existent .locks/owner/
-		"../../etc/passwd", // path traversal
-		"foo bar",          // space
-		"foo:bar",          // colon
-		"foo\nbar",         // newline
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ProjectLockPath(name); err == nil {
-				t.Errorf("expected ProjectLockPath(%q) to reject, got nil error", name)
+	cases := map[string]string{
+		"owner/repo":  "/tmp/fleet-test/projects/.locks/owner_repo.lock",
+		"gift finder": "/tmp/fleet-test/projects/.locks/gift_finder.lock",
+		"foo:bar":     "/tmp/fleet-test/projects/.locks/foo_bar.lock",
+		"":            "/tmp/fleet-test/projects/.locks/_default.lock",
+		".":           "/tmp/fleet-test/projects/.locks/_..lock",
+		"..":          "/tmp/fleet-test/projects/.locks/_...lock",
+		"../escape":   "/tmp/fleet-test/projects/.locks/.._escape.lock",
+	}
+	for in, want := range cases {
+		t.Run(in, func(t *testing.T) {
+			got, err := ProjectLockPath(in)
+			if err != nil {
+				t.Fatalf("ProjectLockPath(%q): %v", in, err)
+			}
+			if got != want {
+				t.Errorf("got %q want %q", got, want)
 			}
 		})
+	}
+}
+
+func TestSafeLockComponent_StableForLegalNames(t *testing.T) {
+	// Legal names should pass through unchanged so existing locks
+	// (and existing test expectations) keep working.
+	for _, in := range []string{"rainier", "gift-finder", "v2.1", "abc_123"} {
+		if got := SafeLockComponent(in); got != in {
+			t.Errorf("SafeLockComponent(%q) = %q, want pass-through", in, got)
+		}
 	}
 }
 
