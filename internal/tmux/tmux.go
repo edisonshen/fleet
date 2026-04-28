@@ -4,6 +4,11 @@
 // Fleet's only runtime dep beyond the binary itself is tmux. Keeping
 // every tmux invocation in one package makes that dep boundary obvious
 // and easy to mock for tests.
+//
+// FLEET_TMUX_SOCKET env var, if set, is passed to every tmux invocation
+// as `-S <path>`. Tests use this to isolate per-test tmux servers and
+// avoid races with parallel test packages on the host's default socket.
+// Production leaves it unset and uses the default tmux server.
 package tmux
 
 import (
@@ -17,11 +22,21 @@ import (
 // doesn't exist (e.g., Attach on a dead agent).
 var ErrNoSession = errors.New("tmux session not found")
 
+// tmuxArgs prepends `-S <FLEET_TMUX_SOCKET>` if the env var is set.
+// Centralizes the socket selection so every tmux subprocess in this
+// package uses the same server.
+func tmuxArgs(rest ...string) []string {
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		return append([]string{"-S", sock}, rest...)
+	}
+	return rest
+}
+
 // Available returns nil if `tmux` is on PATH and exits cleanly when
 // asked for its version. Run this at startup to surface a clear error
 // before any spawn attempt.
 func Available() error {
-	cmd := exec.Command("tmux", "-V")
+	cmd := exec.Command("tmux", tmuxArgs("-V")...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tmux not available (install with `brew install tmux`): %w", err)
 	}
@@ -30,7 +45,7 @@ func Available() error {
 
 // HasSession returns true if a tmux session named `session` exists.
 func HasSession(session string) bool {
-	cmd := exec.Command("tmux", "has-session", "-t", session)
+	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
 	return cmd.Run() == nil
 }
 
@@ -57,7 +72,7 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 		args = append(args, "-c", cwd)
 	}
 	args = append(args, command...)
-	cmd := exec.Command("tmux", args...)
+	cmd := exec.Command("tmux", tmuxArgs(args...)...)
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
@@ -82,7 +97,8 @@ func Attach(session string) error {
 		return fmt.Errorf("locate tmux: %w", err)
 	}
 	// Replace current process. Returns only on error.
-	return execve(bin, []string{"tmux", "attach", "-t", session}, os.Environ())
+	argv := append([]string{"tmux"}, tmuxArgs("attach", "-t", session)...)
+	return execve(bin, argv, os.Environ())
 }
 
 // SendKeys sends one or more key sequences to a tmux session.
@@ -102,7 +118,7 @@ func SendKeys(session string, keys ...string) error {
 		return fmt.Errorf("%w: %s", ErrNoSession, session)
 	}
 	args := append([]string{"send-keys", "-t", session}, keys...)
-	cmd := exec.Command("tmux", args...)
+	cmd := exec.Command("tmux", tmuxArgs(args...)...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux send-keys %s: %w (%s)", session, err, string(out))
 	}
@@ -115,7 +131,7 @@ func Kill(session string) error {
 	if !HasSession(session) {
 		return nil
 	}
-	cmd := exec.Command("tmux", "kill-session", "-t", session)
+	cmd := exec.Command("tmux", tmuxArgs("kill-session", "-t", session)...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("tmux kill-session %s: %w", session, err)
 	}

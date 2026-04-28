@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -9,11 +10,37 @@ import (
 
 // These tests touch the real `tmux` binary. Skip cleanly if it's not
 // installed so CI without tmux still passes.
+//
+// Each test gets its own tmux server via FLEET_TMUX_SOCKET — a short
+// path under /tmp so the macOS Unix-socket length limit isn't hit
+// (TMUX_TMPDIR with t.TempDir()-based paths overflows). Cleans up
+// the server on test exit.
 func requireTmux(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed; skipping integration test")
 	}
+	sock := isolatedSocket(t)
+	t.Setenv("FLEET_TMUX_SOCKET", sock)
+}
+
+// isolatedSocket returns a short /tmp path unique to this test run.
+// 4-hex-char suffix is enough since tests within a process share a
+// single test-binary PID and only one test runs at a time per package.
+func isolatedSocket(t *testing.T) string {
+	t.Helper()
+	return "/tmp/fleet-test-" + randHex(t) + ".sock"
+}
+
+// capturePaneArgs builds the args for `tmux capture-pane` against the
+// current FLEET_TMUX_SOCKET (if set). Tests use this so capture-pane
+// hits the same isolated server as the test's other tmux ops.
+func capturePaneArgs(session string) []string {
+	args := []string{"capture-pane", "-t", session, "-p"}
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		args = append([]string{"-S", sock}, args...)
+	}
+	return args
 }
 
 func TestSessionName(t *testing.T) {
@@ -79,16 +106,21 @@ func TestSpawn_ExtraEnvPropagatesToCommand(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 
-	// Give the shell a moment to print the var.
-	time.Sleep(100 * time.Millisecond)
-
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
-	if err != nil {
-		t.Fatalf("capture-pane: %v", err)
+	// Poll capture-pane until the echo shows up — single-shot capture
+	// races against shell startup.
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(session)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), "handoff-week-4a") {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if !strings.Contains(string(out), "handoff-week-4a") {
-		t.Errorf("extra env did not reach the command:\n%s", string(out))
-	}
+	t.Errorf("extra env did not reach the command within deadline:\n%s", string(lastOut))
 }
 
 func TestSendKeys_NoSession(t *testing.T) {
@@ -116,14 +148,20 @@ func TestSendKeys_DeliversToSession(t *testing.T) {
 		t.Fatalf("SendKeys: %v", err)
 	}
 
-	// Capture the pane and verify the text round-tripped through cat.
-	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
-	if err != nil {
-		t.Fatalf("capture-pane: %v", err)
+	// Poll capture-pane until the text round-trips through cat.
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(session)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), "fleet-handoff-probe") {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if !strings.Contains(string(out), "fleet-handoff-probe") {
-		t.Errorf("send-keys output missing from pane:\n%s", string(out))
-	}
+	t.Errorf("send-keys output missing within deadline:\n%s", string(lastOut))
 }
 
 // randHex returns 4 random lowercase hex chars to keep test session
