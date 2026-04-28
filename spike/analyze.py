@@ -151,8 +151,9 @@ def main() -> int:
         print(f"{ts:<22} {sid:<14} {model:<22} {tok:>10} {lim_str} {pct_str}")
     print()
     print("=== verdict ===")
-    print("Open spike/HOOK-PAYLOAD-SAMPLES.md for raw payloads.")
-    print("Open ~/.fleet/spike/transcript-snippets/ for last-usage objects.")
+    print("Open spike/q3-checkpoints.md for /context vs computed_pct comparisons.")
+    print("Open ~/.fleet/spike/payloads/ for raw Stop hook payloads (one per session).")
+    print("Open ~/.fleet/spike/transcript-snippets/ for last-usage objects per fire.")
     return 0
 
 

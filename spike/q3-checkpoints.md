@@ -8,7 +8,9 @@ from `~/.fleet/spike/metrics.jsonl`.
 **Bar:** spike must be within ±20pp of `/context` ground truth across
 all checkpoints.
 
-## Checkpoints (2026-04-26 → 2026-04-28, session `767799f3`)
+## Checkpoints
+
+### Session `767799f3` (Fleet repo, 2026-04-26 → 2026-04-28)
 
 | `/context` | Closest spike fire `computed_pct` | Fire timestamp (UTC) | Delta |
 |---:|---:|:---|---:|
@@ -18,14 +20,40 @@ all checkpoints.
 | 41% | 40.72% | 2026-04-28T00:34:02Z | −0.28pp |
 | 46% | 45.85% | 2026-04-28T01:17:30Z | −0.15pp |
 
-**Summary:**
+### Session `7a23cd40` (different working dir, cross-session validation, 2026-04-28)
 
-- Max absolute delta: **0.46pp**
-- Mean absolute delta: **0.23pp**
-- Bar (±20pp): **PASS by ~43x margin**
+| `/context` | Spike fire `computed_pct` | Fire timestamp (UTC) | Delta |
+|---:|---:|:---|---:|
+| 16% | 15.00% | 2026-04-28T01:41:13Z | −1.00pp |
 
-All five checkpoints captured on `claude-opus-4-7` (1M context window).
-Spike fires drawn from session `767799f3`.
+Cross-session pairing: same operator, different Claude Code session, different working directory (`/Users/pinkbear/projects/` rather than the fleet repo). Confirms the spike's measurement is consistent across sessions, directories, and context-size scales (sub-200k vs 500k+ tokens).
+
+The 1pp gap is the post-response vs pre-next-request sampling difference (see Methodology note below) — about one assistant-turn worth of tokens.
+
+### Aggregate
+
+- Total checkpoints: **6** (5 same-session + 1 cross-session)
+- Max absolute delta: **1.00pp**
+- Mean absolute delta: **0.36pp**
+- Bar (±20pp): **PASS by ~20x margin**
+
+All on `claude-opus-4-7` (1M context window).
+
+## Methodology refinement
+
+The spike Stop hook fires *after* an assistant response (it walks the transcript, reads the most-recent `usage` object). `/context` shows the state *queued for the next request* — including any input the operator has typed/attached since the last response. So `/context` and the latest spike fire sample slightly different moments:
+
+- **Latest spike fire** = post-response context (state at the time the assistant finished)
+- **`/context`** = pre-next-request context (state about to be sent up)
+
+For the tightest pairing:
+
+1. In the Claude Code session, send any quick message (e.g., "ok") that triggers an assistant response.
+2. The assistant responds → Stop hook fires → new record in `~/.fleet/spike/metrics.jsonl`.
+3. Run `/context` immediately after the response.
+4. The new fire and the `/context` reading should match within ~1pp.
+
+If `/context` is run *without* a fresh response (e.g., right after attaching a file but before sending), it'll be 5-10pp ahead of the latest fire — that's normal sampling drift, not spike error. The 7a23cd40 cross-session checkpoint above used this method (operator typed "okay", got a response, then ran `/context`) and the delta was 1.00pp.
 
 ## Why this is so accurate
 
