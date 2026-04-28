@@ -58,6 +58,38 @@ func TestAvailable(t *testing.T) {
 	}
 }
 
+func TestParseTmuxVersion(t *testing.T) {
+	// Codex iter-11 P1: tmux 3.2+ required for `new-session -e`.
+	// Cover the version strings tmux actually emits.
+	cases := []struct {
+		in    string
+		major int
+		minor int
+		ok    bool
+	}{
+		{"tmux 3.5a\n", 3, 5, true},
+		{"tmux 3.2\n", 3, 2, true},
+		{"tmux 2.6\n", 2, 6, true},
+		{"tmux next-3.5\n", 3, 5, true},
+		{"tmux master-pre-3.6\n", 3, 6, true},
+		{"garbage", 0, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(strings.TrimSpace(tc.in), func(t *testing.T) {
+			maj, min, err := parseTmuxVersion(tc.in)
+			if tc.ok && err != nil {
+				t.Fatalf("parseTmuxVersion(%q): unexpected err %v", tc.in, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("parseTmuxVersion(%q): expected error", tc.in)
+			}
+			if tc.ok && (maj != tc.major || min != tc.minor) {
+				t.Errorf("parseTmuxVersion(%q): got %d.%d want %d.%d", tc.in, maj, min, tc.major, tc.minor)
+			}
+		})
+	}
+}
+
 func TestSpawnAndKill_RoundTrip(t *testing.T) {
 	requireTmux(t)
 

@@ -437,6 +437,55 @@ func TestHandoff_AbortsWhenReplacementDiesAtStartup(t *testing.T) {
 	}
 }
 
+func TestHandoff_RecoveryRefusesDuplicateWhenSessionAlive(t *testing.T) {
+	// Codex iter-11 P1: if the replacement RECORD was hand-deleted
+	// but pending.NewSession is still alive, fresh-spawning would
+	// create a duplicate. Refuse instead.
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Spawn a real tmux session to act as the "still-alive
+	// replacement" — but DON'T register an agent record for it,
+	// simulating an out-of-band record deletion.
+	orphanSession := "fleet-orphanrep"
+	if err := tmux.Spawn(orphanSession, "", []string{"sleep", "60"}, nil); err != nil {
+		t.Fatalf("seed orphan session: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(orphanSession) })
+
+	// Seed a queue file that points at an agent ID that doesn't
+	// exist on disk but whose session DOES exist.
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: "/some/doc.md",
+		Project:    old.Project,
+		TaskID:     old.TaskID,
+		NewAgentID: "orphanrep",
+		NewSession: orphanSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected handoff to refuse when orphan session alive")
+	}
+	if !strings.Contains(err.Error(), "still alive") {
+		t.Errorf("expected error about still-alive session, got: %v", err)
+	}
+	// Queue file MUST still exist — operator needs to investigate.
+	if _, err := os.Stat(filepath.Join(tmp, "queue", "spawn-fresh-"+old.ID+".json")); err != nil {
+		t.Errorf("queue file should still exist, got: %v", err)
+	}
+}
+
 func TestHandoff_RecoveryProbeAbortsOnCorruptedRecord(t *testing.T) {
 	// Codex iter-8 P1: the recovery branch must distinguish
 	// state.ErrNotFound (which triggers cleanup) from other Load

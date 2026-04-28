@@ -33,15 +33,84 @@ func tmuxArgs(rest ...string) []string {
 	return rest
 }
 
-// Available returns nil if `tmux` is on PATH and exits cleanly when
-// asked for its version. Run this at startup to surface a clear error
-// before any spawn attempt.
+// MinTmuxMajor and MinTmuxMinor are the lowest tmux release Fleet
+// supports. 3.2 (2021) added `tmux new-session -e KEY=VALUE`, which
+// Spawn relies on to inject FLEET_AGENT_ID into the spawned command
+// regardless of whether the tmux server was already running.
+const (
+	MinTmuxMajor = 3
+	MinTmuxMinor = 2
+)
+
+// Available returns nil if `tmux` is on PATH AND its version is at
+// least MinTmuxMajor.MinTmuxMinor. Surfaces a clear error at startup
+// before any spawn attempt; on older tmux, dispatch and handoff would
+// fail at `new-session -e` with a confusing "unknown option" message.
 func Available() error {
 	cmd := exec.Command("tmux", tmuxArgs("-V")...)
-	if err := cmd.Run(); err != nil {
+	out, err := cmd.Output()
+	if err != nil {
 		return fmt.Errorf("tmux not available (install with `brew install tmux`): %w", err)
 	}
+	major, minor, parseErr := parseTmuxVersion(string(out))
+	if parseErr != nil {
+		// Couldn't parse — let the spawn fail later if it must, but
+		// don't block startup on a regex miss.
+		return nil
+	}
+	if major < MinTmuxMajor || (major == MinTmuxMajor && minor < MinTmuxMinor) {
+		return fmt.Errorf("tmux %d.%d found but Fleet requires %d.%d+ (for `new-session -e`); upgrade with `brew upgrade tmux` or your distro's package manager",
+			major, minor, MinTmuxMajor, MinTmuxMinor)
+	}
 	return nil
+}
+
+// parseTmuxVersion extracts MAJOR.MINOR from `tmux -V` output, which
+// looks like "tmux 3.5a\n" (suffix letter for patch releases) or
+// "tmux next-3.5\n" (pre-release builds). Returns ("", "", err) if
+// no match found.
+func parseTmuxVersion(s string) (major, minor int, err error) {
+	// Find the first "<digit>.<digit>" pattern.
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		if j == len(s) || s[j] != '.' {
+			continue
+		}
+		k := j + 1
+		for k < len(s) && s[k] >= '0' && s[k] <= '9' {
+			k++
+		}
+		if k == j+1 {
+			continue
+		}
+		major, err = parseInt(s[i:j])
+		if err != nil {
+			continue
+		}
+		minor, err = parseInt(s[j+1 : k])
+		if err != nil {
+			continue
+		}
+		return major, minor, nil
+	}
+	return 0, 0, fmt.Errorf("no MAJOR.MINOR pattern in %q", s)
+}
+
+func parseInt(s string) (int, error) {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("non-digit in %q", s)
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
 }
 
 // HasSession returns true if a tmux session named `session` exists.

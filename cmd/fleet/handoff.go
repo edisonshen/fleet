@@ -156,8 +156,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		newRec, nerr := agent.Load(pending.NewAgentID)
 		switch {
 		case errors.Is(nerr, state.ErrNotFound):
-			// Replacement record vanished — orphan queue file. Delete
-			// and proceed normally so a fresh spawn can happen.
+			// Replacement record vanished. Before re-spawning, check
+			// whether the previously-recorded session is still alive
+			// — if it is, the record was hand-deleted (or some other
+			// out-of-band cleanup) and a fresh spawn would create a
+			// duplicate live session. Refuse and let the operator
+			// reconcile.
+			if pending.NewSession != "" && tmux.HasSession(pending.NewSession) {
+				return fmt.Errorf(
+					"recovery probe: replacement %s record missing but tmux session %s still alive — refusing to spawn duplicate; clean up the orphan session or its queue file before retrying",
+					pending.NewAgentID, pending.NewSession)
+			}
+			// Both record and session gone — true orphan journal.
+			// Delete and proceed normally so a fresh spawn can happen.
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
