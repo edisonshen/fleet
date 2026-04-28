@@ -43,6 +43,12 @@ func TestNew_Defaults(t *testing.T) {
 	if r.Mode != "execute" {
 		t.Errorf("Mode: got %q want execute", r.Mode)
 	}
+	if r.HandoffNumber != 1 {
+		t.Errorf("HandoffNumber: got %d want 1 (first agent on task)", r.HandoffNumber)
+	}
+	if r.LastHandoffPath != nil {
+		t.Errorf("LastHandoffPath: got %v want nil (first agent inherits nothing)", r.LastHandoffPath)
+	}
 	if r.SpawnedAt.IsZero() {
 		t.Error("SpawnedAt should be populated")
 	}
@@ -140,10 +146,103 @@ func TestRecord_JSONShape(t *testing.T) {
 		`"role": "executor"`,
 		`"mode": "execute"`,
 		`"id": "a1b2c3d4"`,
+		`"handoff_number": 1`,
+		`"last_handoff_path": null`,
 	} {
 		if !contains(s, want) {
 			t.Errorf("missing %q in JSON:\n%s", want, s)
 		}
+	}
+}
+
+func TestChainFields_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	prev := "/Users/op/.fleet/handoffs/aaaa1111-20260427-184807.md"
+	r := New("bbbb2222")
+	r.LastHandoffPath = &prev
+	r.HandoffNumber = 4
+
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Load("bbbb2222")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.LastHandoffPath == nil || *got.LastHandoffPath != prev {
+		t.Errorf("LastHandoffPath: got %v want %q", got.LastHandoffPath, prev)
+	}
+	if got.HandoffNumber != 4 {
+		t.Errorf("HandoffNumber: got %d want 4", got.HandoffNumber)
+	}
+}
+
+func TestArchive_MovesFileToArchive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New("aaaa1111")
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if err := r.Archive(); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	// Live file is gone.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", "aaaa1111.json")); !os.IsNotExist(err) {
+		t.Errorf("live file should be gone, stat err: %v", err)
+	}
+	// Archive file exists.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", "archive", "aaaa1111.json")); err != nil {
+		t.Errorf("archive file missing: %v", err)
+	}
+	// List() no longer returns the archived agent.
+	live, err := List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(live) != 0 {
+		t.Errorf("List() returned %d records, want 0", len(live))
+	}
+}
+
+func TestArchive_ErrorWhenLiveMissing(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := New("ghostid0")
+	if err := r.Archive(); err == nil {
+		t.Error("expected error archiving non-existent record")
+	}
+}
+
+func TestArchive_ErrorWhenArchiveAlreadyExists(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "agents", "archive", "dupe1111.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := New("dupe1111")
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := r.Archive(); err == nil {
+		t.Error("expected error when archive path already taken")
 	}
 }
 

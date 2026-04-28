@@ -52,7 +52,17 @@ type Record struct {
 	NeedsInput     bool       `json:"needs_input"`
 	InboxPending   bool       `json:"inbox_pending"`
 	HandoffType    *string    `json:"handoff_type"`
-	SpawnedAt      time.Time  `json:"spawned_at"`
+	// LastHandoffPath points at the handoff doc this agent inherited
+	// from. nil for the first agent on a task. Read by the next handoff
+	// to populate the new doc's previous_handoff frontmatter, building
+	// the chain Fleet shows in TUI task-detail views (DESIGN.md §"Handoff
+	// Chain"). One writer per file, so this is updated only at spawn.
+	LastHandoffPath *string `json:"last_handoff_path"`
+	// HandoffNumber starts at 1 for the first agent on a task and
+	// increments by 1 per handoff. Used as previous_handoff doc's
+	// handoff_number when this agent eventually hands off.
+	HandoffNumber int       `json:"handoff_number"`
+	SpawnedAt     time.Time `json:"spawned_at"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random
@@ -75,6 +85,9 @@ func NewID() string {
 
 // New builds a Record with required defaults filled in. Caller sets
 // task-specific fields before Write.
+//
+// HandoffNumber defaults to 1 — this agent is the first on its task.
+// Spawn-from-handoff (internal/spawn) overrides this with old+1.
 func New(id string) *Record {
 	now := time.Now().UTC()
 	return &Record{
@@ -83,6 +96,7 @@ func New(id string) *Record {
 		Engine:         DefaultEngine,
 		Role:           "executor",
 		Mode:           "execute",
+		HandoffNumber:  1,
 		LastActivityTS: now,
 		SpawnedAt:      now,
 	}
@@ -122,6 +136,42 @@ func Load(id string) (*Record, error) {
 		return nil, fmt.Errorf("parse agent %s: %w", id, err)
 	}
 	return &r, nil
+}
+
+// Archive moves the agent's live record file to ~/.fleet/agents/archive/.
+//
+// Used after a handoff (record's owner agent has been replaced) or a
+// crash (record outlives the tmux session). After Archive, the live
+// agents/ scan in List() no longer returns this record. Atomic via
+// rename(2) on same-filesystem (always true for ~/.fleet/).
+//
+// Returns an error if the live file is missing or the archive path
+// already exists. Idempotent re-archive is intentionally not supported
+// — duplicate IDs in archive would mask bugs.
+func (r *Record) Archive() error {
+	src, err := state.AgentPath(r.ID)
+	if err != nil {
+		return err
+	}
+	dst, err := state.AgentArchivePath(r.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("archive %s: live record %w", r.ID, state.ErrNotFound)
+		}
+		return fmt.Errorf("stat live record %s: %w", r.ID, err)
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("archive %s: archive path already exists at %s", r.ID, dst)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat archive path: %w", err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("rename %s -> archive: %w", r.ID, err)
+	}
+	return nil
 }
 
 // List returns every live agent record under ~/.fleet/agents/.
