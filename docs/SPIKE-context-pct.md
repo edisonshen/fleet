@@ -1,9 +1,9 @@
 # Week 0 Feasibility Spike: Reading Claude Code Context %
 
-**Status:** OPEN
+**Status:** **CLOSED — PASS** (provisional for v0.1; ongoing validation per the section below)
 **Owner:** edisonshen
 **Started:** 2026-04-16
-**Decision deadline:** Before Week 1 begins
+**Closed:** 2026-04-28
 
 The entire Fleet thesis depends on whether a Claude Code skill can read the host agent's `context_pct` reliably enough to drive Yellow (50%) and Red (70%) handoff thresholds. This spike answers that question before any `fleet` binary code is written.
 
@@ -24,7 +24,7 @@ Does any Claude Code hook payload expose current token usage or context-window %
 **Pass:** Token data is exposed (in payload or via transcript) and is current within one turn.
 **Fail:** No token signal available.
 
-**Result:** _TBD_
+**Result: PASS.** The Stop hook payload itself does not carry token data, but `transcript_path` points to a JSONL file where every assistant turn records a `message.usage` object with `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`, and `output_tokens`. The model name lives at `message.model` on the same turn. The spike walks the transcript on every fire and pulls the most-recent `usage` (within one turn of the firing assistant response). 67 fires recorded across 3 sessions with 0 errors and 100% transcript availability. See `~/.fleet/spike/metrics.jsonl` and `spike/analyze.py`.
 
 ### 2. Latency
 
@@ -35,29 +35,27 @@ If exposed, is `context_pct` available within 500ms of the hook firing? The TUI 
 **Pass:** ≤500ms p95.
 **Fail:** >500ms or unreliable.
 
-**Result:** _TBD_
+**Result: PASS by ~28x margin.** Across 67 fires: median 10ms, p95 18ms, p99 23ms, max 23ms (well under the 500ms bar). The transcript JSONL is local-disk read with no network call, no LLM round-trip — the latency floor is essentially the cost of opening and walking the file. Even the largest transcript observed (~1MB) walked in under 25ms.
 
-### 3. Proxy accuracy (only if 1 or 2 fails)
+### 3. Accuracy (re-scoped from "proxy accuracy")
 
-Measure proxy accuracy over 5 real Claude Code sessions including tool use, file reads, and long-context tasks.
+Q1 PASSed with real `usage` token data from the transcript, so the proxy formula was never needed. Q3 became a direct check of the spike's `computed_pct` against `/context` ground truth at matched turn boundaries.
 
-**Proxy formula:**
-```
-tokens_estimate = system_prompt_tokens
-                + sum(message_tokens)
-                + sum(tool_result_tokens)
-                + sum(file_read_tokens)
-```
-Token counts via `tiktoken` at turn boundaries, scraped from the transcript JSONL.
+**Bar:** spike must be within ±20pp of `/context` across 5 manual checkpoints.
 
-**Ground truth:** `/context` output at the same turn boundary.
+**Result: PASS by ~43x margin.** Five `/context` snapshots paired with closest-in-time spike fires (see `spike/q3-checkpoints.md` for the table):
 
-**Pass:** Proxy stays within ±20% of ground truth across all 5 sessions.
-**Fail:** Worse than ±20%.
+| `/context` | spike `computed_pct` | delta |
+|---:|---:|---:|
+| 23% | 23.17% | +0.17pp |
+| 25% | 25.09% | +0.09pp |
+| 32% | 31.54% | −0.46pp |
+| 41% | 40.72% | −0.28pp |
+| 46% | 45.85% | −0.15pp |
 
-**Result:** _TBD_
+Max absolute delta 0.46pp. Mean 0.23pp. The remaining drift is fully accounted for by (a) `/context` displaying integer percentages, and (b) one-turn timing skew between the `/context` invocation and the corresponding spike fire. No correctable bug; the spike reads the same numbers `/context` does.
 
-## Decision Matrix
+## Decision Matrix (historical reference — outcome is the first row, "Full spec")
 
 | (1) Availability | (2) Latency | (3) Proxy | Path |
 |------------------|-------------|-----------|------|
@@ -100,6 +98,33 @@ These are not part of the spike itself but are pinned here so they're not lost:
 
 ## Final Decision
 
-**TBD** — fill this in once questions 1-3 are answered.
+**Full spec.** All three questions PASS by large margins. fleet-guard ships with the auto-handoff trigger at 50%/70% as designed (DESIGN.md Health thresholds table, DECISIONS.md 2026-04-21). The "self-healing fleet" thesis is validated for v0.1.
 
-Commit this doc with the answer before opening any Week 1 PR.
+The pivot path (drop auto-handoff, become a parallelism dashboard with `[h]` manual handoff) is no longer the v0.1 plan. It remains in this document as the documented fallback if ongoing validation (next section) ever surfaces a regression severe enough to retract the closure.
+
+## Ongoing validation (post-closure)
+
+Closure is **provisional for v0.1**, not permanent. The Stop hook stays installed indefinitely; `metrics.jsonl` keeps accumulating; we re-validate on a cadence and against named gates.
+
+**Cadence:**
+
+- Re-run `python3 spike/analyze.py` at the start of each release-prep window. Cheap, automated.
+- Capture one fresh `/context` checkpoint per substantive working session, append to `spike/q3-checkpoints.md`. Already a low-friction habit (the operator runs `/context` regularly anyway).
+- Raise the data bar to **N=500 fires across ≥5 sessions** by Week 6 dogfood. Higher N gives tighter confidence intervals on the threshold-tuning decisions in v0.2.
+
+**Re-open gates** — if any of these fire, the spike re-opens and DESIGN.md may need rescoping:
+
+| Signal | Threshold | Action |
+|---|---|---|
+| Q1 fire-success rate | drops below 95% over a 100-fire window | re-open Q1 |
+| Q2 latency p95 | exceeds 100ms (5x current observed) | re-open Q2; investigate transcript bloat / I/O contention |
+| Q3 max abs delta | exceeds 5pp on any single new checkpoint | re-open Q3; check for Anthropic accounting changes or new model with bad limit |
+| New `claude-*` model in use | model not in `CONTEXT_LIMITS` dict | spike fire records `computed_pct: null`; user must add to dict (operator-overridable via the future `~/.fleet/config.yaml:context_limits` per TODOS F11) |
+
+**Adjacent tooling for ongoing validation** (open TODOs):
+
+- **F10 — `fleet spike status`** subcommand. Reads `metrics.jsonl`, prints current Q1 / Q2 / Q3 numbers on demand. Lets the operator check spike health without invoking `analyze.py` manually. ~30 lines of Go, lands as part of Week 4 or later.
+- **F11 — `~/.fleet/config.yaml:context_limits`** operator-override map. When Anthropic ships a new model ID, operators add one line of YAML and Fleet works again — no waiting on a Fleet release. Already specified at PR #4 conclusion.
+
+The skill-feedback loop (`docs/SKILL-FEEDBACK.md`, Tiers 1-2 in v1) covers a different but adjacent concern: whether the 50%/70% threshold *values themselves* are right. The spike validates that we can *measure* `context_pct`; the skill-feedback loop validates that we *act on it correctly*. Both run continuously in v1.
+
