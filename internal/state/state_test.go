@@ -3,6 +3,7 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -148,12 +149,12 @@ func TestHandoffDir(t *testing.T) {
 	}
 }
 
-func TestHandoffPath_FormatsUTCTimestamp(t *testing.T) {
+func TestHandoffPath_FormatsUTCTimestampWithRandomSuffix(t *testing.T) {
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
 
 	// Pacific time input — must be rendered as the equivalent UTC
-	// in the filename so different operators produce identical paths
-	// for identical handoffs.
+	// in the filename so different operators produce identical
+	// timestamps for identical handoffs (random suffix differs).
 	pacific, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
 		t.Skip("zoneinfo not available on this platform")
@@ -164,22 +165,27 @@ func TestHandoffPath_FormatsUTCTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandoffPath: %v", err)
 	}
-	want := "/tmp/fleet-test/handoffs/a1b2-20260415-143200.md"
-	if got != want {
-		t.Errorf("got %q want %q", got, want)
+	wantPrefix := "/tmp/fleet-test/handoffs/a1b2-20260415-143200-"
+	if !strings.HasPrefix(got, wantPrefix) || !strings.HasSuffix(got, ".md") {
+		t.Errorf("got %q want prefix %q + 4-hex-char suffix + .md", got, wantPrefix)
 	}
 }
 
-func TestHandoffPath_AlreadyUTCRoundTrips(t *testing.T) {
+func TestHandoffPath_RandomSuffixDiffersAcrossCalls(t *testing.T) {
+	// Same agent + same UTC second must produce different filenames
+	// (P3 from codex iter-9: retries within one second would
+	// otherwise overwrite the previous doc and break the chain).
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
 	ts := time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC)
-	got, err := HandoffPath("7f3a92e1", ts)
-	if err != nil {
-		t.Fatalf("HandoffPath: %v", err)
+	a, _ := HandoffPath("7f3a92e1", ts)
+	b, _ := HandoffPath("7f3a92e1", ts)
+	if a == b {
+		t.Errorf("HandoffPath returned identical paths %q for same input — random suffix not applied", a)
 	}
-	want := "/tmp/fleet-test/handoffs/7f3a92e1-20260427-184807.md"
-	if got != want {
-		t.Errorf("got %q want %q", got, want)
+	// Both must share the timestamped prefix.
+	prefix := "/tmp/fleet-test/handoffs/7f3a92e1-20260427-184807-"
+	if !strings.HasPrefix(a, prefix) || !strings.HasPrefix(b, prefix) {
+		t.Errorf("paths missing expected prefix %q: a=%q b=%q", prefix, a, b)
 	}
 }
 

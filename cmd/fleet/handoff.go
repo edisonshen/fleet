@@ -225,6 +225,23 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("spawn replacement: %w", err)
 	}
 
+	// 7a. Verify the replacement session is actually alive before
+	//     we retire the old agent. spawn.Spawn intentionally tolerates
+	//     short-lived commands that exit cleanly (no stderr signal),
+	//     but for handoff the replacement IS supposed to be a
+	//     long-lived agent. If `--command` was a wrapper that crashed
+	//     at startup, killing the old session would leave the task
+	//     with no live successor. Roll back instead.
+	if !tmux.HasSession(newRec.TmuxSession) {
+		if path, perr := state.AgentPath(newRec.ID); perr == nil {
+			_ = os.Remove(path)
+		}
+		_ = queue.Delete(queuePath)
+		return fmt.Errorf(
+			"replacement %s spawned but tmux session %s already exited (command crashed at startup?); old agent untouched",
+			newRec.ID, newRec.TmuxSession)
+	}
+
 	// 7b. Record the successor on the queue file. Crash recovery
 	//     contract (queue.SpawnFresh): if this process dies between
 	//     here and step 12 (queue.Delete), a retry of `fleet handoff
@@ -343,6 +360,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 // Caller holds the per-agent flock.
 func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	oldRec, newRec *agent.Record, docPath, queuePath string) error {
+
+	// Verify the previously-spawned replacement is still alive. If it
+	// died after the original spawn (operator manually killed it,
+	// crashed, etc.), retiring the old agent now would leave the task
+	// with nothing running. Bail without touching the old agent.
+	if !tmux.HasSession(newRec.TmuxSession) {
+		return fmt.Errorf(
+			"resume handoff: replacement %s tmux session %s is gone; old agent %s untouched (clean up agents/%s.json + queue file or restart handoff)",
+			newRec.ID, newRec.TmuxSession, oldRec.ID, newRec.ID)
+	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {

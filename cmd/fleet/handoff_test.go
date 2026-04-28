@@ -341,7 +341,9 @@ func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
 	// can't use seedAgent because that hard-codes "sleep 60" without
 	// passing cwd through dispatch; build the spawn directly.
 	originalCwd := t.TempDir()
-	originalCmd := []string{"sleep", "120", "originalcmd"}
+	// Long-running, valid command (extra arg would crash `sleep` and
+	// trigger the new replacement-session-alive check).
+	originalCmd := []string{"sh", "-c", "exec sleep 120"}
 	first, err := agentSpawnForTest(t, originalCwd, originalCmd, "rainier", "auth-fix")
 	if err != nil {
 		t.Fatalf("seed spawn: %v", err)
@@ -390,6 +392,49 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 		Cwd:     cwd,
 		Command: command,
 	})
+}
+
+func TestHandoff_AbortsWhenReplacementDiesAtStartup(t *testing.T) {
+	// Codex iter-9 P1: if the replacement command exits immediately
+	// (e.g., a wrapper that crashes during startup), spawn.Spawn
+	// returns success by design but the new tmux session is gone.
+	// Handoff MUST detect this and refuse to retire the old agent —
+	// otherwise the task is left with no live successor.
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		cwd:         t.TempDir(),
+		command:     []string{"sh", "-c", "true"}, // exits immediately
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected handoff to fail when replacement dies at startup")
+	}
+	if !strings.Contains(err.Error(), "already exited") {
+		t.Errorf("expected 'already exited' in error, got: %v", err)
+	}
+
+	// Old agent untouched: live record still there, tmux session
+	// still alive, no archive entry.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); err != nil {
+		t.Errorf("old live record should still exist, got: %v", err)
+	}
+	if !tmux.HasSession(old.TmuxSession) {
+		t.Errorf("old session %s should still be alive", old.TmuxSession)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "agents", "archive")); len(entries) > 0 {
+		t.Errorf("old should not be archived, archive contains: %v", entries)
+	}
+	// Queue file removed (rollback cleaned it up).
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "queue")); len(entries) > 0 {
+		t.Errorf("queue file should be removed by rollback, contains: %v", entries)
+	}
 }
 
 func TestHandoff_RecoveryProbeAbortsOnCorruptedRecord(t *testing.T) {

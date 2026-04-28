@@ -6,6 +6,8 @@
 package state
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -98,18 +100,29 @@ func HandoffDir() (string, error) {
 	return filepath.Join(root, "handoffs"), nil
 }
 
-// HandoffPath returns ~/.fleet/handoffs/<id>-<YYYYMMDD-HHMMSS>.md.
+// HandoffPath returns ~/.fleet/handoffs/<id>-<YYYYMMDD-HHMMSS>-<rnd>.md.
 //
 // ts is normalized to UTC so the filename is stable regardless of
-// the operator's machine timezone. Format mirrors the example in
-// docs/DESIGN.md "State directory" (a1-20260415-143200.md).
+// the operator's machine timezone. The trailing 4-hex-char random
+// suffix prevents same-second collisions in retry / auto-handoff
+// flows that could otherwise overwrite a previous doc and break the
+// previous_handoff chain. Format mirrors the checkpoint's intent:
+// `<agent-id>-<utc-iso>-<short-uuid>.md`.
 func HandoffPath(agentID string, ts time.Time) (string, error) {
 	root, err := Root()
 	if err != nil {
 		return "", err
 	}
 	stamp := ts.UTC().Format("20060102-150405")
-	return filepath.Join(root, "handoffs", agentID+"-"+stamp+".md"), nil
+	var rnd [2]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		// Exhaustively rare; fall back to a low-entropy nanosecond
+		// suffix so we still produce a unique filename.
+		return filepath.Join(root, "handoffs",
+			fmt.Sprintf("%s-%s-%04x.md", agentID, stamp, ts.UTC().Nanosecond()&0xffff)), nil
+	}
+	return filepath.Join(root, "handoffs",
+		agentID+"-"+stamp+"-"+hex.EncodeToString(rnd[:])+".md"), nil
 }
 
 // QueueDir returns ~/.fleet/queue/.

@@ -168,15 +168,15 @@ func Load(id string) (*Record, error) {
 // agents/ scan in List() no longer returns this record. Atomic via
 // rename(2) on same-filesystem (always true for ~/.fleet/).
 //
-// Returns an error if the live file is missing or the archive path
-// already exists. Idempotent re-archive is intentionally not supported
-// — duplicate IDs in archive would mask bugs.
+// If agents/archive/<id>.json already exists (from an old archived
+// agent that happened to share the 8-hex-char ID via the birthday
+// paradox over a long-lived install), append a UTC stamp to keep
+// both archives. Loses the old archive only if BOTH the bare path
+// and the stamped path are taken — vanishingly unlikely.
+//
+// Returns ErrNotFound if the live file is missing.
 func (r *Record) Archive() error {
 	src, err := state.AgentPath(r.ID)
-	if err != nil {
-		return err
-	}
-	dst, err := state.AgentArchivePath(r.ID)
 	if err != nil {
 		return err
 	}
@@ -186,8 +186,18 @@ func (r *Record) Archive() error {
 		}
 		return fmt.Errorf("stat live record %s: %w", r.ID, err)
 	}
+	dst, err := state.AgentArchivePath(r.ID)
+	if err != nil {
+		return err
+	}
 	if _, err := os.Stat(dst); err == nil {
-		return fmt.Errorf("archive %s: archive path already exists at %s", r.ID, dst)
+		// Bare archive path collides — append a UTC suffix to keep
+		// both copies. Format: <id>-<UTCYYYYMMDD-HHMMSS>.json.
+		suffixed, derr := state.AgentArchivePath(r.ID + "-" + time.Now().UTC().Format("20060102-150405"))
+		if derr != nil {
+			return derr
+		}
+		dst = suffixed
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat archive path: %w", err)
 	}

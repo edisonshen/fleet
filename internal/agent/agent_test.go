@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -264,21 +265,50 @@ func TestLoad_BackfillsHandoffNumberFromZero(t *testing.T) {
 	}
 }
 
-func TestArchive_ErrorWhenArchiveAlreadyExists(t *testing.T) {
+func TestArchive_FallsBackToTimestampedPathOnCollision(t *testing.T) {
+	// When agents/archive/<id>.json already exists (e.g., long-lived
+	// install where the same 8-hex ID repeated), Archive should not
+	// fail — it should keep both records by appending a UTC stamp to
+	// the new archive's filename.
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(tmp, "agents", "archive", "dupe1111.json"), []byte("{}"), 0o644); err != nil {
+	// Pre-existing archive for the same ID.
+	if err := os.WriteFile(filepath.Join(tmp, "agents", "archive", "dupe1111.json"),
+		[]byte(`{"old":"archive"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	r := New("dupe1111")
 	if err := r.Write(); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if err := r.Archive(); err == nil {
-		t.Error("expected error when archive path already taken")
+	if err := r.Archive(); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	// Live record gone.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", "dupe1111.json")); !os.IsNotExist(err) {
+		t.Errorf("live record should be gone, stat err: %v", err)
+	}
+	// Original archive still there.
+	got, err := os.ReadFile(filepath.Join(tmp, "agents", "archive", "dupe1111.json"))
+	if err != nil {
+		t.Fatalf("read original archive: %v", err)
+	}
+	if string(got) != `{"old":"archive"}` {
+		t.Errorf("original archive overwritten: %s", string(got))
+	}
+	// New archive landed at a stamped path.
+	entries, _ := os.ReadDir(filepath.Join(tmp, "agents", "archive"))
+	stampedFound := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "dupe1111-") && strings.HasSuffix(e.Name(), ".json") {
+			stampedFound = true
+		}
+	}
+	if !stampedFound {
+		t.Errorf("expected a stamped archive file, dir contents: %v", entries)
 	}
 }
 
