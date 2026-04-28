@@ -108,11 +108,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if pending, perr := queue.ReadSpawnFresh(pendingPath); perr == nil && pending.NewAgentID != "" {
 		oldRec, lerr := agent.Load(opts.oldID)
 		if lerr != nil {
-			// Old record gone but queue file references it — partial
-			// state from a previous crash. Clean up the queue file
-			// and bail; nothing more to do for this oldID.
+			// Old record already archived — handoff completed
+			// successfully and only the queue.Delete tail crashed.
+			// Cleanup is the right action AND the right success
+			// signal for retry scripts: exit 0 so `until fleet
+			// handoff X; do sleep; done`-style loops stop.
 			_ = queue.Delete(pendingPath)
-			return fmt.Errorf("agent %s already archived; cleaned stale queue file referencing replacement %s", opts.oldID, pending.NewAgentID)
+			_, _ = fmt.Fprintf(stdout,
+				"agent %s already handed off → %s (cleaned stale queue file)\n",
+				opts.oldID, pending.NewAgentID)
+			return nil
 		}
 		newRec, nerr := agent.Load(pending.NewAgentID)
 		if nerr != nil {
@@ -167,24 +172,31 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
-	// 6. Resolve cwd + command for the replacement, defaulting to
-	//    the outgoing agent's stored values so multi-repo operators
+	// 6. Resolve cwd + command for the replacement. CLI flags win;
+	//    otherwise inherit from oldRec so multi-repo operators
 	//    invoking `fleet handoff` from a different shell still get
-	//    the right project checkout and engine wrapper. CLI flags
-	//    (when set) override the inherited values.
+	//    the right project checkout and engine wrapper.
+	//
+	//    For legacy records (dispatched before this PR added Cwd /
+	//    Command to agent.Record) BOTH the inherited value AND the
+	//    flag may be empty. Silently falling back to os.Getwd() /
+	//    "claude" would land the replacement in the wrong tree
+	//    and/or with the wrong binary while reporting success — the
+	//    exact failure mode codex iter-7 P1 calls out. Refuse and
+	//    require the operator to re-supply explicitly.
 	cwd := opts.cwd
 	if cwd == "" {
 		cwd = oldRec.Cwd
+	}
+	if cwd == "" {
+		return fmt.Errorf("agent %s is a legacy record with no stored cwd; pass --cwd <path> explicitly", opts.oldID)
 	}
 	command := opts.command
 	if len(command) == 0 {
 		command = oldRec.Command
 	}
 	if len(command) == 0 {
-		// Both the flag AND the legacy record were empty (pre-PR
-		// records lack Command). Fall back to "claude" rather than
-		// erroring — that's what dispatch defaults to.
-		command = []string{"claude"}
+		return fmt.Errorf("agent %s is a legacy record with no stored command; pass --command <argv> explicitly", opts.oldID)
 	}
 
 	// 7. Drain: spawn the replacement.

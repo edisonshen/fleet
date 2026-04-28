@@ -262,6 +262,62 @@ func listLive(t *testing.T) []*agent.Record {
 	return live
 }
 
+func TestHandoff_RefusesLegacyRecordMissingCwdAndCommand(t *testing.T) {
+	// Codex iter-7 P1: legacy records (pre-PR, no Cwd/Command in
+	// JSON) MUST NOT silently fall back to os.Getwd / "claude" when
+	// no flags supplied — that would land the replacement in the
+	// wrong tree / wrong binary while reporting success.
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	// Hand-craft a legacy record JSON: no cwd, no command fields.
+	legacy := `{
+  "schema_version": 1,
+  "id": "legacyid",
+  "engine": "claude-code",
+  "role": "executor",
+  "mode": "execute",
+  "tmux_session": "fleet-legacyid",
+  "task_id": "t",
+  "project": "p"
+}`
+	if err := os.WriteFile(filepath.Join(tmp, "agents", "legacyid.json"),
+		[]byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Spawn a real tmux session so tmux.Available passes the load.
+	t.Cleanup(func() { _ = tmux.Kill("fleet-legacyid") })
+	if err := tmux.Spawn("fleet-legacyid", "", []string{"sleep", "60"}, nil); err != nil {
+		t.Fatalf("seed tmux: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       "legacyid",
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected legacy handoff with no flags to refuse")
+	}
+	if !strings.Contains(err.Error(), "legacy record") {
+		t.Errorf("expected error about legacy record, got: %v", err)
+	}
+
+	// Supplying both flags should succeed.
+	out2 := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       "legacyid",
+		cwd:         t.TempDir(),
+		command:     []string{"sleep", "120"},
+		graceMillis: 0,
+	}, out2, out2); err != nil {
+		t.Fatalf("legacy handoff with explicit flags should succeed, got: %v\n%s", err, out2.String())
+	}
+	for _, l := range listLive(t) {
+		t.Cleanup(func() { _ = tmux.Kill(l.TmuxSession) })
+	}
+}
+
 func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
 	// Codex iter-5 P1: handoff invoked from a different shell must
 	// place the replacement in the OUTGOING agent's cwd and run its
