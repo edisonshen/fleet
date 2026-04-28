@@ -65,6 +65,41 @@ func TestSpawn_EmptyCommand(t *testing.T) {
 	}
 }
 
+func TestSendKeys_NoSession(t *testing.T) {
+	requireTmux(t)
+	err := SendKeys("fleet-test-nonexistent-"+randHex(t), "hello", "Enter")
+	if err == nil {
+		t.Fatal("expected ErrNoSession")
+	}
+	if !strings.Contains(err.Error(), "tmux session not found") {
+		t.Errorf("expected ErrNoSession-shaped error, got %v", err)
+	}
+}
+
+func TestSendKeys_DeliversToSession(t *testing.T) {
+	requireTmux(t)
+
+	session := "fleet-test-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+
+	// `cat` echoes whatever we type — perfect probe for send-keys.
+	if err := Spawn(session, "", []string{"cat"}); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if err := SendKeys(session, "fleet-handoff-probe", "Enter"); err != nil {
+		t.Fatalf("SendKeys: %v", err)
+	}
+
+	// Capture the pane and verify the text round-tripped through cat.
+	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	if !strings.Contains(string(out), "fleet-handoff-probe") {
+		t.Errorf("send-keys output missing from pane:\n%s", string(out))
+	}
+}
+
 // randHex returns 4 random lowercase hex chars to keep test session
 // names from colliding when run in parallel.
 func randHex(t *testing.T) string {

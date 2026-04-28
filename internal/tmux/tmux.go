@@ -76,6 +76,30 @@ func Attach(session string) error {
 	return execve(bin, []string{"tmux", "attach", "-t", session}, os.Environ())
 }
 
+// SendKeys sends one or more key sequences to a tmux session.
+//
+// `keys` is forwarded verbatim as positional args to tmux:
+//
+//	tmux send-keys -t <session> <keys...>
+//
+// Pass "Enter" as a separate arg to submit a command. Example:
+//
+//	tmux.SendKeys("fleet-a1b2", "/exit", "Enter")
+//
+// Returns ErrNoSession if the session has already exited — callers
+// in cleanup paths typically ignore this and proceed to Kill.
+func SendKeys(session string, keys ...string) error {
+	if !HasSession(session) {
+		return fmt.Errorf("%w: %s", ErrNoSession, session)
+	}
+	args := append([]string{"send-keys", "-t", session}, keys...)
+	cmd := exec.Command("tmux", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tmux send-keys %s: %w (%s)", session, err, string(out))
+	}
+	return nil
+}
+
 // Kill terminates a tmux session. Returns nil if the session is
 // already gone (idempotent for cleanup paths).
 func Kill(session string) error {
