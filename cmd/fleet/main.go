@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/edisonshen/fleet/internal/tui"
 )
 
 // Version is overwritten at release time via -ldflags.
@@ -20,15 +22,14 @@ func newRootCmd() *cobra.Command {
 many concurrent agents across many repos, one TUI to keep them all
 productive.
 
-Pre-v0.1: ` + "`fleet`" + ` (no args) is the placeholder for the future TUI.
-The CLI subcommands below are the Week 1 scaffold.`,
+` + "`fleet`" + ` (no args) launches the interactive dashboard.
+Subcommands below cover dispatch / attach / status from the shell.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       Version,
-		// No-op default action — when the TUI lands it'll go here.
-		Run: func(_ *cobra.Command, _ []string) {
-			fmt.Printf("fleet v%s\n", Version)
-			fmt.Println("(TUI not yet implemented — try `fleet --help` for available commands)")
+		// `fleet` (no args) → launch the TUI.
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return tui.Run(Version)
 		},
 	}
 

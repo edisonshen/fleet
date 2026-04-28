@@ -1,0 +1,260 @@
+package tui
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/edisonshen/fleet/internal/agent"
+)
+
+// fakeRecords builds N records spaced 1 minute apart, oldest first.
+// The oldest is "a0", newest is "aN-1". sortRecords flips this so the
+// newest spawned is at index 0.
+func fakeRecords(n int) []*agent.Record {
+	now := time.Now().UTC()
+	out := make([]*agent.Record, n)
+	for i := range n {
+		out[i] = &agent.Record{
+			SchemaVersion: 1,
+			ID:            "a" + string(rune('0'+i)),
+			Engine:        "claude-code",
+			Role:          "executor",
+			Mode:          "execute",
+			Project:       "demo",
+			TaskID:        "task-" + string(rune('0'+i)),
+			SpawnedAt:     now.Add(time.Duration(i) * time.Minute),
+		}
+	}
+	return out
+}
+
+func TestNew_Defaults(t *testing.T) {
+	m := New("9.9.9")
+	if m.version != "9.9.9" {
+		t.Errorf("version: got %q, want 9.9.9", m.version)
+	}
+	if m.cursor != 0 {
+		t.Errorf("cursor should start at 0, got %d", m.cursor)
+	}
+	if len(m.records) != 0 {
+		t.Errorf("records should start empty, got %d", len(m.records))
+	}
+}
+
+func TestUpdate_AgentsMsg_PopulatesAndSorts(t *testing.T) {
+	m := New("test")
+	updated, _ := m.Update(agentsMsg{records: fakeRecords(3)})
+	got := updated.(Model)
+
+	if len(got.records) != 3 {
+		t.Fatalf("got %d records, want 3", len(got.records))
+	}
+	// Newest-first ordering: a2 (newest) should be at index 0.
+	if got.records[0].ID != "a2" {
+		t.Errorf("expected newest a2 first, got %s", got.records[0].ID)
+	}
+	if got.records[2].ID != "a0" {
+		t.Errorf("expected oldest a0 last, got %s", got.records[2].ID)
+	}
+}
+
+func TestUpdate_AgentsMsg_PropagatesError(t *testing.T) {
+	m := New("test")
+	wantErr := errors.New("boom")
+	updated, _ := m.Update(agentsMsg{err: wantErr})
+	got := updated.(Model)
+	if got.err == nil || got.err.Error() != "boom" {
+		t.Errorf("err: got %v, want boom", got.err)
+	}
+}
+
+func TestUpdate_AgentsMsg_KeepsCursorInBounds(t *testing.T) {
+	m := New("test")
+	m.records = fakeRecords(5)
+	m.cursor = 4 // pointing at last
+
+	// Shrink to 2 records — cursor should drop to 1 (last valid index).
+	updated, _ := m.Update(agentsMsg{records: fakeRecords(2)})
+	got := updated.(Model)
+	if got.cursor != 1 {
+		t.Errorf("cursor: got %d, want 1 (clamped to last index)", got.cursor)
+	}
+}
+
+func TestUpdate_AgentsMsg_EmptyDoesNotCrash(t *testing.T) {
+	m := New("test")
+	m.records = fakeRecords(3)
+	m.cursor = 2
+
+	updated, _ := m.Update(agentsMsg{records: nil})
+	got := updated.(Model)
+	if got.cursor != 0 {
+		t.Errorf("empty list should clamp cursor to 0, got %d", got.cursor)
+	}
+	if len(got.records) != 0 {
+		t.Errorf("records should be empty, got %d", len(got.records))
+	}
+}
+
+func TestKey_Quit(t *testing.T) {
+	m := New("test")
+	for _, k := range []string{"q", "ctrl+c"} {
+		_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		if k == "ctrl+c" {
+			_, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		}
+		if cmd == nil {
+			t.Errorf("%q should return tea.Quit, got nil cmd", k)
+		}
+	}
+}
+
+func TestKey_Navigation(t *testing.T) {
+	m := New("test")
+	m.records = fakeRecords(3)
+
+	// j moves cursor down
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if updated.(Model).cursor != 1 {
+		t.Errorf("j: cursor got %d, want 1", updated.(Model).cursor)
+	}
+
+	// k moves cursor back up
+	m.cursor = 2
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if updated.(Model).cursor != 1 {
+		t.Errorf("k: cursor got %d, want 1", updated.(Model).cursor)
+	}
+
+	// G jumps to bottom
+	m.cursor = 0
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	if updated.(Model).cursor != 2 {
+		t.Errorf("G: cursor got %d, want 2", updated.(Model).cursor)
+	}
+
+	// g jumps to top
+	m.cursor = 2
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if updated.(Model).cursor != 0 {
+		t.Errorf("g: cursor got %d, want 0", updated.(Model).cursor)
+	}
+}
+
+func TestKey_NavigationClampsAtBounds(t *testing.T) {
+	m := New("test")
+	m.records = fakeRecords(3)
+
+	// k at top stays at top
+	m.cursor = 0
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if updated.(Model).cursor != 0 {
+		t.Errorf("k at top: cursor got %d, want 0", updated.(Model).cursor)
+	}
+
+	// j at bottom stays at bottom
+	m.cursor = 2
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	if updated.(Model).cursor != 2 {
+		t.Errorf("j at bottom: cursor got %d, want 2", updated.(Model).cursor)
+	}
+}
+
+func TestUpdate_TickReturnsRefreshAndNextTick(t *testing.T) {
+	m := New("test")
+	_, cmd := m.Update(tickMsg(time.Now()))
+	if cmd == nil {
+		t.Fatal("tickMsg should produce a command (load + next tick)")
+	}
+	// We can't easily inspect tea.Batch's contents, but a non-nil cmd
+	// is the contract.
+}
+
+func TestUpdate_FsEventReturnsRefreshCmd(t *testing.T) {
+	m := New("test")
+	_, cmd := m.Update(fsEventMsg{})
+	if cmd == nil {
+		t.Fatal("fsEventMsg should produce a load command")
+	}
+}
+
+func TestView_EmptyState(t *testing.T) {
+	m := New("0.0.0")
+	out := m.View()
+	if !strings.Contains(out, "no agents") {
+		t.Errorf("empty view should mention 'no agents', got:\n%s", out)
+	}
+	if !strings.Contains(out, "Fleet 0.0.0") {
+		t.Errorf("view should include version in title, got:\n%s", out)
+	}
+}
+
+func TestView_ShowsErrorBanner(t *testing.T) {
+	m := New("test")
+	m.err = errors.New("disk full")
+	out := m.View()
+	if !strings.Contains(out, "disk full") {
+		t.Errorf("view should surface error, got:\n%s", out)
+	}
+}
+
+func TestView_RendersAgentTable(t *testing.T) {
+	m := New("test")
+	m.records = sortRecords(fakeRecords(2))
+	out := m.View()
+
+	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "BLOCKED"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("view missing column header %q, got:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "a0") || !strings.Contains(out, "a1") {
+		t.Errorf("view should include agent IDs, got:\n%s", out)
+	}
+	if !strings.Contains(out, "2 agent(s)") {
+		t.Errorf("footer should report agent count, got:\n%s", out)
+	}
+}
+
+func TestSortRecords_NewestFirst(t *testing.T) {
+	records := fakeRecords(3) // a0 oldest, a2 newest
+	sorted := sortRecords(records)
+	if sorted[0].ID != "a2" || sorted[2].ID != "a0" {
+		t.Errorf("sortRecords: order wrong, got %s,%s,%s",
+			sorted[0].ID, sorted[1].ID, sorted[2].ID)
+	}
+	// Original slice should not be mutated.
+	if records[0].ID != "a0" {
+		t.Error("sortRecords mutated input slice")
+	}
+}
+
+func TestHumanAge(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "30s"},
+		{5 * time.Minute, "5m"},
+		{2 * time.Hour, "2h"},
+		{3 * 24 * time.Hour, "3d"},
+	}
+	for _, c := range cases {
+		if got := humanAge(c.d); got != c.want {
+			t.Errorf("humanAge(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+func TestPadRight(t *testing.T) {
+	if got := padRight("ab", 5); got != "ab   " {
+		t.Errorf("padRight ab,5 = %q", got)
+	}
+	if got := padRight("abcdef", 3); got != "abcdef" {
+		t.Errorf("padRight should not truncate, got %q", got)
+	}
+}
