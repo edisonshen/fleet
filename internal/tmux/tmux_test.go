@@ -4,6 +4,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests touch the real `tmux` binary. Skip cleanly if it's not
@@ -38,7 +39,7 @@ func TestSpawnAndKill_RoundTrip(t *testing.T) {
 		t.Fatalf("session %s already exists", session)
 	}
 
-	if err := Spawn(session, "", []string{"sleep", "30"}); err != nil {
+	if err := Spawn(session, "", []string{"sleep", "30"}, nil); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
 	if !HasSession(session) {
@@ -60,8 +61,33 @@ func TestKill_IdempotentOnMissing(t *testing.T) {
 }
 
 func TestSpawn_EmptyCommand(t *testing.T) {
-	if err := Spawn("any", "", nil); err == nil {
+	if err := Spawn("any", "", nil, nil); err == nil {
 		t.Error("expected error for empty command")
+	}
+}
+
+func TestSpawn_ExtraEnvPropagatesToCommand(t *testing.T) {
+	requireTmux(t)
+
+	session := "fleet-test-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+
+	// Spawn `sh -c 'echo $FLEET_TEST_PROBE; cat'` so the env var is
+	// echoed at startup and the shell stays alive (cat) for capture.
+	cmd := []string{"sh", "-c", "echo $FLEET_TEST_PROBE; cat"}
+	if err := Spawn(session, "", cmd, []string{"FLEET_TEST_PROBE=handoff-week-4a"}); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	// Give the shell a moment to print the var.
+	time.Sleep(100 * time.Millisecond)
+
+	out, err := exec.Command("tmux", "capture-pane", "-t", session, "-p").Output()
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	if !strings.Contains(string(out), "handoff-week-4a") {
+		t.Errorf("extra env did not reach the command:\n%s", string(out))
 	}
 }
 
@@ -83,7 +109,7 @@ func TestSendKeys_DeliversToSession(t *testing.T) {
 	t.Cleanup(func() { _ = Kill(session) })
 
 	// `cat` echoes whatever we type — perfect probe for send-keys.
-	if err := Spawn(session, "", []string{"cat"}); err != nil {
+	if err := Spawn(session, "", []string{"cat"}, nil); err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}
 	if err := SendKeys(session, "fleet-handoff-probe", "Enter"); err != nil {

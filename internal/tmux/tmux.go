@@ -42,7 +42,13 @@ func HasSession(session string) bool {
 //	tmux new-session -d -s <session> -c <cwd> <command...>
 //
 // `cwd` may be empty to inherit the caller's working directory.
-func Spawn(session, cwd string, command []string) error {
+//
+// `extraEnv` is appended to os.Environ() for the tmux invocation —
+// pass nil for plain inherit. Vars in extraEnv (e.g.,
+// "FLEET_AGENT_ID=a1b2") propagate into the tmux server's spawn of
+// the command. Avoid setting bare cmd.Env (without os.Environ()) —
+// tmux itself depends on PATH/HOME etc to function.
+func Spawn(session, cwd string, command, extraEnv []string) error {
 	if len(command) == 0 {
 		return errors.New("tmux.Spawn: empty command")
 	}
@@ -52,6 +58,9 @@ func Spawn(session, cwd string, command []string) error {
 	}
 	args = append(args, command...)
 	cmd := exec.Command("tmux", args...)
+	if len(extraEnv) > 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tmux new-session %s: %w (%s)", session, err, string(out))

@@ -60,7 +60,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	id := agent.NewID()
 	session := tmux.SessionName(id)
 
-	if err := tmux.Spawn(session, opts.cwd, opts.command); err != nil {
+	if err := tmux.Spawn(session, opts.cwd, opts.command, nil); err != nil {
 		return err
 	}
 
