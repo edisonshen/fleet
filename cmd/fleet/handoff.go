@@ -231,36 +231,50 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("write handoff doc: %w", err)
 	}
 
-	// 6. Write the queue file. With flock acquired, this is no longer
-	//    a race-prone commit point but a journal entry — if we crash
-	//    before queue.Delete (step 12), a future drainer (4b TUI
-	//    background loop) sees a stale queue file pointing at an
-	//    archived agent and skips it. In 4a there's no drainer; the
-	//    file lingers as harmless residue until 4b ships.
+	// 6. Pre-allocate the replacement's agent ID so we can journal
+	//    it BEFORE spawn. This closes the crash window where the old
+	//    code wrote the journal twice (once empty, once with newID
+	//    after spawn) — a crash between those two writes left the
+	//    journal with NewAgentID="" and a retry would double-spawn.
+	//    Now: journal once with the pre-allocated ID, then spawn
+	//    with that exact ID. Crash anywhere after step 7 leaves a
+	//    journal entry the recovery probe can match against the
+	//    actual record on disk (or detect as orphan if no record).
+	newID := agent.NewID()
+	newSession := tmux.SessionName(newID)
+
+	// 7. Write the queue file with the pre-allocated successor ID.
+	//    This is the durable commit point — anything after a crash
+	//    here is recoverable via the resume path in step 2.
 	queuePath, err := queue.WriteSpawnFresh(queue.SpawnFresh{
 		OldAgentID: oldRec.ID,
 		HandoffDoc: docPath,
 		Project:    oldRec.Project,
 		TaskID:     oldRec.TaskID,
+		NewAgentID: newID,
+		NewSession: newSession,
 	})
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
-	// 7. Drain: spawn the replacement.
+	// 8. Drain: spawn the replacement using the pre-allocated ID.
 	newRec, err := spawn.Spawn(spawn.Options{
-		OldRecord:  oldRec,
-		NewDocPath: docPath,
-		Cwd:        cwd,
-		Command:    command,
+		OldRecord:      oldRec,
+		NewDocPath:     docPath,
+		Cwd:            cwd,
+		Command:        command,
+		PreAllocatedID: newID,
 	})
 	if err != nil {
-		// Spawn failed — leave the queue file in place so a later
-		// drain can retry. The old agent is still alive and untouched.
+		// Spawn failed — leave the queue file in place so the
+		// recovery path can detect the orphan (no record + no
+		// session at the journaled NewAgentID/NewSession) and clean
+		// it up on retry. The old agent is still alive and untouched.
 		return fmt.Errorf("spawn replacement: %w", err)
 	}
 
-	// 7a. Verify the replacement session is actually alive before
+	// 8a. Verify the replacement session is actually alive before
 	//     we retire the old agent. spawn.Spawn intentionally tolerates
 	//     short-lived commands that exit cleanly (no stderr signal),
 	//     but for handoff the replacement IS supposed to be a
@@ -277,27 +291,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// 7b. Record the successor on the queue file. Crash recovery
-	//     contract (queue.SpawnFresh): if this process dies between
-	//     here and step 12 (queue.Delete), a retry of `fleet handoff
-	//     <oldID>` finds the queue file with NewAgentID set and
-	//     resumes via resumeHandoff (kill+archive+delete) instead of
-	//     spawning another replacement.
-	if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
-		OldAgentID: oldRec.ID,
-		HandoffDoc: docPath,
-		Project:    oldRec.Project,
-		TaskID:     oldRec.TaskID,
-		NewAgentID: newRec.ID,
-		NewSession: newRec.TmuxSession,
-	}); werr != nil {
-		// Couldn't update the journal. Best-effort — continue with
-		// the handoff; if we crash the retry will double-spawn (the
-		// pre-fix behavior). Surface a warning.
-		_, _ = fmt.Fprintf(stderr, "warning: queue successor update: %v\n", werr)
-	}
-
-	// 8. Send "/exit" to the old session. ErrNoSession means it
+	// 9. Send "/exit" to the old session. ErrNoSession means it
 	//    already died (operator killed manually, crash, etc.) — fine,
 	//    fall through to Kill which is also idempotent.
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
@@ -307,12 +301,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
 	}
 
-	// 9. Grace window so Claude can flush its own state on /exit.
+	// 10. Grace window so Claude can flush its own state on /exit.
 	if opts.graceMillis > 0 {
 		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
 	}
 
-	// 10. Kill the old session. Idempotent — returns nil if already
+	// 11. Kill the old session. Idempotent — returns nil if already
 	//    gone. If Kill fails AND HasSession still reports the session
 	//    alive, we MUST NOT archive the old record (that would hide a
 	//    live agent from `fleet status`) AND we MUST roll back the
@@ -355,7 +349,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
-	// 11. Archive the old record. After this, `fleet status` no
+	// 12. Archive the old record. After this, `fleet status` no
 	//     longer shows the outgoing agent. We've confirmed the old
 	//     session is dead in step 10, so this can't hide a live
 	//     agent. If Archive fails (rare — agents/archive/ went away
@@ -383,7 +377,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		}
 	}
 
-	// 12. Delete the queue file. Work is durable on disk; the journal
+	// 13. Delete the queue file. Work is durable on disk; the journal
 	//     entry is no longer needed.
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)

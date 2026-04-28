@@ -51,6 +51,13 @@ type Options struct {
 	// default — callers must pass it explicitly so the contract is
 	// obvious.
 	Command []string
+
+	// PreAllocatedID, if non-empty, overrides the agent.NewID()
+	// fresh-allocation. Handoff uses this to journal the successor
+	// ID BEFORE spawning, closing the crash window between spawn
+	// and journal-write. Empty (the dispatch path) means generate
+	// a fresh ID inside Spawn.
+	PreAllocatedID string
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -69,7 +76,10 @@ func Spawn(opts Options) (*agent.Record, error) {
 		return nil, fmt.Errorf("spawn.Spawn: Command required")
 	}
 
-	id := agent.NewID()
+	id := opts.PreAllocatedID
+	if id == "" {
+		id = agent.NewID()
+	}
 	session := tmux.SessionName(id)
 	rec := agent.New(id)
 	rec.TmuxSession = session
