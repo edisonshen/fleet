@@ -58,15 +58,16 @@ outgoing record and increments handoff_number by 1.`,
 
 // runHandoff orchestrates the full B2 flow:
 //
-//	load → flock(project) → reload-under-lock → write doc
+//	load → flock(agent) → reload-under-lock → write doc
 //	→ write queue → spawn replacement → send /exit + grace
 //	→ kill → archive → delete queue
 //
-// Concurrency: the per-project flock bounds the entire critical
-// section. Two concurrent `fleet handoff X` invocations both reach
-// step 1 (load), serialize on step 2 (LockProject), and the loser's
-// step 3 (reload-under-lock) sees ErrNotFound (winner already
-// archived) and bails — no double-spawn.
+// Concurrency: the per-agent flock bounds the entire critical
+// section. Two concurrent `fleet handoff X` invocations serialize on
+// step 2 (LockAgent), and the loser's step 3 (reload-under-lock)
+// sees ErrNotFound (winner already archived) and bails — no
+// double-spawn. Per-agent (not per-project) so concurrent handoffs
+// on DIFFERENT agents in the same project run in parallel.
 //
 // Crash safety: the queue file (step 5) is the journal entry. If we
 // crash between step 5 and step 11 (Delete), a future drainer (4b
@@ -84,37 +85,29 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return errors.New("--command must not be empty")
 	}
 
-	// 1. Load the outgoing agent record (used only to pick the lock
-	//    project — re-loaded under the flock below to detect a
-	//    concurrent handoff that already archived the agent).
-	oldRec, err := agent.Load(opts.oldID)
-	if err != nil {
-		return fmt.Errorf("load agent %s: %w", opts.oldID, err)
-	}
-
-	// 2. Per-project flock — acquired BEFORE any side effects so
+	// 1. Per-agent flock — acquired BEFORE any side effects so
 	//    concurrent `fleet handoff X` invocations serialize from the
-	//    earliest possible point. Without this, two callers race the
-	//    queue write + spawn and both spawn replacements (only one
-	//    gets to archive the old record; the other's archive fails
-	//    after spawning). project may be "" for legacy records.
-	lockProject := oldRec.Project
-	if lockProject == "" {
-		lockProject = "default"
-	}
-	release, err := state.LockProject(lockProject)
+	//    earliest possible point. Per-agent (not per-project) so two
+	//    handoffs on DIFFERENT agents in the same project run in
+	//    parallel. Without this, two same-id callers would race the
+	//    queue write + spawn and both spawn replacements.
+	//
+	//    LockAgent uses only opts.oldID (no project lookup needed),
+	//    so we don't pre-Load — the agent might not exist yet, in
+	//    which case the next step surfaces a clear error.
+	release, err := state.LockAgent(opts.oldID)
 	if err != nil {
-		return fmt.Errorf("lock project %s: %w", lockProject, err)
+		return fmt.Errorf("lock agent %s: %w", opts.oldID, err)
 	}
 	defer release()
 
-	// 3. Re-load under the flock. If a concurrent handoff already
-	//    archived this record, agent.Load returns ErrNotFound and we
-	//    bail without double-spawning. The first-loaded oldRec is
-	//    discarded — the under-flock copy is the source of truth.
-	oldRec, err = agent.Load(opts.oldID)
+	// 2. Load the agent record under the flock. If a concurrent
+	//    handoff already archived it, agent.Load returns ErrNotFound
+	//    and we bail without double-spawning. This is the only Load
+	//    — the per-agent lock makes the pre-lock Load redundant.
+	oldRec, err := agent.Load(opts.oldID)
 	if err != nil {
-		return fmt.Errorf("load agent %s under lock: %w (concurrent handoff?)", opts.oldID, err)
+		return fmt.Errorf("load agent %s under lock: %w (already handed off?)", opts.oldID, err)
 	}
 
 	// 4. Write the handoff doc. The doc represents "agent oldID

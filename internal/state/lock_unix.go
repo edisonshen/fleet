@@ -35,7 +35,31 @@ import (
 // same process do NOT serialize via this — they share the same fd.
 // That matches what we want for v1: per-process, per-project.
 func LockProject(project string) (func(), error) {
-	path, err := ProjectLockPath(project)
+	return acquireFlock(ProjectLockPath, project)
+}
+
+// LockAgent takes an exclusive flock on
+// ~/.fleet/agents/.locks/<id>.lock. Concurrent handoffs of the same
+// agent serialize; concurrent handoffs of DIFFERENT agents (even in
+// the same project) proceed in parallel.
+//
+// This is the right granularity for `fleet handoff` because the only
+// shared state under the lock is the single agent record (and its
+// handoff doc). Different agents have disjoint files, so there's no
+// reason to serialize their handoffs together.
+//
+// Compare to LockProject (broader scope, used for project-manifest
+// mutations in 4b+ when many agents share one manifest).
+func LockAgent(id string) (func(), error) {
+	return acquireFlock(AgentLockPath, id)
+}
+
+// acquireFlock is the shared body for the per-scope lock helpers.
+// Takes a path-builder function so each helper can resolve its own
+// canonical lock path while sharing the open + Flock + close-on-release
+// machinery.
+func acquireFlock(pathFn func(string) (string, error), key string) (func(), error) {
+	path, err := pathFn(key)
 	if err != nil {
 		return nil, err
 	}

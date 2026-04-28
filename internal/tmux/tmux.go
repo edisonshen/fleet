@@ -12,6 +12,7 @@
 package tmux
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -78,16 +79,21 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 	}
 	args = append(args, command...)
 	cmd := exec.Command("tmux", tmuxArgs(args...)...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("tmux new-session %s: %w (%s)", session, err, string(out))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("tmux new-session %s: %w (%s)", session, err, stderr.String())
 	}
 	// `tmux new-session` can exit 0 even when it failed to create the
-	// session (unusable socket path, sandbox restriction, oversized
-	// UNIX-socket path). Verify with has-session so spawn.Spawn
-	// doesn't write an agent record for a session that never existed.
-	if !HasSession(session) {
-		return fmt.Errorf("tmux new-session %s: exit 0 but session not created (%s)", session, string(out))
+	// session (unwritable socket path, sandbox restriction, oversized
+	// UNIX-socket path). When that happens it prints to stderr but
+	// doesn't fail the exit code. Verify with HasSession only when
+	// stderr signals trouble — short-lived commands like `sh -c true`
+	// also leave HasSession=false, but cleanly (no stderr), and we
+	// must not flag those as failures.
+	if stderr.Len() > 0 && !HasSession(session) {
+		return fmt.Errorf("tmux new-session %s: exit 0 but session not created (%s)", session, stderr.String())
 	}
 	return nil
 }

@@ -123,6 +123,23 @@ func TestSpawn_ExtraEnvPropagatesToCommand(t *testing.T) {
 	t.Errorf("extra env did not reach the command within deadline:\n%s", string(lastOut))
 }
 
+func TestSpawn_AllowsShortLivedCommands(t *testing.T) {
+	// Codex P3 (2026-04-27): tmux removes a session as soon as its
+	// command exits. The post-spawn HasSession check must NOT flag
+	// short-lived commands (e.g., `sh -c true`) as silent failures —
+	// they ran successfully, the session is just already gone.
+	//
+	// Heuristic: only require HasSession when stderr signals trouble.
+	// Successful short-lived runs leave stderr empty; silent socket
+	// failures print to stderr.
+	requireTmux(t)
+	session := "fleet-test-shortlived-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+	if err := Spawn(session, "", []string{"sh", "-c", "true"}, nil); err != nil {
+		t.Errorf("expected Spawn(short-lived) to succeed, got: %v", err)
+	}
+}
+
 func TestSpawn_FailsWhenSocketUnusable(t *testing.T) {
 	// If FLEET_TMUX_SOCKET points at an unwritable path, tmux can
 	// print errors but exit 0 — the post-spawn HasSession check

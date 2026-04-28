@@ -18,6 +18,7 @@ import (
 // Mirrors the layout in docs/STATE.md.
 var subdirs = []string{
 	"agents",
+	"agents/.locks",
 	"agents/archive",
 	"projects",
 	"projects/.locks",
@@ -132,6 +133,25 @@ func QueuePath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, "queue", name+".json"), nil
+}
+
+// AgentLockPath returns ~/.fleet/agents/.locks/<id>.lock.
+//
+// Per-agent flock target. Used by `fleet handoff` to serialize
+// concurrent handoffs of the same agent without blocking handoffs
+// of OTHER agents in the same project (which would have happened
+// with the broader per-project lock — different agents in the same
+// project have no shared state in 4a).
+//
+// Agent IDs come from agent.NewID (8 hex chars), so SafeLockComponent
+// would be a no-op; we still apply it as belt-and-suspenders for any
+// future ID format change.
+func AgentLockPath(id string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "agents", ".locks", SafeLockComponent(id)+".lock"), nil
 }
 
 // ProjectLockPath returns ~/.fleet/projects/.locks/<safe-name>.lock.
