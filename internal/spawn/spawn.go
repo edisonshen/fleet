@@ -92,15 +92,25 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// canonicalized via filepath.Abs so the record always stores
 	// an absolute path, immune to "next handoff invoked from a
 	// different shell" wrong-tree spawns.
+	//
+	// Resolution failures (deleted cwd, unreadable parent) abort
+	// here rather than silently writing a record with empty/relative
+	// Cwd — that would later trip the "legacy record with no stored
+	// cwd" guard at handoff time AND let tmux launch the agent in
+	// the tmux server's cwd, not the operator's checkout.
 	cwd := opts.Cwd
 	if cwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cwd = wd
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve current working directory: %w", err)
 		}
+		cwd = wd
 	} else if !filepath.IsAbs(cwd) {
-		if abs, err := filepath.Abs(cwd); err == nil {
-			cwd = abs
+		abs, err := filepath.Abs(cwd)
+		if err != nil {
+			return nil, fmt.Errorf("canonicalize cwd %q: %w", cwd, err)
 		}
+		cwd = abs
 	}
 	rec.Cwd = cwd
 
