@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -258,6 +259,68 @@ func listLive(t *testing.T) []*agent.Record {
 		t.Fatalf("List: %v", err)
 	}
 	return live
+}
+
+func TestHandoff_PreservesCwdAndCommandFromOldRecord(t *testing.T) {
+	// Codex iter-5 P1: handoff invoked from a different shell must
+	// place the replacement in the OUTGOING agent's cwd and run its
+	// original command, not the invoker's defaults.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Seed an agent with explicit cwd + a non-default command. We
+	// can't use seedAgent because that hard-codes "sleep 60" without
+	// passing cwd through dispatch; build the spawn directly.
+	originalCwd := t.TempDir()
+	originalCmd := []string{"sleep", "120", "originalcmd"}
+	first, err := agentSpawnForTest(t, originalCwd, originalCmd, "rainier", "auth-fix")
+	if err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+
+	if first.Cwd != originalCwd {
+		t.Fatalf("seed: Cwd not captured: got %q want %q", first.Cwd, originalCwd)
+	}
+
+	// Run handoff WITHOUT --cwd or --command. Replacement should
+	// inherit both from the outgoing record.
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       first.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	rep := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(rep.TmuxSession) })
+
+	if rep.Cwd != originalCwd {
+		t.Errorf("replacement Cwd: got %q want %q (inherited)", rep.Cwd, originalCwd)
+	}
+	if len(rep.Command) != len(originalCmd) {
+		t.Fatalf("replacement Command length: got %d want %d", len(rep.Command), len(originalCmd))
+	}
+	for i := range originalCmd {
+		if rep.Command[i] != originalCmd[i] {
+			t.Errorf("replacement Command[%d]: got %q want %q", i, rep.Command[i], originalCmd[i])
+		}
+	}
+}
+
+func agentSpawnForTest(t *testing.T, cwd string, command []string, project, taskID string) (*agent.Record, error) {
+	t.Helper()
+	return spawn.Spawn(spawn.Options{
+		TaskID:  taskID,
+		Project: project,
+		Cwd:     cwd,
+		Command: command,
+	})
 }
 
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {

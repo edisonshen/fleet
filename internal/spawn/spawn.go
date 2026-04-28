@@ -74,6 +74,23 @@ func Spawn(opts Options) (*agent.Record, error) {
 	rec.TmuxSession = session
 	rec.PID = os.Getpid()
 
+	// Capture the resolved cwd so `fleet handoff` can place the
+	// replacement in the same project checkout even when invoked
+	// from a different shell. Empty opts.Cwd means "inherit caller"
+	// — resolve via os.Getwd() so the record stores the absolute
+	// path, not "" (which would force the next handoff to guess).
+	cwd := opts.Cwd
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+	rec.Cwd = cwd
+
+	// Capture the launch command so `fleet handoff` preserves any
+	// custom engine/wrapper the operator dispatched with.
+	rec.Command = append([]string(nil), opts.Command...)
+
 	// FLEET_AGENT_ID is propagated into the agent's process env so
 	// fleet-guard (4b/c) can identify which agent record to update
 	// without round-tripping via tmux session name parsing.

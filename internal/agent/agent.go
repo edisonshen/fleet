@@ -61,8 +61,20 @@ type Record struct {
 	// HandoffNumber starts at 1 for the first agent on a task and
 	// increments by 1 per handoff. Used as previous_handoff doc's
 	// handoff_number when this agent eventually hands off.
-	HandoffNumber int       `json:"handoff_number"`
-	SpawnedAt     time.Time `json:"spawned_at"`
+	HandoffNumber int `json:"handoff_number"`
+	// Cwd is the absolute working directory the agent was spawned in.
+	// Captured at dispatch (defaulting to os.Getwd() when --cwd is
+	// empty) so `fleet handoff` from a different shell can place the
+	// replacement in the same project checkout. Empty for legacy
+	// records — handoff falls back to its --cwd flag in that case.
+	Cwd string `json:"cwd,omitempty"`
+	// Command is the argv used to spawn the agent process inside
+	// tmux. Captured at dispatch so `fleet handoff` preserves any
+	// custom engine/wrapper the operator chose (e.g., a wrapped
+	// claude binary). Empty for legacy records — handoff falls back
+	// to its --command flag.
+	Command   []string  `json:"command,omitempty"`
+	SpawnedAt time.Time `json:"spawned_at"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random

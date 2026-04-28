@@ -49,9 +49,9 @@ outgoing record and increments handoff_number by 1.`,
 		},
 	}
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
-		"working directory for the replacement session (default: current dir)")
-	cmd.Flags().StringSliceVar(&opts.command, "command", []string{"claude"},
-		"command to run inside the replacement tmux session (default: claude)")
+		"working directory for the replacement (default: outgoing agent's cwd)")
+	cmd.Flags().StringSliceVar(&opts.command, "command", nil,
+		"command to run inside the replacement tmux session (default: outgoing agent's command, or `claude`)")
 	cmd.Flags().IntVar(&opts.graceMillis, "grace-ms", 3000,
 		"milliseconds to wait between /exit and kill on the old session")
 	return cmd
@@ -81,9 +81,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 	if err := tmux.Available(); err != nil {
 		return err
-	}
-	if len(opts.command) == 0 {
-		return errors.New("--command must not be empty")
 	}
 
 	// 1. Per-agent flock — acquired BEFORE any side effects so
@@ -145,12 +142,32 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
-	// 6. Drain: spawn the replacement.
+	// 6. Resolve cwd + command for the replacement, defaulting to
+	//    the outgoing agent's stored values so multi-repo operators
+	//    invoking `fleet handoff` from a different shell still get
+	//    the right project checkout and engine wrapper. CLI flags
+	//    (when set) override the inherited values.
+	cwd := opts.cwd
+	if cwd == "" {
+		cwd = oldRec.Cwd
+	}
+	command := opts.command
+	if len(command) == 0 {
+		command = oldRec.Command
+	}
+	if len(command) == 0 {
+		// Both the flag AND the legacy record were empty (pre-PR
+		// records lack Command). Fall back to "claude" rather than
+		// erroring — that's what dispatch defaults to.
+		command = []string{"claude"}
+	}
+
+	// 7. Drain: spawn the replacement.
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:  oldRec,
 		NewDocPath: docPath,
-		Cwd:        opts.cwd,
-		Command:    opts.command,
+		Cwd:        cwd,
+		Command:    command,
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so a later
@@ -158,7 +175,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("spawn replacement: %w", err)
 	}
 
-	// 7. Send "/exit" to the old session. ErrNoSession means it
+	// 8. Send "/exit" to the old session. ErrNoSession means it
 	//    already died (operator killed manually, crash, etc.) — fine,
 	//    fall through to Kill which is also idempotent.
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
@@ -168,12 +185,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
 	}
 
-	// 8. Grace window so Claude can flush its own state on /exit.
+	// 9. Grace window so Claude can flush its own state on /exit.
 	if opts.graceMillis > 0 {
 		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
 	}
 
-	// 9. Kill the old session. Idempotent — returns nil if already
+	// 10. Kill the old session. Idempotent — returns nil if already
 	//    gone. If Kill fails AND HasSession still reports the session
 	//    alive, we MUST NOT archive the old record (that would hide a
 	//    live agent from `fleet status`) AND we MUST roll back the
@@ -203,16 +220,35 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
-	// 10. Archive the old record. After this, `fleet status` no longer
-	//     shows the outgoing agent. We've confirmed the old session is
-	//     dead in step 9, so this can't hide a live agent.
+	// 11. Archive the old record. After this, `fleet status` no
+	//     longer shows the outgoing agent. We've confirmed the old
+	//     session is dead in step 10, so this can't hide a live
+	//     agent. If Archive fails (rare — agents/archive/ went away
+	//     or is unwritable), fall back to deleting the live record
+	//     directly so a retry of `fleet handoff <id>` doesn't load
+	//     the stale record and double-spawn. If even the delete
+	//     fails, hard-error: the live record is stuck and must be
+	//     removed manually before retry.
 	if err := oldRec.Archive(); err != nil {
-		// Best-effort — the operator can clean up agents/<id>.json by
-		// hand if this fails. The replacement is up and registered.
-		_, _ = fmt.Fprintf(stderr, "warning: archive %s: %v\n", oldRec.ID, err)
+		path, perr := state.AgentPath(oldRec.ID)
+		if perr == nil {
+			if rmErr := os.Remove(path); rmErr == nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: archive %s: %v (live record removed instead, archive copy lost)\n",
+					oldRec.ID, err)
+			} else {
+				return fmt.Errorf(
+					"archive %s failed (%w) AND fallback remove failed (%w); replacement %s spawned but old record stuck — clean up agents/%s.json manually before retrying",
+					oldRec.ID, err, rmErr, newRec.ID, oldRec.ID)
+			}
+		} else {
+			return fmt.Errorf(
+				"archive %s failed (%w) AND could not resolve live path (%w); replacement %s spawned",
+				oldRec.ID, err, perr, newRec.ID)
+		}
 	}
 
-	// 11. Delete the queue file. Work is durable on disk; the journal
+	// 12. Delete the queue file. Work is durable on disk; the journal
 	//     entry is no longer needed.
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)

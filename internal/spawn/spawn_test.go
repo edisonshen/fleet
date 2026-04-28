@@ -105,6 +105,47 @@ func TestSpawn_FreshDispatch(t *testing.T) {
 	}
 }
 
+func TestSpawn_CapturesCwdAndCommandOnRecord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	myCwd := t.TempDir()
+	cmd := []string{"sleep", "30"}
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Cwd:     myCwd,
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Cwd != myCwd {
+		t.Errorf("Cwd not captured: got %q want %q", rec.Cwd, myCwd)
+	}
+	if len(rec.Command) != len(cmd) {
+		t.Fatalf("Command length: got %d want %d", len(rec.Command), len(cmd))
+	}
+	for i := range cmd {
+		if rec.Command[i] != cmd[i] {
+			t.Errorf("Command[%d]: got %q want %q", i, rec.Command[i], cmd[i])
+		}
+	}
+	// Reload from disk to confirm it round-trips.
+	loaded, err := agent.Load(rec.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Cwd != myCwd {
+		t.Errorf("loaded.Cwd: got %q want %q", loaded.Cwd, myCwd)
+	}
+	if len(loaded.Command) != 2 || loaded.Command[0] != "sleep" {
+		t.Errorf("loaded.Command not round-tripped: %v", loaded.Command)
+	}
+}
+
 func TestSpawn_FromHandoffInheritsAndIncrements(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
