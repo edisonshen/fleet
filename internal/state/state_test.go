@@ -3,7 +3,9 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestBootstrap_CreatesAllSubdirs(t *testing.T) {
@@ -120,5 +122,181 @@ func TestAgentPath(t *testing.T) {
 	want := "/tmp/fleet-test/agents/a1b2.json"
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestAgentArchivePath(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := AgentArchivePath("a1b2")
+	if err != nil {
+		t.Fatalf("AgentArchivePath: %v", err)
+	}
+	want := "/tmp/fleet-test/agents/archive/a1b2.json"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestHandoffDir(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := HandoffDir()
+	if err != nil {
+		t.Fatalf("HandoffDir: %v", err)
+	}
+	want := "/tmp/fleet-test/handoffs"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestHandoffPath_FormatsUTCTimestampWithRandomSuffix(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+
+	// Pacific time input — must be rendered as the equivalent UTC
+	// in the filename so different operators produce identical
+	// timestamps for identical handoffs (random suffix differs).
+	pacific, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Skip("zoneinfo not available on this platform")
+	}
+	ts := time.Date(2026, 4, 15, 7, 32, 0, 0, pacific) // 14:32:00 UTC
+
+	got, err := HandoffPath("a1b2", ts)
+	if err != nil {
+		t.Fatalf("HandoffPath: %v", err)
+	}
+	wantPrefix := "/tmp/fleet-test/handoffs/a1b2-20260415-143200-"
+	if !strings.HasPrefix(got, wantPrefix) || !strings.HasSuffix(got, ".md") {
+		t.Errorf("got %q want prefix %q + 4-hex-char suffix + .md", got, wantPrefix)
+	}
+}
+
+func TestHandoffPath_RandomSuffixDiffersAcrossCalls(t *testing.T) {
+	// Same agent + same UTC second must produce different filenames
+	// (P3 from codex iter-9: retries within one second would
+	// otherwise overwrite the previous doc and break the chain).
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	ts := time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC)
+	a, _ := HandoffPath("7f3a92e1", ts)
+	b, _ := HandoffPath("7f3a92e1", ts)
+	if a == b {
+		t.Errorf("HandoffPath returned identical paths %q for same input — random suffix not applied", a)
+	}
+	// Both must share the timestamped prefix.
+	prefix := "/tmp/fleet-test/handoffs/7f3a92e1-20260427-184807-"
+	if !strings.HasPrefix(a, prefix) || !strings.HasPrefix(b, prefix) {
+		t.Errorf("paths missing expected prefix %q: a=%q b=%q", prefix, a, b)
+	}
+}
+
+func TestQueueDir(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := QueueDir()
+	if err != nil {
+		t.Fatalf("QueueDir: %v", err)
+	}
+	want := "/tmp/fleet-test/queue"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestQueuePath_AppendsJSONExtension(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := QueuePath("spawn-fresh-a1b2")
+	if err != nil {
+		t.Fatalf("QueuePath: %v", err)
+	}
+	want := "/tmp/fleet-test/queue/spawn-fresh-a1b2.json"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestProjectLockPath(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := ProjectLockPath("rainier")
+	if err != nil {
+		t.Fatalf("ProjectLockPath: %v", err)
+	}
+	want := "/tmp/fleet-test/projects/.locks/rainier.lock"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestProjectLockPath_SanitizesLegacyNames(t *testing.T) {
+	// ProjectLockPath must NOT reject legacy project names — that
+	// would break handoff for any agent dispatched before
+	// ValidateProjectName landed at the CLI. SafeLockComponent maps
+	// unsafe chars to "_" so the lock file path is always valid.
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	cases := map[string]string{
+		"owner/repo":  "/tmp/fleet-test/projects/.locks/owner_repo.lock",
+		"gift finder": "/tmp/fleet-test/projects/.locks/gift_finder.lock",
+		"foo:bar":     "/tmp/fleet-test/projects/.locks/foo_bar.lock",
+		"":            "/tmp/fleet-test/projects/.locks/_default.lock",
+		".":           "/tmp/fleet-test/projects/.locks/_..lock",
+		"..":          "/tmp/fleet-test/projects/.locks/_...lock",
+		"../escape":   "/tmp/fleet-test/projects/.locks/.._escape.lock",
+	}
+	for in, want := range cases {
+		t.Run(in, func(t *testing.T) {
+			got, err := ProjectLockPath(in)
+			if err != nil {
+				t.Fatalf("ProjectLockPath(%q): %v", in, err)
+			}
+			if got != want {
+				t.Errorf("got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestSafeLockComponent_StableForLegalNames(t *testing.T) {
+	// Legal names should pass through unchanged so existing locks
+	// (and existing test expectations) keep working.
+	for _, in := range []string{"rainier", "gift-finder", "v2.1", "abc_123"} {
+		if got := SafeLockComponent(in); got != in {
+			t.Errorf("SafeLockComponent(%q) = %q, want pass-through", in, got)
+		}
+	}
+}
+
+func TestValidateProjectName_Accepts(t *testing.T) {
+	for _, name := range []string{
+		"rainier",
+		"gift-finder",
+		"caching",
+		"v2.1",
+		"my_project",
+		"abc123",
+		"a",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateProjectName(name); err != nil {
+				t.Errorf("ValidateProjectName(%q) rejected: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestBootstrap_CreatesQueueAndHandoffAndLockDirs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+
+	if _, err := Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	for _, sub := range []string{"queue", "handoffs", "projects/.locks", "agents/archive"} {
+		info, err := os.Stat(filepath.Join(tmp, sub))
+		if err != nil {
+			t.Errorf("missing %s: %v", sub, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("%s is not a directory", sub)
+		}
 	}
 }

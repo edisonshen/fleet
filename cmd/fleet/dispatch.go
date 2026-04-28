@@ -3,11 +3,10 @@ package main
 import (
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/spf13/cobra"
 
-	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -56,31 +55,27 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if err := tmux.Available(); err != nil {
 		return err
 	}
+	// Reject project names with path separators / "..": they'd
+	// silently misbehave at handoff time when they're used as a lock
+	// file name. Better to fail at dispatch.
+	if err := state.ValidateProjectName(opts.project); err != nil {
+		return fmt.Errorf("--project: %w", err)
+	}
 
-	id := agent.NewID()
-	session := tmux.SessionName(id)
-
-	if err := tmux.Spawn(session, opts.cwd, opts.command); err != nil {
+	rec, err := spawn.Spawn(spawn.Options{
+		TaskID:  opts.taskID,
+		Project: opts.project,
+		Cwd:     opts.cwd,
+		Command: opts.command,
+	})
+	if err != nil {
 		return err
 	}
 
-	rec := agent.New(id)
-	rec.TmuxSession = session
-	rec.TaskID = opts.taskID
-	rec.Project = opts.project
-	rec.PID = os.Getpid() // best-effort — tmux pane PID is harder to capture pre-spawn
-
-	if err := rec.Write(); err != nil {
-		// Spawn succeeded but record write failed — kill the orphan
-		// session so we don't leak. Operator can re-run dispatch.
-		_ = tmux.Kill(session)
-		return fmt.Errorf("write agent record: %w (orphan tmux session killed)", err)
-	}
-
-	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", id)
-	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", opts.taskID)
-	_, _ = fmt.Fprintf(stdout, "  project: %s\n", opts.project)
-	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", session)
-	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", id)
+	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
+	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)
+	_, _ = fmt.Fprintf(stdout, "  project: %s\n", rec.Project)
+	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", rec.TmuxSession)
+	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
 	return nil
 }

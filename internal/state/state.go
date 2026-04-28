@@ -6,17 +6,21 @@
 package state
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Subdirectories under ~/.fleet/ that Bootstrap creates.
 // Mirrors the layout in docs/STATE.md.
 var subdirs = []string{
 	"agents",
+	"agents/.locks",
 	"agents/archive",
 	"projects",
 	"projects/.locks",
@@ -73,6 +77,180 @@ func AgentDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, "agents"), nil
+}
+
+// AgentArchivePath returns ~/.fleet/agents/archive/<id>.json.
+//
+// Records move here when the agent crashes or hands off; readers
+// looking for *live* agents iterate AgentDir() and skip subdirs.
+func AgentArchivePath(id string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "agents", "archive", id+".json"), nil
+}
+
+// HandoffDir returns ~/.fleet/handoffs/.
+func HandoffDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "handoffs"), nil
+}
+
+// HandoffPath returns ~/.fleet/handoffs/<id>-<YYYYMMDD-HHMMSS>-<rnd>.md.
+//
+// ts is normalized to UTC so the filename is stable regardless of
+// the operator's machine timezone. The trailing 4-hex-char random
+// suffix prevents same-second collisions in retry / auto-handoff
+// flows that could otherwise overwrite a previous doc and break the
+// previous_handoff chain. Format mirrors the checkpoint's intent:
+// `<agent-id>-<utc-iso>-<short-uuid>.md`.
+func HandoffPath(agentID string, ts time.Time) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	stamp := ts.UTC().Format("20060102-150405")
+	var rnd [2]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		// Exhaustively rare; fall back to a low-entropy nanosecond
+		// suffix so we still produce a unique filename.
+		return filepath.Join(root, "handoffs",
+			fmt.Sprintf("%s-%s-%04x.md", agentID, stamp, ts.UTC().Nanosecond()&0xffff)), nil
+	}
+	return filepath.Join(root, "handoffs",
+		agentID+"-"+stamp+"-"+hex.EncodeToString(rnd[:])+".md"), nil
+}
+
+// QueueDir returns ~/.fleet/queue/.
+func QueueDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "queue"), nil
+}
+
+// QueuePath returns ~/.fleet/queue/<name>.json.
+//
+// name is the queue file's logical identifier; the queue package
+// owns the naming convention (e.g., "spawn-fresh-a1b2c3d4",
+// "handoff-a1b2c3d4"). Centralizing the .json extension here keeps
+// readers (fsnotify filters, list helpers) consistent.
+func QueuePath(name string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "queue", name+".json"), nil
+}
+
+// AgentLockPath returns ~/.fleet/agents/.locks/<id>.lock.
+//
+// Per-agent flock target. Used by `fleet handoff` to serialize
+// concurrent handoffs of the same agent without blocking handoffs
+// of OTHER agents in the same project (which would have happened
+// with the broader per-project lock — different agents in the same
+// project have no shared state in 4a).
+//
+// Agent IDs come from agent.NewID (8 hex chars), so SafeLockComponent
+// would be a no-op; we still apply it as belt-and-suspenders for any
+// future ID format change.
+func AgentLockPath(id string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "agents", ".locks", SafeLockComponent(id)+".lock"), nil
+}
+
+// ProjectLockPath returns ~/.fleet/projects/.locks/<safe-name>.lock.
+//
+// Used as a flock target so handoff/spawn flows for the same project
+// serialize while different projects proceed in parallel. The .locks
+// subdirectory is created by Bootstrap.
+//
+// Project names are passed through SafeLockComponent so legacy records
+// (written before ValidateProjectName existed at the dispatch CLI)
+// continue to lock and hand off correctly. SafeLockComponent maps any
+// unsafe character to "_"; same-project still serializes (same string
+// → same sanitized form), different projects still don't collide
+// (collisions only on names that were already aliases of each other).
+//
+// Validation at the dispatch CLI (ValidateProjectName) prevents NEW
+// agents from getting weird names. This function is the safety net
+// for OLD agents that exist on disk with weird names.
+func ProjectLockPath(project string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "projects", ".locks", SafeLockComponent(project)+".lock"), nil
+}
+
+// SafeLockComponent returns a path-safe transformation of name for use
+// as a single filesystem component. Any character outside
+// [a-zA-Z0-9_.-] is replaced with "_". Empty input becomes "_default".
+//
+// Used by ProjectLockPath so legacy records with names like "owner/repo"
+// or "gift finder" still serialize their handoffs. The mapping is
+// non-injective (collisions possible), but two records that ALREADY
+// shared the same project name remain in the same lock partition,
+// which is the only invariant ProjectLockPath needs to preserve.
+func SafeLockComponent(name string) string {
+	if name == "" {
+		return "_default"
+	}
+	out := make([]byte, 0, len(name))
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '-', c == '_', c == '.':
+			out = append(out, c)
+		default:
+			out = append(out, '_')
+		}
+	}
+	// Reject "." / ".." which would resolve to the parent dir.
+	s := string(out)
+	if s == "." || s == ".." {
+		return "_" + s
+	}
+	return s
+}
+
+// ValidateProjectName rejects strings that would be unsafe to use as
+// a single path component. Allowed: ASCII letters, digits, hyphen,
+// underscore, period (but not just "." or ".."). Empty rejected.
+//
+// Centralized so the dispatch CLI (--project), the project manifest
+// loader (future), and lock-file paths all enforce the same rule.
+// Operator-supplied "owner/repo"-style names get a clear early error
+// instead of a confusing flock-open failure or a silent path traversal.
+func ValidateProjectName(name string) error {
+	if name == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("project name %q reserved", name)
+	}
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		default:
+			return fmt.Errorf("project name %q contains invalid character %q (allowed: letters, digits, _, -, .)", name, c)
+		}
+	}
+	return nil
 }
 
 // WriteAtomic publishes data to path via .tmp + fsync + rename.

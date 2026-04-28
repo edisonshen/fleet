@@ -52,7 +52,29 @@ type Record struct {
 	NeedsInput     bool       `json:"needs_input"`
 	InboxPending   bool       `json:"inbox_pending"`
 	HandoffType    *string    `json:"handoff_type"`
-	SpawnedAt      time.Time  `json:"spawned_at"`
+	// LastHandoffPath points at the handoff doc this agent inherited
+	// from. nil for the first agent on a task. Read by the next handoff
+	// to populate the new doc's previous_handoff frontmatter, building
+	// the chain Fleet shows in TUI task-detail views (DESIGN.md §"Handoff
+	// Chain"). One writer per file, so this is updated only at spawn.
+	LastHandoffPath *string `json:"last_handoff_path"`
+	// HandoffNumber starts at 1 for the first agent on a task and
+	// increments by 1 per handoff. Used as previous_handoff doc's
+	// handoff_number when this agent eventually hands off.
+	HandoffNumber int `json:"handoff_number"`
+	// Cwd is the absolute working directory the agent was spawned in.
+	// Captured at dispatch (defaulting to os.Getwd() when --cwd is
+	// empty) so `fleet handoff` from a different shell can place the
+	// replacement in the same project checkout. Empty for legacy
+	// records — handoff falls back to its --cwd flag in that case.
+	Cwd string `json:"cwd,omitempty"`
+	// Command is the argv used to spawn the agent process inside
+	// tmux. Captured at dispatch so `fleet handoff` preserves any
+	// custom engine/wrapper the operator chose (e.g., a wrapped
+	// claude binary). Empty for legacy records — handoff falls back
+	// to its --command flag.
+	Command   []string  `json:"command,omitempty"`
+	SpawnedAt time.Time `json:"spawned_at"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random
@@ -75,6 +97,9 @@ func NewID() string {
 
 // New builds a Record with required defaults filled in. Caller sets
 // task-specific fields before Write.
+//
+// HandoffNumber defaults to 1 — this agent is the first on its task.
+// Spawn-from-handoff (internal/spawn) overrides this with old+1.
 func New(id string) *Record {
 	now := time.Now().UTC()
 	return &Record{
@@ -83,6 +108,7 @@ func New(id string) *Record {
 		Engine:         DefaultEngine,
 		Role:           "executor",
 		Mode:           "execute",
+		HandoffNumber:  1,
 		LastActivityTS: now,
 		SpawnedAt:      now,
 	}
@@ -105,6 +131,14 @@ func (r *Record) Write() error {
 }
 
 // Load reads an agent record by ID from disk.
+//
+// Backfills HandoffNumber=0 to 1 on read. Records written before the
+// chain-fields PR (Week 4a) lack the handoff_number field;
+// json.Unmarshal leaves it as the int zero value. Treating that zero
+// as "first agent on task" preserves the chain semantics for the
+// first post-upgrade handoff (otherwise the new doc gets
+// handoff_number=0 and the next agent starts at 1, repeating the
+// number — broken chain).
 func Load(id string) (*Record, error) {
 	path, err := state.AgentPath(id)
 	if err != nil {
@@ -121,7 +155,56 @@ func Load(id string) (*Record, error) {
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, fmt.Errorf("parse agent %s: %w", id, err)
 	}
+	if r.HandoffNumber == 0 {
+		r.HandoffNumber = 1
+	}
 	return &r, nil
+}
+
+// Archive moves the agent's live record file to ~/.fleet/agents/archive/.
+//
+// Used after a handoff (record's owner agent has been replaced) or a
+// crash (record outlives the tmux session). After Archive, the live
+// agents/ scan in List() no longer returns this record. Atomic via
+// rename(2) on same-filesystem (always true for ~/.fleet/).
+//
+// If agents/archive/<id>.json already exists (from an old archived
+// agent that happened to share the 8-hex-char ID via the birthday
+// paradox over a long-lived install), append a UTC stamp to keep
+// both archives. Loses the old archive only if BOTH the bare path
+// and the stamped path are taken — vanishingly unlikely.
+//
+// Returns ErrNotFound if the live file is missing.
+func (r *Record) Archive() error {
+	src, err := state.AgentPath(r.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("archive %s: live record %w", r.ID, state.ErrNotFound)
+		}
+		return fmt.Errorf("stat live record %s: %w", r.ID, err)
+	}
+	dst, err := state.AgentArchivePath(r.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(dst); err == nil {
+		// Bare archive path collides — append a UTC suffix to keep
+		// both copies. Format: <id>-<UTCYYYYMMDD-HHMMSS>.json.
+		suffixed, derr := state.AgentArchivePath(r.ID + "-" + time.Now().UTC().Format("20060102-150405"))
+		if derr != nil {
+			return derr
+		}
+		dst = suffixed
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat archive path: %w", err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("rename %s -> archive: %w", r.ID, err)
+	}
+	return nil
 }
 
 // List returns every live agent record under ~/.fleet/agents/.
