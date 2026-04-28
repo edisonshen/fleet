@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBootstrap_CreatesAllSubdirs(t *testing.T) {
@@ -120,5 +121,120 @@ func TestAgentPath(t *testing.T) {
 	want := "/tmp/fleet-test/agents/a1b2.json"
 	if got != want {
 		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestAgentArchivePath(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := AgentArchivePath("a1b2")
+	if err != nil {
+		t.Fatalf("AgentArchivePath: %v", err)
+	}
+	want := "/tmp/fleet-test/agents/archive/a1b2.json"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestHandoffDir(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := HandoffDir()
+	if err != nil {
+		t.Fatalf("HandoffDir: %v", err)
+	}
+	want := "/tmp/fleet-test/handoffs"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestHandoffPath_FormatsUTCTimestamp(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+
+	// Pacific time input — must be rendered as the equivalent UTC
+	// in the filename so different operators produce identical paths
+	// for identical handoffs.
+	pacific, err := time.LoadLocation("America/Los_Angeles")
+	if err != nil {
+		t.Skip("zoneinfo not available on this platform")
+	}
+	ts := time.Date(2026, 4, 15, 7, 32, 0, 0, pacific) // 14:32:00 UTC
+
+	got, err := HandoffPath("a1b2", ts)
+	if err != nil {
+		t.Fatalf("HandoffPath: %v", err)
+	}
+	want := "/tmp/fleet-test/handoffs/a1b2-20260415-143200.md"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestHandoffPath_AlreadyUTCRoundTrips(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	ts := time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC)
+	got, err := HandoffPath("7f3a92e1", ts)
+	if err != nil {
+		t.Fatalf("HandoffPath: %v", err)
+	}
+	want := "/tmp/fleet-test/handoffs/7f3a92e1-20260427-184807.md"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestQueueDir(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := QueueDir()
+	if err != nil {
+		t.Fatalf("QueueDir: %v", err)
+	}
+	want := "/tmp/fleet-test/queue"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestQueuePath_AppendsJSONExtension(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := QueuePath("spawn-fresh-a1b2")
+	if err != nil {
+		t.Fatalf("QueuePath: %v", err)
+	}
+	want := "/tmp/fleet-test/queue/spawn-fresh-a1b2.json"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestProjectLockPath(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	got, err := ProjectLockPath("rainier")
+	if err != nil {
+		t.Fatalf("ProjectLockPath: %v", err)
+	}
+	want := "/tmp/fleet-test/projects/.locks/rainier.lock"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+}
+
+func TestBootstrap_CreatesQueueAndHandoffAndLockDirs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+
+	if _, err := Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+
+	for _, sub := range []string{"queue", "handoffs", "projects/.locks", "agents/archive"} {
+		info, err := os.Stat(filepath.Join(tmp, sub))
+		if err != nil {
+			t.Errorf("missing %s: %v", sub, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("%s is not a directory", sub)
+		}
 	}
 }

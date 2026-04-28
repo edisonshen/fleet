@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 // Subdirectories under ~/.fleet/ that Bootstrap creates.
@@ -73,6 +74,77 @@ func AgentDir() (string, error) {
 		return "", err
 	}
 	return filepath.Join(root, "agents"), nil
+}
+
+// AgentArchivePath returns ~/.fleet/agents/archive/<id>.json.
+//
+// Records move here when the agent crashes or hands off; readers
+// looking for *live* agents iterate AgentDir() and skip subdirs.
+func AgentArchivePath(id string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "agents", "archive", id+".json"), nil
+}
+
+// HandoffDir returns ~/.fleet/handoffs/.
+func HandoffDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "handoffs"), nil
+}
+
+// HandoffPath returns ~/.fleet/handoffs/<id>-<YYYYMMDD-HHMMSS>.md.
+//
+// ts is normalized to UTC so the filename is stable regardless of
+// the operator's machine timezone. Format mirrors the example in
+// docs/DESIGN.md "State directory" (a1-20260415-143200.md).
+func HandoffPath(agentID string, ts time.Time) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	stamp := ts.UTC().Format("20060102-150405")
+	return filepath.Join(root, "handoffs", agentID+"-"+stamp+".md"), nil
+}
+
+// QueueDir returns ~/.fleet/queue/.
+func QueueDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "queue"), nil
+}
+
+// QueuePath returns ~/.fleet/queue/<name>.json.
+//
+// name is the queue file's logical identifier; the queue package
+// owns the naming convention (e.g., "spawn-fresh-a1b2c3d4",
+// "handoff-a1b2c3d4"). Centralizing the .json extension here keeps
+// readers (fsnotify filters, list helpers) consistent.
+func QueuePath(name string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "queue", name+".json"), nil
+}
+
+// ProjectLockPath returns ~/.fleet/projects/.locks/<project>.lock.
+//
+// Used as a flock target so handoff/spawn flows for the same project
+// serialize while different projects proceed in parallel. The .locks
+// subdirectory is created by Bootstrap.
+func ProjectLockPath(project string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "projects", ".locks", project+".lock"), nil
 }
 
 // WriteAtomic publishes data to path via .tmp + fsync + rename.
