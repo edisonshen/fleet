@@ -168,6 +168,67 @@ than retrofit. Tiers 3 + 4 ride later releases.
 
 ---
 
+### [ ] F10 — `fleet spike status` subcommand
+
+**What.** A read-only CLI that re-aggregates `~/.fleet/spike/metrics.jsonl`
+and prints current Q1 / Q2 / Q3 numbers against the bars from
+`docs/SPIKE-context-pct.md`. Lets the operator check spike health
+without invoking `python3 spike/analyze.py` manually.
+
+**Why.** The spike closed PASS for v0.1 but is provisional — see the
+"Ongoing validation (post-closure)" section of `SPIKE-context-pct.md`
+for the re-open gates (Q1 fire-success below 95%, Q2 p95 above 100ms,
+Q3 max delta above 5pp). A one-command health check makes it cheap to
+spot a regression before it bites.
+
+**Sketch.** ~30 lines of Go in `cmd/fleet/spike.go`. Imports nothing
+new — reads the JSONL, computes percentiles in stdlib. Output mirrors
+`spike/analyze.py` for parity.
+
+**Depends on.** Nothing — can ride any Week 4+ PR.
+
+**Decision needed.** Whether to also support `fleet spike status --json`
+for dashboards / CI smoke tests. Probably yes; trivial to add.
+
+---
+
+### [ ] F11 — `~/.fleet/config.yaml:context_limits` operator override
+
+**What.** Add a `context_limits:` map to the global config file so
+operators can register new model IDs (or correct existing ones) without
+waiting for a Fleet release. Both `spike/stop-hook.py` and `fleet-guard`
+read the dict at startup, falling back to the hardcoded `CONTEXT_LIMITS`
+in `spike/stop-hook.py` for unknown keys.
+
+**Why.** When Anthropic ships `claude-opus-5-0` (or whatever's next)
+with a new context window, the spike currently records `computed_pct:
+null` and `context_limit_known: false` — graceful but unhelpful. With
+the override, the operator adds:
+
+```yaml
+# ~/.fleet/config.yaml
+context_limits:
+  claude-opus-5-0: 1500000
+```
+
+…and Fleet works again without a code release.
+
+**Why now (or at least soon).** The hardcoded dict needs a refresh
+every time Anthropic ships a model. Operator override decouples Fleet's
+release cadence from Anthropic's. First mentioned in PR #4's "Not in
+this PR (future)" notes; spike closure pulled it forward to a real
+TODO.
+
+**Depends on.** Nothing structural — could land alongside `fleet
+spike status` (F10) since both touch spike-side code paths.
+
+**Decision needed.** Whether to also expose this via `fleet config set
+context-limits.<model> <tokens>` for ergonomics, or keep it as
+"edit the YAML directly." Recommendation: YAML-only for v0.1;
+ergonomics later.
+
+---
+
 ### [ ] T1 — Prompt/LLM change eval scope (from prior review's test plan)
 
 **What.** Claude Code hook behavior and fleet-guard prompt changes are both
