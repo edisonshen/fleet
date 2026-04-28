@@ -119,6 +119,14 @@ func (r *Record) Write() error {
 }
 
 // Load reads an agent record by ID from disk.
+//
+// Backfills HandoffNumber=0 to 1 on read. Records written before the
+// chain-fields PR (Week 4a) lack the handoff_number field;
+// json.Unmarshal leaves it as the int zero value. Treating that zero
+// as "first agent on task" preserves the chain semantics for the
+// first post-upgrade handoff (otherwise the new doc gets
+// handoff_number=0 and the next agent starts at 1, repeating the
+// number — broken chain).
 func Load(id string) (*Record, error) {
 	path, err := state.AgentPath(id)
 	if err != nil {
@@ -134,6 +142,9 @@ func Load(id string) (*Record, error) {
 	var r Record
 	if err := json.Unmarshal(data, &r); err != nil {
 		return nil, fmt.Errorf("parse agent %s: %w", id, err)
+	}
+	if r.HandoffNumber == 0 {
+		r.HandoffNumber = 1
 	}
 	return &r, nil
 }

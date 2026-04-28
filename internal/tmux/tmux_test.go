@@ -123,6 +123,50 @@ func TestSpawn_ExtraEnvPropagatesToCommand(t *testing.T) {
 	t.Errorf("extra env did not reach the command within deadline:\n%s", string(lastOut))
 }
 
+func TestSpawn_ExtraEnvWorksAgainstExistingServer(t *testing.T) {
+	// Codex P1 (2026-04-27): cmd.Env doesn't propagate when the tmux
+	// client connects to an existing server. The fix is to pass env
+	// via `tmux new-session -e KEY=VALUE`. This test exercises that
+	// path by pre-starting the tmux server (so the Spawn under test
+	// connects to an existing one), then verifying the env var still
+	// reaches the command.
+	requireTmux(t)
+
+	// Pre-start the tmux server by creating + killing a throwaway
+	// session. After this, the server is up but no fleet-* sessions
+	// exist; the next Spawn call connects to the running server.
+	prep := "fleet-test-prep-" + randHex(t)
+	if err := Spawn(prep, "", []string{"sleep", "10"}, nil); err != nil {
+		t.Fatalf("prep Spawn: %v", err)
+	}
+	if err := Kill(prep); err != nil {
+		t.Fatalf("prep Kill: %v", err)
+	}
+
+	session := "fleet-test-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+
+	cmd := []string{"sh", "-c", "echo PROBE=$EXISTING_SERVER_PROBE; cat"}
+	if err := Spawn(session, "", cmd, []string{"EXISTING_SERVER_PROBE=via-dash-e-flag"}); err != nil {
+		t.Fatalf("Spawn against existing server: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(session)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), "PROBE=via-dash-e-flag") {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("env did not reach session spawned against existing server:\n%s",
+		string(lastOut))
+}
+
 func TestSendKeys_NoSession(t *testing.T) {
 	requireTmux(t)
 	err := SendKeys("fleet-test-nonexistent-"+randHex(t), "hello", "Enter")

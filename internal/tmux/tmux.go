@@ -54,15 +54,17 @@ func HasSession(session string) bool {
 //
 // Equivalent shell:
 //
-//	tmux new-session -d -s <session> -c <cwd> <command...>
+//	tmux new-session -d -s <session> -c <cwd> -e K1=V1 -e K2=V2 <command...>
 //
 // `cwd` may be empty to inherit the caller's working directory.
 //
-// `extraEnv` is appended to os.Environ() for the tmux invocation —
-// pass nil for plain inherit. Vars in extraEnv (e.g.,
-// "FLEET_AGENT_ID=a1b2") propagate into the tmux server's spawn of
-// the command. Avoid setting bare cmd.Env (without os.Environ()) —
-// tmux itself depends on PATH/HOME etc to function.
+// `extraEnv` is forwarded as repeated `-e KEY=VALUE` flags to
+// `tmux new-session`. This is the documented way to inject per-session
+// env into tmux. Setting cmd.Env on the client subprocess does NOT
+// propagate when tmux talks to an already-running server — the server
+// inherited its own env at startup and won't pick up new vars from a
+// later client connection. Using `-e` works in both cases (fresh
+// server or existing).
 func Spawn(session, cwd string, command, extraEnv []string) error {
 	if len(command) == 0 {
 		return errors.New("tmux.Spawn: empty command")
@@ -71,11 +73,11 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 	if cwd != "" {
 		args = append(args, "-c", cwd)
 	}
+	for _, kv := range extraEnv {
+		args = append(args, "-e", kv)
+	}
 	args = append(args, command...)
 	cmd := exec.Command("tmux", tmuxArgs(args...)...)
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("tmux new-session %s: %w (%s)", session, err, string(out))

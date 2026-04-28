@@ -139,12 +139,48 @@ func QueuePath(name string) (string, error) {
 // Used as a flock target so handoff/spawn flows for the same project
 // serialize while different projects proceed in parallel. The .locks
 // subdirectory is created by Bootstrap.
+//
+// The project name is validated against ValidateProjectName: rejects
+// path separators, "..", and other path-component-unsafe inputs that
+// would either escape the .locks/ directory or land at a path inside
+// a not-yet-created subdir (which would fail the flock open).
 func ProjectLockPath(project string) (string, error) {
+	if err := ValidateProjectName(project); err != nil {
+		return "", err
+	}
 	root, err := Root()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Join(root, "projects", ".locks", project+".lock"), nil
+}
+
+// ValidateProjectName rejects strings that would be unsafe to use as
+// a single path component. Allowed: ASCII letters, digits, hyphen,
+// underscore, period (but not just "." or ".."). Empty rejected.
+//
+// Centralized so the dispatch CLI (--project), the project manifest
+// loader (future), and lock-file paths all enforce the same rule.
+// Operator-supplied "owner/repo"-style names get a clear early error
+// instead of a confusing flock-open failure or a silent path traversal.
+func ValidateProjectName(name string) error {
+	if name == "" {
+		return fmt.Errorf("project name must not be empty")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("project name %q reserved", name)
+	}
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		default:
+			return fmt.Errorf("project name %q contains invalid character %q (allowed: letters, digits, _, -, .)", name, c)
+		}
+	}
+	return nil
 }
 
 // WriteAtomic publishes data to path via .tmp + fsync + rename.

@@ -228,6 +228,42 @@ func TestArchive_ErrorWhenLiveMissing(t *testing.T) {
 	}
 }
 
+func TestLoad_BackfillsHandoffNumberFromZero(t *testing.T) {
+	// Pre-PR records (written before chain fields existed) lack
+	// handoff_number entirely. json.Unmarshal leaves the field at 0,
+	// which would break the chain on first post-upgrade handoff.
+	// Load() backfills 0 → 1 so the first agent on a task always
+	// reports as handoff #1.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hand-craft a pre-PR record JSON: no handoff_number field.
+	preUpgrade := `{
+  "schema_version": 1,
+  "id": "preupgrd",
+  "engine": "claude-code",
+  "role": "executor",
+  "mode": "execute",
+  "task_id": "t",
+  "project": "p"
+}`
+	if err := os.WriteFile(filepath.Join(tmp, "agents", "preupgrd.json"),
+		[]byte(preUpgrade), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load("preupgrd")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.HandoffNumber != 1 {
+		t.Errorf("HandoffNumber: got %d want 1 (backfilled from missing field)", got.HandoffNumber)
+	}
+}
+
 func TestArchive_ErrorWhenArchiveAlreadyExists(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

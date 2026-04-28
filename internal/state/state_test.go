@@ -219,6 +219,44 @@ func TestProjectLockPath(t *testing.T) {
 	}
 }
 
+func TestProjectLockPath_RejectsUnsafeNames(t *testing.T) {
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	for _, name := range []string{
+		"",
+		".",
+		"..",
+		"owner/repo",       // would land in non-existent .locks/owner/
+		"../../etc/passwd", // path traversal
+		"foo bar",          // space
+		"foo:bar",          // colon
+		"foo\nbar",         // newline
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ProjectLockPath(name); err == nil {
+				t.Errorf("expected ProjectLockPath(%q) to reject, got nil error", name)
+			}
+		})
+	}
+}
+
+func TestValidateProjectName_Accepts(t *testing.T) {
+	for _, name := range []string{
+		"rainier",
+		"gift-finder",
+		"caching",
+		"v2.1",
+		"my_project",
+		"abc123",
+		"a",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateProjectName(name); err != nil {
+				t.Errorf("ValidateProjectName(%q) rejected: %v", name, err)
+			}
+		})
+	}
+}
+
 func TestBootstrap_CreatesQueueAndHandoffAndLockDirs(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

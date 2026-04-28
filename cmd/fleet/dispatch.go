@@ -55,6 +55,12 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if err := tmux.Available(); err != nil {
 		return err
 	}
+	// Reject project names with path separators / "..": they'd
+	// silently misbehave at handoff time when they're used as a lock
+	// file name. Better to fail at dispatch.
+	if err := state.ValidateProjectName(opts.project); err != nil {
+		return fmt.Errorf("--project: %w", err)
+	}
 
 	rec, err := spawn.Spawn(spawn.Options{
 		TaskID:  opts.taskID,
