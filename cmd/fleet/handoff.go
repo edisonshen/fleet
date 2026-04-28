@@ -58,16 +58,21 @@ outgoing record and increments handoff_number by 1.`,
 
 // runHandoff orchestrates the full B2 flow:
 //
-//	write doc → write queue file (commit point) → flock → drain
-//	→ spawn replacement → send /exit + grace → kill → archive → delete queue
+//	load → flock(project) → reload-under-lock → write doc
+//	→ write queue → spawn replacement → send /exit + grace
+//	→ kill → archive → delete queue
 //
-// Crash safety: the queue file is written before any side effect on
-// the OLD agent (kill / archive) and before spawning the replacement.
-// If this process dies between the queue-file write and Delete, the
-// next drain (4b TUI background loop, or the next CLI invocation if
-// we ever add a `fleet drain` subcommand) sees the queue file and
-// finishes the handoff. Spawning is idempotent in practice — the new
-// agent's ID is generated fresh each attempt.
+// Concurrency: the per-project flock bounds the entire critical
+// section. Two concurrent `fleet handoff X` invocations both reach
+// step 1 (load), serialize on step 2 (LockProject), and the loser's
+// step 3 (reload-under-lock) sees ErrNotFound (winner already
+// archived) and bails — no double-spawn.
+//
+// Crash safety: the queue file (step 5) is the journal entry. If we
+// crash between step 5 and step 11 (Delete), a future drainer (4b
+// TUI background loop) sees a stale queue file pointing at an
+// already-archived old_agent_id and skips it. In 4a there is no
+// drainer; the file lingers as harmless residue until 4b ships.
 func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
