@@ -1,6 +1,8 @@
 package tmux
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"strings"
@@ -250,14 +252,13 @@ func TestSendKeys_DeliversToSession(t *testing.T) {
 }
 
 // randHex returns 4 random lowercase hex chars to keep test session
-// names from colliding when run in parallel.
+// names from colliding when run in parallel. In-process so tests
+// don't depend on external tools beyond `tmux` itself.
 func randHex(t *testing.T) string {
 	t.Helper()
-	out, err := exec.Command("openssl", "rand", "-hex", "2").Output()
-	if err != nil {
-		// Fallback if openssl is missing; not great but tests still
-		// pass on CI without it.
-		return "0000"
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
 	}
-	return strings.TrimSpace(string(out))
+	return hex.EncodeToString(b[:])
 }

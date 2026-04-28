@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -174,14 +175,25 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 
 	// 9. Kill the old session. Idempotent — returns nil if already
 	//    gone. If Kill fails AND HasSession still reports the session
-	//    alive, the old agent is still running and we MUST NOT
-	//    archive its record (that would hide a live agent from
-	//    `fleet status` while the task continued in two sessions).
-	//    Operator must investigate manually.
+	//    alive, we MUST NOT archive the old record (that would hide a
+	//    live agent from `fleet status`) AND we MUST roll back the
+	//    new agent (otherwise a retry of `fleet handoff <id>` finds
+	//    the still-live old record and spawns ANOTHER replacement).
+	//
+	//    Rollback: kill the new tmux session, delete the new record,
+	//    delete the queue file. Old agent + old session untouched.
+	//    Handoff doc stays as a (stale) artifact — operator can
+	//    inspect it. Operator retries cleanly after investigating
+	//    why kill failed.
 	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
 		if tmux.HasSession(oldRec.TmuxSession) {
+			_ = tmux.Kill(newRec.TmuxSession)
+			if path, perr := state.AgentPath(newRec.ID); perr == nil {
+				_ = os.Remove(path)
+			}
+			_ = queue.Delete(queuePath)
 			return fmt.Errorf(
-				"old session %s still alive after kill failure: %w (replacement %s spawned; investigate before re-running)",
+				"old session %s still alive after kill failure: %w (replacement %s rolled back; investigate before retrying)",
 				oldRec.TmuxSession, err, newRec.ID)
 		}
 		// Session vanished concurrently with our Kill attempt

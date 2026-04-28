@@ -1,6 +1,8 @@
 package spawn
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,11 +33,12 @@ func requireTmux(t *testing.T) {
 	}
 	// Per-test tmux server via FLEET_TMUX_SOCKET so cross-package
 	// parallel runs don't contend on the host's default tmux server.
-	out, err := exec.Command("openssl", "rand", "-hex", "3").Output()
-	if err != nil {
-		t.Fatalf("rand: %v", err)
+	// In-process random suffix — no openssl/external-tool dep.
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
 	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+strings.TrimSpace(string(out))+".sock")
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
 }
 
 // capturePaneArgs builds tmux args for capture-pane against the

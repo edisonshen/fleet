@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,11 +30,13 @@ func requireTmux(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("tmux not installed; skipping integration test")
 	}
-	out, err := exec.Command("openssl", "rand", "-hex", "3").Output()
-	if err != nil {
-		t.Fatalf("rand: %v", err)
+	// In-process random suffix for FLEET_TMUX_SOCKET — no external
+	// `openssl` dep so tests pass anywhere tmux + Go work.
+	var b [3]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
 	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+strings.TrimSpace(string(out))+".sock")
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
 }
 
 // seedAgent dispatches a long-lived agent for handoff to operate on.
