@@ -303,6 +303,18 @@ func TestHandoff_RefusesLegacyRecordMissingCwdAndCommand(t *testing.T) {
 		t.Errorf("expected error about legacy record, got: %v", err)
 	}
 
+	// Codex iter-8 P2: refusal MUST NOT leave on-disk side effects
+	// (no handoff doc, no queue file, no archived record).
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "handoffs")); len(entries) > 0 {
+		t.Errorf("legacy refusal left handoff doc on disk: %v", entries)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "queue")); len(entries) > 0 {
+		t.Errorf("legacy refusal left queue file on disk: %v", entries)
+	}
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "agents", "archive")); len(entries) > 0 {
+		t.Errorf("legacy refusal archived old record: %v", entries)
+	}
+
 	// Supplying both flags should succeed.
 	out2 := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
@@ -378,6 +390,51 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 		Cwd:     cwd,
 		Command: command,
 	})
+}
+
+func TestHandoff_RecoveryProbeAbortsOnCorruptedRecord(t *testing.T) {
+	// Codex iter-8 P1: the recovery branch must distinguish
+	// state.ErrNotFound (which triggers cleanup) from other Load
+	// errors (corrupted JSON, perm error). A corrupted-JSON read
+	// must NOT be treated as "old already archived" — that would
+	// silently delete the journal and exit success while the agent
+	// is still live.
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	// Seed a queue file with NewAgentID set (so the recovery probe
+	// engages), then write a corrupted JSON for the old agent.
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: "corrupt1",
+		HandoffDoc: "/some/doc.md",
+		Project:    "p",
+		TaskID:     "t",
+		NewAgentID: "newrepl1",
+		NewSession: "fleet-newrepl1",
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, "agents", "corrupt1.json"),
+		[]byte("{not valid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := &bytes.Buffer{}
+	err := runHandoff(&handoffOpts{
+		oldID:       "corrupt1",
+		graceMillis: 0,
+	}, out, out)
+	if err == nil {
+		t.Fatal("expected handoff to abort on corrupted record, got success")
+	}
+	if !strings.Contains(err.Error(), "recovery probe") {
+		t.Errorf("expected error to mention recovery probe, got: %v", err)
+	}
+	// Queue file MUST NOT have been deleted — operator needs to
+	// investigate the corrupted record.
+	if _, err := os.Stat(filepath.Join(tmp, "queue", "spawn-fresh-corrupt1.json")); err != nil {
+		t.Errorf("queue file should still exist after probe failure, got: %v", err)
+	}
 }
 
 func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {

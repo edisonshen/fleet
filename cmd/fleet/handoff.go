@@ -104,10 +104,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    the queue file, the queue file's NewAgentID will be set.
 	//    Resume by completing kill+archive+delete with the existing
 	//    replacement instead of spawning a second one.
+	//
+	//    Distinguish state.ErrNotFound (the actual recovery case)
+	//    from other Load errors (corrupted JSON, permission issue) —
+	//    silently cleaning up the journal on a corrupted-record read
+	//    would either mask broken state or trigger a double-spawn.
 	pendingPath, _ := state.QueuePath(queue.SpawnFreshName(opts.oldID))
 	if pending, perr := queue.ReadSpawnFresh(pendingPath); perr == nil && pending.NewAgentID != "" {
 		oldRec, lerr := agent.Load(opts.oldID)
-		if lerr != nil {
+		switch {
+		case errors.Is(lerr, state.ErrNotFound):
 			// Old record already archived — handoff completed
 			// successfully and only the queue.Delete tail crashed.
 			// Cleanup is the right action AND the right success
@@ -118,13 +124,20 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
 				opts.oldID, pending.NewAgentID)
 			return nil
+		case lerr != nil:
+			// Read failure that isn't "missing" — abort so the
+			// operator can investigate without us touching state.
+			return fmt.Errorf("recovery probe: load agent %s failed: %w", opts.oldID, lerr)
 		}
 		newRec, nerr := agent.Load(pending.NewAgentID)
-		if nerr != nil {
+		switch {
+		case errors.Is(nerr, state.ErrNotFound):
 			// Replacement record vanished — orphan queue file. Delete
 			// and proceed normally so a fresh spawn can happen.
 			_ = queue.Delete(pendingPath)
-		} else {
+		case nerr != nil:
+			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
+		default:
 			return resumeHandoff(opts, stdout, stderr, oldRec, newRec, pending.HandoffDoc, pendingPath)
 		}
 	}
@@ -138,7 +151,34 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("load agent %s under lock: %w (already handed off?)", opts.oldID, err)
 	}
 
-	// 4. Write the handoff doc. The doc represents "agent oldID
+	// 4. Resolve cwd + command for the replacement BEFORE writing
+	//    any side effects. CLI flags win; otherwise inherit from
+	//    oldRec so multi-repo operators invoking `fleet handoff`
+	//    from a different shell still get the right project checkout
+	//    and engine wrapper.
+	//
+	//    For legacy records (dispatched before this PR added Cwd /
+	//    Command to agent.Record) BOTH the inherited value AND the
+	//    flag may be empty. Refuse early — silently falling back to
+	//    os.Getwd() / "claude" would land the replacement in the
+	//    wrong tree and report success. Validating before doc/queue
+	//    writes means a refusal leaves zero on-disk artifacts.
+	cwd := opts.cwd
+	if cwd == "" {
+		cwd = oldRec.Cwd
+	}
+	if cwd == "" {
+		return fmt.Errorf("agent %s is a legacy record with no stored cwd; pass --cwd <path> explicitly", opts.oldID)
+	}
+	command := opts.command
+	if len(command) == 0 {
+		command = oldRec.Command
+	}
+	if len(command) == 0 {
+		return fmt.Errorf("agent %s is a legacy record with no stored command; pass --command <argv> explicitly", opts.oldID)
+	}
+
+	// 5. Write the handoff doc. The doc represents "agent oldID
 	//    handed off"; its handoff_number is the OLD agent's number,
 	//    its previous_handoff chains back to whatever the old agent
 	//    itself inherited from. The next handoff increments by 1
@@ -156,9 +196,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("write handoff doc: %w", err)
 	}
 
-	// 5. Write the queue file. With flock acquired, this is no longer
+	// 6. Write the queue file. With flock acquired, this is no longer
 	//    a race-prone commit point but a journal entry — if we crash
-	//    before queue.Delete (step 10), a future drainer (4b TUI
+	//    before queue.Delete (step 12), a future drainer (4b TUI
 	//    background loop) sees a stale queue file pointing at an
 	//    archived agent and skips it. In 4a there's no drainer; the
 	//    file lingers as harmless residue until 4b ships.
@@ -170,33 +210,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	})
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
-	}
-
-	// 6. Resolve cwd + command for the replacement. CLI flags win;
-	//    otherwise inherit from oldRec so multi-repo operators
-	//    invoking `fleet handoff` from a different shell still get
-	//    the right project checkout and engine wrapper.
-	//
-	//    For legacy records (dispatched before this PR added Cwd /
-	//    Command to agent.Record) BOTH the inherited value AND the
-	//    flag may be empty. Silently falling back to os.Getwd() /
-	//    "claude" would land the replacement in the wrong tree
-	//    and/or with the wrong binary while reporting success — the
-	//    exact failure mode codex iter-7 P1 calls out. Refuse and
-	//    require the operator to re-supply explicitly.
-	cwd := opts.cwd
-	if cwd == "" {
-		cwd = oldRec.Cwd
-	}
-	if cwd == "" {
-		return fmt.Errorf("agent %s is a legacy record with no stored cwd; pass --cwd <path> explicitly", opts.oldID)
-	}
-	command := opts.command
-	if len(command) == 0 {
-		command = oldRec.Command
-	}
-	if len(command) == 0 {
-		return fmt.Errorf("agent %s is a legacy record with no stored command; pass --command <argv> explicitly", opts.oldID)
 	}
 
 	// 7. Drain: spawn the replacement.
