@@ -151,6 +151,52 @@ func TestRender_DeterministicForSameInput(t *testing.T) {
 	}
 }
 
+// TestRender_SkillByteGolden pins the exact bytes Render produces for a
+// known input. The same byte-for-byte assertion lives in the Python skill at
+// skills/fleet-guard/tests/test_handoff.py:EXPECTED_GOLDEN — both sides MUST
+// produce the same bytes for the same input. If either drifts, both fail
+// and we re-converge intentionally rather than discovering at handoff time
+// that 4a's chain reader can't parse 4b's auto-handoff doc.
+func TestRender_SkillByteGolden(t *testing.T) {
+	prev := "/home/op/.fleet/handoffs/prev.md"
+	pct := 50.0
+	d := &Doc{
+		AgentID:             "abcd1234",
+		TaskID:              "demo-task",
+		Project:             "myproj",
+		Type:                TypeAutoYellow,
+		Number:              2,
+		PreviousPath:        &prev,
+		ContextPctAtHandoff: &pct,
+		Timestamp:           time.Date(2026, 4, 28, 12, 34, 56, 0, time.UTC),
+		Completed:           "Wrote tests for foo",
+		KeyDecisions:        Placeholder,
+		FilesModified:       Placeholder,
+		OpenQuestions:       Placeholder,
+		NextSteps:           Placeholder,
+	}
+	want := "---\n" +
+		"agent_id: \"abcd1234\"\n" +
+		"task_id: \"demo-task\"\n" +
+		"project: \"myproj\"\n" +
+		"context_pct_at_handoff: 50\n" +
+		"previous_handoff: \"/home/op/.fleet/handoffs/prev.md\"\n" +
+		"handoff_number: 2\n" +
+		"timestamp: \"2026-04-28T12:34:56Z\"\n" +
+		"handoff_type: \"auto-yellow\"\n" +
+		"---\n" +
+		"\n" +
+		"## Completed\nWrote tests for foo\n\n" +
+		"## Key Decisions\n" + Placeholder + "\n\n" +
+		"## Files Modified\n" + Placeholder + "\n\n" +
+		"## Open Questions\n" + Placeholder + "\n\n" +
+		"## Next Steps (prioritized)\n" + Placeholder + "\n"
+	got := string(Render(d))
+	if got != want {
+		t.Errorf("Render byte-shape drifted from skill golden.\nwant:\n%s\n\ngot:\n%s", want, got)
+	}
+}
+
 func TestWrite_PublishesAtomically(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
