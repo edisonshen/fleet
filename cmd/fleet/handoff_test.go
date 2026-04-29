@@ -591,6 +591,126 @@ func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {
 	}
 }
 
+func TestHandoff_DeadSession_ArchivesWithoutSpawn(t *testing.T) {
+	// Smart [h] for orphan records: when the outgoing tmux session is
+	// already dead (claude exited inside it), handoff archives the
+	// record without spawning a replacement, writing a doc, or queueing.
+	// The operator's intent is cleanup, not "continue this work" — there
+	// is no work in flight to continue.
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	old := seedAgent(t)
+	// Kill the tmux session so the outgoing agent looks orphaned.
+	if err := tmux.Kill(old.TmuxSession); err != nil {
+		t.Fatalf("seed kill: %v", err)
+	}
+	if tmux.HasSession(old.TmuxSession) {
+		t.Fatalf("seed: session %s should be dead after kill", old.TmuxSession)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff on dead session: %v\n%s", err, out.String())
+	}
+
+	// Old live record gone.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); !os.IsNotExist(err) {
+		t.Errorf("old live record should be gone, stat err=%v", err)
+	}
+	// Old record archived.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", "archive", old.ID+".json")); err != nil {
+		t.Errorf("old archive missing: %v", err)
+	}
+	// No replacement spawned.
+	if n := len(listLive(t)); n != 0 {
+		t.Errorf("expected 0 live agents after dead-session cleanup, got %d", n)
+	}
+	// No handoff doc written.
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "handoffs")); len(entries) > 0 {
+		t.Errorf("dead-session cleanup should not write a handoff doc, got: %v", entries)
+	}
+	// No queue file left behind.
+	if entries, _ := os.ReadDir(filepath.Join(tmp, "queue")); len(entries) > 0 {
+		t.Errorf("dead-session cleanup should not leave queue files, got: %v", entries)
+	}
+	// Output explains what happened so the operator isn't confused by
+	// the missing "handed off → <new id>" line.
+	s := out.String()
+	for _, want := range []string{old.ID, "session was dead", "no replacement spawned"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("output missing %q:\n%s", want, s)
+		}
+	}
+}
+
+func TestHandoff_DeadSession_RecoveryStillWinsWhenPendingExists(t *testing.T) {
+	// If a previous handoff crashed after spawning the replacement
+	// (queue file with NewAgentID set, replacement record + session
+	// alive), a retry on a now-dead OUTGOING session must still take
+	// the resume path — the dead-session short-circuit must not run
+	// before the recovery probe and orphan the live replacement.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Spawn a real replacement record + session (simulating the
+	// post-spawn pre-archive crash state).
+	repCwd := t.TempDir()
+	replacement, err := agentSpawnForTest(t, repCwd, []string{"sleep", "120"}, old.Project, old.TaskID)
+	if err != nil {
+		t.Fatalf("seed replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
+
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: "/some/doc.md",
+		Project:    old.Project,
+		TaskID:     old.TaskID,
+		NewAgentID: replacement.ID,
+		NewSession: replacement.TmuxSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	// Now kill the outgoing session so it LOOKS like a dead-session
+	// candidate. The recovery probe must still win.
+	if err := tmux.Kill(old.TmuxSession); err != nil {
+		t.Fatalf("kill old: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("resume handoff: %v\n%s", err, out.String())
+	}
+
+	// Replacement preserved as the single live agent (not orphaned).
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	if live[0].ID != replacement.ID {
+		t.Errorf("expected replacement %s alive, got %s", replacement.ID, live[0].ID)
+	}
+	// Output should mention "resumed", not the dead-session message.
+	s := out.String()
+	if !strings.Contains(s, "resumed") {
+		t.Errorf("expected resume path output, got:\n%s", s)
+	}
+	if strings.Contains(s, "no replacement spawned") {
+		t.Errorf("dead-session message must not fire when recovery applies:\n%s", s)
+	}
+}
+
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

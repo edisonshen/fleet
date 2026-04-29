@@ -205,6 +205,44 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("load agent %s under lock: %w (already handed off?)", opts.oldID, err)
 	}
 
+	// 3a. Dead-session short-circuit: if the outgoing tmux session is
+	//     already gone (claude exited inside it via Ctrl-D / /exit /
+	//     crash), there is no in-flight work to hand off and no agent
+	//     to /exit. Spawning a replacement would emit a stub doc full
+	//     of placeholders the new agent has no way to fill, then drop
+	//     into a fresh shell — the operator wanted cleanup, not a
+	//     fresh agent. Archive the record and return.
+	//
+	//     Runs AFTER the recovery probe so an in-flight handoff (queue
+	//     file with NewAgentID set) still resumes via resumeHandoff,
+	//     which retires the outgoing record using the already-spawned
+	//     replacement instead of orphaning it.
+	if !tmux.HasSession(oldRec.TmuxSession) {
+		if err := oldRec.Archive(); err != nil {
+			// Same fallback shape as step 12: try removing the live
+			// record so a retry doesn't load a stale entry and loop.
+			path, perr := state.AgentPath(oldRec.ID)
+			if perr == nil {
+				if rmErr := os.Remove(path); rmErr == nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: archive %s: %v (live record removed instead, archive copy lost)\n",
+						oldRec.ID, err)
+				} else {
+					return fmt.Errorf(
+						"dead-session archive %s failed (%w) AND fallback remove failed (%w); clean up agents/%s.json manually",
+						oldRec.ID, err, rmErr, oldRec.ID)
+				}
+			} else {
+				return fmt.Errorf(
+					"dead-session archive %s failed (%w) AND could not resolve live path (%w)",
+					oldRec.ID, err, perr)
+			}
+		}
+		_, _ = fmt.Fprintf(stdout,
+			"agent %s session was dead — record archived, no replacement spawned\n", oldRec.ID)
+		return nil
+	}
+
 	// 4. Resolve cwd + command for the replacement BEFORE writing
 	//    any side effects. CLI flags win; otherwise inherit from
 	//    oldRec so multi-repo operators invoking `fleet handoff`
