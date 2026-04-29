@@ -43,8 +43,14 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		"project name to tag this agent with")
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
 		"working directory for the spawned session (default: current dir)")
-	cmd.Flags().StringSliceVar(&opts.command, "command", []string{"claude"},
-		"command to run inside the tmux session (default: claude)")
+	// Default includes --dangerously-skip-permissions because Fleet's
+	// premise is fire-and-forget parallel agents: every permission
+	// prompt blocks one of N agents and forces the operator to babysit
+	// it. Operators who want the per-tool prompts can override with
+	// `--command claude` or supply their own argv.
+	cmd.Flags().StringSliceVar(&opts.command, "command",
+		[]string{"claude", "--dangerously-skip-permissions"},
+		"command to run inside the tmux session (default: claude --dangerously-skip-permissions)")
 	return cmd
 }
 
