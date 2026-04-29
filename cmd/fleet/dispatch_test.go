@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/spf13/pflag"
 )
 
 // TestDispatch_DefaultCommandWrapsAndSkipsPermissions locks in two
@@ -18,14 +20,29 @@ func TestDispatch_DefaultCommandWrapsAndSkipsPermissions(t *testing.T) {
 	if flag == nil {
 		t.Fatal("dispatch must expose --command")
 	}
-	got := flag.DefValue
-	if !strings.Contains(got, "sh") || !strings.Contains(got, "-c") {
-		t.Errorf("default --command should wrap in a shell, got %q", got)
+	// pflag.SliceValue exposes the unescaped slice; flag.DefValue is
+	// the cobra-escaped help-text rendering and would mangle the
+	// inner double quotes around shell vars.
+	slice, ok := flag.Value.(pflag.SliceValue)
+	if !ok {
+		t.Fatalf("--command flag is not a SliceValue: %T", flag.Value)
 	}
-	if !strings.Contains(got, "--dangerously-skip-permissions") {
-		t.Errorf("default --command should pass --dangerously-skip-permissions, got %q", got)
+	parts := slice.GetSlice()
+	if len(parts) < 3 || parts[0] != "sh" || parts[1] != "-c" {
+		t.Fatalf("default --command should be [sh -c <script>], got %v", parts)
 	}
-	if !strings.Contains(got, "exec") || !strings.Contains(got, "SHELL") {
-		t.Errorf("default --command should drop into an interactive shell on claude exit, got %q", got)
+	script := parts[2]
+	if !strings.Contains(script, "--dangerously-skip-permissions") {
+		t.Errorf("default script should pass --dangerously-skip-permissions, got %q", script)
+	}
+	if !strings.Contains(script, "exec ${SHELL:-bash}") {
+		t.Errorf("default script should drop into an interactive shell on clean claude exit, got %q", script)
+	}
+	// codex iter-3 P1 regression: non-zero claude exits must propagate
+	// out of the wrapper so the tmux session terminates and fleet's
+	// failure-detection sees no live session — preventing zombie
+	// agent records pointing at idle shells.
+	if !strings.Contains(script, "RC=$?") || !strings.Contains(script, `exit "$RC"`) {
+		t.Errorf("default script should propagate non-zero claude exits, got %q", script)
 	}
 }

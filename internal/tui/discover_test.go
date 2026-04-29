@@ -205,13 +205,18 @@ func TestProjectTag_ParentBasename(t *testing.T) {
 		{"/Users/x/personal/fleet", "personal-fleet"},
 		{"/tmp/projects/foo", "projects-foo"},
 		{"/foo", "foo"}, // single segment falls back to basename
-		{"/", "fleet"},  // sanitization → empty → fallback
 	}
 	for _, tc := range cases {
 		got := ProjectTag(tc.path)
 		if got != tc.want {
 			t.Errorf("ProjectTag(%q)=%q, want %q", tc.path, got, tc.want)
 		}
+	}
+	// "/" sanitizes through to the fallback "fleet" with a hash
+	// suffix because raw="/" differs from sanitized="fleet".
+	got := ProjectTag("/")
+	if !strings.HasPrefix(got, "fleet-") || len(got) != len("fleet-")+4 {
+		t.Errorf(`ProjectTag("/")=%q, want "fleet-XXXX"`, got)
 	}
 }
 
@@ -219,24 +224,47 @@ func TestProjectTag_ParentBasename(t *testing.T) {
 // with spaces or other punctuation used to produce tags that
 // state.ValidateProjectName rejects, and dispatch failed before any
 // agent spawned. Sanitization maps unsafe chars to "-" and ensures
-// every output is a valid project name.
+// every output is a valid project name. Lossy-sanitization cases get
+// a -XXXX hash suffix (codex iter-3 P2) so two paths that collapse
+// to the same sanitized form keep distinct tags.
 func TestProjectTag_SanitizesUnsafeChars(t *testing.T) {
 	cases := []struct {
-		path string
-		want string
+		path       string
+		wantPrefix string
+		expectHash bool
 	}{
-		{"/Users/x/Client Work/api", "Client-Work-api"},
-		{"/foo bar baz", "foo-bar-baz"},
-		{"/proj/v1.0", "proj-v1.0"},             // dots preserved
-		{"/proj/with;semis", "proj-with-semis"}, // semis → dash
-		{"/  /  ", "fleet"},                     // all whitespace → fallback
-		{"/foo/bar baz qux", "foo-bar-baz-qux"}, // parent "foo" + sanitized basename
+		{"/Users/x/Client Work/api", "Client-Work-api-", true},
+		{"/foo bar baz", "foo-bar-baz-", true},
+		{"/proj/v1.0", "proj-v1.0", false}, // dots preserved, clean
+		{"/proj/with;semis", "proj-with-semis-", true},
+		{"/  /  ", "fleet-", true}, // all whitespace → fallback "fleet" + hash (raw≠sanitized)
+		{"/foo/bar baz qux", "foo-bar-baz-qux-", true},
 	}
 	for _, tc := range cases {
 		got := ProjectTag(tc.path)
-		if got != tc.want {
-			t.Errorf("ProjectTag(%q)=%q, want %q", tc.path, got, tc.want)
+		if !strings.HasPrefix(got, tc.wantPrefix) {
+			t.Errorf("ProjectTag(%q)=%q, want prefix %q", tc.path, got, tc.wantPrefix)
+			continue
 		}
+		hasHashSuffix := len(got) == len(tc.wantPrefix)+4
+		if tc.expectHash && !hasHashSuffix {
+			t.Errorf("ProjectTag(%q)=%q, expected -XXXX hash suffix", tc.path, got)
+		}
+		if !tc.expectHash && len(got) > len(tc.wantPrefix) {
+			t.Errorf("ProjectTag(%q)=%q, expected clean tag without hash", tc.path, got)
+		}
+	}
+}
+
+// TestProjectTag_DistinctSanitizedPathsTagDistinctly is the codex
+// iter-3 P2 regression check: two paths whose sanitized form would
+// collide must still produce different ProjectTag outputs so they
+// don't share fleet-guard's per-project lock.
+func TestProjectTag_DistinctSanitizedPathsTagDistinctly(t *testing.T) {
+	a := ProjectTag("/Users/x/foo bar/api")
+	b := ProjectTag("/Users/x/foo-bar/api")
+	if a == b {
+		t.Errorf("paths that sanitize identically must still tag distinctly: both got %q", a)
 	}
 }
 
