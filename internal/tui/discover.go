@@ -1,8 +1,6 @@
 package tui
 
 import (
-	"fmt"
-	"hash/fnv"
 	"os"
 	"path/filepath"
 	"sort"
@@ -147,33 +145,18 @@ func ProjectTag(p string) string {
 	} else {
 		raw = parent + "-" + base
 	}
-	sanitized := sanitizeProjectTag(raw)
-
-	// codex iter-3 P2 mitigation: sanitization is lossy (space and
-	// hyphen both collapse to "-", so "~/foo bar/api" and
-	// "~/foo-bar/api" produce the same sanitized tag and would share
-	// fleet-guard's per-project lock). Append a 4-hex-char hash of
-	// the canonical path WHEN sanitization changed the input —
-	// distinct inputs that sanitize identically get distinct tags,
-	// while clean paths keep their readable basename-only tag.
-	if raw == sanitized {
-		return sanitized
-	}
-	return fmt.Sprintf("%s-%04x", sanitized, pathHash(p))
+	return sanitizeProjectTag(raw)
 }
 
-// pathHash returns a stable 16-bit hash of p's canonical
-// (symlinks-resolved) form so two distinct paths always hash apart
-// even on macOS where /private/var aliases /var.
-func pathHash(p string) uint32 {
-	canon := p
-	if c, err := filepath.EvalSymlinks(p); err == nil {
-		canon = c
-	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(canon))
-	return h.Sum32() & 0xffff
-}
+// Known limitation (codex iter-3 P2): sanitization is lossy, so two
+// distinct paths whose parent-basename collapses identically after
+// sanitizing share a project tag. Example: "~/foo bar/api" and
+// "~/foo-bar/api" both → "foo-bar-api". Operators who hit this case
+// can override per-dispatch via `fleet dispatch --project <unique>`.
+// A path-derived hash suffix would solve it but breaks tag stability
+// across builds for in-flight agents (codex iter-4 P1), which is a
+// worse practical regression for a pre-1.0 project. Revisit at v1.0
+// with a documented migration path.
 
 // sanitizeProjectTag forces s into the ValidateProjectName allowlist
 // ([A-Za-z0-9._-]). Anything else becomes "-"; runs collapse;
