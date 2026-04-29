@@ -557,6 +557,129 @@ class TestRefireProtection:
             "handoff_type was not pre-marked on disk before write_doc"
 
 
+# -- wedge protection: clear pending on producer failure (codex P1) -------
+
+class TestWedgeRecovery:
+    """If write_doc or write_queue fails after handoff_type was pre-marked,
+    the rollback in _clear_pending must restore handoff_type=None so the
+    next fire retries instead of being silently wedged in pending state.
+    Without rollback, is_handoff_pending stays True and Red short-circuits
+    forever — agent is stuck until manual repair."""
+
+    def _seed_and_force_doc_failure(
+        self, fleet_home_tmp: Path, agent_id: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Path:
+        record_path = _seed_record(fleet_home_tmp, agent_id)
+        # Make write_doc return "" (failure sentinel from the function).
+        monkeypatch.setattr(handoff, "write_doc", lambda **_: "")
+        return record_path
+
+    def test_red_failure_clears_handoff_type(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        record_path = self._seed_and_force_doc_failure(
+            fleet_home_tmp, "wedgeR1", monkeypatch)
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="wedgeR1", session="fleet-wedgeR1",
+        )
+        # After failure, handoff_type rolled back to None so next fire
+        # retries from the top instead of bailing on pending=True.
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] is None, \
+            f"expected rollback to None, got {record['handoff_type']!r}"
+
+    def test_red_retries_after_failure(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """End-to-end on the wedge: first fire fails the doc write,
+        second fire (after the failure-induced clear) must NOT short-
+        circuit — it has to write fresh doc + queue."""
+        _seed_record(fleet_home_tmp, "wedgeR2")
+
+        real_write_doc = handoff.write_doc
+        call_count = {"n": 0}
+
+        def write_doc_first_fails(**kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return ""  # fail
+            return real_write_doc(**kwargs)
+        monkeypatch.setattr(handoff, "write_doc", write_doc_first_fails)
+
+        payload = {"transcript_path": str(
+            _transcript(tmp_path, input_tokens=145_000))}
+        handoff.maybe_trigger(
+            payload, agent_id="wedgeR2", session="fleet-wedgeR2")
+        handoff.maybe_trigger(
+            payload, agent_id="wedgeR2", session="fleet-wedgeR2")
+
+        assert call_count["n"] == 2, "second fire must retry, not bail"
+        docs = list((fleet_home_tmp / "handoffs").glob("wedgeR2-*.md"))
+        assert len(docs) == 1, "second fire's retry must produce a doc"
+        queues = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
+        assert len(queues) == 1
+
+    def test_precompact_failure_clears_handoff_type(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PreCompact's wedge case is the worst — compaction is imminent,
+        and being stuck means future Yellow fires also bail (pending=True)
+        with no MILESTONE recovery path. Rollback must work here too."""
+        record_path = self._seed_and_force_doc_failure(
+            fleet_home_tmp, "wedgePC", monkeypatch)
+        handoff.emergency_trigger(
+            {"transcript_path": str(_transcript(tmp_path))},
+            agent_id="wedgePC", session="fleet-wedgePC",
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] is None
+
+    def test_yellow_milestone_failure_clears_handoff_type(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Yellow's MILESTONE-triggered _do_handoff also rolls back on
+        failure. Pre-state: agent is auto-yellow pending. _do_handoff
+        fails. Post-state: handoff_type=None so the next fire either
+        re-injects HANDOFF REQUESTED (Yellow first-fire) or re-checks
+        Red threshold; either way, no silent wedge."""
+        record_path = _seed_record(fleet_home_tmp, "wedgeY1",
+                                   handoff_type=handoff.TYPE_AUTO_YELLOW)
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "MILESTONE\n"
+        )
+        monkeypatch.setattr(handoff, "write_doc", lambda **_: "")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="wedgeY1", session="fleet-wedgeY1",
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] is None
+
+    def test_queue_write_failure_also_clears(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """write_doc succeeds but write_queue fails — rollback still
+        fires. (Without this, an orphan doc lingers AND the agent is
+        wedged.)"""
+        record_path = _seed_record(fleet_home_tmp, "wedgeQ1")
+        monkeypatch.setattr(handoff, "write_queue",
+                            lambda **_: False)
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="wedgeQ1", session="fleet-wedgeQ1",
+        )
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] is None
+
+
 # -- emergency_trigger -------------------------------------------------------
 
 class TestEmergencyTrigger:

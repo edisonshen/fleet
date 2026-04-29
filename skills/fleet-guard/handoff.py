@@ -214,11 +214,8 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
             # this _do_handoff completes sees pending=True and bails
             # at the check above.
             health.update_record(agent_id, handoff_type=TYPE_AUTO_RED)
-            # Re-load so _do_handoff sees the freshly-set type (its
-            # captured `record` dict is now stale on that field, but
-            # _do_handoff doesn't use record.handoff_type — it takes
-            # the type as an argument).
-            _do_handoff(record, session, TYPE_AUTO_RED, pct)
+            if not _do_handoff(record, session, TYPE_AUTO_RED, pct):
+                _clear_pending(agent_id)
             return None
 
         if state == "yellow":
@@ -226,7 +223,8 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
                 if find_milestone(session):
                     handoff_type = (record.get("handoff_type")
                                     or TYPE_AUTO_YELLOW)
-                    _do_handoff(record, session, handoff_type, pct)
+                    if not _do_handoff(record, session, handoff_type, pct):
+                        _clear_pending(agent_id)
                 return None
             health.update_record(agent_id, handoff_type=TYPE_AUTO_YELLOW)
             return inject_handoff_requested()
@@ -255,18 +253,27 @@ def emergency_trigger(payload: dict[str, Any], *, agent_id: str,
             return
         pct, _ = health.read_context_pct(payload)
         health.update_record(agent_id, handoff_type=TYPE_PRECOMPACT)
-        _do_handoff(record, session, TYPE_PRECOMPACT, pct)
+        if not _do_handoff(record, session, TYPE_PRECOMPACT, pct):
+            _clear_pending(agent_id)
     except Exception as exc:
         print(f"fleet-guard handoff.emergency_trigger: {exc}",
               file=sys.stderr)
 
 
 def _do_handoff(record: dict[str, Any], session: str,
-                handoff_type: str, pct: float | None) -> None:
-    """Capture the pane, render + write the doc, write the queue file,
-    update the record's handoff_type. Pure best-effort: any I/O failure
-    aborts the chain (we don't want a queue file pointing at a doc that
-    failed to render)."""
+                handoff_type: str, pct: float | None) -> bool:
+    """Capture the pane, render + write the doc, write the queue file.
+
+    Returns True on success (both doc and queue durable on disk),
+    False on any I/O failure. Caller is responsible for clearing the
+    pre-marked handoff_type when this returns False — without that
+    rollback, the agent stays pending forever and is_handoff_pending
+    short-circuits every subsequent fire (no retry, no successor,
+    wedged until manual repair).
+
+    Pure best-effort otherwise: any failure aborts the chain so we
+    don't leave a queue file pointing at a doc that didn't render.
+    """
     agent_id = record["id"]
     task_id = record.get("task_id", "")
     project = record.get("project", "")
@@ -290,7 +297,7 @@ def _do_handoff(record: dict[str, Any], session: str,
         recent_activity=recent,
     )
     if not doc_path:
-        return
+        return False
     if not write_queue(
         old_id=agent_id,
         new_id=new_id,
@@ -299,12 +306,19 @@ def _do_handoff(record: dict[str, Any], session: str,
         task_id=task_id,
         ts=ts,
     ):
-        return
-    # handoff_type is set by maybe_trigger BEFORE this call (so a
-    # re-fire racing _do_handoff sees pending=True and skips). The
-    # post-write idempotent re-set used to live here; removing it
-    # because the pre-mark is the load-bearing one and a redundant
-    # write at the end widens the race window for nothing.
+        return False
+    return True
+
+
+def _clear_pending(agent_id: str) -> None:
+    """Roll back a pre-marked handoff_type when _do_handoff failed
+    on the producer side (write_doc or write_queue I/O failure).
+    Without this rollback, the next Stop fire sees pending=True and
+    Red short-circuits forever. Best-effort — if this update_record
+    also fails, the agent stays wedged, but at that point disk I/O
+    is broken across the board and the wedge is the operator's
+    least concern."""
+    health.update_record(agent_id, handoff_type=None)
 
 
 # -- doc rendering -----------------------------------------------------------
