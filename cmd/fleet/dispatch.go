@@ -49,6 +49,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 }
 
 func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
+	maybeAutoInit(stdout, "")
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}

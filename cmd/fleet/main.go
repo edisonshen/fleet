@@ -27,8 +27,11 @@ Subcommands below cover dispatch / attach / status from the shell.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Version:       Version,
-		// `fleet` (no args) → launch the TUI.
-		RunE: func(_ *cobra.Command, _ []string) error {
+		// `fleet` (no args) → launch the TUI. Auto-init runs BEFORE
+		// tui.Run so any install output prints to the user's regular
+		// terminal (bubbletea's altscreen would swallow it).
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			maybeAutoInit(cmd.OutOrStdout(), "")
 			return tui.Run(Version)
 		},
 	}
