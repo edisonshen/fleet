@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -32,6 +33,7 @@ type inputMode int
 
 const (
 	modeNav inputMode = iota
+	modePickRepo
 	modePromptDispatch
 )
 
@@ -93,6 +95,9 @@ var runFleetCmd = func(args []string, msgFn func(string, error) tea.Msg) tea.Cmd
 // Returns (model, cmd, handled). When handled=false, caller falls
 // back to the navigation handler.
 func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
+	if m.mode == modePickRepo {
+		return m.handlePickerKey(key)
+	}
 	if m.mode == modePromptDispatch {
 		return m.handlePromptKey(key)
 	}
@@ -109,11 +114,65 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	case "d", "n":
-		m.mode = modePromptDispatch
-		m.promptBuf = ""
+		// [d] enters the repo picker. discoverRepos runs synchronously;
+		// the cost is one Getwd + one ReadDir per project root, fine for
+		// hundreds of repos. If discovery fails (no cwd, no projects/),
+		// the picker still renders — just empty — and esc cancels.
+		m.repoCandidates = discoverRepos()
+		m.pickerFilter = ""
+		m.pickerCursor = 0
+		m.mode = modePickRepo
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+// handlePickerKey processes keystrokes while the repo picker is active.
+// Up/Down (or Ctrl-N/Ctrl-P) navigate; enter picks; esc cancels;
+// printable runes — including j/k — feed the substring filter (matching
+// fzf semantics). Backspace trims the filter.
+func (m Model) handlePickerKey(key string) (Model, tea.Cmd, bool) {
+	filtered := filterCandidates(m.repoCandidates, m.pickerFilter)
+	switch key {
+	case "esc":
+		m.mode = modeNav
+		m.pickerFilter = ""
+		m.repoCandidates = nil
+		return m, nil, true
+	case "enter":
+		if len(filtered) == 0 || m.pickerCursor >= len(filtered) {
+			return m, nil, true
+		}
+		m.pickedRepo = m.repoCandidates[filtered[m.pickerCursor]]
+		m.mode = modePromptDispatch
+		m.promptBuf = ""
+		return m, nil, true
+	case "down", "ctrl+n":
+		if m.pickerCursor < len(filtered)-1 {
+			m.pickerCursor++
+		}
+		return m, nil, true
+	case "up", "ctrl+p":
+		if m.pickerCursor > 0 {
+			m.pickerCursor--
+		}
+		return m, nil, true
+	case "backspace":
+		if len(m.pickerFilter) > 0 {
+			m.pickerFilter = m.pickerFilter[:len(m.pickerFilter)-1]
+			m.pickerCursor = 0
+		}
+		return m, nil, true
+	}
+	if len(key) == 1 && key[0] >= 0x20 && key[0] < 0x7f {
+		m.pickerFilter += key
+		m.pickerCursor = 0
+		return m, nil, true
+	}
+	// Unknown key in picker mode → swallow rather than fall through to
+	// nav (otherwise [j/k] would also move the agent table cursor under
+	// the picker).
+	return m, nil, true
 }
 
 // handlePromptKey processes keystrokes while the dispatch prompt is
@@ -158,9 +217,16 @@ func (m Model) startHandoff(id string) tea.Cmd {
 }
 
 // startDispatch returns a tea.Cmd that runs `fleet dispatch <task>`
-// and emits dispatchDoneMsg on completion.
+// and emits dispatchDoneMsg on completion. When the picker recorded a
+// repo, --cwd and --project pin the spawn to that directory; the
+// project tag is the repo's basename (e.g. "fleet" for ~/projects/fleet).
 func (m Model) startDispatch(task string) tea.Cmd {
-	return runFleetCmd([]string{"dispatch", task}, func(out string, err error) tea.Msg {
+	args := []string{"dispatch", task}
+	if m.pickedRepo.Path != "" {
+		args = append(args, "--cwd", m.pickedRepo.Path,
+			"--project", filepath.Base(m.pickedRepo.Path))
+	}
+	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		return dispatchDoneMsg{out: out, err: err}
 	})
 }

@@ -133,36 +133,70 @@ func TestKey_AttachWithEmptyListIsNoop(t *testing.T) {
 	}
 }
 
-// -- [d] / [n] dispatch prompt -----------------------------------------
+// -- [d] / [n] dispatch picker → prompt --------------------------------
 
-func TestKey_DispatchOpensPrompt(t *testing.T) {
+// isolatePicker keeps tests reproducible across machines: only the cwd
+// row appears in the picker (no surprise repos from $HOME/projects/).
+// The path it points at can't exist, so projectDirs() returns an empty
+// scan but discoverRepos still adds Getwd().
+func isolatePicker(t *testing.T) {
+	t.Helper()
+	t.Setenv("FLEET_PROJECT_DIRS", t.TempDir())
+}
+
+func TestKey_DispatchOpensPicker(t *testing.T) {
+	isolatePicker(t)
 	m := makeModelWithAgents()
 	updated, cmd := m.Update(keyMsg("d"))
 	mm := updated.(Model)
-	if mm.mode != modePromptDispatch {
-		t.Errorf("expected modePromptDispatch, got %v", mm.mode)
+	if mm.mode != modePickRepo {
+		t.Errorf("expected modePickRepo, got %v", mm.mode)
 	}
 	if cmd != nil {
-		t.Error("opening prompt should not return a cmd")
+		t.Error("opening picker should not return a cmd")
+	}
+	if len(mm.repoCandidates) == 0 {
+		t.Error("picker should at least contain cwd as a candidate")
 	}
 }
 
 func TestKey_NisAliasForD(t *testing.T) {
+	isolatePicker(t)
 	m := makeModelWithAgents()
 	updated, _ := m.Update(keyMsg("n"))
-	if updated.(Model).mode != modePromptDispatch {
-		t.Error("[n] should also enter dispatch prompt")
+	if updated.(Model).mode != modePickRepo {
+		t.Error("[n] should also enter the repo picker")
+	}
+}
+
+func TestKey_PickerEnterAdvancesToPrompt(t *testing.T) {
+	isolatePicker(t)
+	m := makeModelWithAgents()
+	mm, _ := m.Update(keyMsg("d"))
+	mm, _ = mm.Update(keyMsg("enter"))
+	mmm := mm.(Model)
+	if mmm.mode != modePromptDispatch {
+		t.Errorf("expected modePromptDispatch after picker enter, got %v", mmm.mode)
+	}
+	if mmm.pickedRepo.Path == "" {
+		t.Error("pickedRepo should be set after enter")
 	}
 }
 
 func TestKey_PromptCollectsRunesAndSubmits(t *testing.T) {
+	isolatePicker(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
 	m := makeModelWithAgents()
-	// Open prompt
+	// Open picker → enter to pick cwd
 	mm, _ := m.Update(keyMsg("d"))
-	// Type "fix-bug"
+	mm, _ = mm.Update(keyMsg("enter"))
+	pickedPath := mm.(Model).pickedRepo.Path
+	if pickedPath == "" {
+		t.Fatal("picker did not record a path")
+	}
+	// Type "fix-bug" into the dispatch prompt
 	for _, r := range "fix-bug" {
 		mm, _ = mm.Update(keyMsg(string(r)))
 	}
@@ -182,18 +216,31 @@ func TestKey_PromptCollectsRunesAndSubmits(t *testing.T) {
 		t.Fatal("expected tea.Cmd from prompt submit")
 	}
 	_ = cmd()
-	if len(stub.calls) != 1 || stub.calls[0][0] != "dispatch" ||
-		stub.calls[0][1] != "fix-bug" {
-		t.Errorf("expected ['dispatch', 'fix-bug'], got %v", stub.calls)
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one fleet call, got %v", stub.calls)
+	}
+	args := stub.calls[0]
+	if args[0] != "dispatch" || args[1] != "fix-bug" {
+		t.Errorf("expected ['dispatch', 'fix-bug', ...], got %v", args)
+	}
+	// --cwd and --project must accompany a picked repo so the spawn
+	// lands deterministically in the operator's chosen directory.
+	if !containsPair(args, "--cwd", pickedPath) {
+		t.Errorf("expected --cwd %q in args, got %v", pickedPath, args)
+	}
+	if !containsFlag(args, "--project") {
+		t.Errorf("expected --project flag in args, got %v", args)
 	}
 }
 
 func TestKey_PromptEscCancels(t *testing.T) {
+	isolatePicker(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
 	m := makeModelWithAgents()
 	mm, _ := m.Update(keyMsg("d"))
+	mm, _ = mm.Update(keyMsg("enter")) // pick cwd → prompt mode
 	mm, _ = mm.Update(keyMsg("x"))
 	mm, cmd := mm.Update(keyMsg("esc"))
 	mmm := mm.(Model)
@@ -209,8 +256,10 @@ func TestKey_PromptEscCancels(t *testing.T) {
 }
 
 func TestKey_PromptBackspaceDeletesRune(t *testing.T) {
+	isolatePicker(t)
 	m := makeModelWithAgents()
 	mm, _ := m.Update(keyMsg("d"))
+	mm, _ = mm.Update(keyMsg("enter")) // pick cwd
 	for _, r := range "abc" {
 		mm, _ = mm.Update(keyMsg(string(r)))
 	}
@@ -221,11 +270,13 @@ func TestKey_PromptBackspaceDeletesRune(t *testing.T) {
 }
 
 func TestKey_PromptEmptySubmitDoesNotShellOut(t *testing.T) {
+	isolatePicker(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
 	m := makeModelWithAgents()
 	mm, _ := m.Update(keyMsg("d"))
+	mm, _ = mm.Update(keyMsg("enter")) // pick cwd
 	mm, cmd := mm.Update(keyMsg("enter"))
 	if cmd != nil {
 		t.Error("empty submit should be a noop")
@@ -236,6 +287,100 @@ func TestKey_PromptEmptySubmitDoesNotShellOut(t *testing.T) {
 	if len(stub.calls) != 0 {
 		t.Errorf("no calls expected, got %v", stub.calls)
 	}
+}
+
+// -- picker-specific behavior -----------------------------------------
+
+func TestKey_PickerEscCancels(t *testing.T) {
+	isolatePicker(t)
+	m := makeModelWithAgents()
+	mm, _ := m.Update(keyMsg("d"))
+	mm, cmd := mm.Update(keyMsg("esc"))
+	mmm := mm.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("esc should return to nav, got %v", mmm.mode)
+	}
+	if cmd != nil {
+		t.Error("esc should not produce a cmd")
+	}
+	if mmm.repoCandidates != nil {
+		t.Error("repoCandidates should be cleared on esc")
+	}
+}
+
+func TestKey_PickerFilterTyping(t *testing.T) {
+	isolatePicker(t)
+	m := makeModelWithAgents()
+	mm, _ := m.Update(keyMsg("d"))
+	for _, r := range "xyz" {
+		mm, _ = mm.Update(keyMsg(string(r)))
+	}
+	if mm.(Model).pickerFilter != "xyz" {
+		t.Errorf("filter=%q want xyz", mm.(Model).pickerFilter)
+	}
+	mm, _ = mm.Update(keyMsg("backspace"))
+	if mm.(Model).pickerFilter != "xy" {
+		t.Errorf("backspace filter failed: %q", mm.(Model).pickerFilter)
+	}
+}
+
+func TestKey_PickerArrowsNavigateFiltered(t *testing.T) {
+	isolatePicker(t)
+	m := makeModelWithAgents()
+	// Inject a multi-row candidate list directly to exercise nav.
+	m.mode = modePickRepo
+	m.repoCandidates = []repoCandidate{
+		{Path: "/a", Display: "alpha"},
+		{Path: "/b", Display: "beta"},
+		{Path: "/c", Display: "charlie"},
+	}
+	mm, _ := m.Update(keyMsg("down"))
+	if mm.(Model).pickerCursor != 1 {
+		t.Errorf("down should move cursor to 1, got %d", mm.(Model).pickerCursor)
+	}
+	mm, _ = mm.Update(keyMsg("down"))
+	mm, _ = mm.Update(keyMsg("down")) // bound at len-1
+	if mm.(Model).pickerCursor != 2 {
+		t.Errorf("cursor should clamp at 2, got %d", mm.(Model).pickerCursor)
+	}
+	mm, _ = mm.Update(keyMsg("up"))
+	if mm.(Model).pickerCursor != 1 {
+		t.Errorf("up should move cursor to 1, got %d", mm.(Model).pickerCursor)
+	}
+}
+
+func TestKey_PickerEmptyEnterIsNoop(t *testing.T) {
+	isolatePicker(t)
+	m := makeModelWithAgents()
+	m.mode = modePickRepo
+	m.repoCandidates = nil // simulate "no repos" case
+	mm, cmd := m.Update(keyMsg("enter"))
+	if cmd != nil {
+		t.Error("empty picker enter should not advance")
+	}
+	if mm.(Model).mode != modePickRepo {
+		t.Error("empty picker should stay in picker mode")
+	}
+}
+
+// containsPair reports whether args contains `flag <value>` adjacent.
+func containsPair(args []string, flag, value string) bool {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+// containsFlag reports whether args contains flag at any position.
+func containsFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
 }
 
 // -- handoffDoneMsg / dispatchDoneMsg → flash --------------------------

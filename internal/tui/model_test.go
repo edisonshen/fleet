@@ -199,6 +199,52 @@ func TestView_EmptyState(t *testing.T) {
 	}
 }
 
+func TestView_PickerRendersFilterAndCandidates(t *testing.T) {
+	m := New("test")
+	m.mode = modePickRepo
+	m.repoCandidates = []repoCandidate{
+		{Path: "/x/alpha", Display: "alpha"},
+		{Path: "/x/beta", Display: "beta"},
+	}
+	m.pickerFilter = "al"
+	out := m.View()
+	if !strings.Contains(out, "pick repo: al") {
+		t.Errorf("picker view missing filter input, got:\n%s", out)
+	}
+	if !strings.Contains(out, "alpha") {
+		t.Errorf("picker view missing alpha row, got:\n%s", out)
+	}
+	if strings.Contains(out, "beta") {
+		t.Errorf("filter 'al' should hide beta, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[enter] pick") {
+		t.Errorf("picker missing keybind hint, got:\n%s", out)
+	}
+}
+
+func TestView_PickerEmptyShowsHint(t *testing.T) {
+	m := New("test")
+	m.mode = modePickRepo
+	m.repoCandidates = nil
+	out := m.View()
+	if !strings.Contains(out, "no repos found") {
+		t.Errorf("empty picker should show hint, got:\n%s", out)
+	}
+	if !strings.Contains(out, "FLEET_PROJECT_DIRS") {
+		t.Errorf("empty picker should mention env var, got:\n%s", out)
+	}
+}
+
+func TestView_PromptHeaderShowsPickedRepo(t *testing.T) {
+	m := New("test")
+	m.mode = modePromptDispatch
+	m.pickedRepo = repoCandidate{Path: "/x/fleet", Display: "fleet"}
+	out := m.View()
+	if !strings.Contains(out, "dispatch task in fleet") {
+		t.Errorf("prompt header should reference picked repo, got:\n%s", out)
+	}
+}
+
 func TestView_ShowsErrorBanner(t *testing.T) {
 	m := New("test")
 	m.err = errors.New("disk full")
