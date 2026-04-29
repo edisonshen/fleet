@@ -557,6 +557,96 @@ class TestRefireProtection:
             "handoff_type was not pre-marked on disk before write_doc"
 
 
+# -- Yellow → Red escalation safety net (codex iter-3 P1) ------------------
+
+class TestYellowToRedEscalation:
+    """SKILL.md and DESIGN.md guarantee Red is the safety net when an
+    agent ignores or misses MILESTONE after HANDOFF REQUESTED. The
+    pending check on Red used to suppress this — auto-yellow counted
+    as 'pending' so Red bailed and the agent ran past 70% indefinitely
+    with no successor. Codex iter-3 caught it; these tests pin the fix."""
+
+    def test_red_escalates_when_yellow_pending(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """Agent in auto-yellow (HANDOFF REQUESTED out, no MILESTONE
+        emitted) crossing 70% MUST write the auto-red emergency
+        handoff."""
+        record_path = _seed_record(fleet_home_tmp, "esc1",
+                                   handoff_type=handoff.TYPE_AUTO_YELLOW)
+        # Pane has the injection but no MILESTONE — agent ignored it.
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "agent kept working without writing MILESTONE...\n"
+        )
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="esc1", session="fleet-esc1",
+        )
+        assert result is None  # silent — Red writes the doc, no injection
+        docs = list((fleet_home_tmp / "handoffs").glob("esc1-*.md"))
+        assert len(docs) == 1, "Red must write doc when escalating from Yellow"
+        body = docs[0].read_bytes()
+        assert b'handoff_type: "auto-red"' in body, \
+            "Escalation doc must use auto-red type"
+        # handoff_type on disk now reflects auto-red (overwrote auto-yellow).
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_AUTO_RED
+
+    def test_red_bails_only_when_committed(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """auto-red and precompact mean the doc + queue already exist;
+        re-firing Red would orphan a doc. Both must bail."""
+        for committed_type in (handoff.TYPE_AUTO_RED, handoff.TYPE_PRECOMPACT):
+            home = fleet_home_tmp  # shared per the autouse fixture
+            (home / "handoffs").mkdir(parents=True, exist_ok=True)
+            (home / "queue").mkdir(parents=True, exist_ok=True)
+            agent_id = f"esc-{committed_type}"
+            _seed_record(home, agent_id, handoff_type=committed_type)
+            handoff.maybe_trigger(
+                {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+                agent_id=agent_id, session=f"fleet-{agent_id}",
+            )
+            docs = list((home / "handoffs").glob(f"{agent_id}-*.md"))
+            assert len(docs) == 0, \
+                f"Red must NOT re-write when committed as {committed_type}"
+
+    def test_precompact_escalates_when_yellow_pending(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """PreCompact is even more urgent — context is about to be lost.
+        An auto-yellow agent must NOT block PreCompact's escalation."""
+        record_path = _seed_record(fleet_home_tmp, "escPC1",
+                                   handoff_type=handoff.TYPE_AUTO_YELLOW)
+        handoff.emergency_trigger(
+            {"transcript_path": str(_transcript(tmp_path))},
+            agent_id="escPC1", session="fleet-escPC1",
+        )
+        docs = list((fleet_home_tmp / "handoffs").glob("escPC1-*.md"))
+        assert len(docs) == 1
+        body = docs[0].read_bytes()
+        assert b'handoff_type: "precompact"' in body
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_PRECOMPACT
+
+    def test_yellow_noops_when_committed(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """An agent that already had Red fire (auto-red committed) but
+        whose context bounced back below 70% (compaction by host? unlikely
+        but possible) must NOT re-enter Yellow's first-fire branch and
+        re-inject. Yellow has its own committed bailout."""
+        _seed_record(fleet_home_tmp, "ycom1",
+                     handoff_type=handoff.TYPE_AUTO_RED)
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="ycom1", session="fleet-ycom1",
+        )
+        assert result is None, \
+            "Yellow must noop when handoff already committed"
+
+
 # -- wedge protection: clear pending on producer failure (codex P1) -------
 
 class TestWedgeRecovery:

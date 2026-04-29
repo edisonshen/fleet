@@ -61,16 +61,22 @@ TYPE_AUTO_YELLOW = "auto-yellow"
 TYPE_AUTO_RED = "auto-red"
 TYPE_PRECOMPACT = "precompact"
 
-# is_handoff_pending must distinguish "this agent was spawned from a handoff"
-# (handoff_type stamped to "manual" by internal/spawn/spawn.go on every
-# successor record) from "a handoff is pending right now". Without this
-# distinction, every successor agent starts life with pending=True, which
-# silently kills auto-handoff after the first chain step: Yellow skips the
-# HANDOFF REQUESTED injection and jumps straight to MILESTONE grep, and Red
-# short-circuits entirely because the pre-mark race-protection bails out.
-# Only the three auto-* values mark "pending" — "manual" and anything else
-# is a spawn-origin label, not a pending state.
+# Two distinct "pending" semantics:
+#
+# _PENDING_TYPES — any of the three auto-* values, meaning the skill is
+# tracking a handoff state for this agent. Used by the public-ish
+# is_handoff_pending() and the Yellow MILESTONE branch (auto-yellow is the
+# only state where MILESTONE matters).
+#
+# _COMMITTED_TYPES — auto-red or precompact only. These are states where a
+# handoff doc + queue file have ALREADY been written and are waiting on
+# drain. Red and PreCompact branches bail when the record is committed
+# (re-firing would orphan a doc), but they MUST still escalate when only
+# auto-yellow is set: Yellow's injection went out without a doc, so Red is
+# the safety net the agent reaches by ignoring/missing MILESTONE. SKILL.md
+# documents this as the explicit Yellow→Red guarantee.
 _PENDING_TYPES = frozenset({TYPE_AUTO_YELLOW, TYPE_AUTO_RED, TYPE_PRECOMPACT})
+_COMMITTED_TYPES = frozenset({TYPE_AUTO_RED, TYPE_PRECOMPACT})
 
 # Canonical placeholder string for unfilled body sections. MUST match
 # internal/handoff.Placeholder byte-for-byte — alternate sentinels would
@@ -111,6 +117,15 @@ def is_handoff_pending(record: dict[str, Any]) -> bool:
     that future skill fires must overwrite when an actual auto-handoff
     is requested."""
     return record.get("handoff_type") in _PENDING_TYPES
+
+
+def _is_handoff_committed(record: dict[str, Any]) -> bool:
+    """Doc + queue file have already been written for this agent (auto-red
+    or precompact). Re-running _do_handoff would orphan the existing doc.
+    Distinct from is_handoff_pending: auto-yellow is pending (injection
+    out, no doc) but NOT committed (Yellow→Red escalation must still
+    fire if the agent never reaches MILESTONE)."""
+    return record.get("handoff_type") in _COMMITTED_TYPES
 
 
 def find_milestone(session: str) -> bool:
@@ -199,31 +214,32 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
 
         pct, _model = health.read_context_pct(payload)
         state = health.threshold(pct)
-        pending = is_handoff_pending(record)
+        committed = _is_handoff_committed(record)
+        yellow_pending = record.get("handoff_type") == TYPE_AUTO_YELLOW
 
         if state == "red":
-            # Pending check protects against re-fire racing the drain:
-            # if the previous fire already wrote doc + queue, skip
-            # entirely so we don't leave an orphan doc on disk (a
-            # second render would have a different timestamp+rnd
-            # filename, and the queue would be re-clobbered to point
-            # at it — orphaning the first doc).
-            if pending:
+            # Bail only if the doc + queue already exist (drain owns it
+            # now). auto-yellow is NOT committed: Yellow injected
+            # HANDOFF REQUESTED but the agent ignored/missed MILESTONE
+            # and is now over 70%. Red is the documented safety net —
+            # write the emergency auto-red handoff and overwrite the
+            # auto-yellow mark.
+            if committed:
                 return None
-            # Pre-mark handoff_type so any re-fire that lands before
-            # this _do_handoff completes sees pending=True and bails
-            # at the check above.
             health.update_record(agent_id, handoff_type=TYPE_AUTO_RED)
             if not _do_handoff(record, session, TYPE_AUTO_RED, pct):
                 _clear_pending(agent_id)
             return None
 
         if state == "yellow":
-            if pending:
+            if committed:
+                # Doc + queue exist for an earlier Red/PreCompact fire;
+                # drain will pick up. Yellow noop.
+                return None
+            if yellow_pending:
                 if find_milestone(session):
-                    handoff_type = (record.get("handoff_type")
-                                    or TYPE_AUTO_YELLOW)
-                    if not _do_handoff(record, session, handoff_type, pct):
+                    if not _do_handoff(record, session,
+                                       TYPE_AUTO_YELLOW, pct):
                         _clear_pending(agent_id)
                 return None
             health.update_record(agent_id, handoff_type=TYPE_AUTO_YELLOW)
@@ -249,7 +265,11 @@ def emergency_trigger(payload: dict[str, Any], *, agent_id: str,
         record = health.read_record(agent_id)
         if record is None:
             return
-        if is_handoff_pending(record):
+        # Same semantics as Red: bail only if a doc + queue already exist.
+        # auto-yellow (injection out, no doc) escalates to precompact —
+        # context is about to be lost; we'd rather overwrite the yellow
+        # mark with a real handoff than respect the pending check.
+        if _is_handoff_committed(record):
             return
         pct, _ = health.read_context_pct(payload)
         health.update_record(agent_id, handoff_type=TYPE_PRECOMPACT)
