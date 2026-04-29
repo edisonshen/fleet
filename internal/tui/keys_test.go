@@ -274,6 +274,53 @@ func TestUpdate_HandoffDoneFailureMarksFlashError(t *testing.T) {
 	}
 }
 
+// -- queueEventMsg → drain --------------------------------------------
+
+func TestUpdate_QueueEventMsgShellsOutToDrain(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents()
+	_, cmd := m.Update(queueEventMsg{})
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from queueEventMsg")
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 || stub.calls[0][0] != "drain" {
+		t.Errorf("expected ['drain'], got %v", stub.calls)
+	}
+}
+
+func TestUpdate_DrainDoneSuccessIsSilent(t *testing.T) {
+	m := makeModelWithAgents()
+	updated, cmd := m.Update(drainDoneMsg{out: "drained agent01 -> agent02"})
+	mm := updated.(Model)
+	// Successful drain must NOT set a flash — the queue fsnotify will
+	// fire on every spawn-fresh write, and a banner per drain would
+	// spam the operator.
+	if mm.flash != nil {
+		t.Errorf("expected no flash on successful drain, got: %+v", mm.flash)
+	}
+	if cmd == nil {
+		t.Error("expected agent-list refresh cmd")
+	}
+}
+
+func TestUpdate_DrainDoneFailureSetsErrorFlash(t *testing.T) {
+	m := makeModelWithAgents()
+	updated, _ := m.Update(drainDoneMsg{
+		out: "lock failed",
+		err: errors.New("exit 1"),
+	})
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("expected error flash, got: %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "drain failed") {
+		t.Errorf("error flash missing prefix: %q", mm.flash.text)
+	}
+}
+
 // -- nav still works alongside actions --------------------------------
 
 func TestKey_NavStillWorksAfterActionWiring(t *testing.T) {

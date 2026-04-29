@@ -87,6 +87,12 @@ type tickMsg time.Time
 // changes. The receiver kicks off a fresh agent load.
 type fsEventMsg struct{}
 
+// queueEventMsg is emitted by the fsnotify watcher when
+// ~/.fleet/queue/ changes (a producer wrote a spawn-fresh-*.json).
+// The receiver shells out to `fleet drain` so the auto-handoff
+// completes without operator intervention.
+type queueEventMsg struct{}
+
 const pollInterval = 1 * time.Second
 
 func tickCmd() tea.Cmd {
@@ -130,6 +136,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case fsEventMsg:
 		// fsnotify saw a change — refresh agents now (don't wait for
 		// the next tick).
+		return m, loadAgentsCmd()
+
+	case queueEventMsg:
+		// fsnotify saw a queue file land — auto-drain. Drain itself is
+		// idempotent and per-agent flocked, so multiple events firing
+		// in quick succession (e.g. atomic-write rename) are safe.
+		return m, runFleetCmd([]string{"drain"}, func(out string, err error) tea.Msg {
+			return drainDoneMsg{out: out, err: err}
+		})
+
+	case drainDoneMsg:
+		// Surface drain output as a flash if there's anything
+		// interesting (errors or non-empty output). Empty success runs
+		// are silent — we don't want every queue event to spam the
+		// banner.
+		if msg.err != nil {
+			fl := flashMsg{
+				text:  fmt.Sprintf("drain failed: %v\n%s", msg.err, msg.out),
+				isErr: true,
+			}
+			m.flash = &fl
+		}
 		return m, loadAgentsCmd()
 
 	case handoffDoneMsg:

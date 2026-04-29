@@ -73,12 +73,22 @@ func execTmuxAttach(session string) error {
 }
 
 // startWatcher returns a stop func and an error. On success, the
-// watcher goroutine is running and will Send fsEventMsg into the
-// bubbletea program for any change under ~/.fleet/agents/.
+// watcher goroutine is running and Sends two message types into the
+// bubbletea program:
+//
+//   - fsEventMsg for changes under ~/.fleet/agents/ — drives a refresh
+//     of the agent list (cursor stays in bounds, archives disappear).
+//   - queueEventMsg for changes under ~/.fleet/queue/ — drives an
+//     auto-drain so a fleet-guard auto-handoff queue file landing on
+//     disk is processed without operator intervention.
 //
 // If fsnotify is unsupported on this platform or the watcher can't be
 // created, returns the error so the caller can fall back to polling
-// (which is wired separately via tickCmd in model.go).
+// (which is wired separately via tickCmd in model.go). Polling does
+// NOT cover queue drain — without fsnotify, queue files only process
+// when the operator runs `fleet drain` manually or the next handoff
+// happens. The TUI's banner surfaces this case via the agent list
+// (no records appearing) but it's a known limitation.
 func startWatcher(prog *tea.Program) (func(), error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -91,9 +101,22 @@ func startWatcher(prog *tea.Program) (func(), error) {
 		return nil, err
 	}
 	agentsDir := filepath.Join(root, "agents")
+	queueDir := filepath.Join(root, "queue")
 	if err := w.Add(agentsDir); err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("watch %s: %w", agentsDir, err)
+	}
+	// queue/ may not exist yet on a fresh install — Bootstrap creates
+	// it, but defend against an environment where the operator deleted
+	// it manually. fsnotify.Add fails on missing dirs; treat that as a
+	// non-fatal warning and let the polling tick + manual `fleet drain`
+	// still work.
+	queueWatched := true
+	if err := w.Add(queueDir); err != nil {
+		queueWatched = false
+		fmt.Fprintf(os.Stderr,
+			"warning: queue/ watcher unavailable (%v) — auto-drain disabled, run `fleet drain` manually\n",
+			err)
 	}
 
 	done := make(chan struct{})
@@ -106,21 +129,27 @@ func startWatcher(prog *tea.Program) (func(), error) {
 				if !ok {
 					return
 				}
-				// Filter: only react to .json file events. fsnotify
-				// fires events on the directory itself sometimes, and
-				// on .tmp.<pid> sidecars during atomic writes — both
-				// are noise.
-				if filepath.Ext(ev.Name) != ".json" {
-					continue
+				dir := filepath.Dir(ev.Name)
+				switch {
+				case dir == agentsDir:
+					// Filter to .json so .tmp sidecars during atomic
+					// writes don't fire spurious refreshes.
+					if filepath.Ext(ev.Name) != ".json" {
+						continue
+					}
+					prog.Send(fsEventMsg{})
+				case dir == queueDir && queueWatched:
+					// Same .json filter as agents/. spawn-fresh-*.json
+					// is the only real shape; anything else is noise.
+					if filepath.Ext(ev.Name) != ".json" {
+						continue
+					}
+					prog.Send(queueEventMsg{})
 				}
-				prog.Send(fsEventMsg{})
 			case _, ok := <-w.Errors:
 				if !ok {
 					return
 				}
-				// fsnotify error: fall through. Polling tick still
-				// covers us. We don't surface this to the user — too
-				// noisy on the platforms that fire spurious errors.
 			}
 		}
 	}()

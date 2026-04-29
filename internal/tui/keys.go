@@ -41,14 +41,18 @@ type flashMsg struct {
 	isErr bool
 }
 
-// dispatchDoneMsg / handoffDoneMsg are emitted after the shelled-out
-// command returns. Carries combined stdout+stderr so the banner can
-// show the operator what happened.
+// dispatchDoneMsg / handoffDoneMsg / drainDoneMsg are emitted after
+// the shelled-out command returns. Carries combined stdout+stderr so
+// the banner can show the operator what happened.
 type handoffDoneMsg struct {
 	out string
 	err error
 }
 type dispatchDoneMsg struct {
+	out string
+	err error
+}
+type drainDoneMsg struct {
 	out string
 	err error
 }
