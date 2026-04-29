@@ -43,12 +43,30 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		"project name to tag this agent with")
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
 		"working directory for the spawned session (default: current dir)")
-	cmd.Flags().StringSliceVar(&opts.command, "command", []string{"claude"},
-		"command to run inside the tmux session (default: claude)")
+	// Default wraps claude in a shell so the tmux session SURVIVES
+	// claude exiting CLEANLY (Ctrl-D / /exit). Without the wrapper,
+	// any claude exit kills the session and `fleet attach` later
+	// fails with "no sessions". The wrapper drops into an interactive
+	// shell only when claude returned 0 — non-zero exits (binary
+	// missing, unsupported flag, crash) propagate so the session
+	// terminates, mirroring the no-wrapper failure-detection
+	// behavior: tmux.Spawn / fleet status see no live session and
+	// the operator gets a hard signal that something went wrong
+	// instead of a zombie agent record on top of an idle shell.
+	//
+	// `--dangerously-skip-permissions` is on by default because
+	// Fleet's premise is fire-and-forget parallel agents: every
+	// permission prompt blocks one of N agents and forces the
+	// operator to babysit it. Override with `--command` for scripted
+	// pipelines or alternate engines.
+	cmd.Flags().StringSliceVar(&opts.command, "command",
+		[]string{"sh", "-c", `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`},
+		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
 	return cmd
 }
 
 func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
+	maybeAutoInit(stdout, "")
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}

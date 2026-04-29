@@ -161,6 +161,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if err := tmux.Spawn(session, cwd, opts.Command, extraEnv); err != nil {
 		return nil, err
 	}
+	// Best-effort: pin a "Ctrl-b d to detach" hint into this session's
+	// status bar so operators see it persistently while attached.
+	// Failure is silent — TUI keybind hints + the wrapped command's
+	// in-session banner are fallback discovery paths.
+	_ = tmux.SetStatusHint(session, "[Ctrl-b d to detach]")
 	if err := rec.Write(); err != nil {
 		// Orphan rollback: tmux session up, record missing → operator
 		// would see a ghost session in `tmux ls` with no `fleet status`

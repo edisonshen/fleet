@@ -209,6 +209,45 @@ func SendKeys(session string, keys ...string) error {
 	return nil
 }
 
+// SetStatusHint prepends a fleet hint to the given session's
+// status-right so operators see "Ctrl-b d to detach" persistently
+// while attached, without losing whatever custom right-status they
+// configured globally. The change is session-scoped — other sessions
+// keep the user's normal config.
+//
+// Best-effort: any failure (old tmux, sandbox, format-string quirks)
+// returns the error so the caller can ignore it. The TUI's pre-attach
+// footer + the in-session shell banner are fallback hint paths if
+// this no-ops.
+//
+// status-right-length is bumped so a long pre-existing format string
+// plus the prepended hint fits without truncation.
+func SetStatusHint(session, hint string) error {
+	// Read the user's current status-right (global). The format
+	// string is preserved verbatim, so #[fg=...] and #() interpolations
+	// stay intact.
+	out, _ := exec.Command("tmux", tmuxArgs("show-options", "-gqv", "status-right")...).Output()
+	existing := string(bytes.TrimSpace(out))
+
+	var combined string
+	if existing == "" {
+		combined = hint
+	} else {
+		combined = hint + " " + existing
+	}
+
+	// Order matters: bump length before assigning the longer value.
+	if err := exec.Command("tmux", tmuxArgs("set-option", "-t", session,
+		"status-right-length", "200")...).Run(); err != nil {
+		return fmt.Errorf("set status-right-length: %w", err)
+	}
+	if err := exec.Command("tmux", tmuxArgs("set-option", "-t", session,
+		"status-right", combined)...).Run(); err != nil {
+		return fmt.Errorf("set status-right: %w", err)
+	}
+	return nil
+}
+
 // Kill terminates a tmux session. Returns nil if the session is
 // already gone (idempotent for cleanup paths).
 func Kill(session string) error {

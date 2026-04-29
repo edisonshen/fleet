@@ -43,10 +43,18 @@ type Model struct {
 	// cmd/fleet/main.go's ldflags-overridable Version.
 	version string
 
-	// Action keybind state (Week 4b+4c).
-	mode      inputMode // modeNav or modePromptDispatch
+	// Action keybind state (Week 4b+4c, picker added Week 5).
+	mode      inputMode // modeNav, modePickRepo, or modePromptDispatch
 	promptBuf string    // dispatch prompt buffer; empty in modeNav
 	flash     *flashMsg // banner shown under the table after an action
+
+	// Repo picker state (modePickRepo). Populated when the operator
+	// presses [d]; cleared on esc or after enter advances to
+	// modePromptDispatch with pickedRepo locked in.
+	repoCandidates []repoCandidate
+	pickerFilter   string // case-insensitive substring filter
+	pickerCursor   int    // index into the FILTERED slice
+	pickedRepo     repoCandidate
 
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
@@ -227,7 +235,7 @@ func (m Model) View() string {
 	}
 
 	if len(m.records) == 0 {
-		b.WriteString(dimStyle.Render("no agents (run `fleet dispatch <task-id>` to start one)"))
+		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
 		b.WriteString(renderTable(m.records, m.cursor))
@@ -244,18 +252,83 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
-	if m.mode == modePromptDispatch {
+	switch m.mode {
+	case modePickRepo:
 		b.WriteString("\n")
-		b.WriteString(promptStyle.Render("dispatch task: " + m.promptBuf + "█"))
+		b.WriteString(renderPicker(m))
+	case modePromptDispatch:
+		b.WriteString("\n")
+		header := "dispatch task"
+		if m.pickedRepo.Display != "" {
+			header += " in " + m.pickedRepo.Display
+		}
+		b.WriteString(promptStyle.Render(header + ": " + m.promptBuf + "█"))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
 		b.WriteString("\n")
-	} else {
+	default:
 		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [q] quit",
 			len(m.records))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render(footer))
+		// Detach hint lives in the spawned session's tmux status bar
+		// (see tmux.SetStatusHint), not here — by the time the
+		// operator needs it, the TUI is gone and tmux owns the screen.
 	}
+	return b.String()
+}
+
+// pickerVisibleRows caps how many repos are listed at once. Anything
+// further is reachable via the filter.
+const pickerVisibleRows = 8
+
+// renderPicker draws the [d] repo picker: a one-line filter input, a
+// scrolling list of matched candidates with the cursor, an overflow
+// hint when the filter is too broad, and a footer of keybinds.
+func renderPicker(m Model) string {
+	var b strings.Builder
+	b.WriteString(promptStyle.Render("pick repo: " + m.pickerFilter + "█"))
+	b.WriteString("\n")
+
+	filtered := filterCandidates(m.repoCandidates, m.pickerFilter)
+	switch {
+	case len(m.repoCandidates) == 0:
+		b.WriteString(dimStyle.Render(
+			"  no repos found — set $FLEET_PROJECT_DIRS or run from a repo dir"))
+		b.WriteString("\n")
+	case len(filtered) == 0:
+		b.WriteString(dimStyle.Render("  (no matches)"))
+		b.WriteString("\n")
+	default:
+		// Scroll window: keep the cursor in the top half whenever
+		// possible. start drifts forward as the cursor approaches the
+		// last visible row.
+		start := 0
+		if m.pickerCursor >= pickerVisibleRows {
+			start = m.pickerCursor - pickerVisibleRows + 1
+		}
+		end := start + pickerVisibleRows
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		for i := start; i < end; i++ {
+			line := m.repoCandidates[filtered[i]].Display
+			if i == m.pickerCursor {
+				b.WriteString(cursorStyle.Render("▸ " + line))
+			} else {
+				b.WriteString("  " + line)
+			}
+			b.WriteString("\n")
+		}
+		if remaining := len(filtered) - end; remaining > 0 {
+			b.WriteString(dimStyle.Render(
+				fmt.Sprintf("  (%d more — type to filter)", remaining)))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString(dimStyle.Render(
+		"[↑/↓] navigate  [enter] pick  [esc] cancel  type to filter"))
+	b.WriteString("\n")
 	return b.String()
 }
 

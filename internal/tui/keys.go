@@ -7,7 +7,14 @@ import (
 	"os/exec"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// sessionAliveFn is the tmux liveness probe used by [a] attach. var
+// so tests can stub without forking tmux. Production calls
+// tmux.HasSession.
+var sessionAliveFn = tmux.HasSession
 
 // Action keybinds added in Week 4b+4c. Layered onto the existing
 // navigation set (j/k/g/G/q) without touching them.
@@ -32,6 +39,7 @@ type inputMode int
 
 const (
 	modeNav inputMode = iota
+	modePickRepo
 	modePromptDispatch
 )
 
@@ -93,6 +101,9 @@ var runFleetCmd = func(args []string, msgFn func(string, error) tea.Msg) tea.Cmd
 // Returns (model, cmd, handled). When handled=false, caller falls
 // back to the navigation handler.
 func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
+	if m.mode == modePickRepo {
+		return m.handlePickerKey(key)
+	}
 	if m.mode == modePromptDispatch {
 		return m.handlePromptKey(key)
 	}
@@ -104,16 +115,88 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case "a":
 		if cur := m.selected(); cur != nil {
+			// Pre-flight liveness check: tmux's `attach -t <session>`
+			// on a dead session prints "no sessions" / "can't find
+			// session" and the operator drops back to their shell with
+			// no idea why. The most common cause is claude having
+			// exited inside the tmux session (Ctrl-D / /exit /
+			// SIGCHLD), which terminates the session because claude
+			// was the session's only process. Surface the diagnosis
+			// in-TUI so the operator knows what happened and can
+			// clean up via `[h]` handoff.
+			if !sessionAliveFn(cur.TmuxSession) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"agent %s session is dead — claude likely exited inside it. Press [h] to clean up the orphan record.",
+						cur.ID),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			m.pendingAttach = cur.TmuxSession
 			return m, tea.Quit, true
 		}
 		return m, nil, true
 	case "d", "n":
-		m.mode = modePromptDispatch
-		m.promptBuf = ""
+		// [d] enters the repo picker. discoverRepos runs synchronously;
+		// the cost is one Getwd + one ReadDir per project root, fine for
+		// hundreds of repos. If discovery fails (no cwd, no projects/),
+		// the picker still renders — just empty — and esc cancels.
+		m.repoCandidates = discoverRepos()
+		m.pickerFilter = ""
+		m.pickerCursor = 0
+		m.mode = modePickRepo
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+// handlePickerKey processes keystrokes while the repo picker is active.
+// Up/Down (or Ctrl-N/Ctrl-P) navigate; enter picks; esc cancels;
+// printable runes — including j/k — feed the substring filter (matching
+// fzf semantics). Backspace trims the filter.
+func (m Model) handlePickerKey(key string) (Model, tea.Cmd, bool) {
+	filtered := filterCandidates(m.repoCandidates, m.pickerFilter)
+	switch key {
+	case "esc":
+		m.mode = modeNav
+		m.pickerFilter = ""
+		m.repoCandidates = nil
+		return m, nil, true
+	case "enter":
+		if len(filtered) == 0 || m.pickerCursor >= len(filtered) {
+			return m, nil, true
+		}
+		m.pickedRepo = m.repoCandidates[filtered[m.pickerCursor]]
+		m.mode = modePromptDispatch
+		m.promptBuf = ""
+		return m, nil, true
+	case "down", "ctrl+n":
+		if m.pickerCursor < len(filtered)-1 {
+			m.pickerCursor++
+		}
+		return m, nil, true
+	case "up", "ctrl+p":
+		if m.pickerCursor > 0 {
+			m.pickerCursor--
+		}
+		return m, nil, true
+	case "backspace":
+		if len(m.pickerFilter) > 0 {
+			m.pickerFilter = m.pickerFilter[:len(m.pickerFilter)-1]
+			m.pickerCursor = 0
+		}
+		return m, nil, true
+	}
+	if len(key) == 1 && key[0] >= 0x20 && key[0] < 0x7f {
+		m.pickerFilter += key
+		m.pickerCursor = 0
+		return m, nil, true
+	}
+	// Unknown key in picker mode → swallow rather than fall through to
+	// nav (otherwise [j/k] would also move the agent table cursor under
+	// the picker).
+	return m, nil, true
 }
 
 // handlePromptKey processes keystrokes while the dispatch prompt is
@@ -158,9 +241,18 @@ func (m Model) startHandoff(id string) tea.Cmd {
 }
 
 // startDispatch returns a tea.Cmd that runs `fleet dispatch <task>`
-// and emits dispatchDoneMsg on completion.
+// and emits dispatchDoneMsg on completion. When the picker recorded a
+// repo, --cwd and --project pin the spawn to that directory; the
+// project tag includes the parent directory so two repos that share a
+// basename (~/work/fleet vs ~/personal/fleet) tag distinctly and
+// don't share fleet-guard's per-project locks. See ProjectTag.
 func (m Model) startDispatch(task string) tea.Cmd {
-	return runFleetCmd([]string{"dispatch", task}, func(out string, err error) tea.Msg {
+	args := []string{"dispatch", task}
+	if m.pickedRepo.Path != "" {
+		args = append(args, "--cwd", m.pickedRepo.Path,
+			"--project", ProjectTag(m.pickedRepo.Path))
+	}
+	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		return dispatchDoneMsg{out: out, err: err}
 	})
 }
