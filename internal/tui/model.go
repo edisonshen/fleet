@@ -42,7 +42,23 @@ type Model struct {
 	// version is shown in the title bar. Caller injects from
 	// cmd/fleet/main.go's ldflags-overridable Version.
 	version string
+
+	// Action keybind state (Week 4b+4c).
+	mode      inputMode  // modeNav or modePromptDispatch
+	promptBuf string     // dispatch prompt buffer; empty in modeNav
+	flash     *flashMsg  // banner shown under the table after an action
+
+	// pendingAttach is set when [a] fires. tea.Quit returns control to
+	// tui.Run, which exec's `tmux attach -t <session>` after the
+	// program exits. Process replacement only works post-program — a
+	// regular tea.Cmd would be inside bubbletea's altscreen and tmux
+	// would draw on top of bubbletea's state.
+	pendingAttach string
 }
+
+// PendingAttach returns the tmux session to attach to after the
+// program exits, or "" if no [a] was pressed. tui.Run reads this.
+func (m Model) PendingAttach() string { return m.pendingAttach }
 
 // New returns a Model ready to be passed to tea.NewProgram.
 func New(version string) Model {
@@ -115,13 +131,40 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// fsnotify saw a change — refresh agents now (don't wait for
 		// the next tick).
 		return m, loadAgentsCmd()
+
+	case handoffDoneMsg:
+		fl := formatHandoffFlash(msg.out, msg.err)
+		m.flash = &fl
+		return m, loadAgentsCmd() // refresh: agent should be archived
+
+	case dispatchDoneMsg:
+		fl := formatDispatchFlash(msg.out, msg.err)
+		m.flash = &fl
+		return m, loadAgentsCmd() // refresh: new agent should appear
 	}
 	return m, nil
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "q", "ctrl+c":
+	key := msg.String()
+
+	// ctrl+c always quits, even mid-prompt — escape hatch for the
+	// operator who pressed [d] by accident.
+	if key == "ctrl+c" {
+		return m, tea.Quit
+	}
+
+	// Action keys (handoff/attach/dispatch) and prompt-mode keys take
+	// precedence over navigation. handleActionKey returns handled=false
+	// only when in nav mode and the key isn't an action key, in which
+	// case we fall through to navigation below.
+	updated, cmd, handled := m.handleActionKey(key)
+	if handled {
+		return updated, cmd
+	}
+
+	switch key {
+	case "q":
 		return m, tea.Quit
 	case "j", "down":
 		if m.cursor < len(m.records)-1 {
@@ -163,9 +206,28 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	}
 
-	footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [q] quit", len(m.records))
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render(footer))
+	if m.flash != nil {
+		style := dimStyle
+		if m.flash.isErr {
+			style = errStyle
+		}
+		b.WriteString("\n")
+		b.WriteString(style.Render(m.flash.text))
+		b.WriteString("\n")
+	}
+
+	if m.mode == modePromptDispatch {
+		b.WriteString("\n")
+		b.WriteString(promptStyle.Render("dispatch task: " + m.promptBuf + "█"))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
+		b.WriteString("\n")
+	} else {
+		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [q] quit",
+			len(m.records))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render(footer))
+	}
 	return b.String()
 }
 
@@ -283,9 +345,10 @@ func humanAge(d time.Duration) string {
 // Lipgloss styles. Kept in the same file as the View() that uses them
 // so changes are co-located.
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	headerStyle = lipgloss.NewStyle().Bold(true).Faint(true)
-	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	dimStyle    = lipgloss.NewStyle().Faint(true)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	headerStyle  = lipgloss.NewStyle().Bold(true).Faint(true)
+	cursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	dimStyle     = lipgloss.NewStyle().Faint(true)
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
 )

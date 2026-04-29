@@ -3,7 +3,9 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fsnotify/fsnotify"
@@ -38,8 +40,36 @@ func Run(version string) error {
 		defer stop()
 	}
 
-	_, err = prog.Run()
-	return err
+	finalModel, err := prog.Run()
+	if err != nil {
+		return err
+	}
+
+	// Post-program: if [a] was pressed, exec `tmux attach` so it
+	// replaces this process. Doing it here (after bubbletea's
+	// altscreen has been torn down) avoids the conflict between
+	// tmux's terminal control and bubbletea's render loop.
+	if m, ok := finalModel.(Model); ok {
+		if session := m.PendingAttach(); session != "" {
+			return execTmuxAttach(session)
+		}
+	}
+	return nil
+}
+
+// execTmuxAttach replaces the current process with `tmux attach -t
+// <session>`. After this returns (which only happens on error),
+// control is back in tui.Run's caller.
+func execTmuxAttach(session string) error {
+	bin, err := exec.LookPath("tmux")
+	if err != nil {
+		return fmt.Errorf("tmux not found: %w", err)
+	}
+	args := []string{"tmux", "attach", "-t", session}
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		args = []string{"tmux", "-S", sock, "attach", "-t", session}
+	}
+	return syscall.Exec(bin, args, os.Environ())
 }
 
 // startWatcher returns a stop func and an error. On success, the
