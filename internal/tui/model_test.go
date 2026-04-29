@@ -235,6 +235,14 @@ func TestView_PickerEmptyShowsHint(t *testing.T) {
 	}
 }
 
+func TestView_FooterShowsDetachHint(t *testing.T) {
+	m := New("test")
+	out := m.View()
+	if !strings.Contains(out, "Ctrl-b") || !strings.Contains(out, "detach") {
+		t.Errorf("footer should explain how to detach from an attached session, got:\n%s", out)
+	}
+}
+
 func TestView_PromptHeaderShowsPickedRepo(t *testing.T) {
 	m := New("test")
 	m.mode = modePromptDispatch
