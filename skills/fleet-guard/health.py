@@ -143,6 +143,24 @@ def now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def read_record(agent_id: str) -> dict[str, Any] | None:
+    """Load the agent record from disk. Returns None if the file is missing
+    or unparseable. Never raises — the skill must not block the host turn on
+    a transient I/O hiccup. Callers that need a real record (handoff.py)
+    treat None as 'no auto-action this fire' rather than escalating."""
+    path = agent_record_path(agent_id)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            record = json.load(f)
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    if not isinstance(record, dict):
+        return None
+    return record
+
+
 def update_record(agent_id: str, **fields: Any) -> bool:
     """Read-modify-write the agent record, touching only OWNED_FIELDS plus
     last_activity_ts (set automatically each fire).
