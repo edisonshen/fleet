@@ -69,6 +69,37 @@ func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	}
 }
 
+// TestMaybeAutoInit_HookDriftReinstalls regresses codex iter-2 P2.
+// Files all present, but settings.json never had the hook
+// registrations (e.g. mergeHookRegistrations crashed in a previous
+// run, or the operator hand-edited settings.json and removed them).
+// The file-only check used to skip forever; now hooksRegistered
+// catches the drift and triggers a re-merge.
+func TestMaybeAutoInit_HookDriftReinstalls(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+
+	// Bootstrap files + hooks.
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("setup runInit: %v", err)
+	}
+	// Now wipe settings.json so the hooks are gone but the files
+	// remain — exactly the partial-install scenario codex flagged.
+	if err := os.Remove(filepath.Join(claudeHome, "settings.json")); err != nil {
+		t.Fatalf("remove settings.json: %v", err)
+	}
+
+	var out bytes.Buffer
+	maybeAutoInit(&out, claudeHome)
+
+	if !strings.Contains(out.String(), "first run") {
+		t.Errorf("missing settings.json should trigger re-install, got:\n%s", out.String())
+	}
+	if _, err := os.Stat(filepath.Join(claudeHome, "settings.json")); err != nil {
+		t.Errorf("re-install should restore settings.json: %v", err)
+	}
+}
+
 // TestMaybeAutoInit_PartialInstallReinstalls is the codex P1
 // regression: the previous check "main.py exists → skip" left a
 // half-installed skill stuck forever if any sibling file was missing

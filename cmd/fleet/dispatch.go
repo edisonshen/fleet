@@ -43,14 +43,23 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		"project name to tag this agent with")
 	cmd.Flags().StringVar(&opts.cwd, "cwd", "",
 		"working directory for the spawned session (default: current dir)")
-	// Default includes --dangerously-skip-permissions because Fleet's
-	// premise is fire-and-forget parallel agents: every permission
-	// prompt blocks one of N agents and forces the operator to babysit
-	// it. Operators who want the per-tool prompts can override with
-	// `--command claude` or supply their own argv.
+	// Default wraps claude in a shell so the tmux session SURVIVES
+	// claude exiting. Without the wrapper, the operator who attaches,
+	// then accidentally types Ctrl-D / `/exit` / `/quit` inside claude
+	// finds the tmux session terminated (claude was the session's
+	// only process). Subsequent `fleet attach` then fails with
+	// "no sessions". The wrapper drops into an interactive shell
+	// after claude exits, keeping the session alive for restart or
+	// inspection. Operators who want raw claude (e.g. for scripted
+	// pipelines) override with `--command claude`.
+	//
+	// `--dangerously-skip-permissions` is on by default because
+	// Fleet's premise is fire-and-forget parallel agents: every
+	// permission prompt blocks one of N agents and forces the
+	// operator to babysit it.
 	cmd.Flags().StringSliceVar(&opts.command, "command",
-		[]string{"claude", "--dangerously-skip-permissions"},
-		"command to run inside the tmux session (default: claude --dangerously-skip-permissions)")
+		[]string{"sh", "-c", `claude --dangerously-skip-permissions; echo; echo "[fleet] claude exited — Ctrl-b then & to kill this session, or run \"claude --dangerously-skip-permissions\" to restart"; exec ${SHELL:-bash} -i`},
+		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
 	return cmd
 }
 

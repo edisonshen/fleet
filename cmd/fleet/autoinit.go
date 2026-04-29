@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -45,7 +46,7 @@ func maybeAutoInit(stdout io.Writer, claudeHomeOverride string) {
 	}
 
 	skillRoot := filepath.Join(claudeHome, "skills", "fleet-guard")
-	if skillFullyInstalled(skillRoot) {
+	if skillFullyInstalled(claudeHome, skillRoot) {
 		return
 	}
 
@@ -58,16 +59,28 @@ func maybeAutoInit(stdout io.Writer, claudeHomeOverride string) {
 	}
 }
 
-// skillFullyInstalled returns true iff every file embedded by
-// FleetGuardFS has a counterpart on disk under skillRoot. A partial
-// install (main.py present but a sibling missing because the previous
-// run crashed mid-loop, or an operator manually deleted one file)
-// returns false so maybeAutoInit re-runs runInit and lets its
-// idempotent "skip (exists)" / "wrote:" loop restore the missing
-// pieces. Any walk error (permission denied, embedded-FS corruption)
-// is treated as "not fully installed" — better to repeat work than
+// skillFullyInstalled returns true iff (a) every embedded file is on
+// disk under skillRoot AND (b) ~/.claude/settings.json registers the
+// fleet-guard hook command for every required event. A partial
+// install (files written but settings.json merge crashed, or the
+// reverse) is the codex iter-2 P2 case: the previous file-only check
+// missed the second failure mode and the operator was stuck without
+// auto-handoff forever.
+//
+// Any walk error or settings.json read/parse failure is treated as
+// "not fully installed" — better to repeat idempotent work than
 // silently leave the install broken.
-func skillFullyInstalled(skillRoot string) bool {
+func skillFullyInstalled(claudeHome, skillRoot string) bool {
+	if !skillFilesPresent(skillRoot) {
+		return false
+	}
+	mainPath := filepath.Join(skillRoot, "main.py")
+	return hooksRegistered(claudeHome, mainPath)
+}
+
+// skillFilesPresent returns true iff every file in the embedded
+// FleetGuardFS exists under skillRoot.
+func skillFilesPresent(skillRoot string) bool {
 	fsys := fleet.FleetGuardFS()
 	complete := true
 	walkErr := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
@@ -88,4 +101,58 @@ func skillFullyInstalled(skillRoot string) bool {
 		return false
 	}
 	return complete
+}
+
+// hooksRegistered returns true iff settings.json contains a hook
+// command pointing at mainPath under every event in hookEvents
+// (Stop / PreCompact / SessionStart). Missing file, unparseable JSON,
+// missing hooks key, or a missing event entry all return false so
+// auto-init re-runs and mergeHookRegistrations can re-apply the
+// (idempotent) merge. Mirrors the same matching the merge does, so
+// re-running adds nothing on a healthy install.
+func hooksRegistered(claudeHome, mainPath string) bool {
+	settingsPath := filepath.Join(claudeHome, "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return false
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return false
+	}
+	hooks, ok := settings["hooks"].(map[string]any)
+	if !ok {
+		return false
+	}
+	command := "/usr/bin/env python3 " + mainPath
+	for _, event := range hookEvents {
+		if !hookEntryPresent(hooks, event, command) {
+			return false
+		}
+	}
+	return true
+}
+
+// hookEntryPresent walks the same nested shape that ensureHookEntry
+// writes (hooks.<event>: [{ "hooks": [{ "command": "..." }] }]) and
+// reports whether any sub-entry has command == want.
+func hookEntryPresent(hooks map[string]any, event, want string) bool {
+	arr, _ := hooks[event].([]any)
+	for _, raw := range arr {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		sub, _ := entry["hooks"].([]any)
+		for _, h := range sub {
+			hm, ok := h.(map[string]any)
+			if !ok {
+				continue
+			}
+			if cmd, _ := hm["command"].(string); cmd == want {
+				return true
+			}
+		}
+	}
+	return false
 }

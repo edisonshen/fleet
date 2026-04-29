@@ -7,7 +7,14 @@ import (
 	"os/exec"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// sessionAliveFn is the tmux liveness probe used by [a] attach. var
+// so tests can stub without forking tmux. Production calls
+// tmux.HasSession.
+var sessionAliveFn = tmux.HasSession
 
 // Action keybinds added in Week 4b+4c. Layered onto the existing
 // navigation set (j/k/g/G/q) without touching them.
@@ -108,6 +115,24 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case "a":
 		if cur := m.selected(); cur != nil {
+			// Pre-flight liveness check: tmux's `attach -t <session>`
+			// on a dead session prints "no sessions" / "can't find
+			// session" and the operator drops back to their shell with
+			// no idea why. The most common cause is claude having
+			// exited inside the tmux session (Ctrl-D / /exit /
+			// SIGCHLD), which terminates the session because claude
+			// was the session's only process. Surface the diagnosis
+			// in-TUI so the operator knows what happened and can
+			// clean up via `[h]` handoff.
+			if !sessionAliveFn(cur.TmuxSession) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"agent %s session is dead — claude likely exited inside it. Press [h] to clean up the orphan record.",
+						cur.ID),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			m.pendingAttach = cur.TmuxSession
 			return m, tea.Quit, true
 		}

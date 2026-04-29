@@ -205,13 +205,58 @@ func TestProjectTag_ParentBasename(t *testing.T) {
 		{"/Users/x/personal/fleet", "personal-fleet"},
 		{"/tmp/projects/foo", "projects-foo"},
 		{"/foo", "foo"}, // single segment falls back to basename
-		{"/", string(filepath.Separator)},
+		{"/", "fleet"},  // sanitization → empty → fallback
 	}
 	for _, tc := range cases {
 		got := ProjectTag(tc.path)
 		if got != tc.want {
 			t.Errorf("ProjectTag(%q)=%q, want %q", tc.path, got, tc.want)
 		}
+	}
+}
+
+// TestProjectTag_SanitizesUnsafeChars regresses codex iter-2 P1: paths
+// with spaces or other punctuation used to produce tags that
+// state.ValidateProjectName rejects, and dispatch failed before any
+// agent spawned. Sanitization maps unsafe chars to "-" and ensures
+// every output is a valid project name.
+func TestProjectTag_SanitizesUnsafeChars(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/Users/x/Client Work/api", "Client-Work-api"},
+		{"/foo bar baz", "foo-bar-baz"},
+		{"/proj/v1.0", "proj-v1.0"},             // dots preserved
+		{"/proj/with;semis", "proj-with-semis"}, // semis → dash
+		{"/  /  ", "fleet"},                     // all whitespace → fallback
+		{"/foo/bar baz qux", "foo-bar-baz-qux"}, // parent "foo" + sanitized basename
+	}
+	for _, tc := range cases {
+		got := ProjectTag(tc.path)
+		if got != tc.want {
+			t.Errorf("ProjectTag(%q)=%q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestDisambiguateDisplays_FallsBackToFullPath regresses codex iter-2
+// P3: two repos at .../src/fleet from different mounts both produce
+// "src/fleet" after the 1-parent prefix. The second pass falls back
+// to the full Path so the operator can still tell them apart.
+func TestDisambiguateDisplays_FallsBackToFullPath(t *testing.T) {
+	c := []repoCandidate{
+		{Path: "/Users/x/src/fleet", Display: "fleet"},
+		{Path: "/Volumes/ssd/src/fleet", Display: "fleet"},
+	}
+	disambiguateDisplays(c)
+	// After 1-parent: both become "src/fleet" — still colliding.
+	// After 2nd pass: replaced with full Path, distinct.
+	if c[0].Display == c[1].Display {
+		t.Fatalf("expected distinct displays after disambiguation, got %q twice", c[0].Display)
+	}
+	if c[0].Display != "/Users/x/src/fleet" || c[1].Display != "/Volumes/ssd/src/fleet" {
+		t.Errorf("expected full-path fallback, got %q and %q", c[0].Display, c[1].Display)
 	}
 }
 

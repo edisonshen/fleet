@@ -88,13 +88,12 @@ func discoverRepos() []repoCandidate {
 	return out
 }
 
-// disambiguateDisplays adds a parent-directory prefix to any rows
-// whose Display would otherwise collide. Operators with both
-// ~/work/fleet and ~/personal/fleet should see "work/fleet" and
-// "personal/fleet" in the picker, not two indistinguishable "fleet"
-// rows. The cwd row keeps its "(cwd) <basename>" label and never
-// collides with a project-scan row of the same basename — the (cwd)
-// prefix makes the strings distinct.
+// disambiguateDisplays makes every Display unique. First pass adds a
+// parent-directory prefix to rows whose basename collides
+// (~/work/fleet → "work/fleet"). If two paths still share the same
+// "parent/basename" pair (~/src/fleet vs /Volumes/ssd/src/fleet both
+// resolve to "src/fleet"), fall back to the full absolute path so the
+// operator can at least see which checkout will be selected.
 func disambiguateDisplays(c []repoCandidate) {
 	counts := map[string]int{}
 	for _, r := range c {
@@ -110,6 +109,17 @@ func disambiguateDisplays(c []repoCandidate) {
 		}
 		c[i].Display = parent + "/" + c[i].Display
 	}
+	// Second pass: any row that's still a duplicate falls back to its
+	// absolute path. Less pretty, always unique.
+	counts2 := map[string]int{}
+	for _, r := range c {
+		counts2[r.Display]++
+	}
+	for i := range c {
+		if counts2[c[i].Display] > 1 {
+			c[i].Display = c[i].Path
+		}
+	}
 }
 
 // ProjectTag returns the project name to pass to `fleet dispatch
@@ -119,17 +129,53 @@ func disambiguateDisplays(c []repoCandidate) {
 // "personal-fleet". Without this, both would tag as "fleet" and
 // fleet-guard's per-project locking would serialize unrelated work.
 //
-// Falls back to plain basename when the path is one segment deep
-// (e.g. /tmp). Sanitization strips path separators that would break
-// state.ValidateProjectName.
+// Output is always safe for state.ValidateProjectName: characters
+// outside [A-Za-z0-9._-] are replaced with "-", runs of "-" are
+// collapsed, and leading/trailing punctuation is stripped. Without
+// this, dispatch fails for repos under paths containing spaces or
+// other punctuation (~/Client Work/api). Falls back to "fleet" when
+// every segment sanitizes to empty (e.g. path was "/").
 func ProjectTag(p string) string {
 	p = filepath.Clean(p)
 	base := filepath.Base(p)
 	parent := filepath.Base(filepath.Dir(p))
+	var raw string
 	if parent == "" || parent == "." || parent == string(filepath.Separator) {
-		return base
+		raw = base
+	} else {
+		raw = parent + "-" + base
 	}
-	return parent + "-" + base
+	return sanitizeProjectTag(raw)
+}
+
+// sanitizeProjectTag forces s into the ValidateProjectName allowlist
+// ([A-Za-z0-9._-]). Anything else becomes "-"; runs collapse;
+// leading/trailing "-" and "." are trimmed because ValidateProjectName
+// rejects "." and "..". Returns "fleet" when the result would
+// otherwise be empty or reserved.
+func sanitizeProjectTag(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-.")
+	if out == "" || out == "." || out == ".." {
+		return "fleet"
+	}
+	return out
 }
 
 // canonical returns p with symlinks resolved, falling back to p itself

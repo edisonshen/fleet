@@ -104,7 +104,23 @@ func TestKey_HandoffWithEmptyListIsNoop(t *testing.T) {
 
 // -- [a] attach ---------------------------------------------------------
 
+// stubSessionAlive replaces sessionAliveFn so [a] tests don't shell
+// out to tmux. Returns alive=true unless the session is in dead.
+type stubSessionAlive struct {
+	dead map[string]bool
+}
+
+func (s *stubSessionAlive) install(t *testing.T) {
+	t.Helper()
+	prev := sessionAliveFn
+	sessionAliveFn = func(session string) bool {
+		return !s.dead[session]
+	}
+	t.Cleanup(func() { sessionAliveFn = prev })
+}
+
 func TestKey_AttachSetsPendingAndQuits(t *testing.T) {
+	(&stubSessionAlive{}).install(t) // every session alive by default
 	m := makeModelWithAgents(sampleAgent("agent01"))
 	updated, cmd := m.Update(keyMsg("a"))
 
@@ -119,6 +135,32 @@ func TestKey_AttachSetsPendingAndQuits(t *testing.T) {
 	msg := cmd()
 	if _, ok := msg.(tea.QuitMsg); !ok {
 		t.Errorf("expected tea.QuitMsg, got %T", msg)
+	}
+}
+
+// TestKey_AttachOnDeadSessionShowsFlash regresses the user-reported
+// "no sessions" UX: when the tmux session has died (claude exited
+// inside it), [a] used to exec tmux which failed with a cryptic
+// shell-side error. Now the TUI surfaces a clear flash and stays put.
+func TestKey_AttachOnDeadSessionShowsFlash(t *testing.T) {
+	stub := &stubSessionAlive{dead: map[string]bool{"fleet-agent01": true}}
+	stub.install(t)
+
+	m := makeModelWithAgents(sampleAgent("agent01"))
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.PendingAttach() != "" {
+		t.Error("pendingAttach must NOT be set for a dead session")
+	}
+	if cmd != nil {
+		t.Error("dead-session [a] should not produce a tea.Cmd")
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "agent01") ||
+		!strings.Contains(mm.flash.text, "session is dead") {
+		t.Errorf("flash should name the dead agent and explain, got: %q", mm.flash.text)
 	}
 }
 
