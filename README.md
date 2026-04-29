@@ -72,6 +72,17 @@ $ fleet status             # one-shot health summary
 
 The full operator walkthrough — registering a project, planning, dispatching, handing off, hitting `max_concurrent_agents` — lives at [`docs/FLOW.md`](docs/FLOW.md).
 
+### Tmux tip — scroll wheel in attached sessions
+
+Claude Code captures mouse events in altscreen mode ([anthropics/claude-code#15780](https://github.com/anthropics/claude-code/issues/15780)), so the wheel doesn't scroll claude's output by default when you `fleet attach`. Add this to `~/.tmux.conf`:
+
+```sh
+echo 'set -g mouse on' >> ~/.tmux.conf
+tmux source-file ~/.tmux.conf   # apply to running server
+```
+
+Now the wheel scrolls into tmux copy-mode (press `q` to exit). Tradeoff: native click-drag text selection becomes shift+drag inside tmux — standard mouse-mode behavior. `Ctrl-b [` is the always-works keyboard alternative.
+
 ## Architecture
 
 Single Go binary. Filesystem state under `~/.fleet/`. fsnotify for live updates with a 1s polling fallback. tmux as the only runtime dependency. Per-project `flock(2)` for write contention. Atomic writes (`.tmp` then rename, fsync before signaling).
