@@ -44,9 +44,9 @@ type Model struct {
 	version string
 
 	// Action keybind state (Week 4b+4c).
-	mode      inputMode  // modeNav or modePromptDispatch
-	promptBuf string     // dispatch prompt buffer; empty in modeNav
-	flash     *flashMsg  // banner shown under the table after an action
+	mode      inputMode // modeNav or modePromptDispatch
+	promptBuf string    // dispatch prompt buffer; empty in modeNav
+	flash     *flashMsg // banner shown under the table after an action
 
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
@@ -373,10 +373,10 @@ func humanAge(d time.Duration) string {
 // Lipgloss styles. Kept in the same file as the View() that uses them
 // so changes are co-located.
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	headerStyle  = lipgloss.NewStyle().Bold(true).Faint(true)
-	cursorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	dimStyle     = lipgloss.NewStyle().Faint(true)
-	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	headerStyle = lipgloss.NewStyle().Bold(true).Faint(true)
+	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
+	dimStyle    = lipgloss.NewStyle().Faint(true)
+	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	promptStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
 )

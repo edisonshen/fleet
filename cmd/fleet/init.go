@@ -65,7 +65,7 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 		return err
 	}
 
-	fmt.Fprintln(stdout, "fleet init: done")
+	_, _ = fmt.Fprintln(stdout, "fleet init: done")
 	return nil
 }
 
@@ -84,7 +84,7 @@ func installSkillFiles(stdout io.Writer, dst string, force bool) error {
 		target := filepath.Join(dst, path)
 		if !force {
 			if _, err := os.Stat(target); err == nil {
-				fmt.Fprintf(stdout, "skip (exists): %s\n", target)
+				_, _ = fmt.Fprintf(stdout, "skip (exists): %s\n", target)
 				return nil
 			}
 		}
@@ -106,7 +106,7 @@ func installSkillFiles(stdout io.Writer, dst string, force bool) error {
 				return fmt.Errorf("chmod %s: %w", target, err)
 			}
 		}
-		fmt.Fprintf(stdout, "wrote: %s\n", target)
+		_, _ = fmt.Fprintf(stdout, "wrote: %s\n", target)
 		return nil
 	})
 }
@@ -148,9 +148,9 @@ func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error
 	for _, event := range hookEvents {
 		if ensureHookEntry(hooks, event, command) {
 			added++
-			fmt.Fprintf(stdout, "registered: %s → %s\n", event, mainPath)
+			_, _ = fmt.Fprintf(stdout, "registered: %s → %s\n", event, mainPath)
 		} else {
-			fmt.Fprintf(stdout, "skip (registered): %s\n", event)
+			_, _ = fmt.Fprintf(stdout, "skip (registered): %s\n", event)
 		}
 	}
 
@@ -166,7 +166,7 @@ func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error
 		return fmt.Errorf("write settings.json: %w", err)
 	}
 	if added == 0 {
-		fmt.Fprintln(stdout, "settings.json already up to date")
+		_, _ = fmt.Fprintln(stdout, "settings.json already up to date")
 	}
 	return nil
 }

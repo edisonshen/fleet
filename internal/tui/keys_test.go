@@ -45,8 +45,8 @@ func sampleAgent(id string) *agent.Record {
 // stubFleetCmd replaces runFleetCmd for tests so we don't actually
 // fork `fleet`. Returns a captured args slice + a controllable msg.
 type stubFleetCmd struct {
-	calls    [][]string
-	stubbed  func(args []string) tea.Msg
+	calls   [][]string
+	stubbed func(args []string) tea.Msg
 }
 
 func (s *stubFleetCmd) install(t *testing.T) {
@@ -149,12 +149,8 @@ func TestKey_DispatchOpensPrompt(t *testing.T) {
 
 func TestKey_NisAliasForD(t *testing.T) {
 	m := makeModelWithAgents()
-	mm := m
-	mm, _ = func() (Model, tea.Cmd) {
-		updated, cmd := m.Update(keyMsg("n"))
-		return updated.(Model), cmd
-	}()
-	if mm.mode != modePromptDispatch {
+	updated, _ := m.Update(keyMsg("n"))
+	if updated.(Model).mode != modePromptDispatch {
 		t.Error("[n] should also enter dispatch prompt")
 	}
 }

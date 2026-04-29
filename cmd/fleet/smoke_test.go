@@ -199,4 +199,3 @@ func writeFakeTranscript(t *testing.T, model string, inputTokens int) string {
 	}
 	return path
 }
-

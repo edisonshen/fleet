@@ -62,7 +62,7 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 		return fmt.Errorf("list queue: %w", err)
 	}
 	if len(paths) == 0 {
-		fmt.Fprintln(stdout, "fleet drain: no pending handoffs")
+		_, _ = fmt.Fprintln(stdout, "fleet drain: no pending handoffs")
 		return nil
 	}
 
@@ -74,19 +74,19 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 			// Skip rather than fail-fast — a malformed or future-schema
 			// file is one problem among many. Log and continue so other
 			// pending agents still drain.
-			fmt.Fprintf(stderr, "fleet drain: read %s: %v\n", path, perr)
+			_, _ = fmt.Fprintf(stderr, "fleet drain: read %s: %v\n", path, perr)
 			failed++
 			continue
 		}
 		if err := drainOne(req, path, graceMillis, stdout, stderr); err != nil {
-			fmt.Fprintf(stderr, "fleet drain: %s: %v\n", req.OldAgentID, err)
+			_, _ = fmt.Fprintf(stderr, "fleet drain: %s: %v\n", req.OldAgentID, err)
 			failed++
 			continue
 		}
 		processed++
 	}
 
-	fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
+	_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",
 		processed, failed)
 	if processed == 0 && failed > 0 {
 		return errors.New("fleet drain: every pending handoff failed")
