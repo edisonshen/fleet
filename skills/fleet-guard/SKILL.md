@@ -30,7 +30,7 @@ Set by `fleet dispatch` and inherited via `tmux new-session -e`:
 
 ## Required tools
 
-- `python3` ≥ 3.10 (stdlib only — no pip dependencies for the runtime path; pytest is dev-only).
+- `python3` ≥ 3.9 (stdlib only — no pip dependencies for the runtime path; pytest is dev-only). Annotations use `from __future__ import annotations` so PEP 604 (`X | None`) and PEP 585 (`dict[str, int]`) syntax stays string-form for parser compat.
 - `tmux` — `capture-pane -t <session> -p` is how the skill grabs recent agent output for the handoff doc body and detects `MILESTONE` markers in Yellow path.
 
 ## Hook payload contract
