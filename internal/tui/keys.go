@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -219,12 +218,14 @@ func (m Model) startHandoff(id string) tea.Cmd {
 // startDispatch returns a tea.Cmd that runs `fleet dispatch <task>`
 // and emits dispatchDoneMsg on completion. When the picker recorded a
 // repo, --cwd and --project pin the spawn to that directory; the
-// project tag is the repo's basename (e.g. "fleet" for ~/projects/fleet).
+// project tag includes the parent directory so two repos that share a
+// basename (~/work/fleet vs ~/personal/fleet) tag distinctly and
+// don't share fleet-guard's per-project locks. See ProjectTag.
 func (m Model) startDispatch(task string) tea.Cmd {
 	args := []string{"dispatch", task}
 	if m.pickedRepo.Path != "" {
 		args = append(args, "--cwd", m.pickedRepo.Path,
-			"--project", filepath.Base(m.pickedRepo.Path))
+			"--project", ProjectTag(m.pickedRepo.Path))
 	}
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		return dispatchDoneMsg{out: out, err: err}

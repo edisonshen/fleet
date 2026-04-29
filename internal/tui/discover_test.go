@@ -165,6 +165,56 @@ func TestProjectDirs_DefaultsToHomeProjects(t *testing.T) {
 	}
 }
 
+// TestDiscoverRepos_DisambiguatesDuplicateBasenames is the codex
+// P2 regression: two repos with the same basename in different
+// project roots must render as distinct picker rows. Without
+// disambiguation the operator sees two identical "fleet" labels and
+// can't tell which checkout will be selected.
+func TestDiscoverRepos_DisambiguatesDuplicateBasenames(t *testing.T) {
+	tmp := t.TempDir()
+	work := filepath.Join(tmp, "work")
+	personal := filepath.Join(tmp, "personal")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(personal, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	makeRepo(t, work, "fleet")
+	makeRepo(t, personal, "fleet")
+
+	t.Setenv("FLEET_PROJECT_DIRS", work+string(os.PathListSeparator)+personal)
+	withCwd(t, t.TempDir())
+
+	got := discoverRepos()
+	displays := []string{}
+	for _, c := range got {
+		displays = append(displays, c.Display)
+	}
+	mustContain(t, displays, "work/fleet")
+	mustContain(t, displays, "personal/fleet")
+	mustNotContain(t, displays, "fleet") // no bare label survives
+}
+
+func TestProjectTag_ParentBasename(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/Users/x/work/fleet", "work-fleet"},
+		{"/Users/x/personal/fleet", "personal-fleet"},
+		{"/tmp/projects/foo", "projects-foo"},
+		{"/foo", "foo"}, // single segment falls back to basename
+		{"/", string(filepath.Separator)},
+	}
+	for _, tc := range cases {
+		got := ProjectTag(tc.path)
+		if got != tc.want {
+			t.Errorf("ProjectTag(%q)=%q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
 func TestProjectDirs_DropsEmptyEntries(t *testing.T) {
 	t.Setenv("FLEET_PROJECT_DIRS",
 		"/a"+string(os.PathListSeparator)+

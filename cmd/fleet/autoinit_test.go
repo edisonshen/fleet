@@ -32,19 +32,25 @@ func TestMaybeAutoInit_FreshHome(t *testing.T) {
 	}
 }
 
-// TestMaybeAutoInit_AlreadyInstalled skips when main.py exists.
-// Important: the operator who ran `fleet init` once shouldn't see a
-// "first run" message every dispatch.
+// TestMaybeAutoInit_AlreadyInstalled skips when every embedded file is
+// already on disk. Important: the operator who ran `fleet init` once
+// shouldn't see a "first run" message every dispatch.
 func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
-	skillRoot := filepath.Join(claudeHome, "skills", "fleet-guard")
-	if err := os.MkdirAll(skillRoot, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+
+	// Bootstrap a clean install once via runInit so every embedded
+	// file lands on disk; then maybeAutoInit should be a no-op.
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("setup runInit: %v", err)
 	}
-	mainPath := filepath.Join(skillRoot, "main.py")
-	if err := os.WriteFile(mainPath, []byte("# stub"), 0o644); err != nil {
-		t.Fatalf("write stub main.py: %v", err)
+	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
+
+	// Replace main.py contents with a sentinel so we can prove
+	// auto-init didn't clobber it.
+	const sentinel = "# sentinel — preserved by maybeAutoInit"
+	if err := os.WriteFile(mainPath, []byte(sentinel), 0o644); err != nil {
+		t.Fatalf("write sentinel: %v", err)
 	}
 
 	var out bytes.Buffer
@@ -54,13 +60,46 @@ func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 		t.Errorf("expected silence when already installed, got:\n%s", got)
 	}
 
-	// Stub content should be untouched (no force-overwrite).
 	data, err := os.ReadFile(mainPath)
 	if err != nil {
 		t.Fatalf("read main.py: %v", err)
 	}
-	if string(data) != "# stub" {
-		t.Errorf("auto-init clobbered existing main.py; got %q", string(data))
+	if string(data) != sentinel {
+		t.Errorf("auto-init clobbered main.py; got %q", string(data))
+	}
+}
+
+// TestMaybeAutoInit_PartialInstallReinstalls is the codex P1
+// regression: the previous check "main.py exists → skip" left a
+// half-installed skill stuck forever if any sibling file was missing
+// (crashed mid-loop, manually deleted, etc.). Now the check walks the
+// embedded FS so any missing file triggers a re-install.
+func TestMaybeAutoInit_PartialInstallReinstalls(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	skillRoot := filepath.Join(claudeHome, "skills", "fleet-guard")
+	if err := os.MkdirAll(skillRoot, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Create JUST main.py — no siblings, no settings.json. This
+	// simulates a previous install that crashed after writing the
+	// first file.
+	if err := os.WriteFile(filepath.Join(skillRoot, "main.py"),
+		[]byte("# partial"), 0o644); err != nil {
+		t.Fatalf("write partial main.py: %v", err)
+	}
+
+	var out bytes.Buffer
+	maybeAutoInit(&out, claudeHome)
+
+	got := out.String()
+	if !strings.Contains(got, "first run") {
+		t.Errorf("partial install should trigger re-install, got:\n%s", got)
+	}
+	// At least one sibling must now exist on disk.
+	handoff := filepath.Join(skillRoot, "handoff.py")
+	if _, err := os.Stat(handoff); err != nil {
+		t.Errorf("re-install should restore handoff.py: %v", err)
 	}
 }
 

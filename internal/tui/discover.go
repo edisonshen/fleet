@@ -84,7 +84,52 @@ func discoverRepos() []repoCandidate {
 		})
 		out = append(out, batch...)
 	}
+	disambiguateDisplays(out)
 	return out
+}
+
+// disambiguateDisplays adds a parent-directory prefix to any rows
+// whose Display would otherwise collide. Operators with both
+// ~/work/fleet and ~/personal/fleet should see "work/fleet" and
+// "personal/fleet" in the picker, not two indistinguishable "fleet"
+// rows. The cwd row keeps its "(cwd) <basename>" label and never
+// collides with a project-scan row of the same basename — the (cwd)
+// prefix makes the strings distinct.
+func disambiguateDisplays(c []repoCandidate) {
+	counts := map[string]int{}
+	for _, r := range c {
+		counts[r.Display]++
+	}
+	for i := range c {
+		if counts[c[i].Display] <= 1 {
+			continue
+		}
+		parent := filepath.Base(filepath.Dir(c[i].Path))
+		if parent == "" || parent == "." || parent == string(filepath.Separator) {
+			continue
+		}
+		c[i].Display = parent + "/" + c[i].Display
+	}
+}
+
+// ProjectTag returns the project name to pass to `fleet dispatch
+// --project` for a picked path. Last-two-segments form
+// (parent-basename) keeps two checkouts with the same basename
+// distinct: ~/work/fleet → "work-fleet", ~/personal/fleet →
+// "personal-fleet". Without this, both would tag as "fleet" and
+// fleet-guard's per-project locking would serialize unrelated work.
+//
+// Falls back to plain basename when the path is one segment deep
+// (e.g. /tmp). Sanitization strips path separators that would break
+// state.ValidateProjectName.
+func ProjectTag(p string) string {
+	p = filepath.Clean(p)
+	base := filepath.Base(p)
+	parent := filepath.Base(filepath.Dir(p))
+	if parent == "" || parent == "." || parent == string(filepath.Separator) {
+		return base
+	}
+	return parent + "-" + base
 }
 
 // canonical returns p with symlinks resolved, falling back to p itself

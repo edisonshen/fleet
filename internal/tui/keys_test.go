@@ -228,8 +228,10 @@ func TestKey_PromptCollectsRunesAndSubmits(t *testing.T) {
 	if !containsPair(args, "--cwd", pickedPath) {
 		t.Errorf("expected --cwd %q in args, got %v", pickedPath, args)
 	}
-	if !containsFlag(args, "--project") {
-		t.Errorf("expected --project flag in args, got %v", args)
+	// --project is parent-basename via ProjectTag — see codex P2.
+	wantTag := ProjectTag(pickedPath)
+	if !containsPair(args, "--project", wantTag) {
+		t.Errorf("expected --project %q in args, got %v", wantTag, args)
 	}
 }
 
@@ -367,16 +369,6 @@ func TestKey_PickerEmptyEnterIsNoop(t *testing.T) {
 func containsPair(args []string, flag, value string) bool {
 	for i := 0; i < len(args)-1; i++ {
 		if args[i] == flag && args[i+1] == value {
-			return true
-		}
-	}
-	return false
-}
-
-// containsFlag reports whether args contains flag at any position.
-func containsFlag(args []string, flag string) bool {
-	for _, a := range args {
-		if a == flag {
 			return true
 		}
 	}
