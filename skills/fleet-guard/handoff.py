@@ -61,6 +61,17 @@ TYPE_AUTO_YELLOW = "auto-yellow"
 TYPE_AUTO_RED = "auto-red"
 TYPE_PRECOMPACT = "precompact"
 
+# is_handoff_pending must distinguish "this agent was spawned from a handoff"
+# (handoff_type stamped to "manual" by internal/spawn/spawn.go on every
+# successor record) from "a handoff is pending right now". Without this
+# distinction, every successor agent starts life with pending=True, which
+# silently kills auto-handoff after the first chain step: Yellow skips the
+# HANDOFF REQUESTED injection and jumps straight to MILESTONE grep, and Red
+# short-circuits entirely because the pre-mark race-protection bails out.
+# Only the three auto-* values mark "pending" — "manual" and anything else
+# is a spawn-origin label, not a pending state.
+_PENDING_TYPES = frozenset({TYPE_AUTO_YELLOW, TYPE_AUTO_RED, TYPE_PRECOMPACT})
+
 # Canonical placeholder string for unfilled body sections. MUST match
 # internal/handoff.Placeholder byte-for-byte — alternate sentinels would
 # break 4a's chain reader. The em dash is U+2014.
@@ -94,24 +105,50 @@ def inject_handoff_requested() -> str:
 
 
 def is_handoff_pending(record: dict[str, Any]) -> bool:
-    """A handoff is pending when the record's handoff_type is set to one
-    of the auto values. Treats None / missing / empty string as not
-    pending."""
-    return bool(record.get("handoff_type"))
+    """A handoff is pending when the record's handoff_type is one of the
+    auto-* values. The "manual" stamp written by internal/spawn/spawn.go
+    on every successor record is NOT pending — it's a spawn-origin label
+    that future skill fires must overwrite when an actual auto-handoff
+    is requested."""
+    return record.get("handoff_type") in _PENDING_TYPES
 
 
 def find_milestone(session: str) -> bool:
-    """Capture the agent's tmux pane and search for MILESTONE on its own
-    line. Returns False on tmux failure — the skill is non-blocking, and
-    a missed MILESTONE just means the next fire tries again.
+    """Capture the agent's tmux pane and search for a MILESTONE line that
+    appeared AFTER the most recent HANDOFF REQUESTED injection. Returns
+    False on tmux failure — the skill is non-blocking, and a missed
+    MILESTONE just means the next fire tries again.
 
-    Match is exact (`^MILESTONE$` after stripping whitespace), so the word
-    "MILESTONES" or "MILESTONE: foo" never falsely triggers.
+    Bounded to "after HANDOFF REQUESTED" because the pane scrollback can
+    contain prior MILESTONE lines (the agent's own narration of the
+    handoff token, an earlier discussion that quoted the marker, even
+    a previous Yellow cycle's wrap-up). Counting any historical
+    MILESTONE would fire the handoff the moment Yellow first injects —
+    cutting off active work mid-subtask.
+
+    Match is exact (`^MILESTONE$` after stripping whitespace), so the
+    word "MILESTONES" or "MILESTONE: foo" never falsely triggers.
     """
     out = _capture_pane(session)
     if not out:
         return False
-    for line in out.splitlines():
+    lines = out.splitlines()
+    # Find the LAST occurrence of HANDOFF REQUESTED. Multiple matches are
+    # plausible — the injection itself, the agent quoting it, etc. The
+    # most recent one is what bounds the new MILESTONE search.
+    last_request = -1
+    for i, line in enumerate(lines):
+        if HANDOFF_REQUESTED in line:
+            last_request = i
+    if last_request == -1:
+        # No HANDOFF REQUESTED visible — either it scrolled off or
+        # never fired. Conservative: don't trigger. The pending check
+        # in maybe_trigger would have called this only when the record
+        # already had handoff_type=auto-yellow set, so the injection
+        # DID fire on a prior turn; if it scrolled off, the agent
+        # eventually crosses 70% and emergency triggers via Red.
+        return False
+    for line in lines[last_request + 1:]:
         if line.strip() == MILESTONE:
             return True
     return False

@@ -247,13 +247,21 @@ def _diff_first_byte(got: bytes, want: bytes) -> str:
 
 class TestFindMilestone:
     def test_milestone_on_own_line(self, fake_tmux: _FakeTmux) -> None:
-        fake_tmux.output = "doing work\nMILESTONE\nnext line\n"
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "doing work\n"
+            "MILESTONE\n"
+            "next line\n"
+        )
         assert handoff.find_milestone("fleet-abc") is True
 
     def test_milestone_with_surrounding_whitespace(
         self, fake_tmux: _FakeTmux,
     ) -> None:
-        fake_tmux.output = "  MILESTONE  \n"
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\n"
+            "  MILESTONE  \n"
+        )
         assert handoff.find_milestone("fleet-abc") is True
 
     def test_milestones_word_does_not_match(self, fake_tmux: _FakeTmux) -> None:
@@ -264,6 +272,42 @@ class TestFindMilestone:
 
     def test_milestone_inline_does_not_match(self, fake_tmux: _FakeTmux) -> None:
         fake_tmux.output = "ok MILESTONE: done\n"
+        assert handoff.find_milestone("fleet-abc") is False
+
+    def test_old_milestone_before_handoff_requested_ignored(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """A MILESTONE line earlier in pane history (from a prior wrap-up
+        or from the agent narrating the marker) MUST NOT satisfy the
+        check on the very turn HANDOFF REQUESTED was injected. Otherwise
+        Yellow would cut off active work the moment the injection lands."""
+        fake_tmux.output = (
+            "earlier work\n"
+            "MILESTONE\n"                 # historical, must be ignored
+            "more work\n"
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "agent is wrapping up...\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is False
+
+    def test_milestone_after_handoff_requested_matches(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "wrapping...\n"
+            "MILESTONE\n"
+        )
+        assert handoff.find_milestone("fleet-abc") is True
+
+    def test_no_handoff_requested_in_pane_returns_false(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """If HANDOFF REQUESTED scrolled off pane history, the bounded
+        search returns False rather than counting any MILESTONE as the
+        trigger. The Red threshold + emergency_trigger eventually catch
+        a runaway agent."""
+        fake_tmux.output = "no injection in this pane\nMILESTONE\n"
         assert handoff.find_milestone("fleet-abc") is False
 
     def test_tmux_failure_returns_false(self, fake_tmux: _FakeTmux) -> None:
@@ -351,7 +395,11 @@ class TestMaybeTrigger:
     ) -> None:
         _seed_record(fleet_home_tmp, "agent04",
                      handoff_type=handoff.TYPE_AUTO_YELLOW)
-        fake_tmux.output = "wrapped up the work\nMILESTONE\n"
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up at next safe boundary\n"
+            "wrapped up the work\n"
+            "MILESTONE\n"
+        )
         result = handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
             agent_id="agent04", session="fleet-agent04",
@@ -404,6 +452,59 @@ class TestMaybeTrigger:
         assert b'handoff_type: "auto-red"' in body
         queue_files = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
         assert len(queue_files) == 1
+
+
+# -- successor agent must not start "pending" (codex P1.A) -----------------
+
+class TestPendingDistinguishesAutoFromManual:
+    def test_manual_handoff_type_is_not_pending(self) -> None:
+        """internal/spawn/spawn.go stamps every successor record with
+        handoff_type='manual'. is_handoff_pending must NOT treat that as
+        a live auto-handoff request — otherwise every successor starts
+        life with pending=True and Yellow's first-fire never injects."""
+        assert handoff.is_handoff_pending({"handoff_type": "manual"}) is False
+
+    @pytest.mark.parametrize("t", [
+        handoff.TYPE_AUTO_YELLOW,
+        handoff.TYPE_AUTO_RED,
+        handoff.TYPE_PRECOMPACT,
+    ])
+    def test_auto_types_are_pending(self, t: str) -> None:
+        assert handoff.is_handoff_pending({"handoff_type": t}) is True
+
+    def test_none_or_missing_is_not_pending(self) -> None:
+        assert handoff.is_handoff_pending({"handoff_type": None}) is False
+        assert handoff.is_handoff_pending({}) is False
+        assert handoff.is_handoff_pending({"handoff_type": ""}) is False
+
+    def test_yellow_first_fire_on_successor_with_manual_stamp(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """End-to-end on the bug: a successor record (handoff_type=manual)
+        crossing 50% must inject HANDOFF REQUESTED on its first fire, NOT
+        skip straight to MILESTONE grep."""
+        _seed_record(fleet_home_tmp, "successor1", handoff_type="manual")
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="successor1", session="fleet-successor1",
+        )
+        # Injection MUST fire — successor was a fresh agent, not pending.
+        assert result is not None
+        assert handoff.HANDOFF_REQUESTED in result
+
+    def test_red_on_successor_with_manual_stamp_writes_handoff(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """Same bug, Red side: a successor crossing 70% must still write
+        the emergency handoff. The 'manual' stamp is not a pending state."""
+        _seed_record(fleet_home_tmp, "successor2", handoff_type="manual")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="successor2", session="fleet-successor2",
+        )
+        docs = list((fleet_home_tmp / "handoffs").glob("successor2-*.md"))
+        assert len(docs) == 1, \
+            "Red on successor with manual stamp must still write a doc"
 
 
 # -- re-fire race protection (P1.4) -----------------------------------------
