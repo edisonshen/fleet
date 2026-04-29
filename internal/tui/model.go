@@ -227,7 +227,7 @@ func (m Model) View() string {
 	}
 
 	if len(m.records) == 0 {
-		b.WriteString(dimStyle.Render("no agents (run `fleet dispatch <task-id>` to start one)"))
+		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
 		b.WriteString(renderTable(m.records, m.cursor))

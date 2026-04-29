@@ -188,6 +188,12 @@ func TestView_EmptyState(t *testing.T) {
 	if !strings.Contains(out, "no agents") {
 		t.Errorf("empty view should mention 'no agents', got:\n%s", out)
 	}
+	// Hint must point operator at the in-TUI dispatch shortcut, not
+	// the shell command. With `[d]` already in the footer, this is
+	// the discoverable path for someone seeing an empty TUI.
+	if !strings.Contains(out, "[d]") {
+		t.Errorf("empty view should hint at [d] dispatch shortcut, got:\n%s", out)
+	}
 	if !strings.Contains(out, "Fleet 0.0.0") {
 		t.Errorf("view should include version in title, got:\n%s", out)
 	}
