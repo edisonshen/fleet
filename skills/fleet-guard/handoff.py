@@ -162,13 +162,30 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
 
         pct, _model = health.read_context_pct(payload)
         state = health.threshold(pct)
+        pending = is_handoff_pending(record)
 
         if state == "red":
+            # Pending check protects against re-fire racing the drain:
+            # if the previous fire already wrote doc + queue, skip
+            # entirely so we don't leave an orphan doc on disk (a
+            # second render would have a different timestamp+rnd
+            # filename, and the queue would be re-clobbered to point
+            # at it — orphaning the first doc).
+            if pending:
+                return None
+            # Pre-mark handoff_type so any re-fire that lands before
+            # this _do_handoff completes sees pending=True and bails
+            # at the check above.
+            health.update_record(agent_id, handoff_type=TYPE_AUTO_RED)
+            # Re-load so _do_handoff sees the freshly-set type (its
+            # captured `record` dict is now stale on that field, but
+            # _do_handoff doesn't use record.handoff_type — it takes
+            # the type as an argument).
             _do_handoff(record, session, TYPE_AUTO_RED, pct)
             return None
 
         if state == "yellow":
-            if is_handoff_pending(record):
+            if pending:
                 if find_milestone(session):
                     handoff_type = (record.get("handoff_type")
                                     or TYPE_AUTO_YELLOW)
@@ -188,13 +205,19 @@ def emergency_trigger(payload: dict[str, Any], *, agent_id: str,
     """PreCompact path: write doc + queue regardless of threshold.
 
     Best-effort and silent on failure. The compaction is already in
-    motion; we save what we can.
+    motion; we save what we can. Same pre-mark-pending pattern as
+    maybe_trigger's Red branch — protects against a hypothetical
+    PreCompact re-fire (Claude Code shouldn't double-fire, but the
+    skill's "never block" contract demands we don't trust upstream).
     """
     try:
         record = health.read_record(agent_id)
         if record is None:
             return
+        if is_handoff_pending(record):
+            return
         pct, _ = health.read_context_pct(payload)
+        health.update_record(agent_id, handoff_type=TYPE_PRECOMPACT)
         _do_handoff(record, session, TYPE_PRECOMPACT, pct)
     except Exception as exc:
         print(f"fleet-guard handoff.emergency_trigger: {exc}",
@@ -240,7 +263,11 @@ def _do_handoff(record: dict[str, Any], session: str,
         ts=ts,
     ):
         return
-    health.update_record(agent_id, handoff_type=handoff_type)
+    # handoff_type is set by maybe_trigger BEFORE this call (so a
+    # re-fire racing _do_handoff sees pending=True and skips). The
+    # post-write idempotent re-set used to live here; removing it
+    # because the pre-mark is the load-bearing one and a redundant
+    # write at the end widens the race window for nothing.
 
 
 # -- doc rendering -----------------------------------------------------------

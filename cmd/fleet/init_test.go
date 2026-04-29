@@ -252,6 +252,41 @@ func TestRunInit_RegistersAllThreeHookEvents(t *testing.T) {
 	}
 }
 
+// TestRunInit_RefusesCorruptHooksField — a hand-edited settings.json
+// that has 'hooks' as something other than a JSON object (an array,
+// a string, etc.) MUST cause runInit to error out instead of silently
+// overwriting with an empty map. Otherwise an operator's misformatted
+// file is wiped and they get a confusing "missing hooks" experience.
+func TestRunInit_RefusesCorruptHooksField(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 'hooks' as an array — invalid for our merge but plausible for a
+	// hand-edit that confused arrays of events with the keyed object.
+	corrupt := `{"hooks": ["Stop", "PreCompact"]}` + "\n"
+	if err := os.WriteFile(filepath.Join(claudeHome, "settings.json"),
+		[]byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runInit(&bytes.Buffer{}, false, claudeHome)
+	if err == nil {
+		t.Fatal("expected error on corrupt hooks field; got nil")
+	}
+	if !strings.Contains(err.Error(), "expected JSON object") {
+		t.Errorf("error did not explain the type mismatch: %v", err)
+	}
+
+	// Original file untouched — operator can repair manually.
+	got, _ := os.ReadFile(filepath.Join(claudeHome, "settings.json"))
+	if string(got) != corrupt {
+		t.Errorf("corrupt settings.json was modified: got %q want %q",
+			string(got), corrupt)
+	}
+}
+
 // walkExpectedSkillFiles returns the relative paths that //go:embed bound
 // at compile time. Tests use this as the source of truth for "what should
 // be installed" so a stray new file in the embed doesn't go untested.

@@ -210,6 +210,34 @@ class TestStopHook:
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["inbox_pending"] is False
 
+    def test_inbox_pending_stays_set_when_archive_fails(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If inbox.archive returns False (rename failed), the skill must
+        NOT clear inbox_pending — otherwise the TUI shows 'no message'
+        while the file persists on disk and gets re-delivered next fire."""
+        record_path = _seed_record(fleet_home_tmp, inbox_pending=True)
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("hi", encoding="utf-8")
+
+        import inbox as inbox_module
+        monkeypatch.setattr(inbox_module, "archive", lambda _id: False)
+
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        # Operator message still delivered to the agent (we have the
+        # body in memory; failure is on disk-archive, not delivery).
+        assert "[OPERATOR] hi" in out
+        # But inbox_pending stays True so the TUI agrees with disk.
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["inbox_pending"] is True
+
 
 # -- PreCompact hook ---------------------------------------------------------
 

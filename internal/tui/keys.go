@@ -3,6 +3,7 @@ package tui
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -57,14 +58,29 @@ type drainDoneMsg struct {
 	err error
 }
 
-// runFleetCmd shells out to `fleet <args...>` and returns a tea.Cmd
-// that emits the resulting message. Output is captured combined so
-// the banner shows the same text the operator would see at the
-// shell. Replaced by tests with a stub that returns canned output.
+// fleetBinary is resolved once at startup via os.Executable() so the
+// TUI invokes ITSELF for sub-commands rather than depending on the
+// PATH-resolved `fleet`. Critical for dev runs (`go run`, install
+// paths not on PATH) where `exec.Command("fleet", ...)` would emit
+// "fleet: command not found" on every queueEventMsg, silently
+// killing auto-drain. Falls back to "fleet" on PATH only as a last
+// resort. Tests stub runFleetCmd directly so this path isn't taken.
+var fleetBinary = func() string {
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	return "fleet"
+}()
+
+// runFleetCmd shells out to `<fleetBinary> <args...>` and returns a
+// tea.Cmd that emits the resulting message. Output is captured
+// combined so the banner shows the same text the operator would see
+// at the shell. Replaced by tests with a stub that returns canned
+// output.
 var runFleetCmd = func(args []string, msgFn func(string, error) tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		var buf bytes.Buffer
-		cmd := exec.Command("fleet", args...)
+		cmd := exec.Command(fleetBinary, args...)
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		err := cmd.Run()

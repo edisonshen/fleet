@@ -125,8 +125,21 @@ func mergeHookRegistrations(stdout io.Writer, claudeHome, mainPath string) error
 		return err
 	}
 
-	hooks, ok := settings["hooks"].(map[string]any)
-	if !ok {
+	// Distinguish "missing" (fine, create) from "wrong type" (refuse). A
+	// hand-edited settings.json that put the hooks key as an array or
+	// string would otherwise be silently overwritten with an empty map,
+	// destroying operator config. Bail with a clear pointer instead so
+	// the operator can repair manually.
+	var hooks map[string]any
+	if raw, present := settings["hooks"]; present && raw != nil {
+		typed, ok := raw.(map[string]any)
+		if !ok {
+			return fmt.Errorf(
+				"settings.json: 'hooks' is %T, expected JSON object — refusing to overwrite; repair %s manually",
+				raw, filepath.Join(claudeHome, "settings.json"))
+		}
+		hooks = typed
+	} else {
 		hooks = map[string]any{}
 		settings["hooks"] = hooks
 	}

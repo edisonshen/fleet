@@ -88,8 +88,12 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:
         injections.append(inbox.deliver(inbox_body))
-        inbox.archive(agent_id)
-        health.update_record(agent_id, inbox_pending=False)
+        # Only clear inbox_pending on a successful archive. If the rename
+        # fails, the file persists and gets re-delivered next fire — the
+        # flag must stay set so the TUI's banner agrees with the actual
+        # state of disk.
+        if inbox.archive(agent_id):
+            health.update_record(agent_id, inbox_pending=False)
 
     handoff_inject = handoff.maybe_trigger(
         payload, agent_id=agent_id, session=session,
@@ -112,8 +116,12 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:
         injections.append(inbox.deliver(inbox_body))
-        inbox.archive(agent_id)
-        health.update_record(agent_id, inbox_pending=False)
+        # Only clear inbox_pending on a successful archive. If the rename
+        # fails, the file persists and gets re-delivered next fire — the
+        # flag must stay set so the TUI's banner agrees with the actual
+        # state of disk.
+        if inbox.archive(agent_id):
+            health.update_record(agent_id, inbox_pending=False)
 
 
 if __name__ == "__main__":

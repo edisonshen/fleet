@@ -406,6 +406,56 @@ class TestMaybeTrigger:
         assert len(queue_files) == 1
 
 
+# -- re-fire race protection (P1.4) -----------------------------------------
+
+class TestRefireProtection:
+    def test_red_refire_while_pending_is_noop(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """A Red agent that already enqueued a handoff (handoff_type set)
+        must NOT re-render on the next Stop fire — that would write a
+        second doc with a different timestamp/random suffix and orphan
+        the first one (the queue file gets clobbered to point at the
+        second doc; the first becomes garbage on disk)."""
+        _seed_record(fleet_home_tmp, "agentR1",
+                     handoff_type=handoff.TYPE_AUTO_RED)
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="agentR1", session="fleet-agentR1",
+        )
+        assert result is None
+        # Crucially, NO new doc was written for this fire.
+        docs = list((fleet_home_tmp / "handoffs").glob("agentR1-*.md"))
+        assert len(docs) == 0
+
+    def test_red_pre_marks_handoff_type_before_render(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux,
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pre-mark must land BEFORE write_doc so a re-fire racing
+        _do_handoff sees pending=True and short-circuits. Test by
+        sniffing the order of calls via monkey-patching write_doc to
+        record the record's handoff_type at the moment write_doc is
+        invoked."""
+        record_path = _seed_record(fleet_home_tmp, "agentR2")
+        observed: dict = {}
+
+        real_write_doc = handoff.write_doc
+
+        def spy_write_doc(**kwargs):
+            current = json.loads(record_path.read_text(encoding="utf-8"))
+            observed["handoff_type_at_write"] = current.get("handoff_type")
+            return real_write_doc(**kwargs)
+        monkeypatch.setattr(handoff, "write_doc", spy_write_doc)
+
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="agentR2", session="fleet-agentR2",
+        )
+        assert observed.get("handoff_type_at_write") == handoff.TYPE_AUTO_RED, \
+            "handoff_type was not pre-marked on disk before write_doc"
+
+
 # -- emergency_trigger -------------------------------------------------------
 
 class TestEmergencyTrigger:
@@ -431,6 +481,21 @@ class TestEmergencyTrigger:
         handoff.emergency_trigger({}, agent_id="missing", session="x")
         assert not (fleet_home_tmp / "handoffs").exists() or \
             list((fleet_home_tmp / "handoffs").iterdir()) == []
+
+    def test_refire_while_pending_is_noop(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """PreCompact firing twice (e.g., upstream double-fire) must
+        not write a second handoff doc — same orphan-doc concern as
+        the Red branch in maybe_trigger."""
+        _seed_record(fleet_home_tmp, "agentP1",
+                     handoff_type=handoff.TYPE_PRECOMPACT)
+        handoff.emergency_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=10_000))},
+            agent_id="agentP1", session="fleet-agentP1",
+        )
+        docs = list((fleet_home_tmp / "handoffs").glob("agentP1-*.md"))
+        assert len(docs) == 0
 
 
 # -- write_queue schema ------------------------------------------------------
