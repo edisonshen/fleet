@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fsnotify/fsnotify"
@@ -13,63 +12,82 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
-// Run starts the bubbletea program with the agents/ directory under
-// fsnotify supervision. The polling tick (model.go's tickCmd) covers
-// the case where fsnotify misbehaves; both signals trigger the same
-// agent-list reload.
+// Run launches the dashboard. After [a] attach, control returns here
+// when the operator detaches — the TUI relaunches automatically so
+// `Ctrl-b d` brings them back to the dashboard, not their shell.
+//
+// Implementation: tmux runs as a subprocess (was: syscall.Exec
+// replacement), so tui.Run can wait for it and loop back into a
+// fresh bubbletea program. The altscreen is torn down between
+// iterations, which avoids tmux fighting bubbletea for the
+// terminal — this was the original reason for syscall.Exec; the
+// subprocess approach preserves that property by running tmux only
+// AFTER prog.Run() returns.
 func Run(version string) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
+	for {
+		session, err := runOnce(version)
+		if err != nil {
+			return err
+		}
+		if session == "" {
+			return nil // user quit with [q] or ctrl+c
+		}
+		if err := runTmuxAttach(session); err != nil {
+			// Detach failure (session died mid-attach, etc.) is
+			// non-fatal — fall through to re-launch the TUI so the
+			// operator can inspect or clean up.
+			fmt.Fprintf(os.Stderr, "warning: tmux attach %s: %v\n", session, err)
+		}
+	}
+}
 
+// runOnce starts one bubbletea program iteration. Returns the tmux
+// session the operator wants to attach to, or "" if they quit.
+func runOnce(version string) (string, error) {
 	model := New(version)
 	prog := tea.NewProgram(model, tea.WithAltScreen())
 
 	// Wire fsnotify on agents/. On any event (CREATE/WRITE/REMOVE/
 	// RENAME), Send an fsEventMsg into the bubbletea event loop.
-	// The watcher goroutine runs for the program's lifetime; tea.Quit
-	// closes prog.Send's downstream so the goroutine exits when its
-	// next send blocks (or when the channel is closed by program exit).
 	stop, err := startWatcher(prog)
 	if err != nil {
-		// Non-fatal: polling fallback still works. Log to stderr via
-		// the program's message stream so it surfaces in the TUI's
-		// error line, then proceed.
-		fmt.Fprintf(os.Stderr, "warning: fsnotify unavailable, falling back to 1s polling: %v\n", err)
+		fmt.Fprintf(os.Stderr,
+			"warning: fsnotify unavailable, falling back to 1s polling: %v\n", err)
 	} else {
 		defer stop()
 	}
 
 	finalModel, err := prog.Run()
 	if err != nil {
-		return err
+		return "", err
 	}
-
-	// Post-program: if [a] was pressed, exec `tmux attach` so it
-	// replaces this process. Doing it here (after bubbletea's
-	// altscreen has been torn down) avoids the conflict between
-	// tmux's terminal control and bubbletea's render loop.
 	if m, ok := finalModel.(Model); ok {
-		if session := m.PendingAttach(); session != "" {
-			return execTmuxAttach(session)
-		}
+		return m.PendingAttach(), nil
 	}
-	return nil
+	return "", nil
 }
 
-// execTmuxAttach replaces the current process with `tmux attach -t
-// <session>`. After this returns (which only happens on error),
-// control is back in tui.Run's caller.
-func execTmuxAttach(session string) error {
+// runTmuxAttach runs `tmux attach -t <session>` as a child process
+// and returns when the operator detaches (Ctrl-b d) or the session
+// terminates. stdin/stdout/stderr are wired to fleet's terminal so
+// tmux drives the screen directly.
+func runTmuxAttach(session string) error {
 	bin, err := exec.LookPath("tmux")
 	if err != nil {
 		return fmt.Errorf("tmux not found: %w", err)
 	}
-	args := []string{"tmux", "attach", "-t", session}
+	args := []string{"attach", "-t", session}
 	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
-		args = []string{"tmux", "-S", sock, "attach", "-t", session}
+		args = append([]string{"-S", sock}, args...)
 	}
-	return syscall.Exec(bin, args, os.Environ())
+	cmd := exec.Command(bin, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // startWatcher returns a stop func and an error. On success, the

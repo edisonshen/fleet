@@ -271,14 +271,9 @@ func (m Model) View() string {
 			len(m.records))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render(footer))
-		// Detach hint sits below the keybind row because [a] attach
-		// replaces the TUI process with `tmux attach` via syscall.Exec
-		// — once tmux takes the screen there's no place for fleet to
-		// surface the detach key. Operators who don't know tmux's
-		// Ctrl-b prefix end up stuck inside the agent's session.
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(
-			"after [a] attach: Ctrl-b then d detaches back to your shell — rerun `fleet` to return here"))
+		// Detach hint lives in the spawned session's tmux status bar
+		// (see tmux.SetStatusHint), not here — by the time the
+		// operator needs it, the TUI is gone and tmux owns the screen.
 	}
 	return b.String()
 }
