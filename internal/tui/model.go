@@ -843,18 +843,21 @@ func agentProgressLine(r *agent.Record, status string) string {
 // selected row. Status-aware so we don't dangle keys that won't
 // work.
 //
-// In-flight handoff states (auto-yellow / auto-red / precompact)
-// hide BOTH [h] (already in flight) AND [x] — `fleet rm` refuses
-// while a queue journal exists (cmd/fleet/rm.go:99), and these
-// states are precisely when the journal is present. Operators can
-// still [a] attach to watch the replacement come up.
+// auto-yellow keeps [x] because the queue journal isn't written
+// until the agent reaches MILESTONE — between Yellow firing
+// "HANDOFF REQUESTED" and the journal landing on disk, `fleet rm`
+// is still a valid cleanup path (cmd/fleet/rm.go:99 only refuses
+// when the journal file exists). [h] hides because the handoff
+// is already in flight (codex iter-4 P3).
+//
+// auto-red and precompact happen after MILESTONE → journal exists
+// → `fleet rm` will refuse → hide [x].
 //
 // Dead agents keep [h] AND [x] because either could be the right
-// recovery path: if a handoff journal landed before the session
-// died, only `fleet handoff` (or `fleet drain`) resumes the
-// in-flight recovery; if no journal exists, `fleet rm` cleans up.
-// Showing both lets the operator pick — agentProgressLine surfaces
-// the same hint inline.
+// recovery path: if a journal landed before the session died, only
+// `fleet handoff` (or `fleet drain`) resumes recovery; otherwise
+// `fleet rm` cleans up. Showing both lets the operator pick —
+// agentProgressLine surfaces the same hint inline.
 func actionChipsFor(status string) []string {
 	switch status {
 	case "dead":
@@ -862,7 +865,12 @@ func actionChipsFor(status string) []string {
 			keyChip("[h]", "handoff"),
 			keyChip("[x]", "archive"),
 		}
-	case "auto-yellow", "auto-red", "precompact":
+	case "auto-yellow":
+		return []string{
+			keyChip("[a]", "attach"),
+			keyChip("[x]", "archive"),
+		}
+	case "auto-red", "precompact":
 		return []string{keyChip("[a]", "attach")}
 	}
 	return []string{
@@ -1071,14 +1079,24 @@ func defaultStr(s, def string) string {
 // (path-segment derivation, future relabeling) can't accidentally
 // reshuffle groups.
 //
-// Cwd-bearing records key on the cleaned absolute path: every agent
-// from the same checkout collapses into one group regardless of how
-// the operator typed `--cwd`. Legacy / Cwd-empty records key on
-// r.Project. Mixed legacy/current records for the same physical
-// repo can still split — that's honest, the data on disk truly
-// disagrees — but each shape stays internally consistent.
+// Cwd-bearing records key on the symlink-resolved absolute path:
+// every agent from the same checkout collapses into one group
+// regardless of how the operator typed `--cwd`. EvalSymlinks
+// matters on macOS where /var → /private/var (and any user-set
+// worktree symlinks) — without it, the same physical repo
+// addressed two ways splits into two project headers and
+// double-counts in the footer (codex iter-4 P2).
+//
+// EvalSymlinks fails when the path no longer exists (the operator
+// archived the checkout). Fall back to filepath.Clean in that case
+// so grouping degrades gracefully instead of going stringly-untyped.
+//
+// Legacy / Cwd-empty records key on r.Project.
 func projectGroupKey(r *agent.Record) string {
 	if r.Cwd != "" {
+		if resolved, err := filepath.EvalSymlinks(r.Cwd); err == nil {
+			return resolved
+		}
 		return filepath.Clean(r.Cwd)
 	}
 	return defaultStr(r.Project, "-")
@@ -1261,6 +1279,14 @@ func statusStyleFor(status string) lipgloss.Style {
 // operator-facing word shown in the STATUS column. The mockup
 // vocabulary is: doing / review / blocked / dead / handoff —
 // not the raw "live"/"waiting" internal names.
+//
+// "waiting" → "review" intentionally follows the v2 mockup: any
+// state that needs operator attention (NeedsInput, Mode==review,
+// blocked-on-question) reads as "review" at a glance. The inline
+// detail line under the selected row carries the actual mode +
+// last-activity-age so an executor that paused for input is
+// disambiguated from a literal review-mode agent (codex iter-4
+// P2: label conflation, kept by design).
 func statusLabel(status string) string {
 	switch status {
 	case "live":
