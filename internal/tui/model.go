@@ -686,13 +686,20 @@ func renderAgents(records []*agent.Record, cursor int,
 			b.WriteString("\n")
 			continue
 		}
-		// Selected: pin row + detail block under a full-width dark-blue
-		// highlight. lipgloss handles ANSI-reset reapplication so the
-		// internal fg colors survive the wrapper.
+		// Selected: pin row + detail block under a dark-blue
+		// highlight. lipgloss handles ANSI-reset reapplication so
+		// the internal fg colors survive the wrapper.
+		//
+		// width-1 leaves the same 1-cell right margin titleRow and
+		// divider use — padding to the full terminal width writes
+		// into the final column and re-triggers the phantom-newline
+		// auto-wrap that adds a stray row to the highlight, which
+		// throws off padToBottom's height accounting and slides the
+		// footer off-screen.
 		detail := renderAgentDetail(r, status)
 		block := row + "\n" + strings.TrimRight(detail, "\n")
-		if width > 0 {
-			b.WriteString(selectedRowStyle.Width(width).Render(block))
+		if width > 1 {
+			b.WriteString(selectedRowStyle.Width(width - 1).Render(block))
 		} else {
 			b.WriteString(block)
 		}
@@ -806,7 +813,7 @@ func renderAgentDetail(r *agent.Record, status string) string {
 func agentProgressLine(r *agent.Record, status string) string {
 	switch status {
 	case "dead":
-		return "session ended — press [x] to archive"
+		return "session ended — press [h] to recover or [x] to archive"
 	case "blocked":
 		if r.BlockedReason != nil && strings.TrimSpace(*r.BlockedReason) != "" {
 			return "⏸ \"" + strings.TrimSpace(*r.BlockedReason) + "\""
@@ -830,12 +837,21 @@ func agentProgressLine(r *agent.Record, status string) string {
 
 // actionChipsFor returns the inline action chips shown on the
 // selected row. Status-aware so we don't dangle keys that won't
-// work — a dead agent only offers [x] archive, and an in-flight
-// handoff hides [h] (already in flight).
+// work — an in-flight handoff hides [h] (already in flight).
+//
+// Dead agents keep [h] AND [x] because either could be the right
+// recovery path: if a handoff journal landed before the session
+// died, `fleet rm` refuses to clean up (cmd/fleet/rm.go:99) and
+// only `fleet handoff` (or `fleet drain`) resumes the in-flight
+// recovery. Showing both lets the operator pick — agentProgressLine
+// surfaces the same hint inline.
 func actionChipsFor(status string) []string {
 	switch status {
 	case "dead":
-		return []string{keyChip("[x]", "archive")}
+		return []string{
+			keyChip("[h]", "handoff"),
+			keyChip("[x]", "archive"),
+		}
 	case "auto-yellow", "auto-red", "precompact":
 		return []string{
 			keyChip("[a]", "attach"),
