@@ -42,7 +42,11 @@ Stdin is a JSON payload containing at least `transcript_path`, `session_id`, and
 
 The `payload.model` field is unreliable on `Stop` (often empty). Authoritative model name comes from the transcript walk (`message.model` on the most-recent `assistant` line), matching `spike/stop-hook.py:118-141`.
 
-Stdout (if non-empty) is treated by Claude Code as additional context for the next turn. The skill emits at most two concatenated injections per fire, in this order:
+When the Stop hook needs to inject text into the agent's next turn (operator inbox or `HANDOFF REQUESTED`), the skill emits a JSON response: `{"decision": "block", "reason": <concatenated injections>}`. Claude Code refuses to stop and treats `reason` as the next assistant-side input.
+
+Plain stdout from a Stop hook is NOT auto-injected into the conversation — verified empirically across all transcripts on disk. The original v0.1 contract assumed otherwise and shipped broken: auto-yellow agents stayed stuck because the agent never saw the injection. The JSON form is the documented mechanism.
+
+The skill emits at most two concatenated injections per fire, joined by a blank line, in this order:
 
 1. Operator inbox message — `[OPERATOR] <body>` (if `~/.fleet/inbox/<id>.md` is present).
 2. `HANDOFF REQUESTED` — Yellow-threshold prompt directing the agent to wrap with `MILESTONE` on its own line so the next turn can write a clean handoff doc.
