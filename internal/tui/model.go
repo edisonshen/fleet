@@ -600,17 +600,18 @@ func renderPicker(m Model) string {
 	return b.String()
 }
 
-// sortRecords returns a copy sorted by (project asc, spawned desc) so
-// agents cluster under their project group header in the v2 layout.
-// Within a group, newest-first matches `fleet status` (and matches
-// the v1 behavior — for repos with one project, this is equivalent).
+// sortRecords returns a copy sorted by (group-key asc, spawned desc)
+// so agents cluster under their project group header in the v2
+// layout. Sort key uses projectGroupKey (cwd-derived) so display
+// changes don't reshuffle order. Within a group, newest-first
+// matches `fleet status`.
 func sortRecords(in []*agent.Record) []*agent.Record {
 	out := make([]*agent.Record, len(in))
 	copy(out, in)
 	sort.SliceStable(out, func(i, j int) bool {
-		pi, pj := projectDisplay(out[i]), projectDisplay(out[j])
-		if pi != pj {
-			return pi < pj
+		ki, kj := projectGroupKey(out[i]), projectGroupKey(out[j])
+		if ki != kj {
+			return ki < kj
 		}
 		return out[i].SpawnedAt.After(out[j].SpawnedAt)
 	})
@@ -648,16 +649,19 @@ func renderAgents(records []*agent.Record, cursor int,
 	}
 
 	// Group counts so the header can show "(N tasks, M active)".
+	// Counts key on projectGroupKey (cwd path / Project tag) so
+	// display-only differences don't fragment a group; the header
+	// label still uses projectDisplay for the human-readable form.
 	// active = records whose status isn't "dead" — matches the v2
 	// mockup's read of "active = an agent is currently working it".
 	type groupCounts struct{ total, active int }
 	counts := map[string]*groupCounts{}
 	for _, r := range records {
-		proj := projectDisplay(r)
-		gc := counts[proj]
+		key := projectGroupKey(r)
+		gc := counts[key]
 		if gc == nil {
 			gc = &groupCounts{}
-			counts[proj] = gc
+			counts[key] = gc
 		}
 		gc.total++
 		if deriveStatus(r, alive) != "dead" {
@@ -666,16 +670,16 @@ func renderAgents(records []*agent.Record, cursor int,
 	}
 
 	var b strings.Builder
-	lastProject := ""
+	lastKey := ""
 	for i, r := range records {
-		proj := projectDisplay(r)
-		if proj != lastProject {
-			if lastProject != "" {
+		key := projectGroupKey(r)
+		if key != lastKey {
+			if lastKey != "" {
 				b.WriteString("\n") // blank line between groups
 			}
-			gc := counts[proj]
-			b.WriteString(renderProjectHeader(proj, gc.total, gc.active))
-			lastProject = proj
+			gc := counts[key]
+			b.WriteString(renderProjectHeader(projectDisplay(r), gc.total, gc.active))
+			lastKey = key
 		}
 
 		status := deriveStatus(r, alive)
@@ -837,14 +841,20 @@ func agentProgressLine(r *agent.Record, status string) string {
 
 // actionChipsFor returns the inline action chips shown on the
 // selected row. Status-aware so we don't dangle keys that won't
-// work — an in-flight handoff hides [h] (already in flight).
+// work.
+//
+// In-flight handoff states (auto-yellow / auto-red / precompact)
+// hide BOTH [h] (already in flight) AND [x] — `fleet rm` refuses
+// while a queue journal exists (cmd/fleet/rm.go:99), and these
+// states are precisely when the journal is present. Operators can
+// still [a] attach to watch the replacement come up.
 //
 // Dead agents keep [h] AND [x] because either could be the right
 // recovery path: if a handoff journal landed before the session
-// died, `fleet rm` refuses to clean up (cmd/fleet/rm.go:99) and
-// only `fleet handoff` (or `fleet drain`) resumes the in-flight
-// recovery. Showing both lets the operator pick — agentProgressLine
-// surfaces the same hint inline.
+// died, only `fleet handoff` (or `fleet drain`) resumes the
+// in-flight recovery; if no journal exists, `fleet rm` cleans up.
+// Showing both lets the operator pick — agentProgressLine surfaces
+// the same hint inline.
 func actionChipsFor(status string) []string {
 	switch status {
 	case "dead":
@@ -853,10 +863,7 @@ func actionChipsFor(status string) []string {
 			keyChip("[x]", "archive"),
 		}
 	case "auto-yellow", "auto-red", "precompact":
-		return []string{
-			keyChip("[a]", "attach"),
-			keyChip("[x]", "archive"),
-		}
+		return []string{keyChip("[a]", "attach")}
 	}
 	return []string{
 		keyChip("[a]", "attach"),
@@ -915,14 +922,15 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	return strings.Join(parts, "   ") + "\n"
 }
 
-// footerSummary builds the one-line "N agents · M blocked" summary
-// shown above the global chip row. Skips zero-counts so the line
-// stays scannable.
+// footerSummary builds the one-line "N projects · M agents · K blocked"
+// summary shown above the global chip row. Project count keys on
+// projectGroupKey so display tweaks don't change the count, matching
+// the renderAgents grouping.
 func footerSummary(records []*agent.Record, alive map[string]bool) string {
 	projects := map[string]struct{}{}
 	var blocked, dead int
 	for _, r := range records {
-		projects[projectDisplay(r)] = struct{}{}
+		projects[projectGroupKey(r)] = struct{}{}
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
@@ -1056,6 +1064,24 @@ func defaultStr(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// projectGroupKey returns the stable identity used for sorting +
+// grouping records. Decoupled from projectDisplay so display tweaks
+// (path-segment derivation, future relabeling) can't accidentally
+// reshuffle groups.
+//
+// Cwd-bearing records key on the cleaned absolute path: every agent
+// from the same checkout collapses into one group regardless of how
+// the operator typed `--cwd`. Legacy / Cwd-empty records key on
+// r.Project. Mixed legacy/current records for the same physical
+// repo can still split — that's honest, the data on disk truly
+// disagrees — but each shape stays internally consistent.
+func projectGroupKey(r *agent.Record) string {
+	if r.Cwd != "" {
+		return filepath.Clean(r.Cwd)
+	}
+	return defaultStr(r.Project, "-")
 }
 
 // projectDisplay derives the human-readable project label for the
