@@ -58,9 +58,13 @@ func runRm(opts *rmOpts, stdout, stderr io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
-	if err := tmux.Available(); err != nil {
-		return err
-	}
+	// Intentionally NO tmux.Available() check here. The dead-session
+	// cleanup path doesn't need tmux at all (HasSession returns false
+	// when tmux is missing, so the kill block is skipped and archive
+	// proceeds). Likewise, "no agent record" for a typo'd id should
+	// surface a clear error, not a tmux-setup error. Live-session
+	// kills are gated on HasSession below — if tmux is genuinely
+	// broken, that path returns an error with context.
 
 	release, err := state.LockAgent(opts.id)
 	if err != nil {
@@ -89,11 +93,15 @@ func runRm(opts *rmOpts, stdout, stderr io.Writer) error {
 			opts.id, pendingPath)
 	}
 
-	// Kill the session. tmux.Kill is idempotent — returns nil if the
-	// session is already gone. If Kill fails AND the session is still
-	// alive, refuse to archive: that would hide a live agent from
-	// `fleet status` while leaving a phantom tmux session running.
-	if rec.TmuxSession != "" {
+	// Kill the session if it's alive. tmux.HasSession returns false
+	// for both "session is gone" AND "tmux not installed" — both
+	// outcomes mean we have nothing to kill, so the archive path
+	// proceeds without needing tmux at all (this is what makes
+	// dead-session cleanup work without requiring tmux on PATH).
+	// If Kill fails AND the session is still alive, refuse to archive:
+	// that would hide a live agent from `fleet status` while leaving
+	// a phantom tmux session running.
+	if rec.TmuxSession != "" && tmux.HasSession(rec.TmuxSession) {
 		if err := tmux.Kill(rec.TmuxSession); err != nil {
 			if tmux.HasSession(rec.TmuxSession) {
 				return fmt.Errorf(

@@ -62,6 +62,13 @@ type Model struct {
 	// the prompt resolves either way.
 	archiveCandidate string
 
+	// aliveByID is the cached tmux liveness snapshot from the most
+	// recent agentsMsg. Populated off the render path by
+	// loadAgentsCmd; deriveStatus reads from it. Nil/empty means no
+	// load has completed yet — deriveStatus treats that as "no
+	// evidence of dead", not "definitely dead".
+	aliveByID map[string]bool
+
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
 	// program exits. Process replacement only works post-program — a
@@ -87,9 +94,16 @@ func (m Model) Init() tea.Cmd {
 
 // agentsMsg carries a refreshed list of agent records (or an error)
 // from the loader goroutine.
+//
+// alive snapshots tmux session liveness for each loaded record at
+// load time. Probing once per refresh — instead of once per row per
+// View() repaint — avoids fanning out to N `tmux has-session`
+// subprocesses on every cursor move or 1s tick. deriveStatus reads
+// from this cache.
 type agentsMsg struct {
 	records []*agent.Record
 	err     error
+	alive   map[string]bool
 }
 
 // tickMsg fires every pollInterval so we can re-read agents/ even when
@@ -114,11 +128,20 @@ func tickCmd() tea.Cmd {
 }
 
 // loadAgentsCmd reads ~/.fleet/agents/*.json once and returns the
-// result as an agentsMsg.
+// result as an agentsMsg. Probes tmux liveness for each loaded
+// record here (off the render path) so deriveStatus can read from
+// the cached map instead of forking `tmux has-session` per row on
+// every repaint.
 func loadAgentsCmd() tea.Cmd {
 	return func() tea.Msg {
 		records, err := agent.List()
-		return agentsMsg{records: records, err: err}
+		alive := make(map[string]bool, len(records))
+		for _, r := range records {
+			if r.TmuxSession != "" {
+				alive[r.ID] = sessionAliveFn(r.TmuxSession)
+			}
+		}
+		return agentsMsg{records: records, err: err, alive: alive}
 	}
 }
 
@@ -136,6 +159,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentsMsg:
 		m.err = msg.err
 		m.records = sortRecords(msg.records)
+		m.aliveByID = msg.alive
 		// Keep the cursor in bounds when the list shrinks.
 		if m.cursor >= len(m.records) {
 			m.cursor = max(0, len(m.records)-1)
@@ -255,7 +279,7 @@ func (m Model) View() string {
 		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
-		b.WriteString(renderTable(m.records, m.cursor))
+		b.WriteString(renderTable(m.records, m.cursor, m.aliveByID))
 	}
 
 	if m.flash != nil {
@@ -385,8 +409,9 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 // renderTable produces the tabular agent list with the cursor row
 // highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  STATUS.
 //
-// STATUS is derived per-row from the agent record + a tmux liveness
-// probe (sessionAliveFn) — see deriveStatus for precedence.
+// alive is the cached tmux liveness snapshot from the most recent
+// load. deriveStatus reads from it instead of probing tmux per-row,
+// so render is pure formatting (no subprocess fan-out, no I/O).
 //
 // Per-cell styling: the AGENT cell on the cursor row picks up
 // cursorStyle (bold blue) so the operator's eye lands on the selected
@@ -394,7 +419,7 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 // statusStyleFor. Padding is applied to plain text first so column
 // widths line up; style.Render adds zero-width ANSI escapes that
 // don't disturb the math.
-func renderTable(records []*agent.Record, cursor int) string {
+func renderTable(records []*agent.Record, cursor int, alive map[string]bool) string {
 	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"}
 	const statusCol = 5
 	rows := make([][]string, 0, len(records))
@@ -405,7 +430,7 @@ func renderTable(records []*agent.Record, cursor int) string {
 			defaultStr(r.TaskID, "-"),
 			defaultStr(r.Mode, "-"),
 			humanAge(time.Since(r.SpawnedAt)),
-			deriveStatus(r),
+			deriveStatus(r, alive),
 		})
 	}
 	widths := columnWidths(header, rows)
@@ -538,9 +563,18 @@ func projectDisplay(r *agent.Record) string {
 // blocked / waiting because the agent is being retired regardless of
 // what it was doing. blocked wins over waiting because a hard block
 // is more urgent for the operator to see than ambient idle.
-func deriveStatus(r *agent.Record) string {
-	if r.TmuxSession != "" && !sessionAliveFn(r.TmuxSession) {
-		return "dead"
+//
+// alive is the cached liveness snapshot from the most recent
+// loadAgentsCmd. Reading from cache (instead of probing tmux here)
+// keeps subprocess fan-out off the render path. A nil/missing entry
+// conservatively reads as "live" rather than "dead" so a not-yet-
+// probed record never falsely paints as dead before the first
+// agentsMsg lands.
+func deriveStatus(r *agent.Record, alive map[string]bool) string {
+	if r.TmuxSession != "" {
+		if probed, ok := alive[r.ID]; ok && !probed {
+			return "dead"
+		}
 	}
 	if r.HandoffType != nil {
 		switch *r.HandoffType {

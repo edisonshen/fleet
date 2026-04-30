@@ -273,107 +273,134 @@ func TestView_RendersAgentTable(t *testing.T) {
 }
 
 func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
-	// Records with no TmuxSession skip the dead-check (deriveStatus
-	// falls through). Records with a session set drive the stub via
-	// sessionAliveFn so we don't shell out to tmux.
+	// alive is the cached liveness map keyed by agent ID.
+	// alive[id]=true → probed alive; alive[id]=false → probed dead;
+	// missing entry → conservatively treated as live (no probe yet).
+	const id = "x"
 	const sess = "fleet-x"
+	aliveTrue := map[string]bool{id: true}
+	aliveFalse := map[string]bool{id: false}
 	manualType := "manual"
 	autoYellow := "auto-yellow"
 	autoRed := "auto-red"
 	precompact := "precompact"
 
 	cases := []struct {
-		name string
-		rec  *agent.Record
-		dead map[string]bool
-		want string
+		name  string
+		rec   *agent.Record
+		alive map[string]bool
+		want  string
 	}{
 		{
 			name: "dead session beats every other state",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				Blocked:     true,
 				NeedsInput:  true,
 				HandoffType: &autoYellow,
 			},
-			dead: map[string]bool{sess: true},
-			want: "dead",
+			alive: aliveFalse,
+			want:  "dead",
 		},
 		{
 			name: "auto-yellow handoff beats blocked + waiting",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				Blocked:     true,
 				NeedsInput:  true,
 				HandoffType: &autoYellow,
 			},
-			want: "auto-yellow",
+			alive: aliveTrue,
+			want:  "auto-yellow",
 		},
 		{
 			name: "auto-red surfaces as in-flight handoff",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				HandoffType: &autoRed,
 			},
-			want: "auto-red",
+			alive: aliveTrue,
+			want:  "auto-red",
 		},
 		{
 			name: "precompact surfaces as in-flight handoff",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				HandoffType: &precompact,
 			},
-			want: "precompact",
+			alive: aliveTrue,
+			want:  "precompact",
 		},
 		{
 			name: "manual handoff_type is provenance, not status — falls through to waiting",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				NeedsInput:  true,
 				HandoffType: &manualType,
 			},
-			want: "waiting",
+			alive: aliveTrue,
+			want:  "waiting",
 		},
 		{
 			name: "manual handoff_type with no other flags falls through to live",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				HandoffType: &manualType,
 			},
-			want: "live",
+			alive: aliveTrue,
+			want:  "live",
 		},
 		{
 			name: "blocked beats waiting",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				Blocked:     true,
 				NeedsInput:  true,
 			},
-			want: "blocked",
+			alive: aliveTrue,
+			want:  "blocked",
 		},
 		{
 			name: "waiting when only needs_input set",
 			rec: &agent.Record{
+				ID:          id,
 				TmuxSession: sess,
 				NeedsInput:  true,
 			},
-			want: "waiting",
+			alive: aliveTrue,
+			want:  "waiting",
 		},
 		{
-			name: "live by default",
-			rec:  &agent.Record{TmuxSession: sess},
-			want: "live",
+			name:  "live by default",
+			rec:   &agent.Record{ID: id, TmuxSession: sess},
+			alive: aliveTrue,
+			want:  "live",
 		},
 		{
 			name: "empty TmuxSession skips dead-check (legacy / pre-spawn rec)",
-			rec:  &agent.Record{NeedsInput: true},
+			rec:  &agent.Record{ID: id, NeedsInput: true},
 			want: "waiting",
+		},
+		{
+			name: "missing alive entry conservatively reads as live (no probe yet)",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+			},
+			alive: nil,
+			want:  "live",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			(&stubSessionAlive{dead: tc.dead}).install(t)
-			if got := deriveStatus(tc.rec); got != tc.want {
+			if got := deriveStatus(tc.rec, tc.alive); got != tc.want {
 				t.Errorf("deriveStatus = %q, want %q", got, tc.want)
 			}
 		})
