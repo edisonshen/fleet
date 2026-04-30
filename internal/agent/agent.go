@@ -73,8 +73,17 @@ type Record struct {
 	// custom engine/wrapper the operator chose (e.g., a wrapped
 	// claude binary). Empty for legacy records — handoff falls back
 	// to its --command flag.
-	Command   []string  `json:"command,omitempty"`
-	SpawnedAt time.Time `json:"spawned_at"`
+	Command []string `json:"command,omitempty"`
+	// DisableAutoResume opts the agent out of fleet's handoff
+	// auto-resume — the resume prompt typed into a freshly spawned
+	// replacement after handoff. Default false (auto-resume ON) for
+	// claude code's natural-language UI; operators set true via
+	// `fleet dispatch --no-auto-resume` for custom wrappers (shells,
+	// REPLs, vim, alternate engines) where typing
+	// "Read your handoff doc..." would execute as garbage input.
+	// Inherited unchanged across handoffs (codex review iter-7 P2).
+	DisableAutoResume bool      `json:"disable_auto_resume,omitempty"`
+	SpawnedAt         time.Time `json:"spawned_at"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random

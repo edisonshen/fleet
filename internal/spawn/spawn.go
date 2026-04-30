@@ -18,38 +18,12 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
-
-// SupportsAutoResume returns true if the spawned argv looks like
-// it's running claude code (by finding "claude" in any arg). The
-// auto-resume prompt is claude-shaped natural language ("Read your
-// handoff doc..."); typing it into a shell, REPL, vim, codex CLI,
-// or other non-claude wrapper would execute garbage or wedge the
-// session (codex review iter-6 P1).
-//
-// The check is intentionally permissive: any arg containing "claude"
-// counts. Catches the default `sh -c 'claude --dangerously-skip-...'`
-// wrapper, custom claude invocations, and aliases. Operators running
-// a non-claude command get auto-resume skipped silently and can
-// type their own first prompt on attach.
-//
-// v1 heuristic — a future iteration may add an explicit
-// --no-auto-resume / --auto-resume flag on dispatch + handoff if
-// users want finer control.
-func SupportsAutoResume(command []string) bool {
-	for _, arg := range command {
-		if strings.Contains(arg, "claude") {
-			return true
-		}
-	}
-	return false
-}
 
 // SendInitialPrompt timing knobs. Production needs to ride out
 // claude code's startup animation (logo + spinner before the input
@@ -219,6 +193,13 @@ type Options struct {
 	// and journal-write. Empty (the dispatch path) means generate
 	// a fresh ID inside Spawn.
 	PreAllocatedID string
+
+	// DisableAutoResume opts the agent out of fleet's handoff
+	// auto-resume on FRESH dispatch only. When OldRecord is non-nil
+	// (handoff path), the value is inherited from OldRecord and
+	// this field is ignored — auto-resume policy is set once at
+	// first dispatch and follows the agent forever.
+	DisableAutoResume bool
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -300,6 +281,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 		if opts.OldRecord.Mode != "" {
 			rec.Mode = opts.OldRecord.Mode
 		}
+		// Auto-resume policy is sticky across handoffs: the operator
+		// chose it at first dispatch, the same policy must apply to
+		// every replacement. opts.DisableAutoResume is ignored in the
+		// handoff path.
+		rec.DisableAutoResume = opts.OldRecord.DisableAutoResume
 		// Chain: handoff_number = old + 1, prev_path = doc just written.
 		rec.HandoffNumber = opts.OldRecord.HandoffNumber + 1
 		if opts.NewDocPath != "" {
@@ -311,6 +297,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	} else {
 		rec.TaskID = opts.TaskID
 		rec.Project = opts.Project
+		rec.DisableAutoResume = opts.DisableAutoResume
 	}
 
 	// Pass the canonicalized cwd (not opts.Cwd) so the tmux session

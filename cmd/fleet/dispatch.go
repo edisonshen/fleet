@@ -14,10 +14,11 @@ import (
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
 type dispatchOpts struct {
-	taskID  string
-	project string
-	cwd     string
-	command []string
+	taskID       string
+	project      string
+	cwd          string
+	command      []string
+	noAutoResume bool
 }
 
 func newDispatchCmd() *cobra.Command {
@@ -62,6 +63,13 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	cmd.Flags().StringSliceVar(&opts.command, "command",
 		[]string{"sh", "-c", `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`},
 		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
+	// Auto-resume types "Read your handoff doc at <path> and continue"
+	// into the replacement on handoff. Disable for custom --command
+	// argvs running shells / REPLs / non-claude engines where the
+	// natural-language prompt would execute as garbage input
+	// (codex review iter-7 P2). Inherited across handoffs.
+	cmd.Flags().BoolVar(&opts.noAutoResume, "no-auto-resume", false,
+		"skip auto-typing the resume prompt on handoff (use for non-claude --command argvs)")
 	return cmd
 }
 
@@ -81,10 +89,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 
 	rec, err := spawn.Spawn(spawn.Options{
-		TaskID:  opts.taskID,
-		Project: opts.project,
-		Cwd:     opts.cwd,
-		Command: opts.command,
+		TaskID:            opts.taskID,
+		Project:           opts.project,
+		Cwd:               opts.cwd,
+		Command:           opts.command,
+		DisableAutoResume: opts.noAutoResume,
 	})
 	if err != nil {
 		return err

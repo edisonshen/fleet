@@ -242,11 +242,14 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			oldRec.TmuxSession, err)
 	}
 
-	// Auto-resume only fires for claude-flavored wrappers — a shell,
-	// vim, or non-claude REPL would execute the natural-language
-	// prompt as garbage input (codex review iter-6 P1). Custom
-	// commands without "claude" in argv get auto-resume skipped.
-	autoResume := spawn.SupportsAutoResume(newRec.Command)
+	// Auto-resume is skipped when the operator dispatched with
+	// --no-auto-resume — typically for custom --command argvs
+	// (shells, vim, REPLs, alternate engines) where typing the
+	// natural-language prompt would execute as garbage input.
+	// Inherited from oldRec → newRec at spawn time, so this
+	// reflects the policy chosen at first dispatch (codex review
+	// iter-7 P2).
+	autoResume := !newRec.DisableAutoResume
 
 	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
 	// so a crash during the wait stays recoverable. The actual

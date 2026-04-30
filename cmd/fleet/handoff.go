@@ -409,10 +409,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
-	// 11b. Auto-resume only fires for claude-flavored wrappers — a
-	//      shell, vim, or non-claude REPL would treat the natural-
-	//      language prompt as garbage input (codex review iter-6 P1).
-	autoResume := spawn.SupportsAutoResume(newRec.Command)
+	// 11b. Auto-resume is skipped when the operator dispatched with
+	//      --no-auto-resume — typically for custom --command argvs
+	//      (shells, vim, REPLs, alternate engines). Inherited from
+	//      oldRec at spawn time so the policy follows the agent
+	//      across handoffs (codex review iter-7 P2).
+	autoResume := !newRec.DisableAutoResume
 
 	// 11c. Wait for the new agent's pane to stabilize BEFORE
 	//      queue.Delete so a crash during the wait stays
@@ -492,6 +494,14 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
+	if !autoResume {
+		// Auto-resume was disabled at dispatch — the replacement is
+		// alive but idle. Tell the operator what to type once they
+		// attach so the new agent picks up where the old left off
+		// (codex review iter-7 P2).
+		_, _ = fmt.Fprintf(stdout,
+			"then say: read the handoff doc at %s and continue\n", docPath)
+	}
 	return nil
 }
 
@@ -531,9 +541,10 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			oldRec.TmuxSession, err)
 	}
 
-	// Auto-resume only fires for claude-flavored wrappers (codex
-	// review iter-6 P1). Custom commands skip the prompt path.
-	autoResume := spawn.SupportsAutoResume(newRec.Command)
+	// Auto-resume opt-out follows the agent's persisted policy —
+	// chosen at first dispatch via --no-auto-resume (codex review
+	// iter-7 P2).
+	autoResume := !newRec.DisableAutoResume
 
 	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
 	// so a crash during the wait stays recoverable. Re-check
@@ -588,5 +599,9 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", newRec.TmuxSession)
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
+	if !autoResume {
+		_, _ = fmt.Fprintf(stdout,
+			"then say: read the handoff doc at %s and continue\n", docPath)
+	}
 	return nil
 }
