@@ -344,9 +344,12 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 }
 
 // renderTable produces the tabular agent list with the cursor row
-// highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  BLOCKED.
+// highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  STATUS.
+//
+// STATUS is derived per-row from the agent record + a tmux liveness
+// probe (sessionAliveFn) — see deriveStatus for precedence.
 func renderTable(records []*agent.Record, cursor int) string {
-	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "BLOCKED"}
+	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"}
 	rows := make([][]string, 0, len(records))
 	for _, r := range records {
 		rows = append(rows, []string{
@@ -355,7 +358,7 @@ func renderTable(records []*agent.Record, cursor int) string {
 			defaultStr(r.TaskID, "-"),
 			defaultStr(r.Mode, "-"),
 			humanAge(time.Since(r.SpawnedAt)),
-			boolStr(r.Blocked),
+			deriveStatus(r),
 		})
 	}
 	widths := columnWidths(header, rows)
@@ -419,11 +422,36 @@ func defaultStr(s, def string) string {
 	return s
 }
 
-func boolStr(b bool) string {
-	if b {
-		return "yes"
+// deriveStatus picks one short label that summarizes the agent's
+// current condition for the STATUS column. Precedence (most-urgent
+// first):
+//
+//  1. dead         — tmux session is gone (claude exited inside it)
+//  2. <handoff>    — handoff_type non-nil: auto-yellow / auto-red /
+//     precompact / manual (handoff in flight)
+//  3. blocked      — fleet-guard / operator flagged the agent blocked
+//  4. waiting      — needs_input=true (Stop fired, awaiting operator)
+//  5. live         — fresh spawn or actively-running turn
+//
+// dead wins over everything because the other states are meaningless
+// when the underlying process is gone. Handoff wins over blocked /
+// waiting because the agent is being retired regardless of what it
+// was doing. blocked wins over waiting because a hard block is more
+// urgent for the operator to see than ambient idle.
+func deriveStatus(r *agent.Record) string {
+	if r.TmuxSession != "" && !sessionAliveFn(r.TmuxSession) {
+		return "dead"
 	}
-	return "no"
+	if r.HandoffType != nil && *r.HandoffType != "" {
+		return *r.HandoffType
+	}
+	if r.Blocked {
+		return "blocked"
+	}
+	if r.NeedsInput {
+		return "waiting"
+	}
+	return "live"
 }
 
 // humanAge — same shape as cmd/fleet/status.go. Duplicated here rather

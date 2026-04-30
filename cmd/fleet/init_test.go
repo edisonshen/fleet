@@ -223,10 +223,11 @@ func TestRunInit_PreservesExistingHooks(t *testing.T) {
 	}
 }
 
-// TestRunInit_RegistersAllThreeHookEvents — Stop / PreCompact / SessionStart
-// all need entries pointing at main.py. A regression that registered only
-// Stop would silently disable the inbox-on-resume path.
-func TestRunInit_RegistersAllThreeHookEvents(t *testing.T) {
+// TestRunInit_RegistersAllHookEvents — every entry in hookEvents
+// needs a settings.json registration pointing at main.py. A regression
+// that dropped one would silently break that hook's behavior (e.g.
+// missing UserPromptSubmit leaves needs_input stuck at true).
+func TestRunInit_RegistersAllHookEvents(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
@@ -244,7 +245,7 @@ func TestRunInit_RegistersAllThreeHookEvents(t *testing.T) {
 	if !ok {
 		t.Fatal("hooks map missing")
 	}
-	for _, ev := range []string{"Stop", "PreCompact", "SessionStart"} {
+	for _, ev := range []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmit"} {
 		arr, ok := hooks[ev].([]any)
 		if !ok || len(arr) == 0 {
 			t.Errorf("hook event %q missing or empty", ev)

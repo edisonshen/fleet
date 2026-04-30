@@ -59,6 +59,8 @@ def main(stdin: TextIO | None = None) -> int:
             _on_precompact(payload, agent_id, session)
         elif hook_name == "SessionStart":
             _on_session_start(agent_id, injections)
+        elif hook_name == "UserPromptSubmit":
+            _on_user_prompt_submit(agent_id)
         # Any other hook event: silent no-op. Future hooks land here without
         # changes to this dispatch table.
     except Exception as exc:
@@ -79,10 +81,15 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     sees operator context BEFORE deciding whether to wrap with MILESTONE.
     """
     pct, _model = health.read_context_pct(payload)
+    # Set needs_input=true: claude has finished a turn and is now waiting
+    # for the operator to type something. UserPromptSubmit clears it on the
+    # next operator turn. The TUI uses this to show a "waiting" badge so
+    # the operator can spot which agent is blocked on them at a glance.
     health.update_record(
         agent_id,
         context_pct=pct,
         context_source="hook",
+        needs_input=True,
     )
 
     inbox_body = inbox.read_pending(agent_id)
@@ -107,6 +114,17 @@ def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     by Claude Code on this hook — the compaction is already in motion —
     so emergency_trigger only writes the doc + queue."""
     handoff.emergency_trigger(payload, agent_id=agent_id, session=session)
+
+
+def _on_user_prompt_submit(agent_id: str) -> None:
+    """UserPromptSubmit fires when the operator submits a prompt to the
+    agent. That is the moment claude transitions from waiting → working,
+    so clear needs_input. Pairs with Stop, which sets needs_input=true.
+
+    Stdout is ignored by Claude Code on this hook (the prompt is already
+    being processed); we touch only the agent record.
+    """
+    health.update_record(agent_id, needs_input=False)
 
 
 def _on_session_start(agent_id: str, injections: list[str]) -> None:

@@ -259,7 +259,7 @@ func TestView_RendersAgentTable(t *testing.T) {
 	m.records = sortRecords(fakeRecords(2))
 	out := m.View()
 
-	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "BLOCKED"} {
+	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("view missing column header %q, got:\n%s", want, out)
 		}
@@ -269,6 +269,79 @@ func TestView_RendersAgentTable(t *testing.T) {
 	}
 	if !strings.Contains(out, "2 agent(s)") {
 		t.Errorf("footer should report agent count, got:\n%s", out)
+	}
+}
+
+func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
+	// Records with no TmuxSession skip the dead-check (deriveStatus
+	// falls through). Records with a session set drive the stub via
+	// sessionAliveFn so we don't shell out to tmux.
+	const sess = "fleet-x"
+	manualType := "manual"
+	autoYellow := "auto-yellow"
+
+	cases := []struct {
+		name string
+		rec  *agent.Record
+		dead map[string]bool
+		want string
+	}{
+		{
+			name: "dead session beats every other state",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+				HandoffType: &autoYellow,
+			},
+			dead: map[string]bool{sess: true},
+			want: "dead",
+		},
+		{
+			name: "handoff_type beats blocked + waiting on a live session",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+				HandoffType: &manualType,
+			},
+			want: "manual",
+		},
+		{
+			name: "blocked beats waiting",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+			},
+			want: "blocked",
+		},
+		{
+			name: "waiting when only needs_input set",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				NeedsInput:  true,
+			},
+			want: "waiting",
+		},
+		{
+			name: "live by default",
+			rec:  &agent.Record{TmuxSession: sess},
+			want: "live",
+		},
+		{
+			name: "empty TmuxSession skips dead-check (legacy / pre-spawn rec)",
+			rec:  &agent.Record{NeedsInput: true},
+			want: "waiting",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			(&stubSessionAlive{dead: tc.dead}).install(t)
+			if got := deriveStatus(tc.rec); got != tc.want {
+				t.Errorf("deriveStatus = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

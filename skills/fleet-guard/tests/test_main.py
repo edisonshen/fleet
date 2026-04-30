@@ -285,6 +285,40 @@ class TestSessionStartHook:
         assert out == ""
 
 
+# -- needs_input wiring (Stop sets, UserPromptSubmit clears) ---------------
+
+class TestNeedsInputFlag:
+    def test_stop_sets_needs_input_true(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Fresh records start needs_input=false; Stop must flip it true
+        # so the TUI can render "waiting" while claude is between turns.
+        record_path = _seed_record(fleet_home_tmp, needs_input=False)
+        rc, _, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is True
+
+    def test_user_prompt_submit_clears_needs_input(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Seed record in the post-Stop state (waiting); UserPromptSubmit
+        # is the moment claude transitions waiting → working, so the
+        # flag must drop to false so the TUI stops rendering "waiting".
+        record_path = _seed_record(fleet_home_tmp, needs_input=True)
+        rc, out, _ = _run({"hook_event_name": "UserPromptSubmit"}, capsys)
+        assert rc == 0
+        # Stdout is ignored by Claude Code on this hook — keep it empty
+        # so we don't accidentally inject into the operator's prompt.
+        assert out == ""
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is False
+
+
 # -- never-block-the-host ---------------------------------------------------
 
 class TestNeverBlocks:

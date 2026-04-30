@@ -17,8 +17,10 @@ import (
 
 // hookEvents are the Claude Code hook event names fleet-guard listens on.
 // Order is fixed for deterministic settings.json output and matches
-// SKILL.md's Hook bindings table.
-var hookEvents = []string{"Stop", "PreCompact", "SessionStart"}
+// SKILL.md's Hook bindings table. UserPromptSubmit was added alongside
+// the needs_input flag so the TUI can surface "waiting on operator" —
+// without that hook the flag would set true on Stop and never clear.
+var hookEvents = []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmit"}
 
 func newInitCmd() *cobra.Command {
 	var force bool
