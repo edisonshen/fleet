@@ -279,6 +279,8 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 	const sess = "fleet-x"
 	manualType := "manual"
 	autoYellow := "auto-yellow"
+	autoRed := "auto-red"
+	precompact := "precompact"
 
 	cases := []struct {
 		name string
@@ -298,14 +300,47 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 			want: "dead",
 		},
 		{
-			name: "handoff_type beats blocked + waiting on a live session",
+			name: "auto-yellow handoff beats blocked + waiting",
 			rec: &agent.Record{
 				TmuxSession: sess,
 				Blocked:     true,
 				NeedsInput:  true,
+				HandoffType: &autoYellow,
+			},
+			want: "auto-yellow",
+		},
+		{
+			name: "auto-red surfaces as in-flight handoff",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				HandoffType: &autoRed,
+			},
+			want: "auto-red",
+		},
+		{
+			name: "precompact surfaces as in-flight handoff",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				HandoffType: &precompact,
+			},
+			want: "precompact",
+		},
+		{
+			name: "manual handoff_type is provenance, not status — falls through to waiting",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				NeedsInput:  true,
 				HandoffType: &manualType,
 			},
-			want: "manual",
+			want: "waiting",
+		},
+		{
+			name: "manual handoff_type with no other flags falls through to live",
+			rec: &agent.Record{
+				TmuxSession: sess,
+				HandoffType: &manualType,
+			},
+			want: "live",
 		},
 		{
 			name: "blocked beats waiting",

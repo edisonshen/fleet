@@ -443,23 +443,32 @@ func defaultStr(s, def string) string {
 // first):
 //
 //  1. dead         — tmux session is gone (claude exited inside it)
-//  2. <handoff>    — handoff_type non-nil: auto-yellow / auto-red /
-//     precompact / manual (handoff in flight)
+//  2. <handoff>    — handoff_type set to an in-flight value
+//     (auto-yellow / auto-red / precompact). "manual"
+//     is a spawn-origin label set by spawn.Spawn on
+//     every successor and is NOT surfaced — it would
+//     pin "manual" on every post-handoff agent forever
+//     (skills/fleet-guard/handoff.py:113-119).
 //  3. blocked      — fleet-guard / operator flagged the agent blocked
 //  4. waiting      — needs_input=true (Stop fired, awaiting operator)
 //  5. live         — fresh spawn or actively-running turn
 //
 // dead wins over everything because the other states are meaningless
-// when the underlying process is gone. Handoff wins over blocked /
-// waiting because the agent is being retired regardless of what it
-// was doing. blocked wins over waiting because a hard block is more
-// urgent for the operator to see than ambient idle.
+// when the underlying process is gone. In-flight handoff wins over
+// blocked / waiting because the agent is being retired regardless of
+// what it was doing. blocked wins over waiting because a hard block
+// is more urgent for the operator to see than ambient idle.
 func deriveStatus(r *agent.Record) string {
 	if r.TmuxSession != "" && !sessionAliveFn(r.TmuxSession) {
 		return "dead"
 	}
-	if r.HandoffType != nil && *r.HandoffType != "" {
-		return *r.HandoffType
+	if r.HandoffType != nil {
+		switch *r.HandoffType {
+		case "auto-yellow", "auto-red", "precompact":
+			return *r.HandoffType
+		}
+		// "manual" and unknown values fall through — they are not
+		// in-flight indicators.
 	}
 	if r.Blocked {
 		return "blocked"

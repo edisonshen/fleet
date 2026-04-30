@@ -130,7 +130,16 @@ def _on_user_prompt_submit(agent_id: str) -> None:
 def _on_session_start(agent_id: str, injections: list[str]) -> None:
     """SessionStart fires once per session (resume or fresh). Deliver any
     pending inbox message — the operator may have queued context while the
-    agent was idle. No threshold evaluation: context is fresh."""
+    agent was idle. No threshold evaluation: context is fresh.
+
+    Mark needs_input=true so the TUI shows "waiting" until the operator
+    sends the first prompt. SessionStart leaves claude at an idle prompt
+    in both fresh-dispatch and resume cases — the operator is the
+    bottleneck. Without this, fresh agents render as "live" until the
+    first Stop fires (which only happens AFTER the operator types).
+    UserPromptSubmit then clears the flag on the operator's first turn.
+    """
+    health.update_record(agent_id, needs_input=True)
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:
         injections.append(inbox.deliver(inbox_body))

@@ -318,6 +318,20 @@ class TestNeedsInputFlag:
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["needs_input"] is False
 
+    def test_session_start_sets_needs_input_true(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # SessionStart fires for both fresh dispatch and resume; in both
+        # cases claude is sitting at an idle prompt and the operator is
+        # the bottleneck. Without this, fresh agents render "live" until
+        # the first Stop fires (which only happens after the operator
+        # types something).
+        record_path = _seed_record(fleet_home_tmp, needs_input=False)
+        rc, _, _ = _run({"hook_event_name": "SessionStart"}, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is True
+
 
 # -- never-block-the-host ---------------------------------------------------
 
