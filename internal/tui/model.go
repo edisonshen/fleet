@@ -501,6 +501,14 @@ func padToBottom(top, bottom string, targetHeight int) string {
 // further is reachable via the filter.
 const pickerVisibleRows = 8
 
+// statusColW pins the rendered status word to a fixed cell width so
+// every row's right block is the same total width — the percent and
+// age columns then align across rows instead of drifting under
+// shorter words like "doing". 7 covers the longest known label
+// ("blocked", "handoff", "planned"); a one-off longer label gets
+// truncated by the row, not rejected.
+const statusColW = 7
+
 // renderPicker draws the [d] repo picker: a one-line filter input, a
 // scrolling list of matched candidates with the cursor, an overflow
 // hint when the filter is too broad, and a footer of keybinds.
@@ -705,10 +713,14 @@ func renderAgentLine(r *agent.Record, status string, selected bool,
 		idStyle.Render(id) + "  " +
 		taskStyle.Render(task)
 
-	// Right half: ctx % | age | status. Three 2-space gaps inside.
+	// Right half: ctx % (5 cells) + 2-space gap + age (5 cells) +
+	// 2-space gap + status (statusColW cells). Status padded so the
+	// total right-block width is identical across rows — otherwise
+	// "doing" rows (5) and "blocked" rows (7) push the percent
+	// column to different offsets and the columns visibly drift.
 	right := ctxStyle.Render(ctxText) + "  " +
 		dimStyle.Render(age) + "  " +
-		statusStyleFor(status).Render(label)
+		statusStyleFor(status).Render(padRight(label, statusColW))
 
 	// Plain widths (cells, ignoring ANSI escapes) drive the filler
 	// math. The selected row's bg highlight is applied by the caller
