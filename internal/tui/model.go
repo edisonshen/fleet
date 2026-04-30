@@ -235,8 +235,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var b strings.Builder
 
+	// Title block: blank line above so the title isn't flush with the
+	// terminal top, padded title text, dim divider underneath. Gives
+	// the header a clear visual zone instead of a single dim line.
 	title := fmt.Sprintf("Fleet %s", m.version)
+	b.WriteString("\n")
 	b.WriteString(titleStyle.Render(title))
+	b.WriteString("\n")
+	b.WriteString(dividerStyle.Render(strings.Repeat("─", lipgloss.Width(title)+2)))
 	b.WriteString("\n\n")
 
 	if m.err != nil {
@@ -249,7 +255,6 @@ func (m Model) View() string {
 		b.WriteString("\n")
 	} else {
 		b.WriteString(renderTable(m.records, m.cursor))
-		b.WriteString("\n")
 	}
 
 	if m.flash != nil {
@@ -283,10 +288,22 @@ func (m Model) View() string {
 			m.archiveCandidate)))
 		b.WriteString("\n")
 	default:
-		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [x] archive  [q] quit",
-			len(m.records))
+		// Footer: each [k] label pair is a chip — colored key, dim
+		// label — joined by a dim middle dot so the operator's eye
+		// can land on the action keys without scanning prose.
+		count := dimStyle.Render(fmt.Sprintf("%d agent(s)", len(m.records)))
+		sep := dimStyle.Render("  ·  ")
+		footer := strings.Join([]string{
+			count,
+			keyChip("[j/k]", "navigate"),
+			keyChip("[h]", "handoff"),
+			keyChip("[a]", "attach"),
+			keyChip("[d]", "dispatch"),
+			keyChip("[x]", "archive"),
+			keyChip("[q]", "quit"),
+		}, sep)
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(footer))
+		b.WriteString(footer)
 		// Detach hint lives in the spawned session's tmux status bar
 		// (see tmux.SetStatusHint), not here — by the time the
 		// operator needs it, the TUI is gone and tmux owns the screen.
@@ -364,8 +381,16 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 //
 // STATUS is derived per-row from the agent record + a tmux liveness
 // probe (sessionAliveFn) — see deriveStatus for precedence.
+//
+// Per-cell styling: the AGENT cell on the cursor row picks up
+// cursorStyle (bold blue) so the operator's eye lands on the selected
+// id. The STATUS cell on every row gets a per-state color via
+// statusStyleFor. Padding is applied to plain text first so column
+// widths line up; style.Render adds zero-width ANSI escapes that
+// don't disturb the math.
 func renderTable(records []*agent.Record, cursor int) string {
 	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"}
+	const statusCol = 5
 	rows := make([][]string, 0, len(records))
 	for _, r := range records {
 		rows = append(rows, []string{
@@ -383,9 +408,26 @@ func renderTable(records []*agent.Record, cursor int) string {
 	b.WriteString(headerStyle.Render(joinCols(header, widths)))
 	b.WriteString("\n")
 	for i, row := range rows {
-		line := joinCols(row, widths)
+		cells := make([]string, len(row))
+		for j, c := range row {
+			if j == len(row)-1 {
+				cells[j] = c // last column: no trailing pad
+			} else {
+				cells[j] = padRight(c, widths[j])
+			}
+		}
+		// STATUS gets a per-state color on every row.
+		cells[statusCol] = statusStyleFor(row[statusCol]).Render(cells[statusCol])
+		// On the cursor row, give the AGENT id the cursor color so
+		// the selected agent is unmistakable without painting the
+		// whole line (which would override the STATUS color).
 		if i == cursor {
-			b.WriteString(cursorStyle.Render("▸ " + line))
+			cells[0] = cursorStyle.Render(cells[0])
+		}
+		line := strings.Join(cells, "  ")
+		if i == cursor {
+			b.WriteString(cursorStyle.Render("▸ "))
+			b.WriteString(line)
 		} else {
 			b.WriteString("  " + line)
 		}
@@ -499,10 +541,52 @@ func humanAge(d time.Duration) string {
 // Lipgloss styles. Kept in the same file as the View() that uses them
 // so changes are co-located.
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	headerStyle = lipgloss.NewStyle().Bold(true).Faint(true)
-	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	dimStyle    = lipgloss.NewStyle().Faint(true)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	promptStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63")).PaddingLeft(1).PaddingRight(1)
+	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("60"))
+	headerStyle   = lipgloss.NewStyle().Bold(true).Faint(true)
+	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	dimStyle      = lipgloss.NewStyle().Faint(true)
+	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	promptStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")) // pink — action keybind chips
+	keyLabelStyle = lipgloss.NewStyle().Faint(true)
+
+	// Per-status colors for the STATUS column. The padded plain text
+	// is built first (so column widths remain correct), then wrapped
+	// in these styles — lipgloss adds zero-width ANSI escapes so the
+	// alignment math is unaffected.
+	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))  // green
+	statusWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // amber
+	statusBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	statusDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
+	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — handoff in flight
+	statusUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")) // red — auto-red / precompact
 )
+
+// statusStyleFor maps a STATUS value to its lipgloss style. Falls back
+// to dim for unknown values so a future status that lands on disk
+// before the TUI is rebuilt still renders legibly.
+func statusStyleFor(status string) lipgloss.Style {
+	switch status {
+	case "live":
+		return statusLiveStyle
+	case "waiting":
+		return statusWaitingStyle
+	case "blocked":
+		return statusBlockedStyle
+	case "dead":
+		return statusDeadStyle
+	case "auto-yellow":
+		return statusHandoffStyle
+	case "auto-red", "precompact":
+		return statusUrgentStyle
+	}
+	return dimStyle
+}
+
+// keyChip renders a "[k] label" pair with a colored bracketed key and
+// a dim label. Used by the footer so the operator's eye can land on
+// the action keys without scanning the whole prose line.
+func keyChip(key, label string) string {
+	return keyStyle.Render(key) + " " + keyLabelStyle.Render(label)
+}
