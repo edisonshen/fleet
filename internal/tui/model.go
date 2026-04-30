@@ -631,7 +631,7 @@ func renderAgents(records []*agent.Record, cursor int,
 
 		status := deriveStatus(r, alive)
 		selected := i == cursor
-		row := renderAgentLine(r, status, selected, idW, taskW)
+		row := renderAgentLine(r, status, selected, idW, taskW, width)
 		if !selected {
 			b.WriteString(row)
 			b.WriteString("\n")
@@ -669,19 +669,24 @@ func renderProjectHeader(name string, total, active int) string {
 //
 // Layout (cells, monospaced):
 //
-//	"▶ " | "● " | id (idW) | "  " | task (taskW) | … | "  90%" | "  " | "  14m" | "  " | doing
+//	"▶ " | "● " | id | "  " | task   <flex filler>   "  90%" "  14m" "  doing"
+//
+// The right-side stat columns (ctx % / age / status word) right-align
+// to the terminal edge: a calculated filler of spaces sits between
+// the task cell and the right block so percent/age/status anchor at
+// width-of-terminal. When the terminal width is unknown (early
+// render before WindowSizeMsg lands) we fall back to a single-gap
+// layout — nothing is right-aligned, but the row still renders.
 //
 // The 2-char gutter holds the cursor arrow on the selected row and
-// is blank otherwise — keeping every row indented the same amount so
-// the columns line up across the whole list. Cursor glyph "▶" + bold
-// cyan matches the v2 mockup.
+// is blank otherwise. Cursor glyph "▶" + bold cyan matches the v2
+// mockup.
 func renderAgentLine(r *agent.Record, status string, selected bool,
-	idW, taskW int) string {
+	idW, taskW, width int) string {
 
 	glyph, glyphStyle := glyphFor(status)
 	id := padRight(r.ID, idW)
 	task := truncate(defaultStr(r.TaskID, "-"), taskW)
-	taskCell := padRight(task, taskW)
 	ctxText, ctxStyle := formatCtxPct(r.ContextPct)
 	age := padLeft(humanAge(time.Since(r.SpawnedAt)), 5)
 	label := statusLabel(status)
@@ -690,16 +695,32 @@ func renderAgentLine(r *agent.Record, status string, selected bool,
 	if selected {
 		gutter = cursorStyle.Render("▶ ")
 	}
-	idCell := idStyle.Render(id)
-	taskRendered := taskStyle.Render(taskCell)
 
-	return gutter +
+	// Left half: gutter + glyph + id + 2-space gap + task name.
+	// Task isn't padded to taskW here — width-based filler does the
+	// alignment instead, so short task names don't drag the right
+	// columns inward.
+	left := gutter +
 		glyphStyle.Render(glyph+" ") +
-		idCell + "  " +
-		taskRendered + "  " +
-		ctxStyle.Render(ctxText) + "  " +
+		idStyle.Render(id) + "  " +
+		taskStyle.Render(task)
+
+	// Right half: ctx % | age | status. Three 2-space gaps inside.
+	right := ctxStyle.Render(ctxText) + "  " +
 		dimStyle.Render(age) + "  " +
 		statusStyleFor(status).Render(label)
+
+	// Plain widths (cells, ignoring ANSI escapes) drive the filler
+	// math. The selected row's bg highlight is applied by the caller
+	// at the Width(width) wrapper, so we don't need to compensate
+	// for it here.
+	leftW := lipgloss.Width(left)
+	rightW := lipgloss.Width(right)
+	gap := width - leftW - rightW
+	if width <= 0 || gap < 2 {
+		gap = 2 // narrow terminals + early renders fall back to a flat gap
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 // renderAgentDetail returns the 2-line block under the selected row:
@@ -1074,10 +1095,11 @@ var (
 	dimStyle     = lipgloss.NewStyle().Faint(true)
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
-	// Yellow chip key + light foreground label. Bare-foreground
-	// (no Faint) keeps the labels readable against the selected
-	// row's dark-blue background — Faint dimmed them too far.
-	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	// Cyan chip key + light foreground label. Bare-foreground (no
+	// Faint) keeps the labels readable against the selected row's
+	// dark-blue background. Cyan keys match the title color in the
+	// v2 mockup — yellow read as alert, not as affordance.
+	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 	keyLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 
 	// v2 layout styles.
