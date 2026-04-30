@@ -91,6 +91,12 @@ type Model struct {
 	// evidence of dead", not "definitely dead".
 	aliveByID map[string]bool
 
+	// groupKeysByID is the cached projectGroupKey result per record,
+	// populated by loadAgentsCmd so renderAgents / footerSummary /
+	// sortRecords don't pay the EvalSymlinks stat syscall on every
+	// cursor move. Missing key falls back to live computation.
+	groupKeysByID map[string]string
+
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
 	// program exits. Process replacement only works post-program — a
@@ -141,10 +147,18 @@ func (m Model) Init() tea.Cmd {
 // View() repaint — avoids fanning out to N `tmux has-session`
 // subprocesses on every cursor move or 1s tick. deriveStatus reads
 // from this cache.
+//
+// groupKeys snapshots the resolved project group key per record at
+// load time. projectGroupKey calls filepath.EvalSymlinks (a stat
+// syscall) when r.Cwd is set; running that per-row per-View() means
+// dozens of syscalls per cursor move on slow / NFS mounts. The
+// loader resolves once and the renderer reads from this map (codex
+// iter-5 P2).
 type agentsMsg struct {
-	records []*agent.Record
-	err     error
-	alive   map[string]bool
+	records   []*agent.Record
+	err       error
+	alive     map[string]bool
+	groupKeys map[string]string
 }
 
 // tickMsg fires every pollInterval so we can re-read agents/ even when
@@ -183,19 +197,18 @@ func loadAgentsCmd() tea.Cmd {
 	return func() tea.Msg {
 		records, err := agent.List()
 		alive := make(map[string]bool, len(records))
+		groupKeys := make(map[string]string, len(records))
 		for _, r := range records {
-			if r.TmuxSession == "" {
-				continue
-			}
-			ok, probeErr := sessionProbeFn(r.TmuxSession)
-			if probeErr != nil {
-				// Transport failure — leave the entry missing so the
+			if r.TmuxSession != "" {
+				if ok, probeErr := sessionProbeFn(r.TmuxSession); probeErr == nil {
+					alive[r.ID] = ok
+				}
+				// Transport failure → leave entry missing so the
 				// dashboard reads "live" instead of mislabeling.
-				continue
 			}
-			alive[r.ID] = ok
+			groupKeys[r.ID] = projectGroupKey(r)
 		}
-		return agentsMsg{records: records, err: err, alive: alive}
+		return agentsMsg{records: records, err: err, alive: alive, groupKeys: groupKeys}
 	}
 }
 
@@ -212,8 +225,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case agentsMsg:
 		m.err = msg.err
-		m.records = sortRecords(msg.records)
 		m.aliveByID = msg.alive
+		m.groupKeysByID = msg.groupKeys
+		m.records = sortRecordsBy(msg.records, msg.groupKeys)
 		// Keep the cursor in bounds when the list shrinks.
 		if m.cursor >= len(m.records) {
 			m.cursor = max(0, len(m.records)-1)
@@ -374,7 +388,7 @@ func (m Model) renderTop() string {
 			b.WriteString(dividerStyle.Render(divider(m.width, 0)))
 			b.WriteString("\n")
 		}
-		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID, m.width))
+		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID, m.groupKeysByID, m.width))
 		if !m.coachDismissed {
 			b.WriteString("\n")
 			b.WriteString(coachStyle.Render(
@@ -435,7 +449,7 @@ func (m Model) renderFooter() string {
 			keyChip("[d]", "dispatch new"),
 			keyChip("[q]", "quit"),
 		}, "  ")
-		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID)))
+		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID, m.groupKeysByID)))
 		b.WriteString("\n")
 		b.WriteString(chips)
 		b.WriteString("\n")
@@ -600,22 +614,43 @@ func renderPicker(m Model) string {
 	return b.String()
 }
 
-// sortRecords returns a copy sorted by (group-key asc, spawned desc)
-// so agents cluster under their project group header in the v2
-// layout. Sort key uses projectGroupKey (cwd-derived) so display
-// changes don't reshuffle order. Within a group, newest-first
-// matches `fleet status`.
+// sortRecords returns a copy sorted by (group-key asc, spawned desc).
+// Computes group keys live — used by tests and any caller that
+// doesn't have a precomputed cache. Production renders go through
+// sortRecordsBy with the loadAgentsCmd-computed cache.
 func sortRecords(in []*agent.Record) []*agent.Record {
+	return sortRecordsBy(in, nil)
+}
+
+// sortRecordsBy returns a copy sorted by (group-key asc, spawned
+// desc) using a precomputed groupKeys map (id → key) when present.
+// Falls back to live projectGroupKey calls per record when the map
+// is nil or missing entries — keeps tests + early-render paths
+// working before the first agentsMsg lands.
+func sortRecordsBy(in []*agent.Record, groupKeys map[string]string) []*agent.Record {
 	out := make([]*agent.Record, len(in))
 	copy(out, in)
 	sort.SliceStable(out, func(i, j int) bool {
-		ki, kj := projectGroupKey(out[i]), projectGroupKey(out[j])
+		ki := groupKeyFor(out[i], groupKeys)
+		kj := groupKeyFor(out[j], groupKeys)
 		if ki != kj {
 			return ki < kj
 		}
 		return out[i].SpawnedAt.After(out[j].SpawnedAt)
 	})
 	return out
+}
+
+// groupKeyFor reads from the cache when present, falls back to a
+// live projectGroupKey() call when the cache is nil or the entry is
+// missing (legacy code paths, early renders).
+func groupKeyFor(r *agent.Record, cache map[string]string) string {
+	if cache != nil {
+		if k, ok := cache[r.ID]; ok {
+			return k
+		}
+	}
+	return projectGroupKey(r)
 }
 
 // renderAgents produces the grouped agent list. Project group headers
@@ -635,7 +670,7 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 // load. deriveStatus reads from it instead of probing tmux per-row,
 // so render is pure formatting (no subprocess fan-out, no I/O).
 func renderAgents(records []*agent.Record, cursor int,
-	alive map[string]bool, width int) string {
+	alive map[string]bool, groupKeys map[string]string, width int) string {
 
 	idW := columnWidth(records, func(r *agent.Record) string { return r.ID }, 6)
 	taskW := columnWidth(records,
@@ -652,33 +687,55 @@ func renderAgents(records []*agent.Record, cursor int,
 	// Counts key on projectGroupKey (cwd path / Project tag) so
 	// display-only differences don't fragment a group; the header
 	// label still uses projectDisplay for the human-readable form.
-	// active = records whose status isn't "dead" — matches the v2
-	// mockup's read of "active = an agent is currently working it".
-	type groupCounts struct{ total, active int }
+	//
+	// "tasks" deduplicates by TaskID so a planner+executor pair on
+	// the same task counts as 1, not 2 (codex iter-5 P2). Records
+	// with empty TaskID each count as a distinct task — operator
+	// dispatched without a task id and we have nothing to merge on.
+	// "active" = task IDs whose any record isn't dead.
+	type groupCounts struct {
+		seenTasks   map[string]struct{}
+		activeTasks map[string]struct{}
+		anonTotal   int
+		anonActive  int
+	}
 	counts := map[string]*groupCounts{}
 	for _, r := range records {
-		key := projectGroupKey(r)
+		key := groupKeyFor(r, groupKeys)
 		gc := counts[key]
 		if gc == nil {
-			gc = &groupCounts{}
+			gc = &groupCounts{
+				seenTasks:   map[string]struct{}{},
+				activeTasks: map[string]struct{}{},
+			}
 			counts[key] = gc
 		}
-		gc.total++
-		if deriveStatus(r, alive) != "dead" {
-			gc.active++
+		notDead := deriveStatus(r, alive) != "dead"
+		if r.TaskID == "" {
+			gc.anonTotal++
+			if notDead {
+				gc.anonActive++
+			}
+			continue
+		}
+		gc.seenTasks[r.TaskID] = struct{}{}
+		if notDead {
+			gc.activeTasks[r.TaskID] = struct{}{}
 		}
 	}
 
 	var b strings.Builder
 	lastKey := ""
 	for i, r := range records {
-		key := projectGroupKey(r)
+		key := groupKeyFor(r, groupKeys)
 		if key != lastKey {
 			if lastKey != "" {
 				b.WriteString("\n") // blank line between groups
 			}
 			gc := counts[key]
-			b.WriteString(renderProjectHeader(projectDisplay(r), gc.total, gc.active))
+			total := len(gc.seenTasks) + gc.anonTotal
+			active := len(gc.activeTasks) + gc.anonActive
+			b.WriteString(renderProjectHeader(projectDisplay(r), total, active))
 			lastKey = key
 		}
 
@@ -896,7 +953,7 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
-		case "waiting":
+		case "waiting", "review":
 			review++
 		case "dead":
 			dead++
@@ -932,13 +989,13 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 
 // footerSummary builds the one-line "N projects · M agents · K blocked"
 // summary shown above the global chip row. Project count keys on
-// projectGroupKey so display tweaks don't change the count, matching
-// the renderAgents grouping.
-func footerSummary(records []*agent.Record, alive map[string]bool) string {
+// the cached projectGroupKey so display tweaks don't change the
+// count, matching the renderAgents grouping.
+func footerSummary(records []*agent.Record, alive map[string]bool, groupKeys map[string]string) string {
 	projects := map[string]struct{}{}
 	var blocked, dead int
 	for _, r := range records {
-		projects[projectGroupKey(r)] = struct{}{}
+		projects[groupKeyFor(r, groupKeys)] = struct{}{}
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
@@ -966,7 +1023,7 @@ func glyphFor(status string) (string, lipgloss.Style) {
 	switch status {
 	case "live":
 		return "●", glyphLiveStyle
-	case "waiting":
+	case "waiting", "review":
 		return "●", glyphReviewStyle
 	case "blocked":
 		return "▌", glyphBlockedStyle
@@ -1149,13 +1206,20 @@ func projectDisplay(r *agent.Record) string {
 //     (skills/fleet-guard/handoff.py:113-119).
 //  3. blocked      — fleet-guard / operator flagged the agent blocked
 //  4. waiting      — needs_input=true (Stop fired, awaiting operator)
-//  5. live         — fresh spawn or actively-running turn
+//  5. review       — Mode=="review" (an agent dispatched as reviewer)
+//  6. live         — fresh spawn or actively-running turn
 //
 // dead wins over everything because the other states are meaningless
 // when the underlying process is gone. In-flight handoff wins over
 // blocked / waiting because the agent is being retired regardless of
 // what it was doing. blocked wins over waiting because a hard block
 // is more urgent for the operator to see than ambient idle.
+//
+// "review" precedence sits below "waiting" so an executor that
+// pauses for input still surfaces as needs-attention; only an idle
+// reviewer (no NeedsInput, not blocked) lands here. Both render
+// with the cyan dot + "review" word — see statusLabel for the
+// design vocabulary (codex iter-5 P1).
 //
 // alive is the cached liveness snapshot from the most recent
 // loadAgentsCmd. Reading from cache (instead of probing tmux here)
@@ -1182,6 +1246,9 @@ func deriveStatus(r *agent.Record, alive map[string]bool) string {
 	}
 	if r.NeedsInput {
 		return "waiting"
+	}
+	if r.Mode == "review" {
+		return "review"
 	}
 	return "live"
 }
@@ -1261,7 +1328,7 @@ func statusStyleFor(status string) lipgloss.Style {
 	switch status {
 	case "live":
 		return statusLiveStyle
-	case "waiting":
+	case "waiting", "review":
 		return statusReviewStyle
 	case "blocked":
 		return statusBlockedStyle
@@ -1291,7 +1358,7 @@ func statusLabel(status string) string {
 	switch status {
 	case "live":
 		return "doing"
-	case "waiting":
+	case "waiting", "review":
 		return "review"
 	case "auto-yellow", "auto-red", "precompact":
 		return "handoff"
