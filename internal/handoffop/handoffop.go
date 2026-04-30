@@ -142,19 +142,26 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	// the FIRST send, not a duplicate.
 	//
 	// Resolve auto-resume from queue override + newRec baseline
-	// (codex review iter-12 P2).
+	// (codex review iter-12 P2). Gate on schema v2+ (codex
+	// iter-15 P2) — v1 queue files predate this feature.
 	disableAutoResume := newRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
 		disableAutoResume = *req.DisableAutoResume
 	}
-	autoResume := !disableAutoResume
+	autoResume := !disableAutoResume && req.SchemaVersion >= 2
 	if autoResume {
 		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
 			_, _ = fmt.Fprintf(stdout,
 				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
 				newRec.TmuxSession, err)
 		}
-		if !tmux.HasSession(newRec.TmuxSession) {
+		// SessionAlive (not HasSession) so transport probe failures
+		// don't fail the recovery (codex iter-15 P1).
+		if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+				newRec.TmuxSession, perr)
+		} else if !alive {
 			return fmt.Errorf(
 				"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 				req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
@@ -331,7 +338,13 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
 			newRec.TmuxSession, err)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// SessionAlive (not HasSession) so transport probe failures
+	// don't roll back a live replacement (codex iter-15 P1).
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
 		if path, perr := state.AgentPath(newRec.ID); perr == nil {
 			_ = os.Remove(path)
 		}

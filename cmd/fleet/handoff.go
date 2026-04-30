@@ -188,18 +188,28 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// baseline (codex review iter-12 P2): the original
 			// handoff may have specified --no-auto-resume /
 			// --auto-resume.
+			//
+			// Gate on schema v2+ (codex review iter-15 P2): older
+			// queue files predate auto-resume entirely, so an
+			// unconditional send here would inject a prompt into
+			// a replacement the operator already kicked off
+			// manually back when those v1 files were written.
 			disableAutoResume := newRec.DisableAutoResume
 			if pending.DisableAutoResume != nil {
 				disableAutoResume = *pending.DisableAutoResume
 			}
-			autoResume := !disableAutoResume
+			autoResume := !disableAutoResume && pending.SchemaVersion >= 2
 			if autoResume {
 				if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
 					_, _ = fmt.Fprintf(stderr,
 						"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
 						newRec.TmuxSession, err)
 				}
-				if !tmux.HasSession(newRec.TmuxSession) {
+				if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+						newRec.TmuxSession, perr)
+				} else if !alive {
 					return fmt.Errorf(
 						"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
 						opts.oldID, pending.NewAgentID, newRec.TmuxSession)
@@ -500,7 +510,15 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
 			newRec.TmuxSession, err)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// Use SessionAlive (not HasSession) so a transport probe failure
+	// — bad socket, lost server, transient error — doesn't masquerade
+	// as "session dead" and roll back a live replacement (codex
+	// review iter-15 P1).
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
 		if path, perr := state.AgentPath(newRec.ID); perr == nil {
 			_ = os.Remove(path)
 		}
@@ -696,7 +714,13 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
 			newRec.TmuxSession, err)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// SessionAlive (not HasSession) so probe failures don't roll
+	// back a live replacement (codex iter-15 P1).
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
 		return fmt.Errorf(
 			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)

@@ -285,12 +285,19 @@ func SendKeys(session string, keys ...string) error {
 // panes the alt-capture errors with "no alternate screen" — we
 // treat that as empty and return just the current capture.
 //
-// Returns ErrNoSession if the session has already exited so callers
-// can distinguish "session gone" from generic capture-pane errors.
-// Returns an error only if BOTH captures fail (or HasSession is
-// false on entry).
+// Pre-flight uses SessionAlive (not HasSession) so a transport
+// failure (bad socket, lost server) bubbles up as a generic error
+// rather than masquerading as ErrNoSession. Callers downstream
+// roll back the new agent on ErrNoSession but only log on other
+// errors, so misclassifying transport failures would strand live
+// replacements (codex review iter-15 P1).
 func CapturePane(session string) ([]byte, error) {
-	if !HasSession(session) {
+	alive, probeErr := SessionAlive(session)
+	switch {
+	case probeErr != nil:
+		return nil, fmt.Errorf("tmux capture-pane %s: probe failed: %w",
+			session, probeErr)
+	case !alive:
 		return nil, fmt.Errorf("%w: %s", ErrNoSession, session)
 	}
 	var combined []byte
