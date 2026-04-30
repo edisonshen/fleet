@@ -374,37 +374,39 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 
 	// 8b. Auto-resume policy for the rest of this handoff. Inherited
 	//     from spawn (which got it from oldRec or the operator's
-	//     --no-auto-resume flag). Used both to gate the readiness
-	//     wait and the eventual send.
+	//     --no-auto-resume flag). Gates the SEND only — the wait
+	//     runs unconditionally since it's also our post-spawn
+	//     liveness check (codex review iter-9 P1).
 	autoResume := !newRec.DisableAutoResume
 
 	// 8c. Wait for the new agent's pane to stabilize BEFORE we touch
 	//     the old session. The wait is passive (new is rendering UI,
 	//     not doing work — only SendPromptKeys later starts the new
 	//     agent's work), so this respects the iter-2 P2 invariant
-	//     that "new doesn't do work during the OLD↔NEW overlap" while
-	//     also keeping recovery clean: if the new agent crashes
-	//     during the up-to-30 s wait, old is still alive, so we can
-	//     roll back the spawn (kill new, delete record + queue) and
-	//     return — the operator retries with old still standing.
-	//     Pre-fix, the wait happened AFTER Kill(old); a dead-during-
-	//     wait left the task stranded with no live agent (codex
-	//     review iter-8 P1).
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
+	//     that "new doesn't do work during the OLD↔NEW overlap"
+	//     while also keeping recovery clean: if the new agent
+	//     crashes during the up-to-30 s wait, old is still alive, so
+	//     we roll back the spawn (kill new, delete record + queue)
+	//     and return — the operator retries with old still standing.
+	//
+	//     Always runs, even when auto-resume is disabled — this is
+	//     the only post-spawn liveness window, and a wrapper that
+	//     survives step 8a but crashes shortly after would otherwise
+	//     slip through to retire-old, stranding the task (codex
+	//     review iter-9 P1).
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	if !tmux.HasSession(newRec.TmuxSession) {
+		if path, perr := state.AgentPath(newRec.ID); perr == nil {
+			_ = os.Remove(path)
 		}
-		if !tmux.HasSession(newRec.TmuxSession) {
-			if path, perr := state.AgentPath(newRec.ID); perr == nil {
-				_ = os.Remove(path)
-			}
-			_ = queue.Delete(queuePath)
-			return fmt.Errorf(
-				"replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
-				newRec.ID, newRec.TmuxSession, oldRec.ID)
-		}
+		_ = queue.Delete(queuePath)
+		return fmt.Errorf(
+			"replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
 	// 9. Send "/exit" to the old session. ErrNoSession means it
@@ -555,20 +557,20 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 
 	autoResume := !newRec.DisableAutoResume
 
-	// Wait BEFORE killing old (codex iter-8 P1). If the new agent
-	// dies during the wait, leave the old session alone and surface
-	// the error — operator retries cleanly.
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
-		}
-		if !tmux.HasSession(newRec.TmuxSession) {
-			return fmt.Errorf(
-				"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
-				newRec.ID, newRec.TmuxSession, oldRec.ID)
-		}
+	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
+	// wait doubles as a post-spawn liveness check, and a wrapper
+	// that crashes shortly after the previous run's spawn must be
+	// caught here so we don't retire old into nothing (codex iter-9
+	// P1).
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	if !tmux.HasSession(newRec.TmuxSession) {
+		return fmt.Errorf(
+			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&

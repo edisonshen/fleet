@@ -68,6 +68,25 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		return fmt.Errorf("resume: load agent %s failed: %w", req.OldAgentID, lerr)
 	}
 
+	// 1a. Reject auto-handoff for opt-out agents (codex review iter-9
+	//     P1). The auto-handoff drain is non-interactive: there's no
+	//     operator to type the manual prompt that --no-auto-resume
+	//     agents need. Silently completing the handoff would leave
+	//     the replacement idle forever. Surface a clear error so the
+	//     operator must trigger handoff manually via `fleet handoff`,
+	//     where they can attach + type the first prompt.
+	//
+	//     In practice this is rare — fleet-guard, the producer of
+	//     auto-handoff queue files, only runs inside claude code's
+	//     hook system, so a non-claude wrapper wouldn't generate
+	//     these queue files in the first place. But the check is
+	//     cheap belt-and-suspenders.
+	if oldRec.DisableAutoResume {
+		return fmt.Errorf(
+			"resume: agent %s has --no-auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
+			req.OldAgentID, req.OldAgentID, queuePath)
+	}
+
 	// 2. Recovery probe on the replacement.
 	newRec, nerr := agent.Load(req.NewAgentID)
 	switch {
@@ -224,28 +243,29 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	autoResume := !newRec.DisableAutoResume
 
 	// Wait BEFORE killing old (codex review iter-8 P1). The wait is
-	// passive (new is rendering UI, not doing work — only the
-	// post-queue.Delete SendPromptKeys starts the new agent's work),
-	// so this respects the iter-2 P2 invariant. If the new agent
-	// dies during the wait, OLD is still alive — roll back the new,
-	// leave old standing, return error so operator/recovery can
-	// retry cleanly. Pre-fix, the wait happened AFTER Kill(old) and
-	// a dead-during-wait stranded the task with no live agent.
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
+	// passive — new is rendering UI, not doing work; only the post-
+	// queue.Delete SendPromptKeys starts the new agent's work — so
+	// this respects the iter-2 P2 invariant. If the new agent dies
+	// during the wait, OLD is still alive; roll back the new and
+	// return so operator/recovery can retry cleanly.
+	//
+	// Always runs, even when auto-resume is disabled (codex iter-9
+	// P1): the wait doubles as a post-spawn liveness check, catching
+	// wrappers that survive the immediate HasSession check but crash
+	// shortly after.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	if !tmux.HasSession(newRec.TmuxSession) {
+		if path, perr := state.AgentPath(newRec.ID); perr == nil {
+			_ = os.Remove(path)
 		}
-		if !tmux.HasSession(newRec.TmuxSession) {
-			if path, perr := state.AgentPath(newRec.ID); perr == nil {
-				_ = os.Remove(path)
-			}
-			_ = queue.Delete(queuePath)
-			return fmt.Errorf(
-				"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
-				newRec.ID, newRec.TmuxSession, oldRec.ID)
-		}
+		_ = queue.Delete(queuePath)
+		return fmt.Errorf(
+			"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
