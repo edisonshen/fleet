@@ -540,12 +540,18 @@ func defaultStr(s, def string) string {
 // hyphen-joins parent + basename for filesystem safety
 // (projects-fleet) and reads as one mashed word in the dashboard.
 //
+// filepath.Clean drops trailing slashes and "/.“ tails before the
+// Base/Dir split (codex iter-9 P3) — without it, --cwd values like
+// "/path/to/repo/" or "/path/to/repo/." would derive base="repo"
+// AND parent="repo" (or "."), rendering "repo/repo" or "repo/.".
+//
 // Falls back to r.Project — and then to "-" — for legacy records or
 // agents whose Cwd wasn't captured at dispatch.
 func projectDisplay(r *agent.Record) string {
 	if r.Cwd != "" {
-		base := filepath.Base(r.Cwd)
-		parent := filepath.Base(filepath.Dir(r.Cwd))
+		clean := filepath.Clean(r.Cwd)
+		base := filepath.Base(clean)
+		parent := filepath.Base(filepath.Dir(clean))
 		if parent != "" && parent != "." && parent != string(filepath.Separator) {
 			return parent + "/" + base
 		}
