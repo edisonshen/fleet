@@ -57,9 +57,16 @@ type SpawnFresh struct {
 	// NewAgentID and NewSession are empty before spawn, populated
 	// after. Their presence in a re-read queue file is the signal
 	// "replacement already exists; do not re-spawn."
-	NewAgentID string    `json:"new_agent_id,omitempty"`
-	NewSession string    `json:"new_session,omitempty"`
-	EnqueuedAt time.Time `json:"enqueued_at"`
+	NewAgentID string `json:"new_agent_id,omitempty"`
+	NewSession string `json:"new_session,omitempty"`
+	// DisableAutoResume captures the per-handoff auto-resume opt-out
+	// chosen by the operator (e.g. `fleet handoff --no-auto-resume`)
+	// or implied by the outgoing record. Persisting it here ensures
+	// that a crashed handoff resumed by `fleet drain` / TUI watcher
+	// honors the same policy instead of falling back to the
+	// outgoing record's value (codex review iter-10 P2).
+	DisableAutoResume bool      `json:"disable_auto_resume,omitempty"`
+	EnqueuedAt        time.Time `json:"enqueued_at"`
 }
 
 // SpawnFreshName returns the queue filename (without .json) for

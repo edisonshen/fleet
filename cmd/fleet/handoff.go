@@ -154,9 +154,35 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
 					opts.oldID, pending.NewAgentID, newRec.TmuxSession, pendingPath)
 			}
-			// Old archived, replacement live — handoff truly
-			// completed. Clean up the journal and report success.
+			// Old archived, replacement live. The previous run
+			// reached at least Archive but may have crashed before
+			// SendPromptKeys (codex review iter-10 P1). If the queue
+			// file is still here, queue.Delete didn't run either,
+			// which means SendPromptKeys also didn't (it lives
+			// AFTER queue.Delete in runHandoff). Send the prompt
+			// now to cover that gap, then delete the queue.
+			autoResume := !newRec.DisableAutoResume
+			if autoResume {
+				if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+						newRec.TmuxSession, err)
+				}
+				if !tmux.HasSession(newRec.TmuxSession) {
+					return fmt.Errorf(
+						"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
+						opts.oldID, pending.NewAgentID, newRec.TmuxSession)
+				}
+			}
 			_ = queue.Delete(pendingPath)
+			if autoResume {
+				if err := spawn.SendPromptKeys(newRec.TmuxSession,
+					handoff.ResumePrompt(pending.HandoffDoc)); err != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: send resume prompt to %s after archive-recovery: %v (replacement may need manual prompt on attach)\n",
+						newRec.TmuxSession, err)
+				}
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
 				opts.oldID, pending.NewAgentID)
@@ -313,29 +339,33 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	newID := agent.NewID()
 	newSession := tmux.SessionName(newID)
 
-	// 7. Write the queue file with the pre-allocated successor ID.
-	//    This is the durable commit point — anything after a crash
-	//    here is recoverable via the resume path in step 2.
-	queuePath, err := queue.WriteSpawnFresh(queue.SpawnFresh{
-		OldAgentID: oldRec.ID,
-		HandoffDoc: docPath,
-		Project:    oldRec.Project,
-		TaskID:     oldRec.TaskID,
-		NewAgentID: newID,
-		NewSession: newSession,
-	})
-	if err != nil {
-		return fmt.Errorf("enqueue spawn-fresh: %w", err)
-	}
-
 	// Auto-resume policy for the replacement: if the operator passed
 	// --no-auto-resume on this handoff, use that; else inherit from
 	// the outgoing record. Lets `fleet handoff --command bash` opt
 	// out without permanently flipping the policy on records that
-	// originally used claude (codex review iter-8 P2).
+	// originally used claude (codex review iter-8 P2). Computed
+	// BEFORE the queue write so the override survives a crash and
+	// gets honored by the auto-handoff drain (codex review iter-10
+	// P2).
 	disableAutoResume := oldRec.DisableAutoResume
 	if opts.noAutoResumeWasSet {
 		disableAutoResume = opts.noAutoResume
+	}
+
+	// 7. Write the queue file with the pre-allocated successor ID.
+	//    This is the durable commit point — anything after a crash
+	//    here is recoverable via the resume path in step 2.
+	queuePath, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID:        oldRec.ID,
+		HandoffDoc:        docPath,
+		Project:           oldRec.Project,
+		TaskID:            oldRec.TaskID,
+		NewAgentID:        newID,
+		NewSession:        newSession,
+		DisableAutoResume: disableAutoResume,
+	})
+	if err != nil {
+		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
 	// 8. Drain: spawn the replacement using the pre-allocated ID.
