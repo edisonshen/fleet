@@ -324,8 +324,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		Cwd:            cwd,
 		Command:        command,
 		PreAllocatedID: newID,
-		InitialPrompt: "Read your handoff doc at " + docPath +
-			" and continue the task. Do not wait for further operator input.",
+		InitialPrompt:  handoff.ResumePrompt(docPath),
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
