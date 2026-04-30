@@ -72,18 +72,23 @@ outgoing record and increments handoff_number by 1.`,
 	cmd.Flags().IntVar(&opts.graceMillis, "grace-ms", 3000,
 		"milliseconds to wait between /exit and kill on the old session")
 	// Override the auto-resume policy inherited from the outgoing
-	// record (codex review iter-8 P2 + iter-11 P2). Three states:
-	//   - neither flag → inherit oldRec.DisableAutoResume.
-	//   - --no-auto-resume → force OFF for this handoff (e.g.
-	//     handing into a shell or non-claude wrapper).
-	//   - --auto-resume → force ON for this handoff (e.g. a
-	//     previously opted-out agent that's now handing into a
-	//     claude wrapper that DOES want the prompt).
+	// record (codex review iter-8 / 11 / 13 P2). Three states:
+	//   - neither flag → inherit oldRec.DisableAutoResume; the new
+	//     record's baseline matches.
+	//   - --no-auto-resume → force OFF for this handoff AND persist
+	//     OFF as the new record's baseline. Future handoffs of the
+	//     replacement inherit OFF until --auto-resume is passed.
+	//   - --auto-resume → force ON and persist ON, similarly.
+	// Persisting (sticky) is the right default when the operator
+	// switches command class via `--command` (e.g. claude → bash),
+	// because the new agent IS the new command class and its
+	// future handoffs should follow the new policy. Operators who
+	// truly want a one-shot must re-pass the inverse flag next time.
 	// Mutually exclusive — enforced in RunE above.
 	cmd.Flags().BoolVar(&opts.noAutoResume, "no-auto-resume", false,
-		"override: skip auto-typing the resume prompt on this handoff")
+		"skip auto-typing the resume prompt; persists on the replacement record so future handoffs inherit OFF")
 	cmd.Flags().BoolVar(&opts.autoResume, "auto-resume", false,
-		"override: force auto-typing the resume prompt on this handoff (overrides outgoing record's --no-auto-resume)")
+		"force auto-typing the resume prompt; persists on the replacement record so future handoffs inherit ON")
 	return cmd
 }
 
@@ -209,8 +214,15 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				if err := spawn.SendPromptKeys(newRec.TmuxSession,
 					handoff.ResumePrompt(pending.HandoffDoc)); err != nil {
 					_, _ = fmt.Fprintf(stderr,
-						"warning: send resume prompt to %s after archive-recovery: %v (replacement may need manual prompt on attach)\n",
+						"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
 						newRec.TmuxSession, err)
+					// Re-enqueue so the next retry can attempt
+					// delivery (codex review iter-14 P1).
+					if _, werr := queue.WriteSpawnFresh(pending); werr != nil {
+						_, _ = fmt.Fprintf(stderr,
+							"warning: re-enqueue after archive-recovery send failure: %v\n",
+							werr)
+					}
 				}
 			}
 			_, _ = fmt.Fprintf(stdout,

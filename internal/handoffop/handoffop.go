@@ -170,8 +170,17 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(req.HandoffDoc)); err != nil {
 			_, _ = fmt.Fprintf(stdout,
-				"warning: send resume prompt to %s after archive-recovery: %v (replacement may need manual prompt on attach)\n",
+				"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
 				newRec.TmuxSession, err)
+			// Re-enqueue so a future drain / `fleet handoff` can
+			// retry delivery — without this, send failure on the
+			// non-interactive drain path silently strands the
+			// replacement (codex review iter-14 P1).
+			if _, werr := queue.WriteSpawnFresh(req); werr != nil {
+				_, _ = fmt.Fprintf(stdout,
+					"warning: re-enqueue after archive-recovery send failure: %v\n",
+					werr)
+			}
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
