@@ -285,11 +285,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
 	// NOTE: the handoff resume prompt is typed by the caller's retire
-	// path (handoffop.retireOldAgent / cmd/fleet/handoff.go step 8b)
+	// path (handoffop.retireOldAgent / cmd/fleet/handoff.go step 11b)
 	// via SendInitialPrompt, NOT here. Keeping it out of Spawn means
 	// crash recovery's "replacement spawned, retire interrupted"
 	// branch — which goes through retireOldAgent directly without
 	// re-spawning — still delivers the prompt. See codex review
-	// iter-1 P1.
+	// iter-1 P1 / iter-2 P2.
 	return rec, nil
 }

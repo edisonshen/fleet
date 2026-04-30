@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/queue"
@@ -595,6 +596,84 @@ func TestHandoff_ResumesCrashedHandoffWithoutDoubleSpawn(t *testing.T) {
 	if !strings.Contains(out.String(), "resumed") {
 		t.Errorf("expected output to mention 'resumed':\n%s", out.String())
 	}
+}
+
+func TestHandoff_ResumeDeliversPromptToReplacement(t *testing.T) {
+	// Codex review iter-3 P1: resumeHandoff (operator-triggered crash
+	// recovery, dispatched when a queue entry is found at handoff
+	// start) was missing the SendInitialPrompt call, so a recovered
+	// replacement got the kill/archive of the old but never received
+	// "read your handoff doc" — sat idle until manual operator input.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Pre-spawn a replacement with a shell that echoes whatever
+	// resumeHandoff types into it, so the test can assert on
+	// captured pane content.
+	repCwd := t.TempDir()
+	replacement, err := agentSpawnForTest(t, repCwd,
+		[]string{"sh", "-c", "read line; echo GOT:$line; sleep 30"},
+		old.Project, old.TaskID)
+	if err != nil {
+		t.Fatalf("seed replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
+
+	// Use a real on-disk handoff doc path so ResumePrompt embeds it
+	// verbatim — matches what fleet would write in production.
+	now := time.Now().UTC()
+	docPath, err := state.HandoffPath(old.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, []byte("stub doc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		OldAgentID: old.ID,
+		HandoffDoc: docPath,
+		Project:    old.Project,
+		TaskID:     old.TaskID,
+		NewAgentID: replacement.ID,
+		NewSession: replacement.TmuxSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("resumed handoff: %v\n%s", err, out.String())
+	}
+
+	// Replacement still alive; pane contains the resume prompt
+	// (echoed back as GOT:<prompt>). Strip newlines because tmux
+	// capture-pane wraps long lines at terminal width.
+	want := "GOT:Read your handoff doc at " + docPath
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		captured, err := tmux.CapturePane(replacement.TmuxSession)
+		if err == nil {
+			lastOut = captured
+			joined := strings.ReplaceAll(string(captured), "\n", "")
+			if strings.Contains(joined, want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("resumeHandoff did not deliver resume prompt; want substring %q in:\n%s",
+		want, string(lastOut))
 }
 
 func TestHandoff_DeadSession_ArchivesWithoutSpawn(t *testing.T) {

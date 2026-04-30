@@ -504,6 +504,21 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
 			oldRec.TmuxSession, err)
 	}
+
+	// Old is dead → safe to deliver the resume prompt. The previous
+	// run that crashed before reaching this point never sent the
+	// prompt either (SendInitialPrompt only runs after Kill(old)
+	// succeeds in runHandoff), so this delivery is the FIRST
+	// delivery, not a duplicate. Without this, the recovered
+	// replacement would sit idle until an operator attached and
+	// typed manually (codex review iter-3 P1).
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+			newRec.TmuxSession, err)
+	}
+
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {

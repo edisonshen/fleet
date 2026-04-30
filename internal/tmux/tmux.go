@@ -274,22 +274,41 @@ func SendKeys(session string, keys ...string) error {
 }
 
 // CapturePane returns the visible content of the given session's
-// active pane (the equivalent of `tmux capture-pane -t <session> -p`).
-// Used by spawn.SendInitialPrompt's readiness poll: when the pane
-// stops changing, the agent is idle and ready to receive input.
+// active pane plus the alternate screen if one is active. Used by
+// spawn.SendInitialPrompt's readiness poll: when both buffers stop
+// changing, the agent is idle and ready to receive input.
+//
+// We concatenate "current" (`capture-pane -p`) AND "alternate"
+// (`capture-pane -p -a`) so the poll sees activity regardless of
+// whether the wrapped command runs in the main screen (shells) or
+// the alternate screen (claude code / vim / TUI apps). On main-only
+// panes the alt-capture errors with "no alternate screen" — we
+// treat that as empty and return just the current capture.
 //
 // Returns ErrNoSession if the session has already exited so callers
 // can distinguish "session gone" from generic capture-pane errors.
+// Returns an error only if BOTH captures fail (or HasSession is
+// false on entry).
 func CapturePane(session string) ([]byte, error) {
 	if !HasSession(session) {
 		return nil, fmt.Errorf("%w: %s", ErrNoSession, session)
 	}
-	cmd := exec.Command("tmux", tmuxArgs("capture-pane", "-t", session, "-p")...)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("tmux capture-pane %s: %w", session, err)
+	var combined []byte
+	visibleOut, visibleErr := exec.Command("tmux",
+		tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
+	if visibleErr == nil {
+		combined = append(combined, visibleOut...)
 	}
-	return out, nil
+	altOut, altErr := exec.Command("tmux",
+		tmuxArgs("capture-pane", "-t", session, "-p", "-a")...).Output()
+	if altErr == nil {
+		combined = append(combined, altOut...)
+	}
+	if visibleErr != nil && altErr != nil {
+		return nil, fmt.Errorf("tmux capture-pane %s: visible=%w; alt=%v",
+			session, visibleErr, altErr)
+	}
+	return combined, nil
 }
 
 // SetStatusHint prepends a fleet hint to the given session's
