@@ -435,15 +435,25 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 		queueDeleted = false
 	}
 
-	// Send the resume prompt only when queue.Delete succeeded so
-	// the retry doesn't re-send via cleanUpStaleQueue (codex review
-	// iter-11 P3). On queue.Delete failure, the next retry will
-	// recover via cleanUpStaleQueue (or the cmd/fleet equivalent),
-	// which has its own send + delete pair. On SEND failure with
-	// queue already deleted, re-enqueue so cleanUpStaleQueue can
-	// retry — preserves recovery for non-interactive drains where
-	// no operator can type the prompt manually (codex iter-13 P2).
-	if queueDeleted && autoResume {
+	// If queue.Delete failed, surface as error so drain reports
+	// the handoff as not-yet-complete (codex review iter-20 P1).
+	// Old is already archived, so a retry will reach
+	// cleanUpStaleQueue, which has its own send + delete pair.
+	// Returning nil here would silently strand the replacement
+	// (queue still on disk, prompt never sent, drain reports
+	// success).
+	if !queueDeleted {
+		return fmt.Errorf(
+			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt",
+			oldRec.ID)
+	}
+
+	// Send the resume prompt now that queue.Delete succeeded (we
+	// returned early on failure above). On SEND failure, re-enqueue
+	// so cleanUpStaleQueue can retry — preserves recovery for non-
+	// interactive drains where no operator can type the prompt
+	// manually (codex iter-13 P2).
+	if autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,
