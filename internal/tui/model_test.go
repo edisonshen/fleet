@@ -255,21 +255,84 @@ func TestView_ShowsErrorBanner(t *testing.T) {
 	}
 }
 
-func TestView_RendersAgentTable(t *testing.T) {
+func TestView_RendersAgentList(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2))
 	out := m.View()
 
-	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("view missing column header %q, got:\n%s", want, out)
-		}
-	}
+	// v2 layout drops the AGENT/PROJECT/TASK/MODE/AGE/STATUS column
+	// header row — the row is self-documenting via the leading
+	// status glyph + cursor arrow + colored cells. Just assert the
+	// data shows up.
 	if !strings.Contains(out, "a0") || !strings.Contains(out, "a1") {
 		t.Errorf("view should include agent IDs, got:\n%s", out)
 	}
-	if !strings.Contains(out, "2 agent(s)") {
+	// Project group header surfaces the count + active count alongside
+	// the project label so the operator can scan groups at a glance.
+	// Format: "demo (2 tasks, 2 active)".
+	if !strings.Contains(out, "demo") || !strings.Contains(out, "(2 tasks, 2 active)") {
+		t.Errorf("view should include project group header, got:\n%s", out)
+	}
+	// Smart footer summary line: "N project · M agents".
+	if !strings.Contains(out, "2 agents") {
 		t.Errorf("footer should report agent count, got:\n%s", out)
+	}
+	// Cursor row gets an inline action chip strip.
+	if !strings.Contains(out, "[a]") || !strings.Contains(out, "attach") {
+		t.Errorf("selected row should expose inline [a] attach chip, got:\n%s", out)
+	}
+}
+
+func TestView_CoachHintShownInitiallyHiddenAfterKeypress(t *testing.T) {
+	m := New("test")
+	m.records = sortRecords(fakeRecords(2))
+
+	// Fresh launch shows the coach hint so a first-time operator
+	// understands "the selected row IS the interface" without docs.
+	if !strings.Contains(m.View(), "actions appear on the selected row") {
+		t.Errorf("coach hint should render before any keypress, got:\n%s", m.View())
+	}
+
+	// First nav keypress dismisses it — once you've moved, you've
+	// demonstrated you know how.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	out := updated.(Model).View()
+	if strings.Contains(out, "actions appear on the selected row") {
+		t.Errorf("coach hint should be dismissed after [j], got:\n%s", out)
+	}
+}
+
+func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
+	m := New("test")
+	recs := fakeRecords(3)
+	// One blocked, one with hot context. Banner should aggregate
+	// both counts independently — a hot+blocked agent would bump
+	// both bars, but here we keep them separate for clarity.
+	recs[0].Blocked = true
+	hot := 75.0
+	recs[1].ContextPct = &hot
+	m.records = sortRecords(recs)
+
+	out := m.View()
+	if !strings.Contains(out, "1 blocked") {
+		t.Errorf("banner should show blocked count, got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 hot context") {
+		t.Errorf("banner should show hot-context count, got:\n%s", out)
+	}
+}
+
+func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
+	m := New("test")
+	m.records = sortRecords(fakeRecords(2)) // all default → live
+	out := m.View()
+	// v2 banner glyphs: ▌ blocked, △ hot context, ✗ dead. The cyan
+	// ● review glyph is also a row-level glyph so we can't blanket-
+	// check it — instead guard the descriptive words.
+	for _, sym := range []string{"▌", "△", "✗", "blocked", "hot context", "dead", "in review"} {
+		if strings.Contains(out, sym) {
+			t.Errorf("clean dashboard should hide banner for %q, got:\n%s", sym, out)
+		}
 	}
 }
 
@@ -493,5 +556,40 @@ func TestPadRight(t *testing.T) {
 	}
 	if got := padRight("abcdef", 3); got != "abcdef" {
 		t.Errorf("padRight should not truncate, got %q", got)
+	}
+}
+
+// TestVisualRows pins down the wrap-aware row count: a soft-wrapped
+// long line counts as multiple terminal rows, not one. This drives
+// padToBottom so the bottom-pinned footer stays pinned on narrow
+// terminals where the archive-confirm prompt or a blocked-reason
+// quote wraps to extra rows (codex iter / P2).
+func TestVisualRows(t *testing.T) {
+	cases := []struct {
+		name      string
+		s         string
+		termWidth int
+		want      int
+	}{
+		{"empty", "", 80, 0},
+		{"single line no newline", "hello", 80, 1},
+		{"single line with newline", "hello\n", 80, 1},
+		{"two lines", "foo\nbar", 80, 2},
+		{"trailing newline doesn't double-count", "foo\nbar\n", 80, 2},
+		{"empty middle line counts as 1", "foo\n\nbar", 80, 3},
+		{"just a newline", "\n", 80, 1},
+		// Soft-wrap: 100-char line on an 80-col terminal = 2 rows.
+		{"wrap once", strings.Repeat("x", 100), 80, 2},
+		// 80-char line fits exactly in 80 cells = 1 row, not 2.
+		{"exact fit", strings.Repeat("x", 80), 80, 1},
+		// 161 chars on 80 cols → 3 rows (80+80+1).
+		{"wrap twice", strings.Repeat("x", 161), 80, 3},
+		// termWidth ≤ 0 disables wrap math — falls back to logical lines.
+		{"no width known", strings.Repeat("x", 200) + "\n" + strings.Repeat("y", 200), 0, 2},
+	}
+	for _, c := range cases {
+		if got := visualRows(c.s, c.termWidth); got != c.want {
+			t.Errorf("visualRows(%q, %d) = %d, want %d", c.name, c.termWidth, got, c.want)
+		}
 	}
 }
