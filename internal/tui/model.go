@@ -36,6 +36,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -58,6 +60,11 @@ type Model struct {
 	// version is shown in the title bar. Caller injects from
 	// cmd/fleet/main.go's ldflags-overridable Version.
 	version string
+
+	// userName is rendered right-aligned in the title row. Captured
+	// once at New() time — it doesn't change mid-session, and looking
+	// it up per-render would be a syscall on every tick.
+	userName string
 
 	// Action keybind state (Week 4b+4c, picker added Week 5).
 	mode      inputMode // modeNav, modePickRepo, or modePromptDispatch
@@ -106,7 +113,18 @@ func (m Model) PendingAttach() string { return m.pendingAttach }
 
 // New returns a Model ready to be passed to tea.NewProgram.
 func New(version string) Model {
-	return Model{version: version}
+	return Model{version: version, userName: currentUserName()}
+}
+
+// currentUserName resolves the operator's username for the title row.
+// Prefers os/user (works for unprivileged + chrooted environments),
+// falls back to $USER, then "" if both fail. Empty just hides the
+// right-aligned label — never blocks the dashboard from rendering.
+func currentUserName() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
 }
 
 // Init is the bubbletea entry point. We kick off the first agent load
@@ -325,13 +343,12 @@ func (m Model) View() string {
 func (m Model) renderTop() string {
 	var b strings.Builder
 
-	// Title block: blank line above so the title isn't flush with the
-	// terminal top, padded title text, dim divider that spans the full
-	// terminal width. Falls back to a title-relative width when the
-	// terminal hasn't reported its size yet (m.width == 0).
+	// Title row: "Fleet x.y.z" left, username right, separated by
+	// padding. Below it: a full-width dim divider. The mockup runs
+	// title flush against the top of the alt-screen — no leading
+	// blank line.
 	title := fmt.Sprintf("Fleet %s", m.version)
-	b.WriteString("\n")
-	b.WriteString(titleStyle.Render(title))
+	b.WriteString(titleRow(title, m.userName, m.width))
 	b.WriteString("\n")
 	b.WriteString(dividerStyle.Render(divider(m.width, lipgloss.Width(title)+2)))
 	b.WriteString("\n")
@@ -346,15 +363,15 @@ func (m Model) renderTop() string {
 		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
-		// Alert banner sits between two dividers. The top divider is
-		// the title divider above; we add a bottom divider here so
-		// the banner reads as its own visual section.
+		// Alert banner: sits inside its own divider-bracketed section
+		// so it reads as a dashboard-level summary, not part of the
+		// agent list. Skipped entirely on a clean dashboard.
 		if banner := renderAlertBanner(m.records, m.aliveByID); banner != "" {
 			b.WriteString(banner)
 			b.WriteString(dividerStyle.Render(divider(m.width, 0)))
 			b.WriteString("\n")
 		}
-		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID))
+		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID, m.width))
 		if !m.coachDismissed {
 			b.WriteString("\n")
 			b.WriteString(coachStyle.Render(
@@ -403,19 +420,18 @@ func (m Model) renderFooter() string {
 		b.WriteString("\n")
 	default:
 		// Smart footer: summary line + chip row. The summary is
-		// fleet-level state ("2 agents · 1 blocked"); the chips are
-		// the always-available global keys. The cursor row's inline
-		// chips (in renderAgents) handle context-sensitive actions —
-		// the footer chips are the floor, not the ceiling.
-		sep := dimStyle.Render("  ·  ")
+		// fleet-level state ("4 projects · 4 agents · 1 blocked");
+		// the chips are the always-available global keys. The
+		// cursor row's inline chips (renderAgentDetail) carry the
+		// context-sensitive row actions — the footer is the floor,
+		// not the ceiling. Two-space separator + compact "[k]label"
+		// chips match the v2 mockup.
 		chips := strings.Join([]string{
 			keyChip("[j/k]", "navigate"),
 			keyChip("[a]", "attach"),
-			keyChip("[h]", "handoff"),
-			keyChip("[d]", "dispatch"),
-			keyChip("[x]", "archive"),
+			keyChip("[d]", "dispatch new"),
 			keyChip("[q]", "quit"),
-		}, sep)
+		}, "  ")
 		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID)))
 		b.WriteString("\n")
 		b.WriteString(chips)
@@ -425,6 +441,24 @@ func (m Model) renderFooter() string {
 		// operator needs it, the TUI is gone and tmux owns the screen.
 	}
 	return b.String()
+}
+
+// titleRow renders the top line: bold cyan "Fleet x.y.z" on the left,
+// faint username on the right, padded with spaces to fill width.
+// When width is unknown (early renders) or username is empty, falls
+// back to just the title — keeping the row stable as the terminal
+// reports its size in.
+func titleRow(title, name string, width int) string {
+	left := titleStyle.Render(title)
+	if name == "" || width <= 0 {
+		return left
+	}
+	right := userStyle.Render(name)
+	gap := width - lipgloss.Width(title) - lipgloss.Width(name)
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
 }
 
 // divider returns a horizontal line of ─ characters spanning the
@@ -541,10 +575,18 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 // by sortRecords (project asc, spawned desc) so a single pass is
 // enough.
 //
+// width is the terminal width; the selected row's background tint is
+// padded to it so the highlight reads as a full-width band. When 0
+// (no WindowSizeMsg yet), the highlight falls back to inline-only
+// styling — degrading gracefully instead of collapsing to a 0-cell
+// row.
+//
 // alive is the cached tmux liveness snapshot from the most recent
 // load. deriveStatus reads from it instead of probing tmux per-row,
 // so render is pure formatting (no subprocess fan-out, no I/O).
-func renderAgents(records []*agent.Record, cursor int, alive map[string]bool) string {
+func renderAgents(records []*agent.Record, cursor int,
+	alive map[string]bool, width int) string {
+
 	idW := columnWidth(records, func(r *agent.Record) string { return r.ID }, 6)
 	taskW := columnWidth(records,
 		func(r *agent.Record) string { return defaultStr(r.TaskID, "-") }, 8)
@@ -556,10 +598,22 @@ func renderAgents(records []*agent.Record, cursor int, alive map[string]bool) st
 		taskW = 40
 	}
 
-	// Group counts so the header can show "(N agents)".
-	counts := map[string]int{}
+	// Group counts so the header can show "(N tasks, M active)".
+	// active = records whose status isn't "dead" — matches the v2
+	// mockup's read of "active = an agent is currently working it".
+	type groupCounts struct{ total, active int }
+	counts := map[string]*groupCounts{}
 	for _, r := range records {
-		counts[projectDisplay(r)]++
+		proj := projectDisplay(r)
+		gc := counts[proj]
+		if gc == nil {
+			gc = &groupCounts{}
+			counts[proj] = gc
+		}
+		gc.total++
+		if deriveStatus(r, alive) != "dead" {
+			gc.active++
+		}
 	}
 
 	var b strings.Builder
@@ -570,31 +624,44 @@ func renderAgents(records []*agent.Record, cursor int, alive map[string]bool) st
 			if lastProject != "" {
 				b.WriteString("\n") // blank line between groups
 			}
-			b.WriteString(renderProjectHeader(proj, counts[proj]))
+			gc := counts[proj]
+			b.WriteString(renderProjectHeader(proj, gc.total, gc.active))
 			lastProject = proj
 		}
 
 		status := deriveStatus(r, alive)
 		selected := i == cursor
-		b.WriteString(renderAgentLine(r, status, selected, idW, taskW))
-		b.WriteString("\n")
-		if selected {
-			b.WriteString(renderAgentDetail(r, status))
+		row := renderAgentLine(r, status, selected, idW, taskW)
+		if !selected {
+			b.WriteString(row)
+			b.WriteString("\n")
+			continue
 		}
+		// Selected: pin row + detail block under a full-width dark-blue
+		// highlight. lipgloss handles ANSI-reset reapplication so the
+		// internal fg colors survive the wrapper.
+		detail := renderAgentDetail(r, status)
+		block := row + "\n" + strings.TrimRight(detail, "\n")
+		if width > 0 {
+			b.WriteString(selectedRowStyle.Width(width).Render(block))
+		} else {
+			b.WriteString(block)
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
 }
 
-// renderProjectHeader returns "rainier (2 agents)" with project
-// label bold-fg and the count dim. Empty project labels show as
-// "(no project)" so legacy / pre-spawn records still get a header
+// renderProjectHeader returns "rainier (3 tasks, 1 active)" with the
+// project label bold-fg and the count dim. Empty project labels show
+// as "(no project)" so legacy / pre-spawn records still get a header
 // instead of slipping into a nameless group.
-func renderProjectHeader(name string, count int) string {
+func renderProjectHeader(name string, total, active int) string {
 	label := name
 	if label == "" || label == "-" {
 		label = "(no project)"
 	}
-	suffix := fmt.Sprintf("(%d agent%s)", count, plural(count))
+	suffix := fmt.Sprintf("(%d task%s, %d active)", total, plural(total), active)
 	return groupHeaderStyle.Render(label) + " " + dimStyle.Render(suffix) + "\n"
 }
 
@@ -602,11 +669,12 @@ func renderProjectHeader(name string, count int) string {
 //
 // Layout (cells, monospaced):
 //
-//	"▸ " | "● " | id (idW) | "  " | task (taskW) | "  " | "  68%" | "  " | "  14m" | "  " | live
+//	"▶ " | "● " | id (idW) | "  " | task (taskW) | … | "  90%" | "  " | "  14m" | "  " | doing
 //
 // The 2-char gutter holds the cursor arrow on the selected row and
 // is blank otherwise — keeping every row indented the same amount so
-// the columns line up across the whole list.
+// the columns line up across the whole list. Cursor glyph "▶" + bold
+// cyan matches the v2 mockup.
 func renderAgentLine(r *agent.Record, status string, selected bool,
 	idW, taskW int) string {
 
@@ -616,23 +684,22 @@ func renderAgentLine(r *agent.Record, status string, selected bool,
 	taskCell := padRight(task, taskW)
 	ctxText, ctxStyle := formatCtxPct(r.ContextPct)
 	age := padLeft(humanAge(time.Since(r.SpawnedAt)), 5)
+	label := statusLabel(status)
 
 	gutter := "  "
 	if selected {
-		gutter = cursorStyle.Render("▸ ")
+		gutter = cursorStyle.Render("▶ ")
 	}
 	idCell := idStyle.Render(id)
-	if selected {
-		idCell = cursorStyle.Render(id)
-	}
+	taskRendered := taskStyle.Render(taskCell)
 
 	return gutter +
 		glyphStyle.Render(glyph+" ") +
 		idCell + "  " +
-		taskCell + "  " +
+		taskRendered + "  " +
 		ctxStyle.Render(ctxText) + "  " +
 		dimStyle.Render(age) + "  " +
-		statusStyleFor(status).Render(status)
+		statusStyleFor(status).Render(label)
 }
 
 // renderAgentDetail returns the 2-line block under the selected row:
@@ -710,17 +777,20 @@ func actionChipsFor(status string) []string {
 // into a single line. Empty when nothing's wrong — a clean dashboard
 // shouldn't waste a line on "0 of everything".
 //
+// Glyphs and colors match the v2 mockup: orange ▌ for blocked, red △
+// for hot context, cyan ● for in-review (waiting), faint ✗ for dead.
+//
 // Counts run independently: a record can be both "blocked" AND have
 // hot context, so it bumps both counts. That's intentional — the
 // banner is a heads-up, not a partition.
 func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
-	var blocked, waiting, hot, dead int
+	var blocked, review, hot, dead int
 	for _, r := range records {
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
 		case "waiting":
-			waiting++
+			review++
 		case "dead":
 			dead++
 		}
@@ -731,15 +801,15 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	var parts []string
 	if blocked > 0 {
 		parts = append(parts, statusBlockedStyle.Render(
-			fmt.Sprintf("⏸ %d blocked", blocked)))
-	}
-	if waiting > 0 {
-		parts = append(parts, statusWaitingStyle.Render(
-			fmt.Sprintf("◐ %d waiting", waiting)))
+			fmt.Sprintf("▌ %d blocked", blocked)))
 	}
 	if hot > 0 {
 		parts = append(parts, statusUrgentStyle.Render(
-			fmt.Sprintf("⚠ %d hot context", hot)))
+			fmt.Sprintf("△ %d hot context", hot)))
+	}
+	if review > 0 {
+		parts = append(parts, statusReviewStyle.Render(
+			fmt.Sprintf("● %d in review", review)))
 	}
 	if dead > 0 {
 		parts = append(parts, statusDeadStyle.Render(
@@ -748,7 +818,9 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, dimStyle.Render("  ·  ")) + "\n"
+	// Two-space gap between chips matches mockup spacing — bullet
+	// dot was the v1 separator and read busier than the design.
+	return strings.Join(parts, "   ") + "\n"
 }
 
 // footerSummary builds the one-line "N agents · M blocked" summary
@@ -780,17 +852,16 @@ func footerSummary(records []*agent.Record, alive map[string]bool) string {
 }
 
 // glyphFor returns the single-character status glyph and its lipgloss
-// style. The glyph palette mirrors the v2 design (● for live, ⏸ for
-// blocked, etc.) so the dashboard reads the same way at a glance
-// without having to parse the status word.
+// style. Glyphs match the v2 mockup: filled green dot for doing, solid
+// orange bar for blocked, cyan dot for review, dim ✗ for dead.
 func glyphFor(status string) (string, lipgloss.Style) {
 	switch status {
 	case "live":
 		return "●", glyphLiveStyle
 	case "waiting":
-		return "◐", glyphWaitingStyle
+		return "●", glyphReviewStyle
 	case "blocked":
-		return "⏸", glyphBlockedStyle
+		return "▌", glyphBlockedStyle
 	case "dead":
 		return "✗", glyphDeadStyle
 	case "auto-yellow":
@@ -822,7 +893,7 @@ func ctxColorFor(p float64) lipgloss.Style {
 	case p < 50:
 		return statusLiveStyle
 	case p < 70:
-		return statusWaitingStyle
+		return statusBlockedStyle // orange — warning band, not yet hot
 	default:
 		return statusUrgentStyle
 	}
@@ -991,42 +1062,54 @@ func humanAge(d time.Duration) string {
 	}
 }
 
-// Lipgloss styles. Kept in the same file as the View() that uses them
-// so changes are co-located.
+// Lipgloss styles. Palette matches the v2 mockup screenshot —
+// soft cyan title, orange/red/cyan alert glyphs, yellow action
+// chips, dim slate dividers. Co-located with View() so changes
+// are easy to scan.
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63")).PaddingLeft(1).PaddingRight(1)
-	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("60"))
-	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	dimStyle      = lipgloss.NewStyle().Faint(true)
-	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	promptStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
-	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — action keybind chips
-	keyLabelStyle = lipgloss.NewStyle().Faint(true)
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117")) // soft cyan
+	userStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("245"))
+	dividerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	cursorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
+	dimStyle     = lipgloss.NewStyle().Faint(true)
+	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	// Yellow chip key + light foreground label. Bare-foreground
+	// (no Faint) keeps the labels readable against the selected
+	// row's dark-blue background — Faint dimmed them too far.
+	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	keyLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 
 	// v2 layout styles.
-	idStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("81")) // cyan — agent ids stand out
+	idStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // dim — IDs are anchors, not focal
+	taskStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("252")) // task name reads at default fg
 	groupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
 	detailStyle      = lipgloss.NewStyle().Faint(true).Italic(true)
 	coachStyle       = lipgloss.NewStyle().Faint(true).Italic(true).Foreground(lipgloss.Color("245"))
 
+	// Selected row gets a subtle dark-blue background that spans the
+	// full terminal width. Width is applied at render time (m.width),
+	// not on the style itself.
+	selectedRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("237"))
+
 	// Glyph styles for the leading status icon column.
-	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	glyphWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	glyphBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))  // green
+	glyphReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // cyan — needs review
+	glyphBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
 	glyphDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
 	glyphHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
-	glyphUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	glyphUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
 
 	// Per-status colors for the STATUS label and the alert banner.
 	// The padded plain text is built first (so column widths remain
 	// correct), then wrapped in these styles — lipgloss adds
 	// zero-width ANSI escapes so the alignment math is unaffected.
-	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))  // green
-	statusWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // amber
-	statusBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))  // green — doing
+	statusReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // cyan — review
+	statusBlockedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")) // orange
 	statusDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
-	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — handoff in flight
-	statusUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")) // red — auto-red / precompact
+	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	statusUrgentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")) // red — hot context / auto-red
 )
 
 // statusStyleFor maps a STATUS value to its lipgloss style. Falls back
@@ -1037,7 +1120,7 @@ func statusStyleFor(status string) lipgloss.Style {
 	case "live":
 		return statusLiveStyle
 	case "waiting":
-		return statusWaitingStyle
+		return statusReviewStyle
 	case "blocked":
 		return statusBlockedStyle
 	case "dead":
@@ -1050,9 +1133,25 @@ func statusStyleFor(status string) lipgloss.Style {
 	return dimStyle
 }
 
-// keyChip renders a "[k] label" pair with a colored bracketed key and
-// a dim label. Used by the footer so the operator's eye can land on
-// the action keys without scanning the whole prose line.
+// statusLabel maps the canonical deriveStatus value to the
+// operator-facing word shown in the STATUS column. The mockup
+// vocabulary is: doing / review / blocked / dead / handoff —
+// not the raw "live"/"waiting" internal names.
+func statusLabel(status string) string {
+	switch status {
+	case "live":
+		return "doing"
+	case "waiting":
+		return "review"
+	case "auto-yellow", "auto-red", "precompact":
+		return "handoff"
+	}
+	return status
+}
+
+// keyChip renders a "[k]label" pair with a colored bracketed key and
+// a foreground label. Mockup uses [a]attach (no space) so the chips
+// read as compact tokens, not "key + descriptor".
 func keyChip(key, label string) string {
-	return keyStyle.Render(key) + " " + keyLabelStyle.Render(label)
+	return keyStyle.Render(key) + keyLabelStyle.Render(label)
 }

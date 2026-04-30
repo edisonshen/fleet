@@ -267,9 +267,10 @@ func TestView_RendersAgentList(t *testing.T) {
 	if !strings.Contains(out, "a0") || !strings.Contains(out, "a1") {
 		t.Errorf("view should include agent IDs, got:\n%s", out)
 	}
-	// Project group header surfaces the count alongside the project
-	// label so the operator can scan groups at a glance.
-	if !strings.Contains(out, "demo") || !strings.Contains(out, "(2 agents)") {
+	// Project group header surfaces the count + active count alongside
+	// the project label so the operator can scan groups at a glance.
+	// Format: "demo (2 tasks, 2 active)".
+	if !strings.Contains(out, "demo") || !strings.Contains(out, "(2 tasks, 2 active)") {
 		t.Errorf("view should include project group header, got:\n%s", out)
 	}
 	// Smart footer summary line: "N project · M agents".
@@ -325,7 +326,10 @@ func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2)) // all default → live
 	out := m.View()
-	for _, sym := range []string{"⏸", "⚠", "✗", "blocked", "hot context", "dead"} {
+	// v2 banner glyphs: ▌ blocked, △ hot context, ✗ dead. The cyan
+	// ● review glyph is also a row-level glyph so we can't blanket-
+	// check it — instead guard the descriptive words.
+	for _, sym := range []string{"▌", "△", "✗", "blocked", "hot context", "dead", "in review"} {
 		if strings.Contains(out, sym) {
 			t.Errorf("clean dashboard should hide banner for %q, got:\n%s", sym, out)
 		}
