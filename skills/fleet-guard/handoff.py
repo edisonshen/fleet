@@ -468,7 +468,13 @@ def write_queue(*, old_id: str, new_id: str, doc_path: str,
     `tmux has-session` check no-op and produces orphaned auto-handoffs.
     """
     payload = {
-        "schema_version": 1,
+        # v2 added DisableAutoResume for the per-handoff auto-resume
+        # override (codex review iter-12 P2). fleet-guard never sets
+        # an override — auto-handoff inherits from the outgoing record
+        # — but writing the current schema version means the consumer
+        # can distinguish v2 (auto-resume aware) from v1 (legacy, no
+        # auto-resume; consumer skips the prompt for safety).
+        "schema_version": 2,
         "old_agent_id": old_id,
         "handoff_doc": doc_path,
         "project": project,

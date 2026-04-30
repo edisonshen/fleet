@@ -272,6 +272,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			}
 			// Both record and session gone — true orphan journal.
 			// Delete and proceed normally so a fresh spawn can happen.
+			// Preserve the persisted auto-resume override into opts
+			// so the fall-through respects the original handoff's
+			// policy (codex review iter-17 P1) — otherwise an opt-out
+			// for a non-claude wrapper would silently re-enable on
+			// the retry.
+			if pending.DisableAutoResume != nil {
+				opts.noAutoResume = *pending.DisableAutoResume
+				opts.autoResume = !*pending.DisableAutoResume
+				opts.autoResumeFlagWasSet = true
+			}
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -287,6 +297,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			if !tmux.HasSession(newRec.TmuxSession) {
 				if path, perr := state.AgentPath(newRec.ID); perr == nil {
 					_ = os.Remove(path)
+				}
+				// Preserve auto-resume override into opts before
+				// fall-through (codex iter-17 P1).
+				if pending.DisableAutoResume != nil {
+					opts.noAutoResume = *pending.DisableAutoResume
+					opts.autoResume = !*pending.DisableAutoResume
+					opts.autoResumeFlagWasSet = true
 				}
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
@@ -668,14 +685,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
-	// Print the manual prompt fallback whenever auto-resume DIDN'T
-	// happen for ANY reason: explicit opt-out, or queue.Delete
-	// failure that gated the send (codex review iter-7 P2 +
-	// iter-16 P2). Without this, a transient queue.Delete error
-	// leaves the replacement idle while the CLI reports success.
-	if !autoResume || !queueDeleted {
+	switch {
+	case !autoResume:
+		// Auto-resume disabled — replacement is alive but idle.
+		// Tell the operator what to type once they attach (codex
+		// review iter-7 P2).
 		_, _ = fmt.Fprintf(stdout,
 			"then say: read the handoff doc at %s and continue\n", docPath)
+	case !queueDeleted:
+		// queue.Delete failed → SendPromptKeys was skipped for the
+		// at-most-once guarantee. The journal is still on disk;
+		// running fleet handoff again triggers cleanUpStaleQueue
+		// which delivers the prompt + cleans up. Telling the
+		// operator to type the prompt manually here would race
+		// with that recovery and produce a double-send (codex
+		// review iter-17 P2).
+		_, _ = fmt.Fprintf(stdout,
+			"queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt\n",
+			oldRec.ID)
 	}
 	return nil
 }

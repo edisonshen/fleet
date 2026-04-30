@@ -111,12 +111,17 @@ _(operator-triggered handoff — fill in before resuming)_
 
 	newID := agent.NewID()
 	req = queue.SpawnFresh{
-		OldAgentID: oldRec.ID,
-		HandoffDoc: dp,
-		Project:    oldRec.Project,
-		TaskID:     oldRec.TaskID,
-		NewAgentID: newID,
-		NewSession: tmux.SessionName(newID),
+		// Set explicitly so the returned value matches what
+		// WriteSpawnFresh persists on disk — the test wants the
+		// in-memory req and file to agree (auto-resume gates the
+		// drain on req.SchemaVersion >= 2).
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    oldRec.ID,
+		HandoffDoc:    dp,
+		Project:       oldRec.Project,
+		TaskID:        oldRec.TaskID,
+		NewAgentID:    newID,
+		NewSession:    tmux.SessionName(newID),
 	}
 	qp, err := queue.WriteSpawnFresh(req)
 	if err != nil {

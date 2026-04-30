@@ -102,10 +102,17 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		return spawnAndRetire(req, queuePath, oldRec, graceMillis, stdout, stderr)
 	}
 	// Resolve THIS handoff's auto-resume policy from queue override
-	// + oldRec baseline (codex review iter-12 P2).
+	// + oldRec baseline (codex review iter-12 P2). Gate on schema
+	// v2+ (codex review iter-17 P2): a v1 queue file processed by
+	// fleet drain / TUI watcher must NOT auto-type, since v1 had
+	// no auto-resume and the operator may already have started
+	// the replacement manually.
 	thisHandoffDisable := oldRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
 		thisHandoffDisable = *req.DisableAutoResume
+	}
+	if req.SchemaVersion < 2 {
+		thisHandoffDisable = true
 	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisable, graceMillis, stdout, stderr)
@@ -224,11 +231,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	}
 	// Resolve THIS handoff's auto-resume: queue's override (if set)
 	// wins, else inherit from oldRec (codex review iter-10/11/12 P2).
-	// The new record's baseline always inherits from oldRec — the
-	// override is one-shot.
+	// Gate on schema v2+ (codex review iter-17 P2): v1 queue files
+	// predate auto-resume entirely; the auto-handoff drain must not
+	// type a prompt that the operator might have already delivered.
 	thisHandoffDisableAutoResume := oldRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
 		thisHandoffDisableAutoResume = *req.DisableAutoResume
+	}
+	if req.SchemaVersion < 2 {
+		thisHandoffDisableAutoResume = true
 	}
 
 	// Reject fresh-spawn auto-handoff for opt-out agents (codex
