@@ -19,10 +19,12 @@ import (
 
 // handoffOpts captures cobra-parsed flags + positional arg.
 type handoffOpts struct {
-	oldID       string
-	cwd         string
-	command     []string
-	graceMillis int
+	oldID              string
+	cwd                string
+	command            []string
+	graceMillis        int
+	noAutoResume       bool
+	noAutoResumeWasSet bool // true when operator explicitly passed --no-auto-resume / --auto-resume
 }
 
 func newHandoffCmd() *cobra.Command {
@@ -48,6 +50,7 @@ outgoing record and increments handoff_number by 1.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.oldID = args[0]
+			opts.noAutoResumeWasSet = cmd.Flags().Changed("no-auto-resume")
 			return runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
@@ -57,6 +60,13 @@ outgoing record and increments handoff_number by 1.`,
 		"command to run inside the replacement tmux session (default: outgoing agent's command, or `claude`)")
 	cmd.Flags().IntVar(&opts.graceMillis, "grace-ms", 3000,
 		"milliseconds to wait between /exit and kill on the old session")
+	// Override the auto-resume policy inherited from the outgoing
+	// record. Use when handing off into a non-claude --command
+	// (shell, vim, REPL, alternate engine) where typing the natural-
+	// language prompt would execute as garbage input. Codex review
+	// iter-8 P2.
+	cmd.Flags().BoolVar(&opts.noAutoResume, "no-auto-resume", false,
+		"override the inherited auto-resume policy: skip auto-typing the resume prompt on this handoff")
 	return cmd
 }
 
@@ -318,13 +328,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
 	}
 
+	// Auto-resume policy for the replacement: if the operator passed
+	// --no-auto-resume on this handoff, use that; else inherit from
+	// the outgoing record. Lets `fleet handoff --command bash` opt
+	// out without permanently flipping the policy on records that
+	// originally used claude (codex review iter-8 P2).
+	disableAutoResume := oldRec.DisableAutoResume
+	if opts.noAutoResumeWasSet {
+		disableAutoResume = opts.noAutoResume
+	}
+
 	// 8. Drain: spawn the replacement using the pre-allocated ID.
 	newRec, err := spawn.Spawn(spawn.Options{
-		OldRecord:      oldRec,
-		NewDocPath:     docPath,
-		Cwd:            cwd,
-		Command:        command,
-		PreAllocatedID: newID,
+		OldRecord:         oldRec,
+		NewDocPath:        docPath,
+		Cwd:               cwd,
+		Command:           command,
+		PreAllocatedID:    newID,
+		DisableAutoResume: disableAutoResume,
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
@@ -349,6 +370,41 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf(
 			"replacement %s spawned but tmux session %s already exited (command crashed at startup?); old agent untouched",
 			newRec.ID, newRec.TmuxSession)
+	}
+
+	// 8b. Auto-resume policy for the rest of this handoff. Inherited
+	//     from spawn (which got it from oldRec or the operator's
+	//     --no-auto-resume flag). Used both to gate the readiness
+	//     wait and the eventual send.
+	autoResume := !newRec.DisableAutoResume
+
+	// 8c. Wait for the new agent's pane to stabilize BEFORE we touch
+	//     the old session. The wait is passive (new is rendering UI,
+	//     not doing work — only SendPromptKeys later starts the new
+	//     agent's work), so this respects the iter-2 P2 invariant
+	//     that "new doesn't do work during the OLD↔NEW overlap" while
+	//     also keeping recovery clean: if the new agent crashes
+	//     during the up-to-30 s wait, old is still alive, so we can
+	//     roll back the spawn (kill new, delete record + queue) and
+	//     return — the operator retries with old still standing.
+	//     Pre-fix, the wait happened AFTER Kill(old); a dead-during-
+	//     wait left the task stranded with no live agent (codex
+	//     review iter-8 P1).
+	if autoResume {
+		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+				newRec.TmuxSession, err)
+		}
+		if !tmux.HasSession(newRec.TmuxSession) {
+			if path, perr := state.AgentPath(newRec.ID); perr == nil {
+				_ = os.Remove(path)
+			}
+			_ = queue.Delete(queuePath)
+			return fmt.Errorf(
+				"replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+				newRec.ID, newRec.TmuxSession, oldRec.ID)
+		}
 	}
 
 	// 9. Send "/exit" to the old session. ErrNoSession means it
@@ -409,33 +465,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
-	// 11b. Auto-resume is skipped when the operator dispatched with
-	//      --no-auto-resume — typically for custom --command argvs
-	//      (shells, vim, REPLs, alternate engines). Inherited from
-	//      oldRec at spawn time so the policy follows the agent
-	//      across handoffs (codex review iter-7 P2).
-	autoResume := !newRec.DisableAutoResume
-
-	// 11c. Wait for the new agent's pane to stabilize BEFORE
-	//      queue.Delete so a crash during the wait stays
-	//      recoverable (resumeHandoff will redo wait + send on
-	//      retry). Codex review iter-5 P2. Re-check liveness AFTER
-	//      the wait: a wrapper can crash post-banner during the
-	//      30 s poll window, in which case proceeding would leave
-	//      the task with NO live successor (codex review iter-6 P1).
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
-		}
-		if !tmux.HasSession(newRec.TmuxSession) {
-			return fmt.Errorf(
-				"replacement %s tmux session %s exited during readiness wait; old %s record + queue file preserved for manual recovery",
-				newRec.ID, newRec.TmuxSession, oldRec.ID)
-		}
-	}
-
 	// 12. Archive the old record. After this, `fleet status` no
 	//     longer shows the outgoing agent. We've confirmed the old
 	//     session is dead in step 10, so this can't hide a live
@@ -471,13 +500,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 
 	// 14. Send the resume prompt AFTER queue.Delete. Pure send-keys —
-	//     no waits. The readiness wait already ran in step 11c
+	//     no waits. The readiness wait already ran in step 8c
 	//     (recoverable via the still-on-disk queue file). Now the
 	//     queue is gone so this send happens at most once per
 	//     logical handoff. Lost-prompt window: the microseconds
 	//     between queue.Delete returning and this line. Best-effort:
 	//     a tmux failure logs a warning, operator types manually.
-	//     Skipped entirely for non-claude wrappers (autoResume false).
+	//     Skipped entirely when DisableAutoResume is set.
 	if autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
@@ -524,6 +553,24 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			newRec.ID, newRec.TmuxSession, oldRec.ID, newRec.ID)
 	}
 
+	autoResume := !newRec.DisableAutoResume
+
+	// Wait BEFORE killing old (codex iter-8 P1). If the new agent
+	// dies during the wait, leave the old session alone and surface
+	// the error — operator retries cleanly.
+	if autoResume {
+		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+				newRec.TmuxSession, err)
+		}
+		if !tmux.HasSession(newRec.TmuxSession) {
+			return fmt.Errorf(
+				"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+				newRec.ID, newRec.TmuxSession, oldRec.ID)
+		}
+	}
+
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {
 		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
@@ -539,27 +586,6 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		}
 		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
 			oldRec.TmuxSession, err)
-	}
-
-	// Auto-resume opt-out follows the agent's persisted policy —
-	// chosen at first dispatch via --no-auto-resume (codex review
-	// iter-7 P2).
-	autoResume := !newRec.DisableAutoResume
-
-	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
-	// so a crash during the wait stays recoverable. Re-check
-	// liveness after — wrapper may have crashed post-banner.
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
-		}
-		if !tmux.HasSession(newRec.TmuxSession) {
-			return fmt.Errorf(
-				"resume handoff: replacement %s tmux session %s exited during readiness wait; old %s record + queue file preserved for manual recovery",
-				newRec.ID, newRec.TmuxSession, oldRec.ID)
-		}
 	}
 
 	if err := oldRec.Archive(); err != nil {

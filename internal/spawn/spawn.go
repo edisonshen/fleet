@@ -194,11 +194,11 @@ type Options struct {
 	// a fresh ID inside Spawn.
 	PreAllocatedID string
 
-	// DisableAutoResume opts the agent out of fleet's handoff
-	// auto-resume on FRESH dispatch only. When OldRecord is non-nil
-	// (handoff path), the value is inherited from OldRecord and
-	// this field is ignored — auto-resume policy is set once at
-	// first dispatch and follows the agent forever.
+	// DisableAutoResume sets the new record's DisableAutoResume.
+	// Caller computes the right value: dispatch passes the CLI flag
+	// directly; handoff inherits from OldRecord by default but the
+	// operator can override via `--no-auto-resume` when handing off
+	// into a different command class (codex review iter-8 P2).
 	DisableAutoResume bool
 }
 
@@ -281,11 +281,13 @@ func Spawn(opts Options) (*agent.Record, error) {
 		if opts.OldRecord.Mode != "" {
 			rec.Mode = opts.OldRecord.Mode
 		}
-		// Auto-resume policy is sticky across handoffs: the operator
-		// chose it at first dispatch, the same policy must apply to
-		// every replacement. opts.DisableAutoResume is ignored in the
-		// handoff path.
-		rec.DisableAutoResume = opts.OldRecord.DisableAutoResume
+		// Auto-resume policy: caller (cmd/fleet/handoff.go or
+		// internal/handoffop) is responsible for computing the right
+		// value — typically inherit-from-old, but operator may
+		// override on `fleet handoff --no-auto-resume` when the
+		// replacement is a different command class (codex review
+		// iter-8 P2). Spawn just persists what it's given.
+		rec.DisableAutoResume = opts.DisableAutoResume
 		// Chain: handoff_number = old + 1, prev_path = doc just written.
 		rec.HandoffNumber = opts.OldRecord.HandoffNumber + 1
 		if opts.NewDocPath != "" {

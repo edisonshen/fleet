@@ -160,6 +160,9 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
+		// Auto-handoff inherits the policy verbatim — there's no
+		// operator override on this path (drain is non-interactive).
+		DisableAutoResume: oldRec.DisableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -176,39 +179,74 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		graceMillis, stdout, stderr)
 }
 
-// retireOldAgent runs the post-spawn tail: /exit + grace + kill the
-// old, wait for new's pane to stabilize, archive, delete queue, send
-// the resume prompt to new. Caller has verified newRec.TmuxSession
-// is alive at entry.
+// retireOldAgent runs the post-spawn tail in this order: wait for
+// new's pane to stabilize → /exit + grace + kill the old → archive
+// → delete queue → send the resume prompt. Caller has verified
+// newRec.TmuxSession is alive at entry.
 //
-// Sequencing rationale (codex review iter-1, iter-2, iter-4, iter-5):
+// Sequencing rationale across the codex review series (iter-1, 2,
+// 4, 5, 6, 7, 8):
 //
-//  1. The resume prompt is delivered HERE (not inside spawn.Spawn) so
-//     crash recovery's "previous run spawned but didn't retire"
-//     branch — Resume() calling retireOldAgent directly — uses the
-//     same delivery path as the happy path. Single source of truth.
+//  1. Prompt delivery lives HERE, not in spawn.Spawn, so crash
+//     recovery (Resume → retireOldAgent for case-3) uses the same
+//     delivery path as happy path. Single source of truth.
 //
-//  2. The prompt is sent AFTER tmux.Kill(old) succeeds — sending
-//     earlier would mean the new agent could already be editing
-//     files / making external calls during the grace window, so a
-//     Kill-failure rollback (kill new, delete new record) would
-//     silently drop work.
+//  2. The readiness wait runs BEFORE Kill(old). The wait is passive
+//     — new is rendering UI, not doing work — so it doesn't violate
+//     the iter-2 P2 invariant that "new doesn't do work during the
+//     OLD↔NEW overlap." Putting the wait first means a dead-during-
+//     wait crashes cleanly: roll back the new, leave the old alive,
+//     surface the error so the operator/recovery can retry. Pre-fix
+//     (iter-7), the wait happened AFTER Kill(old) and a dead-during-
+//     wait left the task stranded with no live agent.
 //
-//  3. The readiness wait runs BEFORE queue.Delete; the actual key
-//     send runs AFTER. The wait can take up to 30 s (slow startup),
-//     during which the queue file remains on disk so a crash there
-//     is recoverable. After queue.Delete the send is microsecond-
-//     scale, so the unrecoverable "lost prompt" window is tiny.
-//     This split avoids both (a) double-send when a previous run
-//     crashed mid-wait (queue was still on disk → retry), and (b)
-//     a 30 s lost-prompt window if we'd put the wait after queue
-//     delete.
+//  3. The actual send-keys runs AFTER queue.Delete. Once the queue
+//     file is gone no recovery path can run, so the prompt is
+//     delivered at most once per logical handoff. Sending earlier
+//     would mean a crash between send and queue.Delete leads to a
+//     retry that re-sends, making claude redo work. Lost-prompt
+//     window is the microseconds between queue.Delete returning
+//     and the send-keys call.
 //
-// Mirrors steps 9-14 of cmd/fleet/handoff.go::runHandoff. Rollback
-// semantics on Kill failure: kill the new session, delete the new record
-// + queue, surface the live old session for operator triage.
+//  4. Auto-resume can be disabled per-record via DisableAutoResume
+//     (set by --no-auto-resume on dispatch or handoff). When off,
+//     both the wait and the send are skipped — the operator types
+//     their own first prompt on attach. This protects non-claude
+//     wrappers from receiving "Read your handoff doc..." as garbage
+//     input.
+//
+// Rollback semantics on Kill failure: kill the new session, delete
+// the new record + queue, surface the live old session for operator
+// triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	graceMillis int, stdout, stderr io.Writer) error {
+
+	autoResume := !newRec.DisableAutoResume
+
+	// Wait BEFORE killing old (codex review iter-8 P1). The wait is
+	// passive (new is rendering UI, not doing work — only the
+	// post-queue.Delete SendPromptKeys starts the new agent's work),
+	// so this respects the iter-2 P2 invariant. If the new agent
+	// dies during the wait, OLD is still alive — roll back the new,
+	// leave old standing, return error so operator/recovery can
+	// retry cleanly. Pre-fix, the wait happened AFTER Kill(old) and
+	// a dead-during-wait stranded the task with no live agent.
+	if autoResume {
+		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+				newRec.TmuxSession, err)
+		}
+		if !tmux.HasSession(newRec.TmuxSession) {
+			if path, perr := state.AgentPath(newRec.ID); perr == nil {
+				_ = os.Remove(path)
+			}
+			_ = queue.Delete(queuePath)
+			return fmt.Errorf(
+				"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+				newRec.ID, newRec.TmuxSession, oldRec.ID)
+		}
+	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {
@@ -240,40 +278,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 		_, _ = fmt.Fprintf(stderr,
 			"note: kill %s reported error but session is gone: %v\n",
 			oldRec.TmuxSession, err)
-	}
-
-	// Auto-resume is skipped when the operator dispatched with
-	// --no-auto-resume — typically for custom --command argvs
-	// (shells, vim, REPLs, alternate engines) where typing the
-	// natural-language prompt would execute as garbage input.
-	// Inherited from oldRec → newRec at spawn time, so this
-	// reflects the policy chosen at first dispatch (codex review
-	// iter-7 P2).
-	autoResume := !newRec.DisableAutoResume
-
-	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
-	// so a crash during the wait stays recoverable. The actual
-	// SendPromptKeys runs AFTER queue.Delete (single-shot, no retry
-	// double-send). Codex review iter-5 P2.
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
-		}
-		// Re-check liveness AFTER the wait — the readiness poll can
-		// take up to 30 s, during which the new session may have
-		// exited (wrapper crashed post-banner). Proceeding to retire
-		// the old agent in that case would leave the task with NO
-		// live successor (codex review iter-6 P1). Abort retire,
-		// surface the error, leave queue file + records on disk so
-		// the operator can investigate / a future recovery can pick
-		// up.
-		if !tmux.HasSession(newRec.TmuxSession) {
-			return fmt.Errorf(
-				"resume: replacement %s tmux session %s exited during readiness wait; old %s record + queue file %s preserved for manual recovery",
-				newRec.ID, newRec.TmuxSession, oldRec.ID, queuePath)
-		}
 	}
 
 	if err := oldRec.Archive(); err != nil {
