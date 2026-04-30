@@ -8,6 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -127,7 +128,22 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	}
 	switch key {
 	case "h":
-		if cur := m.selected(); cur != nil {
+		if cur := m.selectedRecord(); cur != nil {
+			// Gate [h] to match the chip strip's status-aware
+			// affordances (codex iter-6 P2). In-flight handoff
+			// states hide [h] in actionChipsFor; without a hotkey
+			// gate, an operator who knows the old shortcut could
+			// still start a duplicate handoff during auto-yellow's
+			// pre-MILESTONE window. Flash the explanation instead
+			// of silently swallowing.
+			status := deriveStatus(cur, m.aliveByID)
+			if status == "auto-yellow" || status == "auto-red" || status == "precompact" {
+				m.flash = &flashMsg{
+					text:  fmt.Sprintf("agent %s already has a handoff in flight (%s)", cur.ID, status),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			return m, m.startHandoff(cur.ID), true
 		}
 		return m, nil, true
@@ -136,7 +152,22 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		// immediately. rm is destructive (kills the tmux session + deletes
 		// the record, no replacement) and a stray keypress on a busy
 		// dashboard would lose work irretrievably.
-		if cur := m.selected(); cur != nil {
+		//
+		// Gate auto-red / precompact: post-MILESTONE handoff states
+		// have a queue journal on disk, and `fleet rm` refuses while
+		// the journal exists (cmd/fleet/rm.go:99). Match the chip
+		// strip's hide-behavior so the hotkey doesn't end-run the UI.
+		// auto-yellow is NOT gated: that state can exist before the
+		// journal is written, and rm legitimately works there.
+		if cur := m.selectedRecord(); cur != nil {
+			status := deriveStatus(cur, m.aliveByID)
+			if status == "auto-red" || status == "precompact" {
+				m.flash = &flashMsg{
+					text:  fmt.Sprintf("agent %s has a pending handoff journal — `fleet drain` first", cur.ID),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			m.mode = modeConfirmArchive
 			m.archiveCandidate = cur.ID
 			return m, nil, true
@@ -325,6 +356,16 @@ func (m Model) selected() *agentRow {
 	}
 	r := m.records[m.cursor]
 	return &agentRow{ID: r.ID, TmuxSession: r.TmuxSession}
+}
+
+// selectedRecord returns the underlying *agent.Record at the cursor,
+// or nil if the list is empty. Used by action gates that need to
+// check status fields beyond what agentRow exposes.
+func (m Model) selectedRecord() *agent.Record {
+	if m.cursor < 0 || m.cursor >= len(m.records) {
+		return nil
+	}
+	return m.records[m.cursor]
 }
 
 // agentRow is a thin DTO so tests don't depend on agent.Record's full

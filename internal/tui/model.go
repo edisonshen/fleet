@@ -1136,27 +1136,31 @@ func defaultStr(s, def string) string {
 // (path-segment derivation, future relabeling) can't accidentally
 // reshuffle groups.
 //
-// Cwd-bearing records key on the symlink-resolved absolute path:
-// every agent from the same checkout collapses into one group
-// regardless of how the operator typed `--cwd`. EvalSymlinks
-// matters on macOS where /var → /private/var (and any user-set
-// worktree symlinks) — without it, the same physical repo
-// addressed two ways splits into two project headers and
-// double-counts in the footer (codex iter-4 P2).
+// Key shape: "<resolved-cwd>\x00<project-tag>" so two agents from
+// the same physical checkout but with different `--project` values
+// (different lock domains, fleet's own model of "distinct project"
+// — see internal/state lock files) keep separate group headers.
+// The NUL separator means a project tag containing "/" or other
+// path chars can't accidentally collide with a cwd boundary.
 //
-// EvalSymlinks fails when the path no longer exists (the operator
-// archived the checkout). Fall back to filepath.Clean in that case
-// so grouping degrades gracefully instead of going stringly-untyped.
+// EvalSymlinks resolves macOS /var → /private/var and other
+// symlinked worktree paths so the same physical checkout reached
+// via different path spellings collapses into one group. Falls
+// back to filepath.Clean when the path no longer exists.
 //
-// Legacy / Cwd-empty records key on r.Project.
+// Legacy / Cwd-empty records key on r.Project alone.
 func projectGroupKey(r *agent.Record) string {
-	if r.Cwd != "" {
-		if resolved, err := filepath.EvalSymlinks(r.Cwd); err == nil {
-			return resolved
-		}
-		return filepath.Clean(r.Cwd)
+	tag := defaultStr(r.Project, "-")
+	if r.Cwd == "" {
+		return tag
 	}
-	return defaultStr(r.Project, "-")
+	var resolved string
+	if eval, err := filepath.EvalSymlinks(r.Cwd); err == nil {
+		resolved = eval
+	} else {
+		resolved = filepath.Clean(r.Cwd)
+	}
+	return resolved + "\x00" + tag
 }
 
 // projectDisplay derives the human-readable project label for the
