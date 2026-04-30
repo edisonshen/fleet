@@ -19,12 +19,13 @@ import (
 
 // handoffOpts captures cobra-parsed flags + positional arg.
 type handoffOpts struct {
-	oldID              string
-	cwd                string
-	command            []string
-	graceMillis        int
-	noAutoResume       bool
-	noAutoResumeWasSet bool // true when operator explicitly passed --no-auto-resume / --auto-resume
+	oldID                string
+	cwd                  string
+	command              []string
+	graceMillis          int
+	noAutoResume         bool
+	autoResume           bool
+	autoResumeFlagWasSet bool // true when operator explicitly passed --no-auto-resume OR --auto-resume
 }
 
 func newHandoffCmd() *cobra.Command {
@@ -50,7 +51,12 @@ outgoing record and increments handoff_number by 1.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.oldID = args[0]
-			opts.noAutoResumeWasSet = cmd.Flags().Changed("no-auto-resume")
+			noChanged := cmd.Flags().Changed("no-auto-resume")
+			yesChanged := cmd.Flags().Changed("auto-resume")
+			if noChanged && yesChanged {
+				return fmt.Errorf("--no-auto-resume and --auto-resume are mutually exclusive")
+			}
+			opts.autoResumeFlagWasSet = noChanged || yesChanged
 			return runHandoff(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
@@ -61,12 +67,18 @@ outgoing record and increments handoff_number by 1.`,
 	cmd.Flags().IntVar(&opts.graceMillis, "grace-ms", 3000,
 		"milliseconds to wait between /exit and kill on the old session")
 	// Override the auto-resume policy inherited from the outgoing
-	// record. Use when handing off into a non-claude --command
-	// (shell, vim, REPL, alternate engine) where typing the natural-
-	// language prompt would execute as garbage input. Codex review
-	// iter-8 P2.
+	// record (codex review iter-8 P2 + iter-11 P2). Three states:
+	//   - neither flag → inherit oldRec.DisableAutoResume.
+	//   - --no-auto-resume → force OFF for this handoff (e.g.
+	//     handing into a shell or non-claude wrapper).
+	//   - --auto-resume → force ON for this handoff (e.g. a
+	//     previously opted-out agent that's now handing into a
+	//     claude wrapper that DOES want the prompt).
+	// Mutually exclusive — enforced in RunE above.
 	cmd.Flags().BoolVar(&opts.noAutoResume, "no-auto-resume", false,
-		"override the inherited auto-resume policy: skip auto-typing the resume prompt on this handoff")
+		"override: skip auto-typing the resume prompt on this handoff")
+	cmd.Flags().BoolVar(&opts.autoResume, "auto-resume", false,
+		"override: force auto-typing the resume prompt on this handoff (overrides outgoing record's --no-auto-resume)")
 	return cmd
 }
 
@@ -174,8 +186,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 						opts.oldID, pending.NewAgentID, newRec.TmuxSession)
 				}
 			}
-			_ = queue.Delete(pendingPath)
-			if autoResume {
+			queueDeleted := true
+			if err := queue.Delete(pendingPath); err != nil {
+				_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+				queueDeleted = false
+			}
+			if queueDeleted && autoResume {
 				if err := spawn.SendPromptKeys(newRec.TmuxSession,
 					handoff.ResumePrompt(pending.HandoffDoc)); err != nil {
 					_, _ = fmt.Fprintf(stderr,
@@ -186,6 +202,15 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
 				opts.oldID, pending.NewAgentID)
+			if !autoResume {
+				// The original handoff opted out of auto-resume, so
+				// the replacement is alive but still idle. Print the
+				// manual prompt instruction so the operator knows
+				// what to type on attach (codex review iter-11 P2).
+				_, _ = fmt.Fprintf(stdout,
+					"then say: read the handoff doc at %s and continue\n",
+					pending.HandoffDoc)
+			}
 			return nil
 		case lerr != nil:
 			// Read failure that isn't "missing" — abort so the
@@ -339,22 +364,30 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	newID := agent.NewID()
 	newSession := tmux.SessionName(newID)
 
-	// Auto-resume policy for the replacement: if the operator passed
-	// --no-auto-resume on this handoff, use that; else inherit from
-	// the outgoing record. Lets `fleet handoff --command bash` opt
-	// out without permanently flipping the policy on records that
-	// originally used claude (codex review iter-8 P2). Computed
-	// BEFORE the queue write so the override survives a crash and
-	// gets honored by the auto-handoff drain (codex review iter-10
-	// P2).
+	// Auto-resume policy for the replacement (codex review iter-8 P2
+	// + iter-10 / iter-11 P2). Tri-state, set BEFORE the queue
+	// write so it survives a crash:
+	//   - flag NOT passed: override = nil; queue and spawn inherit
+	//     from oldRec.DisableAutoResume.
+	//   - --no-auto-resume: override = &true; force OFF for this
+	//     handoff regardless of oldRec.
+	//   - --auto-resume:    override = &false; force ON regardless.
+	var override *bool
+	if opts.autoResumeFlagWasSet {
+		v := opts.noAutoResume // exactly one of the two flags was set
+		override = &v
+	}
 	disableAutoResume := oldRec.DisableAutoResume
-	if opts.noAutoResumeWasSet {
-		disableAutoResume = opts.noAutoResume
+	if override != nil {
+		disableAutoResume = *override
 	}
 
 	// 7. Write the queue file with the pre-allocated successor ID.
 	//    This is the durable commit point — anything after a crash
-	//    here is recoverable via the resume path in step 2.
+	//    here is recoverable via the resume path in step 2. The
+	//    override pointer (NOT the resolved bool) is persisted so a
+	//    later recovery can distinguish "operator overrode" from
+	//    "inherited from old."
 	queuePath, err := queue.WriteSpawnFresh(queue.SpawnFresh{
 		OldAgentID:        oldRec.ID,
 		HandoffDoc:        docPath,
@@ -362,7 +395,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		TaskID:            oldRec.TaskID,
 		NewAgentID:        newID,
 		NewSession:        newSession,
-		DisableAutoResume: disableAutoResume,
+		DisableAutoResume: override,
 	})
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
@@ -526,20 +559,22 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 
 	// 13. Delete the queue file. Work is durable on disk; the journal
-	//     entry is no longer needed.
+	//     entry is no longer needed. We GATE step 14's send on this
+	//     succeeding — if queue.Delete fails the journal lingers, a
+	//     retry will run cleanUpStaleQueue (or the equivalent
+	//     archive-recovery branch above) which has its own send +
+	//     delete pair; sending here too would double-deliver (codex
+	//     review iter-11 P3).
+	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+		queueDeleted = false
 	}
 
-	// 14. Send the resume prompt AFTER queue.Delete. Pure send-keys —
-	//     no waits. The readiness wait already ran in step 8c
-	//     (recoverable via the still-on-disk queue file). Now the
-	//     queue is gone so this send happens at most once per
-	//     logical handoff. Lost-prompt window: the microseconds
-	//     between queue.Delete returning and this line. Best-effort:
-	//     a tmux failure logs a warning, operator types manually.
-	//     Skipped entirely when DisableAutoResume is set.
-	if autoResume {
+	// 14. Send the resume prompt — only when queue.Delete succeeded
+	//     so the at-most-once guarantee holds. Skipped entirely when
+	//     DisableAutoResume is set.
+	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,
@@ -632,16 +667,15 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			}
 		}
 	}
+	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+		queueDeleted = false
 	}
 
-	// Send the resume prompt AFTER queue.Delete. Pure send-keys —
-	// the readiness wait already ran above. Both runHandoff and this
-	// path send post-queue.Delete, so this delivery is the FIRST —
-	// never a duplicate (codex review iter-4 / iter-5 P2). Skipped
-	// for non-claude wrappers.
-	if autoResume {
+	// Send the resume prompt only if queue.Delete succeeded — see
+	// runHandoff step 14 / codex iter-11 P3.
+	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,

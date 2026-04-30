@@ -167,6 +167,16 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	_, _ = fmt.Fprintf(stdout,
 		"agent %s already handed off → %s (cleaned stale queue file)\n",
 		req.OldAgentID, req.NewAgentID)
+	if !autoResume {
+		// Original handoff opted out — replacement is alive but
+		// idle. Tell the operator what to type on attach (codex
+		// review iter-11 P2). Note: this is the auto-handoff drain
+		// path so "operator" output goes to whoever's reading
+		// stdout (drain CLI / TUI background message stream).
+		_, _ = fmt.Fprintf(stdout,
+			"then say: read the handoff doc at %s and continue\n",
+			req.HandoffDoc)
+	}
 	return nil
 }
 
@@ -186,6 +196,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s is a legacy record with no stored command; manual `fleet handoff --command` required",
 			oldRec.ID)
 	}
+	// Resolve the auto-resume policy: queue's override (if set) wins,
+	// else inherit from oldRec (codex review iter-10 / iter-11 P2).
+	disableAutoResume := oldRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+
 	// Reject fresh-spawn auto-handoff for opt-out agents (codex
 	// review iter-9 P1, scoped to spawnAndRetire per iter-10 P2).
 	// We're about to bring up a NEW agent that won't get a resume
@@ -199,23 +216,18 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// replacement was spawned by an operator who already accepted
 	// the manual-prompt requirement, so we just complete the retire
 	// without sending.
-	if req.DisableAutoResume || oldRec.DisableAutoResume {
+	if disableAutoResume {
 		return fmt.Errorf(
 			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
 			req.OldAgentID, req.OldAgentID, queuePath)
 	}
 	newRec, err := spawn.Spawn(spawn.Options{
-		OldRecord:      oldRec,
-		NewDocPath:     req.HandoffDoc,
-		Cwd:            oldRec.Cwd,
-		Command:        oldRec.Command,
-		PreAllocatedID: req.NewAgentID,
-		// Honor the queue's DisableAutoResume — it captures any
-		// per-handoff override the operator passed via
-		// `fleet handoff --no-auto-resume` before the crash that
-		// triggered this recovery (codex review iter-10 P2). Falls
-		// back to oldRec on legacy queue files (zero value of bool).
-		DisableAutoResume: req.DisableAutoResume || oldRec.DisableAutoResume,
+		OldRecord:         oldRec,
+		NewDocPath:        req.HandoffDoc,
+		Cwd:               oldRec.Cwd,
+		Command:           oldRec.Command,
+		PreAllocatedID:    req.NewAgentID,
+		DisableAutoResume: disableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -352,15 +364,18 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				oldRec.ID, err, perr, newRec.ID)
 		}
 	}
+	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+		queueDeleted = false
 	}
 
-	// Send the resume prompt AFTER queue.Delete. Pure send-keys —
-	// no waits, microsecond-scale. The readiness wait already ran
-	// above (recoverable via the queue file). Now the queue is gone
-	// so this send happens at most once per logical handoff.
-	if autoResume {
+	// Send the resume prompt only when queue.Delete succeeded so
+	// the retry doesn't re-send via cleanUpStaleQueue (codex review
+	// iter-11 P3). On queue.Delete failure, the next retry will
+	// recover via cleanUpStaleQueue (or the cmd/fleet equivalent),
+	// which has its own send + delete pair.
+	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,

@@ -59,13 +59,19 @@ type SpawnFresh struct {
 	// "replacement already exists; do not re-spawn."
 	NewAgentID string `json:"new_agent_id,omitempty"`
 	NewSession string `json:"new_session,omitempty"`
-	// DisableAutoResume captures the per-handoff auto-resume opt-out
-	// chosen by the operator (e.g. `fleet handoff --no-auto-resume`)
-	// or implied by the outgoing record. Persisting it here ensures
-	// that a crashed handoff resumed by `fleet drain` / TUI watcher
-	// honors the same policy instead of falling back to the
-	// outgoing record's value (codex review iter-10 P2).
-	DisableAutoResume bool      `json:"disable_auto_resume,omitempty"`
+	// DisableAutoResume captures the per-handoff auto-resume override
+	// chosen by the operator (e.g. `fleet handoff --no-auto-resume`
+	// or `--auto-resume`). Pointer semantics so we can distinguish:
+	//   - nil → no override; recovery should inherit from the
+	//     outgoing record's DisableAutoResume.
+	//   - &true → operator explicitly disabled auto-resume for this
+	//     handoff regardless of the outgoing record's policy.
+	//   - &false → operator explicitly enabled auto-resume for this
+	//     handoff regardless of the outgoing record's policy.
+	// Persisting it here ensures that a crashed handoff resumed by
+	// `fleet drain` / TUI watcher honors the same policy
+	// (codex review iter-10 / iter-11 P2).
+	DisableAutoResume *bool     `json:"disable_auto_resume,omitempty"`
 	EnqueuedAt        time.Time `json:"enqueued_at"`
 }
 
