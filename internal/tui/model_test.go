@@ -255,21 +255,80 @@ func TestView_ShowsErrorBanner(t *testing.T) {
 	}
 }
 
-func TestView_RendersAgentTable(t *testing.T) {
+func TestView_RendersAgentList(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2))
 	out := m.View()
 
-	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("view missing column header %q, got:\n%s", want, out)
-		}
-	}
+	// v2 layout drops the AGENT/PROJECT/TASK/MODE/AGE/STATUS column
+	// header row — the row is self-documenting via the leading
+	// status glyph + cursor arrow + colored cells. Just assert the
+	// data shows up.
 	if !strings.Contains(out, "a0") || !strings.Contains(out, "a1") {
 		t.Errorf("view should include agent IDs, got:\n%s", out)
 	}
-	if !strings.Contains(out, "2 agent(s)") {
+	// Project group header surfaces the count alongside the project
+	// label so the operator can scan groups at a glance.
+	if !strings.Contains(out, "demo") || !strings.Contains(out, "(2 agents)") {
+		t.Errorf("view should include project group header, got:\n%s", out)
+	}
+	// Smart footer summary line: "N project · M agents".
+	if !strings.Contains(out, "2 agents") {
 		t.Errorf("footer should report agent count, got:\n%s", out)
+	}
+	// Cursor row gets an inline action chip strip.
+	if !strings.Contains(out, "[a]") || !strings.Contains(out, "attach") {
+		t.Errorf("selected row should expose inline [a] attach chip, got:\n%s", out)
+	}
+}
+
+func TestView_CoachHintShownInitiallyHiddenAfterKeypress(t *testing.T) {
+	m := New("test")
+	m.records = sortRecords(fakeRecords(2))
+
+	// Fresh launch shows the coach hint so a first-time operator
+	// understands "the selected row IS the interface" without docs.
+	if !strings.Contains(m.View(), "actions appear on the selected row") {
+		t.Errorf("coach hint should render before any keypress, got:\n%s", m.View())
+	}
+
+	// First nav keypress dismisses it — once you've moved, you've
+	// demonstrated you know how.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	out := updated.(Model).View()
+	if strings.Contains(out, "actions appear on the selected row") {
+		t.Errorf("coach hint should be dismissed after [j], got:\n%s", out)
+	}
+}
+
+func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
+	m := New("test")
+	recs := fakeRecords(3)
+	// One blocked, one with hot context. Banner should aggregate
+	// both counts independently — a hot+blocked agent would bump
+	// both bars, but here we keep them separate for clarity.
+	recs[0].Blocked = true
+	hot := 75.0
+	recs[1].ContextPct = &hot
+	m.records = sortRecords(recs)
+
+	out := m.View()
+	if !strings.Contains(out, "1 blocked") {
+		t.Errorf("banner should show blocked count, got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 hot context") {
+		t.Errorf("banner should show hot-context count, got:\n%s", out)
+	}
+}
+
+func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
+	m := New("test")
+	m.records = sortRecords(fakeRecords(2)) // all default → live
+	out := m.View()
+	for _, sym := range []string{"⏸", "⚠", "✗", "blocked", "hot context", "dead"} {
+		if strings.Contains(out, sym) {
+			t.Errorf("clean dashboard should hide banner for %q, got:\n%s", sym, out)
+		}
 	}
 }
 

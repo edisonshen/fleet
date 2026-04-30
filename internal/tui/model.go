@@ -1,9 +1,26 @@
 // Package tui owns the bubbletea-based interactive dashboard.
 //
-// The MVP shows a live-updating table of every agent record under
-// ~/.fleet/agents/. fsnotify drives refreshes when files change; a 1s
-// polling tick is the fallback for platforms where fsnotify misbehaves
+// Renders agent records under ~/.fleet/agents/ as a grouped list.
+// fsnotify drives refreshes when files change; a 1s polling tick
+// is the fallback for platforms where fsnotify misbehaves
 // (per docs/DESIGN.md).
+//
+// Layout (v2 — "the selected row IS the interface"):
+//
+//	Fleet 0.1.0
+//	────────────
+//	⏸ 1 blocked  ·  ⚠ 2 hot context              <- alert banner (only if any)
+//
+//	rainier (1 agent)                            <- project group header
+//	  ●  agent01   add-rate-limiting     68%  14m  live
+//	▸ ⏸  agent02   rec-engine-v2         41%   6m  blocked     <- selected
+//	       ⏸ "which similarity metric — cosine or jaccard?"
+//	       [a] attach   [h] handoff   [x] archive
+//
+//	use j/k to navigate · actions appear on the selected row   <- coach hint
+//
+//	2 agents · 1 blocked
+//	[j/k] navigate  [a] attach  [h] handoff  [d] dispatch  [x] archive  [q] quit
 //
 // Keyboard:
 //   - q, ctrl+c: quit
@@ -11,12 +28,10 @@
 //   - k, ↑: cursor up
 //   - g: jump to top
 //   - G: jump to bottom
-//
-// Out of scope for the MVP (deferred to follow-up PRs):
-//   - [n] new project, [d] dispatch, [a] attach
-//   - banner aggregation (⚠ N unhealthy ...)
-//   - glyph column (● ✏ ⊕)
-//   - project groupings
+//   - h: handoff selected agent
+//   - a: attach to selected agent
+//   - d, n: dispatch (opens repo picker)
+//   - x: archive selected agent (confirm with y)
 package tui
 
 import (
@@ -75,6 +90,14 @@ type Model struct {
 	// regular tea.Cmd would be inside bubbletea's altscreen and tmux
 	// would draw on top of bubbletea's state.
 	pendingAttach string
+
+	// coachDismissed flips true after the first nav/action keypress so
+	// the coaching hint ("use j/k to navigate · actions appear on the
+	// selected row") fades out once the operator has demonstrated they
+	// know what they're doing. In-memory only — fresh launches re-show
+	// the hint, which is the right default for a CLI that's still in
+	// early adoption.
+	coachDismissed bool
 }
 
 // PendingAttach returns the tmux session to attach to after the
@@ -238,6 +261,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 
+	// Coach hint fades on the first nav-mode keypress. We gate on
+	// modeNav so picker filter typing doesn't (re-)dismiss something
+	// that's already gone, and so the dismissal corresponds 1:1 with
+	// the operator demonstrating they know how to interact with the
+	// dashboard.
+	if m.mode == modeNav {
+		m.coachDismissed = true
+	}
+
 	// Action keys (handoff/attach/dispatch) and prompt-mode keys take
 	// precedence over navigation. handleActionKey returns handled=false
 	// only when in nav mode and the key isn't an action key, in which
@@ -270,6 +302,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // View renders the current state. Called by bubbletea on every model
 // update. Keep this pure: no I/O, no time.Now(), no surprises.
+//
+// time.Since is called for "age" and "active X ago" derivations — the
+// alternative would be to snapshot the time on every Update, which
+// would be churn for a render-only quantity. We accept the impurity
+// for the sake of a live age column.
 func (m Model) View() string {
 	var b strings.Builder
 
@@ -292,7 +329,19 @@ func (m Model) View() string {
 		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
-		b.WriteString(renderTable(m.records, m.cursor, m.aliveByID))
+		// Alert banner above the list — only when there's something
+		// urgent. A clean dashboard means no banner.
+		if banner := renderAlertBanner(m.records, m.aliveByID); banner != "" {
+			b.WriteString(banner)
+			b.WriteString("\n")
+		}
+		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID))
+		if !m.coachDismissed {
+			b.WriteString("\n")
+			b.WriteString(coachStyle.Render(
+				"  use j/k to navigate · actions appear on the selected row"))
+			b.WriteString("\n")
+		}
 	}
 
 	if m.flash != nil {
@@ -326,25 +375,22 @@ func (m Model) View() string {
 			m.archiveCandidate)))
 		b.WriteString("\n")
 	default:
-		// Footer is split across two lines so the count and the
-		// action-key row don't compete for the same horizontal eyeline:
-		//   1 agent(s)
-		//   [j/k] navigate  ·  [h] handoff  ·  ...
-		// Each [k] label pair is a chip — colored key, dim label —
-		// joined by a dim middle dot so the operator's eye can land
-		// on the action keys without scanning prose.
-		count := dimStyle.Render(fmt.Sprintf("%d agent(s)", len(m.records)))
+		// Smart footer: summary line + chip row. The summary is
+		// fleet-level state ("2 agents · 1 blocked"); the chips are
+		// the always-available global keys. The cursor row's inline
+		// chips (in renderAgents) handle context-sensitive actions —
+		// the footer chips are the floor, not the ceiling.
 		sep := dimStyle.Render("  ·  ")
 		chips := strings.Join([]string{
 			keyChip("[j/k]", "navigate"),
-			keyChip("[h]", "handoff"),
 			keyChip("[a]", "attach"),
+			keyChip("[h]", "handoff"),
 			keyChip("[d]", "dispatch"),
 			keyChip("[x]", "archive"),
 			keyChip("[q]", "quit"),
 		}, sep)
 		b.WriteString("\n")
-		b.WriteString(count)
+		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID)))
 		b.WriteString("\n")
 		b.WriteString(chips)
 		// Detach hint lives in the spawned session's tmux status bar
@@ -408,122 +454,375 @@ func renderPicker(m Model) string {
 	return b.String()
 }
 
-// sortRecords returns a copy sorted newest-first by SpawnedAt — same
-// rule fleet status uses, so the two views agree.
+// sortRecords returns a copy sorted by (project asc, spawned desc) so
+// agents cluster under their project group header in the v2 layout.
+// Within a group, newest-first matches `fleet status` (and matches
+// the v1 behavior — for repos with one project, this is equivalent).
 func sortRecords(in []*agent.Record) []*agent.Record {
 	out := make([]*agent.Record, len(in))
 	copy(out, in)
-	sort.Slice(out, func(i, j int) bool {
+	sort.SliceStable(out, func(i, j int) bool {
+		pi, pj := projectDisplay(out[i]), projectDisplay(out[j])
+		if pi != pj {
+			return pi < pj
+		}
 		return out[i].SpawnedAt.After(out[j].SpawnedAt)
 	})
 	return out
 }
 
-// renderTable produces the tabular agent list with the cursor row
-// highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  STATUS.
+// renderAgents produces the grouped agent list. Project group headers
+// are emitted whenever the project changes between consecutive
+// records, and the cursor row gets a 2-line detail block (progress
+// quote + inline action chips) under it. Records arrive pre-sorted
+// by sortRecords (project asc, spawned desc) so a single pass is
+// enough.
 //
 // alive is the cached tmux liveness snapshot from the most recent
 // load. deriveStatus reads from it instead of probing tmux per-row,
 // so render is pure formatting (no subprocess fan-out, no I/O).
-//
-// Per-cell styling: the AGENT cell on the cursor row picks up
-// cursorStyle (bold blue) so the operator's eye lands on the selected
-// id. The STATUS cell on every row gets a per-state color via
-// statusStyleFor. Padding is applied to plain text first so column
-// widths line up; style.Render adds zero-width ANSI escapes that
-// don't disturb the math.
-func renderTable(records []*agent.Record, cursor int, alive map[string]bool) string {
-	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"}
-	const statusCol = 5
-	rows := make([][]string, 0, len(records))
-	for _, r := range records {
-		rows = append(rows, []string{
-			r.ID,
-			projectDisplay(r),
-			defaultStr(r.TaskID, "-"),
-			defaultStr(r.Mode, "-"),
-			humanAge(time.Since(r.SpawnedAt)),
-			deriveStatus(r, alive),
-		})
+func renderAgents(records []*agent.Record, cursor int, alive map[string]bool) string {
+	idW := columnWidth(records, func(r *agent.Record) string { return r.ID }, 6)
+	taskW := columnWidth(records,
+		func(r *agent.Record) string { return defaultStr(r.TaskID, "-") }, 8)
+
+	// Cap task width so a single 80-char task ID doesn't push ctx/age
+	// off-screen on a 120-col terminal. Long task IDs truncate with an
+	// ellipsis; the full value is still visible via [a] attach.
+	if taskW > 40 {
+		taskW = 40
 	}
-	widths := columnWidths(header, rows)
+
+	// Group counts so the header can show "(N agents)".
+	counts := map[string]int{}
+	for _, r := range records {
+		counts[projectDisplay(r)]++
+	}
 
 	var b strings.Builder
-	// Prefix the header with the same 2-char gutter the data rows use
-	// ("▸ " on the cursor row, "  " elsewhere) so the column titles
-	// line up over their values instead of sliding two cells left.
-	b.WriteString("  ")
-	b.WriteString(headerStyle.Render(joinCols(header, widths)))
-	b.WriteString("\n")
-	for i, row := range rows {
-		cells := make([]string, len(row))
-		for j, c := range row {
-			if j == len(row)-1 {
-				cells[j] = c // last column: no trailing pad
-			} else {
-				cells[j] = padRight(c, widths[j])
+	lastProject := ""
+	for i, r := range records {
+		proj := projectDisplay(r)
+		if proj != lastProject {
+			if lastProject != "" {
+				b.WriteString("\n") // blank line between groups
 			}
+			b.WriteString(renderProjectHeader(proj, counts[proj]))
+			lastProject = proj
 		}
-		// STATUS gets a per-state color on every row.
-		cells[statusCol] = statusStyleFor(row[statusCol]).Render(cells[statusCol])
-		// On the cursor row, give the AGENT id the cursor color so
-		// the selected agent is unmistakable without painting the
-		// whole line (which would override the STATUS color).
-		if i == cursor {
-			cells[0] = cursorStyle.Render(cells[0])
-		}
-		line := strings.Join(cells, columnGap)
-		if i == cursor {
-			b.WriteString(cursorStyle.Render("▸ "))
-			b.WriteString(line)
-		} else {
-			b.WriteString("  " + line)
-		}
+
+		status := deriveStatus(r, alive)
+		selected := i == cursor
+		b.WriteString(renderAgentLine(r, status, selected, idW, taskW))
 		b.WriteString("\n")
+		if selected {
+			b.WriteString(renderAgentDetail(r, status))
+		}
 	}
 	return b.String()
 }
 
-// columnGap is the spacer rendered between adjacent columns. 4 spaces
-// gives the dashboard breathing room without making the table feel
-// stretched at typical terminal widths (~120 cols).
-const columnGap = "    "
-
-func joinCols(cols []string, widths []int) string {
-	parts := make([]string, len(cols))
-	for i, c := range cols {
-		// Pad each column to its width, except the last (avoid
-		// trailing whitespace).
-		if i == len(cols)-1 {
-			parts[i] = c
-		} else {
-			parts[i] = padRight(c, widths[i])
-		}
+// renderProjectHeader returns "rainier (2 agents)" with project
+// label bold-fg and the count dim. Empty project labels show as
+// "(no project)" so legacy / pre-spawn records still get a header
+// instead of slipping into a nameless group.
+func renderProjectHeader(name string, count int) string {
+	label := name
+	if label == "" || label == "-" {
+		label = "(no project)"
 	}
-	return strings.Join(parts, columnGap)
+	suffix := fmt.Sprintf("(%d agent%s)", count, plural(count))
+	return groupHeaderStyle.Render(label) + " " + dimStyle.Render(suffix) + "\n"
 }
 
-// columnWidths returns max(len) per column across header + rows.
-func columnWidths(header []string, rows [][]string) []int {
-	widths := make([]int, len(header))
-	for i, h := range header {
-		widths[i] = len(h)
+// renderAgentLine renders one collapsed agent row.
+//
+// Layout (cells, monospaced):
+//
+//	"▸ " | "● " | id (idW) | "  " | task (taskW) | "  " | "  68%" | "  " | "  14m" | "  " | live
+//
+// The 2-char gutter holds the cursor arrow on the selected row and
+// is blank otherwise — keeping every row indented the same amount so
+// the columns line up across the whole list.
+func renderAgentLine(r *agent.Record, status string, selected bool,
+	idW, taskW int) string {
+
+	glyph, glyphStyle := glyphFor(status)
+	id := padRight(r.ID, idW)
+	task := truncate(defaultStr(r.TaskID, "-"), taskW)
+	taskCell := padRight(task, taskW)
+	ctxText, ctxStyle := formatCtxPct(r.ContextPct)
+	age := padLeft(humanAge(time.Since(r.SpawnedAt)), 5)
+
+	gutter := "  "
+	if selected {
+		gutter = cursorStyle.Render("▸ ")
 	}
-	for _, row := range rows {
-		for i, c := range row {
-			if i < len(widths) && len(c) > widths[i] {
-				widths[i] = len(c)
-			}
+	idCell := idStyle.Render(id)
+	if selected {
+		idCell = cursorStyle.Render(id)
+	}
+
+	return gutter +
+		glyphStyle.Render(glyph+" ") +
+		idCell + "  " +
+		taskCell + "  " +
+		ctxStyle.Render(ctxText) + "  " +
+		dimStyle.Render(age) + "  " +
+		statusStyleFor(status).Render(status)
+}
+
+// renderAgentDetail returns the 2-line block under the selected row:
+// progress/status quote and inline action chips. Hangs off the row
+// at a 7-char indent (gutter + glyph + ~2 chars into id) so it
+// visually subordinates to the row above.
+func renderAgentDetail(r *agent.Record, status string) string {
+	const indent = "       " // 7 cells
+
+	var b strings.Builder
+	if line := agentProgressLine(r, status); line != "" {
+		b.WriteString(indent)
+		b.WriteString(detailStyle.Render(line))
+		b.WriteString("\n")
+	}
+	chips := strings.Join(actionChipsFor(status), "  ")
+	b.WriteString(indent)
+	b.WriteString(chips)
+	b.WriteString("\n")
+	return b.String()
+}
+
+// agentProgressLine builds the contextual one-liner under the
+// selected row. Blocked agents get their reason in quotes (or a
+// generic prompt if no reason was recorded); dead agents get an
+// archive hint; otherwise we summarize last-activity age, mode, and
+// handoff count.
+func agentProgressLine(r *agent.Record, status string) string {
+	switch status {
+	case "dead":
+		return "session ended — press [x] to archive"
+	case "blocked":
+		if r.BlockedReason != nil && strings.TrimSpace(*r.BlockedReason) != "" {
+			return "⏸ \"" + strings.TrimSpace(*r.BlockedReason) + "\""
+		}
+		return "⏸ blocked — needs your input"
+	case "auto-yellow", "auto-red", "precompact":
+		return "⊕ handoff in flight (" + status + ")"
+	}
+	var parts []string
+	if !r.LastActivityTS.IsZero() {
+		parts = append(parts, "active "+humanAge(time.Since(r.LastActivityTS))+" ago")
+	}
+	if r.Mode != "" {
+		parts = append(parts, r.Mode)
+	}
+	if r.HandoffNumber > 0 {
+		parts = append(parts, fmt.Sprintf("handoff #%d", r.HandoffNumber))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// actionChipsFor returns the inline action chips shown on the
+// selected row. Status-aware so we don't dangle keys that won't
+// work — a dead agent only offers [x] archive, and an in-flight
+// handoff hides [h] (already in flight).
+func actionChipsFor(status string) []string {
+	switch status {
+	case "dead":
+		return []string{keyChip("[x]", "archive")}
+	case "auto-yellow", "auto-red", "precompact":
+		return []string{
+			keyChip("[a]", "attach"),
+			keyChip("[x]", "archive"),
 		}
 	}
-	return widths
+	return []string{
+		keyChip("[a]", "attach"),
+		keyChip("[h]", "handoff"),
+		keyChip("[x]", "archive"),
+	}
+}
+
+// renderAlertBanner aggregates the urgent counts across all records
+// into a single line. Empty when nothing's wrong — a clean dashboard
+// shouldn't waste a line on "0 of everything".
+//
+// Counts run independently: a record can be both "blocked" AND have
+// hot context, so it bumps both counts. That's intentional — the
+// banner is a heads-up, not a partition.
+func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
+	var blocked, waiting, hot, dead int
+	for _, r := range records {
+		switch deriveStatus(r, alive) {
+		case "blocked":
+			blocked++
+		case "waiting":
+			waiting++
+		case "dead":
+			dead++
+		}
+		if r.ContextPct != nil && *r.ContextPct >= 70 {
+			hot++
+		}
+	}
+	var parts []string
+	if blocked > 0 {
+		parts = append(parts, statusBlockedStyle.Render(
+			fmt.Sprintf("⏸ %d blocked", blocked)))
+	}
+	if waiting > 0 {
+		parts = append(parts, statusWaitingStyle.Render(
+			fmt.Sprintf("◐ %d waiting", waiting)))
+	}
+	if hot > 0 {
+		parts = append(parts, statusUrgentStyle.Render(
+			fmt.Sprintf("⚠ %d hot context", hot)))
+	}
+	if dead > 0 {
+		parts = append(parts, statusDeadStyle.Render(
+			fmt.Sprintf("✗ %d dead", dead)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, dimStyle.Render("  ·  ")) + "\n"
+}
+
+// footerSummary builds the one-line "N agents · M blocked" summary
+// shown above the global chip row. Skips zero-counts so the line
+// stays scannable.
+func footerSummary(records []*agent.Record, alive map[string]bool) string {
+	projects := map[string]struct{}{}
+	var blocked, dead int
+	for _, r := range records {
+		projects[projectDisplay(r)] = struct{}{}
+		switch deriveStatus(r, alive) {
+		case "blocked":
+			blocked++
+		case "dead":
+			dead++
+		}
+	}
+	parts := []string{
+		fmt.Sprintf("%d project%s", len(projects), plural(len(projects))),
+		fmt.Sprintf("%d agent%s", len(records), plural(len(records))),
+	}
+	if blocked > 0 {
+		parts = append(parts, fmt.Sprintf("%d blocked", blocked))
+	}
+	if dead > 0 {
+		parts = append(parts, fmt.Sprintf("%d dead", dead))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// glyphFor returns the single-character status glyph and its lipgloss
+// style. The glyph palette mirrors the v2 design (● for live, ⏸ for
+// blocked, etc.) so the dashboard reads the same way at a glance
+// without having to parse the status word.
+func glyphFor(status string) (string, lipgloss.Style) {
+	switch status {
+	case "live":
+		return "●", glyphLiveStyle
+	case "waiting":
+		return "◐", glyphWaitingStyle
+	case "blocked":
+		return "⏸", glyphBlockedStyle
+	case "dead":
+		return "✗", glyphDeadStyle
+	case "auto-yellow":
+		return "⊕", glyphHandoffStyle
+	case "auto-red", "precompact":
+		return "⊕", glyphUrgentStyle
+	}
+	return "·", dimStyle
+}
+
+// formatCtxPct returns the right-aligned 5-cell context-percent text
+// and the health-tinted style. Renders "    —" when the agent has no
+// context source yet — same column footprint, no number.
+func formatCtxPct(p *float64) (string, lipgloss.Style) {
+	if p == nil {
+		return "    —", dimStyle
+	}
+	pct := int(*p)
+	if pct > 999 {
+		pct = 999 // clamp absurd values without breaking the column width
+	}
+	return fmt.Sprintf("%4d%%", pct), ctxColorFor(*p)
+}
+
+// ctxColorFor maps a context percentage to its health color.
+// Thresholds match fleet-guard: <50 healthy, 50-69 warning, ≥70 hot.
+func ctxColorFor(p float64) lipgloss.Style {
+	switch {
+	case p < 50:
+		return statusLiveStyle
+	case p < 70:
+		return statusWaitingStyle
+	default:
+		return statusUrgentStyle
+	}
+}
+
+// columnWidth returns max(len(extract(r))) across records, floored
+// to min. Uses lipgloss.Width so multi-byte runes count their cell
+// span, not their byte length.
+func columnWidth(records []*agent.Record, extract func(*agent.Record) string, min int) int {
+	w := min
+	for _, r := range records {
+		if n := lipgloss.Width(extract(r)); n > w {
+			w = n
+		}
+	}
+	return w
 }
 
 func padRight(s string, w int) string {
-	if len(s) >= w {
+	cur := lipgloss.Width(s)
+	if cur >= w {
 		return s
 	}
-	return s + strings.Repeat(" ", w-len(s))
+	return s + strings.Repeat(" ", w-cur)
+}
+
+func padLeft(s string, w int) string {
+	cur := lipgloss.Width(s)
+	if cur >= w {
+		return s
+	}
+	return strings.Repeat(" ", w-cur) + s
+}
+
+// truncate clips s to w cells, replacing the tail with "…" when it
+// overflows. Width is cell-based so multi-byte runes don't undercount.
+func truncate(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	// Walk runes from the start until the next rune would push us
+	// past w-1 cells, then append "…" to use the last cell.
+	out := make([]rune, 0, w)
+	used := 0
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if used+rw > w-1 {
+			break
+		}
+		out = append(out, r)
+		used += rw
+	}
+	return string(out) + "…"
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
 }
 
 func defaultStr(s, def string) string {
@@ -634,7 +933,6 @@ func humanAge(d time.Duration) string {
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63")).PaddingLeft(1).PaddingRight(1)
 	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("60"))
-	headerStyle   = lipgloss.NewStyle().Bold(true).Faint(true)
 	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
 	dimStyle      = lipgloss.NewStyle().Faint(true)
 	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
@@ -642,10 +940,24 @@ var (
 	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — action keybind chips
 	keyLabelStyle = lipgloss.NewStyle().Faint(true)
 
-	// Per-status colors for the STATUS column. The padded plain text
-	// is built first (so column widths remain correct), then wrapped
-	// in these styles — lipgloss adds zero-width ANSI escapes so the
-	// alignment math is unaffected.
+	// v2 layout styles.
+	idStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("81")) // cyan — agent ids stand out
+	groupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
+	detailStyle      = lipgloss.NewStyle().Faint(true).Italic(true)
+	coachStyle       = lipgloss.NewStyle().Faint(true).Italic(true).Foreground(lipgloss.Color("245"))
+
+	// Glyph styles for the leading status icon column.
+	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	glyphWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	glyphBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
+	glyphDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
+	glyphHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
+	glyphUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+
+	// Per-status colors for the STATUS label and the alert banner.
+	// The padded plain text is built first (so column widths remain
+	// correct), then wrapped in these styles — lipgloss adds
+	// zero-width ANSI escapes so the alignment math is unaffected.
 	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))  // green
 	statusWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // amber
 	statusBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
