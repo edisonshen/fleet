@@ -409,21 +409,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
-	// 11b. Old is dead → safe to deliver the resume prompt to NEW.
-	//      Sending earlier (before kill) would mean a Kill-failure
-	//      rollback could discard work the new agent had already
-	//      started during the grace window (codex review iter-2 P2).
-	//      Best-effort: if SendInitialPrompt fails (new crashed
-	//      during readiness wait), we surface a warning but still
-	//      archive the old record + delete the queue. The operator
-	//      sees the warning and can respawn manually.
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
-		handoff.ResumePrompt(docPath)); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
-			newRec.TmuxSession, err)
-	}
-
 	// 12. Archive the old record. After this, `fleet status` no
 	//     longer shows the outgoing agent. We've confirmed the old
 	//     session is dead in step 10, so this can't hide a live
@@ -456,6 +441,21 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//     entry is no longer needed.
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	}
+
+	// 14. Deliver the resume prompt AFTER queue.Delete so a crash
+	//     between Kill(old) and queue.Delete cannot lead to a retry
+	//     re-sending it (codex review iter-4 P2). Once the queue is
+	//     gone resumeHandoff cannot run, so this delivery happens at
+	//     most once per logical handoff. Trade-off: a crash between
+	//     queue.Delete and this line drops the prompt (microsecond
+	//     window). Best-effort: a tmux failure logs a warning,
+	//     operator types manually.
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+			newRec.TmuxSession, err)
 	}
 
 	_, _ = fmt.Fprintf(stdout, "agent %s handed off → %s\n", oldRec.ID, newRec.ID)
@@ -505,20 +505,6 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			oldRec.TmuxSession, err)
 	}
 
-	// Old is dead → safe to deliver the resume prompt. The previous
-	// run that crashed before reaching this point never sent the
-	// prompt either (SendInitialPrompt only runs after Kill(old)
-	// succeeds in runHandoff), so this delivery is the FIRST
-	// delivery, not a duplicate. Without this, the recovered
-	// replacement would sit idle until an operator attached and
-	// typed manually (codex review iter-3 P1).
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
-		handoff.ResumePrompt(docPath)); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
-			newRec.TmuxSession, err)
-	}
-
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {
@@ -533,6 +519,18 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	}
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	}
+
+	// Deliver the resume prompt AFTER queue.Delete (codex review
+	// iter-4 P2). The original runHandoff that crashed before
+	// reaching here never sent the prompt either (it also delivers
+	// post-queue.Delete in step 14), so this delivery is the FIRST
+	// — never a duplicate that would make claude redo work.
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+			newRec.TmuxSession, err)
 	}
 
 	_, _ = fmt.Fprintf(stdout, "resumed crashed handoff: %s → %s (replacement was already spawned)\n",

@@ -105,18 +105,25 @@ func SendInitialPrompt(session, prompt string) error {
 // "Stable" is a coarse heuristic for "agent is idle waiting for
 // input" — works for any wrapper that prints a startup banner then
 // settles, regardless of whether it's claude, codex, or a custom
-// shell. We tolerate empty captures (treat as not-stable so we keep
-// polling) so a slow-starting pane doesn't flag stable instantly.
+// shell. Empty captures count toward stability (codex review iter-4
+// P2): wrappers that `clear` the screen at startup leave the pane
+// blank-but-idle, and gating on len(cur) > 0 would mean those
+// wrappers never converge and every handoff stalls for the full
+// maxWait.
 func waitForPaneStable(session string, stableWindow, maxWait time.Duration) error {
 	deadline := time.Now().Add(maxWait)
 	var prev []byte
+	first := true
 	stableSince := time.Time{}
 	for {
 		cur, err := tmux.CapturePane(session)
 		if err != nil {
 			return err
 		}
-		if len(cur) > 0 && bytes.Equal(cur, prev) {
+		// First iteration always counts as "changed" — we have nothing
+		// to compare against. Subsequent iterations: equal to prev =>
+		// stable, otherwise reset the stable timer.
+		if !first && bytes.Equal(cur, prev) {
 			if stableSince.IsZero() {
 				stableSince = time.Now()
 			} else if time.Since(stableSince) >= stableWindow {
@@ -126,6 +133,7 @@ func waitForPaneStable(session string, stableWindow, maxWait time.Duration) erro
 			stableSince = time.Time{}
 		}
 		prev = cur
+		first = false
 		if time.Now().After(deadline) {
 			return fmt.Errorf("pane did not stabilize within %s", maxWait)
 		}

@@ -177,26 +177,29 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 }
 
 // retireOldAgent runs the post-spawn tail: /exit + grace + kill the
-// old, deliver the resume prompt to the new, then archive + delete
-// queue. Caller has verified newRec.TmuxSession is alive at entry.
+// old, archive, delete queue, deliver the resume prompt to the new.
+// Caller has verified newRec.TmuxSession is alive at entry.
 //
-// Sequencing rationale (codex review iter-1 + iter-2):
+// Sequencing rationale (codex review iter-1, iter-2, iter-4):
 //
 //  1. The resume prompt is delivered HERE (not inside spawn.Spawn) so
 //     crash recovery's "previous run spawned but didn't retire"
 //     branch — Resume() calling retireOldAgent directly — uses the
 //     same delivery path as the happy path. Single source of truth.
 //
-//  2. The prompt is sent AFTER tmux.Kill(old) succeeds, not before.
-//     Sending earlier would mean the new agent could already be
-//     editing files / making external calls during the grace window,
-//     so the Kill-failure rollback (kill new, delete new record)
-//     would silently drop work. Sending after Kill is the earliest
-//     point at which rolling back the new is no longer destructive
-//     because (a) old is gone, and (b) new hasn't been prompted yet
-//     so it's still idle.
+//  2. The prompt is sent AFTER tmux.Kill(old) succeeds — sending
+//     earlier would mean the new agent could already be editing
+//     files / making external calls during the grace window, so a
+//     Kill-failure rollback (kill new, delete new record) would
+//     silently drop work.
 //
-// Mirrors steps 9-13 of cmd/fleet/handoff.go::runHandoff. Rollback
+//  3. The prompt is sent AFTER queue.Delete — once the queue file is
+//     gone no recovery path can run, so the prompt is delivered at
+//     most once per logical handoff. Sending earlier would mean a
+//     crash between the prompt-send and queue.Delete leads to a
+//     retry that re-sends, making claude redo work.
+//
+// Mirrors steps 9-14 of cmd/fleet/handoff.go::runHandoff. Rollback
 // semantics on Kill failure: kill the new session, delete the new record
 // + queue, surface the live old session for operator triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
@@ -234,20 +237,6 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			oldRec.TmuxSession, err)
 	}
 
-	// Old is dead → rolling back the new is no longer destructive.
-	// NOW deliver the resume prompt (codex review iter-2 P2). Best-
-	// effort: if SendInitialPrompt fails (the new session crashed
-	// during readiness wait, or wrapper exited), surface a warning
-	// but keep going through Archive + queue.Delete so we don't
-	// strand a stale old record + queue file. The operator sees the
-	// warning and can respawn manually.
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
-		handoff.ResumePrompt(docPath)); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
-			newRec.TmuxSession, err)
-	}
-
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {
@@ -268,6 +257,21 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	}
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+	}
+
+	// Deliver the resume prompt AFTER queue.Delete (codex review
+	// iter-4 P2). Once the queue file is gone no recovery path runs,
+	// so this delivery happens at most once per logical handoff —
+	// avoiding the "previous run sent the prompt then crashed before
+	// queue.Delete; retry sends it again and claude does the work
+	// twice" failure mode. Trade-off: a crash between queue.Delete
+	// and this line drops the prompt (microsecond window). Best-
+	// effort: a tmux failure logs a warning, operator types manually.
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+			newRec.TmuxSession, err)
 	}
 
 	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, newRec.ID)
