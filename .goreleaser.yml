@@ -81,6 +81,12 @@ changelog:
 # loud — better than silently skipping the tap update.
 brews:
   - name: fleet
+    # Default for `directory` is the tap repo's root; Homebrew
+    # resolves `brew install owner/tap/name` only when the formula
+    # lives under `Formula/`. Pin it explicitly so future releases
+    # don't drift back to the root (v0.1.0's first run pushed to
+    # the wrong path; we relocated the file in-place).
+    directory: Formula
     repository:
       owner: edisonshen
       name: homebrew-tap
