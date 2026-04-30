@@ -334,7 +334,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	top := m.renderTop()
 	footer := m.renderFooter()
-	return padToBottom(top, footer, m.height)
+	return padToBottom(top, footer, m.height, m.width)
 }
 
 // renderTop returns everything above the footer: title block,
@@ -478,23 +478,50 @@ func divider(width, fallback int) string {
 }
 
 // padToBottom inserts blank lines between top and bottom so the
-// combined output exactly fills targetHeight rows. When the content
-// is already too tall (or the terminal hasn't reported its height
-// yet), concatenates without padding — the footer will simply scroll
-// off the top, which is preferable to truncating it.
-func padToBottom(top, bottom string, targetHeight int) string {
+// combined output fills targetHeight visual rows on a terminal of
+// termWidth cells. "Visual rows" matters because long lines (the
+// archive-confirm prompt, blocked-reason quotes) soft-wrap on
+// narrow terminals — counting only "\n" undercounts those rows and
+// pushes the footer off-screen on 80-col displays. termWidth ≤ 0
+// (early renders before WindowSizeMsg lands) collapses to logical
+// row count, which is fine because no wrap happens at unknown
+// width. When content is already taller than targetHeight, returns
+// top+bottom unpadded — the footer scrolls off the top, which beats
+// truncating it.
+func padToBottom(top, bottom string, targetHeight, termWidth int) string {
 	if targetHeight <= 0 {
 		return top + bottom
 	}
-	used := strings.Count(top, "\n") + strings.Count(bottom, "\n")
-	// One implicit final line if bottom doesn't end with newline.
-	if !strings.HasSuffix(bottom, "\n") {
-		used++
-	}
+	used := visualRows(top, termWidth) + visualRows(bottom, termWidth)
 	if used >= targetHeight {
 		return top + bottom
 	}
 	return top + strings.Repeat("\n", targetHeight-used) + bottom
+}
+
+// visualRows counts how many terminal rows s consumes when rendered
+// in a window of termWidth cells. Each logical line (separated by
+// \n) takes ceil(width / termWidth) rows after soft-wrap; empty
+// lines count as 1. A trailing "\n" doesn't add an extra empty row.
+// termWidth ≤ 0 falls back to logical line counting (no wrap math).
+func visualRows(s string, termWidth int) int {
+	if s == "" {
+		return 0
+	}
+	s = strings.TrimSuffix(s, "\n")
+	if s == "" {
+		return 1 // s was just "\n"
+	}
+	rows := 0
+	for _, line := range strings.Split(s, "\n") {
+		w := lipgloss.Width(line)
+		if termWidth <= 0 || w <= termWidth {
+			rows++
+			continue
+		}
+		rows += (w + termWidth - 1) / termWidth
+	}
+	return rows
 }
 
 // pickerVisibleRows caps how many repos are listed at once. Anything
@@ -1000,19 +1027,24 @@ func defaultStr(s, def string) string {
 }
 
 // projectDisplay derives the human-readable project label for the
-// PROJECT column. Prefers the last two path segments of r.Cwd
-// joined with "/" (so /Users/op/projects/fleet renders as
-// "projects/fleet") instead of the on-disk Project tag, which
-// hyphen-joins parent + basename for filesystem safety
-// (projects-fleet) and reads as one mashed word in the dashboard.
+// PROJECT column and the project-group header. Prefers the last two
+// path segments of r.Cwd joined with "/" — /Users/op/projects/fleet
+// renders as "projects/fleet" — so dashboards from typical
+// ~/projects/<repo> layouts read like file paths.
 //
-// filepath.Clean drops trailing slashes and "/.“ tails before the
+// filepath.Clean drops trailing slashes and "/." tails before the
 // Base/Dir split (codex iter-9 P3) — without it, --cwd values like
 // "/path/to/repo/" or "/path/to/repo/." would derive base="repo"
 // AND parent="repo" (or "."), rendering "repo/repo" or "repo/.".
 //
-// Falls back to r.Project — and then to "-" — for legacy records or
-// agents whose Cwd wasn't captured at dispatch.
+// Fallback (no Cwd captured): r.Project as-is. r.Project is
+// operator-set via `--project` (default "default") and never
+// auto-derived from the cwd — so legacy records and new records
+// from the same checkout DON'T inherently disagree. They DO
+// disagree when an operator explicitly chose `--project foo-bar`
+// for a checkout at /path/to/foo/bar (rare); that case lands in
+// two project headers, which is honest because the Project tag
+// truly differs.
 func projectDisplay(r *agent.Record) string {
 	if r.Cwd != "" {
 		clean := filepath.Clean(r.Cwd)

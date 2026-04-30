@@ -558,3 +558,38 @@ func TestPadRight(t *testing.T) {
 		t.Errorf("padRight should not truncate, got %q", got)
 	}
 }
+
+// TestVisualRows pins down the wrap-aware row count: a soft-wrapped
+// long line counts as multiple terminal rows, not one. This drives
+// padToBottom so the bottom-pinned footer stays pinned on narrow
+// terminals where the archive-confirm prompt or a blocked-reason
+// quote wraps to extra rows (codex iter / P2).
+func TestVisualRows(t *testing.T) {
+	cases := []struct {
+		name      string
+		s         string
+		termWidth int
+		want      int
+	}{
+		{"empty", "", 80, 0},
+		{"single line no newline", "hello", 80, 1},
+		{"single line with newline", "hello\n", 80, 1},
+		{"two lines", "foo\nbar", 80, 2},
+		{"trailing newline doesn't double-count", "foo\nbar\n", 80, 2},
+		{"empty middle line counts as 1", "foo\n\nbar", 80, 3},
+		{"just a newline", "\n", 80, 1},
+		// Soft-wrap: 100-char line on an 80-col terminal = 2 rows.
+		{"wrap once", strings.Repeat("x", 100), 80, 2},
+		// 80-char line fits exactly in 80 cells = 1 row, not 2.
+		{"exact fit", strings.Repeat("x", 80), 80, 1},
+		// 161 chars on 80 cols → 3 rows (80+80+1).
+		{"wrap twice", strings.Repeat("x", 161), 80, 3},
+		// termWidth ≤ 0 disables wrap math — falls back to logical lines.
+		{"no width known", strings.Repeat("x", 200) + "\n" + strings.Repeat("y", 200), 0, 2},
+	}
+	for _, c := range cases {
+		if got := visualRows(c.s, c.termWidth); got != c.want {
+			t.Errorf("visualRows(%q, %d) = %d, want %d", c.name, c.termWidth, got, c.want)
+		}
+	}
+}
