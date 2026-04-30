@@ -261,6 +261,76 @@ func TestSpawn_RollsBackTmuxOnRecordWriteFailure(t *testing.T) {
 	// invariant (verified by code review) and the tmux.Kill unit test.
 }
 
+func TestSpawn_InitialPromptTypedIntoSession(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Drop the startup delay — the test command (a shell builtin
+	// `read`) is ready to receive input immediately, and a 3 s wait
+	// per spawn would balloon the test suite.
+	t.Setenv("FLEET_INITIAL_PROMPT_DELAY_MS", "0")
+
+	// `read line; echo GOT:$line` echoes whatever Spawn types as the
+	// initial prompt, then sleeps so the tmux session stays alive
+	// long enough for the assertion's capture-pane to land.
+	rec, err := Spawn(Options{
+		TaskID:        "auto-resume",
+		Project:       "p",
+		Command:       []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"},
+		InitialPrompt: "echo HELLO_FROM_PROMPT",
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	want := "GOT:echo HELLO_FROM_PROMPT"
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("initial prompt did not reach session within deadline; want %q in:\n%s",
+		want, string(lastOut))
+}
+
+func TestSpawn_NoInitialPromptKeepsSessionIdle(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	t.Setenv("FLEET_INITIAL_PROMPT_DELAY_MS", "0")
+
+	// Same shell as the prompt test, but no InitialPrompt — `read`
+	// should block forever (no auto-typed input), and the marker
+	// must NOT appear.
+	rec, err := Spawn(Options{
+		TaskID:  "no-prompt",
+		Project: "p",
+		Command: []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Brief settle so any (incorrect) typing would have landed.
+	time.Sleep(150 * time.Millisecond)
+	out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	if strings.Contains(string(out), "GOT:") {
+		t.Errorf("session received input despite no InitialPrompt; pane:\n%s", string(out))
+	}
+}
+
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

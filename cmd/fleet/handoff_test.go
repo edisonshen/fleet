@@ -39,6 +39,10 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// runHandoff calls spawn.Spawn with InitialPrompt set; production
+	// waits 3 s for claude to come up before typing it. Tests pin
+	// short-lived shells, so drop the wait.
+	t.Setenv("FLEET_INITIAL_PROMPT_DELAY_MS", "0")
 }
 
 // seedAgent dispatches a long-lived agent for handoff to operate on.

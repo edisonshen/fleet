@@ -34,6 +34,22 @@ import (
 // handoff path may override.
 const DefaultGraceMillis = 3000
 
+// resumePrompt builds the first-turn prompt typed into a freshly spawned
+// replacement so it picks up its predecessor's work without operator
+// intervention. The agent reads the doc with its Read tool on turn one.
+//
+// Path reference (not inlined doc body) keeps the prompt to one line —
+// no escape headaches for tmux send-keys, no size cap on the doc, and
+// the doc on disk remains the single source of truth if the operator
+// later edits it before the agent's first read.
+func resumePrompt(docPath string) string {
+	if docPath == "" {
+		return ""
+	}
+	return "Read your handoff doc at " + docPath +
+		" and continue the task. Do not wait for further operator input."
+}
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -159,6 +175,7 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
+		InitialPrompt:  resumePrompt(req.HandoffDoc),
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)

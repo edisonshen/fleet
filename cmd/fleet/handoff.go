@@ -37,8 +37,10 @@ archives its record.
 
 Week 4a (operator-triggered): the doc body is a stub with placeholders
 in all five sections — the agent never received a HANDOFF REQUESTED
-injection so we can't fill its view of the work. After ` + "`fleet attach`" + `
-to the new agent, paste the handoff doc path and ask it to read+continue.
+injection so we can't fill its view of the work. After spawn, fleet
+auto-types a "Read your handoff doc at <path> and continue" prompt
+into the new session so the replacement starts working without
+operator intervention; ` + "`fleet attach`" + ` shows the result.
 
 The new agent inherits TaskID, Project, Engine, Role, Mode from the
 outgoing record and increments handoff_number by 1.`,
@@ -322,6 +324,8 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		Cwd:            cwd,
 		Command:        command,
 		PreAllocatedID: newID,
+		InitialPrompt: "Read your handoff doc at " + docPath +
+			" and continue the task. Do not wait for further operator input.",
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the

@@ -16,11 +16,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// defaultInitialPromptDelay is how long Spawn waits between bringing
+// the tmux session up and typing InitialPrompt into it. Claude Code
+// takes a moment to start reading stdin; sending keys before it's
+// ready drops them into the wrapper shell instead of claude's input
+// box. Override with FLEET_INITIAL_PROMPT_DELAY_MS for tests.
+const defaultInitialPromptDelay = 3 * time.Second
+
+func initialPromptDelay() time.Duration {
+	if s := os.Getenv("FLEET_INITIAL_PROMPT_DELAY_MS"); s != "" {
+		if ms, err := strconv.Atoi(s); err == nil && ms >= 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return defaultInitialPromptDelay
+}
 
 // Options control a single Spawn call.
 //
@@ -58,6 +76,17 @@ type Options struct {
 	// and journal-write. Empty (the dispatch path) means generate
 	// a fresh ID inside Spawn.
 	PreAllocatedID string
+
+	// InitialPrompt, if non-empty, is typed into the new tmux session
+	// (via tmux send-keys + Enter) after a startup delay so the agent
+	// begins its first turn without operator intervention. The handoff
+	// path uses this to point the replacement at its inherited handoff
+	// doc; dispatch leaves it empty (operator types the first prompt).
+	//
+	// Best-effort: a send-keys failure does NOT roll back the spawn —
+	// the agent is up, the operator can attach and type the prompt
+	// manually. We log to stderr and proceed.
+	InitialPrompt string
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -172,6 +201,19 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// entry. Kill the session so spawn is all-or-nothing.
 		_ = tmux.Kill(session)
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
+	}
+
+	// Auto-resume: type the initial prompt into the new session after
+	// a startup delay. Best-effort — a send-keys error here means the
+	// operator must type the prompt themselves on attach, but the
+	// agent record + session are valid and worth preserving.
+	if opts.InitialPrompt != "" {
+		time.Sleep(initialPromptDelay())
+		if err := tmux.SendKeys(session, opts.InitialPrompt, "Enter"); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: send initial prompt to %s: %v (agent is up; attach and type the prompt manually)\n",
+				session, err)
+		}
 	}
 	return rec, nil
 }

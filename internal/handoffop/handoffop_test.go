@@ -38,6 +38,10 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// Spawn types InitialPrompt after a 3 s delay in production so
+	// claude is ready; tests use shells that read stdin instantly,
+	// and a 3 s wait per Resume balloons the suite. Drop to zero.
+	t.Setenv("FLEET_INITIAL_PROMPT_DELAY_MS", "0")
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record
