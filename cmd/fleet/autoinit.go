@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -79,7 +80,18 @@ func skillFullyInstalled(claudeHome, skillRoot string) bool {
 }
 
 // skillFilesPresent returns true iff every file in the embedded
-// FleetGuardFS exists under skillRoot.
+// FleetGuardFS exists under skillRoot AND has the same byte content
+// as the embedded copy. The byte-compare is what self-heals an
+// upgraded fleet binary: when the bundled fleet-guard ships new
+// hook handlers (e.g., UserPromptSubmit), an existing install with
+// stale main.py is detected here and runInit's installSkillFiles
+// rewrites the mismatched files. Without the compare, autoinit would
+// see "files exist" and skip the refresh, leaving new hooks firing
+// against a dispatcher that has no handler for them.
+//
+// Any read or walk error counts as "not present" so the autoinit
+// path repeats idempotent work rather than leaving an install in
+// a half-upgraded state.
 func skillFilesPresent(skillRoot string) bool {
 	fsys := fleet.FleetGuardFS()
 	complete := true
@@ -91,7 +103,13 @@ func skillFilesPresent(skillRoot string) bool {
 		if d.IsDir() {
 			return nil
 		}
-		if _, statErr := os.Stat(filepath.Join(skillRoot, path)); statErr != nil {
+		embedded, readErr := fs.ReadFile(fsys, path)
+		if readErr != nil {
+			complete = false
+			return fs.SkipAll
+		}
+		installed, statErr := os.ReadFile(filepath.Join(skillRoot, path))
+		if statErr != nil || !bytes.Equal(installed, embedded) {
 			complete = false
 			return fs.SkipAll
 		}

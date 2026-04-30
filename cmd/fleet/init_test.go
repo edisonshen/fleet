@@ -104,15 +104,21 @@ func TestRunInit_IsIdempotent(t *testing.T) {
 		t.Errorf("idempotent re-run changed settings.json:\nbefore: %s\nafter:  %s",
 			first, second)
 	}
-	if !strings.Contains(out.String(), "skip (exists)") {
-		t.Errorf("expected 'skip (exists)' in second-run output, got:\n%s", out.String())
+	if !strings.Contains(out.String(), "skip (up to date)") {
+		t.Errorf("expected 'skip (up to date)' in second-run output, got:\n%s", out.String())
 	}
 }
 
-// TestRunInit_ForceOverwritesFiles — --force must overwrite an
-// operator-edited skill file. The test plants stale content and asserts
-// the second pass with force=true restores the embedded byte stream.
-func TestRunInit_ForceOverwritesFiles(t *testing.T) {
+// TestRunInit_StaleFilesAutoRefresh — the new contract (codex review
+// iter-3 P1): when an installed skill file's bytes differ from the
+// embedded copy, the next runInit (even without --force) refreshes
+// it. This is the upgrade path: a fleet binary that adds a hook
+// handler must auto-heal the stale main.py without operator action.
+//
+// Trade-off: operator-edited skill files are not preserved. fleet
+// owns the bundled skill files; customization belongs in a fork or
+// outside the fleet-guard install path.
+func TestRunInit_StaleFilesAutoRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
 
@@ -121,27 +127,23 @@ func TestRunInit_ForceOverwritesFiles(t *testing.T) {
 		t.Fatalf("first runInit: %v", err)
 	}
 	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
-	if err := os.WriteFile(mainPath, []byte("# corrupted by operator"), 0o644); err != nil {
-		t.Fatalf("plant corrupt main.py: %v", err)
+	if err := os.WriteFile(mainPath, []byte("# stale from old fleet binary"), 0o644); err != nil {
+		t.Fatalf("plant stale main.py: %v", err)
 	}
 
-	// Without force, the corrupted file is preserved.
-	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
-		t.Fatalf("non-force runInit: %v", err)
+	// Without --force, the stale file is auto-refreshed back to the
+	// embedded byte stream — the byte-compare path triggers.
+	var out bytes.Buffer
+	if err := runInit(&out, false, claudeHome); err != nil {
+		t.Fatalf("auto-heal runInit: %v", err)
+	}
+	if !strings.Contains(out.String(), "refresh (stale)") {
+		t.Errorf("expected 'refresh (stale)' message for drift, got:\n%s", out.String())
 	}
 	got, _ := os.ReadFile(mainPath)
-	if !bytes.Equal(got, []byte("# corrupted by operator")) {
-		t.Error("non-force runInit overwrote the operator's edited file")
-	}
-
-	// With force, the embedded version is restored.
-	if err := runInit(&bytes.Buffer{}, true, claudeHome); err != nil {
-		t.Fatalf("force runInit: %v", err)
-	}
-	got, _ = os.ReadFile(mainPath)
 	want, _ := fs.ReadFile(fleet.FleetGuardFS(), "main.py")
 	if !bytes.Equal(got, want) {
-		t.Errorf("force runInit did not restore embedded main.py")
+		t.Errorf("stale main.py not refreshed to embedded content")
 	}
 }
 

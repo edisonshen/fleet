@@ -33,8 +33,9 @@ func TestMaybeAutoInit_FreshHome(t *testing.T) {
 }
 
 // TestMaybeAutoInit_AlreadyInstalled skips when every embedded file is
-// already on disk. Important: the operator who ran `fleet init` once
-// shouldn't see a "first run" message every dispatch.
+// already on disk AND matches the embedded byte content. Important:
+// the operator who ran `fleet init` once shouldn't see a "first run"
+// message every dispatch.
 func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
@@ -44,14 +45,6 @@ func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
 		t.Fatalf("setup runInit: %v", err)
 	}
-	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
-
-	// Replace main.py contents with a sentinel so we can prove
-	// auto-init didn't clobber it.
-	const sentinel = "# sentinel — preserved by maybeAutoInit"
-	if err := os.WriteFile(mainPath, []byte(sentinel), 0o644); err != nil {
-		t.Fatalf("write sentinel: %v", err)
-	}
 
 	var out bytes.Buffer
 	maybeAutoInit(&out, claudeHome)
@@ -59,13 +52,49 @@ func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	if got := out.String(); got != "" {
 		t.Errorf("expected silence when already installed, got:\n%s", got)
 	}
+}
 
-	data, err := os.ReadFile(mainPath)
+// TestMaybeAutoInit_StaleSkillFileSelfHeals regresses codex review
+// iter-3 P1: when fleet adds a hook event (e.g., UserPromptSubmit),
+// settings.json gets re-merged but the installed main.py stays at the
+// old dispatcher with no handler for the new hook. Without self-heal,
+// the new hook fires against stale code → silent no-op → needs_input
+// never clears on upgraded installs. skillFilesPresent now byte-compares
+// embedded vs installed and triggers a refresh on any drift.
+func TestMaybeAutoInit_StaleSkillFileSelfHeals(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+
+	// Bootstrap a clean install, then deliberately corrupt main.py to
+	// simulate the upgrade-path drift a stale binary would leave.
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("setup runInit: %v", err)
+	}
+	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
+	const stale = "# stale main.py from an older fleet binary\n"
+	if err := os.WriteFile(mainPath, []byte(stale), 0o644); err != nil {
+		t.Fatalf("write stale: %v", err)
+	}
+
+	var out bytes.Buffer
+	maybeAutoInit(&out, claudeHome)
+
+	// Auto-init should detect the drift and re-run runInit so the
+	// stale file gets refreshed to the embedded byte content.
+	if !strings.Contains(out.String(), "first run") {
+		t.Errorf("stale main.py should trigger re-install, got:\n%s", out.String())
+	}
+	got, err := os.ReadFile(mainPath)
 	if err != nil {
 		t.Fatalf("read main.py: %v", err)
 	}
-	if string(data) != sentinel {
-		t.Errorf("auto-init clobbered main.py; got %q", string(data))
+	if string(got) == stale {
+		t.Errorf("auto-init left stale main.py in place; expected refresh")
+	}
+	// Sanity check: the refreshed file should at least include the
+	// new dispatcher entry for UserPromptSubmit.
+	if !strings.Contains(string(got), "UserPromptSubmit") {
+		t.Errorf("refreshed main.py missing UserPromptSubmit handler:\n%s", string(got))
 	}
 }
 

@@ -75,21 +75,26 @@ def main(stdin: TextIO | None = None) -> int:
 
 def _on_stop(payload: dict, agent_id: str, session: str,
              injections: list[str]) -> None:
-    """Stop fires after every assistant turn. Three concerns, in order:
-    update health JSON, deliver any pending operator inbox message, then
-    evaluate the handoff state machine. Inbox runs first so the agent
-    sees operator context BEFORE deciding whether to wrap with MILESTONE.
+    """Stop fires after every assistant turn. Four concerns, in order:
+    update health JSON with context_pct, deliver any pending operator
+    inbox message, evaluate the handoff state machine, then resolve
+    needs_input based on whether anything is being injected. Inbox runs
+    first so the agent sees operator context BEFORE deciding whether to
+    wrap with MILESTONE.
+
+    needs_input semantics: true iff this Stop leaves claude truly idle.
+    If the hook injects an inbox message OR a HANDOFF REQUESTED prompt
+    via stdout, claude immediately starts another turn — that is
+    "working", not "waiting". Marking it waiting in those paths would
+    pin the TUI's "waiting" badge on agents that are actively
+    processing the injected content (caught by codex review iter-2 P2
+    on inbox-driven Stops).
     """
     pct, _model = health.read_context_pct(payload)
-    # Set needs_input=true: claude has finished a turn and is now waiting
-    # for the operator to type something. UserPromptSubmit clears it on the
-    # next operator turn. The TUI uses this to show a "waiting" badge so
-    # the operator can spot which agent is blocked on them at a glance.
     health.update_record(
         agent_id,
         context_pct=pct,
         context_source="hook",
-        needs_input=True,
     )
 
     inbox_body = inbox.read_pending(agent_id)
@@ -107,6 +112,12 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     )
     if handoff_inject is not None:
         injections.append(handoff_inject)
+
+    # Settle needs_input AFTER injection decisions: empty injections
+    # means a real idle Stop (operator must type next), non-empty means
+    # claude has work to do on the next turn. UserPromptSubmit clears
+    # the flag on the operator's first human prompt either way.
+    health.update_record(agent_id, needs_input=(len(injections) == 0))
 
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
@@ -132,14 +143,12 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
     pending inbox message — the operator may have queued context while the
     agent was idle. No threshold evaluation: context is fresh.
 
-    Mark needs_input=true so the TUI shows "waiting" until the operator
-    sends the first prompt. SessionStart leaves claude at an idle prompt
-    in both fresh-dispatch and resume cases — the operator is the
-    bottleneck. Without this, fresh agents render as "live" until the
-    first Stop fires (which only happens AFTER the operator types).
-    UserPromptSubmit then clears the flag on the operator's first turn.
+    needs_input semantics mirror Stop: true iff no injection is being
+    sent, false if SessionStart hands claude an inbox message that
+    starts work immediately. Without the late settle, a resumed agent
+    with pending operator context would show "waiting" while it is
+    actually processing the injected message (codex review iter-2 P2).
     """
-    health.update_record(agent_id, needs_input=True)
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:
         injections.append(inbox.deliver(inbox_body))
@@ -149,6 +158,7 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
         # state of disk.
         if inbox.archive(agent_id):
             health.update_record(agent_id, inbox_pending=False)
+    health.update_record(agent_id, needs_input=(len(injections) == 0))
 
 
 if __name__ == "__main__":

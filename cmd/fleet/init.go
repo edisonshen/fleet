@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,6 +75,14 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 // installSkillFiles walks the embedded FS and writes each file to dst.
 // Files are written via state.WriteAtomic so a crashed install never
 // publishes a half-written main.py to the hook runner.
+//
+// Self-healing on upgrade: when force is false and the target exists,
+// the embedded content is byte-compared against the installed file.
+// Matches are skipped (idempotent re-run); mismatches are overwritten
+// so upgrading the fleet binary auto-refreshes the bundled skill code.
+// Without this, hookEvents additions (e.g., UserPromptSubmit) would
+// fire against a stale main.py that has no handler for the new hook.
+// force=true short-circuits the compare and always rewrites.
 func installSkillFiles(stdout io.Writer, dst string, force bool) error {
 	fsys := fleet.FleetGuardFS()
 	return fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
@@ -84,15 +93,21 @@ func installSkillFiles(stdout io.Writer, dst string, force bool) error {
 			return nil
 		}
 		target := filepath.Join(dst, path)
-		if !force {
-			if _, err := os.Stat(target); err == nil {
-				_, _ = fmt.Fprintf(stdout, "skip (exists): %s\n", target)
-				return nil
-			}
-		}
 		data, err := fs.ReadFile(fsys, path)
 		if err != nil {
 			return fmt.Errorf("read embedded %s: %w", path, err)
+		}
+		if !force {
+			existing, statErr := os.ReadFile(target)
+			switch {
+			case statErr == nil && bytes.Equal(existing, data):
+				_, _ = fmt.Fprintf(stdout, "skip (up to date): %s\n", target)
+				return nil
+			case statErr == nil:
+				_, _ = fmt.Fprintf(stdout, "refresh (stale): %s\n", target)
+			case !os.IsNotExist(statErr):
+				return fmt.Errorf("stat %s: %w", target, statErr)
+			}
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", filepath.Dir(target), err)
