@@ -324,7 +324,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		Cwd:            cwd,
 		Command:        command,
 		PreAllocatedID: newID,
-		InitialPrompt:  handoff.ResumePrompt(docPath),
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
@@ -349,6 +348,20 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf(
 			"replacement %s spawned but tmux session %s already exited (command crashed at startup?); old agent untouched",
 			newRec.ID, newRec.TmuxSession)
+	}
+
+	// 8b. Type the resume prompt into NEW so it picks up its
+	//     predecessor's work without operator intervention. Best-
+	//     effort: a tmux failure here doesn't roll back the handoff
+	//     — agent record + session are valid, operator can attach and
+	//     type manually. SendInitialPrompt polls pane stability before
+	//     sending so slow wrappers don't drop keys into the shell
+	//     (codex review iter-1 P1).
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (agent is up; attach and type the prompt manually)\n",
+			newRec.TmuxSession, err)
 	}
 
 	// 9. Send "/exit" to the old session. ErrNoSession means it

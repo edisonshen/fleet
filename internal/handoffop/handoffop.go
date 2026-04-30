@@ -160,7 +160,6 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
-		InitialPrompt:  handoff.ResumePrompt(req.HandoffDoc),
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -177,14 +176,32 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		graceMillis, stdout, stderr)
 }
 
-// retireOldAgent runs the post-spawn tail: send /exit, grace, kill,
-// archive, delete queue. Caller has verified newRec.TmuxSession is alive.
+// retireOldAgent runs the post-spawn tail: send the resume prompt
+// to the new agent, then send /exit to the old, grace, kill, archive,
+// delete queue. Caller has verified newRec.TmuxSession is alive.
 //
-// Mirrors steps 9-13 of cmd/fleet/handoff.go::runHandoff. Rollback
+// The resume prompt is delivered HERE (not inside spawn.Spawn) so the
+// crash-recovery branch — Resume() calling retireOldAgent directly
+// when the previous run spawned but didn't archive — gets the same
+// delivery as the happy path. Single source of truth, no double-send,
+// no lost prompt across crashes (codex review iter-1 P1).
+//
+// Mirrors steps 8b-13 of cmd/fleet/handoff.go::runHandoff. Rollback
 // semantics on Kill failure: kill the new session, delete the new record
 // + queue, surface the live old session for operator triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	graceMillis int, stdout, stderr io.Writer) error {
+
+	// Type the resume prompt into NEW before /exit'ing OLD. Best-
+	// effort: a tmux failure here doesn't roll back the handoff —
+	// agent record + session remain valid, operator can attach and
+	// type the prompt manually.
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (agent is up; attach and type the prompt manually)\n",
+			newRec.TmuxSession, err)
+	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {

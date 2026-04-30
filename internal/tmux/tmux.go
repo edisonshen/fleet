@@ -273,6 +273,25 @@ func SendKeys(session string, keys ...string) error {
 	return nil
 }
 
+// CapturePane returns the visible content of the given session's
+// active pane (the equivalent of `tmux capture-pane -t <session> -p`).
+// Used by spawn.SendInitialPrompt's readiness poll: when the pane
+// stops changing, the agent is idle and ready to receive input.
+//
+// Returns ErrNoSession if the session has already exited so callers
+// can distinguish "session gone" from generic capture-pane errors.
+func CapturePane(session string) ([]byte, error) {
+	if !HasSession(session) {
+		return nil, fmt.Errorf("%w: %s", ErrNoSession, session)
+	}
+	cmd := exec.Command("tmux", tmuxArgs("capture-pane", "-t", session, "-p")...)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("tmux capture-pane %s: %w", session, err)
+	}
+	return out, nil
+}
+
 // SetStatusHint prepends a fleet hint to the given session's
 // status-right so operators see "Ctrl-b d to detach" persistently
 // while attached, without losing whatever custom right-status they

@@ -13,6 +13,7 @@
 package spawn
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,20 +25,112 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// defaultInitialPromptDelay is how long Spawn waits between bringing
-// the tmux session up and typing InitialPrompt into it. Claude Code
-// takes a moment to start reading stdin; sending keys before it's
-// ready drops them into the wrapper shell instead of claude's input
-// box. Override with FLEET_INITIAL_PROMPT_DELAY_MS for tests.
-const defaultInitialPromptDelay = 3 * time.Second
+// SendInitialPrompt timing knobs. Production needs to ride out
+// claude code's startup animation (logo + spinner before the input
+// box appears) without staking the delivery on a single fixed sleep
+// — custom engine wrappers (per oldRec.Command) can take longer than
+// any one number we'd pick. Instead: poll the pane content; once it
+// stops changing for stableWindow we treat the agent as ready.
+//
+// FLEET_INITIAL_PROMPT_STABLE_MS / FLEET_INITIAL_PROMPT_MAX_MS let
+// tests pin small values so the suite doesn't pay multi-second
+// real-world waits; production uses the constants below.
+const (
+	defaultInitialPromptStableWindow = 500 * time.Millisecond
+	defaultInitialPromptMaxWait      = 30 * time.Second
+	initialPromptPollInterval        = 100 * time.Millisecond
+)
 
-func initialPromptDelay() time.Duration {
-	if s := os.Getenv("FLEET_INITIAL_PROMPT_DELAY_MS"); s != "" {
+func initialPromptStableWindow() time.Duration {
+	return envDuration("FLEET_INITIAL_PROMPT_STABLE_MS",
+		defaultInitialPromptStableWindow)
+}
+
+func initialPromptMaxWait() time.Duration {
+	return envDuration("FLEET_INITIAL_PROMPT_MAX_MS",
+		defaultInitialPromptMaxWait)
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if s := os.Getenv(key); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms >= 0 {
 			return time.Duration(ms) * time.Millisecond
 		}
 	}
-	return defaultInitialPromptDelay
+	return fallback
+}
+
+// SendInitialPrompt waits for the tmux session's pane to stabilize
+// (claude code's startup animation finished, input box rendered),
+// then types prompt + Enter. Used by both handoff entry points
+// (cmd/fleet/handoff.go's inline retire and handoffop.retireOldAgent)
+// to make the replacement agent autonomously pick up its predecessor's
+// work.
+//
+// Centralizing the wait+send pair in one helper means crash-recovery's
+// retireOldAgent calls the SAME code as the happy path — so the prompt
+// gets delivered exactly once even when a previous run crashed between
+// spawn and retire. (codex review iter-1 P1: fixed sleep + crash
+// window were two separate ways to silently drop the prompt.)
+//
+// Empty prompt is a silent no-op so callers can pass
+// handoff.ResumePrompt(docPath) without nil-checking docPath.
+//
+// Best-effort: a tmux error returns nil-or-error to the caller, but
+// the caller should not roll back the spawn — the agent record +
+// session are valid, and the operator can attach + type the prompt
+// manually if the auto-resume failed.
+func SendInitialPrompt(session, prompt string) error {
+	if prompt == "" {
+		return nil
+	}
+	if err := waitForPaneStable(session,
+		initialPromptStableWindow(),
+		initialPromptMaxWait()); err != nil {
+		// Stability poll didn't converge before maxWait. Send anyway
+		// — keys land in tmux's pty buffer and claude consumes them
+		// once it's ready. Better to over-send than to skip.
+		_, _ = fmt.Fprintf(os.Stderr,
+			"warning: initial-prompt readiness poll for %s did not converge: %v (sending anyway)\n",
+			session, err)
+	}
+	return tmux.SendKeys(session, prompt, "Enter")
+}
+
+// waitForPaneStable polls tmux capture-pane every
+// initialPromptPollInterval; returns nil when the pane content has
+// not changed for at least stableWindow, or an error if maxWait
+// elapses without convergence.
+//
+// "Stable" is a coarse heuristic for "agent is idle waiting for
+// input" — works for any wrapper that prints a startup banner then
+// settles, regardless of whether it's claude, codex, or a custom
+// shell. We tolerate empty captures (treat as not-stable so we keep
+// polling) so a slow-starting pane doesn't flag stable instantly.
+func waitForPaneStable(session string, stableWindow, maxWait time.Duration) error {
+	deadline := time.Now().Add(maxWait)
+	var prev []byte
+	stableSince := time.Time{}
+	for {
+		cur, err := tmux.CapturePane(session)
+		if err != nil {
+			return err
+		}
+		if len(cur) > 0 && bytes.Equal(cur, prev) {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			} else if time.Since(stableSince) >= stableWindow {
+				return nil
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+		prev = cur
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pane did not stabilize within %s", maxWait)
+		}
+		time.Sleep(initialPromptPollInterval)
+	}
 }
 
 // Options control a single Spawn call.
@@ -76,17 +169,6 @@ type Options struct {
 	// and journal-write. Empty (the dispatch path) means generate
 	// a fresh ID inside Spawn.
 	PreAllocatedID string
-
-	// InitialPrompt, if non-empty, is typed into the new tmux session
-	// (via tmux send-keys + Enter) after a startup delay so the agent
-	// begins its first turn without operator intervention. The handoff
-	// path uses this to point the replacement at its inherited handoff
-	// doc; dispatch leaves it empty (operator types the first prompt).
-	//
-	// Best-effort: a send-keys failure does NOT roll back the spawn —
-	// the agent is up, the operator can attach and type the prompt
-	// manually. We log to stderr and proceed.
-	InitialPrompt string
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -202,18 +284,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 		_ = tmux.Kill(session)
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
-
-	// Auto-resume: type the initial prompt into the new session after
-	// a startup delay. Best-effort — a send-keys error here means the
-	// operator must type the prompt themselves on attach, but the
-	// agent record + session are valid and worth preserving.
-	if opts.InitialPrompt != "" {
-		time.Sleep(initialPromptDelay())
-		if err := tmux.SendKeys(session, opts.InitialPrompt, "Enter"); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr,
-				"warning: send initial prompt to %s: %v (agent is up; attach and type the prompt manually)\n",
-				session, err)
-		}
-	}
+	// NOTE: the handoff resume prompt is typed by the caller's retire
+	// path (handoffop.retireOldAgent / cmd/fleet/handoff.go step 8b)
+	// via SendInitialPrompt, NOT here. Keeping it out of Spawn means
+	// crash recovery's "replacement spawned, retire interrupted"
+	// branch — which goes through retireOldAgent directly without
+	// re-spawning — still delivers the prompt. See codex review
+	// iter-1 P1.
 	return rec, nil
 }

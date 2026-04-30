@@ -38,10 +38,12 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
-	// Spawn types InitialPrompt after a 3 s delay in production so
-	// claude is ready; tests use shells that read stdin instantly,
-	// and a 3 s wait per Resume balloons the suite. Drop to zero.
-	t.Setenv("FLEET_INITIAL_PROMPT_DELAY_MS", "0")
+	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
+	// pane for stability. Production windows (500 ms stable / 30 s
+	// max) would balloon the suite; tests pin small values that
+	// converge fast on the synthetic shell commands seedAgent uses.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "1000")
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record
@@ -200,6 +202,68 @@ func TestResume_AlreadySpawnedSkipsSpawnRunsTail(t *testing.T) {
 	if !tmux.HasSession(newRec.TmuxSession) {
 		t.Error("new session killed during resume — should have been left alone")
 	}
+}
+
+// TestResume_CrashRecoveryDeliversPromptToReplacement verifies the
+// codex iter-1 P1 fix: when a previous Resume crashed AFTER spawn but
+// BEFORE retire, the recovery path's retireOldAgent call delivers the
+// resume prompt to the surviving replacement. Pre-fix, send-keys lived
+// inside spawn.Spawn — the recovery path skipped spawn → never sent
+// the prompt → replacement sat idle forever.
+func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, docPath := writeSkillQueue(t, oldRec)
+
+	// Pre-spawn the replacement with a shell that echoes whatever
+	// Resume types into it. Mirrors "crashed AFTER spawn but BEFORE
+	// archive": record + session exist, queue + doc + old still
+	// intact, but no prompt was delivered. We expect Resume's
+	// retireOldAgent call to type ResumePrompt(docPath) into this
+	// session, which the shell echoes back as `GOT:<prompt>`.
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = []string{"sh", "-c",
+		"read line; echo GOT:$line; sleep 30"}
+	newRec.TmuxSession = req.NewSession
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("pre-spawn replacement: %v", err)
+	}
+	if err := newRec.Write(); err != nil {
+		_ = tmux.Kill(newRec.TmuxSession)
+		t.Fatalf("write replacement record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Replacement still alive; prompt was delivered (shell echoed it).
+	// tmux capture-pane wraps long lines at terminal width — strip
+	// newlines before substring matching so the path-bearing prompt
+	// matches whether or not it crossed a column boundary.
+	want := "GOT:Read your handoff doc at " + docPath
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		captured, err := tmux.CapturePane(newRec.TmuxSession)
+		if err == nil {
+			lastOut = captured
+			joined := strings.ReplaceAll(string(captured), "\n", "")
+			if strings.Contains(joined, want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("crash-recovery did not deliver resume prompt; want substring %q in:\n%s",
+		want, string(lastOut))
 }
 
 // -- stale queue cleanup ----------------------------------------------------
