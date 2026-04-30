@@ -149,23 +149,23 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 		disableAutoResume = *req.DisableAutoResume
 	}
 	autoResume := !disableAutoResume && req.SchemaVersion >= 2
-	if autoResume {
-		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-				newRec.TmuxSession, err)
-		}
-		// SessionAlive (not HasSession) so transport probe failures
-		// don't fail the recovery (codex iter-15 P1).
-		if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
-				newRec.TmuxSession, perr)
-		} else if !alive {
-			return fmt.Errorf(
-				"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
-				req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
-		}
+
+	// Wait + liveness probe ALWAYS run, even when autoResume is off
+	// — the wait doubles as a post-spawn liveness probe (codex
+	// review iter-16 P1). Only the SEND is gated on autoResume below.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stdout,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stdout,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
+		return fmt.Errorf(
+			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
+			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
 	}
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stdout,

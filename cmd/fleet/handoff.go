@@ -199,21 +199,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				disableAutoResume = *pending.DisableAutoResume
 			}
 			autoResume := !disableAutoResume && pending.SchemaVersion >= 2
-			if autoResume {
-				if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-					_, _ = fmt.Fprintf(stderr,
-						"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-						newRec.TmuxSession, err)
-				}
-				if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
-					_, _ = fmt.Fprintf(stderr,
-						"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
-						newRec.TmuxSession, perr)
-				} else if !alive {
-					return fmt.Errorf(
-						"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
-						opts.oldID, pending.NewAgentID, newRec.TmuxSession)
-				}
+			// Wait + liveness check ALWAYS run; the readiness wait
+			// doubles as a post-spawn liveness probe that catches
+			// wrappers crashing shortly after step 8a's check
+			// (codex review iter-16 P1). Only the SEND is gated on
+			// autoResume below.
+			if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+					newRec.TmuxSession, err)
+			}
+			if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+					newRec.TmuxSession, perr)
+			} else if !alive {
+				return fmt.Errorf(
+					"agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
+					opts.oldID, pending.NewAgentID, newRec.TmuxSession)
 			}
 			queueDeleted := true
 			if err := queue.Delete(pendingPath); err != nil {
@@ -293,7 +296,8 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				break
 			}
 			return resumeHandoff(opts, stdout, stderr, oldRec, newRec,
-				pending.HandoffDoc, pendingPath, pending.DisableAutoResume)
+				pending.HandoffDoc, pendingPath, pending.DisableAutoResume,
+				pending.SchemaVersion)
 		}
 	}
 
@@ -664,11 +668,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
-	if !autoResume {
-		// Auto-resume was disabled at dispatch — the replacement is
-		// alive but idle. Tell the operator what to type once they
-		// attach so the new agent picks up where the old left off
-		// (codex review iter-7 P2).
+	// Print the manual prompt fallback whenever auto-resume DIDN'T
+	// happen for ANY reason: explicit opt-out, or queue.Delete
+	// failure that gated the send (codex review iter-7 P2 +
+	// iter-16 P2). Without this, a transient queue.Delete error
+	// leaves the replacement idle while the CLI reports success.
+	if !autoResume || !queueDeleted {
 		_, _ = fmt.Fprintf(stdout,
 			"then say: read the handoff doc at %s and continue\n", docPath)
 	}
@@ -683,7 +688,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 // Caller holds the per-agent flock.
 func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	oldRec, newRec *agent.Record, docPath, queuePath string,
-	pendingDisableAutoResume *bool) error {
+	pendingDisableAutoResume *bool, pendingSchemaVersion int) error {
 
 	// Verify the previously-spawned replacement is still alive. If it
 	// died after the original spawn (operator manually killed it,
@@ -697,12 +702,15 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 
 	// Resolve THIS handoff's auto-resume policy: queue override
 	// (set by the original handoff CLI) wins over newRec baseline
-	// (codex review iter-12 P2).
+	// (codex review iter-12 P2). Gate on schema v2+ (codex review
+	// iter-16 P2): v1 queue files predate auto-resume; resuming
+	// one with the new binary would unexpectedly inject a prompt
+	// into a replacement the operator already started manually.
 	disableAutoResume := newRec.DisableAutoResume
 	if pendingDisableAutoResume != nil {
 		disableAutoResume = *pendingDisableAutoResume
 	}
-	autoResume := !disableAutoResume
+	autoResume := !disableAutoResume && pendingSchemaVersion >= 2
 
 	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
 	// wait doubles as a post-spawn liveness check, and a wrapper
