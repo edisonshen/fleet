@@ -11,10 +11,20 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// sessionAliveFn is the tmux liveness probe used by [a] attach. var
-// so tests can stub without forking tmux. Production calls
-// tmux.HasSession.
+// sessionAliveFn is the tmux liveness probe used by [a] attach.
+// var so tests can stub without forking tmux. Production calls
+// tmux.HasSession — for [a] a probe failure is fine to treat as
+// "alive" (the operator will see tmux's own error if the actual
+// attach fails). Cleanup paths and the STATUS cache use
+// sessionProbeFn instead because they MUST distinguish probe
+// failures from definitive dead.
 var sessionAliveFn = tmux.HasSession
+
+// sessionProbeFn returns the tristate (alive, dead, error) probe
+// used by loadAgentsCmd to populate the STATUS-cache without
+// mistaking transport errors for dead sessions. var so tests can
+// stub without forking tmux.
+var sessionProbeFn = tmux.SessionAlive
 
 // Action keybinds added in Week 4b+4c. Layered onto the existing
 // navigation set (j/k/g/G/q) without touching them.
@@ -41,6 +51,7 @@ const (
 	modeNav inputMode = iota
 	modePickRepo
 	modePromptDispatch
+	modeConfirmArchive
 )
 
 // flash is the banner surfaced under the table after a keybind action
@@ -62,6 +73,10 @@ type dispatchDoneMsg struct {
 	err error
 }
 type drainDoneMsg struct {
+	out string
+	err error
+}
+type rmDoneMsg struct {
 	out string
 	err error
 }
@@ -107,10 +122,24 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	if m.mode == modePromptDispatch {
 		return m.handlePromptKey(key)
 	}
+	if m.mode == modeConfirmArchive {
+		return m.handleConfirmArchiveKey(key)
+	}
 	switch key {
 	case "h":
 		if cur := m.selected(); cur != nil {
 			return m, m.startHandoff(cur.ID), true
+		}
+		return m, nil, true
+	case "x":
+		// [x] archive: enter a y/esc confirmation mode rather than firing
+		// immediately. rm is destructive (kills the tmux session + deletes
+		// the record, no replacement) and a stray keypress on a busy
+		// dashboard would lose work irretrievably.
+		if cur := m.selected(); cur != nil {
+			m.mode = modeConfirmArchive
+			m.archiveCandidate = cur.ID
+			return m, nil, true
 		}
 		return m, nil, true
 	case "a":
@@ -127,7 +156,7 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 			if !sessionAliveFn(cur.TmuxSession) {
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"agent %s session is dead — claude likely exited inside it. Press [h] to clean up the orphan record.",
+						"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
 						cur.ID),
 					isErr: true,
 				}
@@ -149,6 +178,29 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+// handleConfirmArchiveKey runs while modeConfirmArchive is active. The
+// only confirm key is `y`/`Y`; everything else (including `n`/`N` and
+// `esc`) cancels. We deliberately swallow other keys instead of falling
+// through to nav so an absent-minded `j`/`k` while the prompt is up
+// can't move the cursor and lose the operator's place.
+func (m Model) handleConfirmArchiveKey(key string) (Model, tea.Cmd, bool) {
+	switch key {
+	case "y", "Y":
+		id := m.archiveCandidate
+		m.mode = modeNav
+		m.archiveCandidate = ""
+		if id == "" {
+			return m, nil, true
+		}
+		return m, m.startRm(id), true
+	case "esc", "n", "N":
+		m.mode = modeNav
+		m.archiveCandidate = ""
+		return m, nil, true
+	}
+	return m, nil, true
 }
 
 // handlePickerKey processes keystrokes while the repo picker is active.
@@ -240,6 +292,15 @@ func (m Model) startHandoff(id string) tea.Cmd {
 	})
 }
 
+// startRm returns a tea.Cmd that runs `fleet rm <id>` and emits
+// rmDoneMsg on completion. Only called after the operator confirms in
+// modeConfirmArchive.
+func (m Model) startRm(id string) tea.Cmd {
+	return runFleetCmd([]string{"rm", id}, func(out string, err error) tea.Msg {
+		return rmDoneMsg{out: out, err: err}
+	})
+}
+
 // startDispatch returns a tea.Cmd that runs `fleet dispatch <task>`
 // and emits dispatchDoneMsg on completion. When the picker recorded a
 // repo, --cwd and --project pin the spawn to that directory; the
@@ -290,6 +351,16 @@ func formatDispatchFlash(out string, err error) flashMsg {
 	if err != nil {
 		return flashMsg{
 			text:  fmt.Sprintf("dispatch failed: %v\n%s", err, out),
+			isErr: true,
+		}
+	}
+	return flashMsg{text: out}
+}
+
+func formatRmFlash(out string, err error) flashMsg {
+	if err != nil {
+		return flashMsg{
+			text:  fmt.Sprintf("rm failed: %v\n%s", err, out),
 			isErr: true,
 		}
 	}

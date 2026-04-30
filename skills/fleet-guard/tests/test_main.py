@@ -285,6 +285,112 @@ class TestSessionStartHook:
         assert out == ""
 
 
+# -- needs_input wiring (Stop sets, UserPromptSubmit clears) ---------------
+
+class TestNeedsInputFlag:
+    def test_stop_sets_needs_input_true_when_idle(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Fresh Stop with no inbox + no handoff threshold = real idle:
+        # claude finished a turn and is now waiting for the operator.
+        # The TUI renders "waiting" off this flag.
+        record_path = _seed_record(fleet_home_tmp, needs_input=False)
+        rc, _, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is True
+
+    def test_stop_with_inbox_does_not_mark_waiting(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # When Stop injects an inbox message via stdout, claude starts
+        # processing it immediately — that's "working", not "waiting".
+        # Marking needs_input=true here would pin the TUI's "waiting"
+        # badge on an agent that's actively running (codex iter-2 P2).
+        record_path = _seed_record(fleet_home_tmp, needs_input=True)
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("ship by friday",
+                                                encoding="utf-8")
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        assert "[OPERATOR]" in out
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is False
+
+    def test_stop_with_handoff_injection_does_not_mark_waiting(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Same logic for the handoff path: yellow-threshold injects
+        # HANDOFF REQUESTED so claude continues working on the wrap-up.
+        # needs_input must stay false until claude actually idles.
+        record_path = _seed_record(fleet_home_tmp, needs_input=False)
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            # 110k / 200k = 55% → yellow injects HANDOFF REQUESTED
+            "transcript_path": str(_transcript(tmp_path, input_tokens=110_000)),
+        }, capsys)
+        assert rc == 0
+        assert "HANDOFF REQUESTED" in out
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is False
+
+    def test_user_prompt_submit_clears_needs_input(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # Seed record in the post-Stop state (waiting); UserPromptSubmit
+        # is the moment claude transitions waiting → working, so the
+        # flag must drop to false so the TUI stops rendering "waiting".
+        record_path = _seed_record(fleet_home_tmp, needs_input=True)
+        rc, out, _ = _run({"hook_event_name": "UserPromptSubmit"}, capsys)
+        assert rc == 0
+        # Stdout is ignored by Claude Code on this hook — keep it empty
+        # so we don't accidentally inject into the operator's prompt.
+        assert out == ""
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is False
+
+    def test_session_start_no_inbox_marks_waiting(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # SessionStart with no inbox means claude is sitting at an idle
+        # prompt and the operator must type next. needs_input=true so
+        # the TUI renders "waiting" (otherwise fresh agents look "live"
+        # while actually blocked on the operator).
+        record_path = _seed_record(fleet_home_tmp, needs_input=False)
+        rc, _, _ = _run({"hook_event_name": "SessionStart"}, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is True
+
+    def test_session_start_with_inbox_does_not_mark_waiting(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # SessionStart can inject queued operator context on resume.
+        # Claude starts processing it immediately — needs_input=false
+        # so the TUI doesn't show "waiting" while the agent is actually
+        # working through the injected message (codex iter-2 P2).
+        record_path = _seed_record(fleet_home_tmp, needs_input=True)
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("welcome back",
+                                                encoding="utf-8")
+        rc, out, _ = _run({"hook_event_name": "SessionStart"}, capsys)
+        assert rc == 0
+        assert "[OPERATOR]" in out
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["needs_input"] is False
+
+
 # -- never-block-the-host ---------------------------------------------------
 
 class TestNeverBlocks:

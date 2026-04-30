@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -259,7 +260,7 @@ func TestView_RendersAgentTable(t *testing.T) {
 	m.records = sortRecords(fakeRecords(2))
 	out := m.View()
 
-	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "BLOCKED"} {
+	for _, want := range []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("view missing column header %q, got:\n%s", want, out)
 		}
@@ -269,6 +270,141 @@ func TestView_RendersAgentTable(t *testing.T) {
 	}
 	if !strings.Contains(out, "2 agent(s)") {
 		t.Errorf("footer should report agent count, got:\n%s", out)
+	}
+}
+
+func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
+	// alive is the cached liveness map keyed by agent ID.
+	// alive[id]=true → probed alive; alive[id]=false → probed dead;
+	// missing entry → conservatively treated as live (no probe yet).
+	const id = "x"
+	const sess = "fleet-x"
+	aliveTrue := map[string]bool{id: true}
+	aliveFalse := map[string]bool{id: false}
+	manualType := "manual"
+	autoYellow := "auto-yellow"
+	autoRed := "auto-red"
+	precompact := "precompact"
+
+	cases := []struct {
+		name  string
+		rec   *agent.Record
+		alive map[string]bool
+		want  string
+	}{
+		{
+			name: "dead session beats every other state",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+				HandoffType: &autoYellow,
+			},
+			alive: aliveFalse,
+			want:  "dead",
+		},
+		{
+			name: "auto-yellow handoff beats blocked + waiting",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+				HandoffType: &autoYellow,
+			},
+			alive: aliveTrue,
+			want:  "auto-yellow",
+		},
+		{
+			name: "auto-red surfaces as in-flight handoff",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				HandoffType: &autoRed,
+			},
+			alive: aliveTrue,
+			want:  "auto-red",
+		},
+		{
+			name: "precompact surfaces as in-flight handoff",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				HandoffType: &precompact,
+			},
+			alive: aliveTrue,
+			want:  "precompact",
+		},
+		{
+			name: "manual handoff_type is provenance, not status — falls through to waiting",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				NeedsInput:  true,
+				HandoffType: &manualType,
+			},
+			alive: aliveTrue,
+			want:  "waiting",
+		},
+		{
+			name: "manual handoff_type with no other flags falls through to live",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				HandoffType: &manualType,
+			},
+			alive: aliveTrue,
+			want:  "live",
+		},
+		{
+			name: "blocked beats waiting",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				Blocked:     true,
+				NeedsInput:  true,
+			},
+			alive: aliveTrue,
+			want:  "blocked",
+		},
+		{
+			name: "waiting when only needs_input set",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+				NeedsInput:  true,
+			},
+			alive: aliveTrue,
+			want:  "waiting",
+		},
+		{
+			name:  "live by default",
+			rec:   &agent.Record{ID: id, TmuxSession: sess},
+			alive: aliveTrue,
+			want:  "live",
+		},
+		{
+			name: "empty TmuxSession skips dead-check (legacy / pre-spawn rec)",
+			rec:  &agent.Record{ID: id, NeedsInput: true},
+			want: "waiting",
+		},
+		{
+			name: "missing alive entry conservatively reads as live (no probe yet)",
+			rec: &agent.Record{
+				ID:          id,
+				TmuxSession: sess,
+			},
+			alive: nil,
+			want:  "live",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deriveStatus(tc.rec, tc.alive); got != tc.want {
+				t.Errorf("deriveStatus = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -282,6 +418,55 @@ func TestSortRecords_NewestFirst(t *testing.T) {
 	// Original slice should not be mutated.
 	if records[0].ID != "a0" {
 		t.Error("sortRecords mutated input slice")
+	}
+}
+
+// TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned regresses
+// codex review iter-5 P2: a tmux probe that fails (binary missing,
+// socket broken) MUST NOT write a "false" entry into the alive
+// cache, since that would render a healthy agent as "dead" and
+// could trick an operator into pressing [x] on a live session.
+// Only definitive "session does not exist" results write false.
+func TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned(t *testing.T) {
+	(&stubSessionProbe{
+		// agent01: probe says definitively dead (writes false)
+		// agent02: probe transport error (must NOT write false)
+		// agent03: probe says alive (writes true)
+		dead:        map[string]bool{"fleet-agent01": true},
+		errSessions: map[string]bool{"fleet-agent02": true},
+	}).install(t)
+
+	// Seed three agent records on disk so loadAgentsCmd has something
+	// to walk. Use the helper from keys_test.go shape (sampleAgent
+	// builds a record with TmuxSession = "fleet-<id>").
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(tmp+"/agents", 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, id := range []string{"agent01", "agent02", "agent03"} {
+		rec := agent.New(id)
+		rec.TmuxSession = "fleet-" + id
+		rec.SpawnedAt = time.Now().UTC()
+		if err := rec.Write(); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	msg := loadAgentsCmd()().(agentsMsg)
+	if msg.err != nil {
+		t.Fatalf("loadAgentsCmd: %v", msg.err)
+	}
+	if msg.alive["agent01"] != false {
+		t.Errorf("agent01 (definitively dead) should be false, got %v", msg.alive["agent01"])
+	}
+	if msg.alive["agent03"] != true {
+		t.Errorf("agent03 (alive) should be true, got %v", msg.alive["agent03"])
+	}
+	// The key invariant: probe failure leaves the entry MISSING, not
+	// false. deriveStatus's nil-safe fallback then renders "live".
+	if _, present := msg.alive["agent02"]; present {
+		t.Errorf("agent02 probe failed — entry should be absent (not false), got alive=%v", msg.alive["agent02"])
 	}
 }
 

@@ -59,6 +59,8 @@ def main(stdin: TextIO | None = None) -> int:
             _on_precompact(payload, agent_id, session)
         elif hook_name == "SessionStart":
             _on_session_start(agent_id, injections)
+        elif hook_name == "UserPromptSubmit":
+            _on_user_prompt_submit(agent_id)
         # Any other hook event: silent no-op. Future hooks land here without
         # changes to this dispatch table.
     except Exception as exc:
@@ -73,10 +75,20 @@ def main(stdin: TextIO | None = None) -> int:
 
 def _on_stop(payload: dict, agent_id: str, session: str,
              injections: list[str]) -> None:
-    """Stop fires after every assistant turn. Three concerns, in order:
-    update health JSON, deliver any pending operator inbox message, then
-    evaluate the handoff state machine. Inbox runs first so the agent
-    sees operator context BEFORE deciding whether to wrap with MILESTONE.
+    """Stop fires after every assistant turn. Four concerns, in order:
+    update health JSON with context_pct, deliver any pending operator
+    inbox message, evaluate the handoff state machine, then resolve
+    needs_input based on whether anything is being injected. Inbox runs
+    first so the agent sees operator context BEFORE deciding whether to
+    wrap with MILESTONE.
+
+    needs_input semantics: true iff this Stop leaves claude truly idle.
+    If the hook injects an inbox message OR a HANDOFF REQUESTED prompt
+    via stdout, claude immediately starts another turn — that is
+    "working", not "waiting". Marking it waiting in those paths would
+    pin the TUI's "waiting" badge on agents that are actively
+    processing the injected content (caught by codex review iter-2 P2
+    on inbox-driven Stops).
     """
     pct, _model = health.read_context_pct(payload)
     health.update_record(
@@ -101,6 +113,12 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     if handoff_inject is not None:
         injections.append(handoff_inject)
 
+    # Settle needs_input AFTER injection decisions: empty injections
+    # means a real idle Stop (operator must type next), non-empty means
+    # claude has work to do on the next turn. UserPromptSubmit clears
+    # the flag on the operator's first human prompt either way.
+    health.update_record(agent_id, needs_input=(len(injections) == 0))
+
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     """PreCompact fires just before context compaction. Stdout is ignored
@@ -109,10 +127,28 @@ def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     handoff.emergency_trigger(payload, agent_id=agent_id, session=session)
 
 
+def _on_user_prompt_submit(agent_id: str) -> None:
+    """UserPromptSubmit fires when the operator submits a prompt to the
+    agent. That is the moment claude transitions from waiting → working,
+    so clear needs_input. Pairs with Stop, which sets needs_input=true.
+
+    Stdout is ignored by Claude Code on this hook (the prompt is already
+    being processed); we touch only the agent record.
+    """
+    health.update_record(agent_id, needs_input=False)
+
+
 def _on_session_start(agent_id: str, injections: list[str]) -> None:
     """SessionStart fires once per session (resume or fresh). Deliver any
     pending inbox message — the operator may have queued context while the
-    agent was idle. No threshold evaluation: context is fresh."""
+    agent was idle. No threshold evaluation: context is fresh.
+
+    needs_input semantics mirror Stop: true iff no injection is being
+    sent, false if SessionStart hands claude an inbox message that
+    starts work immediately. Without the late settle, a resumed agent
+    with pending operator context would show "waiting" while it is
+    actually processing the injected message (codex review iter-2 P2).
+    """
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:
         injections.append(inbox.deliver(inbox_body))
@@ -122,6 +158,7 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
         # state of disk.
         if inbox.archive(agent_id):
             health.update_record(agent_id, inbox_pending=False)
+    health.update_record(agent_id, needs_input=(len(injections) == 0))
 
 
 if __name__ == "__main__":

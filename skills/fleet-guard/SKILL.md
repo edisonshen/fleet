@@ -15,9 +15,10 @@ Registration lives in `~/.claude/settings.json` and is written by `fleet init`. 
 
 | Hook | When | Skill action |
 |------|------|--------------|
-| `Stop` | After every assistant turn | Update health JSON, deliver inbox, evaluate handoff thresholds |
+| `Stop` | After every assistant turn | Update health JSON (sets `needs_input=true`), deliver inbox, evaluate handoff thresholds |
 | `PreCompact` | Just before context compaction | Emergency handoff: write doc + queue immediately, no MILESTONE wait |
 | `SessionStart` | Session begins (resume or fresh) | Deliver any pending operator inbox message |
+| `UserPromptSubmit` | Operator submits a prompt to the agent | Clear `needs_input` (agent transitions waiting → working) |
 
 The original DESIGN.md referenced a `PostResponse` hook; that hook does not exist in Claude Code. `Stop` is the real binding and is what the spike validated (67 fires, 100% transcript availability, p95 18ms).
 
@@ -53,6 +54,10 @@ Stdin is the same JSON shape minus token deltas. Stdout is ignored (the compacti
 ### `SessionStart`
 
 Stdin contains `session_id` and resumption metadata. The skill checks for a pending inbox message and emits it via stdout (same `[OPERATOR] <body>` shape). No threshold evaluation on this hook — context is fresh.
+
+### `UserPromptSubmit`
+
+Stdin contains the operator-submitted prompt and metadata. Stdout is ignored (the prompt is already being processed). The skill clears `needs_input=false` on the agent record — the agent has transitioned from waiting → working. Pairs with `Stop`, which sets `needs_input=true` after every assistant turn.
 
 ## Handoff thresholds
 

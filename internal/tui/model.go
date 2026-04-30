@@ -21,6 +21,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -56,6 +57,18 @@ type Model struct {
 	pickerCursor   int    // index into the FILTERED slice
 	pickedRepo     repoCandidate
 
+	// archiveCandidate is the agent ID the operator pressed [x] on,
+	// awaiting y/esc confirmation in modeConfirmArchive. Cleared when
+	// the prompt resolves either way.
+	archiveCandidate string
+
+	// aliveByID is the cached tmux liveness snapshot from the most
+	// recent agentsMsg. Populated off the render path by
+	// loadAgentsCmd; deriveStatus reads from it. Nil/empty means no
+	// load has completed yet — deriveStatus treats that as "no
+	// evidence of dead", not "definitely dead".
+	aliveByID map[string]bool
+
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
 	// program exits. Process replacement only works post-program — a
@@ -81,9 +94,16 @@ func (m Model) Init() tea.Cmd {
 
 // agentsMsg carries a refreshed list of agent records (or an error)
 // from the loader goroutine.
+//
+// alive snapshots tmux session liveness for each loaded record at
+// load time. Probing once per refresh — instead of once per row per
+// View() repaint — avoids fanning out to N `tmux has-session`
+// subprocesses on every cursor move or 1s tick. deriveStatus reads
+// from this cache.
 type agentsMsg struct {
 	records []*agent.Record
 	err     error
+	alive   map[string]bool
 }
 
 // tickMsg fires every pollInterval so we can re-read agents/ even when
@@ -108,11 +128,33 @@ func tickCmd() tea.Cmd {
 }
 
 // loadAgentsCmd reads ~/.fleet/agents/*.json once and returns the
-// result as an agentsMsg.
+// result as an agentsMsg. Probes tmux liveness for each loaded
+// record here (off the render path) so deriveStatus can read from
+// the cached map instead of forking `tmux has-session` per row on
+// every repaint.
+//
+// Uses the tristate sessionProbeFn so transport failures (tmux
+// missing, broken socket) DON'T poison the cache with false "dead"
+// readings — those records are simply omitted from the alive map,
+// and deriveStatus's nil-safe fallback renders them as "live"
+// rather than mislabeling a healthy agent (codex review iter-5 P2).
 func loadAgentsCmd() tea.Cmd {
 	return func() tea.Msg {
 		records, err := agent.List()
-		return agentsMsg{records: records, err: err}
+		alive := make(map[string]bool, len(records))
+		for _, r := range records {
+			if r.TmuxSession == "" {
+				continue
+			}
+			ok, probeErr := sessionProbeFn(r.TmuxSession)
+			if probeErr != nil {
+				// Transport failure — leave the entry missing so the
+				// dashboard reads "live" instead of mislabeling.
+				continue
+			}
+			alive[r.ID] = ok
+		}
+		return agentsMsg{records: records, err: err, alive: alive}
 	}
 }
 
@@ -130,6 +172,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case agentsMsg:
 		m.err = msg.err
 		m.records = sortRecords(msg.records)
+		m.aliveByID = msg.alive
 		// Keep the cursor in bounds when the list shrinks.
 		if m.cursor >= len(m.records) {
 			m.cursor = max(0, len(m.records)-1)
@@ -177,6 +220,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fl := formatDispatchFlash(msg.out, msg.err)
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: new agent should appear
+
+	case rmDoneMsg:
+		fl := formatRmFlash(msg.out, msg.err)
+		m.flash = &fl
+		return m, loadAgentsCmd() // refresh: agent should be archived
 	}
 	return m, nil
 }
@@ -225,8 +273,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var b strings.Builder
 
+	// Title block: blank line above so the title isn't flush with the
+	// terminal top, padded title text, dim divider underneath. Gives
+	// the header a clear visual zone instead of a single dim line.
 	title := fmt.Sprintf("Fleet %s", m.version)
+	b.WriteString("\n")
 	b.WriteString(titleStyle.Render(title))
+	b.WriteString("\n")
+	b.WriteString(dividerStyle.Render(strings.Repeat("─", lipgloss.Width(title)+2)))
 	b.WriteString("\n\n")
 
 	if m.err != nil {
@@ -238,8 +292,7 @@ func (m Model) View() string {
 		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
-		b.WriteString(renderTable(m.records, m.cursor))
-		b.WriteString("\n")
+		b.WriteString(renderTable(m.records, m.cursor, m.aliveByID))
 	}
 
 	if m.flash != nil {
@@ -266,11 +319,34 @@ func (m Model) View() string {
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
 		b.WriteString("\n")
-	default:
-		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [q] quit",
-			len(m.records))
+	case modeConfirmArchive:
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render(footer))
+		b.WriteString(promptStyle.Render(fmt.Sprintf(
+			"Archive agent %s? Kills tmux session + deletes record (no replacement). [y/N]",
+			m.archiveCandidate)))
+		b.WriteString("\n")
+	default:
+		// Footer is split across two lines so the count and the
+		// action-key row don't compete for the same horizontal eyeline:
+		//   1 agent(s)
+		//   [j/k] navigate  ·  [h] handoff  ·  ...
+		// Each [k] label pair is a chip — colored key, dim label —
+		// joined by a dim middle dot so the operator's eye can land
+		// on the action keys without scanning prose.
+		count := dimStyle.Render(fmt.Sprintf("%d agent(s)", len(m.records)))
+		sep := dimStyle.Render("  ·  ")
+		chips := strings.Join([]string{
+			keyChip("[j/k]", "navigate"),
+			keyChip("[h]", "handoff"),
+			keyChip("[a]", "attach"),
+			keyChip("[d]", "dispatch"),
+			keyChip("[x]", "archive"),
+			keyChip("[q]", "quit"),
+		}, sep)
+		b.WriteString("\n")
+		b.WriteString(count)
+		b.WriteString("\n")
+		b.WriteString(chips)
 		// Detach hint lives in the spawned session's tmux status bar
 		// (see tmux.SetStatusHint), not here — by the time the
 		// operator needs it, the TUI is gone and tmux owns the screen.
@@ -344,29 +420,62 @@ func sortRecords(in []*agent.Record) []*agent.Record {
 }
 
 // renderTable produces the tabular agent list with the cursor row
-// highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  BLOCKED.
-func renderTable(records []*agent.Record, cursor int) string {
-	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "BLOCKED"}
+// highlighted. Columns: AGENT  PROJECT  TASK  MODE  AGE  STATUS.
+//
+// alive is the cached tmux liveness snapshot from the most recent
+// load. deriveStatus reads from it instead of probing tmux per-row,
+// so render is pure formatting (no subprocess fan-out, no I/O).
+//
+// Per-cell styling: the AGENT cell on the cursor row picks up
+// cursorStyle (bold blue) so the operator's eye lands on the selected
+// id. The STATUS cell on every row gets a per-state color via
+// statusStyleFor. Padding is applied to plain text first so column
+// widths line up; style.Render adds zero-width ANSI escapes that
+// don't disturb the math.
+func renderTable(records []*agent.Record, cursor int, alive map[string]bool) string {
+	header := []string{"AGENT", "PROJECT", "TASK", "MODE", "AGE", "STATUS"}
+	const statusCol = 5
 	rows := make([][]string, 0, len(records))
 	for _, r := range records {
 		rows = append(rows, []string{
 			r.ID,
-			defaultStr(r.Project, "-"),
+			projectDisplay(r),
 			defaultStr(r.TaskID, "-"),
 			defaultStr(r.Mode, "-"),
 			humanAge(time.Since(r.SpawnedAt)),
-			boolStr(r.Blocked),
+			deriveStatus(r, alive),
 		})
 	}
 	widths := columnWidths(header, rows)
 
 	var b strings.Builder
+	// Prefix the header with the same 2-char gutter the data rows use
+	// ("▸ " on the cursor row, "  " elsewhere) so the column titles
+	// line up over their values instead of sliding two cells left.
+	b.WriteString("  ")
 	b.WriteString(headerStyle.Render(joinCols(header, widths)))
 	b.WriteString("\n")
 	for i, row := range rows {
-		line := joinCols(row, widths)
+		cells := make([]string, len(row))
+		for j, c := range row {
+			if j == len(row)-1 {
+				cells[j] = c // last column: no trailing pad
+			} else {
+				cells[j] = padRight(c, widths[j])
+			}
+		}
+		// STATUS gets a per-state color on every row.
+		cells[statusCol] = statusStyleFor(row[statusCol]).Render(cells[statusCol])
+		// On the cursor row, give the AGENT id the cursor color so
+		// the selected agent is unmistakable without painting the
+		// whole line (which would override the STATUS color).
 		if i == cursor {
-			b.WriteString(cursorStyle.Render("▸ " + line))
+			cells[0] = cursorStyle.Render(cells[0])
+		}
+		line := strings.Join(cells, columnGap)
+		if i == cursor {
+			b.WriteString(cursorStyle.Render("▸ "))
+			b.WriteString(line)
 		} else {
 			b.WriteString("  " + line)
 		}
@@ -374,6 +483,11 @@ func renderTable(records []*agent.Record, cursor int) string {
 	}
 	return b.String()
 }
+
+// columnGap is the spacer rendered between adjacent columns. 4 spaces
+// gives the dashboard breathing room without making the table feel
+// stretched at typical terminal widths (~120 cols).
+const columnGap = "    "
 
 func joinCols(cols []string, widths []int) string {
 	parts := make([]string, len(cols))
@@ -386,7 +500,7 @@ func joinCols(cols []string, widths []int) string {
 			parts[i] = padRight(c, widths[i])
 		}
 	}
-	return strings.Join(parts, "  ")
+	return strings.Join(parts, columnGap)
 }
 
 // columnWidths returns max(len) per column across header + rows.
@@ -419,11 +533,83 @@ func defaultStr(s, def string) string {
 	return s
 }
 
-func boolStr(b bool) string {
-	if b {
-		return "yes"
+// projectDisplay derives the human-readable project label for the
+// PROJECT column. Prefers the last two path segments of r.Cwd
+// joined with "/" (so /Users/op/projects/fleet renders as
+// "projects/fleet") instead of the on-disk Project tag, which
+// hyphen-joins parent + basename for filesystem safety
+// (projects-fleet) and reads as one mashed word in the dashboard.
+//
+// filepath.Clean drops trailing slashes and "/.“ tails before the
+// Base/Dir split (codex iter-9 P3) — without it, --cwd values like
+// "/path/to/repo/" or "/path/to/repo/." would derive base="repo"
+// AND parent="repo" (or "."), rendering "repo/repo" or "repo/.".
+//
+// Falls back to r.Project — and then to "-" — for legacy records or
+// agents whose Cwd wasn't captured at dispatch.
+func projectDisplay(r *agent.Record) string {
+	if r.Cwd != "" {
+		clean := filepath.Clean(r.Cwd)
+		base := filepath.Base(clean)
+		parent := filepath.Base(filepath.Dir(clean))
+		if parent != "" && parent != "." && parent != string(filepath.Separator) {
+			return parent + "/" + base
+		}
+		if base != "" && base != "." {
+			return base
+		}
 	}
-	return "no"
+	return defaultStr(r.Project, "-")
+}
+
+// deriveStatus picks one short label that summarizes the agent's
+// current condition for the STATUS column. Precedence (most-urgent
+// first):
+//
+//  1. dead         — tmux session is gone (claude exited inside it)
+//  2. <handoff>    — handoff_type set to an in-flight value
+//     (auto-yellow / auto-red / precompact). "manual"
+//     is a spawn-origin label set by spawn.Spawn on
+//     every successor and is NOT surfaced — it would
+//     pin "manual" on every post-handoff agent forever
+//     (skills/fleet-guard/handoff.py:113-119).
+//  3. blocked      — fleet-guard / operator flagged the agent blocked
+//  4. waiting      — needs_input=true (Stop fired, awaiting operator)
+//  5. live         — fresh spawn or actively-running turn
+//
+// dead wins over everything because the other states are meaningless
+// when the underlying process is gone. In-flight handoff wins over
+// blocked / waiting because the agent is being retired regardless of
+// what it was doing. blocked wins over waiting because a hard block
+// is more urgent for the operator to see than ambient idle.
+//
+// alive is the cached liveness snapshot from the most recent
+// loadAgentsCmd. Reading from cache (instead of probing tmux here)
+// keeps subprocess fan-out off the render path. A nil/missing entry
+// conservatively reads as "live" rather than "dead" so a not-yet-
+// probed record never falsely paints as dead before the first
+// agentsMsg lands.
+func deriveStatus(r *agent.Record, alive map[string]bool) string {
+	if r.TmuxSession != "" {
+		if probed, ok := alive[r.ID]; ok && !probed {
+			return "dead"
+		}
+	}
+	if r.HandoffType != nil {
+		switch *r.HandoffType {
+		case "auto-yellow", "auto-red", "precompact":
+			return *r.HandoffType
+		}
+		// "manual" and unknown values fall through — they are not
+		// in-flight indicators.
+	}
+	if r.Blocked {
+		return "blocked"
+	}
+	if r.NeedsInput {
+		return "waiting"
+	}
+	return "live"
 }
 
 // humanAge — same shape as cmd/fleet/status.go. Duplicated here rather
@@ -446,10 +632,52 @@ func humanAge(d time.Duration) string {
 // Lipgloss styles. Kept in the same file as the View() that uses them
 // so changes are co-located.
 var (
-	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	headerStyle = lipgloss.NewStyle().Bold(true).Faint(true)
-	cursorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("63"))
-	dimStyle    = lipgloss.NewStyle().Faint(true)
-	errStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	promptStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63")).PaddingLeft(1).PaddingRight(1)
+	dividerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("60"))
+	headerStyle   = lipgloss.NewStyle().Bold(true).Faint(true)
+	cursorStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	dimStyle      = lipgloss.NewStyle().Faint(true)
+	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	promptStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
+	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — action keybind chips
+	keyLabelStyle = lipgloss.NewStyle().Faint(true)
+
+	// Per-status colors for the STATUS column. The padded plain text
+	// is built first (so column widths remain correct), then wrapped
+	// in these styles — lipgloss adds zero-width ANSI escapes so the
+	// alignment math is unaffected.
+	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))  // green
+	statusWaitingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")) // amber
+	statusBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	statusDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
+	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — handoff in flight
+	statusUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")) // red — auto-red / precompact
 )
+
+// statusStyleFor maps a STATUS value to its lipgloss style. Falls back
+// to dim for unknown values so a future status that lands on disk
+// before the TUI is rebuilt still renders legibly.
+func statusStyleFor(status string) lipgloss.Style {
+	switch status {
+	case "live":
+		return statusLiveStyle
+	case "waiting":
+		return statusWaitingStyle
+	case "blocked":
+		return statusBlockedStyle
+	case "dead":
+		return statusDeadStyle
+	case "auto-yellow":
+		return statusHandoffStyle
+	case "auto-red", "precompact":
+		return statusUrgentStyle
+	}
+	return dimStyle
+}
+
+// keyChip renders a "[k] label" pair with a colored bracketed key and
+// a dim label. Used by the footer so the operator's eye can land on
+// the action keys without scanning the whole prose line.
+func keyChip(key, label string) string {
+	return keyStyle.Render(key) + " " + keyLabelStyle.Render(label)
+}
