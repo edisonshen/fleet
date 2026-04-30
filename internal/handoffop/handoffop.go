@@ -102,11 +102,13 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		return spawnAndRetire(req, queuePath, oldRec, graceMillis, stdout, stderr)
 	}
 	// Resolve THIS handoff's auto-resume policy from queue override
-	// + oldRec baseline (codex review iter-12 P2). Gate on schema
-	// v2+ (codex review iter-17 P2): a v1 queue file processed by
-	// fleet drain / TUI watcher must NOT auto-type, since v1 had
-	// no auto-resume and the operator may already have started
-	// the replacement manually.
+	// + oldRec baseline (codex review iter-12 P2). Combine v1 schema
+	// gate (codex iter-17 P2) — but ONLY for the SEND. Don't conflate
+	// "v1 legacy drain" with "operator opted out" (codex iter-18 P2):
+	// case-3 always proceeds to retire (the replacement is already
+	// alive, caller of `fleet handoff` already accepted manual
+	// prompt requirements), so the only knob the v1 gate touches
+	// here is whether retireOldAgent SENDS the prompt.
 	thisHandoffDisable := oldRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
 		thisHandoffDisable = *req.DisableAutoResume
@@ -175,10 +177,14 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
 	}
 	if err := queue.Delete(queuePath); err != nil {
-		_, _ = fmt.Fprintf(stdout,
-			"warning: agent %s already handed off → %s but queue cleanup failed: %v\n",
+		// Return error so fleet drain / TUI watcher retries; under
+		// the new post-delete send order the prompt would never have
+		// been sent if the delete failed, so silently reporting
+		// success would leave the replacement idle (codex review
+		// iter-18 P2).
+		return fmt.Errorf(
+			"resume: agent %s already handed off → %s but queue cleanup failed (%w); will retry",
 			req.OldAgentID, req.NewAgentID, err)
-		return nil
 	}
 	if autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
@@ -231,15 +237,9 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	}
 	// Resolve THIS handoff's auto-resume: queue's override (if set)
 	// wins, else inherit from oldRec (codex review iter-10/11/12 P2).
-	// Gate on schema v2+ (codex review iter-17 P2): v1 queue files
-	// predate auto-resume entirely; the auto-handoff drain must not
-	// type a prompt that the operator might have already delivered.
-	thisHandoffDisableAutoResume := oldRec.DisableAutoResume
+	disableAutoResume := oldRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
-		thisHandoffDisableAutoResume = *req.DisableAutoResume
-	}
-	if req.SchemaVersion < 2 {
-		thisHandoffDisableAutoResume = true
+		disableAutoResume = *req.DisableAutoResume
 	}
 
 	// Reject fresh-spawn auto-handoff for opt-out agents (codex
@@ -250,15 +250,27 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// forever. Surface a clear error pointing at `fleet handoff`,
 	// the interactive path. Queue file preserved for that retry.
 	//
-	// Already-spawned recovery (case 3 in Resume) takes the
-	// retireOldAgent branch directly, NOT this one — there the
-	// replacement was spawned by an operator who already accepted
-	// the manual-prompt requirement, so we just complete the retire
-	// without sending.
-	if thisHandoffDisableAutoResume {
+	// IMPORTANT: this reject is for EXPLICIT opt-out only (record
+	// baseline or queue override). v1 schema queues (codex iter-18
+	// P2) are NOT opt-outs — they just predate the auto-resume
+	// feature. v1 queues drain normally; the only difference is
+	// retireOldAgent skips the send for them.
+	if disableAutoResume {
 		return fmt.Errorf(
 			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
 			req.OldAgentID, req.OldAgentID, queuePath)
+	}
+
+	// thisHandoffDisableAutoResume is what gets passed to retire's
+	// SEND gate. It collapses "explicit opt-out" with "v1 queue
+	// legacy compatibility" — both mean "don't send" but we already
+	// returned above on the explicit opt-out, so this is just the
+	// v1 case. Spawn.DisableAutoResume gets the explicit-only value
+	// (disableAutoResume) so v1 drains don't permanently flip the
+	// new record's baseline.
+	thisHandoffDisableAutoResume := disableAutoResume
+	if req.SchemaVersion < 2 {
+		thisHandoffDisableAutoResume = true
 	}
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:      oldRec,
@@ -266,9 +278,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
-		// Persist resolved override so the new record's baseline
-		// reflects the operator's choice (codex review iter-13 P2).
-		DisableAutoResume: thisHandoffDisableAutoResume,
+		// Use disableAutoResume (explicit opt-out only), not
+		// thisHandoffDisableAutoResume (which includes the v1
+		// legacy case). A v1 drain shouldn't permanently flip the
+		// new record's baseline to opt-out (codex iter-18 P2).
+		DisableAutoResume: disableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
