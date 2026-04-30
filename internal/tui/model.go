@@ -307,18 +307,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // alternative would be to snapshot the time on every Update, which
 // would be churn for a render-only quantity. We accept the impurity
 // for the sake of a live age column.
+//
+// Layout is built in two halves — the "top" (title, banner, agent
+// list, coach hint, flash) and the "footer" (summary + chips, or the
+// active prompt) — then padToBottom inserts blank lines between them
+// so the footer pins to the bottom of the terminal regardless of
+// agent count. m.height comes from tea.WindowSizeMsg.
 func (m Model) View() string {
+	top := m.renderTop()
+	footer := m.renderFooter()
+	return padToBottom(top, footer, m.height)
+}
+
+// renderTop returns everything above the footer: title block,
+// optional error, alert banner (with section divider), agent list,
+// coach hint, flash. Always ends with a trailing newline.
+func (m Model) renderTop() string {
 	var b strings.Builder
 
 	// Title block: blank line above so the title isn't flush with the
-	// terminal top, padded title text, dim divider underneath. Gives
-	// the header a clear visual zone instead of a single dim line.
+	// terminal top, padded title text, dim divider that spans the full
+	// terminal width. Falls back to a title-relative width when the
+	// terminal hasn't reported its size yet (m.width == 0).
 	title := fmt.Sprintf("Fleet %s", m.version)
 	b.WriteString("\n")
 	b.WriteString(titleStyle.Render(title))
 	b.WriteString("\n")
-	b.WriteString(dividerStyle.Render(strings.Repeat("─", lipgloss.Width(title)+2)))
-	b.WriteString("\n\n")
+	b.WriteString(dividerStyle.Render(divider(m.width, lipgloss.Width(title)+2)))
+	b.WriteString("\n")
 
 	if m.err != nil {
 		b.WriteString(errStyle.Render(fmt.Sprintf("error reading agents: %v", m.err)))
@@ -326,13 +342,16 @@ func (m Model) View() string {
 	}
 
 	if len(m.records) == 0 {
+		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
 		b.WriteString("\n")
 	} else {
-		// Alert banner above the list — only when there's something
-		// urgent. A clean dashboard means no banner.
+		// Alert banner sits between two dividers. The top divider is
+		// the title divider above; we add a bottom divider here so
+		// the banner reads as its own visual section.
 		if banner := renderAlertBanner(m.records, m.aliveByID); banner != "" {
 			b.WriteString(banner)
+			b.WriteString(dividerStyle.Render(divider(m.width, 0)))
 			b.WriteString("\n")
 		}
 		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID))
@@ -353,13 +372,22 @@ func (m Model) View() string {
 		b.WriteString(style.Render(m.flash.text))
 		b.WriteString("\n")
 	}
+	return b.String()
+}
+
+// renderFooter returns the bottom-of-screen block — either a mode
+// prompt (picker / dispatch / confirm) or the smart footer (divider +
+// summary + chip row). Always opens with a divider line so the
+// footer reads as its own section pinned to the terminal bottom.
+func (m Model) renderFooter() string {
+	var b strings.Builder
+	b.WriteString(dividerStyle.Render(divider(m.width, 0)))
+	b.WriteString("\n")
 
 	switch m.mode {
 	case modePickRepo:
-		b.WriteString("\n")
 		b.WriteString(renderPicker(m))
 	case modePromptDispatch:
-		b.WriteString("\n")
 		header := "dispatch task"
 		if m.pickedRepo.Display != "" {
 			header += " in " + m.pickedRepo.Display
@@ -369,7 +397,6 @@ func (m Model) View() string {
 		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
 		b.WriteString("\n")
 	case modeConfirmArchive:
-		b.WriteString("\n")
 		b.WriteString(promptStyle.Render(fmt.Sprintf(
 			"Archive agent %s? Kills tmux session + deletes record (no replacement). [y/N]",
 			m.archiveCandidate)))
@@ -389,15 +416,51 @@ func (m Model) View() string {
 			keyChip("[x]", "archive"),
 			keyChip("[q]", "quit"),
 		}, sep)
-		b.WriteString("\n")
 		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID)))
 		b.WriteString("\n")
 		b.WriteString(chips)
+		b.WriteString("\n")
 		// Detach hint lives in the spawned session's tmux status bar
 		// (see tmux.SetStatusHint), not here — by the time the
 		// operator needs it, the TUI is gone and tmux owns the screen.
 	}
 	return b.String()
+}
+
+// divider returns a horizontal line of ─ characters spanning the
+// terminal width. When width is unknown (early renders before
+// WindowSizeMsg lands), falls back to a sensible minimum so the
+// title divider still draws under the heading.
+func divider(width, fallback int) string {
+	const minWidth = 12
+	w := width
+	if w <= 0 {
+		w = fallback
+	}
+	if w < minWidth {
+		w = minWidth
+	}
+	return strings.Repeat("─", w)
+}
+
+// padToBottom inserts blank lines between top and bottom so the
+// combined output exactly fills targetHeight rows. When the content
+// is already too tall (or the terminal hasn't reported its height
+// yet), concatenates without padding — the footer will simply scroll
+// off the top, which is preferable to truncating it.
+func padToBottom(top, bottom string, targetHeight int) string {
+	if targetHeight <= 0 {
+		return top + bottom
+	}
+	used := strings.Count(top, "\n") + strings.Count(bottom, "\n")
+	// One implicit final line if bottom doesn't end with newline.
+	if !strings.HasSuffix(bottom, "\n") {
+		used++
+	}
+	if used >= targetHeight {
+		return top + bottom
+	}
+	return top + strings.Repeat("\n", targetHeight-used) + bottom
 }
 
 // pickerVisibleRows caps how many repos are listed at once. Anything
