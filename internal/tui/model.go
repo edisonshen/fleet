@@ -21,6 +21,7 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -400,7 +401,7 @@ func renderTable(records []*agent.Record, cursor int) string {
 	for _, r := range records {
 		rows = append(rows, []string{
 			r.ID,
-			defaultStr(r.Project, "-"),
+			projectDisplay(r),
 			defaultStr(r.TaskID, "-"),
 			defaultStr(r.Mode, "-"),
 			humanAge(time.Since(r.SpawnedAt)),
@@ -433,7 +434,7 @@ func renderTable(records []*agent.Record, cursor int) string {
 		if i == cursor {
 			cells[0] = cursorStyle.Render(cells[0])
 		}
-		line := strings.Join(cells, "  ")
+		line := strings.Join(cells, columnGap)
 		if i == cursor {
 			b.WriteString(cursorStyle.Render("▸ "))
 			b.WriteString(line)
@@ -444,6 +445,11 @@ func renderTable(records []*agent.Record, cursor int) string {
 	}
 	return b.String()
 }
+
+// columnGap is the spacer rendered between adjacent columns. 4 spaces
+// gives the dashboard breathing room without making the table feel
+// stretched at typical terminal widths (~120 cols).
+const columnGap = "    "
 
 func joinCols(cols []string, widths []int) string {
 	parts := make([]string, len(cols))
@@ -456,7 +462,7 @@ func joinCols(cols []string, widths []int) string {
 			parts[i] = padRight(c, widths[i])
 		}
 	}
-	return strings.Join(parts, "  ")
+	return strings.Join(parts, columnGap)
 }
 
 // columnWidths returns max(len) per column across header + rows.
@@ -487,6 +493,29 @@ func defaultStr(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// projectDisplay derives the human-readable project label for the
+// PROJECT column. Prefers the last two path segments of r.Cwd
+// joined with "/" (so /Users/op/projects/fleet renders as
+// "projects/fleet") instead of the on-disk Project tag, which
+// hyphen-joins parent + basename for filesystem safety
+// (projects-fleet) and reads as one mashed word in the dashboard.
+//
+// Falls back to r.Project — and then to "-" — for legacy records or
+// agents whose Cwd wasn't captured at dispatch.
+func projectDisplay(r *agent.Record) string {
+	if r.Cwd != "" {
+		base := filepath.Base(r.Cwd)
+		parent := filepath.Base(filepath.Dir(r.Cwd))
+		if parent != "" && parent != "." && parent != string(filepath.Separator) {
+			return parent + "/" + base
+		}
+		if base != "" && base != "." {
+			return base
+		}
+	}
+	return defaultStr(r.Project, "-")
 }
 
 // deriveStatus picks one short label that summarizes the agent's
