@@ -129,17 +129,20 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	switch key {
 	case "h":
 		if cur := m.selectedRecord(); cur != nil {
-			// Gate [h] to match the chip strip's status-aware
-			// affordances (codex iter-6 P2). In-flight handoff
-			// states hide [h] in actionChipsFor; without a hotkey
-			// gate, an operator who knows the old shortcut could
-			// still start a duplicate handoff during auto-yellow's
-			// pre-MILESTONE window. Flash the explanation instead
-			// of silently swallowing.
+			// Gate [h] only for COMMITTED handoff states
+			// (auto-red / precompact) — those have a queue journal
+			// on disk, so a manual handoff would race against the
+			// in-flight one. auto-yellow is NOT gated: the journal
+			// hasn't been written yet (only after MILESTONE), and
+			// [h] is the operator's escape hatch when the auto
+			// handoff stalls — observed when the agent goes idle
+			// after Yellow fires without ever taking another turn
+			// to emit MILESTONE. Without [h], such agents stay
+			// stuck forever.
 			status := deriveStatus(cur, m.aliveByID)
-			if status == "auto-yellow" || status == "auto-red" || status == "precompact" {
+			if status == "auto-red" || status == "precompact" {
 				m.flash = &flashMsg{
-					text:  fmt.Sprintf("agent %s already has a handoff in flight (%s)", cur.ID, status),
+					text:  fmt.Sprintf("agent %s already has a handoff journal — `fleet drain` first", cur.ID),
 					isErr: true,
 				}
 				return m, nil, true

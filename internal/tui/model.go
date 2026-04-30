@@ -900,15 +900,18 @@ func agentProgressLine(r *agent.Record, status string) string {
 // selected row. Status-aware so we don't dangle keys that won't
 // work.
 //
-// auto-yellow keeps [x] because the queue journal isn't written
-// until the agent reaches MILESTONE — between Yellow firing
-// "HANDOFF REQUESTED" and the journal landing on disk, `fleet rm`
-// is still a valid cleanup path (cmd/fleet/rm.go:99 only refuses
-// when the journal file exists). [h] hides because the handoff
-// is already in flight (codex iter-4 P3).
+// auto-yellow keeps the full chip set because the queue journal
+// isn't written until the agent reaches MILESTONE. In the window
+// between "HANDOFF REQUESTED" being injected and that journal
+// landing, both `fleet handoff` and `fleet rm` still work
+// (cmd/fleet/rm.go:99 only refuses when the journal file exists).
+// [h] is the operator's escape hatch when the auto-handoff
+// stalls — observed when the agent goes idle after Yellow fires
+// without ever taking another turn to emit MILESTONE; without
+// [h] the agent stays stuck in auto-yellow forever.
 //
 // auto-red and precompact happen after MILESTONE → journal exists
-// → `fleet rm` will refuse → hide [x].
+// → both `fleet handoff` and `fleet rm` will refuse → hide them.
 //
 // Dead agents keep [h] AND [x] because either could be the right
 // recovery path: if a journal landed before the session died, only
@@ -922,14 +925,11 @@ func actionChipsFor(status string) []string {
 			keyChip("[h]", "handoff"),
 			keyChip("[x]", "archive"),
 		}
-	case "auto-yellow":
-		return []string{
-			keyChip("[a]", "attach"),
-			keyChip("[x]", "archive"),
-		}
 	case "auto-red", "precompact":
 		return []string{keyChip("[a]", "attach")}
 	}
+	// auto-yellow falls through to the default (full chip set) — see
+	// comment above.
 	return []string{
 		keyChip("[a]", "attach"),
 		keyChip("[h]", "handoff"),

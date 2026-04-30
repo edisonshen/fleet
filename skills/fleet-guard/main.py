@@ -69,7 +69,23 @@ def main(stdin: TextIO | None = None) -> int:
         return 0
 
     if injections:
-        sys.stdout.write("\n\n".join(injections))
+        body = "\n\n".join(injections)
+        # Claude Code's Stop hook does NOT auto-inject plain stdout
+        # into the next turn's context (verified empirically: scanning
+        # all transcripts found zero matches for the literal injection
+        # prefix). The supported mechanism is JSON with
+        # decision="block" + reason=<text>; Claude refuses to stop and
+        # treats `reason` as the next assistant-side input. Without
+        # this format the agent never sees HANDOFF REQUESTED, never
+        # emits MILESTONE, and stays stuck in auto-yellow forever.
+        #
+        # Other hooks (SessionStart) keep plain-stdout for now — they
+        # don't have a documented "block" semantic, and the inbox-on-
+        # resume path is less load-bearing than auto-handoff.
+        if hook_name == "Stop":
+            print(json.dumps({"decision": "block", "reason": body}))
+        else:
+            sys.stdout.write(body)
     return 0
 
 
