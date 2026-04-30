@@ -86,11 +86,24 @@ func runRm(opts *rmOpts, stdout, stderr io.Writer) error {
 	// but no old record on retry, then hit the "task has no live
 	// agent" error path). Operator should drain or let the handoff
 	// finish first.
+	//
+	// Codex iter-8 P2: distinguish ENOENT (no pending handoff, fine
+	// to proceed) from other Stat errors (permission denied, I/O
+	// failure). A non-ENOENT error means the queue file MAY exist
+	// and we just can't see it — refusing is safer than archiving
+	// on the assumption that the journal is absent.
 	pendingPath, _ := state.QueuePath(queue.SpawnFreshName(opts.id))
-	if _, perr := os.Stat(pendingPath); perr == nil {
+	switch _, perr := os.Stat(pendingPath); {
+	case perr == nil:
 		return fmt.Errorf(
 			"agent %s has a pending handoff (%s) — `fleet drain` (or finish the handoff) before rm",
 			opts.id, pendingPath)
+	case errors.Is(perr, os.ErrNotExist):
+		// No queue file — fine, proceed.
+	default:
+		return fmt.Errorf(
+			"refusing to archive %s: cannot probe pending-handoff journal at %s — fix permissions and retry: %w",
+			opts.id, pendingPath, perr)
 	}
 
 	// Kill the session if it's alive. SessionAlive distinguishes

@@ -156,7 +156,7 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 			if !sessionAliveFn(cur.TmuxSession) {
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"agent %s session is dead — claude likely exited inside it. Press [h] to clean up the orphan record.",
+						"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
 						cur.ID),
 					isErr: true,
 				}
