@@ -343,11 +343,14 @@ func (m Model) View() string {
 func (m Model) renderTop() string {
 	var b strings.Builder
 
-	// Title row: "Fleet x.y.z" left, username right, separated by
-	// padding. Below it: a full-width dim divider. The mockup runs
-	// title flush against the top of the alt-screen — no leading
-	// blank line.
+	// Title row: "Fleet x.y.z" left, username right. Leading blank
+	// line keeps the title from sitting on the very first row of
+	// the alt-screen — some terminals (Warp, certain tmux configs)
+	// overlay command/status chrome on row 1 and the title vanishes
+	// behind it. Pushing the title to row 2 makes it always visible
+	// regardless of host UI.
 	title := fmt.Sprintf("Fleet %s", m.version)
+	b.WriteString("\n")
 	b.WriteString(titleRow(title, m.userName, m.width))
 	b.WriteString("\n")
 	b.WriteString(dividerStyle.Render(divider(m.width, lipgloss.Width(title)+2)))
@@ -444,17 +447,22 @@ func (m Model) renderFooter() string {
 }
 
 // titleRow renders the top line: bold cyan "Fleet x.y.z" on the left,
-// faint username on the right, padded with spaces to fill width.
-// When width is unknown (early renders) or username is empty, falls
-// back to just the title — keeping the row stable as the terminal
-// reports its size in.
+// faint username on the right, padded with spaces between them.
+// Stops one cell short of width so the rightmost terminal column
+// stays empty — many terminals auto-wrap when content lands in the
+// final column, and the resulting phantom newline visually eats the
+// row. When width is unknown (early renders) or username is empty,
+// falls back to just the title — keeping the row stable as the
+// terminal reports its size in.
 func titleRow(title, name string, width int) string {
 	left := titleStyle.Render(title)
 	if name == "" || width <= 0 {
 		return left
 	}
 	right := userStyle.Render(name)
-	gap := width - lipgloss.Width(title) - lipgloss.Width(name)
+	// width-1 leaves a 1-cell margin so the row never lands a
+	// printable character in the final column.
+	gap := (width - 1) - lipgloss.Width(title) - lipgloss.Width(name)
 	if gap < 1 {
 		gap = 1
 	}
@@ -462,7 +470,10 @@ func titleRow(title, name string, width int) string {
 }
 
 // divider returns a horizontal line of ─ characters spanning the
-// terminal width. When width is unknown (early renders before
+// terminal width minus one cell. The 1-cell right margin matches
+// titleRow's reasoning: rows that print into the final column can
+// trigger phantom-newline wrap on some terminals, eating the row
+// visually. When width is unknown (early renders before
 // WindowSizeMsg lands), falls back to a sensible minimum so the
 // title divider still draws under the heading.
 func divider(width, fallback int) string {
@@ -470,6 +481,9 @@ func divider(width, fallback int) string {
 	w := width
 	if w <= 0 {
 		w = fallback
+	}
+	if w > 1 {
+		w-- // 1-cell right margin
 	}
 	if w < minWidth {
 		w = minWidth
@@ -750,12 +764,14 @@ func renderAgentLine(r *agent.Record, status string, selected bool,
 		statusStyleFor(status).Render(padRight(label, statusColW))
 
 	// Plain widths (cells, ignoring ANSI escapes) drive the filler
-	// math. The selected row's bg highlight is applied by the caller
-	// at the Width(width) wrapper, so we don't need to compensate
-	// for it here.
+	// math. width-1 leaves a 1-cell right margin so the status word
+	// never lands in the terminal's final column — see titleRow for
+	// the phantom-newline rationale. The selected row's bg highlight
+	// is applied by the caller at the Width(width) wrapper, so we
+	// don't need to compensate for it here.
 	leftW := lipgloss.Width(left)
 	rightW := lipgloss.Width(right)
-	gap := width - leftW - rightW
+	gap := (width - 1) - leftW - rightW
 	if width <= 0 || gap < 2 {
 		gap = 2 // narrow terminals + early renders fall back to a flat gap
 	}
