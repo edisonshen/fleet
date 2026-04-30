@@ -1,0 +1,112 @@
+# GoReleaser config for `fleet`. See https://goreleaser.com/customization/.
+#
+# Triggered by .github/workflows/release.yml on `v*` tag pushes. The
+# workflow needs two secrets:
+#   - GITHUB_TOKEN          (default, scoped to this repo — for the release upload)
+#   - HOMEBREW_TAP_GITHUB_TOKEN (PAT with `repo` scope on edisonshen/homebrew-tap)
+#
+# Local snapshot (no publish):
+#   goreleaser release --snapshot --clean --skip=publish
+#
+# Local check that the config parses:
+#   goreleaser check
+version: 2
+
+project_name: fleet
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: fleet
+    main: ./cmd/fleet
+    binary: fleet
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # -s -w strips DWARF + symbol tables; -X injects the version so
+    # `fleet --version` and the TUI title match the tag. Default
+    # (cmd/fleet/main.go) is "0.1.0" for dev builds — overridden here.
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    files:
+      - LICENSE
+      - README.md
+      - docs/DESIGN.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{.ShortCommit}}"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "merge conflict"
+      - "Merge pull request"
+      - "Merge remote-tracking branch"
+      - "Merge branch"
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+# Homebrew formula auto-published to edisonshen/homebrew-tap on every
+# release. Operator prerequisite: the tap repo must exist with a
+# `Formula/` directory and the HOMEBREW_TAP_GITHUB_TOKEN secret must
+# be set on the fleet repo. Without the secret the release job fails
+# loud — better than silently skipping the tap update.
+brews:
+  - name: fleet
+    repository:
+      owner: edisonshen
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "chore: bump fleet to {{ .Tag }}"
+    homepage: https://github.com/edisonshen/fleet
+    description: "Open-source command console for running many Claude Code agents in parallel."
+    license: MIT
+    # tmux is the one runtime dep beyond the single binary (per
+    # docs/DESIGN.md). brew installs it transitively for users.
+    dependencies:
+      - name: tmux
+        type: required
+    install: |
+      bin.install "fleet"
+    test: |
+      system "#{bin}/fleet --version"
+
+release:
+  github:
+    owner: edisonshen
+    name: fleet
+  draft: false
+  prerelease: auto
+  name_template: "v{{ .Version }}"

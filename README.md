@@ -53,21 +53,20 @@ Three pillars launched together. The parallelism demo only carries with the full
 
 ## Quick start
 
-Not yet released. Today the binary is a stub that prints its version and exits:
+Until v0.1 is tagged, install from source (requires Go 1.25+ and `tmux` on `$PATH`):
 
 ```sh
-$ go build ./cmd/fleet && ./fleet
-fleet v0.0.0
-```
-
-Once v0.1 ships:
-
-```sh
-$ brew install edisonshen/tap/fleet
+$ go install github.com/edisonshen/fleet/cmd/fleet@main
 $ fleet                    # opens the TUI
 $ fleet dispatch <task>    # spawn an agent on a task
 $ fleet attach <agent-id>  # take over a running agent
 $ fleet status             # one-shot health summary
+```
+
+Once v0.1 ships, brew is the recommended path (pulls `tmux` transitively):
+
+```sh
+$ brew install edisonshen/tap/fleet
 ```
 
 The full operator walkthrough — registering a project, planning, dispatching, handing off, hitting `max_concurrent_agents` — lives at [`docs/FLOW.md`](docs/FLOW.md).

@@ -1,0 +1,46 @@
+name: release
+
+# Tag-triggered release. Push a tag like `v0.1.0` and this workflow
+# builds multi-arch binaries, publishes a GitHub release with the
+# changelog, and pushes the brew formula to edisonshen/homebrew-tap.
+#
+# Secrets:
+#   - GITHUB_TOKEN: provided by Actions; scoped to this repo (release upload).
+#   - HOMEBREW_TAP_GITHUB_TOKEN: PAT with `repo` scope on
+#     edisonshen/homebrew-tap. GoReleaser uses it to push the
+#     formula. Without it, the brews step fails — that's intentional
+#     so a missing secret is loud, not silent.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # release upload
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # GoReleaser needs the full history to build the changelog
+          # from `git log` between this tag and the previous one.
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
