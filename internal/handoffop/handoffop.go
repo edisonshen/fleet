@@ -177,10 +177,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 }
 
 // retireOldAgent runs the post-spawn tail: /exit + grace + kill the
-// old, archive, delete queue, deliver the resume prompt to the new.
-// Caller has verified newRec.TmuxSession is alive at entry.
+// old, wait for new's pane to stabilize, archive, delete queue, send
+// the resume prompt to new. Caller has verified newRec.TmuxSession
+// is alive at entry.
 //
-// Sequencing rationale (codex review iter-1, iter-2, iter-4):
+// Sequencing rationale (codex review iter-1, iter-2, iter-4, iter-5):
 //
 //  1. The resume prompt is delivered HERE (not inside spawn.Spawn) so
 //     crash recovery's "previous run spawned but didn't retire"
@@ -193,11 +194,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 //     Kill-failure rollback (kill new, delete new record) would
 //     silently drop work.
 //
-//  3. The prompt is sent AFTER queue.Delete — once the queue file is
-//     gone no recovery path can run, so the prompt is delivered at
-//     most once per logical handoff. Sending earlier would mean a
-//     crash between the prompt-send and queue.Delete leads to a
-//     retry that re-sends, making claude redo work.
+//  3. The readiness wait runs BEFORE queue.Delete; the actual key
+//     send runs AFTER. The wait can take up to 30 s (slow startup),
+//     during which the queue file remains on disk so a crash there
+//     is recoverable. After queue.Delete the send is microsecond-
+//     scale, so the unrecoverable "lost prompt" window is tiny.
+//     This split avoids both (a) double-send when a previous run
+//     crashed mid-wait (queue was still on disk → retry), and (b)
+//     a 30 s lost-prompt window if we'd put the wait after queue
+//     delete.
 //
 // Mirrors steps 9-14 of cmd/fleet/handoff.go::runHandoff. Rollback
 // semantics on Kill failure: kill the new session, delete the new record
@@ -237,6 +242,17 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			oldRec.TmuxSession, err)
 	}
 
+	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
+	// so a crash during the wait stays recoverable. The actual
+	// SendPromptKeys runs AFTER queue.Delete (single-shot, no retry
+	// double-send). Codex review iter-5 P2.
+	waitErr := spawn.WaitForReadyToPrompt(newRec.TmuxSession)
+	if waitErr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+			newRec.TmuxSession, waitErr)
+	}
+
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {
@@ -259,15 +275,11 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 	}
 
-	// Deliver the resume prompt AFTER queue.Delete (codex review
-	// iter-4 P2). Once the queue file is gone no recovery path runs,
-	// so this delivery happens at most once per logical handoff —
-	// avoiding the "previous run sent the prompt then crashed before
-	// queue.Delete; retry sends it again and claude does the work
-	// twice" failure mode. Trade-off: a crash between queue.Delete
-	// and this line drops the prompt (microsecond window). Best-
-	// effort: a tmux failure logs a warning, operator types manually.
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+	// Send the resume prompt AFTER queue.Delete. Pure send-keys —
+	// no waits, microsecond-scale. The readiness wait already ran
+	// above (recoverable via the queue file). Now the queue is gone
+	// so this send happens at most once per logical handoff.
+	if err := spawn.SendPromptKeys(newRec.TmuxSession,
 		handoff.ResumePrompt(docPath)); err != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",

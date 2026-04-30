@@ -409,6 +409,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			oldRec.TmuxSession, err)
 	}
 
+	// 11b. Wait for the new agent's pane to stabilize BEFORE
+	//      queue.Delete so a crash during the wait stays
+	//      recoverable (resumeHandoff will redo wait + send on
+	//      retry). Codex review iter-5 P2.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+			newRec.TmuxSession, err)
+	}
+
 	// 12. Archive the old record. After this, `fleet status` no
 	//     longer shows the outgoing agent. We've confirmed the old
 	//     session is dead in step 10, so this can't hide a live
@@ -443,15 +453,14 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 	}
 
-	// 14. Deliver the resume prompt AFTER queue.Delete so a crash
-	//     between Kill(old) and queue.Delete cannot lead to a retry
-	//     re-sending it (codex review iter-4 P2). Once the queue is
-	//     gone resumeHandoff cannot run, so this delivery happens at
-	//     most once per logical handoff. Trade-off: a crash between
-	//     queue.Delete and this line drops the prompt (microsecond
-	//     window). Best-effort: a tmux failure logs a warning,
-	//     operator types manually.
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+	// 14. Send the resume prompt AFTER queue.Delete. Pure send-keys —
+	//     no waits. The readiness wait already ran in step 11b
+	//     (recoverable via the still-on-disk queue file). Now the
+	//     queue is gone so this send happens at most once per
+	//     logical handoff. Lost-prompt window: the microseconds
+	//     between queue.Delete returning and this line. Best-effort:
+	//     a tmux failure logs a warning, operator types manually.
+	if err := spawn.SendPromptKeys(newRec.TmuxSession,
 		handoff.ResumePrompt(docPath)); err != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
@@ -465,7 +474,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  handoff: %s\n", docPath)
 	_, _ = fmt.Fprintf(stdout, "  number:  %d (was %d)\n", newRec.HandoffNumber, oldRec.HandoffNumber)
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", newRec.ID)
-	_, _ = fmt.Fprintf(stdout, "then say: read the handoff doc at %s and continue\n", docPath)
 	return nil
 }
 
@@ -505,6 +513,14 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			oldRec.TmuxSession, err)
 	}
 
+	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
+	// so a crash during the wait stays recoverable.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+			newRec.TmuxSession, err)
+	}
+
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {
@@ -521,12 +537,11 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
 	}
 
-	// Deliver the resume prompt AFTER queue.Delete (codex review
-	// iter-4 P2). The original runHandoff that crashed before
-	// reaching here never sent the prompt either (it also delivers
-	// post-queue.Delete in step 14), so this delivery is the FIRST
-	// — never a duplicate that would make claude redo work.
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+	// Send the resume prompt AFTER queue.Delete. Pure send-keys —
+	// the readiness wait already ran above. Both runHandoff and this
+	// path send post-queue.Delete, so this delivery is the FIRST —
+	// never a duplicate (codex review iter-4 / iter-5 P2).
+	if err := spawn.SendPromptKeys(newRec.TmuxSession,
 		handoff.ResumePrompt(docPath)); err != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",

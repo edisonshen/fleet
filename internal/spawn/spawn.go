@@ -60,41 +60,57 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// SendInitialPrompt waits for the tmux session's pane to stabilize
-// (claude code's startup animation finished, input box rendered),
-// then types prompt + Enter. Used by both handoff entry points
-// (cmd/fleet/handoff.go's inline retire and handoffop.retireOldAgent)
-// to make the replacement agent autonomously pick up its predecessor's
-// work.
+// WaitForReadyToPrompt polls the tmux session's pane until it
+// stabilizes (claude code's startup animation finished, input box
+// rendered), or maxWait elapses. Returns nil on stable convergence,
+// or an error if the poll didn't converge.
 //
-// Centralizing the wait+send pair in one helper means crash-recovery's
-// retireOldAgent calls the SAME code as the happy path — so the prompt
-// gets delivered exactly once even when a previous run crashed between
-// spawn and retire. (codex review iter-1 P1: fixed sleep + crash
-// window were two separate ways to silently drop the prompt.)
+// Callers should run this BEFORE queue.Delete so a crash during the
+// wait remains recoverable: the queue file is still on disk and
+// resumeHandoff / handoffop.Resume will re-run the wait + send on
+// retry. Pairing this with SendPromptKeys (run AFTER queue.Delete)
+// gives at-most-once delivery with a microsecond-scale lost-prompt
+// window, instead of the 30 s window an in-one-function design has
+// (codex review iter-5 P2).
+//
+// Best-effort: caller should NOT abort on this returning error —
+// just call SendPromptKeys anyway. Keys queue in tmux's pty buffer
+// and the agent consumes them once ready.
+func WaitForReadyToPrompt(session string) error {
+	return waitForPaneStable(session,
+		initialPromptStableWindow(),
+		initialPromptMaxWait())
+}
+
+// SendPromptKeys types prompt + Enter into the tmux session. No
+// readiness wait — caller must have called WaitForReadyToPrompt
+// first (or accept that keys may land before claude is ready, in
+// which case they queue in the pty).
 //
 // Empty prompt is a silent no-op so callers can pass
 // handoff.ResumePrompt(docPath) without nil-checking docPath.
-//
-// Best-effort: a tmux error returns nil-or-error to the caller, but
-// the caller should not roll back the spawn — the agent record +
-// session are valid, and the operator can attach + type the prompt
-// manually if the auto-resume failed.
+func SendPromptKeys(session, prompt string) error {
+	if prompt == "" {
+		return nil
+	}
+	return tmux.SendKeys(session, prompt, "Enter")
+}
+
+// SendInitialPrompt is the wait-then-send pair as a single call.
+// Convenient for tests and for paths where there's no transactional
+// boundary to split around (no queue file to worry about). Production
+// handoff callers should use WaitForReadyToPrompt + SendPromptKeys
+// directly so they can interleave queue.Delete between them.
 func SendInitialPrompt(session, prompt string) error {
 	if prompt == "" {
 		return nil
 	}
-	if err := waitForPaneStable(session,
-		initialPromptStableWindow(),
-		initialPromptMaxWait()); err != nil {
-		// Stability poll didn't converge before maxWait. Send anyway
-		// — keys land in tmux's pty buffer and claude consumes them
-		// once it's ready. Better to over-send than to skip.
+	if err := WaitForReadyToPrompt(session); err != nil {
 		_, _ = fmt.Fprintf(os.Stderr,
 			"warning: initial-prompt readiness poll for %s did not converge: %v (sending anyway)\n",
 			session, err)
 	}
-	return tmux.SendKeys(session, prompt, "Enter")
+	return SendPromptKeys(session, prompt)
 }
 
 // waitForPaneStable polls tmux capture-pane every
