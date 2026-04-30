@@ -288,13 +288,16 @@ func (m Model) View() string {
 			m.archiveCandidate)))
 		b.WriteString("\n")
 	default:
-		// Footer: each [k] label pair is a chip — colored key, dim
-		// label — joined by a dim middle dot so the operator's eye
-		// can land on the action keys without scanning prose.
+		// Footer is split across two lines so the count and the
+		// action-key row don't compete for the same horizontal eyeline:
+		//   1 agent(s)
+		//   [j/k] navigate  ·  [h] handoff  ·  ...
+		// Each [k] label pair is a chip — colored key, dim label —
+		// joined by a dim middle dot so the operator's eye can land
+		// on the action keys without scanning prose.
 		count := dimStyle.Render(fmt.Sprintf("%d agent(s)", len(m.records)))
 		sep := dimStyle.Render("  ·  ")
-		footer := strings.Join([]string{
-			count,
+		chips := strings.Join([]string{
 			keyChip("[j/k]", "navigate"),
 			keyChip("[h]", "handoff"),
 			keyChip("[a]", "attach"),
@@ -303,7 +306,9 @@ func (m Model) View() string {
 			keyChip("[q]", "quit"),
 		}, sep)
 		b.WriteString("\n")
-		b.WriteString(footer)
+		b.WriteString(count)
+		b.WriteString("\n")
+		b.WriteString(chips)
 		// Detach hint lives in the spawned session's tmux status bar
 		// (see tmux.SetStatusHint), not here — by the time the
 		// operator needs it, the TUI is gone and tmux owns the screen.
@@ -405,6 +410,10 @@ func renderTable(records []*agent.Record, cursor int) string {
 	widths := columnWidths(header, rows)
 
 	var b strings.Builder
+	// Prefix the header with the same 2-char gutter the data rows use
+	// ("▸ " on the cursor row, "  " elsewhere) so the column titles
+	// line up over their values instead of sliding two cells left.
+	b.WriteString("  ")
 	b.WriteString(headerStyle.Render(joinCols(header, widths)))
 	b.WriteString("\n")
 	for i, row := range rows {
@@ -548,7 +557,7 @@ var (
 	dimStyle      = lipgloss.NewStyle().Faint(true)
 	errStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	promptStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
-	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")) // pink — action keybind chips
+	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220")) // yellow — action keybind chips
 	keyLabelStyle = lipgloss.NewStyle().Faint(true)
 
 	// Per-status colors for the STATUS column. The padded plain text
