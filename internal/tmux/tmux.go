@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 // ErrNoSession is returned when an operation references a session that
@@ -126,29 +127,45 @@ func HasSession(session string) bool {
 // session, which HasSession collapses into a single bool:
 //
 //   - alive=true,  err=nil  — session exists
-//   - alive=false, err=nil  — tmux says session does not exist
-//     (has-session exit 1) — definitive dead
+//   - alive=false, err=nil  — tmux confirmed the session does not
+//     exist (or no server is running, which means no sessions
+//     anywhere) — definitive dead
 //   - alive=false, err!=nil — probe failed (tmux missing, socket
-//     unreadable, etc.) — caller must NOT treat this as "dead"
+//     unreadable, lost-server transport error) — caller must NOT
+//     treat this as "dead"
 //
 // Used by destructive paths (`fleet rm`) and the TUI status cache
 // where mistaking a transport failure for a dead session would
 // either archive a live agent or paint a healthy row "dead".
 //
-// tmux exit codes for `has-session`:
-//
-//	0 — exists
-//	1 — does not exist
-//	other — error (this function reports it via err)
+// tmux exit-code reality: `has-session` returns 1 for BOTH "no such
+// session" AND many connection failures (bad socket path, server
+// disappeared). Distinguishing them requires inspecting stderr —
+// the only reliable signal that the session is genuinely gone is
+// tmux's "can't find session" / "no server running" message.
+// Anything else with exit 1 is reported as a probe error so the
+// caller refuses to act on ambiguous state.
 func SessionAlive(session string) (bool, error) {
 	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	runErr := cmd.Run()
 	if runErr == nil {
 		return true, nil
 	}
 	if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-		// tmux's authoritative "no such session" — definitive dead.
-		return false, nil
+		msg := strings.ToLower(stderr.String())
+		// "can't find session" — tmux's explicit "no such session".
+		// "no server running" — server isn't up at all, so the
+		// session can't be running anywhere — also definitive dead.
+		switch {
+		case strings.Contains(msg, "can't find session"),
+			strings.Contains(msg, "session not found"),
+			strings.Contains(msg, "no server running"):
+			return false, nil
+		}
+		return false, fmt.Errorf("probe session %s: tmux exit 1 with stderr %q (treating as ambiguous, not dead)",
+			session, strings.TrimSpace(stderr.String()))
 	}
 	return false, fmt.Errorf("probe session %s: %w", session, runErr)
 }

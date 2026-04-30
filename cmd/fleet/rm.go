@@ -112,13 +112,25 @@ func runRm(opts *rmOpts, stdout, stderr io.Writer) error {
 		}
 		if alive {
 			if err := tmux.Kill(rec.TmuxSession); err != nil {
-				if tmux.HasSession(rec.TmuxSession) {
+				// Re-probe with the tristate function. Using HasSession
+				// here would conflate "session vanished" with "tmux
+				// access broke between the first probe and Kill" —
+				// archiving on a transport failure would orphan a live
+				// session (codex review iter-6 P2).
+				stillAlive, postProbeErr := tmux.SessionAlive(rec.TmuxSession)
+				if postProbeErr != nil {
+					return fmt.Errorf(
+						"kill session %s failed (%w) AND post-kill probe also failed (%w): refusing to archive — investigate manually",
+						rec.TmuxSession, err, postProbeErr)
+				}
+				if stillAlive {
 					return fmt.Errorf(
 						"kill session %s failed AND session still alive: %w (refusing to archive a live agent)",
 						rec.TmuxSession, err)
 				}
-				// Session vanished concurrently with our Kill (operator
-				// killed it manually, OS shutdown, etc.). Safe to proceed.
+				// Session genuinely gone (tmux confirmed no-such-session
+				// or no-server). Operator killed it manually / OS
+				// shutdown / similar. Safe to proceed.
 				_, _ = fmt.Fprintf(stderr,
 					"note: kill %s reported error but session is gone: %v\n",
 					rec.TmuxSession, err)
