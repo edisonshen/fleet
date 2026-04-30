@@ -242,15 +242,35 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			oldRec.TmuxSession, err)
 	}
 
+	// Auto-resume only fires for claude-flavored wrappers — a shell,
+	// vim, or non-claude REPL would execute the natural-language
+	// prompt as garbage input (codex review iter-6 P1). Custom
+	// commands without "claude" in argv get auto-resume skipped.
+	autoResume := spawn.SupportsAutoResume(newRec.Command)
+
 	// Wait for the new agent's pane to stabilize BEFORE queue.Delete
 	// so a crash during the wait stays recoverable. The actual
 	// SendPromptKeys runs AFTER queue.Delete (single-shot, no retry
 	// double-send). Codex review iter-5 P2.
-	waitErr := spawn.WaitForReadyToPrompt(newRec.TmuxSession)
-	if waitErr != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
-			newRec.TmuxSession, waitErr)
+	if autoResume {
+		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: readiness poll for %s did not converge: %v (sending anyway)\n",
+				newRec.TmuxSession, err)
+		}
+		// Re-check liveness AFTER the wait — the readiness poll can
+		// take up to 30 s, during which the new session may have
+		// exited (wrapper crashed post-banner). Proceeding to retire
+		// the old agent in that case would leave the task with NO
+		// live successor (codex review iter-6 P1). Abort retire,
+		// surface the error, leave queue file + records on disk so
+		// the operator can investigate / a future recovery can pick
+		// up.
+		if !tmux.HasSession(newRec.TmuxSession) {
+			return fmt.Errorf(
+				"resume: replacement %s tmux session %s exited during readiness wait; old %s record + queue file %s preserved for manual recovery",
+				newRec.ID, newRec.TmuxSession, oldRec.ID, queuePath)
+		}
 	}
 
 	if err := oldRec.Archive(); err != nil {
@@ -279,11 +299,13 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// no waits, microsecond-scale. The readiness wait already ran
 	// above (recoverable via the queue file). Now the queue is gone
 	// so this send happens at most once per logical handoff.
-	if err := spawn.SendPromptKeys(newRec.TmuxSession,
-		handoff.ResumePrompt(docPath)); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
-			newRec.TmuxSession, err)
+	if autoResume {
+		if err := spawn.SendPromptKeys(newRec.TmuxSession,
+			handoff.ResumePrompt(docPath)); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+				newRec.TmuxSession, err)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, newRec.ID)

@@ -612,10 +612,13 @@ func TestHandoff_ResumeDeliversPromptToReplacement(t *testing.T) {
 
 	// Pre-spawn a replacement with a shell that echoes whatever
 	// resumeHandoff types into it, so the test can assert on
-	// captured pane content.
+	// captured pane content. Command must contain "claude" (in any
+	// arg) so SupportsAutoResume returns true — see codex review
+	// iter-6 P1. The reference lives in an inline comment, not
+	// argv 0, so the shell still runs `read`.
 	repCwd := t.TempDir()
 	replacement, err := agentSpawnForTest(t, repCwd,
-		[]string{"sh", "-c", "read line; echo GOT:$line; sleep 30"},
+		[]string{"sh", "-c", "# claude wrapper\nread line; echo GOT:$line; sleep 30"},
 		old.Project, old.TaskID)
 	if err != nil {
 		t.Fatalf("seed replacement: %v", err)

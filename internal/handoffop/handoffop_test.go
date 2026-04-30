@@ -222,12 +222,18 @@ func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
 	// intact, but no prompt was delivered. We expect Resume's
 	// retireOldAgent call to type ResumePrompt(docPath) into this
 	// session, which the shell echoes back as `GOT:<prompt>`.
+	//
+	// Command must contain "claude" (any arg) so SupportsAutoResume
+	// returns true and the auto-resume path fires — see codex review
+	// iter-6 P1 for why custom non-claude commands skip the prompt.
+	// The literal claude reference lives in the inline comment, not
+	// in argv 0, so the shell still runs `read`.
 	newRec := agent.New(req.NewAgentID)
 	newRec.TaskID = oldRec.TaskID
 	newRec.Project = oldRec.Project
 	newRec.Cwd = oldRec.Cwd
 	newRec.Command = []string{"sh", "-c",
-		"read line; echo GOT:$line; sleep 30"}
+		"# claude wrapper\nread line; echo GOT:$line; sleep 30"}
 	newRec.TmuxSession = req.NewSession
 	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
 		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
@@ -264,6 +270,54 @@ func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
 	}
 	t.Errorf("crash-recovery did not deliver resume prompt; want substring %q in:\n%s",
 		want, string(lastOut))
+}
+
+// TestResume_NonClaudeWrapperSkipsAutoResume verifies the codex
+// iter-6 P1 fix: --command argvs that don't contain "claude" (custom
+// engines, shells, REPLs) get auto-resume skipped so the natural-
+// language prompt isn't typed as garbage input.
+func TestResume_NonClaudeWrapperSkipsAutoResume(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Pre-spawn replacement with a command that does NOT contain
+	// "claude". If auto-resume fired, the shell would echo
+	// "GOT:Read your handoff doc..." into the pane.
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"}
+	newRec.TmuxSession = req.NewSession
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("pre-spawn replacement: %v", err)
+	}
+	if err := newRec.Write(); err != nil {
+		_ = tmux.Kill(newRec.TmuxSession)
+		t.Fatalf("write replacement record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Replacement still alive (no prompt sent → shell still blocked
+	// on read). Pane must NOT contain GOT: marker.
+	time.Sleep(300 * time.Millisecond)
+	captured, err := tmux.CapturePane(newRec.TmuxSession)
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	joined := strings.ReplaceAll(string(captured), "\n", "")
+	if strings.Contains(joined, "GOT:") {
+		t.Errorf("auto-resume fired on non-claude wrapper; pane:\n%s",
+			string(captured))
+	}
 }
 
 // -- stale queue cleanup ----------------------------------------------------
