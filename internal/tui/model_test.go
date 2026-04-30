@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -417,6 +418,55 @@ func TestSortRecords_NewestFirst(t *testing.T) {
 	// Original slice should not be mutated.
 	if records[0].ID != "a0" {
 		t.Error("sortRecords mutated input slice")
+	}
+}
+
+// TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned regresses
+// codex review iter-5 P2: a tmux probe that fails (binary missing,
+// socket broken) MUST NOT write a "false" entry into the alive
+// cache, since that would render a healthy agent as "dead" and
+// could trick an operator into pressing [x] on a live session.
+// Only definitive "session does not exist" results write false.
+func TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned(t *testing.T) {
+	(&stubSessionProbe{
+		// agent01: probe says definitively dead (writes false)
+		// agent02: probe transport error (must NOT write false)
+		// agent03: probe says alive (writes true)
+		dead:        map[string]bool{"fleet-agent01": true},
+		errSessions: map[string]bool{"fleet-agent02": true},
+	}).install(t)
+
+	// Seed three agent records on disk so loadAgentsCmd has something
+	// to walk. Use the helper from keys_test.go shape (sampleAgent
+	// builds a record with TmuxSession = "fleet-<id>").
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(tmp+"/agents", 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	for _, id := range []string{"agent01", "agent02", "agent03"} {
+		rec := agent.New(id)
+		rec.TmuxSession = "fleet-" + id
+		rec.SpawnedAt = time.Now().UTC()
+		if err := rec.Write(); err != nil {
+			t.Fatalf("seed %s: %v", id, err)
+		}
+	}
+
+	msg := loadAgentsCmd()().(agentsMsg)
+	if msg.err != nil {
+		t.Fatalf("loadAgentsCmd: %v", msg.err)
+	}
+	if msg.alive["agent01"] != false {
+		t.Errorf("agent01 (definitively dead) should be false, got %v", msg.alive["agent01"])
+	}
+	if msg.alive["agent03"] != true {
+		t.Errorf("agent03 (alive) should be true, got %v", msg.alive["agent03"])
+	}
+	// The key invariant: probe failure leaves the entry MISSING, not
+	// false. deriveStatus's nil-safe fallback then renders "live".
+	if _, present := msg.alive["agent02"]; present {
+		t.Errorf("agent02 probe failed — entry should be absent (not false), got alive=%v", msg.alive["agent02"])
 	}
 }
 

@@ -114,9 +114,43 @@ func parseInt(s string) (int, error) {
 }
 
 // HasSession returns true if a tmux session named `session` exists.
+// It conflates "session does not exist" with "probe failed" (binary
+// missing, socket broken). Cleanup or status paths that must NOT
+// confuse those two cases should use SessionAlive instead.
 func HasSession(session string) bool {
 	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
 	return cmd.Run() == nil
+}
+
+// SessionAlive distinguishes the three outcomes of probing a tmux
+// session, which HasSession collapses into a single bool:
+//
+//   - alive=true,  err=nil  — session exists
+//   - alive=false, err=nil  — tmux says session does not exist
+//     (has-session exit 1) — definitive dead
+//   - alive=false, err!=nil — probe failed (tmux missing, socket
+//     unreadable, etc.) — caller must NOT treat this as "dead"
+//
+// Used by destructive paths (`fleet rm`) and the TUI status cache
+// where mistaking a transport failure for a dead session would
+// either archive a live agent or paint a healthy row "dead".
+//
+// tmux exit codes for `has-session`:
+//
+//	0 — exists
+//	1 — does not exist
+//	other — error (this function reports it via err)
+func SessionAlive(session string) (bool, error) {
+	cmd := exec.Command("tmux", tmuxArgs("has-session", "-t", session)...)
+	runErr := cmd.Run()
+	if runErr == nil {
+		return true, nil
+	}
+	if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+		// tmux's authoritative "no such session" — definitive dead.
+		return false, nil
+	}
+	return false, fmt.Errorf("probe session %s: %w", session, runErr)
 }
 
 // Spawn starts a detached tmux session running `command`. Returns

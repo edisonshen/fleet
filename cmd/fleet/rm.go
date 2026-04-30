@@ -93,26 +93,36 @@ func runRm(opts *rmOpts, stdout, stderr io.Writer) error {
 			opts.id, pendingPath)
 	}
 
-	// Kill the session if it's alive. tmux.HasSession returns false
-	// for both "session is gone" AND "tmux not installed" — both
-	// outcomes mean we have nothing to kill, so the archive path
-	// proceeds without needing tmux at all (this is what makes
-	// dead-session cleanup work without requiring tmux on PATH).
-	// If Kill fails AND the session is still alive, refuse to archive:
-	// that would hide a live agent from `fleet status` while leaving
-	// a phantom tmux session running.
-	if rec.TmuxSession != "" && tmux.HasSession(rec.TmuxSession) {
-		if err := tmux.Kill(rec.TmuxSession); err != nil {
-			if tmux.HasSession(rec.TmuxSession) {
-				return fmt.Errorf(
-					"kill session %s failed AND session still alive: %w (refusing to archive a live agent)",
+	// Kill the session if it's alive. SessionAlive distinguishes
+	// "session does not exist" (definitive dead — skip kill, archive
+	// proceeds) from "probe failed" (tmux binary missing, socket
+	// unreadable). The probe-failure case MUST NOT silently archive
+	// the record: if a live tmux session is still running and we
+	// archive anyway, the agent disappears from `fleet status` while
+	// the session lingers as a phantom — exactly the destructive
+	// regression codex review iter-5 P1 flagged. Refuse instead and
+	// surface the underlying tmux error so the operator can fix it
+	// (or pass --no-tmux for legacy/empty-session records below).
+	if rec.TmuxSession != "" {
+		alive, probeErr := tmux.SessionAlive(rec.TmuxSession)
+		if probeErr != nil {
+			return fmt.Errorf(
+				"refusing to archive %s: cannot probe tmux session %s — fix tmux access and retry, or remove agents/%s.json manually if you're certain the session is gone: %w",
+				rec.ID, rec.TmuxSession, rec.ID, probeErr)
+		}
+		if alive {
+			if err := tmux.Kill(rec.TmuxSession); err != nil {
+				if tmux.HasSession(rec.TmuxSession) {
+					return fmt.Errorf(
+						"kill session %s failed AND session still alive: %w (refusing to archive a live agent)",
+						rec.TmuxSession, err)
+				}
+				// Session vanished concurrently with our Kill (operator
+				// killed it manually, OS shutdown, etc.). Safe to proceed.
+				_, _ = fmt.Fprintf(stderr,
+					"note: kill %s reported error but session is gone: %v\n",
 					rec.TmuxSession, err)
 			}
-			// Session vanished concurrently with our Kill (operator
-			// killed it manually, OS shutdown, etc.). Safe to proceed.
-			_, _ = fmt.Fprintf(stderr,
-				"note: kill %s reported error but session is gone: %v\n",
-				rec.TmuxSession, err)
 		}
 	}
 

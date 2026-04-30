@@ -11,10 +11,20 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// sessionAliveFn is the tmux liveness probe used by [a] attach. var
-// so tests can stub without forking tmux. Production calls
-// tmux.HasSession.
+// sessionAliveFn is the tmux liveness probe used by [a] attach.
+// var so tests can stub without forking tmux. Production calls
+// tmux.HasSession — for [a] a probe failure is fine to treat as
+// "alive" (the operator will see tmux's own error if the actual
+// attach fails). Cleanup paths and the STATUS cache use
+// sessionProbeFn instead because they MUST distinguish probe
+// failures from definitive dead.
 var sessionAliveFn = tmux.HasSession
+
+// sessionProbeFn returns the tristate (alive, dead, error) probe
+// used by loadAgentsCmd to populate the STATUS-cache without
+// mistaking transport errors for dead sessions. var so tests can
+// stub without forking tmux.
+var sessionProbeFn = tmux.SessionAlive
 
 // Action keybinds added in Week 4b+4c. Layered onto the existing
 // navigation set (j/k/g/G/q) without touching them.

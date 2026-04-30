@@ -104,8 +104,9 @@ func TestKey_HandoffWithEmptyListIsNoop(t *testing.T) {
 
 // -- [a] attach ---------------------------------------------------------
 
-// stubSessionAlive replaces sessionAliveFn so [a] tests don't shell
-// out to tmux. Returns alive=true unless the session is in dead.
+// stubSessionAlive replaces sessionAliveFn (used by [a] attach) so
+// tests don't shell out to tmux. Returns alive=true unless the
+// session is in dead.
 type stubSessionAlive struct {
 	dead map[string]bool
 }
@@ -117,6 +118,28 @@ func (s *stubSessionAlive) install(t *testing.T) {
 		return !s.dead[session]
 	}
 	t.Cleanup(func() { sessionAliveFn = prev })
+}
+
+// stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's
+// status cache). Distinguishes "definitively dead" (dead=true, no
+// err) from "probe failed" (errSessions=true, transport-style
+// error) so tests can exercise the don't-poison-cache-on-error
+// behavior — codex review iter-5 P2.
+type stubSessionProbe struct {
+	dead        map[string]bool
+	errSessions map[string]bool
+}
+
+func (s *stubSessionProbe) install(t *testing.T) {
+	t.Helper()
+	prev := sessionProbeFn
+	sessionProbeFn = func(session string) (bool, error) {
+		if s.errSessions[session] {
+			return false, errors.New("stub probe transport error")
+		}
+		return !s.dead[session], nil
+	}
+	t.Cleanup(func() { sessionProbeFn = prev })
 }
 
 func TestKey_AttachSetsPendingAndQuits(t *testing.T) {

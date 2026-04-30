@@ -132,14 +132,27 @@ func tickCmd() tea.Cmd {
 // record here (off the render path) so deriveStatus can read from
 // the cached map instead of forking `tmux has-session` per row on
 // every repaint.
+//
+// Uses the tristate sessionProbeFn so transport failures (tmux
+// missing, broken socket) DON'T poison the cache with false "dead"
+// readings — those records are simply omitted from the alive map,
+// and deriveStatus's nil-safe fallback renders them as "live"
+// rather than mislabeling a healthy agent (codex review iter-5 P2).
 func loadAgentsCmd() tea.Cmd {
 	return func() tea.Msg {
 		records, err := agent.List()
 		alive := make(map[string]bool, len(records))
 		for _, r := range records {
-			if r.TmuxSession != "" {
-				alive[r.ID] = sessionAliveFn(r.TmuxSession)
+			if r.TmuxSession == "" {
+				continue
 			}
+			ok, probeErr := sessionProbeFn(r.TmuxSession)
+			if probeErr != nil {
+				// Transport failure — leave the entry missing so the
+				// dashboard reads "live" instead of mislabeling.
+				continue
+			}
+			alive[r.ID] = ok
 		}
 		return agentsMsg{records: records, err: err, alive: alive}
 	}
