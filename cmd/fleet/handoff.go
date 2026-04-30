@@ -51,8 +51,13 @@ outgoing record and increments handoff_number by 1.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.oldID = args[0]
-			noChanged := cmd.Flags().Changed("no-auto-resume")
-			yesChanged := cmd.Flags().Changed("auto-resume")
+			// Treat `--flag=false` (explicit "I don't want this
+			// override") the same as "flag not passed" — both mean
+			// inherit. Otherwise wrapper scripts that always render
+			// boolean flags accidentally trigger overrides (codex
+			// review iter-12 P3).
+			noChanged := cmd.Flags().Changed("no-auto-resume") && opts.noAutoResume
+			yesChanged := cmd.Flags().Changed("auto-resume") && opts.autoResume
 			if noChanged && yesChanged {
 				return fmt.Errorf("--no-auto-resume and --auto-resume are mutually exclusive")
 			}
@@ -173,7 +178,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// which means SendPromptKeys also didn't (it lives
 			// AFTER queue.Delete in runHandoff). Send the prompt
 			// now to cover that gap, then delete the queue.
-			autoResume := !newRec.DisableAutoResume
+			//
+			// Resolve auto-resume from queue override + newRec
+			// baseline (codex review iter-12 P2): the original
+			// handoff may have specified --no-auto-resume /
+			// --auto-resume.
+			disableAutoResume := newRec.DisableAutoResume
+			if pending.DisableAutoResume != nil {
+				disableAutoResume = *pending.DisableAutoResume
+			}
+			autoResume := !disableAutoResume
 			if autoResume {
 				if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
 					_, _ = fmt.Fprintf(stderr,
@@ -256,7 +270,8 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				// Fall through to normal spawn flow.
 				break
 			}
-			return resumeHandoff(opts, stdout, stderr, oldRec, newRec, pending.HandoffDoc, pendingPath)
+			return resumeHandoff(opts, stdout, stderr, oldRec, newRec,
+				pending.HandoffDoc, pendingPath, pending.DisableAutoResume)
 		}
 	}
 
@@ -365,21 +380,25 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	newSession := tmux.SessionName(newID)
 
 	// Auto-resume policy for the replacement (codex review iter-8 P2
-	// + iter-10 / iter-11 P2). Tri-state, set BEFORE the queue
-	// write so it survives a crash:
-	//   - flag NOT passed: override = nil; queue and spawn inherit
-	//     from oldRec.DisableAutoResume.
-	//   - --no-auto-resume: override = &true; force OFF for this
-	//     handoff regardless of oldRec.
-	//   - --auto-resume:    override = &false; force ON regardless.
+	// + iter-10 / iter-11 / iter-12 P2). Tri-state override applies
+	// ONLY to THIS handoff's wait+send, never to the new record's
+	// baseline policy:
+	//   - flag NOT passed: override = nil; this handoff inherits
+	//     oldRec.DisableAutoResume.
+	//   - --no-auto-resume: override = &true; force OFF here only.
+	//   - --auto-resume:    override = &false; force ON here only.
+	//
+	// The new record's DisableAutoResume always inherits from oldRec
+	// (no override) so a one-shot --no-auto-resume on a claude agent
+	// doesn't permanently flip future handoffs to skip the prompt.
 	var override *bool
 	if opts.autoResumeFlagWasSet {
 		v := opts.noAutoResume // exactly one of the two flags was set
 		override = &v
 	}
-	disableAutoResume := oldRec.DisableAutoResume
+	thisHandoffDisableAutoResume := oldRec.DisableAutoResume
 	if override != nil {
-		disableAutoResume = *override
+		thisHandoffDisableAutoResume = *override
 	}
 
 	// 7. Write the queue file with the pre-allocated successor ID.
@@ -402,13 +421,16 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 
 	// 8. Drain: spawn the replacement using the pre-allocated ID.
+	//    NewRec inherits the baseline policy (no override) so the
+	//    operator's per-handoff flag doesn't become sticky for
+	//    future handoffs (codex review iter-12 P2).
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
 		Cwd:               cwd,
 		Command:           command,
 		PreAllocatedID:    newID,
-		DisableAutoResume: disableAutoResume,
+		DisableAutoResume: oldRec.DisableAutoResume,
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
@@ -435,12 +457,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// 8b. Auto-resume policy for the rest of this handoff. Inherited
-	//     from spawn (which got it from oldRec or the operator's
-	//     --no-auto-resume flag). Gates the SEND only — the wait
-	//     runs unconditionally since it's also our post-spawn
-	//     liveness check (codex review iter-9 P1).
-	autoResume := !newRec.DisableAutoResume
+	// 8b. Auto-resume policy for the rest of this handoff. Uses the
+	//     per-handoff resolved value (not newRec's baseline) so a
+	//     one-shot --no-auto-resume / --auto-resume override only
+	//     affects this handoff (codex review iter-12 P2). Gates the
+	//     SEND only — the wait runs unconditionally since it's also
+	//     our post-spawn liveness check (codex review iter-9 P1).
+	autoResume := !thisHandoffDisableAutoResume
 
 	// 8c. Wait for the new agent's pane to stabilize BEFORE we touch
 	//     the old session. The wait is passive (new is rendering UI,
@@ -608,7 +631,8 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 //
 // Caller holds the per-agent flock.
 func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
-	oldRec, newRec *agent.Record, docPath, queuePath string) error {
+	oldRec, newRec *agent.Record, docPath, queuePath string,
+	pendingDisableAutoResume *bool) error {
 
 	// Verify the previously-spawned replacement is still alive. If it
 	// died after the original spawn (operator manually killed it,
@@ -620,7 +644,14 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			newRec.ID, newRec.TmuxSession, oldRec.ID, newRec.ID)
 	}
 
-	autoResume := !newRec.DisableAutoResume
+	// Resolve THIS handoff's auto-resume policy: queue override
+	// (set by the original handoff CLI) wins over newRec baseline
+	// (codex review iter-12 P2).
+	disableAutoResume := newRec.DisableAutoResume
+	if pendingDisableAutoResume != nil {
+		disableAutoResume = *pendingDisableAutoResume
+	}
+	autoResume := !disableAutoResume
 
 	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
 	// wait doubles as a post-spawn liveness check, and a wrapper

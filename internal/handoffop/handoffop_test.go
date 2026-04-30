@@ -269,25 +269,31 @@ func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
 }
 
 // TestResume_DisableAutoResumeSkipsPrompt verifies the codex iter-7
-// P2 fix: agents dispatched with --no-auto-resume (DisableAutoResume
-// true on the record) get auto-resume skipped on handoff, so the
-// natural-language prompt isn't typed into a non-claude wrapper.
+// P2 fix (updated for iter-12): per-handoff override on the queue
+// file ANDed with the record's baseline. Either pathway disables
+// auto-resume → no prompt typed.
 func TestResume_DisableAutoResumeSkipsPrompt(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
+
+	// Seed the outgoing agent with DisableAutoResume=true (baseline
+	// policy from a hypothetical original `fleet dispatch
+	// --no-auto-resume`).
 	oldRec := spawnSeedAgent(t)
+	oldRec.DisableAutoResume = true
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("re-write old with DisableAutoResume=true: %v", err)
+	}
 	req, qp, _ := writeSkillQueue(t, oldRec)
 
-	// Pre-spawn replacement with DisableAutoResume=true. If auto-
-	// resume fired anyway, the shell would echo "GOT:Read..." into
-	// the pane.
+	// Pre-spawn replacement that would echo any typed prompt.
 	newRec := agent.New(req.NewAgentID)
 	newRec.TaskID = oldRec.TaskID
 	newRec.Project = oldRec.Project
 	newRec.Cwd = oldRec.Cwd
 	newRec.Command = []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"}
 	newRec.TmuxSession = req.NewSession
-	newRec.DisableAutoResume = true
+	newRec.DisableAutoResume = oldRec.DisableAutoResume // baseline inherits
 	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
 		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
 		t.Fatalf("pre-spawn replacement: %v", err)

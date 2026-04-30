@@ -27,7 +27,13 @@ import (
 
 // SchemaVersion is bumped when SpawnFresh's on-disk shape changes
 // incompatibly. Readers compare and refuse newer versions.
-const SchemaVersion = 1
+//
+// v2 added DisableAutoResume (the per-handoff auto-resume override).
+// An older fleet binary reading a v2 file would ignore the new field
+// and drain the handoff with the wrong policy — bumping the version
+// makes that case a clean refuse-to-read instead. Codex review
+// iter-12 P2.
+const SchemaVersion = 2
 
 // SpawnFreshPrefix is the queue filename prefix for "spawn a
 // replacement agent" requests. Producers use SpawnFreshName(id) to

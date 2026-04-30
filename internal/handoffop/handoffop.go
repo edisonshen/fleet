@@ -101,8 +101,14 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 		return spawnAndRetire(req, queuePath, oldRec, graceMillis, stdout, stderr)
 	}
+	// Resolve THIS handoff's auto-resume policy from queue override
+	// + oldRec baseline (codex review iter-12 P2).
+	thisHandoffDisable := oldRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		thisHandoffDisable = *req.DisableAutoResume
+	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		graceMillis, stdout, stderr)
+		thisHandoffDisable, graceMillis, stdout, stderr)
 }
 
 // cleanUpStaleQueue handles the "old record already archived" branch.
@@ -133,11 +139,15 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 	// The replacement is alive but un-prompted. Send here. If we
 	// got past queue.Delete in the previous run, queue would be
 	// gone and we wouldn't be on this path — so this delivery is
-	// the FIRST send, not a duplicate. (The narrow exception:
-	// queue.Delete returned an unexpected error after success and
-	// the previous run's SendPromptKeys already ran — extremely
-	// rare; we accept the double-send risk for cleanliness.)
-	autoResume := !newRec.DisableAutoResume
+	// the FIRST send, not a duplicate.
+	//
+	// Resolve auto-resume from queue override + newRec baseline
+	// (codex review iter-12 P2).
+	disableAutoResume := newRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+	autoResume := !disableAutoResume
 	if autoResume {
 		if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
 			_, _ = fmt.Fprintf(stdout,
@@ -196,11 +206,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s is a legacy record with no stored command; manual `fleet handoff --command` required",
 			oldRec.ID)
 	}
-	// Resolve the auto-resume policy: queue's override (if set) wins,
-	// else inherit from oldRec (codex review iter-10 / iter-11 P2).
-	disableAutoResume := oldRec.DisableAutoResume
+	// Resolve THIS handoff's auto-resume: queue's override (if set)
+	// wins, else inherit from oldRec (codex review iter-10/11/12 P2).
+	// The new record's baseline always inherits from oldRec — the
+	// override is one-shot.
+	thisHandoffDisableAutoResume := oldRec.DisableAutoResume
 	if req.DisableAutoResume != nil {
-		disableAutoResume = *req.DisableAutoResume
+		thisHandoffDisableAutoResume = *req.DisableAutoResume
 	}
 
 	// Reject fresh-spawn auto-handoff for opt-out agents (codex
@@ -216,18 +228,19 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// replacement was spawned by an operator who already accepted
 	// the manual-prompt requirement, so we just complete the retire
 	// without sending.
-	if disableAutoResume {
+	if thisHandoffDisableAutoResume {
 		return fmt.Errorf(
 			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
 			req.OldAgentID, req.OldAgentID, queuePath)
 	}
 	newRec, err := spawn.Spawn(spawn.Options{
-		OldRecord:         oldRec,
-		NewDocPath:        req.HandoffDoc,
-		Cwd:               oldRec.Cwd,
-		Command:           oldRec.Command,
-		PreAllocatedID:    req.NewAgentID,
-		DisableAutoResume: disableAutoResume,
+		OldRecord:      oldRec,
+		NewDocPath:     req.HandoffDoc,
+		Cwd:            oldRec.Cwd,
+		Command:        oldRec.Command,
+		PreAllocatedID: req.NewAgentID,
+		// Baseline only — no override (codex review iter-12 P2).
+		DisableAutoResume: oldRec.DisableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -241,7 +254,7 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		graceMillis, stdout, stderr)
+		thisHandoffDisableAutoResume, graceMillis, stdout, stderr)
 }
 
 // retireOldAgent runs the post-spawn tail in this order: wait for
@@ -284,9 +297,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 // the new record + queue, surface the live old session for operator
 // triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
+	disableAutoResume bool,
 	graceMillis int, stdout, stderr io.Writer) error {
 
-	autoResume := !newRec.DisableAutoResume
+	// disableAutoResume comes from the caller so per-handoff
+	// overrides (queue's *bool) win over newRec's baseline policy
+	// (codex review iter-12 P2).
+	autoResume := !disableAutoResume
 
 	// Wait BEFORE killing old (codex review iter-8 P1). The wait is
 	// passive — new is rendering UI, not doing work; only the post-
