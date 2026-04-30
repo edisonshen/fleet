@@ -56,6 +56,11 @@ type Model struct {
 	pickerCursor   int    // index into the FILTERED slice
 	pickedRepo     repoCandidate
 
+	// archiveCandidate is the agent ID the operator pressed [x] on,
+	// awaiting y/esc confirmation in modeConfirmArchive. Cleared when
+	// the prompt resolves either way.
+	archiveCandidate string
+
 	// pendingAttach is set when [a] fires. tea.Quit returns control to
 	// tui.Run, which exec's `tmux attach -t <session>` after the
 	// program exits. Process replacement only works post-program — a
@@ -177,6 +182,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fl := formatDispatchFlash(msg.out, msg.err)
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: new agent should appear
+
+	case rmDoneMsg:
+		fl := formatRmFlash(msg.out, msg.err)
+		m.flash = &fl
+		return m, loadAgentsCmd() // refresh: agent should be archived
 	}
 	return m, nil
 }
@@ -266,8 +276,14 @@ func (m Model) View() string {
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
 		b.WriteString("\n")
+	case modeConfirmArchive:
+		b.WriteString("\n")
+		b.WriteString(promptStyle.Render(fmt.Sprintf(
+			"Archive agent %s? Kills tmux session + deletes record (no replacement). [y/N]",
+			m.archiveCandidate)))
+		b.WriteString("\n")
 	default:
-		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [q] quit",
+		footer := fmt.Sprintf("%d agent(s)  ·  [j/k] navigate  [h] handoff  [a] attach  [d] dispatch  [x] archive  [q] quit",
 			len(m.records))
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render(footer))

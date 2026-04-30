@@ -509,3 +509,150 @@ func TestKey_NavStillWorksAfterActionWiring(t *testing.T) {
 		t.Errorf("G failed: cursor=%d", mm.(Model).cursor)
 	}
 }
+
+// -- [x] archive (confirmation flow) ----------------------------------
+
+func TestKey_ArchiveEntersConfirmModeNoFleetCallYet(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents(sampleAgent("agent01"))
+	updated, cmd := m.Update(keyMsg("x"))
+
+	mm := updated.(Model)
+	if mm.mode != modeConfirmArchive {
+		t.Errorf("mode = %v, want modeConfirmArchive", mm.mode)
+	}
+	if mm.archiveCandidate != "agent01" {
+		t.Errorf("archiveCandidate = %q, want agent01", mm.archiveCandidate)
+	}
+	if cmd != nil {
+		t.Errorf("[x] alone should not shell out, got cmd != nil")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls before confirmation, got %v", stub.calls)
+	}
+	// View must show the confirmation banner so the operator knows
+	// they're one keypress away from a destructive action.
+	if !strings.Contains(mm.View(), "Archive agent agent01") {
+		t.Errorf("confirmation banner missing from view, got:\n%s", mm.View())
+	}
+}
+
+func TestKey_ArchiveConfirmYShellsOutWithRm(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents(sampleAgent("agent01"))
+	mm, _ := m.Update(keyMsg("x"))
+	updated, cmd := mm.(Model).Update(keyMsg("y"))
+
+	mmm := updated.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("mode after [y] = %v, want modeNav", mmm.mode)
+	}
+	if mmm.archiveCandidate != "" {
+		t.Errorf("archiveCandidate not cleared, got %q", mmm.archiveCandidate)
+	}
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from [y] confirm, got nil")
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 || stub.calls[0][0] != "rm" || stub.calls[0][1] != "agent01" {
+		t.Errorf("expected ['rm', 'agent01'], got %v", stub.calls)
+	}
+}
+
+func TestKey_ArchiveConfirmEscCancels(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents(sampleAgent("agent01"))
+	mm, _ := m.Update(keyMsg("x"))
+	updated, cmd := mm.(Model).Update(keyMsg("esc"))
+
+	mmm := updated.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("esc should return to modeNav, got %v", mmm.mode)
+	}
+	if mmm.archiveCandidate != "" {
+		t.Errorf("archiveCandidate not cleared on cancel, got %q", mmm.archiveCandidate)
+	}
+	if cmd != nil {
+		t.Errorf("esc cancel should produce no cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls on cancel, got %v", stub.calls)
+	}
+}
+
+func TestKey_ArchiveConfirmNAlsoCancels(t *testing.T) {
+	// `n` in modeConfirmArchive cancels the prompt; it must NOT fall
+	// through to the [n]/[d] dispatch picker (which would be jarring
+	// — the operator just declined a destructive action and would
+	// suddenly be in a repo picker).
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents(sampleAgent("agent01"))
+	mm, _ := m.Update(keyMsg("x"))
+	updated, _ := mm.(Model).Update(keyMsg("n"))
+
+	mmm := updated.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("n should cancel to modeNav, got %v (picker would be modePickRepo=%v)",
+			mmm.mode, modePickRepo)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls, got %v", stub.calls)
+	}
+}
+
+func TestKey_ArchiveOtherKeysSwallowedDuringConfirm(t *testing.T) {
+	// `j`/`k` while the destructive prompt is up must not move the
+	// cursor — that would silently change WHICH agent the next [y]
+	// would archive.
+	m := makeModelWithAgents(sampleAgent("agent01"), sampleAgent("agent02"))
+	mm, _ := m.Update(keyMsg("x"))
+	beforeCursor := mm.(Model).cursor
+
+	updated, _ := mm.(Model).Update(keyMsg("j"))
+	mmm := updated.(Model)
+	if mmm.mode != modeConfirmArchive {
+		t.Errorf("j should not exit modeConfirmArchive, got %v", mmm.mode)
+	}
+	if mmm.cursor != beforeCursor {
+		t.Errorf("cursor moved during confirmation: was %d, now %d", beforeCursor, mmm.cursor)
+	}
+}
+
+func TestUpdate_RmDoneSetsFlashAndRefreshes(t *testing.T) {
+	m := makeModelWithAgents()
+	updated, cmd := m.Update(rmDoneMsg{out: "agent agent01 archived (no replacement spawned)\n"})
+
+	mm := updated.(Model)
+	if mm.flash == nil || mm.flash.isErr {
+		t.Errorf("expected non-error flash, got: %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "archived") {
+		t.Errorf("flash should surface command output, got: %q", mm.flash.text)
+	}
+	if cmd == nil {
+		t.Errorf("rmDone should trigger a refresh (loadAgentsCmd), got nil")
+	}
+}
+
+func TestUpdate_RmDoneFailureSetsErrorFlash(t *testing.T) {
+	m := makeModelWithAgents()
+	updated, _ := m.Update(rmDoneMsg{
+		out: "no agent record",
+		err: errors.New("exit 1"),
+	})
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("expected error flash, got: %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "rm failed") {
+		t.Errorf("error flash missing prefix: %q", mm.flash.text)
+	}
+}

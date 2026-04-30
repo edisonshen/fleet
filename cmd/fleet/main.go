@@ -42,6 +42,7 @@ Subcommands below cover dispatch / attach / status from the shell.`,
 	root.AddCommand(newHandoffCmd())
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newDrainCmd())
+	root.AddCommand(newRmCmd())
 	return root
 }
 
