@@ -155,13 +155,26 @@ func SessionAlive(session string) (bool, error) {
 	}
 	if exitErr, ok := runErr.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 		msg := strings.ToLower(stderr.String())
-		// "can't find session" — tmux's explicit "no such session".
-		// "no server running" — server isn't up at all, so the
-		// session can't be running anywhere — also definitive dead.
+		// Patterns where tmux exit 1 is authoritative for "session is
+		// not running anywhere" — safe to treat as definitive dead.
+		// All variations land here because if the server isn't up, no
+		// session can be alive, and the operator's intent (rm, status
+		// cache) is the same as if tmux explicitly said no-such-session.
+		//
+		// Codex iter-7 P1: FLEET_TMUX_SOCKET test isolation tears the
+		// server down after the last session is killed, leaving the
+		// socket file removed. Subsequent has-session calls land in
+		// the "no such file or directory" / "connection refused"
+		// branches — those used to be misclassified as probe errors,
+		// which made the new dead-session cleanup path refuse to
+		// archive orphaned agents.
 		switch {
 		case strings.Contains(msg, "can't find session"),
 			strings.Contains(msg, "session not found"),
-			strings.Contains(msg, "no server running"):
+			strings.Contains(msg, "no server running"),
+			strings.Contains(msg, "no such file or directory"),
+			strings.Contains(msg, "connection refused"),
+			strings.Contains(msg, "lost server"):
 			return false, nil
 		}
 		return false, fmt.Errorf("probe session %s: tmux exit 1 with stderr %q (treating as ambiguous, not dead)",
@@ -300,9 +313,19 @@ func SetStatusHint(session, hint string) error {
 }
 
 // Kill terminates a tmux session. Returns nil if the session is
-// already gone (idempotent for cleanup paths).
+// already gone (idempotent for cleanup paths). Probe errors are
+// surfaced to the caller — without that, a transport-level tmux
+// failure between the pre-probe and the kill would silently skip
+// the actual kill-session command and the caller would archive a
+// live session as if it had been terminated (codex review iter-7
+// P2). Uses the tristate SessionAlive instead of HasSession so the
+// "probe failed" case no longer collapses into "already gone".
 func Kill(session string) error {
-	if !HasSession(session) {
+	alive, err := SessionAlive(session)
+	if err != nil {
+		return fmt.Errorf("tmux kill-session %s: pre-probe failed: %w", session, err)
+	}
+	if !alive {
 		return nil
 	}
 	cmd := exec.Command("tmux", tmuxArgs("kill-session", "-t", session)...)
