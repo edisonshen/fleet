@@ -35,8 +35,8 @@ import (
 // later edits it before the agent's first read tool call.
 //
 // Empty docPath returns "" so callers can pass the result straight
-// into spawn.Options.InitialPrompt; spawn skips the send-keys when
-// the prompt is empty.
+// into spawn.SendInitialPrompt; the helper treats an empty prompt as
+// a silent no-op.
 func ResumePrompt(docPath string) string {
 	if docPath == "" {
 		return ""

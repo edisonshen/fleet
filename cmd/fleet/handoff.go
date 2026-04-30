@@ -37,10 +37,11 @@ archives its record.
 
 Week 4a (operator-triggered): the doc body is a stub with placeholders
 in all five sections — the agent never received a HANDOFF REQUESTED
-injection so we can't fill its view of the work. After spawn, fleet
-auto-types a "Read your handoff doc at <path> and continue" prompt
-into the new session so the replacement starts working without
-operator intervention; ` + "`fleet attach`" + ` shows the result.
+injection so we can't fill its view of the work. Once the old session
+is killed, fleet auto-types a "Read your handoff doc at <path> and
+continue" prompt into the new session so the replacement starts
+working without operator intervention; ` + "`fleet attach`" + ` shows
+the result.
 
 The new agent inherits TaskID, Project, Engine, Role, Mode from the
 outgoing record and increments handoff_number by 1.`,
@@ -350,20 +351,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// 8b. Type the resume prompt into NEW so it picks up its
-	//     predecessor's work without operator intervention. Best-
-	//     effort: a tmux failure here doesn't roll back the handoff
-	//     — agent record + session are valid, operator can attach and
-	//     type manually. SendInitialPrompt polls pane stability before
-	//     sending so slow wrappers don't drop keys into the shell
-	//     (codex review iter-1 P1).
-	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
-		handoff.ResumePrompt(docPath)); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: send resume prompt to %s: %v (agent is up; attach and type the prompt manually)\n",
-			newRec.TmuxSession, err)
-	}
-
 	// 9. Send "/exit" to the old session. ErrNoSession means it
 	//    already died (operator killed manually, crash, etc.) — fine,
 	//    fall through to Kill which is also idempotent.
@@ -420,6 +407,21 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// Safe to proceed.
 		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
 			oldRec.TmuxSession, err)
+	}
+
+	// 11b. Old is dead → safe to deliver the resume prompt to NEW.
+	//      Sending earlier (before kill) would mean a Kill-failure
+	//      rollback could discard work the new agent had already
+	//      started during the grace window (codex review iter-2 P2).
+	//      Best-effort: if SendInitialPrompt fails (new crashed
+	//      during readiness wait), we surface a warning but still
+	//      archive the old record + delete the queue. The operator
+	//      sees the warning and can respawn manually.
+	if err := spawn.SendInitialPrompt(newRec.TmuxSession,
+		handoff.ResumePrompt(docPath)); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+			newRec.TmuxSession, err)
 	}
 
 	// 12. Archive the old record. After this, `fleet status` no
