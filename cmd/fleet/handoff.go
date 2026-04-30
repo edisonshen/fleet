@@ -238,6 +238,15 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					}
 				}
 			}
+			if !queueDeleted {
+				// queue.Delete failed → SendPromptKeys was skipped,
+				// so the replacement is still un-prompted and the
+				// journal entry persists. Surface as error so the
+				// operator retries (codex review iter-19 P2).
+				return fmt.Errorf(
+					"agent %s already archived BUT queue cleanup failed; rerun `fleet handoff %s` to deliver the resume prompt",
+					opts.oldID, opts.oldID)
+			}
 			_, _ = fmt.Fprintf(stdout,
 				"agent %s already handed off → %s (cleaned stale queue file)\n",
 				opts.oldID, pending.NewAgentID)

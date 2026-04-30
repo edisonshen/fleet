@@ -465,9 +465,14 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				NewSession:        newRec.TmuxSession,
 				DisableAutoResume: override,
 			}); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
-					werr)
+				// Send failed AND re-enqueue failed → replacement
+				// is alive but un-prompted, no journal entry to
+				// recover from. Surface as error so the drainer
+				// reports failure instead of silent success
+				// (codex review iter-19 P2).
+				return fmt.Errorf(
+					"resume: send prompt to %s failed (%w) AND re-enqueue failed (%w); replacement %s alive but idle, retry handoff manually",
+					newRec.TmuxSession, err, werr, newRec.ID)
 			}
 		}
 	}
