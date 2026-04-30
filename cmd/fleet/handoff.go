@@ -421,16 +421,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 
 	// 8. Drain: spawn the replacement using the pre-allocated ID.
-	//    NewRec inherits the baseline policy (no override) so the
-	//    operator's per-handoff flag doesn't become sticky for
-	//    future handoffs (codex review iter-12 P2).
+	//    NewRec gets the resolved policy (override OR baseline) so
+	//    a `--no-auto-resume` into a shell/vim/non-claude wrapper
+	//    sticks for future handoffs of this lineage — otherwise the
+	//    next hop would happily auto-type into the wrapper again
+	//    (codex review iter-13 P2). Operators who want a true
+	//    one-shot must re-pass the flag on the next handoff.
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
 		Cwd:               cwd,
 		Command:           command,
 		PreAllocatedID:    newID,
-		DisableAutoResume: oldRec.DisableAutoResume,
+		DisableAutoResume: thisHandoffDisableAutoResume,
 	})
 	if err != nil {
 		// Spawn failed — leave the queue file in place so the
@@ -595,14 +598,32 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	}
 
 	// 14. Send the resume prompt — only when queue.Delete succeeded
-	//     so the at-most-once guarantee holds. Skipped entirely when
+	//     so the at-most-once guarantee holds. If the send itself
+	//     fails after the queue was deleted, re-enqueue so a future
+	//     `fleet handoff` / `fleet drain` can retry the delivery
+	//     (codex review iter-13 P2). Without this, send failure
+	//     would silently strand the replacement: queue is gone, no
+	//     journal to recover from. Skipped entirely when
 	//     DisableAutoResume is set.
 	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
 				newRec.TmuxSession, err)
+			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
+				OldAgentID:        oldRec.ID,
+				HandoffDoc:        docPath,
+				Project:           oldRec.Project,
+				TaskID:            oldRec.TaskID,
+				NewAgentID:        newID,
+				NewSession:        newSession,
+				DisableAutoResume: override,
+			}); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
+					werr)
+			}
 		}
 	}
 
@@ -705,13 +726,27 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	}
 
 	// Send the resume prompt only if queue.Delete succeeded — see
-	// runHandoff step 14 / codex iter-11 P3.
+	// runHandoff step 14 / codex iter-11 P3. Re-enqueue on send
+	// failure so the next retry can deliver (codex iter-13 P2).
 	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
 				newRec.TmuxSession, err)
+			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
+				OldAgentID:        oldRec.ID,
+				HandoffDoc:        docPath,
+				Project:           oldRec.Project,
+				TaskID:            oldRec.TaskID,
+				NewAgentID:        newRec.ID,
+				NewSession:        newRec.TmuxSession,
+				DisableAutoResume: pendingDisableAutoResume,
+			}); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
+					werr)
+			}
 		}
 	}
 

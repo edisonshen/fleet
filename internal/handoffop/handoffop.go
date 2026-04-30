@@ -239,8 +239,9 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
-		// Baseline only — no override (codex review iter-12 P2).
-		DisableAutoResume: oldRec.DisableAutoResume,
+		// Persist resolved override so the new record's baseline
+		// reflects the operator's choice (codex review iter-13 P2).
+		DisableAutoResume: thisHandoffDisableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -391,13 +392,36 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	// the retry doesn't re-send via cleanUpStaleQueue (codex review
 	// iter-11 P3). On queue.Delete failure, the next retry will
 	// recover via cleanUpStaleQueue (or the cmd/fleet equivalent),
-	// which has its own send + delete pair.
+	// which has its own send + delete pair. On SEND failure with
+	// queue already deleted, re-enqueue so cleanUpStaleQueue can
+	// retry — preserves recovery for non-interactive drains where
+	// no operator can type the prompt manually (codex iter-13 P2).
 	if queueDeleted && autoResume {
 		if err := spawn.SendPromptKeys(newRec.TmuxSession,
 			handoff.ResumePrompt(docPath)); err != nil {
 			_, _ = fmt.Fprintf(stderr,
-				"warning: send resume prompt to %s: %v (replacement may need manual prompt on attach)\n",
+				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
 				newRec.TmuxSession, err)
+			// Re-enqueue: oldRec is now archived, so a retry
+			// will land in cleanUpStaleQueue, which sends + deletes.
+			var override *bool
+			if disableAutoResume != oldRec.DisableAutoResume {
+				v := disableAutoResume
+				override = &v
+			}
+			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
+				OldAgentID:        oldRec.ID,
+				HandoffDoc:        docPath,
+				Project:           oldRec.Project,
+				TaskID:            oldRec.TaskID,
+				NewAgentID:        newRec.ID,
+				NewSession:        newRec.TmuxSession,
+				DisableAutoResume: override,
+			}); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
+					werr)
+			}
 		}
 	}
 
