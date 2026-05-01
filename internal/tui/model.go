@@ -942,18 +942,29 @@ func actionChipsFor(status string) []string {
 // shouldn't waste a line on "0 of everything".
 //
 // Glyphs and colors match the v2 mockup: orange ▌ for blocked, red △
-// for hot context, cyan ● for in-review (waiting), faint ✗ for dead.
+// for hot context, cyan ● for review-mode and idle agents, faint ✗ for
+// dead.
+//
+// "idle" = `waiting` canonical (NeedsInput=true, agent stopped without
+// fleet-guard injecting anything). "in review" = `review` canonical
+// (Mode == "review"). They render with the same cyan dot but separate
+// banner chips so the operator can tell apart a paused executor
+// asking a question from a literal review-mode agent (codex iter-5
+// P2 follow-up; surfaced again in dogfood as "many status in 'review'
+// even agent is asking question").
 //
 // Counts run independently: a record can be both "blocked" AND have
 // hot context, so it bumps both counts. That's intentional — the
 // banner is a heads-up, not a partition.
 func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
-	var blocked, review, hot, dead int
+	var blocked, idle, review, hot, dead int
 	for _, r := range records {
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
-		case "waiting", "review":
+		case "waiting":
+			idle++
+		case "review":
 			review++
 		case "dead":
 			dead++
@@ -970,6 +981,10 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	if hot > 0 {
 		parts = append(parts, statusUrgentStyle.Render(
 			fmt.Sprintf("△ %d hot context", hot)))
+	}
+	if idle > 0 {
+		parts = append(parts, statusReviewStyle.Render(
+			fmt.Sprintf("● %d idle", idle)))
 	}
 	if review > 0 {
 		parts = append(parts, statusReviewStyle.Render(
@@ -1347,22 +1362,26 @@ func statusStyleFor(status string) lipgloss.Style {
 }
 
 // statusLabel maps the canonical deriveStatus value to the
-// operator-facing word shown in the STATUS column. The mockup
-// vocabulary is: doing / review / blocked / dead / handoff —
-// not the raw "live"/"waiting" internal names.
+// operator-facing word shown in the STATUS column. The vocabulary:
+// doing / idle / review / blocked / dead / handoff.
 //
-// "waiting" → "review" intentionally follows the v2 mockup: any
-// state that needs operator attention (NeedsInput, Mode==review,
-// blocked-on-question) reads as "review" at a glance. The inline
-// detail line under the selected row carries the actual mode +
-// last-activity-age so an executor that paused for input is
-// disambiguated from a literal review-mode agent (codex iter-4
-// P2: label conflation, kept by design).
+// "waiting" (NeedsInput=true) renders as "idle" — honest about the
+// fact that the agent has just stopped without fleet-guard injecting
+// anything. The agent may have asked a question, may have finished
+// cleanly, or may just be paused; we can't tell from the canonical
+// state alone, so we don't claim. "asking" would over-claim.
+//
+// "review" (Mode == "review") renders as "review" — distinct from
+// idle so an executor paused for input doesn't read as a literal
+// reviewer (dogfood report: "many status in 'review' even agent is
+// asking question").
 func statusLabel(status string) string {
 	switch status {
 	case "live":
 		return "doing"
-	case "waiting", "review":
+	case "waiting":
+		return "idle"
+	case "review":
 		return "review"
 	case "auto-yellow", "auto-red", "precompact":
 		return "handoff"
