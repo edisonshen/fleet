@@ -10,7 +10,7 @@ Four agents, four repos, four states — coding, blocked on you, asking, reviewi
 
 ## Status
 
-**v0.1.1 shipped to brew** ([releases](https://github.com/edisonshen/fleet/releases)). The Week 0 spike resolved (Stop hooks deliver per-session context % at low latency, see [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md)) and the v1 surface — TUI, dispatch / attach / handoff / drain, fleet-guard auto-handoffs at 50% (graceful) and 70% (emergency) — is live. We're dogfooding through Week 6 and shipping bug-fix patches behind the scenes; expect frequent `brew upgrade fleet`.
+**v0.1.2 shipped to brew** ([releases](https://github.com/edisonshen/fleet/releases)). The Week 0 spike resolved (Stop hooks deliver per-session context % at low latency, see [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md)) and the v1 surface — TUI, dispatch / attach / handoff / drain, fleet-guard auto-handoffs at 50% (graceful) and 70% (emergency) — is live. We're dogfooding through Week 6 and shipping bug-fix patches behind the scenes; expect frequent `brew upgrade edisonshen/tap/fleet`.
 
 The full design is at [`docs/DESIGN.md`](docs/DESIGN.md).
 
@@ -90,7 +90,9 @@ $ fleet init                    # install the fleet-guard skill into ~/.claude/
 $ fleet                         # opens the TUI
 ```
 
-Upgrade later with `brew update && brew upgrade fleet`.
+Upgrade later with `brew update && brew upgrade edisonshen/tap/fleet`.
+
+> The fully-qualified tap path matters on `upgrade`: there's a JetBrains IDE also distributed as a brew cask called `fleet`, so `brew upgrade fleet` resolves to that cask first and errors with `cask 'fleet' is not installed`. Always upgrade by tap path, or use `brew upgrade --formula fleet` to disambiguate.
 
 From source (Go 1.25+):
 
