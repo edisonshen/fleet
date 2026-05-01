@@ -343,6 +343,80 @@ func TestSendInitialPrompt_EmptyPromptIsNoOp(t *testing.T) {
 	}
 }
 
+// TestSendPromptKeys_SeparatesPromptAndEnter is the regression test
+// for the May 2026 bug where SendPromptKeys sent the prompt text and
+// the Enter key as a single `tmux send-keys <prompt> Enter`
+// invocation. That makes the bytes arrive at the pty as one
+// contiguous burst, and Claude Code's TUI treats the trailing CR as
+// part of a paste rather than a submit. End result was the auto-
+// resume prompt sat in the input box waiting for the operator to
+// press Enter manually — exactly what auto-resume is supposed to
+// avoid.
+//
+// The fix splits the send into two `tmux send-keys` invocations
+// with a sleep between them. This test pins the sleep via env var
+// to a measurable value and asserts SendPromptKeys actually pauses
+// — proving the structural split is in place. A future refactor
+// that collapses back to a single send-keys call will fail this
+// test.
+func TestSendPromptKeys_SeparatesPromptAndEnter(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pin the inter-key delay to something measurable but small
+	// enough to keep the test fast. 250 ms gives ~2x headroom over
+	// scheduling jitter on busy CI runners.
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "250")
+
+	rec, err := Spawn(Options{
+		TaskID:  "split-send",
+		Project: "p",
+		Command: []string{"sh", "-c",
+			"echo READY; read line; echo GOT:$line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Wait for the `read` to be ready so SendPromptKeys's only
+	// blocking work is the inter-key sleep, not pty buffering.
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	if err := SendPromptKeys(rec.TmuxSession, "echo SPLIT_SEND_DELIVERED"); err != nil {
+		t.Fatalf("SendPromptKeys: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Lower bound only — the pinned delay is a floor, not a ceiling.
+	// Two send-keys subprocess invocations + the 250 ms sleep land
+	// well above 200 ms; a single-call regression would return in a
+	// handful of milliseconds.
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("SendPromptKeys returned in %s; expected ≥200 ms because the prompt and Enter must be sent as two send-keys calls separated by FLEET_PROMPT_ENTER_DELAY_MS to defeat Claude Code's bracketed-paste detection",
+			elapsed)
+	}
+
+	// And the prompt still has to actually reach the session — the
+	// split must not have broken delivery.
+	want := "GOT:echo SPLIT_SEND_DELIVERED"
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("prompt did not reach session within deadline; want %q in:\n%s",
+		want, string(lastOut))
+}
+
 func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

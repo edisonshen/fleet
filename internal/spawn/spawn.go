@@ -39,6 +39,11 @@ const (
 	defaultInitialPromptStableWindow = 500 * time.Millisecond
 	defaultInitialPromptMaxWait      = 30 * time.Second
 	initialPromptPollInterval        = 100 * time.Millisecond
+
+	// defaultPromptEnterDelay is the gap between sending the prompt
+	// text and sending the Enter key. See SendPromptKeys for why this
+	// can't be zero.
+	defaultPromptEnterDelay = 200 * time.Millisecond
 )
 
 func initialPromptStableWindow() time.Duration {
@@ -49,6 +54,11 @@ func initialPromptStableWindow() time.Duration {
 func initialPromptMaxWait() time.Duration {
 	return envDuration("FLEET_INITIAL_PROMPT_MAX_MS",
 		defaultInitialPromptMaxWait)
+}
+
+func promptEnterDelay() time.Duration {
+	return envDuration("FLEET_PROMPT_ENTER_DELAY_MS",
+		defaultPromptEnterDelay)
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -89,11 +99,27 @@ func WaitForReadyToPrompt(session string) error {
 //
 // Empty prompt is a silent no-op so callers can pass
 // handoff.ResumePrompt(docPath) without nil-checking docPath.
+//
+// The prompt and Enter are sent as TWO separate `tmux send-keys`
+// invocations with a small sleep between them. Single-invocation
+// `tmux send-keys <prompt> Enter` streams the prompt bytes and the
+// trailing CR into the pty as one contiguous burst, and Claude Code
+// (and other modern TUIs) treat such a burst as a paste — the CR
+// becomes a literal newline inside the pasted content rather than a
+// submit. End result without the split: the resume prompt sits in
+// the input box and the agent waits for the operator to press Enter
+// manually, defeating the whole point of auto-resume. The 200 ms gap
+// is enough for claude's input handler to close the paste window
+// before the Enter arrives as its own keystroke event.
 func SendPromptKeys(session, prompt string) error {
 	if prompt == "" {
 		return nil
 	}
-	return tmux.SendKeys(session, prompt, "Enter")
+	if err := tmux.SendKeys(session, prompt); err != nil {
+		return err
+	}
+	time.Sleep(promptEnterDelay())
+	return tmux.SendKeys(session, "Enter")
 }
 
 // SendInitialPrompt is the wait-then-send pair as a single call.
