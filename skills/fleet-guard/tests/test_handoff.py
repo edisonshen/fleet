@@ -310,6 +310,34 @@ class TestFindMilestone:
         fake_tmux.output = "no injection in this pane\nMILESTONE\n"
         assert handoff.find_milestone("fleet-abc") is False
 
+    def test_capture_requests_scrollback(
+        self, fake_tmux: _FakeTmux,
+    ) -> None:
+        """find_milestone must capture WITH scrollback (-S -<N>), not
+        just the visible pane window. Long-running Yellow cycles (the
+        agent emits many turns of output between HANDOFF REQUESTED
+        injection and finally writing MILESTONE) outrun the visible
+        ~50 lines, so without scrollback both markers scroll off and
+        the trigger never fires. Regression for the Apr 2026 case
+        where agent 89ebf034 sat at 64% / auto-yellow without
+        handing off."""
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: context window over 50%\n"
+            "MILESTONE\n"
+        )
+        handoff.find_milestone("fleet-abc")
+        assert len(fake_tmux.calls) >= 1, "tmux capture-pane never invoked"
+        cmd = fake_tmux.calls[-1]
+        # Scrollback request: `-S -<N>` for some N >= 1.
+        assert "-S" in cmd, f"capture missing scrollback flag: {cmd}"
+        s_idx = cmd.index("-S")
+        assert s_idx + 1 < len(cmd), f"-S without value: {cmd}"
+        scroll_arg = cmd[s_idx + 1]
+        assert scroll_arg.startswith("-"), \
+            f"-S value should be negative line count, got {scroll_arg!r}"
+        n = int(scroll_arg[1:])  # raises if non-numeric
+        assert n >= 1000, f"scrollback {n} too small to cover busy agent"
+
     def test_tmux_failure_returns_false(self, fake_tmux: _FakeTmux) -> None:
         fake_tmux.returncode = 1  # tmux error
         assert handoff.find_milestone("fleet-abc") is False

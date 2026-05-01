@@ -143,8 +143,15 @@ def find_milestone(session: str) -> bool:
 
     Match is exact (`^MILESTONE$` after stripping whitespace), so the
     word "MILESTONES" or "MILESTONE: foo" never falsely triggers.
+
+    Capture extends into scrollback (10000 lines) so a long-running
+    Yellow cycle — the agent has produced many turns of output between
+    the HANDOFF REQUESTED injection and finally emitting MILESTONE —
+    still finds both markers. Without scrollback the visible 50-line
+    pane window outruns busy agents and find_milestone returns False
+    forever, leaving the handoff stuck in auto-yellow until 70% / Red.
     """
-    out = _capture_pane(session)
+    out = _capture_pane(session, lines=10000)
     if not out:
         return False
     lines = out.splitlines()
