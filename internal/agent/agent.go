@@ -52,6 +52,25 @@ type Record struct {
 	NeedsInput     bool       `json:"needs_input"`
 	InboxPending   bool       `json:"inbox_pending"`
 	HandoffType    *string    `json:"handoff_type"`
+	// HandoffTypeAt timestamps when HandoffType was last set (RFC 3339,
+	// written by skills/fleet-guard/health.py:now_rfc3339). The
+	// stuck-pending watchdog (handoff.py:_yellow_stuck_too_long) reads
+	// this to decide whether to re-inject HANDOFF REQUESTED when Yellow
+	// has lingered without a MILESTONE — the prior injection may have
+	// been lost (pre-v0.1.1 stdout-only Stop-hook output, crashed pane,
+	// etc.). nil for legacy records and whenever HandoffType is nil;
+	// the watchdog treats nil as "re-inject on the next Stop" so legacy
+	// stuck agents migrate in one fire.
+	//
+	// Stored as *string (not *time.Time) so a malformed value on disk —
+	// operator hand-edit, partial write, future schema drift — degrades
+	// to "watchdog re-injects" rather than failing json.Unmarshal of the
+	// whole Record and bricking every Go reader (fleet attach / handoff
+	// / rm / drain). The Python watchdog already designs for graceful
+	// degradation here; matching that on the Go side avoids the wedge
+	// where one side keeps moving and the other can't read the record
+	// (codex review for stuck-yellow-watchdog: P2).
+	HandoffTypeAt *string `json:"handoff_type_at,omitempty"`
 	// LastHandoffPath points at the handoff doc this agent inherited
 	// from. nil for the first agent on a task. Read by the next handoff
 	// to populate the new doc's previous_handoff frontmatter, building

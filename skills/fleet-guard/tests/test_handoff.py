@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -414,6 +414,12 @@ class TestMaybeTrigger:
         assert handoff.MILESTONE in result
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["handoff_type"] == handoff.TYPE_AUTO_YELLOW
+        # handoff_type_at must be set on the same write so the watchdog
+        # has a baseline (otherwise Yellow's very next Stop would treat
+        # the just-set yellow_pending as "missing timestamp = stuck"
+        # and re-inject every fire).
+        assert isinstance(record.get("handoff_type_at"), str)
+        assert record["handoff_type_at"].endswith("Z")
         # No queue file written yet — Yellow waits for MILESTONE.
         queue_dir = fleet_home_tmp / "queue"
         assert not queue_dir.exists() or list(queue_dir.iterdir()) == []
@@ -450,11 +456,16 @@ class TestMaybeTrigger:
         assert q["task_id"] == "demo-task"
         assert q["project"] == "myproj"
 
-    def test_yellow_pending_without_milestone_noop(
+    def test_yellow_pending_fresh_timestamp_noops(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
     ) -> None:
+        """Within the watchdog threshold, yellow_pending without MILESTONE
+        is a silent noop — agent has been recently nudged and may still
+        be wrapping. Re-injecting on every Stop here would spam the
+        agent and waste turns."""
         _seed_record(fleet_home_tmp, "agent05",
-                     handoff_type=handoff.TYPE_AUTO_YELLOW)
+                     handoff_type=handoff.TYPE_AUTO_YELLOW,
+                     handoff_type_at=health.now_rfc3339())
         fake_tmux.output = "still working...\n"
         result = handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
@@ -463,6 +474,61 @@ class TestMaybeTrigger:
         assert result is None
         assert not (fleet_home_tmp / "handoffs").exists() or \
             list((fleet_home_tmp / "handoffs").iterdir()) == []
+
+    def test_yellow_pending_stuck_too_long_reinjects(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """Watchdog: if yellow_pending lingers past the threshold without
+        MILESTONE, re-inject HANDOFF REQUESTED so the agent gets a fresh
+        nudge. The original injection may have been lost (pre-v0.1.1
+        stdout-only Stop output) or ignored. Without this, the agent
+        stays wedged until Red at 70% or operator [h]."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(seconds=handoff._YELLOW_RESEND_THRESHOLD_SEC + 60)
+                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        record_path = _seed_record(fleet_home_tmp, "stuck1",
+                                   handoff_type=handoff.TYPE_AUTO_YELLOW,
+                                   handoff_type_at=stale)
+        fake_tmux.output = "still working...\n"
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="stuck1", session="fleet-stuck1",
+        )
+        assert result is not None, "watchdog must re-inject when stuck"
+        assert handoff.HANDOFF_REQUESTED in result
+        # Timestamp is bumped so we don't re-inject every Stop until
+        # the next threshold window elapses.
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["handoff_type"] == handoff.TYPE_AUTO_YELLOW
+        assert record["handoff_type_at"] != stale
+        # Still no doc/queue — only HANDOFF REQUESTED nudge.
+        assert not (fleet_home_tmp / "handoffs").exists() or \
+            list((fleet_home_tmp / "handoffs").iterdir()) == []
+
+    def test_yellow_pending_missing_timestamp_reinjects(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+    ) -> None:
+        """Legacy migration: a record stuck under a pre-watchdog skill
+        has handoff_type=auto-yellow but no handoff_type_at. Treat
+        missing timestamp as 'very stale' so the operator who upgrades
+        explicitly to fix this bug sees recovery on the very next Stop,
+        not after another full threshold window."""
+        record_path = _seed_record(fleet_home_tmp, "legacy1",
+                                   handoff_type=handoff.TYPE_AUTO_YELLOW)
+        # Sanity: the seed truly omits handoff_type_at — if a future
+        # _seed_record default backfills it, this regression test
+        # silently degrades.
+        seeded = json.loads(record_path.read_text(encoding="utf-8"))
+        assert "handoff_type_at" not in seeded
+        fake_tmux.output = "still working...\n"
+        result = handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="legacy1", session="fleet-legacy1",
+        )
+        assert result is not None
+        assert handoff.HANDOFF_REQUESTED in result
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert isinstance(record.get("handoff_type_at"), str)
 
     def test_red_writes_immediately(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,

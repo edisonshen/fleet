@@ -86,6 +86,15 @@ PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 # Modes where auto-handoff is disabled — see SKILL.md Handoff thresholds.
 THINKING_MODES = frozenset({"plan", "review", "fix"})
 
+# Stuck-pending watchdog: re-inject HANDOFF REQUESTED if Yellow has
+# lingered for this long without a MILESTONE. Without re-injection the
+# agent stays wedged at auto-yellow until Red fires at 70% or operator
+# presses [h] — observed in dogfood as "agent at 53% for >1 day, no
+# handoff action, 'hello' didn't wake it." The most common root cause
+# is a lost prior injection (pre-v0.1.1 stdout-only Stop-hook output);
+# crashed tmux pane and operator-edited records also land here.
+_YELLOW_RESEND_THRESHOLD_SEC = 30 * 60
+
 # ANSI SGR escape codes that show up in tmux capture-pane output. Stripping
 # these is the minimum useful polish; bracketed-paste sequences and cursor
 # moves will land in iteration 1.
@@ -233,7 +242,11 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
             # auto-yellow mark.
             if committed:
                 return None
-            health.update_record(agent_id, handoff_type=TYPE_AUTO_RED)
+            health.update_record(
+                agent_id,
+                handoff_type=TYPE_AUTO_RED,
+                handoff_type_at=health.now_rfc3339(),
+            )
             if not _do_handoff(record, session, TYPE_AUTO_RED, pct):
                 _clear_pending(agent_id)
             return None
@@ -248,8 +261,26 @@ def maybe_trigger(payload: dict[str, Any], *, agent_id: str,
                     if not _do_handoff(record, session,
                                        TYPE_AUTO_YELLOW, pct):
                         _clear_pending(agent_id)
+                    return None
+                # Stuck-pending watchdog: prior HANDOFF REQUESTED
+                # may have been lost. Re-stamp + re-inject so the
+                # agent gets a fresh nudge; without this it stays
+                # wedged until Red or [h]. Treat missing timestamp
+                # as "re-inject now" so legacy records (set under a
+                # pre-watchdog skill) recover on the first Stop
+                # after the operator upgrades.
+                if _yellow_stuck_too_long(record):
+                    health.update_record(
+                        agent_id,
+                        handoff_type_at=health.now_rfc3339(),
+                    )
+                    return inject_handoff_requested()
                 return None
-            health.update_record(agent_id, handoff_type=TYPE_AUTO_YELLOW)
+            health.update_record(
+                agent_id,
+                handoff_type=TYPE_AUTO_YELLOW,
+                handoff_type_at=health.now_rfc3339(),
+            )
             return inject_handoff_requested()
 
         return None
@@ -279,7 +310,11 @@ def emergency_trigger(payload: dict[str, Any], *, agent_id: str,
         if _is_handoff_committed(record):
             return
         pct, _ = health.read_context_pct(payload)
-        health.update_record(agent_id, handoff_type=TYPE_PRECOMPACT)
+        health.update_record(
+            agent_id,
+            handoff_type=TYPE_PRECOMPACT,
+            handoff_type_at=health.now_rfc3339(),
+        )
         if not _do_handoff(record, session, TYPE_PRECOMPACT, pct):
             _clear_pending(agent_id)
     except Exception as exc:
@@ -345,7 +380,34 @@ def _clear_pending(agent_id: str) -> None:
     also fails, the agent stays wedged, but at that point disk I/O
     is broken across the board and the wedge is the operator's
     least concern."""
-    health.update_record(agent_id, handoff_type=None)
+    health.update_record(agent_id, handoff_type=None, handoff_type_at=None)
+
+
+def _yellow_stuck_too_long(record: dict[str, Any]) -> bool:
+    """True if Yellow has lingered without MILESTONE long enough that
+    the watchdog should re-inject HANDOFF REQUESTED. Reads
+    `handoff_type_at` as RFC 3339 (matching health.now_rfc3339).
+
+    Missing/unparseable timestamp returns True — that path covers
+    legacy records stuck under a pre-watchdog skill. Treating "no
+    timestamp" as "very stale" migrates them in one Stop after the
+    operator upgrades; the alternative (set the timestamp now and
+    wait) leaves operators staring at a still-stuck agent for
+    another full threshold window after they explicitly upgraded
+    to fix this very bug."""
+    raw = record.get("handoff_type_at")
+    if not isinstance(raw, str) or not raw:
+        return True
+    try:
+        # health.now_rfc3339 emits trailing "Z"; Python's fromisoformat
+        # accepts "Z" only on 3.11+. Normalize to "+00:00" for safety.
+        ts = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - ts).total_seconds()
+    return elapsed >= _YELLOW_RESEND_THRESHOLD_SEC
 
 
 # -- doc rendering -----------------------------------------------------------
