@@ -68,7 +68,7 @@ Stdin contains the operator-submitted prompt and metadata. Stdout is ignored (th
 | context_pct | State | Action |
 |-------------|-------|--------|
 | < 50% | Green | Update health JSON only. |
-| ≥ 50% | Yellow | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. |
+| ≥ 50% | Yellow | Inject `HANDOFF REQUESTED` once. Mark `handoff_type: "auto-yellow"` and `handoff_type_at: <RFC3339>` in agent record. On subsequent fires, grep tmux pane for `MILESTONE` on its own line; when found, write doc + queue with `handoff_type: "auto-yellow"`. If MILESTONE never lands and `handoff_type_at` is older than 30 min (or missing — legacy migration), re-inject `HANDOFF REQUESTED` and bump the timestamp. |
 | ≥ 70% | Red | Emergency: write doc + queue immediately with `handoff_type: "auto-red"`. No MILESTONE wait. |
 
 `PreCompact` writes its handoff doc with `handoff_type: "precompact"`.

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewID_HexAndUnique(t *testing.T) {
@@ -180,6 +181,54 @@ func TestChainFields_RoundTrip(t *testing.T) {
 	}
 	if got.HandoffNumber != 4 {
 		t.Errorf("HandoffNumber: got %d want 4", got.HandoffNumber)
+	}
+}
+
+// TestHandoffTypeAt_RoundTrip pins on-disk persistence of the
+// stuck-pending watchdog timestamp written by fleet-guard. Go reads
+// these records (TUI, drain) and the watchdog field must survive the
+// JSON round-trip, including the omitempty tag (legacy records have
+// no handoff_type_at on disk; reading must return nil, not the zero
+// time).
+func TestHandoffTypeAt_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	yellow := "auto-yellow"
+	at := time.Date(2026, 5, 1, 9, 30, 0, 0, time.UTC)
+	r := New("cccc3333")
+	r.HandoffType = &yellow
+	r.HandoffTypeAt = &at
+
+	if err := r.Write(); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Load("cccc3333")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.HandoffTypeAt == nil || !got.HandoffTypeAt.Equal(at) {
+		t.Errorf("HandoffTypeAt round-trip: got %v want %v", got.HandoffTypeAt, at)
+	}
+
+	// Legacy: a record without handoff_type_at on disk must read as nil
+	// (omitempty + *time.Time → no field → nil pointer). The fleet-guard
+	// watchdog explicitly relies on missing-as-nil to migrate stuck
+	// records on first Stop after upgrade.
+	legacy := New("dddd4444")
+	legacy.HandoffType = &yellow
+	if err := legacy.Write(); err != nil {
+		t.Fatalf("Write legacy: %v", err)
+	}
+	gotLegacy, err := Load("dddd4444")
+	if err != nil {
+		t.Fatalf("Load legacy: %v", err)
+	}
+	if gotLegacy.HandoffTypeAt != nil {
+		t.Errorf("legacy HandoffTypeAt: got %v want nil", gotLegacy.HandoffTypeAt)
 	}
 }
 

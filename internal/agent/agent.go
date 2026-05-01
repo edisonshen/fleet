@@ -52,6 +52,15 @@ type Record struct {
 	NeedsInput     bool       `json:"needs_input"`
 	InboxPending   bool       `json:"inbox_pending"`
 	HandoffType    *string    `json:"handoff_type"`
+	// HandoffTypeAt timestamps when HandoffType was last set.
+	// fleet-guard's stuck-pending watchdog reads this to decide whether
+	// to re-inject HANDOFF REQUESTED when Yellow has lingered without a
+	// MILESTONE — the prior injection may have been lost (pre-v0.1.1
+	// stdout-only Stop-hook output, agent crashed, etc.). nil for legacy
+	// records and whenever HandoffType is nil; the watchdog treats nil
+	// as "re-inject on the next Stop" so legacy stuck agents migrate
+	// in one fire.
+	HandoffTypeAt *time.Time `json:"handoff_type_at,omitempty"`
 	// LastHandoffPath points at the handoff doc this agent inherited
 	// from. nil for the first agent on a task. Read by the next handoff
 	// to populate the new doc's previous_handoff frontmatter, building

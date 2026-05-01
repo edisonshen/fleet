@@ -52,6 +52,7 @@ OWNED_FIELDS: frozenset[str] = frozenset({
     "needs_input",
     "inbox_pending",
     "handoff_type",
+    "handoff_type_at",
 })
 
 YELLOW_THRESHOLD = 50.0
