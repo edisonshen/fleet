@@ -1224,8 +1224,8 @@ func projectDisplay(r *agent.Record) string {
 //     pin "manual" on every post-handoff agent forever
 //     (skills/fleet-guard/handoff.py:113-119).
 //  3. blocked      — fleet-guard / operator flagged the agent blocked
-//  4. waiting      — needs_input=true (Stop fired, awaiting operator)
-//  5. review       — Mode=="review" (an agent dispatched as reviewer)
+//  4. review       — Mode=="review" (an agent dispatched as reviewer)
+//  5. waiting      — needs_input=true (Stop fired, awaiting operator)
 //  6. live         — fresh spawn or actively-running turn
 //
 // dead wins over everything because the other states are meaningless
@@ -1234,11 +1234,14 @@ func projectDisplay(r *agent.Record) string {
 // what it was doing. blocked wins over waiting because a hard block
 // is more urgent for the operator to see than ambient idle.
 //
-// "review" precedence sits below "waiting" so an executor that
-// pauses for input still surfaces as needs-attention; only an idle
-// reviewer (no NeedsInput, not blocked) lands here. Both render
-// with the cyan dot + "review" word — see statusLabel for the
-// design vocabulary (codex iter-5 P1).
+// "review" precedence sits ABOVE "waiting" because fleet-guard sets
+// NeedsInput=true on every Stop with no injected follow-up, so a
+// reviewer between turns has both flags. The mode is the more
+// informative signal — "this is a reviewer, currently paused" beats
+// "this is some agent, currently idle". Pre-split (waiting+review →
+// "review") this didn't matter; post-split, putting waiting first
+// would mislabel paused reviewers as `idle` for most of their life
+// (codex review for split iter: paused-reviewer regression).
 //
 // alive is the cached liveness snapshot from the most recent
 // loadAgentsCmd. Reading from cache (instead of probing tmux here)
@@ -1263,11 +1266,11 @@ func deriveStatus(r *agent.Record, alive map[string]bool) string {
 	if r.Blocked {
 		return "blocked"
 	}
-	if r.NeedsInput {
-		return "waiting"
-	}
 	if r.Mode == "review" {
 		return "review"
+	}
+	if r.NeedsInput {
+		return "waiting"
 	}
 	return "live"
 }

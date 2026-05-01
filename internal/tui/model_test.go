@@ -347,6 +347,23 @@ func TestView_AlertBannerSplitsIdleAndReview(t *testing.T) {
 	}
 }
 
+// TestDeriveStatus_PausedReviewerStaysReview pins the precedence that
+// review > waiting — fleet-guard flips NeedsInput=true on every Stop
+// with no injection, so a reviewer between turns has both Mode=review
+// and NeedsInput=true. The mode is the load-bearing signal: a paused
+// reviewer must surface as "review", not "waiting"/"idle", or the
+// label split misclassifies reviewers in their common idle state.
+func TestDeriveStatus_PausedReviewerStaysReview(t *testing.T) {
+	r := &agent.Record{ID: "r", TmuxSession: "s", Mode: "review", NeedsInput: true}
+	alive := map[string]bool{"r": true}
+	if got := deriveStatus(r, alive); got != "review" {
+		t.Errorf("deriveStatus(Mode=review, NeedsInput=true) = %q, want %q", got, "review")
+	}
+	if got := statusLabel(deriveStatus(r, alive)); got != "review" {
+		t.Errorf("statusLabel for paused reviewer = %q, want %q", got, "review")
+	}
+}
+
 func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2)) // all default → live
