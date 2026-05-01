@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestNewID_HexAndUnique(t *testing.T) {
@@ -185,11 +184,11 @@ func TestChainFields_RoundTrip(t *testing.T) {
 }
 
 // TestHandoffTypeAt_RoundTrip pins on-disk persistence of the
-// stuck-pending watchdog timestamp written by fleet-guard. Go reads
-// these records (TUI, drain) and the watchdog field must survive the
-// JSON round-trip, including the omitempty tag (legacy records have
-// no handoff_type_at on disk; reading must return nil, not the zero
-// time).
+// stuck-pending watchdog timestamp written by fleet-guard. Go round-
+// trips the field opaquely (no parsing) — only the Python skill
+// reads it semantically. The string-not-time choice is the load-
+// bearing detail: a malformed value must NOT fail Load and brick
+// every reader (fleet attach / handoff / rm / drain).
 func TestHandoffTypeAt_RoundTrip(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
@@ -198,7 +197,7 @@ func TestHandoffTypeAt_RoundTrip(t *testing.T) {
 	}
 
 	yellow := "auto-yellow"
-	at := time.Date(2026, 5, 1, 9, 30, 0, 0, time.UTC)
+	at := "2026-05-01T09:30:00Z"
 	r := New("cccc3333")
 	r.HandoffType = &yellow
 	r.HandoffTypeAt = &at
@@ -210,14 +209,14 @@ func TestHandoffTypeAt_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.HandoffTypeAt == nil || !got.HandoffTypeAt.Equal(at) {
-		t.Errorf("HandoffTypeAt round-trip: got %v want %v", got.HandoffTypeAt, at)
+	if got.HandoffTypeAt == nil || *got.HandoffTypeAt != at {
+		t.Errorf("HandoffTypeAt round-trip: got %v want %q", got.HandoffTypeAt, at)
 	}
 
 	// Legacy: a record without handoff_type_at on disk must read as nil
-	// (omitempty + *time.Time → no field → nil pointer). The fleet-guard
-	// watchdog explicitly relies on missing-as-nil to migrate stuck
-	// records on first Stop after upgrade.
+	// (omitempty + *string → no field → nil pointer). The fleet-guard
+	// watchdog relies on missing-as-nil to migrate stuck records on
+	// first Stop after upgrade.
 	legacy := New("dddd4444")
 	legacy.HandoffType = &yellow
 	if err := legacy.Write(); err != nil {
@@ -229,6 +228,49 @@ func TestHandoffTypeAt_RoundTrip(t *testing.T) {
 	}
 	if gotLegacy.HandoffTypeAt != nil {
 		t.Errorf("legacy HandoffTypeAt: got %v want nil", gotLegacy.HandoffTypeAt)
+	}
+}
+
+// TestHandoffTypeAt_MalformedDoesNotBrickLoad ensures a corrupted
+// handoff_type_at value (operator hand-edit, partial write, future
+// schema drift) does NOT fail json.Unmarshal of the whole Record.
+// If it did, every Go reader of the agent record (`fleet attach`,
+// `fleet handoff`, `fleet rm`, drain) would error out until the
+// JSON was repaired by hand — exactly the wedge the Python
+// watchdog explicitly avoids on its side. Codex review caught this
+// when the field was *time.Time; the *string choice degrades the
+// failure to "watchdog re-injects on next Stop" instead.
+func TestHandoffTypeAt_MalformedDoesNotBrickLoad(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	agents := filepath.Join(tmp, "agents")
+	if err := os.MkdirAll(agents, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Hand-write a record whose handoff_type_at is garbage. This is the
+	// shape an operator hand-edit could land on disk.
+	raw := `{
+		"schema_version": 1,
+		"id": "eeee5555",
+		"engine": "claude-code",
+		"role": "executor",
+		"mode": "execute",
+		"handoff_type": "auto-yellow",
+		"handoff_type_at": "garbage-not-a-time",
+		"last_activity_ts": "2026-05-01T00:00:00Z",
+		"spawned_at": "2026-05-01T00:00:00Z",
+		"handoff_number": 1
+	}`
+	if err := os.WriteFile(filepath.Join(agents, "eeee5555.json"),
+		[]byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load("eeee5555")
+	if err != nil {
+		t.Fatalf("Load with malformed handoff_type_at must not fail: %v", err)
+	}
+	if got.HandoffTypeAt == nil || *got.HandoffTypeAt != "garbage-not-a-time" {
+		t.Errorf("HandoffTypeAt should preserve raw string, got %v", got.HandoffTypeAt)
 	}
 }
 
