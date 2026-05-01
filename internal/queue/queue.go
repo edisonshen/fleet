@@ -27,7 +27,13 @@ import (
 
 // SchemaVersion is bumped when SpawnFresh's on-disk shape changes
 // incompatibly. Readers compare and refuse newer versions.
-const SchemaVersion = 1
+//
+// v2 added DisableAutoResume (the per-handoff auto-resume override).
+// An older fleet binary reading a v2 file would ignore the new field
+// and drain the handoff with the wrong policy — bumping the version
+// makes that case a clean refuse-to-read instead. Codex review
+// iter-12 P2.
+const SchemaVersion = 2
 
 // SpawnFreshPrefix is the queue filename prefix for "spawn a
 // replacement agent" requests. Producers use SpawnFreshName(id) to
@@ -57,9 +63,22 @@ type SpawnFresh struct {
 	// NewAgentID and NewSession are empty before spawn, populated
 	// after. Their presence in a re-read queue file is the signal
 	// "replacement already exists; do not re-spawn."
-	NewAgentID string    `json:"new_agent_id,omitempty"`
-	NewSession string    `json:"new_session,omitempty"`
-	EnqueuedAt time.Time `json:"enqueued_at"`
+	NewAgentID string `json:"new_agent_id,omitempty"`
+	NewSession string `json:"new_session,omitempty"`
+	// DisableAutoResume captures the per-handoff auto-resume override
+	// chosen by the operator (e.g. `fleet handoff --no-auto-resume`
+	// or `--auto-resume`). Pointer semantics so we can distinguish:
+	//   - nil → no override; recovery should inherit from the
+	//     outgoing record's DisableAutoResume.
+	//   - &true → operator explicitly disabled auto-resume for this
+	//     handoff regardless of the outgoing record's policy.
+	//   - &false → operator explicitly enabled auto-resume for this
+	//     handoff regardless of the outgoing record's policy.
+	// Persisting it here ensures that a crashed handoff resumed by
+	// `fleet drain` / TUI watcher honors the same policy
+	// (codex review iter-10 / iter-11 P2).
+	DisableAutoResume *bool     `json:"disable_auto_resume,omitempty"`
+	EnqueuedAt        time.Time `json:"enqueued_at"`
 }
 
 // SpawnFreshName returns the queue filename (without .json) for

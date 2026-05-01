@@ -273,6 +273,51 @@ func SendKeys(session string, keys ...string) error {
 	return nil
 }
 
+// CapturePane returns the visible content of the given session's
+// active pane plus the alternate screen if one is active. Used by
+// spawn.SendInitialPrompt's readiness poll: when both buffers stop
+// changing, the agent is idle and ready to receive input.
+//
+// We concatenate "current" (`capture-pane -p`) AND "alternate"
+// (`capture-pane -p -a`) so the poll sees activity regardless of
+// whether the wrapped command runs in the main screen (shells) or
+// the alternate screen (claude code / vim / TUI apps). On main-only
+// panes the alt-capture errors with "no alternate screen" — we
+// treat that as empty and return just the current capture.
+//
+// Pre-flight uses SessionAlive (not HasSession) so a transport
+// failure (bad socket, lost server) bubbles up as a generic error
+// rather than masquerading as ErrNoSession. Callers downstream
+// roll back the new agent on ErrNoSession but only log on other
+// errors, so misclassifying transport failures would strand live
+// replacements (codex review iter-15 P1).
+func CapturePane(session string) ([]byte, error) {
+	alive, probeErr := SessionAlive(session)
+	switch {
+	case probeErr != nil:
+		return nil, fmt.Errorf("tmux capture-pane %s: probe failed: %w",
+			session, probeErr)
+	case !alive:
+		return nil, fmt.Errorf("%w: %s", ErrNoSession, session)
+	}
+	var combined []byte
+	visibleOut, visibleErr := exec.Command("tmux",
+		tmuxArgs("capture-pane", "-t", session, "-p")...).Output()
+	if visibleErr == nil {
+		combined = append(combined, visibleOut...)
+	}
+	altOut, altErr := exec.Command("tmux",
+		tmuxArgs("capture-pane", "-t", session, "-p", "-a")...).Output()
+	if altErr == nil {
+		combined = append(combined, altOut...)
+	}
+	if visibleErr != nil && altErr != nil {
+		return nil, fmt.Errorf("tmux capture-pane %s: visible=%w; alt=%v",
+			session, visibleErr, altErr)
+	}
+	return combined, nil
+}
+
 // SetStatusHint prepends a fleet hint to the given session's
 // status-right so operators see "Ctrl-b d to detach" persistently
 // while attached, without losing whatever custom right-status they

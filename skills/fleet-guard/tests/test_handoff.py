@@ -418,7 +418,7 @@ class TestMaybeTrigger:
         assert q["new_agent_id"] != ""
         assert q["new_session"] == f"fleet-{q['new_agent_id']}"
         assert q["handoff_doc"] == str(docs[0])
-        assert q["schema_version"] == 1
+        assert q["schema_version"] == 2
         assert q["task_id"] == "demo-task"
         assert q["project"] == "myproj"
 

@@ -261,6 +261,134 @@ func TestSpawn_RollsBackTmuxOnRecordWriteFailure(t *testing.T) {
 	// invariant (verified by code review) and the tmux.Kill unit test.
 }
 
+func TestSendInitialPrompt_TypedAfterPaneStable(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pin small windows so the test suite doesn't pay production's
+	// 500 ms stable / 30 s max waits.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "150")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+
+	// `echo READY; read line; echo GOT:$line` prints a banner (so
+	// CapturePane has non-empty content), blocks on read (pane goes
+	// stable), then echoes whatever was typed. Mirrors how production
+	// claude prints a startup banner, then idles waiting for input.
+	rec, err := Spawn(Options{
+		TaskID:  "auto-resume",
+		Project: "p",
+		Command: []string{"sh", "-c",
+			"echo READY; read line; echo GOT:$line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if err := SendInitialPrompt(rec.TmuxSession, "echo HELLO_FROM_PROMPT"); err != nil {
+		t.Fatalf("SendInitialPrompt: %v", err)
+	}
+
+	want := "GOT:echo HELLO_FROM_PROMPT"
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("prompt did not reach session within deadline; want %q in:\n%s",
+		want, string(lastOut))
+}
+
+func TestSendInitialPrompt_EmptyPromptIsNoOp(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "150")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+
+	rec, err := Spawn(Options{
+		TaskID:  "no-prompt",
+		Project: "p",
+		Command: []string{"sh", "-c",
+			"echo READY; read line; echo GOT:$line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Empty prompt: SendInitialPrompt should return immediately
+	// without typing anything. No GOT: should appear in the pane.
+	start := time.Now()
+	if err := SendInitialPrompt(rec.TmuxSession, ""); err != nil {
+		t.Fatalf("SendInitialPrompt(empty): %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Errorf("SendInitialPrompt(empty) took %s, expected near-instant", elapsed)
+	}
+	time.Sleep(150 * time.Millisecond)
+	out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	if strings.Contains(string(out), "GOT:") {
+		t.Errorf("session received input despite empty prompt; pane:\n%s", string(out))
+	}
+}
+
+func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pin a tiny max wait — the test command keeps the pane changing
+	// forever (printing every 50 ms), so stability never converges.
+	// SendInitialPrompt should log the timeout and send anyway.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "200")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "300")
+
+	rec, err := Spawn(Options{
+		TaskID:  "never-stable",
+		Project: "p",
+		// `while ... read line` so the shell still consumes input
+		// when send-keys arrives, even though the printing loop in
+		// the background keeps the pane churning. The marker proves
+		// the prompt was delivered despite the unstable pane.
+		Command: []string{"sh", "-c",
+			"(while true; do echo TICK; sleep 0.05; done) & read line; echo GOT:$line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if err := SendInitialPrompt(rec.TmuxSession, "echo NEVER_STABLE_BUT_DELIVERED"); err != nil {
+		t.Fatalf("SendInitialPrompt: %v", err)
+	}
+
+	want := "GOT:echo NEVER_STABLE_BUT_DELIVERED"
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("prompt not delivered after max-wait fallback; want %q in:\n%s",
+		want, string(lastOut))
+}
+
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

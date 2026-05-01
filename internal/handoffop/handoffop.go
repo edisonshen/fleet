@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
@@ -100,8 +101,23 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 		return spawnAndRetire(req, queuePath, oldRec, graceMillis, stdout, stderr)
 	}
+	// Resolve THIS handoff's auto-resume policy from queue override
+	// + oldRec baseline (codex review iter-12 P2). Combine v1 schema
+	// gate (codex iter-17 P2) — but ONLY for the SEND. Don't conflate
+	// "v1 legacy drain" with "operator opted out" (codex iter-18 P2):
+	// case-3 always proceeds to retire (the replacement is already
+	// alive, caller of `fleet handoff` already accepted manual
+	// prompt requirements), so the only knob the v1 gate touches
+	// here is whether retireOldAgent SENDS the prompt.
+	thisHandoffDisable := oldRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		thisHandoffDisable = *req.DisableAutoResume
+	}
+	if req.SchemaVersion < 2 {
+		thisHandoffDisable = true
+	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		graceMillis, stdout, stderr)
+		thisHandoffDisable, graceMillis, stdout, stderr)
 }
 
 // cleanUpStaleQueue handles the "old record already archived" branch.
@@ -125,15 +141,81 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s already archived BUT replacement %s tmux session %s is gone — task has no live agent; investigate before deleting queue file %s",
 			req.OldAgentID, req.NewAgentID, newRec.TmuxSession, queuePath)
 	}
-	if err := queue.Delete(queuePath); err != nil {
+
+	// Cover the iter-10 P1 crash window: if the previous run
+	// crashed AFTER oldRec.Archive() but BEFORE queue.Delete,
+	// SendPromptKeys also never ran (it lives after queue.Delete).
+	// The replacement is alive but un-prompted. Send here. If we
+	// got past queue.Delete in the previous run, queue would be
+	// gone and we wouldn't be on this path — so this delivery is
+	// the FIRST send, not a duplicate.
+	//
+	// Resolve auto-resume from queue override + newRec baseline
+	// (codex review iter-12 P2). Gate on schema v2+ (codex
+	// iter-15 P2) — v1 queue files predate this feature.
+	disableAutoResume := newRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+	autoResume := !disableAutoResume && req.SchemaVersion >= 2
+
+	// Wait + liveness probe ALWAYS run, even when autoResume is off
+	// — the wait doubles as a post-spawn liveness probe (codex
+	// review iter-16 P1). Only the SEND is gated on autoResume below.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
 		_, _ = fmt.Fprintf(stdout,
-			"warning: agent %s already handed off → %s but queue cleanup failed: %v\n",
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stdout,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
+		return fmt.Errorf(
+			"resume: agent %s already archived BUT replacement %s tmux session %s exited during readiness wait — task has no live agent",
+			req.OldAgentID, req.NewAgentID, newRec.TmuxSession)
+	}
+	if err := queue.Delete(queuePath); err != nil {
+		// Return error so fleet drain / TUI watcher retries; under
+		// the new post-delete send order the prompt would never have
+		// been sent if the delete failed, so silently reporting
+		// success would leave the replacement idle (codex review
+		// iter-18 P2).
+		return fmt.Errorf(
+			"resume: agent %s already handed off → %s but queue cleanup failed (%w); will retry",
 			req.OldAgentID, req.NewAgentID, err)
-		return nil
+	}
+	if autoResume {
+		if err := spawn.SendPromptKeys(newRec.TmuxSession,
+			handoff.ResumePrompt(req.HandoffDoc)); err != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"warning: send resume prompt to %s after archive-recovery: %v (re-enqueuing for retry)\n",
+				newRec.TmuxSession, err)
+			// Re-enqueue so a future drain / `fleet handoff` can
+			// retry delivery — without this, send failure on the
+			// non-interactive drain path silently strands the
+			// replacement (codex review iter-14 P1).
+			if _, werr := queue.WriteSpawnFresh(req); werr != nil {
+				_, _ = fmt.Fprintf(stdout,
+					"warning: re-enqueue after archive-recovery send failure: %v\n",
+					werr)
+			}
+		}
 	}
 	_, _ = fmt.Fprintf(stdout,
 		"agent %s already handed off → %s (cleaned stale queue file)\n",
 		req.OldAgentID, req.NewAgentID)
+	if !autoResume {
+		// Original handoff opted out — replacement is alive but
+		// idle. Tell the operator what to type on attach (codex
+		// review iter-11 P2). Note: this is the auto-handoff drain
+		// path so "operator" output goes to whoever's reading
+		// stdout (drain CLI / TUI background message stream).
+		_, _ = fmt.Fprintf(stdout,
+			"then say: read the handoff doc at %s and continue\n",
+			req.HandoffDoc)
+	}
 	return nil
 }
 
@@ -153,12 +235,54 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			"resume: agent %s is a legacy record with no stored command; manual `fleet handoff --command` required",
 			oldRec.ID)
 	}
+	// Resolve THIS handoff's auto-resume: queue's override (if set)
+	// wins, else inherit from oldRec (codex review iter-10/11/12 P2).
+	disableAutoResume := oldRec.DisableAutoResume
+	if req.DisableAutoResume != nil {
+		disableAutoResume = *req.DisableAutoResume
+	}
+
+	// Reject fresh-spawn auto-handoff for opt-out agents (codex
+	// review iter-9 P1, scoped to spawnAndRetire per iter-10 P2).
+	// We're about to bring up a NEW agent that won't get a resume
+	// prompt — and there's no operator on this drain path to type
+	// one manually. Spawning would leave the replacement idle
+	// forever. Surface a clear error pointing at `fleet handoff`,
+	// the interactive path. Queue file preserved for that retry.
+	//
+	// IMPORTANT: this reject is for EXPLICIT opt-out only (record
+	// baseline or queue override). v1 schema queues (codex iter-18
+	// P2) are NOT opt-outs — they just predate the auto-resume
+	// feature. v1 queues drain normally; the only difference is
+	// retireOldAgent skips the send for them.
+	if disableAutoResume {
+		return fmt.Errorf(
+			"resume: agent %s opted out of auto-resume; auto-handoff would leave the replacement idle. Trigger handoff manually with `fleet handoff %s` (queue file %s preserved)",
+			req.OldAgentID, req.OldAgentID, queuePath)
+	}
+
+	// thisHandoffDisableAutoResume is what gets passed to retire's
+	// SEND gate. It collapses "explicit opt-out" with "v1 queue
+	// legacy compatibility" — both mean "don't send" but we already
+	// returned above on the explicit opt-out, so this is just the
+	// v1 case. Spawn.DisableAutoResume gets the explicit-only value
+	// (disableAutoResume) so v1 drains don't permanently flip the
+	// new record's baseline.
+	thisHandoffDisableAutoResume := disableAutoResume
+	if req.SchemaVersion < 2 {
+		thisHandoffDisableAutoResume = true
+	}
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:      oldRec,
 		NewDocPath:     req.HandoffDoc,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
 		PreAllocatedID: req.NewAgentID,
+		// Use disableAutoResume (explicit opt-out only), not
+		// thisHandoffDisableAutoResume (which includes the v1
+		// legacy case). A v1 drain shouldn't permanently flip the
+		// new record's baseline to opt-out (codex iter-18 P2).
+		DisableAutoResume: disableAutoResume,
 	})
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
@@ -172,17 +296,88 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		graceMillis, stdout, stderr)
+		thisHandoffDisableAutoResume, graceMillis, stdout, stderr)
 }
 
-// retireOldAgent runs the post-spawn tail: send /exit, grace, kill,
-// archive, delete queue. Caller has verified newRec.TmuxSession is alive.
+// retireOldAgent runs the post-spawn tail in this order: wait for
+// new's pane to stabilize → /exit + grace + kill the old → archive
+// → delete queue → send the resume prompt. Caller has verified
+// newRec.TmuxSession is alive at entry.
 //
-// Mirrors steps 9-13 of cmd/fleet/handoff.go::runHandoff. Rollback
-// semantics on Kill failure: kill the new session, delete the new record
-// + queue, surface the live old session for operator triage.
+// Sequencing rationale across the codex review series (iter-1, 2,
+// 4, 5, 6, 7, 8):
+//
+//  1. Prompt delivery lives HERE, not in spawn.Spawn, so crash
+//     recovery (Resume → retireOldAgent for case-3) uses the same
+//     delivery path as happy path. Single source of truth.
+//
+//  2. The readiness wait runs BEFORE Kill(old). The wait is passive
+//     — new is rendering UI, not doing work — so it doesn't violate
+//     the iter-2 P2 invariant that "new doesn't do work during the
+//     OLD↔NEW overlap." Putting the wait first means a dead-during-
+//     wait crashes cleanly: roll back the new, leave the old alive,
+//     surface the error so the operator/recovery can retry. Pre-fix
+//     (iter-7), the wait happened AFTER Kill(old) and a dead-during-
+//     wait left the task stranded with no live agent.
+//
+//  3. The actual send-keys runs AFTER queue.Delete. Once the queue
+//     file is gone no recovery path can run, so the prompt is
+//     delivered at most once per logical handoff. Sending earlier
+//     would mean a crash between send and queue.Delete leads to a
+//     retry that re-sends, making claude redo work. Lost-prompt
+//     window is the microseconds between queue.Delete returning
+//     and the send-keys call.
+//
+//  4. Auto-resume can be disabled per-record via DisableAutoResume
+//     (set by --no-auto-resume on dispatch or handoff). When off,
+//     both the wait and the send are skipped — the operator types
+//     their own first prompt on attach. This protects non-claude
+//     wrappers from receiving "Read your handoff doc..." as garbage
+//     input.
+//
+// Rollback semantics on Kill failure: kill the new session, delete
+// the new record + queue, surface the live old session for operator
+// triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
+	disableAutoResume bool,
 	graceMillis int, stdout, stderr io.Writer) error {
+
+	// disableAutoResume comes from the caller so per-handoff
+	// overrides (queue's *bool) win over newRec's baseline policy
+	// (codex review iter-12 P2).
+	autoResume := !disableAutoResume
+
+	// Wait BEFORE killing old (codex review iter-8 P1). The wait is
+	// passive — new is rendering UI, not doing work; only the post-
+	// queue.Delete SendPromptKeys starts the new agent's work — so
+	// this respects the iter-2 P2 invariant. If the new agent dies
+	// during the wait, OLD is still alive; roll back the new and
+	// return so operator/recovery can retry cleanly.
+	//
+	// Always runs, even when auto-resume is disabled (codex iter-9
+	// P1): the wait doubles as a post-spawn liveness check, catching
+	// wrappers that survive the immediate HasSession check but crash
+	// shortly after.
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	// SessionAlive (not HasSession) so transport probe failures
+	// don't roll back a live replacement (codex iter-15 P1).
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
+		if path, perr := state.AgentPath(newRec.ID); perr == nil {
+			_ = os.Remove(path)
+		}
+		_ = queue.Delete(queuePath)
+		return fmt.Errorf(
+			"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+			newRec.ID, newRec.TmuxSession, oldRec.ID)
+	}
 
 	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
 		!errors.Is(err, tmux.ErrNoSession) {
@@ -215,6 +410,7 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			"note: kill %s reported error but session is gone: %v\n",
 			oldRec.TmuxSession, err)
 	}
+
 	if err := oldRec.Archive(); err != nil {
 		path, perr := state.AgentPath(oldRec.ID)
 		if perr == nil {
@@ -233,8 +429,62 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				oldRec.ID, err, perr, newRec.ID)
 		}
 	}
+	queueDeleted := true
 	if err := queue.Delete(queuePath); err != nil {
 		_, _ = fmt.Fprintf(stderr, "warning: delete queue file: %v\n", err)
+		queueDeleted = false
+	}
+
+	// If queue.Delete failed, surface as error so drain reports
+	// the handoff as not-yet-complete (codex review iter-20 P1).
+	// Old is already archived, so a retry will reach
+	// cleanUpStaleQueue, which has its own send + delete pair.
+	// Returning nil here would silently strand the replacement
+	// (queue still on disk, prompt never sent, drain reports
+	// success).
+	if !queueDeleted {
+		return fmt.Errorf(
+			"resume: %s archived but queue file delete failed; rerun fleet drain (or fleet handoff) to deliver the resume prompt",
+			oldRec.ID)
+	}
+
+	// Send the resume prompt now that queue.Delete succeeded (we
+	// returned early on failure above). On SEND failure, re-enqueue
+	// so cleanUpStaleQueue can retry — preserves recovery for non-
+	// interactive drains where no operator can type the prompt
+	// manually (codex iter-13 P2).
+	if autoResume {
+		if err := spawn.SendPromptKeys(newRec.TmuxSession,
+			handoff.ResumePrompt(docPath)); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: send resume prompt to %s: %v (re-enqueuing for retry)\n",
+				newRec.TmuxSession, err)
+			// Re-enqueue: oldRec is now archived, so a retry
+			// will land in cleanUpStaleQueue, which sends + deletes.
+			var override *bool
+			if disableAutoResume != oldRec.DisableAutoResume {
+				v := disableAutoResume
+				override = &v
+			}
+			if _, werr := queue.WriteSpawnFresh(queue.SpawnFresh{
+				OldAgentID:        oldRec.ID,
+				HandoffDoc:        docPath,
+				Project:           oldRec.Project,
+				TaskID:            oldRec.TaskID,
+				NewAgentID:        newRec.ID,
+				NewSession:        newRec.TmuxSession,
+				DisableAutoResume: override,
+			}); werr != nil {
+				// Send failed AND re-enqueue failed → replacement
+				// is alive but un-prompted, no journal entry to
+				// recover from. Surface as error so the drainer
+				// reports failure instead of silent success
+				// (codex review iter-19 P2).
+				return fmt.Errorf(
+					"resume: send prompt to %s failed (%w) AND re-enqueue failed (%w); replacement %s alive but idle, retry handoff manually",
+					newRec.TmuxSession, err, werr, newRec.ID)
+			}
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "drained %s → %s\n", oldRec.ID, newRec.ID)

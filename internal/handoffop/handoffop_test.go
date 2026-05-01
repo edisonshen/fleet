@@ -38,6 +38,12 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
+	// pane for stability. Production windows (500 ms stable / 30 s
+	// max) would balloon the suite; tests pin small values that
+	// converge fast on the synthetic shell commands seedAgent uses.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "1000")
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record
@@ -105,12 +111,17 @@ _(operator-triggered handoff — fill in before resuming)_
 
 	newID := agent.NewID()
 	req = queue.SpawnFresh{
-		OldAgentID: oldRec.ID,
-		HandoffDoc: dp,
-		Project:    oldRec.Project,
-		TaskID:     oldRec.TaskID,
-		NewAgentID: newID,
-		NewSession: tmux.SessionName(newID),
+		// Set explicitly so the returned value matches what
+		// WriteSpawnFresh persists on disk — the test wants the
+		// in-memory req and file to agree (auto-resume gates the
+		// drain on req.SchemaVersion >= 2).
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    oldRec.ID,
+		HandoffDoc:    dp,
+		Project:       oldRec.Project,
+		TaskID:        oldRec.TaskID,
+		NewAgentID:    newID,
+		NewSession:    tmux.SessionName(newID),
 	}
 	qp, err := queue.WriteSpawnFresh(req)
 	if err != nil {
@@ -195,6 +206,125 @@ func TestResume_AlreadySpawnedSkipsSpawnRunsTail(t *testing.T) {
 	}
 	if !tmux.HasSession(newRec.TmuxSession) {
 		t.Error("new session killed during resume — should have been left alone")
+	}
+}
+
+// TestResume_CrashRecoveryDeliversPromptToReplacement verifies the
+// codex iter-1 P1 fix: when a previous Resume crashed AFTER spawn but
+// BEFORE retire, the recovery path's retireOldAgent call delivers the
+// resume prompt to the surviving replacement. Pre-fix, send-keys lived
+// inside spawn.Spawn — the recovery path skipped spawn → never sent
+// the prompt → replacement sat idle forever.
+func TestResume_CrashRecoveryDeliversPromptToReplacement(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, docPath := writeSkillQueue(t, oldRec)
+
+	// Pre-spawn the replacement with a shell that echoes whatever
+	// Resume types into it. Mirrors "crashed AFTER spawn but BEFORE
+	// archive": record + session exist, queue + doc + old still
+	// intact, but no prompt was delivered. We expect Resume's
+	// retireOldAgent call to type ResumePrompt(docPath) into this
+	// session, which the shell echoes back as `GOT:<prompt>`.
+	//
+	// DisableAutoResume defaults to false (zero value) → auto-resume
+	// fires, prompt is typed.
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"}
+	newRec.TmuxSession = req.NewSession
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("pre-spawn replacement: %v", err)
+	}
+	if err := newRec.Write(); err != nil {
+		_ = tmux.Kill(newRec.TmuxSession)
+		t.Fatalf("write replacement record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Replacement still alive; prompt was delivered (shell echoed it).
+	// tmux capture-pane wraps long lines at terminal width — strip
+	// newlines before substring matching so the path-bearing prompt
+	// matches whether or not it crossed a column boundary.
+	want := "GOT:Read your handoff doc at " + docPath
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		captured, err := tmux.CapturePane(newRec.TmuxSession)
+		if err == nil {
+			lastOut = captured
+			joined := strings.ReplaceAll(string(captured), "\n", "")
+			if strings.Contains(joined, want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("crash-recovery did not deliver resume prompt; want substring %q in:\n%s",
+		want, string(lastOut))
+}
+
+// TestResume_DisableAutoResumeSkipsPrompt verifies the codex iter-7
+// P2 fix (updated for iter-12): per-handoff override on the queue
+// file ANDed with the record's baseline. Either pathway disables
+// auto-resume → no prompt typed.
+func TestResume_DisableAutoResumeSkipsPrompt(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Seed the outgoing agent with DisableAutoResume=true (baseline
+	// policy from a hypothetical original `fleet dispatch
+	// --no-auto-resume`).
+	oldRec := spawnSeedAgent(t)
+	oldRec.DisableAutoResume = true
+	if err := oldRec.Write(); err != nil {
+		t.Fatalf("re-write old with DisableAutoResume=true: %v", err)
+	}
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Pre-spawn replacement that would echo any typed prompt.
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = []string{"sh", "-c", "read line; echo GOT:$line; sleep 30"}
+	newRec.TmuxSession = req.NewSession
+	newRec.DisableAutoResume = oldRec.DisableAutoResume // baseline inherits
+	if err := tmux.Spawn(newRec.TmuxSession, newRec.Cwd, newRec.Command,
+		[]string{"FLEET_AGENT_ID=" + newRec.ID}); err != nil {
+		t.Fatalf("pre-spawn replacement: %v", err)
+	}
+	if err := newRec.Write(); err != nil {
+		_ = tmux.Kill(newRec.TmuxSession)
+		t.Fatalf("write replacement record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Replacement still alive (no prompt sent → shell still blocked
+	// on read). Pane must NOT contain GOT: marker.
+	time.Sleep(300 * time.Millisecond)
+	captured, err := tmux.CapturePane(newRec.TmuxSession)
+	if err != nil {
+		t.Fatalf("capture-pane: %v", err)
+	}
+	joined := strings.ReplaceAll(string(captured), "\n", "")
+	if strings.Contains(joined, "GOT:") {
+		t.Errorf("auto-resume fired despite DisableAutoResume=true; pane:\n%s",
+			string(captured))
 	}
 }
 

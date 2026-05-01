@@ -197,6 +197,22 @@ func TestRender_SkillByteGolden(t *testing.T) {
 	}
 }
 
+func TestResumePrompt(t *testing.T) {
+	t.Run("non-empty path embeds it", func(t *testing.T) {
+		got := ResumePrompt("/Users/x/.fleet/handoffs/a1b2c3d4-20260430-100000.md")
+		want := "Read your handoff doc at /Users/x/.fleet/handoffs/a1b2c3d4-20260430-100000.md" +
+			" and continue the task. Do not wait for further operator input."
+		if got != want {
+			t.Errorf("ResumePrompt mismatch:\ngot:  %q\nwant: %q", got, want)
+		}
+	})
+	t.Run("empty path returns empty string so spawn skips send-keys", func(t *testing.T) {
+		if got := ResumePrompt(""); got != "" {
+			t.Errorf("ResumePrompt(\"\") = %q, want \"\"", got)
+		}
+	})
+}
+
 func TestWrite_PublishesAtomically(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
