@@ -322,6 +322,48 @@ func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 	}
 }
 
+// TestView_AlertBannerSplitsIdleAndReview pins the dogfood-driven
+// label split: NeedsInput=true (canonical "waiting") shows as "idle"
+// and Mode=="review" shows as "in review" — distinct chips, not the
+// pre-fix conflation that rendered both as "in review".
+func TestView_AlertBannerSplitsIdleAndReview(t *testing.T) {
+	m := New("test")
+	recs := fakeRecords(2)
+	recs[0].NeedsInput = true // → status "waiting" → "idle"
+	recs[1].Mode = "review"   // → status "review" → "in review"
+	m.records = sortRecords(recs)
+
+	out := m.View()
+	if !strings.Contains(out, "1 idle") {
+		t.Errorf("banner should show idle count for NeedsInput agent, got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 in review") {
+		t.Errorf("banner should show in-review count for Mode==review agent, got:\n%s", out)
+	}
+	// And critically — they must be separate chips, not collapsed:
+	// "1 idle" + "1 in review", not "2 in review".
+	if strings.Contains(out, "2 in review") {
+		t.Errorf("idle and review must not be conflated; got:\n%s", out)
+	}
+}
+
+// TestDeriveStatus_PausedReviewerStaysReview pins the precedence that
+// review > waiting — fleet-guard flips NeedsInput=true on every Stop
+// with no injection, so a reviewer between turns has both Mode=review
+// and NeedsInput=true. The mode is the load-bearing signal: a paused
+// reviewer must surface as "review", not "waiting"/"idle", or the
+// label split misclassifies reviewers in their common idle state.
+func TestDeriveStatus_PausedReviewerStaysReview(t *testing.T) {
+	r := &agent.Record{ID: "r", TmuxSession: "s", Mode: "review", NeedsInput: true}
+	alive := map[string]bool{"r": true}
+	if got := deriveStatus(r, alive); got != "review" {
+		t.Errorf("deriveStatus(Mode=review, NeedsInput=true) = %q, want %q", got, "review")
+	}
+	if got := statusLabel(deriveStatus(r, alive)); got != "review" {
+		t.Errorf("statusLabel for paused reviewer = %q, want %q", got, "review")
+	}
+}
+
 func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2)) // all default → live
@@ -329,7 +371,7 @@ func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 	// v2 banner glyphs: ▌ blocked, △ hot context, ✗ dead. The cyan
 	// ● review glyph is also a row-level glyph so we can't blanket-
 	// check it — instead guard the descriptive words.
-	for _, sym := range []string{"▌", "△", "✗", "blocked", "hot context", "dead", "in review"} {
+	for _, sym := range []string{"▌", "△", "✗", "blocked", "hot context", "dead", "in review", " idle"} {
 		if strings.Contains(out, sym) {
 			t.Errorf("clean dashboard should hide banner for %q, got:\n%s", sym, out)
 		}
