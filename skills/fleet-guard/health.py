@@ -50,6 +50,7 @@ OWNED_FIELDS: frozenset[str] = frozenset({
     "blocked_reason",
     "blocked_since",
     "needs_input",
+    "has_pending_question",
     "inbox_pending",
     "handoff_type",
     "handoff_type_at",

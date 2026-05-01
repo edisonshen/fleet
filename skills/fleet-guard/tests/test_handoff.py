@@ -371,6 +371,50 @@ class TestCaptureRecent:
 
 # -- maybe_trigger state machine --------------------------------------------
 
+class TestDetectQuestion:
+    """Heuristic to split asking/idle. False positives (rhetorical "?")
+    and false negatives ("Let me know if X.") are both expected; these
+    tests pin the patterns we DO want to catch + a few we explicitly
+    don't, so the heuristic doesn't silently regress."""
+
+    def test_empty_input_is_idle(self) -> None:
+        assert handoff.detect_question("") is False
+
+    def test_trailing_question_mark_is_asking(self) -> None:
+        pane = "Working on it.\n\nDo you want me to continue?"
+        assert handoff.detect_question(pane) is True
+
+    def test_question_opener_without_qmark_is_asking(self) -> None:
+        pane = "Build is green.\nShould I open the PR now"
+        assert handoff.detect_question(pane) is True
+
+    def test_yn_widget_is_asking(self) -> None:
+        pane = "Apply this change to 3 files? [y/n]"
+        assert handoff.detect_question(pane) is True
+
+    def test_plain_status_line_is_idle(self) -> None:
+        pane = "Done. 5 tests pass.\nAll green."
+        assert handoff.detect_question(pane) is False
+
+    def test_question_buried_far_back_in_pane_is_idle(self) -> None:
+        """Old answered question in scrollback must not pin the agent
+        as 'asking'. Only the last few non-empty lines matter."""
+        pane = "Should I proceed?\n" + "\n".join(["work " + str(i) for i in range(20)]) + "\nDone."
+        assert handoff.detect_question(pane) is False
+
+    def test_trailing_blank_lines_dont_hide_question(self) -> None:
+        pane = "Plan ready.\nReady to apply?\n\n\n  \n"
+        assert handoff.detect_question(pane) is True
+
+    def test_bullet_prefix_doesnt_hide_opener(self) -> None:
+        pane = "- Should I push to main"
+        assert handoff.detect_question(pane) is True
+
+    def test_case_insensitive_opener(self) -> None:
+        pane = "DO YOU want this merged"
+        assert handoff.detect_question(pane) is True
+
+
 class TestMaybeTrigger:
     def test_missing_record_returns_none(self) -> None:
         assert handoff.maybe_trigger({}, agent_id="missing", session="x") is None

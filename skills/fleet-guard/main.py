@@ -133,7 +133,22 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     # means a real idle Stop (operator must type next), non-empty means
     # claude has work to do on the next turn. UserPromptSubmit clears
     # the flag on the operator's first human prompt either way.
-    health.update_record(agent_id, needs_input=(len(injections) == 0))
+    #
+    # has_pending_question splits the idle case: if the agent ended on
+    # a question for the operator (heuristic in handoff.detect_question),
+    # the TUI labels it "asking"; otherwise "idle". When the agent has
+    # work queued (injections present), both flags are False — the
+    # agent isn't waiting at all.
+    needs_input = len(injections) == 0
+    has_question = (
+        needs_input
+        and handoff.detect_question(handoff.capture_recent(session))
+    )
+    health.update_record(
+        agent_id,
+        needs_input=needs_input,
+        has_pending_question=has_question,
+    )
 
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:

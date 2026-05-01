@@ -50,8 +50,18 @@ type Record struct {
 	BlockedReason  *string    `json:"blocked_reason"`
 	BlockedSince   *time.Time `json:"blocked_since"`
 	NeedsInput     bool       `json:"needs_input"`
-	InboxPending   bool       `json:"inbox_pending"`
-	HandoffType    *string    `json:"handoff_type"`
+	// HasPendingQuestion distinguishes "agent stopped on a question for
+	// the operator" (asking) from "agent stopped, work done, nothing
+	// pending" (idle). Both have NeedsInput=true; the heuristic that
+	// flips this lives in skills/fleet-guard/health.py:detect_question
+	// (tail-of-pane: trailing "?", "Do you" / "Should I" openers,
+	// "[y/n]"). False on legacy records and whenever NeedsInput is
+	// false. The TUI uses this to render two different statuses with
+	// distinct glyph + color so the operator can ignore idle agents
+	// at a glance and only attend to "asking" ones.
+	HasPendingQuestion bool    `json:"has_pending_question,omitempty"`
+	InboxPending       bool    `json:"inbox_pending"`
+	HandoffType        *string `json:"handoff_type"`
 	// HandoffTypeAt timestamps when HandoffType was last set (RFC 3339,
 	// written by skills/fleet-guard/health.py:now_rfc3339). The
 	// stuck-pending watchdog (handoff.py:_yellow_stuck_too_long) reads
