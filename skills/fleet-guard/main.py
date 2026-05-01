@@ -133,7 +133,22 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     # means a real idle Stop (operator must type next), non-empty means
     # claude has work to do on the next turn. UserPromptSubmit clears
     # the flag on the operator's first human prompt either way.
-    health.update_record(agent_id, needs_input=(len(injections) == 0))
+    #
+    # has_pending_question splits the idle case: if the agent ended on
+    # a question for the operator (heuristic in handoff.detect_question),
+    # the TUI labels it "asking"; otherwise "idle". When the agent has
+    # work queued (injections present), both flags are False — the
+    # agent isn't waiting at all.
+    needs_input = len(injections) == 0
+    has_question = (
+        needs_input
+        and handoff.detect_question(handoff.capture_recent(session))
+    )
+    health.update_record(
+        agent_id,
+        needs_input=needs_input,
+        has_pending_question=has_question,
+    )
 
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
@@ -146,12 +161,22 @@ def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
 def _on_user_prompt_submit(agent_id: str) -> None:
     """UserPromptSubmit fires when the operator submits a prompt to the
     agent. That is the moment claude transitions from waiting → working,
-    so clear needs_input. Pairs with Stop, which sets needs_input=true.
+    so clear needs_input AND has_pending_question. Pairs with Stop,
+    which recomputes both flags.
+
+    has_pending_question must clear here too: the operator just answered
+    whatever the agent asked, so the question is no longer pending. Left
+    set, the TUI would mislabel a working agent as "asking" until the
+    next Stop fires (codex review iter for asking/idle split: P2).
 
     Stdout is ignored by Claude Code on this hook (the prompt is already
     being processed); we touch only the agent record.
     """
-    health.update_record(agent_id, needs_input=False)
+    health.update_record(
+        agent_id,
+        needs_input=False,
+        has_pending_question=False,
+    )
 
 
 def _on_session_start(agent_id: str, injections: list[str]) -> None:
@@ -174,7 +199,18 @@ def _on_session_start(agent_id: str, injections: list[str]) -> None:
         # state of disk.
         if inbox.archive(agent_id):
             health.update_record(agent_id, inbox_pending=False)
-    health.update_record(agent_id, needs_input=(len(injections) == 0))
+    # Clear has_pending_question on SessionStart: a resumed agent
+    # is at a fresh prompt regardless of what it ended on last
+    # session. Without this clear, a record that crashed mid-Yellow
+    # with has_pending_question=true on disk would render as
+    # "asking" forever after the resume — codex review iter for
+    # asking/idle split caught this exact path: seed the flag,
+    # fire SessionStart, watch it stay set.
+    health.update_record(
+        agent_id,
+        needs_input=(len(injections) == 0),
+        has_pending_question=False,
+    )
 
 
 if __name__ == "__main__":

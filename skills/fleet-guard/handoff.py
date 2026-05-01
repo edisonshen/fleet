@@ -194,6 +194,66 @@ def capture_recent(session: str, lines: int = 200) -> str:
     return _ANSI_SGR_RE.sub("", out)
 
 
+# Common openers that signal the agent is asking the operator a question
+# even when the line doesn't end in "?". Lowercased; matched as the line
+# prefix after stripping whitespace + leading bullets/quotes.
+_QUESTION_OPENERS = (
+    "do you", "did you", "should i", "should we", "would you",
+    "shall i", "shall we", "can i", "can you", "could you",
+    "may i", "want me to", "would you like", "are you",
+    "is this", "is that", "ok to", "okay to", "ready to",
+    "proceed?", "continue?", "approve",
+)
+
+# Inline interactive prompts we treat as questions: claude code's own
+# y/n confirmation widgets, multi-choice, etc.
+_QUESTION_INLINE = (
+    "[y/n]", "(y/n)", "[Y/n]", "(Y/n)", "[y/N]", "(y/N)",
+    "❯ 1.", "❯ 1)",
+)
+
+
+def detect_question(pane_text: str) -> bool:
+    """True if the agent's last visible turn ended on a question for the
+    operator. Heuristic — false positives ("Maybe X?" in a status line)
+    and false negatives ("Let me know if you'd like X.") are both
+    expected. The TUI uses this only to split "asking" vs "idle" labels;
+    nothing load-bearing depends on accuracy.
+
+    Strategy: scan the last few non-empty lines (the agent's reply usually
+    ends with the question, sometimes followed by short whitespace or
+    decorations). Match if any of:
+      - line ends with "?"
+      - line, lowercased, starts with a known question opener
+      - line contains a y/n widget marker
+    Empty / pane-capture-failed text returns False (default to idle —
+    safer to under-claim than to wake the operator on a false alarm)."""
+    if not pane_text:
+        return False
+    # Walk lines from end backward; stop after inspecting up to 8
+    # non-empty lines. Bounded because a long pane can include earlier
+    # questions the operator already answered, and we only care about
+    # what the final turn ended on.
+    inspected = 0
+    for raw in reversed(pane_text.splitlines()):
+        line = raw.strip()
+        if not line:
+            continue
+        inspected += 1
+        if inspected > 8:
+            break
+        if line.endswith("?"):
+            return True
+        low = line.lstrip("> -*•").lstrip().lower()
+        for opener in _QUESTION_OPENERS:
+            if low.startswith(opener):
+                return True
+        for marker in _QUESTION_INLINE:
+            if marker in line:
+                return True
+    return False
+
+
 def _capture_pane(session: str, lines: int | None = None) -> str:
     """Wrap `tmux capture-pane -t <session> -p`. With lines, request only
     the last N via `-S -<lines>`. Returns stdout on success, "" on any

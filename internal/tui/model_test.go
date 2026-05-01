@@ -322,45 +322,61 @@ func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 	}
 }
 
-// TestView_AlertBannerSplitsIdleAndReview pins the dogfood-driven
-// label split: NeedsInput=true (canonical "waiting") shows as "idle"
-// and Mode=="review" shows as "in review" — distinct chips, not the
-// pre-fix conflation that rendered both as "in review".
-func TestView_AlertBannerSplitsIdleAndReview(t *testing.T) {
+// TestView_AlertBannerSplitsAskingIdleReview pins the three-way label
+// split: a NeedsInput agent without a pending question reads as "idle"
+// (dim ○), a NeedsInput agent with a pending question reads as
+// "asking" (bright cyan ●), and a Mode=="review" agent reads as
+// "in review" (soft cyan ●). All three must appear as distinct chips,
+// not collapsed.
+func TestView_AlertBannerSplitsAskingIdleReview(t *testing.T) {
 	m := New("test")
-	recs := fakeRecords(2)
-	recs[0].NeedsInput = true // → status "waiting" → "idle"
-	recs[1].Mode = "review"   // → status "review" → "in review"
+	recs := fakeRecords(3)
+	recs[0].NeedsInput = true // → idle
+	recs[1].NeedsInput = true
+	recs[1].HasPendingQuestion = true // → asking
+	recs[2].Mode = "review"           // → in review
 	m.records = sortRecords(recs)
 
 	out := m.View()
+	if !strings.Contains(out, "1 asking") {
+		t.Errorf("banner should show asking count, got:\n%s", out)
+	}
 	if !strings.Contains(out, "1 idle") {
-		t.Errorf("banner should show idle count for NeedsInput agent, got:\n%s", out)
+		t.Errorf("banner should show idle count, got:\n%s", out)
 	}
 	if !strings.Contains(out, "1 in review") {
-		t.Errorf("banner should show in-review count for Mode==review agent, got:\n%s", out)
+		t.Errorf("banner should show in-review count, got:\n%s", out)
 	}
-	// And critically — they must be separate chips, not collapsed:
-	// "1 idle" + "1 in review", not "2 in review".
-	if strings.Contains(out, "2 in review") {
-		t.Errorf("idle and review must not be conflated; got:\n%s", out)
+	// And critically — none can be collapsed into the others.
+	for _, bad := range []string{"2 asking", "2 idle", "2 in review", "3 idle", "3 asking"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("chips must stay distinct; got %q in:\n%s", bad, out)
+		}
 	}
 }
 
 // TestDeriveStatus_PausedReviewerStaysReview pins the precedence that
-// review > waiting — fleet-guard flips NeedsInput=true on every Stop
-// with no injection, so a reviewer between turns has both Mode=review
-// and NeedsInput=true. The mode is the load-bearing signal: a paused
-// reviewer must surface as "review", not "waiting"/"idle", or the
-// label split misclassifies reviewers in their common idle state.
+// review wins over both asking and idle — fleet-guard flips
+// NeedsInput=true on every Stop with no injection, and may also flip
+// HasPendingQuestion if the reviewer asked something. Mode is the
+// load-bearing signal: a paused reviewer must surface as "review", not
+// "asking"/"idle", or the three-way split mislabels reviewers in their
+// common state.
 func TestDeriveStatus_PausedReviewerStaysReview(t *testing.T) {
-	r := &agent.Record{ID: "r", TmuxSession: "s", Mode: "review", NeedsInput: true}
-	alive := map[string]bool{"r": true}
-	if got := deriveStatus(r, alive); got != "review" {
-		t.Errorf("deriveStatus(Mode=review, NeedsInput=true) = %q, want %q", got, "review")
-	}
-	if got := statusLabel(deriveStatus(r, alive)); got != "review" {
-		t.Errorf("statusLabel for paused reviewer = %q, want %q", got, "review")
+	for _, hasQ := range []bool{false, true} {
+		r := &agent.Record{
+			ID: "r", TmuxSession: "s",
+			Mode: "review", NeedsInput: true, HasPendingQuestion: hasQ,
+		}
+		alive := map[string]bool{"r": true}
+		if got := deriveStatus(r, alive); got != "review" {
+			t.Errorf("deriveStatus(review, NeedsInput, hasQ=%v) = %q, want %q",
+				hasQ, got, "review")
+		}
+		if got := statusLabel(deriveStatus(r, alive)); got != "review" {
+			t.Errorf("statusLabel for paused reviewer (hasQ=%v) = %q, want %q",
+				hasQ, got, "review")
+		}
 	}
 }
 
@@ -442,7 +458,7 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 			want:  "precompact",
 		},
 		{
-			name: "manual handoff_type is provenance, not status — falls through to waiting",
+			name: "manual handoff_type is provenance, not status — falls through to idle",
 			rec: &agent.Record{
 				ID:          id,
 				TmuxSession: sess,
@@ -450,7 +466,7 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 				HandoffType: &manualType,
 			},
 			alive: aliveTrue,
-			want:  "waiting",
+			want:  "idle",
 		},
 		{
 			name: "manual handoff_type with no other flags falls through to live",
@@ -463,7 +479,7 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 			want:  "live",
 		},
 		{
-			name: "blocked beats waiting",
+			name: "blocked beats asking/idle",
 			rec: &agent.Record{
 				ID:          id,
 				TmuxSession: sess,
@@ -474,14 +490,25 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 			want:  "blocked",
 		},
 		{
-			name: "waiting when only needs_input set",
+			name: "idle when only needs_input set (no question)",
 			rec: &agent.Record{
 				ID:          id,
 				TmuxSession: sess,
 				NeedsInput:  true,
 			},
 			alive: aliveTrue,
-			want:  "waiting",
+			want:  "idle",
+		},
+		{
+			name: "asking when needs_input + has_pending_question",
+			rec: &agent.Record{
+				ID:                 id,
+				TmuxSession:        sess,
+				NeedsInput:         true,
+				HasPendingQuestion: true,
+			},
+			alive: aliveTrue,
+			want:  "asking",
 		},
 		{
 			name:  "live by default",
@@ -492,7 +519,7 @@ func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
 		{
 			name: "empty TmuxSession skips dead-check (legacy / pre-spawn rec)",
 			rec:  &agent.Record{ID: id, NeedsInput: true},
-			want: "waiting",
+			want: "idle",
 		},
 		{
 			name: "missing alive entry conservatively reads as live (no probe yet)",

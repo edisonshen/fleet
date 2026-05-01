@@ -941,28 +941,32 @@ func actionChipsFor(status string) []string {
 // into a single line. Empty when nothing's wrong — a clean dashboard
 // shouldn't waste a line on "0 of everything".
 //
-// Glyphs and colors match the v2 mockup: orange ▌ for blocked, red △
-// for hot context, cyan ● for review-mode and idle agents, faint ✗ for
-// dead.
+// Glyphs and colors:
+//   - ▌ orange   blocked
+//   - △ red      hot context (≥70% on any record)
+//   - ● cyan     asking (agent ended its last turn on a question)
+//   - ● cyan     in review (Mode=="review")
+//   - ○ dim      idle (stopped, work done, no question)
+//   - ✗ faint    dead
 //
-// "idle" = `waiting` canonical (NeedsInput=true, agent stopped without
-// fleet-guard injecting anything). "in review" = `review` canonical
-// (Mode == "review"). They render with the same cyan dot but separate
-// banner chips so the operator can tell apart a paused executor
-// asking a question from a literal review-mode agent (codex iter-5
-// P2 follow-up; surfaced again in dogfood as "many status in 'review'
-// even agent is asking question").
+// The asking/idle split (open ○ vs filled ●, faint vs cyan) is what
+// lets the operator scan the dashboard and instantly see which rows
+// need attention. "in review" gets its own chip even though it shares
+// the asking color because mode is a separate signal — a paused
+// reviewer must read as review, not asking/idle.
 //
 // Counts run independently: a record can be both "blocked" AND have
 // hot context, so it bumps both counts. That's intentional — the
 // banner is a heads-up, not a partition.
 func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
-	var blocked, idle, review, hot, dead int
+	var blocked, asking, idle, review, hot, dead int
 	for _, r := range records {
 		switch deriveStatus(r, alive) {
 		case "blocked":
 			blocked++
-		case "waiting":
+		case "asking":
+			asking++
+		case "idle":
 			idle++
 		case "review":
 			review++
@@ -982,13 +986,17 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 		parts = append(parts, statusUrgentStyle.Render(
 			fmt.Sprintf("△ %d hot context", hot)))
 	}
-	if idle > 0 {
-		parts = append(parts, statusReviewStyle.Render(
-			fmt.Sprintf("● %d idle", idle)))
+	if asking > 0 {
+		parts = append(parts, statusAskingStyle.Render(
+			fmt.Sprintf("● %d asking", asking)))
 	}
 	if review > 0 {
 		parts = append(parts, statusReviewStyle.Render(
 			fmt.Sprintf("● %d in review", review)))
+	}
+	if idle > 0 {
+		parts = append(parts, statusIdleStyle.Render(
+			fmt.Sprintf("○ %d idle", idle)))
 	}
 	if dead > 0 {
 		parts = append(parts, statusDeadStyle.Render(
@@ -1038,8 +1046,12 @@ func glyphFor(status string) (string, lipgloss.Style) {
 	switch status {
 	case "live":
 		return "●", glyphLiveStyle
-	case "waiting", "review":
+	case "asking":
+		return "●", glyphAskingStyle
+	case "review":
 		return "●", glyphReviewStyle
+	case "idle":
+		return "○", glyphIdleStyle
 	case "blocked":
 		return "▌", glyphBlockedStyle
 	case "dead":
@@ -1225,8 +1237,11 @@ func projectDisplay(r *agent.Record) string {
 //     (skills/fleet-guard/handoff.py:113-119).
 //  3. blocked      — fleet-guard / operator flagged the agent blocked
 //  4. review       — Mode=="review" (an agent dispatched as reviewer)
-//  5. waiting      — needs_input=true (Stop fired, awaiting operator)
-//  6. live         — fresh spawn or actively-running turn
+//  5. asking       — needs_input=true AND has_pending_question=true
+//     (agent stopped on a question for the operator)
+//  6. idle         — needs_input=true AND has_pending_question=false
+//     (agent stopped, work done, nothing pending)
+//  7. live         — fresh spawn or actively-running turn
 //
 // dead wins over everything because the other states are meaningless
 // when the underlying process is gone. In-flight handoff wins over
@@ -1270,7 +1285,10 @@ func deriveStatus(r *agent.Record, alive map[string]bool) string {
 		return "review"
 	}
 	if r.NeedsInput {
-		return "waiting"
+		if r.HasPendingQuestion {
+			return "asking"
+		}
+		return "idle"
 	}
 	return "live"
 }
@@ -1324,8 +1342,10 @@ var (
 	selectedRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("237"))
 
 	// Glyph styles for the leading status icon column.
-	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))  // green
-	glyphReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // cyan — needs review
+	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))              // green
+	glyphAskingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("87"))   // bright cyan — needs answer
+	glyphReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))             // soft cyan — needs review
+	glyphIdleStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244")) // dim — finished, ignorable
 	glyphBlockedStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
 	glyphDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
 	glyphHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
@@ -1335,9 +1355,11 @@ var (
 	// The padded plain text is built first (so column widths remain
 	// correct), then wrapped in these styles — lipgloss adds
 	// zero-width ANSI escapes so the alignment math is unaffected.
-	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))  // green — doing
-	statusReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117")) // cyan — review
-	statusBlockedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208")) // orange
+	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))              // green — doing
+	statusAskingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("87"))   // bright cyan — asking
+	statusReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))             // soft cyan — review
+	statusIdleStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244")) // dim — idle, ignorable
+	statusBlockedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))             // orange
 	statusDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
 	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	statusUrgentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")) // red — hot context / auto-red
@@ -1350,8 +1372,12 @@ func statusStyleFor(status string) lipgloss.Style {
 	switch status {
 	case "live":
 		return statusLiveStyle
-	case "waiting", "review":
+	case "asking":
+		return statusAskingStyle
+	case "review":
 		return statusReviewStyle
+	case "idle":
+		return statusIdleStyle
 	case "blocked":
 		return statusBlockedStyle
 	case "dead":
@@ -1366,23 +1392,27 @@ func statusStyleFor(status string) lipgloss.Style {
 
 // statusLabel maps the canonical deriveStatus value to the
 // operator-facing word shown in the STATUS column. The vocabulary:
-// doing / idle / review / blocked / dead / handoff.
+// doing / asking / idle / review / blocked / dead / handoff.
 //
-// "waiting" (NeedsInput=true) renders as "idle" — honest about the
-// fact that the agent has just stopped without fleet-guard injecting
-// anything. The agent may have asked a question, may have finished
-// cleanly, or may just be paused; we can't tell from the canonical
-// state alone, so we don't claim. "asking" would over-claim.
+// "asking" (NeedsInput=true && HasPendingQuestion=true) — the agent's
+// last turn ended on a question for the operator (heuristic in
+// fleet-guard). The cyan ● glyph + bright cyan label calls attention.
 //
-// "review" (Mode == "review") renders as "review" — distinct from
-// idle so an executor paused for input doesn't read as a literal
-// reviewer (dogfood report: "many status in 'review' even agent is
-// asking question").
+// "idle" (NeedsInput=true && HasPendingQuestion=false) — the agent
+// stopped, work done, no question pending. The dim ○ glyph + faint
+// label tells the operator they can ignore this row at a glance.
+//
+// "review" (Mode == "review") — agent dispatched as a reviewer.
+// Distinct cyan ● from asking; review precedence sits above the
+// asking/idle split so paused reviewers stay labeled "review" even
+// when fleet-guard would otherwise classify them as asking/idle.
 func statusLabel(status string) string {
 	switch status {
 	case "live":
 		return "doing"
-	case "waiting":
+	case "asking":
+		return "asking"
+	case "idle":
 		return "idle"
 	case "review":
 		return "review"
