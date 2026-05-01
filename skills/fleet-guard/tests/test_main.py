@@ -359,6 +359,22 @@ class TestNeedsInputFlag:
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["needs_input"] is False
 
+    def test_user_prompt_submit_clears_has_pending_question(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # has_pending_question must clear when the operator answers —
+        # otherwise the TUI renders "asking" while the agent is already
+        # processing the new prompt, until the next Stop recomputes
+        # (codex review iter for asking/idle split: P2).
+        record_path = _seed_record(fleet_home_tmp,
+                                   needs_input=True,
+                                   has_pending_question=True)
+        rc, _, _ = _run({"hook_event_name": "UserPromptSubmit"}, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["has_pending_question"] is False
+        assert record["needs_input"] is False
+
     def test_session_start_no_inbox_marks_waiting(
         self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
     ) -> None:
@@ -371,6 +387,24 @@ class TestNeedsInputFlag:
         assert rc == 0
         record = json.loads(record_path.read_text(encoding="utf-8"))
         assert record["needs_input"] is True
+
+    def test_session_start_clears_stale_has_pending_question(
+        self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
+    ) -> None:
+        # A record that was Stopped with has_pending_question=true and
+        # then session-restarted (claude restored, agent paused, etc.)
+        # must NOT carry the question flag forward — the resume hands
+        # claude a fresh prompt regardless of what the prior turn
+        # ended on. Without this clear, the TUI renders the resumed
+        # agent as "asking" forever (codex review iter for
+        # asking/idle split: P2 reproducer).
+        record_path = _seed_record(fleet_home_tmp,
+                                   needs_input=False,
+                                   has_pending_question=True)
+        rc, _, _ = _run({"hook_event_name": "SessionStart"}, capsys)
+        assert rc == 0
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        assert record["has_pending_question"] is False
 
     def test_session_start_with_inbox_does_not_mark_waiting(
         self, fleet_home_tmp: Path, capsys: pytest.CaptureFixture,
