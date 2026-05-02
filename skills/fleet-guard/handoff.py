@@ -442,41 +442,6 @@ def _do_handoff(record: dict[str, Any], session: str,
 _KICK_BACKOFF_S = 30
 
 
-def is_drain_in_flight(agent_id: str) -> bool:
-    """Best-effort: True iff a queue file is on disk AND drain is
-    expected to land soon (this Stop will kick, or a recent kick is
-    still propagating). False means either no queue (no handoff in
-    progress) or drain has been failing/blocked for longer than the
-    backoff window (DisableAutoResume reject and legacy v1 record
-    without cwd both leave queue intact — see
-    internal/handoffop/handoffop.go:258; missing fleet binary leaves
-    the kick path unable to launch at all).
-
-    Used by main._on_stop to decide whether to deliver inbox to a
-    committed-handoff agent. In flight: suppress (drain is about to
-    kill the agent; work would be lost — codex iter-7 P2). Failing:
-    deliver (the old agent is the only live target — codex iter-8 P1,
-    iter-9 P2).
-    """
-    queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
-    try:
-        queue_mtime = queue_path.stat().st_mtime
-    except FileNotFoundError:
-        return False
-    sentinel = queue_path.with_name(queue_path.name + ".kicked")
-    now = datetime.now(timezone.utc).timestamp()
-    try:
-        return (now - sentinel.stat().st_mtime) < _KICK_BACKOFF_S
-    except FileNotFoundError:
-        # No sentinel = kick never succeeded. Could be "queue just
-        # written, this Stop's tail will kick" OR "kick can't launch
-        # at all (no fleet binary)." Distinguish by queue mtime: a
-        # fresh queue is in flight; an old queue without a sentinel
-        # means the kick is permanently failing — fall through to
-        # deliver inbox to the still-live agent (codex iter-9 P2).
-        return (now - queue_mtime) < _KICK_BACKOFF_S
-
-
 def kick_drain_if_pending(agent_id: str) -> None:
     """Public entry point: kick `fleet drain` iff this agent's queue file
     exists AND we haven't kicked it within the last _KICK_BACKOFF_S
@@ -521,13 +486,13 @@ def kick_drain_if_pending(agent_id: str) -> None:
     except FileNotFoundError:
         pass  # never kicked; proceed
     if not _kick_drain():
-        # Kick failed (no fleet binary, Popen blew up). Don't stamp
-        # the sentinel — is_drain_in_flight would then suppress
-        # inbox to a still-live agent for _KICK_BACKOFF_S seconds
-        # even though no drain is actually about to retire it
-        # (codex iter-9 P2). Falling through here means the next
-        # Stop will retry the kick path, and inbox keeps reaching
-        # the only live target.
+        # Popen didn't actually launch (no fleet binary, Popen
+        # exception). Don't stamp the sentinel: it gates the
+        # throttle, and refusing to advance it lets the next Stop
+        # retry. The cost is: log spam if the failure is permanent
+        # (DisableAutoResume + no fleet binary at the same time —
+        # rare). With a working fleet binary, the throttle works as
+        # intended once a launch succeeds.
         return
     try:
         sentinel.touch()

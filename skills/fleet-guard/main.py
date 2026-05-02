@@ -113,27 +113,15 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         context_source="hook",
     )
 
-    # When a committed handoff is in flight (drain about to kill this
-    # session and spawn a replacement), don't deliver inbox to the
-    # dying agent: maybe_trigger won't rewrite the handoff doc once
-    # committed, so any work the agent does on the injected inbox is
-    # invisible to the replacement (codex iter-7 P2). BUT — if drain
-    # has been failing (DisableAutoResume opt-out, legacy v1 record),
-    # the old agent stays alive forever; suppressing inbox there
-    # silently strands every operator message (codex iter-8 P1).
-    # is_drain_in_flight separates the two: True only when a queue
-    # file exists AND drain hasn't been failing for longer than the
-    # backoff window.
-    if not handoff.is_drain_in_flight(agent_id):
-        inbox_body = inbox.read_pending(agent_id)
-        if inbox_body is not None:
-            injections.append(inbox.deliver(inbox_body))
-            # Only clear inbox_pending on a successful archive. If the
-            # rename fails, the file persists and gets re-delivered next
-            # fire — the flag must stay set so the TUI's banner agrees
-            # with the actual state of disk.
-            if inbox.archive(agent_id):
-                health.update_record(agent_id, inbox_pending=False)
+    inbox_body = inbox.read_pending(agent_id)
+    if inbox_body is not None:
+        injections.append(inbox.deliver(inbox_body))
+        # Only clear inbox_pending on a successful archive. If the rename
+        # fails, the file persists and gets re-delivered next fire — the
+        # flag must stay set so the TUI's banner agrees with the actual
+        # state of disk.
+        if inbox.archive(agent_id):
+            health.update_record(agent_id, inbox_pending=False)
 
     handoff_inject = handoff.maybe_trigger(
         payload, agent_id=agent_id, session=session,
