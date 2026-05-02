@@ -239,6 +239,64 @@ class TestStopHook:
         assert record["inbox_pending"] is True
 
 
+    def test_kick_deferred_when_injections_present(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-6 P2 regression. If a queue file is already on disk
+        (from a prior committed handoff that didn't drain) and a new
+        inbox message arrives, the Stop hook MUST NOT kick drain — that
+        would race the inbox-driven turn the agent is about to start.
+        Drain's `/exit` would land mid-work, splitting or duplicating
+        what the agent processes. Defer until the next idle Stop."""
+        import handoff as fleet_handoff  # noqa: WPS433
+
+        _seed_record(fleet_home_tmp)
+        # Seed a stale queue file as if a prior Stop committed a handoff
+        # that the consumer never picked up.
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "spawn-fresh-agent7777.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "old_agent_id": "agent7777",
+                "handoff_doc": "/tmp/fake.md",
+                "project": "myproj",
+                "task_id": "demo-task",
+                "new_agent_id": "newagent",
+                "new_session": "fleet-newagent",
+                "enqueued_at": "2026-04-30T00:00:00Z",
+            }) + "\n", encoding="utf-8")
+        # And drop an inbox message.
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("ship by friday",
+                                                encoding="utf-8")
+
+        # Capture every Popen — autouse fixture makes it a noop, but
+        # this per-test override records calls so we can assert.
+        popen_calls: list[Any] = []
+        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
+                            lambda argv, **_: popen_calls.append(argv) or object())
+        # which() must resolve so the kick path actually reaches Popen
+        # if it fires.
+        monkeypatch.setattr(fleet_handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        assert "[OPERATOR] ship by friday" in out
+        assert popen_calls == [], (
+            "drain kicked while inbox was being injected; the agent "
+            f"would race its own retirement: {popen_calls}")
+        # Queue file persists for the next idle Stop / TUI watcher.
+        assert (queue_dir / "spawn-fresh-agent7777.json").exists()
+
+
 # -- PreCompact hook ---------------------------------------------------------
 
 class TestPreCompactHook:

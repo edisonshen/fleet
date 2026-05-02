@@ -151,12 +151,18 @@ def _on_stop(payload: dict, agent_id: str, session: str,
     )
 
     # Kick drain LAST, after every hook write to the agent record has
-    # landed. If we kicked earlier (inside _do_handoff), drain's
-    # `oldRec.Archive()` could rename agents/<id>.json between
-    # update_record's read and its os.replace, recreating an archived
-    # record as live (codex iter-5 P1). Idempotent + cheap when no
-    # queue file is pending — safe to call unconditionally.
-    handoff.kick_drain_if_pending(agent_id)
+    # landed (codex iter-5 P1: avoid the archive/update_record race).
+    #
+    # AND only when this Stop made no injections — i.e. the agent is
+    # idle. If we just gave it work (inbox message OR a fresh
+    # HANDOFF REQUESTED prompt), drain would race the agent's next
+    # turn: drain's `/exit` could land while claude is processing
+    # the injected content, splitting/duplicating that work (codex
+    # iter-6 P2). The kick defers safely — the queue file persists,
+    # and the next Stop (after the agent's injected turn settles
+    # without producing more injections) will pick it up.
+    if not injections:
+        handoff.kick_drain_if_pending(agent_id)
 
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
