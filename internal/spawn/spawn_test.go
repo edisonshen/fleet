@@ -517,6 +517,49 @@ func TestSpawn_FleetBinInEnv(t *testing.T) {
 	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
 }
 
+// TestSpawn_FleetTmuxSocketPropagated verifies the operator's custom
+// tmux socket flows into the agent's env. Codex iter-2 P2 on
+// fix-fleet-guard-self-drains: without this, FLEET_TMUX_SOCKET
+// users would have auto-drain land queue files but kick `fleet
+// drain` against the default tmux server, which can't see the
+// agent's session — handoff never retires/spawns. The requireTmux
+// helper sets FLEET_TMUX_SOCKET on the test process for isolation;
+// we assert it reaches the spawned shell.
+func TestSpawn_FleetTmuxSocketPropagated(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cmd := []string{"sh", "-c", "echo TMUX_SOCK=$FLEET_TMUX_SOCKET; cat"}
+	rec, err := Spawn(Options{
+		TaskID:  "x",
+		Project: "y",
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	want := "TMUX_SOCK=" + os.Getenv("FLEET_TMUX_SOCKET")
+	if want == "TMUX_SOCK=" {
+		t.Fatal("FLEET_TMUX_SOCKET unset; requireTmux should have set " +
+			"it — failing rather than passing on a weak assertion")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

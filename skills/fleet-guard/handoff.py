@@ -452,12 +452,15 @@ def _kick_drain() -> None:
     Resolution order:
     1. `FLEET_BIN` env (stamped by spawn — internal/spawn/spawn.go via
        os.Executable()). Mirrors the TUI's keys.go fleetBinary trick so
-       dev runs (`go run`), side-loaded installs, and any setup where
-       fleet isn't on PATH still self-drain. Without this fallback the
-       skill's auto-drain silently noops in those environments.
+       side-loaded installs, where `which fleet` resolves to nothing
+       or a different binary, still self-drain. `go run` is partial:
+       works while the operator's parent fleet is alive, breaks once
+       the parent exits and the go tool deletes the temp build.
     2. `shutil.which("fleet")` — covers older fleet binaries that spawn
-       agents without FLEET_BIN, and any edge case where the stamped
-       path was deleted (e.g. go run temp build evaporated).
+       agents without FLEET_BIN, brew/`go install` setups regardless
+       of FLEET_BIN, and any edge case where the stamped path went
+       stale (e.g. go run temp build evaporated; in checkout-only
+       setups where `fleet` is also not on PATH, fall through).
     3. Noop. Queue file stays on disk and any later drain run consumes
        it. The skill must never raise.
     """

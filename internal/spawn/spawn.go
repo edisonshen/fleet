@@ -293,13 +293,25 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// FLEET_BIN stamps the path of THIS fleet binary so the agent's
 	// fleet-guard skill can spawn `<this-fleet> drain` without a
 	// PATH lookup. Mirrors the TUI's fleetBinary trick (see
-	// internal/tui/keys.go) — required for dev runs (`go run`) and
-	// side-loaded installs where `which fleet` resolves to nothing
-	// or to a different binary. os.Executable() failure is rare and
-	// non-fatal: the skill falls back to `which("fleet")`.
+	// internal/tui/keys.go) — required for side-loaded installs
+	// where `which fleet` resolves to nothing or a different binary.
+	// `go run` is partial coverage: works while the parent process
+	// is alive (the temp build artifact lives with it), drops to
+	// the skill's `which("fleet")` fallback after the parent exits.
+	// os.Executable() failure is rare and non-fatal.
+	//
+	// FLEET_TMUX_SOCKET propagates the operator's custom tmux socket
+	// so kicked `fleet drain` runs hit the same server that owns the
+	// agent's session. Without this, custom-socket setups
+	// (FLEET_TMUX_SOCKET=/some/path) silently break auto-drain: the
+	// queue file lands but drain talks to the default tmux server
+	// and can't find the session it's trying to retire.
 	extraEnv := []string{"FLEET_AGENT_ID=" + id}
 	if exe, err := os.Executable(); err == nil {
 		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
+	}
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		extraEnv = append(extraEnv, "FLEET_TMUX_SOCKET="+sock)
 	}
 
 	if opts.OldRecord != nil {
