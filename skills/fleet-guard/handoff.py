@@ -442,6 +442,35 @@ def _do_handoff(record: dict[str, Any], session: str,
 _KICK_BACKOFF_S = 30
 
 
+def is_drain_in_flight(agent_id: str) -> bool:
+    """Best-effort: True iff a queue file is on disk AND drain is
+    expected to land soon (this Stop will kick, or a recent kick is
+    still propagating). False means either no queue (no handoff in
+    progress) or drain has been failing for longer than the backoff
+    window (DisableAutoResume reject, legacy v1 record without cwd —
+    see internal/handoffop/handoffop.go:258).
+
+    Used by main._on_stop to decide whether to deliver inbox to a
+    committed-handoff agent. In flight: suppress (drain is about to
+    kill the agent; work would be lost — codex iter-7 P2). Failing:
+    deliver (the old agent is the only live target — codex iter-8 P1).
+    """
+    queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
+    if not queue_path.exists():
+        return False
+    sentinel = queue_path.with_name(queue_path.name + ".kicked")
+    try:
+        age = (
+            datetime.now(timezone.utc).timestamp() - sentinel.stat().st_mtime
+        )
+        return age < _KICK_BACKOFF_S
+    except FileNotFoundError:
+        # No sentinel = no kick yet. THIS Stop's tail will kick (via
+        # kick_drain_if_pending), so drain is about to run. Treat as
+        # in flight.
+        return True
+
+
 def kick_drain_if_pending(agent_id: str) -> None:
     """Public entry point: kick `fleet drain` iff this agent's queue file
     exists AND we haven't kicked it within the last _KICK_BACKOFF_S

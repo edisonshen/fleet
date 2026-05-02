@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -239,48 +240,30 @@ class TestStopHook:
         assert record["inbox_pending"] is True
 
 
-    def test_inbox_not_delivered_when_handoff_committed(
+    def test_inbox_suppressed_when_drain_in_flight(
         self, fleet_home_tmp: Path, tmp_path: Path,
         capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Codex iter-7 P2 regression. Once a handoff is committed
-        (auto-red / precompact: doc + queue already on disk), the
-        agent is in retirement. Delivering a new inbox message would
-        let the dying agent process work that the replacement can't
-        see — maybe_trigger won't rewrite the handoff doc once
-        committed, so any inbox-driven turn is invisible to the
-        replacement. Skip delivery; inbox file persists at
-        <old_id>.md so the operator can re-deliver to the
-        replacement."""
+        """Codex iter-7 P2 regression. When a handoff is committed AND
+        drain is in flight (queue on disk, no stale sentinel), the
+        agent is about to die. Don't deliver inbox: maybe_trigger
+        won't rewrite the handoff doc, so the inbox-driven turn would
+        be invisible to the replacement."""
         import handoff as fleet_handoff  # noqa: WPS433
 
-        # Seed a record already in committed state (auto-red).
         _seed_record(fleet_home_tmp,
                      handoff_type="auto-red",
                      handoff_type_at="2026-04-30T00:00:00Z")
-        # And the matching queue file (would normally exist alongside
-        # the doc when committed).
         queue_dir = fleet_home_tmp / "queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
-        (queue_dir / "spawn-fresh-agent7777.json").write_text(
-            json.dumps({
-                "schema_version": 2,
-                "old_agent_id": "agent7777",
-                "handoff_doc": "/tmp/fake.md",
-                "project": "myproj",
-                "task_id": "demo-task",
-                "new_agent_id": "newagent",
-                "new_session": "fleet-newagent",
-                "enqueued_at": "2026-04-30T00:00:00Z",
-            }) + "\n", encoding="utf-8")
-        # Drop an inbox message AFTER the handoff committed.
+        (queue_dir / "spawn-fresh-agent7777.json").write_text("{}")
+        # NO sentinel file — drain hasn't been kicked yet, so this
+        # Stop's tail will kick. is_drain_in_flight returns True.
         inbox_dir = fleet_home_tmp / "inbox"
         inbox_dir.mkdir(parents=True, exist_ok=True)
         inbox_path = inbox_dir / "agent7777.md"
         inbox_path.write_text("ship by friday", encoding="utf-8")
 
-        # Capture Popen so we can verify drain DOES kick (no
-        # injections this turn → kick fires).
         popen_calls: list[Any] = []
         monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
                             lambda argv, **_: popen_calls.append(argv) or object())
@@ -293,74 +276,96 @@ class TestStopHook:
             "transcript_path": str(_transcript(tmp_path, input_tokens=145_000)),
         }, capsys)
         assert rc == 0
-        # Inbox was NOT delivered. Agent body is empty (or just the
-        # block decision wrapper without the inbox text).
         assert "[OPERATOR] ship by friday" not in out
-        # Inbox file still on disk for replacement.
         assert inbox_path.exists()
-        # Drain DID kick — agent has no injections, so the kick
-        # gate (injections-empty) fires. Filter to drain-only since
-        # _on_stop also Popens tmux capture-pane for question detection.
         drain_calls = [c for c in popen_calls if c and c[-1] == "drain"]
-        assert len(drain_calls) == 1, (
-            f"expected drain kick on committed agent, got: {popen_calls}")
+        assert len(drain_calls) == 1
 
-    def test_kick_deferred_when_injections_present(
+    def test_inbox_delivered_when_drain_failing(
         self, fleet_home_tmp: Path, tmp_path: Path,
         capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Codex iter-6 P2 regression. If a queue file is already on disk
-        (from a prior committed handoff that didn't drain) and a new
-        inbox message arrives, the Stop hook MUST NOT kick drain — that
-        would race the inbox-driven turn the agent is about to start.
-        Drain's `/exit` would land mid-work, splitting or duplicating
-        what the agent processes. Defer until the next idle Stop."""
+        """Codex iter-8 P1 regression. When drain has been failing for
+        longer than the backoff window (DisableAutoResume opt-out,
+        legacy v1 record without cwd), the old agent stays alive
+        forever. Operator inbox MUST reach it — it's the only live
+        target. is_drain_in_flight returns False here because the
+        sentinel is older than _KICK_BACKOFF_S."""
         import handoff as fleet_handoff  # noqa: WPS433
 
-        _seed_record(fleet_home_tmp)
-        # Seed a stale queue file as if a prior Stop committed a handoff
-        # that the consumer never picked up.
+        _seed_record(fleet_home_tmp,
+                     handoff_type="auto-red",
+                     handoff_type_at="2026-04-30T00:00:00Z")
         queue_dir = fleet_home_tmp / "queue"
         queue_dir.mkdir(parents=True, exist_ok=True)
-        (queue_dir / "spawn-fresh-agent7777.json").write_text(
-            json.dumps({
-                "schema_version": 2,
-                "old_agent_id": "agent7777",
-                "handoff_doc": "/tmp/fake.md",
-                "project": "myproj",
-                "task_id": "demo-task",
-                "new_agent_id": "newagent",
-                "new_session": "fleet-newagent",
-                "enqueued_at": "2026-04-30T00:00:00Z",
-            }) + "\n", encoding="utf-8")
-        # And drop an inbox message.
+        queue_file = queue_dir / "spawn-fresh-agent7777.json"
+        queue_file.write_text("{}")
+        # Sentinel exists but is OLDER than backoff → drain has been
+        # failing repeatedly; deliver inbox to old agent.
+        sentinel = queue_file.with_name(queue_file.name + ".kicked")
+        sentinel.touch()
+        old = (
+            datetime.now(timezone.utc).timestamp()
+            - fleet_handoff._KICK_BACKOFF_S - 5
+        )
+        os.utime(sentinel, (old, old))
+
         inbox_dir = fleet_home_tmp / "inbox"
         inbox_dir.mkdir(parents=True, exist_ok=True)
-        (inbox_dir / "agent7777.md").write_text("ship by friday",
+        (inbox_dir / "agent7777.md").write_text("retry the build",
                                                 encoding="utf-8")
-
-        # Capture every Popen — autouse fixture makes it a noop, but
-        # this per-test override records calls so we can assert.
-        popen_calls: list[Any] = []
-        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
-                            lambda argv, **_: popen_calls.append(argv) or object())
-        # which() must resolve so the kick path actually reaches Popen
-        # if it fires.
-        monkeypatch.setattr(fleet_handoff.shutil, "which",
-                            lambda name: "/usr/local/bin/fleet"
-                            if name == "fleet" else None)
 
         rc, out, _ = _run({
             "hook_event_name": "Stop",
             "transcript_path": str(_transcript(tmp_path)),
         }, capsys)
         assert rc == 0
+        # Inbox WAS delivered — the agent is alive and addressable.
+        assert "[OPERATOR] retry the build" in out
+
+    def test_kick_deferred_when_inbox_and_handoff_in_same_turn(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-6 P2 regression. When inbox AND a fresh red
+        handoff land in the same Stop (queue was NOT pending coming
+        in, so iter-7's inbox-suppression doesn't fire — inbox
+        delivers normally — and maybe_trigger then writes the queue
+        on the red threshold trip), the kick must defer. Otherwise
+        drain's `/exit` would race the inbox-driven turn the agent
+        is about to start, splitting / duplicating its work."""
+        import handoff as fleet_handoff  # noqa: WPS433
+
+        _seed_record(fleet_home_tmp)
+        # No pre-existing queue file: is_drain_in_flight is False at
+        # inbox-check time, so inbox flows through normally.
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("ship by friday",
+                                                encoding="utf-8")
+
+        popen_calls: list[Any] = []
+        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
+                            lambda argv, **_: popen_calls.append(argv) or object())
+        monkeypatch.setattr(fleet_handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+
+        # 145k tokens → 72.5% → red. maybe_trigger writes queue this
+        # turn. With inbox already in injections, the iter-6 gate
+        # defers the kick to the next idle Stop.
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path, input_tokens=145_000)),
+        }, capsys)
+        assert rc == 0
         assert "[OPERATOR] ship by friday" in out
-        assert popen_calls == [], (
+        drain_calls = [c for c in popen_calls if c and c[-1] == "drain"]
+        assert drain_calls == [], (
             "drain kicked while inbox was being injected; the agent "
             f"would race its own retirement: {popen_calls}")
         # Queue file persists for the next idle Stop / TUI watcher.
-        assert (queue_dir / "spawn-fresh-agent7777.json").exists()
+        assert (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
 
 
 # -- PreCompact hook ---------------------------------------------------------
