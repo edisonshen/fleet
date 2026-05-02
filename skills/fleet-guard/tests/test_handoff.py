@@ -15,6 +15,7 @@ edge cases. See test_health.py for the FLEET_HOME redirect fixture.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -1238,6 +1239,78 @@ class TestKickDrain:
         # No queue file written; agent_id is arbitrary.
         handoff.kick_drain_if_pending("ghost-agent")
         assert calls == []
+
+    def test_kick_throttled_when_recently_kicked(
+        self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-7 P2 regression: a queue file that drain rejects
+        permanently (DisableAutoResume opt-out, legacy v1 record
+        without cwd) must not trigger a kick on every Stop. The
+        sentinel file's mtime gates re-kicks to once per
+        _KICK_BACKOFF_S so a doomed handoff doesn't fork a new
+        `fleet drain` for every assistant turn."""
+        calls = self._mock_drain_calls(monkeypatch)
+        # Manually create the queue file so kick_drain_if_pending sees
+        # something to kick. (TestKickDrain mostly drives this through
+        # maybe_trigger; here we drive it directly.)
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "spawn-fresh-throttle.json").write_text("{}")
+
+        # First call: kicks. Sentinel gets touched.
+        handoff.kick_drain_if_pending("throttle")
+        assert len(calls) == 1
+        # Second call within backoff: throttled. No new kick.
+        handoff.kick_drain_if_pending("throttle")
+        assert len(calls) == 1, (
+            f"second kick within backoff window must noop, got: {calls}")
+
+    def test_kick_resumes_after_backoff(
+        self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After _KICK_BACKOFF_S elapses, kick fires again — covering
+        the case where drain genuinely failed transiently and the
+        operator wants the next Stop to retry. Simulate by rewinding
+        the sentinel's mtime."""
+        calls = self._mock_drain_calls(monkeypatch)
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        queue_path = queue_dir / "spawn-fresh-resume.json"
+        queue_path.write_text("{}")
+
+        handoff.kick_drain_if_pending("resume")
+        assert len(calls) == 1
+
+        # Rewind sentinel mtime to BACKOFF + 1s ago.
+        sentinel = queue_path.with_name(queue_path.name + ".kicked")
+        old = (
+            datetime.now(timezone.utc).timestamp()
+            - handoff._KICK_BACKOFF_S - 1
+        )
+        os.utime(sentinel, (old, old))
+
+        handoff.kick_drain_if_pending("resume")
+        assert len(calls) == 2, (
+            f"expected re-kick after backoff elapsed, got {len(calls)}")
+
+    def test_stale_sentinel_cleaned_when_queue_consumed(
+        self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When drain consumes the queue file, the sentinel is stale.
+        Leaving it behind would throttle a NEW handoff that lands
+        within _KICK_BACKOFF_S of the previous one. kick_drain_if_pending
+        cleans up sentinels whose queue file is gone."""
+        self._mock_drain_calls(monkeypatch)
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        # Sentinel from a prior, since-consumed handoff.
+        sentinel = queue_dir / "spawn-fresh-cleanup.json.kicked"
+        sentinel.touch()
+        assert sentinel.exists()
+
+        # No queue file → kick_drain_if_pending noops AND cleans up.
+        handoff.kick_drain_if_pending("cleanup")
+        assert not sentinel.exists()
 
 
 # -- write_queue schema ------------------------------------------------------

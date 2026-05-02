@@ -113,15 +113,27 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         context_source="hook",
     )
 
-    inbox_body = inbox.read_pending(agent_id)
-    if inbox_body is not None:
-        injections.append(inbox.deliver(inbox_body))
-        # Only clear inbox_pending on a successful archive. If the rename
-        # fails, the file persists and gets re-delivered next fire — the
-        # flag must stay set so the TUI's banner agrees with the actual
-        # state of disk.
-        if inbox.archive(agent_id):
-            health.update_record(agent_id, inbox_pending=False)
+    # When handoff is already committed (auto-red / precompact: doc +
+    # queue file already on disk), the agent is in retirement —
+    # drain will spawn the replacement and kill this session. Don't
+    # deliver inbox to a dying agent: maybe_trigger won't rewrite the
+    # handoff doc once committed, so any work the agent does on the
+    # injected inbox is invisible to the replacement (codex iter-7
+    # P2 — extra turn not captured anywhere). Inbox file persists at
+    # ~/.fleet/inbox/<old_id>.md; operator re-delivers to replacement
+    # if needed.
+    record = health.read_record(agent_id)
+    is_committed = record is not None and handoff._is_handoff_committed(record)
+    if not is_committed:
+        inbox_body = inbox.read_pending(agent_id)
+        if inbox_body is not None:
+            injections.append(inbox.deliver(inbox_body))
+            # Only clear inbox_pending on a successful archive. If the
+            # rename fails, the file persists and gets re-delivered next
+            # fire — the flag must stay set so the TUI's banner agrees
+            # with the actual state of disk.
+            if inbox.archive(agent_id):
+                health.update_record(agent_id, inbox_pending=False)
 
     handoff_inject = handoff.maybe_trigger(
         payload, agent_id=agent_id, session=session,

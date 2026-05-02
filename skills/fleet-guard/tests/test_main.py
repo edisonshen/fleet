@@ -239,6 +239,72 @@ class TestStopHook:
         assert record["inbox_pending"] is True
 
 
+    def test_inbox_not_delivered_when_handoff_committed(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-7 P2 regression. Once a handoff is committed
+        (auto-red / precompact: doc + queue already on disk), the
+        agent is in retirement. Delivering a new inbox message would
+        let the dying agent process work that the replacement can't
+        see — maybe_trigger won't rewrite the handoff doc once
+        committed, so any inbox-driven turn is invisible to the
+        replacement. Skip delivery; inbox file persists at
+        <old_id>.md so the operator can re-deliver to the
+        replacement."""
+        import handoff as fleet_handoff  # noqa: WPS433
+
+        # Seed a record already in committed state (auto-red).
+        _seed_record(fleet_home_tmp,
+                     handoff_type="auto-red",
+                     handoff_type_at="2026-04-30T00:00:00Z")
+        # And the matching queue file (would normally exist alongside
+        # the doc when committed).
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        (queue_dir / "spawn-fresh-agent7777.json").write_text(
+            json.dumps({
+                "schema_version": 2,
+                "old_agent_id": "agent7777",
+                "handoff_doc": "/tmp/fake.md",
+                "project": "myproj",
+                "task_id": "demo-task",
+                "new_agent_id": "newagent",
+                "new_session": "fleet-newagent",
+                "enqueued_at": "2026-04-30T00:00:00Z",
+            }) + "\n", encoding="utf-8")
+        # Drop an inbox message AFTER the handoff committed.
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        inbox_path = inbox_dir / "agent7777.md"
+        inbox_path.write_text("ship by friday", encoding="utf-8")
+
+        # Capture Popen so we can verify drain DOES kick (no
+        # injections this turn → kick fires).
+        popen_calls: list[Any] = []
+        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
+                            lambda argv, **_: popen_calls.append(argv) or object())
+        monkeypatch.setattr(fleet_handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path, input_tokens=145_000)),
+        }, capsys)
+        assert rc == 0
+        # Inbox was NOT delivered. Agent body is empty (or just the
+        # block decision wrapper without the inbox text).
+        assert "[OPERATOR] ship by friday" not in out
+        # Inbox file still on disk for replacement.
+        assert inbox_path.exists()
+        # Drain DID kick — agent has no injections, so the kick
+        # gate (injections-empty) fires. Filter to drain-only since
+        # _on_stop also Popens tmux capture-pane for question detection.
+        drain_calls = [c for c in popen_calls if c and c[-1] == "drain"]
+        assert len(drain_calls) == 1, (
+            f"expected drain kick on committed agent, got: {popen_calls}")
+
     def test_kick_deferred_when_injections_present(
         self, fleet_home_tmp: Path, tmp_path: Path,
         capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,

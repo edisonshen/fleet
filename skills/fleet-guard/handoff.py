@@ -439,19 +439,60 @@ def _do_handoff(record: dict[str, Any], session: str,
     return True
 
 
+_KICK_BACKOFF_S = 30
+
+
 def kick_drain_if_pending(agent_id: str) -> None:
     """Public entry point: kick `fleet drain` iff this agent's queue file
-    exists. Called by main._on_stop / _on_precompact AFTER all hook
-    writes complete, so drain's archive can't race the hook's
-    read-modify-write of the agent record (codex iter-5 P1).
+    exists AND we haven't kicked it within the last _KICK_BACKOFF_S
+    seconds. Called by main._on_stop / _on_precompact AFTER all hook
+    writes complete (codex iter-5 P1: avoid the archive/update_record
+    race).
 
-    Idempotent: noops when no queue file is pending. Safe to call on
-    every Stop fire — the filesystem stat is the only cost.
+    Throttle rationale: some drain failures are permanent and
+    intentionally leave the queue file in place — DisableAutoResume
+    agents are rejected by spawnAndRetire (interactive `fleet handoff`
+    is the supported path), and legacy v1 records without cwd can hit
+    similar paths. Without throttling, every Stop forks a doomed
+    `fleet drain` — log spam, wasted cycles, no signal to the
+    operator since stdio goes to DEVNULL (codex iter-7 P2). The
+    sentinel file's mtime carries cross-process state without
+    needing the agent record schema.
+
+    Idempotent + cheap when no queue file pending — safe to call on
+    every Stop fire. Stale sentinel from a long-completed drain is
+    cleaned up here too.
     """
     queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
+    sentinel = queue_path.with_name(queue_path.name + ".kicked")
     if not queue_path.exists():
+        # Drain consumed the queue; clean up the sentinel so a future
+        # handoff re-fires immediately instead of being throttled by
+        # an unrelated past kick.
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
         return
+    try:
+        last_kick_age = (
+            datetime.now(timezone.utc).timestamp()
+            - sentinel.stat().st_mtime
+        )
+        if last_kick_age < _KICK_BACKOFF_S:
+            return
+    except FileNotFoundError:
+        pass  # never kicked; proceed
     _kick_drain()
+    try:
+        sentinel.touch()
+    except OSError:
+        # Best-effort: if we can't stamp the sentinel, the worst
+        # outcome is we re-kick on the next Stop. No correctness
+        # impact.
+        pass
 
 
 def _kick_drain() -> None:
