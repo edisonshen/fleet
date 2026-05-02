@@ -37,6 +37,25 @@ def fleet_home_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def _silence_kick_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Producer-triggers-drain (`_do_handoff` calls `_kick_drain` after a
+    successful queue write) launches a real `fleet drain` subprocess
+    when `fleet` is on PATH — which it is in dev / CI / homebrew
+    environments. That drain reads FLEET_HOME, finds the queue file
+    the test just wrote, and deletes it, racing with the test's queue
+    assertions. Module-level no-op subprocess.Popen eliminates the race
+    for every test by default; TestKickDrain re-patches subprocess.Popen
+    to its own capturing fake (per-test monkeypatch overrides autouse)."""
+
+    def _noop_popen(*_args: Any, **_kwargs: Any) -> Any:
+        class _FakeProc:
+            pass
+        return _FakeProc()
+
+    monkeypatch.setattr(handoff.subprocess, "Popen", _noop_popen)
+
+
 def _seed_record(home: Path, agent_id: str, **overrides: Any) -> Path:
     """Same shape as test_health._seed_record — duplicated here intentionally
     so test files don't depend on each other through implicit imports."""
