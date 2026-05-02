@@ -180,14 +180,19 @@ def _on_stop(payload: dict, agent_id: str, session: str,
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     """PreCompact fires just before context compaction. Stdout is ignored
     by Claude Code on this hook — the compaction is already in motion —
-    so emergency_trigger only writes the doc + queue."""
+    so emergency_trigger only writes the doc + queue.
+
+    No drain kick here (codex iter-9 P1): PreCompact runs while the
+    agent is mid-compaction, NOT idle like Stop. Kicking drain from
+    this hook would have drain's `/exit` land during the agent's
+    compaction turn — interrupting it, potentially mid-tool-call, so
+    side effects can land that the handoff doc (written before
+    compaction started) won't reflect. That risks duplicated or
+    silently lost work in the replacement. Queue file persists; the
+    next Stop after compaction completes will pick it up via
+    _on_stop's tail kick. If compaction hangs / crashes, the TUI
+    fsnotify watcher remains the long-tail consumer."""
     handoff.emergency_trigger(payload, agent_id=agent_id, session=session)
-    # Same ordering rationale as _on_stop: kick drain after the hook's
-    # last write. emergency_trigger today does no follow-up writes
-    # itself, but keeping the kick at the hook's tail is the
-    # invariant that makes future writes safe (and matches _on_stop's
-    # shape, so the two paths don't diverge).
-    handoff.kick_drain_if_pending(agent_id)
 
 
 def _on_user_prompt_submit(agent_id: str) -> None:

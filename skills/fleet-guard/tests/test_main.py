@@ -323,6 +323,50 @@ class TestStopHook:
         # Inbox WAS delivered — the agent is alive and addressable.
         assert "[OPERATOR] retry the build" in out
 
+    def test_inbox_delivered_when_kick_can_never_launch(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-9 P2 regression. If the kick path can't launch
+        anything (no FLEET_BIN, no fleet on PATH), no sentinel ever
+        appears — yet the queue file persists. Without a fallback,
+        is_drain_in_flight would loop on the "no sentinel = drain
+        about to run" path and silently suppress every inbox. Queue
+        mtime carries the signal: a queue file older than the backoff
+        window with no sentinel means kick is permanently broken and
+        the old agent is the only live target."""
+        import handoff as fleet_handoff  # noqa: WPS433
+
+        _seed_record(fleet_home_tmp,
+                     handoff_type="auto-red",
+                     handoff_type_at="2026-04-30T00:00:00Z")
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        queue_file = queue_dir / "spawn-fresh-agent7777.json"
+        queue_file.write_text("{}")
+        # No sentinel; queue mtime backdated past backoff.
+        old = (
+            datetime.now(timezone.utc).timestamp()
+            - fleet_handoff._KICK_BACKOFF_S - 5
+        )
+        os.utime(queue_file, (old, old))
+
+        # Kick path totally broken: no FLEET_BIN, no fleet on PATH.
+        monkeypatch.delenv("FLEET_BIN", raising=False)
+        monkeypatch.setattr(fleet_handoff.shutil, "which", lambda _name: None)
+
+        inbox_dir = fleet_home_tmp / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        (inbox_dir / "agent7777.md").write_text("retry the build",
+                                                encoding="utf-8")
+
+        rc, out, _ = _run({
+            "hook_event_name": "Stop",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        assert "[OPERATOR] retry the build" in out
+
     def test_kick_deferred_when_inbox_and_handoff_in_same_turn(
         self, fleet_home_tmp: Path, tmp_path: Path,
         capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
@@ -387,6 +431,39 @@ class TestPreCompactHook:
         assert len(docs) == 1
         body = docs[0].read_bytes()
         assert b'handoff_type: "precompact"' in body
+
+    def test_does_not_kick_drain(
+        self, fleet_home_tmp: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-9 P1 regression. PreCompact fires while the
+        agent is mid-compaction, NOT idle. Kicking drain here would
+        send `/exit` to a session that's actively running its
+        compaction turn — interrupts mid-tool-call, producing side
+        effects the handoff doc (written before compaction started)
+        won't reflect. Queue file persists; the next Stop after
+        compaction completes will pick it up."""
+        import handoff as fleet_handoff  # noqa: WPS433
+
+        _seed_record(fleet_home_tmp)
+        popen_calls: list[Any] = []
+        monkeypatch.setattr(fleet_handoff.subprocess, "Popen",
+                            lambda argv, **_: popen_calls.append(argv) or object())
+        monkeypatch.setattr(fleet_handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+
+        rc, _, _ = _run({
+            "hook_event_name": "PreCompact",
+            "transcript_path": str(_transcript(tmp_path)),
+        }, capsys)
+        assert rc == 0
+        drain_calls = [c for c in popen_calls if c and c[-1] == "drain"]
+        assert drain_calls == [], (
+            "drain kicked from PreCompact would interrupt the agent's "
+            f"compaction turn: {popen_calls}")
+        # But the queue file IS on disk for the next Stop / TUI to pick up.
+        assert (fleet_home_tmp / "queue" / "spawn-fresh-agent7777.json").exists()
 
 
 # -- SessionStart hook -------------------------------------------------------

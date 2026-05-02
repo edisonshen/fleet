@@ -1293,6 +1293,42 @@ class TestKickDrain:
         assert len(calls) == 2, (
             f"expected re-kick after backoff elapsed, got {len(calls)}")
 
+    def test_failed_kick_does_not_stamp_sentinel(
+        self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-9 P2 regression. If _kick_drain can't actually
+        launch (no fleet binary on PATH and no FLEET_BIN), the
+        sentinel must NOT be stamped. Otherwise is_drain_in_flight
+        would suppress inbox to a still-live agent for the next
+        _KICK_BACKOFF_S even though no drain is coming to retire it."""
+        # No fleet binary anywhere → _kick_drain returns False.
+        monkeypatch.delenv("FLEET_BIN", raising=False)
+        monkeypatch.setattr(handoff.shutil, "which", lambda _name: None)
+        # Ensure Popen is captured so test fails loudly if anything tries to launch.
+        monkeypatch.setattr(handoff.subprocess, "Popen",
+                            lambda *a, **kw: pytest.fail(
+                                "Popen should not run when fleet binary missing"))
+
+        queue_dir = fleet_home_tmp / "queue"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        queue_path = queue_dir / "spawn-fresh-nokick.json"
+        queue_path.write_text("{}")
+
+        handoff.kick_drain_if_pending("nokick")
+
+        sentinel = queue_path.with_name(queue_path.name + ".kicked")
+        assert not sentinel.exists(), (
+            "sentinel was stamped despite kick failing — inbox to a "
+            "still-live agent would be silently suppressed")
+        # is_drain_in_flight uses the sentinel check; with no sentinel
+        # it falls back to the "no kick yet" path, returning True. But
+        # since no kick will EVER succeed in this state, the next
+        # Stop's tail kick will also fail, sentinel stays absent, and
+        # the cycle keeps inbox flowing if drain is genuinely impossible.
+        # We assert the immediate "no sentinel after a failed kick"
+        # invariant; downstream behavior is covered by the inbox tests
+        # in test_main.py.
+
     def test_stale_sentinel_cleaned_when_queue_consumed(
         self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

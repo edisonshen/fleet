@@ -446,29 +446,35 @@ def is_drain_in_flight(agent_id: str) -> bool:
     """Best-effort: True iff a queue file is on disk AND drain is
     expected to land soon (this Stop will kick, or a recent kick is
     still propagating). False means either no queue (no handoff in
-    progress) or drain has been failing for longer than the backoff
-    window (DisableAutoResume reject, legacy v1 record without cwd —
-    see internal/handoffop/handoffop.go:258).
+    progress) or drain has been failing/blocked for longer than the
+    backoff window (DisableAutoResume reject and legacy v1 record
+    without cwd both leave queue intact — see
+    internal/handoffop/handoffop.go:258; missing fleet binary leaves
+    the kick path unable to launch at all).
 
     Used by main._on_stop to decide whether to deliver inbox to a
     committed-handoff agent. In flight: suppress (drain is about to
     kill the agent; work would be lost — codex iter-7 P2). Failing:
-    deliver (the old agent is the only live target — codex iter-8 P1).
+    deliver (the old agent is the only live target — codex iter-8 P1,
+    iter-9 P2).
     """
     queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
-    if not queue_path.exists():
+    try:
+        queue_mtime = queue_path.stat().st_mtime
+    except FileNotFoundError:
         return False
     sentinel = queue_path.with_name(queue_path.name + ".kicked")
+    now = datetime.now(timezone.utc).timestamp()
     try:
-        age = (
-            datetime.now(timezone.utc).timestamp() - sentinel.stat().st_mtime
-        )
-        return age < _KICK_BACKOFF_S
+        return (now - sentinel.stat().st_mtime) < _KICK_BACKOFF_S
     except FileNotFoundError:
-        # No sentinel = no kick yet. THIS Stop's tail will kick (via
-        # kick_drain_if_pending), so drain is about to run. Treat as
-        # in flight.
-        return True
+        # No sentinel = kick never succeeded. Could be "queue just
+        # written, this Stop's tail will kick" OR "kick can't launch
+        # at all (no fleet binary)." Distinguish by queue mtime: a
+        # fresh queue is in flight; an old queue without a sentinel
+        # means the kick is permanently failing — fall through to
+        # deliver inbox to the still-live agent (codex iter-9 P2).
+        return (now - queue_mtime) < _KICK_BACKOFF_S
 
 
 def kick_drain_if_pending(agent_id: str) -> None:
@@ -514,7 +520,15 @@ def kick_drain_if_pending(agent_id: str) -> None:
             return
     except FileNotFoundError:
         pass  # never kicked; proceed
-    _kick_drain()
+    if not _kick_drain():
+        # Kick failed (no fleet binary, Popen blew up). Don't stamp
+        # the sentinel — is_drain_in_flight would then suppress
+        # inbox to a still-live agent for _KICK_BACKOFF_S seconds
+        # even though no drain is actually about to retire it
+        # (codex iter-9 P2). Falling through here means the next
+        # Stop will retry the kick path, and inbox keeps reaching
+        # the only live target.
+        return
     try:
         sentinel.touch()
     except OSError:
@@ -524,9 +538,13 @@ def kick_drain_if_pending(agent_id: str) -> None:
         pass
 
 
-def _kick_drain() -> None:
+def _kick_drain() -> bool:
     """Fire a detached `fleet drain` so the handoff completes end-to-end
-    without depending on a running TUI watcher.
+    without depending on a running TUI watcher. Returns True iff
+    Popen actually launched a drain process; False on missing binary
+    or Popen failure. Caller uses this to decide whether to stamp the
+    in-flight sentinel (codex iter-9 P2 — don't suppress inbox on a
+    drain that never started).
 
     Detached: start_new_session=True puts drain in its own process group
     so it survives if claude (the parent of fleet-guard) exits between
@@ -546,14 +564,14 @@ def _kick_drain() -> None:
        of FLEET_BIN, and any edge case where the stamped path went
        stale (e.g. go run temp build evaporated; in checkout-only
        setups where `fleet` is also not on PATH, fall through).
-    3. Noop. Queue file stays on disk and any later drain run consumes
-       it. The skill must never raise.
+    3. Noop, return False. Queue file stays on disk and any later
+       drain run consumes it. The skill must never raise.
     """
     fleet_bin = os.environ.get("FLEET_BIN")
     if not fleet_bin or not os.access(fleet_bin, os.X_OK):
         fleet_bin = shutil.which("fleet")
     if not fleet_bin:
-        return
+        return False
     try:
         subprocess.Popen(
             [fleet_bin, "drain"],
@@ -562,11 +580,12 @@ def _kick_drain() -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        return True
     except Exception:
         # Producer's job is done (queue file is on disk). Drain is a
-        # convenience trigger; failure here just means we wait for the
-        # next consumer.
-        pass
+        # convenience trigger; failure here just means we wait for
+        # the next consumer.
+        return False
 
 
 def _clear_pending(agent_id: str) -> None:
