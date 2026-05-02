@@ -37,25 +37,6 @@ def fleet_home_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-@pytest.fixture(autouse=True)
-def _silence_kick_drain(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Producer-triggers-drain (`_do_handoff` calls `_kick_drain` after a
-    successful queue write) launches a real `fleet drain` subprocess
-    when `fleet` is on PATH — which it is in dev / CI / homebrew
-    environments. That drain reads FLEET_HOME, finds the queue file
-    the test just wrote, and deletes it, racing with the test's queue
-    assertions. Module-level no-op subprocess.Popen eliminates the race
-    for every test by default; TestKickDrain re-patches subprocess.Popen
-    to its own capturing fake (per-test monkeypatch overrides autouse)."""
-
-    def _noop_popen(*_args: Any, **_kwargs: Any) -> Any:
-        class _FakeProc:
-            pass
-        return _FakeProc()
-
-    monkeypatch.setattr(handoff.subprocess, "Popen", _noop_popen)
-
-
 def _seed_record(home: Path, agent_id: str, **overrides: Any) -> Path:
     """Same shape as test_health._seed_record — duplicated here intentionally
     so test files don't depend on each other through implicit imports."""
@@ -972,13 +953,16 @@ class TestEmergencyTrigger:
 # -- producer-triggers-consumer (drain auto-kick) ----------------------------
 
 class TestKickDrain:
-    """When _do_handoff successfully writes the queue file, fleet-guard
-    fires `fleet drain` as a detached subprocess so the handoff completes
-    end-to-end without depending on a running TUI watcher / operator
-    intervention. Dogfood report: "context >50%, injection happened, but
-    no kill, no new instance" on a laptop where fleet TUI wasn't running.
-    The TUI's fsnotify watcher is the OLD consumer; this is the producer
-    triggering its own consumer."""
+    """End-to-end producer-triggers-drain flow: maybe_trigger /
+    emergency_trigger writes the queue file synchronously, then the
+    caller (main._on_stop / _on_precompact) invokes
+    kick_drain_if_pending — that public entry point launches `fleet
+    drain` iff a queue file exists. The kick is deferred to the end
+    of the Stop hook so drain's archive can't race the hook's tail
+    writes (codex iter-5 P1). Dogfood origin: "context >50%, injection
+    happened, but no kill, no new instance" on a laptop where fleet
+    TUI wasn't running — the TUI's fsnotify watcher is the OLD
+    consumer; this is the producer triggering its own consumer."""
 
     def _mock_drain_calls(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         """Capture every Popen invocation so tests can assert on argv.
@@ -1026,6 +1010,10 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
             agent_id="kick1", session="fleet-kick1",
         )
+        # Caller (main._on_stop) invokes the kick after its own writes
+        # finish. Without this call the queue file lingers; the test
+        # would silently pass on `assert calls == []`.
+        handoff.kick_drain_if_pending("kick1")
         assert len(calls) == 1, f"expected 1 drain kick, got {len(calls)}: {calls}"
         assert calls[0] == ["/usr/local/bin/fleet", "drain"]
 
@@ -1040,6 +1028,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kick2", session="fleet-kick2",
         )
+        handoff.kick_drain_if_pending("kick2")
         assert len(calls) == 1
         assert calls[0][-1] == "drain"
 
@@ -1056,6 +1045,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path))},
             agent_id="kick3", session="fleet-kick3",
         )
+        handoff.kick_drain_if_pending("kick3")
         assert len(calls) == 1
         assert calls[0][-1] == "drain"
 
@@ -1074,6 +1064,8 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kick4", session="fleet-kick4",
         )
+        # write_queue returned False → no queue file on disk → kick noops.
+        handoff.kick_drain_if_pending("kick4")
         assert calls == [], f"drain must not kick on queue-write failure, got: {calls}"
 
     def test_silent_when_fleet_binary_missing(
@@ -1094,6 +1086,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kick5", session="fleet-kick5",
         )
+        handoff.kick_drain_if_pending("kick5")
         assert popen_calls == [], "Popen must not run when fleet binary is absent"
 
     def test_fleet_bin_env_preferred_over_path(
@@ -1124,6 +1117,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kickbin1", session="fleet-kickbin1",
         )
+        handoff.kick_drain_if_pending("kickbin1")
         assert calls == [[str(stamped), "drain"]]
 
     def test_fleet_bin_falls_back_when_path_missing(
@@ -1149,6 +1143,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kickbin2", session="fleet-kickbin2",
         )
+        handoff.kick_drain_if_pending("kickbin2")
         assert calls == [["/usr/local/bin/fleet", "drain"]]
 
     def test_fleet_bin_falls_back_when_not_executable(
@@ -1177,6 +1172,7 @@ class TestKickDrain:
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kickbin3", session="fleet-kickbin3",
         )
+        handoff.kick_drain_if_pending("kickbin3")
         assert calls == [["/usr/local/bin/fleet", "drain"]]
 
     def test_popen_failure_is_swallowed(
@@ -1196,14 +1192,52 @@ class TestKickDrain:
         monkeypatch.setattr(handoff.subprocess, "Popen", boom)
 
         _seed_record(fleet_home_tmp, "kick6")
-        # Should not raise; record the queue file is what matters.
+        # Should not raise; the queue file is what matters.
         handoff.maybe_trigger(
             {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
             agent_id="kick6", session="fleet-kick6",
         )
+        handoff.kick_drain_if_pending("kick6")
         # Queue file landed despite drain kick failure.
         queues = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
         assert len(queues) == 1
+
+
+    def test_maybe_trigger_does_not_kick_on_its_own(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression for codex iter-5 P1: _do_handoff (called via
+        maybe_trigger) must NOT kick drain. The Stop hook still has
+        capture_recent + a final health.update_record after this
+        returns; if drain ran in parallel and archived the agent
+        record between update_record's read and write, the os.replace
+        would resurrect it. Kick belongs at the hook tail, via
+        kick_drain_if_pending."""
+        calls = self._mock_drain_calls(monkeypatch)
+        _seed_record(fleet_home_tmp, "noracekick")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="noracekick", session="fleet-noracekick",
+        )
+        # Queue file MUST be on disk (the producer write succeeded).
+        queues = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
+        assert len(queues) == 1
+        # But drain MUST NOT have been kicked. The hook's caller does
+        # that at the end, after its own writes finish.
+        assert calls == [], f"maybe_trigger kicked drain inline: {calls}"
+
+    def test_kick_drain_if_pending_noops_without_queue_file(
+        self, fleet_home_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No queue file → no kick. The hook tail calls
+        kick_drain_if_pending unconditionally; on Stops where no
+        handoff fired, the function must noop without spending a
+        Popen. Cheap stat in the common case."""
+        calls = self._mock_drain_calls(monkeypatch)
+        # No queue file written; agent_id is arbitrary.
+        handoff.kick_drain_if_pending("ghost-agent")
+        assert calls == []
 
 
 # -- write_queue schema ------------------------------------------------------

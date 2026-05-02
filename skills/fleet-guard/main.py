@@ -150,12 +150,26 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         has_pending_question=has_question,
     )
 
+    # Kick drain LAST, after every hook write to the agent record has
+    # landed. If we kicked earlier (inside _do_handoff), drain's
+    # `oldRec.Archive()` could rename agents/<id>.json between
+    # update_record's read and its os.replace, recreating an archived
+    # record as live (codex iter-5 P1). Idempotent + cheap when no
+    # queue file is pending — safe to call unconditionally.
+    handoff.kick_drain_if_pending(agent_id)
+
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     """PreCompact fires just before context compaction. Stdout is ignored
     by Claude Code on this hook — the compaction is already in motion —
     so emergency_trigger only writes the doc + queue."""
     handoff.emergency_trigger(payload, agent_id=agent_id, session=session)
+    # Same ordering rationale as _on_stop: kick drain after the hook's
+    # last write. emergency_trigger today does no follow-up writes
+    # itself, but keeping the kick at the hook's tail is the
+    # invariant that makes future writes safe (and matches _on_stop's
+    # shape, so the two paths don't diverge).
+    handoff.kick_drain_if_pending(agent_id)
 
 
 def _on_user_prompt_submit(agent_id: str) -> None:

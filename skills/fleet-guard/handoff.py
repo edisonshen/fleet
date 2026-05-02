@@ -430,13 +430,28 @@ def _do_handoff(record: dict[str, Any], session: str,
         ts=ts,
     ):
         return False
-    # Producer triggers consumer: kick off `fleet drain` as a detached
-    # subprocess so the handoff completes (kill old, spawn replacement)
-    # without requiring a running TUI watcher or operator intervention.
-    # Best-effort, silent on failure — the queue file stays on disk and
-    # the next drain run picks it up.
-    _kick_drain()
+    # NOTE: drain is NOT kicked here. main._on_stop() still has tail
+    # writes (capture_recent + final health.update_record) after
+    # maybe_trigger() returns; if drain ran in parallel and archived
+    # the agent record between update_record's read and write, the
+    # os.replace would resurrect it (codex iter-5 P1). Caller invokes
+    # `kick_drain_if_pending(agent_id)` after all hook writes finish.
     return True
+
+
+def kick_drain_if_pending(agent_id: str) -> None:
+    """Public entry point: kick `fleet drain` iff this agent's queue file
+    exists. Called by main._on_stop / _on_precompact AFTER all hook
+    writes complete, so drain's archive can't race the hook's
+    read-modify-write of the agent record (codex iter-5 P1).
+
+    Idempotent: noops when no queue file is pending. Safe to call on
+    every Stop fire — the filesystem stat is the only cost.
+    """
+    queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
+    if not queue_path.exists():
+        return
+    _kick_drain()
 
 
 def _kick_drain() -> None:
