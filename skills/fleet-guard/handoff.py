@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -429,7 +430,46 @@ def _do_handoff(record: dict[str, Any], session: str,
         ts=ts,
     ):
         return False
+    # Producer triggers consumer: kick off `fleet drain` as a detached
+    # subprocess so the handoff completes (kill old, spawn replacement)
+    # without requiring a running TUI watcher or operator intervention.
+    # Best-effort, silent on failure — the queue file stays on disk and
+    # the next drain run picks it up.
+    _kick_drain()
     return True
+
+
+def _kick_drain() -> None:
+    """Fire a detached `fleet drain` so the handoff completes end-to-end
+    without depending on a running TUI watcher.
+
+    Detached: start_new_session=True puts drain in its own process group
+    so it survives if claude (the parent of fleet-guard) exits between
+    queue write and drain finish. DEVNULL on all three streams keeps
+    drain's output out of claude's altscreen tty (claude renders that
+    pane; stray writes corrupt the rendering).
+
+    Silent on missing `fleet` binary (rare — operator installed via brew
+    so fleet is on PATH, but if not, the queue file persists for any
+    later drain to consume). Silent on Popen failure for the same
+    reason: the contract is "skill never blocks the host turn."
+    """
+    fleet_bin = shutil.which("fleet")
+    if not fleet_bin:
+        return
+    try:
+        subprocess.Popen(
+            [fleet_bin, "drain"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        # Producer's job is done (queue file is on disk). Drain is a
+        # convenience trigger; failure here just means we wait for the
+        # next consumer.
+        pass
 
 
 def _clear_pending(agent_id: str) -> None:

@@ -950,6 +950,148 @@ class TestEmergencyTrigger:
         assert len(docs) == 0
 
 
+# -- producer-triggers-consumer (drain auto-kick) ----------------------------
+
+class TestKickDrain:
+    """When _do_handoff successfully writes the queue file, fleet-guard
+    fires `fleet drain` as a detached subprocess so the handoff completes
+    end-to-end without depending on a running TUI watcher / operator
+    intervention. Dogfood report: "context >50%, injection happened, but
+    no kill, no new instance" on a laptop where fleet TUI wasn't running.
+    The TUI's fsnotify watcher is the OLD consumer; this is the producer
+    triggering its own consumer."""
+
+    def _mock_drain_calls(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+        """Capture every Popen invocation so tests can assert on argv.
+        Returns a list that gets appended to as Popen is called."""
+        calls: list[list[str]] = []
+
+        # which() must return a path so _kick_drain doesn't bail early.
+        monkeypatch.setattr(handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet" if name == "fleet" else None)
+
+        def fake_popen(argv, **kwargs):
+            calls.append(argv)
+            # Return something Popen-shaped enough to not crash callers
+            # if they inspect attrs (we don't, but defensive).
+            class _FakeProc:
+                pass
+            return _FakeProc()
+
+        monkeypatch.setattr(handoff.subprocess, "Popen", fake_popen)
+        return calls
+
+    def test_yellow_milestone_kicks_drain(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Yellow + MILESTONE writes doc + queue → drain auto-kicks."""
+        calls = self._mock_drain_calls(monkeypatch)
+        _seed_record(fleet_home_tmp, "kick1",
+                     handoff_type=handoff.TYPE_AUTO_YELLOW,
+                     handoff_type_at=health.now_rfc3339())
+        fake_tmux.output = (
+            f"{handoff.HANDOFF_REQUESTED}: wrap up\nMILESTONE\n"
+        )
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=110_000))},
+            agent_id="kick1", session="fleet-kick1",
+        )
+        assert len(calls) == 1, f"expected 1 drain kick, got {len(calls)}: {calls}"
+        assert calls[0] == ["/usr/local/bin/fleet", "drain"]
+
+    def test_red_kicks_drain(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Red emergency writes doc + queue → drain auto-kicks."""
+        calls = self._mock_drain_calls(monkeypatch)
+        _seed_record(fleet_home_tmp, "kick2")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kick2", session="fleet-kick2",
+        )
+        assert len(calls) == 1
+        assert calls[0][-1] == "drain"
+
+    def test_precompact_kicks_drain(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """PreCompact emergency_trigger also writes the queue, so it
+        too must kick drain — without this the operator's most urgent
+        handoff path (compaction imminent) silently piles up."""
+        calls = self._mock_drain_calls(monkeypatch)
+        _seed_record(fleet_home_tmp, "kick3")
+        handoff.emergency_trigger(
+            {"transcript_path": str(_transcript(tmp_path))},
+            agent_id="kick3", session="fleet-kick3",
+        )
+        assert len(calls) == 1
+        assert calls[0][-1] == "drain"
+
+    def test_no_kick_when_queue_write_fails(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If write_queue fails, _do_handoff returns False and the kick
+        must NOT fire. Otherwise drain runs against a missing queue
+        file and either errors or silently noops — both are wasted
+        work and noise."""
+        calls = self._mock_drain_calls(monkeypatch)
+        _seed_record(fleet_home_tmp, "kick4")
+        monkeypatch.setattr(handoff, "write_queue", lambda **_: False)
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kick4", session="fleet-kick4",
+        )
+        assert calls == [], f"drain must not kick on queue-write failure, got: {calls}"
+
+    def test_silent_when_fleet_binary_missing(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If `fleet` isn't on PATH (rare — operator installed via brew),
+        _kick_drain noops silently. The queue file stays on disk and
+        any later drain run consumes it. The skill must never raise."""
+        # which() returns None → no Popen call.
+        monkeypatch.setattr(handoff.shutil, "which", lambda _name: None)
+        popen_calls: list[Any] = []
+        monkeypatch.setattr(handoff.subprocess, "Popen",
+                            lambda *a, **kw: popen_calls.append(a) or None)
+        _seed_record(fleet_home_tmp, "kick5")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kick5", session="fleet-kick5",
+        )
+        assert popen_calls == [], "Popen must not run when fleet binary is absent"
+
+    def test_popen_failure_is_swallowed(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Popen raising (rare: kernel resource limits, transient sandbox
+        errors) must not propagate — the producer's job is done as soon
+        as the queue file lands. Drain failures are recoverable; skill
+        crashes are not (host turn blocks)."""
+        monkeypatch.setattr(handoff.shutil, "which",
+                            lambda _name: "/usr/local/bin/fleet")
+
+        def boom(*_a, **_kw):
+            raise OSError("simulated Popen failure")
+        monkeypatch.setattr(handoff.subprocess, "Popen", boom)
+
+        _seed_record(fleet_home_tmp, "kick6")
+        # Should not raise; record the queue file is what matters.
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kick6", session="fleet-kick6",
+        )
+        # Queue file landed despite drain kick failure.
+        queues = list((fleet_home_tmp / "queue").glob("spawn-fresh-*.json"))
+        assert len(queues) == 1
+
+
 # -- write_queue schema ------------------------------------------------------
 
 class TestWriteQueue:
