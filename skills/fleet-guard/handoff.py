@@ -449,12 +449,21 @@ def _kick_drain() -> None:
     drain's output out of claude's altscreen tty (claude renders that
     pane; stray writes corrupt the rendering).
 
-    Silent on missing `fleet` binary (rare — operator installed via brew
-    so fleet is on PATH, but if not, the queue file persists for any
-    later drain to consume). Silent on Popen failure for the same
-    reason: the contract is "skill never blocks the host turn."
+    Resolution order:
+    1. `FLEET_BIN` env (stamped by spawn — internal/spawn/spawn.go via
+       os.Executable()). Mirrors the TUI's keys.go fleetBinary trick so
+       dev runs (`go run`), side-loaded installs, and any setup where
+       fleet isn't on PATH still self-drain. Without this fallback the
+       skill's auto-drain silently noops in those environments.
+    2. `shutil.which("fleet")` — covers older fleet binaries that spawn
+       agents without FLEET_BIN, and any edge case where the stamped
+       path was deleted (e.g. go run temp build evaporated).
+    3. Noop. Queue file stays on disk and any later drain run consumes
+       it. The skill must never raise.
     """
-    fleet_bin = shutil.which("fleet")
+    fleet_bin = os.environ.get("FLEET_BIN")
+    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
+        fleet_bin = shutil.which("fleet")
     if not fleet_bin:
         return
     try:

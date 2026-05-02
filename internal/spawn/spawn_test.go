@@ -463,6 +463,60 @@ func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T
 		want, string(lastOut))
 }
 
+// TestSpawn_FleetBinInEnv verifies fleet stamps its own executable
+// path into the agent's process env so fleet-guard's _kick_drain can
+// invoke the SAME binary without a PATH lookup. Codex review on
+// fix-fleet-guard-self-drains flagged that `shutil.which("fleet")`
+// silently breaks the new auto-drain path on dev runs / non-PATH
+// installs; FLEET_BIN is the fix, this test is its smoke check.
+func TestSpawn_FleetBinInEnv(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cmd := []string{"sh", "-c", "echo FLEET_BIN=$FLEET_BIN; cat"}
+	rec, err := Spawn(Options{
+		TaskID:  "x",
+		Project: "y",
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable() failed: %v — env stamp is best-effort", err)
+	}
+	want := "FLEET_BIN=" + exe
+	// Test binary paths land in /var/folders/.../go-build*/spawn.test
+	// which is longer than a tmux pane line, so capture-pane wraps the
+	// path across multiple rows. Normalize whitespace before matching.
+	stripWS := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if r != ' ' && r != '\n' && r != '\r' && r != '\t' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	wantNorm := stripWS(want)
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(stripWS(string(out)), wantNorm) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

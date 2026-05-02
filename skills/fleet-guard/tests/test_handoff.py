@@ -963,8 +963,18 @@ class TestKickDrain:
 
     def _mock_drain_calls(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
         """Capture every Popen invocation so tests can assert on argv.
-        Returns a list that gets appended to as Popen is called."""
+        Returns a list that gets appended to as Popen is called.
+
+        The PATH branch is what these tests exercise — FLEET_BIN is
+        deleted so _kick_drain falls through to shutil.which. Tests
+        that want to exercise the FLEET_BIN branch set the env var
+        themselves and should not rely on this helper's which() stub
+        (or override it)."""
         calls: list[list[str]] = []
+
+        # Sandbox: dev shell may export FLEET_BIN; clear it so the
+        # which() branch is what these tests assert against.
+        monkeypatch.delenv("FLEET_BIN", raising=False)
 
         # which() must return a path so _kick_drain doesn't bail early.
         monkeypatch.setattr(handoff.shutil, "which",
@@ -1054,7 +1064,8 @@ class TestKickDrain:
         """If `fleet` isn't on PATH (rare — operator installed via brew),
         _kick_drain noops silently. The queue file stays on disk and
         any later drain run consumes it. The skill must never raise."""
-        # which() returns None → no Popen call.
+        # Both resolution sources blank → no Popen call.
+        monkeypatch.delenv("FLEET_BIN", raising=False)
         monkeypatch.setattr(handoff.shutil, "which", lambda _name: None)
         popen_calls: list[Any] = []
         monkeypatch.setattr(handoff.subprocess, "Popen",
@@ -1066,6 +1077,89 @@ class TestKickDrain:
         )
         assert popen_calls == [], "Popen must not run when fleet binary is absent"
 
+    def test_fleet_bin_env_preferred_over_path(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FLEET_BIN (stamped by spawn) wins over `which fleet`. This is
+        the codex P1 fix: dev runs / non-PATH installs need the producer
+        to invoke the SAME fleet binary that spawned the agent, not
+        whatever (or nothing) PATH resolves to."""
+        # Create a real executable at a non-PATH location so os.access
+        # X_OK passes. Tempfile + chmod is enough — we never run it,
+        # subprocess.Popen is faked.
+        stamped = tmp_path / "fleet-from-spawn"
+        stamped.write_text("#!/bin/sh\nexit 0\n")
+        stamped.chmod(0o755)
+        monkeypatch.setenv("FLEET_BIN", str(stamped))
+        # which() returns a different path so the test fails loudly if
+        # _kick_drain falls through to PATH.
+        monkeypatch.setattr(handoff.shutil, "which",
+                            lambda _name: "/should/not/be/used")
+        calls: list[list[str]] = []
+        monkeypatch.setattr(handoff.subprocess, "Popen",
+                            lambda argv, **_kw: calls.append(argv) or object())
+
+        _seed_record(fleet_home_tmp, "kickbin1")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kickbin1", session="fleet-kickbin1",
+        )
+        assert calls == [[str(stamped), "drain"]]
+
+    def test_fleet_bin_falls_back_when_path_missing(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If FLEET_BIN points at a path that no longer exists (e.g.
+        `go run` temp build evaporated, or operator deleted a side-loaded
+        binary mid-session), _kick_drain falls back to `which fleet`.
+        Without this fallback the producer-trigger silently breaks the
+        moment the stamped path becomes stale."""
+        ghost = tmp_path / "fleet-was-here"  # never created
+        monkeypatch.setenv("FLEET_BIN", str(ghost))
+        monkeypatch.setattr(handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+        calls: list[list[str]] = []
+        monkeypatch.setattr(handoff.subprocess, "Popen",
+                            lambda argv, **_kw: calls.append(argv) or object())
+
+        _seed_record(fleet_home_tmp, "kickbin2")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kickbin2", session="fleet-kickbin2",
+        )
+        assert calls == [["/usr/local/bin/fleet", "drain"]]
+
+    def test_fleet_bin_falls_back_when_not_executable(
+        self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FLEET_BIN points at a real file that lost its execute bit
+        (rare: filesystem perms drift, partial brew install). Falling
+        back to PATH is safer than running an un-executable file
+        — Popen would raise PermissionError and the queue would still
+        get drained, but we'd have spent the producer's exception
+        budget on something the fallback handles cleanly."""
+        no_exec = tmp_path / "fleet-no-exec"
+        no_exec.write_text("not executable")
+        no_exec.chmod(0o644)
+        monkeypatch.setenv("FLEET_BIN", str(no_exec))
+        monkeypatch.setattr(handoff.shutil, "which",
+                            lambda name: "/usr/local/bin/fleet"
+                            if name == "fleet" else None)
+        calls: list[list[str]] = []
+        monkeypatch.setattr(handoff.subprocess, "Popen",
+                            lambda argv, **_kw: calls.append(argv) or object())
+
+        _seed_record(fleet_home_tmp, "kickbin3")
+        handoff.maybe_trigger(
+            {"transcript_path": str(_transcript(tmp_path, input_tokens=145_000))},
+            agent_id="kickbin3", session="fleet-kickbin3",
+        )
+        assert calls == [["/usr/local/bin/fleet", "drain"]]
+
     def test_popen_failure_is_swallowed(
         self, fleet_home_tmp: Path, fake_tmux: _FakeTmux, tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -1074,6 +1168,7 @@ class TestKickDrain:
         errors) must not propagate — the producer's job is done as soon
         as the queue file lands. Drain failures are recoverable; skill
         crashes are not (host turn blocks)."""
+        monkeypatch.delenv("FLEET_BIN", raising=False)
         monkeypatch.setattr(handoff.shutil, "which",
                             lambda _name: "/usr/local/bin/fleet")
 

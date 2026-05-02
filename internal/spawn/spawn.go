@@ -289,7 +289,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// FLEET_AGENT_ID is propagated into the agent's process env so
 	// fleet-guard (4b/c) can identify which agent record to update
 	// without round-tripping via tmux session name parsing.
+	//
+	// FLEET_BIN stamps the path of THIS fleet binary so the agent's
+	// fleet-guard skill can spawn `<this-fleet> drain` without a
+	// PATH lookup. Mirrors the TUI's fleetBinary trick (see
+	// internal/tui/keys.go) — required for dev runs (`go run`) and
+	// side-loaded installs where `which fleet` resolves to nothing
+	// or to a different binary. os.Executable() failure is rare and
+	// non-fatal: the skill falls back to `which("fleet")`.
 	extraEnv := []string{"FLEET_AGENT_ID=" + id}
+	if exe, err := os.Executable(); err == nil {
+		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
+	}
 
 	if opts.OldRecord != nil {
 		// Inherit task identity from outgoing agent.
