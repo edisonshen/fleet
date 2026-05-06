@@ -562,6 +562,12 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		}
 		if strings.HasPrefix(line, "### ") {
 			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
+			if !isReservedH3(name) {
+				// Non-reserved H3 outside any section's body —
+				// operator-edit error (e.g. `### Followup` sitting
+				// alone before `### Spec`). Surface as ParseError.
+				return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "unknown H3 section: " + name}
+			}
 			body, next := readSection(lines, idx+1)
 			if seenH3[name] {
 				return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "duplicate ### " + name + " section"}
@@ -574,8 +580,6 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 				t.Acceptance = body
 			case "Notes":
 				t.Notes = body
-			default:
-				return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "unknown H3 section: " + name}
 			}
 			idx = next
 			continue
@@ -592,15 +596,27 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 	if !validPriority(t.Priority) {
 		return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "invalid priority: " + string(t.Priority)}
 	}
+	// All three reserved H3 sections must be present (per ENG §3.1
+	// `task-block := ..., h3-section+`). Missing sections would be
+	// silently synthesized as empty by Write — surface the operator
+	// edit error instead.
+	for _, name := range []string{"Spec", "Acceptance", "Notes"} {
+		if !seenH3[name] {
+			return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "task missing required ### " + name + " section"}
+		}
+	}
 
 	return t, idx, nil
 }
 
 // readSection reads lines forming the body of an H3 section, stopping
-// at the next H2/H3 (or EOF). H1 (`# `) is permitted inside the body
-// — Spec/Acceptance/Notes are documented as free-form markdown and
-// must round-trip verbatim, so an in-body `# Root cause` heading
-// stays in the body. The canonical layout is:
+// at the next H2 OR a known H3 section name (Spec/Acceptance/Notes)
+// or EOF. Bodies are free-form markdown — H1 (`# Title`) and arbitrary
+// `### Subheading` lines whose name is NOT one of our reserved
+// section names are kept inside the body, so worker/operator notes
+// with subheadings like `### Follow-up` survive round-trip.
+//
+// The canonical layout is:
 //
 //	### Section
 //	<blank>
@@ -617,8 +633,15 @@ func readSection(lines []string, start int) (string, int) {
 	end := start
 	for end < len(lines) {
 		line := lines[end]
-		if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") {
+		if strings.HasPrefix(line, "## ") {
 			break
+		}
+		if strings.HasPrefix(line, "### ") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
+			if isReservedH3(name) {
+				break
+			}
+			// Non-reserved H3 — body content; keep going.
 		}
 		end++
 	}
@@ -634,6 +657,13 @@ func readSection(lines []string, start int) (string, int) {
 		body = body[:len(body)-1]
 	}
 	return strings.Join(body, "\n"), end
+}
+
+// isReservedH3 reports whether name is one of the recognized task
+// H3 sections. Used by readSection to keep arbitrary `### Subheading`
+// content inside section bodies as free-form markdown.
+func isReservedH3(name string) bool {
+	return name == "Spec" || name == "Acceptance" || name == "Notes"
 }
 
 // splitKV splits "key: value" into (key, value, ok). Anything before

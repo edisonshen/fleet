@@ -155,6 +155,61 @@ func TestSection_RejectsDuplicateH3(t *testing.T) {
 	}
 }
 
+func TestSection_AllowsNonReservedH3Subheadings(t *testing.T) {
+	// Worker writes a `### Follow-up` inside Notes — keep verbatim.
+	// Only Spec/Acceptance/Notes are reserved section names; other
+	// `### ` lines stay in the body.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: subhead-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nSpec body.\n\n" +
+		"### Acceptance\n\nAcceptance body.\n\n" +
+		"### Notes\n\nLeading note.\n\n### Follow-up\n\nSubheading body.\n"
+	tmp := filepath.Join(t.TempDir(), "subhead.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "### Follow-up") {
+		t.Errorf("Notes missing subheading; got %q", f.Tasks[0].Notes)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "Subheading body") {
+		t.Errorf("Notes truncated; got %q", f.Tasks[0].Notes)
+	}
+}
+
+func TestSection_RequiresAllH3Sections(t *testing.T) {
+	// Missing ### Acceptance → ParseError.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: incomplete-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nSpec only.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "incomplete.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for missing Acceptance")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "Acceptance") {
+		t.Errorf("Msg=%q; want substring 'Acceptance'", perr.Msg)
+	}
+}
+
 func TestSection_AllowsH1Headings(t *testing.T) {
 	// Spec/Acceptance/Notes are free-form markdown — `# Root cause`
 	// or `### Follow-up` inside a body must round-trip verbatim,

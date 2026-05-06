@@ -186,6 +186,24 @@ func TestFilter_Limit(t *testing.T) {
 	}
 }
 
+func TestAppend_RejectsDelimiterInFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	bad := []*Entry{
+		{Author: "agent · sneaky", Tag: "x", Body: "x"},                   // delimiter in author
+		{Author: "operator", Tag: "x · poison", Body: "x"},                // delimiter in tag
+		{Author: "operator", TaskSlug: "a · b-1234", Tag: "x", Body: "x"}, // delimiter in slug
+		{Author: "agent\nnewline", Tag: "x", Body: "x"},                   // newline in author
+		{Author: "operator", Tag: "x\rcarriage", Body: "x"},               // CR in tag
+	}
+	for i, e := range bad {
+		err := Append("fleet", e)
+		if err == nil {
+			t.Errorf("Append %d returned nil; want ErrInvalidEntry", i)
+		}
+	}
+}
+
 func TestParseMalformed_PreservedAcrossRewrite(t *testing.T) {
 	// Append/Prune rewrite the file. A malformed block must NOT be
 	// silently deleted on rewrite — it's operator memory, fail open.

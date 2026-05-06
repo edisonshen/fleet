@@ -71,6 +71,23 @@ func Append(project string, e *Entry) error {
 	if e.Tag == "" {
 		return fmt.Errorf("%w: empty tag", ErrInvalidEntry)
 	}
+	// Reject fields that contain the H2 delimiter (" · ") or a
+	// newline — both would produce a header that this package's
+	// own parser cannot read back, silently demoting the entry to
+	// a raw block on the next read. Self-corrupting writes are
+	// rejected at the source.
+	for _, f := range []struct{ name, val string }{
+		{"author", e.Author},
+		{"tag", e.Tag},
+		{"task_slug", e.TaskSlug},
+	} {
+		if strings.Contains(f.val, " · ") {
+			return fmt.Errorf("%w: %s contains delimiter ' · '", ErrInvalidEntry, f.name)
+		}
+		if strings.ContainsAny(f.val, "\r\n") {
+			return fmt.Errorf("%w: %s contains newline", ErrInvalidEntry, f.name)
+		}
+	}
 
 	return withLock(project, func() error {
 		path, err := learningsPath(project)
