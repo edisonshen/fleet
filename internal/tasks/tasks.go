@@ -117,7 +117,6 @@ var (
 	ErrDuplicateSlug = errors.New("duplicate task slug")
 	ErrTaskNotFound  = errors.New("task not found")
 	ErrInvalidTask   = errors.New("invalid task")
-	ErrMalformedFile = errors.New("malformed tasks.md")
 )
 
 // ParseError carries line + column + raw line for actionable errors.

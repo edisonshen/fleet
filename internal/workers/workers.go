@@ -372,12 +372,9 @@ func Archive(project, slug string) error {
 			return nil
 		}
 		// EEXIST or directory-not-empty — bump suffix and retry.
-		// We use n=0..7 sub-second salt; PruneArchive's parser
-		// only inspects the canonical 15-char stamp, so the salt
-		// doesn't break retention math (the dir mtime is still
-		// preserved per the codex iter-2 fix, but we read the
-		// trailing 15 chars of the name, which include the salt;
-		// resolve by parsing only the first stamp suffix).
+		// Salt is single digit (1..7); parseArchiveStamp strips a
+		// trailing -<digit> before reading the canonical 15-char
+		// stamp, so retention math is independent of the salt.
 		dst2, derr := state.WorkerArchiveDir(project, slug, fmt.Sprintf("%s-%d", stamp, attempt+1))
 		if derr != nil {
 			return derr
