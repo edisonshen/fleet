@@ -292,7 +292,7 @@ func TestGenerateSlug_ShortPlusHex(t *testing.T) {
 	// 4hex is hex digits only.
 	suffix := got[len("add-readme-"):]
 	for _, c := range suffix {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("suffix %q has non-hex char %q", suffix, c)
 		}
 	}

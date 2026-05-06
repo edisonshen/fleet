@@ -103,11 +103,11 @@ type File struct {
 
 // Errors. All carry context via fmt.Errorf("...: %w", base).
 var (
-	ErrSchemaTooNew   = errors.New("tasks.md schema version newer than this binary supports")
-	ErrDuplicateSlug  = errors.New("duplicate task slug")
-	ErrTaskNotFound   = errors.New("task not found")
-	ErrInvalidTask    = errors.New("invalid task")
-	ErrMalformedFile  = errors.New("malformed tasks.md")
+	ErrSchemaTooNew  = errors.New("tasks.md schema version newer than this binary supports")
+	ErrDuplicateSlug = errors.New("duplicate task slug")
+	ErrTaskNotFound  = errors.New("task not found")
+	ErrInvalidTask   = errors.New("invalid task")
+	ErrMalformedFile = errors.New("malformed tasks.md")
 )
 
 // ParseError carries line + column + raw line for actionable errors.
@@ -281,12 +281,12 @@ func isFullSlug(s string) bool {
 		return false
 	}
 	for _, c := range s[:len(s)-5] {
-		if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
 			return false
 		}
 	}
 	for _, c := range s[len(s)-4:] {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -773,4 +773,3 @@ func formatDeps(deps []string) string {
 	sort.Strings(cp)
 	return "[" + strings.Join(cp, ", ") + "]"
 }
-
