@@ -567,6 +567,42 @@ func TestArchive_UnknownSlugSkipped(t *testing.T) {
 	}
 }
 
+// TestArchive_RejectsReusedSlug verifies that a slug present in BOTH
+// tasks.md and tasks-archive.md with DIFFERENT Created timestamps
+// triggers ErrDuplicateSlug rather than silently dropping the newer
+// record. Created is the immutable identity of a task — same Created
+// means retry-recovery; different Created means the slug was reused
+// after a prior Archive (Add doesn't check archive today).
+func TestArchive_RejectsReusedSlug(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string, created time.Time) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: created, Updated: created, SpawnedBy: "user"}
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	// Pre-existing archive entry (older Created).
+	if err := Write(filepath.Join(dir, "tasks-archive.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("alpha-1234", t1)},
+	}); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+	// Active file with same slug but newer Created (slug reuse).
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("alpha-1234", t2)},
+	}); err != nil {
+		t.Fatalf("seed tasks: %v", err)
+	}
+	err := Archive("fleet", []string{"alpha-1234"})
+	if err == nil {
+		t.Fatal("Archive returned nil; want ErrDuplicateSlug for reused slug")
+	}
+	if !errors.Is(err, ErrDuplicateSlug) {
+		t.Errorf("got %v; want ErrDuplicateSlug", err)
+	}
+}
+
 // TestArchive_ConcurrentSameProject fires N concurrent Archive calls on
 // the same project with overlapping slug sets, then asserts no error,
 // each archived slug appears exactly once in tasks-archive.md, and no

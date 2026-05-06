@@ -196,7 +196,12 @@ func Prune(project string, olderThan time.Time) error {
 
 		// Build a dedup set keyed on the wire-format identity (the
 		// fields the parser reads back) so a previously-archived
-		// entry isn't appended twice across a Prune retry.
+		// entry isn't appended twice across a Prune retry. The set
+		// is seeded ONLY from the pre-existing archive — duplicates
+		// within the current pass are preserved because two
+		// legitimately-identical entries (same RFC3339 second, same
+		// header, same body) are valid in an append-only log and
+		// must survive prune.
 		archived := make(map[string]struct{}, len(archive))
 		for _, a := range archive {
 			archived[entryKey(a)] = struct{}{}
@@ -207,7 +212,6 @@ func Prune(project string, olderThan time.Time) error {
 			if e.Timestamp.Before(olderThan) {
 				if _, dup := archived[entryKey(e)]; !dup {
 					archive = append(archive, e)
-					archived[entryKey(e)] = struct{}{}
 				}
 				continue
 			}

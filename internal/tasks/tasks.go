@@ -243,21 +243,36 @@ func Archive(project string, slugs []string) error {
 	// the loop body mutates), but the explicit allocation is harder
 	// to misread on a future edit.
 	//
-	// Dedupe against the archive's existing slugs: a partial
-	// previous Archive (crashed between writing archive and writing
-	// tasks) leaves the same slug in BOTH files; the retry would
-	// otherwise append a duplicate to archive, breaking subsequent
-	// Read with ErrDuplicateSlug.
-	archived := make(map[string]struct{}, len(archive.Tasks))
+	// Dedupe against the archive: a partial previous Archive (crashed
+	// between writing archive and writing tasks) leaves the same
+	// slug in BOTH files; the retry would otherwise append a
+	// duplicate to archive, breaking subsequent Read with
+	// ErrDuplicateSlug.
+	//
+	// Use Task.Created (immutable from Add) as the identity check:
+	//   - same Created  → retry-recovery case, keep archive entry as-is
+	//   - diff Created  → slug was REUSED after archive (Add doesn't
+	//                     check archive today; future Phase B should).
+	//                     Surface ErrDuplicateSlug rather than silently
+	//                     dropping the newer record.
+	archived := make(map[string]*Task, len(archive.Tasks))
 	for _, t := range archive.Tasks {
-		archived[t.Slug] = struct{}{}
+		archived[t.Slug] = t
 	}
 	kept := make([]*Task, 0, len(current.Tasks))
 	for _, t := range current.Tasks {
 		if _, ok := want[t.Slug]; ok {
-			if _, dup := archived[t.Slug]; !dup {
-				archive.Tasks = append(archive.Tasks, t)
+			if existing, dup := archived[t.Slug]; dup {
+				if !existing.Created.Equal(t.Created) {
+					return fmt.Errorf("%w: %s reused after archive (archive Created=%s, current Created=%s)",
+						ErrDuplicateSlug, t.Slug,
+						existing.Created.UTC().Format(time.RFC3339),
+						t.Created.UTC().Format(time.RFC3339))
+				}
+				// Retry-recovery — leave archive entry alone, drop from current.
+				continue
 			}
+			archive.Tasks = append(archive.Tasks, t)
 			continue
 		}
 		kept = append(kept, t)

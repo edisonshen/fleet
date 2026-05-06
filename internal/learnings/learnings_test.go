@@ -111,6 +111,38 @@ func TestPrune_MovesOldEntries(t *testing.T) {
 	}
 }
 
+// TestPrune_PreservesIdenticalDuplicatesInBatch confirms the dedup
+// only fires against PRE-EXISTING archive entries, not entries
+// archived during the same Prune pass. Two identical-content entries
+// in current must both survive Prune (legal in append-only log; can
+// happen when two appenders write the same message in the same
+// second with the same headers).
+func TestPrune_PreservesIdenticalDuplicatesInBatch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// Two identical entries — same RFC3339 timestamp, same headers,
+	// same body. Both should survive prune (move to archive, not
+	// drop one as a "duplicate").
+	for i := 0; i < 2; i++ {
+		if err := Append("fleet", &Entry{Timestamp: old, Author: "operator", Tag: "stale", Body: "same"}); err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+	}
+	cutoff := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	if err := Prune("fleet", cutoff); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	dir, _ := state.ProjectDir("fleet")
+	arc, err := readEntries(filepath.Join(dir, "learnings-archive.md"))
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if len(arc) != 2 {
+		t.Errorf("archive has %d entries; want 2 (both identical-content entries preserved)", len(arc))
+	}
+}
+
 // TestPrune_RetrySafeAfterPartialFailure simulates the crash-recovery
 // path: a previous Prune wrote learnings-archive.md but failed before
 // rewriting learnings.md, so the same entry exists in BOTH files. The
