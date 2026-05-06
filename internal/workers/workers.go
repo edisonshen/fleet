@@ -359,8 +359,22 @@ func Archive(project, slug string) error {
 		// Only consult IsAlive when no exit code is recorded —
 		// e.g. the worker reached terminal phase and crashed
 		// before exit could be set.
-		if cur.Exit == nil && cur.PID > 0 && IsAlive(cur.PID) {
-			return fmt.Errorf("%w: phase=%q but pid=%d still alive", ErrPreconditionLive, cur.Phase, cur.PID)
+		//
+		// pid==0 + exit==nil is "unknown" — UpdateState bootstraps
+		// states with phase=starting and no PID, so a worker that
+		// flips straight to terminal before its PID/exit is persisted
+		// would otherwise sail through this gate while still running.
+		// Refuse: the caller must record an exit code (or a PID) before
+		// archive is safe (codex iter-10 P2).
+		switch {
+		case cur.Exit != nil:
+			// Process gone, archive is safe.
+		case cur.PID > 0:
+			if IsAlive(cur.PID) {
+				return fmt.Errorf("%w: phase=%q but pid=%d still alive", ErrPreconditionLive, cur.Phase, cur.PID)
+			}
+		default:
+			return fmt.Errorf("%w: phase=%q but pid=0 and no exit recorded — refuse to archive (record exit code first)", ErrPreconditionLive, cur.Phase)
 		}
 	case errors.Is(rerr, ErrNotFound):
 		// No state file — proceed (caller's responsibility).

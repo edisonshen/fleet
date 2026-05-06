@@ -525,6 +525,41 @@ func TestAdd_AllowsFencedH2InBody(t *testing.T) {
 	}
 }
 
+func TestAdd_RejectsUnfencedReservedH3InBody(t *testing.T) {
+	// readSection treats column-0 reserved `### Spec|Acceptance|Notes`
+	// as a structural boundary, so Add must reject the same to keep
+	// write→read round-trip stable. Pasting an example task template
+	// into a Spec body would otherwise write fine and fail on next
+	// parse with "duplicate ### Acceptance section" (codex iter-10 P1).
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	for _, name := range []string{"Spec", "Acceptance", "Notes"} {
+		tk := &Task{
+			Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+			Created: now, Updated: now, SpawnedBy: "user",
+			Spec: "intro\n### " + name + "\nleaked", Acceptance: "ok", Notes: "ok",
+		}
+		f := &File{Schema: 1}
+		err := f.Add(tk)
+		if err == nil {
+			t.Errorf("Add accepted unfenced `### %s` in spec body", name)
+			continue
+		}
+		if !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("`### %s`: got %v; want ErrInvalidTask", name, err)
+		}
+	}
+	// Fenced reserved-H3 must still pass — same fence escape hatch as `## `.
+	tk := &Task{
+		Slug: "beta-5678", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: "doc:\n\n```\n### Acceptance\nexample\n```\n", Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Errorf("Add rejected fenced `### Acceptance`: %v", err)
+	}
+}
+
 func TestAdd_RejectsUnfencedH2EvenAfterFenceCloses(t *testing.T) {
 	// A fenced block followed by an unfenced `## ` must still be
 	// rejected — the fence-aware check toggles state, it doesn't

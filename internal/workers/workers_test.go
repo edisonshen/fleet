@@ -260,6 +260,40 @@ func TestArchive_TrustsRecordedExitOverPIDReuse(t *testing.T) {
 	}
 }
 
+func TestArchive_RefusesZeroPIDWithoutExit(t *testing.T) {
+	// UpdateState bootstraps states with phase=starting and no PID.
+	// If a worker flips straight to a terminal phase before its PID
+	// or exit is persisted, Archive must NOT consider that a safe
+	// archive — the process may still be running. Require a recorded
+	// exit code OR a non-zero PID before we trust the precondition
+	// (codex iter-10 P2).
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := WriteState("fleet", "ghost-aaaa", &State{
+		Slug: "ghost-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL:     "https://x/y/1",
+		StartedAt: time.Now().UTC(),
+		PID:       0, // unknown
+		Exit:      nil,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	err := Archive("fleet", "ghost-aaaa")
+	if !errors.Is(err, ErrPreconditionLive) {
+		t.Errorf("got %v; want ErrPreconditionLive (pid=0 + no exit)", err)
+	}
+	// And recovery: write an exit code, then archive proceeds.
+	if err := UpdateState("fleet", "ghost-aaaa", func(s *State) {
+		exit := 0
+		s.Exit = &exit
+	}); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	if err := Archive("fleet", "ghost-aaaa"); err != nil {
+		t.Errorf("Archive after exit recorded: %v; want nil", err)
+	}
+}
+
 func TestArchive_AllowsBlockedAndFailed(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

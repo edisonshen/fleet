@@ -210,11 +210,14 @@ func (f *File) Add(t *Task) error {
 	if t.Updated.IsZero() {
 		return fmt.Errorf("%w: updated must be set", ErrInvalidTask)
 	}
-	// Spec/Acceptance/Notes are free-form markdown but a column-0 H2
-	// OUTSIDE a fenced code block would terminate the task block on
-	// next parse — reject so the writer never produces a file it
-	// can't read back. Fenced `## Example` is allowed; readSection
-	// honors the same fence rule on the read side.
+	// Spec/Acceptance/Notes are free-form markdown but two markers
+	// would terminate the task block on next parse:
+	//   - column-0 `## ` (next task header)
+	//   - column-0 reserved `### Spec|Acceptance|Notes` (next H3 section)
+	// Reject both when they appear OUTSIDE a fenced code block so the
+	// writer never produces a file it can't read back. Fenced examples
+	// are allowed; readSection honors the same fence rule on the read
+	// side. Non-reserved `### ` is fine (it's body content for us).
 	for _, sec := range []struct{ name, body string }{
 		{"spec", t.Spec},
 		{"acceptance", t.Acceptance},
@@ -226,8 +229,17 @@ func (f *File) Add(t *Task) error {
 				inFence = !inFence
 				continue
 			}
-			if !inFence && strings.HasPrefix(ln, "## ") {
+			if inFence {
+				continue
+			}
+			if strings.HasPrefix(ln, "## ") {
 				return fmt.Errorf("%w: %s body has unfenced column-0 '## ' (use ### for in-section headings, or wrap in ``` for examples)", ErrInvalidTask, sec.name)
+			}
+			if strings.HasPrefix(ln, "### ") {
+				name := strings.TrimSpace(strings.TrimPrefix(ln, "### "))
+				if isReservedH3(name) {
+					return fmt.Errorf("%w: %s body contains unfenced reserved heading '### %s' (wrap in ``` for examples)", ErrInvalidTask, sec.name, name)
+				}
 			}
 		}
 	}
