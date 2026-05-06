@@ -293,3 +293,98 @@ func WriteAtomic(path string, data []byte) (err error) {
 
 // ErrNotFound is returned by readers when an expected path is absent.
 var ErrNotFound = errors.New("not found")
+
+// ProjectDir returns ~/.fleet/projects/<safe-name>/.
+//
+// v0.2 per-project coordinator state lives here: tasks.md, learnings.md,
+// per-project standards.md, workers/<slug>/, worktrees/<slug>/, and the
+// .locks/ subdirectory holding state.lock + coordinator.lock.
+//
+// The trailing slash is intentional — callers join with `filepath.Join`
+// or treat the result as a directory prefix. Project name is sanitized
+// via SafeLockComponent so legacy / unsafe inputs (e.g. "owner/repo")
+// never escape the projects/ root.
+//
+// This is a path-only helper; it does NOT create the directory. First
+// writer (e.g. tasks.Write) is responsible for MkdirAll.
+func ProjectDir(name string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "projects", SafeLockComponent(name)) + string(filepath.Separator), nil
+}
+
+// ProjectStateLockPath returns ~/.fleet/projects/<safe-name>/.locks/state.lock.
+//
+// The Q1-locked v0.2 single state-lock — serializes writes to tasks.md /
+// tasks-archive.md / learnings.md / learnings-archive.md within one
+// project. Distinct from the v0.1 ProjectLockPath (which serializes
+// dispatch + handoff under projects/.locks/<name>.lock); the two lock
+// trees do not interact.
+func ProjectStateLockPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".locks", "state.lock"), nil
+}
+
+// CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
+//
+// Held by the running coordinator agent for the lifetime of one tick;
+// a second coord that finds it taken logs and exits cleanly. Sibling of
+// state.lock under .locks/ but never combined with it (different
+// invariants, different acquisition disciplines).
+func CoordinatorLockPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".locks", "coordinator.lock"), nil
+}
+
+// WorkerDir returns ~/.fleet/projects/<project>/workers/<slug>/.
+//
+// Each worker (a `claude --print` subprocess launched by the coord)
+// owns one directory containing state.json + output.log. Coordinator
+// watches state.json via fsnotify; operator inspects via `fleet peek`.
+//
+// Slug is passed through SafeLockComponent so a crafted slug cannot
+// escape workers/. In practice slugs are <short>-<4hex> per the v0.2
+// slug rule, but this helper is defensive.
+func WorkerDir(project, slug string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "workers", SafeLockComponent(slug)) + string(filepath.Separator), nil
+}
+
+// WorkerArchiveDir returns
+// ~/.fleet/projects/<project>/workers/archive/<slug>-<ts>/.
+//
+// Workers archive on phase=done; auto-prune at 7d. ts is a UTC stamp
+// produced by the caller (e.g. ts.UTC().Format("20060102-150405")) so
+// archive paths are stable across timezones.
+func WorkerArchiveDir(project, slug, ts string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "workers", "archive", SafeLockComponent(slug)+"-"+ts) + string(filepath.Separator), nil
+}
+
+// WorktreePath returns ~/.fleet/projects/<project>/worktrees/<slug>/.
+//
+// Used when the coord runs in cap > 1 mode (parallel workers). Created
+// via `git worktree add` and removed via `git worktree remove --force`
+// on task archive. Single-worker mode (default) reuses the repo root
+// instead.
+func WorktreePath(project, slug string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "worktrees", SafeLockComponent(slug)) + string(filepath.Separator), nil
+}
