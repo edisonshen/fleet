@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -233,12 +234,20 @@ func SafeLockComponent(name string) string {
 // loader (future), and lock-file paths all enforce the same rule.
 // Operator-supplied "owner/repo"-style names get a clear early error
 // instead of a confusing flock-open failure or a silent path traversal.
+//
+// Reserved-name checks are case-INSENSITIVE so macOS/APFS (default
+// case-insensitive) can't alias a reserved control directory by
+// varying the case (".LOCKS" → same inode as ".locks").
 func ValidateProjectName(name string) error {
 	if name == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
-	if name == "." || name == ".." {
+	lower := strings.ToLower(name)
+	if lower == "." || lower == ".." {
 		return fmt.Errorf("project name %q reserved", name)
+	}
+	if lower == ".locks" {
+		return fmt.Errorf("project name %q reserved (collides with projects/.locks/ on case-insensitive filesystems)", name)
 	}
 	for _, c := range name {
 		switch {
@@ -265,16 +274,19 @@ func ValidateProjectName(name string) error {
 // "archive" rejected because workers/archive/ is the reserved holding
 // pen for archived worker dirs — a worker with slug=archive would
 // alias that directory and become invisible to ListActive + un-
-// archivable (rename into self).
+// archivable (rename into self). Reserved-name check is case-
+// INSENSITIVE so macOS/APFS can't alias the reserved dir by varying
+// case ("Archive" → same inode as "archive").
 func ValidateSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("slug must not be empty")
 	}
-	if slug == "." || slug == ".." {
+	lower := strings.ToLower(slug)
+	if lower == "." || lower == ".." {
 		return fmt.Errorf("slug %q reserved", slug)
 	}
-	if slug == "archive" {
-		return fmt.Errorf("slug %q reserved (collides with workers/archive/)", slug)
+	if lower == "archive" {
+		return fmt.Errorf("slug %q reserved (collides with workers/archive/ on case-insensitive filesystems)", slug)
 	}
 	for _, c := range slug {
 		switch {

@@ -136,14 +136,28 @@ func TestWorkerDir_RejectsUnsafeSlug(t *testing.T) {
 }
 
 func TestValidateSlug_RejectsReserved(t *testing.T) {
-	// Slug "archive" would alias workers/archive/ — the reserved
-	// holding pen for archived worker dirs. ValidateSlug must reject
-	// it so callers (tasks.Add, tasks.Read, WorkerDir,
-	// WorkerArchiveDir, WorktreePath) all see the rejection.
-	for _, in := range []string{"archive", ".", ".."} {
+	// Slug "archive" (any case on case-insensitive APFS) would alias
+	// workers/archive/ — the reserved holding pen for archived
+	// worker dirs. ValidateSlug must reject it so callers (tasks.Add,
+	// tasks.Read, WorkerDir, WorkerArchiveDir, WorktreePath) all see
+	// the rejection.
+	for _, in := range []string{"archive", "Archive", "ARCHIVE", "ArChIvE", ".", "..", ".."} {
 		t.Run(in, func(t *testing.T) {
 			if err := ValidateSlug(in); err == nil {
 				t.Errorf("ValidateSlug(%q) returned nil err; want rejection", in)
+			}
+		})
+	}
+}
+
+func TestValidateProjectName_RejectsReservedCaseInsensitive(t *testing.T) {
+	// On macOS/APFS the default filesystem is case-insensitive, so
+	// ".LOCKS" would resolve to the same inode as the reserved
+	// projects/.locks/ control directory. Reject case-insensitively.
+	for _, in := range []string{".locks", ".LOCKS", ".Locks", ".loCKS"} {
+		t.Run(in, func(t *testing.T) {
+			if err := ValidateProjectName(in); err == nil {
+				t.Errorf("ValidateProjectName(%q) returned nil err; want rejection", in)
 			}
 		})
 	}
