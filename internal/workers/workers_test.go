@@ -164,10 +164,11 @@ func TestIsAlive_ZeroPID(t *testing.T) {
 func TestArchive_AtomicMove(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
 	if err := WriteState("fleet", "ar-aaaa", &State{
 		Slug: "ar-aaaa", Project: "fleet", Phase: PhaseDone,
 		PRURL:     "https://github.com/x/y/pull/1",
-		StartedAt: time.Now().UTC(), PID: 1,
+		StartedAt: time.Now().UTC(), PID: deadPID,
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
 	}
@@ -192,6 +193,68 @@ func TestArchive_AtomicMove(t *testing.T) {
 	}
 }
 
+func TestArchive_RefusesLiveWorker(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := WriteState("fleet", "live-aaaa", &State{
+		Slug: "live-aaaa", Project: "fleet", Phase: PhaseTDDGreen,
+		StartedAt: time.Now().UTC(), PID: 1,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	err := Archive("fleet", "live-aaaa")
+	if !errors.Is(err, ErrPreconditionLive) {
+		t.Errorf("got %v; want ErrPreconditionLive", err)
+	}
+}
+
+func TestArchive_AllowsBlockedAndFailed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
+	for _, c := range []struct {
+		slug   string
+		phase  Phase
+		reason string
+	}{
+		{"blocked-aaaa", PhaseBlocked, "stuck on auth"},
+		{"failed-bbbb", PhaseFailed, ""},
+	} {
+		s := &State{
+			Slug: c.slug, Project: "fleet", Phase: c.phase,
+			StartedAt: time.Now().UTC(), PID: deadPID,
+		}
+		if c.phase == PhaseBlocked {
+			s.BlockedReason = c.reason
+		}
+		if err := WriteState("fleet", c.slug, s); err != nil {
+			t.Fatalf("seed %s: %v", c.slug, err)
+		}
+		if err := Archive("fleet", c.slug); err != nil {
+			t.Errorf("Archive(%s) phase=%s: %v", c.slug, c.phase, err)
+		}
+	}
+}
+
+func TestArchive_RefusesLiveProcessAtTerminalPhase(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	live := startSleeper(t, 5*time.Second)
+	defer func() { _ = live.Process.Kill(); _ = live.Wait() }()
+	// State says "done" but PID is alive — Archive must refuse.
+	if err := WriteState("fleet", "live-done-aaaa", &State{
+		Slug: "live-done-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(),
+		PID: live.Process.Pid,
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	err := Archive("fleet", "live-done-aaaa")
+	if !errors.Is(err, ErrPreconditionLive) {
+		t.Errorf("got %v; want ErrPreconditionLive (alive PID)", err)
+	}
+}
+
 func TestArchive_Idempotent(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
@@ -201,7 +264,10 @@ func TestArchive_Idempotent(t *testing.T) {
 	}
 }
 
-func TestPruneArchive(t *testing.T) {
+func TestPruneArchive_UsesEmbeddedTimestamp(t *testing.T) {
+	// Decision must come from the timestamp encoded in the dir name,
+	// NOT mtime — rename(2) preserves the source dir's mtime, which
+	// would otherwise let us prune just-archived dirs immediately.
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	dir, _ := state.ProjectDir("fleet")
@@ -209,23 +275,21 @@ func TestPruneArchive(t *testing.T) {
 	if err := os.MkdirAll(archRoot, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	// Create two archive dirs with mtimes 30d and 1d in the past.
+	// Two dirs: one with embedded stamp 30d ago, one with 1d ago.
+	// Set mtime to NOW for both — the implementation must ignore it.
 	old := filepath.Join(archRoot, "old-aaaa-20260401-000000")
 	young := filepath.Join(archRoot, "young-bbbb-20260505-000000")
 	for _, d := range []string{old, young} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
 		}
+		now := time.Now()
+		if err := os.Chtimes(d, now, now); err != nil {
+			t.Fatalf("chtimes %s: %v", d, err)
+		}
 	}
-	thirtyAgo := time.Now().Add(-30 * 24 * time.Hour)
-	oneAgo := time.Now().Add(-24 * time.Hour)
-	if err := os.Chtimes(old, thirtyAgo, thirtyAgo); err != nil {
-		t.Fatalf("chtimes old: %v", err)
-	}
-	if err := os.Chtimes(young, oneAgo, oneAgo); err != nil {
-		t.Fatalf("chtimes young: %v", err)
-	}
-	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	// Cutoff between the two stamps.
+	cutoff := time.Date(2026, 4, 15, 0, 0, 0, 0, time.UTC)
 	n, err := PruneArchive("fleet", cutoff)
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
@@ -241,18 +305,49 @@ func TestPruneArchive(t *testing.T) {
 	}
 }
 
+func TestPruneArchive_SkipsUnrecognizedNames(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	dir, _ := state.ProjectDir("fleet")
+	archRoot := filepath.Join(dir, "workers", "archive")
+	weird := filepath.Join(archRoot, "manually-created")
+	if err := os.MkdirAll(weird, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Cutoff far in the future — would prune everything if we trusted
+	// mtime; must skip the unrecognized name.
+	cutoff := time.Now().Add(time.Hour)
+	n, err := PruneArchive("fleet", cutoff)
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("pruned=%d; want 0 (unrecognized name)", n)
+	}
+	if _, err := os.Stat(weird); err != nil {
+		t.Errorf("weird dir removed: %v", err)
+	}
+}
+
 func TestListActive(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
 	for _, slug := range []string{"alpha-aaaa", "beta-bbbb", "gamma-cccc"} {
 		if err := WriteState("fleet", slug, &State{
 			Slug: slug, Project: "fleet", Phase: PhaseStarting,
-			StartedAt: time.Now().UTC(), PID: 1,
+			StartedAt: time.Now().UTC(), PID: deadPID,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", slug, err)
 		}
 	}
-	// Archive one of them.
+	// Mark alpha terminal + dead PID (Archive precondition) before archiving it.
+	if err := WriteState("fleet", "alpha-aaaa", &State{
+		Slug: "alpha-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(), PID: deadPID,
+	}); err != nil {
+		t.Fatalf("update alpha to done: %v", err)
+	}
 	if err := Archive("fleet", "alpha-aaaa"); err != nil {
 		t.Fatalf("Archive: %v", err)
 	}
@@ -272,15 +367,16 @@ func TestListActive(t *testing.T) {
 func TestListAll(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
 	if err := WriteState("fleet", "live-aaaa", &State{
 		Slug: "live-aaaa", Project: "fleet", Phase: PhaseStarting,
-		StartedAt: time.Now().UTC(), PID: 1,
+		StartedAt: time.Now().UTC(), PID: deadPID,
 	}); err != nil {
 		t.Fatalf("seed live: %v", err)
 	}
 	if err := WriteState("fleet", "gone-bbbb", &State{
 		Slug: "gone-bbbb", Project: "fleet", Phase: PhaseDone,
-		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(), PID: 1,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(), PID: deadPID,
 	}); err != nil {
 		t.Fatalf("seed gone: %v", err)
 	}
@@ -343,6 +439,28 @@ func startSleeper(t *testing.T, d time.Duration) *exec.Cmd {
 		t.Fatalf("exec sleep: %v", err)
 	}
 	return cmd
+}
+
+// terminatedPID returns a PID that is reaped (no live process). The
+// kernel may recycle it for another process at any moment, so this is
+// best-effort — but `true` exits in microseconds and the test checks
+// IsAlive immediately after, so race window is tiny on busy CI.
+func terminatedPID(t *testing.T) int {
+	t.Helper()
+	bin, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("no `true` in PATH: %v", err)
+	}
+	cmd := exec.Command(bin)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("exec true: %v", err)
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Wait()
+	if IsAlive(pid) {
+		t.Skipf("PID %d recycled too quickly; cannot test reliably", pid)
+	}
+	return pid
 }
 
 func startsWith(s, prefix string) bool {

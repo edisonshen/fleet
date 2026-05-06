@@ -96,9 +96,16 @@ type Task struct {
 // File is the parsed shape of tasks.md. Schema is the version read off
 // the frontmatter; missing-frontmatter files are read as 0 and lazy-
 // upgraded to SchemaVersion on the next Write.
+//
+// Footer holds any trailing markdown after the last `## task:` block —
+// the grammar (ENG §3.1) explicitly allows arbitrary footer text, and
+// the round-trip rule requires it be preserved verbatim. Operator
+// notes added below the task list survive `fleet tasks add/set/archive`
+// because Read captures Footer and Write re-emits it.
 type File struct {
 	Schema int
 	Tasks  []*Task
+	Footer string
 }
 
 // Errors. All carry context via fmt.Errorf("...: %w", base).
@@ -190,12 +197,24 @@ func (f *File) Add(t *Task) error {
 }
 
 // Archive moves the named slugs from <project>/tasks.md to
-// <project>/tasks-archive.md. Both writes go through WriteAtomic;
-// caller MUST hold state.ProjectStateLockPath.
+// <project>/tasks-archive.md. Both writes go through WriteAtomic.
+//
+// Internally takes state.LockProjectState so callers don't need to
+// (mirrors learnings.Prune). Order: write archive first (additive),
+// then write tasks (removal). On crash between the two writes, slugs
+// appear in BOTH files — coord reconciles by treating tasks.md as the
+// source of truth (presence wins). This bias matches v0.2's Ralph
+// rule: tasks.md is the durable plan; archive is operational debris.
 //
 // Slugs not present in tasks.md are silently skipped (callers can
 // detect this by diffing before/after task counts if needed).
 func Archive(project string, slugs []string) error {
+	release, err := state.LockProjectState(project)
+	if err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	defer release()
+
 	dir, err := state.ProjectDir(project)
 	if err != nil {
 		return err
@@ -217,7 +236,11 @@ func Archive(project string, slugs []string) error {
 		want[s] = struct{}{}
 	}
 
-	kept := current.Tasks[:0]
+	// Build a fresh kept slice instead of aliasing current.Tasks[:0].
+	// The aliased form was correct (range copies the header before
+	// the loop body mutates), but the explicit allocation is harder
+	// to misread on a future edit.
+	kept := make([]*Task, 0, len(current.Tasks))
 	for _, t := range current.Tasks {
 		if _, ok := want[t.Slug]; ok {
 			archive.Tasks = append(archive.Tasks, t)
@@ -372,7 +395,8 @@ func parse(data []byte) (*File, error) {
 	idx = consumed
 
 	// Walk remaining lines; on each `## task: <slug>` line, parse
-	// one task block.
+	// one task block. Anything after the LAST task block is footer.
+	lastTaskEnd := idx
 	for idx < len(lines) {
 		line := lines[idx]
 		if strings.HasPrefix(line, "## task: ") {
@@ -389,9 +413,30 @@ func parse(data []byte) (*File, error) {
 			}
 			f.Tasks = append(f.Tasks, t)
 			idx = next
+			lastTaskEnd = idx
 			continue
 		}
 		idx++
+	}
+	// Footer = lines after the last task block. For files with no
+	// tasks, lastTaskEnd is the line after frontmatter — everything
+	// past there is footer too. Trim leading blank lines (canonical
+	// separator) and the trailing newline injected by Split, but
+	// preserve internal whitespace verbatim.
+	if lastTaskEnd < len(lines) {
+		footer := lines[lastTaskEnd:]
+		for len(footer) > 0 && strings.TrimSpace(footer[0]) == "" {
+			footer = footer[1:]
+		}
+		// `strings.Split` on text ending in "\n" yields a trailing
+		// empty string; drop it to prevent re-emission of an extra
+		// blank.
+		if len(footer) > 0 && footer[len(footer)-1] == "" {
+			footer = footer[:len(footer)-1]
+		}
+		if len(footer) > 0 {
+			f.Footer = strings.Join(footer, "\n")
+		}
 	}
 	return f, nil
 }
@@ -487,6 +532,11 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		if strings.HasPrefix(line, "## ") {
 			break // next task block
 		}
+		// `# ` (H1) implies footer territory — tasks reserve H3 for
+		// section headers and never emit H1/H2 inside a task block.
+		if strings.HasPrefix(line, "# ") {
+			break
+		}
 		if strings.HasPrefix(line, "### ") {
 			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
 			body, next := readSection(lines, idx+1)
@@ -517,7 +567,7 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 }
 
 // readSection reads lines forming the body of an H3 section, stopping
-// at the next H2/H3 or EOF. The canonical layout is:
+// at the next H1/H2/H3 (or EOF). The canonical layout is:
 //
 //	### Section
 //	<blank>
@@ -530,11 +580,14 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 // body) and trim the trailing blank(s) so the round-trip is stable.
 // Multi-paragraph bodies (with internal blank lines) round-trip
 // verbatim because trimming is anchored at start/end only.
+//
+// `# ` (H1) at column 0 also terminates — tasks.md grammar reserves
+// H1/H2 for file-level structure, so an H1 implies operator footer.
 func readSection(lines []string, start int) (string, int) {
 	end := start
 	for end < len(lines) {
 		line := lines[end]
-		if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") {
+		if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "# ") {
 			break
 		}
 		end++
@@ -674,25 +727,35 @@ func parseDeps(v string) ([]string, error) {
 
 // render emits the canonical bytes for f. Frontmatter is always at
 // SchemaVersion. Tasks are emitted in slice order — caller controls
-// ordering; we don't sort.
+// ordering; we don't sort. Footer (if present) is appended verbatim
+// after a blank-line separator so operator-authored trailing markdown
+// survives round-trip.
 func render(f *File) ([]byte, error) {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString("schema: v")
 	b.WriteString(strconv.Itoa(SchemaVersion))
 	b.WriteString("\n---\n")
-	if len(f.Tasks) == 0 {
-		return []byte(b.String()), nil
-	}
-	b.WriteByte('\n')
-	for i, t := range f.Tasks {
-		if err := renderTask(&b, t); err != nil {
-			return nil, err
+	if len(f.Tasks) > 0 {
+		b.WriteByte('\n')
+		for i, t := range f.Tasks {
+			if err := renderTask(&b, t); err != nil {
+				return nil, err
+			}
+			// Blank line between tasks; trailing blank is intentional
+			// to make `git diff` show the previous block unchanged when
+			// only the new last task is appended.
+			if i < len(f.Tasks)-1 {
+				b.WriteByte('\n')
+			}
 		}
-		// Blank line between tasks; trailing blank is intentional
-		// to make `git diff` show the previous block unchanged when
-		// only the new last task is appended.
-		if i < len(f.Tasks)-1 {
+	}
+	if f.Footer != "" {
+		b.WriteByte('\n')
+		b.WriteString(f.Footer)
+		// Ensure the output ends with a newline (POSIX text-file
+		// convention).
+		if !strings.HasSuffix(f.Footer, "\n") {
 			b.WriteByte('\n')
 		}
 	}

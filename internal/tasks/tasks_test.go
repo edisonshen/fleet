@@ -53,6 +53,49 @@ func TestRoundTrip_MultiStatus(t *testing.T) { roundTripFixture(t, "multi-status
 func TestRoundTrip_Deps(t *testing.T)        { roundTripFixture(t, "deps.md") }
 func TestRoundTrip_WorkerNotes(t *testing.T) { roundTripFixture(t, "worker-notes.md") }
 func TestRoundTrip_Fifty(t *testing.T)       { roundTripFixture(t, "fifty-tasks.md") }
+func TestRoundTrip_Footer(t *testing.T)      { roundTripFixture(t, "with-footer.md") }
+
+func TestFooter_PreservedAcrossEdit(t *testing.T) {
+	// Operator adds a task; existing footer must not get clobbered.
+	tmp := filepath.Join(t.TempDir(), "f.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "with-footer.md"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if f.Footer == "" {
+		t.Fatalf("Footer empty after Read")
+	}
+	now := time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC)
+	if err := f.Add(&Task{
+		Slug: "beta-5678", Status: StatusTodo, Priority: PriorityP2,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: "Beta.", Acceptance: "Beta.", Notes: "",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if !strings.Contains(string(got), "# Operator notes") {
+		t.Errorf("footer lost after Add+Write; got\n%s", got)
+	}
+	// Re-read: footer survives.
+	f2, err := Read(out)
+	if err != nil {
+		t.Fatalf("re-Read: %v", err)
+	}
+	if !strings.Contains(f2.Footer, "Operator notes") {
+		t.Errorf("re-Read footer=%q; want substring 'Operator notes'", f2.Footer)
+	}
+}
 
 func TestSchemaVersionRefuse(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "schema-v2.md")

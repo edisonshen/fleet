@@ -88,6 +88,7 @@ var (
 	ErrPhaseRequiresWhy = errors.New("phase=blocked requires blocked_reason")
 	ErrInvalidPhase     = errors.New("invalid phase")
 	ErrInvalidSlug      = errors.New("invalid worker slug")
+	ErrPreconditionLive = errors.New("cannot archive live worker")
 )
 
 // updateMu serializes UpdateState calls within one process per
@@ -237,6 +238,20 @@ func IsAlive(pid int) bool {
 // Archive moves workers/<slug>/ → workers/archive/<slug>-<UTC-stamp>/.
 // The rename is atomic on POSIX same-fs. Stamp uses YYYYMMDD-HHMMSS.
 // If the source dir doesn't exist, returns nil (idempotent).
+//
+// PRECONDITION: the worker process must be exited AND its state must
+// have reached a terminal phase (done | blocked | failed). The phase
+// check alone is insufficient — a worker that wrote phase=done can
+// still emit one more UpdateState (e.g. setting `exit`). If we
+// archive between those two writes, the second write recreates
+// workers/<slug>/state.json at the original path, leaving a stray
+// active dir AND an archive — coord then sees two states for one
+// slug. To avoid that race we also require IsAlive(pid)==false.
+//
+// If state.json is missing entirely, Archive proceeds — we have no
+// liveness signal and assume the caller knows what they're doing.
+// If state.json is present and either condition fails, returns
+// ErrPreconditionLive (typed so coord can retry next tick).
 func Archive(project, slug string) error {
 	src, err := state.WorkerDir(project, slug)
 	if err != nil {
@@ -247,6 +262,26 @@ func Archive(project, slug string) error {
 	} else if statErr != nil {
 		return fmt.Errorf("stat worker dir: %w", statErr)
 	}
+
+	// Defensive precondition check: refuse to archive a live worker.
+	cur, rerr := ReadState(project, slug)
+	switch {
+	case rerr == nil:
+		if !isTerminalPhase(cur.Phase) {
+			return fmt.Errorf("%w: phase=%q (must be done|blocked|failed)", ErrPreconditionLive, cur.Phase)
+		}
+		// Even at terminal phase, the process may still be alive
+		// for the brief window between writing phase=done and
+		// exit. Re-check.
+		if cur.PID > 0 && IsAlive(cur.PID) {
+			return fmt.Errorf("%w: phase=%q but pid=%d still alive", ErrPreconditionLive, cur.Phase, cur.PID)
+		}
+	case errors.Is(rerr, ErrNotFound):
+		// No state file — proceed (caller's responsibility).
+	default:
+		return fmt.Errorf("read state for archive precondition: %w", rerr)
+	}
+
 	stamp := time.Now().UTC().Format("20060102-150405")
 	dst, err := state.WorkerArchiveDir(project, slug, stamp)
 	if err != nil {
@@ -265,12 +300,27 @@ func Archive(project, slug string) error {
 	return nil
 }
 
+// isTerminalPhase reports whether p represents a worker that has
+// stopped writing state.json. Coord uses this to decide when it's
+// safe to archive a worker dir.
+func isTerminalPhase(p Phase) bool {
+	switch p {
+	case PhaseDone, PhaseBlocked, PhaseFailed:
+		return true
+	}
+	return false
+}
+
 // PruneArchive removes archive directories older than olderThan.
-// Decision is based on the directory's mtime (cheap; rename(2) sets
-// it to "now"). A worker archived 2026-05-01 with PruneArchive(t,
-// 2026-05-08) is removed.
+// Decision is based on the UTC timestamp embedded in the directory
+// name (`<slug>-YYYYMMDD-HHMMSS`). We do NOT use mtime because
+// rename(2) preserves the source dir's mtime — a long-lived worker
+// archived today could otherwise be pruned immediately because its
+// mtime reflects when the worker first ran, not when it was archived.
 //
-// Returns the count of removed directories.
+// Directories whose names don't parse as the canonical archive
+// pattern are skipped (returned in the int as un-pruned). Returns
+// the count of removed directories.
 func PruneArchive(project string, olderThan time.Time) (int, error) {
 	dir, err := state.ProjectDir(project)
 	if err != nil {
@@ -289,20 +339,44 @@ func PruneArchive(project string, olderThan time.Time) (int, error) {
 		if !e.IsDir() {
 			continue
 		}
+		archivedAt, ok := parseArchiveStamp(e.Name())
+		if !ok {
+			// Unrecognized naming — leave alone. Operator can
+			// remove manually.
+			continue
+		}
+		if !archivedAt.Before(olderThan) {
+			continue
+		}
 		full := filepath.Join(archDir, e.Name())
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		if !info.ModTime().Before(olderThan) {
-			continue
-		}
 		if err := os.RemoveAll(full); err != nil {
 			return removed, fmt.Errorf("remove %s: %w", full, err)
 		}
 		removed++
 	}
 	return removed, nil
+}
+
+// parseArchiveStamp extracts the trailing `-YYYYMMDD-HHMMSS` from an
+// archive directory name (`<slug>-YYYYMMDD-HHMMSS`). Returns the
+// parsed UTC time and true on success; zero time + false on any
+// parse failure.
+//
+// The slug itself can contain hyphens, so we look for the LAST 16
+// chars matching the canonical stamp format. We use a fixed format
+// rather than walking back to the last hyphen pair because a slug
+// like `add-readme-7a3c` would otherwise be ambiguous.
+func parseArchiveStamp(name string) (time.Time, bool) {
+	const stampLen = len("YYYYMMDD-HHMMSS") // 15
+	if len(name) < stampLen+1 || name[len(name)-stampLen-1] != '-' {
+		return time.Time{}, false
+	}
+	stamp := name[len(name)-stampLen:]
+	t, err := time.ParseInLocation("20060102-150405", stamp, time.UTC)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // ListActive scans workers/*/state.json and returns the parsed states
