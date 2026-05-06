@@ -159,20 +159,23 @@ func ProjectTag(p string) string {
 // with a documented migration path.
 
 // sanitizeProjectTag forces s into the ValidateProjectName allowlist
-// ([A-Za-z0-9._-]). Anything else becomes "-"; runs collapse;
+// ([a-z0-9._-]). Anything else becomes "-"; runs collapse;
 // leading/trailing "-" and "." are trimmed because ValidateProjectName
-// rejects "." and "..". Returns "fleet" when the result would
-// otherwise be empty or reserved.
+// rejects "." and "..". Uppercase is lowercased because v0.2 made
+// ValidateProjectName lowercase-only (case-insensitive filesystems
+// would otherwise alias case-only variants onto the same project tree).
+// Returns "fleet" when the result would otherwise be empty or reserved.
 func sanitizeProjectTag(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z',
-			r >= 'A' && r <= 'Z',
 			r >= '0' && r <= '9',
 			r == '-' || r == '_' || r == '.':
 			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
 		default:
 			b.WriteRune('-')
 		}
