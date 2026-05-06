@@ -111,6 +111,52 @@ func TestPrune_MovesOldEntries(t *testing.T) {
 	}
 }
 
+// TestPrune_RetrySafeAfterPartialFailure simulates the crash-recovery
+// path: a previous Prune wrote learnings-archive.md but failed before
+// rewriting learnings.md, so the same entry exists in BOTH files. The
+// retry must NOT duplicate it in the archive.
+func TestPrune_RetrySafeAfterPartialFailure(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	new := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	// Seed both learnings.md and learnings-archive.md with the
+	// "stale" entry — exact crash-state after a partial Prune.
+	if err := Append("fleet", &Entry{Timestamp: old, Author: "operator", Tag: "stale", Body: "old"}); err != nil {
+		t.Fatalf("Append stale to current: %v", err)
+	}
+	if err := Append("fleet", &Entry{Timestamp: new, Author: "operator", Tag: "fresh", Body: "new"}); err != nil {
+		t.Fatalf("Append fresh to current: %v", err)
+	}
+	dir, _ := state.ProjectDir("fleet")
+	arcPath := filepath.Join(dir, "learnings-archive.md")
+	if err := writeFile(arcPath, []Entry{{Timestamp: old, Author: "operator", Tag: "stale", Body: "old"}}, nil); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+
+	// Retry the prune — should be a no-op for archive (already
+	// there) and remove "stale" from current.
+	cutoff := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	if err := Prune("fleet", cutoff); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	arc, err := readEntries(arcPath)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if len(arc) != 1 {
+		t.Errorf("archive has %d entries; want 1 (deduped after retry); got tags=%v", len(arc), tagList(arc))
+	}
+	cur, err := Read("fleet")
+	if err != nil {
+		t.Fatalf("Read current: %v", err)
+	}
+	if len(cur) != 1 || cur[0].Tag != "fresh" {
+		t.Errorf("after retry learnings.md has %v; want [fresh]", tagList(cur))
+	}
+}
+
 func TestFilter_TagSubstring(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

@@ -167,6 +167,12 @@ func Filter(project string, tagSubstr, taskSlug string, limit int) ([]Entry, err
 // in-place — they stay in learnings.md, not in the archive — because
 // we can't decide their age without a parseable timestamp. Operator
 // can fix or remove them by hand.
+//
+// Retry-safe: a partial previous Prune (archive write succeeded but
+// current write failed/crashed) leaves expired entries in BOTH files.
+// On retry we dedupe against entries already in the archive so a
+// re-run never appends duplicates — same invariant tasks.Archive
+// upholds via slug equality.
 func Prune(project string, olderThan time.Time) error {
 	return withLock(project, func() error {
 		curPath, err := learningsPath(project)
@@ -188,10 +194,21 @@ func Prune(project string, olderThan time.Time) error {
 			return fmt.Errorf("read archive: %w", err)
 		}
 
+		// Build a dedup set keyed on the wire-format identity (the
+		// fields the parser reads back) so a previously-archived
+		// entry isn't appended twice across a Prune retry.
+		archived := make(map[string]struct{}, len(archive))
+		for _, a := range archive {
+			archived[entryKey(a)] = struct{}{}
+		}
+
 		kept := make([]Entry, 0, len(current))
 		for _, e := range current {
 			if e.Timestamp.Before(olderThan) {
-				archive = append(archive, e)
+				if _, dup := archived[entryKey(e)]; !dup {
+					archive = append(archive, e)
+					archived[entryKey(e)] = struct{}{}
+				}
 				continue
 			}
 			kept = append(kept, e)
@@ -205,6 +222,17 @@ func Prune(project string, olderThan time.Time) error {
 		}
 		return nil
 	})
+}
+
+// entryKey produces a dedup key matching the on-disk identity of an
+// Entry. RFC3339 normalizes Timestamp precision (writeFile writes
+// second-resolution; freshly-Append'd entries may carry sub-second)
+// so a current-side Entry round-trips to the same key as its
+// archive-side copy. Body is included so two entries with identical
+// headers but distinct bodies (rare but legal) don't collapse.
+func entryKey(e Entry) string {
+	return e.Timestamp.UTC().Format(time.RFC3339) + "|" +
+		e.Author + "|" + e.TaskSlug + "|" + e.Tag + "|" + e.Body
 }
 
 // ---------- internals ----------

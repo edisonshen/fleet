@@ -262,12 +262,19 @@ func ValidateProjectName(name string) error {
 // workers/<x>/ directory.
 //
 // Empty rejected; "." and ".." rejected (parent-dir traversal).
+// "archive" rejected because workers/archive/ is the reserved holding
+// pen for archived worker dirs — a worker with slug=archive would
+// alias that directory and become invisible to ListActive + un-
+// archivable (rename into self).
 func ValidateSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("slug must not be empty")
 	}
 	if slug == "." || slug == ".." {
 		return fmt.Errorf("slug %q reserved", slug)
+	}
+	if slug == "archive" {
+		return fmt.Errorf("slug %q reserved (collides with workers/archive/)", slug)
 	}
 	for _, c := range slug {
 		switch {

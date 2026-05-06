@@ -135,6 +135,20 @@ func TestWorkerDir_RejectsUnsafeSlug(t *testing.T) {
 	}
 }
 
+func TestValidateSlug_RejectsReserved(t *testing.T) {
+	// Slug "archive" would alias workers/archive/ — the reserved
+	// holding pen for archived worker dirs. ValidateSlug must reject
+	// it so callers (tasks.Add, tasks.Read, WorkerDir,
+	// WorkerArchiveDir, WorktreePath) all see the rejection.
+	for _, in := range []string{"archive", ".", ".."} {
+		t.Run(in, func(t *testing.T) {
+			if err := ValidateSlug(in); err == nil {
+				t.Errorf("ValidateSlug(%q) returned nil err; want rejection", in)
+			}
+		})
+	}
+}
+
 func TestWorkerArchiveDir(t *testing.T) {
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
 	got, err := WorkerArchiveDir("fleet", "add-readme-7a3c", "20260506-140000")
