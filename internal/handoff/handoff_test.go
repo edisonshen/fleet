@@ -21,11 +21,12 @@ func TestRender_HasFrontmatterFences(t *testing.T) {
 	}
 }
 
-func TestRender_HasAllFiveSections(t *testing.T) {
+func TestRender_HasAllSections(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
 
 	for _, h := range []string{
+		"## First Action (auto)",
 		"## Completed",
 		"## Key Decisions",
 		"## Files Modified",
@@ -34,6 +35,34 @@ func TestRender_HasAllFiveSections(t *testing.T) {
 	} {
 		if !strings.Contains(got, h) {
 			t.Errorf("missing section %q in:\n%s", h, got)
+		}
+	}
+}
+
+func TestRender_FirstActionAppearsBeforeCompleted(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
+	got := string(Render(d))
+	first := strings.Index(got, "## First Action (auto)")
+	completed := strings.Index(got, "## Completed")
+	if first < 0 || completed < 0 {
+		t.Fatalf("missing one of the sections — first=%d completed=%d", first, completed)
+	}
+	if first >= completed {
+		t.Errorf("First Action must appear before Completed; first=%d completed=%d", first, completed)
+	}
+}
+
+func TestRender_FirstActionCarriesRemoteControlInvocation(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
+	got := string(Render(d))
+	for _, want := range []string{
+		`pgrep -f "claude remote-control"`,
+		"nohup claude remote-control",
+		`--remote-control-session-name-prefix "fleet-handoff"`,
+		"run_in_background: true",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("First Action body missing %q", want)
 		}
 	}
 }
@@ -186,6 +215,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"handoff_type: \"auto-yellow\"\n" +
 		"---\n" +
 		"\n" +
+		"## First Action (auto)\n" + FirstAction + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
 		"## Files Modified\n" + Placeholder + "\n\n" +

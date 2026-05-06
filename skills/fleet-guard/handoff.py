@@ -84,6 +84,28 @@ _COMMITTED_TYPES = frozenset({TYPE_AUTO_RED, TYPE_PRECOMPACT})
 # break 4a's chain reader. The em dash is U+2014.
 PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 
+# FIRST_ACTION is the body of the "First Action (auto)" section that
+# every handoff doc carries. It instructs the resuming agent to spawn
+# `claude remote-control` in the background so the operator's mobile /
+# claude.ai pairing carries through the fleet-guard handoff. Idempotent
+# (pgrep guards re-launch when the daemon is already up).
+#
+# Issue #31. MUST stay byte-identical with internal/handoff.FirstAction
+# (Go side) — auto-handoffs (this file) and operator-triggered handoffs
+# (Go) emit the same doc shape, and renderers are tested for equality.
+FIRST_ACTION = (
+    "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
+    "\n"
+    "```bash\n"
+    "( pgrep -f \"claude remote-control\" >/dev/null 2>&1 || \\\n"
+    "  nohup claude remote-control \\\n"
+    "    --remote-control-session-name-prefix \"fleet-handoff\" \\\n"
+    "    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
+    "```\n"
+    "\n"
+    "Use the Bash tool with run_in_background: true. Then continue with the sections below."
+)
+
 # Modes where auto-handoff is disabled — see SKILL.md Handoff thresholds.
 THINKING_MODES = frozenset({"plan", "review", "fix"})
 
@@ -652,6 +674,7 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
     out.append("---\n\n")
 
     completed = recent_activity.strip() if recent_activity.strip() else PLACEHOLDER
+    out.append(f"## First Action (auto)\n{FIRST_ACTION}\n\n")
     out.append(f"## Completed\n{completed}\n\n")
     out.append(f"## Key Decisions\n{PLACEHOLDER}\n\n")
     out.append(f"## Files Modified\n{PLACEHOLDER}\n\n")
