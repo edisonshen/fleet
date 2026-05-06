@@ -329,10 +329,13 @@ func Archive(project, slug string) error {
 		if !isTerminalPhase(cur.Phase) {
 			return fmt.Errorf("%w: phase=%q (must be done|blocked|failed)", ErrPreconditionLive, cur.Phase)
 		}
-		// Even at terminal phase, the process may still be alive
-		// for the brief window between writing phase=done and
-		// exit. Re-check.
-		if cur.PID > 0 && IsAlive(cur.PID) {
+		// Trust a recorded exit code: if the worker wrote one,
+		// the process IS gone, and IsAlive(PID) is unreliable
+		// (kernel may have recycled the PID for another process).
+		// Only consult IsAlive when no exit code is recorded —
+		// e.g. the worker reached terminal phase and crashed
+		// before exit could be set.
+		if cur.Exit == nil && cur.PID > 0 && IsAlive(cur.PID) {
 			return fmt.Errorf("%w: phase=%q but pid=%d still alive", ErrPreconditionLive, cur.Phase, cur.PID)
 		}
 	case errors.Is(rerr, ErrNotFound):

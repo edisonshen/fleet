@@ -434,6 +434,15 @@ func parse(data []byte) (*File, error) {
 		if strings.HasPrefix(line, "## ") {
 			// Non-task H2 → footer territory. Anything from this
 			// line forward (including this header) is footer.
+			// If a later `## task:` would otherwise appear after
+			// this point, it'd silently disappear into the footer
+			// blob — surface that as a parse error so the operator
+			// fixes the layout.
+			for j := idx + 1; j < len(lines); j++ {
+				if strings.HasPrefix(lines[j], "## task: ") {
+					return nil, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "footer header appears before later task block — move footer to end of file"}
+				}
+			}
 			footerStart = idx
 			break
 		}

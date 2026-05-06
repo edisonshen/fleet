@@ -238,6 +238,28 @@ func TestArchive_RefusesLiveWorker(t *testing.T) {
 	}
 }
 
+func TestArchive_TrustsRecordedExitOverPIDReuse(t *testing.T) {
+	// State has phase=done + a recorded exit code, but PID happens
+	// to be alive (recycled by another process). Archive must trust
+	// the exit code over IsAlive — the original worker is gone.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	live := startSleeper(t, 5*time.Second)
+	defer func() { _ = live.Process.Kill(); _ = live.Wait() }()
+	exit := 0
+	if err := WriteState("fleet", "exited-aaaa", &State{
+		Slug: "exited-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(),
+		PID:  live.Process.Pid, // recycled — pretend this is a re-used PID
+		Exit: &exit,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := Archive("fleet", "exited-aaaa"); err != nil {
+		t.Errorf("Archive returned %v; want nil (recorded exit beats IsAlive)", err)
+	}
+}
+
 func TestArchive_AllowsBlockedAndFailed(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

@@ -204,6 +204,20 @@ func TestAppend_RejectsDelimiterInFields(t *testing.T) {
 	}
 }
 
+func TestAppend_RejectsWhitespaceOnlyFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, e := range []*Entry{
+		{Author: "   ", Tag: "x", Body: "x"},
+		{Author: "operator", Tag: "  \t  ", Body: "x"},
+	} {
+		err := Append("fleet", e)
+		if err == nil {
+			t.Errorf("Append %+v returned nil; want ErrInvalidEntry", e)
+		}
+	}
+}
+
 func TestParseMalformed_PreservedAcrossRewrite(t *testing.T) {
 	// Append/Prune rewrite the file. A malformed block must NOT be
 	// silently deleted on rewrite — it's operator memory, fail open.

@@ -65,11 +65,11 @@ func Append(project string, e *Entry) error {
 	if e.Timestamp.IsZero() {
 		e.Timestamp = time.Now().UTC()
 	}
-	if e.Author == "" {
-		return fmt.Errorf("%w: empty author", ErrInvalidEntry)
+	if strings.TrimSpace(e.Author) == "" {
+		return fmt.Errorf("%w: empty or whitespace-only author", ErrInvalidEntry)
 	}
-	if e.Tag == "" {
-		return fmt.Errorf("%w: empty tag", ErrInvalidEntry)
+	if strings.TrimSpace(e.Tag) == "" {
+		return fmt.Errorf("%w: empty or whitespace-only tag", ErrInvalidEntry)
 	}
 	// Reject fields that contain the H2 delimiter (" · ") or a
 	// newline — both would produce a header that this package's
