@@ -71,6 +71,15 @@ func validPriority(p Priority) bool {
 	return false
 }
 
+// requiredTaskBullets enumerates every `- key:` bullet a well-formed
+// task block must carry. Keep in sync with setKV — these are the keys
+// Write emits, so the parser must refuse to accept anything missing
+// (otherwise the next Write zero-values them).
+var requiredTaskBullets = []string{
+	"status", "priority", "worker_pid", "worktree", "pr_url", "branch",
+	"created", "updated", "depends_on", "spawned_by",
+}
+
 // Task is one entry in tasks.md. Workers are NOT Fleet agents; they're
 // `claude --print` subprocesses. WorkerPID is the OS PID of that
 // subprocess (0 = no worker active). Spec / Acceptance / Notes are the
@@ -201,17 +210,24 @@ func (f *File) Add(t *Task) error {
 	if t.Updated.IsZero() {
 		return fmt.Errorf("%w: updated must be set", ErrInvalidTask)
 	}
-	// Spec/Acceptance/Notes are free-form markdown but column-0 H2
-	// lines would terminate the task block on next parse — reject so
-	// the writer never produces a file it can't read back.
+	// Spec/Acceptance/Notes are free-form markdown but a column-0 H2
+	// OUTSIDE a fenced code block would terminate the task block on
+	// next parse — reject so the writer never produces a file it
+	// can't read back. Fenced `## Example` is allowed; readSection
+	// honors the same fence rule on the read side.
 	for _, sec := range []struct{ name, body string }{
 		{"spec", t.Spec},
 		{"acceptance", t.Acceptance},
 		{"notes", t.Notes},
 	} {
+		inFence := false
 		for _, ln := range strings.Split(sec.body, "\n") {
-			if strings.HasPrefix(ln, "## ") {
-				return fmt.Errorf("%w: %s body has column-0 '## ' (use ### for in-section headings)", ErrInvalidTask, sec.name)
+			if isFenceMarker(ln) {
+				inFence = !inFence
+				continue
+			}
+			if !inFence && strings.HasPrefix(ln, "## ") {
+				return fmt.Errorf("%w: %s body has unfenced column-0 '## ' (use ### for in-section headings, or wrap in ``` for examples)", ErrInvalidTask, sec.name)
 			}
 		}
 	}
@@ -653,6 +669,16 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 	if !validPriority(t.Priority) {
 		return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "invalid priority: " + string(t.Priority)}
 	}
+	// All bullet keys must be present. If an operator edit or merge
+	// conflict drops e.g. `- created:`, the in-memory Task carries a
+	// zero value and the next Write silently rewrites the file with
+	// `0001-01-01T00:00:00Z` / empty deps — destroying task state. List
+	// matches the keys recognized by setKV; keep in sync.
+	for _, key := range requiredTaskBullets {
+		if !seenKey[key] {
+			return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "task missing required field: - " + key}
+		}
+	}
 	// All three reserved H3 sections must be present (per ENG §3.1
 	// `task-block := ..., h3-section+`). Missing sections would be
 	// silently synthesized as empty by Write — surface the operator
@@ -686,19 +712,39 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 // body) and trim the trailing blank(s) so the round-trip is stable.
 // Multi-paragraph bodies (with internal blank lines) round-trip
 // verbatim because trimming is anchored at start/end only.
+//
+// Code-fence safety: lines inside a ```-delimited fenced code block
+// are body content, never structural headers. A fenced example like:
+//
+//	```
+//	### Acceptance
+//	some pasted markdown
+//	```
+//
+// must stay inside the section body. We toggle inFence on every
+// column-0 line whose trimmed prefix is ```, matching CommonMark's
+// fenced-code-block opener/closer rules at indent 0.
 func readSection(lines []string, start int) (string, int) {
 	end := start
+	inFence := false
 	for end < len(lines) {
 		line := lines[end]
-		if strings.HasPrefix(line, "## ") {
-			break
+		if isFenceMarker(line) {
+			inFence = !inFence
+			end++
+			continue
 		}
-		if strings.HasPrefix(line, "### ") {
-			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
-			if isReservedH3(name) {
+		if !inFence {
+			if strings.HasPrefix(line, "## ") {
 				break
 			}
-			// Non-reserved H3 — body content; keep going.
+			if strings.HasPrefix(line, "### ") {
+				name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
+				if isReservedH3(name) {
+					break
+				}
+				// Non-reserved H3 — body content; keep going.
+			}
 		}
 		end++
 	}
@@ -721,6 +767,22 @@ func readSection(lines []string, start int) (string, int) {
 // content inside section bodies as free-form markdown.
 func isReservedH3(name string) bool {
 	return name == "Spec" || name == "Acceptance" || name == "Notes"
+}
+
+// isFenceMarker reports whether line is a column-0 ```-delimited
+// fenced-code-block opener/closer (with or without a language tag).
+// Indented fences are intentionally not recognized — operator-authored
+// task bodies use indent 0 fences; deeper indents are nested content
+// inside the outer fence we already track.
+func isFenceMarker(line string) bool {
+	if !strings.HasPrefix(line, "```") {
+		return false
+	}
+	// Reject ```` (4+ backticks) — CommonMark allows them but our
+	// canonical layout uses 3. Anything starting with exactly ``` plus
+	// optional language tag counts.
+	rest := line[3:]
+	return !strings.HasPrefix(rest, "`")
 }
 
 // splitKV splits "key: value" into (key, value, ok). Anything before

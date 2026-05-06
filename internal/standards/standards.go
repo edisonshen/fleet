@@ -218,7 +218,9 @@ func parse(data []byte, from From) (*Standards, error) {
 	}
 
 	// Skip the optional `# Standards` H1 — it's part of the canonical
-	// shape but not an H2 we care about.
+	// shape but not an H2 we care about. Pre-section preamble has no
+	// fenced code blocks in the canonical layout (any markdown here
+	// would be a noisy file anyway), so a plain prefix scan is fine.
 	for idx < len(lines) {
 		line := lines[idx]
 		if strings.HasPrefix(line, "## ") {
@@ -236,8 +238,19 @@ func parse(data []byte, from From) (*Standards, error) {
 		name := strings.TrimSpace(strings.TrimPrefix(line, "## "))
 		idx++
 		bodyStart := idx
+		// Section bodies are opaque markdown. A fenced code block
+		// containing `## Example` must NOT terminate the section —
+		// otherwise standards files with markdown examples corrupt
+		// on round-trip. Track fence state and only break on `## `
+		// when we're not inside a ```-delimited block.
+		inFence := false
 		for idx < len(lines) {
-			if strings.HasPrefix(lines[idx], "## ") {
+			if isFenceMarker(lines[idx]) {
+				inFence = !inFence
+				idx++
+				continue
+			}
+			if !inFence && strings.HasPrefix(lines[idx], "## ") {
 				break
 			}
 			idx++
@@ -258,6 +271,18 @@ func parse(data []byte, from From) (*Standards, error) {
 		})
 	}
 	return s, nil
+}
+
+// isFenceMarker reports whether line is a column-0 ```-delimited
+// fenced-code-block opener/closer (with or without a language tag).
+// Matches the same rule the tasks package uses; keep semantics in
+// sync to avoid drift if a section body is moved between files.
+func isFenceMarker(line string) bool {
+	if !strings.HasPrefix(line, "```") {
+		return false
+	}
+	rest := line[3:]
+	return !strings.HasPrefix(rest, "`")
 }
 
 func splitKV(line string) (string, string, bool) {

@@ -494,6 +494,107 @@ func TestAdd_RejectsBodyH2InSection(t *testing.T) {
 	}
 }
 
+func TestAdd_AllowsFencedH2InBody(t *testing.T) {
+	// A column-0 `## ` inside a fenced code block is example markdown,
+	// not a structural header. Add must accept it; readSection must
+	// keep it inside the section body. Round-trip proves both sides.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	body := "Example doc layout:\n\n```\n## task: example-deadbeef\n- status: todo\n```\n\nback to body."
+	tk := &Task{
+		Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: body, Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add rejected fenced H2: %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "fenced.md")
+	if err := Write(tmp, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d (fence treated as task boundary)", len(got.Tasks))
+	}
+	if got.Tasks[0].Spec != body {
+		t.Errorf("Spec body changed across round-trip:\n want=%q\n  got=%q", body, got.Tasks[0].Spec)
+	}
+}
+
+func TestAdd_RejectsUnfencedH2EvenAfterFenceCloses(t *testing.T) {
+	// A fenced block followed by an unfenced `## ` must still be
+	// rejected — the fence-aware check toggles state, it doesn't
+	// disable the check globally.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	body := "```\n## inside fence\n```\n\n## but THIS is real and bad"
+	tk := &Task{
+		Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: body, Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	err := f.Add(tk)
+	if err == nil {
+		t.Fatal("Add accepted unfenced H2 after a closed fence")
+	}
+	if !errors.Is(err, ErrInvalidTask) {
+		t.Errorf("got %v; want ErrInvalidTask", err)
+	}
+}
+
+func TestParse_RejectsTaskMissingRequiredBullets(t *testing.T) {
+	// If an operator edit drops `- created:` (or any other required
+	// bullet), the parser must refuse rather than zero-value the field
+	// and corrupt the file on next Write. Test each required bullet
+	// in turn by deleting one line at a time from a known-good fixture.
+	canonical := "---\nschema: v1\n---\n\n" +
+		"## task: req-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+
+	required := []string{
+		"status", "priority", "worker_pid", "worktree", "pr_url", "branch",
+		"created", "updated", "depends_on", "spawned_by",
+	}
+	for _, key := range required {
+		// Delete the matching `- key:` line.
+		var kept []string
+		for _, ln := range strings.Split(canonical, "\n") {
+			if strings.HasPrefix(ln, "- "+key+":") {
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		broken := strings.Join(kept, "\n")
+		tmp := filepath.Join(t.TempDir(), "missing-"+key+".md")
+		if err := os.WriteFile(tmp, []byte(broken), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, err := Read(tmp)
+		if err == nil {
+			t.Errorf("Read accepted file missing `- %s:`; want ParseError", key)
+			continue
+		}
+		var pe *ParseError
+		if !errors.As(err, &pe) {
+			// status / priority dropped paths return validStatus/Priority
+			// errors via empty-value detection — those are acceptable
+			// surfacings of the same problem. Just confirm SOME error.
+			continue
+		}
+		if !strings.Contains(pe.Msg, key) {
+			t.Errorf("missing-%s: error message %q does not name the missing key", key, pe.Msg)
+		}
+	}
+}
+
 func TestSlugUniqueness_Read(t *testing.T) {
 	// File with two H2 blocks sharing a slug must error on Read.
 	src := "---\nschema: v1\n---\n\n" +

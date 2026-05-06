@@ -198,6 +198,39 @@ func TestRender_EmitsSchemaFrontmatter(t *testing.T) {
 	}
 }
 
+func TestParse_FencedH2StaysInBody(t *testing.T) {
+	// Section bodies are opaque markdown. A fenced ```...``` example
+	// containing a column-0 `## Example` must NOT split the section.
+	// Pre-fix the parser saw the inner `## ` and started a new section,
+	// shredding both the body of the outer section and the file's
+	// section count.
+	src := "---\nschema: v1\n---\n\n# Standards\n\n" +
+		"## Testing\n\n" +
+		"Use fenced examples liberally:\n\n" +
+		"```\n## Example header (inside fence)\nstill body\n```\n\n" +
+		"trailing line.\n\n" +
+		"## Code review\n\n" +
+		"Reviewers must be ruthless.\n"
+	t.Setenv("FLEET_HOME", t.TempDir())
+	writeFile(t, filepath.Join(os.Getenv("FLEET_HOME"), "standards.md"), src)
+	g, err := LoadGlobal()
+	if err != nil {
+		t.Fatalf("LoadGlobal: %v", err)
+	}
+	if len(g.Sections) != 2 {
+		t.Fatalf("got %d sections; want 2 — fenced `## ` was treated as a header", len(g.Sections))
+	}
+	if g.Sections[0].Name != "Testing" {
+		t.Errorf("first section name=%q; want Testing", g.Sections[0].Name)
+	}
+	if !strings.Contains(g.Sections[0].Body, "## Example header (inside fence)") {
+		t.Errorf("Testing body lost the fenced `## Example` line:\n%s", g.Sections[0].Body)
+	}
+	if !strings.Contains(g.Sections[0].Body, "trailing line.") {
+		t.Errorf("Testing body truncated before fence closed:\n%s", g.Sections[0].Body)
+	}
+}
+
 func names(secs []Section) []string {
 	out := make([]string, 0, len(secs))
 	for _, s := range secs {
