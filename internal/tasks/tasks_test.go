@@ -444,6 +444,56 @@ func TestSlugUniqueness_Add(t *testing.T) {
 	}
 }
 
+func TestAdd_RejectsZeroTimestamps(t *testing.T) {
+	// Archive distinguishes retry-recovery from slug-reuse via
+	// Created equality; zero timestamps would make every reused slug
+	// look like a retry. Add must reject zero values up front.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	cases := []*Task{
+		{Slug: "a-1234", Status: StatusTodo, Priority: PriorityP1, Updated: now}, // zero Created
+		{Slug: "b-1234", Status: StatusTodo, Priority: PriorityP1, Created: now}, // zero Updated
+	}
+	for i, tc := range cases {
+		f := &File{Schema: 1}
+		err := f.Add(tc)
+		if err == nil {
+			t.Errorf("case %d: Add returned nil; want ErrInvalidTask", i)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("case %d: got %v; want ErrInvalidTask", i, err)
+		}
+	}
+}
+
+func TestAdd_RejectsBodyH2InSection(t *testing.T) {
+	// Spec/Acceptance/Notes are free-form markdown but column-0 H2
+	// (`## ...`) would split the task on next Read. Add rejects so
+	// the writer never produces a self-corrupting file.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(spec, acc, notes string) *Task {
+		return &Task{
+			Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+			Created: now, Updated: now, SpawnedBy: "user",
+			Spec: spec, Acceptance: acc, Notes: notes,
+		}
+	}
+	cases := []*Task{
+		mk("## Sneaky H2 in spec", "ok", "ok"),
+		mk("ok", "Line 1\n## Mid-body H2 in acceptance\nline 3", "ok"),
+		mk("ok", "ok", "## Notes-section H2 (workers love these)"),
+	}
+	for i, tc := range cases {
+		f := &File{Schema: 1}
+		err := f.Add(tc)
+		if err == nil {
+			t.Errorf("case %d: Add returned nil; want ErrInvalidTask", i)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("case %d: got %v; want ErrInvalidTask", i, err)
+		}
+	}
+}
+
 func TestSlugUniqueness_Read(t *testing.T) {
 	// File with two H2 blocks sharing a slug must error on Read.
 	src := "---\nschema: v1\n---\n\n" +

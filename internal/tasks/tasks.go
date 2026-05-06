@@ -175,7 +175,9 @@ func (f *File) Get(slug string) (*Task, error) {
 }
 
 // Add appends a task; returns ErrDuplicateSlug if Slug is already in
-// use. Validates Status/Priority enums.
+// use. Validates Status/Priority enums, non-zero Created/Updated, and
+// rejects column-0 H2 lines in Spec/Acceptance/Notes (would self-corrupt
+// the file: Read uses `## ` at column 0 as the task-block boundary).
 func (f *File) Add(t *Task) error {
 	if t == nil {
 		return fmt.Errorf("%w: nil task", ErrInvalidTask)
@@ -188,6 +190,30 @@ func (f *File) Add(t *Task) error {
 	}
 	if !validPriority(t.Priority) {
 		return fmt.Errorf("%w: priority=%q", ErrInvalidTask, t.Priority)
+	}
+	// Non-zero Created/Updated. Archive uses Created.Equal() to
+	// distinguish retry-recovery from slug-reuse; two zero-valued
+	// Created tasks would compare equal and let the second silently
+	// drop on Archive (codex iter-12 finding).
+	if t.Created.IsZero() {
+		return fmt.Errorf("%w: created must be set", ErrInvalidTask)
+	}
+	if t.Updated.IsZero() {
+		return fmt.Errorf("%w: updated must be set", ErrInvalidTask)
+	}
+	// Spec/Acceptance/Notes are free-form markdown but column-0 H2
+	// lines would terminate the task block on next parse — reject so
+	// the writer never produces a file it can't read back.
+	for _, sec := range []struct{ name, body string }{
+		{"spec", t.Spec},
+		{"acceptance", t.Acceptance},
+		{"notes", t.Notes},
+	} {
+		for _, ln := range strings.Split(sec.body, "\n") {
+			if strings.HasPrefix(ln, "## ") {
+				return fmt.Errorf("%w: %s body has column-0 '## ' (use ### for in-section headings)", ErrInvalidTask, sec.name)
+			}
+		}
 	}
 	for _, existing := range f.Tasks {
 		if existing.Slug == t.Slug {

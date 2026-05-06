@@ -124,9 +124,33 @@ func ReadState(project, slug string) (*State, error) {
 // requirements (done→pr_url, blocked→blocked_reason) and bumps
 // UpdatedAt.
 //
-// Caller is responsible for holding any cross-process lock if
-// multiple writers may race; UpdateState wraps this with an flock.
+// Takes the per-worker in-process mutex + flock so concurrent writers
+// (including a concurrent Archive) serialize through the same lock as
+// UpdateState. Without this, a WriteState landing after Archive's
+// rename would recreate workers/<slug>/state.json and leave both an
+// archived dir and a fresh active one.
 func WriteState(project, slug string, s *State) error {
+	if slug == "" {
+		return fmt.Errorf("%w: empty slug", ErrInvalidSlug)
+	}
+	key := project + "/" + slug
+	muIface, _ := updateMu.LoadOrStore(key, &sync.Mutex{})
+	mu := muIface.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := acquireWorkerLock(project, slug)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return writeStateLocked(project, slug, s)
+}
+
+// writeStateLocked is the body of WriteState without lock acquisition.
+// UpdateState calls this directly because it already holds the lock;
+// public callers must go through WriteState (which locks) so concurrent
+// writes serialize with Archive.
+func writeStateLocked(project, slug string, s *State) error {
 	if s == nil {
 		return fmt.Errorf("%w: nil state", ErrInvalidState)
 	}
@@ -220,7 +244,7 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 		}
 	}
 	mutate(cur)
-	return WriteState(project, slug, cur)
+	return writeStateLocked(project, slug, cur)
 }
 
 // acquireWorkerLock returns an exclusive flock on the per-worker lock
