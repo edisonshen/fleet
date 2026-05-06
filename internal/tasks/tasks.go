@@ -98,10 +98,13 @@ type Task struct {
 // upgraded to SchemaVersion on the next Write.
 //
 // Footer holds any trailing markdown after the last `## task:` block —
-// the grammar (ENG §3.1) explicitly allows arbitrary footer text, and
-// the round-trip rule requires it be preserved verbatim. Operator
-// notes added below the task list survive `fleet tasks add/set/archive`
-// because Read captures Footer and Write re-emits it.
+// the grammar (ENG §3.1) allows arbitrary footer text, preserved
+// verbatim. Footer detection requires the trailing region to start
+// with a `## ` (non-task H2) header; the grammar's `body := text up
+// to next ## or ### or EOF` rule means a paragraph or list item
+// directly after `### Notes` is treated as Notes body, NOT footer.
+// Operators wanting cross-task notes should anchor them with an
+// explicit `## Operator notes` header.
 type File struct {
 	Schema int
 	Tasks  []*Task
@@ -542,7 +545,10 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		idx++
 	}
 
-	// H3 sections (Spec / Acceptance / Notes), in any order.
+	// H3 sections (Spec / Acceptance / Notes), in any order. Track
+	// which sections have been parsed so a duplicate H3 raises an
+	// error (instead of silently overwriting the earlier body).
+	seenH3 := make(map[string]bool, 3)
 	for idx < len(lines) {
 		line := lines[idx]
 		if strings.HasPrefix(line, "## ") {
@@ -551,6 +557,10 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		if strings.HasPrefix(line, "### ") {
 			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
 			body, next := readSection(lines, idx+1)
+			if seenH3[name] {
+				return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "duplicate ### " + name + " section"}
+			}
+			seenH3[name] = true
 			switch name {
 			case "Spec":
 				t.Spec = body
