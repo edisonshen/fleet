@@ -175,9 +175,12 @@ func WriteState(project, slug string, s *State) error {
 // atomically publishes. Both an in-process mutex and a per-worker
 // flock serialize concurrent updaters.
 //
-// The flock target is workers/<slug>/.update.lock — separate from
-// state.json so the lock file isn't itself the data and is safe to
-// leave persistent.
+// The flock target is ~/.fleet/projects/<project>/.locks/worker-<slug>.lock
+// — under the per-project lock dir, NOT under workers/<slug>/. Putting
+// the lock under workers/<slug>/ would let Archive's rename move it
+// out from under in-flight updaters; Archive could then race a fresh
+// UpdateState that recreates workers/<slug>/state.json after the
+// rename, leaving stray active + archive dirs.
 func UpdateState(project, slug string, mutate func(*State)) error {
 	if mutate == nil {
 		return fmt.Errorf("%w: nil mutate fn", ErrInvalidState)
@@ -189,6 +192,12 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 	mu.Lock()
 	defer mu.Unlock()
 
+	release, err := acquireWorkerLock(project, slug)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	dir, err := state.WorkerDir(project, slug)
 	if err != nil {
 		return err
@@ -196,16 +205,6 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir worker dir: %w", err)
 	}
-	lockPath := filepath.Join(dir, ".update.lock")
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return fmt.Errorf("open lock: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock: %w", err)
-	}
-	// Implicit unlock on Close.
 
 	cur, err := ReadState(project, slug)
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -222,6 +221,34 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 	}
 	mutate(cur)
 	return WriteState(project, slug, cur)
+}
+
+// acquireWorkerLock returns an exclusive flock on the per-worker lock
+// file under ~/.fleet/projects/<project>/.locks/worker-<slug>.lock.
+// The path is stable across worker dir renames, so Archive and
+// UpdateState contend through the same fs object even when the
+// worker dir itself is being moved.
+//
+// Returns a release function the caller must defer.
+func acquireWorkerLock(project, slug string) (func(), error) {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	lockDir := filepath.Join(pdir, ".locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "worker-"+state.SafeLockComponent(slug)+".lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open worker lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("flock worker lock: %w", err)
+	}
+	return func() { _ = f.Close() }, nil
 }
 
 // IsAlive returns true if the OS process with pid is alive. Uses
@@ -274,25 +301,21 @@ func Archive(project, slug string) error {
 	}
 
 	// Coordinate with UpdateState: take the same in-process mutex
-	// AND the per-worker .update.lock so an in-flight UpdateState
-	// can't race the rename. The flock+mutex pair mirrors
-	// UpdateState's discipline; closing the fd at scope exit
-	// releases the kernel lock.
+	// + per-worker flock. Both live under .locks/ — a stable path
+	// the rename below does NOT touch, so the lock survives the
+	// directory move and any concurrent UpdateState observes the
+	// lock through the SAME inode.
 	key := project + "/" + slug
 	muIface, _ := updateMu.LoadOrStore(key, &sync.Mutex{})
 	mu := muIface.(*sync.Mutex)
 	mu.Lock()
 	defer mu.Unlock()
 
-	lockPath := filepath.Join(src, ".update.lock")
-	lockF, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	release, err := acquireWorkerLock(project, slug)
 	if err != nil {
-		return fmt.Errorf("open update lock for archive: %w", err)
+		return fmt.Errorf("acquire worker lock for archive: %w", err)
 	}
-	defer func() { _ = lockF.Close() }()
-	if err := syscall.Flock(int(lockF.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock update lock: %w", err)
-	}
+	defer release()
 
 	// Re-verify preconditions under the lock — the predecessor's
 	// UpdateState may have just landed and bumped phase/pid.
@@ -314,13 +337,11 @@ func Archive(project, slug string) error {
 		return fmt.Errorf("read state for archive precondition: %w", rerr)
 	}
 
-	// Close the lock fd before renaming. macOS allows rename on a
-	// dir whose contents are open, but the fd would dangle inside
-	// the archived path; we don't need it past this point because
-	// the in-process mutex still serializes us against any future
-	// UpdateState call (which would itself reopen the lock at the
-	// new path and find no work to do).
-	_ = lockF.Close()
+	// Lock stays held through the rename (closure runs on return).
+	// A second UpdateState entering after our return must take the
+	// same lock first; by that time tasks.md should have been
+	// updated by the coord to clear worker_pid, and a fresh
+	// UpdateState on the now-archived slug is the caller's bug.
 
 	stamp := time.Now().UTC().Format("20060102-150405")
 	dst, err := state.WorkerArchiveDir(project, slug, stamp)

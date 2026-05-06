@@ -1,7 +1,6 @@
 package state
 
 import (
-	"strings"
 	"testing"
 )
 
@@ -10,20 +9,14 @@ import (
 // path layout so callers (internal/tasks, internal/learnings,
 // internal/standards, internal/workers) can rely on the shapes.
 
-func TestProjectDir(t *testing.T) {
+func TestProjectDir_AcceptsValidNames(t *testing.T) {
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
 	cases := map[string]string{
 		"fleet":       "/tmp/fleet-test/projects/fleet/",
 		"gift-finder": "/tmp/fleet-test/projects/gift-finder/",
-		// Safe-name sanitization mirrors SafeLockComponent: legacy
-		// names with slashes / spaces / colons must still resolve to
-		// a single-component directory, never escape projects/.
-		"owner/repo":  "/tmp/fleet-test/projects/owner_repo/",
-		"gift finder": "/tmp/fleet-test/projects/gift_finder/",
-		"foo:bar":     "/tmp/fleet-test/projects/foo_bar/",
+		"v2.1":        "/tmp/fleet-test/projects/v2.1/",
+		"my_project":  "/tmp/fleet-test/projects/my_project/",
 		"":            "/tmp/fleet-test/projects/_default/",
-		"..":          "/tmp/fleet-test/projects/_../",
-		"../escape":   "/tmp/fleet-test/projects/.._escape/",
 	}
 	for in, want := range cases {
 		t.Run(in, func(t *testing.T) {
@@ -33,6 +26,28 @@ func TestProjectDir(t *testing.T) {
 			}
 			if got != want {
 				t.Errorf("got %q want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestProjectDir_RejectsAliasingNames(t *testing.T) {
+	// ProjectDir refuses inputs that SafeLockComponent would alias —
+	// silent collision on tasks.md / workers/ would corrupt state
+	// across two distinct projects.
+	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
+	for _, in := range []string{
+		"owner/repo",
+		"gift finder",
+		"foo:bar",
+		"..",
+		"../escape",
+		".",
+	} {
+		t.Run(in, func(t *testing.T) {
+			_, err := ProjectDir(in)
+			if err == nil {
+				t.Errorf("ProjectDir(%q) returned nil err; want validation failure", in)
 			}
 		})
 	}
@@ -50,15 +65,14 @@ func TestProjectStateLockPath(t *testing.T) {
 	}
 }
 
-func TestProjectStateLockPath_SanitizesLegacyNames(t *testing.T) {
+func TestProjectStateLockPath_RejectsAliasingNames(t *testing.T) {
+	// ProjectStateLockPath layers on ProjectDir, which refuses
+	// names that would alias on disk. Verify the rejection
+	// propagates.
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
-	got, err := ProjectStateLockPath("owner/repo")
-	if err != nil {
-		t.Fatalf("ProjectStateLockPath: %v", err)
-	}
-	want := "/tmp/fleet-test/projects/owner_repo/.locks/state.lock"
-	if got != want {
-		t.Errorf("got %q want %q", got, want)
+	_, err := ProjectStateLockPath("owner/repo")
+	if err == nil {
+		t.Error("ProjectStateLockPath(owner/repo) returned nil err; want validation failure")
 	}
 }
 
@@ -105,22 +119,19 @@ func TestWorkerDir(t *testing.T) {
 	}
 }
 
-func TestWorkerDir_SafeSlug(t *testing.T) {
-	// Slug is supposed to be [a-z0-9-]+-<4hex>, but defensively pass
-	// it through SafeLockComponent so a crafted slug never escapes
-	// the workers/ dir. Dot-only / dot-dot must be rejected too.
+func TestWorkerDir_RejectsUnsafeSlug(t *testing.T) {
+	// Slug is supposed to be [a-z0-9-]+-<4hex>. WorkerDir refuses
+	// slugs containing path separators or other unsafe runes —
+	// silent SafeLockComponent mapping would alias `feature/a` and
+	// `feature_a` onto the same workers/<x>/ directory.
 	t.Setenv("FLEET_HOME", "/tmp/fleet-test")
-	for _, in := range []string{"../escape", "foo bar"} {
-		got, err := WorkerDir("fleet", in)
-		if err != nil {
-			t.Fatalf("WorkerDir(%q): %v", in, err)
-		}
-		if strings.Contains(got, "..") && !strings.HasSuffix(got, "_../") && !strings.Contains(got, ".._escape") {
-			t.Errorf("WorkerDir(%q)=%q escaped sanitizer", in, got)
-		}
-		if strings.Contains(got, " ") {
-			t.Errorf("WorkerDir(%q)=%q kept space", in, got)
-		}
+	for _, in := range []string{"../escape", "foo bar", "feature/a", "with:colon"} {
+		t.Run(in, func(t *testing.T) {
+			_, err := WorkerDir("fleet", in)
+			if err == nil {
+				t.Errorf("WorkerDir(fleet, %q) returned nil err; want rejection", in)
+			}
+		})
 	}
 }
 

@@ -178,8 +178,8 @@ func (f *File) Add(t *Task) error {
 	if t == nil {
 		return fmt.Errorf("%w: nil task", ErrInvalidTask)
 	}
-	if t.Slug == "" {
-		return fmt.Errorf("%w: empty slug", ErrInvalidTask)
+	if err := state.ValidateSlug(t.Slug); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTask, err)
 	}
 	if !validStatus(t.Status) {
 		return fmt.Errorf("%w: status=%q", ErrInvalidTask, t.Status)
@@ -496,6 +496,12 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 	slug = strings.TrimSpace(slug)
 	if slug == "" {
 		return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "task header missing slug"}
+	}
+	// Reject slugs that would alias on disk via state.SafeLockComponent
+	// — `feature/a` and `feature_a` would otherwise collapse onto the
+	// same workers/<x>/ directory at runtime.
+	if err := state.ValidateSlug(slug); err != nil {
+		return nil, 0, &ParseError{Line: start + 1, Col: 1, Raw: header, Msg: "invalid slug: " + err.Error()}
 	}
 	t.Slug = slug
 

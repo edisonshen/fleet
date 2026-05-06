@@ -253,6 +253,35 @@ func ValidateProjectName(name string) error {
 	return nil
 }
 
+// ValidateSlug rejects task / worker slugs that would alias on disk.
+//
+// Same character set as ValidateProjectName: ASCII letters, digits,
+// hyphen, underscore, period — no path separators, spaces, or other
+// runes that SafeLockComponent would map to "_". An invalid slug
+// would otherwise let `feature/a` and `feature_a` collide on the
+// workers/<x>/ directory.
+//
+// Empty rejected; "." and ".." rejected (parent-dir traversal).
+func ValidateSlug(slug string) error {
+	if slug == "" {
+		return fmt.Errorf("slug must not be empty")
+	}
+	if slug == "." || slug == ".." {
+		return fmt.Errorf("slug %q reserved", slug)
+	}
+	for _, c := range slug {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		default:
+			return fmt.Errorf("slug %q contains invalid character %q (allowed: letters, digits, _, -, .)", slug, c)
+		}
+	}
+	return nil
+}
+
 // WriteAtomic publishes data to path via .tmp + fsync + rename.
 // Implements docs/STATE.md A1 (Atomic file publish).
 //
@@ -301,9 +330,17 @@ var ErrNotFound = errors.New("not found")
 // .locks/ subdirectory holding state.lock + coordinator.lock.
 //
 // The trailing slash is intentional — callers join with `filepath.Join`
-// or treat the result as a directory prefix. Project name is sanitized
-// via SafeLockComponent so legacy / unsafe inputs (e.g. "owner/repo")
-// never escape the projects/ root.
+// or treat the result as a directory prefix.
+//
+// SAFE-NAME RULE: name must be empty (resolves to "_default") or pass
+// the same character set as ValidateProjectName ([a-zA-Z0-9_.-], no
+// "." or ".."). The v0.1 ProjectLockPath path used SafeLockComponent
+// to map unsafe inputs to "_" so legacy LOCK files kept working —
+// that's tolerable for a zero-byte sentinel where collisions are
+// harmless. For ProjectDir the same mapping would silently alias
+// `owner/repo` and `owner_repo` onto the SAME tasks.md / learnings.md
+// / workers/ tree — corrupting both projects' state. We reject
+// invalid names here instead, and callers must use safe names.
 //
 // This is a path-only helper; it does NOT create the directory. First
 // writer (e.g. tasks.Write) is responsible for MkdirAll.
@@ -312,7 +349,15 @@ func ProjectDir(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(root, "projects", SafeLockComponent(name)) + string(filepath.Separator), nil
+	if name == "" {
+		// Backwards-compat with empty input: use the same fallback
+		// as SafeLockComponent so a zero-value caller doesn't break.
+		return filepath.Join(root, "projects", "_default") + string(filepath.Separator), nil
+	}
+	if err := ValidateProjectName(name); err != nil {
+		return "", fmt.Errorf("ProjectDir: %w", err)
+	}
+	return filepath.Join(root, "projects", name) + string(filepath.Separator), nil
 }
 
 // ProjectStateLockPath returns ~/.fleet/projects/<safe-name>/.locks/state.lock.
@@ -350,15 +395,19 @@ func CoordinatorLockPath(name string) (string, error) {
 // owns one directory containing state.json + output.log. Coordinator
 // watches state.json via fsnotify; operator inspects via `fleet peek`.
 //
-// Slug is passed through SafeLockComponent so a crafted slug cannot
-// escape workers/. In practice slugs are <short>-<4hex> per the v0.2
-// slug rule, but this helper is defensive.
+// Slug must pass ValidateSlug — only [a-zA-Z0-9_.-] allowed, no
+// "." or "..". Unsafe input is rejected rather than mapped via
+// SafeLockComponent because that mapping would alias `feature/a` and
+// `feature_a` onto the same workers/<x>/ directory.
 func WorkerDir(project, slug string) (string, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "workers", SafeLockComponent(slug)) + string(filepath.Separator), nil
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorkerDir: %w", err)
+	}
+	return filepath.Join(dir, "workers", slug) + string(filepath.Separator), nil
 }
 
 // WorkerArchiveDir returns
@@ -367,12 +416,17 @@ func WorkerDir(project, slug string) (string, error) {
 // Workers archive on phase=done; auto-prune at 7d. ts is a UTC stamp
 // produced by the caller (e.g. ts.UTC().Format("20060102-150405")) so
 // archive paths are stable across timezones.
+//
+// Slug is validated (same rule as WorkerDir).
 func WorkerArchiveDir(project, slug, ts string) (string, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "workers", "archive", SafeLockComponent(slug)+"-"+ts) + string(filepath.Separator), nil
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorkerArchiveDir: %w", err)
+	}
+	return filepath.Join(dir, "workers", "archive", slug+"-"+ts) + string(filepath.Separator), nil
 }
 
 // WorktreePath returns ~/.fleet/projects/<project>/worktrees/<slug>/.
@@ -381,10 +435,15 @@ func WorkerArchiveDir(project, slug, ts string) (string, error) {
 // via `git worktree add` and removed via `git worktree remove --force`
 // on task archive. Single-worker mode (default) reuses the repo root
 // instead.
+//
+// Slug is validated (same rule as WorkerDir).
 func WorktreePath(project, slug string) (string, error) {
 	dir, err := ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "worktrees", SafeLockComponent(slug)) + string(filepath.Separator), nil
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorktreePath: %w", err)
+	}
+	return filepath.Join(dir, "worktrees", slug) + string(filepath.Separator), nil
 }
