@@ -77,12 +77,12 @@ func Append(project string, e *Entry) error {
 		if err != nil {
 			return err
 		}
-		entries, err := readEntries(path)
+		entries, raws, err := readEntriesAndRaw(path)
 		if err != nil {
 			return fmt.Errorf("read: %w", err)
 		}
 		entries = append(entries, *e)
-		return writeEntries(path, entries)
+		return writeFile(path, entries, raws)
 	})
 }
 
@@ -135,6 +135,11 @@ func Filter(project string, tagSubstr, taskSlug string, limit int) ([]Entry, err
 // Prune moves entries older than olderThan to learnings-archive.md and
 // rewrites learnings.md with the survivors. Atomic publish for both
 // files; lock taken once across the whole operation.
+//
+// Malformed (unparseable) blocks in the source file are preserved
+// in-place — they stay in learnings.md, not in the archive — because
+// we can't decide their age without a parseable timestamp. Operator
+// can fix or remove them by hand.
 func Prune(project string, olderThan time.Time) error {
 	return withLock(project, func() error {
 		curPath, err := learningsPath(project)
@@ -147,16 +152,16 @@ func Prune(project string, olderThan time.Time) error {
 		}
 		arcPath := filepath.Join(dir, "learnings-archive.md")
 
-		current, err := readEntries(curPath)
+		current, curRaws, err := readEntriesAndRaw(curPath)
 		if err != nil {
 			return fmt.Errorf("read current: %w", err)
 		}
-		archive, err := readEntries(arcPath)
+		archive, arcRaws, err := readEntriesAndRaw(arcPath)
 		if err != nil {
 			return fmt.Errorf("read archive: %w", err)
 		}
 
-		kept := current[:0]
+		kept := make([]Entry, 0, len(current))
 		for _, e := range current {
 			if e.Timestamp.Before(olderThan) {
 				archive = append(archive, e)
@@ -164,12 +169,11 @@ func Prune(project string, olderThan time.Time) error {
 			}
 			kept = append(kept, e)
 		}
-		current = kept
 
-		if err := writeEntries(arcPath, archive); err != nil {
+		if err := writeFile(arcPath, archive, arcRaws); err != nil {
 			return fmt.Errorf("write archive: %w", err)
 		}
-		if err := writeEntries(curPath, current); err != nil {
+		if err := writeFile(curPath, kept, curRaws); err != nil {
 			return fmt.Errorf("write current: %w", err)
 		}
 		return nil
@@ -186,15 +190,32 @@ func learningsPath(project string) (string, error) {
 	return filepath.Join(dir, "learnings.md"), nil
 }
 
+// rawBlock holds the verbatim text of an H2 block whose header we
+// could not parse. We carry these through Append/Prune so a single
+// malformed entry doesn't get silently deleted on the next rewrite —
+// the file is operator memory, and "fail open / preserve unknowns"
+// is the correct stance for a markdown log.
+type rawBlock struct {
+	header string   // the `<text>` after `## `
+	body   []string // body lines verbatim, including leading + trailing blanks
+}
+
 // readEntries parses an entire learnings.md file. Missing file ⇒ empty
-// slice (not error). Schema mismatch ⇒ ErrSchemaTooNew.
+// slice (not error). Schema mismatch ⇒ ErrSchemaTooNew. Malformed
+// blocks (bad header) are returned as a parallel rawBlock slice so the
+// rewrite path can splice them back in unchanged.
 func readEntries(path string) ([]Entry, error) {
+	entries, _, err := readEntriesAndRaw(path)
+	return entries, err
+}
+
+func readEntriesAndRaw(path string) ([]Entry, []rawBlock, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read: %w", err)
+		return nil, nil, fmt.Errorf("read: %w", err)
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
@@ -215,30 +236,31 @@ func readEntries(path string) ([]Entry, error) {
 				if strings.TrimSpace(line) == "" {
 					continue
 				}
-				return nil, fmt.Errorf("frontmatter line %d malformed: %q", i+1, line)
+				return nil, nil, fmt.Errorf("frontmatter line %d malformed: %q", i+1, line)
 			}
 			if k == "schema" {
 				v = strings.TrimSpace(v)
 				if !strings.HasPrefix(v, "v") {
-					return nil, fmt.Errorf("schema must be vN: %q", v)
+					return nil, nil, fmt.Errorf("schema must be vN: %q", v)
 				}
 				var n int
 				if _, ferr := fmt.Sscanf(v[1:], "%d", &n); ferr != nil {
-					return nil, fmt.Errorf("schema vN: %w", ferr)
+					return nil, nil, fmt.Errorf("schema vN: %w", ferr)
 				}
 				if n > SchemaVersion {
-					return nil, fmt.Errorf("%w: file=v%d max=v%d", ErrSchemaTooNew, n, SchemaVersion)
+					return nil, nil, fmt.Errorf("%w: file=v%d max=v%d", ErrSchemaTooNew, n, SchemaVersion)
 				}
 			}
 		}
 		if end < 0 {
-			return nil, fmt.Errorf("unterminated frontmatter")
+			return nil, nil, fmt.Errorf("unterminated frontmatter")
 		}
 		idx = end + 1
 	}
 
 	// Walk H2 entries.
 	var out []Entry
+	var raws []rawBlock
 	for idx < len(lines) {
 		line := lines[idx]
 		if !strings.HasPrefix(line, "## ") {
@@ -257,7 +279,15 @@ func readEntries(path string) ([]Entry, error) {
 			idx++
 		}
 		body := lines[bodyStart:idx]
-		// Trim a leading + trailing blank line.
+		if perr != nil {
+			// Preserve verbatim — caller will re-emit on rewrite
+			// so a single bad entry doesn't get silently dropped.
+			rawCopy := make([]string, len(body))
+			copy(rawCopy, body)
+			raws = append(raws, rawBlock{header: header, body: rawCopy})
+			continue
+		}
+		// Trim a leading + trailing blank line on parsed body.
 		for len(body) > 0 && strings.TrimSpace(body[0]) == "" {
 			body = body[1:]
 		}
@@ -265,15 +295,9 @@ func readEntries(path string) ([]Entry, error) {
 			body = body[:len(body)-1]
 		}
 		entry.Body = strings.Join(body, "\n")
-		if perr != nil {
-			// Log via stderr would be wrong here (library code).
-			// Skip the malformed entry — TestParseMalformed asserts
-			// we don't crash + don't emit the entry.
-			continue
-		}
 		out = append(out, entry)
 	}
-	return out, nil
+	return out, raws, nil
 }
 
 // parseHeader splits "RFC3339 · author · task-or-op · tag:tag" into an
@@ -310,8 +334,14 @@ func parseHeader(h string) (Entry, error) {
 	return e, nil
 }
 
-// writeEntries renders frontmatter + entries and atomic-publishes.
-func writeEntries(path string, entries []Entry) error {
+// writeFile renders frontmatter + parsed entries + preserved raw
+// blocks (re-emitted verbatim) and atomic-publishes.
+//
+// Raws are appended after entries — they hold their original text
+// including any internal whitespace, so the operator sees them in a
+// stable position after each rewrite. We don't try to interleave by
+// timestamp because raws have no parseable timestamp.
+func writeFile(path string, entries []Entry, raws []rawBlock) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir parent: %w", err)
 	}
@@ -330,6 +360,15 @@ func writeEntries(path string, entries []Entry) error {
 		if e.Body != "" {
 			b.WriteString("\n")
 			b.WriteString(e.Body)
+			b.WriteString("\n")
+		}
+	}
+	for _, r := range raws {
+		b.WriteString("\n## ")
+		b.WriteString(r.header)
+		b.WriteString("\n")
+		for _, ln := range r.body {
+			b.WriteString(ln)
 			b.WriteString("\n")
 		}
 	}

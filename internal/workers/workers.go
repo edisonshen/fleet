@@ -139,7 +139,16 @@ func WriteState(project, slug string, s *State) error {
 	if s.Phase == PhaseBlocked && strings.TrimSpace(s.BlockedReason) == "" {
 		return ErrPhaseRequiresWhy
 	}
-	// Force consistency between schema's slug and on-disk slug.
+	// Enforce consistency between on-disk slug/project and the
+	// state object. A buggy caller passing slug "a" with s.Slug "b"
+	// would otherwise persist a mismatched record that breaks
+	// reconciliation; reject the write rather than backfill it.
+	if s.Slug != "" && s.Slug != slug {
+		return fmt.Errorf("%w: slug mismatch: state=%q path=%q", ErrInvalidState, s.Slug, slug)
+	}
+	if s.Project != "" && s.Project != project {
+		return fmt.Errorf("%w: project mismatch: state=%q path=%q", ErrInvalidState, s.Project, project)
+	}
 	if s.Slug == "" {
 		s.Slug = slug
 	}
@@ -240,13 +249,14 @@ func IsAlive(pid int) bool {
 // If the source dir doesn't exist, returns nil (idempotent).
 //
 // PRECONDITION: the worker process must be exited AND its state must
-// have reached a terminal phase (done | blocked | failed). The phase
-// check alone is insufficient — a worker that wrote phase=done can
-// still emit one more UpdateState (e.g. setting `exit`). If we
-// archive between those two writes, the second write recreates
-// workers/<slug>/state.json at the original path, leaving a stray
-// active dir AND an archive — coord then sees two states for one
-// slug. To avoid that race we also require IsAlive(pid)==false.
+// have reached a terminal phase (done | blocked | failed). Even a
+// worker that wrote phase=done may emit one more UpdateState (e.g.
+// setting `exit`); if we rename between those two writes, the
+// updater's subsequent WriteState recreates workers/<slug>/state.json
+// at the original path, leaving stray active + archive dirs. To
+// close that race we (1) acquire the same in-process mutex +
+// per-worker .update.lock that UpdateState uses, and (2) re-verify
+// the precondition under that lock before renaming.
 //
 // If state.json is missing entirely, Archive proceeds — we have no
 // liveness signal and assume the caller knows what they're doing.
@@ -263,7 +273,29 @@ func Archive(project, slug string) error {
 		return fmt.Errorf("stat worker dir: %w", statErr)
 	}
 
-	// Defensive precondition check: refuse to archive a live worker.
+	// Coordinate with UpdateState: take the same in-process mutex
+	// AND the per-worker .update.lock so an in-flight UpdateState
+	// can't race the rename. The flock+mutex pair mirrors
+	// UpdateState's discipline; closing the fd at scope exit
+	// releases the kernel lock.
+	key := project + "/" + slug
+	muIface, _ := updateMu.LoadOrStore(key, &sync.Mutex{})
+	mu := muIface.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	lockPath := filepath.Join(src, ".update.lock")
+	lockF, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return fmt.Errorf("open update lock for archive: %w", err)
+	}
+	defer func() { _ = lockF.Close() }()
+	if err := syscall.Flock(int(lockF.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock update lock: %w", err)
+	}
+
+	// Re-verify preconditions under the lock — the predecessor's
+	// UpdateState may have just landed and bumped phase/pid.
 	cur, rerr := ReadState(project, slug)
 	switch {
 	case rerr == nil:
@@ -281,6 +313,14 @@ func Archive(project, slug string) error {
 	default:
 		return fmt.Errorf("read state for archive precondition: %w", rerr)
 	}
+
+	// Close the lock fd before renaming. macOS allows rename on a
+	// dir whose contents are open, but the fd would dangle inside
+	// the archived path; we don't need it past this point because
+	// the in-process mutex still serializes us against any future
+	// UpdateState call (which would itself reopen the lock at the
+	// new path and find no work to do).
+	_ = lockF.Close()
 
 	stamp := time.Now().UTC().Format("20060102-150405")
 	dst, err := state.WorkerArchiveDir(project, slug, stamp)

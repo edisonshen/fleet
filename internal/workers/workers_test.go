@@ -116,6 +116,36 @@ func TestPhaseValidation_BlockedRequiresReason(t *testing.T) {
 	}
 }
 
+func TestWriteState_RejectsSlugMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:      "wrong-slug-1234",
+		Project:   "fleet",
+		Phase:     PhaseStarting,
+		StartedAt: time.Now().UTC(),
+	}
+	err := WriteState("fleet", "right-slug-5678", s)
+	if !errors.Is(err, ErrInvalidState) {
+		t.Errorf("got %v; want ErrInvalidState (slug mismatch)", err)
+	}
+}
+
+func TestWriteState_RejectsProjectMismatch(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:      "x-1234",
+		Project:   "wrong-project",
+		Phase:     PhaseStarting,
+		StartedAt: time.Now().UTC(),
+	}
+	err := WriteState("right-project", "x-1234", s)
+	if !errors.Is(err, ErrInvalidState) {
+		t.Errorf("got %v; want ErrInvalidState (project mismatch)", err)
+	}
+}
+
 func TestPhaseValidation_InvalidPhase(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
@@ -233,6 +263,44 @@ func TestArchive_AllowsBlockedAndFailed(t *testing.T) {
 		if err := Archive("fleet", c.slug); err != nil {
 			t.Errorf("Archive(%s) phase=%s: %v", c.slug, c.phase, err)
 		}
+	}
+}
+
+// TestArchive_SerializesWithUpdateState confirms an in-flight
+// UpdateState blocks Archive from racing the rename. We launch
+// UpdateState on a goroutine that holds the lock for ~50ms, then
+// call Archive — which must wait, then re-check the precondition.
+// Since UpdateState bumps phase to a non-terminal value, Archive
+// must surface ErrPreconditionLive.
+func TestArchive_SerializesWithUpdateState(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
+	if err := WriteState("fleet", "race-aaaa", &State{
+		Slug: "race-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(), PID: deadPID,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	updateStarted := make(chan struct{})
+	updateDone := make(chan struct{})
+	go func() {
+		defer close(updateDone)
+		_ = UpdateState("fleet", "race-aaaa", func(s *State) {
+			close(updateStarted)
+			// Hold the lock briefly so Archive must wait.
+			time.Sleep(50 * time.Millisecond)
+			// Bump to non-terminal — Archive's re-check should reject.
+			s.Phase = PhaseTDDGreen
+			s.PRURL = ""
+		})
+	}()
+	<-updateStarted
+	// Archive should block on the same lock, then re-check and refuse.
+	err := Archive("fleet", "race-aaaa")
+	<-updateDone
+	if !errors.Is(err, ErrPreconditionLive) {
+		t.Errorf("got %v; want ErrPreconditionLive (UpdateState bumped phase under lock)", err)
 	}
 }
 

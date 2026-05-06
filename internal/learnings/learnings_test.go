@@ -186,6 +186,44 @@ func TestFilter_Limit(t *testing.T) {
 	}
 }
 
+func TestParseMalformed_PreservedAcrossRewrite(t *testing.T) {
+	// Append/Prune rewrite the file. A malformed block must NOT be
+	// silently deleted on rewrite — it's operator memory, fail open.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	dir, err := state.ProjectDir("fleet")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	src := "---\nschema: v1\n---\n\n" +
+		"## not-a-timestamp · operator · operator · tag:bad\n\nMalformed body line 1.\nMalformed body line 2.\n"
+	if err := os.WriteFile(filepath.Join(dir, "learnings.md"), []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Trigger a rewrite via Append.
+	if err := Append("fleet", &Entry{
+		Timestamp: time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC),
+		Author:    "operator", Tag: "good", Body: "good entry",
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	// Both the new entry AND the malformed block must be present.
+	data, err := os.ReadFile(filepath.Join(dir, "learnings.md"))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "Malformed body line 1") {
+		t.Errorf("malformed block deleted on rewrite; got:\n%s", got)
+	}
+	if !strings.Contains(got, "tag:good") {
+		t.Errorf("new entry missing; got:\n%s", got)
+	}
+}
+
 func TestParseMalformed_HeaderSkipped(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
