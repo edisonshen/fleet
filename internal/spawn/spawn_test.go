@@ -463,6 +463,139 @@ func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T
 		want, string(lastOut))
 }
 
+// TestSpawn_FleetBinInEnv verifies fleet stamps its own executable
+// path into the agent's process env so fleet-guard's _kick_drain can
+// invoke the SAME binary without a PATH lookup. Codex review on
+// fix-fleet-guard-self-drains flagged that `shutil.which("fleet")`
+// silently breaks the new auto-drain path on dev runs / non-PATH
+// installs; FLEET_BIN is the fix, this test is its smoke check.
+func TestSpawn_FleetBinInEnv(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cmd := []string{"sh", "-c", "echo FLEET_BIN=$FLEET_BIN; cat"}
+	rec, err := Spawn(Options{
+		TaskID:  "x",
+		Project: "y",
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable() failed: %v — env stamp is best-effort", err)
+	}
+	want := "FLEET_BIN=" + exe
+	// Test binary paths land in /var/folders/.../go-build*/spawn.test
+	// which is longer than a tmux pane line, so capture-pane wraps the
+	// path across multiple rows. Normalize whitespace before matching.
+	stripWS := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if r != ' ' && r != '\n' && r != '\r' && r != '\t' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	wantNorm := stripWS(want)
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			if strings.Contains(stripWS(string(out)), wantNorm) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
+// TestSpawn_RuntimeEnvPropagated verifies every var in
+// propagatedRuntimeEnv flows into the agent's session when set.
+// Codex iter-2 P2 (FLEET_TMUX_SOCKET) and iter-3 P2 (prompt-timing
+// + FLEET_HOME by extension) on fix-fleet-guard-self-drains: tmux
+// strips non-`-e` vars when the server is already running, so a
+// drain kicked from inside the agent pane wouldn't see the
+// operator's overrides. Without propagation: custom FLEET_HOME
+// splits reads/writes between operator and agent (TUI doesn't see
+// the agent), slow-wrapper prompt-timing overrides regress to
+// defaults, and custom tmux sockets break auto-drain entirely.
+func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Set every propagated var with a recognizable value. requireTmux
+	// already set FLEET_TMUX_SOCKET; setupFleetHome set FLEET_HOME.
+	// The two prompt-timing knobs we set explicitly here.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "777")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "8888")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "99")
+
+	cmd := []string{"sh", "-c",
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS; cat"}
+	rec, err := Spawn(Options{
+		TaskID:  "x",
+		Project: "y",
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Each marker is short enough to fit on a single tmux pane line.
+	wants := []string{
+		"STABLE=777", "MAX=8888", "DELAY=99",
+		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
+	}
+	if got := os.Getenv("FLEET_HOME"); got != "" {
+		wants = append(wants, "FH="+got)
+	}
+
+	// FLEET_HOME (under TempDir) and FLEET_TMUX_SOCKET paths are long
+	// enough that tmux capture-pane wraps them. Normalize whitespace
+	// before matching so a path split across lines still validates.
+	stripWS := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if r != ' ' && r != '\n' && r != '\r' && r != '\t' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		lastOut = out
+		normalized := stripWS(string(out))
+		all := true
+		for _, w := range wants {
+			if !strings.Contains(normalized, stripWS(w)) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected all of %v in pane within deadline:\n%s", wants, string(lastOut))
+}
+
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

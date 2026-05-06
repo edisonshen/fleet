@@ -47,7 +47,18 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/version"
 )
+
+// upgradeNudgeFn resolves the current "is there a newer release?"
+// banner text. Defaults to version.Nudge (reads ~/.fleet/version_check.json
+// + compares against the running binary's version). var so tests can
+// stub without faking a cache file.
+var upgradeNudgeFn = version.Nudge
+
+// upgradeStartFn kicks off the async background fetch + cache
+// refresh. var so tests can stub the network call out entirely.
+var upgradeStartFn = version.Start
 
 // Model is the bubbletea state for the dashboard.
 type Model struct {
@@ -111,6 +122,14 @@ type Model struct {
 	// the hint, which is the right default for a CLI that's still in
 	// early adoption.
 	coachDismissed bool
+
+	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
+	// chip when a newer release is on disk in the version cache.
+	// Empty means no banner — every failure mode in the version
+	// package collapses to "" so this field reads as the single
+	// authoritative "is there a nudge?" signal. Populated via
+	// upgradeAvailableMsg fired from a goroutine launched in Init.
+	upgradeBanner string
 }
 
 // PendingAttach returns the tmux session to attach to after the
@@ -133,10 +152,17 @@ func currentUserName() string {
 	return os.Getenv("USER")
 }
 
-// Init is the bubbletea entry point. We kick off the first agent load
-// and start the 1s polling tick. fsnotify is wired in tui.go's Run.
+// Init is the bubbletea entry point. We kick off the first agent load,
+// start the 1s polling tick, and run the upgrade-check probe. fsnotify
+// is wired in tui.go's Run.
+//
+// versionCheckCmd both kicks off the async network fetch (background
+// goroutine, never blocks) AND reads the existing on-disk cache so
+// the banner can render on startup if a previous run already learned
+// about a newer release. Both happen async to keep render
+// non-blocking — see the cmd's docstring.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadAgentsCmd(), tickCmd())
+	return tea.Batch(loadAgentsCmd(), tickCmd(), versionCheckCmd(m.version))
 }
 
 // agentsMsg carries a refreshed list of agent records (or an error)
@@ -176,10 +202,42 @@ type fsEventMsg struct{}
 // completes without operator intervention.
 type queueEventMsg struct{}
 
+// upgradeAvailableMsg carries the rendered nudge text when a newer
+// release is on disk. Empty text leaves m.upgradeBanner cleared
+// (no banner) — every failure mode in the version package collapses
+// to "", and Update treats "" as "no signal".
+type upgradeAvailableMsg struct {
+	text string
+}
+
 const pollInterval = 1 * time.Second
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(pollInterval, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+// versionCheckCmd kicks off the background upgrade probe AND reads the
+// existing on-disk cache. Two-step pattern:
+//
+//  1. version.Start spawns a goroutine that hits the GitHub API and
+//     writes the cache. Returns immediately — never blocks startup.
+//  2. version.Nudge reads whatever cache is already on disk (from a
+//     PREVIOUS run) so the banner can render on the very first frame
+//     without waiting for the network.
+//
+// If step 1's fetch eventually populates a fresh cache, step 2 won't
+// re-read it — the operator sees the new banner on next launch. That's
+// fine: the spec only requires "at most once per day per process",
+// and we'd rather be conservative than poll the cache mid-session.
+//
+// Every failure inside version.Nudge collapses to "" — no errors
+// propagate, no logging, nothing on stderr. Banner just doesn't
+// render.
+func versionCheckCmd(current string) tea.Cmd {
+	return func() tea.Msg {
+		upgradeStartFn(current)
+		return upgradeAvailableMsg{text: upgradeNudgeFn(current)}
+	}
 }
 
 // loadAgentsCmd reads ~/.fleet/agents/*.json once and returns the
@@ -280,6 +338,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fl := formatRmFlash(msg.out, msg.err)
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: agent should be archived
+
+	case upgradeAvailableMsg:
+		// Banner is set / cleared atomically here. Subsequent renders
+		// pick it up via m.upgradeBanner; no other path mutates it.
+		m.upgradeBanner = msg.text
+		return m, nil
 	}
 	return m, nil
 }
@@ -369,6 +433,15 @@ func (m Model) renderTop() string {
 	b.WriteString("\n")
 	b.WriteString(dividerStyle.Render(divider(m.width, lipgloss.Width(title)+2)))
 	b.WriteString("\n")
+
+	// Upgrade nudge — rendered between the title divider and the alert
+	// banner so it sits above all per-agent state but below the
+	// product header. Skipped (no row consumed) when no upgrade is
+	// available so a clean dashboard isn't padded with an empty line.
+	if m.upgradeBanner != "" {
+		b.WriteString(upgradeBannerStyle.Render(m.upgradeBanner))
+		b.WriteString("\n")
+	}
 
 	if m.err != nil {
 		b.WriteString(errStyle.Render(fmt.Sprintf("error reading agents: %v", m.err)))
@@ -1363,6 +1436,12 @@ var (
 	statusDeadStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("244"))
 	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	statusUrgentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")) // red — hot context / auto-red
+
+	// Upgrade-nudge banner. Bold cyan ⬆ glyph (matches the title's
+	// title-bar accent) + light foreground for the message body. Sits
+	// above the alert banner so the product-level "you're behind"
+	// signal doesn't compete with the per-agent alert chips.
+	upgradeBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 )
 
 // statusStyleFor maps a STATUS value to its lipgloss style. Falls back

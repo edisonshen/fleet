@@ -150,11 +150,36 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         has_pending_question=has_question,
     )
 
+    # Kick drain LAST, after every hook write to the agent record has
+    # landed (codex iter-5 P1: avoid the archive/update_record race).
+    #
+    # AND only when this Stop made no injections — i.e. the agent is
+    # idle. If we just gave it work (inbox message OR a fresh
+    # HANDOFF REQUESTED prompt), drain would race the agent's next
+    # turn: drain's `/exit` could land while claude is processing
+    # the injected content, splitting/duplicating that work (codex
+    # iter-6 P2). The kick defers safely — the queue file persists,
+    # and the next Stop (after the agent's injected turn settles
+    # without producing more injections) will pick it up.
+    if not injections:
+        handoff.kick_drain_if_pending(agent_id)
+
 
 def _on_precompact(payload: dict, agent_id: str, session: str) -> None:
     """PreCompact fires just before context compaction. Stdout is ignored
     by Claude Code on this hook — the compaction is already in motion —
-    so emergency_trigger only writes the doc + queue."""
+    so emergency_trigger only writes the doc + queue.
+
+    No drain kick here (codex iter-9 P1): PreCompact runs while the
+    agent is mid-compaction, NOT idle like Stop. Kicking drain from
+    this hook would have drain's `/exit` land during the agent's
+    compaction turn — interrupting it, potentially mid-tool-call, so
+    side effects can land that the handoff doc (written before
+    compaction started) won't reflect. That risks duplicated or
+    silently lost work in the replacement. Queue file persists; the
+    next Stop after compaction completes will pick it up via
+    _on_stop's tail kick. If compaction hangs / crashes, the TUI
+    fsnotify watcher remains the long-tail consumer."""
     handoff.emergency_trigger(payload, agent_id=agent_id, session=session)
 
 

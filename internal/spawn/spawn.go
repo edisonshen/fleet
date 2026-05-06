@@ -61,6 +61,25 @@ func promptEnterDelay() time.Duration {
 		defaultPromptEnterDelay)
 }
 
+// propagatedRuntimeEnv lists FLEET_* vars whose values must reach the
+// agent's tmux session so anything launched from inside the pane
+// (notably `_kick_drain → fleet drain`) sees the same configuration
+// the operator's fleet was started with. tmux strips non-`-e` vars
+// when the server is already running, so we forward these explicitly.
+//
+// Excluded by design:
+//   - FLEET_AGENT_ID is set per-agent on the same tmux -e flight.
+//   - FLEET_BIN is computed per-spawn (os.Executable()).
+//   - FLEET_ROLE / FLEET_MODE are part of agent.Record, set elsewhere.
+//   - FLEET_TEST_PROBE is test-only.
+var propagatedRuntimeEnv = []string{
+	"FLEET_HOME",                     // queue/handoffs/agents root
+	"FLEET_TMUX_SOCKET",              // alt-server isolation
+	"FLEET_INITIAL_PROMPT_STABLE_MS", // prompt-timing for slow wrappers
+	"FLEET_INITIAL_PROMPT_MAX_MS",
+	"FLEET_PROMPT_ENTER_DELAY_MS",
+}
+
 func envDuration(key string, fallback time.Duration) time.Duration {
 	if s := os.Getenv(key); s != "" {
 		if ms, err := strconv.Atoi(s); err == nil && ms >= 0 {
@@ -289,7 +308,36 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// FLEET_AGENT_ID is propagated into the agent's process env so
 	// fleet-guard (4b/c) can identify which agent record to update
 	// without round-tripping via tmux session name parsing.
+	//
+	// FLEET_BIN stamps the path of THIS fleet binary so the agent's
+	// fleet-guard skill can spawn `<this-fleet> drain` without a
+	// PATH lookup. Mirrors the TUI's fleetBinary trick (see
+	// internal/tui/keys.go) — required for side-loaded installs
+	// where `which fleet` resolves to nothing or a different binary.
+	// `go run` is partial coverage: works while the parent process
+	// is alive (the temp build artifact lives with it), drops to
+	// the skill's `which("fleet")` fallback after the parent exits.
+	// os.Executable() failure is rare and non-fatal.
+	//
+	// propagatedRuntimeEnv carries the operator's FLEET_* knobs into
+	// the agent's session. Necessary because tmux strips non-`-e`
+	// vars when the server is already running (see tmux.Spawn comment),
+	// and `_kick_drain` runs `fleet drain` from inside the agent pane
+	// — that drain needs to see the same FLEET_HOME, custom socket,
+	// and prompt-timing knobs the operator's fleet was started with.
+	// Without this propagation: custom FLEET_HOME silently splits
+	// reads/writes between operator and agent (TUI doesn't see the
+	// agent at all), and slow-wrapper prompt-timing overrides regress
+	// to defaults so resume-prompt delivery races.
 	extraEnv := []string{"FLEET_AGENT_ID=" + id}
+	if exe, err := os.Executable(); err == nil {
+		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
+	}
+	for _, key := range propagatedRuntimeEnv {
+		if v := os.Getenv(key); v != "" {
+			extraEnv = append(extraEnv, key+"="+v)
+		}
+	}
 
 	if opts.OldRecord != nil {
 		// Inherit task identity from outgoing agent.

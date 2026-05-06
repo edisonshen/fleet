@@ -12,9 +12,12 @@ import (
 )
 
 // Version is overwritten at release time via -ldflags. Default
-// tracks the upcoming release tag so dev builds and the dashboard
-// title row read consistently before the first tagged build.
-var Version = "0.1.0"
+// "dev" so non-released builds (`go run`, `go build` without
+// goreleaser) DON'T get told to "brew upgrade fleet" — brew didn't
+// install that binary, and a dev binary may even contain unreleased
+// code newer than the latest tag. Released builds get the actual
+// tag injected via -X main.Version=<tag>.
+var Version = "dev"
 
 func newRootCmd() *cobra.Command {
 	root := &cobra.Command{

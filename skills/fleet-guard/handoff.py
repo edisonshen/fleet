@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -429,7 +430,127 @@ def _do_handoff(record: dict[str, Any], session: str,
         ts=ts,
     ):
         return False
+    # NOTE: drain is NOT kicked here. main._on_stop() still has tail
+    # writes (capture_recent + final health.update_record) after
+    # maybe_trigger() returns; if drain ran in parallel and archived
+    # the agent record between update_record's read and write, the
+    # os.replace would resurrect it (codex iter-5 P1). Caller invokes
+    # `kick_drain_if_pending(agent_id)` after all hook writes finish.
     return True
+
+
+_KICK_BACKOFF_S = 30
+
+
+def kick_drain_if_pending(agent_id: str) -> None:
+    """Public entry point: kick `fleet drain` iff this agent's queue file
+    exists AND we haven't kicked it within the last _KICK_BACKOFF_S
+    seconds. Called by main._on_stop / _on_precompact AFTER all hook
+    writes complete (codex iter-5 P1: avoid the archive/update_record
+    race).
+
+    Throttle rationale: some drain failures are permanent and
+    intentionally leave the queue file in place — DisableAutoResume
+    agents are rejected by spawnAndRetire (interactive `fleet handoff`
+    is the supported path), and legacy v1 records without cwd can hit
+    similar paths. Without throttling, every Stop forks a doomed
+    `fleet drain` — log spam, wasted cycles, no signal to the
+    operator since stdio goes to DEVNULL (codex iter-7 P2). The
+    sentinel file's mtime carries cross-process state without
+    needing the agent record schema.
+
+    Idempotent + cheap when no queue file pending — safe to call on
+    every Stop fire. Stale sentinel from a long-completed drain is
+    cleaned up here too.
+    """
+    queue_path = health.fleet_home() / "queue" / f"spawn-fresh-{agent_id}.json"
+    sentinel = queue_path.with_name(queue_path.name + ".kicked")
+    if not queue_path.exists():
+        # Drain consumed the queue; clean up the sentinel so a future
+        # handoff re-fires immediately instead of being throttled by
+        # an unrelated past kick.
+        try:
+            sentinel.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        return
+    try:
+        last_kick_age = (
+            datetime.now(timezone.utc).timestamp()
+            - sentinel.stat().st_mtime
+        )
+        if last_kick_age < _KICK_BACKOFF_S:
+            return
+    except FileNotFoundError:
+        pass  # never kicked; proceed
+    if not _kick_drain():
+        # Popen didn't actually launch (no fleet binary, Popen
+        # exception). Don't stamp the sentinel: it gates the
+        # throttle, and refusing to advance it lets the next Stop
+        # retry. The cost is: log spam if the failure is permanent
+        # (DisableAutoResume + no fleet binary at the same time —
+        # rare). With a working fleet binary, the throttle works as
+        # intended once a launch succeeds.
+        return
+    try:
+        sentinel.touch()
+    except OSError:
+        # Best-effort: if we can't stamp the sentinel, the worst
+        # outcome is we re-kick on the next Stop. No correctness
+        # impact.
+        pass
+
+
+def _kick_drain() -> bool:
+    """Fire a detached `fleet drain` so the handoff completes end-to-end
+    without depending on a running TUI watcher. Returns True iff
+    Popen actually launched a drain process; False on missing binary
+    or Popen failure. Caller uses this to decide whether to stamp the
+    in-flight sentinel (codex iter-9 P2 — don't suppress inbox on a
+    drain that never started).
+
+    Detached: start_new_session=True puts drain in its own process group
+    so it survives if claude (the parent of fleet-guard) exits between
+    queue write and drain finish. DEVNULL on all three streams keeps
+    drain's output out of claude's altscreen tty (claude renders that
+    pane; stray writes corrupt the rendering).
+
+    Resolution order:
+    1. `FLEET_BIN` env (stamped by spawn — internal/spawn/spawn.go via
+       os.Executable()). Mirrors the TUI's keys.go fleetBinary trick so
+       side-loaded installs, where `which fleet` resolves to nothing
+       or a different binary, still self-drain. `go run` is partial:
+       works while the operator's parent fleet is alive, breaks once
+       the parent exits and the go tool deletes the temp build.
+    2. `shutil.which("fleet")` — covers older fleet binaries that spawn
+       agents without FLEET_BIN, brew/`go install` setups regardless
+       of FLEET_BIN, and any edge case where the stamped path went
+       stale (e.g. go run temp build evaporated; in checkout-only
+       setups where `fleet` is also not on PATH, fall through).
+    3. Noop, return False. Queue file stays on disk and any later
+       drain run consumes it. The skill must never raise.
+    """
+    fleet_bin = os.environ.get("FLEET_BIN")
+    if not fleet_bin or not os.access(fleet_bin, os.X_OK):
+        fleet_bin = shutil.which("fleet")
+    if not fleet_bin:
+        return False
+    try:
+        subprocess.Popen(
+            [fleet_bin, "drain"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        # Producer's job is done (queue file is on disk). Drain is a
+        # convenience trigger; failure here just means we wait for
+        # the next consumer.
+        return False
 
 
 def _clear_pending(agent_id: str) -> None:
