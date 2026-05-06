@@ -71,9 +71,9 @@ var inflight sync.Mutex
 // path can never break TUI startup.
 //
 // current is the running build's version (cmd/fleet/main.go's Version
-// var, baked in via -ldflags at release). "dev" / "0.1.0" defaults
-// suppress the nudge in Nudge() but DON'T skip the fetch — we still
-// want the cache populated for the next run.
+// var, baked in via -ldflags at release). The "dev" default for
+// non-released builds suppresses the nudge in Nudge() but DOES NOT
+// skip the fetch — we still want the cache populated for the next run.
 func Start(current string) {
 	go runCheck(DefaultEndpoint, current)
 }
@@ -81,6 +81,14 @@ func Start(current string) {
 // runCheck is the goroutine body extracted for tests. Internal — tests
 // in this package call it directly to avoid the goroutine timing dance.
 func runCheck(endpoint, current string) {
+	doCheck(endpoint, current, fetchTimeout)
+}
+
+// doCheck does one cache-aware fetch. Shared by Start (async) and
+// ensureFresh (sync). Returns silently on every failure mode so
+// callers don't have to handle errors — the cache simply doesn't
+// update.
+func doCheck(endpoint, current string, timeout time.Duration) {
 	if !inflight.TryLock() {
 		return // another check already in flight
 	}
@@ -92,7 +100,7 @@ func runCheck(endpoint, current string) {
 		return
 	}
 
-	tag, err := fetchLatest(endpoint, fetchTimeout)
+	tag, err := fetchLatest(endpoint, timeout)
 	if err != nil {
 		// Silent on every failure — offline laptops, GitHub 5xx, DNS
 		// blocks. Don't write the cache (a poisoned cache would suppress
@@ -104,6 +112,31 @@ func runCheck(endpoint, current string) {
 		Latest:    tag,
 		Current:   current,
 	})
+}
+
+// EnsureFresh blocks until the version cache is fresh OR the timeout
+// elapses, whichever comes first. Use from short-lived CLI commands
+// (`fleet status`) where the goroutine pattern doesn't work — main
+// exits before a background fetch finishes, killing it mid-write.
+//
+// Silent on every failure mode (offline, slow GitHub, parse error).
+// Caller follows up with Nudge() to read whatever the cache now
+// contains. timeout caps the total blocking window so a slow API
+// doesn't hang the CLI; 2s is a reasonable default for the operator
+// who's already waiting for `fleet status` output.
+//
+// No-op when the on-disk cache is already fresh (within cacheTTL) —
+// CLI users running `fleet status` repeatedly don't pay for a network
+// hit on every invocation.
+func EnsureFresh(current string, timeout time.Duration) {
+	ensureFresh(DefaultEndpoint, current, timeout)
+}
+
+// ensureFresh is the test-overridable inner function (endpoint
+// parameterized). Production callers use EnsureFresh which pins to
+// DefaultEndpoint.
+func ensureFresh(endpoint, current string, timeout time.Duration) {
+	doCheck(endpoint, current, timeout)
 }
 
 // Nudge returns the banner string if a newer version is on disk,
@@ -294,7 +327,9 @@ func cmpInt(a, b int) int {
 // parseSemver pulls major/minor/patch + optional pre-release out of s.
 // Tolerates a leading "v" since GitHub tags use "v0.1.0" and the
 // ldflags-injected Version is bare "0.1.0". Returns ok=false on any
-// parse error so callers can decide the fallback policy.
+// parse error so callers can decide the fallback policy. The "dev"
+// default for unreleased builds is intentionally rejected — that's
+// how Nudge() suppresses brew-upgrade hints for go-run binaries.
 func parseSemver(s string) (major, minor, patch int, pre string, ok bool) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")

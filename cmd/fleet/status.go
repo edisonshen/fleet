@@ -36,7 +36,26 @@ raw records for shell scripting.`,
 	return cmd
 }
 
+// statusEnsureFreshFn is overridable so tests don't pay for HTTP
+// calls. Production runs version.EnsureFresh which performs a
+// timeout-bounded synchronous check on the operator's machine.
+var statusEnsureFreshFn = version.EnsureFresh
+
+// statusEnsureFreshTimeout caps the synchronous cache refresh from
+// the CLI path. 2s is a reasonable budget — `fleet status` is
+// already waiting for stdio + agent.List, an extra 2s on the
+// online-but-slow path is invisible. Offline users hit dial-refused
+// in ~milliseconds.
+const statusEnsureFreshTimeout = 2 * time.Second
+
 func runStatus(opts *statusOpts, stdout io.Writer, current string) error {
+	// Refresh the version cache before printing — short-lived CLI
+	// can't rely on a goroutine the way the TUI does (the binary
+	// exits before the goroutine finishes). Skipped when the cache
+	// is already fresh, so back-to-back `fleet status` invocations
+	// don't fan out HTTP calls.
+	statusEnsureFreshFn(current, statusEnsureFreshTimeout)
+
 	records, err := agent.List()
 	if err != nil {
 		return err

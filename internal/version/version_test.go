@@ -262,3 +262,93 @@ func TestCheckAsync_OfflineSilent(t *testing.T) {
 		t.Fatalf("expected no cache file after failed fetch")
 	}
 }
+
+// TestEnsureFresh_PopulatesCacheSynchronously asserts the synchronous
+// helper used by `fleet status` (a short-lived CLI command) actually
+// blocks until the cache is on disk — async-via-goroutine doesn't work
+// there because the binary exits before the goroutine finishes.
+func TestEnsureFresh_PopulatesCacheSynchronously(t *testing.T) {
+	withTempHome(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"tag_name": "v0.5.0"})
+	}))
+	defer srv.Close()
+
+	ensureFresh(srv.URL, "0.1.2", 2*time.Second)
+
+	got, err := readCache()
+	if err != nil {
+		t.Fatalf("readCache after ensureFresh: %v", err)
+	}
+	if got.Latest != "v0.5.0" {
+		t.Errorf("cache.Latest: got %q want v0.5.0", got.Latest)
+	}
+}
+
+// TestEnsureFresh_OfflineDoesNotBlock asserts the helper returns
+// quickly when the network is dead — short-lived CLI must not hang.
+func TestEnsureFresh_OfflineDoesNotBlock(t *testing.T) {
+	withTempHome(t)
+	start := time.Now()
+	ensureFresh("http://127.0.0.1:1", "0.1.2", 500*time.Millisecond)
+	elapsed := time.Since(start)
+	if elapsed > 1500*time.Millisecond {
+		t.Errorf("ensureFresh blocked too long on offline: %v", elapsed)
+	}
+	// And no cache should be written.
+	if _, err := readCache(); err == nil {
+		t.Fatalf("offline ensureFresh should not write cache")
+	}
+}
+
+// TestEnsureFresh_SkipsWhenFresh asserts the helper is a no-op when
+// the cache is already fresh — we don't punish CLI users with an HTTP
+// hit on every invocation.
+func TestEnsureFresh_SkipsWhenFresh(t *testing.T) {
+	withTempHome(t)
+	if err := writeCache(cacheEntry{
+		CheckedAt: time.Now().UTC(),
+		Latest:    "v0.1.0",
+		Current:   "0.1.2",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Endpoint that would return v9.9.9 if hit. Should NOT be hit
+	// because cache is fresh.
+	hit := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hit = true
+		_ = json.NewEncoder(w).Encode(map[string]string{"tag_name": "v9.9.9"})
+	}))
+	defer srv.Close()
+
+	ensureFresh(srv.URL, "0.1.2", 2*time.Second)
+	if hit {
+		t.Errorf("fresh cache should suppress the network call")
+	}
+	got, _ := readCache()
+	if got.Latest != "v0.1.0" {
+		t.Errorf("cache should not have been overwritten; got %q", got.Latest)
+	}
+}
+
+// TestNudge_DefaultDevVersionSuppressed asserts that the *default*
+// build version "dev" (cmd/fleet/main.go's package var) suppresses
+// the nudge — go-run / unreleased binaries shouldn't see "brew
+// upgrade fleet". Codex review feedback: the previous default
+// "0.1.0" parsed as semver and would have nudged side-loaded builds
+// the moment v0.1.1 landed.
+func TestNudge_DefaultDevVersionSuppressed(t *testing.T) {
+	withTempHome(t)
+	if err := writeCache(cacheEntry{
+		CheckedAt: time.Now().UTC(),
+		Latest:    "v0.1.3",
+		Current:   "dev",
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Default Version is now "dev" — should suppress.
+	if got := Nudge("dev"); got != "" {
+		t.Errorf("expected dev build suppression, got %q", got)
+	}
+}
