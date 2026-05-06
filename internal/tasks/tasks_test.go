@@ -97,6 +97,34 @@ func TestFooter_PreservedAcrossEdit(t *testing.T) {
 	}
 }
 
+func TestSection_RejectsStrayTextBetweenSections(t *testing.T) {
+	// A stray paragraph between bullets and the first H3 must error
+	// — silent drop on next Write would lose operator edits.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: stray-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"This stray paragraph sits between bullets and Spec.\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "stray.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for stray content")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "unexpected") {
+		t.Errorf("Msg=%q; want substring 'unexpected'", perr.Msg)
+	}
+}
+
 func TestSection_RejectsDuplicateH3(t *testing.T) {
 	// Two `### Notes` blocks in one task is operator-error; silent
 	// overwrite would lose the earlier text. Parser must error.

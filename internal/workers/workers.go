@@ -294,11 +294,6 @@ func Archive(project, slug string) error {
 	if err != nil {
 		return err
 	}
-	if _, statErr := os.Stat(src); os.IsNotExist(statErr) {
-		return nil
-	} else if statErr != nil {
-		return fmt.Errorf("stat worker dir: %w", statErr)
-	}
 
 	// Coordinate with UpdateState: take the same in-process mutex
 	// + per-worker flock. Both live under .locks/ — a stable path
@@ -316,6 +311,15 @@ func Archive(project, slug string) error {
 		return fmt.Errorf("acquire worker lock for archive: %w", err)
 	}
 	defer release()
+
+	// Existence check AFTER the lock — a concurrent Archive could
+	// have moved the dir between our entry and the lock acquire.
+	// Treat post-lock missing-dir as a successful no-op.
+	if _, statErr := os.Stat(src); os.IsNotExist(statErr) {
+		return nil
+	} else if statErr != nil {
+		return fmt.Errorf("stat worker dir: %w", statErr)
+	}
 
 	// Re-verify preconditions under the lock — the predecessor's
 	// UpdateState may have just landed and bumped phase/pid.
@@ -343,6 +347,10 @@ func Archive(project, slug string) error {
 	// updated by the coord to clear worker_pid, and a fresh
 	// UpdateState on the now-archived slug is the caller's bug.
 
+	// Archive same slug twice within one second is possible (worker
+	// blocked → operator clarifies → coord re-dispatches → worker
+	// fails fast → archive again). Bump second-precision stamp to
+	// retry on EEXIST so we never leave the worker dir behind.
 	stamp := time.Now().UTC().Format("20060102-150405")
 	dst, err := state.WorkerArchiveDir(project, slug, stamp)
 	if err != nil {
@@ -355,10 +363,25 @@ func Archive(project, slug string) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("mkdir archive parent: %w", err)
 	}
-	if err := os.Rename(src, dst); err != nil {
-		return fmt.Errorf("rename %s → %s: %w", src, dst, err)
+	for attempt := 0; attempt < 8; attempt++ {
+		err := os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		// EEXIST or directory-not-empty — bump suffix and retry.
+		// We use n=0..7 sub-second salt; PruneArchive's parser
+		// only inspects the canonical 15-char stamp, so the salt
+		// doesn't break retention math (the dir mtime is still
+		// preserved per the codex iter-2 fix, but we read the
+		// trailing 15 chars of the name, which include the salt;
+		// resolve by parsing only the first stamp suffix).
+		dst2, derr := state.WorkerArchiveDir(project, slug, fmt.Sprintf("%s-%d", stamp, attempt+1))
+		if derr != nil {
+			return derr
+		}
+		dst = strings.TrimSuffix(dst2, string(filepath.Separator))
 	}
-	return nil
+	return fmt.Errorf("rename %s → %s after 8 attempts", src, dst)
 }
 
 // isTerminalPhase reports whether p represents a worker that has
@@ -418,17 +441,23 @@ func PruneArchive(project string, olderThan time.Time) (int, error) {
 	return removed, nil
 }
 
-// parseArchiveStamp extracts the trailing `-YYYYMMDD-HHMMSS` from an
-// archive directory name (`<slug>-YYYYMMDD-HHMMSS`). Returns the
-// parsed UTC time and true on success; zero time + false on any
-// parse failure.
+// parseArchiveStamp extracts the trailing UTC stamp from an archive
+// directory name. The canonical name shape is:
 //
-// The slug itself can contain hyphens, so we look for the LAST 16
-// chars matching the canonical stamp format. We use a fixed format
-// rather than walking back to the last hyphen pair because a slug
-// like `add-readme-7a3c` would otherwise be ambiguous.
+//	<slug>-YYYYMMDD-HHMMSS               (most common)
+//	<slug>-YYYYMMDD-HHMMSS-<N>           (collision-retry suffix; N=1..7)
+//
+// Returns the parsed UTC time and true on success; zero time + false
+// on any parse failure. The slug itself can contain hyphens, so we
+// anchor on the fixed 15-char stamp pattern preceded by `-`.
 func parseArchiveStamp(name string) (time.Time, bool) {
 	const stampLen = len("YYYYMMDD-HHMMSS") // 15
+	// Strip a possible `-<digit>` collision suffix first so the
+	// stamp inspection sees the canonical form. We accept up to a
+	// single-digit salt (matches the producer in Archive).
+	if len(name) >= 2 && name[len(name)-2] == '-' && name[len(name)-1] >= '0' && name[len(name)-1] <= '9' {
+		name = name[:len(name)-2]
+	}
 	if len(name) < stampLen+1 || name[len(name)-stampLen-1] != '-' {
 		return time.Time{}, false
 	}

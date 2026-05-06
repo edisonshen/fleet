@@ -548,6 +548,12 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 	// H3 sections (Spec / Acceptance / Notes), in any order. Track
 	// which sections have been parsed so a duplicate H3 raises an
 	// error (instead of silently overwriting the earlier body).
+	//
+	// Stray non-blank text between bullets and the first H3 (or
+	// between H3 sections) would otherwise be silently dropped on
+	// the next Write — surface it as a ParseError so operator-edit
+	// mistakes are visible. Blank lines are tolerated (they're the
+	// canonical separators).
 	seenH3 := make(map[string]bool, 3)
 	for idx < len(lines) {
 		line := lines[idx]
@@ -573,6 +579,9 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 			}
 			idx = next
 			continue
+		}
+		if strings.TrimSpace(line) != "" {
+			return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "unexpected content between sections (allowed: blank lines, ### Spec/Acceptance/Notes)"}
 		}
 		idx++
 	}

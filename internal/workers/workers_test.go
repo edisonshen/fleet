@@ -323,6 +323,40 @@ func TestArchive_RefusesLiveProcessAtTerminalPhase(t *testing.T) {
 	}
 }
 
+func TestArchive_CollisionRetriesWithSalt(t *testing.T) {
+	// Same-second double archive: producer must retry with `-N`
+	// salt rather than fail with EEXIST.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	deadPID := terminatedPID(t)
+	dir, _ := state.ProjectDir("fleet")
+
+	// Pre-create a colliding archive entry.
+	stamp := time.Now().UTC().Format("20060102-150405")
+	collide := filepath.Join(dir, "workers", "archive", "twin-aaaa-"+stamp)
+	if err := os.MkdirAll(collide, 0o755); err != nil {
+		t.Fatalf("seed collision: %v", err)
+	}
+
+	if err := WriteState("fleet", "twin-aaaa", &State{
+		Slug: "twin-aaaa", Project: "fleet", Phase: PhaseDone,
+		PRURL: "https://x/y/1", StartedAt: time.Now().UTC(), PID: deadPID,
+	}); err != nil {
+		t.Fatalf("seed worker: %v", err)
+	}
+	if err := Archive("fleet", "twin-aaaa"); err != nil {
+		t.Fatalf("Archive (with collision): %v", err)
+	}
+	// Both the colliding placeholder and the salted archive exist.
+	entries, err := os.ReadDir(filepath.Join(dir, "workers", "archive"))
+	if err != nil {
+		t.Fatalf("readdir archive: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Errorf("archive entries=%d; want >=2 (collision + salted retry)", len(entries))
+	}
+}
+
 func TestArchive_Idempotent(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
