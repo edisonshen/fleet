@@ -240,10 +240,22 @@ func Archive(project string, slugs []string) error {
 	// The aliased form was correct (range copies the header before
 	// the loop body mutates), but the explicit allocation is harder
 	// to misread on a future edit.
+	//
+	// Dedupe against the archive's existing slugs: a partial
+	// previous Archive (crashed between writing archive and writing
+	// tasks) leaves the same slug in BOTH files; the retry would
+	// otherwise append a duplicate to archive, breaking subsequent
+	// Read with ErrDuplicateSlug.
+	archived := make(map[string]struct{}, len(archive.Tasks))
+	for _, t := range archive.Tasks {
+		archived[t.Slug] = struct{}{}
+	}
 	kept := make([]*Task, 0, len(current.Tasks))
 	for _, t := range current.Tasks {
 		if _, ok := want[t.Slug]; ok {
-			archive.Tasks = append(archive.Tasks, t)
+			if _, dup := archived[t.Slug]; !dup {
+				archive.Tasks = append(archive.Tasks, t)
+			}
 			continue
 		}
 		kept = append(kept, t)
@@ -394,9 +406,10 @@ func parse(data []byte) (*File, error) {
 	}
 	idx = consumed
 
-	// Walk remaining lines; on each `## task: <slug>` line, parse
-	// one task block. Anything after the LAST task block is footer.
-	lastTaskEnd := idx
+	// Walk remaining lines: on `## task: <slug>` parse a task block,
+	// on any other `## <name>` we've reached the footer (file-level
+	// markdown after the last task). Footer is captured verbatim.
+	footerStart := -1
 	for idx < len(lines) {
 		line := lines[idx]
 		if strings.HasPrefix(line, "## task: ") {
@@ -413,24 +426,21 @@ func parse(data []byte) (*File, error) {
 			}
 			f.Tasks = append(f.Tasks, t)
 			idx = next
-			lastTaskEnd = idx
 			continue
+		}
+		if strings.HasPrefix(line, "## ") {
+			// Non-task H2 → footer territory. Anything from this
+			// line forward (including this header) is footer.
+			footerStart = idx
+			break
 		}
 		idx++
 	}
-	// Footer = lines after the last task block. For files with no
-	// tasks, lastTaskEnd is the line after frontmatter — everything
-	// past there is footer too. Trim leading blank lines (canonical
-	// separator) and the trailing newline injected by Split, but
-	// preserve internal whitespace verbatim.
-	if lastTaskEnd < len(lines) {
-		footer := lines[lastTaskEnd:]
-		for len(footer) > 0 && strings.TrimSpace(footer[0]) == "" {
-			footer = footer[1:]
-		}
-		// `strings.Split` on text ending in "\n" yields a trailing
-		// empty string; drop it to prevent re-emission of an extra
-		// blank.
+	if footerStart >= 0 {
+		footer := lines[footerStart:]
+		// Drop the trailing empty entry strings.Split injects when
+		// the file ends in '\n' — otherwise we'd re-emit an extra
+		// blank on round-trip.
 		if len(footer) > 0 && footer[len(footer)-1] == "" {
 			footer = footer[:len(footer)-1]
 		}
@@ -536,12 +546,7 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 	for idx < len(lines) {
 		line := lines[idx]
 		if strings.HasPrefix(line, "## ") {
-			break // next task block
-		}
-		// `# ` (H1) implies footer territory — tasks reserve H3 for
-		// section headers and never emit H1/H2 inside a task block.
-		if strings.HasPrefix(line, "# ") {
-			break
+			break // next task block (or non-task H2 — footer)
 		}
 		if strings.HasPrefix(line, "### ") {
 			name := strings.TrimSpace(strings.TrimPrefix(line, "### "))
@@ -573,7 +578,10 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 }
 
 // readSection reads lines forming the body of an H3 section, stopping
-// at the next H1/H2/H3 (or EOF). The canonical layout is:
+// at the next H2/H3 (or EOF). H1 (`# `) is permitted inside the body
+// — Spec/Acceptance/Notes are documented as free-form markdown and
+// must round-trip verbatim, so an in-body `# Root cause` heading
+// stays in the body. The canonical layout is:
 //
 //	### Section
 //	<blank>
@@ -586,14 +594,11 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 // body) and trim the trailing blank(s) so the round-trip is stable.
 // Multi-paragraph bodies (with internal blank lines) round-trip
 // verbatim because trimming is anchored at start/end only.
-//
-// `# ` (H1) at column 0 also terminates — tasks.md grammar reserves
-// H1/H2 for file-level structure, so an H1 implies operator footer.
 func readSection(lines []string, start int) (string, int) {
 	end := start
 	for end < len(lines) {
 		line := lines[end]
-		if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") || strings.HasPrefix(line, "# ") {
+		if strings.HasPrefix(line, "## ") || strings.HasPrefix(line, "### ") {
 			break
 		}
 		end++
@@ -757,6 +762,8 @@ func render(f *File) ([]byte, error) {
 		}
 	}
 	if f.Footer != "" {
+		// Separator between last task (or frontmatter, if no tasks)
+		// and the footer's own `## ` header.
 		b.WriteByte('\n')
 		b.WriteString(f.Footer)
 		// Ensure the output ends with a newline (POSIX text-file

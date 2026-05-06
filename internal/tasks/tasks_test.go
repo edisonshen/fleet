@@ -84,7 +84,7 @@ func TestFooter_PreservedAcrossEdit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read out: %v", err)
 	}
-	if !strings.Contains(string(got), "# Operator notes") {
+	if !strings.Contains(string(got), "## Operator notes") {
 		t.Errorf("footer lost after Add+Write; got\n%s", got)
 	}
 	// Re-read: footer survives.
@@ -94,6 +94,38 @@ func TestFooter_PreservedAcrossEdit(t *testing.T) {
 	}
 	if !strings.Contains(f2.Footer, "Operator notes") {
 		t.Errorf("re-Read footer=%q; want substring 'Operator notes'", f2.Footer)
+	}
+}
+
+func TestSection_AllowsH1Headings(t *testing.T) {
+	// Spec/Acceptance/Notes are free-form markdown — `# Root cause`
+	// or `### Follow-up` inside a body must round-trip verbatim,
+	// not get truncated as a section terminator.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: bug-9999\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nFix the bug.\n\n" +
+		"### Acceptance\n\nNo more bug.\n\n" +
+		"### Notes\n\n# Root cause\n\nThe bug was here.\n"
+	tmp := filepath.Join(t.TempDir(), "h1-in-body.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "# Root cause") {
+		t.Errorf("Notes lost H1 heading; got %q", f.Tasks[0].Notes)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "The bug was here") {
+		t.Errorf("Notes truncated body; got %q", f.Tasks[0].Notes)
+	}
+	if f.Footer != "" {
+		t.Errorf("Footer should be empty; got %q", f.Footer)
 	}
 }
 
@@ -293,6 +325,41 @@ func TestArchive(t *testing.T) {
 	gotSlugs := slugList(arc.Tasks)
 	if !contains(gotSlugs, "a-aaaa") || !contains(gotSlugs, "c-cccc") {
 		t.Errorf("archive has %v; want [a-aaaa, c-cccc]", gotSlugs)
+	}
+}
+
+func TestArchive_IdempotentOnPartialPriorRun(t *testing.T) {
+	// Simulate the crash-recovery path: archive contains a slug
+	// from a previous Archive that died between writing archive
+	// and writing tasks. tasks.md still has that slug. Retrying
+	// Archive must NOT duplicate the entry in archive.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: now, Updated: now, SpawnedBy: "user"}
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("a-aaaa")},
+	}); err != nil {
+		t.Fatalf("seed tasks: %v", err)
+	}
+	// Pre-existing archive with the same slug (crash recovery state).
+	if err := Write(filepath.Join(dir, "tasks-archive.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("a-aaaa")},
+	}); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+	if err := Archive("fleet", []string{"a-aaaa"}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("re-read archive: %v", err)
+	}
+	if len(arc.Tasks) != 1 {
+		t.Errorf("archive has %d tasks; want 1 (deduped)", len(arc.Tasks))
 	}
 }
 

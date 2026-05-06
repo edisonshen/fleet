@@ -26,7 +26,7 @@ Alpha done.
 ### Notes
 
 
-# Operator notes
+## Operator notes
 
 This footer captures cross-task operator memory that v0.2 explicitly
 allows under the tasks.md grammar. It must round-trip verbatim.
