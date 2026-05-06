@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/version"
 )
 
 type statusOpts struct {
@@ -27,7 +28,7 @@ summary per agent. Default output is human-readable; --json emits the
 raw records for shell scripting.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return runStatus(opts, cmd.OutOrStdout())
+			return runStatus(opts, cmd.OutOrStdout(), Version)
 		},
 	}
 	cmd.Flags().BoolVar(&opts.jsonOut, "json", false,
@@ -35,7 +36,7 @@ raw records for shell scripting.`,
 	return cmd
 }
 
-func runStatus(opts *statusOpts, stdout io.Writer) error {
+func runStatus(opts *statusOpts, stdout io.Writer, current string) error {
 	records, err := agent.List()
 	if err != nil {
 		return err
@@ -52,27 +53,40 @@ func runStatus(opts *statusOpts, stdout io.Writer) error {
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
+		// JSON path stays a single record array — appending the
+		// nudge would break jq pipelines and `fleet status --json |
+		// fleet ...` chains. Operators piping through jq see only
+		// the records.
 		return enc.Encode(records)
 	}
 
 	if len(records) == 0 {
 		_, _ = fmt.Fprintln(stdout, "no agents (run `fleet dispatch <task-id>` to start one)")
-		return nil
+	} else {
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		_, _ = fmt.Fprintln(tw, "AGENT\tPROJECT\tTASK\tMODE\tAGE\tBLOCKED")
+		for _, r := range records {
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+				r.ID,
+				defaultStr(r.Project, "-"),
+				defaultStr(r.TaskID, "-"),
+				defaultStr(r.Mode, "-"),
+				humanAge(time.Since(r.SpawnedAt)),
+				boolStr(r.Blocked),
+			)
+		}
+		if err := tw.Flush(); err != nil {
+			return err
+		}
 	}
 
-	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "AGENT\tPROJECT\tTASK\tMODE\tAGE\tBLOCKED")
-	for _, r := range records {
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.ID,
-			defaultStr(r.Project, "-"),
-			defaultStr(r.TaskID, "-"),
-			defaultStr(r.Mode, "-"),
-			humanAge(time.Since(r.SpawnedAt)),
-			boolStr(r.Blocked),
-		)
+	// Upgrade nudge footer. Pure read against ~/.fleet/version_check.json;
+	// silent when no cache, no upgrade, or dev build. Same source of
+	// truth as the TUI banner — single chip, identical format.
+	if nudge := version.Nudge(current); nudge != "" {
+		_, _ = fmt.Fprintln(stdout, nudge)
 	}
-	return tw.Flush()
+	return nil
 }
 
 func defaultStr(s, def string) string {
