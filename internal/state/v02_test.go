@@ -150,14 +150,42 @@ func TestValidateSlug_RejectsReserved(t *testing.T) {
 	}
 }
 
-func TestValidateProjectName_RejectsReservedCaseInsensitive(t *testing.T) {
-	// On macOS/APFS the default filesystem is case-insensitive, so
-	// ".LOCKS" would resolve to the same inode as the reserved
-	// projects/.locks/ control directory. Reject case-insensitively.
-	for _, in := range []string{".locks", ".LOCKS", ".Locks", ".loCKS"} {
+func TestValidateProjectName_RejectsReserved(t *testing.T) {
+	// ".locks" aliases the reserved projects/.locks/ control dir.
+	// (Case variants are caught by the lowercase-only rule below
+	// before they ever reach the reserved-name comparison, but we
+	// keep the explicit reserved-name reject so the error message
+	// is precise on the exact-match case.)
+	for _, in := range []string{".locks", ".", ".."} {
 		t.Run(in, func(t *testing.T) {
 			if err := ValidateProjectName(in); err == nil {
 				t.Errorf("ValidateProjectName(%q) returned nil err; want rejection", in)
+			}
+		})
+	}
+}
+
+func TestValidateProjectName_RejectsUppercase(t *testing.T) {
+	// macOS/APFS case-insensitive default would alias "Foo" and
+	// "foo" onto the same projects/<name>/ tree → silent state
+	// corruption. Lowercase-only is the canonical-name rule.
+	for _, in := range []string{"Fleet", "FLEET", "myProject", "MyProject", "iOS", "macOS"} {
+		t.Run(in, func(t *testing.T) {
+			if err := ValidateProjectName(in); err == nil {
+				t.Errorf("ValidateProjectName(%q) returned nil err; want rejection (uppercase)", in)
+			}
+		})
+	}
+}
+
+func TestValidateSlug_RejectsUppercase(t *testing.T) {
+	// Same case-insensitive aliasing risk as project names: two
+	// slugs differing only in case alias the same workers/<slug>/
+	// while tasks.Read treats them as distinct.
+	for _, in := range []string{"Alpha-1234", "ALPHA-1234", "alphaBeta-1234", "Task-9999"} {
+		t.Run(in, func(t *testing.T) {
+			if err := ValidateSlug(in); err == nil {
+				t.Errorf("ValidateSlug(%q) returned nil err; want rejection (uppercase)", in)
 			}
 		})
 	}

@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -227,36 +226,37 @@ func SafeLockComponent(name string) string {
 }
 
 // ValidateProjectName rejects strings that would be unsafe to use as
-// a single path component. Allowed: ASCII letters, digits, hyphen,
-// underscore, period (but not just "." or ".."). Empty rejected.
+// a single path component. Allowed: ASCII lowercase letters, digits,
+// hyphen, underscore, period (but not just "." or ".."). Empty rejected.
+//
+// Lowercase-only is intentional: macOS/APFS is case-insensitive by
+// default, so "Foo" and "foo" would alias the same projects/<name>/
+// tree and silently corrupt each other's state. Forcing lowercase
+// gives one canonical name per inode across all filesystems.
 //
 // Centralized so the dispatch CLI (--project), the project manifest
 // loader (future), and lock-file paths all enforce the same rule.
 // Operator-supplied "owner/repo"-style names get a clear early error
 // instead of a confusing flock-open failure or a silent path traversal.
-//
-// Reserved-name checks are case-INSENSITIVE so macOS/APFS (default
-// case-insensitive) can't alias a reserved control directory by
-// varying the case (".LOCKS" → same inode as ".locks").
 func ValidateProjectName(name string) error {
 	if name == "" {
 		return fmt.Errorf("project name must not be empty")
 	}
-	lower := strings.ToLower(name)
-	if lower == "." || lower == ".." {
+	if name == "." || name == ".." {
 		return fmt.Errorf("project name %q reserved", name)
 	}
-	if lower == ".locks" {
-		return fmt.Errorf("project name %q reserved (collides with projects/.locks/ on case-insensitive filesystems)", name)
+	if name == ".locks" {
+		return fmt.Errorf("project name %q reserved (collides with projects/.locks/)", name)
 	}
 	for _, c := range name {
 		switch {
 		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
 		case c >= '0' && c <= '9':
 		case c == '-' || c == '_' || c == '.':
+		case c >= 'A' && c <= 'Z':
+			return fmt.Errorf("project name %q contains uppercase %q (lowercase-only — case-insensitive filesystems alias case variants)", name, c)
 		default:
-			return fmt.Errorf("project name %q contains invalid character %q (allowed: letters, digits, _, -, .)", name, c)
+			return fmt.Errorf("project name %q contains invalid character %q (allowed: lowercase letters, digits, _, -, .)", name, c)
 		}
 	}
 	return nil
@@ -264,38 +264,41 @@ func ValidateProjectName(name string) error {
 
 // ValidateSlug rejects task / worker slugs that would alias on disk.
 //
-// Same character set as ValidateProjectName: ASCII letters, digits,
-// hyphen, underscore, period — no path separators, spaces, or other
-// runes that SafeLockComponent would map to "_". An invalid slug
-// would otherwise let `feature/a` and `feature_a` collide on the
-// workers/<x>/ directory.
+// Allowed: ASCII lowercase letters, digits, hyphen, underscore, period
+// — no path separators, spaces, uppercase, or other runes that
+// SafeLockComponent would map to "_". An invalid slug would otherwise
+// let `feature/a` and `feature_a` collide on the workers/<x>/ tree.
+//
+// Lowercase-only matches ValidateProjectName's reasoning: macOS/APFS
+// is case-insensitive by default, so two slugs differing only in case
+// would alias the same workers/<slug>/, archive, and worktrees paths
+// while tasks.Read treats them as distinct entries — silent state
+// corruption.
 //
 // Empty rejected; "." and ".." rejected (parent-dir traversal).
 // "archive" rejected because workers/archive/ is the reserved holding
 // pen for archived worker dirs — a worker with slug=archive would
 // alias that directory and become invisible to ListActive + un-
-// archivable (rename into self). Reserved-name check is case-
-// INSENSITIVE so macOS/APFS can't alias the reserved dir by varying
-// case ("Archive" → same inode as "archive").
+// archivable (rename into self).
 func ValidateSlug(slug string) error {
 	if slug == "" {
 		return fmt.Errorf("slug must not be empty")
 	}
-	lower := strings.ToLower(slug)
-	if lower == "." || lower == ".." {
+	if slug == "." || slug == ".." {
 		return fmt.Errorf("slug %q reserved", slug)
 	}
-	if lower == "archive" {
-		return fmt.Errorf("slug %q reserved (collides with workers/archive/ on case-insensitive filesystems)", slug)
+	if slug == "archive" {
+		return fmt.Errorf("slug %q reserved (collides with workers/archive/)", slug)
 	}
 	for _, c := range slug {
 		switch {
 		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
 		case c >= '0' && c <= '9':
 		case c == '-' || c == '_' || c == '.':
+		case c >= 'A' && c <= 'Z':
+			return fmt.Errorf("slug %q contains uppercase %q (lowercase-only — case-insensitive filesystems alias case variants)", slug, c)
 		default:
-			return fmt.Errorf("slug %q contains invalid character %q (allowed: letters, digits, _, -, .)", slug, c)
+			return fmt.Errorf("slug %q contains invalid character %q (allowed: lowercase letters, digits, _, -, .)", slug, c)
 		}
 	}
 	return nil
