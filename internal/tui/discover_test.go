@@ -222,17 +222,24 @@ func TestProjectTag_ParentBasename(t *testing.T) {
 // every output is a valid project name. Tag collision on lossy
 // sanitization (e.g. "~/foo bar/api" vs "~/foo-bar/api") is a known
 // limitation — see ProjectTag's comment.
+//
+// v0.2 codex iter-15: ValidateProjectName became lowercase-only to
+// prevent case-only aliasing on macOS/APFS. ProjectTag now lowercases
+// uppercase letters (instead of preserving them) so paths like
+// "~/Client Work/api" still produce a tag that passes validation at
+// dispatch time.
 func TestProjectTag_SanitizesUnsafeChars(t *testing.T) {
 	cases := []struct {
 		path string
 		want string
 	}{
-		{"/Users/x/Client Work/api", "Client-Work-api"},
+		{"/Users/x/Client Work/api", "client-work-api"},
 		{"/foo bar baz", "foo-bar-baz"},
 		{"/proj/v1.0", "proj-v1.0"}, // dots preserved
 		{"/proj/with;semis", "proj-with-semis"},
 		{"/  /  ", "fleet"}, // all whitespace → fallback
 		{"/foo/bar baz qux", "foo-bar-baz-qux"},
+		{"/Users/x/MyRepo", "x-myrepo"}, // uppercase lowercased (parent-basename = x/MyRepo)
 	}
 	for _, tc := range cases {
 		got := ProjectTag(tc.path)

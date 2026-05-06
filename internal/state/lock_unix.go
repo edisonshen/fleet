@@ -5,6 +5,7 @@ package state
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -36,6 +37,39 @@ import (
 // That matches what we want for v1: per-process, per-project.
 func LockProject(project string) (func(), error) {
 	return acquireFlock(ProjectLockPath, project)
+}
+
+// LockProjectState takes an exclusive flock on
+// ~/.fleet/projects/<project>/.locks/state.lock — the v0.2 single
+// state-lock per project state-dir (Q1 decision). Held briefly during
+// writes to tasks.md / tasks-archive.md / learnings.md /
+// learnings-archive.md.
+//
+// Distinct from LockProject (which serializes dispatch + handoff under
+// projects/.locks/<name>.lock). The two lock trees do not interact;
+// `fleet dispatch` doesn't touch tasks.md and `fleet tasks add`
+// doesn't dispatch.
+//
+// The .locks/ dir is NOT created by Bootstrap — it's lazily created
+// here on first acquire (the per-project state-dir is itself lazy:
+// see internal/state.ProjectDir, which doesn't MkdirAll either).
+func LockProjectState(project string) (func(), error) {
+	path, err := ProjectStateLockPath(project)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir lock dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("flock %s: %w", path, err)
+	}
+	return func() { _ = f.Close() }, nil
 }
 
 // LockAgent takes an exclusive flock on

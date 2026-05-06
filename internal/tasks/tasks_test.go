@@ -1,0 +1,977 @@
+package tasks
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// fixtureBytes loads a testdata/<name>.md file or fails the test.
+func fixtureBytes(t *testing.T, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("read fixture %s: %v", name, err)
+	}
+	return b
+}
+
+// roundTripFixture loads a fixture, parses it, re-renders, and asserts
+// byte equality. The fixtures are hand-authored to match the writer's
+// canonical form.
+func roundTripFixture(t *testing.T, name string) {
+	t.Helper()
+	want := fixtureBytes(t, name)
+	tmp := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(tmp, want, 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read %s: %v", name, err)
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("round-trip mismatch for %s\n--- want ---\n%s\n--- got ---\n%s", name, want, got)
+	}
+}
+
+func TestRoundTrip_Empty(t *testing.T)       { roundTripFixture(t, "empty.md") }
+func TestRoundTrip_SingleTodo(t *testing.T)  { roundTripFixture(t, "single-todo.md") }
+func TestRoundTrip_MultiStatus(t *testing.T) { roundTripFixture(t, "multi-status.md") }
+func TestRoundTrip_Deps(t *testing.T)        { roundTripFixture(t, "deps.md") }
+func TestRoundTrip_WorkerNotes(t *testing.T) { roundTripFixture(t, "worker-notes.md") }
+func TestRoundTrip_Fifty(t *testing.T)       { roundTripFixture(t, "fifty-tasks.md") }
+func TestRoundTrip_Footer(t *testing.T)      { roundTripFixture(t, "with-footer.md") }
+
+func TestFooter_PreservedAcrossEdit(t *testing.T) {
+	// Operator adds a task; existing footer must not get clobbered.
+	tmp := filepath.Join(t.TempDir(), "f.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "with-footer.md"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if f.Footer == "" {
+		t.Fatalf("Footer empty after Read")
+	}
+	now := time.Date(2026, 5, 7, 10, 0, 0, 0, time.UTC)
+	if err := f.Add(&Task{
+		Slug: "beta-5678", Status: StatusTodo, Priority: PriorityP2,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: "Beta.", Acceptance: "Beta.", Notes: "",
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if !strings.Contains(string(got), "## Operator notes") {
+		t.Errorf("footer lost after Add+Write; got\n%s", got)
+	}
+	// Re-read: footer survives.
+	f2, err := Read(out)
+	if err != nil {
+		t.Fatalf("re-Read: %v", err)
+	}
+	if !strings.Contains(f2.Footer, "Operator notes") {
+		t.Errorf("re-Read footer=%q; want substring 'Operator notes'", f2.Footer)
+	}
+}
+
+func TestParse_RejectsFooterBeforeLastTask(t *testing.T) {
+	// Operator inserts `## Operator notes` between two task blocks
+	// — must error so the second task isn't silently demoted into
+	// the footer.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: alpha-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n" +
+		"## Operator notes\n\nMid-file footer.\n\n" +
+		"## task: beta-5678\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T11:00:00Z\n- updated: 2026-05-06T11:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nB.\n\n### Acceptance\n\nB.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "midfooter.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for mid-file footer")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "footer") {
+		t.Errorf("Msg=%q; want substring 'footer'", perr.Msg)
+	}
+}
+
+func TestSection_RejectsStrayTextBetweenSections(t *testing.T) {
+	// A stray paragraph between bullets and the first H3 must error
+	// — silent drop on next Write would lose operator edits.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: stray-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"This stray paragraph sits between bullets and Spec.\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "stray.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for stray content")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "unexpected") {
+		t.Errorf("Msg=%q; want substring 'unexpected'", perr.Msg)
+	}
+}
+
+func TestParse_RejectsDuplicateMetadataBullets(t *testing.T) {
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: dupkey-1234\n\n" +
+		"- status: todo\n" +
+		"- priority: P1\n" +
+		"- worker_pid: 0\n" +
+		"- worktree:\n" +
+		"- pr_url:\n" +
+		"- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n" +
+		"- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n" +
+		"- spawned_by: user\n" +
+		"- status: in-progress\n\n" + // duplicate!
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "dupkey.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for duplicate field")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "duplicate") {
+		t.Errorf("Msg=%q; want substring 'duplicate'", perr.Msg)
+	}
+}
+
+func TestSection_RejectsDuplicateH3(t *testing.T) {
+	// Two `### Notes` blocks in one task is operator-error; silent
+	// overwrite would lose the earlier text. Parser must error.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: dup-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n" +
+		"### Acceptance\n\nA.\n\n" +
+		"### Notes\n\nFirst notes.\n\n" +
+		"### Notes\n\nSecond notes — duplicate!\n"
+	tmp := filepath.Join(t.TempDir(), "dup.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for duplicate H3")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "duplicate") {
+		t.Errorf("Msg=%q; want substring 'duplicate'", perr.Msg)
+	}
+}
+
+func TestSection_AllowsNonReservedH3Subheadings(t *testing.T) {
+	// Worker writes a `### Follow-up` inside Notes — keep verbatim.
+	// Only Spec/Acceptance/Notes are reserved section names; other
+	// `### ` lines stay in the body.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: subhead-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nSpec body.\n\n" +
+		"### Acceptance\n\nAcceptance body.\n\n" +
+		"### Notes\n\nLeading note.\n\n### Follow-up\n\nSubheading body.\n"
+	tmp := filepath.Join(t.TempDir(), "subhead.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "### Follow-up") {
+		t.Errorf("Notes missing subheading; got %q", f.Tasks[0].Notes)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "Subheading body") {
+		t.Errorf("Notes truncated; got %q", f.Tasks[0].Notes)
+	}
+}
+
+func TestSection_RequiresAllH3Sections(t *testing.T) {
+	// Missing ### Acceptance → ParseError.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: incomplete-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nSpec only.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "incomplete.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read returned nil; want ParseError for missing Acceptance")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(perr.Msg, "Acceptance") {
+		t.Errorf("Msg=%q; want substring 'Acceptance'", perr.Msg)
+	}
+}
+
+func TestSection_AllowsH1Headings(t *testing.T) {
+	// Spec/Acceptance/Notes are free-form markdown — `# Root cause`
+	// or `### Follow-up` inside a body must round-trip verbatim,
+	// not get truncated as a section terminator.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: bug-9999\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nFix the bug.\n\n" +
+		"### Acceptance\n\nNo more bug.\n\n" +
+		"### Notes\n\n# Root cause\n\nThe bug was here.\n"
+	tmp := filepath.Join(t.TempDir(), "h1-in-body.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "# Root cause") {
+		t.Errorf("Notes lost H1 heading; got %q", f.Tasks[0].Notes)
+	}
+	if !strings.Contains(f.Tasks[0].Notes, "The bug was here") {
+		t.Errorf("Notes truncated body; got %q", f.Tasks[0].Notes)
+	}
+	if f.Footer != "" {
+		t.Errorf("Footer should be empty; got %q", f.Footer)
+	}
+}
+
+func TestSchemaVersionRefuse(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "schema-v2.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "schema-v2.md"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read schema-v2.md returned nil err; want ErrSchemaTooNew")
+	}
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Errorf("got err %v; want ErrSchemaTooNew", err)
+	}
+}
+
+func TestSchemaVersionUpgrade(t *testing.T) {
+	// no-frontmatter.md has no `---` header — Read accepts it as
+	// schema=0, Write prepends v1 frontmatter.
+	tmp := filepath.Join(t.TempDir(), "no-frontmatter.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "no-frontmatter.md"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if f.Schema != 0 {
+		t.Errorf("Schema=%d; want 0 (no frontmatter)", f.Schema)
+	}
+	if len(f.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(f.Tasks))
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if !strings.HasPrefix(string(got), "---\nschema: v1\n---\n") {
+		t.Errorf("Write did not prepend frontmatter; got prefix %q", string(got)[:32])
+	}
+	// Re-read should now show Schema=1.
+	f2, err := Read(out)
+	if err != nil {
+		t.Fatalf("Read after upgrade: %v", err)
+	}
+	if f2.Schema != 1 {
+		t.Errorf("after-upgrade Schema=%d; want 1", f2.Schema)
+	}
+}
+
+func TestFrontmatterRoundTrip_CRLF(t *testing.T) {
+	// File with CRLF line endings should parse the same as LF.
+	src := "---\r\nschema: v1\r\n---\r\n\r\n## task: crlf-1234\r\n\r\n" +
+		"- status: todo\r\n- priority: P1\r\n- worker_pid: 0\r\n" +
+		"- worktree:\r\n- pr_url:\r\n- branch:\r\n" +
+		"- created: 2026-05-06T10:00:00Z\r\n- updated: 2026-05-06T10:00:00Z\r\n" +
+		"- depends_on: []\r\n- spawned_by: user\r\n\r\n" +
+		"### Spec\r\n\r\nCRLF body.\r\n\r\n### Acceptance\r\n\r\nCRLF.\r\n\r\n### Notes\r\n\r\n\r\n"
+	tmp := filepath.Join(t.TempDir(), "crlf.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(f.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(f.Tasks))
+	}
+	if f.Tasks[0].Slug != "crlf-1234" {
+		t.Errorf("Slug=%q; want crlf-1234", f.Tasks[0].Slug)
+	}
+	if f.Tasks[0].Spec != "CRLF body." {
+		t.Errorf("Spec=%q; want %q", f.Tasks[0].Spec, "CRLF body.")
+	}
+}
+
+func TestMalformedRecovery_BadDate(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "bad-date.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "malformed-bad-date.md"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read malformed-bad-date.md returned nil err")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("err is %T; want *ParseError: %v", err, err)
+	}
+	if perr.Line == 0 {
+		t.Errorf("ParseError.Line=0; want non-zero (got %+v)", perr)
+	}
+	if !strings.Contains(perr.Msg, "created") {
+		t.Errorf("ParseError.Msg=%q; want substring 'created'", perr.Msg)
+	}
+}
+
+func TestMalformedRecovery_BadStatus(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "bad-status.md")
+	if err := os.WriteFile(tmp, fixtureBytes(t, "malformed-bad-status.md"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read malformed-bad-status.md returned nil err")
+	}
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("err is %T; want *ParseError: %v", err, err)
+	}
+	if !strings.Contains(perr.Msg, "status") {
+		t.Errorf("ParseError.Msg=%q; want substring 'status'", perr.Msg)
+	}
+}
+
+func TestSlugUniqueness_Add(t *testing.T) {
+	f := &File{Schema: 1}
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	t1 := &Task{Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1, Created: now, Updated: now}
+	if err := f.Add(t1); err != nil {
+		t.Fatalf("Add t1: %v", err)
+	}
+	t2 := &Task{Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1, Created: now, Updated: now}
+	err := f.Add(t2)
+	if err == nil {
+		t.Fatal("Add duplicate slug returned nil; want ErrDuplicateSlug")
+	}
+	if !errors.Is(err, ErrDuplicateSlug) {
+		t.Errorf("got %v; want ErrDuplicateSlug", err)
+	}
+}
+
+func TestAdd_RejectsZeroTimestamps(t *testing.T) {
+	// Archive distinguishes retry-recovery from slug-reuse via
+	// Created equality; zero timestamps would make every reused slug
+	// look like a retry. Add must reject zero values up front.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	cases := []*Task{
+		{Slug: "a-1234", Status: StatusTodo, Priority: PriorityP1, Updated: now}, // zero Created
+		{Slug: "b-1234", Status: StatusTodo, Priority: PriorityP1, Created: now}, // zero Updated
+	}
+	for i, tc := range cases {
+		f := &File{Schema: 1}
+		err := f.Add(tc)
+		if err == nil {
+			t.Errorf("case %d: Add returned nil; want ErrInvalidTask", i)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("case %d: got %v; want ErrInvalidTask", i, err)
+		}
+	}
+}
+
+func TestAdd_RejectsBodyH2InSection(t *testing.T) {
+	// Spec/Acceptance/Notes are free-form markdown but column-0 H2
+	// (`## ...`) would split the task on next Read. Add rejects so
+	// the writer never produces a self-corrupting file.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(spec, acc, notes string) *Task {
+		return &Task{
+			Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+			Created: now, Updated: now, SpawnedBy: "user",
+			Spec: spec, Acceptance: acc, Notes: notes,
+		}
+	}
+	cases := []*Task{
+		mk("## Sneaky H2 in spec", "ok", "ok"),
+		mk("ok", "Line 1\n## Mid-body H2 in acceptance\nline 3", "ok"),
+		mk("ok", "ok", "## Notes-section H2 (workers love these)"),
+	}
+	for i, tc := range cases {
+		f := &File{Schema: 1}
+		err := f.Add(tc)
+		if err == nil {
+			t.Errorf("case %d: Add returned nil; want ErrInvalidTask", i)
+		}
+		if err != nil && !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("case %d: got %v; want ErrInvalidTask", i, err)
+		}
+	}
+}
+
+func TestAdd_AllowsFencedH2InBody(t *testing.T) {
+	// A column-0 `## ` inside a fenced code block is example markdown,
+	// not a structural header. Add must accept it; readSection must
+	// keep it inside the section body. Round-trip proves both sides.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	body := "Example doc layout:\n\n```\n## task: example-deadbeef\n- status: todo\n```\n\nback to body."
+	tk := &Task{
+		Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: body, Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add rejected fenced H2: %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "fenced.md")
+	if err := Write(tmp, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d (fence treated as task boundary)", len(got.Tasks))
+	}
+	if got.Tasks[0].Spec != body {
+		t.Errorf("Spec body changed across round-trip:\n want=%q\n  got=%q", body, got.Tasks[0].Spec)
+	}
+}
+
+func TestAdd_RejectsUnfencedReservedH3InBody(t *testing.T) {
+	// readSection treats column-0 reserved `### Spec|Acceptance|Notes`
+	// as a structural boundary, so Add must reject the same to keep
+	// write→read round-trip stable. Pasting an example task template
+	// into a Spec body would otherwise write fine and fail on next
+	// parse with "duplicate ### Acceptance section" (codex iter-10 P1).
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	for _, name := range []string{"Spec", "Acceptance", "Notes"} {
+		tk := &Task{
+			Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+			Created: now, Updated: now, SpawnedBy: "user",
+			Spec: "intro\n### " + name + "\nleaked", Acceptance: "ok", Notes: "ok",
+		}
+		f := &File{Schema: 1}
+		err := f.Add(tk)
+		if err == nil {
+			t.Errorf("Add accepted unfenced `### %s` in spec body", name)
+			continue
+		}
+		if !errors.Is(err, ErrInvalidTask) {
+			t.Errorf("`### %s`: got %v; want ErrInvalidTask", name, err)
+		}
+	}
+	// Fenced reserved-H3 must still pass — same fence escape hatch as `## `.
+	tk := &Task{
+		Slug: "beta-5678", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: "doc:\n\n```\n### Acceptance\nexample\n```\n", Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Errorf("Add rejected fenced `### Acceptance`: %v", err)
+	}
+}
+
+func TestAdd_RejectsUnfencedH2EvenAfterFenceCloses(t *testing.T) {
+	// A fenced block followed by an unfenced `## ` must still be
+	// rejected — the fence-aware check toggles state, it doesn't
+	// disable the check globally.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	body := "```\n## inside fence\n```\n\n## but THIS is real and bad"
+	tk := &Task{
+		Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+		Spec: body, Acceptance: "ok", Notes: "ok",
+	}
+	f := &File{Schema: 1}
+	err := f.Add(tk)
+	if err == nil {
+		t.Fatal("Add accepted unfenced H2 after a closed fence")
+	}
+	if !errors.Is(err, ErrInvalidTask) {
+		t.Errorf("got %v; want ErrInvalidTask", err)
+	}
+}
+
+func TestParse_RejectsTaskMissingRequiredBullets(t *testing.T) {
+	// If an operator edit drops `- created:` (or any other required
+	// bullet), the parser must refuse rather than zero-value the field
+	// and corrupt the file on next Write. Test each required bullet
+	// in turn by deleting one line at a time from a known-good fixture.
+	canonical := "---\nschema: v1\n---\n\n" +
+		"## task: req-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+
+	required := []string{
+		"status", "priority", "worker_pid", "worktree", "pr_url", "branch",
+		"created", "updated", "depends_on", "spawned_by",
+	}
+	for _, key := range required {
+		// Delete the matching `- key:` line.
+		var kept []string
+		for _, ln := range strings.Split(canonical, "\n") {
+			if strings.HasPrefix(ln, "- "+key+":") {
+				continue
+			}
+			kept = append(kept, ln)
+		}
+		broken := strings.Join(kept, "\n")
+		tmp := filepath.Join(t.TempDir(), "missing-"+key+".md")
+		if err := os.WriteFile(tmp, []byte(broken), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, err := Read(tmp)
+		if err == nil {
+			t.Errorf("Read accepted file missing `- %s:`; want ParseError", key)
+			continue
+		}
+		var pe *ParseError
+		if !errors.As(err, &pe) {
+			// status / priority dropped paths return validStatus/Priority
+			// errors via empty-value detection — those are acceptable
+			// surfacings of the same problem. Just confirm SOME error.
+			continue
+		}
+		if !strings.Contains(pe.Msg, key) {
+			t.Errorf("missing-%s: error message %q does not name the missing key", key, pe.Msg)
+		}
+	}
+}
+
+func TestSlugUniqueness_Read(t *testing.T) {
+	// File with two H2 blocks sharing a slug must error on Read.
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: dup-1234\n\n- status: todo\n- priority: P1\n" +
+		"- worker_pid: 0\n- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n\n" +
+		"## task: dup-1234\n\n- status: todo\n- priority: P1\n" +
+		"- worker_pid: 0\n- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n### Spec\n\nB.\n\n### Acceptance\n\nB.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "dup.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read dup returned nil; want ErrDuplicateSlug")
+	}
+	if !errors.Is(err, ErrDuplicateSlug) {
+		t.Errorf("got %v; want ErrDuplicateSlug", err)
+	}
+}
+
+func TestArchive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	// Seed tasks.md with three tasks; archive two of them.
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string, st Status) *Task {
+		return &Task{Slug: slug, Status: st, Priority: PriorityP1, Created: now, Updated: now, SpawnedBy: "user"}
+	}
+	f := &File{Schema: 1, Tasks: []*Task{
+		mk("a-aaaa", StatusDone),
+		mk("b-bbbb", StatusTodo),
+		mk("c-cccc", StatusDone),
+	}}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	tasksPath := filepath.Join(dir, "tasks.md")
+	if err := Write(tasksPath, f); err != nil {
+		t.Fatalf("seed Write: %v", err)
+	}
+	if err := Archive("fleet", []string{"a-aaaa", "c-cccc"}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	// tasks.md should have b only.
+	cur, err := Read(tasksPath)
+	if err != nil {
+		t.Fatalf("Read tasks: %v", err)
+	}
+	if len(cur.Tasks) != 1 || cur.Tasks[0].Slug != "b-bbbb" {
+		t.Errorf("after archive, tasks.md has %v; want [b-bbbb]", slugList(cur.Tasks))
+	}
+	// tasks-archive.md should have a + c.
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("Read archive: %v", err)
+	}
+	gotSlugs := slugList(arc.Tasks)
+	if !contains(gotSlugs, "a-aaaa") || !contains(gotSlugs, "c-cccc") {
+		t.Errorf("archive has %v; want [a-aaaa, c-cccc]", gotSlugs)
+	}
+}
+
+func TestArchive_IdempotentOnPartialPriorRun(t *testing.T) {
+	// Simulate the crash-recovery path: archive contains a slug
+	// from a previous Archive that died between writing archive
+	// and writing tasks. tasks.md still has that slug. Retrying
+	// Archive must NOT duplicate the entry in archive.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: now, Updated: now, SpawnedBy: "user"}
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("a-aaaa")},
+	}); err != nil {
+		t.Fatalf("seed tasks: %v", err)
+	}
+	// Pre-existing archive with the same slug (crash recovery state).
+	if err := Write(filepath.Join(dir, "tasks-archive.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("a-aaaa")},
+	}); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+	if err := Archive("fleet", []string{"a-aaaa"}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("re-read archive: %v", err)
+	}
+	if len(arc.Tasks) != 1 {
+		t.Errorf("archive has %d tasks; want 1 (deduped)", len(arc.Tasks))
+	}
+}
+
+func TestArchive_UnknownSlugSkipped(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	f := &File{Schema: 1, Tasks: []*Task{{
+		Slug: "alpha-1234", Status: StatusTodo, Priority: PriorityP1,
+		Created: now, Updated: now, SpawnedBy: "user",
+	}}}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	if err := Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := Archive("fleet", []string{"nonexistent-9999"}); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	cur, err := Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(cur.Tasks) != 1 {
+		t.Errorf("tasks=%v; want untouched", slugList(cur.Tasks))
+	}
+}
+
+// TestArchive_RejectsReusedSlug verifies that a slug present in BOTH
+// tasks.md and tasks-archive.md with DIFFERENT Created timestamps
+// triggers ErrDuplicateSlug rather than silently dropping the newer
+// record. Created is the immutable identity of a task — same Created
+// means retry-recovery; different Created means the slug was reused
+// after a prior Archive (Add doesn't check archive today).
+func TestArchive_RejectsReusedSlug(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	t1 := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	t2 := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string, created time.Time) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: created, Updated: created, SpawnedBy: "user"}
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	// Pre-existing archive entry (older Created).
+	if err := Write(filepath.Join(dir, "tasks-archive.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("alpha-1234", t1)},
+	}); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+	// Active file with same slug but newer Created (slug reuse).
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{mk("alpha-1234", t2)},
+	}); err != nil {
+		t.Fatalf("seed tasks: %v", err)
+	}
+	err := Archive("fleet", []string{"alpha-1234"})
+	if err == nil {
+		t.Fatal("Archive returned nil; want ErrDuplicateSlug for reused slug")
+	}
+	if !errors.Is(err, ErrDuplicateSlug) {
+		t.Errorf("got %v; want ErrDuplicateSlug", err)
+	}
+}
+
+// TestArchive_ConcurrentSameProject fires N concurrent Archive calls on
+// the same project with overlapping slug sets, then asserts no error,
+// each archived slug appears exactly once in tasks-archive.md, and no
+// archived slug remains in tasks.md. Exercises state.LockProjectState's
+// serialization guarantee under contention — a documented hazard the
+// rest of the tasks_test suite leaves untouched.
+func TestArchive_ConcurrentSameProject(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: now, Updated: now, SpawnedBy: "user"}
+	}
+	const N = 10
+	seed := make([]*Task, 0, N)
+	all := make([]string, 0, N)
+	for i := 0; i < N; i++ {
+		s := "slug-" + stringFromInt(i+1000)
+		seed = append(seed, mk(s))
+		all = append(all, s)
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{Schema: 1, Tasks: seed}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Fire 4 goroutines, each archiving the FULL slug set. Heavy
+	// overlap intentionally — Archive must dedupe + serialize cleanly.
+	var wg sync.WaitGroup
+	const goroutines = 4
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := Archive("fleet", all); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("Archive: %v", err)
+	}
+	// tasks.md should be empty (or carry no archived slug).
+	cur, err := Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("Read tasks: %v", err)
+	}
+	for _, ts := range cur.Tasks {
+		if contains(all, ts.Slug) {
+			t.Errorf("tasks.md still has archived slug %q", ts.Slug)
+		}
+	}
+	// tasks-archive.md should contain each slug exactly once.
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("Read archive: %v", err)
+	}
+	seen := map[string]int{}
+	for _, ts := range arc.Tasks {
+		seen[ts.Slug]++
+	}
+	for _, s := range all {
+		if seen[s] != 1 {
+			t.Errorf("archive count for %q = %d; want 1", s, seen[s])
+		}
+	}
+}
+
+func TestGenerateSlug_FullSlugPassthrough(t *testing.T) {
+	got := GenerateSlug("add-readme-7a3c", "spec body", nil)
+	if got != "add-readme-7a3c" {
+		t.Errorf("got %q; want passthrough add-readme-7a3c", got)
+	}
+}
+
+func TestGenerateSlug_ShortPlusHex(t *testing.T) {
+	got := GenerateSlug("add-readme", "ignored", nil)
+	if !strings.HasPrefix(got, "add-readme-") || len(got) != len("add-readme-")+4 {
+		t.Errorf("got %q; want add-readme-<4hex>", got)
+	}
+	// 4hex is hex digits only.
+	suffix := got[len("add-readme-"):]
+	for _, c := range suffix {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			t.Errorf("suffix %q has non-hex char %q", suffix, c)
+		}
+	}
+}
+
+func TestGenerateSlug_DerivedFromSpec(t *testing.T) {
+	spec := "Write a README for build instructions\n\n## Acceptance\n..."
+	got := GenerateSlug("", spec, nil)
+	// First line, kebab, ≤24 chars, then -<4hex>.
+	if !strings.HasSuffix(got, "") {
+		t.Fatalf("got empty: %q", got)
+	}
+	parts := strings.Split(got, "-")
+	if len(parts) < 2 {
+		t.Fatalf("got %q; want at least one hyphen", got)
+	}
+	short := strings.Join(parts[:len(parts)-1], "-")
+	if len(short) > 24 {
+		t.Errorf("short %q exceeds 24 chars (got=%q)", short, got)
+	}
+	if !strings.HasPrefix(short, "write-a-readme") {
+		t.Errorf("short=%q; want prefix 'write-a-readme'", short)
+	}
+}
+
+func TestGenerateSlug_DerivedTruncates(t *testing.T) {
+	spec := "abcdefghijklmnopqrstuvwxyz0123456789"
+	got := GenerateSlug("", spec, nil)
+	parts := strings.Split(got, "-")
+	short := strings.Join(parts[:len(parts)-1], "-")
+	if len(short) > 24 {
+		t.Errorf("short=%q exceeds 24 chars", short)
+	}
+}
+
+func TestGenerateSlug_FallbackWhenSpecEmpty(t *testing.T) {
+	got := GenerateSlug("", "", nil)
+	if !strings.HasPrefix(got, "task-") {
+		t.Errorf("got %q; want prefix 'task-'", got)
+	}
+}
+
+// TestConcurrentWritesAreSerialized uses Write under a single goroutine
+// per file; concurrent Write to the SAME path is the caller's problem
+// (they take state.lock). This test just ensures Write itself doesn't
+// produce a torn file under contention on different paths.
+func TestConcurrentWritesAreSerialized(t *testing.T) {
+	tmp := t.TempDir()
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string) *File {
+		return &File{Schema: 1, Tasks: []*Task{{
+			Slug: slug, Status: StatusTodo, Priority: PriorityP1,
+			Created: now, Updated: now, SpawnedBy: "user",
+		}}}
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			path := filepath.Join(tmp, "f"+stringFromInt(i)+".md")
+			if err := Write(path, mk("alpha-1234")); err != nil {
+				t.Errorf("Write %d: %v", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// helpers -----------------------------------------------------------
+
+func slugList(ts []*Task) []string {
+	out := make([]string, 0, len(ts))
+	for _, t := range ts {
+		out = append(out, t.Slug)
+	}
+	return out
+}
+
+func contains(s []string, want string) bool {
+	for _, v := range s {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func stringFromInt(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	digits := []byte{}
+	for i > 0 {
+		digits = append([]byte{'0' + byte(i%10)}, digits...)
+		i /= 10
+	}
+	return string(digits)
+}

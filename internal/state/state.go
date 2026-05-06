@@ -226,8 +226,13 @@ func SafeLockComponent(name string) string {
 }
 
 // ValidateProjectName rejects strings that would be unsafe to use as
-// a single path component. Allowed: ASCII letters, digits, hyphen,
-// underscore, period (but not just "." or ".."). Empty rejected.
+// a single path component. Allowed: ASCII lowercase letters, digits,
+// hyphen, underscore, period (but not just "." or ".."). Empty rejected.
+//
+// Lowercase-only is intentional: macOS/APFS is case-insensitive by
+// default, so "Foo" and "foo" would alias the same projects/<name>/
+// tree and silently corrupt each other's state. Forcing lowercase
+// gives one canonical name per inode across all filesystems.
 //
 // Centralized so the dispatch CLI (--project), the project manifest
 // loader (future), and lock-file paths all enforce the same rule.
@@ -240,14 +245,60 @@ func ValidateProjectName(name string) error {
 	if name == "." || name == ".." {
 		return fmt.Errorf("project name %q reserved", name)
 	}
+	if name == ".locks" {
+		return fmt.Errorf("project name %q reserved (collides with projects/.locks/)", name)
+	}
 	for _, c := range name {
 		switch {
 		case c >= 'a' && c <= 'z':
-		case c >= 'A' && c <= 'Z':
 		case c >= '0' && c <= '9':
 		case c == '-' || c == '_' || c == '.':
+		case c >= 'A' && c <= 'Z':
+			return fmt.Errorf("project name %q contains uppercase %q (lowercase-only — case-insensitive filesystems alias case variants)", name, c)
 		default:
-			return fmt.Errorf("project name %q contains invalid character %q (allowed: letters, digits, _, -, .)", name, c)
+			return fmt.Errorf("project name %q contains invalid character %q (allowed: lowercase letters, digits, _, -, .)", name, c)
+		}
+	}
+	return nil
+}
+
+// ValidateSlug rejects task / worker slugs that would alias on disk.
+//
+// Allowed: ASCII lowercase letters, digits, hyphen, underscore, period
+// — no path separators, spaces, uppercase, or other runes that
+// SafeLockComponent would map to "_". An invalid slug would otherwise
+// let `feature/a` and `feature_a` collide on the workers/<x>/ tree.
+//
+// Lowercase-only matches ValidateProjectName's reasoning: macOS/APFS
+// is case-insensitive by default, so two slugs differing only in case
+// would alias the same workers/<slug>/, archive, and worktrees paths
+// while tasks.Read treats them as distinct entries — silent state
+// corruption.
+//
+// Empty rejected; "." and ".." rejected (parent-dir traversal).
+// "archive" rejected because workers/archive/ is the reserved holding
+// pen for archived worker dirs — a worker with slug=archive would
+// alias that directory and become invisible to ListActive + un-
+// archivable (rename into self).
+func ValidateSlug(slug string) error {
+	if slug == "" {
+		return fmt.Errorf("slug must not be empty")
+	}
+	if slug == "." || slug == ".." {
+		return fmt.Errorf("slug %q reserved", slug)
+	}
+	if slug == "archive" {
+		return fmt.Errorf("slug %q reserved (collides with workers/archive/)", slug)
+	}
+	for _, c := range slug {
+		switch {
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.':
+		case c >= 'A' && c <= 'Z':
+			return fmt.Errorf("slug %q contains uppercase %q (lowercase-only — case-insensitive filesystems alias case variants)", slug, c)
+		default:
+			return fmt.Errorf("slug %q contains invalid character %q (allowed: lowercase letters, digits, _, -, .)", slug, c)
 		}
 	}
 	return nil
@@ -293,3 +344,128 @@ func WriteAtomic(path string, data []byte) (err error) {
 
 // ErrNotFound is returned by readers when an expected path is absent.
 var ErrNotFound = errors.New("not found")
+
+// ProjectDir returns ~/.fleet/projects/<safe-name>/.
+//
+// v0.2 per-project coordinator state lives here: tasks.md, learnings.md,
+// per-project standards.md, workers/<slug>/, worktrees/<slug>/, and the
+// .locks/ subdirectory holding state.lock + coordinator.lock.
+//
+// The trailing slash is intentional — callers join with `filepath.Join`
+// or treat the result as a directory prefix.
+//
+// SAFE-NAME RULE: name must be empty (resolves to "_default") or pass
+// the same character set as ValidateProjectName ([a-zA-Z0-9_.-], no
+// "." or ".."). The v0.1 ProjectLockPath path used SafeLockComponent
+// to map unsafe inputs to "_" so legacy LOCK files kept working —
+// that's tolerable for a zero-byte sentinel where collisions are
+// harmless. For ProjectDir the same mapping would silently alias
+// `owner/repo` and `owner_repo` onto the SAME tasks.md / learnings.md
+// / workers/ tree — corrupting both projects' state. We reject
+// invalid names here instead, and callers must use safe names.
+//
+// This is a path-only helper; it does NOT create the directory. First
+// writer (e.g. tasks.Write) is responsible for MkdirAll.
+func ProjectDir(name string) (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	if name == "" {
+		// Backwards-compat with empty input: use the same fallback
+		// as SafeLockComponent so a zero-value caller doesn't break.
+		return filepath.Join(root, "projects", "_default") + string(filepath.Separator), nil
+	}
+	if err := ValidateProjectName(name); err != nil {
+		return "", fmt.Errorf("ProjectDir: %w", err)
+	}
+	return filepath.Join(root, "projects", name) + string(filepath.Separator), nil
+}
+
+// ProjectStateLockPath returns ~/.fleet/projects/<safe-name>/.locks/state.lock.
+//
+// The Q1-locked v0.2 single state-lock — serializes writes to tasks.md /
+// tasks-archive.md / learnings.md / learnings-archive.md within one
+// project. Distinct from the v0.1 ProjectLockPath (which serializes
+// dispatch + handoff under projects/.locks/<name>.lock); the two lock
+// trees do not interact.
+func ProjectStateLockPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".locks", "state.lock"), nil
+}
+
+// CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
+//
+// Held by the running coordinator agent for the lifetime of one tick;
+// a second coord that finds it taken logs and exits cleanly. Sibling of
+// state.lock under .locks/ but never combined with it (different
+// invariants, different acquisition disciplines).
+func CoordinatorLockPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".locks", "coordinator.lock"), nil
+}
+
+// WorkerDir returns ~/.fleet/projects/<project>/workers/<slug>/.
+//
+// Each worker (a `claude --print` subprocess launched by the coord)
+// owns one directory containing state.json + output.log. Coordinator
+// watches state.json via fsnotify; operator inspects via `fleet peek`.
+//
+// Slug must pass ValidateSlug — only [a-zA-Z0-9_.-] allowed, no
+// "." or "..". Unsafe input is rejected rather than mapped via
+// SafeLockComponent because that mapping would alias `feature/a` and
+// `feature_a` onto the same workers/<x>/ directory.
+func WorkerDir(project, slug string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorkerDir: %w", err)
+	}
+	return filepath.Join(dir, "workers", slug) + string(filepath.Separator), nil
+}
+
+// WorkerArchiveDir returns
+// ~/.fleet/projects/<project>/workers/archive/<slug>-<ts>/.
+//
+// Workers archive on phase=done; auto-prune at 7d. ts is a UTC stamp
+// produced by the caller (e.g. ts.UTC().Format("20060102-150405")) so
+// archive paths are stable across timezones.
+//
+// Slug is validated (same rule as WorkerDir).
+func WorkerArchiveDir(project, slug, ts string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorkerArchiveDir: %w", err)
+	}
+	return filepath.Join(dir, "workers", "archive", slug+"-"+ts) + string(filepath.Separator), nil
+}
+
+// WorktreePath returns ~/.fleet/projects/<project>/worktrees/<slug>/.
+//
+// Used when the coord runs in cap > 1 mode (parallel workers). Created
+// via `git worktree add` and removed via `git worktree remove --force`
+// on task archive. Single-worker mode (default) reuses the repo root
+// instead.
+//
+// Slug is validated (same rule as WorkerDir).
+func WorktreePath(project, slug string) (string, error) {
+	dir, err := ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidateSlug(slug); err != nil {
+		return "", fmt.Errorf("WorktreePath: %w", err)
+	}
+	return filepath.Join(dir, "worktrees", slug) + string(filepath.Separator), nil
+}
