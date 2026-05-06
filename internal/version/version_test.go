@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,7 +161,7 @@ func TestNudge_FreshCacheWithUpgrade(t *testing.T) {
 	if got == "" {
 		t.Fatalf("expected nudge string, got empty")
 	}
-	if !contains(got, "v0.1.3") || !contains(got, "brew upgrade fleet") {
+	if !strings.Contains(got, "v0.1.3") || !strings.Contains(got, "brew upgrade fleet") {
 		t.Errorf("unexpected nudge format: %q", got)
 	}
 }
@@ -260,18 +261,4 @@ func TestCheckAsync_OfflineSilent(t *testing.T) {
 	if _, err := readCache(); err == nil {
 		t.Fatalf("expected no cache file after failed fetch")
 	}
-}
-
-func contains(haystack, needle string) bool {
-	return len(needle) == 0 || (len(haystack) >= len(needle) &&
-		indexOf(haystack, needle) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }
