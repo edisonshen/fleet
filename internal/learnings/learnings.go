@@ -88,6 +88,16 @@ func Append(project string, e *Entry) error {
 			return fmt.Errorf("%w: %s contains newline", ErrInvalidEntry, f.name)
 		}
 	}
+	// Body cannot contain a column-0 H2 line (`## ...`) — the
+	// parser uses that as the entry-start anchor, so a body H2
+	// would split the entry on the next read. Workers wanting
+	// nested headings should use H3 (`### ...`) which the parser
+	// keeps inside the body.
+	for _, ln := range strings.Split(e.Body, "\n") {
+		if strings.HasPrefix(ln, "## ") {
+			return fmt.Errorf("%w: body line starts with '## ' (use ### for in-body headings)", ErrInvalidEntry)
+		}
+	}
 
 	return withLock(project, func() error {
 		path, err := learningsPath(project)

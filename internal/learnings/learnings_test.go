@@ -204,6 +204,19 @@ func TestAppend_RejectsDelimiterInFields(t *testing.T) {
 	}
 }
 
+func TestAppend_RejectsH2InBody(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	e := &Entry{
+		Author: "operator", Tag: "x",
+		Body: "First line\n\n## Sneaky H2\n\nSplits the entry on next read.",
+	}
+	err := Append("fleet", e)
+	if err == nil {
+		t.Errorf("Append returned nil; want ErrInvalidEntry for body H2")
+	}
+}
+
 func TestAppend_RejectsWhitespaceOnlyFields(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

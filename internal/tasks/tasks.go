@@ -534,6 +534,10 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		idx++
 	}
 	// Key bullets: `- key: value` until we hit a blank line or H3.
+	// Track which keys appeared so a duplicate (e.g. two `status:`
+	// bullets) raises an error instead of silently overwriting the
+	// first value.
+	seenKey := make(map[string]bool, 11)
 	for idx < len(lines) {
 		line := lines[idx]
 		trimmed := strings.TrimSpace(line)
@@ -548,6 +552,10 @@ func parseTaskBlock(lines []string, start int) (*Task, int, error) {
 		if !ok {
 			return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "expected `- key: value`"}
 		}
+		if seenKey[k] {
+			return nil, 0, &ParseError{Line: idx + 1, Col: 1, Raw: line, Msg: "duplicate task field: " + k}
+		}
+		seenKey[k] = true
 		if err := setKV(t, k, v, idx+1, line); err != nil {
 			return nil, 0, err
 		}
