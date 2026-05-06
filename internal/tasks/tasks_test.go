@@ -567,6 +567,76 @@ func TestArchive_UnknownSlugSkipped(t *testing.T) {
 	}
 }
 
+// TestArchive_ConcurrentSameProject fires N concurrent Archive calls on
+// the same project with overlapping slug sets, then asserts no error,
+// each archived slug appears exactly once in tasks-archive.md, and no
+// archived slug remains in tasks.md. Exercises state.LockProjectState's
+// serialization guarantee under contention — a documented hazard the
+// rest of the tasks_test suite leaves untouched.
+func TestArchive_ConcurrentSameProject(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	now := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	mk := func(slug string) *Task {
+		return &Task{Slug: slug, Status: StatusDone, Priority: PriorityP1, Created: now, Updated: now, SpawnedBy: "user"}
+	}
+	const N = 10
+	seed := make([]*Task, 0, N)
+	all := make([]string, 0, N)
+	for i := 0; i < N; i++ {
+		s := "slug-" + stringFromInt(i+1000)
+		seed = append(seed, mk(s))
+		all = append(all, s)
+	}
+	dir := filepath.Join(tmp, "projects", "fleet")
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{Schema: 1, Tasks: seed}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// Fire 4 goroutines, each archiving the FULL slug set. Heavy
+	// overlap intentionally — Archive must dedupe + serialize cleanly.
+	var wg sync.WaitGroup
+	const goroutines = 4
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := Archive("fleet", all); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("Archive: %v", err)
+	}
+	// tasks.md should be empty (or carry no archived slug).
+	cur, err := Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("Read tasks: %v", err)
+	}
+	for _, ts := range cur.Tasks {
+		if contains(all, ts.Slug) {
+			t.Errorf("tasks.md still has archived slug %q", ts.Slug)
+		}
+	}
+	// tasks-archive.md should contain each slug exactly once.
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("Read archive: %v", err)
+	}
+	seen := map[string]int{}
+	for _, ts := range arc.Tasks {
+		seen[ts.Slug]++
+	}
+	for _, s := range all {
+		if seen[s] != 1 {
+			t.Errorf("archive count for %q = %d; want 1", s, seen[s])
+		}
+	}
+}
+
 func TestGenerateSlug_FullSlugPassthrough(t *testing.T) {
 	got := GenerateSlug("add-readme-7a3c", "spec body", nil)
 	if got != "add-readme-7a3c" {
