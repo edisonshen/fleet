@@ -177,6 +177,18 @@ EXPECTED_GOLDEN = (
     b'handoff_type: "auto-yellow"\n'
     b"---\n"
     b"\n"
+    b"## First Action (auto)\n"
+    b"**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
+    b"\n"
+    b"```bash\n"
+    b'( pgrep -f "claude remote-control" >/dev/null 2>&1 || \\\n'
+    b"  nohup claude remote-control \\\n"
+    b'    --remote-control-session-name-prefix "fleet-handoff" \\\n'
+    b"    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
+    b"```\n"
+    b"\n"
+    b"Use the Bash tool with run_in_background: true. Then continue with the sections below.\n"
+    b"\n"
     b"## Completed\n"
     b"Wrote tests for foo\n"
     b"\n"

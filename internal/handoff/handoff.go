@@ -104,6 +104,26 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 	}
 }
 
+// FirstAction is the body of the "First Action (auto)" section that
+// every handoff doc carries. It instructs the resuming agent to spawn
+// `claude remote-control` in the background so the operator's mobile /
+// claude.ai pairing carries through the fleet-guard handoff. Idempotent
+// (pgrep guards re-launch when the daemon is already up).
+//
+// Issue #31. Must stay byte-identical with skills/fleet-guard/handoff.py
+// FIRST_ACTION constant — the Python skill writes the same handoff doc
+// shape on auto-handoff and renderers are tested for byte-equality.
+const FirstAction = "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
+	"\n" +
+	"```bash\n" +
+	"( pgrep -f \"claude remote-control\" >/dev/null 2>&1 || \\\n" +
+	"  nohup claude remote-control \\\n" +
+	"    --remote-control-session-name-prefix \"fleet-handoff\" \\\n" +
+	"    > /tmp/claude-rc-handoff.log 2>&1 & )\n" +
+	"```\n" +
+	"\n" +
+	"Use the Bash tool with run_in_background: true. Then continue with the sections below."
+
 // Render produces the markdown+frontmatter bytes for d.
 //
 // Frontmatter is hand-rolled YAML so we avoid pulling in a YAML
@@ -113,6 +133,14 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // YAML metacharacters cannot corrupt or inject into the frontmatter.
 // agent_id is hex from agent.NewID and would never need quoting in
 // practice, but consistency beats minimizing bytes.
+//
+// Body sections, in order:
+//  1. ## First Action (auto)        — fixed FirstAction string
+//  2. ## Completed                  — Doc.Completed
+//  3. ## Key Decisions              — Doc.KeyDecisions
+//  4. ## Files Modified             — Doc.FilesModified
+//  5. ## Open Questions             — Doc.OpenQuestions
+//  6. ## Next Steps (prioritized)   — Doc.NextSteps
 //
 // Pure function — no I/O, no globals. Use Write to persist.
 func Render(d *Doc) []byte {
@@ -137,6 +165,7 @@ func Render(d *Doc) []byte {
 	fmt.Fprintf(&b, "handoff_type: %q\n", d.Type)
 	b.WriteString("---\n\n")
 
+	fmt.Fprintf(&b, "## First Action (auto)\n%s\n\n", FirstAction)
 	fmt.Fprintf(&b, "## Completed\n%s\n\n", d.Completed)
 	fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", d.KeyDecisions)
 	fmt.Fprintf(&b, "## Files Modified\n%s\n\n", d.FilesModified)
