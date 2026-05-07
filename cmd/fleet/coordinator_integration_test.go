@@ -682,9 +682,13 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	// Worktree-mode dispatch (cap>1) needs a real git repo at repoCwd.
 	initGitRepo(t, env.repoCwd)
 
-	// Two ready tasks → two dispatches in tick #1.
-	slugA := env.addReadyTask(t, "alpha-c2", "alpha task spec.")
-	slugB := env.addReadyTask(t, "bravo-c2", "bravo task spec.")
+	// Two ready tasks → two dispatches in tick #1. Each task declares
+	// its own disjoint Files: scope so the v0.2.x conflict-aware
+	// dispatch loop lets both run concurrently. Without an explicit
+	// Files: line the loop would conservatively skip the second task
+	// (a no-files task is treated as "could touch anything").
+	slugA := env.addReadyTask(t, "alpha-c2", "alpha task spec.\nFiles: alpha-c2.go")
+	slugB := env.addReadyTask(t, "bravo-c2", "bravo task spec.\nFiles: bravo-c2.go")
 
 	out1 := env.runTickCap(t, 2)
 	if !strings.Contains(out1, `"dispatched": 2`) {
@@ -751,8 +755,11 @@ func TestCoordParallelDispatch_CreatesWorktrees(t *testing.T) {
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
 
-	slugA := env.addReadyTask(t, "wt-alpha", "alpha worktree task spec.")
-	slugB := env.addReadyTask(t, "wt-bravo", "bravo worktree task spec.")
+	// Disjoint Files: scopes so the conflict-aware dispatch loop
+	// dispatches both in the same tick (a no-files task would be
+	// conservatively skipped while another worker is in flight).
+	slugA := env.addReadyTask(t, "wt-alpha", "alpha worktree task spec.\nFiles: wt-alpha.go")
+	slugB := env.addReadyTask(t, "wt-bravo", "bravo worktree task spec.\nFiles: wt-bravo.go")
 
 	// First tick: cap=2 dispatches both tasks, each into its own worktree.
 	out1 := env.runTickCap(t, 2)
@@ -864,6 +871,101 @@ func TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated(t *testing.T) {
 		t.Errorf("cap=1 mode created worktrees/ tree: err=%v", err)
 	}
 
+	for _, rec := range listAllAgents(t) {
+		_ = tmux.Kill(rec.TmuxSession)
+	}
+}
+
+// TestCoordParallelDispatch_SkipsOverlappingTasks covers the v0.2.x
+// conflict-aware dispatch contract end-to-end:
+//
+//   - 3 ready tasks: A (Files: a.go), B (Files: a.go b.go), C (Files: c.go).
+//   - Tick #1 with cap=2: A and C dispatch (disjoint scopes); B is
+//     skipped because it overlaps A on a.go.
+//   - Mark A's worker DONE_PR via the inbox archive; tick #2 drains it
+//     so A transitions to in-review. Now only C is in-flight (with
+//     Files: c.go) — B's a.go and b.go are no longer claimed by an
+//     in-progress worker, and B's scope is disjoint from C's c.go.
+//   - Tick #2 also dispatches B as the second cap slot (cap=2 still has
+//     headroom: A is now in-review, only C is in-progress).
+//
+// The test exercises the full skill path (parse → dispatch → drain)
+// against a real `fleet` binary + real git. CI is stubbed via the
+// default ghStubReturnsEmpty so reconcile leaves tasks alone.
+func TestCoordParallelDispatch_SkipsOverlappingTasks(t *testing.T) {
+	env := setupCoordIntegration(t, "conflict-proj")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+
+	// Three ready tasks. Files: declarations encode the overlap matrix:
+	//   A ↔ B overlap on a.go; A ↔ C disjoint; B ↔ C disjoint.
+	slugA := env.addReadyTask(t, "alpha-conf", "Alpha task.\nFiles: a.go")
+	slugB := env.addReadyTask(t, "bravo-conf", "Bravo task.\nFiles: a.go b.go")
+	slugC := env.addReadyTask(t, "charlie-conf", "Charlie task.\nFiles: c.go")
+
+	// Tick #1: cap=2 → expect 2 dispatches, B skipped.
+	out1 := env.runTickCap(t, 2)
+	if !strings.Contains(out1, `"dispatched": 2`) {
+		t.Fatalf("first tick did not dispatch exactly 2 (expected A+C, B skipped): %s", out1)
+	}
+	assertNoTickErrors(t, out1)
+
+	taskA := env.readTask(t, slugA)
+	taskB := env.readTask(t, slugB)
+	taskC := env.readTask(t, slugC)
+	if taskA.Status != tasks.StatusInProgress {
+		t.Errorf("alpha status=%q want in-progress (sorted first by slug, dispatched)", taskA.Status)
+	}
+	if taskC.Status != tasks.StatusInProgress {
+		t.Errorf("charlie status=%q want in-progress (disjoint from A)", taskC.Status)
+	}
+	if taskB.Status != tasks.StatusReady {
+		t.Errorf("bravo status=%q want ready (overlaps A on a.go, must be skipped)", taskB.Status)
+	}
+
+	// Mark A and C alive so the next tick's reconcile doesn't requeue
+	// them. Worker pid points at the live test process.
+	env.runFleet(t, "tasks", "set", "--project", env.project, slugA,
+		fmt.Sprintf("worker_pid=%d", os.Getpid()))
+	env.runFleet(t, "tasks", "set", "--project", env.project, slugC,
+		fmt.Sprintf("worker_pid=%d", os.Getpid()))
+
+	// Worker A reports DONE_PR — moves to in-review and frees a.go.
+	urlA := "https://github.com/fake/repo/pull/501"
+	env.writeSentinelArchive(t, fmt.Sprintf("TASK_DONE_PR=%s %s", slugA, urlA))
+
+	// Tick #2: drain A's sentinel; B becomes dispatchable because the
+	// only remaining in-flight worker (C) has disjoint scope (c.go).
+	out2 := env.runTickCap(t, 2)
+	if !strings.Contains(out2, `"drained": 1`) {
+		t.Fatalf("second tick did not drain A's sentinel: %s", out2)
+	}
+	if !strings.Contains(out2, `"dispatched": 1`) {
+		t.Fatalf("second tick did not dispatch B (conflict cleared): %s", out2)
+	}
+	assertNoTickErrors(t, out2)
+
+	// Final state:
+	//   A: in-review (drained, pr_url set)
+	//   B: in-progress (newly dispatched — a.go no longer in-flight)
+	//   C: in-progress (still running)
+	taskA = env.readTask(t, slugA)
+	taskB = env.readTask(t, slugB)
+	taskC = env.readTask(t, slugC)
+	if taskA.Status != tasks.StatusInReview {
+		t.Errorf("alpha post-drain status=%q want in-review", taskA.Status)
+	}
+	if taskA.PRURL != urlA {
+		t.Errorf("alpha pr_url=%q want %q", taskA.PRURL, urlA)
+	}
+	if taskB.Status != tasks.StatusInProgress {
+		t.Errorf("bravo post-drain status=%q want in-progress (conflict cleared)", taskB.Status)
+	}
+	if taskC.Status != tasks.StatusInProgress {
+		t.Errorf("charlie post-drain status=%q want in-progress (still running)", taskC.Status)
+	}
+
+	// Cleanup tmux for any dispatched workers.
 	for _, rec := range listAllAgents(t) {
 		_ = tmux.Kill(rec.TmuxSession)
 	}

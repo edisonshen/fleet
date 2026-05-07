@@ -48,23 +48,51 @@ def extract_paths(task: parse.Task) -> set[str]:
     Combines Spec + Acceptance + Notes (all three are operator/worker
     writable). The result is normalized: stripped whitespace, no
     surrounding quotes/backticks, paths-only.
+
+    Includes BOTH labeled (`path:`/`files:` lines) AND inline path
+    tokens (`cmd/fleet/main.go` mentioned in prose). This is the
+    superset used by `conflicts()` for overlap detection — false
+    positives are cheap (one tick of serialization) and false negatives
+    can clobber files. For "did the operator EXPLICITLY declare scope?"
+    callers must use `extract_labeled_paths()` instead; inline path
+    mentions in narrative text are NOT a scope declaration.
     """
-    paths: set[str] = set()
+    paths: set[str] = set(extract_labeled_paths(task))
     for body in (task.spec, task.acceptance, task.notes):
         if not body:
             continue
-        # Labeled paths: `path: foo/bar.go` (one or more comma/space
-        # separated values).
-        for m in _LABELED_PATH_RE.finditer(body):
-            for tok in _split_labeled(m.group(1)):
-                normalized = _normalize_path(tok)
-                if normalized:
-                    paths.add(normalized)
         # Inline path tokens.
         for m in _INLINE_PATH_RE.finditer(body):
             normalized = _normalize_path(m.group(1))
             if normalized:
                 paths.add(normalized)
+    return paths
+
+
+def extract_labeled_paths(task: parse.Task) -> set[str]:
+    """Return ONLY the explicit `Files:` / `path:` / `paths:` / `file:`
+    declarations from a task's bodies.
+
+    This is the operator-explicit scope contract: a task carries a
+    declared scope iff at least one labeled-path line appears in
+    Spec / Acceptance / Notes. Inline path mentions in prose (e.g.
+    "Investigate panic in cmd/fleet/main.go") DO NOT count as a
+    scope declaration — they're context, not a contract.
+
+    Used by the loop-side conservative conflict gate (cap > 1):
+    a task without any labeled-path line is treated as "could touch
+    anything" and is skipped while any worker is in flight, even if
+    the prose happens to name a file.
+    """
+    paths: set[str] = set()
+    for body in (task.spec, task.acceptance, task.notes):
+        if not body:
+            continue
+        for m in _LABELED_PATH_RE.finditer(body):
+            for tok in _split_labeled(m.group(1)):
+                normalized = _normalize_path(tok)
+                if normalized:
+                    paths.add(normalized)
     return paths
 
 

@@ -91,7 +91,13 @@ The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet
    active = count(status==in-progress)
    for t in sort_by_priority(tasks where status==ready and deps_satisfied):
      if active >= cap: break
-     if conflict.has_conflict(t, in_flight_after_dispatch): continue
+     # cap > 1 only: skip on file-overlap with any in-flight worker.
+     # Conservative — a task with no Files: line is treated as "could
+     # touch anything" and is skipped while any worker is in flight.
+     # Operators opt out per task by adding `Files: <path-with-ext>`
+     # to Spec / Acceptance / Notes (a real path, not a wildcard;
+     # the heuristic regex requires a file extension).
+     if cap > 1 and _has_conflict_with_inflight(t, in_flight_after_dispatch): continue
      # cap > 1: per-slug git worktree under projects/<p>/worktrees/<slug>
      if cap > 1:
        wt = `fleet workers worktree-path --project <p> <slug>`
@@ -234,7 +240,8 @@ Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/
 | `loop.py` | One-tick driver. Public entry: `tick(project, ...)` and `main(argv)`. |
 | `parse.py` | Python mirror of `internal/tasks` — read-only inside the skill, byte-equal with Go. |
 | `dispatch.py` | Worker prompt assembly + `fleet dispatch` caller + inbox stub writer. |
-| `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). |
+| `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). Optimistic on no-paths inputs. |
+| `loop._has_conflict_with_inflight` | Conservative loop-side wrapper: a task with no `Files:` line is treated as matching every in-flight task. Operators opt out per task by adding `Files: <real-path>`. |
 
 ## Tests
 
@@ -252,6 +259,7 @@ Critical cases (mirrored from ENG §7.2):
 - `test_dispatch.py::test_dispatch_worker_invokes_correct_argv` — exact argv to `fleet dispatch`.
 - `test_dispatch.py::test_write_worker_inbox_atomic_and_under_fleet_home` — inbox stub is tmp+rename.
 - `test_conflict.py::*` — file-overlap heuristic positive + negative cases.
+- `test_loop_conflict.py::*` — loop-side conservative wrapper at cap > 1: skip overlapping tasks, allow disjoint, conservative skip on no-Files candidates, cap=1 bypass.
 
 The fleet binary itself is never invoked in unit tests; subprocess.run is mocked. End-to-end coverage lives in `cmd/fleet/coordinator_integration_test.go` (Phase D).
 
