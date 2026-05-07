@@ -682,9 +682,13 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	// Worktree-mode dispatch (cap>1) needs a real git repo at repoCwd.
 	initGitRepo(t, env.repoCwd)
 
-	// Two ready tasks → two dispatches in tick #1.
-	slugA := env.addReadyTask(t, "alpha-c2", "alpha task spec.")
-	slugB := env.addReadyTask(t, "bravo-c2", "bravo task spec.")
+	// Two ready tasks → two dispatches in tick #1. Each task declares
+	// its own disjoint Files: scope so the v0.2.x conflict-aware
+	// dispatch loop lets both run concurrently. Without an explicit
+	// Files: line the loop would conservatively skip the second task
+	// (a no-files task is treated as "could touch anything").
+	slugA := env.addReadyTask(t, "alpha-c2", "alpha task spec.\nFiles: alpha-c2.go")
+	slugB := env.addReadyTask(t, "bravo-c2", "bravo task spec.\nFiles: bravo-c2.go")
 
 	out1 := env.runTickCap(t, 2)
 	if !strings.Contains(out1, `"dispatched": 2`) {
@@ -751,8 +755,11 @@ func TestCoordParallelDispatch_CreatesWorktrees(t *testing.T) {
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
 
-	slugA := env.addReadyTask(t, "wt-alpha", "alpha worktree task spec.")
-	slugB := env.addReadyTask(t, "wt-bravo", "bravo worktree task spec.")
+	// Disjoint Files: scopes so the conflict-aware dispatch loop
+	// dispatches both in the same tick (a no-files task would be
+	// conservatively skipped while another worker is in flight).
+	slugA := env.addReadyTask(t, "wt-alpha", "alpha worktree task spec.\nFiles: wt-alpha.go")
+	slugB := env.addReadyTask(t, "wt-bravo", "bravo worktree task spec.\nFiles: wt-bravo.go")
 
 	// First tick: cap=2 dispatches both tasks, each into its own worktree.
 	out1 := env.runTickCap(t, 2)

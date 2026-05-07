@@ -1039,7 +1039,12 @@ def _dispatch_ready(
     for t in candidates:
         if active >= cap:
             break
-        if conflict.has_conflict(t, in_flight_after_dispatch):
+        # Conflict check is gated on cap > 1: cap=1 already serializes
+        # everything (only one in-progress at a time), so the wrapper is
+        # provably a no-op there. Skipping the call keeps single-worker
+        # mode byte-identical to v0.2.0 and removes one source of
+        # behavior drift from the regression-safe path.
+        if cap > 1 and _has_conflict_with_inflight(t, in_flight_after_dispatch):
             continue
         # Worktree mode: cap>1. Resolve canonical path via the Go CLI,
         # then `git worktree add`. On any failure we record the error
@@ -1103,6 +1108,65 @@ def _dispatch_ready(
         active += 1
         in_flight_after_dispatch.append(t)
     return actions
+
+
+def _has_conflict_with_inflight(
+    candidate: parse.Task, in_flight: list[parse.Task],
+) -> bool:
+    """Conservative conflict check used by the cap > 1 dispatch loop.
+
+    Layers a "no Files: line → matches anything" rule on top of
+    conflict.has_conflict (which is intentionally optimistic when EITHER
+    side has no extracted paths — same-tick non-conflict). The reason
+    for the override at the loop level: a worker whose task has no
+    declared file scope could touch ANY file — running it in parallel
+    with another worker risks a clobber on overlapping writes that
+    the heuristic can't see ahead of time.
+
+    Decision tree (candidate vs each in-flight task):
+
+      candidate has zero extracted paths           → True  (conservative — could touch anything)
+      in-flight task has zero extracted paths      → True  (same — opaque scope on the other side)
+      explicit overlap (conflict.has_conflict)     → True
+      otherwise                                    → False (both sides declared, disjoint)
+
+    Operators opt out of the conservative skip by adding an explicit
+    `Files: <path-with-extension>` line to the task Spec / Acceptance /
+    Notes. The conflict heuristic's regex requires a real file extension
+    (so a bare token like `Files: *` is NOT picked up as a path and the
+    conservative skip would still fire). The intended escape hatch is
+    `Files: README.md` or similar — a real path the operator deems
+    shared with everything else.
+
+    Self-conflict guard: a candidate may appear in in_flight if a caller
+    passes a stale snapshot. conflict.has_conflict already filters
+    same-slug pairs; the no-paths short-circuits below would otherwise
+    flag a self-vs-self comparison, so we explicitly skip the candidate
+    when scanning in_flight.
+    """
+    if not in_flight:
+        return False
+    cand_paths = conflict.extract_paths(candidate)
+    # Candidate has no declared scope → assume it matches anything that
+    # is already running. Operator opts out via explicit Files: line.
+    if not cand_paths:
+        for other in in_flight:
+            if other.slug == candidate.slug:
+                continue
+            return True
+        return False
+    # Candidate declared scope. Walk the in-flight list: if any other
+    # task has no scope (opaque), or has overlapping paths, it's a
+    # conflict.
+    for other in in_flight:
+        if other.slug == candidate.slug:
+            continue
+        other_paths = conflict.extract_paths(other)
+        if not other_paths:
+            return True
+        if cand_paths & other_paths:
+            return True
+    return False
 
 
 def _filter_ready(tasks: list[parse.Task]) -> list[parse.Task]:
