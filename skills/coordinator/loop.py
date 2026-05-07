@@ -995,23 +995,37 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     """
     if action.error:
         return
-    # Order matters for crash-recovery:
-    #  1. state.json bootstrap FIRST so even a crash mid-_apply_dispatch
-    #     leaves a fresh state.json on disk that reconcile reads as
-    #     alive (the worker's tmux session is up at this point because
-    #     dispatch_worker has already returned successfully).
-    #  2. status flip second (commits the task to in-progress).
-    #  3. branch third (so the operator's `fleet tasks show` lines up
-    #     with the worker's actual checkout).
-    #  4. worker_pid fourth (sentinel so the immediate next tick sees a
-    #     non-zero pid before the worker has a chance to write its own
-    #     OS pid via `fleet workers update --pid $$`).
+    # Order matters for crash-recovery + duplicate-dispatch
+    # avoidance:
+    #  1. status flip FIRST. _dispatch_ready filters by
+    #     status=ready, so the moment status flips to in-progress
+    #     the task is no longer a candidate for re-dispatch.
+    #     Codex iter-4 [P1]: an earlier attempt bootstrapped
+    #     state.json before the status flip, which on a partial
+    #     failure (status flip raises) left tasks.md still at
+    #     ready and the worker's tmux session running — the next
+    #     tick re-dispatched the same task and we ran two workers.
+    #  2. branch second (so the operator's `fleet tasks show`
+    #     lines up with the worker's actual checkout).
+    #  3. workers/<slug>/state.json bootstrap third. After the
+    #     status flip is durable, an updated_at-fresh state.json
+    #     anchors reconcile's _is_worker_alive check on the very
+    #     next tick — even if worker_pid is dead by then. A crash
+    #     between status flip + bootstrap leaves reconcile with a
+    #     1-tick window of "alive=False" and falls through to the
+    #     pr_url branch (no PR yet → status=todo + clear_worker)
+    #     which IS a duplicate-dispatch opportunity but only on
+    #     two consecutive crashes, much narrower than the
+    #     bootstrap-first race above.
+    #  4. worker_pid sentinel fourth (legacy field; reconcile no
+    #     longer trusts it across ticks, but `fleet status` still
+    #     renders it).
     #  5. note last (informational; missing it is a graceful
     #     degradation, not state corruption).
-    _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
+    _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
 

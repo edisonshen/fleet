@@ -121,14 +121,13 @@ func TestWorkersPrune_BadDuration(t *testing.T) {
 	}
 }
 
-// TestWorkersUpdate_SetsPhaseAndPID — happy path: a worker calls
-// `fleet workers update <slug> --phase tdd-red`. The state.json
-// must materialize with phase=tdd-red, pid=os.Getpid(), and the
-// previous phase recorded in phases_completed when transitioning
-// from a non-empty starting state. Regresses codex full-stack [P1]:
-// the worker prompt invokes this command on every phase boundary,
-// so missing it caused state.json to never reach the coord.
-func TestWorkersUpdate_SetsPhaseAndPID(t *testing.T) {
+// TestWorkersUpdate_SetsPhase_NoExplicitPid — happy path without
+// --pid: state.json materializes with phase set, but pid stays at
+// the previous value (0 for a fresh bootstrap). Codex iter-4 [P1]
+// regress: defaulting --pid to os.Getpid() of the short-lived
+// `fleet` helper made workers list/peek render active workers as
+// dead almost immediately. We now require --pid to be explicit.
+func TestWorkersUpdate_SetsPhase_NoExplicitPid(t *testing.T) {
 	_, project := setupTasksHome(t)
 	out := &bytes.Buffer{}
 	opts := &workersUpdateOpts{
@@ -145,11 +144,77 @@ func TestWorkersUpdate_SetsPhaseAndPID(t *testing.T) {
 	if st.Phase != workers.PhaseTDDRed {
 		t.Errorf("phase = %q, want tdd-red", st.Phase)
 	}
-	if st.PID != os.Getpid() {
-		t.Errorf("pid = %d, want %d (os.Getpid)", st.PID, os.Getpid())
+	// Without --pid, pid stays at the bootstrap default (0), NOT
+	// os.Getpid() of this test process.
+	if st.PID != 0 {
+		t.Errorf("pid = %d, want 0 (no --pid passed)", st.PID)
 	}
 	if !strings.Contains(out.String(), "tdd-red") {
 		t.Errorf("stdout should report new phase: %s", out.String())
+	}
+}
+
+// TestWorkersUpdate_ExplicitPidIsRecorded — passing --pid <n> writes
+// that pid to state.json. Workers running inside a stable subprocess
+// pass it explicitly; the helper-process default (no flag) is
+// "preserve existing pid" so we don't trash a live worker's pid.
+func TestWorkersUpdate_ExplicitPidIsRecorded(t *testing.T) {
+	_, project := setupTasksHome(t)
+	opts := &workersUpdateOpts{
+		project: project,
+		phase:   "tdd-red",
+		pid:     42424,
+		pidSet:  true,
+	}
+	if err := runWorkersUpdate("alpha-1234", opts, &bytes.Buffer{}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	st, err := workers.ReadState(project, "alpha-1234")
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if st.PID != 42424 {
+		t.Errorf("pid = %d, want 42424 (explicit --pid)", st.PID)
+	}
+}
+
+// TestWorkersUpdate_NonTerminalClearsTerminalMetadata — codex iter-4
+// [P2] regress: a retry that reuses the same workers/<slug>/state.json
+// (e.g. after CI red, the coord re-dispatches the same task) must
+// not carry the previous attempt's pr_url / blocked_reason / exit
+// fields onto the new attempt. --phase starting clears them.
+func TestWorkersUpdate_NonTerminalClearsTerminalMetadata(t *testing.T) {
+	_, project := setupTasksHome(t)
+
+	// First attempt: worker shipped a PR.
+	if err := runWorkersUpdate("alpha-9876", &workersUpdateOpts{
+		project: project, phase: "done",
+		prURL: "https://example.invalid/pr/old",
+		exit:  0, exitSet: true,
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("first attempt: %v", err)
+	}
+
+	// Second attempt: coord re-dispatches; bootstrap to phase=starting.
+	if err := runWorkersUpdate("alpha-9876", &workersUpdateOpts{
+		project: project, phase: "starting",
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("second attempt bootstrap: %v", err)
+	}
+
+	st, err := workers.ReadState(project, "alpha-9876")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if st.PRURL != "" {
+		t.Errorf("retry should clear prior pr_url, got %q", st.PRURL)
+	}
+	if st.BlockedReason != "" {
+		t.Errorf("retry should clear prior blocked_reason, got %q",
+			st.BlockedReason)
+	}
+	if st.Exit != nil {
+		t.Errorf("retry should clear prior exit, got %v", st.Exit)
 	}
 }
 

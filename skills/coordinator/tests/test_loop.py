@@ -570,19 +570,19 @@ def test_gh_pr_checks_propagates_view_error(monkeypatch) -> None:
     assert "not found" in res.error
 
 
-def test_apply_dispatch_orders_state_status_branch_pid_note(
+def test_apply_dispatch_orders_status_branch_state_pid_note(
     fleet_run_recorder,
 ) -> None:
-    """workers state.json bootstrap first, then status flip, branch,
-    worker_pid, note — for crash-safety + reconcile compatibility.
+    """status flip FIRST (defeats duplicate-dispatch on partial
+    failure), then branch, state.json bootstrap, worker_pid, note.
 
-    Codex full-stack iter-1 + iter-2 [P1] regress: previously
-    _apply_dispatch left worker_pid=0 OR set it to a short-lived
-    coord pid that died by the next tick, both of which made
-    reconcile read the task as "worker never ran" and requeue it.
-    Now we pre-seed workers/<slug>/state.json so the state.json
-    freshness check (the canonical liveness signal) sees a fresh
-    record on the very first reconcile after dispatch.
+    Codex iter-4 [P1] regress: an earlier ordering bootstrapped
+    state.json BEFORE the status flip. If the status flip raised
+    after bootstrap succeeded, tasks.md still said "ready" and the
+    next tick's _dispatch_ready picked the task up again — running
+    a second tmux session for the same slug. Status-first kills
+    that race because the moment status=in-progress is durable,
+    _dispatch_ready filters the task out.
 
     Every mutation must also pass `--project <project>` so the CLI's
     cwd-default project resolution can't accidentally write to a
@@ -593,15 +593,15 @@ def test_apply_dispatch_orders_state_status_branch_pid_note(
         slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
     )
     loop._apply_dispatch(action, "fleet-proj", "fleet")
-    # Five calls in order: workers update bootstrap, status, branch,
+    # Five calls in order: status, branch, workers update bootstrap,
     # worker_pid, note.
     assert len(fleet_run_recorder) == 5
-    assert fleet_run_recorder[0][1:3] == ["workers", "update"]
-    assert "--phase" in fleet_run_recorder[0]
-    assert "starting" in fleet_run_recorder[0]
-    assert "status=in-progress" in fleet_run_recorder[1]
-    assert fleet_run_recorder[2][1:3] == ["tasks", "set"]
-    assert "branch=" in fleet_run_recorder[2][-1]
+    assert "status=in-progress" in fleet_run_recorder[0]
+    assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
+    assert "branch=" in fleet_run_recorder[1][-1]
+    assert fleet_run_recorder[2][1:3] == ["workers", "update"]
+    assert "--phase" in fleet_run_recorder[2]
+    assert "starting" in fleet_run_recorder[2]
     assert fleet_run_recorder[3][1:3] == ["tasks", "set"]
     assert fleet_run_recorder[3][-1].startswith("worker_pid=")
     # The PID written must be the live coord's PID — non-zero, not
