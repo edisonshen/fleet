@@ -420,10 +420,16 @@ class _ReconcileAction:
     raised_to_user: bool = False
     raise_text: str = ""
     set_pr_url: str = ""  # populated when a phase=done worker shipped
-                          # a PR but the task block didn't have one yet
-                          # (codex full-stack iter-2 [P1]: state.json
-                          # is the only signal until the inbox sentinel
-                          # path lands; reconcile must transcribe it).
+                          # a PR (codex full-stack iter-2 [P1]:
+                          # state.json is the only signal until the
+                          # inbox sentinel path lands; reconcile must
+                          # transcribe it).
+    clear_pr_url: bool = False  # set on requeue paths whose retry will
+                                # open a NEW PR (CI red, worker failed).
+                                # Without clearing, the stale URL stays
+                                # attached and the next reconcile keeps
+                                # polling the dead PR (codex iter-3
+                                # [P2]).
 
 
 def _reconcile_inflight(
@@ -453,43 +459,58 @@ def _reconcile_inflight(
         # here, the reconcile path classifies a cleanly-done worker
         # as "died without PR" and silently requeues the task to todo
         # (codex full-stack iter-2 [P1]).
-        terminal = _worker_terminal_state(project, t.slug, home=home)
-        if terminal is not None:
-            phase, pr_url, blocked_reason = terminal
-            if phase == "done" and pr_url:
-                # Worker shipped — flip to in-review with the PR URL
-                # so the next tick's pr_url branch can run gh checks.
-                action = _ReconcileAction(
-                    slug=t.slug, new_status="in-review",
-                    clear_worker=True,
-                    note=f"worker phase=done, PR {pr_url}",
-                    raised_to_user=True,
-                    raise_text=f"worker shipped {t.slug}: {pr_url}",
-                )
-                if not t.pr_url:
+        #
+        # Critically: the terminal-state branch only fires for tasks
+        # currently at status=in-progress. Once the task transitions
+        # to in-review, the existing pr_url + CI path owns the
+        # decision tree (codex iter-3 [P1] — without this guard, a
+        # stale state.json with phase=done kept re-flipping the task
+        # to in-review every tick and short-circuited the CI checks
+        # that finish the merge → done lifecycle).
+        if t.status == "in-progress":
+            terminal = _worker_terminal_state(project, t.slug, home=home)
+            if terminal is not None:
+                phase, pr_url, blocked_reason = terminal
+                if phase == "done" and pr_url:
+                    # Worker shipped — flip to in-review with the PR
+                    # URL so the next tick's pr_url branch runs gh
+                    # checks against the new PR.
+                    action = _ReconcileAction(
+                        slug=t.slug, new_status="in-review",
+                        clear_worker=True,
+                        note=f"worker phase=done, PR {pr_url}",
+                        raised_to_user=True,
+                        raise_text=f"worker shipped {t.slug}: {pr_url}",
+                    )
+                    # Always overwrite tasks.md.pr_url with the
+                    # fresh state.json value: a re-dispatched worker
+                    # opens a NEW PR after a CI-red retry, and
+                    # leaving the stale PR URL would have the next
+                    # reconcile poll the wrong PR (codex iter-3 [P2]).
                     action.set_pr_url = pr_url
-                actions.append(action)
-                continue
-            if phase == "blocked" and blocked_reason:
-                actions.append(_ReconcileAction(
-                    slug=t.slug, new_status="blocked",
-                    clear_worker=True,
-                    note=f"worker blocked: {blocked_reason}",
-                    raised_to_user=True,
-                    raise_text=f"{t.slug} blocked: {blocked_reason}",
-                ))
-                continue
-            if phase == "failed":
-                actions.append(_ReconcileAction(
-                    slug=t.slug, new_status="todo", clear_worker=True,
-                    note="worker failed",
-                    raised_to_user=True,
-                    raise_text=f"{t.slug} worker failed",
-                ))
-                continue
-            # phase=done without pr_url, or phase=blocked without
-            # reason — fall through to pr_url + CI; the worker
-            # didn't honor the contract.
+                    actions.append(action)
+                    continue
+                if phase == "blocked" and blocked_reason:
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="blocked",
+                        clear_worker=True,
+                        note=f"worker blocked: {blocked_reason}",
+                        raised_to_user=True,
+                        raise_text=f"{t.slug} blocked: {blocked_reason}",
+                    ))
+                    continue
+                if phase == "failed":
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="todo", clear_worker=True,
+                        clear_pr_url=True,
+                        note="worker failed",
+                        raised_to_user=True,
+                        raise_text=f"{t.slug} worker failed",
+                    ))
+                    continue
+                # phase=done without pr_url, or phase=blocked
+                # without reason — fall through to pr_url + CI; the
+                # worker didn't honor the contract.
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:
@@ -503,13 +524,24 @@ def _reconcile_inflight(
                     raise_text=f"CI green for {t.slug}, ready to merge",
                 ))
             elif not ci.mergeable:
+                # Rebase needed — keep the existing pr_url; the
+                # operator (or a re-dispatch) will rebase the SAME
+                # branch onto main, so the PR URL is still the right
+                # poll target.
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="todo", clear_worker=True,
                     note="rebase needed",
                 ))
             elif ci.failed:
+                # CI red — clear pr_url so a re-dispatched worker's
+                # new PR (different branch / different number) becomes
+                # the next poll target. Without clear_pr_url, the
+                # stale failed PR URL stays attached and reconcile
+                # in the next cycle re-polls the dead PR forever
+                # (codex iter-3 [P2]).
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="todo", clear_worker=True,
+                    clear_pr_url=True,
                     note=f"CI red {t.pr_url}",
                     raised_to_user=True,
                     raise_text=f"CI red for {t.slug}",
@@ -660,6 +692,8 @@ def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> 
     """
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
+    if action.clear_pr_url:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "pr_url="])
     if action.set_pr_url:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
     if action.clear_worker:

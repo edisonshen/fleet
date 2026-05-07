@@ -124,15 +124,17 @@ Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
 (section omitted entirely when no learnings recorded)
 
 ## Required workflow
-  fleet workers update <slug> --phase branch
+  fleet workers update <slug> --project <project> --phase branch
 1. git checkout -b worker/<slug>
   ... (TDD red/green/refactor → review-claude → review-codex → push → done)
 
 ## Constraints
 - Stay on this task. File incidental bugs (max 3/session, honor system).
 - Do NOT edit tasks.md or standards.md directly.
-- Stuck → fleet workers update <slug> --phase blocked --reason "<one line>"
+- Stuck → fleet workers update <slug> --project <project> --phase blocked --reason "<one line>"
 ```
+
+Every `fleet workers update` invocation in the rendered prompt includes `--project <project>` so heartbeats land in the right `~/.fleet/projects/<project>/workers/...` tree even when the worker's cwd basename differs from the project name.
 
 `dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. fleet-guard's SessionStart hook reads that file on the worker's first turn and injects it as `[OPERATOR] <body>`.
 
@@ -151,14 +153,16 @@ Slug-keyed payloads are the C2 invariant (worker status reports never mix). The 
 
 ## Reconcile + raise-hand
 
-When a task is in-progress or in-review and its worker_pid is no longer alive, the coord queries `gh pr checks` (per the PR-URL on the task block, if any) and decides:
+When a task is in-progress or in-review and its worker is no longer alive (worker_pid dead AND `workers/<slug>/state.json` either missing, stale, or terminal), the coord decides the next status from two signals in order:
 
-- All green + merged → `status=done`, archive triggered out-of-band by `fleet tasks archive` later.
-- All green + not merged → `status=in-review`, raise to operator ("CI green, ready to merge").
-- Not mergeable → `status=todo`, clear worker, note "rebase needed".
-- Failed → `status=todo`, clear worker, raise to operator ("CI red").
-- Pending → leave as-is until next tick.
-- No PR URL at all → `status=todo`, clear worker, note "worker died without PR".
+1. **State.json terminal phase (in-progress only).** If the worker exited with `phase=done` + `pr_url`, flip to `in-review`, transcribe the PR URL onto tasks.md, raise "worker shipped". `phase=blocked` + reason → flip to `blocked`, raise. `phase=failed` → requeue to `todo`, clear pr_url, raise. The terminal-phase branch is gated to `status=in-progress` so subsequent ticks (already in-review) drive CI checks instead of re-flipping.
+2. **PR URL + `gh pr checks` (in-review or fallback).** When the task is in-review or when in-progress fell through (no terminal state), the coord queries CI:
+   - All green + merged → `status=done`.
+   - All green + not merged → `status=in-review`, raise ("ready to merge").
+   - Not mergeable → `status=todo`, clear worker, note "rebase needed" (keeps pr_url — same branch, different rebase).
+   - Failed → `status=todo`, clear worker, **clear pr_url** (next worker opens a NEW PR), raise "CI red".
+   - Pending → leave as-is.
+   - No PR URL at all → `status=todo`, clear worker, note "worker died without PR".
 
 `gh pr checks` is hit synchronously per tick. ENG §8.2 caches results on `coord-state.json:pr_check_cache` for 5 minutes; v0.2.0 ships without the cache (300ms cost is invisible in idle ticks). v0.2.1 may add it.
 

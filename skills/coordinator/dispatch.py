@@ -119,31 +119,38 @@ def build_worker_prompt(
             learnings_section,
             "",
         ])
+    # All `fleet workers update` invocations include --project so they
+    # land in the right project tree even when cwd's basename differs
+    # from the project name (codex iter-3 [P2]: without an explicit
+    # --project, the CLI's cwd-default project resolution would write
+    # heartbeats into a phantom ~/.fleet/projects/<wrong>/workers/...
+    # tree the coordinator never reads).
+    proj_flag = f"--project {project}"
     lines.extend([
         "## Required workflow",
         "",
-        f"  fleet workers update {task.slug} --phase branch",
+        f"  fleet workers update {task.slug} {proj_flag} --phase branch",
         f"1. git checkout -b {branch}",
         "",
-        f"  fleet workers update {task.slug} --phase tdd-red",
+        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-red",
         "2a. Write the failing test. git commit.",
         "",
-        f"  fleet workers update {task.slug} --phase tdd-green",
+        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-green",
         "2b. Write the minimal impl. Test passes. git commit.",
         "",
-        f"  fleet workers update {task.slug} --phase tdd-refactor",
+        f"  fleet workers update {task.slug} {proj_flag} --phase tdd-refactor",
         "2c. Refactor without changing test behavior. git commit.",
         "",
-        f"  fleet workers update {task.slug} --phase review-claude",
+        f"  fleet workers update {task.slug} {proj_flag} --phase review-claude",
         "3a. /review on your diff. Fix every P0/P1.",
         "",
-        f"  fleet workers update {task.slug} --phase review-codex",
+        f"  fleet workers update {task.slug} {proj_flag} --phase review-codex",
         "3b. /codex review on your diff. Fix every P0/P1.",
         "",
-        f"  fleet workers update {task.slug} --phase push",
+        f"  fleet workers update {task.slug} {proj_flag} --phase push",
         "4. gh pr create. Capture the PR URL.",
         "",
-        f"  fleet workers update {task.slug} --phase done --pr-url <url>",
+        f"  fleet workers update {task.slug} {proj_flag} --phase done --pr-url <url>",
         "5. Done. Coord sees phase=done, archives this dir, transitions task to in-review.",
         "6. Optional:",
         f"   fleet learnings add --project {project} --tag <topic> \\",
@@ -157,7 +164,7 @@ def build_worker_prompt(
         "  Operator must promote before dispatch.",
         "- Do NOT edit tasks.md or standards.md directly.",
         "- Stuck or genuinely confused:",
-        f"    fleet workers update {task.slug} --phase blocked --reason \"<one line>\"",
+        f"    fleet workers update {task.slug} {proj_flag} --phase blocked --reason \"<one line>\"",
         "  Then exit 0. Coord raises to operator.",
         "",
         "You have: /review, /codex review, gh, git, full repo at <cwd>.",

@@ -717,6 +717,89 @@ def test_reconcile_phase_done_with_state_pr_url_flips_to_in_review(
     ), f"pr_url not transcribed onto tasks.md: {set_calls}"
 
 
+def test_reconcile_in_review_does_not_re_apply_terminal_phase(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Codex iter-3 [P1] regress: a stale state.json with phase=done
+    must NOT keep re-flipping a task already at status=in-review back
+    to in-review every tick. The terminal-phase branch is gated to
+    status=in-progress so subsequent ticks (already in-review) drive
+    the gh pr checks → done lifecycle instead of short-circuiting it.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "settled-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "settled-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/9",
+    }), encoding="utf-8")
+
+    # Task is ALREADY in-review with the PR URL set; CI says merged.
+    _write_tasks(project_dir, [
+        _make_task(
+            "settled-aaaa", status="in-review",
+            worker_pid=99999, pr_url="https://github.com/x/y/pull/9",
+        ),
+    ])
+    merged = loop._CIResult(all_green=True, merged=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=merged):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # The CI-driven done flip must run; the terminal-state branch
+    # must NOT have fired (which would have re-flipped to in-review).
+    assert any("status=done" in c for c in set_calls), (
+        f"merged PR should advance to done, calls: {set_calls}"
+    )
+    assert not any("status=in-review" in c for c in set_calls), (
+        f"in-review task should not re-flip to in-review, calls: {set_calls}"
+    )
+
+
+def test_reconcile_ci_red_clears_pr_url_for_retry(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Codex iter-3 [P2] regress: when CI is red and the task gets
+    requeued for retry, the stale pr_url must be cleared so the
+    re-dispatched worker's NEW PR becomes the next reconcile target.
+    Without this, every subsequent tick re-polls the dead failed PR
+    forever."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "redci-aaaa", status="in-review",
+            worker_pid=1, pr_url="https://github.com/x/y/pull/3",
+        ),
+    ])
+    failed = loop._CIResult(failed=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=failed):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # Both status=todo AND pr_url= (clear) must fire.
+    assert any("status=todo" in c for c in set_calls)
+    assert any(
+        c[-1] == "pr_url=" for c in set_calls
+    ), f"CI-red retry must clear pr_url, calls: {set_calls}"
+
+
 def test_reconcile_phase_blocked_with_reason_flips_to_blocked(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
