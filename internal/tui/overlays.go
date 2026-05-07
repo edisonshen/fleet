@@ -6,6 +6,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -20,7 +21,7 @@ var helpEntries = []helpEntry{
 	{"n", "add a new task to the current project"},
 	{"a", "attach (agents) or peek (workers)"},
 	{"h", "handoff (agents only)"},
-	{"x", "archive (agents) or kill (workers)"},
+	{"x", "archive (agents) — worker kill ships in v0.2.x"},
 	{"d", "dispatch a new agent (opens repo picker)"},
 	{"/", "filter dashboard rows by substring"},
 	{"?", "this help"},
@@ -67,20 +68,45 @@ func renderHelpOverlay(width int) string {
 // header; body is rendered verbatim (caller pre-formats so the panel
 // can show JSON, markdown, log tails, etc. without re-parsing).
 //
-// width / height are accepted for symmetry with future clipping
-// support but currently unused — the body renders fully and relies on
-// the terminal's own scroll for tall content.
+// width is unused (panel doesn't reflow); height clips long bodies
+// so the close-hint stays visible even when the body would otherwise
+// scroll past the alt-screen bottom (codex iter-8 P2). The footer
+// already reserves ~3 rows; we budget 5 rows for header + spacing +
+// hint and clip the body to fit the rest. Operators who need the
+// full content of a clipped panel get a "(N more lines — see fleet
+// peek)" tail hint; bubbletea's alt-screen has no inline scroll
+// affordance and adding one would require viewport state we don't
+// otherwise carry.
 func renderDetailOverlay(d detailView, width, height int) string {
 	_ = width
-	_ = height
+	body := d.body
+	if height > 0 {
+		// Reserve: 1 banner (model.go pre-pends), 1 title, 1 blank, 1
+		// blank-before-hint, 1 hint, 2 footer lines (divider + chip
+		// row). 7 rows total chrome + a 1-row safety margin = 8.
+		const chromeRows = 8
+		bodyBudget := height - chromeRows
+		if bodyBudget < 5 {
+			bodyBudget = 5
+		}
+		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+		if len(lines) > bodyBudget {
+			more := len(lines) - bodyBudget + 1
+			lines = lines[:bodyBudget-1]
+			lines = append(lines,
+				headerSubtleStyle.Render(
+					fmt.Sprintf("… %d more — `fleet peek <slug>` for full content", more)))
+			body = strings.Join(lines, "\n")
+		}
+	}
 
 	var b strings.Builder
 	b.WriteString(headerLabelStyle.Render("FLEET"))
 	b.WriteString(headerSepStyle.Render(" — "))
 	b.WriteString(headerTextStyle.Render(d.title))
 	b.WriteString("\n\n")
-	b.WriteString(d.body)
-	if !strings.HasSuffix(d.body, "\n") {
+	b.WriteString(body)
+	if !strings.HasSuffix(body, "\n") {
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")

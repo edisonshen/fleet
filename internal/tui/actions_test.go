@@ -834,3 +834,22 @@ func TestReadLastLines_KeepsLineAtBoundary(t *testing.T) {
 		t.Errorf("tail line count = %d, want 5\ntail:\n%s", got, tail)
 	}
 }
+
+// TestDetailOverlay_ClipsLongBody regresses codex iter-8 P2: when the
+// detail panel's body would push the close-hint off the alt-screen,
+// it must be clipped with a "(N more)" tail so the operator always
+// sees the dismiss affordance.
+func TestDetailOverlay_ClipsLongBody(t *testing.T) {
+	var b strings.Builder
+	for i := 0; i < 60; i++ {
+		fmt.Fprintf(&b, "body line %02d\n", i)
+	}
+	d := detailView{title: "test", body: b.String()}
+	out := renderDetailOverlay(d, 120, 24)
+	if !strings.Contains(out, "more") {
+		t.Errorf("clipped overlay should announce remaining lines, got:\n%s", out)
+	}
+	if !strings.Contains(out, "press [esc] or [⏎] to close") {
+		t.Errorf("clipped overlay should keep close hint visible, got:\n%s", out)
+	}
+}

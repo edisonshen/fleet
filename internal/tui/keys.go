@@ -279,7 +279,7 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 		return m, nil, true
 	default:
 		m.flash = &flashMsg{
-			text:  "[x] applies to v0.1 agents (archive) and workers (kill); not to tasks/projects",
+			text:  "[x] applies only to v0.1 agents in this version — worker kill ships in v0.2.x",
 			isErr: true,
 		}
 		return m, nil, true
