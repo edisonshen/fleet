@@ -52,6 +52,7 @@ Subcommands below cover dispatch / attach / status from the shell.`,
 	root.AddCommand(newLearningsCmd())
 	root.AddCommand(newStandardsCmd())
 	root.AddCommand(newWorkersCmd())
+	root.AddCommand(newPeekCmd())
 	return root
 }
 
