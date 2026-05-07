@@ -7,6 +7,10 @@ on:
     branches: [main]
 
 jobs:
+  # Single job (build + format + lint + go test + python test) keeps the
+  # CI surface simple and shares one checkout. Branch protection requires
+  # the status check named `build-test-lint`; keep this job name stable so
+  # no admin update is needed when adding steps.
   build-test-lint:
     runs-on: ubuntu-latest
     steps:
@@ -17,13 +21,32 @@ jobs:
           go-version: "1.25"
           cache: true
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python3 -m pip install --upgrade pip pytest
+
       - name: Build
         run: go build ./...
 
-      - name: Test
-        run: go test -race -count=1 ./...
+      - name: Format check (gofmt)
+        run: |
+          diff=$(gofmt -l .)
+          if [ -n "$diff" ]; then
+            echo "::error::Files need gofmt:"
+            echo "$diff"
+            exit 1
+          fi
 
       - name: Lint
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.11.4
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Python tests
+        run: python3 -m pytest skills/ -q
