@@ -621,3 +621,65 @@ func TestKeyN_RefusesUnknownCwd(t *testing.T) {
 		t.Errorf("[n] flash should say 'no project context', got %q", got.flash.text)
 	}
 }
+
+// TestKeyN_AgentProjectGatedOnExistence regresses codex iter-4 P2:
+// pressing [n] with the cursor on a legacy agent row whose Project tag
+// no longer has a corresponding ~/.fleet/projects/<name>/ dir must NOT
+// create a phantom project. taskAddProject returns "" → submit flashes
+// "no project context".
+func TestKeyN_AgentProjectGatedOnExistence(t *testing.T) {
+	withFleetHome(t)
+	// Move cwd somewhere outside ~/.fleet so the cwd-fallback in
+	// taskAddProject doesn't sneak in a different project.
+	cwd, _ := os.Getwd()
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Agent record references a project that doesn't exist on disk.
+	r := sampleAgent("ghost")
+	r.Project = "missing-project"
+
+	m := New("test")
+	m.records = []*agent.Record{r}
+	m.dashCursor = 0
+
+	mm, _ := m.Update(keyMsg("n"))
+	if mm.(Model).taskAddProjectFrozen != "" {
+		t.Errorf("[n] on stale agent row should NOT freeze a missing project; got %q",
+			mm.(Model).taskAddProjectFrozen)
+	}
+}
+
+// TestAddTask_ArchiveReadErrorSurfaces regresses codex iter-4 P3:
+// when tasks-archive.md is unreadable / corrupted, addTask must
+// return an error rather than silently treating the archive as empty
+// (which would let GenerateSlug reuse archived slugs).
+func TestAddTask_ArchiveReadErrorSurfaces(t *testing.T) {
+	pdir := withFleetHome(t)
+	dir := filepath.Join(pdir, "broken")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// tasks.md present (empty) so the active read succeeds.
+	if err := os.WriteFile(filepath.Join(dir, "tasks.md"),
+		[]byte("---\nschema: v1\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// tasks-archive.md is malformed: a real schema header but an
+	// invalid version that internal/tasks.parse refuses with
+	// ErrSchemaTooNew.
+	if err := os.WriteFile(filepath.Join(dir, "tasks-archive.md"),
+		[]byte("---\nschema: v99\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := addTask("broken", "test spec")
+	if err == nil {
+		t.Fatal("addTask should return error when tasks-archive.md is corrupted")
+	}
+	if !strings.Contains(err.Error(), "tasks-archive") {
+		t.Errorf("error should reference tasks-archive: %v", err)
+	}
+}

@@ -138,8 +138,14 @@ func (m Model) taskAddProject() string {
 				return row.worker.Project
 			}
 		case rowAgent:
+			// Same existence gate as the cwd-fallback path below: a
+			// legacy agent whose Project tag no longer corresponds to a
+			// real ~/.fleet/projects/<name>/ dir would otherwise let
+			// [n] silently create a phantom project (codex iter-4 P2).
 			if row.agent != nil && row.agent.Project != "" {
-				return row.agent.Project
+				if projectDirExists(row.agent.Project) {
+					return row.agent.Project
+				}
 			}
 		}
 	}
@@ -159,17 +165,23 @@ func (m Model) taskAddProject() string {
 	if tag == "" {
 		return ""
 	}
-	// Existence check: ~/.fleet/projects/<tag>/ must already be
-	// present. If not, refuse so the operator gets an explicit error
-	// rather than a silently-created project.
-	root, err := state.Root()
-	if err != nil {
-		return ""
-	}
-	if _, err := os.Stat(filepath.Join(root, "projects", tag)); err != nil {
+	if !projectDirExists(tag) {
 		return ""
 	}
 	return tag
+}
+
+// projectDirExists returns true when ~/.fleet/projects/<name>/ is
+// present on disk. Used by both the cursor-on-agent-row branch and
+// the cwd fallback to refuse pressing [n] into a project that doesn't
+// exist (codex iter-4 P2).
+func projectDirExists(name string) bool {
+	root, err := state.Root()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(root, "projects", name))
+	return err == nil
 }
 
 // projectFromWorktreeCwd is duplicated from cmd/fleet/tasks.go to
@@ -245,15 +257,27 @@ func addTask(project, spec string) (string, error) {
 	}
 
 	// Collect existing slugs (active + archived) so GenerateSlug avoids
-	// 4hex collisions.
+	// 4hex collisions. Archive read errors must NOT be silently
+	// ignored — if tasks-archive.md is corrupted, we'd otherwise
+	// regenerate slugs that already exist there and the next archive
+	// merge would conflict (codex iter-4 P3). ENOENT is fine (no
+	// archive yet); anything else surfaces to the operator via the
+	// taskAddDoneMsg flash.
 	existing := make([]string, 0, len(f.Tasks))
 	for _, t := range f.Tasks {
 		existing = append(existing, t.Slug)
 	}
-	if archive, _ := tasks.Read(filepath.Join(dir, "tasks-archive.md")); archive != nil {
+	archivePath := filepath.Join(dir, "tasks-archive.md")
+	if _, statErr := os.Stat(archivePath); statErr == nil {
+		archive, archErr := tasks.Read(archivePath)
+		if archErr != nil {
+			return "", fmt.Errorf("read tasks-archive.md: %w", archErr)
+		}
 		for _, t := range archive.Tasks {
 			existing = append(existing, t.Slug)
 		}
+	} else if !os.IsNotExist(statErr) {
+		return "", fmt.Errorf("stat tasks-archive.md: %w", statErr)
 	}
 
 	slug := tasks.GenerateSlug("", spec, existing)
