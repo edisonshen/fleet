@@ -514,14 +514,11 @@ func runTasksShow(opts *tasksShowOpts, slug string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// Render the single-task block by writing a tasks.File with just
-	// this one task and stripping the frontmatter. Avoids drift between
-	// `tasks show` output and the on-disk shape.
-	one := &tasks.File{Tasks: []*tasks.Task{t}}
-	// We can't reach the unexported render() — read-back our own write
-	// would require disk. Instead, manually render the canonical shape
-	// (a thin mirror of internal/tasks.renderTask).
-	_ = one
+	// Render the single-task block via renderTaskMarkdown — a thin
+	// mirror of the unexported internal/tasks.renderTask. We can't
+	// reach the on-disk renderer without a write, so the format lives
+	// here too; tests assert byte-equality against the canonical
+	// `## task: <slug>` shape so drift is caught.
 	return renderTaskMarkdown(stdout, t)
 }
 
