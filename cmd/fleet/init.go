@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -25,29 +27,41 @@ var hookEvents = []string{"Stop", "PreCompact", "SessionStart", "UserPromptSubmi
 
 func newInitCmd() *cobra.Command {
 	var force bool
+	var upgrade bool
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Install the fleet-guard skill into ~/.claude/skills/ and register hooks",
-		Long: `Writes the embedded fleet-guard skill files to
-~/.claude/skills/fleet-guard/ and merges Stop / PreCompact / SessionStart
-hook registrations into ~/.claude/settings.json.
+		Short: "Install bundled skills into ~/.claude/skills/ and register hooks",
+		Long: `Writes the embedded skills (fleet-guard, coordinator) to
+~/.claude/skills/<name>/ and merges Stop / PreCompact / SessionStart /
+UserPromptSubmit hook registrations into ~/.claude/settings.json. Also
+seeds a canonical ~/.fleet/standards.md when one is missing — that file
+is the operator-edited "the bar" the v0.2 coordinator inlines into
+worker prompts.
 
-Idempotent: re-running on an installed skill prints "skip (exists)" for
-each existing file unless --force is given. Existing settings.json
-entries with the same command are not duplicated.`,
+Idempotent: re-running on an installed skill prints "skip (up to date)"
+for each existing file. --upgrade overwrites bundled skill files (so a
+newer fleet binary auto-refreshes the install) but never overwrites
+~/.fleet/standards.md (operator edits to the bar are preserved). --force
+is the legacy alias for --upgrade.`,
 		RunE: func(c *cobra.Command, _ []string) error {
-			return runInit(c.OutOrStdout(), force, "")
+			return runInit(c.OutOrStdout(), force || upgrade, "")
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false,
-		"overwrite existing skill files (settings.json is always merged, never replaced)")
+		"alias for --upgrade (kept for compat with v0.1 muscle memory)")
+	cmd.Flags().BoolVar(&upgrade, "upgrade", false,
+		"refresh bundled skill files from the binary (settings.json is always merged; ~/.fleet/standards.md is preserved)")
 	return cmd
 }
 
-// runInit copies embedded skill files into ~/.claude/skills/fleet-guard/
-// and merges hook registrations into ~/.claude/settings.json.
+// runInit copies every embedded skill into ~/.claude/skills/<name>/,
+// merges hook registrations into ~/.claude/settings.json, and seeds
+// ~/.fleet/standards.md from the bundled template when missing.
 //
 // claudeHomeOverride lets tests redirect ~/.claude/. Production passes "".
+// fleet-guard remains the source of the hook command — coordinator runs
+// as a slash skill the coord agent invokes itself, not via Claude Code
+// hooks (matches SKILL.md "Hook bindings" section).
 func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 	claudeHome := claudeHomeOverride
 	if claudeHome == "" {
@@ -57,24 +71,55 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 		}
 		claudeHome = filepath.Join(home, ".claude")
 	}
-	skillRoot := filepath.Join(claudeHome, "skills", "fleet-guard")
 
-	if err := installSkillFiles(stdout, skillRoot, force); err != nil {
+	// Walk every bundled skill in a stable order so install output is
+	// deterministic across runs (fleet-guard first, coordinator second).
+	// fleet.SkillFS() is the single source of truth — adding a new skill
+	// here means adding the //go:embed directive in embed.go and the
+	// map entry in SkillFS().
+	skills := fleet.SkillFS()
+	for _, name := range skillInstallOrder(skills) {
+		skillRoot := filepath.Join(claudeHome, "skills", name)
+		if err := installSkillFilesFS(stdout, skills[name], skillRoot, force); err != nil {
+			return fmt.Errorf("install %s: %w", name, err)
+		}
+	}
+
+	// fleet-guard owns the hook registrations. Coordinator is invoked
+	// via the slash-skill path, not via hooks — see SKILL.md "Hook
+	// bindings". Adding coordinator here would double-fire on every
+	// Stop / PreCompact and run loop.tick() inside fleet-guard's hook
+	// payload, which the skill explicitly does not want.
+	mainPath := filepath.Join(claudeHome, "skills", "fleet-guard", "main.py")
+	if err := mergeHookRegistrations(stdout, claudeHome, mainPath); err != nil {
 		return err
 	}
 
-	mainPath := filepath.Join(skillRoot, "main.py")
-	if err := mergeHookRegistrations(stdout, claudeHome, mainPath); err != nil {
-		return err
+	if err := seedStandardsTemplate(stdout); err != nil {
+		return fmt.Errorf("seed standards: %w", err)
 	}
 
 	_, _ = fmt.Fprintln(stdout, "fleet init: done")
 	return nil
 }
 
-// installSkillFiles walks the embedded FS and writes each file to dst.
-// Files are written via state.WriteAtomic so a crashed install never
-// publishes a half-written main.py to the hook runner.
+// skillInstallOrder returns skill names in a deterministic order so
+// install output is stable across runs (helps tests + UX). Sort by
+// skill name; fleet-guard happens to sort before coordinator, so the
+// historical "fleet-guard first" order is preserved without a
+// hardcoded list.
+func skillInstallOrder(skills map[string]fs.FS) []string {
+	names := make([]string, 0, len(skills))
+	for name := range skills {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// installSkillFilesFS walks the supplied embedded FS and writes each
+// file to dst. Files are written via state.WriteAtomic so a crashed
+// install never publishes a half-written main.py to the hook runner.
 //
 // Self-healing on upgrade: when force is false and the target exists,
 // the embedded content is byte-compared against the installed file.
@@ -83,8 +128,11 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 // Without this, hookEvents additions (e.g., UserPromptSubmit) would
 // fire against a stale main.py that has no handler for the new hook.
 // force=true short-circuits the compare and always rewrites.
-func installSkillFiles(stdout io.Writer, dst string, force bool) error {
-	fsys := fleet.FleetGuardFS()
+//
+// Generalized in v0.2 to accept any fs.FS so the same loop installs
+// fleet-guard, coordinator, and any future bundled skill (the embed
+// directives live in embed.go; this function doesn't care which).
+func installSkillFilesFS(stdout io.Writer, fsys fs.FS, dst string, force bool) error {
 	return fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -126,6 +174,33 @@ func installSkillFiles(stdout io.Writer, dst string, force bool) error {
 		_, _ = fmt.Fprintf(stdout, "wrote: %s\n", target)
 		return nil
 	})
+}
+
+// seedStandardsTemplate writes the canonical ~/.fleet/standards.md
+// template if no standards.md exists. NEVER overwrites — operator edits
+// to the bar are preserved across `fleet init --upgrade` (matches the
+// PR 12 contract: skill files refresh, standards.md does not).
+//
+// Bootstrap is required first so ~/.fleet/ exists; the template is
+// rendered via state.WriteAtomic so a crash mid-write can't leave a
+// torn frontmatter that the parser would later reject.
+func seedStandardsTemplate(stdout io.Writer) error {
+	root, err := state.Bootstrap()
+	if err != nil {
+		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
+	}
+	target := filepath.Join(root, "standards.md")
+	if _, err := os.Stat(target); err == nil {
+		_, _ = fmt.Fprintf(stdout, "skip (existing): %s\n", target)
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", target, err)
+	}
+	if err := state.WriteAtomic(target, fleet.StandardsTemplate()); err != nil {
+		return fmt.Errorf("write %s: %w", target, err)
+	}
+	_, _ = fmt.Fprintf(stdout, "seeded: %s\n", target)
+	return nil
 }
 
 // mergeHookRegistrations adds Stop / PreCompact / SessionStart entries to

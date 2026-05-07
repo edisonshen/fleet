@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -310,4 +311,228 @@ func walkExpectedSkillFiles(t *testing.T) []string {
 		t.Fatal("FleetGuardFS contains zero files; //go:embed lost the skill")
 	}
 	return files
+}
+
+// TestRunInit_InstallsCoordinatorSkill — v0.2 PR 12 contract: every
+// skill returned by fleet.SkillFS() must land at
+// ~/.claude/skills/<name>/. A regression that dropped coordinator from
+// the install loop would leave the operator's coord agent without
+// /coordinator on disk; the skill would silently degrade to "command
+// not found" inside the running coord.
+func TestRunInit_InstallsCoordinatorSkill(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+
+	coordRoot := filepath.Join(claudeHome, "skills", "coordinator")
+	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py"} {
+		got := filepath.Join(coordRoot, want)
+		info, err := os.Stat(got)
+		if err != nil {
+			t.Errorf("coordinator skill file missing: %s (%v)", want, err)
+			continue
+		}
+		if info.Size() == 0 {
+			t.Errorf("coordinator skill file empty: %s", want)
+		}
+	}
+	// Byte-equality with the embedded source so a copy-pipeline
+	// transformation (BOM, line-ending normalization) fails the test
+	// before it bites the operator.
+	fsys := fleet.CoordinatorFS()
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		want, _ := fs.ReadFile(fsys, path)
+		got, readErr := os.ReadFile(filepath.Join(coordRoot, path))
+		if readErr != nil {
+			t.Errorf("read installed coordinator/%s: %v", path, readErr)
+			return nil
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("coordinator/%s: installed differs from embedded", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRunInit_InstallsAllBundledSkills — wider contract test: the
+// install loop walks fleet.SkillFS() so a future skill addition (just
+// dropping it into embed.go's map) lands automatically. If a future
+// skill goes missing from the install path, this test catches it
+// without per-skill assertions cluttering the suite.
+func TestRunInit_InstallsAllBundledSkills(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+
+	for name, fsys := range fleet.SkillFS() {
+		skillRoot := filepath.Join(claudeHome, "skills", name)
+		err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			if _, err := os.Stat(filepath.Join(skillRoot, path)); err != nil {
+				t.Errorf("skill %s: %s missing after install (%v)", name, path, err)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestRunInit_SeedsStandardsTemplate — ~/.fleet/standards.md must land
+// after init when missing, with v1 frontmatter and the canonical
+// "# Standards" H1 so `fleet standards show` produces parseable output
+// immediately. Operator can edit it freely afterward; --upgrade
+// preserves edits (covered in TestRunInit_UpgradePreservesStandards).
+func TestRunInit_SeedsStandardsTemplate(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	fleetHome := filepath.Join(tmp, ".fleet")
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("runInit: %v", err)
+	}
+	stdPath := filepath.Join(fleetHome, "standards.md")
+	got, err := os.ReadFile(stdPath)
+	if err != nil {
+		t.Fatalf("standards.md not seeded: %v", err)
+	}
+	body := string(got)
+	if !strings.HasPrefix(body, "---\nschema: v1\n---\n") {
+		t.Errorf("seed missing v1 frontmatter; got prefix %q", body[:32])
+	}
+	if !strings.Contains(body, "# Standards") {
+		t.Errorf("seed missing '# Standards' H1:\n%s", body)
+	}
+	if !strings.Contains(body, "## Testing") {
+		t.Errorf("seed missing '## Testing' section:\n%s", body)
+	}
+	if !strings.Contains(body, "## Code review") {
+		t.Errorf("seed missing '## Code review' section:\n%s", body)
+	}
+}
+
+// TestRunInit_UpgradePreservesStandards — the load-bearing rule of
+// `fleet init --upgrade`: skill files refresh from the binary, but a
+// hand-edited ~/.fleet/standards.md is preserved verbatim. Without
+// this guard, every binary upgrade would silently overwrite the
+// operator's bar with the canned template.
+func TestRunInit_UpgradePreservesStandards(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	fleetHome := filepath.Join(tmp, ".fleet")
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("first runInit: %v", err)
+	}
+	stdPath := filepath.Join(fleetHome, "standards.md")
+
+	// Operator hand-edits the standards file.
+	customBody := "---\nschema: v1\n---\n\n# Standards\n\n## Testing\n\nMy custom rules. Not the template.\n"
+	if err := os.WriteFile(stdPath, []byte(customBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second `fleet init --upgrade` (force=true) must NOT clobber the
+	// hand-edit. The skill files DO get refreshed (covered by the
+	// fleet-guard tests above); standards.md stays put.
+	var out bytes.Buffer
+	if err := runInit(&out, true, claudeHome); err != nil {
+		t.Fatalf("upgrade runInit: %v", err)
+	}
+	got, err := os.ReadFile(stdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != customBody {
+		t.Errorf("--upgrade clobbered hand-edited standards.md:\nwant: %q\n got: %q",
+			customBody, string(got))
+	}
+	if !strings.Contains(out.String(), "skip (existing): "+stdPath) {
+		t.Errorf("expected 'skip (existing)' message for preserved standards.md, got:\n%s", out.String())
+	}
+}
+
+// TestRunInit_IsIdempotentAcrossSkills — re-running init after a clean
+// install must produce zero writes for either skill AND for
+// standards.md. Catches regressions where one skill's install path
+// trampled the idempotency contract.
+func TestRunInit_IsIdempotentAcrossSkills(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	fleetHome := filepath.Join(tmp, ".fleet")
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("first runInit: %v", err)
+	}
+	// Snapshot all installed bytes.
+	first := snapshotInstall(t, claudeHome, fleetHome)
+
+	var out bytes.Buffer
+	if err := runInit(&out, false, claudeHome); err != nil {
+		t.Fatalf("second runInit: %v", err)
+	}
+	second := snapshotInstall(t, claudeHome, fleetHome)
+	if !bytes.Equal(first, second) {
+		t.Errorf("install bytes drifted across idempotent runs:\nout=%s", out.String())
+	}
+	// Coordinator skip messages must be present too — verifies the
+	// install loop actually iterated over coordinator on the second
+	// run (otherwise we'd silently regress to fleet-guard-only).
+	if !strings.Contains(out.String(), "skills/coordinator") {
+		t.Errorf("second-run output missing coordinator path; install loop may have skipped it:\n%s", out.String())
+	}
+}
+
+// snapshotInstall reads every installed file under claudeHome's
+// skills/ tree and ~/.fleet/standards.md into one deterministic blob.
+// Used by idempotency tests to assert no bytes drifted across re-runs.
+func snapshotInstall(t *testing.T, claudeHome, fleetHome string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	skillsDir := filepath.Join(claudeHome, "skills")
+	err := filepath.Walk(skillsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		fmt.Fprintf(&b, "FILE %s\n", path)
+		b.Write(data)
+		b.WriteByte('\n')
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdPath := filepath.Join(fleetHome, "standards.md")
+	if data, err := os.ReadFile(stdPath); err == nil {
+		fmt.Fprintf(&b, "FILE %s\n", stdPath)
+		b.Write(data)
+	}
+	return b.Bytes()
 }
