@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/workers"
 )
@@ -279,22 +280,40 @@ func TestView_HeaderShowsTotals(t *testing.T) {
 	}
 }
 
-func TestKeyG_SwitchesToAgentsView(t *testing.T) {
+// TestView_AgentsRenderInDashboard_NoGToggle pins issue #53 part A:
+// agent records appear inside the dashboard's right column under the
+// "v0.1 agents — N active" sub-heading, NOT behind a [g] toggle. The
+// [g] keybind no longer exists.
+func TestView_AgentsRenderInDashboard_NoGToggle(t *testing.T) {
 	m := New("test")
-	if m.view != viewDashboard {
-		t.Fatalf("default view should be dashboard, got %v", m.view)
+	m.width = 140
+	m.height = 30
+	m.records = []*agent.Record{
+		{
+			SchemaVersion: 1,
+			ID:            "agent99",
+			TmuxSession:   "fleet-agent99",
+			Project:       "demo",
+			TaskID:        "demo-task",
+			SpawnedAt:     time.Now().UTC(),
+		},
+	}
+	out := m.View()
+	if !strings.Contains(out, "v0.1 agents") {
+		t.Errorf("dashboard should include the v0.1 agents sub-heading, got:\n%s", out)
+	}
+	if !strings.Contains(out, "agent99") {
+		t.Errorf("dashboard should render the agent ID, got:\n%s", out)
 	}
 
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	if updated.(Model).view != viewAgents {
-		t.Errorf("after [g] view should be agents, got %v", updated.(Model).view)
+	// Pressing [g] is a no-op — the legacy toggle is gone.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	if cmd != nil {
+		t.Errorf("[g] should be a no-op, got non-nil cmd")
 	}
-
-	// Pressing g again toggles back.
-	m2 := updated.(Model)
-	updated2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	if updated2.(Model).view != viewDashboard {
-		t.Errorf("second [g] should toggle back to dashboard, got %v", updated2.(Model).view)
+	out2 := updated.(Model).View()
+	if !strings.Contains(out2, "v0.1 agents") {
+		t.Errorf("[g] must not switch views; dashboard should still render. got:\n%s", out2)
 	}
 }
 
@@ -469,7 +488,9 @@ func TestUpdate_DashboardMsg_Stores(t *testing.T) {
 }
 
 // TestView_DashboardEmptyShowsHint pins that an empty projects tree
-// renders a coachmark instead of a blank column.
+// renders a coachmark instead of a blank column. Hint nudges to the
+// in-TUI [n] task add since `fleet tasks add` is no longer the
+// recommended entry point per operator feedback in issue #53.
 func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
@@ -478,7 +499,10 @@ func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	m.dashboard = scanDashboard(time.Now())
 	out := m.View()
 	if !strings.Contains(out, "no projects yet") {
-		t.Errorf("empty dashboard should hint at fleet tasks add, got:\n%s", out)
+		t.Errorf("empty dashboard should hint, got:\n%s", out)
+	}
+	if !strings.Contains(out, "[n]") {
+		t.Errorf("empty dashboard should nudge to [n], got:\n%s", out)
 	}
 }
 

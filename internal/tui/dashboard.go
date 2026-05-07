@@ -51,12 +51,13 @@ type ProjectRow struct {
 	Name      string // bare project name (the dir under ~/.fleet/projects/)
 	RepoSlug  string // "edisonshen/<name>" style; falls back to Name
 	Counts    TaskCounts
-	Active    bool      // coord lock mtime within window
-	IdleStop  bool      // file present but stale → "auto-stopped" pill
-	LastTick  time.Time // coord-state.json mtime; zero if missing
-	Attention int       // count of blocked workers + raise-hand items
-	BlockedQ  string    // first blocked worker's reason (for raise-hand expansion P2)
-	BlockedID string    // first blocked worker's ID
+	Active    bool       // coord lock mtime within window
+	IdleStop  bool       // file present but stale → "auto-stopped" pill
+	LastTick  time.Time  // coord-state.json mtime; zero if missing
+	Attention int        // count of blocked workers + raise-hand items
+	BlockedQ  string     // first blocked worker's reason (for raise-hand expansion P2)
+	BlockedID string     // first blocked worker's ID
+	Tasks     []*taskRow // task rows for [j/k] navigation + [⏎] open
 }
 
 // TaskCounts mirrors the columns in the mockup:
@@ -181,8 +182,11 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 		RepoSlug: deriveRepoSlug(dir, name),
 	}
 
-	// Task counts. Read errors collapse to zero counts — the row still
-	// renders so the operator can see the project exists.
+	// Task counts + per-task rows. Read errors collapse to zero counts
+	// + nil Tasks — the row still renders so the operator can see the
+	// project exists. Per-task rows feed [j/k] navigation + [⏎] open;
+	// done tasks are filtered out so the dashboard doesn't drown in
+	// completed work (operator can see them via fleet tasks list).
 	if f, err := tasks.Read(filepath.Join(dir, "tasks.md")); err == nil {
 		for _, t := range f.Tasks {
 			switch t.Status {
@@ -197,6 +201,13 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 			case tasks.StatusDone:
 				row.Counts.Done++
 			}
+			if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
+				continue
+			}
+			row.Tasks = append(row.Tasks, &taskRow{
+				Slug:   t.Slug,
+				Status: string(t.Status),
+			})
 		}
 	}
 

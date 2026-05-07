@@ -25,20 +25,27 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // renderDashboard returns the full Ops Console view (header strip,
 // 2-col body, footer) as a single string. width is the terminal width
 // reported by tea.WindowSizeMsg; falls back to a sensible 110 when 0
 // (early renders before the size message lands).
+//
+// The body folds projects, tasks, workers, AND v0.1 agents into the
+// rendered output (issue #53 part A). Agents render as a sub-section
+// underneath the workers column with the heading "v0.1 agents — N
+// active". The cursor lives in dashboardRows() (model.go) and walks
+// every row regardless of column.
 func renderDashboard(m Model) string {
 	w := m.width
 	if w <= 0 {
 		w = 110
 	}
-	// 1-cell right margin matches the v0.1 layout's anti-wrap rule
-	// (titleRow / divider). Anything wider triggers phantom-newline
-	// wrap on some terminals.
+	// 1-cell right margin matches the v0.1 layout's anti-wrap rule.
+	// Anything wider triggers phantom-newline wrap on some terminals.
 	usable := w - 1
 	if usable < 60 {
 		usable = 60
@@ -49,7 +56,7 @@ func renderDashboard(m Model) string {
 	var b strings.Builder
 	b.WriteString(renderDashboardHeader(m, usable))
 	b.WriteString("\n")
-	b.WriteString(renderColumnHeadings(leftW, rightW, m.dashboard))
+	b.WriteString(renderColumnHeadings(m, leftW, rightW))
 	b.WriteString("\n")
 	b.WriteString(renderTwoColumnBody(m, leftW, rightW))
 	return b.String()
@@ -121,15 +128,22 @@ func renderDashboardHeader(m Model, usable int) string {
 }
 
 // renderColumnHeadings renders the "PROJECTS · 3 ACTIVE" /
-// "WORKERS · 5 ACTIVE" strip below the totals.
-func renderColumnHeadings(leftW, rightW int, snap *Snapshot) string {
+// "WORKERS · 5 ACTIVE" strip below the totals. Right column label
+// includes the v0.1 agent count when the model has any records,
+// matching issue #53 part A's agents-folded-into-dashboard intent.
+func renderColumnHeadings(m Model, leftW, rightW int) string {
 	pn, wn := 0, 0
-	if snap != nil {
-		pn = len(snap.Projects)
-		wn = len(snap.Workers)
+	if m.dashboard != nil {
+		pn = len(m.dashboard.Projects)
+		wn = len(m.dashboard.Workers)
 	}
+	an := len(m.records)
 	leftLabel := columnHeadingStyle.Render(fmt.Sprintf("PROJECTS · %d ACTIVE", pn))
-	rightLabel := columnHeadingStyle.Render(fmt.Sprintf("WORKERS · %d ACTIVE", wn))
+	rightHeading := fmt.Sprintf("WORKERS · %d ACTIVE", wn)
+	if an > 0 {
+		rightHeading += fmt.Sprintf("  ·  AGENTS %d", an)
+	}
+	rightLabel := columnHeadingStyle.Render(rightHeading)
 
 	// Pad each label to its column width minus a 2-cell indent that
 	// matches the body rows.
@@ -143,9 +157,13 @@ func renderColumnHeadings(leftW, rightW int, snap *Snapshot) string {
 // joins them side-by-side at row level. When one column has fewer
 // rows the shorter one is bottom-padded with blank lines so the
 // separator stays uniform.
+//
+// The body is built from the unified dashboardRows() so the cursor
+// can highlight the right line: left column = projects + tasks; right
+// column = workers + agents (with a "v0.1 agents — N active"
+// sub-heading between worker rows and agent rows when both exist).
 func renderTwoColumnBody(m Model, leftW, rightW int) string {
-	leftLines := buildProjectLines(m.dashboard, leftW)
-	rightLines := buildWorkerLines(m.dashboard, rightW)
+	leftLines, rightLines := buildBodyLines(m, leftW, rightW)
 
 	maxRows := len(leftLines)
 	if len(rightLines) > maxRows {
@@ -177,21 +195,83 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 	return b.String()
 }
 
-// buildProjectLines produces the rendered text lines for the projects
-// column (one project = 3 lines + a blank). leftW is the column's
-// cell width budget.
-func buildProjectLines(snap *Snapshot, leftW int) []string {
-	if snap == nil || len(snap.Projects) == 0 {
-		return []string{
-			"",
-			columnHeadingStyle.Render("  no projects yet — run `fleet tasks add` in a repo"),
+// buildBodyLines is the per-column line builder. Iterates
+// dashboardRows() ONCE so a single cursor index maps consistently to
+// both the rendered output and the action handlers in keys.go.
+//
+//	left column (top-to-bottom):
+//	  project header (3 lines + blank)
+//	    └─ task lines (1 each)
+//	  next project …
+//
+//	right column:
+//	  worker block (2 lines + blank)
+//	  next worker …
+//	  v0.1 agents — N active     <- sub-heading when records non-empty
+//	    agent block (2 lines + blank)
+//	    next agent …
+//
+// The cursor row is highlighted with a bold ▶ glyph in the left
+// margin (project/task) or replacing the leading dot (worker/agent).
+func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
+	rows := m.dashboardRows()
+
+	// Left column: project + task rows.
+	var left []string
+	if (m.dashboard == nil || len(m.dashboard.Projects) == 0) && !rowsHaveLeft(rows) {
+		left = append(left, "",
+			columnHeadingStyle.Render("  no projects yet — press [n] to add a task"))
+	}
+	for i, row := range rows {
+		selected := i == m.dashCursor
+		switch row.kind {
+		case rowProject:
+			left = append(left, projectBlockLines(row.project, leftW, selected)...)
+		case rowTask:
+			left = append(left, taskBlockLine(row.task, leftW, selected))
 		}
 	}
-	var lines []string
-	for _, p := range snap.Projects {
-		lines = append(lines, projectBlockLines(p, leftW)...)
+
+	// Right column: worker rows, then a sub-header, then agent rows.
+	var right []string
+	hasWorkers, hasAgents := false, false
+	for i, row := range rows {
+		selected := i == m.dashCursor
+		if row.kind == rowWorker {
+			right = append(right, workerBlockLines(row.worker, rightW, selected)...)
+			hasWorkers = true
+		}
 	}
-	return lines
+	if !hasWorkers {
+		right = append(right, "",
+			columnHeadingStyle.Render("  no workers running"))
+	}
+	// Insert v0.1 agents sub-heading only when records exist.
+	if len(m.records) > 0 {
+		right = append(right, "",
+			columnHeadingStyle.Render(fmt.Sprintf(
+				"  v0.1 agents — %d active", len(m.records))))
+	}
+	for i, row := range rows {
+		selected := i == m.dashCursor
+		if row.kind == rowAgent {
+			right = append(right, agentBlockLines(row.agent, m.aliveByID, rightW, selected)...)
+			hasAgents = true
+		}
+	}
+	_ = hasAgents
+	return left, right
+}
+
+// rowsHaveLeft returns true when at least one row would render in the
+// left column. Used to decide whether to emit the empty-projects hint.
+func rowsHaveLeft(rows []dashRow) bool {
+	for _, r := range rows {
+		if r.kind == rowProject || r.kind == rowTask {
+			return true
+		}
+	}
+	return false
 }
 
 // projectBlockLines renders one project's three-line block:
@@ -201,11 +281,23 @@ func buildProjectLines(snap *Snapshot, leftW int) []string {
 //	⏳ N ▶ N 👁 N ⚠ N ✓ N    ● active     last-tick
 //
 // Attention rows get a leading "▌ " accent (red bold) on every line of
-// the block to mirror the mockup's left-border treatment.
-func projectBlockLines(p *ProjectRow, w int) []string {
+// the block to mirror the mockup's left-border treatment. The
+// selected variant prefixes line 1 with the cursor glyph "▶" so the
+// operator can see which row [⏎]/[a] etc. will act on.
+func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 	prefix := "  "
 	if p.Attention > 0 {
 		prefix = attentionBorderStyle.Render("▌ ") + " "
+	}
+	cursorPrefix := prefix
+	if selected {
+		// Replace the 2-cell prefix's leading spaces with the cursor
+		// glyph so the cell width stays the same — no shift in the
+		// block's right-side stat columns when selection toggles.
+		cursorPrefix = cursorGlyphStyle.Render("▶ ")
+		if p.Attention > 0 {
+			cursorPrefix = cursorGlyphStyle.Render("▶ ") + attentionBorderStyle.Render("▌ ")
+		}
 	}
 
 	// Line 1: name + (right-flushed) attention chip.
@@ -214,7 +306,7 @@ func projectBlockLines(p *ProjectRow, w int) []string {
 	if p.Attention > 0 {
 		attnRight = attentionChipStyle.Render(fmt.Sprintf("● %d attn", p.Attention))
 	}
-	line1 := prefix + name
+	line1 := cursorPrefix + name
 	if attnRight != "" {
 		gap := w - lipgloss.Width(line1) - lipgloss.Width(attnRight) - 2
 		if gap < 1 {
@@ -244,6 +336,30 @@ func projectBlockLines(p *ProjectRow, w int) []string {
 	}
 
 	return []string{line1, line2, line3, ""}
+}
+
+// taskBlockLine renders one task row indented under its parent
+// project:
+//
+//   - todo  add-readme
+//
+// The selected variant uses the cursor glyph "▶" in place of the
+// bullet to mark which task [⏎] open will operate on.
+func taskBlockLine(t *taskRow, w int, selected bool) string {
+	if t == nil {
+		return ""
+	}
+	prefix := "    "
+	bullet := "•"
+	bulletStyle := dimStyle
+	if selected {
+		prefix = "  "
+		bullet = "▶"
+		bulletStyle = cursorGlyphStyle
+	}
+	status := projectCountTodoStyle.Render(t.Status)
+	slug := workerSlugStyle.Render(t.Slug)
+	return prefix + bulletStyle.Render(bullet) + " " + status + "  " + slug
 }
 
 // renderCountChips builds "⏳ 3  ▶ 1  👁 1  ⚠ 1  ✓ 12" with the
@@ -284,29 +400,18 @@ func renderCoordStatus(p *ProjectRow) string {
 	}
 }
 
-// buildWorkerLines produces the rendered text lines for the workers
-// column. Each worker takes two lines + a blank separator, matching
-// the mockup's spacing.
-func buildWorkerLines(snap *Snapshot, rightW int) []string {
-	if snap == nil || len(snap.Workers) == 0 {
-		return []string{
-			"",
-			columnHeadingStyle.Render("  no workers running"),
-		}
-	}
-	var lines []string
-	for _, wkr := range snap.Workers {
-		lines = append(lines, workerBlockLines(wkr, rightW)...)
-	}
-	return lines
-}
-
 // workerBlockLines renders one worker's two-line block:
 //
 //	● <id>
 //	  <project>:<slug>      <age> <state>
-func workerBlockLines(w *WorkerRow, width int) []string {
+//
+// The selected variant replaces the leading status dot with the
+// cursor glyph "▶" so the row reads as "next [⏎]/[a]/[x] target".
+func workerBlockLines(w *WorkerRow, width int, selected bool) []string {
 	dot := workerDotStyle(w.Color).Render("●")
+	if selected {
+		dot = cursorGlyphStyle.Render("▶")
+	}
 	id := workerIDStyle.Render(w.ID)
 	line1 := "  " + dot + " " + id
 
@@ -317,6 +422,53 @@ func workerBlockLines(w *WorkerRow, width int) []string {
 		gap = 1
 	}
 	line2 := "    " + slug + strings.Repeat(" ", gap) + stateLabel
+	return []string{line1, line2, ""}
+}
+
+// agentBlockLines renders one v0.1 agent's two-line block under the
+// "v0.1 agents" sub-heading. Same shape as workerBlockLines so the
+// right column reads consistently.
+//
+//	● <agent-id-short>                       <status>
+//	  <project>:<task>                       <age>
+func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected bool) []string {
+	if r == nil {
+		return nil
+	}
+	status := deriveStatus(r, alive)
+	glyph, gStyle := glyphFor(status)
+	if selected {
+		glyph = "▶"
+		gStyle = cursorGlyphStyle
+	}
+	idShort := r.ID
+	if len(idShort) > 8 {
+		idShort = idShort[:8]
+	}
+	id := workerIDStyle.Render(idShort)
+	statusLab := statusStyleFor(status).Render(statusLabel(status))
+	line1raw := "  " + gStyle.Render(glyph) + " " + id
+	gap1 := width - lipgloss.Width(line1raw) - lipgloss.Width(statusLab) - 2
+	if gap1 < 1 {
+		gap1 = 1
+	}
+	line1 := line1raw + strings.Repeat(" ", gap1) + statusLab
+
+	project := r.Project
+	if project == "" {
+		project = "-"
+	}
+	task := r.TaskID
+	if task == "" {
+		task = "-"
+	}
+	slug := workerSlugStyle.Render(fmt.Sprintf("%s:%s", project, task))
+	age := dimStyle.Render(humanAge(time.Since(r.SpawnedAt)))
+	gap2 := width - lipgloss.Width("    ") - lipgloss.Width(slug) - lipgloss.Width(age) - 2
+	if gap2 < 1 {
+		gap2 = 1
+	}
+	line2 := "    " + slug + strings.Repeat(" ", gap2) + age
 	return []string{line1, line2, ""}
 }
 
@@ -343,15 +495,15 @@ func isHexLower(c rune) bool {
 }
 
 // renderDashboardFooter draws the bottom keybind legend line.
-// Matches the mockup's `[j/k] nav  [⏎] open  [n] task  [a] attach  [/] search  [?] help`.
-// The right side carries an uptime indicator.
-func renderDashboardFooter(uptime time.Duration, usable int) string {
+// Matches the mockup's `[j/k] nav  [⏎] open  [n] task  [a] attach
+// [/] search  [?] help`. The right side carries an uptime indicator
+// and (when set) the active search filter.
+func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string) string {
 	chips := []struct{ key, label string }{
 		{"j/k", "nav"},
 		{"⏎", "open"},
 		{"n", "task"},
 		{"a", "attach"},
-		{"g", "agents"},
 		{"/", "search"},
 		{"?", "help"},
 		{"q", "quit"},
@@ -366,7 +518,14 @@ func renderDashboardFooter(uptime time.Duration, usable int) string {
 		)
 	}
 	left := strings.Join(parts, "  ")
-	right := headerSubtleStyle.Render(fmt.Sprintf("uptime %s", formatUptime(uptime)))
+	rightParts := []string{}
+	if searchFilter != "" {
+		rightParts = append(rightParts, searchFooterStyle.Render(
+			fmt.Sprintf("/%s · esc clears", searchFilter)))
+	}
+	rightParts = append(rightParts, headerSubtleStyle.Render(
+		fmt.Sprintf("uptime %s", formatUptime(uptime))))
+	right := strings.Join(rightParts, "  ")
 	gap := usable - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1

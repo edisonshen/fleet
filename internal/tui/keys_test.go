@@ -29,13 +29,13 @@ func keyMsg(s string) tea.KeyMsg {
 
 func makeModelWithAgents(records ...*agent.Record) Model {
 	m := New("test")
-	// v0.2 default startup view is the dashboard; record-scoped action
-	// tests target the agents view because that's where the cursor is
-	// visible and [h]/[x]/[a] operate. The dashboard-gating behavior
-	// (flash hint instead of action) gets its own coverage in
-	// TestKey_RecordActionsGatedInDashboardView.
-	m.view = viewAgents
+	// v0.2 dashboard is the only view (issue #53). Records appear in the
+	// right column under "v0.1 agents — N active"; dashCursor must land
+	// on the first agent row for [h]/[x]/[a] to dispatch to it. With no
+	// projects/workers seeded, dashboardRows() yields exactly len(records)
+	// rows so dashCursor=0 points at the first agent.
 	m.records = records
+	m.dashCursor = 0
 	return m
 }
 
@@ -77,7 +77,9 @@ func TestKey_HandoffShellsOutWithSelectedID(t *testing.T) {
 	stub.install(t)
 
 	m := makeModelWithAgents(sampleAgent("agent01"), sampleAgent("agent02"))
-	m.cursor = 1
+	// dashCursor=1 lands on the second agent in dashboardRows()
+	// (no projects/workers, so rows are agents in order).
+	m.dashCursor = 1
 
 	updated, cmd := m.Update(keyMsg("h"))
 	if cmd == nil {
@@ -231,12 +233,17 @@ func TestKey_DispatchOpensPicker(t *testing.T) {
 	}
 }
 
-func TestKey_NisAliasForD(t *testing.T) {
-	isolatePicker(t)
+// TestKeyN_OpensTaskAddPrompt pins issue #53 part B: [n] opens the
+// task-add prompt (not the repo picker — that was the v0.1 alias).
+func TestKeyN_OpensTaskAddPrompt(t *testing.T) {
 	m := makeModelWithAgents()
 	updated, _ := m.Update(keyMsg("n"))
-	if updated.(Model).mode != modePickRepo {
-		t.Error("[n] should also enter the repo picker")
+	mm := updated.(Model)
+	if mm.mode != modePromptTaskAdd {
+		t.Errorf("[n] should enter modePromptTaskAdd, got %v", mm.mode)
+	}
+	if !strings.Contains(mm.View(), "task spec:") {
+		t.Errorf("[n] view should show task-add prompt, got:\n%s", mm.View())
 	}
 }
 
@@ -527,55 +534,64 @@ func TestUpdate_DrainDoneFailureSetsErrorFlash(t *testing.T) {
 
 // -- nav still works alongside actions --------------------------------
 
-func TestKey_NavStillWorksAfterActionWiring(t *testing.T) {
+// TestKeyJK_MovesCursor pins issue #53 spec: [j/k] moves the
+// dashCursor across all rows. With three agent records and no
+// projects/workers, dashboardRows() returns three rows in order, so j
+// twice moves dashCursor 0→2 and k pulls back to 1.
+func TestKeyJK_MovesCursor(t *testing.T) {
 	m := makeModelWithAgents(sampleAgent("a"), sampleAgent("b"), sampleAgent("c"))
 	mm, _ := m.Update(keyMsg("j"))
-	if mm.(Model).cursor != 1 {
-		t.Errorf("cursor=%d want 1", mm.(Model).cursor)
+	if mm.(Model).dashCursor != 1 {
+		t.Errorf("after j: dashCursor=%d want 1", mm.(Model).dashCursor)
 	}
-	mm, _ = mm.Update(keyMsg("G"))
-	if mm.(Model).cursor != 2 {
-		t.Errorf("G failed: cursor=%d", mm.(Model).cursor)
+	mm, _ = mm.Update(keyMsg("j"))
+	if mm.(Model).dashCursor != 2 {
+		t.Errorf("after jj: dashCursor=%d want 2", mm.(Model).dashCursor)
+	}
+	mm, _ = mm.Update(keyMsg("k"))
+	if mm.(Model).dashCursor != 1 {
+		t.Errorf("after jjk: dashCursor=%d want 1", mm.(Model).dashCursor)
 	}
 }
 
-// TestKey_RecordActionsGatedInDashboardView regresses the codex P1
-// finding: with the v0.2 default dashboard startup view, [h]/[x]/[a]
-// operate on m.records[m.cursor] but the dashboard does not render
-// that selection. Without a gate, [j]/[k] can move a hidden cursor and
-// the next action attaches/handoffs/archives the wrong agent. The
-// gate flashes a hint and refuses to act until the operator switches
-// to the agents view via [g].
-func TestKey_RecordActionsGatedInDashboardView(t *testing.T) {
-	stub := &stubFleetCmd{}
-	stub.install(t)
+// TestKey_RowTypeGatingForActions regresses the codex iter-1 fix in
+// 240a3b0, extended for issue #53 row-type discrimination: [h] only
+// applies to agent rows, [a] applies to agent OR worker rows, [x]
+// applies to agent (archive) or worker (kill) rows. When the cursor
+// lands on a project/task row, the action flashes "doesn't apply" and
+// does NOT shell out.
+func TestKey_RowTypeGatingForActions(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
 
 	for _, key := range []string{"h", "x", "a"} {
+		stub := &stubFleetCmd{}
+		stub.install(t)
+
 		m := New("test")
-		m.records = []*agent.Record{sampleAgent("agent01"), sampleAgent("agent02")}
-		// Move hidden cursor — proves the bug surface that the gate
-		// closes: [j] in dashboard moves m.cursor with no visible
-		// indication, then [h]/[x]/[a] would have fired on the wrong
-		// agent.
-		m.cursor = 1
+		m.width = 130
+		m.height = 30
+		m.dashboard = scanDashboard(time.Now())
+		// dashCursor=0 lands on the project row (left column, top).
+		m.dashCursor = 0
 
 		updated, cmd := m.Update(keyMsg(key))
 		mm := updated.(Model)
 
+		// [h] strictly rejects non-agent rows; [a]/[x] reject project rows.
 		if cmd != nil {
-			t.Errorf("[%s] in dashboard view returned a cmd; expected nil (action gated)", key)
+			// [a] on a project flashes; [x] on a project flashes; [h]
+			// on a project flashes. None should produce a cmd.
+			t.Errorf("[%s] on project row returned a cmd; expected nil (gated)", key)
 		}
 		if mm.mode != modeNav {
-			t.Errorf("[%s] in dashboard view changed mode to %v; expected modeNav (action gated)", key, mm.mode)
+			t.Errorf("[%s] on project row changed mode to %v; expected modeNav", key, mm.mode)
 		}
 		if mm.flash == nil || !mm.flash.isErr {
-			t.Errorf("[%s] in dashboard view did not set an error flash; got %+v", key, mm.flash)
-		}
-		if mm.flash != nil && !strings.Contains(mm.flash.text, "[g]") {
-			t.Errorf("[%s] flash should hint to press [g], got: %q", key, mm.flash.text)
+			t.Errorf("[%s] on project row did not set an error flash; got %+v", key, mm.flash)
 		}
 		if len(stub.calls) != 0 {
-			t.Errorf("[%s] in dashboard view shelled out (calls=%v); expected zero", key, stub.calls)
+			t.Errorf("[%s] on project row shelled out (calls=%v); expected zero", key, stub.calls)
 		}
 	}
 }
@@ -684,15 +700,15 @@ func TestKey_ArchiveOtherKeysSwallowedDuringConfirm(t *testing.T) {
 	// would archive.
 	m := makeModelWithAgents(sampleAgent("agent01"), sampleAgent("agent02"))
 	mm, _ := m.Update(keyMsg("x"))
-	beforeCursor := mm.(Model).cursor
+	beforeCursor := mm.(Model).dashCursor
 
 	updated, _ := mm.(Model).Update(keyMsg("j"))
 	mmm := updated.(Model)
 	if mmm.mode != modeConfirmArchive {
 		t.Errorf("j should not exit modeConfirmArchive, got %v", mmm.mode)
 	}
-	if mmm.cursor != beforeCursor {
-		t.Errorf("cursor moved during confirmation: was %d, now %d", beforeCursor, mmm.cursor)
+	if mmm.dashCursor != beforeCursor {
+		t.Errorf("dashCursor moved during confirmation: was %d, now %d", beforeCursor, mmm.dashCursor)
 	}
 }
 
