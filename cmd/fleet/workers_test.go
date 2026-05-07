@@ -121,6 +121,189 @@ func TestWorkersPrune_BadDuration(t *testing.T) {
 	}
 }
 
+// TestWorkersUpdate_SetsPhase_NoExplicitPid — happy path without
+// --pid: state.json materializes with phase set, but pid stays at
+// the previous value (0 for a fresh bootstrap). Codex iter-4 [P1]
+// regress: defaulting --pid to os.Getpid() of the short-lived
+// `fleet` helper made workers list/peek render active workers as
+// dead almost immediately. We now require --pid to be explicit.
+func TestWorkersUpdate_SetsPhase_NoExplicitPid(t *testing.T) {
+	_, project := setupTasksHome(t)
+	out := &bytes.Buffer{}
+	opts := &workersUpdateOpts{
+		project: project,
+		phase:   "tdd-red",
+	}
+	if err := runWorkersUpdate("alpha-1234", opts, out); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	st, err := workers.ReadState(project, "alpha-1234")
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if st.Phase != workers.PhaseTDDRed {
+		t.Errorf("phase = %q, want tdd-red", st.Phase)
+	}
+	// Without --pid, pid stays at the bootstrap default (0), NOT
+	// os.Getpid() of this test process.
+	if st.PID != 0 {
+		t.Errorf("pid = %d, want 0 (no --pid passed)", st.PID)
+	}
+	if !strings.Contains(out.String(), "tdd-red") {
+		t.Errorf("stdout should report new phase: %s", out.String())
+	}
+}
+
+// TestWorkersUpdate_ExplicitPidIsRecorded — passing --pid <n> writes
+// that pid to state.json. Workers running inside a stable subprocess
+// pass it explicitly; the helper-process default (no flag) is
+// "preserve existing pid" so we don't trash a live worker's pid.
+func TestWorkersUpdate_ExplicitPidIsRecorded(t *testing.T) {
+	_, project := setupTasksHome(t)
+	opts := &workersUpdateOpts{
+		project: project,
+		phase:   "tdd-red",
+		pid:     42424,
+		pidSet:  true,
+	}
+	if err := runWorkersUpdate("alpha-1234", opts, &bytes.Buffer{}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	st, err := workers.ReadState(project, "alpha-1234")
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if st.PID != 42424 {
+		t.Errorf("pid = %d, want 42424 (explicit --pid)", st.PID)
+	}
+}
+
+// TestWorkersUpdate_NonTerminalClearsTerminalMetadata — codex iter-4
+// [P2] regress: a retry that reuses the same workers/<slug>/state.json
+// (e.g. after CI red, the coord re-dispatches the same task) must
+// not carry the previous attempt's pr_url / blocked_reason / exit
+// fields onto the new attempt. --phase starting clears them.
+func TestWorkersUpdate_NonTerminalClearsTerminalMetadata(t *testing.T) {
+	_, project := setupTasksHome(t)
+
+	// First attempt: worker shipped a PR.
+	if err := runWorkersUpdate("alpha-9876", &workersUpdateOpts{
+		project: project, phase: "done",
+		prURL: "https://example.invalid/pr/old",
+		exit:  0, exitSet: true,
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("first attempt: %v", err)
+	}
+
+	// Second attempt: coord re-dispatches; bootstrap to phase=starting.
+	if err := runWorkersUpdate("alpha-9876", &workersUpdateOpts{
+		project: project, phase: "starting",
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("second attempt bootstrap: %v", err)
+	}
+
+	st, err := workers.ReadState(project, "alpha-9876")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if st.PRURL != "" {
+		t.Errorf("retry should clear prior pr_url, got %q", st.PRURL)
+	}
+	if st.BlockedReason != "" {
+		t.Errorf("retry should clear prior blocked_reason, got %q",
+			st.BlockedReason)
+	}
+	if st.Exit != nil {
+		t.Errorf("retry should clear prior exit, got %v", st.Exit)
+	}
+}
+
+// TestWorkersUpdate_DonePhaseRequiresPRURL — phase=done is rejected
+// without --pr-url because workers.writeStateLocked enforces
+// ErrPhaseRequiresPR. The CLI must surface that error rather than
+// silently writing an inconsistent state.
+func TestWorkersUpdate_DonePhaseRequiresPRURL(t *testing.T) {
+	_, project := setupTasksHome(t)
+	err := runWorkersUpdate("alpha-2222", &workersUpdateOpts{
+		project: project, phase: "done",
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("phase=done without --pr-url should error")
+	}
+	if !strings.Contains(err.Error(), "pr_url") {
+		t.Errorf("error should mention pr_url: %v", err)
+	}
+}
+
+// TestWorkersUpdate_BlockedRequiresReason — phase=blocked is rejected
+// without --reason. Same contract as done+pr-url; this lets the
+// coordinator distinguish "worker said it was blocked" from
+// "worker died" without parsing the OS PID.
+func TestWorkersUpdate_BlockedRequiresReason(t *testing.T) {
+	_, project := setupTasksHome(t)
+	err := runWorkersUpdate("alpha-3333", &workersUpdateOpts{
+		project: project, phase: "blocked",
+	}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("phase=blocked without --reason should error")
+	}
+	if !strings.Contains(err.Error(), "blocked_reason") {
+		t.Errorf("error should mention blocked_reason: %v", err)
+	}
+}
+
+// TestWorkersUpdate_DoneWithPRURL — phase=done + --pr-url succeeds
+// and persists the URL so the coord's reconcile loop sees it.
+func TestWorkersUpdate_DoneWithPRURL(t *testing.T) {
+	_, project := setupTasksHome(t)
+	if err := runWorkersUpdate("alpha-4444", &workersUpdateOpts{
+		project: project, phase: "done",
+		prURL: "https://example.invalid/pr/42",
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("done update: %v", err)
+	}
+	st, err := workers.ReadState(project, "alpha-4444")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if st.Phase != workers.PhaseDone {
+		t.Errorf("phase = %q, want done", st.Phase)
+	}
+	if st.PRURL != "https://example.invalid/pr/42" {
+		t.Errorf("pr_url = %q, want example URL", st.PRURL)
+	}
+}
+
+// TestWorkersUpdate_AppendsPhaseHistory — every phase change after
+// the initial bootstrap appends the previous phase to phases_completed,
+// so the coord/peek surfaces can show a worker's TDD pipeline progress.
+func TestWorkersUpdate_AppendsPhaseHistory(t *testing.T) {
+	_, project := setupTasksHome(t)
+	steps := []string{"branch", "tdd-red", "tdd-green", "tdd-refactor"}
+	for _, p := range steps {
+		if err := runWorkersUpdate("alpha-5555", &workersUpdateOpts{
+			project: project, phase: p,
+		}, &bytes.Buffer{}); err != nil {
+			t.Fatalf("update %s: %v", p, err)
+		}
+	}
+	st, err := workers.ReadState(project, "alpha-5555")
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if st.Phase != workers.PhaseTDDRefactor {
+		t.Errorf("final phase = %q", st.Phase)
+	}
+	// Bootstrap is "starting"; first transition appends "starting",
+	// then each subsequent transition appends the previous phase.
+	// Expected history: starting, branch, tdd-red, tdd-green.
+	wantLen := len(steps) // starting + (steps-1) prior phases = len(steps)
+	if len(st.PhasesCompleted) != wantLen {
+		t.Errorf("phases_completed = %v (len %d), want len %d",
+			st.PhasesCompleted, len(st.PhasesCompleted), wantLen)
+	}
+}
+
 // TestWorkersPrune_RemovesOldArchive — plants two archive dirs (one
 // old, one fresh) and verifies prune drops only the old one.
 func TestWorkersPrune_RemovesOldArchive(t *testing.T) {

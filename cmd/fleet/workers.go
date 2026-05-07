@@ -7,8 +7,10 @@ package main
 // state.
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -32,6 +34,7 @@ For tailing one worker's logs, use ` + "`fleet peek <slug> --logs`" + `.`,
 	cmd.AddCommand(
 		newWorkersListCmd(),
 		newWorkersPruneCmd(),
+		newWorkersUpdateCmd(),
 	)
 	return cmd
 }
@@ -198,5 +201,174 @@ func runWorkersPrune(opts *workersPruneOpts, stdout io.Writer) error {
 		return fmt.Errorf("prune: %w", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "pruned %d archived worker dir(s) older than %s\n", removed, dur)
+	return nil
+}
+
+// ---------- fleet workers update ----------
+
+// workersUpdateOpts captures the worker-side mutation surface. Workers
+// (coord-dispatched `claude --print` subprocesses) call this on every
+// phase boundary to publish their progress; the coordinator's reconcile
+// loop reads the resulting state.json and decides what to do next.
+//
+// `--phase` is required because every legitimate use of this command
+// is "I just transitioned to phase X". `--pr-url` and `--reason` are
+// phase-coupled: phase=done requires a PR URL (workers.writeStateLocked
+// enforces ErrPhaseRequiresPR), phase=blocked requires a reason
+// (ErrPhaseRequiresWhy). Setting --pid records the worker's own OS
+// PID so coord's reconcile can liveness-check via kill(0).
+type workersUpdateOpts struct {
+	project string
+	phase   string
+	prURL   string
+	reason  string
+	pid     int
+	exit    int
+	exitSet bool // distinguishes "not passed" from "exit=0"
+	pidSet  bool // distinguishes "not passed" from "pid=0"
+}
+
+func newWorkersUpdateCmd() *cobra.Command {
+	opts := &workersUpdateOpts{}
+	cmd := &cobra.Command{
+		Use:   "update <slug>",
+		Short: "Update one worker's state.json (called by the worker subprocess)",
+		Long: `update writes a phase boundary into the worker's state.json under
+~/.fleet/projects/<project>/workers/<slug>/state.json. Workers run this
+on every phase change in their TDD → review → push pipeline so the
+coordinator can reconcile in-flight tasks correctly.
+
+Phases: starting, branch, tdd-red, tdd-green, tdd-refactor,
+review-claude, review-codex, push, done, blocked, failed.
+
+Phase=done requires --pr-url. Phase=blocked requires --reason. The
+state file is created on first call (the coord pre-seeds it on
+dispatch but a missing file is bootstrapped here so workers don't
+fail open).
+
+Bootstraps the worker dir + state.json if absent (mirrors the coord's
+pre-seed) so a missing file does not fail the worker on its first
+phase update. PID defaults to the caller's os.Getpid(); pass --pid
+explicitly when the caller is a wrapper script.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Detect explicit --exit / --pid so default 0 doesn't
+			// accidentally shadow a still-running worker. Codex
+			// iter-3 [P1]: defaulting --pid to os.Getpid() of the
+			// short-lived `fleet` helper made workers list/peek
+			// report active workers as dead almost immediately
+			// (the helper exits, the recorded pid dies, the
+			// rendered state shows "dead" until the next phase
+			// boundary writes a fresh transient pid).
+			opts.exitSet = cmd.Flags().Changed("exit")
+			opts.pidSet = cmd.Flags().Changed("pid")
+			return runWorkersUpdate(args[0], opts, cmd.OutOrStdout())
+		},
+	}
+	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
+	cmd.Flags().StringVar(&opts.phase, "phase", "",
+		"new worker phase (starting|branch|tdd-red|tdd-green|tdd-refactor|review-claude|review-codex|push|done|blocked|failed)")
+	cmd.Flags().StringVar(&opts.prURL, "pr-url", "", "PR URL (required for phase=done)")
+	cmd.Flags().StringVar(&opts.reason, "reason", "", "blocked reason (required for phase=blocked)")
+	cmd.Flags().IntVar(&opts.pid, "pid", 0, "worker OS PID (default: os.Getpid())")
+	cmd.Flags().IntVar(&opts.exit, "exit", 0, "worker exit code (set on phase=done|failed)")
+	_ = cmd.MarkFlagRequired("phase")
+	return cmd
+}
+
+func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) error {
+	if _, err := state.Bootstrap(); err != nil {
+		return fmt.Errorf("bootstrap: %w", err)
+	}
+	project, err := resolveProject(opts.project)
+	if err != nil {
+		return err
+	}
+	phase := workers.Phase(strings.TrimSpace(opts.phase))
+	if phase == "" {
+		return errors.New("--phase is required")
+	}
+
+	updateErr := workers.UpdateState(project, slug, func(s *workers.State) {
+		// Record phase transition: append the previous phase to the
+		// completed list so workers.list / peek can show "5/9 phases
+		// done" without losing history. Skip the append on the very
+		// first transition out of "starting" (= bootstrap default)
+		// so we don't double-count it.
+		if s.Phase != "" && s.Phase != phase {
+			s.PhasesCompleted = append(s.PhasesCompleted, s.Phase)
+		}
+		s.Phase = phase
+		// Only set pid when the caller passed --pid explicitly.
+		// Defaulting to os.Getpid() captured the short-lived
+		// `fleet` helper PID and made workers look dead immediately
+		// after each phase update (codex iter-3 [P1]). Without
+		// --pid, preserve whatever pid is already in state.json
+		// (typically 0 from the dispatch bootstrap).
+		if opts.pidSet {
+			s.PID = opts.pid
+		}
+		// Phase-specific terminal fields. Codex iter-4 [P2]: when
+		// state.json is reused for a retry (worker restart on the
+		// same slug after CI-red), --phase starting must not leave
+		// the previous attempt's pr_url / blocked_reason / exit
+		// hanging around. We clear them on every non-terminal
+		// transition (starting, branch, tdd-*, review-*, push) and
+		// only re-write them when the caller explicitly passes the
+		// matching flag.
+		switch phase {
+		case workers.PhaseDone:
+			if strings.TrimSpace(opts.prURL) != "" {
+				s.PRURL = strings.TrimSpace(opts.prURL)
+			}
+			if opts.exitSet {
+				ec := opts.exit
+				s.Exit = &ec
+			}
+		case workers.PhaseBlocked:
+			if strings.TrimSpace(opts.reason) != "" {
+				s.BlockedReason = strings.TrimSpace(opts.reason)
+			}
+		case workers.PhaseFailed:
+			if strings.TrimSpace(opts.reason) != "" {
+				s.BlockedReason = strings.TrimSpace(opts.reason)
+			}
+			if opts.exitSet {
+				ec := opts.exit
+				s.Exit = &ec
+			}
+		default:
+			// Non-terminal phases: clear terminal metadata so a
+			// retry doesn't carry over the previous attempt's
+			// completion markers. Operator can still pass the
+			// flags explicitly to override (e.g., setting pr_url
+			// on review-codex when the PR was opened earlier).
+			s.PRURL = ""
+			s.BlockedReason = ""
+			s.Exit = nil
+			if strings.TrimSpace(opts.prURL) != "" {
+				s.PRURL = strings.TrimSpace(opts.prURL)
+			}
+			if strings.TrimSpace(opts.reason) != "" {
+				s.BlockedReason = strings.TrimSpace(opts.reason)
+			}
+			if opts.exitSet {
+				ec := opts.exit
+				s.Exit = &ec
+			}
+		}
+	})
+	if updateErr != nil {
+		return fmt.Errorf("workers update: %w", updateErr)
+	}
+	// Re-read the persisted state so the success line reports the
+	// actual pid we wrote (the file's existing pid when --pid was
+	// omitted, or opts.pid when explicit).
+	persisted, _ := workers.ReadState(project, slug)
+	persistedPID := 0
+	if persisted != nil {
+		persistedPID = persisted.PID
+	}
+	_, _ = fmt.Fprintf(stdout, "worker %s phase=%s pid=%d\n", slug, phase, persistedPID)
 	return nil
 }

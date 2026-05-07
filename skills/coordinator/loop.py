@@ -167,7 +167,7 @@ def _tick_locked(
     result.parsed_tasks = len(f.tasks)
 
     # 3. Reconcile in-flight workers.
-    reconciled = _reconcile_inflight(f.tasks, project, fleet_bin)
+    reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
     for action in reconciled:
         try:
             _apply_reconcile(action, project, fleet_bin)
@@ -295,6 +295,122 @@ def _save_coord_state(path: Path, state: dict) -> None:
 # ---------- reconcile ----------
 
 
+def _is_worker_alive(t: parse.Task, project: str, home: Path | None = None) -> bool:
+    """Return True if the worker behind task t is still working.
+
+    Two signals, OR'd:
+      1. worker_pid > 0 AND that PID responds to kill(0). Cheap;
+         catches the in-tick window where the coord just dispatched.
+      2. workers/<slug>/state.json exists AND its phase is non-terminal
+         (not done|blocked|failed) AND updated_at is fresh (within
+         _WORKER_STATE_FRESH_S). This is the canonical signal once
+         the worker subprocess starts calling `fleet workers update`:
+         the OS PID stored on tasks.md is unreliable across coord
+         ticks (the coord tick is short-lived) but state.json
+         freshness is owned by the live worker subprocess. Without
+         this fallback, every coord-dispatched task gets requeued
+         the next tick (codex full-stack [P1]).
+    """
+    if t.worker_pid > 0 and _pid_alive(t.worker_pid):
+        return True
+    return _worker_state_fresh(project, t.slug, home=home)
+
+
+# How long a worker's state.json may go without an update before the
+# coord treats it as dead (and consults pr_url + CI to decide the next
+# status). Longer than the longest expected phase boundary (`/codex
+# review` can take several minutes) but shorter than a wedged-process
+# wait that would block the queue forever.
+_WORKER_STATE_FRESH_S = 15 * 60
+
+
+def _read_worker_state(
+    project: str, slug: str, *, home: Path | None = None,
+) -> dict | None:
+    """Load workers/<slug>/state.json. Returns None on any read/parse
+    failure so callers fall through to their default behavior.
+
+    home: project-tree root (~/.fleet by default). Tests pass an
+    isolated tmp_path so the host's real ~/.fleet/projects/ doesn't
+    bleed into the test's worker-state visibility.
+    """
+    if home is None:
+        home = Path(os.environ.get("FLEET_HOME") or os.path.expanduser("~/.fleet"))
+    state_path = home / "projects" / project / "workers" / slug / "state.json"
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def _worker_state_fresh(
+    project: str, slug: str, *, home: Path | None = None,
+) -> bool:
+    """Read workers/<slug>/state.json and return True iff the worker
+    is still publishing progress.
+
+    Returns False on any error (missing file, parse error, terminal
+    phase, stale heartbeat) — the caller falls through to the
+    pr_url + CI decision tree, matching the v0.2 design's
+    "if we can't tell, treat as dead" stance.
+    """
+    st = _read_worker_state(project, slug, home=home)
+    if st is None:
+        return False
+    phase = st.get("phase", "")
+    if phase in ("done", "blocked", "failed"):
+        return False
+    updated_at = st.get("updated_at", "")
+    if not updated_at:
+        # Bootstrapped state (just dispatched, no first tick yet).
+        # Treat as alive so the worker has a chance to run.
+        return True
+    try:
+        # Workers serialize updated_at via Go time.Time JSON, which is
+        # RFC3339 with nanos. Python's fromisoformat handles RFC3339
+        # since 3.11; for older interpreters we fall back to a regex
+        # strip of the trailing fractional seconds.
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(tz=timezone.utc) - ts).total_seconds()
+    except ValueError:
+        return False
+    return age_s <= _WORKER_STATE_FRESH_S
+
+
+def _worker_terminal_state(
+    project: str, slug: str, *, home: Path | None = None,
+) -> tuple[str, str, str] | None:
+    """Read workers/<slug>/state.json and, if the worker is in a
+    terminal phase, return (phase, pr_url, blocked_reason).
+
+    Returns None when state.json is missing/unparseable or the phase
+    is non-terminal — caller falls through to its existing decision
+    path (pr_url + CI). This is how reconcile transcribes worker-side
+    "I'm done" / "I'm blocked" signals into tasks.md when the worker
+    process exited cleanly between ticks (codex full-stack iter-2
+    [P1]: without this, a phase=done worker that exited got
+    classified as "died without PR" and the task was requeued).
+    """
+    st = _read_worker_state(project, slug, home=home)
+    if st is None:
+        return None
+    phase = st.get("phase", "")
+    if phase not in ("done", "blocked", "failed"):
+        return None
+    return (
+        phase,
+        str(st.get("pr_url", "") or ""),
+        str(st.get("blocked_reason", "") or ""),
+    )
+
+
 @dataclass
 class _ReconcileAction:
     slug: str
@@ -303,15 +419,29 @@ class _ReconcileAction:
     note: str = ""
     raised_to_user: bool = False
     raise_text: str = ""
+    set_pr_url: str = ""  # populated when a phase=done worker shipped
+                          # a PR (codex full-stack iter-2 [P1]:
+                          # state.json is the only signal until the
+                          # inbox sentinel path lands; reconcile must
+                          # transcribe it).
+    clear_pr_url: bool = False  # set on requeue paths whose retry will
+                                # open a NEW PR (CI red, worker failed).
+                                # Without clearing, the stale URL stays
+                                # attached and the next reconcile keeps
+                                # polling the dead PR (codex iter-3
+                                # [P2]).
 
 
 def _reconcile_inflight(
     tasks: list[parse.Task],
     project: str,
     fleet_bin: str,
+    *,
+    home: Path | None = None,
 ) -> list[_ReconcileAction]:
     """For each in-flight task, check the worker is alive; otherwise
-    decide the next status from pr_url + CI.
+    decide the next status from state.json's terminal phase, then
+    pr_url + CI.
 
     Returns a list of _ReconcileAction; caller applies via the fleet CLI.
     """
@@ -319,8 +449,68 @@ def _reconcile_inflight(
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
             continue
-        if t.worker_pid > 0 and _pid_alive(t.worker_pid):
+        if _is_worker_alive(t, project, home=home):
             continue
+        # Worker is gone. Before falling through to pr_url + CI, check
+        # whether state.json reports a terminal phase. v0.2 workers
+        # only signal completion via `fleet workers update --phase done
+        # --pr-url X` (which writes state.json) or `--phase blocked
+        # --reason X`. Without copying that signal back to tasks.md
+        # here, the reconcile path classifies a cleanly-done worker
+        # as "died without PR" and silently requeues the task to todo
+        # (codex full-stack iter-2 [P1]).
+        #
+        # Critically: the terminal-state branch only fires for tasks
+        # currently at status=in-progress. Once the task transitions
+        # to in-review, the existing pr_url + CI path owns the
+        # decision tree (codex iter-3 [P1] — without this guard, a
+        # stale state.json with phase=done kept re-flipping the task
+        # to in-review every tick and short-circuited the CI checks
+        # that finish the merge → done lifecycle).
+        if t.status == "in-progress":
+            terminal = _worker_terminal_state(project, t.slug, home=home)
+            if terminal is not None:
+                phase, pr_url, blocked_reason = terminal
+                if phase == "done" and pr_url:
+                    # Worker shipped — flip to in-review with the PR
+                    # URL so the next tick's pr_url branch runs gh
+                    # checks against the new PR.
+                    action = _ReconcileAction(
+                        slug=t.slug, new_status="in-review",
+                        clear_worker=True,
+                        note=f"worker phase=done, PR {pr_url}",
+                        raised_to_user=True,
+                        raise_text=f"worker shipped {t.slug}: {pr_url}",
+                    )
+                    # Always overwrite tasks.md.pr_url with the
+                    # fresh state.json value: a re-dispatched worker
+                    # opens a NEW PR after a CI-red retry, and
+                    # leaving the stale PR URL would have the next
+                    # reconcile poll the wrong PR (codex iter-3 [P2]).
+                    action.set_pr_url = pr_url
+                    actions.append(action)
+                    continue
+                if phase == "blocked" and blocked_reason:
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="blocked",
+                        clear_worker=True,
+                        note=f"worker blocked: {blocked_reason}",
+                        raised_to_user=True,
+                        raise_text=f"{t.slug} blocked: {blocked_reason}",
+                    ))
+                    continue
+                if phase == "failed":
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="todo", clear_worker=True,
+                        clear_pr_url=True,
+                        note="worker failed",
+                        raised_to_user=True,
+                        raise_text=f"{t.slug} worker failed",
+                    ))
+                    continue
+                # phase=done without pr_url, or phase=blocked
+                # without reason — fall through to pr_url + CI; the
+                # worker didn't honor the contract.
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:
@@ -334,13 +524,24 @@ def _reconcile_inflight(
                     raise_text=f"CI green for {t.slug}, ready to merge",
                 ))
             elif not ci.mergeable:
+                # Rebase needed — keep the existing pr_url; the
+                # operator (or a re-dispatch) will rebase the SAME
+                # branch onto main, so the PR URL is still the right
+                # poll target.
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="todo", clear_worker=True,
                     note="rebase needed",
                 ))
             elif ci.failed:
+                # CI red — clear pr_url so a re-dispatched worker's
+                # new PR (different branch / different number) becomes
+                # the next poll target. Without clear_pr_url, the
+                # stale failed PR URL stays attached and reconcile
+                # in the next cycle re-polls the dead PR forever
+                # (codex iter-3 [P2]).
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="todo", clear_worker=True,
+                    clear_pr_url=True,
                     note=f"CI red {t.pr_url}",
                     raised_to_user=True,
                     raise_text=f"CI red for {t.slug}",
@@ -491,6 +692,10 @@ def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> 
     """
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
+    if action.clear_pr_url:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "pr_url="])
+    if action.set_pr_url:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
     if action.clear_worker:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
@@ -761,17 +966,28 @@ def _priority_sort_key(t: parse.Task) -> tuple[int, str]:
 
 
 def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> None:
-    """Mark a task in-progress + record worker_pid via the fleet CLI.
+    """Mark a task in-progress + pre-seed workers/<slug>/state.json so
+    reconcile recognizes the dispatched worker as alive on its first
+    pass.
 
     The agent ID is an 8-hex Fleet agent record key, not an OS PID;
     storing it on the task block requires a future schema bump (the
     in-flight `worker_pid` field on tasks.md still expects an OS PID
-    per ENG §3.1 because the v0.2 design pivoted workers from "Fleet
-    agents" to "claude --print subprocesses with state.json"). For the
-    skill side, we write the agent_id as a NOTE so the operator can
-    correlate the agent row with the task. Future Phase D / v0.2.x
-    can either add a `worker_id` field or have the worker subprocess
-    write its OS PID to state.json on launch.
+    per ENG §3.1). v0.2 dispatches workers via `fleet dispatch` (tmux
+    + interactive Claude session); the worker drives the TDD pipeline
+    itself and publishes progress via `fleet workers update`, which
+    writes workers/<slug>/state.json. For the skill side, we write
+    the agent_id as a NOTE so the operator can correlate the agent
+    row with the task.
+
+    Codex full-stack iter-1 + iter-2 [P1] regress: the OS pid in
+    tasks.md.worker_pid is unreliable across coordinator ticks (the
+    coord tick is short-lived; setting worker_pid=os.getpid() in this
+    function makes the pid dead by the next tick). Instead, we
+    pre-seed workers/<slug>/state.json with phase=starting before
+    the worker subprocess has done anything; the reconcile loop's
+    state.json freshness check is the canonical liveness signal and
+    survives across ticks correctly.
 
     `--project <project>` is threaded into every mutation so the
     cwd-default project resolution can't misroute writes to a sibling
@@ -779,14 +995,38 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     """
     if action.error:
         return
-    # Order matters for crash-recovery: status flip first (so a crash
-    # between calls leaves the task with the worker actually started),
-    # branch second (so the operator's `fleet tasks show` lines up with
-    # the worker's actual checkout), note last (informational; missing
-    # it is a graceful degradation, not state corruption).
+    # Order matters for crash-recovery + duplicate-dispatch
+    # avoidance:
+    #  1. status flip FIRST. _dispatch_ready filters by
+    #     status=ready, so the moment status flips to in-progress
+    #     the task is no longer a candidate for re-dispatch.
+    #     Codex iter-4 [P1]: an earlier attempt bootstrapped
+    #     state.json before the status flip, which on a partial
+    #     failure (status flip raises) left tasks.md still at
+    #     ready and the worker's tmux session running — the next
+    #     tick re-dispatched the same task and we ran two workers.
+    #  2. branch second (so the operator's `fleet tasks show`
+    #     lines up with the worker's actual checkout).
+    #  3. workers/<slug>/state.json bootstrap third. After the
+    #     status flip is durable, an updated_at-fresh state.json
+    #     anchors reconcile's _is_worker_alive check on the very
+    #     next tick — even if worker_pid is dead by then. A crash
+    #     between status flip + bootstrap leaves reconcile with a
+    #     1-tick window of "alive=False" and falls through to the
+    #     pr_url branch (no PR yet → status=todo + clear_worker)
+    #     which IS a duplicate-dispatch opportunity but only on
+    #     two consecutive crashes, much narrower than the
+    #     bootstrap-first race above.
+    #  4. worker_pid sentinel fourth (legacy field; reconcile no
+    #     longer trusts it across ticks, but `fleet status` still
+    #     renders it).
+    #  5. note last (informational; missing it is a graceful
+    #     degradation, not state corruption).
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
+    _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
 
 

@@ -570,10 +570,19 @@ def test_gh_pr_checks_propagates_view_error(monkeypatch) -> None:
     assert "not found" in res.error
 
 
-def test_apply_dispatch_orders_status_branch_note(
+def test_apply_dispatch_orders_status_branch_state_pid_note(
     fleet_run_recorder,
 ) -> None:
-    """status flip first, branch second, note last — for crash-safety.
+    """status flip FIRST (defeats duplicate-dispatch on partial
+    failure), then branch, state.json bootstrap, worker_pid, note.
+
+    Codex iter-4 [P1] regress: an earlier ordering bootstrapped
+    state.json BEFORE the status flip. If the status flip raised
+    after bootstrap succeeded, tasks.md still said "ready" and the
+    next tick's _dispatch_ready picked the task up again — running
+    a second tmux session for the same slug. Status-first kills
+    that race because the moment status=in-progress is durable,
+    _dispatch_ready filters the task out.
 
     Every mutation must also pass `--project <project>` so the CLI's
     cwd-default project resolution can't accidentally write to a
@@ -584,16 +593,273 @@ def test_apply_dispatch_orders_status_branch_note(
         slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
     )
     loop._apply_dispatch(action, "fleet-proj", "fleet")
-    # Three calls in order.
-    assert len(fleet_run_recorder) == 3
+    # Five calls in order: status, branch, workers update bootstrap,
+    # worker_pid, note.
+    assert len(fleet_run_recorder) == 5
     assert "status=in-progress" in fleet_run_recorder[0]
     assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
     assert "branch=" in fleet_run_recorder[1][-1]
-    assert fleet_run_recorder[2][1:3] == ["tasks", "note"]
+    assert fleet_run_recorder[2][1:3] == ["workers", "update"]
+    assert "--phase" in fleet_run_recorder[2]
+    assert "starting" in fleet_run_recorder[2]
+    assert fleet_run_recorder[3][1:3] == ["tasks", "set"]
+    assert fleet_run_recorder[3][-1].startswith("worker_pid=")
+    # The PID written must be the live coord's PID — non-zero, not
+    # the agent_id's hex value, not 0. Tested via parse-back.
+    pid_str = fleet_run_recorder[3][-1].split("=", 1)[1]
+    assert int(pid_str) > 0, f"worker_pid must be live PID, got {pid_str!r}"
+    assert fleet_run_recorder[4][1:3] == ["tasks", "note"]
     # Every call carries --project to defeat cwd-default drift.
     for call in fleet_run_recorder:
         assert "--project" in call, f"missing --project in {call}"
         assert "fleet-proj" in call, f"wrong project in {call}"
+
+
+def test_is_worker_alive_reads_state_json_freshness(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """Codex full-stack [P1] regress: a worker whose tasks.md worker_pid
+    is dead but whose state.json was just updated must still count as
+    alive — otherwise every coord-dispatched task gets requeued before
+    the worker can finish even one phase.
+
+    The fix: _is_worker_alive falls through to _worker_state_fresh,
+    which checks workers/<slug>/state.json. Fresh updated_at →
+    presumed alive; stale or terminal phase → presumed dead.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "alpha-1234"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "alpha-1234", "project": project,
+        "phase": "tdd-red", "updated_at": fresh,
+    }), encoding="utf-8")
+
+    t = _make_task("alpha-1234", status="in-progress", worker_pid=99999)
+    # PID 99999 is dead in this test env, but state.json is fresh →
+    # _is_worker_alive returns True via the state.json fallback.
+    with patch.object(loop, "_pid_alive", return_value=False):
+        assert loop._is_worker_alive(t, project) is True
+
+
+def test_is_worker_alive_treats_stale_state_json_as_dead(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """Stale state.json (last update > _WORKER_STATE_FRESH_S ago) does
+    NOT count as alive — the worker has wedged or crashed silently."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "alpha-9999"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+
+    stale = _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "alpha-9999", "project": project,
+        "phase": "tdd-red", "updated_at": stale,
+    }), encoding="utf-8")
+
+    t = _make_task("alpha-9999", status="in-progress", worker_pid=99999)
+    with patch.object(loop, "_pid_alive", return_value=False):
+        assert loop._is_worker_alive(t, project) is False
+
+
+def test_reconcile_phase_done_with_state_pr_url_flips_to_in_review(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Codex full-stack iter-2 [P1] regress: a worker that finishes
+    cleanly via `fleet workers update --phase done --pr-url X` and
+    exits would otherwise get classified as "died without PR" by
+    reconcile (because tasks.md.pr_url is empty until reconcile
+    transcribes it). The fix: reconcile reads state.json's terminal
+    phase + pr_url and flips status to in-review with the URL set."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "shipper-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "shipper-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/7",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipper-aaaa", status="in-progress",
+            worker_pid=99999, pr_url="",
+        ),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    assert any("status=in-review" in c for c in set_calls)
+    assert any(
+        "pr_url=https://github.com/x/y/pull/7" in c[-1]
+        for c in set_calls
+    ), f"pr_url not transcribed onto tasks.md: {set_calls}"
+
+
+def test_reconcile_in_review_does_not_re_apply_terminal_phase(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Codex iter-3 [P1] regress: a stale state.json with phase=done
+    must NOT keep re-flipping a task already at status=in-review back
+    to in-review every tick. The terminal-phase branch is gated to
+    status=in-progress so subsequent ticks (already in-review) drive
+    the gh pr checks → done lifecycle instead of short-circuiting it.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "settled-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "settled-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/9",
+    }), encoding="utf-8")
+
+    # Task is ALREADY in-review with the PR URL set; CI says merged.
+    _write_tasks(project_dir, [
+        _make_task(
+            "settled-aaaa", status="in-review",
+            worker_pid=99999, pr_url="https://github.com/x/y/pull/9",
+        ),
+    ])
+    merged = loop._CIResult(all_green=True, merged=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=merged):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # The CI-driven done flip must run; the terminal-state branch
+    # must NOT have fired (which would have re-flipped to in-review).
+    assert any("status=done" in c for c in set_calls), (
+        f"merged PR should advance to done, calls: {set_calls}"
+    )
+    assert not any("status=in-review" in c for c in set_calls), (
+        f"in-review task should not re-flip to in-review, calls: {set_calls}"
+    )
+
+
+def test_reconcile_ci_red_clears_pr_url_for_retry(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Codex iter-3 [P2] regress: when CI is red and the task gets
+    requeued for retry, the stale pr_url must be cleared so the
+    re-dispatched worker's NEW PR becomes the next reconcile target.
+    Without this, every subsequent tick re-polls the dead failed PR
+    forever."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "redci-aaaa", status="in-review",
+            worker_pid=1, pr_url="https://github.com/x/y/pull/3",
+        ),
+    ])
+    failed = loop._CIResult(failed=True, mergeable=True)
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=failed):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # Both status=todo AND pr_url= (clear) must fire.
+    assert any("status=todo" in c for c in set_calls)
+    assert any(
+        c[-1] == "pr_url=" for c in set_calls
+    ), f"CI-red retry must clear pr_url, calls: {set_calls}"
+
+
+def test_reconcile_phase_blocked_with_reason_flips_to_blocked(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """phase=blocked + blocked_reason in state.json → reconcile flips
+    status to blocked + raises to operator. Without this, a stuck
+    worker that exited gets requeued to todo silently."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "stuck-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "stuck-aaaa", "project": project,
+        "phase": "blocked", "updated_at": fresh,
+        "blocked_reason": "API key missing",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("stuck-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.reconciled == 1
+    assert result.raised == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    assert any("status=blocked" in c for c in set_calls)
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    assert any("API key missing" in c[-1] for c in note_calls)
+
+
+def test_is_worker_alive_terminal_phase_is_not_alive(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """phase=done|blocked|failed always counts as not-alive even if
+    updated_at is fresh — terminal phases mean the worker is gone."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    for phase in ("done", "blocked", "failed"):
+        slug = f"term-{phase}-aaaa"
+        workers_dir = fleet_home / "projects" / project / "workers" / slug
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+            "+00:00", "Z",
+        )
+        (workers_dir / "state.json").write_text(json.dumps({
+            "slug": slug, "project": project,
+            "phase": phase, "updated_at": fresh,
+        }), encoding="utf-8")
+        t = _make_task(slug, status="in-progress", worker_pid=99999)
+        with patch.object(loop, "_pid_alive", return_value=False):
+            assert loop._is_worker_alive(t, project) is False, phase
 
 
 def test_parse_sentinel_known_kinds() -> None:
