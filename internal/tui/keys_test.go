@@ -29,6 +29,12 @@ func keyMsg(s string) tea.KeyMsg {
 
 func makeModelWithAgents(records ...*agent.Record) Model {
 	m := New("test")
+	// v0.2 default startup view is the dashboard; record-scoped action
+	// tests target the agents view because that's where the cursor is
+	// visible and [h]/[x]/[a] operate. The dashboard-gating behavior
+	// (flash hint instead of action) gets its own coverage in
+	// TestKey_RecordActionsGatedInDashboardView.
+	m.view = viewAgents
 	m.records = records
 	return m
 }
@@ -530,6 +536,47 @@ func TestKey_NavStillWorksAfterActionWiring(t *testing.T) {
 	mm, _ = mm.Update(keyMsg("G"))
 	if mm.(Model).cursor != 2 {
 		t.Errorf("G failed: cursor=%d", mm.(Model).cursor)
+	}
+}
+
+// TestKey_RecordActionsGatedInDashboardView regresses the codex P1
+// finding: with the v0.2 default dashboard startup view, [h]/[x]/[a]
+// operate on m.records[m.cursor] but the dashboard does not render
+// that selection. Without a gate, [j]/[k] can move a hidden cursor and
+// the next action attaches/handoffs/archives the wrong agent. The
+// gate flashes a hint and refuses to act until the operator switches
+// to the agents view via [g].
+func TestKey_RecordActionsGatedInDashboardView(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	for _, key := range []string{"h", "x", "a"} {
+		m := New("test")
+		m.records = []*agent.Record{sampleAgent("agent01"), sampleAgent("agent02")}
+		// Move hidden cursor — proves the bug surface that the gate
+		// closes: [j] in dashboard moves m.cursor with no visible
+		// indication, then [h]/[x]/[a] would have fired on the wrong
+		// agent.
+		m.cursor = 1
+
+		updated, cmd := m.Update(keyMsg(key))
+		mm := updated.(Model)
+
+		if cmd != nil {
+			t.Errorf("[%s] in dashboard view returned a cmd; expected nil (action gated)", key)
+		}
+		if mm.mode != modeNav {
+			t.Errorf("[%s] in dashboard view changed mode to %v; expected modeNav (action gated)", key, mm.mode)
+		}
+		if mm.flash == nil || !mm.flash.isErr {
+			t.Errorf("[%s] in dashboard view did not set an error flash; got %+v", key, mm.flash)
+		}
+		if mm.flash != nil && !strings.Contains(mm.flash.text, "[g]") {
+			t.Errorf("[%s] flash should hint to press [g], got: %q", key, mm.flash.text)
+		}
+		if len(stub.calls) != 0 {
+			t.Errorf("[%s] in dashboard view shelled out (calls=%v); expected zero", key, stub.calls)
+		}
 	}
 }
 

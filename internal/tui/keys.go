@@ -126,6 +126,22 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	if m.mode == modeConfirmArchive {
 		return m.handleConfirmArchiveKey(key)
 	}
+	// Record-scoped actions ([h]/[x]/[a]) operate on m.records[m.cursor],
+	// but the dashboard view does not render that selection. Without a
+	// gate, [j]/[k] move a hidden cursor and the next action could
+	// attach/handoff/archive the wrong agent. Require an explicit switch
+	// to the agents view first via [g] — keeps the action contract
+	// unchanged and makes the target visible before any destructive op.
+	if m.view == viewDashboard {
+		switch key {
+		case "h", "x", "a":
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("[%s] needs the agents view — press [g] to switch, then retry", key),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+	}
 	switch key {
 	case "h":
 		if cur := m.selectedRecord(); cur != nil {

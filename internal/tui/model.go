@@ -462,13 +462,49 @@ func (m Model) View() string {
 		// dispatch, confirm) fall back to the agents-style footer
 		// because the prompts target single-agent operations and don't
 		// fit the 2-col layout.
-		top := renderDashboard(m)
+		//
+		// Banners (upgrade nudge, agent-load error, flash) are prepended
+		// so dispatch/handoff/rm failure output and load errors stay
+		// visible in dashboard mode — operators on the default view must
+		// still see when commands fail or records are malformed without
+		// having to flip to the legacy agents view.
+		top := m.renderDashboardBanners() + renderDashboard(m)
 		footer := m.renderFooter()
 		return padToBottom(top, footer, m.height, m.width)
 	}
 	top := m.renderTop()
 	footer := m.renderFooter()
 	return padToBottom(top, footer, m.height, m.width)
+}
+
+// renderDashboardBanners renders the upgrade banner, agent-load error,
+// and active flash above the dashboard body. Returns "" when nothing is
+// active so the dashboard layout is not shifted by an empty row. Mirrors
+// the renderTop banner ordering so dashboard and agents views read the
+// same: upgrade banner first (lowest urgency), error second, flash last
+// (highest urgency, most ephemeral).
+func (m Model) renderDashboardBanners() string {
+	if m.upgradeBanner == "" && m.err == nil && m.flash == nil {
+		return ""
+	}
+	var b strings.Builder
+	if m.upgradeBanner != "" {
+		b.WriteString(upgradeBannerStyle.Render(m.upgradeBanner))
+		b.WriteString("\n")
+	}
+	if m.err != nil {
+		b.WriteString(errStyle.Render(fmt.Sprintf("error reading agents: %v", m.err)))
+		b.WriteString("\n")
+	}
+	if m.flash != nil {
+		style := dimStyle
+		if m.flash.isErr {
+			style = errStyle
+		}
+		b.WriteString(style.Render(m.flash.text))
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // renderTop returns everything above the footer: title block,

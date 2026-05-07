@@ -2,6 +2,7 @@ package tui
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -478,6 +479,42 @@ func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	out := m.View()
 	if !strings.Contains(out, "no projects yet") {
 		t.Errorf("empty dashboard should hint at fleet tasks add, got:\n%s", out)
+	}
+}
+
+// TestView_DashboardSurfacesBanners regresses the codex P1: in the v0.2
+// default dashboard view, View() bypassed renderTop(), so flash, agent
+// load errors, and the upgrade banner went unrendered. Operators on
+// the default view stopped seeing dispatch/handoff/rm failures and
+// upgrade nudges entirely.
+func TestView_DashboardSurfacesBanners(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 120
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+
+	// Upgrade banner should render in dashboard mode.
+	m.upgradeBanner = "v9.9.9 — brew upgrade fleet"
+	out := m.View()
+	if !strings.Contains(out, "v9.9.9") {
+		t.Errorf("dashboard view should render upgradeBanner, got:\n%s", out)
+	}
+
+	// Error flash from a failed dispatch must show.
+	m.flash = &flashMsg{text: "dispatch failed: boom", isErr: true}
+	out = m.View()
+	if !strings.Contains(out, "dispatch failed: boom") {
+		t.Errorf("dashboard view should render flash, got:\n%s", out)
+	}
+
+	// Agent-load error must show.
+	m.flash = nil
+	m.upgradeBanner = ""
+	m.err = errors.New("read failed")
+	out = m.View()
+	if !strings.Contains(out, "read failed") {
+		t.Errorf("dashboard view should render agent-load err, got:\n%s", out)
 	}
 }
 
