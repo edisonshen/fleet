@@ -120,9 +120,24 @@ func startWatcher(prog *tea.Program) (func(), error) {
 	}
 	agentsDir := filepath.Join(root, "agents")
 	queueDir := filepath.Join(root, "queue")
+	projectsDir := filepath.Join(root, "projects")
 	if err := w.Add(agentsDir); err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("watch %s: %w", agentsDir, err)
+	}
+	// projects/ holds per-project coord state for the v0.2 Variant A
+	// dashboard. Top-level watch only — catches new project dirs being
+	// created; per-project file changes ride on the 1s polling tick.
+	// Recursive watching every workers/<slug>/ + tasks.md would explode
+	// the watcher count on a multi-project setup; the dashboard scan is
+	// cheap (single-digit ms) and the tick cadence is fine for an ops
+	// console. Missing dir is non-fatal: Bootstrap creates it, but a
+	// fresh install before the first dispatch leaves it absent.
+	projectsWatched := true
+	if err := w.Add(projectsDir); err != nil {
+		projectsWatched = false
+		// Quietly fall back to polling; this is expected on fresh
+		// installs and not worth a stderr line.
 	}
 	// queue/ may not exist yet on a fresh install — Bootstrap creates
 	// it, but defend against an environment where the operator deleted
@@ -163,6 +178,12 @@ func startWatcher(prog *tea.Program) (func(), error) {
 						continue
 					}
 					prog.Send(queueEventMsg{})
+				case dir == projectsDir && projectsWatched:
+					// New project dir created — refresh the dashboard
+					// snapshot. Per-project file changes fall through
+					// to the 1s polling tick (see tickMsg in
+					// model.go).
+					prog.Send(fsEventMsg{})
 				}
 			case _, ok := <-w.Errors:
 				if !ok {

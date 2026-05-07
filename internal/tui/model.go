@@ -60,6 +60,17 @@ var upgradeNudgeFn = version.Nudge
 // refresh. var so tests can stub the network call out entirely.
 var upgradeStartFn = version.Start
 
+// viewMode picks between the v0.2 Variant A "Ops Console" dashboard
+// (default) and the v0.1 single-pane agent list. Operator toggles via
+// `g` / `G` (g switches to the agents fleet-guard view; pressing `g`
+// again returns to the dashboard).
+type viewMode int
+
+const (
+	viewDashboard viewMode = iota // Variant A 2-column ops console
+	viewAgents                    // legacy fleet-guard agent list
+)
+
 // Model is the bubbletea state for the dashboard.
 type Model struct {
 	records []*agent.Record
@@ -67,6 +78,22 @@ type Model struct {
 	err     error
 	width   int
 	height  int
+
+	// view selects which top-level layout to render. v0.2 ships with
+	// the dashboard as default; the agents-list view stays accessible
+	// via [g] for fleet-guard inspection.
+	view viewMode
+
+	// dashboard is the most recent v0.2 ops-console snapshot. Loaded
+	// asynchronously by loadDashboardCmd; nil until the first load
+	// lands. Render path is nil-safe so the first frame just shows
+	// empty columns.
+	dashboard *Snapshot
+
+	// startedAt is captured at New() time for the dashboard footer's
+	// "uptime HH:MM" indicator. Tests inject via Model.startedAt
+	// directly; a zero value means "show 00:00" rather than crash.
+	startedAt time.Time
 
 	// version is shown in the title bar. Caller injects from
 	// cmd/fleet/main.go's ldflags-overridable Version.
@@ -138,7 +165,12 @@ func (m Model) PendingAttach() string { return m.pendingAttach }
 
 // New returns a Model ready to be passed to tea.NewProgram.
 func New(version string) Model {
-	return Model{version: version, userName: currentUserName()}
+	return Model{
+		version:   version,
+		userName:  currentUserName(),
+		view:      viewDashboard,
+		startedAt: time.Now(),
+	}
 }
 
 // currentUserName resolves the operator's username for the title row.
@@ -162,7 +194,7 @@ func currentUserName() string {
 // about a newer release. Both happen async to keep render
 // non-blocking — see the cmd's docstring.
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadAgentsCmd(), tickCmd(), versionCheckCmd(m.version))
+	return tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd(), versionCheckCmd(m.version))
 }
 
 // agentsMsg carries a refreshed list of agent records (or an error)
@@ -293,14 +325,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tickMsg:
-		// Polling fallback: re-read agents/ every pollInterval, then
-		// schedule the next tick.
-		return m, tea.Batch(loadAgentsCmd(), tickCmd())
+		// Polling fallback: re-read agents/ AND the v0.2 dashboard
+		// snapshot every pollInterval, then schedule the next tick.
+		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd())
 
 	case fsEventMsg:
-		// fsnotify saw a change — refresh agents now (don't wait for
-		// the next tick).
-		return m, loadAgentsCmd()
+		// fsnotify saw a change — refresh agents AND the dashboard
+		// snapshot now (don't wait for the next tick). Dashboard scan
+		// is cheap (a handful of stat + small JSON reads) so we don't
+		// gate on which subtree fired the event.
+		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd())
+
+	case dashboardMsg:
+		m.dashboard = msg.snap
+		return m, nil
 
 	case queueEventMsg:
 		// fsnotify saw a queue file land — auto-drain. Drain itself is
@@ -387,7 +425,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor--
 		}
 	case "g":
-		m.cursor = 0
+		// v0.2: g toggles between the Variant A dashboard (default
+		// startup view) and the v0.1 agents list. The legacy
+		// "g jumps to top" semantic is dropped — G still jumps to
+		// bottom of the agents list, and `gg`-style top-jump can
+		// return as a P2 polish if dogfooding asks for it.
+		if m.view == viewDashboard {
+			m.view = viewAgents
+		} else {
+			m.view = viewDashboard
+		}
 	case "G":
 		if len(m.records) > 0 {
 			m.cursor = len(m.records) - 1
@@ -410,6 +457,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // so the footer pins to the bottom of the terminal regardless of
 // agent count. m.height comes from tea.WindowSizeMsg.
 func (m Model) View() string {
+	if m.view == viewDashboard && m.mode == modeNav {
+		// v0.2 default: Variant A "Ops Console". Modal prompts (picker,
+		// dispatch, confirm) fall back to the agents-style footer
+		// because the prompts target single-agent operations and don't
+		// fit the 2-col layout.
+		top := renderDashboard(m)
+		footer := m.renderFooter()
+		return padToBottom(top, footer, m.height, m.width)
+	}
 	top := m.renderTop()
 	footer := m.renderFooter()
 	return padToBottom(top, footer, m.height, m.width)
@@ -486,7 +542,26 @@ func (m Model) renderTop() string {
 // prompt (picker / dispatch / confirm) or the smart footer (divider +
 // summary + chip row). Always opens with a divider line so the
 // footer reads as its own section pinned to the terminal bottom.
+//
+// When the model is rendering the v0.2 Variant A dashboard view AND
+// no modal prompt is active, we substitute the dashboard's keybind
+// strip (mockup-aligned) so the row reads as part of the ops console
+// instead of the v0.1 chip layout. Modal prompts (picker, dispatch,
+// confirm-archive) keep the v0.1 footer because the prompts are still
+// agent-centric in v0.2.
 func (m Model) renderFooter() string {
+	if m.view == viewDashboard && m.mode == modeNav {
+		usable := m.width - 1
+		if usable < 60 {
+			usable = 60
+		}
+		var b strings.Builder
+		b.WriteString(dividerStyle.Render(divider(m.width, 0)))
+		b.WriteString("\n")
+		b.WriteString(renderDashboardFooter(time.Since(m.startedAt), usable))
+		b.WriteString("\n")
+		return b.String()
+	}
 	var b strings.Builder
 	b.WriteString(dividerStyle.Render(divider(m.width, 0)))
 	b.WriteString("\n")
