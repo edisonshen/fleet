@@ -121,6 +121,48 @@ func TestWorkersPrune_BadDuration(t *testing.T) {
 	}
 }
 
+// TestWorkersWorktreePath_PrintsCanonicalPath — the cap > 1 dispatch
+// resolver. Coordinator skill calls `fleet workers worktree-path
+// --project <p> <slug>` and uses stdout verbatim as the second arg to
+// `git worktree add`. Smoke test that we emit the expected layout
+// (~/.fleet/projects/<p>/worktrees/<slug>) without creating the dir.
+func TestWorkersWorktreePath_PrintsCanonicalPath(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+	out := &bytes.Buffer{}
+	cmd := newWorkersWorktreePathCmd()
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"--project", project, "alpha-1234"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("worktree-path: %v\n%s", err, out.String())
+	}
+	want := filepath.Join(fleetHome, "projects", project, "worktrees", "alpha-1234")
+	got := strings.TrimSpace(out.String())
+	// state.WorktreePath returns a trailing-slash; tolerate either form.
+	if !strings.HasPrefix(got, want) {
+		t.Errorf("worktree-path emitted %q, want prefix %q", got, want)
+	}
+	// Path-only resolver must NOT create the dir.
+	if _, err := os.Stat(filepath.Join(fleetHome, "projects", project, "worktrees")); !os.IsNotExist(err) {
+		t.Errorf("worktree-path created the directory tree (should be path-only): %v", err)
+	}
+}
+
+// TestWorkersWorktreePath_RejectsEmptySlug — basic argv guard.
+func TestWorkersWorktreePath_RejectsEmptySlug(t *testing.T) {
+	_, project := setupTasksHome(t)
+	out := &bytes.Buffer{}
+	cmd := newWorkersWorktreePathCmd()
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	// cobra eats the empty string before us, but a single whitespace
+	// arg slips through as a positional — we reject explicitly.
+	cmd.SetArgs([]string{"--project", project, "   "})
+	if err := cmd.Execute(); err == nil {
+		t.Errorf("expected error on whitespace-only slug, got nil; out=%q", out.String())
+	}
+}
+
 // TestWorkersUpdate_SetsPhase_NoExplicitPid — happy path without
 // --pid: state.json materializes with phase set, but pid stays at
 // the previous value (0 for a fresh bootstrap). Codex iter-4 [P1]
