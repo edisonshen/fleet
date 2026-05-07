@@ -41,11 +41,17 @@ from typing import Iterable
 import conflict
 import dispatch as dispatch_mod
 import parse
+import worktree as worktree_mod
 
 
 # Defaults tuned for the v0.2 single-worker mode (PLAN §"Coordinator
-# skill"). cap=1 serializes everything; tests exercise cap > 1.
+# skill"). cap=1 serializes everything; cap > 1 enables worktree-mode
+# parallel dispatch (one git worktree per worker; v0.2.x).
 DEFAULT_CAP = 1
+# Filename under projects/<name>/ holding the per-project parallelism
+# config. Schema: {"parallelism": <int>}. Missing or unparseable file →
+# DEFAULT_CAP. Single tunable for now — v0.3 may grow more knobs.
+COORD_CONFIG_FILE = "coord-config.json"
 # Hard cap on archive files scanned per tick — prevents a runaway tick
 # when the inbox archive grows unbounded across coord crashes. Files
 # beyond this just wait for the next tick.
@@ -127,6 +133,14 @@ def tick(
         result.skipped = True
         result.reason = "lock-busy"
         return result
+    # Load per-project parallelism config (cap>1 → worktree mode).
+    # Caller-provided cap overrides only when it differs from
+    # DEFAULT_CAP — that way tests can pin cap=2 explicitly while
+    # production deployments rely on the on-disk config.
+    if cap == DEFAULT_CAP:
+        configured = _load_parallelism(project_dir)
+        if configured > 0:
+            cap = configured
     try:
         return _tick_locked(
             result, project, project_dir, coord_id, cwd, cap,
@@ -168,9 +182,16 @@ def _tick_locked(
 
     # 3. Reconcile in-flight workers.
     reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
+    pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
+    reconcile_repo = cwd if cap > 1 else ""
+    reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
     for action in reconciled:
         try:
-            _apply_reconcile(action, project, fleet_bin)
+            _apply_reconcile(
+                action, project, fleet_bin,
+                repo=reconcile_repo,
+                tasks_by_slug=reconcile_tasks_by_slug,
+            )
             result.reconciled += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -180,15 +201,26 @@ def _tick_locked(
     # 4. Drain inbox archive sentinels.
     state_path = project_dir / "coord-state.json"
     state = _load_coord_state(state_path)
+    tasks_by_slug = {t.slug: t for t in f.tasks}
     drained, last_seen = _drain_archive(
         home / "inbox" / "archive",
         coord_id=coord_id,
         since=state.get("last_archive_scan_ts", ""),
-        tasks_by_slug={t.slug: t for t in f.tasks},
+        tasks_by_slug=tasks_by_slug,
     )
+    # Worktree cleanup needs a base repo + the pre-mutation snapshot of
+    # tasks.md (so we can read t.worktree before the sentinel clears
+    # it). Single-worker mode keeps tasks_by_slug empty so the cleanup
+    # path is a no-op — preserving v0.2.0 byte-identical behavior.
+    sentinel_repo = cwd if cap > 1 else ""
+    sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
     for action in drained:
         try:
-            _apply_sentinel(action, project, fleet_bin)
+            _apply_sentinel(
+                action, project, fleet_bin,
+                repo=sentinel_repo,
+                tasks_by_slug=sentinel_tasks_by_slug,
+            )
             result.drained += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -270,6 +302,35 @@ def _load_coord_state(path: Path) -> dict:
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     return {}
+
+
+def _load_parallelism(project_dir: Path) -> int:
+    """Read coord-config.json's `parallelism` field. Defaults to 0
+    (caller falls through to DEFAULT_CAP).
+
+    Schema: `{"parallelism": <int>}`. Out-of-range values (<1 or >50)
+    are clamped to the legal window — coord misconfig should never
+    crash the tick. v0.2.x ships parallelism only; future fields will
+    live alongside without breaking the loader.
+    """
+    cfg_path = project_dir / COORD_CONFIG_FILE
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    raw = data.get("parallelism")
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        return 0
+    # Clamp to 1..50; >50 is operator error (50 concurrent workers
+    # would saturate fsnotify + tmux long before disk fills).
+    if raw < 1:
+        return 0
+    if raw > 50:
+        return 50
+    return raw
 
 
 def _save_coord_state(path: Path, state: dict) -> None:
@@ -679,7 +740,14 @@ def _gh_run_json(cmd: list[str], *, timeout_s: float):
         return None, f"json decode: {exc}"
 
 
-def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> None:
+def _apply_reconcile(
+    action: _ReconcileAction,
+    project: str,
+    fleet_bin: str,
+    *,
+    repo: str = "",
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+) -> None:
     """Apply an _ReconcileAction via the fleet CLI.
 
     Each `fleet tasks` invocation passes `--project <project>` explicitly
@@ -689,6 +757,12 @@ def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> 
     own project name would mutate a sibling project's tasks.md — a
     silent corruption that's invisible until the wrong project's task
     list shows surprise edits.
+
+    `repo` + `tasks_by_slug` non-empty in worktree-mode (cap>1): on
+    a terminal transition (status=done from CI-merged, or status=todo
+    after worker died) we remove the per-slug worktree. Same best-
+    effort semantics as the sentinel-side cleanup — failures stay out
+    of the reconcile result.
     """
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
@@ -700,6 +774,14 @@ def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> 
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
         _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, action.note])
+    # Worktree cleanup on terminal transitions (cap>1 only). Done +
+    # todo-without-PR are the two states where the working tree is no
+    # longer needed: the PR is merged (done) or the worker bailed before
+    # opening a PR (todo). Other transitions (in-review, blocked) keep
+    # the worktree because a re-dispatch may want to resume on the same
+    # checkout.
+    if action.new_status in ("done", "todo"):
+        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
     # Note: action.raised_to_user is informational; the operator sees
     # the raise via the agent record's needs_input + the appended note.
     # The skill doesn't fan out a separate inbox message — the next
@@ -817,17 +899,33 @@ def _parse_sentinel(line: str) -> _SentinelAction | None:
     return None
 
 
-def _apply_sentinel(action: _SentinelAction, project: str, fleet_bin: str) -> None:
+def _apply_sentinel(
+    action: _SentinelAction,
+    project: str,
+    fleet_bin: str,
+    *,
+    repo: str = "",
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+) -> None:
     """Apply a parsed sentinel via the fleet CLI.
 
     `--project <project>` is threaded into every mutation so a coord
     whose cwd resolves to a different sanitized name than its project
     can't accidentally mutate a sibling project's tasks.md (see
     _apply_reconcile docstring for the failure mode).
+
+    `repo` + `tasks_by_slug` arrive non-empty in worktree-mode (cap>1):
+    on TASK_DONE_PR the worker's worktree is removed (the branch
+    lives on, but the working tree under
+    ~/.fleet/projects/<p>/worktrees/<slug>/ is no longer needed since
+    the PR is open). WORKER_FAILED also clears the worktree because the
+    next dispatch creates a fresh one. Both are best-effort — failures
+    log to stderr but don't roll back the tasks.md mutation.
     """
     if action.kind == "task_done_pr":
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.payload}"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-review"])
+        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
     elif action.kind == "blocked_question":
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=blocked"])
         if action.payload:
@@ -837,11 +935,53 @@ def _apply_sentinel(action: _SentinelAction, project: str, fleet_bin: str) -> No
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
+        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
         # was the wake; dispatch_ready in the same tick will pick up
         # the new task if it's ready.
         return
+
+
+def _maybe_remove_worktree(
+    slug: str,
+    repo: str,
+    tasks_by_slug: dict[str, parse.Task] | None,
+    fleet_bin: str,
+    project: str,
+) -> None:
+    """Best-effort `git worktree remove` for the named slug.
+
+    No-op when:
+      - tasks_by_slug is None (single-worker tick),
+      - the task block has no worktree path set (cap=1 mode),
+      - repo is empty (caller didn't supply a base repo).
+
+    Worktree removal failures are logged to stderr but do NOT bubble up.
+    The worktree dir may persist on disk; the operator cleans manually
+    via `git worktree prune`. Aborting the sentinel apply on a cleanup
+    failure would leave tasks.md inconsistent with reality.
+    """
+    if not tasks_by_slug or not repo:
+        return
+    t = tasks_by_slug.get(slug)
+    if t is None or not t.worktree:
+        return
+    res = worktree_mod.remove_worktree(repo, t.worktree)
+    if res.error:
+        # Surface to stderr; the tick result already records the
+        # caller's note. We don't fail the sentinel — the task is
+        # already in-review per the operator's tasks.md.
+        import sys
+        print(f"coord: worktree remove failed for {slug}: {res.error}", file=sys.stderr)
+        return
+    # Clear the worktree field on tasks.md so a re-dispatch (CI red,
+    # operator re-promote) doesn't think the old worktree is still live.
+    try:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worktree="])
+    except Exception:
+        # Non-fatal — same logic as worktree-remove failure.
+        pass
 
 
 # ---------- dispatch ----------
@@ -852,6 +992,9 @@ class _DispatchAction:
     slug: str
     agent_id: str = ""
     branch: str = ""
+    worktree: str = ""  # populated only in cap>1 worktree-mode dispatch;
+                        # empty string means "task ran in repo root, no
+                        # worktree to clean up on terminal".
     error: str = ""
 
 
@@ -868,6 +1011,18 @@ def _dispatch_ready(
     under cap. Returns the actions we successfully (or unsuccessfully)
     started — each action carries its own error so caller can decide
     what to record.
+
+    Worktree-mode (cap > 1): each dispatched worker gets its own git
+    worktree under ~/.fleet/projects/<p>/worktrees/<slug>/, branched
+    `worker/<slug>` off the repo's current HEAD. Worker's cwd is the
+    worktree path (NOT the main repo). A failed worktree create
+    aborts that one dispatch — the loop continues with the next
+    candidate so a stale on-disk worktree doesn't block all of cap.
+
+    Single-worker mode (cap == 1): unchanged from v0.2.0 — every
+    worker uses the project's main repo as its cwd, no worktree, no
+    cleanup. Byte-identical behavior; this is the regression-safe
+    path.
     """
     in_progress = [t for t in tasks if t.status == "in-progress"]
     active = len(in_progress)
@@ -886,17 +1041,47 @@ def _dispatch_ready(
             break
         if conflict.has_conflict(t, in_flight_after_dispatch):
             continue
+        # Worktree mode: cap>1. Resolve canonical path via the Go CLI,
+        # then `git worktree add`. On any failure we record the error
+        # and skip this task — leaving stale state would corrupt the
+        # next tick's view of in-flight tasks.
+        worker_cwd = cwd
+        worker_branch = f"worker/{t.slug}"
+        worker_worktree = ""
+        if cap > 1:
+            wt_path = worktree_mod.compute_worktree_path(
+                project, t.slug, fleet_bin=fleet_bin,
+            )
+            if not wt_path:
+                actions.append(_DispatchAction(
+                    slug=t.slug,
+                    error=f"worktree-path resolution failed for {t.slug}",
+                ))
+                continue
+            wt_result = worktree_mod.create_worktree(
+                cwd, wt_path, worker_branch,
+            )
+            if wt_result.error:
+                actions.append(_DispatchAction(
+                    slug=t.slug, error=wt_result.error,
+                ))
+                continue
+            worker_cwd = wt_result.path
+            worker_worktree = wt_result.path
+
         try:
             prompt = dispatch_mod.build_worker_prompt(
                 t, project=project,
                 standards_md=standards_md,
                 learnings_text=learnings_text,
+                branch=worker_branch,
+                worktree_pre_created=bool(worker_worktree),
             )
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
             continue
         result = dispatch_mod.dispatch_worker(
-            t, project=project, cwd=cwd, fleet_bin=fleet_bin,
+            t, project=project, cwd=worker_cwd, fleet_bin=fleet_bin,
         )
         if result.error:
             actions.append(_DispatchAction(slug=t.slug, error=result.error))
@@ -912,7 +1097,8 @@ def _dispatch_ready(
             ))
             continue
         actions.append(_DispatchAction(
-            slug=t.slug, agent_id=result.agent_id, branch=result.branch,
+            slug=t.slug, agent_id=result.agent_id, branch=worker_branch,
+            worktree=worker_worktree,
         ))
         active += 1
         in_flight_after_dispatch.append(t)
@@ -1025,6 +1211,11 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
+    if action.worktree:
+        # Persist the worktree path so reconcile knows where to clean
+        # up on terminal transition (done/abandoned). Single-worker
+        # mode leaves this empty so existing behavior is unchanged.
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worktree={action.worktree}"])
     _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])

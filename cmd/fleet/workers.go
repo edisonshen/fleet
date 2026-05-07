@@ -35,7 +35,55 @@ For tailing one worker's logs, use ` + "`fleet peek <slug> --logs`" + `.`,
 		newWorkersListCmd(),
 		newWorkersPruneCmd(),
 		newWorkersUpdateCmd(),
+		newWorkersWorktreePathCmd(),
 	)
+	return cmd
+}
+
+// ---------- fleet workers worktree-path ----------
+
+// newWorkersWorktreePathCmd prints the canonical worktree path for one
+// (project, slug) pair and exits 0. It is a thin wrapper over
+// state.WorktreePath; the Python skill (skills/coordinator/worktree.py)
+// shells out to it so Go remains the single source of truth for project
+// tree layout. Plumbing only — no mkdir, no `git worktree add`.
+//
+// Path-only by design: the coord skill calls this to learn WHERE the
+// worktree should live, then issues `git worktree add` itself. v0.2
+// keeps the create / remove primitives in Python because they have to
+// be subprocess-cheap inside the tick loop; Go's job is just to vouch
+// for the path.
+func newWorkersWorktreePathCmd() *cobra.Command {
+	var project string
+	cmd := &cobra.Command{
+		Use:   "worktree-path <slug>",
+		Short: "Print ~/.fleet/projects/<project>/worktrees/<slug>/ for cap>1 dispatch",
+		Long: `worktree-path resolves the canonical worktree directory for one
+(project, slug) pair and prints it to stdout. Used by the coordinator
+skill in cap > 1 mode to bootstrap parallel workers via
+"git -C <repo> worktree add <path> -b worker/<slug>".
+
+This is a path-only resolver — the directory is NOT created. The Python
+caller decides whether to create or remove the worktree on disk.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			slug := strings.TrimSpace(args[0])
+			if slug == "" {
+				return errors.New("slug must be non-empty")
+			}
+			proj, err := resolveProject(project)
+			if err != nil {
+				return err
+			}
+			path, err := state.WorktreePath(proj, slug)
+			if err != nil {
+				return fmt.Errorf("worktree-path: %w", err)
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), path)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "project name (default: cwd basename)")
 	return cmd
 }
 

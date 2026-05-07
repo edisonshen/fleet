@@ -123,6 +123,40 @@ def test_build_worker_prompt_custom_branch_and_workers_dir() -> None:
     assert "State file:  /tmp/custom/state.json" in out
 
 
+def test_build_worker_prompt_worktree_pre_created_skips_branch_create() -> None:
+    """Codex iter-1 [P1] regress: in cap > 1 mode the coord ran
+    `git worktree add -b <branch>` already; the prompt must NOT tell
+    the worker to `git checkout -b <branch>` (it would fatal "branch
+    already exists"). Verify mode."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet",
+        standards_md="# Standards",
+        learnings_text="",
+        branch="worker/alpha-1234",
+        worktree_pre_created=True,
+    )
+    # The branch-create command MUST NOT appear under cap>1 mode.
+    assert "git checkout -b worker/alpha-1234" not in out
+    # The worker is told to verify the prepared worktree branch.
+    assert "git rev-parse --abbrev-ref HEAD" in out
+    assert "worker/alpha-1234" in out
+
+
+def test_build_worker_prompt_default_keeps_branch_create() -> None:
+    """Single-worker mode (the default) MUST emit the original
+    `git checkout -b <branch>` step — worktree-mode is the override,
+    not the new default. Byte-identical regression guard."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet",
+        standards_md="# Standards",
+        learnings_text="",
+    )
+    assert "git checkout -b worker/" in out
+    assert "git rev-parse --abbrev-ref HEAD" not in out
+
+
 # ---------- dispatch_worker subprocess assertions ----------
 
 

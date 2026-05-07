@@ -337,7 +337,7 @@ func TestRunInit_InstallsCoordinatorSkill(t *testing.T) {
 	}
 
 	coordRoot := filepath.Join(claudeHome, "skills", "coordinator")
-	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py"} {
+	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py", "worktree.py"} {
 		got := filepath.Join(coordRoot, want)
 		info, err := os.Stat(got)
 		if err != nil {

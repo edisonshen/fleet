@@ -33,7 +33,7 @@ var fleetGuardRaw embed.FS
 // into the binary, and any new skill file requires a deliberate
 // addition here (catches typos that would silently ship a half-skill).
 //
-//go:embed skills/coordinator/SKILL.md skills/coordinator/loop.py skills/coordinator/parse.py skills/coordinator/dispatch.py skills/coordinator/conflict.py
+//go:embed skills/coordinator/SKILL.md skills/coordinator/loop.py skills/coordinator/parse.py skills/coordinator/dispatch.py skills/coordinator/conflict.py skills/coordinator/worktree.py
 var coordinatorRaw embed.FS
 
 // Seed templates rendered into ~/.fleet/ on first init. Currently just

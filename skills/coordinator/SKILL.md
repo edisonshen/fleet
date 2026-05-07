@@ -38,6 +38,20 @@ The skill does NOT need a hook payload — `loop.main` reads `FLEET_PROJECT` (or
 | `~/.fleet/projects/<p>/coord-state.json` | `{"last_archive_scan_ts": "<filename>"}` and 24h rolling counters | tmp + rename + fsync |
 | `~/.fleet/inbox/<worker_id>.md` | freshly built worker prompt for one dispatch | tmp + rename + fsync |
 
+## Files this skill reads (config)
+
+| Path | Content | Default |
+|------|---------|---------|
+| `~/.fleet/projects/<p>/coord-config.json` | `{"parallelism": <int 1..50>}` | `{"parallelism": 1}` (single-worker mode) |
+
+`parallelism > 1` enables worktree-mode dispatch: each worker gets a
+git worktree at `~/.fleet/projects/<p>/worktrees/<slug>/` branched
+`worker/<slug>` off the repo's HEAD. Worker cwd is the worktree, not
+the main repo. Worktrees are removed via `git worktree remove --force`
+when the worker's task transitions to `in-review` (TASK_DONE_PR
+sentinel) or `done` (CI merged via reconcile). The branch lives on so
+the PR stays valid; only the working tree is freed.
+
 The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet tasks set <slug> <key>=<value>` or `fleet tasks note <slug> <text>`, so Go remains the only writer of the per-project task registry. parse.py is read-only inside the skill.
 
 ## Loop algorithm
@@ -73,15 +87,24 @@ The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet
        NEW_TASK=<slug>                → wake-only (no mutation)
    persist last_archive_scan_ts to coord-state.json
 
-5. Dispatch ready tasks under cap (default 1):
+5. Dispatch ready tasks under cap (default 1; coord-config.json overrides):
    active = count(status==in-progress)
    for t in sort_by_priority(tasks where status==ready and deps_satisfied):
      if active >= cap: break
      if conflict.has_conflict(t, in_flight_after_dispatch): continue
-     prompt = build_worker_prompt(t, stds, learn)        # ENG §6.5 layout
-     agent_id = `fleet dispatch <slug> --project <p> --cwd <cwd>`
+     # cap > 1: per-slug git worktree under projects/<p>/worktrees/<slug>
+     if cap > 1:
+       wt = `fleet workers worktree-path --project <p> <slug>`
+       `git -C <repo> worktree add <wt> -b worker/<slug>`
+       worker_cwd = wt
+     else:
+       worker_cwd = repo
+     prompt = build_worker_prompt(t, stds, learn, branch=worker/<slug>)
+     agent_id = `fleet dispatch <slug> --project <p> --cwd <worker_cwd>`
      write_worker_inbox(agent_id, prompt)                # ~/.fleet/inbox/<agent>.md
      `fleet tasks set <slug> status=in-progress`
+     `fleet tasks set <slug> branch=worker/<slug>`
+     `fleet tasks set <slug> worktree=<wt>`               # cap > 1 only
      `fleet tasks note <slug> "dispatched as agent <agent_id>"`
      active += 1
 
