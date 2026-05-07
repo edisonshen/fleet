@@ -323,16 +323,28 @@ func workerRowFor(s *workers.State, project string, now time.Time) *WorkerRow {
 	return row
 }
 
-// shortWorkerID returns the 8-char anchor string the mockup shows in
-// purple (e.g. "91f0a2c4"). Slugs end in a 4-hex suffix per
-// tasks.GenerateSlug; we pull the last 8 hex/alpha chars so two slugs
-// in the same project rarely collide visually. Falls back to the full
-// slug when shorter than 8 chars.
+// shortWorkerID returns the purple anchor string per the mockup. We
+// surface the trailing 4-hex suffix that tasks.GenerateSlug appends
+// (e.g. slug "fix-toolbar-1a2b" → "1a2b"). The mockup illustrates
+// 8-char hex IDs but Fleet slugs only carry a 4-hex disambiguator;
+// 4 chars is enough to scan-distinguish workers in the same project.
+// Slugs that don't end in `-XXXX` (4 hex) fall back to the full slug
+// — covers legacy / hand-edited entries.
 func shortWorkerID(slug string) string {
-	if len(slug) <= 8 {
-		return slug
+	if len(slug) >= 5 && slug[len(slug)-5] == '-' {
+		tail := slug[len(slug)-4:]
+		ok := true
+		for _, c := range tail {
+			if !isHexLower(c) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return tail
+		}
 	}
-	return slug[len(slug)-8:]
+	return slug
 }
 
 // deriveRepoSlug pulls "edisonshen/<name>" from a project's standards.md

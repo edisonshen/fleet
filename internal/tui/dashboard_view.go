@@ -223,8 +223,13 @@ func projectBlockLines(p *ProjectRow, w int) []string {
 		line1 = line1 + strings.Repeat(" ", gap) + attnRight
 	}
 
-	// Line 2: repo slug, dim.
-	line2 := prefix + projectRepoStyle.Render(p.RepoSlug)
+	// Line 2: repo slug, dim. When no standards.md provided a slug we
+	// fall back to the bare project name, which would render twice in
+	// a row. Drop the duplicate to keep the block compact.
+	line2 := prefix
+	if p.RepoSlug != "" && p.RepoSlug != p.Name {
+		line2 += projectRepoStyle.Render(p.RepoSlug)
+	}
 
 	// Line 3: counts + status.
 	counts := renderCountChips(p.Counts)
