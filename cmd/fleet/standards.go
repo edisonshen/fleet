@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -179,6 +180,12 @@ opening nothing).`,
 // runStandardsEdit resolves the target path, seeds a stub if missing,
 // then launches $EDITOR. Stdin/stdout/stderr are wired through so the
 // editor can run interactively even when the CLI's stdout was captured.
+//
+// $EDITOR is split on whitespace so common multi-word values like
+// `code --wait`, `vim -f`, or `emacsclient -nw` work (codex iter-1 P2).
+// We don't run a full POSIX shell parser — quoted/escaped paths in
+// $EDITOR are vanishingly rare, and the simpler split keeps the path
+// predictable.
 func runStandardsEdit(opts *standardsEditOpts, stdout, stderr io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
@@ -197,10 +204,16 @@ func runStandardsEdit(opts *standardsEditOpts, stdout, stderr io.Writer) error {
 	if editor == "" {
 		editor = "vi"
 	}
-	if _, err := exec.LookPath(editor); err != nil {
-		return fmt.Errorf("editor %q not on PATH: %w", editor, err)
+	parts := strings.Fields(editor)
+	if len(parts) == 0 {
+		return fmt.Errorf("editor is empty (set $EDITOR)")
 	}
-	c := exec.Command(editor, path)
+	bin := parts[0]
+	args := append(parts[1:], path)
+	if _, err := exec.LookPath(bin); err != nil {
+		return fmt.Errorf("editor %q not on PATH: %w", bin, err)
+	}
+	c := exec.Command(bin, args...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr

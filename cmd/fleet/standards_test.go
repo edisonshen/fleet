@@ -117,6 +117,24 @@ func TestStandardsEdit_SeedsStubAndInvokesEditor(t *testing.T) {
 	}
 }
 
+// TestStandardsEdit_AcceptsEditorWithArgs — codex iter-1 P2: $EDITOR
+// commonly carries flags like `code --wait` or `vim -f`. The CLI must
+// split on whitespace so the executable name passed to LookPath is
+// just the first token.
+func TestStandardsEdit_AcceptsEditorWithArgs(t *testing.T) {
+	_, project := setupTasksHome(t)
+	out := &bytes.Buffer{}
+	// `true` as the editor; "--placeholder-flag" is consumed by
+	// `true` as a no-op argument so we exercise the splitter.
+	err := runStandardsEdit(&standardsEditOpts{
+		project: project,
+		editor:  "true --placeholder-flag",
+	}, out, &bytes.Buffer{})
+	if err != nil {
+		t.Errorf("editor with args should work: %v", err)
+	}
+}
+
 // TestStandardsEdit_GlobalPath — --global edits ~/.fleet/standards.md,
 // not the per-project file.
 func TestStandardsEdit_GlobalPath(t *testing.T) {

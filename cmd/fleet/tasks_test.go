@@ -319,6 +319,82 @@ func TestResolveProject_RejectsInvalid(t *testing.T) {
 	}
 }
 
+// TestTasksAdd_RejectsUnfencedH2InSpec — codex iter-1 P1 regression:
+// a column-0 `## ` in the spec body would self-corrupt tasks.md
+// (next Read splits the task at the bogus header). Validation must
+// fire on add (not just at parse time).
+func TestTasksAdd_RejectsUnfencedH2InSpec(t *testing.T) {
+	_, project := setupTasksHome(t)
+	err := runTasksAdd(&tasksAddOpts{
+		project:  project,
+		slug:     "h2-test",
+		priority: "P2",
+		spec:     "good line\n\n## evil header inside spec\nmore text",
+		status:   "todo",
+	}, "", &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error on unfenced ## in spec body")
+	}
+}
+
+// TestTasksNote_RejectsReservedH3 — codex iter-1 P1 regression: a
+// reserved `### Acceptance` inside a Notes append would terminate the
+// Notes section on next Read.
+func TestTasksNote_RejectsReservedH3(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "reserved-h3", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	slug := parts[1]
+	err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"},
+		slug, "real note\n\n### Acceptance\nfake follow-up criteria", &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error on reserved ### Acceptance in notes append")
+	}
+}
+
+// TestTasksAdd_RejectsQuotedDeps — codex iter-1 P1: the on-disk parser
+// rejects depends_on entries with quotes (parseDeps), but the writer
+// wouldn't catch them. Validate at the CLI boundary so the file never
+// becomes unreadable.
+func TestTasksAdd_RejectsQuotedDeps(t *testing.T) {
+	_, project := setupTasksHome(t)
+	err := runTasksAdd(&tasksAddOpts{
+		project:   project,
+		slug:      "deps-test",
+		priority:  "P2",
+		spec:      "x",
+		dependsOn: []string{`"foo-1234"`},
+		status:    "todo",
+	}, "", &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error on quoted depends_on entry")
+	}
+}
+
+// TestTasksSet_RejectsQuotedDeps — same rule on the set path.
+func TestTasksSet_RejectsQuotedDeps(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "deps-set-test", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	slug := parts[1]
+	err := runTasksSet(&tasksSetOpts{project: project}, slug, `depends_on=["foo"]`, &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error on quoted depends_on via set")
+	}
+}
+
 // TestTasksAdd_NeedsSlugOrSpec — empty input refuses up front rather
 // than producing an unsalvageable empty task block.
 func TestTasksAdd_NeedsSlugOrSpec(t *testing.T) {

@@ -50,8 +50,9 @@ func TestLearningsAdd_RequiresTag(t *testing.T) {
 	}
 }
 
-// TestLearningsAdd_MultipleTags — extras are folded into the body so
-// the storage primitive (one tag in header) doesn't lose information.
+// TestLearningsAdd_MultipleTags — multiple --tag flags concatenate
+// into the stored Tag with "+" separators so Filter's substring match
+// finds the entry by ANY tag (codex iter-1 P2 fix).
 func TestLearningsAdd_MultipleTags(t *testing.T) {
 	_, project := setupTasksHome(t)
 	if err := runLearningsAdd(&learningsAddOpts{
@@ -64,11 +65,20 @@ func TestLearningsAdd_MultipleTags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if entries[0].Tag != "testing" {
-		t.Errorf("primary tag should be first: %q", entries[0].Tag)
+	for _, want := range []string{"testing", "ci", "flake"} {
+		if !strings.Contains(entries[0].Tag, want) {
+			t.Errorf("stored tag should contain %q: got %q", want, entries[0].Tag)
+		}
 	}
-	if !strings.Contains(entries[0].Body, "additional tags: ci, flake") {
-		t.Errorf("extras not folded into body: %q", entries[0].Body)
+	// Filter must find the entry by any of the tags.
+	for _, q := range []string{"testing", "ci", "flake"} {
+		got, ferr := learnings.Filter(project, q, "", 0)
+		if ferr != nil {
+			t.Fatalf("filter %q: %v", q, ferr)
+		}
+		if len(got) != 1 {
+			t.Errorf("filter --tag=%s should find the entry, got %d", q, len(got))
+		}
 	}
 }
 

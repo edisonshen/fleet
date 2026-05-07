@@ -111,6 +111,69 @@ func existingSlugs(f *tasks.File) []string {
 	return out
 }
 
+// validateSectionBody mirrors the unfenced-header check inside
+// internal/tasks.File.Add (codex iter-1 P1). Operator-supplied bodies
+// must NOT contain column-0 `## ` (would split the task on next read)
+// nor reserved `### Spec|Acceptance|Notes` (would terminate the
+// section). Fenced code blocks are exempt — examples that paste
+// markdown stay quoted.
+//
+// Section name is one of "spec" / "acceptance" / "notes" — used only
+// for the error message.
+func validateSectionBody(section, body string) error {
+	inFence := false
+	for _, ln := range strings.Split(body, "\n") {
+		if isFenceMarker(ln) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if strings.HasPrefix(ln, "## ") {
+			return fmt.Errorf("%s body has unfenced column-0 '## ' (use ### for in-section headings, or wrap in ``` for examples)", section)
+		}
+		if strings.HasPrefix(ln, "### ") {
+			name := strings.TrimSpace(strings.TrimPrefix(ln, "### "))
+			switch name {
+			case "Spec", "Acceptance", "Notes":
+				return fmt.Errorf("%s body contains unfenced reserved heading '### %s' (wrap in ``` for examples)", section, name)
+			}
+		}
+	}
+	return nil
+}
+
+// isFenceMarker mirrors internal/tasks.isFenceMarker — column-0 ```
+// opener/closer with optional language tag, rejecting 4+ backticks.
+func isFenceMarker(line string) bool {
+	if !strings.HasPrefix(line, "```") {
+		return false
+	}
+	rest := line[3:]
+	return !strings.HasPrefix(rest, "`")
+}
+
+// validateDependencySlugs rejects entries the on-disk parser would
+// later refuse (codex iter-1 P1). The internal parser disallows quoted
+// strings and empty entries; the writer does not double-check, so a
+// bogus `depends_on=["foo"]` would silently land on disk and brick the
+// next Read with ErrInvalidTask.
+func validateDependencySlugs(deps []string) error {
+	for _, d := range deps {
+		if d == "" {
+			return fmt.Errorf("depends_on has empty entry")
+		}
+		if strings.ContainsAny(d, `"'`) {
+			return fmt.Errorf("depends_on entry %q must be a bare slug (no quotes)", d)
+		}
+		if err := state.ValidateSlug(d); err != nil {
+			return fmt.Errorf("depends_on entry %q: %w", d, err)
+		}
+	}
+	return nil
+}
+
 // ---------- fleet tasks add ----------
 
 type tasksAddOpts struct {
@@ -184,6 +247,13 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 	if spec == "" && slug == "" {
 		return fmt.Errorf("tasks add: provide a slug, --spec, or a positional spec body")
 	}
+	if err := validateSectionBody("spec", spec); err != nil {
+		return fmt.Errorf("tasks add: %w", err)
+	}
+	deps := nonEmptyStrings(opts.dependsOn)
+	if err := validateDependencySlugs(deps); err != nil {
+		return fmt.Errorf("tasks add: %w", err)
+	}
 
 	now := time.Now().UTC()
 	st := tasks.Status(opts.status)
@@ -200,7 +270,7 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 			Slug:      finalSlug,
 			Status:    st,
 			Priority:  pri,
-			DependsOn: nonEmptyStrings(opts.dependsOn),
+			DependsOn: deps,
 			SpawnedBy: opts.spawnedBy,
 			Spec:      spec,
 			// Acceptance/Notes left empty — operator/worker fills via
@@ -543,7 +613,11 @@ func setTaskField(t *tasks.Task, key, value string) error {
 	case "branch":
 		t.Branch = nullOrValue(value)
 	case "depends_on":
-		t.DependsOn = parseDependsOn(value)
+		deps := parseDependsOn(value)
+		if err := validateDependencySlugs(deps); err != nil {
+			return fmt.Errorf("depends_on: %w", err)
+		}
+		t.DependsOn = deps
 	case "spawned_by":
 		t.SpawnedBy = value
 	case "created", "updated":
@@ -658,6 +732,9 @@ func runTasksNote(opts *tasksNoteOpts, slug, text string, stdout io.Writer) erro
 	}
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("tasks note: text is empty")
+	}
+	if err := validateSectionBody(section, text); err != nil {
+		return fmt.Errorf("tasks note: %w", err)
 	}
 
 	return withTasksLock(project, func() error {

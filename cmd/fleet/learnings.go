@@ -84,19 +84,20 @@ func runLearningsAdd(opts *learningsAddOpts, body string, stdout io.Writer) erro
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("learnings add: body is empty")
 	}
-	// Storage shape carries one tag in the header; extras are merged
-	// into the body as a markdown line so they're searchable but don't
-	// require a schema bump. Keeps the CLI ergonomics ("pass as many
-	// --tag as you want") while leaving internal/learnings unchanged.
-	primary := tags[0]
-	extras := tags[1:]
-	if len(extras) > 0 {
-		body = body + "\n\nadditional tags: " + strings.Join(extras, ", ")
+	// Storage shape carries one Tag string per entry. Multiple --tag
+	// flags are joined with "+" (slug-safe, never appears in a single
+	// tag) so learnings.Filter's substring match still finds the entry
+	// when the operator filters by ANY of the supplied tags (codex
+	// iter-1 P2). Body still notes the full set in human-readable form
+	// so the operator who reads learnings.md sees them spelled out.
+	storedTag := strings.Join(tags, "+")
+	if len(tags) > 1 {
+		body = body + "\n\nadditional tags: " + strings.Join(tags[1:], ", ")
 	}
 	entry := &learnings.Entry{
 		Author:   opts.author,
 		TaskSlug: opts.taskSlug,
-		Tag:      primary,
+		Tag:      storedTag,
 		Body:     body,
 		// Timestamp left zero — Append stamps it with time.Now().UTC()
 		// so two near-simultaneous workers can't pick the same second
@@ -106,7 +107,7 @@ func runLearningsAdd(opts *learningsAddOpts, body string, stdout io.Writer) erro
 		return fmt.Errorf("append: %w", err)
 	}
 	_, _ = fmt.Fprintf(stdout, "appended learning (author=%s tag=%s task=%s)\n",
-		opts.author, primary, defaultStr(opts.taskSlug, "-"))
+		opts.author, storedTag, defaultStr(opts.taskSlug, "-"))
 	return nil
 }
 
