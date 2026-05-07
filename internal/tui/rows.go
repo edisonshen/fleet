@@ -193,7 +193,16 @@ func (m *Model) refreshCursor(prevIdentity string) {
 				return
 			}
 		}
+		// We HAD a previously-selected row identity but it's gone from
+		// the new row list. Reset to the top rather than silently
+		// keeping the same numeric index — the row at that index is a
+		// different entity now, and acting on it via [⏎]/[a]/[h]/[x]
+		// would target the wrong record (codex iter-6 P1).
+		m.dashCursor = 0
+		return
 	}
+	// No previous identity (early renders before the first
+	// agentsMsg/dashboardMsg). Just clamp to range.
 	if m.dashCursor < 0 || m.dashCursor >= len(rows) {
 		m.dashCursor = 0
 	}

@@ -243,8 +243,14 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		}
 	}
 	if !hasWorkers {
-		right = append(right, "",
-			columnHeadingStyle.Render("  no workers running"))
+		// Distinguish "no workers exist" from "filter hides workers"
+		// (codex iter-6 P3): if the unfiltered snapshot still has
+		// workers, the column is just narrowed, not empty.
+		hint := "  no workers running"
+		if m.searchFilter != "" && m.dashboard != nil && len(m.dashboard.Workers) > 0 {
+			hint = fmt.Sprintf("  no workers match /%s — esc clears", m.searchFilter)
+		}
+		right = append(right, "", columnHeadingStyle.Render(hint))
 	}
 	// Insert v0.1 agents sub-heading only when records exist.
 	if len(m.records) > 0 {

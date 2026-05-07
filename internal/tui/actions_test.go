@@ -745,3 +745,59 @@ func TestCursor_StableAcrossAgentsMsgRefresh(t *testing.T) {
 		t.Errorf("cursor should still be on agent b after refresh; got %+v", row)
 	}
 }
+
+// TestCursor_ResetsWhenSelectedRowDisappears regresses codex iter-6
+// P1: when the previously-selected row is removed by a refresh, the
+// cursor must reset to 0 rather than dangle on the same numeric
+// index. With identity-aware refresh, the operator at minimum gets a
+// well-defined "top of the list" landing instead of silent
+// retargeting onto whoever happens to occupy the old slot.
+func TestCursor_ResetsWhenSelectedRowDisappears(t *testing.T) {
+	m := New("test")
+	// fakeRecords spaces records 1 minute apart; sortRecordsBy puts
+	// newest first → after sort the list is [a2, a1, a0]. dashCursor=1
+	// lands on a1.
+	m.records = sortRecords(fakeRecords(3))
+	if m.records[1].ID != "a1" {
+		t.Fatalf("test setup: expected a1 at index 1, got %s", m.records[1].ID)
+	}
+	m.dashCursor = 1
+
+	// Refresh: remove a1. With raw clamping, dashCursor=1 would
+	// silently land on whatever's now at numeric index 1 (the wrong
+	// agent). With identity-aware refresh, dashCursor resets to 0.
+	all := fakeRecords(3)
+	updated, _ := m.Update(agentsMsg{records: []*agent.Record{all[0], all[2]}})
+	got := updated.(Model)
+	if got.dashCursor != 0 {
+		t.Errorf("dashCursor should reset to 0 when selected row disappears; got %d", got.dashCursor)
+	}
+}
+
+// TestView_SearchHidesWorkersShowsMatchHint regresses codex iter-6
+// P3: when a [/] filter hides all workers but the snapshot still has
+// active workers, the right column hint must say "no workers match
+// /<query>" rather than the misleading "no workers running".
+func TestView_SearchHidesWorkersShowsMatchHint(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	seedWorker(t, pdir, "demo", "real-worker-aaaa", workers.State{
+		Phase: workers.PhaseTDDGreen,
+		PID:   1,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+
+	// Apply a filter that doesn't match the worker.
+	m.searchFilter = "zzzz-no-match"
+	out := m.View()
+	if !strings.Contains(out, "no workers match") {
+		t.Errorf("filtered-empty workers should hint about the active filter, got:\n%s", out)
+	}
+	if strings.Contains(out, "no workers running") {
+		t.Errorf("must NOT show the unfiltered 'no workers running' hint when filter is active, got:\n%s", out)
+	}
+}
