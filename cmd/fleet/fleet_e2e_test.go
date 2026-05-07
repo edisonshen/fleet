@@ -38,6 +38,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
 	"github.com/edisonshen/fleet/internal/tui"
@@ -111,7 +112,7 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 
 		// Find the slug we added in scenario 1. There's exactly one
 		// task at this point, so a quick read suffices.
-		dir, err := stateProjectDir(env.project)
+		dir, err := state.ProjectDir(env.project)
 		if err != nil {
 			t.Fatalf("project dir: %v", err)
 		}
@@ -175,7 +176,7 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 	// ---------- Scenario 3: DONE_PR sentinel → drain → in-review ----------
 	t.Run("done_pr_drain_flips_to_in_review", func(t *testing.T) {
 		// Find the slug.
-		dir, err := stateProjectDir(env.project)
+		dir, err := state.ProjectDir(env.project)
 		if err != nil {
 			t.Fatalf("project dir: %v", err)
 		}
@@ -253,7 +254,7 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 	// ---------- Scenario 4: archive → counts decrement ----------
 	t.Run("archive_clears_counts_and_worker", func(t *testing.T) {
 		// Find the slug.
-		dir, err := stateProjectDir(env.project)
+		dir, err := state.ProjectDir(env.project)
 		if err != nil {
 			t.Fatalf("project dir: %v", err)
 		}
@@ -382,19 +383,4 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 			_ = tmux.Kill(rec.TmuxSession)
 		}
 	})
-}
-
-// stateProjectDir is a tiny shim around state.ProjectDir so the test
-// file doesn't need to import internal/state directly. The harness
-// already imports it indirectly via setupCoordIntegration, so adding
-// a duplicate import would noise the file without buying anything.
-func stateProjectDir(project string) (string, error) {
-	// state.ProjectDir is the canonical resolver (~/.fleet/projects/<p>).
-	// We re-derive from FLEET_HOME because the test sets that env and
-	// state.Root() reads it.
-	home := os.Getenv("FLEET_HOME")
-	if home == "" {
-		return "", fmt.Errorf("FLEET_HOME not set")
-	}
-	return filepath.Join(home, "projects", project), nil
 }
