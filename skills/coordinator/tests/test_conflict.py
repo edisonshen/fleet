@@ -129,3 +129,35 @@ def test_extract_paths_handles_quoted_strings() -> None:
     paths = conflict.extract_paths(t)
     assert "a/b.go" in paths
     assert "c/d.go" in paths
+
+
+def test_extract_labeled_paths_only_returns_explicit_declarations() -> None:
+    """`extract_labeled_paths` is the operator-explicit scope contract.
+    Inline mentions in prose are NOT counted as a declaration; only
+    `Files:` / `path:` / `paths:` / `file:` lines.
+    """
+    t = _t(
+        "a-aaaa",
+        spec="Investigate panic in cmd/fleet/main.go.\nFiles: internal/tasks/tasks.go",
+    )
+    # Full extract picks up both (legacy overlap-detection behavior).
+    full = conflict.extract_paths(t)
+    assert "cmd/fleet/main.go" in full
+    assert "internal/tasks/tasks.go" in full
+    # Labeled-only extract returns only the operator-declared scope.
+    labeled = conflict.extract_labeled_paths(t)
+    assert labeled == {"internal/tasks/tasks.go"}
+
+
+def test_extract_labeled_paths_no_declaration_returns_empty() -> None:
+    """A task with inline path mentions but no `Files:` line returns
+    an empty labeled set — used by the loop wrapper to decide the
+    scope is opaque and conservatively skip."""
+    t = _t(
+        "a-aaaa",
+        spec="Touch internal/tasks/tasks.go and cmd/fleet/main.go to fix.",
+    )
+    # extract_paths picks up the inline tokens.
+    assert len(conflict.extract_paths(t)) >= 2
+    # extract_labeled_paths returns empty — no operator declaration.
+    assert conflict.extract_labeled_paths(t) == set()

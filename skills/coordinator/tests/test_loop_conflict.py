@@ -99,6 +99,42 @@ def test_has_conflict_with_inflight_self_slug_skipped() -> None:
     assert loop._has_conflict_with_inflight(candidate, [same]) is False
 
 
+def test_has_conflict_with_inflight_inline_path_is_not_scope_declaration() -> None:
+    """Codex iter-1 [P1] regress: a Spec narrative that *mentions* a
+    file in prose ("Investigate panic in cmd/fleet/main.go") must NOT
+    count as a scope declaration. Without an explicit `Files:` line
+    the candidate is treated as "could touch anything" and is skipped
+    while any worker is in flight — even if the inline-mentioned path
+    happens to be disjoint from the in-flight task's declared scope.
+    """
+    candidate = _ready(
+        "alpha-1234",
+        spec="Investigate panic in cmd/fleet/main.go",
+    )
+    other = _in_progress(
+        "bravo-1234", spec="Files: internal/agent/agent.go",
+    )
+    # `extract_paths` (legacy) would surface `cmd/fleet/main.go` from
+    # the candidate's prose and judge the pair disjoint → optimistic
+    # non-conflict. The wrapper must override that and skip.
+    assert loop._has_conflict_with_inflight(candidate, [other]) is True
+
+
+def test_has_conflict_with_inflight_inline_path_in_inflight_is_not_scope() -> None:
+    """Symmetric: in-flight task with only an inline mention (no Files:
+    line) is opaque, not declared. Candidate skipped even with disjoint
+    declared scope.
+    """
+    candidate = _ready(
+        "alpha-1234", spec="Files: internal/tasks/tasks.go",
+    )
+    other = _in_progress(
+        "bravo-1234",
+        spec="Refactoring loop.py for the auth flow.",
+    )
+    assert loop._has_conflict_with_inflight(candidate, [other]) is True
+
+
 def test_has_conflict_with_inflight_partial_overlap_in_a_set() -> None:
     """One disjoint and one overlapping in-flight → still True."""
     candidate = _ready("alpha-1234", spec="Files: internal/tasks/tasks.go")

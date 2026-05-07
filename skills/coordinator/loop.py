@@ -1115,56 +1115,63 @@ def _has_conflict_with_inflight(
 ) -> bool:
     """Conservative conflict check used by the cap > 1 dispatch loop.
 
-    Layers a "no Files: line → matches anything" rule on top of
-    conflict.has_conflict (which is intentionally optimistic when EITHER
-    side has no extracted paths — same-tick non-conflict). The reason
-    for the override at the loop level: a worker whose task has no
+    Layers a "no labeled Files: line → matches anything" rule on top of
+    conflict.has_conflict (which is intentionally optimistic when either
+    side has no extracted paths). A worker whose task has no operator-
     declared file scope could touch ANY file — running it in parallel
-    with another worker risks a clobber on overlapping writes that
-    the heuristic can't see ahead of time.
+    with another worker risks a clobber on overlapping writes that the
+    heuristic can't see ahead of time.
+
+    "Declared scope" is strictly the labeled-path lines (`Files:`,
+    `path:`, `paths:`, `file:`) in Spec / Acceptance / Notes — NOT
+    inline path mentions in prose. A task whose Spec reads "Investigate
+    panic in cmd/fleet/main.go" is NOT considered scope-declared, even
+    though `conflict.extract_paths` would surface that path token for
+    overlap purposes; the operator never wrote a contract line, so we
+    treat the scope as opaque and skip it conservatively.
 
     Decision tree (candidate vs each in-flight task):
 
-      candidate has zero extracted paths           → True  (conservative — could touch anything)
-      in-flight task has zero extracted paths      → True  (same — opaque scope on the other side)
+      candidate has no labeled paths               → True  (could touch anything)
+      in-flight task has no labeled paths          → True  (opaque scope on the other side)
       explicit overlap (conflict.has_conflict)     → True
-      otherwise                                    → False (both sides declared, disjoint)
+      otherwise                                    → False (both sides declared + disjoint)
 
-    Operators opt out of the conservative skip by adding an explicit
-    `Files: <path-with-extension>` line to the task Spec / Acceptance /
-    Notes. The conflict heuristic's regex requires a real file extension
-    (so a bare token like `Files: *` is NOT picked up as a path and the
-    conservative skip would still fire). The intended escape hatch is
-    `Files: README.md` or similar — a real path the operator deems
-    shared with everything else.
+    Operators opt out of the conservative skip per task by adding an
+    explicit `Files: <path-with-extension>` line. The heuristic regex
+    requires a real file extension (so a bare token like `Files: *`
+    won't satisfy the gate); the intended escape hatch is a real path.
 
     Self-conflict guard: a candidate may appear in in_flight if a caller
     passes a stale snapshot. conflict.has_conflict already filters
-    same-slug pairs; the no-paths short-circuits below would otherwise
-    flag a self-vs-self comparison, so we explicitly skip the candidate
-    when scanning in_flight.
+    same-slug pairs; the labeled-paths short-circuits below would
+    otherwise flag a self-vs-self comparison, so we explicitly skip the
+    candidate when scanning in_flight.
     """
     if not in_flight:
         return False
-    cand_paths = conflict.extract_paths(candidate)
+    cand_labeled = conflict.extract_labeled_paths(candidate)
     # Candidate has no declared scope → assume it matches anything that
     # is already running. Operator opts out via explicit Files: line.
-    if not cand_paths:
+    if not cand_labeled:
         for other in in_flight:
             if other.slug == candidate.slug:
                 continue
             return True
         return False
     # Candidate declared scope. Walk the in-flight list: if any other
-    # task has no scope (opaque), or has overlapping paths, it's a
-    # conflict.
+    # task has no labeled scope (opaque), or has overlapping paths,
+    # it's a conflict. Overlap is computed against the FULL extracted
+    # path set (labeled + inline) so an in-flight task whose prose
+    # mentions a candidate-declared file still trips the gate — false
+    # positives there cost one tick of serialization, false negatives
+    # could clobber files.
     for other in in_flight:
         if other.slug == candidate.slug:
             continue
-        other_paths = conflict.extract_paths(other)
-        if not other_paths:
+        if not conflict.extract_labeled_paths(other):
             return True
-        if cand_paths & other_paths:
+        if conflict.conflicts(candidate, other):
             return True
     return False
 
