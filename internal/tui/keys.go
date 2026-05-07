@@ -137,20 +137,19 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	case modePromptSearch:
 		return m.handleSearchKey(key)
 	}
-	// Help / detail overlays close on any key (handled in Update path);
-	// the action keys below assume modeNav with no overlay.
+	// Help / detail overlays close on any key. The dismissal absorbs
+	// the key (handled=true) so [j]/[k] don't simultaneously move the
+	// hidden cursor — operator must press the nav key again after the
+	// overlay is gone, which is the right cognitive model for a modal.
+	// Quit keys ([q]/ctrl+c) are NOT absorbed: they fall through so
+	// the operator can still exit while a panel is up.
 	if m.showHelp || m.detail != nil {
-		switch key {
-		case "esc", "enter", "?", "q":
-			m.showHelp = false
-			m.detail = nil
-			return m, nil, true
+		if key == "q" || key == "ctrl+c" {
+			return m, nil, false
 		}
-		// Any other key dismisses the overlay too — operator navigates
-		// away from the panel without losing the keystroke.
 		m.showHelp = false
 		m.detail = nil
-		return m, nil, false
+		return m, nil, true
 	}
 	switch key {
 	case "?":
@@ -173,6 +172,12 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, false
 	case "n":
+		// Freeze the target project at press time. Subsequent ticks +
+		// dashboard refreshes can re-sort rows under the prompt; without
+		// this freeze, submit time would resolve the project from the
+		// (now-shifted) dashCursor and the new task could land in the
+		// wrong tasks.md (codex iter-2 P1).
+		m.taskAddProjectFrozen = m.taskAddProject()
 		m.mode = modePromptTaskAdd
 		m.promptBuf = ""
 		return m, nil, true

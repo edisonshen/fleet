@@ -40,15 +40,17 @@ func (m Model) handleTaskAddKey(key string) (Model, tea.Cmd, bool) {
 	case "esc":
 		m.mode = modeNav
 		m.promptBuf = ""
+		m.taskAddProjectFrozen = ""
 		return m, nil, true
 	case "enter":
 		spec := strings.TrimSpace(m.promptBuf)
+		project := m.taskAddProjectFrozen
 		m.mode = modeNav
 		m.promptBuf = ""
+		m.taskAddProjectFrozen = ""
 		if spec == "" {
 			return m, nil, true
 		}
-		project := m.taskAddProject()
 		if project == "" {
 			m.flash = &flashMsg{
 				text:  "no project context — cd into a project repo first or move cursor onto a project row",

@@ -136,6 +136,14 @@ type Model struct {
 	// kind tells the renderer what to show; payload is the row-type-
 	// specific text body.
 	detail *detailView
+
+	// taskAddProjectFrozen captures the target project at the moment
+	// [n] is pressed. Without this, the 1s poll could re-sort
+	// dashboardRows() while the prompt is open and the same dashCursor
+	// would land on a different project at submit time — operator's
+	// new task lands in the wrong tasks.md (codex iter-2 P1). Cleared
+	// when modePromptTaskAdd exits.
+	taskAddProjectFrozen string
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind

@@ -422,3 +422,110 @@ func TestDashboardMsg_ReClampsCursor(t *testing.T) {
 		t.Errorf("dashboardMsg should re-clamp dashCursor when rows shrink; got %d", updated.(Model).dashCursor)
 	}
 }
+
+// TestKeyN_FreezesProjectAtPressTime regresses codex iter-2 P1: the
+// task-add target project must be captured when [n] is pressed, not
+// resolved at submit time. Otherwise a background dashboard refresh
+// can shift dashboardRows() under the prompt and the new task lands
+// in the wrong tasks.md.
+func TestKeyN_FreezesProjectAtPressTime(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "alpha", TaskCounts{Todo: 1})
+	seedTasks(t, pdir, "zulu", TaskCounts{Todo: 1})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	// dashCursor on the first project (alpha — alpha-sorted).
+	m.dashCursor = 0
+	if row := m.selectedRow(); row == nil || row.kind != rowProject || row.project.Name != "alpha" {
+		t.Fatalf("expected cursor on alpha project; got %+v", row)
+	}
+
+	// Press [n] — should freeze "alpha" as the target.
+	mm, _ := m.Update(keyMsg("n"))
+	got := mm.(Model)
+	if got.taskAddProjectFrozen != "alpha" {
+		t.Fatalf("taskAddProjectFrozen = %q, want alpha", got.taskAddProjectFrozen)
+	}
+
+	// Now SHIFT the dashboard rows so dashCursor=0 would land on a
+	// different project. Easiest: simulate a tick that adds a new
+	// project that sorts before alpha (just give it attention via a
+	// blocked worker). For test purposes we directly mutate the
+	// snapshot to put zulu first.
+	got.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "zulu", Counts: TaskCounts{Todo: 1}},
+			{Name: "alpha", Counts: TaskCounts{Todo: 1}},
+		},
+	}
+
+	// Type a spec, threading the model through each rune so promptBuf
+	// actually accumulates across keystrokes.
+	var current tea.Model = got
+	for _, r := range "frozen test" {
+		current, _ = current.Update(keyMsg(string(r)))
+	}
+	// Submit.
+	_, cmd := current.Update(keyMsg("enter"))
+	if cmd == nil {
+		t.Fatal("expected tea.Cmd from enter")
+	}
+	doneMsg := cmd().(taskAddDoneMsg)
+	if doneMsg.err != nil {
+		t.Fatalf("addTask err: %v", doneMsg.err)
+	}
+
+	// The new task MUST land in alpha/tasks.md (the frozen target),
+	// NOT zulu (where dashCursor=0 would now point).
+	alphaFile, err := tasks.Read(filepath.Join(pdir, "alpha", "tasks.md"))
+	if err != nil {
+		t.Fatalf("read alpha tasks.md: %v", err)
+	}
+	zuluFile, err := tasks.Read(filepath.Join(pdir, "zulu", "tasks.md"))
+	if err != nil {
+		t.Fatalf("read zulu tasks.md: %v", err)
+	}
+	alphaHas, zuluHas := false, false
+	for _, tk := range alphaFile.Tasks {
+		if tk.Spec == "frozen test" {
+			alphaHas = true
+		}
+	}
+	for _, tk := range zuluFile.Tasks {
+		if tk.Spec == "frozen test" {
+			zuluHas = true
+		}
+	}
+	if !alphaHas {
+		t.Errorf("frozen test task should land in alpha/tasks.md")
+	}
+	if zuluHas {
+		t.Errorf("frozen test task must NOT land in zulu/tasks.md")
+	}
+}
+
+// TestOverlay_DismissedKeyAbsorbed regresses codex iter-2 P2: when an
+// overlay (help / detail) is up, the next key dismisses it AND that
+// key is absorbed (does not also move the cursor). Otherwise [j]/[k]
+// would silently scroll under the modal.
+func TestOverlay_DismissedKeyAbsorbed(t *testing.T) {
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.records = []*agent.Record{sampleAgent("a"), sampleAgent("b"), sampleAgent("c")}
+	m.dashCursor = 1
+	m.showHelp = true
+
+	// Press [j] while help is up. Help must dismiss; cursor must NOT move.
+	updated, _ := m.Update(keyMsg("j"))
+	got := updated.(Model)
+	if got.showHelp {
+		t.Errorf("[j] should dismiss help overlay")
+	}
+	if got.dashCursor != 1 {
+		t.Errorf("dashCursor moved through dismissed overlay: was 1, now %d", got.dashCursor)
+	}
+}
