@@ -488,9 +488,9 @@ func TestUpdate_DashboardMsg_Stores(t *testing.T) {
 }
 
 // TestView_DashboardEmptyShowsHint pins that an empty projects tree
-// renders a coachmark instead of a blank column. Hint nudges to the
-// in-TUI [n] task add since `fleet tasks add` is no longer the
-// recommended entry point per operator feedback in issue #53.
+// renders a coachmark instead of a blank column. The hint nudges to
+// [d] dispatch — that's the working bootstrap path; [n] would refuse
+// because there's no project to add the task to yet (codex iter-7 P2).
 func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
@@ -501,8 +501,8 @@ func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	if !strings.Contains(out, "no projects yet") {
 		t.Errorf("empty dashboard should hint, got:\n%s", out)
 	}
-	if !strings.Contains(out, "[n]") {
-		t.Errorf("empty dashboard should nudge to [n], got:\n%s", out)
+	if !strings.Contains(out, "[d]") {
+		t.Errorf("empty dashboard should nudge to [d], got:\n%s", out)
 	}
 }
 

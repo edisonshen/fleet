@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -799,5 +800,37 @@ func TestView_SearchHidesWorkersShowsMatchHint(t *testing.T) {
 	}
 	if strings.Contains(out, "no workers running") {
 		t.Errorf("must NOT show the unfiltered 'no workers running' hint when filter is active, got:\n%s", out)
+	}
+}
+
+// TestReadLastLines_KeepsLineAtBoundary regresses codex iter-7 P3:
+// when the seek window lands exactly on a newline boundary, the
+// first line of the read window is whole and must NOT be discarded.
+func TestReadLastLines_KeepsLineAtBoundary(t *testing.T) {
+	tmp := t.TempDir()
+	path := filepath.Join(tmp, "out.log")
+	// 70 lines of "AAAA". Seek window will be 64KiB or n*256, so for
+	// n=5 the window is 64KiB — way bigger than this file. Push
+	// instead with a very large file: ~80KB so the 64KiB window
+	// truncates from the middle.
+	var b strings.Builder
+	for i := 0; i < 8000; i++ {
+		fmt.Fprintf(&b, "line%05d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tail, err := readLastLines(path, 5)
+	if err != nil {
+		t.Fatalf("readLastLines: %v", err)
+	}
+	// The very last line should be present in the tail.
+	if !strings.Contains(tail, "line07999") {
+		t.Errorf("last line missing from tail:\n%s", tail)
+	}
+	// Tail should have 5 lines.
+	got := strings.Count(strings.TrimRight(tail, "\n"), "\n") + 1
+	if got != 5 {
+		t.Errorf("tail line count = %d, want 5\ntail:\n%s", got, tail)
 	}
 }

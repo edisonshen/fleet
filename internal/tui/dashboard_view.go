@@ -219,8 +219,14 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	// Left column: project + task rows.
 	var left []string
 	if (m.dashboard == nil || len(m.dashboard.Projects) == 0) && !rowsHaveLeft(rows) {
+		// Don't advertise [n] here: taskAddProject refuses to create a
+		// brand-new project from a random cwd, so on a fresh install
+		// pressing [n] would just flash "no project context" (codex
+		// iter-7 P2). [d] dispatch is the working bootstrap — it
+		// creates ~/.fleet/projects/<tag>/ as a side effect of
+		// spawning the first agent, after which [n] works.
 		left = append(left, "",
-			columnHeadingStyle.Render("  no projects yet — press [n] to add a task"))
+			columnHeadingStyle.Render("  no projects yet — press [d] to dispatch one"))
 	}
 	for i, row := range rows {
 		selected := i == m.dashCursor

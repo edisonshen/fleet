@@ -467,6 +467,19 @@ func readLastLines(path string, n int) (string, error) {
 	if off < 0 {
 		off = 0
 	}
+	// Probe the byte just before the seek point so we can tell
+	// whether `off` lands mid-line (partial rune we must discard) or
+	// exactly on a newline boundary (line is whole, keep it). codex
+	// iter-7 P3 — previous variant always dropped the first line and
+	// silently hid the most-recent intact log line when the window
+	// happened to start cleanly.
+	startsMidLine := false
+	if off > 0 {
+		buf := make([]byte, 1)
+		if _, perr := f.ReadAt(buf, off-1); perr == nil {
+			startsMidLine = buf[0] != '\n'
+		}
+	}
 	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return "", err
 	}
@@ -474,13 +487,9 @@ func readLastLines(path string, n int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	// Drop the (possibly partial) first line when we seeked past 0 —
-	// otherwise the operator sees a leading half-line that the
-	// previous chunk truncated mid-rune. When off == 0 we have the
-	// entire file and must keep every line.
 	text := strings.TrimRight(string(data), "\n")
 	lines := strings.Split(text, "\n")
-	if off > 0 && len(lines) > 0 {
+	if startsMidLine && len(lines) > 0 {
 		lines = lines[1:]
 	}
 	if len(lines) > n {
