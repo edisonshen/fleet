@@ -152,9 +152,11 @@ func (m Model) taskAddProject() string {
 	}
 	// cwd-based resolution. First check the worktree-cwd path (worker
 	// shells live there); fall back to cwd-derived tag IF and ONLY IF
-	// the project already exists on disk. Without that existence
-	// gate, [n] from a random checkout would create a phantom project
-	// (codex iter-3 P2).
+	// the project already exists on disk (codex iter-3 P2). Walk up
+	// the directory tree so [n] works from a repo subdirectory like
+	// `repo/internal/tui/` — without the walk, ProjectTag(cwd) would
+	// produce "internal-tui" and miss the actual repo's project tag
+	// (codex iter-10 P2).
 	cwd, err := os.Getwd()
 	if err != nil {
 		return ""
@@ -162,14 +164,18 @@ func (m Model) taskAddProject() string {
 	if p := projectFromWorktreeCwd(cwd); p != "" {
 		return p
 	}
-	tag := ProjectTag(cwd)
-	if tag == "" {
-		return ""
+	dir := cwd
+	for {
+		tag := ProjectTag(dir)
+		if tag != "" && projectDirExists(tag) {
+			return tag
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir || parent == "/" || parent == "." {
+			return ""
+		}
+		dir = parent
 	}
-	if !projectDirExists(tag) {
-		return ""
-	}
-	return tag
 }
 
 // projectDirExists returns true when ~/.fleet/projects/<name>/ is
@@ -382,7 +388,13 @@ func projectDetail(p *ProjectRow) (string, string) {
 
 // readWorkerDetail returns (body, title) for the [⏎] open / [a]
 // peek panel when a worker row is selected. Replicates `fleet peek`
-// inline: parsed state.json + last 50 lines of output.log.
+// inline: parsed state.json + last 50 lines of output.log. Falls
+// back to the archive directory when the active worker dir's
+// state.json is gone (e.g. the worker finished + was archived
+// between the last dashboard refresh and the operator's keypress) —
+// matches `fleet peek`'s readWorkerStateAnywhere behavior so the
+// inline peek doesn't degrade to ENOENT for a row the dashboard
+// still happens to show (codex iter-10 P3).
 func readWorkerDetail(project, slug string) (string, string) {
 	title := fmt.Sprintf("worker: %s/%s", project, slug)
 	dir, err := state.WorkerDir(project, slug)
@@ -392,6 +404,18 @@ func readWorkerDetail(project, slug string) (string, string) {
 	dir = strings.TrimSuffix(dir, string(filepath.Separator))
 	statePath := filepath.Join(dir, "state.json")
 	logPath := filepath.Join(dir, "output.log")
+	// Active dir gone? Try the archive (same lookup `fleet peek`
+	// uses). When the archive entry is found, repoint state/log paths
+	// at it so the rest of the function doesn't need to know where
+	// the data came from.
+	if _, statErr := os.Stat(statePath); errors.Is(statErr, os.ErrNotExist) {
+		if archDir := newestArchiveWorkerDir(project, slug); archDir != "" {
+			dir = archDir
+			statePath = filepath.Join(dir, "state.json")
+			logPath = filepath.Join(dir, "output.log")
+			title = fmt.Sprintf("worker (archived): %s/%s", project, slug)
+		}
+	}
 
 	var b strings.Builder
 	if data, err := os.ReadFile(statePath); err == nil {
@@ -439,6 +463,53 @@ func readAgentDetail(r *agent.Record) (string, string) {
 		return fmt.Sprintf("error: %v", err), title
 	}
 	return string(data), title
+}
+
+// newestArchiveWorkerDir scans
+// ~/.fleet/projects/<project>/workers/archive/ for entries shaped
+// `<slug>-YYYYMMDD-HHMMSS[-N]` and returns the lexicographically-
+// largest match (newest stamp). Empty string when no match. Mirrors
+// cmd/fleet/peek.go's readArchivedWorkerState lookup but returns
+// only the directory path — the caller reads state.json + output.log
+// the same way it would for an active worker.
+func newestArchiveWorkerDir(project, slug string) string {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return ""
+	}
+	archRoot := filepath.Join(pdir, "workers", "archive")
+	entries, err := os.ReadDir(archRoot)
+	if err != nil {
+		return ""
+	}
+	const stampLen = len("YYYYMMDD-HHMMSS") // 15
+	var newest string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Strip optional `-N` collision-retry salt (single digit).
+		stripped := name
+		if len(stripped) >= 2 && stripped[len(stripped)-2] == '-' &&
+			stripped[len(stripped)-1] >= '0' && stripped[len(stripped)-1] <= '9' {
+			stripped = stripped[:len(stripped)-2]
+		}
+		if len(stripped) < stampLen+1+len(slug) {
+			continue
+		}
+		end := len(stripped) - stampLen - 1
+		if stripped[end] != '-' || stripped[:end] != slug {
+			continue
+		}
+		if name > newest {
+			newest = name
+		}
+	}
+	if newest == "" {
+		return ""
+	}
+	return filepath.Join(archRoot, newest)
 }
 
 // readLastLines returns the last n lines of path. Reads from the

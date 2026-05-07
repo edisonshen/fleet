@@ -925,3 +925,83 @@ func TestAgentsSubheader_ShowsVisibleAliveOnly(t *testing.T) {
 		t.Errorf("filtered-empty agents must not over-report active count, got:\n%s", out)
 	}
 }
+
+// TestKeyN_WalksUpToFindProject regresses codex iter-10 P2: pressing
+// [n] from a repo SUBDIRECTORY must still resolve to the parent
+// project. Previously ProjectTag(cwd) was applied to the cwd itself,
+// so `repo/internal/tui` produced "internal-tui" and missed the real
+// project.
+func TestKeyN_WalksUpToFindProject(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Stand up a project named after a repo we'll cd into.
+	seedTasks(t, pdir, "myrepo", TaskCounts{Todo: 1})
+
+	// Build a sibling temp tree that ProjectTag(cwd) sees as
+	// "<parent>-myrepo": grandparent/parent/myrepo. The tree must be
+	// such that walking from a sub-subdir of myrepo eventually
+	// resolves to a tag matching "myrepo".
+	tmp := t.TempDir()
+	repoRoot := filepath.Join(tmp, "myrepo")
+	subDir := filepath.Join(repoRoot, "internal", "tui")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Walk-up logic: ProjectTag(repoRoot) = "<tmp_basename>-myrepo".
+	// We want the project name to MATCH the cwd tag. Easiest: name
+	// the project to match. Re-seed with the actual derived tag.
+	wantTag := ProjectTag(repoRoot)
+	if wantTag == "myrepo" {
+		// Tag turned out parent-less; simple match.
+	} else {
+		// Re-seed with the derived tag so walk-up finds it.
+		seedTasks(t, pdir, wantTag, TaskCounts{Todo: 1})
+	}
+
+	cwd, _ := os.Getwd()
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(subDir); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	got := m.taskAddProject()
+	if got != wantTag {
+		t.Errorf("taskAddProject from subdir should walk up to %q, got %q",
+			wantTag, got)
+	}
+}
+
+// TestReadWorkerDetail_FallsBackToArchive regresses codex iter-10 P3:
+// inline peek must show the archived worker's state.json + log when
+// the active workers/<slug>/ has been moved to archive between the
+// last dashboard refresh and the operator pressing [a]/Enter.
+func TestReadWorkerDetail_FallsBackToArchive(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Don't create the active workers/<slug>/ dir at all — only the
+	// archive entry. Stamp follows YYYYMMDD-HHMMSS.
+	archDir := filepath.Join(pdir, "myproj", "workers", "archive",
+		"finished-x-aa11-20260101-120000")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archDir, "state.json"),
+		[]byte(`{"slug":"finished-x-aa11","phase":"done","pid":7}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(archDir, "output.log"),
+		[]byte("archived log line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	body, title := readWorkerDetail("myproj", "finished-x-aa11")
+	if !strings.Contains(title, "archived") {
+		t.Errorf("title should mark archived: %q", title)
+	}
+	if !strings.Contains(body, "finished-x-aa11") {
+		t.Errorf("body should render archived state.json, got:\n%s", body)
+	}
+	if !strings.Contains(body, "archived log line") {
+		t.Errorf("body should render archived output.log tail, got:\n%s", body)
+	}
+}
