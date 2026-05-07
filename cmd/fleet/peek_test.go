@@ -204,13 +204,13 @@ func TestPeek_FollowExitsCleanlyOnArchive(t *testing.T) {
 	// Let peek see the initial state.
 	time.Sleep(2 * pollInterval)
 
-	// Simulate the coord's archive: rm the active dir, plant an
-	// archive entry. (Real path goes through workers.Archive which
-	// requires more setup; this is the same final on-disk state.)
+	// Simulate the coord's archive. workers.Archive does this
+	// atomically via os.Rename(active, archive); we approximate by
+	// populating the archive FIRST so peek's poll never lands in a
+	// window where active is gone AND archive has no state.json yet
+	// (CI race that triggered FAIL: the WriteFile lagged behind the
+	// RemoveAll, peek hit ENOENT-and-no-archive, exited early).
 	activeDir := filepath.Join(fleetHome, "projects", project, "workers", "fast-4444")
-	if err := os.RemoveAll(activeDir); err != nil {
-		t.Fatalf("rm active: %v", err)
-	}
 	archDir := filepath.Join(fleetHome, "projects", project, "workers", "archive", "fast-4444-20260506-120000")
 	if err := os.MkdirAll(archDir, 0o755); err != nil {
 		t.Fatalf("mkdir arch: %v", err)
@@ -221,6 +221,11 @@ func TestPeek_FollowExitsCleanlyOnArchive(t *testing.T) {
 		"started_at":"2026-05-06T12:00:00Z","updated_at":"2026-05-06T12:00:00Z"
 	}`), 0o644); err != nil {
 		t.Fatalf("seed arch: %v", err)
+	}
+	// Active is removed last. peek's next poll sees ENOENT on active
+	// → falls through to readArchivedWorkerState → finds the entry.
+	if err := os.RemoveAll(activeDir); err != nil {
+		t.Fatalf("rm active: %v", err)
 	}
 
 	select {
