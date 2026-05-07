@@ -110,18 +110,20 @@ func (m Model) handleSearchKey(key string) (Model, tea.Cmd, bool) {
 }
 
 // taskAddProject resolves the project context for [n] task-add.
-// Precedence (issue #53 spec):
+// Precedence (issue #53 spec; codex iter-3 P2 tightened):
 //  1. cursor on a project / task / worker row → that project
 //  2. cursor on an agent row with a Project tag → that project
-//  3. cwd basename via state.SafeProjectName(filepath.Base(cwd)) when
-//     it lands inside a fleet-managed project dir
-//  4. tui.ProjectTag(cwd) as a last resort
+//  3. cwd is inside a Fleet-managed worktree under
+//     ~/.fleet/projects/<name>/worktrees/<slug>/ → that project
+//  4. cwd is the operator's project repo AND that project already
+//     exists in ~/.fleet/projects/ (so the operator was previously
+//     working on it via `fleet dispatch` or coord) → that project tag
 //
-// Empty string means "no project context — flash error". The CLI's
-// resolveProject() falls back to ProjectTag(cwd) for any non-fleet
-// dir, but for the in-TUI [n] path we want a stricter check:
-// "do at least one tasks.md exist for this project?" otherwise we'd
-// silently create new projects from typos.
+// Empty string means "no project context — flash error". This
+// deliberately refuses to create a brand-new project from a
+// random cwd: an unknown directory pressing [n] would silently
+// create ~/.fleet/projects/<random-tag>/ with a phantom task,
+// which is worse than asking the operator to be explicit.
 func (m Model) taskAddProject() string {
 	if row := m.selectedRow(); row != nil {
 		switch row.kind {
@@ -141,17 +143,33 @@ func (m Model) taskAddProject() string {
 			}
 		}
 	}
-	// cwd-based resolution. Match the CLI's rules so [n] in the TUI
-	// targets the same project as `fleet tasks add` from the same shell.
-	if cwd, err := os.Getwd(); err == nil {
-		if p := projectFromWorktreeCwd(cwd); p != "" {
-			return p
-		}
-		// Fall back to ProjectTag — sanitization matches what
-		// `fleet tasks add` defaults to.
-		return ProjectTag(cwd)
+	// cwd-based resolution. First check the worktree-cwd path (worker
+	// shells live there); fall back to cwd-derived tag IF and ONLY IF
+	// the project already exists on disk. Without that existence
+	// gate, [n] from a random checkout would create a phantom project
+	// (codex iter-3 P2).
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
 	}
-	return ""
+	if p := projectFromWorktreeCwd(cwd); p != "" {
+		return p
+	}
+	tag := ProjectTag(cwd)
+	if tag == "" {
+		return ""
+	}
+	// Existence check: ~/.fleet/projects/<tag>/ must already be
+	// present. If not, refuse so the operator gets an explicit error
+	// rather than a silently-created project.
+	root, err := state.Root()
+	if err != nil {
+		return ""
+	}
+	if _, err := os.Stat(filepath.Join(root, "projects", tag)); err != nil {
+		return ""
+	}
+	return tag
 }
 
 // projectFromWorktreeCwd is duplicated from cmd/fleet/tasks.go to

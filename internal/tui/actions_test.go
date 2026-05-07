@@ -464,7 +464,7 @@ func TestKeyN_FreezesProjectAtPressTime(t *testing.T) {
 
 	// Type a spec, threading the model through each rune so promptBuf
 	// actually accumulates across keystrokes.
-	var current tea.Model = got
+	current := tea.Model(got)
 	for _, r := range "frozen test" {
 		current, _ = current.Update(keyMsg(string(r)))
 	}
@@ -527,5 +527,97 @@ func TestOverlay_DismissedKeyAbsorbed(t *testing.T) {
 	}
 	if got.dashCursor != 1 {
 		t.Errorf("dashCursor moved through dismissed overlay: was 1, now %d", got.dashCursor)
+	}
+}
+
+// TestKeyX_WorkerRow_FlashesNotImplemented regresses codex iter-3 P1:
+// the worker [x] path used to shell out to `fleet workers kill`,
+// which doesn't exist. Until kill is wired, [x] on a worker must
+// flash a hint and NOT shell out.
+func TestKeyX_WorkerRow_FlashesNotImplemented(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	seedWorker(t, pdir, "fleet", "x-1234", workers.State{
+		Phase: workers.PhaseTDDGreen,
+		PID:   42,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	rows := m.dashboardRows()
+	idx := -1
+	for i, r := range rows {
+		if r.kind == rowWorker {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("no worker row")
+	}
+	m.dashCursor = idx
+
+	updated, cmd := m.Update(keyMsg("x"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[x] on worker should not shell out, got cmd != nil")
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("[x] on worker should flash error, got %+v", mm.flash)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[x] on worker shelled out (calls=%v); should not until kill is wired", stub.calls)
+	}
+}
+
+// TestKeyN_RefusesUnknownCwd regresses codex iter-3 P2: [n] from a
+// random cwd that has no Fleet project state must NOT silently create
+// a new project. taskAddProject returns "" → submit shows the
+// "no project context" flash.
+func TestKeyN_RefusesUnknownCwd(t *testing.T) {
+	withFleetHome(t)
+	// cwd: a temp dir that's NOT inside ~/.fleet and NOT in projects/.
+	tmp := t.TempDir()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	// No dashboard, no records → no project rows; cursor at 0 with
+	// no rows. [n] press → freezes "" → submit flashes error.
+	mm, _ := m.Update(keyMsg("n"))
+	if mm.(Model).taskAddProjectFrozen != "" {
+		t.Errorf("from unknown cwd, [n] should freeze empty project; got %q",
+			mm.(Model).taskAddProjectFrozen)
+	}
+	// Type a spec + submit. Thread the model through each Update so
+	// promptBuf accumulates correctly; tea.Model is the interface
+	// returned by Update so we keep that as the loop variable.
+	current := tea.Model(mm)
+	for _, r := range "ghost task" {
+		current, _ = current.Update(keyMsg(string(r)))
+	}
+	updated, cmd := current.Update(keyMsg("enter"))
+	if cmd != nil {
+		t.Errorf("[n] enter from unknown cwd should NOT trigger tasks.Add cmd")
+	}
+	got := updated.(Model)
+	if got.flash == nil || !got.flash.isErr {
+		t.Errorf("[n] from unknown cwd should flash error, got %+v", got.flash)
+	}
+	if got.flash != nil && !strings.Contains(got.flash.text, "no project") {
+		t.Errorf("[n] flash should say 'no project context', got %q", got.flash.text)
 	}
 }

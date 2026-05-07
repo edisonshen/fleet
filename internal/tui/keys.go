@@ -263,17 +263,20 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 		m.archiveCandidate = cur.ID
 		return m, nil, true
 	case rowWorker:
-		if row.worker == nil {
-			return m, nil, true
+		// Worker termination from the TUI is deferred to a follow-up
+		// PR — `fleet workers kill` does not exist (only list/prune/
+		// update/worktree-path are wired in cmd/fleet/workers.go), and
+		// SIGTERMing a mid-phase worker has subtle implications
+		// (half-archived state, orphaned worktrees, queue-journal
+		// races) that need their own design pass. Until then, flash
+		// the operator-actionable hint pointing at the existing
+		// `fleet workers prune` path for terminated workers (codex
+		// iter-3 P1 — was wired to a non-existent subcommand).
+		m.flash = &flashMsg{
+			text:  "[x] worker termination not yet wired in TUI — use `fleet workers prune` for finished workers",
+			isErr: true,
 		}
-		// `fleet workers kill <slug> --project <p>` is the supported
-		// path. We shell out via runFleetCmd so a worker bug can't
-		// crash the TUI; the flash banner shows the kill output.
-		w := row.worker
-		args := []string{"workers", "kill", w.Slug, "--project", w.Project}
-		return m, runFleetCmd(args, func(out string, err error) tea.Msg {
-			return rmDoneMsg{out: out, err: err}
-		}), true
+		return m, nil, true
 	default:
 		m.flash = &flashMsg{
 			text:  "[x] applies to v0.1 agents (archive) and workers (kill); not to tasks/projects",
