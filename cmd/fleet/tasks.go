@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -601,9 +602,16 @@ func setTaskField(t *tasks.Task, key, value string) error {
 			t.WorkerPID = 0
 			return nil
 		}
-		var pid int
-		if _, err := fmt.Sscanf(value, "%d", &pid); err != nil {
+		// strconv.Atoi rejects trailing garbage (`123abc` → error),
+		// matching internal/tasks.setKV's parser exactly. Sscanf
+		// would silently consume a numeric prefix and persist a
+		// different value than the operator typed (codex iter-3 P2).
+		pid, err := strconv.Atoi(value)
+		if err != nil {
 			return fmt.Errorf("worker_pid: %w", err)
+		}
+		if pid < 0 {
+			return fmt.Errorf("worker_pid: must be non-negative, got %d", pid)
 		}
 		t.WorkerPID = pid
 	case "worktree":

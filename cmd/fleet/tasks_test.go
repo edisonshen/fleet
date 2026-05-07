@@ -395,6 +395,28 @@ func TestTasksSet_RejectsQuotedDeps(t *testing.T) {
 	}
 }
 
+// TestTasksSet_RejectsNonNumericPID — codex iter-3 P2: Sscanf accepts
+// `123abc` and stores 123. strconv.Atoi rejects trailing garbage so
+// the on-disk value matches what the operator typed (or fails fast).
+func TestTasksSet_RejectsNonNumericPID(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "pid-test", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	slug := parts[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=123abc", &bytes.Buffer{}); err == nil {
+		t.Error("expected error on worker_pid with trailing garbage")
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=-5", &bytes.Buffer{}); err == nil {
+		t.Error("expected error on negative worker_pid")
+	}
+}
+
 // TestTasksAdd_NeedsSlugOrSpec — empty input refuses up front rather
 // than producing an unsalvageable empty task block.
 func TestTasksAdd_NeedsSlugOrSpec(t *testing.T) {

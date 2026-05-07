@@ -89,6 +89,68 @@ func TestPeek_FollowExitsOnTerminalPhase(t *testing.T) {
 	}
 }
 
+// TestPeek_ArchiveLookupExactSlug — codex iter-3 P2: archive lookup
+// must NOT prefix-match. `peek foo` should never resolve to archive
+// dir `foo-bar-<stamp>`.
+func TestPeek_ArchiveLookupExactSlug(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+
+	// Plant an unrelated `foo-bar` archive (newer stamp).
+	other := filepath.Join(fleetHome, "projects", project, "workers", "archive", "foo-bar-20260502-100000")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "state.json"), []byte(`{
+		"slug":"foo-bar","project":"`+project+`",
+		"phase":"done","pr_url":"https://example.invalid/pr/foobar",
+		"started_at":"2026-05-02T10:00:00Z","updated_at":"2026-05-02T11:00:00Z"
+	}`), 0o644); err != nil {
+		t.Fatalf("seed other: %v", err)
+	}
+
+	// Peek for the lone-`foo` slug. We have nothing for it. Must NOT
+	// silently resolve to foo-bar's state.
+	err := runPeek(&peekOpts{project: project}, "foo", &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Error("peek foo should not resolve to foo-bar archive entry")
+	}
+}
+
+// TestPeek_FollowOnAlreadyArchived — codex iter-3 P2: --follow on a
+// slug that's ONLY present in archive at startup must read it
+// immediately, not wait 30s for the active dir to appear.
+func TestPeek_FollowOnAlreadyArchived(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+	archDir := filepath.Join(fleetHome, "projects", project, "workers", "archive", "premade-5555-20260501-100000")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(archDir, "state.json"), []byte(`{
+		"slug":"premade-5555","project":"`+project+`",
+		"phase":"done","pr_url":"https://example.invalid/pr/3",
+		"started_at":"2026-05-01T10:00:00Z","updated_at":"2026-05-01T11:00:00Z"
+	}`), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out := &bytes.Buffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- peekFollow(ctx, project, "premade-5555", false, out, &bytes.Buffer{})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("follow on archived: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("peekFollow did not resolve already-archived worker quickly")
+	}
+}
+
 // TestPeek_OnceFallsBackToArchive — codex iter-2 P2: a worker that's
 // already been archived must still be inspectable by `peek` (the slug
 // is still surfaced by `workers list --all`).

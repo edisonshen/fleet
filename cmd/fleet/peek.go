@@ -169,14 +169,34 @@ func readArchivedWorkerState(project, slug string) (*workers.State, string, erro
 		}
 		return nil, "", fmt.Errorf("readdir archive: %w", err)
 	}
-	prefix := slug + "-"
+	// Archive directory names are `<slug>-YYYYMMDD-HHMMSS[-N]`; the
+	// fixed-width stamp lets us isolate the slug component with an
+	// exact-suffix check (codex iter-2 P2 fix). A bare prefix match
+	// would conflate `foo` with `foo-bar` archives. parseArchiveStamp
+	// over in internal/workers does the same job in reverse — kept
+	// out of this file so peek doesn't depend on the workers package's
+	// internal helpers.
+	const stampLen = len("YYYYMMDD-HHMMSS") // 15
 	var newest string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, prefix) {
+		// Strip optional `-N` collision-retry salt (single digit).
+		stripped := name
+		if len(stripped) >= 2 && stripped[len(stripped)-2] == '-' &&
+			stripped[len(stripped)-1] >= '0' && stripped[len(stripped)-1] <= '9' {
+			stripped = stripped[:len(stripped)-2]
+		}
+		// Now expect <slug>-<stampLen-char-stamp>.
+		if len(stripped) < stampLen+1+len(slug) {
+			continue
+		}
+		// Slug occupies stripped[:len(stripped)-stampLen-1]; the dash
+		// at index len-stampLen-1 separates slug from stamp.
+		end := len(stripped) - stampLen - 1
+		if stripped[end] != '-' || stripped[:end] != slug {
 			continue
 		}
 		// Lexicographic order = stamp order (fixed-width
@@ -233,20 +253,13 @@ func peekFollow(ctx context.Context, project, slug string, withLogs bool, stdout
 		st, err := workers.ReadState(project, slug)
 		switch {
 		case errors.Is(err, workers.ErrNotFound):
-			if seenOnce {
-				// Worker dir disappeared after we'd already seen it —
-				// the coord must have archived. Promote to a one-shot
-				// archive read + clean exit so the operator gets a
-				// final terminal-phase render rather than the 30s
-				// startup-timeout error (codex iter-2 P1).
-				archSt, archDir, archErr := readArchivedWorkerState(project, slug)
-				if archErr != nil {
-					if errors.Is(archErr, workers.ErrNotFound) {
-						_, _ = fmt.Fprintf(stderr, "note: worker %q vanished and has no archive entry yet — coord may still be archiving\n", slug)
-						return nil
-					}
-					return archErr
-				}
+			// Whether seenOnce or not, an archived state.json is the
+			// authoritative final answer — promote to one-shot archive
+			// render + clean exit (codex iter-2 P1 + iter-3 P2). The
+			// startup-wait branch only kicks in when archive is ALSO
+			// empty (typo'd slug or worker not yet seeded by coord).
+			archSt, archDir, archErr := readArchivedWorkerState(project, slug)
+			if archErr == nil {
 				if !first {
 					_, _ = fmt.Fprintln(stdout, "---")
 				}
@@ -258,9 +271,18 @@ func peekFollow(ctx context.Context, project, slug string, withLogs bool, stdout
 				}
 				return nil
 			}
-			// Wait for the worker dir to appear. After followTimeout,
-			// give up so a typo'd slug doesn't hang the operator
-			// indefinitely.
+			if !errors.Is(archErr, workers.ErrNotFound) {
+				return archErr
+			}
+			if seenOnce {
+				// Active state vanished AND archive is empty — coord
+				// is probably mid-archive. Don't hang; print a note
+				// and exit so the operator can rerun.
+				_, _ = fmt.Fprintf(stderr, "note: worker %q vanished and has no archive entry yet — coord may still be archiving\n", slug)
+				return nil
+			}
+			// Startup-wait: neither active nor archived. Wait for the
+			// worker dir to appear. After followTimeout, give up.
 			if time.Now().After(deadline) {
 				return fmt.Errorf("no worker %q in project %q after %s of waiting", slug, project, followTimeout)
 			}
