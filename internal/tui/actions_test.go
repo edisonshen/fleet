@@ -622,32 +622,29 @@ func TestKeyN_RefusesUnknownCwd(t *testing.T) {
 	}
 }
 
-// TestKeyN_AgentProjectGatedOnExistence regresses codex iter-4 P2:
-// pressing [n] with the cursor on a legacy agent row whose Project tag
-// no longer has a corresponding ~/.fleet/projects/<name>/ dir must NOT
-// create a phantom project. taskAddProject returns "" → submit flashes
-// "no project context".
-func TestKeyN_AgentProjectGatedOnExistence(t *testing.T) {
+// TestKeyN_AgentProjectAcceptsFreshDispatch regresses codex iter-5 P2:
+// `fleet dispatch` creates an agent record before the per-project
+// state dir exists, so [n] on an agent row must accept the agent's
+// Project tag even when ~/.fleet/projects/<tag>/ is not yet present.
+// (iter-4 was over-tightened.)
+func TestKeyN_AgentProjectAcceptsFreshDispatch(t *testing.T) {
 	withFleetHome(t)
-	// Move cwd somewhere outside ~/.fleet so the cwd-fallback in
-	// taskAddProject doesn't sneak in a different project.
 	cwd, _ := os.Getwd()
 	defer func() { _ = os.Chdir(cwd) }()
 	if err := os.Chdir(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Agent record references a project that doesn't exist on disk.
-	r := sampleAgent("ghost")
-	r.Project = "missing-project"
+	r := sampleAgent("fresh")
+	r.Project = "newly-dispatched"
 
 	m := New("test")
 	m.records = []*agent.Record{r}
 	m.dashCursor = 0
 
 	mm, _ := m.Update(keyMsg("n"))
-	if mm.(Model).taskAddProjectFrozen != "" {
-		t.Errorf("[n] on stale agent row should NOT freeze a missing project; got %q",
+	if mm.(Model).taskAddProjectFrozen != "newly-dispatched" {
+		t.Errorf("[n] on agent row should accept agent.Project; got %q",
 			mm.(Model).taskAddProjectFrozen)
 	}
 }
@@ -681,5 +678,70 @@ func TestAddTask_ArchiveReadErrorSurfaces(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "tasks-archive") {
 		t.Errorf("error should reference tasks-archive: %v", err)
+	}
+}
+
+// TestCursor_StableAcrossDashboardRefresh regresses codex iter-5 P1:
+// when a tick or fsEvent re-sorts dashboardRows() (project gains
+// attention, new task inserted), the cursor must follow its
+// previously-selected row by identity, not by raw index.
+func TestCursor_StableAcrossDashboardRefresh(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "alpha", TaskCounts{Todo: 1})
+	seedTasks(t, pdir, "zulu", TaskCounts{Todo: 1})
+
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	// Find the zulu project row index (alpha sorts first by default).
+	rows := m.dashboardRows()
+	zuluIdx := -1
+	for i, r := range rows {
+		if r.kind == rowProject && r.project.Name == "zulu" {
+			zuluIdx = i
+			break
+		}
+	}
+	if zuluIdx < 0 {
+		t.Fatalf("zulu row not found")
+	}
+	m.dashCursor = zuluIdx
+
+	// Now simulate a refresh that puts zulu FIRST (e.g. it gained
+	// attention). Construct a snapshot with zulu first, alpha second.
+	snap := &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "zulu", Counts: TaskCounts{Todo: 1}, Attention: 1},
+			{Name: "alpha", Counts: TaskCounts{Todo: 1}},
+		},
+	}
+	updated, _ := m.Update(dashboardMsg{snap: snap})
+	got := updated.(Model)
+
+	if row := got.selectedRow(); row == nil || row.kind != rowProject || row.project.Name != "zulu" {
+		t.Errorf("cursor should follow zulu after refresh; got %+v", row)
+	}
+}
+
+// TestCursor_StableAcrossAgentsMsgRefresh covers the agentsMsg path
+// — a new agent landing must not bump the cursor onto a different row.
+func TestCursor_StableAcrossAgentsMsgRefresh(t *testing.T) {
+	m := New("test")
+	m.records = []*agent.Record{sampleAgent("a"), sampleAgent("b")}
+	// Cursor on the second agent (the only place where reorder can hurt).
+	m.dashCursor = 1
+	if row := m.selectedRow(); row == nil || row.kind != rowAgent || row.agent.ID != "b" {
+		t.Fatalf("cursor should be on agent b initially; got %+v", row)
+	}
+
+	// New agentsMsg with an additional agent inserted at the top.
+	updated, _ := m.Update(agentsMsg{records: []*agent.Record{
+		sampleAgent("c"),
+		sampleAgent("a"),
+		sampleAgent("b"),
+	}})
+	got := updated.(Model)
+
+	if row := got.selectedRow(); row == nil || row.kind != rowAgent || row.agent.ID != "b" {
+		t.Errorf("cursor should still be on agent b after refresh; got %+v", row)
 	}
 }

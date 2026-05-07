@@ -138,14 +138,15 @@ func (m Model) taskAddProject() string {
 				return row.worker.Project
 			}
 		case rowAgent:
-			// Same existence gate as the cwd-fallback path below: a
-			// legacy agent whose Project tag no longer corresponds to a
-			// real ~/.fleet/projects/<name>/ dir would otherwise let
-			// [n] silently create a phantom project (codex iter-4 P2).
+			// Trust the agent's Project tag. `fleet dispatch` can
+			// create agent records BEFORE the per-project state dir
+			// exists, so an existence gate here would block [n] on
+			// freshly-spawned agents (codex iter-5 P2). The phantom-
+			// project risk is bounded: a record under ~/.fleet/agents/
+			// only lands when an operator-driven dispatch ran, so the
+			// project tag is intentional, not random-cwd noise.
 			if row.agent != nil && row.agent.Project != "" {
-				if projectDirExists(row.agent.Project) {
-					return row.agent.Project
-				}
+				return row.agent.Project
 			}
 		}
 	}
@@ -440,22 +441,48 @@ func readAgentDetail(r *agent.Record) (string, string) {
 	return string(data), title
 }
 
-// readLastLines returns the last n lines of path. Reads the whole
-// file rather than seeking from the end — output.log files are
-// bounded by tmux pane buffers in practice (a few hundred KB), so
-// the simpler implementation wins per CLAUDE.md "three lines beats a
-// generic helper".
+// readLastLines returns the last n lines of path. Reads from the
+// end of the file in a fixed-size window so a long-running worker
+// with a multi-MB output.log doesn't block the TUI render path or
+// allocate proportional memory (codex iter-5 P2). The window is
+// sized as max(64KiB, n*256B) which comfortably covers 50 lines of
+// typical worker output even when a single line is very long.
 func readLastLines(path string, n int) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	size := info.Size()
+	const minWindow int64 = 64 * 1024
+	want := int64(n) * 256
+	if want < minWindow {
+		want = minWindow
+	}
+	off := size - want
+	if off < 0 {
+		off = 0
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return "", err
+	}
 	data, err := io.ReadAll(f)
 	if err != nil {
 		return "", err
 	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	// Drop the (possibly partial) first line when we seeked past 0 —
+	// otherwise the operator sees a leading half-line that the
+	// previous chunk truncated mid-rune. When off == 0 we have the
+	// entire file and must keep every line.
+	text := strings.TrimRight(string(data), "\n")
+	lines := strings.Split(text, "\n")
+	if off > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
 	if len(lines) > n {
 		lines = lines[len(lines)-n:]
 	}

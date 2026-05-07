@@ -308,17 +308,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case agentsMsg:
+		// Capture the cursor's row identity BEFORE swapping records
+		// in. After refresh, refreshCursor relocates the cursor onto
+		// the same identity (or clamps to start if it disappeared) so
+		// background updates don't silently retarget [⏎]/[a]/[n]/[x]
+		// (codex iter-5 P1).
+		var prevID string
+		if row := m.selectedRow(); row != nil {
+			prevID = rowIdentity(*row)
+		}
 		m.err = msg.err
 		m.aliveByID = msg.alive
 		m.groupKeysByID = msg.groupKeys
 		m.records = sortRecordsBy(msg.records, msg.groupKeys)
-		// Keep the dashboard cursor in bounds when rows disappear.
-		// dashboardRows() lives across projects/tasks/workers/agents,
-		// so we recompute the row count rather than tracking each list
-		// separately.
-		if rows := m.dashboardRows(); m.dashCursor >= len(rows) {
-			m.dashCursor = 0
-		}
+		m.refreshCursor(prevID)
 		return m, nil
 
 	case tickMsg:
@@ -334,15 +337,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd())
 
 	case dashboardMsg:
-		m.dashboard = msg.snap
-		// Re-clamp the unified cursor so a project/worker/task that
-		// disappeared between ticks doesn't leave the cursor pointing
-		// past the end of the row list (codex iter-1 P2). The
-		// agentsMsg handler already does this for agent removals;
-		// dashboardMsg covers the other three row sources.
-		if rows := m.dashboardRows(); m.dashCursor >= len(rows) {
-			m.dashCursor = 0
+		// Capture cursor identity BEFORE swapping the snapshot, then
+		// re-locate via refreshCursor (codex iter-5 P1). This handles
+		// the row-shift case (project resort by Attention; new tasks
+		// inserted ahead of workers/agents) which was silently
+		// retargeting [⏎]/[a]/[n]/[x] under iter-1's clamp-only fix.
+		var prevID string
+		if row := m.selectedRow(); row != nil {
+			prevID = rowIdentity(*row)
 		}
+		m.dashboard = msg.snap
+		m.refreshCursor(prevID)
 		return m, nil
 
 	case queueEventMsg:

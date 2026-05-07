@@ -138,6 +138,67 @@ func (m Model) selectedRow() *dashRow {
 	return &rows[m.dashCursor]
 }
 
+// rowIdentity returns a string key for r that survives reorders /
+// refreshes. Used to re-locate the cursor after a dashboardMsg or
+// agentsMsg shifts the row list (codex iter-5 P1). Identity shape:
+//
+//	"P:<name>"             project
+//	"T:<project>:<slug>"   task
+//	"W:<project>:<slug>"   worker
+//	"A:<id>"               agent
+//
+// Empty string means "no identity available" (defensive — caller
+// falls back to cursor 0).
+func rowIdentity(r dashRow) string {
+	switch r.kind {
+	case rowProject:
+		if r.project != nil {
+			return "P:" + r.project.Name
+		}
+	case rowTask:
+		if r.task != nil {
+			return "T:" + r.parentProject + ":" + r.task.Slug
+		}
+	case rowWorker:
+		if r.worker != nil {
+			return "W:" + r.worker.Project + ":" + r.worker.Slug
+		}
+	case rowAgent:
+		if r.agent != nil {
+			return "A:" + r.agent.ID
+		}
+	}
+	return ""
+}
+
+// refreshCursor relocates dashCursor onto the same row identity it
+// pointed at before the refresh. Called from dashboardMsg / agentsMsg
+// reducers so background updates don't silently retarget [enter] /
+// [a] / [n] / [x] onto a different row.
+//
+// Strategy: if we know the previously-selected row's identity, look
+// for the same identity in the new dashboardRows() and snap the
+// cursor there. If not found (row disappeared), clamp to the start
+// of the list — better than dangling on a stale index.
+func (m *Model) refreshCursor(prevIdentity string) {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		m.dashCursor = 0
+		return
+	}
+	if prevIdentity != "" {
+		for i, r := range rows {
+			if rowIdentity(r) == prevIdentity {
+				m.dashCursor = i
+				return
+			}
+		}
+	}
+	if m.dashCursor < 0 || m.dashCursor >= len(rows) {
+		m.dashCursor = 0
+	}
+}
+
 // containsFold is a case-insensitive strings.Contains. Avoids importing
 // strings just for ToLower in rows.go.
 func containsFold(haystack, needle string) bool {
