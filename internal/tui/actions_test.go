@@ -1052,3 +1052,45 @@ func TestDetailOverlay_NoClipWhenFits(t *testing.T) {
 		t.Errorf("last line of fitting body must render; got:\n%s", out)
 	}
 }
+
+// TestUpdate_DashboardMsgSurfacesScanErr regresses codex iter-12 P2:
+// a Snapshot.Err set by scanDashboard (e.g. unreadable
+// ~/.fleet/projects/) must surface as a flash so the dashboard
+// doesn't silently render as "0 projects".
+func TestUpdate_DashboardMsgSurfacesScanErr(t *testing.T) {
+	m := New("test")
+	scanErr := fmt.Errorf("permission denied")
+	updated, _ := m.Update(dashboardMsg{snap: &Snapshot{
+		Err:      scanErr,
+		LoadedAt: time.Now(),
+	}})
+	got := updated.(Model)
+	if got.flash == nil || !got.flash.isErr {
+		t.Fatalf("dashboard scan err should set error flash; got %+v", got.flash)
+	}
+	if !strings.Contains(got.flash.text, "permission denied") {
+		t.Errorf("flash should reference scan err; got %q", got.flash.text)
+	}
+}
+
+// TestRepoRootForCwd_StopsAtHome regresses codex iter-12 P3: a
+// git-tracked $HOME (dotfiles checkout) must NOT capture [n] from a
+// random subdirectory like ~/Downloads. repoRootForCwd should refuse
+// at the $HOME boundary.
+func TestRepoRootForCwd_StopsAtHome(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	// Make $HOME a git checkout (dotfiles pattern).
+	if err := os.MkdirAll(filepath.Join(tmp, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Subdir below $HOME with no .git of its own.
+	sub := filepath.Join(tmp, "Downloads", "stuff")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := repoRootForCwd(sub); got != "" {
+		t.Errorf("repoRootForCwd should refuse at $HOME; got %q", got)
+	}
+}

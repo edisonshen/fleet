@@ -183,12 +183,29 @@ func (m Model) taskAddProject() string {
 }
 
 // repoRootForCwd walks up from cwd until it finds a directory
-// containing `.git` (file or dir — covers worktrees). Empty string
-// when no repo boundary is reached before hitting the filesystem
-// root or $HOME.
+// containing `.git` (file or dir — covers worktrees). Stops at
+// $HOME so a dotfiles-style git-tracked home directory doesn't
+// hijack [n] from random subdirectories like ~/Downloads (codex
+// iter-12 P3). Empty string when no repo boundary is reached.
 func repoRootForCwd(cwd string) string {
+	home, _ := os.UserHomeDir()
+	homeResolved := home
+	if home != "" {
+		if r, err := filepath.EvalSymlinks(home); err == nil {
+			homeResolved = r
+		}
+	}
 	dir := cwd
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = r
+	}
 	for {
+		// Bail when we reach $HOME — never walk above it. Without this,
+		// a ~/.git would let [n] from ~/Downloads silently target
+		// whatever project tag matches the home directory's basename.
+		if homeResolved != "" && dir == homeResolved {
+			return ""
+		}
 		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 			return dir
 		}

@@ -347,6 +347,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prevID = rowIdentity(*row)
 		}
 		m.dashboard = msg.snap
+		// Surface scan errors as a flash so an unreadable
+		// ~/.fleet/projects/ doesn't silently render as "0 projects"
+		// (codex iter-12 P2). Best-effort: per-project errors inside
+		// scanDashboard collapse to empty rows; only top-level
+		// failures (Snapshot.Err non-nil) need this banner.
+		if msg.snap != nil && msg.snap.Err != nil {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("dashboard scan failed: %v", msg.snap.Err),
+				isErr: true,
+			}
+		}
 		m.refreshCursor(prevID)
 		return m, nil
 
