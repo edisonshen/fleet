@@ -853,3 +853,75 @@ func TestDetailOverlay_ClipsLongBody(t *testing.T) {
 		t.Errorf("clipped overlay should keep close hint visible, got:\n%s", out)
 	}
 }
+
+// TestDetailOverlay_AccountsForSoftWrap regresses codex iter-9 P2:
+// when a single body line is wider than the terminal, the panel
+// budget must count the wrapped rows (cell width / termWidth), not
+// just the line count. Otherwise the close hint scrolls off-screen.
+func TestDetailOverlay_AccountsForSoftWrap(t *testing.T) {
+	// Two long lines that each soft-wrap to ~10 rows on an 80-cell
+	// terminal — together exceed the body budget for a 24-row
+	// alt-screen (24 - 8 chrome = 16 rows). Without visualRows-aware
+	// clipping, len(lines)==2 < 16 so no clip would fire.
+	wide := strings.Repeat("X", 800)
+	body := wide + "\n" + wide + "\n"
+	d := detailView{title: "test", body: body}
+	out := renderDetailOverlay(d, 80, 24)
+	if !strings.Contains(out, "more") {
+		t.Errorf("wrapped body should still trigger clipping hint; got:\n%s", out)
+	}
+	if !strings.Contains(out, "press [esc] or [⏎] to close") {
+		t.Errorf("close hint must remain visible; got:\n%s", out)
+	}
+}
+
+// TestAgentsSubheader_ShowsVisibleAliveOnly regresses codex iter-9 P3:
+// the "v0.1 agents — N active" sub-header must not count records
+// hidden by the search filter, and must not count records whose
+// derived status is "dead".
+func TestAgentsSubheader_ShowsVisibleAliveOnly(t *testing.T) {
+	(&stubSessionProbe{
+		dead: map[string]bool{"fleet-zombie": true},
+	}).install(t)
+
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(tmp+"/agents", 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	// Two agents: one live, one zombie (probe says dead).
+	live := agent.New("liveone")
+	live.TmuxSession = "fleet-liveone"
+	live.SpawnedAt = time.Now().UTC()
+	if err := live.Write(); err != nil {
+		t.Fatal(err)
+	}
+	zombie := agent.New("zombie")
+	zombie.TmuxSession = "fleet-zombie"
+	zombie.SpawnedAt = time.Now().UTC()
+	if err := zombie.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run loadAgentsCmd to populate aliveByID with the dead probe.
+	msg := loadAgentsCmd()().(agentsMsg)
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	updated, _ := m.Update(msg)
+	got := updated.(Model)
+
+	out := got.View()
+	if !strings.Contains(out, "v0.1 agents — 1 active") {
+		t.Errorf("agents sub-header should report 1 active (excluding dead zombie), got:\n%s", out)
+	}
+
+	// Now apply a filter that hides everyone. Sub-header should NOT
+	// appear (or should report 0 active).
+	got.searchFilter = "no-match-zzz"
+	out = got.View()
+	if strings.Contains(out, "v0.1 agents — 1 active") || strings.Contains(out, "v0.1 agents — 2 active") {
+		t.Errorf("filtered-empty agents must not over-report active count, got:\n%s", out)
+	}
+}

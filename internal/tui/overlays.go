@@ -68,17 +68,16 @@ func renderHelpOverlay(width int) string {
 // header; body is rendered verbatim (caller pre-formats so the panel
 // can show JSON, markdown, log tails, etc. without re-parsing).
 //
-// width is unused (panel doesn't reflow); height clips long bodies
-// so the close-hint stays visible even when the body would otherwise
-// scroll past the alt-screen bottom (codex iter-8 P2). The footer
-// already reserves ~3 rows; we budget 5 rows for header + spacing +
-// hint and clip the body to fit the rest. Operators who need the
-// full content of a clipped panel get a "(N more lines — see fleet
+// width drives soft-wrap math (codex iter-9 P2: long log/JSON lines
+// on a narrow terminal occupy more visual rows than logical lines,
+// and len(lines) alone undercounts the row budget). height clips
+// long bodies so the close-hint stays visible even when the body
+// would otherwise scroll past the alt-screen bottom. Operators who
+// need the full content of a clipped panel get a "(N more — fleet
 // peek)" tail hint; bubbletea's alt-screen has no inline scroll
 // affordance and adding one would require viewport state we don't
 // otherwise carry.
 func renderDetailOverlay(d detailView, width, height int) string {
-	_ = width
 	body := d.body
 	if height > 0 {
 		// Reserve: 1 banner (model.go pre-pends), 1 title, 1 blank, 1
@@ -89,11 +88,26 @@ func renderDetailOverlay(d detailView, width, height int) string {
 		if bodyBudget < 5 {
 			bodyBudget = 5
 		}
+		// Walk lines, accumulating their wrapped-row cost via
+		// visualRows() so a 200-cell-wide log entry on an 80-cell
+		// terminal counts as 3 visual rows, not 1 (codex iter-9 P2).
 		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
-		if len(lines) > bodyBudget {
-			more := len(lines) - bodyBudget + 1
-			lines = lines[:bodyBudget-1]
-			lines = append(lines,
+		used := 0
+		cut := -1
+		for i, line := range lines {
+			cost := visualRows(line, width)
+			if cost == 0 {
+				cost = 1
+			}
+			if used+cost > bodyBudget-1 { // -1 reserves a row for the "more" hint
+				cut = i
+				break
+			}
+			used += cost
+		}
+		if cut >= 0 {
+			more := len(lines) - cut
+			lines = append(lines[:cut],
 				headerSubtleStyle.Render(
 					fmt.Sprintf("… %d more — `fleet peek <slug>` for full content", more)))
 			body = strings.Join(lines, "\n")

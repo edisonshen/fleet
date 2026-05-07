@@ -129,15 +129,21 @@ func renderDashboardHeader(m Model, usable int) string {
 
 // renderColumnHeadings renders the "PROJECTS · 3 ACTIVE" /
 // "WORKERS · 5 ACTIVE" strip below the totals. Right column label
-// includes the v0.1 agent count when the model has any records,
-// matching issue #53 part A's agents-folded-into-dashboard intent.
+// includes the live agent count (records minus dead) when any are
+// present, matching issue #53 part A's agents-folded-into-dashboard
+// intent.
 func renderColumnHeadings(m Model, leftW, rightW int) string {
 	pn, wn := 0, 0
 	if m.dashboard != nil {
 		pn = len(m.dashboard.Projects)
 		wn = len(m.dashboard.Workers)
 	}
-	an := len(m.records)
+	an := 0
+	for _, r := range m.records {
+		if deriveStatus(r, m.aliveByID) != "dead" {
+			an++
+		}
+	}
 	leftLabel := columnHeadingStyle.Render(fmt.Sprintf("PROJECTS · %d ACTIVE", pn))
 	rightHeading := fmt.Sprintf("WORKERS · %d ACTIVE", wn)
 	if an > 0 {
@@ -258,11 +264,27 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		}
 		right = append(right, "", columnHeadingStyle.Render(hint))
 	}
-	// Insert v0.1 agents sub-heading only when records exist.
-	if len(m.records) > 0 {
+	// Insert v0.1 agents sub-heading. The counter shows VISIBLE-LIVE
+	// agents — records that survived the filter AND whose derived
+	// status isn't "dead" (codex iter-9 P3 — was using len(m.records)
+	// which over-counted both filtered-out and orphaned sessions).
+	visibleAlive := 0
+	for _, row := range rows {
+		if row.kind != rowAgent || row.agent == nil {
+			continue
+		}
+		if deriveStatus(row.agent, m.aliveByID) == "dead" {
+			continue
+		}
+		visibleAlive++
+	}
+	if visibleAlive > 0 || (len(m.records) > 0 && m.searchFilter == "") {
+		// When the operator hasn't filtered, still show a sub-header
+		// for context (e.g. all agents dead → "v0.1 agents — 0
+		// active" tells the operator the section exists).
 		right = append(right, "",
 			columnHeadingStyle.Render(fmt.Sprintf(
-				"  v0.1 agents — %d active", len(m.records))))
+				"  v0.1 agents — %d active", visibleAlive)))
 	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
