@@ -573,17 +573,27 @@ def test_gh_pr_checks_propagates_view_error(monkeypatch) -> None:
 def test_apply_dispatch_orders_status_branch_note(
     fleet_run_recorder,
 ) -> None:
-    """status flip first, branch second, note last — for crash-safety."""
+    """status flip first, branch second, note last — for crash-safety.
+
+    Every mutation must also pass `--project <project>` so the CLI's
+    cwd-default project resolution can't accidentally write to a
+    sibling project's tasks.md (Phase D codex find: project drift
+    when ProjectTag(cwd) != coord's project).
+    """
     action = loop._DispatchAction(
         slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
     )
-    loop._apply_dispatch(action, "fleet")
+    loop._apply_dispatch(action, "fleet-proj", "fleet")
     # Three calls in order.
     assert len(fleet_run_recorder) == 3
     assert "status=in-progress" in fleet_run_recorder[0]
     assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
     assert "branch=" in fleet_run_recorder[1][-1]
     assert fleet_run_recorder[2][1:3] == ["tasks", "note"]
+    # Every call carries --project to defeat cwd-default drift.
+    for call in fleet_run_recorder:
+        assert "--project" in call, f"missing --project in {call}"
+        assert "fleet-proj" in call, f"wrong project in {call}"
 
 
 def test_parse_sentinel_known_kinds() -> None:

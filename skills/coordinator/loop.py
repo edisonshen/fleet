@@ -170,7 +170,7 @@ def _tick_locked(
     reconciled = _reconcile_inflight(f.tasks, project, fleet_bin)
     for action in reconciled:
         try:
-            _apply_reconcile(action, fleet_bin)
+            _apply_reconcile(action, project, fleet_bin)
             result.reconciled += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -188,7 +188,7 @@ def _tick_locked(
     )
     for action in drained:
         try:
-            _apply_sentinel(action, fleet_bin)
+            _apply_sentinel(action, project, fleet_bin)
             result.drained += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -217,7 +217,7 @@ def _tick_locked(
     )
     for action in dispatched:
         try:
-            _apply_dispatch(action, fleet_bin)
+            _apply_dispatch(action, project, fleet_bin)
             result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
@@ -478,14 +478,23 @@ def _gh_run_json(cmd: list[str], *, timeout_s: float):
         return None, f"json decode: {exc}"
 
 
-def _apply_reconcile(action: _ReconcileAction, fleet_bin: str) -> None:
-    """Apply an _ReconcileAction via the fleet CLI."""
+def _apply_reconcile(action: _ReconcileAction, project: str, fleet_bin: str) -> None:
+    """Apply an _ReconcileAction via the fleet CLI.
+
+    Each `fleet tasks` invocation passes `--project <project>` explicitly
+    so the CLI's cwd-default project resolution (`tui.ProjectTag(cwd)`)
+    can't drift away from the coord's project. Without this guard a
+    coord whose cwd's parent-basename sanitizes differently from its
+    own project name would mutate a sibling project's tasks.md — a
+    silent corruption that's invisible until the wrong project's task
+    list shows surprise edits.
+    """
     if action.new_status:
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, f"status={action.new_status}"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     if action.clear_worker:
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, "worker_pid=0"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
-        _run_fleet([fleet_bin, "tasks", "note", action.slug, action.note])
+        _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, action.note])
     # Note: action.raised_to_user is informational; the operator sees
     # the raise via the agent record's needs_input + the appended note.
     # The skill doesn't fan out a separate inbox message — the next
@@ -603,20 +612,26 @@ def _parse_sentinel(line: str) -> _SentinelAction | None:
     return None
 
 
-def _apply_sentinel(action: _SentinelAction, fleet_bin: str) -> None:
-    """Apply a parsed sentinel via the fleet CLI."""
+def _apply_sentinel(action: _SentinelAction, project: str, fleet_bin: str) -> None:
+    """Apply a parsed sentinel via the fleet CLI.
+
+    `--project <project>` is threaded into every mutation so a coord
+    whose cwd resolves to a different sanitized name than its project
+    can't accidentally mutate a sibling project's tasks.md (see
+    _apply_reconcile docstring for the failure mode).
+    """
     if action.kind == "task_done_pr":
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, f"pr_url={action.payload}"])
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, "status=in-review"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.payload}"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-review"])
     elif action.kind == "blocked_question":
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, "status=blocked"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=blocked"])
         if action.payload:
-            _run_fleet([fleet_bin, "tasks", "note", action.slug, f"BLOCKED_QUESTION: {action.payload}"])
+            _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"BLOCKED_QUESTION: {action.payload}"])
     elif action.kind == "worker_failed":
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, "status=todo"])
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, "worker_pid=0"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         if action.payload:
-            _run_fleet([fleet_bin, "tasks", "note", action.slug, f"WORKER_FAILED: {action.payload}"])
+            _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
         # was the wake; dispatch_ready in the same tick will pick up
@@ -745,7 +760,7 @@ def _priority_sort_key(t: parse.Task) -> tuple[int, str]:
     return (rank, created)
 
 
-def _apply_dispatch(action: _DispatchAction, fleet_bin: str) -> None:
+def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> None:
     """Mark a task in-progress + record worker_pid via the fleet CLI.
 
     The agent ID is an 8-hex Fleet agent record key, not an OS PID;
@@ -757,6 +772,10 @@ def _apply_dispatch(action: _DispatchAction, fleet_bin: str) -> None:
     correlate the agent row with the task. Future Phase D / v0.2.x
     can either add a `worker_id` field or have the worker subprocess
     write its OS PID to state.json on launch.
+
+    `--project <project>` is threaded into every mutation so the
+    cwd-default project resolution can't misroute writes to a sibling
+    project (see _apply_reconcile for the failure mode).
     """
     if action.error:
         return
@@ -765,10 +784,10 @@ def _apply_dispatch(action: _DispatchAction, fleet_bin: str) -> None:
     # branch second (so the operator's `fleet tasks show` lines up with
     # the worker's actual checkout), note last (informational; missing
     # it is a graceful degradation, not state corruption).
-    _run_fleet([fleet_bin, "tasks", "set", action.slug, "status=in-progress"])
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
-        _run_fleet([fleet_bin, "tasks", "set", action.slug, f"branch={action.branch}"])
-    _run_fleet([fleet_bin, "tasks", "note", action.slug, f"dispatched as agent {action.agent_id}"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
+    _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
 
 
 # ---------- shared CLI helper ----------
