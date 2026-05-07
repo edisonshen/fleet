@@ -894,7 +894,7 @@ func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
 	edited := &Task{
 		Slug: "alpha-1234", Status: StatusDone, Priority: PriorityP0,
 		Created: created, Updated: updatedEdited, SpawnedBy: "user",
-		PRURL: "https://example.com/pr/42",
+		PRURL:  "https://example.com/pr/42",
 		Branch: "feat/edits", Notes: "extra context from operator",
 		Spec: "edited spec", Acceptance: "edited acceptance",
 		DependsOn: []string{"beta-5678"},
