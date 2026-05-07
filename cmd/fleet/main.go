@@ -48,6 +48,7 @@ Subcommands below cover dispatch / attach / status from the shell.`,
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newDrainCmd())
 	root.AddCommand(newRmCmd())
+	root.AddCommand(newTasksCmd())
 	return root
 }
 
