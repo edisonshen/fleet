@@ -876,6 +876,79 @@ func TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated(t *testing.T) {
 	}
 }
 
+// TestCoordParallelDispatch_PrunesOrphanWorktrees covers the v0.2.x
+// orphan-cleanup contract: at the top of every cap > 1 tick the coord
+// runs `git worktree prune` so a registry entry pointing at a missing
+// directory (left behind by a coord that crashed mid-tick) doesn't
+// poison the next dispatch.
+//
+// Setup mirrors a real failure: we register a worktree via
+// `git worktree add`, then `rm -rf` the directory. Git keeps the
+// registry entry — `git worktree list` still mentions the path — so
+// the next `git worktree add` for the SAME path would fatal "already
+// exists". After tick(), the prune call must have dropped the entry.
+func TestCoordParallelDispatch_PrunesOrphanWorktrees(t *testing.T) {
+	env := setupCoordIntegration(t, "orphan-proj")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+
+	// Register an orphan worktree: real `git worktree add`, then nuke
+	// the directory. Git's registry entry survives.
+	orphanDir := filepath.Join(env.fleetHome, "projects", env.project, "worktrees", "orphan-leftover")
+	if err := os.MkdirAll(filepath.Dir(orphanDir), 0o755); err != nil {
+		t.Fatalf("mkdir worktrees parent: %v", err)
+	}
+	addCmd := exec.Command("git", "-C", env.repoCwd, "worktree", "add",
+		"-b", "worker/orphan-leftover", orphanDir)
+	var addErr bytes.Buffer
+	addCmd.Stderr = &addErr
+	if err := addCmd.Run(); err != nil {
+		t.Fatalf("seed git worktree add: %v\n%s", err, addErr.String())
+	}
+	// rm -rf the dir; git's registry entry survives.
+	if err := os.RemoveAll(orphanDir); err != nil {
+		t.Fatalf("rm orphan dir: %v", err)
+	}
+
+	// Confirm the orphan is registered before the tick runs.
+	listBefore, err := exec.Command("git", "-C", env.repoCwd, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		t.Fatalf("git worktree list pre-tick: %v", err)
+	}
+	if !strings.Contains(string(listBefore), orphanDir) {
+		t.Fatalf("orphan setup didn't register worktree: %s", listBefore)
+	}
+
+	// Add an unrelated ready task so the tick has something to do
+	// (besides prune). cap=2 dispatch path runs end-to-end.
+	slug := env.addReadyTask(t, "fresh-task", "Fresh task.\nFiles: fresh.go")
+
+	// Drive one cap=2 tick. Prune fires at the top.
+	out := env.runTickCap(t, 2)
+	assertNoTickErrors(t, out)
+
+	// After tick: orphan registry entry pruned. Use --porcelain so the
+	// match is on the absolute path git emits, not a relative shorthand.
+	listAfter, err := exec.Command("git", "-C", env.repoCwd, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		t.Fatalf("git worktree list post-tick: %v", err)
+	}
+	if strings.Contains(string(listAfter), orphanDir) {
+		t.Errorf("orphan worktree still registered post-tick:\n%s", listAfter)
+	}
+
+	// Sanity: the fresh task still dispatched (its worktree exists).
+	freshWT := filepath.Join(env.fleetHome, "projects", env.project, "worktrees", slug)
+	if _, err := os.Stat(freshWT); err != nil {
+		t.Errorf("fresh-task worktree missing: %s (%v)", freshWT, err)
+	}
+
+	// Cleanup tmux for any dispatched workers.
+	for _, rec := range listAllAgents(t) {
+		_ = tmux.Kill(rec.TmuxSession)
+	}
+}
+
 // TestCoordParallelDispatch_SkipsOverlappingTasks covers the v0.2.x
 // conflict-aware dispatch contract end-to-end:
 //

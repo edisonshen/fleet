@@ -344,3 +344,44 @@ def _prune(repo: str, *, timeout_s: float = 10.0) -> None:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return
+
+
+def prune_worktrees(repo: str, *, timeout_s: float = 10.0) -> None:
+    """Public tick-start helper: best-effort `git -C <repo> worktree prune`.
+
+    Called once per coord tick (after the NB-flock, before parse +
+    reconcile + dispatch) to clean up the registry entries of any
+    worktree directory that no longer exists on disk. The classic
+    failure mode this guards: a coord crashes mid-tick after `git
+    worktree add` succeeded but before the tasks.md mutation; a
+    second run of the same dispatch path then trips on git's "already
+    exists" record. `git worktree prune` is idempotent and only drops
+    records pointing at missing directories — it never touches a live
+    checkout.
+
+    Differs from the internal `_prune` only in error handling: a
+    subprocess error here is logged to stderr (so an operator
+    debugging coord behavior sees the failure) but never bubbles up
+    so the tick can proceed. Orphan cleanup is best-effort; if it
+    fails the dispatch path may still hit "already exists" later and
+    surface the underlying problem.
+
+    Empty repo is a no-op (no Go-CLI failure mode that would surface
+    a blank repo, but defending the call site is cheaper than tracing
+    one if it ever shows up).
+    """
+    if not repo:
+        return
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "worktree", "prune"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        import sys
+        print(f"coord: worktree prune failed for {repo}: {exc}", file=sys.stderr)
+        return
+    if proc.returncode != 0:
+        import sys
+        msg = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        print(f"coord: worktree prune failed for {repo}: {msg}", file=sys.stderr)

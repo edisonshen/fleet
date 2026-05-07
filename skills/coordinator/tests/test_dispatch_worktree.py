@@ -249,6 +249,59 @@ def test_remove_worktree_treats_missing_path_as_success(tmp_path) -> None:
         assert "remove" not in call[0][0]
 
 
+# ---------- worktree.py: tick-start orphan cleanup ----------
+
+
+def test_prune_worktrees_invokes_git_with_correct_argv(tmp_path) -> None:
+    """Tick-start orphan cleanup shells `git -C <repo> worktree prune`
+    with no extra flags. Idempotent — git only drops registry entries
+    whose dirs are missing, never touches a live checkout."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m:
+        worktree_mod.prune_worktrees(repo)
+    assert m.call_count == 1
+    args = m.call_args[0][0]
+    assert args == ["git", "-C", repo, "worktree", "prune"]
+
+
+def test_prune_worktrees_silent_on_git_error(tmp_path, capsys) -> None:
+    """Git failures (non-zero exit) are logged to stderr but never
+    raise — orphan cleanup is best-effort and must not abort the tick."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    with patch.object(
+        worktree_mod.subprocess, "run",
+        return_value=_err("fatal: not a git repository\n"),
+    ):
+        # Must not raise.
+        worktree_mod.prune_worktrees(repo)
+    captured = capsys.readouterr()
+    assert "worktree prune failed" in captured.err
+    assert "not a git repository" in captured.err
+
+
+def test_prune_worktrees_silent_on_subprocess_exception(tmp_path, capsys) -> None:
+    """FileNotFoundError (no `git` on PATH) and TimeoutExpired log to
+    stderr but never raise."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    with patch.object(
+        worktree_mod.subprocess, "run",
+        side_effect=FileNotFoundError("git not found"),
+    ):
+        worktree_mod.prune_worktrees(repo)
+    captured = capsys.readouterr()
+    assert "worktree prune failed" in captured.err
+
+
+def test_prune_worktrees_empty_repo_is_noop(tmp_path) -> None:
+    """Empty repo string: defensive no-op, nothing shells out."""
+    with patch.object(worktree_mod.subprocess, "run") as m:
+        worktree_mod.prune_worktrees("")
+    assert m.call_count == 0
+
+
 # ---------- loop.py: cap=1 single-worker mode (regression guard) ----------
 
 
