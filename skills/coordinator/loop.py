@@ -1075,6 +1075,7 @@ def _dispatch_ready(
                 standards_md=standards_md,
                 learnings_text=learnings_text,
                 branch=worker_branch,
+                worktree_pre_created=bool(worker_worktree),
             )
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))

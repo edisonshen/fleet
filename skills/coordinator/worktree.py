@@ -130,11 +130,40 @@ def create_worktree(
     stderr = (proc.stderr or proc.stdout or "").strip()
     # Idempotent path: a coord crash mid-tick can leave the worktree on
     # disk but tasks.md still ready; the next tick re-runs us. git
-    # surfaces this as "already exists" or "is already checked out".
-    low = stderr.lower()
-    if "already exists" in low or "already checked out" in low:
+    # surfaces a worktree-path collision two ways:
+    #   "fatal: '<wt_path>' already exists"
+    #   "fatal: '<wt_path>' is already checked out at <ref>"
+    # We MUST NOT treat the branch-collision message
+    #   "fatal: A branch named '<branch>' already exists."
+    # as idempotent (codex iter-2 [P2]): a retry where the branch
+    # persists for an open PR but the worktree was cleaned up needs
+    # the caller to surface the error so the retry can re-checkout
+    # the existing branch instead of inventing a new one. Match only
+    # when the error references the worktree PATH, not a branch.
+    if _is_worktree_already_present(stderr, wt_path):
         return WorktreeResult(path=wt_path)
     return WorktreeResult(error=f"create_worktree: git worktree add: {stderr}")
+
+
+def _is_worktree_already_present(stderr: str, wt_path: str) -> bool:
+    """Return True iff git's stderr reports that the worktree directory
+    at wt_path already exists (idempotent retry case).
+
+    Two precise signatures:
+      "fatal: '<wt_path>' already exists"
+      "fatal: '<wt_path>' is already checked out at <ref>"
+    Anchoring on wt_path (rather than the bare phrase "already exists")
+    prevents the branch-collision error
+      "fatal: A branch named '<branch>' already exists."
+    from being misclassified as idempotent.
+    """
+    if not stderr or not wt_path:
+        return False
+    low = stderr.lower()
+    wt_low = wt_path.lower()
+    if wt_low not in low:
+        return False
+    return ("already exists" in low) or ("already checked out" in low)
 
 
 def remove_worktree(

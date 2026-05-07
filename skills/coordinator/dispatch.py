@@ -58,6 +58,7 @@ def build_worker_prompt(
     *,
     branch: str | None = None,
     workers_dir: str | None = None,
+    worktree_pre_created: bool = False,
 ) -> str:
     """Assemble the worker's first-turn prompt.
 
@@ -68,6 +69,13 @@ def build_worker_prompt(
                   the same table the operator does.
     branch: defaults to "worker/<slug>".
     workers_dir: defaults to "~/.fleet/projects/<project>/workers/<slug>".
+    worktree_pre_created: True when the coord already created the
+                  worker's worktree via `git worktree add -b <branch>`
+                  (cap > 1 mode). The branch + worktree both already
+                  exist on disk, so step 1 of the workflow is a verify
+                  rather than a `git checkout -b`. False (default) keeps
+                  single-worker mode byte-identical to v0.2.0 — worker
+                  runs `git checkout -b <branch>` itself.
 
     The format mirrors ENG §6.5 — self-contained, no inheritance from
     parent context. Safe to truncate at the hard cap; operator is on
@@ -126,11 +134,25 @@ def build_worker_prompt(
     # heartbeats into a phantom ~/.fleet/projects/<wrong>/workers/...
     # tree the coordinator never reads).
     proj_flag = f"--project {project}"
+    # Step 1 differs by mode: cap=1 the worker creates the branch
+    # itself; cap>1 the coord already ran `git worktree add -b <branch>`
+    # so the worker's cwd is already the worktree on the right branch.
+    # Doing `git checkout -b` again would fatal "branch already exists"
+    # and stall every parallel worker on its first git step (codex
+    # iter-1 [P1]).
+    if worktree_pre_created:
+        step1 = (
+            f"1. Confirm you are on the prepared worktree on branch {branch} "
+            f"(coord ran `git worktree add -b {branch}`). "
+            "Run `git rev-parse --abbrev-ref HEAD` to verify."
+        )
+    else:
+        step1 = f"1. git checkout -b {branch}"
     lines.extend([
         "## Required workflow",
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase branch",
-        f"1. git checkout -b {branch}",
+        step1,
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase tdd-red",
         "2a. Write the failing test. git commit.",

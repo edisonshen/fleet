@@ -85,15 +85,48 @@ def test_create_worktree_passes_base_when_provided(tmp_path) -> None:
 
 
 def test_create_worktree_idempotent_on_already_exists(tmp_path) -> None:
-    """Coord crash mid-tick can leave the wt on disk; resume must succeed."""
+    """Coord crash mid-tick can leave the wt on disk; resume must succeed.
+
+    The git error text references the worktree PATH so our path-anchored
+    check (codex iter-2 [P2]) classifies it as idempotent.
+    """
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / "wt" / "alpha-1234")
-    fake = _err("fatal: '<wt>' already exists\n")
+    fake = _err(f"fatal: '{wt}' already exists\n")
     with patch.object(worktree_mod.subprocess, "run", return_value=fake):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.error == ""
     assert res.path == wt
+
+
+def test_create_worktree_idempotent_on_already_checked_out(tmp_path) -> None:
+    """Variant phrasing: git also says `is already checked out at <ref>`."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    fake = _err(f"fatal: '{wt}' is already checked out at /elsewhere\n")
+    with patch.object(worktree_mod.subprocess, "run", return_value=fake):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.error == ""
+    assert res.path == wt
+
+
+def test_create_worktree_branch_already_exists_is_real_error(tmp_path) -> None:
+    """Codex iter-2 [P2] regress: a retry where the worktree was cleaned
+    up but the branch persists (open PR keeps the ref) must NOT be
+    silently treated as idempotent. git's branch-collision message is
+    distinct from the worktree-collision message — we surface it."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    # Note: the branch-collision message references the BRANCH name, not
+    # the worktree path. Our anchored check rejects it.
+    fake = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    with patch.object(worktree_mod.subprocess, "run", return_value=fake):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "branch named" in res.error.lower() or "already exists" in res.error.lower()
 
 
 def test_create_worktree_surfaces_real_git_error(tmp_path) -> None:
@@ -287,6 +320,50 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     assert disp_calls, "fleet dispatch was not invoked"
     cmd = disp_calls[0]
     assert cmd[cmd.index("--cwd") + 1] == wt_path
+
+
+def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None:
+    """Codex iter-1 [P1] regress guard: cap > 1 dispatch must pass
+    `worktree_pre_created=True` to build_worker_prompt so the worker's
+    first-turn prompt skips `git checkout -b <branch>` (the coord
+    already ran `git worktree add -b <branch>` and the branch exists).
+
+    We assert via the rendered prompt that the inbox file received —
+    `git rev-parse --abbrev-ref HEAD` is the verify-cwd step that the
+    pre-created branch path emits."""
+    t = _ready_task("alpha-1234")
+    wt_path = str(tmp_path / ".fleet" / "projects" / "proj" / "worktrees" / "alpha-1234")
+    repo = "/repo"
+    routes = {
+        ("/usr/local/bin/fleet", "workers", "worktree-path"):
+            _ok(stdout=wt_path + "\n"),
+        ("/usr/local/bin/fleet", "dispatch"):
+            _ok(stdout="agent abcdef01 dispatched\n"),
+        ("git", "-C", repo, "worktree", "add"): _ok(),
+    }
+    fleet_home_dir = str(tmp_path / "fleet_home")
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(
+             dispatch_mod.subprocess, "run",
+             side_effect=_make_subprocess_router(routes),
+         ):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd=repo, cap=2,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=fleet_home_dir,
+        )
+    assert len(actions) == 1
+    assert actions[0].error == ""
+    # Read the inbox file the dispatch path wrote.
+    inbox_path = os.path.join(fleet_home_dir, "inbox", "abcdef01.md")
+    with open(inbox_path, "r", encoding="utf-8") as fh:
+        prompt = fh.read()
+    assert "git checkout -b worker/alpha-1234" not in prompt, \
+        "cap>1 prompt must not re-create the pre-existing branch"
+    assert "git rev-parse --abbrev-ref HEAD" in prompt, \
+        "cap>1 prompt must instruct worker to verify the prepared worktree"
 
 
 def test_dispatch_ready_cap2_skips_when_worktree_path_unresolvable(tmp_path) -> None:
