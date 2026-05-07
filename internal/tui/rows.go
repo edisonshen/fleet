@@ -56,18 +56,38 @@ type taskRow struct {
 // m.records, applying the search filter when set. Always returns left-
 // column rows (projects + tasks) before right-column rows (workers +
 // agents) so cursor reading order matches visual reading order.
+//
+// Filter behavior on project blocks: a project is included when the
+// project name OR repo slug matches, OR when at least one of its
+// tasks matches. The latter case keeps the parent project header
+// rendered alongside the matching tasks so a task-slug query like
+// "/fix-toolbar-1a2b" surfaces a navigable row instead of silently
+// dropping the whole block (codex iter-1 P2).
 func (m Model) dashboardRows() []dashRow {
 	var rows []dashRow
 	if m.dashboard != nil {
 		for _, p := range m.dashboard.Projects {
-			if !m.matchesFilter(p.Name) && !m.matchesFilter(p.RepoSlug) {
-				// Project doesn't match — skip the whole block (tasks
-				// included). filter "" matches everything.
+			projectMatches := m.matchesFilter(p.Name) || m.matchesFilter(p.RepoSlug)
+			// Pre-check: do any tasks match? If yes, render the parent
+			// project header even though its name didn't match.
+			anyTaskMatches := false
+			if !projectMatches {
+				for _, t := range p.Tasks {
+					if m.matchesFilter(t.Slug) {
+						anyTaskMatches = true
+						break
+					}
+				}
+			}
+			if !projectMatches && !anyTaskMatches {
 				continue
 			}
 			rows = append(rows, dashRow{kind: rowProject, project: p})
 			for _, t := range p.Tasks {
-				if !m.matchesFilter(t.Slug) {
+				// When the project itself matched, include all tasks
+				// (operator can scan the block fully). When only tasks
+				// matched, restrict to the matching subset.
+				if !projectMatches && !m.matchesFilter(t.Slug) {
 					continue
 				}
 				rows = append(rows, dashRow{

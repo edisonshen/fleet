@@ -327,6 +327,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dashboardMsg:
 		m.dashboard = msg.snap
+		// Re-clamp the unified cursor so a project/worker/task that
+		// disappeared between ticks doesn't leave the cursor pointing
+		// past the end of the row list (codex iter-1 P2). The
+		// agentsMsg handler already does this for agent removals;
+		// dashboardMsg covers the other three row sources.
+		if rows := m.dashboardRows(); m.dashCursor >= len(rows) {
+			m.dashCursor = 0
+		}
 		return m, nil
 
 	case queueEventMsg:

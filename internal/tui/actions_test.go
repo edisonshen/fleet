@@ -342,3 +342,83 @@ func stateWriteFile(path, data string) error {
 	}
 	return os.WriteFile(path, []byte(data), 0o644)
 }
+
+// TestEsc_ClearsActiveSearchFilter regresses codex iter-1 P2: in
+// modeNav, [esc] must clear an active search filter so the footer's
+// "/<query> · esc clears" hint is honored.
+func TestEsc_ClearsActiveSearchFilter(t *testing.T) {
+	m := New("test")
+	m.searchFilter = "fix-bug"
+	m.dashCursor = 0
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	got := updated.(Model)
+	if got.searchFilter != "" {
+		t.Errorf("[esc] should clear searchFilter, got %q", got.searchFilter)
+	}
+}
+
+// TestSearch_TaskSlugMatchKeepsParentProject regresses codex iter-1
+// P2: filtering on a task slug must not drop the parent project block
+// — the task is unreachable otherwise.
+func TestSearch_TaskSlugMatchKeepsParentProject(t *testing.T) {
+	pdir := withFleetHome(t)
+	dir := filepath.Join(pdir, "alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	f := &tasks.File{Schema: tasks.SchemaVersion}
+	tk := &tasks.Task{
+		Slug:     "find-me-abcd",
+		Status:   tasks.StatusTodo,
+		Priority: tasks.PriorityP2,
+		Spec:     "needle",
+		Created:  now,
+		Updated:  now,
+	}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	// Filter on the task slug.
+	m.searchFilter = "find-me"
+	rows := m.dashboardRows()
+
+	// Parent project must appear (so the operator can navigate to it).
+	var sawProject, sawTask bool
+	for _, r := range rows {
+		if r.kind == rowProject && r.project.Name == "alpha" {
+			sawProject = true
+		}
+		if r.kind == rowTask && r.task.Slug == "find-me-abcd" {
+			sawTask = true
+		}
+	}
+	if !sawProject {
+		t.Errorf("task-slug filter should keep parent project visible; rows: %+v", rows)
+	}
+	if !sawTask {
+		t.Errorf("task-slug filter should expose the matching task row; rows: %+v", rows)
+	}
+}
+
+// TestDashboardMsg_ReClampsCursor regresses codex iter-1 P2: a
+// dashboard refresh that drops rows (project archived, worker
+// finished) must clamp dashCursor back into bounds, otherwise [⏎]
+// silently no-ops.
+func TestDashboardMsg_ReClampsCursor(t *testing.T) {
+	m := New("test")
+	// Pretend dashCursor was sitting on row 5.
+	m.dashCursor = 5
+	// dashboardMsg with an empty snapshot — dashboardRows() is now empty.
+	updated, _ := m.Update(dashboardMsg{snap: &Snapshot{LoadedAt: time.Now()}})
+	if updated.(Model).dashCursor != 0 {
+		t.Errorf("dashboardMsg should re-clamp dashCursor when rows shrink; got %d", updated.(Model).dashCursor)
+	}
+}

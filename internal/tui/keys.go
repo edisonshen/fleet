@@ -160,6 +160,18 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		m.mode = modePromptSearch
 		m.promptBuf = m.searchFilter
 		return m, nil, true
+	case "esc":
+		// In modeNav, Esc clears the active search filter. Without
+		// this branch, the footer's advertised "/<query> · esc clears"
+		// hint would only work while the search prompt is open — once
+		// committed, the operator would have to re-press [/] just to
+		// dismiss the filter (codex iter-1 P2).
+		if m.searchFilter != "" {
+			m.searchFilter = ""
+			m.dashCursor = 0
+			return m, nil, true
+		}
+		return m, nil, false
 	case "n":
 		m.mode = modePromptTaskAdd
 		m.promptBuf = ""
