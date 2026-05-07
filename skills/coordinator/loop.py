@@ -165,6 +165,18 @@ def _tick_locked(
     now_unix: float,
 ) -> TickResult:
     """Body of the tick once we hold the coord lock."""
+    # 1.5. Orphan-worktree cleanup. A coord that crashed mid-tick can
+    # leave a worktree directory + its git registry entry behind; the
+    # next dispatch then trips on "already exists" and the task is
+    # un-redispatchable. `git worktree prune` is idempotent and only
+    # drops registry entries whose dirs are missing — safe to call
+    # every tick. Gated on cap > 1 because cap=1 mode never creates
+    # worktrees (byte-identical-to-v0.2.0 invariant); the call would
+    # be a no-op there anyway, but skipping it removes one source of
+    # behavior drift on the regression-safe path.
+    if cap > 1:
+        worktree_mod.prune_worktrees(cwd)
+
     # 2. Read tasks.md (read-only — coord doesn't write tasks.md
     # directly; mutations go via `fleet tasks set/note`).
     tasks_path = project_dir / "tasks.md"

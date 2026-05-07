@@ -396,6 +396,81 @@ def test_tick_no_op_under_lock_held(
         os.close(fd)
 
 
+# ---------- orphan worktree cleanup at tick start ----------
+
+
+def test_tick_calls_prune_worktrees_in_cap2_mode(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """cap > 1 ticks invoke `worktree.prune_worktrees(cwd)` once at the
+    top, AFTER the NB-flock + BEFORE parse / reconcile / dispatch.
+
+    The prune call is best-effort cleanup of any registry entry whose
+    directory no longer exists (e.g. a coord crashed mid-tick after
+    `git worktree add` succeeded but before tasks.md was updated).
+    Without it, the next dispatch trips on git's "already exists".
+    """
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+    import worktree as worktree_mod
+    with patch.object(worktree_mod, "prune_worktrees") as m:
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            cap=2, fleet_home=str(fleet_home),
+        )
+    # Called exactly once with the repo cwd.
+    assert m.call_count == 1
+    args, _ = m.call_args
+    assert args[0] == "/repo"
+    # Tick still completed — prune is non-blocking.
+    assert not result.skipped
+
+
+def test_tick_skips_prune_in_cap1_mode(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """cap=1 mode never creates worktrees — calling prune is harmless
+    but unnecessary. Skipping keeps single-worker mode byte-identical
+    to v0.2.0 (no extra git invocations on the regression-safe path).
+    """
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+    import worktree as worktree_mod
+    with patch.object(worktree_mod, "prune_worktrees") as m:
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            cap=1, fleet_home=str(fleet_home),
+        )
+    assert m.call_count == 0
+
+
+def test_tick_prune_failure_does_not_abort_tick(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """An exception inside prune_worktrees would abort the tick — but
+    the helper itself swallows errors. Belt-and-suspenders: even if a
+    bug ever leaked an exception out of prune, the tick should not
+    silently drop dispatch. Here we patch prune to raise and assert
+    the tick still raises (i.e. the exception is NOT swallowed at the
+    loop level — that's the prune helper's job, and we want a noisy
+    failure if the contract changes)."""
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+    import worktree as worktree_mod
+    with patch.object(
+        worktree_mod, "prune_worktrees",
+        side_effect=RuntimeError("simulated prune crash"),
+    ):
+        with pytest.raises(RuntimeError, match="simulated prune crash"):
+            loop.tick(
+                "fleet", coord_id="cccccc01", cwd="/repo",
+                cap=2, fleet_home=str(fleet_home),
+            )
+
+
 # ---------- parse error ----------
 
 

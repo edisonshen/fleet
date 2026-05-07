@@ -60,6 +60,12 @@ The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet
 1. NB-flock coordinator.lock
    on EWOULDBLOCK → log + exit 0  ("another tick in progress, skipping")
 
+1.5. Orphan worktree cleanup (cap > 1 only):
+     `git -C <repo> worktree prune` — drops registry entries whose dirs
+     are missing (e.g. coord crashed mid-tick after `git worktree add`).
+     Idempotent and best-effort; failures log to stderr but never abort
+     the tick. cap=1 mode skips this step (worktrees never created).
+
 2. tasks   = parse(tasks.md)              # parse.py — read-only mirror of internal/tasks
    stds   = `fleet standards show --merged --project <p>`
    learn  = `fleet learnings list --project <p> --limit 20`
