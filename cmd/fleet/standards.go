@@ -88,7 +88,7 @@ the bool selector is --project-only because of the name collision.)`,
 				opts.scope = scopeMerged
 			}
 			if set > 1 {
-				return fmt.Errorf("standards show: --global / --project / --merged are mutually exclusive")
+				return fmt.Errorf("standards show: --global / --project-only / --merged are mutually exclusive")
 			}
 			return runStandardsShow(opts, cmd.OutOrStdout())
 		},
@@ -169,7 +169,7 @@ opening nothing).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if opts.global && opts.proj {
-				return fmt.Errorf("standards edit: --global and --project are mutually exclusive")
+				return fmt.Errorf("standards edit: --global and --project-only are mutually exclusive")
 			}
 			return runStandardsEdit(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},

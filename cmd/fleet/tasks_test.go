@@ -39,6 +39,70 @@ func setupTasksHome(t *testing.T) (string, string) {
 	return fleetHome, "alpha"
 }
 
+// TestResolveProject_FromWorkerWorktree regresses codex iter-7 P1.
+// When a worker invokes a `fleet <subcommand>` from inside its
+// worktree (~/.fleet/projects/<project>/worktrees/<slug>), the
+// default --project must resolve to <project>, NOT to the
+// parent-basename ProjectTag of the worktree dir (which would be
+// "worktrees-<slug>" and silently misroute mutations into a phantom
+// project tree the operator never reads).
+func TestResolveProject_FromWorkerWorktree(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	wt, err := state.WorktreePath("myproject", "feature-1234")
+	if err != nil {
+		t.Fatalf("WorktreePath: %v", err)
+	}
+	wt = strings.TrimSuffix(wt, string(filepath.Separator))
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatalf("mkdir worktree: %v", err)
+	}
+	cwdBefore, _ := os.Getwd()
+	if err := os.Chdir(wt); err != nil {
+		t.Fatalf("chdir worktree: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwdBefore) })
+	got, err := resolveProject("")
+	if err != nil {
+		t.Fatalf("resolveProject: %v", err)
+	}
+	if got != "myproject" {
+		t.Errorf("resolveProject from worktree=%q; want %q", got, "myproject")
+	}
+}
+
+// TestResolveProject_FromOperatorCwd preserves the existing
+// behavior: outside a fleet-managed worktree, the cwd's parent-
+// basename ProjectTag wins (matches `fleet dispatch` default).
+func TestResolveProject_FromOperatorCwd(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	workdir := filepath.Join(t.TempDir(), "myrepo")
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cwdBefore, _ := os.Getwd()
+	if err := os.Chdir(workdir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(cwdBefore) })
+	got, err := resolveProject("")
+	if err != nil {
+		t.Fatalf("resolveProject: %v", err)
+	}
+	// We don't pin the exact value (it depends on tmp-parent name),
+	// but it must not be a worktree-extracted project name and must
+	// pass ValidateProjectName.
+	if got == "" {
+		t.Error("resolveProject empty")
+	}
+	if strings.HasPrefix(got, "worktrees-") {
+		t.Errorf("resolveProject=%q; should not look like a worktree-derived tag", got)
+	}
+}
+
 // TestTasksAdd_DefaultsAndSlug exercises the happy path: add with a
 // spec body produces a task with derived slug, status=todo, and the
 // timestamps get stamped.
@@ -105,7 +169,9 @@ func TestTasksAdd_PositionalSlug(t *testing.T) {
 func TestTasksList_Filters(t *testing.T) {
 	_, project := setupTasksHome(t)
 
-	for _, spec := range []string{"todo one", "ready two", "todo three"} {
+	specs := []string{"first task", "second task", "third task"}
+	slugs := make([]string, 0, len(specs))
+	for _, spec := range specs {
 		out := &bytes.Buffer{}
 		if err := runTasksAdd(&tasksAddOpts{
 			project:   project,
@@ -116,23 +182,69 @@ func TestTasksList_Filters(t *testing.T) {
 		}, "", out); err != nil {
 			t.Fatalf("add %q: %v", spec, err)
 		}
+		// Pull the auto-derived slug out of stdout. Format is:
+		//   "added <slug> (status=... priority=...) to <path>".
+		line := strings.TrimSpace(out.String())
+		parts := strings.Fields(line)
+		if len(parts) < 2 || parts[0] != "added" {
+			t.Fatalf("add output unrecognized: %q", line)
+		}
+		slugs = append(slugs, parts[1])
 	}
-	// Promote the second one to ready.
+	// Flip the second task to ready so unfiltered listing shows a
+	// mixed status set, --status=todo trims to two rows, and
+	// --status=ready trims to one. Without the flip both branches
+	// would pass even if the filter did nothing.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slugs[1], "status=ready", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set ready: %v", err)
+	}
+
+	// rowsByStatus counts data rows (skipping header) whose row has
+	// the expected slug. Output uses tabwriter with space padding,
+	// so we anchor on slug + a status keyword on the same line.
+	rowsContainingSlug := func(buf string, slug string) int {
+		c := 0
+		for _, line := range strings.Split(buf, "\n") {
+			if strings.Contains(line, slug) {
+				c++
+			}
+		}
+		return c
+	}
+
 	out := &bytes.Buffer{}
 	if err := runTasksList(&tasksListOpts{project: project}, out); err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	count := strings.Count(out.String(), "todo")
-	if count < 3 { // header + 3 rows
-		t.Errorf("expected 3 todo rows in unfiltered list, got %q", out.String())
+	all := out.String()
+	for _, s := range slugs {
+		if rowsContainingSlug(all, s) != 1 {
+			t.Errorf("unfiltered list missing or duplicating %q: %s", s, all)
+		}
 	}
 
 	out.Reset()
 	if err := runTasksList(&tasksListOpts{project: project, status: "todo"}, out); err != nil {
-		t.Fatalf("list filtered: %v", err)
+		t.Fatalf("list --status=todo: %v", err)
 	}
-	if strings.Contains(out.String(), "no tasks") {
-		t.Errorf("filter dropped all rows: %s", out.String())
+	todoOut := out.String()
+	if rowsContainingSlug(todoOut, slugs[0]) != 1 || rowsContainingSlug(todoOut, slugs[2]) != 1 {
+		t.Errorf("--status=todo missing first/third todo rows: %s", todoOut)
+	}
+	if strings.Contains(todoOut, slugs[1]) {
+		t.Errorf("--status=todo leaked the ready slug %q: %s", slugs[1], todoOut)
+	}
+
+	out.Reset()
+	if err := runTasksList(&tasksListOpts{project: project, status: "ready"}, out); err != nil {
+		t.Fatalf("list --status=ready: %v", err)
+	}
+	readyOut := out.String()
+	if rowsContainingSlug(readyOut, slugs[1]) != 1 {
+		t.Errorf("--status=ready missing the ready row: %s", readyOut)
+	}
+	if strings.Contains(readyOut, slugs[0]) || strings.Contains(readyOut, slugs[2]) {
+		t.Errorf("--status=ready leaked todo rows: %s", readyOut)
 	}
 }
 

@@ -58,9 +58,16 @@ per-project state-lock, so concurrent invocations are safe.`,
 	return cmd
 }
 
-// resolveProject normalizes --project. Empty input falls back to the
-// cwd's last-two-segments tag (matching the TUI's [d]-picker default
-// so `fleet dispatch` and `fleet tasks` agree on the default project).
+// resolveProject normalizes --project. Empty input falls back to:
+//  1. cwd if cwd is inside ~/.fleet/projects/<project>/worktrees/<slug>
+//     → extract <project>. Workers spawned by the coord run inside
+//     this layout; their cwd's parent-basename would otherwise be
+//     "worktrees-<slug>" and silently misroute mutations into a
+//     phantom project (codex iter-7 P1).
+//  2. otherwise the cwd's last-two-segments tag (matching the TUI's
+//     [d]-picker default so `fleet dispatch` and `fleet tasks` agree
+//     on the default project for operator-side invocations).
+//
 // The result is validated so callers don't have to.
 func resolveProject(p string) (string, error) {
 	if p == "" {
@@ -68,12 +75,51 @@ func resolveProject(p string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("getwd: %w", err)
 		}
-		p = tui.ProjectTag(cwd)
+		if proj := projectFromWorktreeCwd(cwd); proj != "" {
+			p = proj
+		} else {
+			p = tui.ProjectTag(cwd)
+		}
 	}
 	if err := state.ValidateProjectName(p); err != nil {
 		return "", fmt.Errorf("--project: %w", err)
 	}
 	return p, nil
+}
+
+// projectFromWorktreeCwd returns the project name when cwd is under
+// ~/.fleet/projects/<project>/worktrees/<slug>(/...). Empty string
+// means "not inside a fleet-managed worktree" — caller falls back to
+// the operator-side ProjectTag(cwd) heuristic.
+//
+// We resolve symlinks on both sides because state.WorktreePath returns
+// a path that may itself be under a symlinked $HOME on macOS, while
+// os.Getwd() may report the realpath; without resolution the prefix
+// match fails for real worker shells.
+func projectFromWorktreeCwd(cwd string) string {
+	root, err := state.Root()
+	if err != nil {
+		return ""
+	}
+	rootResolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		rootResolved = root
+	}
+	cwdResolved, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		cwdResolved = cwd
+	}
+	prefix := filepath.Join(rootResolved, "projects") + string(filepath.Separator)
+	if !strings.HasPrefix(cwdResolved, prefix) {
+		return ""
+	}
+	rest := cwdResolved[len(prefix):]
+	parts := strings.Split(rest, string(filepath.Separator))
+	// Need at least <project>/worktrees/<slug> after "projects/".
+	if len(parts) < 3 || parts[1] != "worktrees" {
+		return ""
+	}
+	return parts[0]
 }
 
 // readTasks loads tasks.md for project. Missing file returns an empty
