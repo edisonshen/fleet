@@ -323,7 +323,25 @@ func Archive(project string, slugs []string) error {
 						existing.Created.UTC().Format(time.RFC3339),
 						t.Created.UTC().Format(time.RFC3339))
 				}
-				// Retry-recovery — leave archive entry alone, drop from current.
+				// Retry-recovery — refresh the archive entry's mutable
+				// fields from the live row before dropping it. If an
+				// operator edited the still-visible task between the
+				// failed Archive and this retry (issue #37), the stale
+				// archived snapshot would otherwise lose those edits.
+				// Slug + Created are immutable identity; everything
+				// else is operator-mutable state we want to preserve.
+				existing.Status = t.Status
+				existing.Priority = t.Priority
+				existing.WorkerPID = t.WorkerPID
+				existing.Worktree = t.Worktree
+				existing.PRURL = t.PRURL
+				existing.Branch = t.Branch
+				existing.Updated = t.Updated
+				existing.DependsOn = t.DependsOn
+				existing.SpawnedBy = t.SpawnedBy
+				existing.Spec = t.Spec
+				existing.Acceptance = t.Acceptance
+				existing.Notes = t.Notes
 				continue
 			}
 			archive.Tasks = append(archive.Tasks, t)
