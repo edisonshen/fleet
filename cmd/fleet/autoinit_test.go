@@ -14,6 +14,7 @@ import (
 func TestMaybeAutoInit_FreshHome(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	var out bytes.Buffer
 	maybeAutoInit(&out, claudeHome)
@@ -39,6 +40,7 @@ func TestMaybeAutoInit_FreshHome(t *testing.T) {
 func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	// Bootstrap a clean install once via runInit so every embedded
 	// file lands on disk; then maybeAutoInit should be a no-op.
@@ -64,6 +66,7 @@ func TestMaybeAutoInit_AlreadyInstalled(t *testing.T) {
 func TestMaybeAutoInit_StaleSkillFileSelfHeals(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	// Bootstrap a clean install, then deliberately corrupt main.py to
 	// simulate the upgrade-path drift a stale binary would leave.
@@ -107,6 +110,7 @@ func TestMaybeAutoInit_StaleSkillFileSelfHeals(t *testing.T) {
 func TestMaybeAutoInit_HookDriftReinstalls(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	// Bootstrap files + hooks.
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
@@ -137,6 +141,7 @@ func TestMaybeAutoInit_HookDriftReinstalls(t *testing.T) {
 func TestMaybeAutoInit_PartialInstallReinstalls(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 	skillRoot := filepath.Join(claudeHome, "skills", "fleet-guard")
 	if err := os.MkdirAll(skillRoot, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -170,9 +175,44 @@ func TestMaybeAutoInit_PartialInstallReinstalls(t *testing.T) {
 // first run. (The dispatch itself fails because tmux isn't usually
 // available in CI — that failure is fine; auto-init runs before the
 // failure point.)
+// TestMaybeAutoInit_MissingCoordinatorTriggersInstall regresses the
+// v0.1→v0.2 upgrade: a machine with fleet-guard fully installed but
+// the new coordinator skill missing must trigger an auto-install on
+// next dispatch. The previous fleet-guard-only check would have
+// reported "fully installed" and silently skipped, leaving v0.2
+// operators without /coordinator on disk.
+func TestMaybeAutoInit_MissingCoordinatorTriggersInstall(t *testing.T) {
+	tmp := t.TempDir()
+	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
+
+	// Full v0.1-style install: fleet-guard only.
+	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
+		t.Fatalf("setup runInit: %v", err)
+	}
+	// Simulate a v0.1 → v0.2 upgrade: nuke the coordinator skill dir
+	// to mimic an operator who installed fleet at v0.1 (when
+	// coordinator didn't exist) and now upgraded.
+	if err := os.RemoveAll(filepath.Join(claudeHome, "skills", "coordinator")); err != nil {
+		t.Fatalf("remove coordinator skill dir: %v", err)
+	}
+
+	var out bytes.Buffer
+	maybeAutoInit(&out, claudeHome)
+
+	if !strings.Contains(out.String(), "first run") {
+		t.Errorf("missing coordinator skill should trigger auto-install, got:\n%s", out.String())
+	}
+	coordSKILL := filepath.Join(claudeHome, "skills", "coordinator", "SKILL.md")
+	if _, err := os.Stat(coordSKILL); err != nil {
+		t.Errorf("auto-install did not write coordinator/SKILL.md: %v", err)
+	}
+}
+
 func TestMaybeAutoInit_DispatchHooked(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	claudeMain := filepath.Join(tmp, ".claude", "skills", "fleet-guard", "main.py")
 	if _, err := os.Stat(claudeMain); err == nil {

@@ -21,6 +21,7 @@ import (
 func TestRunInit_WritesAllSkillFiles(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	var out bytes.Buffer
 	if err := runInit(&out, false, claudeHome); err != nil {
@@ -49,6 +50,7 @@ func TestRunInit_WritesAllSkillFiles(t *testing.T) {
 func TestRunInit_FilesByteEqualEmbedded(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
 		t.Fatalf("runInit: %v", err)
@@ -83,6 +85,7 @@ func TestRunInit_FilesByteEqualEmbedded(t *testing.T) {
 func TestRunInit_IsIdempotent(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
 		t.Fatalf("first runInit: %v", err)
@@ -122,6 +125,7 @@ func TestRunInit_IsIdempotent(t *testing.T) {
 func TestRunInit_StaleFilesAutoRefresh(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 
 	// First install.
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
@@ -153,6 +157,7 @@ func TestRunInit_StaleFilesAutoRefresh(t *testing.T) {
 func TestRunInit_PythonFilesAreExecutable(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
@@ -173,6 +178,7 @@ func TestRunInit_PythonFilesAreExecutable(t *testing.T) {
 func TestRunInit_PreservesExistingHooks(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +239,7 @@ func TestRunInit_PreservesExistingHooks(t *testing.T) {
 func TestRunInit_RegistersAllHookEvents(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 	if err := runInit(&bytes.Buffer{}, false, claudeHome); err != nil {
 		t.Fatalf("runInit: %v", err)
 	}
@@ -264,6 +271,7 @@ func TestRunInit_RegistersAllHookEvents(t *testing.T) {
 func TestRunInit_RefusesCorruptHooksField(t *testing.T) {
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, ".claude")
+	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
 	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
 		t.Fatal(err)
 	}

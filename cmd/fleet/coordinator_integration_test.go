@@ -29,6 +29,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,10 +39,16 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// fleetBinaryPath is built once per `go test` invocation by
-// buildFleetBinary; tests share the same binary because builds are
-// expensive (~5s) and the binary is read-only.
-var fleetBinaryPath string
+// fleetBinaryPath / fleetBinaryErr are populated once per `go test`
+// invocation by buildFleetBinary; tests share the same binary because
+// the build is expensive (~5s) and the binary is read-only. sync.Once
+// protects against the race where two parallel tests both find an
+// empty path and start two builds.
+var (
+	fleetBinaryOnce sync.Once
+	fleetBinaryPath string
+	fleetBinaryErr  error
+)
 
 // buildFleetBinary compiles cmd/fleet into a tempdir and returns the
 // absolute path. Called lazily on first integration test so the test
@@ -49,34 +56,44 @@ var fleetBinaryPath string
 // invocations (Go's test runner caches across invocations but a
 // per-binary `go build` is unavoidable). On subsequent calls the
 // already-built path is returned.
+//
+// sync.Once ensures only one build runs even if multiple integration
+// tests start concurrently. Build errors propagate through
+// fleetBinaryErr so subsequent callers fail with the same message
+// rather than racing into a second build attempt.
 func buildFleetBinary(t *testing.T) string {
 	t.Helper()
-	if fleetBinaryPath != "" {
-		return fleetBinaryPath
+	fleetBinaryOnce.Do(func() {
+		if _, err := exec.LookPath("go"); err != nil {
+			fleetBinaryErr = fmt.Errorf("`go` not on PATH: %w", err)
+			return
+		}
+		dir, err := os.MkdirTemp("", "fleet-int-bin-")
+		if err != nil {
+			fleetBinaryErr = fmt.Errorf("mkdir bin: %w", err)
+			return
+		}
+		bin := filepath.Join(dir, "fleet")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/fleet")
+		cmd.Dir = repoRoot(t)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			_ = os.RemoveAll(dir)
+			fleetBinaryErr = fmt.Errorf("go build ./cmd/fleet: %w", err)
+			return
+		}
+		fleetBinaryPath = bin
+	})
+	if fleetBinaryErr != nil {
+		// Skip rather than fatal so a missing `go` toolchain on a
+		// CI runner without dev tooling doesn't tank the whole
+		// integration test suite — just declines to run them.
+		t.Skip(fleetBinaryErr.Error())
 	}
-	if _, err := exec.LookPath("go"); err != nil {
-		t.Skip("`go` not on PATH; skipping integration test")
-	}
-	dir, err := os.MkdirTemp("", "fleet-int-bin-")
-	if err != nil {
-		t.Fatalf("mkdir bin: %v", err)
-	}
-	bin := filepath.Join(dir, "fleet")
-	if runtime.GOOS == "windows" {
-		bin += ".exe"
-	}
-	cmd := exec.Command("go", "build", "-o", bin, "./cmd/fleet")
-	// The integration test lives in cmd/fleet/, so the module root is
-	// two levels up. Resolve it via runtime.Caller so we don't rely on
-	// where the test runner was invoked from.
-	cmd.Dir = repoRoot(t)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		_ = os.RemoveAll(dir)
-		t.Fatalf("go build ./cmd/fleet: %v", err)
-	}
-	fleetBinaryPath = bin
-	return bin
+	return fleetBinaryPath
 }
 
 // repoRoot walks upward from this test file's location until it finds
@@ -105,6 +122,7 @@ func repoRoot(t *testing.T) string {
 type integrationEnv struct {
 	fleetHome  string // ~/.fleet equivalent
 	claudeHome string // ~/.claude equivalent
+	homeDir    string // sandboxed $HOME so subprocess `fleet dispatch` can't write to the operator's real ~/.claude
 	repoCwd    string // working directory for dispatched workers
 	binDir     string // PATH directory holding fleet + gh stubs
 	skillDir   string // ~/.claude/skills/coordinator (after init)
@@ -130,15 +148,15 @@ func setupCoordIntegration(t *testing.T, project string) *integrationEnv {
 	bin := buildFleetBinary(t)
 
 	tmp := t.TempDir()
+	homeDir := filepath.Join(tmp, "home")
 	fleetHome := filepath.Join(tmp, ".fleet")
-	claudeHome := filepath.Join(tmp, ".claude")
+	claudeHome := filepath.Join(homeDir, ".claude")
 	repoCwd := filepath.Join(tmp, "repo")
 	binDir := filepath.Join(tmp, "bin")
-	if err := os.MkdirAll(repoCwd, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(binDir, 0o755); err != nil {
-		t.Fatal(err)
+	for _, d := range []string{homeDir, repoCwd, binDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Symlink fleet into binDir so PATH lookup works inside the skill.
@@ -163,8 +181,14 @@ func setupCoordIntegration(t *testing.T, project string) *integrationEnv {
 	// this stub by writing a custom one before driving the tick.
 	writeStubGH(t, binDir, ghStubReturnsEmpty)
 
-	// Set FLEET_HOME + PATH first so subsequent commands hit the sandbox.
+	// Set FLEET_HOME + HOME + PATH first so subsequent commands hit the
+	// sandbox. HOME override is critical: maybeAutoInit (called by
+	// `fleet dispatch`) walks UserHomeDir() to compute its skill
+	// install path. Without this override, the integration test's
+	// dispatched workers would auto-install fleet-guard into the
+	// operator's REAL ~/.claude/skills/, polluting the dev machine.
 	t.Setenv("FLEET_HOME", fleetHome)
+	t.Setenv("HOME", homeDir)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	if _, err := state.Bootstrap(); err != nil {
@@ -186,6 +210,7 @@ func setupCoordIntegration(t *testing.T, project string) *integrationEnv {
 	return &integrationEnv{
 		fleetHome:  fleetHome,
 		claudeHome: claudeHome,
+		homeDir:    homeDir,
 		repoCwd:    repoCwd,
 		binDir:     binDir,
 		skillDir:   skillDir,
@@ -206,8 +231,11 @@ func setupCoordIntegration(t *testing.T, project string) *integrationEnv {
 func (env *integrationEnv) runFleet(t *testing.T, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(env.binDir, "fleet"), args...)
-	cmd.Env = append(os.Environ(), "FLEET_HOME="+env.fleetHome,
-		"PATH="+env.binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = append(os.Environ(),
+		"FLEET_HOME="+env.fleetHome,
+		"HOME="+env.homeDir,
+		"PATH="+env.binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
 	cmd.Dir = env.repoCwd
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -255,6 +283,7 @@ print(json.dumps({
 	cmd := exec.Command("python3", "-c", driver)
 	cmd.Env = append(os.Environ(),
 		"FLEET_HOME="+env.fleetHome,
+		"HOME="+env.homeDir,
 		"FLEET_AGENT_ID="+env.coordID,
 		"PATH="+env.binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
