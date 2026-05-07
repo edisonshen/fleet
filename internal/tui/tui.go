@@ -131,13 +131,14 @@ func startWatcher(prog *tea.Program) (func(), error) {
 	// Recursive watching every workers/<slug>/ + tasks.md would explode
 	// the watcher count on a multi-project setup; the dashboard scan is
 	// cheap (single-digit ms) and the tick cadence is fine for an ops
-	// console. Missing dir is non-fatal: Bootstrap creates it, but a
-	// fresh install before the first dispatch leaves it absent.
+	// console. Bootstrap creates the dir so an Add failure here is
+	// genuinely surprising — log to stderr but don't fail the TUI.
 	projectsWatched := true
 	if err := w.Add(projectsDir); err != nil {
 		projectsWatched = false
-		// Quietly fall back to polling; this is expected on fresh
-		// installs and not worth a stderr line.
+		fmt.Fprintf(os.Stderr,
+			"warning: projects/ watcher unavailable (%v) — dashboard refresh limited to 1s polling\n",
+			err)
 	}
 	// queue/ may not exist yet on a fresh install — Bootstrap creates
 	// it, but defend against an environment where the operator deleted

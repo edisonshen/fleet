@@ -83,20 +83,30 @@ func seedWorker(t *testing.T, projectsRoot, project, slug string, s workers.Stat
 }
 
 // touchCoordLock writes a zero-byte coordinator.lock under the project
-// .locks/ dir with the given mtime. mtime drives the dashboard's
-// active/idle inference.
+// .locks/ dir AND a coord-state.json at the project root with the
+// given mtime. The two-file pair mirrors what a running coord leaves on
+// disk: the lock from first acquire (mtime fixed) and coord-state.json
+// from each tick (mtime advances). The dashboard reads coord-state.json
+// for the active heartbeat — see scanProject's commentary.
 func touchCoordLock(t *testing.T, projectsRoot, project string, mtime time.Time) {
 	t.Helper()
-	dir := filepath.Join(projectsRoot, project, ".locks")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	locksDir := filepath.Join(projectsRoot, project, ".locks")
+	if err := os.MkdirAll(locksDir, 0o755); err != nil {
 		t.Fatalf("mkdir locks: %v", err)
 	}
-	path := filepath.Join(dir, "coordinator.lock")
-	if err := os.WriteFile(path, nil, 0o644); err != nil {
+	lockPath := filepath.Join(locksDir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
 		t.Fatalf("write coord lock: %v", err)
 	}
-	if err := os.Chtimes(path, mtime, mtime); err != nil {
+	statePath := filepath.Join(projectsRoot, project, "coord-state.json")
+	if err := os.WriteFile(statePath, []byte("{}\n"), 0o644); err != nil {
+		t.Fatalf("write coord-state.json: %v", err)
+	}
+	if err := os.Chtimes(lockPath, mtime, mtime); err != nil {
 		t.Fatalf("chtimes coord lock: %v", err)
+	}
+	if err := os.Chtimes(statePath, mtime, mtime); err != nil {
+		t.Fatalf("chtimes coord-state.json: %v", err)
 	}
 }
 
@@ -204,6 +214,37 @@ func TestView_CoordStatusIdleWhenLockStale(t *testing.T) {
 	out := m.View()
 	if !strings.Contains(out, "auto-stopped") {
 		t.Errorf("stale coord lock should render as ○ idle · auto-stopped, got:\n%s", out)
+	}
+}
+
+// TestView_CoordStatusIdleWhenLockOnly pins the case where
+// coordinator.lock exists but coord-state.json does NOT. flock(2)
+// doesn't update mtime, so a stale lock without a fresh state file
+// must NOT read as active — it should render as auto-stopped instead.
+func TestView_CoordStatusIdleWhenLockOnly(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	// Write only the lock file, skipping coord-state.json. mtime
+	// freshness on the lock file is irrelevant by design.
+	locksDir := filepath.Join(pdir, "fleet", ".locks")
+	if err := os.MkdirAll(locksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locksDir, "coordinator.lock"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+
+	out := m.View()
+	if strings.Contains(out, "● active") {
+		t.Errorf("lock-only (no coord-state.json) must NOT show active, got:\n%s", out)
+	}
+	if !strings.Contains(out, "auto-stopped") {
+		t.Errorf("lock-only should render auto-stopped, got:\n%s", out)
 	}
 }
 
@@ -319,6 +360,21 @@ func TestWorkerRow_ColorByPhase(t *testing.T) {
 				t.Errorf("phase=%s state=%s want=%s", c.phase, row.State, c.wantState)
 			}
 		})
+	}
+}
+
+func TestWorkerRow_ZeroUpdatedAtRendersDash(t *testing.T) {
+	// Defensive: a malformed state.json with no UpdatedAt must not
+	// render the age as "734503d" (now minus the zero-time).
+	now := time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC)
+	s := &workers.State{
+		Slug:  "x-1234",
+		Phase: workers.PhaseTDDGreen,
+		// UpdatedAt left as zero on purpose.
+	}
+	row := workerRowFor(s, "p", now)
+	if row.Age != "—" {
+		t.Errorf("zero UpdatedAt should render age as '—', got %q", row.Age)
 	}
 }
 

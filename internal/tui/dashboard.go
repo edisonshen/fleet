@@ -7,11 +7,15 @@
 // snapshot into Model.dashboard.
 //
 // Coord status is inferred without disturbing the flock on
-// coordinator.lock — we stat the file's mtime and treat anything
-// within coordActiveWindow as "active". The actual flock is owned by
-// the running coord; stat-ing reports filesystem mtime which the coord
-// touches every tick (loop.py opens/writes coord-state.json after the
-// flock).
+// coordinator.lock — we stat coord-state.json's mtime and treat
+// anything within coordActiveWindow as "● active". The actual flock
+// is held by the running coord, but flock(2) does NOT touch mtime, so
+// coordinator.lock keeps the mtime of its first creation and is
+// useless as a heartbeat. coord-state.json IS rewritten every tick
+// (skills/coordinator/loop.py:_save_coord_state → tmp + rename), so
+// its mtime advances with every coord tick. Presence of
+// coordinator.lock without a fresh coord-state.json reads as "● idle"
+// (operator can see that a coord ran here once but isn't ticking).
 package tui
 
 import (
@@ -196,20 +200,29 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 		}
 	}
 
-	// Coord active / idle. Lock file mtime is the heartbeat.
-	if info, err := os.Stat(filepath.Join(dir, ".locks", "coordinator.lock")); err == nil {
+	// Coord active / idle. coord-state.json's mtime is the per-tick
+	// heartbeat (loop.py writes it via tmp+rename every tick under the
+	// flock); coordinator.lock's mtime is set at creation and never
+	// advances, so it can't drive the active decision. We still check
+	// for the lock file's existence as a "coord has been here" signal —
+	// when the JSON is missing OR stale AND the lock exists, we render
+	// "○ idle · auto-stopped" so the operator knows the coord has run
+	// here previously even though it isn't ticking now.
+	stateJSON := filepath.Join(dir, "coord-state.json")
+	lockFile := filepath.Join(dir, ".locks", "coordinator.lock")
+	if info, err := os.Stat(stateJSON); err == nil {
 		mt := info.ModTime()
+		row.LastTick = mt
 		if now.Sub(mt) <= coordActiveWindow {
 			row.Active = true
-		} else {
+		} else if _, lerr := os.Stat(lockFile); lerr == nil {
 			row.IdleStop = true
 		}
-	}
-
-	// Last-tick age — coord-state.json's mtime, written every tick after
-	// the flock is acquired (skills/coordinator/loop.py).
-	if info, err := os.Stat(filepath.Join(dir, "coord-state.json")); err == nil {
-		row.LastTick = info.ModTime()
+	} else if _, lerr := os.Stat(lockFile); lerr == nil {
+		// Lock exists but no coord-state.json yet — coord has run here
+		// at some point but never reached the first state-write. Treat
+		// as auto-stopped so the operator sees the project at all.
+		row.IdleStop = true
 	}
 
 	// Workers under workers/<slug>/state.json.
@@ -291,7 +304,15 @@ func workerRowFor(s *workers.State, project string, now time.Time) *WorkerRow {
 		Phase:   s.Phase,
 		Reason:  s.BlockedReason,
 	}
-	row.Age = humanAge(now.Sub(s.UpdatedAt))
+	// Defend against state.json with no UpdatedAt — a malformed write
+	// or a hand-edit can leave the field zero, and humanAge(now - 0001)
+	// renders as a nonsense ~700000000d. Show "—" instead so the row
+	// remains legible.
+	if s.UpdatedAt.IsZero() {
+		row.Age = "—"
+	} else {
+		row.Age = humanAge(now.Sub(s.UpdatedAt))
+	}
 
 	switch s.Phase {
 	case workers.PhaseBlocked:
