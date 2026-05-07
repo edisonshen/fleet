@@ -1,0 +1,233 @@
+---
+name: coordinator
+description: Per-project coordinator that owns tasks.md, dispatches workers under fleet dispatch, monitors PR/CI via gh, and raises hand to the operator only when human input is needed. Reads tasks.md (read-only via parse.py) and mutates exclusively through the fleet CLI (`fleet tasks set`, `fleet tasks note`, etc.) — Go remains the authoritative writer. One coordinator per project enforced via NB-flock on coordinator.lock. v0.2 single-worker mode by default; cap > 1 enabled when worktrees land in v0.2.x.
+---
+
+# coordinator
+
+Per-project tick loop for Fleet v0.2. Replaces the operator-driven hand-pick-and-dispatch flow with an autonomous coordinator that watches a markdown task list and feeds workers through the existing v0.1 dispatch primitives.
+
+The skill ships agent-side. Each Stop hook fire (or operator-triggered `fleet message <coord_id> ...`) runs `loop.tick()` once and exits. Restart equals resume from disk state — there is no daemon, no shared memory, no asyncio.
+
+Source of truth: `docs/PLAN-v0.2-coordinator.md` (the what + why) and `docs/ENG-v0.2-coordinator.md` (the how — package shapes, sequence diagrams, perf budget, test plan). The skill mirrors the algorithm in those docs; deviations are bugs.
+
+## Invocation
+
+The coordinator agent is dispatched via existing `fleet dispatch`:
+
+```bash
+fleet dispatch fleet-coord-<project> \
+  --project <project> \
+  --cwd <repo-path> \
+  --command "claude 'Run the /coordinator skill loop for project <project>.'"
+```
+
+Agent-side environment (set by `fleet dispatch`):
+
+- `FLEET_AGENT_ID` — coord's 8-hex ID. Without it the skill exits silently (fleet-guard discipline).
+- `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests.
+- `FLEET_PROJECT` — set by the dispatch path; falls back to argv[0] when invoked manually.
+
+The skill does NOT need a hook payload — `loop.main` reads `FLEET_PROJECT` (or argv) and runs one tick. The tick is short (target < 500ms p99 per ENG §8.1) and emits a JSON summary to stdout.
+
+## Files this skill writes
+
+| Path | Content | Atomicity |
+|------|---------|-----------|
+| `~/.fleet/projects/<p>/.locks/coordinator.lock` | flock target (zero-byte) | NB acquired per tick, released on exit |
+| `~/.fleet/projects/<p>/coord-state.json` | `{"last_archive_scan_ts": "<filename>"}` and 24h rolling counters | tmp + rename + fsync |
+| `~/.fleet/inbox/<worker_id>.md` | freshly built worker prompt for one dispatch | tmp + rename + fsync |
+
+The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet tasks set <slug> <key>=<value>` or `fleet tasks note <slug> <text>`, so Go remains the only writer of the per-project task registry. parse.py is read-only inside the skill.
+
+## Loop algorithm
+
+```
+1. NB-flock coordinator.lock
+   on EWOULDBLOCK → log + exit 0  ("another tick in progress, skipping")
+
+2. tasks   = parse(tasks.md)              # parse.py — read-only mirror of internal/tasks
+   stds   = `fleet standards show --merged --project <p>`
+   learn  = `fleet learnings list --project <p> --limit 20`
+
+3. Reconcile in-flight workers:
+   for t in tasks where status in {in-progress, in-review}:
+     if t.worker_pid is alive (kill -0):     skip
+     elif t.pr_url:
+       ci = gh pr checks <url> --json state,conclusion
+       all green + merged       → status=done, clear worker
+       all green + not merged   → status=in-review, raise "ready to merge"
+       not mergeable            → status=todo, clear worker, note "rebase needed"
+       failed                   → status=todo, clear worker, note "CI red <url>", raise
+       pending                  → leave as-is until next tick
+     else:
+       status=todo, clear worker, note "worker died without PR"
+   apply via `fleet tasks set/note`
+
+4. Drain inbox archive:
+   for f in ~/.fleet/inbox/archive/<coord_id>-*.md (newer than last_archive_scan_ts):
+     for line in f:
+       TASK_DONE_PR=<slug> <url>      → set pr_url, status=in-review
+       BLOCKED_QUESTION=<slug> <txt>  → status=blocked, note BLOCKED_QUESTION
+       WORKER_FAILED=<slug> <reason>  → status=todo, clear worker, note WORKER_FAILED
+       NEW_TASK=<slug>                → wake-only (no mutation)
+   persist last_archive_scan_ts to coord-state.json
+
+5. Dispatch ready tasks under cap (default 1):
+   active = count(status==in-progress)
+   for t in sort_by_priority(tasks where status==ready and deps_satisfied):
+     if active >= cap: break
+     if conflict.has_conflict(t, in_flight_after_dispatch): continue
+     prompt = build_worker_prompt(t, stds, learn)        # ENG §6.5 layout
+     agent_id = `fleet dispatch <slug> --project <p> --cwd <cwd>`
+     write_worker_inbox(agent_id, prompt)                # ~/.fleet/inbox/<agent>.md
+     `fleet tasks set <slug> status=in-progress`
+     `fleet tasks note <slug> "dispatched as agent <agent_id>"`
+     active += 1
+
+6. Return TickResult{skipped, parsed, reconciled, drained, dispatched, raised, errors}
+```
+
+The fleet CLI commands above came from Phase B (`fleet tasks {add,list,show,set,note,archive,promote}`, `fleet learnings {add,list,prune}`, `fleet standards {show,edit}`, `fleet workers {list,prune}`, `fleet peek <slug>`). Their argv contracts must stay stable for this skill — see `cmd/fleet/tasks.go` etc.
+
+## Worker prompt template
+
+Built fresh per dispatch by `dispatch.build_worker_prompt(task, project, standards_md, learnings_text)`. ENG §6.5 specifies the layout. Hard cap 16KB rendered; oversized prompts raise `PromptTooLargeError` and the loop records the failure rather than dispatch.
+
+The rendered prompt is:
+
+```
+You are a Fleet worker for task: <slug>
+Project: <project>
+Branch: worker/<slug>
+
+You are running as a SINGLE `claude --print` invocation. No interactive
+chat. Communicate progress via `fleet workers update <slug> --phase <p>`.
+
+State file:  ~/.fleet/projects/<p>/workers/<slug>/state.json
+Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
+
+## Task
+<### Spec body, verbatim from tasks.md>
+
+## Acceptance
+<### Acceptance body, verbatim>
+
+## Standards (the bar — non-negotiable)
+<merged content from `fleet standards show --merged`>
+
+## Relevant prior learnings
+<top entries from `fleet learnings list --limit=20`, ≤500 chars × 5>
+(section omitted entirely when no learnings recorded)
+
+## Required workflow
+  fleet workers update <slug> --phase branch
+1. git checkout -b worker/<slug>
+  ... (TDD red/green/refactor → review-claude → review-codex → push → done)
+
+## Constraints
+- Stay on this task. File incidental bugs (max 3/session, honor system).
+- Do NOT edit tasks.md or standards.md directly.
+- Stuck → fleet workers update <slug> --phase blocked --reason "<one line>"
+```
+
+`dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. fleet-guard's SessionStart hook reads that file on the worker's first turn and injects it as `[OPERATOR] <body>`.
+
+## Sentinel grammar (worker → coord)
+
+Workers write status reports to their own `state.json` in v0.2's revised contract (ENG §6.2). The coord watches via the inbox archive when a worker uses `fleet message <coord_id>` to bubble status. Each archive file MUST contain at most one sentinel per line, scoped by task slug:
+
+```
+TASK_DONE_PR=<slug> <pr-url>            # worker post-PR-push
+BLOCKED_QUESTION=<slug> <one-line text> # worker stuck, needs operator
+WORKER_FAILED=<slug> <reason>           # worker hit unrecoverable error
+NEW_TASK=<slug>                         # operator (`fleet tasks add`) wake
+```
+
+Slug-keyed payloads are the C2 invariant (worker status reports never mix). The drain logic mutates only the task whose slug matches; unknown slugs are silently ignored. `_parse_sentinel` lives in `loop.py` for the canonical grammar.
+
+## Reconcile + raise-hand
+
+When a task is in-progress or in-review and its worker_pid is no longer alive, the coord queries `gh pr checks` (per the PR-URL on the task block, if any) and decides:
+
+- All green + merged → `status=done`, archive triggered out-of-band by `fleet tasks archive` later.
+- All green + not merged → `status=in-review`, raise to operator ("CI green, ready to merge").
+- Not mergeable → `status=todo`, clear worker, note "rebase needed".
+- Failed → `status=todo`, clear worker, raise to operator ("CI red").
+- Pending → leave as-is until next tick.
+- No PR URL at all → `status=todo`, clear worker, note "worker died without PR".
+
+`gh pr checks` is hit synchronously per tick. ENG §8.2 caches results on `coord-state.json:pr_check_cache` for 5 minutes; v0.2.0 ships without the cache (300ms cost is invisible in idle ticks). v0.2.1 may add it.
+
+## Two-coord race
+
+Second coord on the same project hits NB-flock EWOULDBLOCK. It logs + exits cleanly (`TickResult.skipped=True, reason="lock-busy"`). Operator notices via `fleet status` showing two coord rows; one is no-op. Cleanup: `fleet rm <id>` for the redundant coord.
+
+## Auto-idle-stop (deferred)
+
+PLAN §6 specifies coord auto-stops after 4h of zero active tasks. v0.2.0 does NOT implement this — the coord ticks until manually killed. v0.2.x adds the idle-streak tracking on `coord-state.json` and the clean-exit path.
+
+## Coordinator handoff (C1)
+
+The coord agent is itself under fleet-guard supervision. At 50%/70% context, fleet-guard hands it off. Because tasks.md is the source of truth and `coord-state.json` carries last_archive_scan_ts on disk, the successor coord re-reads tasks.md on its first tick, reconciles in-flight workers via `worker_pid` alive-check, and resumes. ENG §5.6 walks through this in detail.
+
+The skill's tick lifecycle is intentionally lean (no in-process state survives across hook fires) so handoff is clean by construction.
+
+## Failure modes
+
+| Failure | Behavior |
+|---------|----------|
+| tasks.md parse error | `tick()` returns `skipped=True, reason="parse-error"` and records the error. Coord logs to stderr; operator fixes manually. |
+| Two coordinators race | NB-flock makes the second exit cleanly. |
+| `fleet dispatch` exits non-zero | Recorded in `TickResult.errors`; the candidate task stays in ready, retried next tick. |
+| `fleet tasks set` exits non-zero | Recorded; partial mutations possible (e.g. status set but note not). Next reconcile catches it. |
+| `gh pr checks` errors / not installed | `_CIResult(error=...)` — caller leaves the task as-is until next tick. |
+| Inbox archive scan finds nothing | Tick proceeds normally. |
+| Slug mismatch in a sentinel | Logged via `errors[]`; no mutation. |
+| Prompt over hard cap | `PromptTooLargeError` — task NOT dispatched; recorded in errors. Operator shrinks standards/learnings/spec. |
+
+## Tools used
+
+- `python3` ≥ 3.9 (stdlib only — `subprocess`, `pathlib`, `re`, `tempfile`, `fcntl`, `json`).
+- `fleet` binary on PATH (provides Phase B CLI: `fleet tasks ...`, `fleet learnings ...`, `fleet standards ...`, `fleet dispatch`, `fleet message`).
+- `gh` binary on PATH for PR-status checks. Optional: when missing, the reconcile path skips CI evaluation and leaves PR'd tasks as in-review.
+
+## Hook bindings
+
+Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/settings.json`. It runs as a normal slash-skill the coord agent invokes on its own (`/coordinator`). The Stop hook still drives the cadence — the coord's own assistant turns trigger Stop, fleet-guard ticks, and at the natural sleep boundary the coord runs `/coordinator` again.
+
+## Module layout
+
+| File | Purpose |
+|------|---------|
+| `SKILL.md` | This document. Frontmatter + invocation + loop-in-prose + worker prompt template. |
+| `loop.py` | One-tick driver. Public entry: `tick(project, ...)` and `main(argv)`. |
+| `parse.py` | Python mirror of `internal/tasks` — read-only inside the skill, byte-equal with Go. |
+| `dispatch.py` | Worker prompt assembly + `fleet dispatch` caller + inbox stub writer. |
+| `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). |
+
+## Tests
+
+```
+python3 -m pytest skills/coordinator/tests/ -v
+```
+
+Critical cases (mirrored from ENG §7.2):
+
+- `test_parse.py::test_round_trip_byte_equal` — every fixture in `internal/tasks/testdata/` round-trips byte-equal in Python (CI gate against parser drift).
+- `test_loop.py::test_tick_drains_per_task_sentinels` — C2 invariant: two slugs, two archive files, no cross-mutation.
+- `test_loop.py::test_tick_no_op_under_lock_held` — second tick exits cleanly under lock contention.
+- `test_loop.py::test_slug_mismatch_sentinel_ignored` — unknown slug logs WARN but mutates nothing.
+- `test_loop.py::test_tick_skips_on_parse_error` — corrupt tasks.md doesn't crash the coord.
+- `test_dispatch.py::test_dispatch_worker_invokes_correct_argv` — exact argv to `fleet dispatch`.
+- `test_dispatch.py::test_write_worker_inbox_atomic_and_under_fleet_home` — inbox stub is tmp+rename.
+- `test_conflict.py::*` — file-overlap heuristic positive + negative cases.
+
+The fleet binary itself is never invoked in unit tests; subprocess.run is mocked. End-to-end coverage lives in `cmd/fleet/coordinator_integration_test.go` (Phase D).
+
+## Why these design choices
+
+- **Skill is Python, parser ships in Go and Python.** Two parsers mean a CI-gated byte-equality contract. Removing one would force the other side to call out (Go shelling to Python skill = brittle; Python shelling to a Go binary on every tick = expensive). PLAN §"Code: skill side vs Go side".
+- **Mutations through CLI, not Python writes.** Single writer per aggregate (STATE.md A2). Skill stays read-only on disk; locking and validation live in Go. Adding a parallel Python writer would require porting state.LockProjectState semantics.
+- **One tick per invocation, no daemon.** Stateless reentry over markdown-as-truth is the Ralph rule. Restart equals resume; coord-state.json is the only across-tick state, and it's a couple of timestamps. Every per-task fact lives in tasks.md, every per-worker fact lives in workers/<slug>/state.json or agents/<id>.json.
+- **NB-flock per tick, not per coord lifetime.** Flock auto-releases when the Python process exits, so re-acquiring on every tick is the documented pattern (ENG §4.3). Survives coord restarts and handoffs without leaking the lock.
