@@ -17,7 +17,6 @@ discipline as fleet-guard (stdlib only). Grammar lives at ENG §3.1.
 from __future__ import annotations
 
 import datetime as _dt
-import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -37,9 +36,10 @@ REQUIRED_TASK_BULLETS = (
 
 RESERVED_H3 = ("Spec", "Acceptance", "Notes")
 
-# Slug rule mirrors state.ValidateSlug: lowercase letters, digits, and
-# the connector chars `-_.`. Reserved names rejected.
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*$")
+# Slug validation mirrors state.ValidateSlug: lowercase letters, digits,
+# and the connector chars `-_.`. Reserved names rejected. Done in
+# `_validate_slug` (no separate compiled regex — the per-char loop is
+# clearer and matches the Go side byte-for-byte).
 _RESERVED_SLUGS = {".", "..", "archive"}
 
 

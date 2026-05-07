@@ -383,30 +383,59 @@ class _CIResult:
 
 
 def _gh_pr_checks(pr_url: str, timeout_s: float = 15.0) -> _CIResult:
-    """Run `gh pr checks <url> --json state,conclusion,mergeable`.
+    """Run `gh pr checks` AND `gh pr view` for full reconcile signal.
 
-    Returns a _CIResult with the digested signal. Errors return
-    _CIResult(error=...) and the caller leaves the task as-is.
+    ENG §9.4 distinguishes four post-worker-death states:
+      1. all green + merged                 → status=done
+      2. all green + not merged             → status=in-review (raise)
+      3. not mergeable (conflicts)          → status=todo (rebase)
+      4. failed                             → status=todo (CI red, raise)
+
+    The four states require BOTH `gh pr checks` (per-check state +
+    conclusion) and `gh pr view` (PR-level state + mergeable signal).
+    Querying only one collapses cases 1↔2 and 3↔4. We run both and
+    synthesize the result; either failing leaves _CIResult.error set
+    so the caller treats the task as 'unknown' and skips this tick.
     """
-    try:
-        proc = subprocess.run(
-            ["gh", "pr", "checks", pr_url, "--json", "state,conclusion"],
-            capture_output=True, text=True, timeout=timeout_s, check=False,
+    checks_data, err = _gh_run_json(
+        ["gh", "pr", "checks", pr_url, "--json", "state,conclusion"],
+        timeout_s=timeout_s,
+    )
+    if err:
+        return _CIResult(error=err)
+    view_data, err = _gh_run_json(
+        ["gh", "pr", "view", pr_url, "--json", "state,mergeable"],
+        timeout_s=timeout_s,
+    )
+    if err:
+        # PR view failed but checks succeeded — leave the task with
+        # error set so the caller skips. Otherwise we'd misroute on a
+        # missing mergeable signal.
+        return _CIResult(error=err)
+
+    # PR-level state: "OPEN", "CLOSED", "MERGED" per gh schema.
+    pr_state = ""
+    mergeable = True
+    if isinstance(view_data, dict):
+        pr_state = (view_data.get("state") or "").upper()
+        # `gh pr view` mergeable values: MERGEABLE, CONFLICTING, UNKNOWN.
+        # Treat UNKNOWN as mergeable=True (don't trigger rebase on a
+        # transient gh side answer); CONFLICTING is the only failure.
+        mergeable_str = (view_data.get("mergeable") or "").upper()
+        mergeable = mergeable_str != "CONFLICTING"
+    merged = pr_state == "MERGED"
+
+    if not isinstance(checks_data, list):
+        checks_data = []
+    if not checks_data:
+        # No checks configured on the repo — treat as all green.
+        return _CIResult(
+            all_green=True, merged=merged, mergeable=mergeable,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return _CIResult(error=str(exc))
-    if proc.returncode != 0:
-        return _CIResult(error=(proc.stderr or proc.stdout or "").strip())
-    try:
-        data = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        return _CIResult(error=f"json decode: {exc}")
-    if not isinstance(data, list) or not data:
-        return _CIResult(all_green=True, merged=False, mergeable=True)
     all_green = True
     failed = False
     pending = False
-    for check in data:
+    for check in checks_data:
         if not isinstance(check, dict):
             continue
         state = (check.get("state") or "").upper()
@@ -421,11 +450,32 @@ def _gh_pr_checks(pr_url: str, timeout_s: float = 15.0) -> _CIResult:
             all_green = False
     return _CIResult(
         all_green=all_green and not pending,
-        merged=False,
-        mergeable=True,
+        merged=merged,
+        mergeable=mergeable,
         failed=failed,
         pending=pending,
     )
+
+
+def _gh_run_json(cmd: list[str], *, timeout_s: float):
+    """Run a gh subcommand expected to return JSON. Returns (data, err).
+
+    err is "" on success, else a one-line error message. Caller routes
+    err through _CIResult.error so the reconcile loop skips this tick.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        return None, (proc.stderr or proc.stdout or "").strip()
+    try:
+        return json.loads(proc.stdout or "null"), ""
+    except json.JSONDecodeError as exc:
+        return None, f"json decode: {exc}"
 
 
 def _apply_reconcile(action: _ReconcileAction, fleet_bin: str) -> None:
@@ -494,18 +544,27 @@ def _drain_archive(
             body = (archive_dir / name).read_text(encoding="utf-8")
         except OSError:
             continue
+        # ENG §5.3 / §6.3 contract: "each file has a known schema:
+        # one sentinel per file." Apply only the FIRST recognized
+        # sentinel; subsequent sentinel-shaped lines in the same file
+        # are operator narrative or accidental drift and must not
+        # produce a second mutation. Two sentinels for the same task
+        # in one file would otherwise double-apply (e.g. status set
+        # twice, two `note` calls); two sentinels for DIFFERENT tasks
+        # would silently mutate both off the same delivery, breaking
+        # the slug-keyed isolation guarantee.
         for line in body.splitlines():
             sentinel = _parse_sentinel(line)
             if sentinel is None:
                 continue
-            slug = sentinel.slug
-            if slug not in tasks_by_slug:
+            if sentinel.slug not in tasks_by_slug:
                 # Slug-mismatch logging path (ENG §6.4): coord ignores
-                # but records nothing here — caller logs via errors[]
-                # if it cares. Wake-only sentinels with unknown slugs
-                # are also harmless.
-                continue
+                # this file. The watermark already advanced to `name`
+                # so we don't re-scan; sticking to one sentinel per
+                # file means we don't keep walking past it.
+                break
             actions.append(sentinel)
+            break
     return actions, last_seen
 
 
@@ -701,10 +760,15 @@ def _apply_dispatch(action: _DispatchAction, fleet_bin: str) -> None:
     """
     if action.error:
         return
+    # Order matters for crash-recovery: status flip first (so a crash
+    # between calls leaves the task with the worker actually started),
+    # branch second (so the operator's `fleet tasks show` lines up with
+    # the worker's actual checkout), note last (informational; missing
+    # it is a graceful degradation, not state corruption).
     _run_fleet([fleet_bin, "tasks", "set", action.slug, "status=in-progress"])
-    _run_fleet([fleet_bin, "tasks", "note", action.slug, f"dispatched as agent {action.agent_id}"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", action.slug, f"branch={action.branch}"])
+    _run_fleet([fleet_bin, "tasks", "note", action.slug, f"dispatched as agent {action.agent_id}"])
 
 
 # ---------- shared CLI helper ----------

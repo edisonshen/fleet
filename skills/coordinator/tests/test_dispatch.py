@@ -173,6 +173,31 @@ def test_dispatch_worker_handles_unparseable_stdout() -> None:
     assert "could not parse agent ID" in result.error
 
 
+def test_extract_agent_id_prefers_strict_form() -> None:
+    """When stdout contains both `agent <id>` and a stray 8-hex token
+    (e.g. embedded in a path), the keyword-anchored form wins.
+
+    Regression: an unanchored fallback alone would pick whichever 8-hex
+    appears first, including SHAs / tmux session paths.
+    """
+    text = "/tmp/cafef00d/setup.log\nagent abcdef01 dispatched\n"
+    assert dispatch._extract_agent_id(text) == "abcdef01"
+
+
+def test_extract_agent_id_loose_fallback_only_when_unique() -> None:
+    """No `agent <id>` keyword + multiple 8-hex tokens → no extraction.
+
+    Otherwise we'd pick the wrong token off ambiguous output.
+    """
+    text = "abcdef01 ... cafef00d ..."
+    assert dispatch._extract_agent_id(text) == ""
+
+
+def test_extract_agent_id_loose_fallback_when_unique() -> None:
+    """No keyword + exactly one 8-hex → use it (drift-tolerant)."""
+    assert dispatch._extract_agent_id("dispatched: abcdef01") == "abcdef01"
+
+
 def test_dispatch_worker_handles_missing_binary() -> None:
     t = _make_task()
     with patch.object(

@@ -247,17 +247,32 @@ def dispatch_worker(
     )
 
 
-# 8-hex agent IDs (matches agent.NewID). Anchored at word boundary so
-# "agent abcdef01" or "id=abcdef01" both yield abcdef01. fleet dispatch's
-# canonical output is `agent <id> dispatched`; tolerate format drift.
-_AGENT_ID_RE = re.compile(r"\b([0-9a-f]{8})\b")
+# Agent IDs are 8 hex chars (agent.NewID). Two patterns, in order:
+#   1. Strict: `agent <id>` — fleet dispatch's canonical output shape
+#      ("agent <id> dispatched on tmux session ...").
+#   2. Fallback: any standalone 8-hex token, after stripping the bytes
+#      that look like SHAs / tmux paths to reduce false-positive risk.
+# We try strict first; if it doesn't match, fall back to the looser one
+# but only if there's exactly one 8-hex token in the trimmed text.
+_AGENT_ID_STRICT_RE = re.compile(r"\bagent\s+([0-9a-f]{8})\b")
+_AGENT_ID_LOOSE_RE = re.compile(r"\b([0-9a-f]{8})\b")
+# Strictly validate inputs to write_worker_inbox.
+_AGENT_ID_FULL_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
 def _extract_agent_id(text: str) -> str:
     if not text:
         return ""
-    m = _AGENT_ID_RE.search(text)
-    return m.group(1) if m else ""
+    # Prefer the keyword-anchored form. Drift-tolerant fallback only
+    # fires when there's exactly one 8-hex match across the whole
+    # string — a path like /tmp/abcdef01/foo would otherwise win.
+    strict = _AGENT_ID_STRICT_RE.search(text)
+    if strict:
+        return strict.group(1)
+    matches = _AGENT_ID_LOOSE_RE.findall(text)
+    if len(matches) == 1:
+        return matches[0]
+    return ""
 
 
 def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = None) -> str:
@@ -271,7 +286,7 @@ def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = N
     The agent_id arg must already be validated (8-hex). Caller asserts
     via DispatchResult.agent_id which came from `fleet dispatch`.
     """
-    if not _AGENT_ID_RE.fullmatch(agent_id):
+    if not _AGENT_ID_FULL_RE.fullmatch(agent_id):
         raise ValueError(f"invalid agent_id {agent_id!r}: expected 8 hex chars")
     home = fleet_home or os.environ.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
     inbox_dir = os.path.join(home, "inbox")

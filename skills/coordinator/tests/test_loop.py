@@ -453,6 +453,139 @@ def test_tick_does_not_re_drain_seen_archive(
 # ---------- sentinel grammar ----------
 
 
+def test_drain_archive_one_sentinel_per_file(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """ENG §6.3 contract: one sentinel per file. If an archive file
+    has multiple sentinel-shaped lines (operator narrative drift, or
+    a malformed delivery), only the first one applies.
+    """
+    _write_tasks(project_dir, [
+        _make_task("a-aaaa", status="in-progress", worker_pid=99999),
+        _make_task("b-bbbb", status="in-progress", worker_pid=99998),
+    ])
+    coord = "cccccc01"
+    # File contains two sentinels (only the first should fire).
+    _write_archive(
+        fleet_home, coord, "20260506-120000Z",
+        "TASK_DONE_PR=a-aaaa https://x/y/pull/1\n"
+        "TASK_DONE_PR=b-bbbb https://x/y/pull/2\n",
+    )
+    with patch.object(loop, "_pid_alive", return_value=True):
+        result = loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    # First sentinel applied, second ignored.
+    assert result.drained == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    a_calls = [c for c in set_calls if "a-aaaa" in c]
+    b_calls = [c for c in set_calls if "b-bbbb" in c]
+    assert any("pull/1" in (c[-1] if c else "") for c in a_calls)
+    assert b_calls == []
+
+
+def test_gh_pr_checks_runs_both_checks_and_view(monkeypatch) -> None:
+    """ENG §9.4 reconcile relies on merged + mergeable signals — they
+    require gh pr view, not just gh pr checks. Earlier code queried
+    only checks and left both fields hardcoded.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        if "checks" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout='[{"state":"COMPLETED","conclusion":"SUCCESS"}]',
+                stderr="",
+            )
+        if "view" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0,
+                stdout='{"state":"MERGED","mergeable":"MERGEABLE"}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=cmd, returncode=2, stdout="", stderr="unknown")
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    res = loop._gh_pr_checks("https://github.com/x/y/pull/1")
+    assert res.error == ""
+    assert res.all_green is True
+    assert res.merged is True
+    assert res.mergeable is True
+    # Both subcommands invoked.
+    assert any("checks" in c for c in calls)
+    assert any("view" in c for c in calls)
+
+
+def test_gh_pr_checks_detects_conflicting(monkeypatch) -> None:
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        if "checks" in cmd:
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="[]", stderr="",
+            )
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0,
+            stdout='{"state":"OPEN","mergeable":"CONFLICTING"}',
+            stderr="",
+        )
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    res = loop._gh_pr_checks("https://github.com/x/y/pull/1")
+    assert res.mergeable is False
+    assert res.merged is False
+
+
+def test_gh_pr_checks_unknown_mergeable_treated_as_mergeable(monkeypatch) -> None:
+    """gh's mergeable=UNKNOWN is transient; don't trigger a rebase on it."""
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        if "checks" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0,
+            stdout='{"state":"OPEN","mergeable":"UNKNOWN"}', stderr="",
+        )
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    res = loop._gh_pr_checks("https://github.com/x/y/pull/1")
+    assert res.mergeable is True
+
+
+def test_gh_pr_checks_propagates_view_error(monkeypatch) -> None:
+    """Checks succeeds but view fails → caller must see error and skip
+    rather than misroute on a missing mergeable signal."""
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        if "checks" in cmd:
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr="not found",
+        )
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    res = loop._gh_pr_checks("https://github.com/x/y/pull/1")
+    assert "not found" in res.error
+
+
+def test_apply_dispatch_orders_status_branch_note(
+    fleet_run_recorder,
+) -> None:
+    """status flip first, branch second, note last — for crash-safety."""
+    action = loop._DispatchAction(
+        slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
+    )
+    loop._apply_dispatch(action, "fleet")
+    # Three calls in order.
+    assert len(fleet_run_recorder) == 3
+    assert "status=in-progress" in fleet_run_recorder[0]
+    assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
+    assert "branch=" in fleet_run_recorder[1][-1]
+    assert fleet_run_recorder[2][1:3] == ["tasks", "note"]
+
+
 def test_parse_sentinel_known_kinds() -> None:
     cases = [
         ("TASK_DONE_PR=alpha-aaaa https://x/y/1", "task_done_pr", "alpha-aaaa"),
