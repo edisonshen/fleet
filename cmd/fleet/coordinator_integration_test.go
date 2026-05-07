@@ -257,6 +257,14 @@ func (env *integrationEnv) runFleet(t *testing.T, args ...string) string {
 // calls tick directly so we get structured TickResult assertions.
 func (env *integrationEnv) runTick(t *testing.T) string {
 	t.Helper()
+	return env.runTickCap(t, 1)
+}
+
+// runTickCap drives one tick at the requested cap. cap=1 keeps
+// single-worker mode (byte-identical to v0.2.0); cap>1 enables
+// worktree-mode dispatch (requires a real git repo at env.repoCwd).
+func (env *integrationEnv) runTickCap(t *testing.T, cap int) string {
+	t.Helper()
 	driver := fmt.Sprintf(`import json, os, sys
 sys.path.insert(0, %q)
 import loop
@@ -265,7 +273,7 @@ res = loop.tick(%q,
                 cwd=%q,
                 fleet_home=%q,
                 fleet_bin=%q,
-                cap=2)
+                cap=%d)
 print(json.dumps({
     "skipped": res.skipped,
     "reason": res.reason,
@@ -279,6 +287,7 @@ print(json.dumps({
 `,
 		env.skillDir, env.project, env.coordID,
 		env.repoCwd, env.fleetHome, filepath.Join(env.binDir, "fleet"),
+		cap,
 	)
 	cmd := exec.Command("python3", "-c", driver)
 	cmd.Env = append(os.Environ(),
@@ -373,6 +382,32 @@ func (env *integrationEnv) readTask(t *testing.T, slug string) *tasks.Task {
 		t.Fatalf("tasks.Get %s: %v", slug, err)
 	}
 	return task
+}
+
+// initGitRepo bootstraps `dir` as a real git repository with one
+// initial commit on `main`. The coord's worktree-mode dispatch needs
+// HEAD to exist so `git worktree add -b <branch>` resolves a base
+// commit; without an initial commit git rejects the add as "fatal:
+// not a valid object name: 'HEAD'".
+func initGitRepo(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH; skipping worktree-mode test")
+	}
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "test@example.invalid"},
+		{"config", "user.name", "Test"},
+		{"commit", "--allow-empty", "-q", "-m", "init"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		var errb bytes.Buffer
+		cmd.Stderr = &errb
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, errb.String())
+		}
+	}
 }
 
 // writeSentinelArchive writes one inbox/archive/<coord_id>-<stamp>.md
@@ -644,12 +679,14 @@ func TestCoordHandoffPreservesInflight(t *testing.T) {
 func TestParallelWorkerStatusIsolation(t *testing.T) {
 	env := setupCoordIntegration(t, "c2-proj")
 	env.plantCoord(t)
+	// Worktree-mode dispatch (cap>1) needs a real git repo at repoCwd.
+	initGitRepo(t, env.repoCwd)
 
-	// Two ready tasks → two dispatches in tick #1 (cap=2 in runTick).
+	// Two ready tasks → two dispatches in tick #1.
 	slugA := env.addReadyTask(t, "alpha-c2", "alpha task spec.")
 	slugB := env.addReadyTask(t, "bravo-c2", "bravo task spec.")
 
-	out1 := env.runTick(t)
+	out1 := env.runTickCap(t, 2)
 	if !strings.Contains(out1, `"dispatched": 2`) {
 		t.Fatalf("first tick did not dispatch both: %s", out1)
 	}
@@ -671,7 +708,7 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	env.writeSentinelArchive(t, fmt.Sprintf("TASK_DONE_PR=%s %s", slugB, urlB))
 
-	out2 := env.runTick(t)
+	out2 := env.runTickCap(t, 2)
 	if !strings.Contains(out2, `"drained": 2`) {
 		t.Fatalf("second tick did not drain both sentinels: %s", out2)
 	}
@@ -696,6 +733,137 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	}
 
 	// Cleanup tmux for any dispatched workers.
+	for _, rec := range listAllAgents(t) {
+		_ = tmux.Kill(rec.TmuxSession)
+	}
+}
+
+// ---------- v0.2.x: worktree mode ----------
+
+// TestCoordParallelDispatch_CreatesWorktrees covers the core v0.2.x
+// behavior: with cap > 1 and a real git repo, two parallel dispatches
+// each get their own ~/.fleet/projects/<p>/worktrees/<slug>/ working
+// tree branched off `worker/<slug>`. Cleanup half: simulating both
+// workers reporting DONE_PR triggers `git worktree remove` so the
+// directories disappear after the next tick.
+func TestCoordParallelDispatch_CreatesWorktrees(t *testing.T) {
+	env := setupCoordIntegration(t, "wt-proj")
+	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+
+	slugA := env.addReadyTask(t, "wt-alpha", "alpha worktree task spec.")
+	slugB := env.addReadyTask(t, "wt-bravo", "bravo worktree task spec.")
+
+	// First tick: cap=2 dispatches both tasks, each into its own worktree.
+	out1 := env.runTickCap(t, 2)
+	if !strings.Contains(out1, `"dispatched": 2`) {
+		t.Fatalf("first tick did not dispatch both: %s", out1)
+	}
+	assertNoTickErrors(t, out1)
+
+	// Both worktree dirs exist on disk.
+	wtA := filepath.Join(env.fleetHome, "projects", env.project, "worktrees", slugA)
+	wtB := filepath.Join(env.fleetHome, "projects", env.project, "worktrees", slugB)
+	for _, wt := range []string{wtA, wtB} {
+		if info, err := os.Stat(wt); err != nil {
+			t.Errorf("worktree dir missing: %s (%v)", wt, err)
+		} else if !info.IsDir() {
+			t.Errorf("worktree path is not a dir: %s", wt)
+		}
+	}
+
+	// Both tasks carry the worktree path on tasks.md.
+	taskA := env.readTask(t, slugA)
+	taskB := env.readTask(t, slugB)
+	if !strings.HasPrefix(taskA.Worktree, wtA) {
+		t.Errorf("taskA worktree=%q want prefix %q", taskA.Worktree, wtA)
+	}
+	if !strings.HasPrefix(taskB.Worktree, wtB) {
+		t.Errorf("taskB worktree=%q want prefix %q", taskB.Worktree, wtB)
+	}
+	if taskA.Branch != "worker/"+slugA {
+		t.Errorf("taskA branch=%q want worker/%s", taskA.Branch, slugA)
+	}
+	if taskB.Branch != "worker/"+slugB {
+		t.Errorf("taskB branch=%q want worker/%s", taskB.Branch, slugB)
+	}
+
+	// Cleanup half: simulate both workers reporting DONE_PR via the
+	// inbox archive. Reconcile alone won't fire (workers are alive in
+	// kill -0 sense via test pid), so the cleanup must come through
+	// the sentinel-drain path.
+	env.runFleet(t, "tasks", "set", "--project", env.project, slugA, fmt.Sprintf("worker_pid=%d", os.Getpid()))
+	env.runFleet(t, "tasks", "set", "--project", env.project, slugB, fmt.Sprintf("worker_pid=%d", os.Getpid()))
+	urlA := "https://github.com/fake/repo/pull/100"
+	urlB := "https://github.com/fake/repo/pull/200"
+	env.writeSentinelArchive(t, fmt.Sprintf("TASK_DONE_PR=%s %s", slugA, urlA))
+	time.Sleep(2 * time.Millisecond)
+	env.writeSentinelArchive(t, fmt.Sprintf("TASK_DONE_PR=%s %s", slugB, urlB))
+
+	out2 := env.runTickCap(t, 2)
+	if !strings.Contains(out2, `"drained": 2`) {
+		t.Fatalf("second tick did not drain both sentinels: %s", out2)
+	}
+	assertNoTickErrors(t, out2)
+
+	// Both worktree dirs gone post-cleanup.
+	for _, wt := range []string{wtA, wtB} {
+		if _, err := os.Stat(wt); !os.IsNotExist(err) {
+			t.Errorf("worktree dir still present after cleanup: %s (err=%v)", wt, err)
+		}
+	}
+
+	// tasks.md worktree field cleared so re-dispatch starts fresh.
+	taskA = env.readTask(t, slugA)
+	taskB = env.readTask(t, slugB)
+	if taskA.Worktree != "" {
+		t.Errorf("taskA worktree not cleared post-cleanup: %q", taskA.Worktree)
+	}
+	if taskB.Worktree != "" {
+		t.Errorf("taskB worktree not cleared post-cleanup: %q", taskB.Worktree)
+	}
+	// PR URLs propagated; status flipped to in-review.
+	if taskA.PRURL != urlA || taskB.PRURL != urlB {
+		t.Errorf("PR URLs missing: A=%q B=%q", taskA.PRURL, taskB.PRURL)
+	}
+	if taskA.Status != tasks.StatusInReview || taskB.Status != tasks.StatusInReview {
+		t.Errorf("statuses: A=%q B=%q want both in-review", taskA.Status, taskB.Status)
+	}
+
+	// Cleanup tmux.
+	for _, rec := range listAllAgents(t) {
+		_ = tmux.Kill(rec.TmuxSession)
+	}
+}
+
+// TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated regression-
+// guards single-worker mode: with cap=1, the dispatch path must not
+// create any worktree dir even if the project has multiple ready
+// tasks. Worker uses repoCwd as its cwd; tasks.md.worktree stays "".
+func TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated(t *testing.T) {
+	env := setupCoordIntegration(t, "wt-cap1")
+	env.plantCoord(t)
+	// initGitRepo NOT called — cap=1 mode never invokes git worktree.
+
+	slug := env.addReadyTask(t, "cap1-task", "single-worker task.")
+
+	out := env.runTickCap(t, 1)
+	if !strings.Contains(out, `"dispatched": 1`) {
+		t.Fatalf("cap=1 tick did not dispatch: %s", out)
+	}
+	assertNoTickErrors(t, out)
+
+	task := env.readTask(t, slug)
+	if task.Worktree != "" {
+		t.Errorf("cap=1 dispatch set worktree=%q, want empty", task.Worktree)
+	}
+
+	// No worktrees/ tree was created under projects/<name>/.
+	wtRoot := filepath.Join(env.fleetHome, "projects", env.project, "worktrees")
+	if _, err := os.Stat(wtRoot); !os.IsNotExist(err) {
+		t.Errorf("cap=1 mode created worktrees/ tree: err=%v", err)
+	}
+
 	for _, rec := range listAllAgents(t) {
 		_ = tmux.Kill(rec.TmuxSession)
 	}
