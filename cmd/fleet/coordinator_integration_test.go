@@ -447,11 +447,13 @@ exit 0
 //
 //  1. `fleet tasks add --status=ready` — adds a task ready to dispatch.
 //  2. `loop.tick()` — coord dispatches the task; status flips to
-//     in-progress.
-//  3. Manually plant `worker_pid=<test_pid>` so the next tick's
-//     reconcile finds the worker "alive" and skips that path. (Workers
-//     don't currently auto-write worker_pid back to tasks.md — that's
-//     v0.2.x; for v0.2.0 the test simulates the live worker.)
+//     in-progress and worker_pid is set to the coord's pid (codex
+//     full-stack [P1] regress: previously left worker_pid=0, which
+//     made tick #2's reconcile requeue the task before the drain
+//     step could run).
+//  3. Replant `worker_pid=<test_pid>` to make tick #2's
+//     reconcile see a live worker (the dispatched coord pid is the
+//     test process, alive in this thread).
 //  4. Write a TASK_DONE_PR=<slug> <url> sentinel into inbox/archive/.
 //  5. `loop.tick()` — coord drains the sentinel; status flips to
 //     in-review and pr_url populates.

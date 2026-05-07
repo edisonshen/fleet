@@ -573,7 +573,14 @@ def test_gh_pr_checks_propagates_view_error(monkeypatch) -> None:
 def test_apply_dispatch_orders_status_branch_note(
     fleet_run_recorder,
 ) -> None:
-    """status flip first, branch second, note last — for crash-safety.
+    """status flip first, branch second, worker_pid third, note last —
+    for crash-safety + reconcile compatibility.
+
+    Codex full-stack [P1] regress: previously _apply_dispatch left
+    worker_pid=0, which the next tick's reconcile read as "worker
+    never ran" and requeued the task back to todo. We now write
+    worker_pid=os.getpid() as a non-zero sentinel (state.json
+    freshness is the canonical liveness signal).
 
     Every mutation must also pass `--project <project>` so the CLI's
     cwd-default project resolution can't accidentally write to a
@@ -584,16 +591,103 @@ def test_apply_dispatch_orders_status_branch_note(
         slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
     )
     loop._apply_dispatch(action, "fleet-proj", "fleet")
-    # Three calls in order.
-    assert len(fleet_run_recorder) == 3
+    # Four calls in order: status, branch, worker_pid, note.
+    assert len(fleet_run_recorder) == 4
     assert "status=in-progress" in fleet_run_recorder[0]
     assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
     assert "branch=" in fleet_run_recorder[1][-1]
-    assert fleet_run_recorder[2][1:3] == ["tasks", "note"]
+    assert fleet_run_recorder[2][1:3] == ["tasks", "set"]
+    assert fleet_run_recorder[2][-1].startswith("worker_pid=")
+    # The PID written must be the live coord's PID — non-zero, not
+    # the agent_id's hex value, not 0. Tested via parse-back.
+    pid_str = fleet_run_recorder[2][-1].split("=", 1)[1]
+    assert int(pid_str) > 0, f"worker_pid must be live PID, got {pid_str!r}"
+    assert fleet_run_recorder[3][1:3] == ["tasks", "note"]
     # Every call carries --project to defeat cwd-default drift.
     for call in fleet_run_recorder:
         assert "--project" in call, f"missing --project in {call}"
         assert "fleet-proj" in call, f"wrong project in {call}"
+
+
+def test_is_worker_alive_reads_state_json_freshness(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """Codex full-stack [P1] regress: a worker whose tasks.md worker_pid
+    is dead but whose state.json was just updated must still count as
+    alive — otherwise every coord-dispatched task gets requeued before
+    the worker can finish even one phase.
+
+    The fix: _is_worker_alive falls through to _worker_state_fresh,
+    which checks workers/<slug>/state.json. Fresh updated_at →
+    presumed alive; stale or terminal phase → presumed dead.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "alpha-1234"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "alpha-1234", "project": project,
+        "phase": "tdd-red", "updated_at": fresh,
+    }), encoding="utf-8")
+
+    t = _make_task("alpha-1234", status="in-progress", worker_pid=99999)
+    # PID 99999 is dead in this test env, but state.json is fresh →
+    # _is_worker_alive returns True via the state.json fallback.
+    with patch.object(loop, "_pid_alive", return_value=False):
+        assert loop._is_worker_alive(t, project) is True
+
+
+def test_is_worker_alive_treats_stale_state_json_as_dead(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """Stale state.json (last update > _WORKER_STATE_FRESH_S ago) does
+    NOT count as alive — the worker has wedged or crashed silently."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "alpha-9999"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+
+    stale = _dt.datetime(2020, 1, 1, tzinfo=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "alpha-9999", "project": project,
+        "phase": "tdd-red", "updated_at": stale,
+    }), encoding="utf-8")
+
+    t = _make_task("alpha-9999", status="in-progress", worker_pid=99999)
+    with patch.object(loop, "_pid_alive", return_value=False):
+        assert loop._is_worker_alive(t, project) is False
+
+
+def test_is_worker_alive_terminal_phase_is_not_alive(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch,
+) -> None:
+    """phase=done|blocked|failed always counts as not-alive even if
+    updated_at is fresh — terminal phases mean the worker is gone."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    for phase in ("done", "blocked", "failed"):
+        slug = f"term-{phase}-aaaa"
+        workers_dir = fleet_home / "projects" / project / "workers" / slug
+        workers_dir.mkdir(parents=True, exist_ok=True)
+        fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+            "+00:00", "Z",
+        )
+        (workers_dir / "state.json").write_text(json.dumps({
+            "slug": slug, "project": project,
+            "phase": phase, "updated_at": fresh,
+        }), encoding="utf-8")
+        t = _make_task(slug, status="in-progress", worker_pid=99999)
+        with patch.object(loop, "_pid_alive", return_value=False):
+            assert loop._is_worker_alive(t, project) is False, phase
 
 
 def test_parse_sentinel_known_kinds() -> None:

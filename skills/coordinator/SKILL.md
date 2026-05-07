@@ -101,8 +101,11 @@ You are a Fleet worker for task: <slug>
 Project: <project>
 Branch: worker/<slug>
 
-You are running as a SINGLE `claude --print` invocation. No interactive
-chat. Communicate progress via `fleet workers update <slug> --phase <p>`.
+You are running as a Fleet-dispatched Claude session. The operator is NOT
+watching this terminal — communicate progress via `fleet workers update
+<slug> --phase <p>` after every phase boundary. Exit cleanly (Ctrl-D /
+/exit) once you reach phase=done or phase=blocked; the coordinator polls
+workers/<slug>/state.json to know when to advance the task.
 
 State file:  ~/.fleet/projects/<p>/workers/<slug>/state.json
 Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log

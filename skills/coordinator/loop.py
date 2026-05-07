@@ -295,6 +295,79 @@ def _save_coord_state(path: Path, state: dict) -> None:
 # ---------- reconcile ----------
 
 
+def _is_worker_alive(t: parse.Task, project: str) -> bool:
+    """Return True if the worker behind task t is still working.
+
+    Two signals, OR'd:
+      1. worker_pid > 0 AND that PID responds to kill(0). Cheap;
+         catches the in-tick window where the coord just dispatched
+         (worker_pid was set to coord's pid, coord is still running
+         this tick).
+      2. workers/<slug>/state.json exists AND its phase is non-terminal
+         (not done|blocked|failed) AND updated_at is fresh (within
+         _WORKER_STATE_FRESH_S). This is the canonical signal once
+         the worker subprocess starts calling `fleet workers update`:
+         the OS PID stored on tasks.md may be stale (coord exited
+         between ticks) but state.json freshness is owned by the
+         live worker. Without this fallback, every coord-dispatched
+         task gets requeued the next tick because `worker_pid` only
+         tracked the coord's old PID (codex full-stack [P1]).
+    """
+    if t.worker_pid > 0 and _pid_alive(t.worker_pid):
+        return True
+    return _worker_state_fresh(project, t.slug)
+
+
+# How long a worker's state.json may go without an update before the
+# coord treats it as dead (and consults pr_url + CI to decide the next
+# status). Longer than the longest expected phase boundary (`/codex
+# review` can take several minutes) but shorter than a wedged-process
+# wait that would block the queue forever.
+_WORKER_STATE_FRESH_S = 15 * 60
+
+
+def _worker_state_fresh(project: str, slug: str) -> bool:
+    """Read ~/.fleet/projects/<project>/workers/<slug>/state.json and
+    return True iff the worker is still publishing progress.
+
+    Returns False on any error (missing file, parse error, terminal
+    phase, stale heartbeat) — the caller falls through to the
+    pr_url + CI decision tree, matching the v0.2 design's
+    "if we can't tell, treat as dead" stance.
+    """
+    home = os.environ.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+    state_path = Path(home) / "projects" / project / "workers" / slug / "state.json"
+    try:
+        raw = state_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return False
+    try:
+        st = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    phase = st.get("phase", "")
+    if phase in ("done", "blocked", "failed"):
+        return False
+    updated_at = st.get("updated_at", "")
+    if not updated_at:
+        # Bootstrapped state (just dispatched, no first tick yet).
+        # Treat as alive so the worker has a chance to run.
+        return True
+    try:
+        # Workers serialize updated_at via Go time.Time JSON, which is
+        # RFC3339 with nanos. Python's fromisoformat handles RFC3339
+        # since 3.11; for older interpreters we fall back to a regex
+        # strip of the trailing fractional seconds.
+        from datetime import datetime, timezone
+        ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_s = (datetime.now(tz=timezone.utc) - ts).total_seconds()
+    except ValueError:
+        return False
+    return age_s <= _WORKER_STATE_FRESH_S
+
+
 @dataclass
 class _ReconcileAction:
     slug: str
@@ -319,7 +392,7 @@ def _reconcile_inflight(
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
             continue
-        if t.worker_pid > 0 and _pid_alive(t.worker_pid):
+        if _is_worker_alive(t, project):
             continue
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
@@ -761,17 +834,28 @@ def _priority_sort_key(t: parse.Task) -> tuple[int, str]:
 
 
 def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> None:
-    """Mark a task in-progress + record worker_pid via the fleet CLI.
+    """Mark a task in-progress + record a sentinel worker_pid via the
+    fleet CLI.
 
     The agent ID is an 8-hex Fleet agent record key, not an OS PID;
     storing it on the task block requires a future schema bump (the
     in-flight `worker_pid` field on tasks.md still expects an OS PID
-    per ENG §3.1 because the v0.2 design pivoted workers from "Fleet
-    agents" to "claude --print subprocesses with state.json"). For the
-    skill side, we write the agent_id as a NOTE so the operator can
-    correlate the agent row with the task. Future Phase D / v0.2.x
-    can either add a `worker_id` field or have the worker subprocess
-    write its OS PID to state.json on launch.
+    per ENG §3.1). v0.2 dispatches workers via `fleet dispatch` (tmux
+    + interactive Claude session); the worker drives the TDD pipeline
+    itself and publishes progress via `fleet workers update`, which
+    writes workers/<slug>/state.json. For the skill side, we write
+    the agent_id as a NOTE so the operator can correlate the agent
+    row with the task.
+
+    Codex full-stack [P1] regress: previously this routine left
+    worker_pid=0, which the next tick's reconcile read as "worker
+    never ran" and requeued the task back to todo before the worker
+    could even run its first turn. We now write the coord process's
+    own PID as a non-zero sentinel — alive at least until the next
+    Stop-hook tick, and the reconcile loop's _is_worker_alive() also
+    consults workers/<slug>/state.json freshness, which is the
+    canonical liveness signal once the worker subprocess starts
+    publishing phase updates.
 
     `--project <project>` is threaded into every mutation so the
     cwd-default project resolution can't misroute writes to a sibling
@@ -782,11 +866,14 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     # Order matters for crash-recovery: status flip first (so a crash
     # between calls leaves the task with the worker actually started),
     # branch second (so the operator's `fleet tasks show` lines up with
-    # the worker's actual checkout), note last (informational; missing
-    # it is a graceful degradation, not state corruption).
+    # the worker's actual checkout), worker_pid third so reconcile sees
+    # a non-zero sentinel before noticing the in-progress flip on a
+    # subsequent tick, note last (informational; missing it is a
+    # graceful degradation, not state corruption).
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
 
 
