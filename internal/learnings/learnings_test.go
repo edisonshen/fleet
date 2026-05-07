@@ -189,6 +189,78 @@ func TestPrune_RetrySafeAfterPartialFailure(t *testing.T) {
 	}
 }
 
+// TestPrune_RetryPreservesLegitimateDuplicates is the count-vs-set
+// dedup regression. A previous Prune crash archived ONE copy of an
+// entry that legitimately appears TWICE in learnings.md (identical
+// timestamp, headers, body — explicitly allowed in the append-only
+// log). The retry must archive the second copy, not skip both as
+// "already archived" duplicates.
+//
+// Pre-fix (set membership): both current copies see the key in the
+// archived set, both get dropped, archive ends with 1 entry total —
+// silently losing the legitimate second copy.
+//
+// Post-fix (multiset): the first match decrements the count, the
+// second match falls through and is appended to archive — archive
+// ends with 2 entries total, one from the prior crash + one from
+// this retry.
+func TestPrune_RetryPreservesLegitimateDuplicates(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	new := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+
+	// Two identical-content entries in current (same timestamp,
+	// same header, same body — legal in append-only log).
+	for i := 0; i < 2; i++ {
+		if err := Append("fleet", &Entry{Timestamp: old, Author: "operator", Tag: "stale", Body: "same"}); err != nil {
+			t.Fatalf("Append stale %d: %v", i, err)
+		}
+	}
+	// Plus an unrelated fresh entry that must stay in current.
+	if err := Append("fleet", &Entry{Timestamp: new, Author: "operator", Tag: "fresh", Body: "new"}); err != nil {
+		t.Fatalf("Append fresh: %v", err)
+	}
+	// Seed archive with ONE copy of the stale entry — exact crash
+	// state after a partial previous Prune (archive write
+	// succeeded, current rewrite failed before publishing).
+	dir, _ := state.ProjectDir("fleet")
+	arcPath := filepath.Join(dir, "learnings-archive.md")
+	if err := writeFile(arcPath, []Entry{{Timestamp: old, Author: "operator", Tag: "stale", Body: "same"}}, nil); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+
+	cutoff := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	if err := Prune("fleet", cutoff); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+
+	// Archive must hold 2 stale copies (the seeded one + the second
+	// current copy that wasn't yet archived).
+	arc, err := readEntries(arcPath)
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	staleArc := 0
+	for _, e := range arc {
+		if e.Tag == "stale" {
+			staleArc++
+		}
+	}
+	if staleArc != 2 {
+		t.Errorf("archive stale count=%d; want 2 (seeded + retried second copy); tags=%v", staleArc, tagList(arc))
+	}
+	// Current must hold ONLY the fresh entry — both stale copies
+	// are now in the archive.
+	cur, err := Read("fleet")
+	if err != nil {
+		t.Fatalf("Read current: %v", err)
+	}
+	if len(cur) != 1 || cur[0].Tag != "fresh" {
+		t.Errorf("current has %v; want [fresh]", tagList(cur))
+	}
+}
+
 func TestFilter_TagSubstring(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

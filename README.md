@@ -10,9 +10,38 @@ Four agents, four repos, four states — coding, blocked on you, asking, reviewi
 
 ## Status
 
-**v0.1.2 shipped to brew** ([releases](https://github.com/edisonshen/fleet/releases)). The Week 0 spike resolved (Stop hooks deliver per-session context % at low latency, see [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md)) and the v1 surface — TUI, dispatch / attach / handoff / drain, fleet-guard auto-handoffs at 50% (graceful) and 70% (emergency) — is live. We're dogfooding through Week 6 and shipping bug-fix patches behind the scenes; expect frequent `brew upgrade edisonshen/tap/fleet`.
+**v0.1.3 shipped to brew** ([releases](https://github.com/edisonshen/fleet/releases)). The Week 0 spike resolved (Stop hooks deliver per-session context % at low latency, see [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md)) and the v1 surface — TUI, dispatch / attach / handoff / drain, fleet-guard auto-handoffs at 50% (graceful) and 70% (emergency) — is live. We're dogfooding through Week 6 and shipping bug-fix patches behind the scenes; expect frequent `brew upgrade edisonshen/tap/fleet`.
+
+**v0.2 in flight on `main`.** Adds a per-project autonomous coordinator (see below) plus task / learnings / standards primitives. See [`CHANGELOG.md`](CHANGELOG.md) for the full v0.2.0 entry; tag-and-ship pending Week 6 dogfood.
 
 The full design is at [`docs/DESIGN.md`](docs/DESIGN.md).
+
+## What v0.2 adds — the coordinator
+
+Fleet v0.1 is the operator → agent surface. v0.2 adds an autonomous layer that sits between you and the dispatch loop: a **per-project coordinator** that owns `tasks.md`, dispatches workers under `fleet dispatch`, monitors PR / CI via `gh`, and only raises a hand to the operator when human input is genuinely needed.
+
+You write a one-line task; the coordinator picks it up on its next tick, generates a slug, dispatches a worker into a fresh tmux session, watches the worker's `state.json` heartbeat, and reconciles status off `gh pr checks` once a PR appears. No daemon — each tick is a single process under an NB-flock, so restart equals resume.
+
+```sh
+$ fleet tasks add "fix the auth retry bug"
+queued: auth-retry-bug-7c12
+
+# coordinator's next tick (skill auto-runs from a Claude Code hook):
+# - dispatches fleet worker for slug=auth-retry-bug-7c12
+# - flips status: ready -> in-progress
+# - records worker pid + branch in tasks.md
+
+$ fleet peek auth-retry-bug-7c12 --follow
+slug: auth-retry-bug-7c12
+status: in-progress
+phase: tdd-red
+pid: 41218
+heartbeat: 3s ago
+```
+
+When the worker pushes a branch and opens a PR, the coordinator transcribes the PR URL onto `tasks.md`, polls `gh pr checks` on subsequent ticks, and flips the row to `done` once CI is green and the PR merges. If CI goes red, it clears `pr_url` and re-queues the task for a retry. C1 (handoff preserves in-flight) and C2 (parallel worker status reports never mix) are integration-tested in `cmd/fleet/coordinator_integration_test.go`.
+
+One coordinator per project (NB-flock on `coordinator.lock`); single-worker mode by default in v0.2; cap > 1 with worktrees lands in v0.2.x.
 
 ## Why
 
@@ -86,11 +115,26 @@ Around 50% context, `fleet-guard` injects `HANDOFF REQUESTED` into the agent's n
 
 ```sh
 $ brew install edisonshen/tap/fleet
-$ fleet init                    # install the fleet-guard skill into ~/.claude/
+$ fleet init                    # install bundled skills + seed standards.md into ~/.fleet/
 $ fleet                         # opens the TUI
 ```
 
+`fleet init` (v0.2) installs every bundled skill under `skills/*/` (`fleet-guard` plus the new `coordinator`) and seeds `~/.fleet/standards.md` from the embedded template. `fleet init --upgrade` (alias `--force`) refreshes skill files but never overwrites a hand-edited `standards.md`.
+
 Upgrade later with `brew update && brew upgrade edisonshen/tap/fleet`.
+
+### Coordinator quickstart (v0.2)
+
+```sh
+$ cd ~/projects/myrepo
+$ fleet init                                     # seeds skills + standards.md
+$ fleet tasks add "fix the auth retry bug"       # queues task; status=ready
+# next coordinator tick (auto-runs from Claude Code hook): dispatches worker
+$ fleet peek <slug> --follow                     # watch state.json + phase
+$ fleet tasks list                               # see all tasks for this project
+```
+
+Tasks live in `~/.fleet/projects/<project>/tasks.md` (markdown-as-state, atomic writes, flock-serialized). Workers heartbeat into `~/.fleet/projects/<project>/workers/<slug>/state.json`. `fleet peek` falls back to the archive directory so completed workers are still inspectable.
 
 > The fully-qualified tap path matters on `upgrade`: there's a JetBrains IDE also distributed as a brew cask called `fleet`, so `brew upgrade fleet` resolves to that cask first and errors with `cask 'fleet' is not installed`. Always upgrade by tap path, or use `brew upgrade --formula fleet` to disambiguate.
 
@@ -103,6 +147,8 @@ $ fleet init
 
 ## Commands
 
+Operator surface (v0.1):
+
 ```sh
 $ fleet                   # opens the dashboard TUI
 $ fleet dispatch <task>   # spawn a Claude Code agent in a detached tmux session
@@ -111,10 +157,42 @@ $ fleet status            # one-shot health summary of every live agent
 $ fleet handoff <agent>   # manually hand off a running agent to a fresh replacement
 $ fleet drain             # process pending fleet-guard auto-handoff queue files
 $ fleet rm <agent>        # archive an agent (kill its tmux session, no replacement)
-$ fleet init              # install the fleet-guard skill into ~/.claude/skills/
+$ fleet init              # install bundled skills + seed standards.md (--upgrade refreshes)
 ```
 
-Most operators live in the TUI. The shell subcommands are there for scripting, dotfile aliases, and CI.
+Coordinator surface (v0.2 — per-project task / learnings / standards / workers):
+
+```sh
+$ fleet tasks add <spec>          # queue a task (auto-derives slug from body)
+$ fleet tasks list                # show all tasks for this project
+$ fleet tasks show <slug>         # render one task
+$ fleet tasks set <slug> <k> <v>  # mutate a task field (status, pr_url, etc.)
+$ fleet tasks note <slug> <text>  # append a worker / coord note
+$ fleet tasks archive <slug>      # move a finished task into archive
+$ fleet tasks promote <slug>      # promote a worker-filed task past the gate
+
+$ fleet learnings add <body>      # append; --tag t1 --tag t2 joins with '+'
+$ fleet learnings list            # render the log
+$ fleet learnings prune --before 30d  # prune old entries (Nd / Nw / Go duration)
+
+$ fleet standards show            # default --merged: global + project section-merged
+$ fleet standards show --global       # ~/.fleet/standards.md only
+$ fleet standards show --project-only # per-project only
+$ fleet standards edit            # opens $EDITOR on the right scope
+
+$ fleet workers list              # active workers (slug, status, phase, pid, age, hb)
+$ fleet workers list --all        # include archived
+$ fleet workers update --phase X  # worker-side heartbeat (called from worker prompt)
+$ fleet workers prune --older-than 7d  # delete stamp-old archives
+
+$ fleet peek <slug>               # one-shot inspection of a worker
+$ fleet peek <slug> --follow      # poll state.json until terminal phase
+$ fleet peek <slug> --logs        # include log tail
+```
+
+Most operators live in the TUI for v0.1 flows; the v0.2 surface is shell-first by design — the coordinator skill drives most of it autonomously, and you mostly type `fleet tasks add` and `fleet peek`.
+
+The `--project <name>` flag defaults to `tui.ProjectTag(cwd)` so `fleet tasks` and `fleet dispatch` always agree on the project name.
 
 ## TUI vocabulary
 
@@ -165,7 +243,10 @@ Now the wheel scrolls into tmux copy-mode (press `q` to exit). Tradeoff: native 
 
 Single Go binary. Filesystem state under `~/.fleet/`. fsnotify for live updates with a 1s polling fallback. tmux as the only runtime dependency. Per-project `flock(2)` for write contention. Atomic writes (`.tmp` then rename, fsync before signaling).
 
-The agent-side half is a Claude Code skill ([`skills/fleet-guard/`](skills/fleet-guard/SKILL.md)) that runs on every Stop / SessionStart / UserPromptSubmit / PreCompact hook. It writes `~/.fleet/agents/<id>.json` for the TUI to read, delivers operator inbox messages, and queues handoff requests at `~/.fleet/queue/` for `fleet drain` to consume.
+Two Claude Code skills ship inside the binary and install to `~/.claude/skills/`:
+
+- [`skills/fleet-guard/`](skills/fleet-guard/SKILL.md) — agent-side health watcher. Runs on every Stop / SessionStart / UserPromptSubmit / PreCompact hook, writes `~/.fleet/agents/<id>.json` for the TUI, delivers operator inbox messages, and queues handoff requests at `~/.fleet/queue/` for `fleet drain` to consume.
+- [`skills/coordinator/`](skills/coordinator/SKILL.md) — per-project task driver (v0.2). Single tick per invocation, NB-flock on `coordinator.lock`, mutates state exclusively through `fleet tasks set` / `fleet tasks note` so Go remains the authoritative writer. Byte-equal Python ↔ Go parser parity is a CI gate.
 
 | Doc | What it covers |
 |---|---|
@@ -175,6 +256,8 @@ The agent-side half is a Claude Code skill ([`skills/fleet-guard/`](skills/fleet
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Committed design decisions with reasoning, indexed by date. |
 | [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md) | Week 0 feasibility spike — gating questions and findings. |
 | [`skills/fleet-guard/SKILL.md`](skills/fleet-guard/SKILL.md) | Agent-side Claude Code skill that watches context % and triggers handoffs. |
+| [`skills/coordinator/SKILL.md`](skills/coordinator/SKILL.md) | Per-project autonomous coordinator (v0.2) — task dispatch, reconcile, gh polling. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Per-release additions, changes, fixes. |
 
 ## License
 
