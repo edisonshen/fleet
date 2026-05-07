@@ -91,26 +91,41 @@ func renderDetailOverlay(d detailView, width, height int) string {
 		// Walk lines, accumulating their wrapped-row cost via
 		// visualRows() so a 200-cell-wide log entry on an 80-cell
 		// terminal counts as 3 visual rows, not 1 (codex iter-9 P2).
+		// Two-pass: first pass measures total cost; if it fits, no
+		// truncation. Otherwise second pass cuts lines to fit
+		// bodyBudget-1 (reserving the last row for the "more" hint).
+		// Without the two-pass split, a body that exactly fits would
+		// still get its last line clipped (codex iter-11 P2).
 		lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
-		used := 0
-		cut := -1
-		for i, line := range lines {
+		total := 0
+		for _, line := range lines {
 			cost := visualRows(line, width)
 			if cost == 0 {
 				cost = 1
 			}
-			if used+cost > bodyBudget-1 { // -1 reserves a row for the "more" hint
-				cut = i
-				break
-			}
-			used += cost
+			total += cost
 		}
-		if cut >= 0 {
-			more := len(lines) - cut
-			lines = append(lines[:cut],
-				headerSubtleStyle.Render(
-					fmt.Sprintf("… %d more — `fleet peek <slug>` for full content", more)))
-			body = strings.Join(lines, "\n")
+		if total > bodyBudget {
+			used := 0
+			cut := -1
+			for i, line := range lines {
+				cost := visualRows(line, width)
+				if cost == 0 {
+					cost = 1
+				}
+				if used+cost > bodyBudget-1 {
+					cut = i
+					break
+				}
+				used += cost
+			}
+			if cut >= 0 {
+				more := len(lines) - cut
+				lines = append(lines[:cut],
+					headerSubtleStyle.Render(
+						fmt.Sprintf("… %d more — `fleet peek <slug>` for full content", more)))
+				body = strings.Join(lines, "\n")
+			}
 		}
 	}
 

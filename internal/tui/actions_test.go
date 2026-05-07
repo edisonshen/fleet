@@ -946,6 +946,11 @@ func TestKeyN_WalksUpToFindProject(t *testing.T) {
 	if err := os.MkdirAll(subDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// .git boundary is required so the walk-up stops at repoRoot
+	// instead of climbing further (codex iter-11 P1).
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 
 	// Walk-up logic: ProjectTag(repoRoot) = "<tmp_basename>-myrepo".
 	// We want the project name to MATCH the cwd tag. Easiest: name
@@ -1003,5 +1008,47 @@ func TestReadWorkerDetail_FallsBackToArchive(t *testing.T) {
 	}
 	if !strings.Contains(body, "archived log line") {
 		t.Errorf("body should render archived output.log tail, got:\n%s", body)
+	}
+}
+
+// TestKeyN_RefusesUnrelatedCwd_WithFleetProject regresses codex
+// iter-11 P1: pressing [n] from a cwd that is NOT a git repo (or any
+// ancestor of a git repo with a matching project) must refuse, even
+// when ~/.fleet/projects/fleet/ exists. The previous unbounded walk
+// would resolve "/" to the "fleet" project and silently accept.
+func TestKeyN_RefusesUnrelatedCwd_WithFleetProject(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+
+	tmp := t.TempDir() // no .git anywhere
+	cwd, _ := os.Getwd()
+	defer func() { _ = os.Chdir(cwd) }()
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	got := m.taskAddProject()
+	if got != "" {
+		t.Errorf("taskAddProject from non-repo cwd must refuse; got %q (would silently target /-resolved fleet project)", got)
+	}
+}
+
+// TestDetailOverlay_NoClipWhenFits regresses codex iter-11 P2: a body
+// whose total visual rows equals the budget exactly must NOT trigger
+// the "(N more)" truncation; the operator should see every line.
+func TestDetailOverlay_NoClipWhenFits(t *testing.T) {
+	// height=24 → bodyBudget=16. Generate exactly 16 short lines.
+	var b strings.Builder
+	for i := 0; i < 16; i++ {
+		fmt.Fprintf(&b, "row%02d\n", i)
+	}
+	d := detailView{title: "test", body: b.String()}
+	out := renderDetailOverlay(d, 120, 24)
+	if strings.Contains(out, "more") {
+		t.Errorf("body that exactly fits should not be clipped; got:\n%s", out)
+	}
+	if !strings.Contains(out, "row15") {
+		t.Errorf("last line of fitting body must render; got:\n%s", out)
 	}
 }

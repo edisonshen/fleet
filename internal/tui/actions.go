@@ -164,14 +164,36 @@ func (m Model) taskAddProject() string {
 	if p := projectFromWorktreeCwd(cwd); p != "" {
 		return p
 	}
+	// Find the git repo root by walking up looking for a .git entry.
+	// Without that boundary, an unbounded walk would keep climbing
+	// to the filesystem root, where ProjectTag("/") sanitizes to
+	// "fleet" — pressing [n] from any unrelated cwd would silently
+	// target the project named "fleet" if it exists (codex iter-11
+	// P1). When no repo root is found, refuse so the operator gets
+	// an explicit "no project context" error.
+	root := repoRootForCwd(cwd)
+	if root == "" {
+		return ""
+	}
+	tag := ProjectTag(root)
+	if tag != "" && projectDirExists(tag) {
+		return tag
+	}
+	return ""
+}
+
+// repoRootForCwd walks up from cwd until it finds a directory
+// containing `.git` (file or dir — covers worktrees). Empty string
+// when no repo boundary is reached before hitting the filesystem
+// root or $HOME.
+func repoRootForCwd(cwd string) string {
 	dir := cwd
 	for {
-		tag := ProjectTag(dir)
-		if tag != "" && projectDirExists(tag) {
-			return tag
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir
 		}
 		parent := filepath.Dir(dir)
-		if parent == dir || parent == "/" || parent == "." {
+		if parent == dir {
 			return ""
 		}
 		dir = parent
