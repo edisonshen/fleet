@@ -31,7 +31,7 @@ Implementation order (parallel-safe):
 
 - Boring tech by default (bubbletea, cobra, fsnotify, GoReleaser — already in design). Innovation tokens go to agent-health-as-primitive only.
 - Filesystem state must survive crashes. Atomic writes (write to `.tmp` then rename), fsync before signaling via queue files.
-- Tests come with the feature, not after. CI (`.github/workflows/ci.yml`) runs `go build ./...`, `go test ./...`, and `golangci-lint run ./...` on every PR and push to main (separate from the release-on-tag CI). Local lint: `golangci-lint run ./...` (config at `.golangci.yml`).
+- Tests come with the feature, not after. CI (`.github/workflows/ci.yml`) runs `go build ./...`, `gofmt -l .`, `golangci-lint run ./...`, `go test -race ./...`, and `python3 -m pytest skills/ -q` on every PR and push to main (separate from the release-on-tag CI). Local lint: `golangci-lint run ./...` (config at `.golangci.yml`).
 - Single-binary distribution. No runtime deps beyond tmux.
 
 ## House style
