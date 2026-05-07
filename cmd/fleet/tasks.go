@@ -12,6 +12,7 @@ package main
 // reads impossible).
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -110,6 +111,66 @@ func existingSlugs(f *tasks.File) []string {
 		out = append(out, t.Slug)
 	}
 	return out
+}
+
+// archivedSlugList returns the slugs currently in
+// tasks-archive.md. Missing file → empty slice (not an error).
+func archivedSlugList(project string) ([]string, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	archPath := filepath.Join(dir, "tasks-archive.md")
+	if _, err := os.Stat(archPath); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	f, err := tasks.Read(archPath)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(f.Tasks))
+	for _, t := range f.Tasks {
+		out = append(out, t.Slug)
+	}
+	return out, nil
+}
+
+// isFullSlug mirrors internal/tasks.isFullSlug — `<short>-<4hex>`.
+// Used to decide whether a `--slug` value passed by the operator is
+// already a final slug (so we should refuse on archive collision)
+// versus a short name that GenerateSlug will postfix.
+func isFullSlug(s string) bool {
+	if len(s) < 6 {
+		return false
+	}
+	if s[len(s)-5] != '-' {
+		return false
+	}
+	for _, c := range s[:len(s)-5] {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	for _, c := range s[len(s)-4:] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validateScalarBullet rejects values that would corrupt a `- key:
+// value` bullet on the next round-trip (codex iter-4 P2). Newlines
+// turn the tail of the value into free-floating markdown that
+// internal/tasks.Read then refuses with "unexpected content between
+// sections", bricking tasks.md for the whole project. Multi-line
+// content belongs in section bodies (Spec / Acceptance / Notes), not
+// in scalar bullets.
+func validateScalarBullet(key, value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("%s contains newline (scalar bullet must be one line; multi-line content goes in Spec/Acceptance/Notes)", key)
+	}
+	return nil
 }
 
 // validateSectionBody mirrors the unfenced-header check inside
@@ -255,6 +316,9 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 	if err := validateDependencySlugs(deps); err != nil {
 		return fmt.Errorf("tasks add: %w", err)
 	}
+	if err := validateScalarBullet("--spawned-by", opts.spawnedBy); err != nil {
+		return fmt.Errorf("tasks add: %w", err)
+	}
 
 	now := time.Now().UTC()
 	st := tasks.Status(opts.status)
@@ -265,8 +329,27 @@ func runTasksAdd(opts *tasksAddOpts, positional string, stdout io.Writer) error 
 		if err != nil {
 			return err
 		}
-
-		finalSlug := tasks.GenerateSlug(slug, spec, existingSlugs(f))
+		// Also load tasks-archive.md so GenerateSlug avoids picking a
+		// 4hex collision with an archived slug — and so an explicit
+		// `--slug <full>` value already living in archive is rejected
+		// before we write a duplicate (codex iter-4 P2). Archive read
+		// is best-effort: a parse failure surfaces as an error so the
+		// operator notices the corrupted archive instead of silently
+		// recreating slug collisions.
+		archiveSlugs, err := archivedSlugList(project)
+		if err != nil {
+			return fmt.Errorf("read tasks-archive.md: %w", err)
+		}
+		// Pre-check the user-supplied slug against the archive set.
+		if isFullSlug(slug) {
+			for _, a := range archiveSlugs {
+				if a == slug {
+					return fmt.Errorf("slug %q already exists in tasks-archive.md (would block future tasks.Archive on duplicate); pick a different slug", slug)
+				}
+			}
+		}
+		all := append(existingSlugs(f), archiveSlugs...)
+		finalSlug := tasks.GenerateSlug(slug, spec, all)
 		t := &tasks.Task{
 			Slug:      finalSlug,
 			Status:    st,
@@ -615,10 +698,19 @@ func setTaskField(t *tasks.Task, key, value string) error {
 		}
 		t.WorkerPID = pid
 	case "worktree":
+		if err := validateScalarBullet(key, value); err != nil {
+			return err
+		}
 		t.Worktree = nullOrValue(value)
 	case "pr_url":
+		if err := validateScalarBullet(key, value); err != nil {
+			return err
+		}
 		t.PRURL = nullOrValue(value)
 	case "branch":
+		if err := validateScalarBullet(key, value); err != nil {
+			return err
+		}
 		t.Branch = nullOrValue(value)
 	case "depends_on":
 		deps := parseDependsOn(value)
@@ -627,6 +719,9 @@ func setTaskField(t *tasks.Task, key, value string) error {
 		}
 		t.DependsOn = deps
 	case "spawned_by":
+		if err := validateScalarBullet(key, value); err != nil {
+			return err
+		}
 		t.SpawnedBy = value
 	case "created", "updated":
 		return fmt.Errorf("tasks set: %s is not settable (parser owns created; updated bumps automatically)", key)

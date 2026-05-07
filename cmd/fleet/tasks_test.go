@@ -417,6 +417,72 @@ func TestTasksSet_RejectsNonNumericPID(t *testing.T) {
 	}
 }
 
+// TestTasksAdd_RejectsArchivedSlug — codex iter-4 P2: explicit --slug
+// matching an archived slug must fail. Otherwise re-archive later
+// returns ErrDuplicateSlug and the task lifecycle gets stuck.
+func TestTasksAdd_RejectsArchivedSlug(t *testing.T) {
+	_, project := setupTasksHome(t)
+
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "ghost-1234", priority: "P2",
+		spec: "first", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	slug := parts[1]
+	if err := runTasksArchive(&tasksArchiveOpts{project: project}, []string{slug}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	// Try to reuse the SAME full slug.
+	err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: slug, priority: "P2",
+		spec: "second", spawnedBy: "user", status: "todo",
+	}, "", &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error reusing archived slug")
+	}
+}
+
+// TestTasksAdd_RejectsMultilineSpawnedBy — codex iter-4 P2: a newline
+// in --spawned-by would corrupt the task block on round-trip.
+func TestTasksAdd_RejectsMultilineSpawnedBy(t *testing.T) {
+	_, project := setupTasksHome(t)
+	err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "multi-spawn", priority: "P2",
+		spec: "x", spawnedBy: "user\nrogue line", status: "todo",
+	}, "", &bytes.Buffer{})
+	if err == nil {
+		t.Error("expected error on multiline --spawned-by")
+	}
+}
+
+// TestTasksSet_RejectsMultilineScalars — codex iter-4 P2: scalar
+// bullet mutations must reject newlines.
+func TestTasksSet_RejectsMultilineScalars(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "scalar-mut", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	slug := parts[1]
+	for _, kv := range []string{
+		"pr_url=line1\nline2",
+		"branch=foo\nbar",
+		"worktree=/tmp/a\n/tmp/b",
+		"spawned_by=alice\neve",
+	} {
+		if err := runTasksSet(&tasksSetOpts{project: project}, slug, kv, &bytes.Buffer{}); err == nil {
+			t.Errorf("expected error on multiline value %q", kv)
+		}
+	}
+}
+
 // TestTasksAdd_NeedsSlugOrSpec — empty input refuses up front rather
 // than producing an unsalvageable empty task block.
 func TestTasksAdd_NeedsSlugOrSpec(t *testing.T) {
