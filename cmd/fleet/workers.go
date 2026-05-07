@@ -112,8 +112,13 @@ func runWorkersList(opts *workersListOpts, stdout io.Writer) error {
 }
 
 // workerLiveness reduces a worker's State to one of "alive", "dead",
-// "done", "blocked", "failed". Coord's reconcile path uses the same
-// signals; the CLI just renders them.
+// "starting", "done", "blocked", "failed". Coord's reconcile path
+// uses the same signals; the CLI just renders them.
+//
+// "starting" is a separate bucket because workers.UpdateState
+// bootstraps fresh state files with phase=starting and pid=0 until
+// the coord knows the subprocess PID — in that window the CLI must
+// not report healthy launching workers as dead (codex iter-6 P2).
 func workerLiveness(s *workers.State) string {
 	switch s.Phase {
 	case workers.PhaseDone:
@@ -123,10 +128,16 @@ func workerLiveness(s *workers.State) string {
 	case workers.PhaseFailed:
 		return "failed"
 	}
-	if s.PID > 0 && workers.IsAlive(s.PID) {
-		return "alive"
+	if s.PID > 0 {
+		if workers.IsAlive(s.PID) {
+			return "alive"
+		}
+		return "dead"
 	}
-	return "dead"
+	// PID not yet published. Phase=starting is the canonical
+	// pre-PID bootstrap; treat any other phase the same way for
+	// future-proofing if coord adds a new pre-PID phase.
+	return "starting"
 }
 
 func pidString(pid int) string {

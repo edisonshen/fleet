@@ -67,8 +67,9 @@ func newStandardsShowCmd() *cobra.Command {
 Default is --merged: per-H2 merge of global + per-project, project
 winning on same-named sections, project-only sections appended.
 
---global shows only the global file; --project shows only the
-per-project file.`,
+--global shows only the global file; --project-only shows only the
+per-project file. (--project takes the project NAME, not a scope —
+the bool selector is --project-only because of the name collision.)`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Decide scope from flag combinations. Mutually exclusive:
@@ -156,6 +157,8 @@ func newStandardsEditCmd() *cobra.Command {
 		Long: `edit opens the chosen standards.md in $EDITOR. Default is the
 per-project file (` + "`~/.fleet/projects/<project>/standards.md`" + `);
 pass --global to edit the global file at ` + "`~/.fleet/standards.md`" + `.
+The --project-only bool keeps the explicit-default form (--project
+takes the project NAME, not a scope).
 
 If the target file is missing, edit seeds a v1-frontmatter stub before
 launching the editor so the operator gets a parseable starting point.

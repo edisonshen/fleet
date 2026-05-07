@@ -89,6 +89,29 @@ func TestWorkersList_AllShowsArchived(t *testing.T) {
 	}
 }
 
+// TestWorkersList_StartingHasPidZero — codex iter-6 P2: a fresh
+// state.json (phase=starting, pid=0) must NOT render as "dead".
+func TestWorkersList_StartingHasPidZero(t *testing.T) {
+	_, project := setupTasksHome(t)
+	// Bootstrap a worker via UpdateState — that's the path the coord
+	// uses, and it produces phase=starting with pid=0.
+	if err := workers.UpdateState(project, "fresh-7777", func(s *workers.State) {
+		// Don't mutate; leave the bootstrap defaults.
+	}); err != nil {
+		t.Fatalf("UpdateState: %v", err)
+	}
+	out := &bytes.Buffer{}
+	if err := runWorkersList(&workersListOpts{project: project}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if !strings.Contains(out.String(), "starting") {
+		t.Errorf("starting bucket missing for pid=0 worker: %s", out.String())
+	}
+	if strings.Contains(out.String(), "\tdead\t") {
+		t.Errorf("starting worker should not render as dead: %s", out.String())
+	}
+}
+
 // TestWorkersPrune_BadDuration — invalid --older-than rejects.
 func TestWorkersPrune_BadDuration(t *testing.T) {
 	_, project := setupTasksHome(t)
