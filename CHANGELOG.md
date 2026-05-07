@@ -74,10 +74,10 @@ under `fleet dispatch`, and the operator-facing CLI to drive it.
   (PLAN "Smart sleep").
 - 5-minute TTL cache on `gh pr checks` (current code hits gh
   synchronously per tick).
-- `tasks.Archive` retry edge case — issue #N (link added once
-  filed).
-- `learnings.Prune` retry-dedup — issue #M (link added once
-  filed).
+- `tasks.Archive` retry edge case —
+  [#37](https://github.com/edisonshen/fleet/issues/37).
+- `learnings.Prune` retry-dedup —
+  [#38](https://github.com/edisonshen/fleet/issues/38).
 
 ## [0.1.3] - 2026-05-06
 
