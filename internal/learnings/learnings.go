@@ -194,25 +194,35 @@ func Prune(project string, olderThan time.Time) error {
 			return fmt.Errorf("read archive: %w", err)
 		}
 
-		// Build a dedup set keyed on the wire-format identity (the
-		// fields the parser reads back) so a previously-archived
-		// entry isn't appended twice across a Prune retry. The set
-		// is seeded ONLY from the pre-existing archive — duplicates
-		// within the current pass are preserved because two
-		// legitimately-identical entries (same RFC3339 second, same
-		// header, same body) are valid in an append-only log and
-		// must survive prune.
-		archived := make(map[string]struct{}, len(archive))
+		// Build a dedup multiset keyed on the wire-format identity
+		// (the fields the parser reads back) so a previously-archived
+		// entry isn't appended twice across a Prune retry. The
+		// multiset is seeded ONLY from the pre-existing archive —
+		// duplicates within the current pass are preserved because
+		// two legitimately-identical entries (same RFC3339 second,
+		// same header, same body) are valid in an append-only log
+		// and must survive prune.
+		//
+		// Counts, not membership: if a previous partial Prune already
+		// archived ONE copy of an entry that legitimately appears
+		// TWICE in current, set-membership would skip both copies and
+		// silently drop one. We decrement per match and only skip
+		// while counts remain — extra current copies fall through to
+		// the archive append.
+		archived := make(map[string]int, len(archive))
 		for _, a := range archive {
-			archived[entryKey(a)] = struct{}{}
+			archived[entryKey(a)]++
 		}
 
 		kept := make([]Entry, 0, len(current))
 		for _, e := range current {
 			if e.Timestamp.Before(olderThan) {
-				if _, dup := archived[entryKey(e)]; !dup {
-					archive = append(archive, e)
+				k := entryKey(e)
+				if archived[k] > 0 {
+					archived[k]--
+					continue
 				}
+				archive = append(archive, e)
 				continue
 			}
 			kept = append(kept, e)
