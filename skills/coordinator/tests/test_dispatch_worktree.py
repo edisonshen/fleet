@@ -84,49 +84,100 @@ def test_create_worktree_passes_base_when_provided(tmp_path) -> None:
     assert args[-1] == "main"
 
 
-def test_create_worktree_idempotent_on_already_exists(tmp_path) -> None:
-    """Coord crash mid-tick can leave the wt on disk; resume must succeed.
-
-    The git error text references the worktree PATH so our path-anchored
-    check (codex iter-2 [P2]) classifies it as idempotent.
-    """
+def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
+    """Coord crash mid-tick can leave the wt on disk + registered; resume
+    must succeed. We verify the path is registered via `git worktree
+    list --porcelain` before treating "already exists" as idempotent
+    (codex iter-2 [P2])."""
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / "wt" / "alpha-1234")
-    fake = _err(f"fatal: '{wt}' already exists\n")
-    with patch.object(worktree_mod.subprocess, "run", return_value=fake):
+    add_err = _err(f"fatal: '{wt}' already exists\n")
+    list_ok = _ok(stdout=f"worktree {wt}\nHEAD abc123\nbranch refs/heads/worker/alpha-1234\n\n")
+    runs = [add_err, list_ok]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.error == ""
     assert res.path == wt
 
 
-def test_create_worktree_idempotent_on_already_checked_out(tmp_path) -> None:
-    """Variant phrasing: git also says `is already checked out at <ref>`."""
+def test_create_worktree_idempotent_on_already_checked_out_when_registered(tmp_path) -> None:
+    """Variant phrasing: `is already checked out at <ref>` is also a
+    worktree-path collision and is idempotent IFF the path is a
+    registered worktree."""
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / "wt" / "alpha-1234")
-    fake = _err(f"fatal: '{wt}' is already checked out at /elsewhere\n")
-    with patch.object(worktree_mod.subprocess, "run", return_value=fake):
+    add_err = _err(f"fatal: '{wt}' is already checked out at /elsewhere\n")
+    list_ok = _ok(stdout=f"worktree {wt}\n\n")
+    runs = [add_err, list_ok]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.error == ""
     assert res.path == wt
 
 
-def test_create_worktree_branch_already_exists_is_real_error(tmp_path) -> None:
-    """Codex iter-2 [P2] regress: a retry where the worktree was cleaned
-    up but the branch persists (open PR keeps the ref) must NOT be
-    silently treated as idempotent. git's branch-collision message is
-    distinct from the worktree-collision message — we surface it."""
+def test_create_worktree_already_exists_but_not_registered_is_error(tmp_path) -> None:
+    """Codex iter-2 [P2] regress: a stale non-empty directory at wt_path
+    also triggers `'<path>' already exists`, but it's NOT a real
+    worktree. Without the registry verify, we'd hand the worker a
+    non-checkout cwd and the first git step would fail. With the
+    verify, we surface the error so the operator can clean up."""
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / "wt" / "alpha-1234")
-    # Note: the branch-collision message references the BRANCH name, not
-    # the worktree path. Our anchored check rejects it.
-    fake = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
-    with patch.object(worktree_mod.subprocess, "run", return_value=fake):
+    add_err = _err(f"fatal: '{wt}' already exists\n")
+    # `git worktree list --porcelain` does NOT include wt — confirms the
+    # path is occupied by a stale dir, not a registered worktree.
+    list_no_match = _ok(stdout=f"worktree {repo}\n\n")
+    runs = [add_err, list_no_match]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
     assert res.path == ""
-    assert "branch named" in res.error.lower() or "already exists" in res.error.lower()
+    assert "not a registered git worktree" in res.error
+
+
+def test_create_worktree_branch_already_exists_retries_without_dash_b(tmp_path) -> None:
+    """Codex iter-2 [P1]: when the branch persists (open PR) but the
+    worktree was cleaned up, `git worktree add -b <branch>` fatals
+    "branch already exists". Retry without `-b` so the existing branch
+    is checked out into the new worktree — otherwise the task can
+    never be re-dispatched after its first PR opens."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    retry_ok = _ok()
+    runs = [add_err, retry_ok]
+    calls: list = []
+
+    def _run(cmd, *a, **k):
+        calls.append(list(cmd))
+        return runs.pop(0)
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=_run):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.error == ""
+    assert res.path == wt
+    # First call: with `-b`. Second call: without `-b` (reuse branch).
+    assert calls[0] == ["git", "-C", repo, "worktree", "add", wt, "-b", "worker/alpha-1234"]
+    assert calls[1] == ["git", "-C", repo, "worktree", "add", wt, "worker/alpha-1234"]
+
+
+def test_create_worktree_branch_reuse_failure_surfaces_error(tmp_path) -> None:
+    """If the retry-without-`-b` also fails (e.g. the branch is checked
+    out in another worktree), we surface the error rather than
+    silently succeeding."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    add_err = _err("fatal: A branch named 'worker/alpha-1234' already exists.\n")
+    retry_err = _err("fatal: 'worker/alpha-1234' is already checked out at /other/wt\n")
+    runs = [add_err, retry_err]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        res = worktree_mod.create_worktree(repo, wt, "worker/alpha-1234")
+    assert res.path == ""
+    assert "branch worker/alpha-1234 reuse failed" in res.error
 
 
 def test_create_worktree_surfaces_real_git_error(tmp_path) -> None:

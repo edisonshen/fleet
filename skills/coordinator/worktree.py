@@ -116,6 +116,7 @@ def create_worktree(
             os.makedirs(parent, exist_ok=True)
         except OSError as exc:
             return WorktreeResult(error=f"create_worktree: mkdir {parent}: {exc}")
+    # First pass: try to create both the worktree dir AND the branch.
     cmd = ["git", "-C", repo, "worktree", "add", wt_path, "-b", branch]
     if base:
         cmd.append(base)
@@ -128,34 +129,60 @@ def create_worktree(
     if proc.returncode == 0:
         return WorktreeResult(path=wt_path)
     stderr = (proc.stderr or proc.stdout or "").strip()
-    # Idempotent path: a coord crash mid-tick can leave the worktree on
-    # disk but tasks.md still ready; the next tick re-runs us. git
-    # surfaces a worktree-path collision two ways:
-    #   "fatal: '<wt_path>' already exists"
-    #   "fatal: '<wt_path>' is already checked out at <ref>"
-    # We MUST NOT treat the branch-collision message
-    #   "fatal: A branch named '<branch>' already exists."
-    # as idempotent (codex iter-2 [P2]): a retry where the branch
-    # persists for an open PR but the worktree was cleaned up needs
-    # the caller to surface the error so the retry can re-checkout
-    # the existing branch instead of inventing a new one. Match only
-    # when the error references the worktree PATH, not a branch.
-    if _is_worktree_already_present(stderr, wt_path):
-        return WorktreeResult(path=wt_path)
+    # Branch-already-exists retry path (codex iter-2 [P1]): on TASK_DONE_PR,
+    # WORKER_FAILED, CI red, or rebase-needed, reconcile/sentinel cleanup
+    # removes the worktree but keeps the branch alive (the open PR points
+    # at it). The next dispatch finds the branch still on disk; using
+    # `-b` would fatal "branch already exists" and the task would be
+    # un-redispatchable forever. Re-run without `-b` so the existing
+    # branch is checked out into the new worktree.
+    if _is_branch_already_exists(stderr, branch):
+        retry = ["git", "-C", repo, "worktree", "add", wt_path, branch]
+        try:
+            proc2 = subprocess.run(
+                retry, capture_output=True, text=True, timeout=timeout_s, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            return WorktreeResult(error=f"create_worktree retry: {exc}")
+        if proc2.returncode == 0:
+            return WorktreeResult(path=wt_path)
+        stderr2 = (proc2.stderr or proc2.stdout or "").strip()
+        # Retry path can also hit "already checked out" if the branch is
+        # checked out elsewhere — that's a real conflict, surface it.
+        return WorktreeResult(
+            error=f"create_worktree: branch {branch} reuse failed: {stderr2}",
+        )
+    # Worktree-path collision path: git already has wt_path registered as
+    # a worktree (most often because a previous tick crashed mid-add but
+    # after the wt-dir landed on disk). Verify wt_path is a REGISTERED
+    # worktree before returning success — a stale non-empty directory at
+    # the same path also produces "already exists" but is NOT a real
+    # checkout, and handing it to the worker would crash the first git
+    # step (codex iter-2 [P2]). The verify call goes through git, not
+    # os.path checks, so it can't be fooled by a directory drop-in.
+    if _is_worktree_path_collision(stderr, wt_path):
+        if _is_registered_worktree(repo, wt_path, timeout_s=timeout_s):
+            return WorktreeResult(path=wt_path)
+        return WorktreeResult(
+            error=(
+                f"create_worktree: {wt_path} exists on disk but is not a "
+                f"registered git worktree; remove it and retry"
+            ),
+        )
     return WorktreeResult(error=f"create_worktree: git worktree add: {stderr}")
 
 
-def _is_worktree_already_present(stderr: str, wt_path: str) -> bool:
-    """Return True iff git's stderr reports that the worktree directory
-    at wt_path already exists (idempotent retry case).
+def _is_worktree_path_collision(stderr: str, wt_path: str) -> bool:
+    """Return True iff git's stderr reports that the worktree DIRECTORY
+    at wt_path already exists.
 
-    Two precise signatures:
+    Two phrasings:
       "fatal: '<wt_path>' already exists"
       "fatal: '<wt_path>' is already checked out at <ref>"
-    Anchoring on wt_path (rather than the bare phrase "already exists")
-    prevents the branch-collision error
+    Anchored on wt_path (lowercase compare) so the branch-collision
+    phrasing
       "fatal: A branch named '<branch>' already exists."
-    from being misclassified as idempotent.
+    can't be misclassified as idempotent.
     """
     if not stderr or not wt_path:
         return False
@@ -164,6 +191,68 @@ def _is_worktree_already_present(stderr: str, wt_path: str) -> bool:
     if wt_low not in low:
         return False
     return ("already exists" in low) or ("already checked out" in low)
+
+
+def _is_branch_already_exists(stderr: str, branch: str) -> bool:
+    """Return True iff git's stderr reports that the branch already
+    exists (i.e. `git worktree add -b <branch>` is being told to make
+    a branch that's already on disk).
+
+    Phrasing:
+      "fatal: A branch named '<branch>' already exists."
+    Anchored on the branch name so a worktree-path collision (which
+    has its own retry semantics) can't be misclassified.
+    """
+    if not stderr or not branch:
+        return False
+    low = stderr.lower()
+    # Match the phrase + the branch name (case-insensitive). Don't
+    # anchor on quotes — git renders the branch name with single quotes
+    # but downstream localization could change that. The phrase
+    # "branch named" + the literal branch text is enough.
+    if "branch named" not in low:
+        return False
+    return branch.lower() in low
+
+
+def _is_registered_worktree(
+    repo: str, wt_path: str, *, timeout_s: float = 10.0,
+) -> bool:
+    """Return True iff git lists wt_path among <repo>'s registered
+    worktrees.
+
+    Runs `git -C <repo> worktree list --porcelain` and parses the
+    `worktree <abs-path>` lines. Comparison uses os.path.realpath on
+    both sides because git emits the canonical absolute path even
+    when the caller passed a symlinked or trailing-slash variant.
+
+    Treats subprocess errors as "not registered" — caller surfaces a
+    helpful error so the operator can clean the path manually.
+    """
+    if not repo or not wt_path:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        return False
+    target = os.path.realpath(wt_path)
+    for line in (proc.stdout or "").splitlines():
+        if not line.startswith("worktree "):
+            continue
+        listed = line[len("worktree "):].strip()
+        if not listed:
+            continue
+        try:
+            if os.path.realpath(listed) == target:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def remove_worktree(
