@@ -859,6 +859,105 @@ func TestArchive_ConcurrentSameProject(t *testing.T) {
 	}
 }
 
+// TestArchive_RetryPreservesOperatorEdits covers the issue #37 window:
+// a previous Archive wrote tasks-archive.md but failed before rewriting
+// tasks.md. Between the failure and the retry, the operator edits the
+// still-visible task (Status, Notes, Updated, etc.). The retry's
+// Slug+Created equality flags this as retry-recovery; the fix is that
+// the archived row must absorb the live row's mutable fields rather
+// than keep the stale snapshot.
+func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	created := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	updatedOriginal := created
+	updatedEdited := time.Date(2026, 5, 6, 11, 30, 0, 0, time.UTC)
+	dir := filepath.Join(tmp, "projects", "fleet")
+
+	original := &Task{
+		Slug: "alpha-1234", Status: StatusInProgress, Priority: PriorityP1,
+		Created: created, Updated: updatedOriginal, SpawnedBy: "user",
+		Notes: "stale notes",
+	}
+	// Seed live + run Archive once — succeeds, writes both files.
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{original},
+	}); err != nil {
+		t.Fatalf("seed tasks: %v", err)
+	}
+	if err := Archive("fleet", []string{"alpha-1234"}); err != nil {
+		t.Fatalf("first Archive: %v", err)
+	}
+	// Simulate the post-crash state: rewrite tasks.md so the slug is
+	// "still visible" (mimics a crash between archive write and tasks
+	// rewrite), and apply operator edits to the live row.
+	edited := &Task{
+		Slug: "alpha-1234", Status: StatusDone, Priority: PriorityP0,
+		Created: created, Updated: updatedEdited, SpawnedBy: "user",
+		PRURL:  "https://example.com/pr/42",
+		Branch: "feat/edits", Notes: "extra context from operator",
+		Spec: "edited spec", Acceptance: "edited acceptance",
+		DependsOn: []string{"beta-5678"},
+	}
+	if err := Write(filepath.Join(dir, "tasks.md"), &File{
+		Schema: 1, Tasks: []*Task{edited},
+	}); err != nil {
+		t.Fatalf("rewrite tasks (simulate crash window): %v", err)
+	}
+	// Retry. Slug+Created match → retry-recovery branch.
+	if err := Archive("fleet", []string{"alpha-1234"}); err != nil {
+		t.Fatalf("retry Archive: %v", err)
+	}
+	// tasks.md should now be empty.
+	cur, err := Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("read tasks: %v", err)
+	}
+	if len(cur.Tasks) != 0 {
+		t.Errorf("tasks.md = %v; want empty", slugList(cur.Tasks))
+	}
+	// archive must reflect the EDITED state, not the original snapshot.
+	arc, err := Read(filepath.Join(dir, "tasks-archive.md"))
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if len(arc.Tasks) != 1 {
+		t.Fatalf("archive has %d entries; want 1", len(arc.Tasks))
+	}
+	got := arc.Tasks[0]
+	if got.Status != StatusDone {
+		t.Errorf("Status = %q; want %q (operator edit lost)", got.Status, StatusDone)
+	}
+	if got.Priority != PriorityP0 {
+		t.Errorf("Priority = %q; want %q", got.Priority, PriorityP0)
+	}
+	if !got.Updated.Equal(updatedEdited) {
+		t.Errorf("Updated = %v; want %v", got.Updated, updatedEdited)
+	}
+	if got.Notes != "extra context from operator" {
+		t.Errorf("Notes = %q; want operator-edited value", got.Notes)
+	}
+	if got.PRURL != "https://example.com/pr/42" {
+		t.Errorf("PRURL = %q; want operator-edited value", got.PRURL)
+	}
+	if got.Branch != "feat/edits" {
+		t.Errorf("Branch = %q; want feat/edits", got.Branch)
+	}
+	if got.Spec != "edited spec" {
+		t.Errorf("Spec = %q; want edited spec", got.Spec)
+	}
+	if got.Acceptance != "edited acceptance" {
+		t.Errorf("Acceptance = %q; want edited acceptance", got.Acceptance)
+	}
+	if len(got.DependsOn) != 1 || got.DependsOn[0] != "beta-5678" {
+		t.Errorf("DependsOn = %v; want [beta-5678]", got.DependsOn)
+	}
+	// Created must be immutable identity — unchanged.
+	if !got.Created.Equal(created) {
+		t.Errorf("Created = %v; want immutable %v", got.Created, created)
+	}
+}
+
 func TestGenerateSlug_FullSlugPassthrough(t *testing.T) {
 	got := GenerateSlug("add-readme-7a3c", "spec body", nil)
 	if got != "add-readme-7a3c" {
