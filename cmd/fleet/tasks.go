@@ -904,11 +904,42 @@ func runTasksArchive(opts *tasksArchiveOpts, slugs []string, stdout io.Writer) e
 	if err != nil {
 		return err
 	}
+	// Snapshot the live tasks set BEFORE the lock-free Archive call.
+	// We diff before/after so the success message reports the slugs
+	// that actually moved (codex iter-5 P3). tasks.Archive itself
+	// silently skips slugs already absent — operators couldn't
+	// otherwise tell whether anything happened.
+	before, _, err := readTasks(project)
+	if err != nil {
+		return fmt.Errorf("read tasks: %w", err)
+	}
+	beforeSet := make(map[string]struct{}, len(before.Tasks))
+	for _, t := range before.Tasks {
+		beforeSet[t.Slug] = struct{}{}
+	}
+	want := make(map[string]struct{}, len(slugs))
+	for _, s := range slugs {
+		want[s] = struct{}{}
+	}
+	moved := 0
+	skippedAbsent := make([]string, 0)
+	for s := range want {
+		if _, present := beforeSet[s]; present {
+			moved++
+		} else {
+			skippedAbsent = append(skippedAbsent, s)
+		}
+	}
 	// tasks.Archive takes its own lock; don't double-lock here.
 	if err := tasks.Archive(project, slugs); err != nil {
 		return fmt.Errorf("archive: %w", err)
 	}
-	_, _ = fmt.Fprintf(stdout, "archived %d slug(s)\n", len(slugs))
+	_, _ = fmt.Fprintf(stdout, "archived %d slug(s)\n", moved)
+	if len(skippedAbsent) > 0 {
+		sort.Strings(skippedAbsent)
+		_, _ = fmt.Fprintf(stdout, "  skipped (not in tasks.md): %s\n",
+			strings.Join(skippedAbsent, ", "))
+	}
 	return nil
 }
 

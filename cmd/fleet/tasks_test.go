@@ -311,6 +311,34 @@ func TestTasksArchive_MovesToArchiveFile(t *testing.T) {
 	}
 }
 
+// TestTasksArchive_ReportsActualMoved — codex iter-5 P3: success
+// message must reflect slugs actually moved, not the requested count.
+func TestTasksArchive_ReportsActualMoved(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "real-archive", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	parts := strings.Fields(addOut.String())
+	realSlug := parts[1]
+
+	out := &bytes.Buffer{}
+	if err := runTasksArchive(&tasksArchiveOpts{project: project},
+		[]string{realSlug, "ghost-9999"}, out); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "archived 1 slug(s)") {
+		t.Errorf("count should be 1 (only real slug present), got: %s", got)
+	}
+	if !strings.Contains(got, "ghost-9999") {
+		t.Errorf("missing slug should be reported as skipped: %s", got)
+	}
+}
+
 // TestResolveProject_RejectsInvalid validates the project guardrail
 // short-circuits a bogus name before any disk write.
 func TestResolveProject_RejectsInvalid(t *testing.T) {

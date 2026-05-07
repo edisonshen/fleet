@@ -64,9 +64,21 @@ func runWorkersList(opts *workersListOpts, stdout io.Writer) error {
 		return err
 	}
 
-	active, archived, err := workers.ListAll(project)
+	// Default path stays cheap: only scan workers/<slug>/. The archive
+	// walk fires only when --all is set so a project with a large
+	// archive doesn't pay for its size on every `fleet workers list`
+	// (codex iter-5 P2). An unreadable archive can no longer break
+	// active-worker listing either.
+	active, err := workers.ListActive(project)
 	if err != nil {
 		return err
+	}
+	var archived []*workers.State
+	if opts.all {
+		_, archived, err = workers.ListAll(project)
+		if err != nil {
+			return err
+		}
 	}
 	if !opts.all && len(active) == 0 {
 		_, _ = fmt.Fprintln(stdout, "no active workers (run `fleet tasks add` to seed work for the coordinator)")
@@ -86,17 +98,15 @@ func runWorkersList(opts *workersListOpts, stdout io.Writer) error {
 			humanAge(now.Sub(s.UpdatedAt)),
 		)
 	}
-	if opts.all {
-		for _, s := range archived {
-			_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
-				s.Slug,
-				"archived",
-				s.Phase,
-				pidString(s.PID),
-				humanAge(now.Sub(s.StartedAt)),
-				humanAge(now.Sub(s.UpdatedAt)),
-			)
-		}
+	for _, s := range archived {
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			s.Slug,
+			"archived",
+			s.Phase,
+			pidString(s.PID),
+			humanAge(now.Sub(s.StartedAt)),
+			humanAge(now.Sub(s.UpdatedAt)),
+		)
 	}
 	return tw.Flush()
 }
