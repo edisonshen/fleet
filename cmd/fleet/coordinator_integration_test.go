@@ -466,6 +466,7 @@ func TestCoordIntegration_HappyPath(t *testing.T) {
 	if !strings.Contains(out1, `"dispatched": 1`) {
 		t.Fatalf("first tick did not dispatch: %s", out1)
 	}
+	assertNoTickErrors(t, out1)
 	task := env.readTask(t, slug)
 	if task.Status != tasks.StatusInProgress {
 		t.Fatalf("after dispatch: status=%q want %q", task.Status, tasks.StatusInProgress)
@@ -485,6 +486,7 @@ func TestCoordIntegration_HappyPath(t *testing.T) {
 	if !strings.Contains(out2, `"drained": 1`) {
 		t.Fatalf("second tick did not drain sentinel: %s", out2)
 	}
+	assertNoTickErrors(t, out2)
 	task = env.readTask(t, slug)
 	if task.Status != tasks.StatusInReview {
 		t.Errorf("after drain: status=%q want %q", task.Status, tasks.StatusInReview)
@@ -499,8 +501,8 @@ func TestCoordIntegration_HappyPath(t *testing.T) {
 	}
 }
 
-// listAllAgents returns every agent record on disk (live + archived),
-// used by test cleanups to reap tmux sessions across the full set.
+// listAllAgents returns every live agent record, used by test cleanups
+// to reap tmux sessions for any workers spawned during the test.
 func listAllAgents(t *testing.T) []*agent.Record {
 	t.Helper()
 	live, err := agent.List()
@@ -508,6 +510,19 @@ func listAllAgents(t *testing.T) []*agent.Record {
 		t.Fatalf("agent.List: %v", err)
 	}
 	return live
+}
+
+// assertNoTickErrors fails the test if loop.tick() reported any errors
+// in its TickResult. Catches silent CLI failures (e.g., missing flag,
+// permission error inside the Python skill) that wouldn't otherwise
+// surface as a non-zero exit because tick() always returns 0 to match
+// fleet-guard discipline. The output is JSON; we look for the canonical
+// empty-errors marker rather than parsing the whole blob.
+func assertNoTickErrors(t *testing.T, tickOutput string) {
+	t.Helper()
+	if !strings.Contains(tickOutput, `"errors": []`) {
+		t.Errorf("loop.tick() reported errors:\n%s", tickOutput)
+	}
 }
 
 // ---------- standards seed + skill install ----------
@@ -603,6 +618,7 @@ func TestCoordHandoffPreservesInflight(t *testing.T) {
 	if !strings.Contains(out, `"drained": 0`) {
 		t.Errorf("successor drained unexpected sentinel: %s", out)
 	}
+	assertNoTickErrors(t, out)
 
 	after := env.readTask(t, slug)
 	if after.Status != before.Status {
@@ -635,6 +651,7 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	if !strings.Contains(out1, `"dispatched": 2`) {
 		t.Fatalf("first tick did not dispatch both: %s", out1)
 	}
+	assertNoTickErrors(t, out1)
 
 	// Set both tasks' worker_pid alive so reconcile skips.
 	env.runFleet(t, "tasks", "set", "--project", env.project, slugA, fmt.Sprintf("worker_pid=%d", os.Getpid()))
@@ -656,6 +673,7 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	if !strings.Contains(out2, `"drained": 2`) {
 		t.Fatalf("second tick did not drain both sentinels: %s", out2)
 	}
+	assertNoTickErrors(t, out2)
 
 	taskA := env.readTask(t, slugA)
 	taskB := env.readTask(t, slugB)
