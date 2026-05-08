@@ -243,13 +243,14 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	// Left column: project + task rows.
 	var left []string
 	if len(m.unifiedProjects()) == 0 && !rowsHaveLeft(rows) {
-		// Empty-state hint nudges [n] task. The earlier text advertised
-		// [d] (a stale v0.1 keybind that never landed in v0.2), which
-		// was a discoverability dead-end. [n] is the working v0.2 entry
-		// — issue #55. Operators on a fresh install with zero agents
-		// AND zero v0.2-init'd projects should be pointed at [n] so
-		// the first action they take (add a task) bootstraps a project
-		// tree as a side effect.
+		// Empty-state hint nudges [n] task to match the footer keybind
+		// chip (issue #55). The earlier hint pointed at [d] dispatch
+		// (introduced in codex iter-7 to dodge the "no project context"
+		// flash on truly-fresh installs); the operator clarified that
+		// the hint must agree with the advertised footer key, even at
+		// the cost of that bootstrap edge case. On a non-fresh install
+		// (cwd is a known v0.2 project, or cursor is on a project row)
+		// [n] resolves correctly and adds the task.
 		left = append(left, "",
 			columnHeadingStyle.Render("  no projects yet — press [n] to add a task"))
 	}

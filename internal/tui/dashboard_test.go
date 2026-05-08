@@ -489,10 +489,10 @@ func TestUpdate_DashboardMsg_Stores(t *testing.T) {
 
 // TestView_DashboardEmptyShowsHint pins that an empty projects tree
 // renders a coachmark instead of a blank column. The hint nudges to
-// [n] task — matches the footer (issue #55). The earlier [d] text was
-// promoted in codex iter-7 to dodge the "no project context" flash on
-// fresh installs, but the footer advertises [n] and operator clarity
-// wins over the bootstrap edge case.
+// [n] task — matches the footer keybind chip (issue #55). The earlier
+// [d] text was introduced in codex iter-7 to dodge the "no project
+// context" flash on fresh installs; the operator clarified that hint
+// + footer must agree on a single key, so we revert to [n].
 func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
