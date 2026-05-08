@@ -680,6 +680,83 @@ func TestKeyA_TaskRow_ReadyTask_PointsAtCoord(t *testing.T) {
 	}
 }
 
+// TestKeyA_TaskRow_InReview_PointsAtPeek pins the codex iter-6 P2
+// fix: in-review tasks (post-completion holding state) must NOT be
+// routed into the status=ready recovery suggestion. The coord
+// archives the worker dir AFTER setting status=in-review; once the
+// archive is pruned, status alone is the only signal — and we must
+// NOT suggest re-dispatching already-completed work.
+func TestKeyA_TaskRow_InReview_PointsAtPeek(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "shipping-task-aaaa", tasks.StatusInReview, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "shipping-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] on in-review task should flash, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "in-review") {
+		t.Errorf("flash should label state in-review, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "fleet peek") {
+		t.Errorf("in-review hint should suggest `fleet peek`, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("in-review must NOT suggest re-dispatch (status=ready), got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_Done_PointsAtPeek pins that done is also routed
+// to the peek hint, NOT the recovery command.
+func TestKeyA_TaskRow_Done_PointsAtPeek(t *testing.T) {
+	// done tasks are filtered out of row.Tasks today (dashboard.go
+	// scanProject:215). Test the helper directly to pin the routing
+	// rule independent of dashboard filtering.
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origArch := taskWorkerArchiveExists
+	taskWorkerArchiveExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
+	origLive := liveTaskStatus
+	liveTaskStatus = func(project, slug string) string { return "done" }
+	t.Cleanup(func() { liveTaskStatus = origLive })
+
+	m := New("test")
+	mm, _, _ := m.attachToTaskOrHint("fleet", "merged-task-aaaa", "done")
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("done [a] should flash, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "fleet peek") {
+		t.Errorf("done hint should suggest `fleet peek`, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("done must NOT suggest re-dispatch, got %q", mm.flash.text)
+	}
+}
+
 // TestKeyA_DetailPanel_LiveStatusOverridesCachedStatus pins the
 // codex iter-3 P2 fix: a task that transitioned ready → in-progress
 // between snapshots must route on the LIVE status (not the cached

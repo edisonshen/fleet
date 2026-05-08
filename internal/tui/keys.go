@@ -478,6 +478,27 @@ func noWorkerHintReady(project, slug string) string {
 		project, slug)
 }
 
+// noWorkerHintInReview emits the post-completion holding-state hint.
+// Codex iter-6 P2: in-review tasks have no active worker BY DESIGN —
+// the coord archives the worker dir on phase=done and the task
+// status flips to in-review pending CI / merge. Suggesting
+// status=ready would silently re-dispatch already-completed work.
+// `fleet peek <slug>` reads from the active dir then falls back to
+// archive automatically (peek.go's readWorkerStateAnywhere).
+func noWorkerHintInReview(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is in-review — work is done, awaiting CI / merge; `fleet peek %s --project %s` for the archived worker logs",
+		project, slug, slug, project)
+}
+
+// noWorkerHintTerminal covers done / abandoned. Worker dir is archived
+// and may have been pruned (default 7d). No re-dispatch path applies.
+func noWorkerHintTerminal(project, slug, status string) string {
+	return fmt.Sprintf(
+		"task %s/%s is %s — terminal state, no worker to attach to; `fleet peek %s --project %s` for archived logs (if not yet pruned)",
+		project, slug, status, slug, project)
+}
+
 func noWorkerRecoveryHint(project, slug string) string {
 	return fmt.Sprintf(
 		"no worker for task %s/%s — `fleet tasks set %s status=ready --project %s` to retry",
@@ -536,10 +557,21 @@ func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, 
 		m.flash = &flashMsg{text: noWorkerHintTodo(project, slug), isErr: true}
 	case "ready":
 		m.flash = &flashMsg{text: noWorkerHintReady(project, slug), isErr: true}
+	case "in-review":
+		// Codex iter-6 P2: in-review is the post-completion holding
+		// state — the coord moves finished tasks here AFTER archiving
+		// the worker. Once the archive is pruned (default 7d) the
+		// task naturally has no worker on disk; suggesting status=ready
+		// would re-dispatch already-merged work. Surface the
+		// review-pending state instead.
+		m.flash = &flashMsg{text: noWorkerHintInReview(project, slug), isErr: true}
+	case "done", "abandoned":
+		// Terminal states. The worker is gone by design (worker dir
+		// archived + pruned). Don't suggest a re-dispatch path.
+		m.flash = &flashMsg{text: noWorkerHintTerminal(project, slug, status), isErr: true}
 	default:
-		// blocked / in-progress / in-review / done / abandoned — the
-		// task should have a worker. Surface the recovery hint so the
-		// operator can re-dispatch.
+		// blocked / in-progress — the task should have a worker.
+		// Surface the recovery hint so the operator can re-dispatch.
 		m.flash = &flashMsg{text: noWorkerRecoveryHint(project, slug), isErr: true}
 	}
 	// Dismiss any open detail panel so the flash isn't hidden behind
