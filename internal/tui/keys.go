@@ -401,7 +401,23 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// output.log tail) which IS where the operator sees what the
 		// worker is asking. When no worker exists for the task, flash
 		// the actionable retry hint.
+		//
+		// Codex iter-1 P2: gate on task status so todo/ready tasks
+		// don't get a misleading "no worker" error. Those tasks
+		// legitimately have no worker yet (operator hasn't dispatched);
+		// flash a different hint that points at the right next step
+		// (`fleet dispatch <task>`).
 		if row.task == nil || row.task.Empty || row.task.More > 0 {
+			return m, nil, true
+		}
+		switch row.task.Status {
+		case "todo", "ready":
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"task %s has no worker yet (status=%s) — press [d] to dispatch one",
+					row.task.Slug, row.task.Status),
+				isErr: true,
+			}
 			return m, nil, true
 		}
 		return m.attachToTaskWorker(row.parentProject, row.task.Slug)
@@ -418,7 +434,7 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 
 // attachToTaskWorker is the [a] handler for both task rows and the
 // task detail panel. Routes to the task's worker peek panel when a
-// worker exists; flashes a retry hint otherwise.
+// worker exists; flashes a context-appropriate hint otherwise.
 //
 // Workers in v0.2 are `claude --print` subprocesses, NOT tmux
 // sessions — so "attach" here means "open the same peek panel that
@@ -429,16 +445,35 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 //
 // readTaskWorker is the indirection layer — same stub used by
 // readTaskDetail — so tests can seed a worker without a real
-// state.json file.
+// state.json file. (nil, nil) means "no worker on disk" (ErrNotFound
+// flattened); (nil, err) means a real read error.
+//
+// Codex iter-1 P2: distinguish "no worker" from "read failed" so the
+// flash points at the right next step. The fleet tasks set syntax is
+// `<slug> status=<value>` (NOT --status); valid statuses are
+// todo|ready|in-progress|in-review|done|blocked|abandoned (no
+// "pending"). Suggesting an invalid command would just fail validation
+// and leave the operator stuck.
 func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 	if slug == "" {
 		return m, nil, true
 	}
 	ws, err := readTaskWorker(project, slug)
-	if err != nil || ws == nil {
+	switch {
+	case err != nil:
+		// Real read error — surface verbatim so the operator can see
+		// the underlying disk/parse failure. "No worker" would mislead.
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("worker state for %s unreadable: %v", slug, err),
+			isErr: true,
+		}
+		m.detail = nil
+		return m, nil, true
+	case ws == nil:
+		// ErrNotFound (no state.json on disk).
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
-				"no worker for task %s — `fleet tasks set %s --status pending` to retry",
+				"no worker for task %s — `fleet tasks set %s status=ready` to retry",
 				slug, slug),
 			isErr: true,
 		}

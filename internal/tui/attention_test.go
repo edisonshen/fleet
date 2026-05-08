@@ -7,6 +7,7 @@
 package tui
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -255,7 +256,9 @@ func TestTaskDetail_RendersWorkerInfo(t *testing.T) {
 // TestTaskDetail_HandlesNoWorker pins the graceful path for a
 // blocked task where the worker dir is gone (operator-edited
 // tasks.md, or worker was already archived). The panel must show an
-// actionable hint, not crash.
+// actionable hint, not crash. The recommended command must use the
+// real `<slug> <key>=<value>` syntax (codex iter-1 P2 — earlier
+// version suggested an invalid `--status pending`).
 func TestTaskDetail_HandlesNoWorker(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "needs-input-aaaa", tasks.StatusBlocked, "")
@@ -269,6 +272,36 @@ func TestTaskDetail_HandlesNoWorker(t *testing.T) {
 	}
 	if !strings.Contains(body, "fleet tasks set") {
 		t.Errorf("body should suggest the retry command, got:\n%s", body)
+	}
+	if !strings.Contains(body, "status=ready") {
+		t.Errorf("body should suggest the real `status=<value>` syntax, got:\n%s", body)
+	}
+	if strings.Contains(body, "--status pending") {
+		t.Errorf("body must not suggest the invalid `--status pending` form, got:\n%s", body)
+	}
+}
+
+// TestTaskDetail_SurfacesReadError pins that a non-ENOENT read
+// failure (corrupted state.json, permission denied, etc.) is
+// surfaced verbatim instead of being collapsed to "no worker on
+// disk". Codex iter-1 P2: collapsing would send the operator down
+// the wrong recovery path.
+func TestTaskDetail_SurfacesReadError(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "broken-task-aaaa", tasks.StatusBlocked, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, errors.New("synthetic: state.json malformed")
+	})
+
+	body, _ := readTaskDetail("fleet", "broken-task-aaaa")
+	if !strings.Contains(body, "error reading worker state") {
+		t.Errorf("body should surface read error, got:\n%s", body)
+	}
+	if !strings.Contains(body, "synthetic: state.json malformed") {
+		t.Errorf("body should include the error verbatim, got:\n%s", body)
+	}
+	if strings.Contains(body, "no worker state on disk") {
+		t.Errorf("read failure must NOT collapse to 'no worker' hint, got:\n%s", body)
 	}
 }
 
@@ -347,7 +380,8 @@ func TestKeyA_TaskRow_AttachesToWorkerPeek(t *testing.T) {
 
 // TestKeyA_TaskRow_NoWorker_ShowsInlineMessage pins the graceful
 // path when no worker exists for the task. Operator gets an
-// actionable retry hint instead of a silent no-op.
+// actionable retry hint instead of a silent no-op. The hint must
+// use the real `<slug> <key>=<value>` syntax (codex iter-1 P2).
 func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "stale-task-aaaa", tasks.StatusBlocked, "")
@@ -384,6 +418,102 @@ func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "fleet tasks set") {
 		t.Errorf("flash should suggest the retry command, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("flash should use real `status=<value>` syntax, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "--status pending") {
+		t.Errorf("flash must not suggest invalid `--status pending`, got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_TodoTask_PointsAtDispatch pins that [a] on a
+// todo / ready task row flashes the dispatch hint, NOT the
+// no-worker error. todo/ready tasks legitimately have no worker
+// yet — the right next step is dispatch, not retry. Codex iter-1
+// P2 fix: previous behavior incorrectly reported a normal state as
+// a missing-worker failure.
+func TestKeyA_TaskRow_TodoTask_PointsAtDispatch(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "fresh-task-aaaa", tasks.StatusTodo, "")
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "fresh-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] on todo task should flash a hint, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "no worker yet") {
+		t.Errorf("todo flash should explain there's no worker yet, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "[d]") {
+		t.Errorf("todo flash should point at [d] dispatch, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "no worker for task") {
+		t.Errorf("todo task must NOT use the missing-worker phrasing (it's pre-dispatch, not failure), got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_ReadError_SurfacesError pins that a non-ENOENT
+// worker-state read failure is surfaced as a read error, NOT
+// collapsed to "no worker". Codex iter-1 P2 fix.
+func TestKeyA_TaskRow_ReadError_SurfacesError(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "broken-task-aaaa", tasks.StatusBlocked, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, errors.New("synthetic: permission denied on state.json")
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "broken-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] with worker read error should flash, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "unreadable") {
+		t.Errorf("flash should label the failure as unreadable state, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "synthetic: permission denied") {
+		t.Errorf("flash should include the underlying error, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "no worker for task") {
+		t.Errorf("read error must NOT collapse to 'no worker' phrasing, got %q", mm.flash.text)
 	}
 }
 
@@ -453,6 +583,9 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "no worker for task") {
 		t.Errorf("flash should mention no-worker, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("flash should suggest the real `status=<value>` syntax, got %q", mm.flash.text)
 	}
 }
 

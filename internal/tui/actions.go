@@ -398,10 +398,19 @@ func readTaskDetail(project, slug string) (string, string) {
 		fmt.Fprintf(&b, "depends:   %s\n", strings.Join(t.DependsOn, ", "))
 	}
 
-	// Worker context (issue #75). Best-effort: ENOENT collapses to a
-	// "no worker for this task" hint so a blocked task without a worker
-	// (operator-edited tasks.md, or worker dir was already archived)
-	// still reads cleanly.
+	// Worker context (issue #75). Three branches:
+	//   1. worker present — render slug/phase/PID + BlockedReason as
+	//      the "current question" when blocked.
+	//   2. worker absent (ErrNotFound, surfaced by readTaskWorker as
+	//      (nil, nil)) AND task is in a state that should have one
+	//      (blocked/in-progress) — render the no-worker recovery hint.
+	//      For todo/ready an absent worker is the normal pre-dispatch
+	//      state and the hint would be noise.
+	//   3. worker-state read FAILED with a non-ENOENT error — surface
+	//      the error verbatim. Collapsing to "no worker" would send
+	//      the operator down the wrong recovery path; the actionable
+	//      problem is the corrupt/unreadable state.json on disk
+	//      (codex iter-1 P2).
 	ws, werr := readTaskWorker(project, slug)
 	switch {
 	case werr == nil && ws != nil:
@@ -419,15 +428,17 @@ func readTaskDetail(project, slug string) (string, string) {
 			b.WriteString(reason)
 			b.WriteString("\n")
 		}
+	case werr != nil:
+		// Genuine read failure — surface so the operator sees the
+		// underlying problem rather than a misleading "no worker" hint.
+		b.WriteString("\n### Worker\n")
+		fmt.Fprintf(&b, "error reading worker state: %v\n", werr)
 	default:
-		// Surface only when the task is in a status where the operator
-		// would expect a worker. For todo/ready, an absent worker is
-		// the normal pre-dispatch state and the hint would be noise.
+		// werr == nil && ws == nil → ErrNotFound. Show the no-worker
+		// hint only when the task SHOULD have a worker.
 		if t.Status == tasks.StatusBlocked || t.Status == tasks.StatusInProgress {
 			b.WriteString("\n### Worker\n")
-			b.WriteString("no worker state on disk — `fleet tasks set ")
-			b.WriteString(slug)
-			b.WriteString(" --status pending` to retry\n")
+			fmt.Fprintf(&b, "no worker state on disk — `fleet tasks set %s status=ready` to retry\n", slug)
 		}
 	}
 
