@@ -1126,3 +1126,497 @@ func TestRepoRootForCwd_StopsAtHome(t *testing.T) {
 		t.Errorf("repoRootForCwd should refuse at $HOME; got %q", got)
 	}
 }
+
+// stubPollCoordLock replaces pollCoordLock for tests so we don't sleep
+// for real. Tests that need the spawn flow to succeed install with
+// alwaysOK=true; tests that need the timeout branch install with
+// alwaysOK=false.
+type stubPollCoordLock struct {
+	calls    []string // captured wantIDs
+	alwaysOK bool
+}
+
+func (s *stubPollCoordLock) install(t *testing.T) {
+	t.Helper()
+	prev := pollCoordLock
+	pollCoordLock = func(projectName, wantID string, attempts int, interval time.Duration) bool {
+		s.calls = append(s.calls, wantID)
+		return s.alwaysOK
+	}
+	t.Cleanup(func() { pollCoordLock = prev })
+}
+
+// TestKeyA_ProjectRow_AttachesToExistingFreshCoord pins issue #60's
+// happy path: when a project's CoordID is set (dashboard freshness gate
+// passed) AND the matching agent record is loaded, [a] sets
+// pendingAttach + tea.Quit to attach to that coord's tmux session.
+// No dispatch shells out.
+func TestKeyA_ProjectRow_AttachesToExistingFreshCoord(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Build a model with a project row whose CoordID matches a loaded
+	// agent record.
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	// Find the project row index in the unified row list.
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+	if row := m.selectedRow(); row == nil || row.kind != rowProject {
+		t.Fatalf("expected cursor on project row; got %+v", row)
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if mm.pendingAttach != "fleet-coord001" {
+		t.Errorf("pendingAttach = %q; want fleet-coord001", mm.pendingAttach)
+	}
+	if cmd == nil {
+		t.Error("expected tea.Quit cmd from [a] on existing coord")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] on existing coord should NOT shell out; got %v", stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoordSessionFlashes regresses the case where
+// project.CoordID is set but the tmux session has died. We must not
+// silently exec tmux on a dead session; flash a clear hint instead.
+func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set for dead session; got %q", mm.pendingAttach)
+	}
+	if cmd != nil {
+		t.Errorf("[a] on dead coord should not produce cmd; got non-nil")
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("[a] on dead coord should flash an error; got %+v", mm.flash)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] on dead coord should NOT shell out; got %v", stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches pins the auto-spawn
+// path: when project.CoordID is empty AND no matching record exists,
+// [a] shells out to `fleet dispatch` with --project, --cwd, --prompt,
+// then on success sets pendingAttach to the new coord's tmux session.
+func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	(&stubPollCoordLock{alwaysOK: true}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			// Mimic real `fleet dispatch` output so the regex parser
+			// finds the new agent ID.
+			out := "agent abcd1234 spawned\n  task: coord-X\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}}, // no CoordID
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] on project with no coord should produce a spawn cmd")
+	}
+	// Drain the cmd to fire the dispatch + lock-poll. coordSpawnDoneMsg
+	// is what we expect back.
+	msg := cmd()
+	doneMsg, ok := msg.(coordSpawnDoneMsg)
+	if !ok {
+		t.Fatalf("expected coordSpawnDoneMsg; got %T (%+v)", msg, msg)
+	}
+	if doneMsg.err != nil {
+		t.Fatalf("spawn returned err: %v", doneMsg.err)
+	}
+	if doneMsg.agentID != "abcd1234" {
+		t.Errorf("agentID = %q; want abcd1234", doneMsg.agentID)
+	}
+	if doneMsg.session != "fleet-abcd1234" {
+		t.Errorf("session = %q; want fleet-abcd1234", doneMsg.session)
+	}
+	if doneMsg.projectName != "demo" {
+		t.Errorf("projectName = %q; want demo", doneMsg.projectName)
+	}
+
+	// Verify the dispatch arg shape.
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 fleet call; got %d (%v)", len(stub.calls), stub.calls)
+	}
+	args := stub.calls[0]
+	if args[0] != "dispatch" {
+		t.Errorf("first arg = %q; want dispatch", args[0])
+	}
+	// Must carry --project demo, --prompt with the coordinator skill loop.
+	hasProject, hasPrompt := false, false
+	for i, a := range args {
+		if a == "--project" && i+1 < len(args) && args[i+1] == "demo" {
+			hasProject = true
+		}
+		if a == "--prompt" && i+1 < len(args) &&
+			strings.Contains(args[i+1], "/coordinator skill loop for project demo") {
+			hasPrompt = true
+		}
+	}
+	if !hasProject {
+		t.Errorf("dispatch args missing --project demo: %v", args)
+	}
+	if !hasPrompt {
+		t.Errorf("dispatch args missing --prompt with coord skill loop: %v", args)
+	}
+
+	// Now feed the doneMsg back into Update — pendingAttach must be set
+	// and the cmd must be tea.Quit.
+	updated, cmd2 := m.Update(doneMsg)
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-abcd1234" {
+		t.Errorf("after coordSpawnDoneMsg, pendingAttach = %q; want fleet-abcd1234",
+			mm.pendingAttach)
+	}
+	if cmd2 == nil {
+		t.Error("expected tea.Quit cmd after spawn done")
+	}
+}
+
+// coordSpawnDoneMsgFromArgs is a test helper that mimics what the real
+// startCoordSpawn closure does inside runFleetCmd — calls the msgFn
+// passed to runFleetCmd. We can't easily get the msgFn from within a
+// stub, so instead we execute the same logic the production msgFn
+// runs: parse the agent ID, poll the (stubbed) lock, return the
+// resulting coordSpawnDoneMsg shape. This keeps the test honest about
+// the contract between startCoordSpawn and Update.
+func coordSpawnDoneMsgFromArgs(args []string, out string, dispatchErr error) tea.Msg {
+	if dispatchErr != nil {
+		return coordSpawnDoneMsg{
+			projectName: argValue(args, "--project"),
+			err:         fmt.Errorf("dispatch: %w\n%s", dispatchErr, out),
+		}
+	}
+	match := dispatchAgentIDPattern.FindStringSubmatch(out)
+	if len(match) != 2 {
+		return coordSpawnDoneMsg{
+			projectName: argValue(args, "--project"),
+			err:         fmt.Errorf("dispatch output missing agent ID line:\n%s", out),
+		}
+	}
+	agentID := match[1]
+	session := "fleet-" + agentID
+	if pollCoordLock(argValue(args, "--project"), agentID, 1, 0) {
+		return coordSpawnDoneMsg{
+			projectName: argValue(args, "--project"),
+			agentID:     agentID,
+			session:     session,
+		}
+	}
+	return coordSpawnDoneMsg{
+		projectName: argValue(args, "--project"),
+		agentID:     agentID,
+		err:         fmt.Errorf("coord spawn timed out — agent %s spawned but lock body never published; check tmux session %s", agentID, session),
+	}
+}
+
+// argValue returns the value following flag in args, or "" if absent.
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+// TestKeyA_ProjectRow_DispatchErr regresses the dispatch-error path:
+// when `fleet dispatch` returns non-zero, coordSpawnDoneMsg carries err
+// and Update surfaces it as a flash. pendingAttach stays empty.
+func TestKeyA_ProjectRow_DispatchErr(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			return coordSpawnDoneMsgFromArgs(args, "boom\n", fmt.Errorf("exit 1"))
+		},
+	}
+	stub.install(t)
+	(&stubPollCoordLock{alwaysOK: false}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] should produce a spawn cmd")
+	}
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err == nil {
+		t.Fatal("expected err on dispatch failure")
+	}
+	updated, _ := m.Update(doneMsg)
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "demo") {
+		t.Errorf("flash should reference project name; got %q", mm.flash.text)
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set on dispatch failure; got %q", mm.pendingAttach)
+	}
+}
+
+// TestKeyA_ProjectRow_LockTimeout regresses the lock-poll-timeout path:
+// dispatch succeeds (agent ID parsed) but pollCoordLock returns false
+// for the entire 2s window. The resulting coordSpawnDoneMsg carries
+// err with the "coord spawn timed out" hint — operator sees a banner
+// pointing at the tmux session they can attach to manually.
+func TestKeyA_ProjectRow_LockTimeout(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent ff112233 spawned\n  tmux: fleet-ff112233\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+	(&stubPollCoordLock{alwaysOK: false}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err == nil {
+		t.Fatal("expected err on lock-poll timeout")
+	}
+	if !strings.Contains(doneMsg.err.Error(), "timed out") {
+		t.Errorf("err should mention 'timed out'; got %q", doneMsg.err.Error())
+	}
+	if doneMsg.agentID != "ff112233" {
+		t.Errorf("doneMsg.agentID = %q; want ff112233 (we still know who was spawned)",
+			doneMsg.agentID)
+	}
+	updated, _ := m.Update(doneMsg)
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("expected error flash; got %+v", mm.flash)
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set on lock-poll timeout; got %q", mm.pendingAttach)
+	}
+}
+
+// TestKeyA_ProjectRow_DispatchOutputUnparseable regresses the agent-ID
+// parse-failure path: dispatch returns 0 but stdout shape drifted (no
+// "agent <id> spawned" line). We must surface a parse error rather
+// than waiting forever for a lock that no one will ever publish.
+func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			return coordSpawnDoneMsgFromArgs(args, "weird unexpected output\n", nil)
+		},
+	}
+	stub.install(t)
+	(&stubPollCoordLock{alwaysOK: true}).install(t) // doesn't matter
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err == nil {
+		t.Fatal("expected err on unparseable dispatch output")
+	}
+	if !strings.Contains(doneMsg.err.Error(), "missing agent ID") {
+		t.Errorf("err should reference missing agent ID; got %q", doneMsg.err.Error())
+	}
+}
+
+// TestPollCoordLock_MatchesHolderID exercises the production
+// pollCoordLock against a real coordinator.lock file. Asserts
+// readCoordHolder integration: when the lock body matches wantID,
+// poll returns true on the first iteration; otherwise it returns
+// false after attempts iterations.
+func TestPollCoordLock_MatchesHolderID(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	lockDir := filepath.Join(root, "projects", "demo", ".locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(lockDir, "coordinator.lock")
+
+	// Case 1: body matches → true.
+	if err := os.WriteFile(lockPath, []byte("abcd1234\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
+		t.Errorf("pollCoordLock should return true when body matches")
+	}
+
+	// Case 2: body mismatch → false after exhausting attempts.
+	if err := os.WriteFile(lockPath, []byte("zzzzzzzz\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
+		t.Errorf("pollCoordLock should return false on mismatched body")
+	}
+
+	// Case 3: missing lock file → false (readCoordHolder errors silently).
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
+		t.Errorf("pollCoordLock should return false when lock file is missing")
+	}
+}
+
+// TestKeyA_TaskRow_FlashesNotApplicable regresses issue #60's hard
+// non-goal: [a] on a task row must still flash "doesn't apply". The
+// new project-row branch must not accidentally swallow task rows.
+func TestKeyA_TaskRow_FlashesNotApplicable(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"demo": true} // expand so task rows are present
+	taskIdx := -1
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowTask {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatal("no task row in dashboardRows")
+	}
+	m.dashCursor = taskIdx
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[a] on task row should not produce a cmd; got non-nil")
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set on task row; got %q", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Errorf("[a] on task row should flash an error; got %+v", mm.flash)
+	}
+	if strings.Contains(mm.flash.text, "tasks/projects") {
+		t.Errorf("flash text leaks the old 'tasks/projects' wording: %q", mm.flash.text)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] on task row should NOT shell out; got %v", stub.calls)
+	}
+}
+
+// TestHelpOverlay_AttachDescriptionMentionsProjects pins issue #60: the
+// [?] help overlay must describe [a] as covering projects (coord),
+// agents (tmux), AND workers (peek). Old text was "(agents) or peek
+// (workers)" and would silently mislead operators about the new
+// project-row capability.
+func TestHelpOverlay_AttachDescriptionMentionsProjects(t *testing.T) {
+	out := renderHelpOverlay(120)
+	if !strings.Contains(out, "projects") {
+		t.Errorf("help overlay [a] description should mention projects; got:\n%s", out)
+	}
+	// Sanity: the agent + worker semantics must still be advertised.
+	if !strings.Contains(out, "agents") {
+		t.Errorf("help overlay [a] description should still mention agents; got:\n%s", out)
+	}
+	if !strings.Contains(out, "workers") {
+		t.Errorf("help overlay [a] description should still mention workers; got:\n%s", out)
+	}
+}
+
+// TestCoordCwdForProject_PrefersAgentRecordCwd verifies the cwd
+// resolution: when an agent record carries the matching Project tag
+// AND a Cwd, we reuse it. Otherwise fall back to TUI's cwd.
+func TestCoordCwdForProject_PrefersAgentRecordCwd(t *testing.T) {
+	r := agent.New("a1")
+	r.Project = "demo"
+	r.Cwd = "/Users/op/projects/demo"
+	got := coordCwdForProject([]*agent.Record{r}, "demo")
+	if got != "/Users/op/projects/demo" {
+		t.Errorf("coordCwdForProject should prefer agent record's Cwd; got %q", got)
+	}
+}
+
+// TestCoordCwdForProject_FallsBackToWd: with no matching agent record,
+// we fall through to os.Getwd().
+func TestCoordCwdForProject_FallsBackToWd(t *testing.T) {
+	got := coordCwdForProject(nil, "ghost-project")
+	wd, _ := os.Getwd()
+	if got != wd {
+		t.Errorf("coordCwdForProject with no records should fall back to os.Getwd(); got %q want %q",
+			got, wd)
+	}
+}
