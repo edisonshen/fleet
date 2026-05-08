@@ -46,6 +46,16 @@ func requireTmux(t *testing.T) {
 	// shells that may not stabilize predictably.
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "1000")
+	// Issue #65 added a post-stability buffer (default 1.5 s) plus
+	// bumped the prompt-enter delay default to 1 s, and added
+	// post-send verify/retry delays (defaults 0.5 s + 1.5 s). Pin
+	// all to fast values so handoff tests don't balloon — production
+	// reliability is verified separately in spawn_test.go's buffer +
+	// verifier tests.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
 }
 
 // seedAgent dispatches a long-lived agent for handoff to operate on.

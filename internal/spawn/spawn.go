@@ -15,6 +15,7 @@ package spawn
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,7 +44,60 @@ const (
 	// defaultPromptEnterDelay is the gap between sending the prompt
 	// text and sending the Enter key. See SendPromptKeys for why this
 	// can't be zero.
-	defaultPromptEnterDelay = 200 * time.Millisecond
+	//
+	// Bumped from 200ms → 1000ms (issue #65). Operator setup with the
+	// stock 200ms gap consistently delivered the prompt text but lost
+	// the Enter — Claude Code's bracketed-paste detection still treated
+	// the prompt as in-flight when Enter arrived ~200ms later, so the
+	// CR landed inside the input buffer as a literal newline rather
+	// than a submit. 1s gives the paste window enough slack to close
+	// across CI runners, slow shells, and the operator's box. Cost:
+	// ~1s added to every coord/handoff spawn — acceptable for "the
+	// /coordinator skill actually starts" reliability.
+	defaultPromptEnterDelay = 1000 * time.Millisecond
+
+	// defaultPostReadyBuffer is an additional sleep after
+	// waitForPaneStable returns, before SendPromptKeys actually types.
+	// Pane-stability is necessary but not sufficient for "input box is
+	// ready": Claude Code can be stable on its splash screen, onboarding
+	// prompt, version-update notice, or model-selection screen — none
+	// of which actually accept user input via the prompt box. Without
+	// this buffer, send-keys lands during one of those pre-input-ready
+	// states and is consumed by something else (a button selector,
+	// "press any key" wait, etc.). 1.5s is empirically enough to ride
+	// out the typical post-stability animation gap on a fresh Claude
+	// Code launch (issue #65 symptom B). Env-overridable via
+	// FLEET_POST_READY_BUFFER_MS for tuning / fast tests.
+	defaultPostReadyBuffer = 1500 * time.Millisecond
+
+	// defaultPostSendVerifyDelay is how long we wait after Enter
+	// before capturing the pane to check whether the prompt was
+	// submitted. 500ms gives Claude time to either echo the prompt as
+	// a "user turn" (submitted) or leave it sitting verbatim in the
+	// input box (not submitted). Shorter risks a false "still in
+	// input" because Claude hasn't redrawn yet. Capped tight so the
+	// verify path doesn't add multi-second latency to the happy case.
+	// Tests pin via FLEET_POST_SEND_VERIFY_MS to keep verifier-path
+	// tests fast.
+	defaultPostSendVerifyDelay = 500 * time.Millisecond
+
+	// defaultPostSendRetryDelay is the gap before re-sending Enter on
+	// the retry path. Always longer than the first-pass
+	// defaultPromptEnterDelay since the first pass already failed. We
+	// re-send Enter alone (the prompt text is already in the input
+	// buffer per the still-unsubmitted observation), wait this long
+	// for Claude to clear paste mode, then submit. Tests pin via
+	// FLEET_POST_SEND_RETRY_MS.
+	defaultPostSendRetryDelay = 1500 * time.Millisecond
+
+	// unsubmittedTailLines is how many lines from the bottom of a
+	// capture-pane snapshot we scan to decide whether the prompt is
+	// still in Claude's input box. Claude Code's input box renders at
+	// the very bottom (input field plus border), so a small tail
+	// window captures it without being polluted by the submitted-
+	// transcript echo higher up. 12 covers a multi-line wrapped prompt
+	// plus the box border on standard 80-col terminals.
+	unsubmittedTailLines = 12
 )
 
 func initialPromptStableWindow() time.Duration {
@@ -59,6 +113,21 @@ func initialPromptMaxWait() time.Duration {
 func promptEnterDelay() time.Duration {
 	return envDuration("FLEET_PROMPT_ENTER_DELAY_MS",
 		defaultPromptEnterDelay)
+}
+
+func postReadyBuffer() time.Duration {
+	return envDuration("FLEET_POST_READY_BUFFER_MS",
+		defaultPostReadyBuffer)
+}
+
+func postSendVerifyDelay() time.Duration {
+	return envDuration("FLEET_POST_SEND_VERIFY_MS",
+		defaultPostSendVerifyDelay)
+}
+
+func postSendRetryDelay() time.Duration {
+	return envDuration("FLEET_POST_SEND_RETRY_MS",
+		defaultPostSendRetryDelay)
 }
 
 // propagatedRuntimeEnv lists FLEET_* vars whose values must reach the
@@ -78,6 +147,9 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_INITIAL_PROMPT_STABLE_MS", // prompt-timing for slow wrappers
 	"FLEET_INITIAL_PROMPT_MAX_MS",
 	"FLEET_PROMPT_ENTER_DELAY_MS",
+	"FLEET_POST_READY_BUFFER_MS",
+	"FLEET_POST_SEND_VERIFY_MS",
+	"FLEET_POST_SEND_RETRY_MS",
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -94,27 +166,46 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 // rendered), or maxWait elapses. Returns nil on stable convergence,
 // or an error if the poll didn't converge.
 //
-// Callers should run this BEFORE queue.Delete so a crash during the
-// wait remains recoverable: the queue file is still on disk and
-// resumeHandoff / handoffop.Resume will re-run the wait + send on
-// retry. Pairing this with SendPromptKeys (run AFTER queue.Delete)
-// gives at-most-once delivery with a microsecond-scale lost-prompt
-// window, instead of the 30 s window an in-one-function design has
-// (codex review iter-5 P2).
+// After the stability poll, an additional postReadyBuffer sleep
+// runs (default 1.5s, env-overridable via FLEET_POST_READY_BUFFER_MS).
+// The buffer is required because pane-stability is a necessary-but-
+// not-sufficient signal for "Claude's input box accepts text" —
+// Claude can be stable on its splash, onboarding, version-update,
+// or model-selection screens. Send-keys during one of those
+// intermediate stable states is captured by something other than
+// the input box (issue #65 symptom B). The buffer rides out the
+// gap empirically. On stability-poll error (didn't converge) we
+// SKIP the buffer — the pane is already long-late so adding more
+// delay just makes the failure-path slower without helping.
+//
+// Callers should run this BEFORE queue.Delete so a crash during
+// the wait remains recoverable: the queue file is still on disk
+// and resumeHandoff / handoffop.Resume will re-run the wait + send
+// on retry. Pairing this with SendPromptKeys (run AFTER
+// queue.Delete) gives at-most-once delivery with a microsecond-
+// scale lost-prompt window, instead of the 30 s window an in-one-
+// function design has (codex review iter-5 P2).
 //
 // Best-effort: caller should NOT abort on this returning error —
 // just call SendPromptKeys anyway. Keys queue in tmux's pty buffer
 // and the agent consumes them once ready.
 func WaitForReadyToPrompt(session string) error {
-	return waitForPaneStable(session,
+	if err := waitForPaneStable(session,
 		initialPromptStableWindow(),
-		initialPromptMaxWait())
+		initialPromptMaxWait()); err != nil {
+		return err
+	}
+	if buf := postReadyBuffer(); buf > 0 {
+		time.Sleep(buf)
+	}
+	return nil
 }
 
-// SendPromptKeys types prompt + Enter into the tmux session. No
-// readiness wait — caller must have called WaitForReadyToPrompt
-// first (or accept that keys may land before claude is ready, in
-// which case they queue in the pty).
+// SendPromptKeys types prompt + Enter into the tmux session, then
+// verifies the prompt was actually submitted (and retries Enter once
+// if not). No readiness wait — caller must have called
+// WaitForReadyToPrompt first (or accept that keys may land before
+// claude is ready, in which case they queue in the pty).
 //
 // Empty prompt is a silent no-op so callers can pass
 // handoff.ResumePrompt(docPath) without nil-checking docPath.
@@ -127,18 +218,176 @@ func WaitForReadyToPrompt(session string) error {
 // becomes a literal newline inside the pasted content rather than a
 // submit. End result without the split: the resume prompt sits in
 // the input box and the agent waits for the operator to press Enter
-// manually, defeating the whole point of auto-resume. The 200 ms gap
-// is enough for claude's input handler to close the paste window
-// before the Enter arrives as its own keystroke event.
+// manually, defeating the whole point of auto-resume. The 1 s gap
+// (was 200 ms — see issue #65) is enough for claude's input handler
+// to close the paste window before the Enter arrives as its own
+// keystroke event.
+//
+// Post-send verification (issue #65 symptom A): even with the 1 s
+// gap, paste-detection occasionally swallows Enter. After the
+// initial send we sleep postSendVerifyDelay, capture the pane, and
+// check whether the prompt text is still sitting in the input box
+// (an unsubmitted prompt). If yes: re-send Enter alone after
+// postSendRetryDelay, capture again, log if still unsubmitted.
+// Returns nil even on still-unsubmitted — the caller (dispatch /
+// handoff) should still attach successfully so the operator can
+// manually press Enter.
+//
+// ASCII flow:
+//
+//	send <prompt>     ──┐
+//	  promptEnterDelay  │ split prevents paste-detection swallowing Enter
+//	send Enter        ──┘
+//	  postSendVerifyDelay
+//	capture pane → contains <prompt>?
+//	  no  → submitted, return nil
+//	  yes → not submitted; sleep postSendRetryDelay, send Enter again
+//	         capture pane → contains <prompt>?
+//	           no  → submitted on retry, return nil
+//	           yes → log warning, return nil (caller still attaches)
 func SendPromptKeys(session, prompt string) error {
+	_, err := SendPromptKeysVerified(session, prompt)
+	return err
+}
+
+// SendPromptKeysVerified is SendPromptKeys with the verification
+// outcome surfaced. submitted=true means we observed the prompt
+// leave the input box (success). submitted=false means EITHER the
+// retry path also failed to submit, OR pane capture failed and we
+// couldn't tell — either way the caller should treat the operator
+// as needing to manually press Enter after attach.
+//
+// err is non-nil ONLY for the initial send-keys failures (the prompt
+// or first Enter never reached tmux). Verification failures DO NOT
+// surface as err — they surface as submitted=false.
+//
+// Empty prompt is a silent no-op: returns (true, nil).
+//
+// Used by dispatch.go to log a structured "prompt unsubmitted"
+// warning to operator-visible stdout (issue #65 Fix D). Other
+// callers (handoffop, cmd/fleet/handoff.go) use SendPromptKeys
+// and rely on the stderr warning emitted by the verifier — they
+// don't need to act on the boolean.
+func SendPromptKeysVerified(session, prompt string) (submitted bool, err error) {
 	if prompt == "" {
-		return nil
+		return true, nil
 	}
 	if err := tmux.SendKeys(session, prompt); err != nil {
-		return err
+		return false, err
 	}
 	time.Sleep(promptEnterDelay())
-	return tmux.SendKeys(session, "Enter")
+	if err := tmux.SendKeys(session, "Enter"); err != nil {
+		return false, err
+	}
+	return verifyAndRetry(session, prompt), nil
+}
+
+// verifyAndRetry runs the post-send verification + one-shot retry
+// using the production tmux send-keys / capture-pane primitives. See
+// verifyAndRetryWithDeps for the testable inner core.
+func verifyAndRetry(session, prompt string) bool {
+	return verifyAndRetryWithDeps(session, prompt,
+		tmux.SendKeys, tmux.CapturePane,
+		os.Stderr)
+}
+
+// verifyAndRetryWithDeps is verifyAndRetry's testable core. It takes
+// send-keys / capture-pane primitives + a writer for warnings so a
+// unit test can plug stub implementations and assert behavior
+// deterministically.
+//
+// Returns true if the prompt was submitted (either on the first
+// Enter or the retry); false if it remained unsubmitted.
+//
+// On still-unsubmitted after retry, writes a warning to warnW. The
+// TUI / dispatch caller surfaces this via SendPromptKeysVerified's
+// boolean return; this writer is for log-correlation analysis later.
+//
+// Errors during the retry's send-keys are non-fatal — we log them
+// and trust whatever the last known submission state was. The point
+// of the verifier is to FIX a known regression (Symptom A: Enter
+// eaten by paste detection); we never want verification to itself
+// become a new failure surface.
+func verifyAndRetryWithDeps(
+	session, prompt string,
+	sendKeys func(session string, keys ...string) error,
+	capturePane func(session string) ([]byte, error),
+	warnW io.Writer,
+) bool {
+	time.Sleep(postSendVerifyDelay())
+	if promptSubmittedWithDeps(session, prompt, capturePane) {
+		return true
+	}
+	// Retry: prompt is sitting in the input box. Send Enter alone
+	// after a longer pause to ride out whatever caused the first
+	// Enter to be swallowed.
+	time.Sleep(postSendRetryDelay())
+	if err := sendKeys(session, "Enter"); err != nil {
+		_, _ = fmt.Fprintf(warnW,
+			"warning: post-send retry Enter failed for %s: %v\n",
+			session, err)
+		return false
+	}
+	time.Sleep(postSendVerifyDelay())
+	if promptSubmittedWithDeps(session, prompt, capturePane) {
+		return true
+	}
+	_, _ = fmt.Fprintf(warnW,
+		"warning: prompt for %s appears unsubmitted after retry; attach and press Enter manually\n",
+		session)
+	return false
+}
+
+// promptSubmittedWithDeps captures the pane via the supplied function
+// and returns true if the prompt is NOT still visible in the BOTTOM
+// band of the pane — i.e., it has left the input box.
+//
+// We restrict the search to the last unsubmittedTailLines lines of
+// the capture to avoid a false-positive from the submitted
+// transcript: when Claude Code accepts a user turn, it clears the
+// input box AND re-renders the user message higher up in the
+// conversation transcript (typically with a `>` prefix). A naive
+// whole-pane substring match would see that transcript line and
+// spuriously retry. Restricting to the bottom band catches the
+// "still in input box" case (input box renders at the very bottom
+// of the pane) while ignoring the post-submit transcript echo.
+//
+// Capture errors are conservatively treated as "submitted" so the
+// verifier doesn't loop on transport hiccups; we'd rather miss a
+// retry than run the retry incorrectly. The corollary: a transient
+// tmux failure during verification masks the real submission state,
+// but that's acceptable because (a) the initial Enter still ran,
+// and (b) the post-Enter pane is the only signal we have.
+func promptSubmittedWithDeps(
+	session, prompt string,
+	capturePane func(session string) ([]byte, error),
+) bool {
+	pane, err := capturePane(session)
+	if err != nil {
+		return true
+	}
+	tail := tailLines(pane, unsubmittedTailLines)
+	return !bytes.Contains(tail, []byte(prompt))
+}
+
+// tailLines returns the last n lines of buf. n <= 0 returns buf
+// unchanged. If buf has fewer than n lines, returns buf.
+func tailLines(buf []byte, n int) []byte {
+	if n <= 0 {
+		return buf
+	}
+	count := 0
+	// Walk backwards; each '\n' marks a line boundary.
+	for i := len(buf) - 1; i >= 0; i-- {
+		if buf[i] != '\n' {
+			continue
+		}
+		count++
+		if count > n {
+			return buf[i+1:]
+		}
+	}
+	return buf
 }
 
 // SendInitialPrompt is the wait-then-send pair as a single call.

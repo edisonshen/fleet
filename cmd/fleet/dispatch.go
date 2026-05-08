@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -175,11 +176,29 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// decide whether the spawn succeeded; treating prompt-delivery
 		// failure as fatal would mistakenly mark a running coord as
 		// failed.
-		if perr := sendInitialPrompt(rec.TmuxSession, opts.prompt); perr != nil {
+		//
+		// The two failure modes (issue #65 Fix D):
+		//   - perr != nil: send-keys itself errored. tmux session might
+		//     be dead before we reached it, or the pane is borked.
+		//   - perr == nil, submitted == false: send-keys succeeded but
+		//     the prompt remained sitting in Claude's input box after
+		//     two Enter attempts. Surfacing this is critical — the
+		//     dispatch caller (TUI auto-spawn) currently treats exit-0
+		//     as full success, but the coord won't actually run
+		//     /coordinator until the operator attaches and presses
+		//     Enter manually. Logging here lets operator log analysis
+		//     correlate "coord-spawn-marker exists but coord is idle"
+		//     with the unsubmitted-warning that fired during dispatch.
+		submitted, perr := sendInitialPrompt(rec.TmuxSession, opts.prompt)
+		switch {
+		case perr != nil:
 			_, _ = fmt.Fprintf(stdout,
 				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
 				perr)
-		} else {
+		case !submitted:
+			_, _ = fmt.Fprintf(stdout,
+				"warning: initial prompt typed but Enter did not submit (still in Claude's input box after retry) — attach and press Enter manually\n")
+		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}
 	}
@@ -188,8 +207,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.
-// Production calls spawn.SendInitialPrompt which polls the pane until
-// the wrapped claude is idle, then sends the prompt + Enter.
-var sendInitialPrompt = func(session, prompt string) error {
-	return spawn.SendInitialPrompt(session, prompt)
+// Production wraps spawn.WaitForReadyToPrompt + SendPromptKeysVerified
+// so the caller sees both transport-level errors AND the post-send
+// verification result (submitted=false means the prompt typed but
+// Enter didn't submit — issue #65 Fix D).
+var sendInitialPrompt = func(session, prompt string) (submitted bool, err error) {
+	if prompt == "" {
+		return true, nil
+	}
+	if werr := spawn.WaitForReadyToPrompt(session); werr != nil {
+		_, _ = fmt.Fprintf(os.Stderr,
+			"warning: initial-prompt readiness poll for %s did not converge: %v (sending anyway)\n",
+			session, werr)
+	}
+	return spawn.SendPromptKeysVerified(session, prompt)
 }

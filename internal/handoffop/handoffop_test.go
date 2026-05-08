@@ -44,6 +44,14 @@ func requireTmux(t *testing.T) {
 	// converge fast on the synthetic shell commands seedAgent uses.
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "1000")
+	// Issue #65: post-stability buffer (default 1.5 s), bumped
+	// prompt-enter delay (default 1 s), and post-send verify/retry
+	// delays (0.5/1.5 s) all need to be pinned for fast tests.
+	// Production behavior is verified in spawn_test.go.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record
