@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -615,14 +616,101 @@ func TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly(t *testing.T) {
 	// Must reference the fleet-coord prefix specifically — not any
 	// `claude remote-control` (which would also match a fleet-handoff
 	// daemon).
-	if !strings.Contains(pattern, `"`+remoteControlSessionPrefix+`"`) {
-		t.Errorf("pattern must reference the literal fleet-coord prefix; got %q", pattern)
+	//
+	// Critically: the prefix appears UNQUOTED in the pattern. Shell
+	// quotes (`"fleet-coord"`) are stripped by the bootstrap's bash
+	// before exec, so the live daemon's argv carries the bare
+	// `fleet-coord` token. A pattern with embedded double quotes
+	// would never match (codex review #73 iter-7 P1).
+	if !strings.Contains(pattern, " "+remoteControlSessionPrefix) {
+		t.Errorf("pattern must reference the unquoted fleet-coord prefix (shell quotes don't survive exec); got %q", pattern)
+	}
+	if strings.Contains(pattern, `"`+remoteControlSessionPrefix+`"`) {
+		t.Errorf("pattern must NOT include shell-quote characters around the prefix — those are stripped before exec, so the live daemon's argv has unquoted fleet-coord; got %q",
+			pattern)
 	}
 	// Must reference --remote-control-session-name-prefix so a future
 	// daemon argv that happens to mention "fleet-coord" elsewhere
 	// (in a log path?) doesn't false-positive.
 	if !strings.Contains(pattern, "remote-control-session-name-prefix") {
 		t.Errorf("pattern must reference the prefix flag, not just the literal value; got %q", pattern)
+	}
+}
+
+// TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv pins
+// the regex contract end-to-end: when fed a representative daemon
+// argv (post-shell-strip), the regex must match. When fed the
+// bootstrap bash subprocess's argv (which still has shell-quote
+// chars baked in via `bash -c`), it must NOT match. We compile the
+// pattern with regexp.MustCompile and assert directly — that way
+// drift in the pattern is caught at test time, not in the wild.
+func TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv(t *testing.T) {
+	var capturedArgs []string
+	prev := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string{name}, args...)
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = prev })
+
+	_ = remoteControlDaemonRunning()
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected pgrep call; got %v", capturedArgs)
+	}
+	pattern := capturedArgs[2]
+
+	// pgrep -f uses POSIX extended regex by default on macOS/BSD and
+	// extended on most pgrep implementations; Go's regexp is RE2.
+	// The relevant features here (^, character class, alternation
+	// inside ()) work in both. Compile + test fixtures.
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("pgrep pattern must compile as a regex; got %q (%v)", pattern, err)
+	}
+
+	// Representative argv strings as they'd appear in /proc/<pid>/cmdline
+	// after the shell strips quotes. Spaces are the actual separator
+	// here; pgrep -f sees the joined-with-space form.
+	cases := []struct {
+		name      string
+		cmdline   string
+		wantMatch bool
+	}{
+		{
+			name:      "live fleet-coord daemon, default log path",
+			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord",
+			wantMatch: true,
+		},
+		{
+			name:      "live fleet-coord daemon with trailing args",
+			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord --some-other-flag",
+			wantMatch: true,
+		},
+		{
+			name: "live fleet-handoff daemon — must NOT match (different prefix)",
+			cmdline: "claude remote-control --remote-control-session-name-prefix " +
+				"fleet-handoff",
+			wantMatch: false,
+		},
+		{
+			name:      "transient bash bootstrap subprocess — argv[0] is bash, must NOT match",
+			cmdline:   `bash -c ( pgrep -f "claude remote-control" >/dev/null 2>&1 || nohup claude remote-control --remote-control-session-name-prefix "fleet-coord" > /tmp/claude-rc-coord.log 2>&1 & )`,
+			wantMatch: false,
+		},
+		{
+			name:      "spurious process that mentions fleet-coord elsewhere in argv — must NOT match without the flag-name match",
+			cmdline:   "tail -f /tmp/fleet-coord.log",
+			wantMatch: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := re.MatchString(tc.cmdline)
+			if got != tc.wantMatch {
+				t.Errorf("pattern %q against argv %q: got match=%v, want %v",
+					pattern, tc.cmdline, got, tc.wantMatch)
+			}
+		})
 	}
 }
 

@@ -455,18 +455,23 @@ var remoteControlDaemonRunning = func() bool {
 	// to match ONLY the daemon process whose argv[0] is `claude` —
 	// not the transient `bash -c '... claude remote-control ...'`
 	// bootstrap subprocess that spawn_daemon_if_needed runs (codex
-	// review #73 iter-6 P1: a too-broad probe matches both bash AND
-	// the daemon, so a coord could see "daemon up" when only the
-	// bootstrap shell is running and the actual daemon hasn't
-	// forked yet).
+	// review #73 iter-6 P1).
 	//
-	// `^claude remote-control --remote-control-session-name-prefix "fleet-coord"`
-	// is the literal argv shape spawn_daemon_if_needed emits.
+	// Pattern: `^claude remote-control --remote-control-session-name-prefix fleet-coord`
+	// — the literal argv shape after the shell strips the quotes.
+	// The bootstrap script writes the flag with double quotes
+	// (`--remote-control-session-name-prefix "fleet-coord"`) so the
+	// shell preserves the literal `fleet-coord` token; by the time
+	// the actual `claude` daemon process exists, its argv carries
+	// the unquoted token (codex review #73 iter-7 P1: shell quotes
+	// don't survive exec, so a pattern with embedded quotes never
+	// matches the live daemon).
+	//
 	// pgrep's `-f` flag treats the pattern as a basic regex over the
 	// full command line; the literal flag value has no metacharacters
 	// so the anchoring is safe by construction.
 	return execCommand("pgrep", "-f",
-		`^claude remote-control --remote-control-session-name-prefix "`+remoteControlSessionPrefix+`"`).Run() == nil
+		`^claude remote-control --remote-control-session-name-prefix `+remoteControlSessionPrefix+`( |$)`).Run() == nil
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.
