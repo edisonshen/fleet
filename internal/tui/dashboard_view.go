@@ -414,12 +414,23 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 }
 
 // taskBlockLine renders one task row indented under its parent
-// project:
+// project. Issue #59: titles only (one per line) — the status is
+// already aggregated into the project header's count chips, so we
+// keep the inline list compact.
 //
-//   - todo  add-readme
+//   - <slug>
+//
+// Synthetic markers render as hint lines:
+//
+//	Empty=true  → "  no tasks yet — `fleet init` to create tasks.md"
+//	More=N      → "  +N more"
 //
 // The selected variant uses the cursor glyph "▶" in place of the
-// bullet to mark which task [⏎] open will operate on.
+// bullet so the operator can see which row is active. When the row
+// is a synthetic marker, the cursor glyph still anchors the line
+// even though there's no [⏎] action wired (operator can move past
+// it; per spec: cursor on task sub-rows is a navigation no-op for
+// actions in this PR).
 func taskBlockLine(t *taskRow, w int, selected bool) string {
 	if t == nil {
 		return ""
@@ -432,9 +443,19 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		bullet = "▶"
 		bulletStyle = cursorGlyphStyle
 	}
-	status := projectCountTodoStyle.Render(t.Status)
+	switch {
+	case t.Empty:
+		// Backticks aren't lipgloss-special; render the hint dim so
+		// the operator's eye gets pulled to real task rows when both
+		// kinds of expansion are visible across the column.
+		hint := dimStyle.Render("no tasks yet — `fleet init` to create tasks.md")
+		return prefix + bulletStyle.Render(bullet) + " " + hint
+	case t.More > 0:
+		more := dimStyle.Render(fmt.Sprintf("+%d more", t.More))
+		return prefix + bulletStyle.Render(bullet) + " " + more
+	}
 	slug := workerSlugStyle.Render(t.Slug)
-	return prefix + bulletStyle.Render(bullet) + " " + status + "  " + slug
+	return prefix + bulletStyle.Render(bullet) + " " + slug
 }
 
 // renderCountChips builds "⏳ 3  ▶ 1  👁 1  ⚠ 1  ✓ 12" with the

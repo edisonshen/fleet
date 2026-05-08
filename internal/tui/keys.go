@@ -337,20 +337,51 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 	}
 }
 
-// openDetail handles [⏎] open. Renders a detail panel for the row
-// under cursor — task → spec/acceptance/notes; worker → peek; agent
-// → JSON record; project → task list.
+// openDetail handles [⏎] open. Behavior by row kind:
+//
+//	project → toggle inline task-list expansion under the project
+//	          header (issue #59). First [⏎] expands; second [⏎] on the
+//	          same project collapses. Cursor stays on the project row
+//	          so j/k can immediately walk into the task sub-rows.
+//	task    → render the task's spec/acceptance/notes detail panel
+//	          (existing behavior; task-detail-from-row is a separate
+//	          PR's concern but the wiring is already here and tests
+//	          depend on it).
+//	worker  → render the worker peek panel (state.json + log tail).
+//	agent   → render the agent JSON record.
 func (m Model) openDetail() (Model, tea.Cmd, bool) {
 	row := m.selectedRow()
 	if row == nil {
 		return m, nil, true
 	}
 	switch row.kind {
-	case rowTask:
-		body, title := readTaskDetail(row.parentProject, row.task.Slug)
-		m.detail = &detailView{title: title, body: body}
 	case rowProject:
-		body, title := projectDetail(row.project)
+		if row.project == nil {
+			return m, nil, true
+		}
+		if m.expanded == nil {
+			m.expanded = map[string]bool{}
+		}
+		// Toggle. Map zero-read returns false, so deleting on collapse
+		// keeps the map small over a long session — irrelevant for
+		// correctness, just hygiene.
+		if m.expanded[row.project.Name] {
+			delete(m.expanded, row.project.Name)
+		} else {
+			m.expanded[row.project.Name] = true
+		}
+		return m, nil, true
+	case rowTask:
+		// Synthetic markers (the "no tasks yet" hint and "+N more"
+		// footer under expanded projects, issue #59) carry no slug —
+		// readTaskDetail("") would render an unhelpful "task not
+		// found" modal. Treat as a navigation no-op so j/k can pass
+		// through the marker without trapping the operator in a
+		// dead-end overlay.
+		if row.task == nil || row.task.Empty || row.task.More > 0 {
+			return m, nil, true
+		}
+		body, title := readTaskDetail(row.parentProject, row.task.Slug)
 		m.detail = &detailView{title: title, body: body}
 	case rowWorker:
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)

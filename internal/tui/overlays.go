@@ -17,7 +17,7 @@ type helpEntry struct{ key, desc string }
 
 var helpEntries = []helpEntry{
 	{"j/k or ↓/↑", "move cursor up/down across all rows (wraps)"},
-	{"⏎ enter", "open detail panel for the row under cursor"},
+	{"⏎ enter", "expand/collapse project (on a project row) or open detail (other rows)"},
 	{"n", "add a new task to the current project"},
 	{"a", "attach (agents) or peek (workers)"},
 	{"h", "handoff (agents only)"},

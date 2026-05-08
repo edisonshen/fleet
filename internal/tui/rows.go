@@ -54,7 +54,25 @@ type dashRow struct {
 type taskRow struct {
 	Slug   string
 	Status string // tasks.Status as a string — kept stringly so render doesn't import the enum
+	// Synthetic markers — set when the row is not a real task entry
+	// but a hint line shown under an expanded project (issue #59):
+	//
+	//	Empty=true   → "no tasks yet — `fleet init` to create tasks.md"
+	//	              (synthetic project with no v0.2 dir)
+	//	More=N       → "+N more" footer when an expanded project has
+	//	              more than maxExpandedTasks visible tasks.
+	//
+	// Only one of Empty / More is non-zero per row. Real task rows
+	// have both unset and Slug populated.
+	Empty bool
+	More  int
 }
+
+// maxExpandedTasks caps how many task rows render under one expanded
+// project (issue #59 spec: "up to ~10 visible at full expansion").
+// Tasks beyond this collapse into a "+N more" tail row that is itself
+// navigable so j/k still walks the column predictably.
+const maxExpandedTasks = 10
 
 // unifiedProjects returns the LEFT-column project list: the union of
 // v0.2-initialized project dirs (m.dashboard.Projects) plus synthetic
@@ -116,6 +134,15 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // "/fix-toolbar-1a2b" surfaces a navigable row instead of silently
 // dropping the whole block (codex iter-1 P2).
 //
+// Expansion gating (issue #59): task rows render under a project
+// header iff the project is expanded (m.expanded[name] == true) OR
+// the active search filter is the reason this project was kept in
+// the list (project name didn't match, but a task slug did). The
+// search override means /fix-toolbar still surfaces the matching
+// task row even with the parent project collapsed. When neither
+// gate triggers the project row appears alone — the operator presses
+// [⏎] to open the inline task list.
+//
 // Coord-on-LEFT (issue #55): a coord agent (record whose ID matches
 // some ProjectRow.CoordID) is filtered out of the right-column agents
 // section. The project-side render attaches the coord visually under
@@ -147,16 +174,60 @@ func (m Model) dashboardRows() []dashRow {
 			continue
 		}
 		rows = append(rows, dashRow{kind: rowProject, project: p})
+		// Expansion gate: tasks render only when the operator has
+		// explicitly expanded the project OR a task-slug search is
+		// the reason we're showing this project (search override —
+		// without it /fix-toolbar would surface a parent-only row
+		// and silently hide the matching task).
+		expanded := m.expanded != nil && m.expanded[p.Name]
+		if !expanded && !anyTaskMatches {
+			continue
+		}
+		// Synthetic projects (no v0.2 dir, no tasks.md) carry zero
+		// p.Tasks. Surface a single "no tasks yet" hint row so the
+		// expansion still renders something the operator can read,
+		// matching the spec.
+		if len(p.Tasks) == 0 {
+			rows = append(rows, dashRow{
+				kind:          rowTask,
+				task:          &taskRow{Empty: true},
+				parentProject: p.Name,
+			})
+			continue
+		}
+		// Real tasks. Honor the per-task filter when only tasks
+		// matched, and cap the visible count at maxExpandedTasks
+		// with a "+N more" tail so an expanded project doesn't
+		// dominate the column.
+		//
+		// Two-pass: first collect every task that's eligible to
+		// show (passes the filter), then emit up to N + a "+more"
+		// tail. Single-pass with a running counter would
+		// mis-attribute "+more" to filtered-out rows below the cap.
+		var eligible []*taskRow
 		for _, t := range p.Tasks {
-			// When the project itself matched, include all tasks
-			// (operator can scan the block fully). When only tasks
-			// matched, restrict to the matching subset.
-			if !projectMatches && !m.matchesFilter(t.Slug) {
+			if !projectMatches && !expanded && !m.matchesFilter(t.Slug) {
 				continue
 			}
+			eligible = append(eligible, t)
+		}
+		shown := eligible
+		var more int
+		if len(eligible) > maxExpandedTasks {
+			shown = eligible[:maxExpandedTasks]
+			more = len(eligible) - maxExpandedTasks
+		}
+		for _, t := range shown {
 			rows = append(rows, dashRow{
 				kind:          rowTask,
 				task:          t,
+				parentProject: p.Name,
+			})
+		}
+		if more > 0 {
+			rows = append(rows, dashRow{
+				kind:          rowTask,
+				task:          &taskRow{More: more},
 				parentProject: p.Name,
 			})
 		}
@@ -227,6 +298,18 @@ func rowIdentity(r dashRow) string {
 		}
 	case rowTask:
 		if r.task != nil {
+			// Synthetic markers (empty-state hint, "+N more" footer)
+			// have no slug — give them a stable identity per project so
+			// refreshCursor relocates back onto the same hint row across
+			// dashboardMsg ticks. Without this the operator's cursor
+			// would snap to dashCursor=0 every refresh while the cursor
+			// was on a hint row.
+			switch {
+			case r.task.Empty:
+				return "T:" + r.parentProject + ":__empty__"
+			case r.task.More > 0:
+				return "T:" + r.parentProject + ":__more__"
+			}
 			return "T:" + r.parentProject + ":" + r.task.Slug
 		}
 	case rowWorker:

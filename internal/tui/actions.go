@@ -391,39 +391,12 @@ func readTaskDetail(project, slug string) (string, string) {
 	return b.String(), title
 }
 
-// projectDetail returns (body, title) for the [⏎] open detail panel
-// when a project row is selected. Shows the project's task counts +
-// active worker list — a quick "what is this project doing" summary.
-func projectDetail(p *ProjectRow) (string, string) {
-	if p == nil {
-		return "no project selected", "project"
-	}
-	title := fmt.Sprintf("project: %s", p.Name)
-	var b strings.Builder
-	if p.RepoSlug != "" && p.RepoSlug != p.Name {
-		fmt.Fprintf(&b, "repo:    %s\n", p.RepoSlug)
-	}
-	fmt.Fprintf(&b, "todo:    %d\n", p.Counts.Todo)
-	fmt.Fprintf(&b, "doing:   %d\n", p.Counts.InProgress)
-	fmt.Fprintf(&b, "review:  %d\n", p.Counts.InReview)
-	fmt.Fprintf(&b, "blocked: %d\n", p.Counts.Blocked)
-	fmt.Fprintf(&b, "done:    %d\n", p.Counts.Done)
-	switch {
-	case p.Active:
-		fmt.Fprintf(&b, "coord:   active (last tick %s ago)\n", humanAge(time.Since(p.LastTick)))
-	case p.IdleStop:
-		b.WriteString("coord:   idle / auto-stopped\n")
-	default:
-		b.WriteString("coord:   idle\n")
-	}
-	if len(p.Tasks) > 0 {
-		b.WriteString("\nactive tasks:\n")
-		for _, t := range p.Tasks {
-			fmt.Fprintf(&b, "  %s  %s\n", t.Status, t.Slug)
-		}
-	}
-	return b.String(), title
-}
+// (projectDetail removed — issue #59: [⏎] on a project row now toggles
+// inline task-list expansion under the project header instead of
+// opening a modal panel. The expanded task rows take the place of
+// projectDetail's "active tasks:" listing, so the function had no
+// remaining caller. Operators wanting a summary use the count chips
+// already on the project header line.)
 
 // readWorkerDetail returns (body, title) for the [⏎] open / [a]
 // peek panel when a worker row is selected. Replicates `fleet peek`
