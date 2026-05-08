@@ -199,6 +199,16 @@ def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:
     delivers it as `[OPERATOR] <body>`, archives it. After that the
     file is consumed; the marker file gates re-seeding so the message
     stays one-shot per coord.
+
+    Skip-if-exists posture: if the operator already queued a message at
+    the same path via `fleet message <coord_id>`, do NOT clobber it.
+    Return False so the caller withholds the marker and the next tick
+    retries (by which time fleet-guard's Stop hook will have delivered
+    + archived the operator's message and the path is free). This is
+    rare — the operator would have to message the coord between
+    dispatch and the very first tick — but the cost of clobbering
+    operator context is much higher than the cost of one extra tick of
+    /remote-control delay.
     """
     home = _resolve_home(fleet_home)
     inbox_dir = home / "inbox"
@@ -210,6 +220,13 @@ def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:
             f"coord remote-control: inbox mkdir failed: {exc}",
             file=sys.stderr,
         )
+        return False
+    if target.exists():
+        # Operator (or fleet-guard's prior delivery + a re-seed race we
+        # haven't gated) already wrote to this inbox. Don't clobber.
+        # Return False so bootstrap_remote_control withholds the marker
+        # and we retry next tick — by then the operator's message has
+        # been delivered + archived and the path is free for our seed.
         return False
     body = _INBOX_BODY
     if not body.endswith("\n"):

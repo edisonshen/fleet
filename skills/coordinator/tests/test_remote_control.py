@@ -160,20 +160,39 @@ class TestSeedInbox:
                 f"leftover tmp file: {entry.name}"
             )
 
-    def test_idempotent_on_re_call(self, fleet_home: Path) -> None:
-        """Second call overwrites cleanly — same path, body unchanged.
-        (Bootstrap caller gates re-call via the marker file; this test
-        proves the seed itself doesn't corrupt on re-call.)"""
+    def test_skip_if_inbox_already_exists(self, fleet_home: Path) -> None:
+        """Skip-if-exists posture: don't clobber an existing inbox file
+        (operator may have queued a message between dispatch and the
+        first tick). Second call returns False, leaves the file
+        untouched. The bootstrap caller withholds the marker on this
+        False so the next tick retries — by which time fleet-guard's
+        Stop hook has delivered + archived the existing message."""
         remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
         first = (fleet_home / "inbox" / "abcd1234.md").read_text(
             encoding="utf-8",
         )
         ok = remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
-        assert ok is True
+        assert ok is False
+        # File body untouched.
         second = (fleet_home / "inbox" / "abcd1234.md").read_text(
             encoding="utf-8",
         )
         assert first == second
+
+    def test_skip_if_operator_queued_message(self, fleet_home: Path) -> None:
+        """Concrete scenario: operator queued an inbox message via
+        `fleet message <coord_id>` before the coord's first tick. The
+        seed must not clobber the operator's content."""
+        inbox_dir = fleet_home / "inbox"
+        inbox_dir.mkdir()
+        (inbox_dir / "abcd1234.md").write_text(
+            "operator note: pause work", encoding="utf-8",
+        )
+        ok = remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
+        assert ok is False
+        # Operator content untouched.
+        body = (inbox_dir / "abcd1234.md").read_text(encoding="utf-8")
+        assert body == "operator note: pause work"
 
     def test_body_ends_with_newline(self, fleet_home: Path) -> None:
         """fleet-guard's deliver() rstrips trailing whitespace on
