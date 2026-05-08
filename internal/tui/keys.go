@@ -1073,7 +1073,7 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 		if row.task == nil || row.task.Empty || row.task.More > 0 {
 			return m, nil, true
 		}
-		body, title := readTaskDetail(row.parentProject, row.task.Slug)
+		body, title, loaded := readTaskDetail(row.parentProject, row.task.Slug)
 		// Issue #75: carry task identity (project + slug + status) so
 		// [a] inside the panel routes to the matching worker peek for
 		// blocked/in-progress tasks AND to the dispatch hint for
@@ -1081,13 +1081,20 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 		// regress on pre-dispatch tasks (codex iter-2 P2). Non-task
 		// panels leave these empty and the [a] interceptor falls
 		// through to default attach behavior.
-		m.detail = &detailView{
-			title:       title,
-			body:        body,
-			taskProject: row.parentProject,
-			taskSlug:    row.task.Slug,
-			taskStatus:  row.task.Status,
+		//
+		// Codex iter-7 P3: only arm task-panel [a] when the task
+		// loaded successfully. If readTaskDetail returned an error
+		// body (slug missing, tasks.md unreadable), the panel still
+		// renders the error text but [a] should fall through to
+		// default dismiss instead of running the stale-row attach
+		// flow against a task that may no longer exist.
+		dv := &detailView{title: title, body: body}
+		if loaded {
+			dv.taskProject = row.parentProject
+			dv.taskSlug = row.task.Slug
+			dv.taskStatus = row.task.Status
 		}
+		m.detail = dv
 	case rowWorker:
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
 		m.detail = &detailView{title: title, body: body}

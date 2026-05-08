@@ -184,7 +184,7 @@ func TestTaskDetail_RendersTaskSpec(t *testing.T) {
 		return nil, nil
 	})
 
-	body, title := readTaskDetail("fleet", "needs-input-aaaa")
+	body, title, _ := readTaskDetail("fleet", "needs-input-aaaa")
 	if !strings.Contains(title, "needs-input-aaaa") {
 		t.Errorf("title should mention slug, got %q", title)
 	}
@@ -214,7 +214,7 @@ func TestTaskDetail_RendersAskingQuestion(t *testing.T) {
 		}, nil
 	})
 
-	body, _ := readTaskDetail("fleet", "needs-input-aaaa")
+	body, _, _ := readTaskDetail("fleet", "needs-input-aaaa")
 	if !strings.Contains(body, "Need operator to confirm whether to overwrite existing fleetdb") {
 		t.Errorf("body should surface worker BlockedReason as the question, got:\n%s", body)
 	}
@@ -239,7 +239,7 @@ func TestTaskDetail_RendersWorkerInfo(t *testing.T) {
 		}, nil
 	})
 
-	body, _ := readTaskDetail("fleet", "needs-input-aaaa")
+	body, _, _ := readTaskDetail("fleet", "needs-input-aaaa")
 	if !strings.Contains(body, "### Worker") {
 		t.Errorf("body should include Worker section header, got:\n%s", body)
 	}
@@ -267,7 +267,7 @@ func TestTaskDetail_HandlesNoWorker(t *testing.T) {
 		return nil, nil
 	})
 
-	body, _ := readTaskDetail("fleet", "needs-input-aaaa")
+	body, _, _ := readTaskDetail("fleet", "needs-input-aaaa")
 	if !strings.Contains(body, "no worker state on disk") {
 		t.Errorf("body should show no-worker hint for blocked task, got:\n%s", body)
 	}
@@ -297,7 +297,7 @@ func TestTaskDetail_SurfacesReadError(t *testing.T) {
 		return nil, errors.New("synthetic: state.json malformed")
 	})
 
-	body, _ := readTaskDetail("fleet", "broken-task-aaaa")
+	body, _, _ := readTaskDetail("fleet", "broken-task-aaaa")
 	if !strings.Contains(body, "error reading worker state") {
 		t.Errorf("body should surface read error, got:\n%s", body)
 	}
@@ -319,7 +319,7 @@ func TestTaskDetail_TodoTaskSkipsNoWorkerHint(t *testing.T) {
 		return nil, nil
 	})
 
-	body, _ := readTaskDetail("fleet", "fresh-task-aaaa")
+	body, _, _ := readTaskDetail("fleet", "fresh-task-aaaa")
 	if strings.Contains(body, "no worker state on disk") {
 		t.Errorf("todo task should NOT show the no-worker hint (worker is normal-absent), got:\n%s", body)
 	}
@@ -1065,6 +1065,93 @@ func TestKeyEnter_TaskRow_PreservesStatusOnDetail(t *testing.T) {
 	}
 	if mm.detail.taskStatus != "ready" {
 		t.Errorf("detail.taskStatus should reflect row status, got %q", mm.detail.taskStatus)
+	}
+}
+
+// TestTaskDetail_FallsBackToArchivedWorker pins the codex iter-7
+// P2 fix: when the active worker dir was archived between the
+// dashboard refresh and [⏎], the panel must surface the archived
+// state.json instead of the misleading "no worker on disk" retry
+// hint. Otherwise a one-tick lag invents a nonexistent recovery
+// path for already-completed work.
+func TestTaskDetail_FallsBackToArchivedWorker(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "wrapped-up-aaaa", tasks.StatusInReview, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origArch := readArchivedWorkerState
+	readArchivedWorkerState = func(project, slug string) *workers.State {
+		return &workers.State{
+			Slug: slug, Project: project, Phase: workers.PhaseDone, PID: 5555,
+			BlockedReason: "",
+		}
+	}
+	t.Cleanup(func() { readArchivedWorkerState = origArch })
+
+	body, _, loaded := readTaskDetail("fleet", "wrapped-up-aaaa")
+	if !loaded {
+		t.Fatalf("readTaskDetail should report loaded=true for a real task")
+	}
+	if !strings.Contains(body, "### Worker (archived)") {
+		t.Errorf("body should surface archived worker section, got:\n%s", body)
+	}
+	if !strings.Contains(body, "fleet peek") {
+		t.Errorf("body should suggest `fleet peek` for full archived logs, got:\n%s", body)
+	}
+	if strings.Contains(body, "no worker state on disk") {
+		t.Errorf("archive fallback must NOT also render the no-worker hint, got:\n%s", body)
+	}
+}
+
+// TestKeyEnter_TaskMissing_DoesNotArmTaskAttach pins the codex
+// iter-7 P3 fix: if readTaskDetail returns an error body (slug
+// disappeared between snapshot and [⏎]), the panel must NOT
+// populate taskSlug/taskStatus — otherwise pressing [a] from that
+// error panel would run the task-attach flow against a phantom
+// slug and could open an old archive or suggest a recovery for a
+// task that no longer exists.
+func TestKeyEnter_TaskMissing_DoesNotArmTaskAttach(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Seed a task so the dashboard scan picks up its row...
+	seedBlockedTask(t, pdir, "fleet", "phantom-task-aaaa", tasks.StatusBlocked, "")
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	// ...then delete tasks.md to simulate the task disappearing
+	// between the snapshot and the keypress.
+	if err := os.Remove(filepath.Join(pdir, "fleet", "tasks.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "phantom-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("enter"))
+	mm := updated.(Model)
+	if mm.detail == nil {
+		t.Fatalf("[⏎] should still open a panel (with error body)")
+	}
+	// Panel renders the error but [a] must NOT be armed.
+	if mm.detail.taskSlug != "" {
+		t.Errorf("error panel must NOT carry taskSlug (would arm stale [a]), got %q", mm.detail.taskSlug)
+	}
+	if mm.detail.taskProject != "" {
+		t.Errorf("error panel must NOT carry taskProject, got %q", mm.detail.taskProject)
 	}
 }
 

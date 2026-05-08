@@ -369,19 +369,19 @@ func addTask(project, spec string) (string, error) {
 // We render the worker block ABOVE the task spec when present so a
 // blocked task's question reads first. Spec/Acceptance/Notes follow
 // for full task context.
-func readTaskDetail(project, slug string) (string, string) {
-	title := fmt.Sprintf("task: %s/%s", project, slug)
+func readTaskDetail(project, slug string) (body, title string, loaded bool) {
+	title = fmt.Sprintf("task: %s/%s", project, slug)
 	dir, err := state.ProjectDir(project)
 	if err != nil {
-		return fmt.Sprintf("error: %v", err), title
+		return fmt.Sprintf("error: %v", err), title, false
 	}
 	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
 	if err != nil {
-		return fmt.Sprintf("error reading tasks.md: %v", err), title
+		return fmt.Sprintf("error reading tasks.md: %v", err), title, false
 	}
 	t, err := f.Get(slug)
 	if err != nil {
-		return fmt.Sprintf("task not found: %v", err), title
+		return fmt.Sprintf("task not found: %v", err), title, false
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "status:    %s\n", t.Status)
@@ -398,19 +398,20 @@ func readTaskDetail(project, slug string) (string, string) {
 		fmt.Fprintf(&b, "depends:   %s\n", strings.Join(t.DependsOn, ", "))
 	}
 
-	// Worker context (issue #75). Three branches:
-	//   1. worker present — render slug/phase/PID + BlockedReason as
-	//      the "current question" when blocked.
-	//   2. worker absent (ErrNotFound, surfaced by readTaskWorker as
-	//      (nil, nil)) AND task is in a state that should have one
-	//      (blocked/in-progress) — render the no-worker recovery hint.
-	//      For todo/ready an absent worker is the normal pre-dispatch
-	//      state and the hint would be noise.
-	//   3. worker-state read FAILED with a non-ENOENT error — surface
-	//      the error verbatim. Collapsing to "no worker" would send
-	//      the operator down the wrong recovery path; the actionable
-	//      problem is the corrupt/unreadable state.json on disk
-	//      (codex iter-1 P2).
+	// Worker context (issue #75). Branches:
+	//   1. active worker present — render slug/phase/PID +
+	//      BlockedReason as the "current question" when blocked.
+	//   2. worker-state read FAILED with a non-ENOENT error —
+	//      surface verbatim so the underlying issue is visible
+	//      rather than masked as "no worker" (codex iter-1 P2).
+	//   3. active dir gone but archive present — codex iter-7 P2:
+	//      one-tick lag after the coord archives a finished worker
+	//      means the task row still shows; surface the archived
+	//      state so the operator sees the last question/log
+	//      instead of a misleading retry hint.
+	//   4. active and archive both absent AND task is in a state
+	//      that should have one (blocked/in-progress) — render the
+	//      no-worker recovery hint.
 	ws, werr := readTaskWorker(project, slug)
 	switch {
 	case werr == nil && ws != nil:
@@ -434,9 +435,29 @@ func readTaskDetail(project, slug string) (string, string) {
 		b.WriteString("\n### Worker\n")
 		fmt.Fprintf(&b, "error reading worker state: %v\n", werr)
 	default:
-		// werr == nil && ws == nil → ErrNotFound. Show the no-worker
-		// hint only when the task SHOULD have a worker. Codex iter-4
-		// P2: include --project so a cross-project cwd doesn't update
+		// werr == nil && ws == nil → ErrNotFound on the active dir.
+		// Codex iter-7 P2: try archive before suggesting retry.
+		if archS := readArchivedWorkerState(project, slug); archS != nil {
+			b.WriteString("\n### Worker (archived)\n")
+			fmt.Fprintf(&b, "slug:      %s\n", archS.Slug)
+			fmt.Fprintf(&b, "phase:     %s\n", archS.Phase)
+			if archS.PID > 0 {
+				fmt.Fprintf(&b, "pid:       %d\n", archS.PID)
+			}
+			if !archS.UpdatedAt.IsZero() {
+				fmt.Fprintf(&b, "updated:   %s\n", archS.UpdatedAt.UTC().Format(time.RFC3339))
+			}
+			if reason := strings.TrimSpace(archS.BlockedReason); reason != "" {
+				b.WriteString("\nlast question (worker blocked_reason):\n")
+				b.WriteString(reason)
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "\n(active worker dir archived; `fleet peek %s --project %s` for full logs)\n", slug, project)
+			break
+		}
+		// No archive either. Show the no-worker recovery hint only
+		// when the task SHOULD have a worker. Codex iter-4 P2:
+		// include --project so a cross-project cwd doesn't update
 		// the wrong tasks.md.
 		if t.Status == tasks.StatusBlocked || t.Status == tasks.StatusInProgress {
 			b.WriteString("\n### Worker\n")
@@ -454,7 +475,7 @@ func readTaskDetail(project, slug string) (string, string) {
 		b.WriteString("\n\n### Notes\n")
 		b.WriteString(strings.TrimSpace(t.Notes))
 	}
-	return b.String(), title
+	return b.String(), title, true
 }
 
 // readTaskWorker is the var-stub-able worker.ReadState wrapper used by
@@ -468,6 +489,28 @@ var readTaskWorker = func(project, slug string) (*workers.State, error) {
 		return nil, nil
 	}
 	return s, err
+}
+
+// readArchivedWorkerState reads state.json from the most recent
+// archive directory matching slug. Returns nil when no archive
+// exists or the file is unreadable. Used by readTaskDetail (codex
+// iter-7 P2) to surface the last known worker context for a task
+// whose active worker dir has been archived but whose row still
+// shows on the dashboard. var so tests can stub.
+var readArchivedWorkerState = func(project, slug string) *workers.State {
+	dir := newestArchiveWorkerDir(project, slug)
+	if dir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		return nil
+	}
+	var s workers.State
+	if jerr := json.Unmarshal(data, &s); jerr != nil {
+		return nil
+	}
+	return &s
 }
 
 // liveTaskStatus reads the current task status from tasks.md. Used by
