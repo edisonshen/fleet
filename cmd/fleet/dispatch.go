@@ -112,7 +112,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// operator to babysit it. Override with `--command` for scripted
 	// pipelines or alternate engines.
 	cmd.Flags().StringSliceVar(&opts.command, "command",
-		[]string{"sh", "-c", `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`},
+		[]string{"sh", "-c", defaultClaudeWrapperScript},
 		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
 	// Auto-resume types "Read your handoff doc at <path> and continue"
 	// into the replacement on handoff. Disable for custom --command
@@ -316,6 +316,15 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 // injectRemoteControlFlag.
 const defaultClaudeInvocation = "claude --dangerously-skip-permissions"
 
+// defaultClaudeWrapperScript is the EXACT literal of the default
+// --command's third element (the shell script body). injectRemoteControlFlag
+// matches on this byte-equal string before rewriting, so a custom
+// `--command sh -c '<arbitrary script that mentions claude>'` is NOT
+// silently mutated (codex review #73 iter-3 P2). Must stay byte-equal
+// with newDispatchCmd's --command default; a regression test pins the
+// equality.
+const defaultClaudeWrapperScript = `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`
+
 // injectRemoteControlFlag rewrites a shell-wrapped claude command to
 // include `--remote-control "<sessionName>"` so the spawned Claude
 // Code session auto-attaches to the remote-control daemon at startup.
@@ -337,12 +346,18 @@ const defaultClaudeInvocation = "claude --dangerously-skip-permissions"
 // https://code.claude.com/docs/en/remote-control.md (issue #73 research
 // finding).
 func injectRemoteControlFlag(command []string, sessionName string) []string {
-	// Default shape: ["sh", "-c", "<script>"]. Reject anything else.
+	// Strict shape match: ONLY rewrite Fleet's documented default
+	// `--command` (the literal shell-wrapped claude invocation
+	// registered by newDispatchCmd). Custom operator-supplied
+	// commands — even shell-wrapped ones that incidentally mention
+	// `claude --dangerously-skip-permissions` — are returned
+	// untouched. A loose `Contains` match risked rewriting arbitrary
+	// shell text inside a custom launcher (codex review #73 iter-3 P2).
 	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
 		return command
 	}
 	script := command[2]
-	if !strings.Contains(script, defaultClaudeInvocation) {
+	if script != defaultClaudeWrapperScript {
 		return command
 	}
 	// Inject the flag IMMEDIATELY after the matched substring so the

@@ -420,13 +420,100 @@ func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
 	}
 }
 
+// TestInjectRemoteControlFlag_StrictShapeMatch pins codex review #73
+// iter-3 P2: even a custom `sh -c '<script>'` --command must NOT be
+// rewritten if the script differs in any way from Fleet's documented
+// default — including scripts that incidentally mention
+// `claude --dangerously-skip-permissions` as part of a different
+// wrapper. The strict shape match (byte-equal on the script element)
+// guarantees the documented "custom --command is untouched"
+// contract holds even when the operator writes an unusual launcher.
+func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{
+			name: "custom-script-mentioning-claude",
+			argv: []string{
+				"sh", "-c",
+				// Plausible operator-supplied wrapper that runs claude
+				// but also does additional bookkeeping. Mentions the
+				// literal claude invocation but is NOT byte-equal to
+				// the default.
+				`echo "starting"; claude --dangerously-skip-permissions --custom-flag; echo "done"`,
+			},
+		},
+		{
+			name: "custom-script-with-different-shell-quoting",
+			argv: []string{
+				"sh", "-c",
+				// Default-shaped but with one trailing-space difference —
+				// must still not be rewritten.
+				`claude --dangerously-skip-permissions ; RC=$?; exit $RC`,
+			},
+		},
+		{
+			name: "custom-bash-c-not-sh-c",
+			argv: []string{"bash", "-c", `claude --dangerously-skip-permissions`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := injectRemoteControlFlag(tc.argv, "fleet-coord-cafef00d")
+			if len(got) != len(tc.argv) {
+				t.Fatalf("custom command should be returned unchanged; got %v", got)
+			}
+			for i := range tc.argv {
+				if got[i] != tc.argv[i] {
+					t.Errorf("custom command element %d mutated: %q → %q",
+						i, tc.argv[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultClaudeWrapperScript_MatchesFlagDefault pins the
+// byte-equality between the defaultClaudeWrapperScript constant and
+// the actual --command default registered by newDispatchCmd. The
+// strict-shape match in injectRemoteControlFlag (codex review #73
+// iter-3 P2) depends on this equality — drift would silently disable
+// the rewrite for legitimate fresh dispatches.
+func TestDefaultClaudeWrapperScript_MatchesFlagDefault(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice, ok := flag.Value.(pflag.SliceValue)
+	if !ok {
+		t.Fatalf("--command flag is not a SliceValue: %T", flag.Value)
+	}
+	parts := slice.GetSlice()
+	if len(parts) != 3 {
+		t.Fatalf("default --command should be [sh -c <script>]; got len=%d", len(parts))
+	}
+	if parts[0] != "sh" || parts[1] != "-c" {
+		t.Errorf("default --command sh -c prefix changed; got %v", parts[:2])
+	}
+	if parts[2] != defaultClaudeWrapperScript {
+		t.Errorf("--command default's script element drifted from defaultClaudeWrapperScript "+
+			"— the strict-shape match in injectRemoteControlFlag would silently no-op for "+
+			"legitimate fresh dispatches.\n\ngot:  %q\nwant: %q",
+			parts[2], defaultClaudeWrapperScript)
+	}
+}
+
 // TestInjectRemoteControlFlag_DoesNotMutateInput pins a defensive
 // invariant: the helper must not mutate the caller's input slice.
 // The dispatch code passes opts.command (which originated from
 // cobra's flag parser); silently mutating it would corrupt later
 // reads of the same flag value.
 func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
-	in := []string{"sh", "-c", "claude --dangerously-skip-permissions; RC=$?; exit $RC"}
+	// Use the real default wrapper script so the strict-shape match
+	// (codex review #73 iter-3 P2) actually triggers the rewrite path
+	// — otherwise this test would pass trivially via the early-return
+	// branch and miss its intended invariant (the rewrite path must
+	// not mutate the caller's slice).
+	in := []string{"sh", "-c", defaultClaudeWrapperScript}
 	original := append([]string(nil), in...)
 	originalScript := in[2]
 
