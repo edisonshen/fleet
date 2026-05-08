@@ -14,9 +14,11 @@
 package tui
 
 import (
+	"os"
 	"sort"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // rowKind discriminates which payload the row carries.
@@ -150,8 +152,20 @@ func (m Model) unifiedProjects() []*ProjectRow {
 
 // findCoordByTaskID returns the first agent.Record whose task_id is
 // coordTaskID(projectName) AND project matches AND tmux session is
-// alive. Liveness uses sessionAliveFn (test-stubbable). Returns nil
-// when no record matches OR every match has a dead session.
+// alive AND the per-project state tree exists at
+// ~/.fleet/projects/<name>/. Liveness uses sessionAliveFn
+// (test-stubbable); the project-tree gate uses projectTreeExistsFn
+// so tests can stub the disk check. Returns nil when no record
+// matches.
+//
+// The project-tree gate (codex iter-2 P2) prevents a legacy / hand-
+// edited record with task_id=coord-<project> + project=<project> from
+// being auto-promoted to the project's coord. The TUI's auto-spawn
+// flow always runs state.EnsureProjectInitialized BEFORE dispatch, so
+// any record produced post-issue-#63 satisfies the gate. Records from
+// older builds — which never went through that path — will lack the
+// project tree and stay on the RIGHT column where the operator can
+// triage them via [a] / [x] like any worker.
 //
 // Distinct from findExistingCoordForProject in keys.go: this one is
 // the dashboard's binding signal (does this agent represent the
@@ -160,6 +174,12 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // layer doesn't import keys.go's action wiring.
 func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
 	want := "coord-" + projectName
+	// Project-tree existence is a single stat per call, fast enough to
+	// run inline in unifiedProjects on every render. Cache only if a
+	// future profile shows it's hot.
+	if !projectTreeExistsFn(projectName) {
+		return nil
+	}
 	for _, r := range records {
 		if r == nil {
 			continue
@@ -179,6 +199,25 @@ func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Recor
 		return r
 	}
 	return nil
+}
+
+// projectTreeExistsFn returns true when ~/.fleet/projects/<name>/ is
+// a directory on disk. var so tests can stub the disk check without
+// seeding a tmp tree. Production calls projectTreeExists.
+var projectTreeExistsFn = projectTreeExists
+
+// projectTreeExists is the production stat path used by
+// findCoordByTaskID's anti-promotion gate.
+func projectTreeExists(projectName string) bool {
+	dir, err := state.ProjectDir(projectName)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
 // dashboardRows assembles the unified row list from unifiedProjects() +

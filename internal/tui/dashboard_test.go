@@ -896,6 +896,7 @@ func TestView_NoCoordLineWhenCoordIDEmpty(t *testing.T) {
 // Lock body wins.
 func TestDashboard_CoordSignal_LockBodyPrimaryWins(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -925,6 +926,7 @@ func TestDashboard_CoordSignal_LockBodyPrimaryWins(t *testing.T) {
 // on LEFT immediately.
 func TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -948,6 +950,7 @@ func TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock(t *testing.T) {
 // block renders without a coord line.
 func TestDashboard_CoordSignal_NoMatchNoCoord(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -972,6 +975,7 @@ func TestDashboard_CoordSignal_NoMatchNoCoord(t *testing.T) {
 // downstream).
 func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -994,6 +998,7 @@ func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 // right-column agents section. The coord renders on LEFT only.
 func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1013,6 +1018,46 @@ func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 	}
 	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
 		t.Errorf("coord must be filtered from RIGHT (claimed by LEFT); got %v want [bbbb2222]", agentIDs)
+	}
+}
+
+// TestDashboard_CoordSignal_TaskIDFallbackGatedOnProjectTree pins
+// codex iter-2 P2: a record with the right task_id but NO
+// ~/.fleet/projects/<name>/ tree on disk (legacy / hand-edited /
+// pre-issue-#63 build) must NOT auto-promote to coord. The TUI's
+// post-issue-#63 auto-spawn always runs state.EnsureProjectInitialized
+// before dispatch, so post-PR records satisfy the gate; older records
+// stay on the RIGHT column where the operator can triage them.
+func TestDashboard_CoordSignal_TaskIDFallbackGatedOnProjectTree(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// Project tree missing → fallback must NOT promote even with a
+	// matching task_id + project tag + alive session.
+	(&stubProjectTreeExists{missing: map[string]bool{"demo": true}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "legacy01", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-legacy01", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("legacy record without project tree must not promote to coord; got CoordID=%q",
+			coordIDOrEmpty(got))
+	}
+	// And the legacy agent must STAY on the RIGHT column (not filtered).
+	rows := m.dashboardRows()
+	var seenRight bool
+	for _, r := range rows {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "legacy01" {
+			seenRight = true
+			break
+		}
+	}
+	if !seenRight {
+		t.Error("legacy coord-* record should still appear in RIGHT column for triage")
 	}
 }
 

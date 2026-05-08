@@ -1626,6 +1626,7 @@ func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 // findExistingCoordForProject returns it (record, true).
 func TestFindExistingCoordForProject_ReturnsAliveMatch(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	r := agent.New("c0ffeec0")
 	r.Project = "demo"
@@ -1645,6 +1646,7 @@ func TestFindExistingCoordForProject_ReturnsAliveMatch(t *testing.T) {
 // negative path: no record with the right task_id → no match.
 func TestFindExistingCoordForProject_ReturnsFalseOnNoMatch(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 	other := agent.New("12345678")
 	other.Project = "demo"
 	other.TaskID = "regular-task"
@@ -1660,6 +1662,7 @@ func TestFindExistingCoordForProject_ReturnsFalseOnNoMatch(t *testing.T) {
 // coord rather than attaching to a graveyard.
 func TestFindExistingCoordForProject_ReturnsFalseOnDeadSession(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 
 	r := agent.New("deadc0de")
 	r.Project = "demo"
@@ -1676,6 +1679,7 @@ func TestFindExistingCoordForProject_ReturnsFalseOnDeadSession(t *testing.T) {
 // match a search for "bar". Project prefix in task_id is the gate.
 func TestFindExistingCoordForProject_ProjectMismatchedSkipped(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 	r := agent.New("11111111")
 	r.Project = "foo"
 	r.TaskID = "coord-foo"
@@ -1692,6 +1696,7 @@ func TestFindExistingCoordForProject_ProjectMismatchedSkipped(t *testing.T) {
 // in-flight record by task_id and attaches WITHOUT spawning a duplicate.
 func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 

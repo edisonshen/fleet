@@ -134,16 +134,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if err := state.ValidateProjectName(opts.project); err != nil {
 		return fmt.Errorf("--project: %w", err)
 	}
-	// Reserve the "coord-" task_id prefix for the TUI's auto-spawn
-	// path (issue #63). The dashboard reads this prefix as a coord
-	// identity signal; allowing operator-supplied dispatches with
-	// the prefix would let any worker hijack the LEFT-column coord
-	// slot for its project. The TUI sets --coord-spawn explicitly.
-	if !opts.coordSpawn && len(opts.taskID) >= len(CoordTaskIDPrefix) &&
-		opts.taskID[:len(CoordTaskIDPrefix)] == CoordTaskIDPrefix {
+	// Reserve the EXACT "coord-<project>" task_id sentinel for the
+	// TUI's auto-spawn path (issue #63). The dashboard's task_id
+	// fallback signal treats agents tagged with task_id ==
+	// "coord-"+project AND project == <project> as the project's
+	// coord; without the gate, an operator-supplied
+	// `fleet dispatch coord-foo --project foo` would hijack the
+	// LEFT-column coord slot for a worker. We narrow the rejection
+	// to this exact form (codex iter-2 P2): a benign task name like
+	// `fleet dispatch coord-cache-warm --project ops` ("coord-cache-
+	// warm" != "coord-ops") is unaffected.
+	if !opts.coordSpawn && opts.taskID == CoordTaskIDPrefix+opts.project {
 		return fmt.Errorf(
-			"task_id %q uses reserved prefix %q (the TUI uses this prefix to mark coordinator dispatches; rename the task or use a different prefix)",
-			opts.taskID, CoordTaskIDPrefix)
+			"task_id %q is the reserved coord sentinel for project %q (the TUI uses this exact task_id to mark coordinator dispatches; rename the task)",
+			opts.taskID, opts.project)
 	}
 
 	rec, err := spawn.Spawn(spawn.Options{

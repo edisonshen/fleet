@@ -144,6 +144,24 @@ func (s *stubSessionAlive) install(t *testing.T) {
 	t.Cleanup(func() { sessionAliveFn = prev })
 }
 
+// stubProjectTreeExists replaces projectTreeExistsFn for tests so we
+// don't need to seed real directories under FLEET_HOME just to exercise
+// the dashboard task_id fallback signal. Default returnVal=true so
+// tests don't have to opt in to "yes the project tree exists" — the
+// gate exists to keep LEGACY records out, not to break ordinary tests.
+type stubProjectTreeExists struct {
+	missing map[string]bool // names where the gate should return false
+}
+
+func (s *stubProjectTreeExists) install(t *testing.T) {
+	t.Helper()
+	prev := projectTreeExistsFn
+	projectTreeExistsFn = func(projectName string) bool {
+		return !s.missing[projectName]
+	}
+	t.Cleanup(func() { projectTreeExistsFn = prev })
+}
+
 // stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's
 // status cache). Distinguishes "definitively dead" (dead=true, no
 // err) from "probe failed" (errSessions=true, transport-style

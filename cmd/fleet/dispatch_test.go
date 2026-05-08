@@ -117,11 +117,34 @@ func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
 	if err == nil {
 		t.Fatal("dispatch must reject coord- prefix without --coord-spawn")
 	}
-	if !strings.Contains(err.Error(), "reserved prefix") {
-		t.Errorf("err should mention 'reserved prefix'; got %q", err.Error())
+	if !strings.Contains(err.Error(), "reserved coord sentinel") {
+		t.Errorf("err should mention 'reserved coord sentinel'; got %q", err.Error())
 	}
-	if !strings.Contains(err.Error(), `"coord-"`) {
-		t.Errorf("err should reference the literal coord- prefix; got %q", err.Error())
+	if !strings.Contains(err.Error(), "rename the task") {
+		t.Errorf("err should suggest renaming; got %q", err.Error())
+	}
+}
+
+// TestDispatch_AllowsBenignCoordPrefix pins codex iter-2 P2: the
+// reservation is the EXACT "coord-<project>" sentinel, not the broad
+// "coord-*" prefix. A benign task name like `coord-cache-warm` for
+// project `ops` ("coord-cache-warm" != "coord-ops") must dispatch
+// normally.
+func TestDispatch_AllowsBenignCoordPrefix(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:  "coord-cache-warm",
+		project: "ops",
+	}
+	// We're not actually spawning here (would need tmux); we just
+	// verify the reservation gate doesn't fire. runDispatch will fail
+	// later at tmux.Available() or spawn.Spawn — that's fine; we only
+	// assert the error is NOT the reservation message.
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err != nil && strings.Contains(err.Error(), "reserved coord sentinel") {
+		t.Errorf("benign coord-* task must not trigger reservation gate; got %q", err.Error())
 	}
 }
 
