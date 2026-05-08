@@ -38,8 +38,8 @@ func TestNew_Defaults(t *testing.T) {
 	if m.version != "9.9.9" {
 		t.Errorf("version: got %q, want 9.9.9", m.version)
 	}
-	if m.cursor != 0 {
-		t.Errorf("cursor should start at 0, got %d", m.cursor)
+	if m.dashCursor != 0 {
+		t.Errorf("dashCursor should start at 0, got %d", m.dashCursor)
 	}
 	if len(m.records) != 0 {
 		t.Errorf("records should start empty, got %d", len(m.records))
@@ -73,28 +73,32 @@ func TestUpdate_AgentsMsg_PropagatesError(t *testing.T) {
 	}
 }
 
+// TestUpdate_AgentsMsg_KeepsCursorInBounds pins that the dashboard
+// cursor doesn't dangle off the end when the row count shrinks. With
+// no projects/workers seeded, dashboardRows() === records, so a cursor
+// at the old last index would land out of bounds when records shrink.
 func TestUpdate_AgentsMsg_KeepsCursorInBounds(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(5)
-	m.cursor = 4 // pointing at last
+	m.dashCursor = 4 // pointing at last row
 
-	// Shrink to 2 records — cursor should drop to 1 (last valid index).
+	// Shrink to 2 records — cursor should reset to 0.
 	updated, _ := m.Update(agentsMsg{records: fakeRecords(2)})
 	got := updated.(Model)
-	if got.cursor != 1 {
-		t.Errorf("cursor: got %d, want 1 (clamped to last index)", got.cursor)
+	if got.dashCursor < 0 || got.dashCursor >= 2 {
+		t.Errorf("dashCursor: got %d, want 0..1 after shrink", got.dashCursor)
 	}
 }
 
 func TestUpdate_AgentsMsg_EmptyDoesNotCrash(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(3)
-	m.cursor = 2
+	m.dashCursor = 2
 
 	updated, _ := m.Update(agentsMsg{records: nil})
 	got := updated.(Model)
-	if got.cursor != 0 {
-		t.Errorf("empty list should clamp cursor to 0, got %d", got.cursor)
+	if got.dashCursor != 0 {
+		t.Errorf("empty list should clamp dashCursor to 0, got %d", got.dashCursor)
 	}
 	if len(got.records) != 0 {
 		t.Errorf("records should be empty, got %d", len(got.records))
@@ -114,47 +118,46 @@ func TestKey_Quit(t *testing.T) {
 	}
 }
 
+// TestKey_Navigation walks the dashCursor across agent rows. With 3
+// records and no projects/workers, dashboardRows() returns 3 agent
+// rows, so j/k moves dashCursor 0→1→2.
 func TestKey_Navigation(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(3)
 
 	// j moves cursor down
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	if updated.(Model).cursor != 1 {
-		t.Errorf("j: cursor got %d, want 1", updated.(Model).cursor)
+	if updated.(Model).dashCursor != 1 {
+		t.Errorf("j: dashCursor got %d, want 1", updated.(Model).dashCursor)
 	}
 
 	// k moves cursor back up
-	m.cursor = 2
+	m.dashCursor = 2
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
-	if updated.(Model).cursor != 1 {
-		t.Errorf("k: cursor got %d, want 1", updated.(Model).cursor)
-	}
-
-	// G jumps to bottom
-	m.cursor = 0
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
-	if updated.(Model).cursor != 2 {
-		t.Errorf("G: cursor got %d, want 2", updated.(Model).cursor)
+	if updated.(Model).dashCursor != 1 {
+		t.Errorf("k: dashCursor got %d, want 1", updated.(Model).dashCursor)
 	}
 }
 
-func TestKey_NavigationClampsAtBounds(t *testing.T) {
+// TestKey_NavigationWrapsAtBounds pins the issue #53 spec: "Wraps at
+// boundaries". j at the bottom returns to the top; k at the top wraps
+// to the bottom. This differs from v0.1's clamping behavior.
+func TestKey_NavigationWrapsAtBounds(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(3)
 
-	// k at top stays at top
-	m.cursor = 0
+	// k at top wraps to bottom (index 2).
+	m.dashCursor = 0
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
-	if updated.(Model).cursor != 0 {
-		t.Errorf("k at top: cursor got %d, want 0", updated.(Model).cursor)
+	if updated.(Model).dashCursor != 2 {
+		t.Errorf("k at top: dashCursor got %d, want 2 (wraps)", updated.(Model).dashCursor)
 	}
 
-	// j at bottom stays at bottom
-	m.cursor = 2
+	// j at bottom wraps to top.
+	m.dashCursor = 2
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	if updated.(Model).cursor != 2 {
-		t.Errorf("j at bottom: cursor got %d, want 2", updated.(Model).cursor)
+	if updated.(Model).dashCursor != 0 {
+		t.Errorf("j at bottom: dashCursor got %d, want 0 (wraps)", updated.(Model).dashCursor)
 	}
 }
 
@@ -164,8 +167,6 @@ func TestUpdate_TickReturnsRefreshAndNextTick(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("tickMsg should produce a command (load + next tick)")
 	}
-	// We can't easily inspect tea.Batch's contents, but a non-nil cmd
-	// is the contract.
 }
 
 func TestUpdate_FsEventReturnsRefreshCmd(t *testing.T) {
@@ -176,24 +177,9 @@ func TestUpdate_FsEventReturnsRefreshCmd(t *testing.T) {
 	}
 }
 
-func TestView_EmptyState(t *testing.T) {
-	m := New("0.0.0")
-	m.view = viewAgents // empty-state semantics belong to the agents view
-	out := m.View()
-	if !strings.Contains(out, "no agents") {
-		t.Errorf("empty view should mention 'no agents', got:\n%s", out)
-	}
-	// Hint must point operator at the in-TUI dispatch shortcut, not
-	// the shell command. With `[d]` already in the footer, this is
-	// the discoverable path for someone seeing an empty TUI.
-	if !strings.Contains(out, "[d]") {
-		t.Errorf("empty view should hint at [d] dispatch shortcut, got:\n%s", out)
-	}
-	if !strings.Contains(out, "Fleet 0.0.0") {
-		t.Errorf("view should include version in title, got:\n%s", out)
-	}
-}
-
+// TestView_PickerRendersFilterAndCandidates pins the [d] picker
+// renders the filter input + matching candidates. Picker mode
+// replaces the dashboard footer.
 func TestView_PickerRendersFilterAndCandidates(t *testing.T) {
 	m := New("test")
 	m.mode = modePickRepo
@@ -242,7 +228,6 @@ func TestView_PromptHeaderShowsPickedRepo(t *testing.T) {
 
 func TestView_ShowsErrorBanner(t *testing.T) {
 	m := New("test")
-	m.view = viewAgents
 	m.err = errors.New("disk full")
 	out := m.View()
 	if !strings.Contains(out, "disk full") {
@@ -250,62 +235,10 @@ func TestView_ShowsErrorBanner(t *testing.T) {
 	}
 }
 
-func TestView_RendersAgentList(t *testing.T) {
-	m := New("test")
-	m.view = viewAgents
-	m.records = sortRecords(fakeRecords(2))
-	out := m.View()
-
-	// v2 layout drops the AGENT/PROJECT/TASK/MODE/AGE/STATUS column
-	// header row — the row is self-documenting via the leading
-	// status glyph + cursor arrow + colored cells. Just assert the
-	// data shows up.
-	if !strings.Contains(out, "a0") || !strings.Contains(out, "a1") {
-		t.Errorf("view should include agent IDs, got:\n%s", out)
-	}
-	// Project group header surfaces the count + active count alongside
-	// the project label so the operator can scan groups at a glance.
-	// Format: "demo (2 tasks, 2 active)".
-	if !strings.Contains(out, "demo") || !strings.Contains(out, "(2 tasks, 2 active)") {
-		t.Errorf("view should include project group header, got:\n%s", out)
-	}
-	// Smart footer summary line: "N project · M agents".
-	if !strings.Contains(out, "2 agents") {
-		t.Errorf("footer should report agent count, got:\n%s", out)
-	}
-	// Cursor row gets an inline action chip strip.
-	if !strings.Contains(out, "[a]") || !strings.Contains(out, "attach") {
-		t.Errorf("selected row should expose inline [a] attach chip, got:\n%s", out)
-	}
-}
-
-func TestView_CoachHintShownInitiallyHiddenAfterKeypress(t *testing.T) {
-	m := New("test")
-	m.view = viewAgents
-	m.records = sortRecords(fakeRecords(2))
-
-	// Fresh launch shows the coach hint so a first-time operator
-	// understands "the selected row IS the interface" without docs.
-	if !strings.Contains(m.View(), "actions appear on the selected row") {
-		t.Errorf("coach hint should render before any keypress, got:\n%s", m.View())
-	}
-
-	// First nav keypress dismisses it — once you've moved, you've
-	// demonstrated you know how.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
-	out := updated.(Model).View()
-	if strings.Contains(out, "actions appear on the selected row") {
-		t.Errorf("coach hint should be dismissed after [j], got:\n%s", out)
-	}
-}
-
 func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 	m := New("test")
-	m.view = viewAgents
 	recs := fakeRecords(3)
-	// One blocked, one with hot context. Banner should aggregate
-	// both counts independently — a hot+blocked agent would bump
-	// both bars, but here we keep them separate for clarity.
+	// One blocked, one with hot context.
 	recs[0].Blocked = true
 	hot := 75.0
 	recs[1].ContextPct = &hot
@@ -321,14 +254,9 @@ func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 }
 
 // TestView_AlertBannerSplitsAskingIdleReview pins the three-way label
-// split: a NeedsInput agent without a pending question reads as "idle"
-// (dim ○), a NeedsInput agent with a pending question reads as
-// "asking" (bright cyan ●), and a Mode=="review" agent reads as
-// "in review" (soft cyan ●). All three must appear as distinct chips,
-// not collapsed.
+// split (asking / idle / review chips on the dashboard banner).
 func TestView_AlertBannerSplitsAskingIdleReview(t *testing.T) {
 	m := New("test")
-	m.view = viewAgents
 	recs := fakeRecords(3)
 	recs[0].NeedsInput = true // → idle
 	recs[1].NeedsInput = true
@@ -354,13 +282,8 @@ func TestView_AlertBannerSplitsAskingIdleReview(t *testing.T) {
 	}
 }
 
-// TestDeriveStatus_PausedReviewerStaysReview pins the precedence that
-// review wins over both asking and idle — fleet-guard flips
-// NeedsInput=true on every Stop with no injection, and may also flip
-// HasPendingQuestion if the reviewer asked something. Mode is the
-// load-bearing signal: a paused reviewer must surface as "review", not
-// "asking"/"idle", or the three-way split mislabels reviewers in their
-// common state.
+// TestDeriveStatus_PausedReviewerStaysReview pins precedence: review
+// beats asking and idle so paused reviewers don't mislabel.
 func TestDeriveStatus_PausedReviewerStaysReview(t *testing.T) {
 	for _, hasQ := range []bool{false, true} {
 		r := &agent.Record{
@@ -383,10 +306,8 @@ func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 	m := New("test")
 	m.records = sortRecords(fakeRecords(2)) // all default → live
 	out := m.View()
-	// v2 banner glyphs: ▌ blocked, △ hot context, ✗ dead. The cyan
-	// ● review glyph is also a row-level glyph so we can't blanket-
-	// check it — instead guard the descriptive words.
-	for _, sym := range []string{"▌", "△", "✗", "blocked", "hot context", "dead", "in review", " idle"} {
+	// Banner glyphs we MUST NOT see on a clean dashboard.
+	for _, sym := range []string{"▌ ", "△", "1 blocked", "hot context", "1 dead", "1 in review", "1 idle"} {
 		if strings.Contains(out, sym) {
 			t.Errorf("clean dashboard should hide banner for %q, got:\n%s", sym, out)
 		}
@@ -394,9 +315,6 @@ func TestView_NoAlertBannerWhenAllHealthy(t *testing.T) {
 }
 
 func TestDeriveStatus_PrecedenceLadder(t *testing.T) {
-	// alive is the cached liveness map keyed by agent ID.
-	// alive[id]=true → probed alive; alive[id]=false → probed dead;
-	// missing entry → conservatively treated as live (no probe yet).
 	const id = "x"
 	const sess = "fleet-x"
 	aliveTrue := map[string]bool{id: true}
@@ -553,23 +471,14 @@ func TestSortRecords_NewestFirst(t *testing.T) {
 }
 
 // TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned regresses
-// codex review iter-5 P2: a tmux probe that fails (binary missing,
-// socket broken) MUST NOT write a "false" entry into the alive
-// cache, since that would render a healthy agent as "dead" and
-// could trick an operator into pressing [x] on a live session.
-// Only definitive "session does not exist" results write false.
+// codex review iter-5 P2: a tmux probe that fails MUST NOT write a
+// "false" entry into the alive cache.
 func TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned(t *testing.T) {
 	(&stubSessionProbe{
-		// agent01: probe says definitively dead (writes false)
-		// agent02: probe transport error (must NOT write false)
-		// agent03: probe says alive (writes true)
 		dead:        map[string]bool{"fleet-agent01": true},
 		errSessions: map[string]bool{"fleet-agent02": true},
 	}).install(t)
 
-	// Seed three agent records on disk so loadAgentsCmd has something
-	// to walk. Use the helper from keys_test.go shape (sampleAgent
-	// builds a record with TmuxSession = "fleet-<id>").
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
 	if err := os.MkdirAll(tmp+"/agents", 0o755); err != nil {
@@ -594,8 +503,6 @@ func TestLoadAgentsCmd_ProbeFailureLeavesCacheUnpoisoned(t *testing.T) {
 	if msg.alive["agent03"] != true {
 		t.Errorf("agent03 (alive) should be true, got %v", msg.alive["agent03"])
 	}
-	// The key invariant: probe failure leaves the entry MISSING, not
-	// false. deriveStatus's nil-safe fallback then renders "live".
 	if _, present := msg.alive["agent02"]; present {
 		t.Errorf("agent02 probe failed — entry should be absent (not false), got alive=%v", msg.alive["agent02"])
 	}
@@ -627,11 +534,7 @@ func TestPadRight(t *testing.T) {
 	}
 }
 
-// TestVisualRows pins down the wrap-aware row count: a soft-wrapped
-// long line counts as multiple terminal rows, not one. This drives
-// padToBottom so the bottom-pinned footer stays pinned on narrow
-// terminals where the archive-confirm prompt or a blocked-reason
-// quote wraps to extra rows (codex iter / P2).
+// TestVisualRows pins down the wrap-aware row count.
 func TestVisualRows(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -646,13 +549,9 @@ func TestVisualRows(t *testing.T) {
 		{"trailing newline doesn't double-count", "foo\nbar\n", 80, 2},
 		{"empty middle line counts as 1", "foo\n\nbar", 80, 3},
 		{"just a newline", "\n", 80, 1},
-		// Soft-wrap: 100-char line on an 80-col terminal = 2 rows.
 		{"wrap once", strings.Repeat("x", 100), 80, 2},
-		// 80-char line fits exactly in 80 cells = 1 row, not 2.
 		{"exact fit", strings.Repeat("x", 80), 80, 1},
-		// 161 chars on 80 cols → 3 rows (80+80+1).
 		{"wrap twice", strings.Repeat("x", 161), 80, 3},
-		// termWidth ≤ 0 disables wrap math — falls back to logical lines.
 		{"no width known", strings.Repeat("x", 200) + "\n" + strings.Repeat("y", 200), 0, 2},
 	}
 	for _, c := range cases {

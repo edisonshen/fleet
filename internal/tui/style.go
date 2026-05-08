@@ -84,6 +84,13 @@ var (
 	footerKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBright))
 	footerLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDim))
 
+	// Cursor glyph (▶) prefixed on the selected dashboard row. Bold
+	// cyan reads as the same affordance as v0.1's selectedRowStyle.
+	cursorGlyphStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
+
+	// Dashboard search/filter footer chip ("/foo · clear with esc").
+	searchFooterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
+
 	// Box / divider / border characters.
 	boxBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBox))
 )

@@ -1,37 +1,22 @@
 // Package tui owns the bubbletea-based interactive dashboard.
 //
-// Renders agent records under ~/.fleet/agents/ as a grouped list.
-// fsnotify drives refreshes when files change; a 1s polling tick
-// is the fallback for platforms where fsnotify misbehaves
-// (per docs/DESIGN.md).
-//
-// Layout (v2 — "the selected row IS the interface"):
-//
-//	Fleet 0.1.0
-//	────────────
-//	⏸ 1 blocked  ·  ⚠ 2 hot context              <- alert banner (only if any)
-//
-//	rainier (1 agent)                            <- project group header
-//	  ●  agent01   add-rate-limiting     68%  14m  live
-//	▸ ⏸  agent02   rec-engine-v2         41%   6m  blocked     <- selected
-//	       ⏸ "which similarity metric — cosine or jaccard?"
-//	       [a] attach   [h] handoff   [x] archive
-//
-//	use j/k to navigate · actions appear on the selected row   <- coach hint
-//
-//	2 agents · 1 blocked
-//	[j/k] navigate  [a] attach  [h] handoff  [d] dispatch  [x] archive  [q] quit
+// v0.2 (issue #53): the dashboard is the only view. It folds projects
+// + tasks (left column) and workers + v0.1 agents (right column) into a
+// single ops-console layout with a unified cursor. fsnotify drives
+// refreshes when files change; a 1s polling tick is the fallback for
+// platforms where fsnotify misbehaves (per docs/DESIGN.md).
 //
 // Keyboard:
-//   - q, ctrl+c: quit
-//   - j, ↓: cursor down
-//   - k, ↑: cursor up
-//   - g: jump to top
-//   - G: jump to bottom
-//   - h: handoff selected agent
-//   - a: attach to selected agent
-//   - d, n: dispatch (opens repo picker)
-//   - x: archive selected agent (confirm with y)
+//   - j, ↓ / k, ↑: cursor down / up across all rows (wraps)
+//   - ⏎ enter   : open detail panel for the row under cursor
+//   - n         : add a new task to the current project (in-process call)
+//   - a         : attach (agents, tmux) or peek (workers, log + state)
+//   - h         : handoff (agents only)
+//   - x         : archive (agents) or kill (workers)
+//   - d         : dispatch a new agent (opens repo picker)
+//   - /         : substring filter across projects/workers/agents
+//   - ?         : help overlay
+//   - q, ctrl+c : quit
 package tui
 
 import (
@@ -60,29 +45,12 @@ var upgradeNudgeFn = version.Nudge
 // refresh. var so tests can stub the network call out entirely.
 var upgradeStartFn = version.Start
 
-// viewMode picks between the v0.2 Variant A "Ops Console" dashboard
-// (default) and the v0.1 single-pane agent list. Operator toggles via
-// `g` / `G` (g switches to the agents fleet-guard view; pressing `g`
-// again returns to the dashboard).
-type viewMode int
-
-const (
-	viewDashboard viewMode = iota // Variant A 2-column ops console
-	viewAgents                    // legacy fleet-guard agent list
-)
-
 // Model is the bubbletea state for the dashboard.
 type Model struct {
 	records []*agent.Record
-	cursor  int
 	err     error
 	width   int
 	height  int
-
-	// view selects which top-level layout to render. v0.2 ships with
-	// the dashboard as default; the agents-list view stays accessible
-	// via [g] for fleet-guard inspection.
-	view viewMode
 
 	// dashboard is the most recent v0.2 ops-console snapshot. Loaded
 	// asynchronously by loadDashboardCmd; nil until the first load
@@ -142,14 +110,6 @@ type Model struct {
 	// would draw on top of bubbletea's state.
 	pendingAttach string
 
-	// coachDismissed flips true after the first nav/action keypress so
-	// the coaching hint ("use j/k to navigate · actions appear on the
-	// selected row") fades out once the operator has demonstrated they
-	// know what they're doing. In-memory only — fresh launches re-show
-	// the hint, which is the right default for a CLI that's still in
-	// early adoption.
-	coachDismissed bool
-
 	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
 	// chip when a newer release is on disk in the version cache.
 	// Empty means no banner — every failure mode in the version
@@ -157,6 +117,41 @@ type Model struct {
 	// authoritative "is there a nudge?" signal. Populated via
 	// upgradeAvailableMsg fired from a goroutine launched in Init.
 	upgradeBanner string
+
+	// dashCursor is the index into dashboardRows() for the
+	// currently-selected row. [j/k] move it; [⏎]/[a]/[h]/[x]/[n]
+	// dispatch on the row at this index. Wraps at boundaries.
+	dashCursor int
+
+	// searchFilter is the current substring filter applied to
+	// dashboardRows(). Empty when no filter is active. Set via [/]
+	// search prompt; cleared via [esc] inside the prompt.
+	searchFilter string
+
+	// showHelp toggles the help overlay (set by [?], cleared by any
+	// other key).
+	showHelp bool
+
+	// detail, when non-nil, drives the [⏎] open detail panel. The
+	// kind tells the renderer what to show; payload is the row-type-
+	// specific text body.
+	detail *detailView
+
+	// taskAddProjectFrozen captures the target project at the moment
+	// [n] is pressed. Without this, the 1s poll could re-sort
+	// dashboardRows() while the prompt is open and the same dashCursor
+	// would land on a different project at submit time — operator's
+	// new task lands in the wrong tasks.md (codex iter-2 P1). Cleared
+	// when modePromptTaskAdd exits.
+	taskAddProjectFrozen string
+}
+
+// detailView is the inline detail panel shown by [⏎] open. The kind
+// hints at the source row type (only used for the panel title); body
+// is the pre-rendered multi-line text the panel displays.
+type detailView struct {
+	title string
+	body  string
 }
 
 // PendingAttach returns the tmux session to attach to after the
@@ -168,7 +163,6 @@ func New(version string) Model {
 	return Model{
 		version:   version,
 		userName:  currentUserName(),
-		view:      viewDashboard,
 		startedAt: time.Now(),
 	}
 }
@@ -314,14 +308,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case agentsMsg:
+		// Capture the cursor's row identity BEFORE swapping records
+		// in. After refresh, refreshCursor relocates the cursor onto
+		// the same identity (or clamps to start if it disappeared) so
+		// background updates don't silently retarget [⏎]/[a]/[n]/[x]
+		// (codex iter-5 P1).
+		var prevID string
+		if row := m.selectedRow(); row != nil {
+			prevID = rowIdentity(*row)
+		}
 		m.err = msg.err
 		m.aliveByID = msg.alive
 		m.groupKeysByID = msg.groupKeys
 		m.records = sortRecordsBy(msg.records, msg.groupKeys)
-		// Keep the cursor in bounds when the list shrinks.
-		if m.cursor >= len(m.records) {
-			m.cursor = max(0, len(m.records)-1)
-		}
+		m.refreshCursor(prevID)
 		return m, nil
 
 	case tickMsg:
@@ -337,7 +337,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd())
 
 	case dashboardMsg:
+		// Capture cursor identity BEFORE swapping the snapshot, then
+		// re-locate via refreshCursor (codex iter-5 P1). This handles
+		// the row-shift case (project resort by Attention; new tasks
+		// inserted ahead of workers/agents) which was silently
+		// retargeting [⏎]/[a]/[n]/[x] under iter-1's clamp-only fix.
+		var prevID string
+		if row := m.selectedRow(); row != nil {
+			prevID = rowIdentity(*row)
+		}
 		m.dashboard = msg.snap
+		// Surface scan errors as a flash so an unreadable
+		// ~/.fleet/projects/ doesn't silently render as "0 projects"
+		// (codex iter-12 P2). Best-effort: per-project errors inside
+		// scanDashboard collapse to empty rows; only top-level
+		// failures (Snapshot.Err non-nil) need this banner.
+		if msg.snap != nil && msg.snap.Err != nil {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("dashboard scan failed: %v", msg.snap.Err),
+				isErr: true,
+			}
+		}
+		m.refreshCursor(prevID)
 		return m, nil
 
 	case queueEventMsg:
@@ -377,6 +398,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: agent should be archived
 
+	case taskAddDoneMsg:
+		if msg.err != nil {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("task add failed: %v", msg.err),
+				isErr: true,
+			}
+		} else {
+			m.flash = &flashMsg{text: fmt.Sprintf("added %s", msg.slug)}
+		}
+		// Refresh dashboard so the new task surfaces in the next render.
+		return m, loadDashboardCmd()
+
 	case upgradeAvailableMsg:
 		// Banner is set / cleared atomically here. Subsequent renders
 		// pick it up via m.upgradeBanner; no other path mutates it.
@@ -395,15 +428,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 
-	// Coach hint fades on the first nav-mode keypress. We gate on
-	// modeNav so picker filter typing doesn't (re-)dismiss something
-	// that's already gone, and so the dismissal corresponds 1:1 with
-	// the operator demonstrating they know how to interact with the
-	// dashboard.
-	if m.mode == modeNav {
-		m.coachDismissed = true
-	}
-
 	// Action keys (handoff/attach/dispatch) and prompt-mode keys take
 	// precedence over navigation. handleActionKey returns handled=false
 	// only when in nav mode and the key isn't an action key, in which
@@ -417,30 +441,25 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q":
 		return m, tea.Quit
 	case "j", "down":
-		if m.cursor < len(m.records)-1 {
-			m.cursor++
-		}
+		m.moveCursor(+1)
 	case "k", "up":
-		if m.cursor > 0 {
-			m.cursor--
-		}
-	case "g":
-		// v0.2: g toggles between the Variant A dashboard (default
-		// startup view) and the v0.1 agents list. The legacy
-		// "g jumps to top" semantic is dropped — G still jumps to
-		// bottom of the agents list, and `gg`-style top-jump can
-		// return as a P2 polish if dogfooding asks for it.
-		if m.view == viewDashboard {
-			m.view = viewAgents
-		} else {
-			m.view = viewDashboard
-		}
-	case "G":
-		if len(m.records) > 0 {
-			m.cursor = len(m.records) - 1
-		}
+		m.moveCursor(-1)
 	}
 	return m, nil
+}
+
+// moveCursor advances dashCursor by delta across the unified row list
+// (projects + tasks + workers + agents). Wraps at boundaries so j at
+// the bottom returns to the top — matches issue #53 spec ("Wraps at
+// boundaries"). When the row list is empty (early renders before the
+// first dashboardMsg lands), no-op.
+func (m *Model) moveCursor(delta int) {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		return
+	}
+	n := len(rows)
+	m.dashCursor = ((m.dashCursor+delta)%n + n) % n
 }
 
 // View renders the current state. Called by bubbletea on every model
@@ -457,34 +476,52 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // so the footer pins to the bottom of the terminal regardless of
 // agent count. m.height comes from tea.WindowSizeMsg.
 func (m Model) View() string {
-	if m.view == viewDashboard && m.mode == modeNav {
-		// v0.2 default: Variant A "Ops Console". Modal prompts (picker,
-		// dispatch, confirm) fall back to the agents-style footer
-		// because the prompts target single-agent operations and don't
-		// fit the 2-col layout.
-		//
-		// Banners (upgrade nudge, agent-load error, flash) are prepended
-		// so dispatch/handoff/rm failure output and load errors stay
-		// visible in dashboard mode — operators on the default view must
-		// still see when commands fail or records are malformed without
-		// having to flip to the legacy agents view.
-		top := m.renderDashboardBanners() + renderDashboard(m)
-		footer := m.renderFooter()
-		return padToBottom(top, footer, m.height, m.width)
+	// v0.2 (issue #53): the dashboard is the only view. Legacy v0.1
+	// agents-list rendering paths are gone; agents fold into the
+	// dashboard's right column. Modal overlays (help, detail panel,
+	// task-add prompt, search) are composed on top of the dashboard
+	// body or replace the footer; they don't switch to a separate
+	// view.
+	//
+	// Banners (upgrade nudge, agent-load error, flash) are prepended
+	// so dispatch/handoff/rm failure output and load errors stay
+	// visible — operators must still see when commands fail or records
+	// are malformed.
+	body := m.renderDashboardBanners() + renderDashboard(m)
+	if overlay := m.renderOverlay(); overlay != "" {
+		body = overlay
 	}
-	top := m.renderTop()
 	footer := m.renderFooter()
-	return padToBottom(top, footer, m.height, m.width)
+	return padToBottom(body, footer, m.height, m.width)
+}
+
+// renderOverlay returns a modal overlay (help / detail panel) that
+// REPLACES the dashboard body when active. Empty string means no
+// overlay → dashboard renders normally. Modal overlays compose on top
+// of the dashboard so the banner row + footer keep their position.
+func (m Model) renderOverlay() string {
+	switch {
+	case m.showHelp:
+		return renderHelpOverlay(m.width)
+	case m.detail != nil:
+		return renderDetailOverlay(*m.detail, m.width, m.height)
+	}
+	return ""
 }
 
 // renderDashboardBanners renders the upgrade banner, agent-load error,
-// and active flash above the dashboard body. Returns "" when nothing is
-// active so the dashboard layout is not shifted by an empty row. Mirrors
-// the renderTop banner ordering so dashboard and agents views read the
-// same: upgrade banner first (lowest urgency), error second, flash last
-// (highest urgency, most ephemeral).
+// the agent-derived alert chips ("1 blocked  2 hot context"), and the
+// active flash above the dashboard body. Returns "" when nothing is
+// active so the dashboard layout is not shifted by an empty row.
+//
+// Order (lowest urgency → highest, most ephemeral last):
+//  1. upgrade nudge
+//  2. agent-load error
+//  3. alert banner (per-agent statuses aggregated)
+//  4. flash (last action's success/failure)
 func (m Model) renderDashboardBanners() string {
-	if m.upgradeBanner == "" && m.err == nil && m.flash == nil {
+	alert := renderAlertBanner(m.records, m.aliveByID)
+	if m.upgradeBanner == "" && m.err == nil && m.flash == nil && alert == "" {
 		return ""
 	}
 	var b strings.Builder
@@ -496,6 +533,9 @@ func (m Model) renderDashboardBanners() string {
 		b.WriteString(errStyle.Render(fmt.Sprintf("error reading agents: %v", m.err)))
 		b.WriteString("\n")
 	}
+	if alert != "" {
+		b.WriteString(alert)
+	}
 	if m.flash != nil {
 		style := dimStyle
 		if m.flash.isErr {
@@ -507,72 +547,11 @@ func (m Model) renderDashboardBanners() string {
 	return b.String()
 }
 
-// renderTop returns everything above the footer: title block,
-// optional error, alert banner (with section divider), agent list,
-// coach hint, flash. Always ends with a trailing newline.
-func (m Model) renderTop() string {
-	var b strings.Builder
-
-	// Title row: "Fleet x.y.z" left, username right. Leading blank
-	// line keeps the title from sitting on the very first row of
-	// the alt-screen — some terminals (Warp, certain tmux configs)
-	// overlay command/status chrome on row 1 and the title vanishes
-	// behind it. Pushing the title to row 2 makes it always visible
-	// regardless of host UI.
-	title := fmt.Sprintf("Fleet %s", m.version)
-	b.WriteString("\n")
-	b.WriteString(titleRow(title, m.userName, m.width))
-	b.WriteString("\n")
-	b.WriteString(dividerStyle.Render(divider(m.width, lipgloss.Width(title)+2)))
-	b.WriteString("\n")
-
-	// Upgrade nudge — rendered between the title divider and the alert
-	// banner so it sits above all per-agent state but below the
-	// product header. Skipped (no row consumed) when no upgrade is
-	// available so a clean dashboard isn't padded with an empty line.
-	if m.upgradeBanner != "" {
-		b.WriteString(upgradeBannerStyle.Render(m.upgradeBanner))
-		b.WriteString("\n")
-	}
-
-	if m.err != nil {
-		b.WriteString(errStyle.Render(fmt.Sprintf("error reading agents: %v", m.err)))
-		b.WriteString("\n\n")
-	}
-
-	if len(m.records) == 0 {
-		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("no agents — press [d] to dispatch one"))
-		b.WriteString("\n")
-	} else {
-		// Alert banner: sits inside its own divider-bracketed section
-		// so it reads as a dashboard-level summary, not part of the
-		// agent list. Skipped entirely on a clean dashboard.
-		if banner := renderAlertBanner(m.records, m.aliveByID); banner != "" {
-			b.WriteString(banner)
-			b.WriteString(dividerStyle.Render(divider(m.width, 0)))
-			b.WriteString("\n")
-		}
-		b.WriteString(renderAgents(m.records, m.cursor, m.aliveByID, m.groupKeysByID, m.width))
-		if !m.coachDismissed {
-			b.WriteString("\n")
-			b.WriteString(coachStyle.Render(
-				"  use j/k to navigate · actions appear on the selected row"))
-			b.WriteString("\n")
-		}
-	}
-
-	if m.flash != nil {
-		style := dimStyle
-		if m.flash.isErr {
-			style = errStyle
-		}
-		b.WriteString("\n")
-		b.WriteString(style.Render(m.flash.text))
-		b.WriteString("\n")
-	}
-	return b.String()
-}
+// (renderTop removed in v0.2 issue #53: the dashboard is now the only
+// rendered view. renderDashboardBanners handles the upgrade chip,
+// agent-load error, and flash that used to live here. Alert banner
+// (blocked/hot-context counts across agents) is folded into
+// renderDashboardBanners for the same reason.)
 
 // renderFooter returns the bottom-of-screen block — either a mode
 // prompt (picker / dispatch / confirm) or the smart footer (divider +
@@ -586,17 +565,9 @@ func (m Model) renderTop() string {
 // confirm-archive) keep the v0.1 footer because the prompts are still
 // agent-centric in v0.2.
 func (m Model) renderFooter() string {
-	if m.view == viewDashboard && m.mode == modeNav {
-		usable := m.width - 1
-		if usable < 60 {
-			usable = 60
-		}
-		var b strings.Builder
-		b.WriteString(dividerStyle.Render(divider(m.width, 0)))
-		b.WriteString("\n")
-		b.WriteString(renderDashboardFooter(time.Since(m.startedAt), usable))
-		b.WriteString("\n")
-		return b.String()
+	usable := m.width - 1
+	if usable < 60 {
+		usable = 60
 	}
 	var b strings.Builder
 	b.WriteString(dividerStyle.Render(divider(m.width, 0)))
@@ -619,52 +590,21 @@ func (m Model) renderFooter() string {
 			"Archive agent %s? Kills tmux session + deletes record (no replacement). [y/N]",
 			m.archiveCandidate)))
 		b.WriteString("\n")
+	case modePromptTaskAdd:
+		b.WriteString(promptStyle.Render("task spec: " + m.promptBuf + "█"))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("[enter] submit  [esc] cancel"))
+		b.WriteString("\n")
+	case modePromptSearch:
+		b.WriteString(promptStyle.Render("/" + m.promptBuf + "█"))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("[esc] clear  [enter] keep filter"))
+		b.WriteString("\n")
 	default:
-		// Smart footer: summary line + chip row. The summary is
-		// fleet-level state ("4 projects · 4 agents · 1 blocked");
-		// the chips are the always-available global keys. The
-		// cursor row's inline chips (renderAgentDetail) carry the
-		// context-sensitive row actions — the footer is the floor,
-		// not the ceiling. Two-space separator + compact "[k]label"
-		// chips match the v2 mockup.
-		chips := strings.Join([]string{
-			keyChip("[j/k]", "navigate"),
-			keyChip("[a]", "attach"),
-			keyChip("[d]", "dispatch new"),
-			keyChip("[q]", "quit"),
-		}, "  ")
-		b.WriteString(dimStyle.Render(footerSummary(m.records, m.aliveByID, m.groupKeysByID)))
+		b.WriteString(renderDashboardFooter(time.Since(m.startedAt), usable, m.searchFilter))
 		b.WriteString("\n")
-		b.WriteString(chips)
-		b.WriteString("\n")
-		// Detach hint lives in the spawned session's tmux status bar
-		// (see tmux.SetStatusHint), not here — by the time the
-		// operator needs it, the TUI is gone and tmux owns the screen.
 	}
 	return b.String()
-}
-
-// titleRow renders the top line: bold cyan "Fleet x.y.z" on the left,
-// faint username on the right, padded with spaces between them.
-// Stops one cell short of width so the rightmost terminal column
-// stays empty — many terminals auto-wrap when content lands in the
-// final column, and the resulting phantom newline visually eats the
-// row. When width is unknown (early renders) or username is empty,
-// falls back to just the title — keeping the row stable as the
-// terminal reports its size in.
-func titleRow(title, name string, width int) string {
-	left := titleStyle.Render(title)
-	if name == "" || width <= 0 {
-		return left
-	}
-	right := userStyle.Render(name)
-	// width-1 leaves a 1-cell margin so the row never lands a
-	// printable character in the final column.
-	gap := (width - 1) - lipgloss.Width(title) - lipgloss.Width(name)
-	if gap < 1 {
-		gap = 1
-	}
-	return left + strings.Repeat(" ", gap) + right
 }
 
 // divider returns a horizontal line of ─ characters spanning the
@@ -739,14 +679,6 @@ func visualRows(s string, termWidth int) int {
 // pickerVisibleRows caps how many repos are listed at once. Anything
 // further is reachable via the filter.
 const pickerVisibleRows = 8
-
-// statusColW pins the rendered status word to a fixed cell width so
-// every row's right block is the same total width — the percent and
-// age columns then align across rows instead of drifting under
-// shorter words like "doing". 7 covers the longest known label
-// ("blocked", "handoff", "planned"); a one-off longer label gets
-// truncated by the row, not rejected.
-const statusColW = 7
 
 // renderPicker draws the [d] repo picker: a one-line filter input, a
 // scrolling list of matched candidates with the cursor, an overflow
@@ -837,290 +769,6 @@ func groupKeyFor(r *agent.Record, cache map[string]string) string {
 	return projectGroupKey(r)
 }
 
-// renderAgents produces the grouped agent list. Project group headers
-// are emitted whenever the project changes between consecutive
-// records, and the cursor row gets a 2-line detail block (progress
-// quote + inline action chips) under it. Records arrive pre-sorted
-// by sortRecords (project asc, spawned desc) so a single pass is
-// enough.
-//
-// width is the terminal width; the selected row's background tint is
-// padded to it so the highlight reads as a full-width band. When 0
-// (no WindowSizeMsg yet), the highlight falls back to inline-only
-// styling — degrading gracefully instead of collapsing to a 0-cell
-// row.
-//
-// alive is the cached tmux liveness snapshot from the most recent
-// load. deriveStatus reads from it instead of probing tmux per-row,
-// so render is pure formatting (no subprocess fan-out, no I/O).
-func renderAgents(records []*agent.Record, cursor int,
-	alive map[string]bool, groupKeys map[string]string, width int) string {
-
-	idW := columnWidth(records, func(r *agent.Record) string { return r.ID }, 6)
-	taskW := columnWidth(records,
-		func(r *agent.Record) string { return defaultStr(r.TaskID, "-") }, 8)
-
-	// Cap task width so a single 80-char task ID doesn't push ctx/age
-	// off-screen on a 120-col terminal. Long task IDs truncate with an
-	// ellipsis; the full value is still visible via [a] attach.
-	if taskW > 40 {
-		taskW = 40
-	}
-
-	// Group counts so the header can show "(N tasks, M active)".
-	// Counts key on projectGroupKey (cwd path / Project tag) so
-	// display-only differences don't fragment a group; the header
-	// label still uses projectDisplay for the human-readable form.
-	//
-	// "tasks" deduplicates by TaskID so a planner+executor pair on
-	// the same task counts as 1, not 2 (codex iter-5 P2). Records
-	// with empty TaskID each count as a distinct task — operator
-	// dispatched without a task id and we have nothing to merge on.
-	// "active" = task IDs whose any record isn't dead.
-	type groupCounts struct {
-		seenTasks   map[string]struct{}
-		activeTasks map[string]struct{}
-		anonTotal   int
-		anonActive  int
-	}
-	counts := map[string]*groupCounts{}
-	for _, r := range records {
-		key := groupKeyFor(r, groupKeys)
-		gc := counts[key]
-		if gc == nil {
-			gc = &groupCounts{
-				seenTasks:   map[string]struct{}{},
-				activeTasks: map[string]struct{}{},
-			}
-			counts[key] = gc
-		}
-		notDead := deriveStatus(r, alive) != "dead"
-		if r.TaskID == "" {
-			gc.anonTotal++
-			if notDead {
-				gc.anonActive++
-			}
-			continue
-		}
-		gc.seenTasks[r.TaskID] = struct{}{}
-		if notDead {
-			gc.activeTasks[r.TaskID] = struct{}{}
-		}
-	}
-
-	var b strings.Builder
-	lastKey := ""
-	for i, r := range records {
-		key := groupKeyFor(r, groupKeys)
-		if key != lastKey {
-			if lastKey != "" {
-				b.WriteString("\n") // blank line between groups
-			}
-			gc := counts[key]
-			total := len(gc.seenTasks) + gc.anonTotal
-			active := len(gc.activeTasks) + gc.anonActive
-			b.WriteString(renderProjectHeader(projectDisplay(r), total, active))
-			lastKey = key
-		}
-
-		status := deriveStatus(r, alive)
-		selected := i == cursor
-		row := renderAgentLine(r, status, selected, idW, taskW, width)
-		if !selected {
-			b.WriteString(row)
-			b.WriteString("\n")
-			continue
-		}
-		// Selected: pin row + detail block under a dark-blue
-		// highlight. lipgloss handles ANSI-reset reapplication so
-		// the internal fg colors survive the wrapper.
-		//
-		// width-1 leaves the same 1-cell right margin titleRow and
-		// divider use — padding to the full terminal width writes
-		// into the final column and re-triggers the phantom-newline
-		// auto-wrap that adds a stray row to the highlight, which
-		// throws off padToBottom's height accounting and slides the
-		// footer off-screen.
-		detail := renderAgentDetail(r, status)
-		block := row + "\n" + strings.TrimRight(detail, "\n")
-		if width > 1 {
-			b.WriteString(selectedRowStyle.Width(width - 1).Render(block))
-		} else {
-			b.WriteString(block)
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-// renderProjectHeader returns "rainier (3 tasks, 1 active)" with the
-// project label bold-fg and the count dim. Empty project labels show
-// as "(no project)" so legacy / pre-spawn records still get a header
-// instead of slipping into a nameless group.
-func renderProjectHeader(name string, total, active int) string {
-	label := name
-	if label == "" || label == "-" {
-		label = "(no project)"
-	}
-	suffix := fmt.Sprintf("(%d task%s, %d active)", total, plural(total), active)
-	return groupHeaderStyle.Render(label) + " " + dimStyle.Render(suffix) + "\n"
-}
-
-// renderAgentLine renders one collapsed agent row.
-//
-// Layout (cells, monospaced):
-//
-//	"▶ " | "● " | id | "  " | task   <flex filler>   "  90%" "  14m" "  doing"
-//
-// The right-side stat columns (ctx % / age / status word) right-align
-// to the terminal edge: a calculated filler of spaces sits between
-// the task cell and the right block so percent/age/status anchor at
-// width-of-terminal. When the terminal width is unknown (early
-// render before WindowSizeMsg lands) we fall back to a single-gap
-// layout — nothing is right-aligned, but the row still renders.
-//
-// The 2-char gutter holds the cursor arrow on the selected row and
-// is blank otherwise. Cursor glyph "▶" + bold cyan matches the v2
-// mockup.
-func renderAgentLine(r *agent.Record, status string, selected bool,
-	idW, taskW, width int) string {
-
-	glyph, glyphStyle := glyphFor(status)
-	id := padRight(r.ID, idW)
-	task := truncate(defaultStr(r.TaskID, "-"), taskW)
-	ctxText, ctxStyle := formatCtxPct(r.ContextPct)
-	age := padLeft(humanAge(time.Since(r.SpawnedAt)), 5)
-	label := statusLabel(status)
-
-	gutter := "  "
-	if selected {
-		gutter = cursorStyle.Render("▶ ")
-	}
-
-	// Left half: gutter + glyph + id + 2-space gap + task name.
-	// Task isn't padded to taskW here — width-based filler does the
-	// alignment instead, so short task names don't drag the right
-	// columns inward.
-	left := gutter +
-		glyphStyle.Render(glyph+" ") +
-		idStyle.Render(id) + "  " +
-		taskStyle.Render(task)
-
-	// Right half: ctx % (5 cells) + 2-space gap + age (5 cells) +
-	// 2-space gap + status (statusColW cells). Status padded so the
-	// total right-block width is identical across rows — otherwise
-	// "doing" rows (5) and "blocked" rows (7) push the percent
-	// column to different offsets and the columns visibly drift.
-	right := ctxStyle.Render(ctxText) + "  " +
-		dimStyle.Render(age) + "  " +
-		statusStyleFor(status).Render(padRight(label, statusColW))
-
-	// Plain widths (cells, ignoring ANSI escapes) drive the filler
-	// math. width-1 leaves a 1-cell right margin so the status word
-	// never lands in the terminal's final column — see titleRow for
-	// the phantom-newline rationale. The selected row's bg highlight
-	// is applied by the caller at the Width(width) wrapper, so we
-	// don't need to compensate for it here.
-	leftW := lipgloss.Width(left)
-	rightW := lipgloss.Width(right)
-	gap := (width - 1) - leftW - rightW
-	if width <= 0 || gap < 2 {
-		gap = 2 // narrow terminals + early renders fall back to a flat gap
-	}
-	return left + strings.Repeat(" ", gap) + right
-}
-
-// renderAgentDetail returns the 2-line block under the selected row:
-// progress/status quote and inline action chips. Hangs off the row
-// at a 7-char indent (gutter + glyph + ~2 chars into id) so it
-// visually subordinates to the row above.
-func renderAgentDetail(r *agent.Record, status string) string {
-	const indent = "       " // 7 cells
-
-	var b strings.Builder
-	if line := agentProgressLine(r, status); line != "" {
-		b.WriteString(indent)
-		b.WriteString(detailStyle.Render(line))
-		b.WriteString("\n")
-	}
-	chips := strings.Join(actionChipsFor(status), "  ")
-	b.WriteString(indent)
-	b.WriteString(chips)
-	b.WriteString("\n")
-	return b.String()
-}
-
-// agentProgressLine builds the contextual one-liner under the
-// selected row. Blocked agents get their reason in quotes (or a
-// generic prompt if no reason was recorded); dead agents get an
-// archive hint; otherwise we summarize last-activity age, mode, and
-// handoff count.
-func agentProgressLine(r *agent.Record, status string) string {
-	switch status {
-	case "dead":
-		return "session ended — press [h] to recover or [x] to archive"
-	case "blocked":
-		if r.BlockedReason != nil && strings.TrimSpace(*r.BlockedReason) != "" {
-			return "⏸ \"" + strings.TrimSpace(*r.BlockedReason) + "\""
-		}
-		return "⏸ blocked — needs your input"
-	case "auto-yellow", "auto-red", "precompact":
-		return "⊕ handoff in flight (" + status + ")"
-	}
-	var parts []string
-	if !r.LastActivityTS.IsZero() {
-		parts = append(parts, "active "+humanAge(time.Since(r.LastActivityTS))+" ago")
-	}
-	if r.Mode != "" {
-		parts = append(parts, r.Mode)
-	}
-	if r.HandoffNumber > 0 {
-		parts = append(parts, fmt.Sprintf("handoff #%d", r.HandoffNumber))
-	}
-	return strings.Join(parts, " · ")
-}
-
-// actionChipsFor returns the inline action chips shown on the
-// selected row. Status-aware so we don't dangle keys that won't
-// work.
-//
-// auto-yellow keeps the full chip set because the queue journal
-// isn't written until the agent reaches MILESTONE. In the window
-// between "HANDOFF REQUESTED" being injected and that journal
-// landing, both `fleet handoff` and `fleet rm` still work
-// (cmd/fleet/rm.go:99 only refuses when the journal file exists).
-// [h] is the operator's escape hatch when the auto-handoff
-// stalls — observed when the agent goes idle after Yellow fires
-// without ever taking another turn to emit MILESTONE; without
-// [h] the agent stays stuck in auto-yellow forever.
-//
-// auto-red and precompact happen after MILESTONE → journal exists
-// → both `fleet handoff` and `fleet rm` will refuse → hide them.
-//
-// Dead agents keep [h] AND [x] because either could be the right
-// recovery path: if a journal landed before the session died, only
-// `fleet handoff` (or `fleet drain`) resumes recovery; otherwise
-// `fleet rm` cleans up. Showing both lets the operator pick —
-// agentProgressLine surfaces the same hint inline.
-func actionChipsFor(status string) []string {
-	switch status {
-	case "dead":
-		return []string{
-			keyChip("[h]", "handoff"),
-			keyChip("[x]", "archive"),
-		}
-	case "auto-red", "precompact":
-		return []string{keyChip("[a]", "attach")}
-	}
-	// auto-yellow falls through to the default (full chip set) — see
-	// comment above.
-	return []string{
-		keyChip("[a]", "attach"),
-		keyChip("[h]", "handoff"),
-		keyChip("[x]", "archive"),
-	}
-}
-
 // renderAlertBanner aggregates the urgent counts across all records
 // into a single line. Empty when nothing's wrong — a clean dashboard
 // shouldn't waste a line on "0 of everything".
@@ -1194,35 +842,6 @@ func renderAlertBanner(records []*agent.Record, alive map[string]bool) string {
 	return strings.Join(parts, "   ") + "\n"
 }
 
-// footerSummary builds the one-line "N projects · M agents · K blocked"
-// summary shown above the global chip row. Project count keys on
-// the cached projectGroupKey so display tweaks don't change the
-// count, matching the renderAgents grouping.
-func footerSummary(records []*agent.Record, alive map[string]bool, groupKeys map[string]string) string {
-	projects := map[string]struct{}{}
-	var blocked, dead int
-	for _, r := range records {
-		projects[groupKeyFor(r, groupKeys)] = struct{}{}
-		switch deriveStatus(r, alive) {
-		case "blocked":
-			blocked++
-		case "dead":
-			dead++
-		}
-	}
-	parts := []string{
-		fmt.Sprintf("%d project%s", len(projects), plural(len(projects))),
-		fmt.Sprintf("%d agent%s", len(records), plural(len(records))),
-	}
-	if blocked > 0 {
-		parts = append(parts, fmt.Sprintf("%d blocked", blocked))
-	}
-	if dead > 0 {
-		parts = append(parts, fmt.Sprintf("%d dead", dead))
-	}
-	return strings.Join(parts, " · ")
-}
-
 // glyphFor returns the single-character status glyph and its lipgloss
 // style. Glyphs match the v2 mockup: filled green dot for doing, solid
 // orange bar for blocked, cyan dot for review, dim ✗ for dead.
@@ -1248,91 +867,12 @@ func glyphFor(status string) (string, lipgloss.Style) {
 	return "·", dimStyle
 }
 
-// formatCtxPct returns the right-aligned 5-cell context-percent text
-// and the health-tinted style. Renders "    —" when the agent has no
-// context source yet — same column footprint, no number.
-func formatCtxPct(p *float64) (string, lipgloss.Style) {
-	if p == nil {
-		return "    —", dimStyle
-	}
-	pct := int(*p)
-	if pct > 999 {
-		pct = 999 // clamp absurd values without breaking the column width
-	}
-	return fmt.Sprintf("%4d%%", pct), ctxColorFor(*p)
-}
-
-// ctxColorFor maps a context percentage to its health color.
-// Thresholds match fleet-guard: <50 healthy, 50-69 warning, ≥70 hot.
-func ctxColorFor(p float64) lipgloss.Style {
-	switch {
-	case p < 50:
-		return statusLiveStyle
-	case p < 70:
-		return statusBlockedStyle // orange — warning band, not yet hot
-	default:
-		return statusUrgentStyle
-	}
-}
-
-// columnWidth returns max(len(extract(r))) across records, floored
-// to min. Uses lipgloss.Width so multi-byte runes count their cell
-// span, not their byte length.
-func columnWidth(records []*agent.Record, extract func(*agent.Record) string, min int) int {
-	w := min
-	for _, r := range records {
-		if n := lipgloss.Width(extract(r)); n > w {
-			w = n
-		}
-	}
-	return w
-}
-
 func padRight(s string, w int) string {
 	cur := lipgloss.Width(s)
 	if cur >= w {
 		return s
 	}
 	return s + strings.Repeat(" ", w-cur)
-}
-
-func padLeft(s string, w int) string {
-	cur := lipgloss.Width(s)
-	if cur >= w {
-		return s
-	}
-	return strings.Repeat(" ", w-cur) + s
-}
-
-// truncate clips s to w cells, replacing the tail with "…" when it
-// overflows. Width is cell-based so multi-byte runes don't undercount.
-func truncate(s string, w int) string {
-	if w <= 0 {
-		return ""
-	}
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-	// Walk runes from the start until the next rune would push us
-	// past w-1 cells, then append "…" to use the last cell.
-	out := make([]rune, 0, w)
-	used := 0
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if used+rw > w-1 {
-			break
-		}
-		out = append(out, r)
-		used += rw
-	}
-	return string(out) + "…"
-}
-
-func plural(n int) string {
-	if n == 1 {
-		return ""
-	}
-	return "s"
 }
 
 func defaultStr(s, def string) string {
@@ -1372,40 +912,6 @@ func projectGroupKey(r *agent.Record) string {
 		resolved = filepath.Clean(r.Cwd)
 	}
 	return resolved + "\x00" + tag
-}
-
-// projectDisplay derives the human-readable project label for the
-// PROJECT column and the project-group header. Prefers the last two
-// path segments of r.Cwd joined with "/" — /Users/op/projects/fleet
-// renders as "projects/fleet" — so dashboards from typical
-// ~/projects/<repo> layouts read like file paths.
-//
-// filepath.Clean drops trailing slashes and "/." tails before the
-// Base/Dir split (codex iter-9 P3) — without it, --cwd values like
-// "/path/to/repo/" or "/path/to/repo/." would derive base="repo"
-// AND parent="repo" (or "."), rendering "repo/repo" or "repo/.".
-//
-// Fallback (no Cwd captured): r.Project as-is. r.Project is
-// operator-set via `--project` (default "default") and never
-// auto-derived from the cwd — so legacy records and new records
-// from the same checkout DON'T inherently disagree. They DO
-// disagree when an operator explicitly chose `--project foo-bar`
-// for a checkout at /path/to/foo/bar (rare); that case lands in
-// two project headers, which is honest because the Project tag
-// truly differs.
-func projectDisplay(r *agent.Record) string {
-	if r.Cwd != "" {
-		clean := filepath.Clean(r.Cwd)
-		base := filepath.Base(clean)
-		parent := filepath.Base(filepath.Dir(clean))
-		if parent != "" && parent != "." && parent != string(filepath.Separator) {
-			return parent + "/" + base
-		}
-		if base != "" && base != "." {
-			return base
-		}
-	}
-	return defaultStr(r.Project, "-")
 }
 
 // deriveStatus picks one short label that summarizes the agent's
@@ -1494,38 +1000,20 @@ func humanAge(d time.Duration) string {
 	}
 }
 
-// Lipgloss styles. Palette matches the v2 mockup screenshot —
-// soft cyan title, orange/red/cyan alert glyphs, yellow action
-// chips, dim slate dividers. Co-located with View() so changes
-// are easy to scan.
+// Lipgloss styles. Palette matches the v0.2 mockup. v0.1-only styles
+// (titleStyle/userStyle/idStyle/taskStyle/groupHeaderStyle/detailStyle/
+// coachStyle/selectedRowStyle) were deleted in issue #53 along with
+// the agents-list view. Status & glyph styles remain because they
+// drive the dashboard's alert banner and agent-row coloring.
 var (
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117")) // soft cyan
-	userStyle    = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color("245"))
 	dividerStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	cursorStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 	dimStyle     = lipgloss.NewStyle().Faint(true)
 	errStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
 	promptStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("226"))
-	// Cyan chip key + light foreground label. Bare-foreground (no
-	// Faint) keeps the labels readable against the selected row's
-	// dark-blue background. Cyan keys match the title color in the
-	// v2 mockup — yellow read as alert, not as affordance.
-	keyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
-	keyLabelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 
-	// v2 layout styles.
-	idStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // dim — IDs are anchors, not focal
-	taskStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("252")) // task name reads at default fg
-	groupHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
-	detailStyle      = lipgloss.NewStyle().Faint(true).Italic(true)
-	coachStyle       = lipgloss.NewStyle().Faint(true).Italic(true).Foreground(lipgloss.Color("245"))
-
-	// Selected row gets a subtle dark-blue background that spans the
-	// full terminal width. Width is applied at render time (m.width),
-	// not on the style itself.
-	selectedRowStyle = lipgloss.NewStyle().Background(lipgloss.Color("237"))
-
-	// Glyph styles for the leading status icon column.
+	// Glyph styles for the leading status icon column on agent rows
+	// + the alert banner.
 	glyphLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))              // green
 	glyphAskingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("87"))   // bright cyan — needs answer
 	glyphReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))             // soft cyan — needs review
@@ -1536,9 +1024,6 @@ var (
 	glyphUrgentStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203"))
 
 	// Per-status colors for the STATUS label and the alert banner.
-	// The padded plain text is built first (so column widths remain
-	// correct), then wrapped in these styles — lipgloss adds
-	// zero-width ANSI escapes so the alignment math is unaffected.
 	statusLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))              // green — doing
 	statusAskingStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("87"))   // bright cyan — asking
 	statusReviewStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))             // soft cyan — review
@@ -1548,10 +1033,8 @@ var (
 	statusHandoffStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("220"))
 	statusUrgentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("203")) // red — hot context / auto-red
 
-	// Upgrade-nudge banner. Bold cyan ⬆ glyph (matches the title's
-	// title-bar accent) + light foreground for the message body. Sits
-	// above the alert banner so the product-level "you're behind"
-	// signal doesn't compete with the per-agent alert chips.
+	// Upgrade-nudge banner. Bold cyan ⬆ glyph + light foreground for
+	// the message body.
 	upgradeBannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 )
 
@@ -1610,11 +1093,4 @@ func statusLabel(status string) string {
 		return "handoff"
 	}
 	return status
-}
-
-// keyChip renders a "[k]label" pair with a colored bracketed key and
-// a foreground label. Mockup uses [a]attach (no space) so the chips
-// read as compact tokens, not "key + descriptor".
-func keyChip(key, label string) string {
-	return keyStyle.Render(key) + keyLabelStyle.Render(label)
 }

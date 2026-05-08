@@ -8,7 +8,6 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -53,6 +52,8 @@ const (
 	modePickRepo
 	modePromptDispatch
 	modeConfirmArchive
+	modePromptTaskAdd
+	modePromptSearch
 )
 
 // flash is the banner surfaced under the table after a keybind action
@@ -116,107 +117,79 @@ var runFleetCmd = func(args []string, msgFn func(string, error) tea.Msg) tea.Cmd
 // (handoff, attach, dispatch). Navigation keys stay in handleKey.
 // Returns (model, cmd, handled). When handled=false, caller falls
 // back to the navigation handler.
+//
+// Row-type gating (issue #53 / codex iter-1 fix in 240a3b0):
+// the dashboard cursor walks across project, task, worker, and agent
+// rows; [a]/[h]/[x] only apply to certain row types. We dispatch on
+// row type and surface a flash banner when the operator presses an
+// action that doesn't apply to the current row — this makes the
+// target visible before any destructive op.
 func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
-	if m.mode == modePickRepo {
+	switch m.mode {
+	case modePickRepo:
 		return m.handlePickerKey(key)
-	}
-	if m.mode == modePromptDispatch {
+	case modePromptDispatch:
 		return m.handlePromptKey(key)
-	}
-	if m.mode == modeConfirmArchive {
+	case modeConfirmArchive:
 		return m.handleConfirmArchiveKey(key)
+	case modePromptTaskAdd:
+		return m.handleTaskAddKey(key)
+	case modePromptSearch:
+		return m.handleSearchKey(key)
 	}
-	// Record-scoped actions ([h]/[x]/[a]) operate on m.records[m.cursor],
-	// but the dashboard view does not render that selection. Without a
-	// gate, [j]/[k] move a hidden cursor and the next action could
-	// attach/handoff/archive the wrong agent. Require an explicit switch
-	// to the agents view first via [g] — keeps the action contract
-	// unchanged and makes the target visible before any destructive op.
-	if m.view == viewDashboard {
-		switch key {
-		case "h", "x", "a":
-			m.flash = &flashMsg{
-				text:  fmt.Sprintf("[%s] needs the agents view — press [g] to switch, then retry", key),
-				isErr: true,
-			}
-			return m, nil, true
+	// Help / detail overlays close on any key. The dismissal absorbs
+	// the key (handled=true) so [j]/[k] don't simultaneously move the
+	// hidden cursor — operator must press the nav key again after the
+	// overlay is gone, which is the right cognitive model for a modal.
+	// Quit keys ([q]/ctrl+c) are NOT absorbed: they fall through so
+	// the operator can still exit while a panel is up.
+	if m.showHelp || m.detail != nil {
+		if key == "q" || key == "ctrl+c" {
+			return m, nil, false
 		}
+		m.showHelp = false
+		m.detail = nil
+		return m, nil, true
 	}
 	switch key {
-	case "h":
-		if cur := m.selectedRecord(); cur != nil {
-			// Gate [h] only for COMMITTED handoff states
-			// (auto-red / precompact) — those have a queue journal
-			// on disk, so a manual handoff would race against the
-			// in-flight one. auto-yellow is NOT gated: the journal
-			// hasn't been written yet (only after MILESTONE), and
-			// [h] is the operator's escape hatch when the auto
-			// handoff stalls — observed when the agent goes idle
-			// after Yellow fires without ever taking another turn
-			// to emit MILESTONE. Without [h], such agents stay
-			// stuck forever.
-			status := deriveStatus(cur, m.aliveByID)
-			if status == "auto-red" || status == "precompact" {
-				m.flash = &flashMsg{
-					text:  fmt.Sprintf("agent %s already has a handoff journal — `fleet drain` first", cur.ID),
-					isErr: true,
-				}
-				return m, nil, true
-			}
-			return m, m.startHandoff(cur.ID), true
-		}
+	case "?":
+		m.showHelp = true
 		return m, nil, true
-	case "x":
-		// [x] archive: enter a y/esc confirmation mode rather than firing
-		// immediately. rm is destructive (kills the tmux session + deletes
-		// the record, no replacement) and a stray keypress on a busy
-		// dashboard would lose work irretrievably.
-		//
-		// Gate auto-red / precompact: post-MILESTONE handoff states
-		// have a queue journal on disk, and `fleet rm` refuses while
-		// the journal exists (cmd/fleet/rm.go:99). Match the chip
-		// strip's hide-behavior so the hotkey doesn't end-run the UI.
-		// auto-yellow is NOT gated: that state can exist before the
-		// journal is written, and rm legitimately works there.
-		if cur := m.selectedRecord(); cur != nil {
-			status := deriveStatus(cur, m.aliveByID)
-			if status == "auto-red" || status == "precompact" {
-				m.flash = &flashMsg{
-					text:  fmt.Sprintf("agent %s has a pending handoff journal — `fleet drain` first", cur.ID),
-					isErr: true,
-				}
-				return m, nil, true
-			}
-			m.mode = modeConfirmArchive
-			m.archiveCandidate = cur.ID
+	case "/":
+		m.mode = modePromptSearch
+		m.promptBuf = m.searchFilter
+		return m, nil, true
+	case "esc":
+		// In modeNav, Esc clears the active search filter. Without
+		// this branch, the footer's advertised "/<query> · esc clears"
+		// hint would only work while the search prompt is open — once
+		// committed, the operator would have to re-press [/] just to
+		// dismiss the filter (codex iter-1 P2).
+		if m.searchFilter != "" {
+			m.searchFilter = ""
+			m.dashCursor = 0
 			return m, nil, true
 		}
+		return m, nil, false
+	case "n":
+		// Freeze the target project at press time. Subsequent ticks +
+		// dashboard refreshes can re-sort rows under the prompt; without
+		// this freeze, submit time would resolve the project from the
+		// (now-shifted) dashCursor and the new task could land in the
+		// wrong tasks.md (codex iter-2 P1).
+		m.taskAddProjectFrozen = m.taskAddProject()
+		m.mode = modePromptTaskAdd
+		m.promptBuf = ""
 		return m, nil, true
+	case "enter":
+		return m.openDetail()
+	case "h":
+		return m.actionHandoff()
+	case "x":
+		return m.actionArchive()
 	case "a":
-		if cur := m.selected(); cur != nil {
-			// Pre-flight liveness check: tmux's `attach -t <session>`
-			// on a dead session prints "no sessions" / "can't find
-			// session" and the operator drops back to their shell with
-			// no idea why. The most common cause is claude having
-			// exited inside the tmux session (Ctrl-D / /exit /
-			// SIGCHLD), which terminates the session because claude
-			// was the session's only process. Surface the diagnosis
-			// in-TUI so the operator knows what happened and can
-			// clean up via `[h]` handoff.
-			if !sessionAliveFn(cur.TmuxSession) {
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
-						cur.ID),
-					isErr: true,
-				}
-				return m, nil, true
-			}
-			m.pendingAttach = cur.TmuxSession
-			return m, tea.Quit, true
-		}
-		return m, nil, true
-	case "d", "n":
+		return m.actionAttach()
+	case "d":
 		// [d] enters the repo picker. discoverRepos runs synchronously;
 		// the cost is one Getwd + one ReadDir per project root, fine for
 		// hundreds of repos. If discovery fails (no cwd, no projects/),
@@ -228,6 +201,165 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m, nil, true
 	}
 	return m, nil, false
+}
+
+// actionHandoff dispatches [h] to the agent at the dashboard cursor.
+// Tasks/projects/workers don't have handoff semantics — flash an
+// "doesn't apply" banner so the operator sees why nothing happened.
+func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil || row.kind != rowAgent || row.agent == nil {
+		m.flash = &flashMsg{
+			text:  "[h] handoff applies only to v0.1 agents — move cursor onto an agent row",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	cur := row.agent
+	// Gate [h] only for COMMITTED handoff states (auto-red /
+	// precompact) — those have a queue journal on disk, so a manual
+	// handoff would race against the in-flight one. auto-yellow is
+	// NOT gated: the journal hasn't been written yet (only after
+	// MILESTONE), and [h] is the operator's escape hatch when the
+	// auto handoff stalls.
+	status := deriveStatus(cur, m.aliveByID)
+	if status == "auto-red" || status == "precompact" {
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("agent %s already has a handoff journal — `fleet drain` first", cur.ID),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	return m, m.startHandoff(cur.ID), true
+}
+
+// actionArchive dispatches [x] for the row under the cursor.
+//
+// Worker row → run `fleet workers kill <slug>` (operator wants to
+// terminate a stuck worker). Agent row → enter the archive-confirm
+// mode (rm is destructive, requires y to commit). Other row types
+// flash "doesn't apply".
+func (m Model) actionArchive() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil {
+		m.flash = &flashMsg{text: "[x] no row selected", isErr: true}
+		return m, nil, true
+	}
+	switch row.kind {
+	case rowAgent:
+		if row.agent == nil {
+			return m, nil, true
+		}
+		cur := row.agent
+		status := deriveStatus(cur, m.aliveByID)
+		if status == "auto-red" || status == "precompact" {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("agent %s has a pending handoff journal — `fleet drain` first", cur.ID),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		m.mode = modeConfirmArchive
+		m.archiveCandidate = cur.ID
+		return m, nil, true
+	case rowWorker:
+		// Worker termination from the TUI is deferred to a follow-up
+		// PR — `fleet workers kill` does not exist (only list/prune/
+		// update/worktree-path are wired in cmd/fleet/workers.go), and
+		// SIGTERMing a mid-phase worker has subtle implications
+		// (half-archived state, orphaned worktrees, queue-journal
+		// races) that need their own design pass. Until then, flash
+		// the operator-actionable hint pointing at the existing
+		// `fleet workers prune` path for terminated workers (codex
+		// iter-3 P1 — was wired to a non-existent subcommand).
+		m.flash = &flashMsg{
+			text:  "[x] worker termination not yet wired in TUI — use `fleet workers prune` for finished workers",
+			isErr: true,
+		}
+		return m, nil, true
+	default:
+		m.flash = &flashMsg{
+			text:  "[x] applies only to v0.1 agents in this version — worker kill ships in v0.2.x",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+}
+
+// actionAttach dispatches [a] for the row under the cursor.
+//
+// Agent row → tmux attach to the agent's session.
+// Worker row → open the worker peek detail panel (output.log + state.json).
+// Other row types flash "doesn't apply".
+func (m Model) actionAttach() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil {
+		m.flash = &flashMsg{text: "[a] no row selected", isErr: true}
+		return m, nil, true
+	}
+	switch row.kind {
+	case rowAgent:
+		if row.agent == nil {
+			return m, nil, true
+		}
+		cur := row.agent
+		// Pre-flight liveness check (same behavior as v0.1 [a] flow):
+		// tmux's `attach -t <session>` on a dead session prints "no
+		// sessions" and the operator drops back to their shell with
+		// no idea why. Surface the diagnosis in-TUI.
+		if !sessionAliveFn(cur.TmuxSession) {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
+					cur.ID),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		m.pendingAttach = cur.TmuxSession
+		return m, tea.Quit, true
+	case rowWorker:
+		if row.worker == nil {
+			return m, nil, true
+		}
+		// [a] on a worker = peek (no tmux session to attach to —
+		// workers run as `claude --print` subprocesses). Open the
+		// detail panel inline; same path as [⏎] open on a worker.
+		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
+		m.detail = &detailView{title: title, body: body}
+		return m, nil, true
+	default:
+		m.flash = &flashMsg{
+			text:  "[a] attach applies to agents (tmux) or workers (peek); not to tasks/projects",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+}
+
+// openDetail handles [⏎] open. Renders a detail panel for the row
+// under cursor — task → spec/acceptance/notes; worker → peek; agent
+// → JSON record; project → task list.
+func (m Model) openDetail() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil {
+		return m, nil, true
+	}
+	switch row.kind {
+	case rowTask:
+		body, title := readTaskDetail(row.parentProject, row.task.Slug)
+		m.detail = &detailView{title: title, body: body}
+	case rowProject:
+		body, title := projectDetail(row.project)
+		m.detail = &detailView{title: title, body: body}
+	case rowWorker:
+		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
+		m.detail = &detailView{title: title, body: body}
+	case rowAgent:
+		body, title := readAgentDetail(row.agent)
+		m.detail = &detailView{title: title, body: body}
+	}
+	return m, nil, true
 }
 
 // handleConfirmArchiveKey runs while modeConfirmArchive is active. The
@@ -366,32 +498,6 @@ func (m Model) startDispatch(task string) tea.Cmd {
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		return dispatchDoneMsg{out: out, err: err}
 	})
-}
-
-// selected returns the cursor's record or nil if the list is empty.
-func (m Model) selected() *agentRow {
-	if m.cursor < 0 || m.cursor >= len(m.records) {
-		return nil
-	}
-	r := m.records[m.cursor]
-	return &agentRow{ID: r.ID, TmuxSession: r.TmuxSession}
-}
-
-// selectedRecord returns the underlying *agent.Record at the cursor,
-// or nil if the list is empty. Used by action gates that need to
-// check status fields beyond what agentRow exposes.
-func (m Model) selectedRecord() *agent.Record {
-	if m.cursor < 0 || m.cursor >= len(m.records) {
-		return nil
-	}
-	return m.records[m.cursor]
-}
-
-// agentRow is a thin DTO so tests don't depend on agent.Record's full
-// schema.
-type agentRow struct {
-	ID          string
-	TmuxSession string
 }
 
 // formatHandoffFlash converts a handoffDoneMsg into a banner string.
