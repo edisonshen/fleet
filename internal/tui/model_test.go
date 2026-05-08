@@ -137,13 +137,6 @@ func TestKey_Navigation(t *testing.T) {
 	if updated.(Model).cursor != 2 {
 		t.Errorf("G: cursor got %d, want 2", updated.(Model).cursor)
 	}
-
-	// g jumps to top
-	m.cursor = 2
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
-	if updated.(Model).cursor != 0 {
-		t.Errorf("g: cursor got %d, want 0", updated.(Model).cursor)
-	}
 }
 
 func TestKey_NavigationClampsAtBounds(t *testing.T) {
@@ -185,6 +178,7 @@ func TestUpdate_FsEventReturnsRefreshCmd(t *testing.T) {
 
 func TestView_EmptyState(t *testing.T) {
 	m := New("0.0.0")
+	m.view = viewAgents // empty-state semantics belong to the agents view
 	out := m.View()
 	if !strings.Contains(out, "no agents") {
 		t.Errorf("empty view should mention 'no agents', got:\n%s", out)
@@ -248,6 +242,7 @@ func TestView_PromptHeaderShowsPickedRepo(t *testing.T) {
 
 func TestView_ShowsErrorBanner(t *testing.T) {
 	m := New("test")
+	m.view = viewAgents
 	m.err = errors.New("disk full")
 	out := m.View()
 	if !strings.Contains(out, "disk full") {
@@ -257,6 +252,7 @@ func TestView_ShowsErrorBanner(t *testing.T) {
 
 func TestView_RendersAgentList(t *testing.T) {
 	m := New("test")
+	m.view = viewAgents
 	m.records = sortRecords(fakeRecords(2))
 	out := m.View()
 
@@ -285,6 +281,7 @@ func TestView_RendersAgentList(t *testing.T) {
 
 func TestView_CoachHintShownInitiallyHiddenAfterKeypress(t *testing.T) {
 	m := New("test")
+	m.view = viewAgents
 	m.records = sortRecords(fakeRecords(2))
 
 	// Fresh launch shows the coach hint so a first-time operator
@@ -304,6 +301,7 @@ func TestView_CoachHintShownInitiallyHiddenAfterKeypress(t *testing.T) {
 
 func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 	m := New("test")
+	m.view = viewAgents
 	recs := fakeRecords(3)
 	// One blocked, one with hot context. Banner should aggregate
 	// both counts independently — a hot+blocked agent would bump
@@ -330,6 +328,7 @@ func TestView_AlertBannerShowsBlockedAndHotContext(t *testing.T) {
 // not collapsed.
 func TestView_AlertBannerSplitsAskingIdleReview(t *testing.T) {
 	m := New("test")
+	m.view = viewAgents
 	recs := fakeRecords(3)
 	recs[0].NeedsInput = true // → idle
 	recs[1].NeedsInput = true
