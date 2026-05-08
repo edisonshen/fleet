@@ -226,6 +226,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// hitting in #73 — there the daemon is already up from the
 	// coord's prior boot, so this flag connects immediately.
 	//
+	// Mixed-daemon caveat (codex review #73 iter-4 P1, accepted as
+	// known limitation): if a `fleet-handoff`-prefix daemon is
+	// already running on the host (from a prior handoff flow,
+	// internal/handoff.FirstAction), the broad pgrep guard in
+	// `bootstrap_remote_control` short-circuits and a `fleet-coord`
+	// daemon is never spawned. Our injected --remote-control name
+	// would then fail to attach to the live daemon (prefix mismatch).
+	// The slash-command inbox-relay path has the same brittleness
+	// against the running prefix; both should be addressed by a
+	// daemon-prefix unification refactor in a follow-up PR
+	// (out-of-scope per dispatch brief: "Don't touch daemon spawn").
+	// In a pure-coord environment (the v0.2 dogfood case), this PR
+	// works as designed.
+	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
 	// matching v0.1's manual-attach contract.
