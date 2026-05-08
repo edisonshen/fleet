@@ -988,12 +988,14 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 // Codex iter-3 P1: [d] is the loose-agent picker, not a per-task
 // dispatch — promote is the correct next step.
 func TestKeyA_DetailPanel_TodoTask_PointsAtPromote(t *testing.T) {
-	// liveTaskStatus stub: no on-disk task → returns "" so the
-	// cached taskStatus drives routing. Tests for the live-override
-	// path live separately.
-	origLive := liveTaskStatus
-	liveTaskStatus = func(project, slug string) string { return "" }
-	t.Cleanup(func() { liveTaskStatus = origLive })
+	pdir := withFleetHome(t)
+	// Seed the task so liveTaskStatus returns "todo" (not "")
+	// — codex iter-8 P2 #1 routes "" to a not-found error, which
+	// is a different branch than this test pins.
+	seedBlockedTask(t, pdir, "fleet", "fresh-task-aaaa", tasks.StatusTodo, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
 
 	m := New("test")
 	m.width = 130
@@ -1152,6 +1154,73 @@ func TestKeyEnter_TaskMissing_DoesNotArmTaskAttach(t *testing.T) {
 	}
 	if mm.detail.taskProject != "" {
 		t.Errorf("error panel must NOT carry taskProject, got %q", mm.detail.taskProject)
+	}
+}
+
+// TestKeyA_TaskRow_TaskDeleted_FlashesNotFound pins the codex
+// iter-8 P2 #1 fix: when the task vanished between snapshots
+// (operator-edited tasks.md, archived externally), [a] must flash
+// not-found instead of suggesting promote/retry against a phantom
+// slug. liveTaskStatus returning "" is the signal.
+func TestKeyA_TaskRow_TaskDeleted_FlashesNotFound(t *testing.T) {
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origArch := taskWorkerArchiveExists
+	taskWorkerArchiveExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
+	origDir := taskWorkerDirExists
+	taskWorkerDirExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerDirExists = origDir })
+	origLive := liveTaskStatus
+	liveTaskStatus = func(project, slug string) string { return "" } // task gone
+	t.Cleanup(func() { liveTaskStatus = origLive })
+
+	m := New("test")
+	mm, _, _ := m.attachToTaskOrHint("fleet", "phantom-aaaa", "todo")
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("vanished task should flash not-found, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "no longer exists") {
+		t.Errorf("flash should label task as gone, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "fleet tasks promote") {
+		t.Errorf("must NOT suggest promote for a deleted task, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("must NOT suggest retry for a deleted task, got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_WorkerDirWithoutStateJSON_OpensPeek pins the
+// codex iter-8 P2 #2 fix: during the worker-startup window the
+// worker dir exists before state.json lands. readWorkerDetail
+// already renders "(no state.json yet)" in that case — route
+// through it instead of flashing the no-worker hint.
+func TestKeyA_TaskRow_WorkerDirWithoutStateJSON_OpensPeek(t *testing.T) {
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		// state.json absent → ENOENT.
+		return nil, nil
+	})
+	origArch := taskWorkerArchiveExists
+	taskWorkerArchiveExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
+	origDir := taskWorkerDirExists
+	taskWorkerDirExists = func(project, slug string) bool { return true } // dir exists, state.json doesn't
+	t.Cleanup(func() { taskWorkerDirExists = origDir })
+
+	m := New("test")
+	mm, _, _ := m.attachToTaskOrHint("fleet", "starting-aaaa", "in-progress")
+	// Should open peek panel (readWorkerDetail will render
+	// "(no state.json yet)"). No flash.
+	if mm.flash != nil && mm.flash.isErr {
+		t.Errorf("worker dir present (state.json pending) should open peek without flashing, got %q", mm.flash.text)
+	}
+	if mm.detail == nil {
+		t.Fatalf("[a] should open peek when worker dir exists, got nil panel")
+	}
+	if !strings.Contains(mm.detail.title, "worker") {
+		t.Errorf("panel should be the worker peek, got %q", mm.detail.title)
 	}
 }
 

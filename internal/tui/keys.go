@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -509,9 +510,10 @@ func noWorkerRecoveryHint(project, slug string) string {
 // the task detail panel. Routes by worker existence, NOT by task
 // status:
 //
-//  1. Worker state.json exists OR worker archive dir exists
-//     → open peek panel via attachToTaskWorker (which handles the
-//     active+archive split internally via readWorkerDetail).
+//  1. Worker state.json exists OR worker dir exists (state.json may
+//     not have landed yet — startup/rename window) OR archive dir
+//     exists → open peek panel via attachToTaskWorker (which handles
+//     all three via readWorkerDetail's active+archive split).
 //  2. No worker on disk
 //     → flash status-aware guidance (promote / wait-for-coord /
 //     retry) so the operator's next step matches the task's
@@ -519,14 +521,21 @@ func noWorkerRecoveryHint(project, slug string) string {
 //
 // Codex iter-5 P2 fix: the previous version short-circuited on
 // status BEFORE checking worker existence, hiding existing logs from
-// reset-to-todo recovery flows (e.g. when reconcile flips a failed
-// worker's task back to todo while preserving workers/<slug>/).
+// reset-to-todo recovery flows.
 //
 // Codex iter-3 P2 / iter-4 P3 are preserved here: live status read
 // overrides the snapshot status so a transition between refreshes
-// doesn't dead-end on stale routing. The status fallback is only
-// consulted when no worker exists, so the live-vs-snapshot race
-// can't accidentally suppress a peek.
+// doesn't dead-end on stale routing.
+//
+// Codex iter-8 P2 #1: when liveTaskStatus returns "" AND no worker
+// exists (active/archive/dir), the task has disappeared between the
+// snapshot and the keypress. Surface a not-found error instead of
+// suggesting promote/retry against a phantom slug.
+//
+// Codex iter-8 P2 #2: when the worker dir exists but state.json
+// hasn't landed yet (startup window), readWorkerDetail's
+// "(no state.json yet)" path is the right peek — route through it
+// instead of the no-worker hint.
 func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, tea.Cmd, bool) {
 	if slug == "" {
 		return m, nil, true
@@ -542,14 +551,37 @@ func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, 
 	if err != nil {
 		return m.attachToTaskWorker(project, slug)
 	}
-	// ws == nil → ENOENT on active dir. Try the archive.
+	// ws == nil && err == nil → ENOENT on state.json. Worker dir
+	// itself may still exist (startup window before first
+	// UpdateState). readWorkerDetail's "(no state.json yet)" path
+	// is the right surface in that case (codex iter-8 P2).
+	if taskWorkerDirExists(project, slug) {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// Active dir gone. Try the archive.
 	if taskWorkerArchiveExists(project, slug) {
 		return m.attachToTaskWorker(project, slug)
 	}
-	// No worker, active or archived. Apply status-aware hint. Live
-	// re-read overrides the snapshot when available.
+	// No worker, active or archived. Codex iter-8 P2 #1: if the
+	// task itself is gone (liveTaskStatus empty), surface
+	// not-found instead of routing on stale snapshot status —
+	// suggesting promote/retry for a deleted slug is the same
+	// failure mode the detail-panel path was just hardened against.
+	live := liveTaskStatus(project, slug)
+	if live == "" && snapshotStatus != "" {
+		// snapshot says the task existed but the live read can't
+		// find it → archived/deleted between refreshes.
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"task %s/%s no longer exists in tasks.md (archived or deleted) — refresh and pick a current task",
+				project, slug),
+			isErr: true,
+		}
+		m.detail = nil
+		return m, nil, true
+	}
 	status := snapshotStatus
-	if live := liveTaskStatus(project, slug); live != "" {
+	if live != "" {
 		status = live
 	}
 	switch status {
@@ -578,6 +610,23 @@ func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, 
 	// a stale overlay.
 	m.detail = nil
 	return m, nil, true
+}
+
+// taskWorkerDirExists returns true when ~/.fleet/projects/<project>/
+// workers/<slug>/ exists on disk. Codex iter-8 P2: closes the
+// state.json-not-yet-written gap so the [a] flow doesn't dead-end on
+// the no-worker hint during the worker's first-tick startup window.
+// var so tests can stub.
+var taskWorkerDirExists = func(project, slug string) bool {
+	dir, err := state.WorkerDir(project, slug)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(strings.TrimSuffix(dir, string(filepath.Separator)))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
 }
 
 // attachToTaskWorker is the [a] handler for both task rows and the
@@ -626,11 +675,12 @@ func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 		m.detail = nil
 		return m, nil, true
 	case ws == nil:
-		// ErrNotFound on the active worker dir. Try archive fallback
-		// before declaring "no worker" — readWorkerDetail handles the
-		// active + archive split internally; we only need to know
-		// whether SOME state exists for the slug.
-		if !taskWorkerArchiveExists(project, slug) {
+		// ErrNotFound on state.json. Three reasons to still peek:
+		//   1. worker dir exists but state.json hasn't landed yet
+		//      (startup window — codex iter-8 P2 #2).
+		//   2. archive dir exists (codex iter-3 P2).
+		// Otherwise flash the recovery hint.
+		if !taskWorkerDirExists(project, slug) && !taskWorkerArchiveExists(project, slug) {
 			m.flash = &flashMsg{
 				text:  noWorkerRecoveryHint(project, slug),
 				isErr: true,
@@ -641,8 +691,8 @@ func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 			m.detail = nil
 			return m, nil, true
 		}
-		// Fall through to readWorkerDetail — its archive fallback
-		// (newestArchiveWorkerDir) reads from workers/archive/<slug>-<stamp>/.
+		// Fall through to readWorkerDetail — handles the
+		// "(no state.json yet)" case AND the archive fallback.
 	}
 	body, title := readWorkerDetail(project, slug)
 	m.detail = &detailView{title: title, body: body}
