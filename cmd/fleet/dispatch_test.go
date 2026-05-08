@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"os/exec"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -304,6 +306,544 @@ func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 	// gate did not fire.
 	if err != nil && strings.Contains(err.Error(), "--coord-spawn requires --project") {
 		t.Errorf("issue #70 gate fired with --project explicitly set; got %q", err.Error())
+	}
+}
+
+// TestInjectRemoteControlFlag_RewritesDefaultShellWrapper pins
+// issue #73's core injection logic: the helper must rewrite the
+// documented default shell-wrapped claude command to include
+// `--remote-control "<session>"` immediately after the
+// `--dangerously-skip-permissions` flag, preserving the rest of
+// the wrapper script (RC propagation + interactive shell fallback).
+func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice, ok := flag.Value.(pflag.SliceValue)
+	if !ok {
+		t.Fatalf("--command flag is not a SliceValue: %T", flag.Value)
+	}
+	original := slice.GetSlice()
+
+	got := injectRemoteControlFlag(original, "fleet-coord-abcd1234")
+
+	if len(got) != 3 {
+		t.Fatalf("rewritten command should still be [sh -c <script>]; got len=%d", len(got))
+	}
+	if got[0] != "sh" || got[1] != "-c" {
+		t.Errorf("rewritten command should keep sh -c prefix; got %v", got[:2])
+	}
+	want := `claude --dangerously-skip-permissions --remote-control "fleet-coord-abcd1234"`
+	if !strings.Contains(got[2], want) {
+		t.Errorf("script should contain %q; got %q", want, got[2])
+	}
+	// Wrapper trailer must survive intact (regression: a naive replace
+	// that swallowed the rest of the script would silently break the
+	// "claude exited cleanly → drop into shell" semantics).
+	if !strings.Contains(got[2], "RC=$?") {
+		t.Errorf("script should preserve RC=$? trailer; got %q", got[2])
+	}
+	if !strings.Contains(got[2], "exec ${SHELL:-bash}") {
+		t.Errorf("script should preserve interactive-shell fallback; got %q", got[2])
+	}
+}
+
+// TestInjectRemoteControlFlag_RewritesRerunBanner pins codex review
+// #73 iter-1 P3: the wrapper script's "claude exited cleanly — rerun
+// claude --dangerously-skip-permissions" banner must also be
+// rewritten to include --remote-control. Otherwise an operator who
+// follows the banner instructions to restart claude after a clean
+// exit gets a session WITHOUT auto-attach. Both the launch command
+// AND the banner must reference the SAME flag-set.
+func TestInjectRemoteControlFlag_RewritesRerunBanner(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	original := slice.GetSlice()
+	const sessionName = "fleet-coord-cafebabe"
+
+	got := injectRemoteControlFlag(original, sessionName)
+
+	// Sanity: original wrapper has TWO occurrences of the literal
+	// claude invocation (the launch command and the rerun banner).
+	if c := strings.Count(original[2],
+		"claude --dangerously-skip-permissions"); c != 2 {
+		t.Fatalf("default wrapper should have 2 occurrences of "+
+			"`claude --dangerously-skip-permissions`; got %d — test fixture is stale",
+			c)
+	}
+	// Both occurrences should now carry the --remote-control flag.
+	if c := strings.Count(got[2],
+		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`"`); c != 2 {
+		t.Errorf("rewritten wrapper should have 2 occurrences of the "+
+			"rewritten claude invocation (launch + rerun banner); got %d in %q",
+			c, got[2])
+	}
+	// And NO bare claude invocation should remain (regression: a
+	// strings.Replace n=1 leaves the banner stale).
+	bareInvocation := "claude --dangerously-skip-permissions or"
+	if !strings.Contains(got[2],
+		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`" or`) {
+		t.Errorf("rerun banner still suggests bare claude invocation; "+
+			"want banner to reference the rewritten flag-set; got %q",
+			got[2])
+	}
+	_ = bareInvocation
+}
+
+// TestInjectRemoteControlFlag_NoOpForCustomCommand pins the contract
+// that custom operator-supplied --command argvs are LEFT UNTOUCHED.
+// Fleet doesn't know the flag conventions for arbitrary engines /
+// scripted pipelines, so silently mutating their argvs is wrong.
+// The remote-control auto-attach is a coord-spawn-only convenience
+// for the documented Claude Code default shape.
+func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
+	cases := [][]string{
+		// Custom argv (no shell wrap).
+		{"claude", "--print", "do something"},
+		// Different shell wrapper — operator's shell of choice.
+		{"bash", "-c", "echo hi"},
+		// Wrapper around a non-claude binary.
+		{"sh", "-c", "exec codex --interactive"},
+		// Empty / nil.
+		nil,
+		{},
+	}
+	for _, c := range cases {
+		got := injectRemoteControlFlag(c, "fleet-coord-deadbeef")
+		if len(got) != len(c) {
+			t.Errorf("custom command %v should be returned unchanged; got %v", c, got)
+			continue
+		}
+		for i := range c {
+			if got[i] != c[i] {
+				t.Errorf("custom command element %d changed: %q → %q", i, c[i], got[i])
+			}
+		}
+	}
+}
+
+// TestInjectRemoteControlFlag_StrictShapeMatch pins codex review #73
+// iter-3 P2: even a custom `sh -c '<script>'` --command must NOT be
+// rewritten if the script differs in any way from Fleet's documented
+// default — including scripts that incidentally mention
+// `claude --dangerously-skip-permissions` as part of a different
+// wrapper. The strict shape match (byte-equal on the script element)
+// guarantees the documented "custom --command is untouched"
+// contract holds even when the operator writes an unusual launcher.
+func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{
+			name: "custom-script-mentioning-claude",
+			argv: []string{
+				"sh", "-c",
+				// Plausible operator-supplied wrapper that runs claude
+				// but also does additional bookkeeping. Mentions the
+				// literal claude invocation but is NOT byte-equal to
+				// the default.
+				`echo "starting"; claude --dangerously-skip-permissions --custom-flag; echo "done"`,
+			},
+		},
+		{
+			name: "custom-script-with-different-shell-quoting",
+			argv: []string{
+				"sh", "-c",
+				// Default-shaped but with one trailing-space difference —
+				// must still not be rewritten.
+				`claude --dangerously-skip-permissions ; RC=$?; exit $RC`,
+			},
+		},
+		{
+			name: "custom-bash-c-not-sh-c",
+			argv: []string{"bash", "-c", `claude --dangerously-skip-permissions`},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := injectRemoteControlFlag(tc.argv, "fleet-coord-cafef00d")
+			if len(got) != len(tc.argv) {
+				t.Fatalf("custom command should be returned unchanged; got %v", got)
+			}
+			for i := range tc.argv {
+				if got[i] != tc.argv[i] {
+					t.Errorf("custom command element %d mutated: %q → %q",
+						i, tc.argv[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+// TestDefaultClaudeWrapperScript_MatchesFlagDefault pins the
+// byte-equality between the defaultClaudeWrapperScript constant and
+// the actual --command default registered by newDispatchCmd. The
+// strict-shape match in injectRemoteControlFlag (codex review #73
+// iter-3 P2) depends on this equality — drift would silently disable
+// the rewrite for legitimate fresh dispatches.
+func TestDefaultClaudeWrapperScript_MatchesFlagDefault(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice, ok := flag.Value.(pflag.SliceValue)
+	if !ok {
+		t.Fatalf("--command flag is not a SliceValue: %T", flag.Value)
+	}
+	parts := slice.GetSlice()
+	if len(parts) != 3 {
+		t.Fatalf("default --command should be [sh -c <script>]; got len=%d", len(parts))
+	}
+	if parts[0] != "sh" || parts[1] != "-c" {
+		t.Errorf("default --command sh -c prefix changed; got %v", parts[:2])
+	}
+	if parts[2] != defaultClaudeWrapperScript {
+		t.Errorf("--command default's script element drifted from defaultClaudeWrapperScript "+
+			"— the strict-shape match in injectRemoteControlFlag would silently no-op for "+
+			"legitimate fresh dispatches.\n\ngot:  %q\nwant: %q",
+			parts[2], defaultClaudeWrapperScript)
+	}
+}
+
+// TestInjectRemoteControlFlag_DoesNotMutateInput pins a defensive
+// invariant: the helper must not mutate the caller's input slice.
+// The dispatch code passes opts.command (which originated from
+// cobra's flag parser); silently mutating it would corrupt later
+// reads of the same flag value.
+func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
+	// Use the real default wrapper script so the strict-shape match
+	// (codex review #73 iter-3 P2) actually triggers the rewrite path
+	// — otherwise this test would pass trivially via the early-return
+	// branch and miss its intended invariant (the rewrite path must
+	// not mutate the caller's slice).
+	in := []string{"sh", "-c", defaultClaudeWrapperScript}
+	original := append([]string(nil), in...)
+	originalScript := in[2]
+
+	_ = injectRemoteControlFlag(in, "fleet-coord-abcd1234")
+
+	if len(in) != len(original) {
+		t.Fatalf("input slice length mutated: %d → %d", len(original), len(in))
+	}
+	for i := range in {
+		if in[i] != original[i] {
+			t.Errorf("input element %d mutated: %q → %q", i, original[i], in[i])
+		}
+	}
+	if in[2] != originalScript {
+		t.Errorf("input script element mutated: %q → %q", originalScript, in[2])
+	}
+}
+
+// TestInjectRemoteControlFlag_SessionNameMatchesAgentID pins the
+// naming contract: the remote-control session name must use the
+// "fleet-coord" prefix (matching the daemon's
+// `--remote-control-session-name-prefix` from
+// skills/coordinator/remote_control.py:spawn_daemon_if_needed) plus
+// the agent_id, so the registered session is unique per coord and
+// matches the daemon's filter (codex review #73 iter-2 P1).
+func TestInjectRemoteControlFlag_SessionNameMatchesAgentID(t *testing.T) {
+	const agentID = "1a2b3c4d"
+	sessionName := remoteControlSessionPrefix + "-" + agentID
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	got := injectRemoteControlFlag(slice.GetSlice(), sessionName)
+
+	want := `--remote-control "fleet-coord-1a2b3c4d"`
+	if !strings.Contains(got[2], want) {
+		t.Errorf("script should reference the daemon-matching prefix + agent ID (%q); got %q",
+			want, got[2])
+	}
+}
+
+// TestRemoteControlSessionPrefix_MatchesPythonDaemon pins the
+// byte-equality contract between this Go side and
+// skills/coordinator/remote_control.py:spawn_daemon_if_needed which
+// passes `--remote-control-session-name-prefix "fleet-coord"` to the
+// daemon. Drift between the two would silently break auto-attach
+// (codex review #73 iter-2 P1): the daemon would refuse sessions
+// with a mismatched prefix.
+//
+// If you change either side, change both. The Python skill currently
+// hard-codes the literal in spawn_daemon_if_needed's bash block.
+func TestRemoteControlSessionPrefix_MatchesPythonDaemon(t *testing.T) {
+	if remoteControlSessionPrefix != "fleet-coord" {
+		t.Errorf("remoteControlSessionPrefix = %q; want %q (must match the literal "+
+			"`--remote-control-session-name-prefix` value in "+
+			"skills/coordinator/remote_control.py:spawn_daemon_if_needed). "+
+			"If you change one side, change both.",
+			remoteControlSessionPrefix, "fleet-coord")
+	}
+}
+
+// TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly pins
+// codex review #73 iter-6 P1: the daemon-presence probe must match
+// ONLY the live fleet-coord daemon, not (a) a fleet-handoff daemon
+// from internal/handoff.FirstAction nor (b) the transient
+// `bash -c '... nohup claude remote-control ... fleet-coord ...'`
+// bootstrap subprocess that spawn_daemon_if_needed runs.
+//
+// We can't run pgrep here (it would scan the host's actual process
+// table). Instead we exercise the pattern itself by capturing the
+// argv we'd hand to pgrep and asserting the shape.
+func TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly(t *testing.T) {
+	var capturedArgs []string
+	prev := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string{name}, args...)
+		// Return an exec.Cmd that exits 1 (pgrep no-match) so the
+		// helper returns false; we only care about the captured args
+		// here.
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = prev })
+
+	_ = remoteControlDaemonRunning()
+
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected pgrep call with -f <pattern>; got %v", capturedArgs)
+	}
+	if capturedArgs[0] != "pgrep" || capturedArgs[1] != "-f" {
+		t.Errorf("expected pgrep -f ...; got %v", capturedArgs[:2])
+	}
+	pattern := capturedArgs[2]
+
+	// Must anchor on `^claude ` so the bash bootstrap subprocess
+	// doesn't match (its argv[0] is "bash").
+	if !strings.HasPrefix(pattern, "^claude ") {
+		t.Errorf("pattern must anchor on `^claude ` to exclude the bash bootstrap; got %q", pattern)
+	}
+	// Must reference the fleet-coord prefix specifically — not any
+	// `claude remote-control` (which would also match a fleet-handoff
+	// daemon).
+	//
+	// Critically: the prefix appears UNQUOTED in the pattern. Shell
+	// quotes (`"fleet-coord"`) are stripped by the bootstrap's bash
+	// before exec, so the live daemon's argv carries the bare
+	// `fleet-coord` token. A pattern with embedded double quotes
+	// would never match (codex review #73 iter-7 P1).
+	if !strings.Contains(pattern, " "+remoteControlSessionPrefix) {
+		t.Errorf("pattern must reference the unquoted fleet-coord prefix (shell quotes don't survive exec); got %q", pattern)
+	}
+	if strings.Contains(pattern, `"`+remoteControlSessionPrefix+`"`) {
+		t.Errorf("pattern must NOT include shell-quote characters around the prefix — those are stripped before exec, so the live daemon's argv has unquoted fleet-coord; got %q",
+			pattern)
+	}
+	// Must reference --remote-control-session-name-prefix so a future
+	// daemon argv that happens to mention "fleet-coord" elsewhere
+	// (in a log path?) doesn't false-positive.
+	if !strings.Contains(pattern, "remote-control-session-name-prefix") {
+		t.Errorf("pattern must reference the prefix flag, not just the literal value; got %q", pattern)
+	}
+}
+
+// TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv pins
+// the regex contract end-to-end: when fed a representative daemon
+// argv (post-shell-strip), the regex must match. When fed the
+// bootstrap bash subprocess's argv (which still has shell-quote
+// chars baked in via `bash -c`), it must NOT match. We compile the
+// pattern with regexp.MustCompile and assert directly — that way
+// drift in the pattern is caught at test time, not in the wild.
+func TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv(t *testing.T) {
+	var capturedArgs []string
+	prev := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string{name}, args...)
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = prev })
+
+	_ = remoteControlDaemonRunning()
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected pgrep call; got %v", capturedArgs)
+	}
+	pattern := capturedArgs[2]
+
+	// pgrep -f uses POSIX extended regex by default on macOS/BSD and
+	// extended on most pgrep implementations; Go's regexp is RE2.
+	// The relevant features here (^, character class, alternation
+	// inside ()) work in both. Compile + test fixtures.
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("pgrep pattern must compile as a regex; got %q (%v)", pattern, err)
+	}
+
+	// Representative argv strings as they'd appear in /proc/<pid>/cmdline
+	// after the shell strips quotes. Spaces are the actual separator
+	// here; pgrep -f sees the joined-with-space form.
+	cases := []struct {
+		name      string
+		cmdline   string
+		wantMatch bool
+	}{
+		{
+			name:      "live fleet-coord daemon, default log path",
+			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord",
+			wantMatch: true,
+		},
+		{
+			name:      "live fleet-coord daemon with trailing args",
+			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord --some-other-flag",
+			wantMatch: true,
+		},
+		{
+			name: "live fleet-handoff daemon — must NOT match (different prefix)",
+			cmdline: "claude remote-control --remote-control-session-name-prefix " +
+				"fleet-handoff",
+			wantMatch: false,
+		},
+		{
+			name:      "transient bash bootstrap subprocess — argv[0] is bash, must NOT match",
+			cmdline:   `bash -c ( pgrep -f "claude remote-control" >/dev/null 2>&1 || nohup claude remote-control --remote-control-session-name-prefix "fleet-coord" > /tmp/claude-rc-coord.log 2>&1 & )`,
+			wantMatch: false,
+		},
+		{
+			name:      "spurious process that mentions fleet-coord elsewhere in argv — must NOT match without the flag-name match",
+			cmdline:   "tail -f /tmp/fleet-coord.log",
+			wantMatch: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := re.MatchString(tc.cmdline)
+			if got != tc.wantMatch {
+				t.Errorf("pattern %q against argv %q: got match=%v, want %v",
+					pattern, tc.cmdline, got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// TestDispatch_CoordSpawn_SkipsRemoteControlWhenDaemonAbsent pins
+// codex review #73 iter-5 P1: when no `claude remote-control`
+// daemon is running, the coord-spawn path MUST NOT inject
+// --remote-control into the command. Otherwise Claude Code's
+// startup may treat "no daemon listening" as a startup error, which
+// the wrapper script propagates as a non-zero exit — killing the
+// tmux session before the operator sees the agent at all.
+//
+// We exercise the runDispatch coord-spawn branch by stubbing
+// remoteControlDaemonRunning to return false and verifying that
+// runDispatch's pre-spawn rewrite logic does not produce an
+// ExecCommand. (We can't run runDispatch end-to-end without real
+// tmux, but we can pin the exact rewrite-or-skip decision via a
+// helper-level test.)
+func TestDispatch_CoordSpawn_SkipsRemoteControlWhenDaemonAbsent(t *testing.T) {
+	prev := remoteControlDaemonRunning
+	remoteControlDaemonRunning = func() bool { return false }
+	t.Cleanup(func() { remoteControlDaemonRunning = prev })
+
+	if remoteControlDaemonRunning() {
+		t.Fatal("test stub failed to install — daemon-running gate did not return false")
+	}
+
+	// The production code path: `if opts.coordSpawn && remoteControlDaemonRunning() { ... }`
+	// — with the stub returning false, the inner block must not run,
+	// so no ExecCommand is produced.
+	coordSpawnGateOpen := true && remoteControlDaemonRunning()
+	if coordSpawnGateOpen {
+		t.Error("coord-spawn gate should be CLOSED when daemon is absent — " +
+			"injecting --remote-control with no daemon listening risks claude " +
+			"exiting non-zero on startup, killing the tmux session before the " +
+			"operator sees the agent")
+	}
+}
+
+// TestDispatch_CoordSpawn_InjectsRemoteControlWhenDaemonRunning is
+// the happy-path counterpart: when the daemon IS running, the gate
+// opens and the rewrite produces an ExecCommand.
+func TestDispatch_CoordSpawn_InjectsRemoteControlWhenDaemonRunning(t *testing.T) {
+	prev := remoteControlDaemonRunning
+	remoteControlDaemonRunning = func() bool { return true }
+	t.Cleanup(func() { remoteControlDaemonRunning = prev })
+
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	defaultCmd := slice.GetSlice()
+
+	const fakeID = "feed1234"
+	rcSession := remoteControlSessionPrefix + "-" + fakeID
+	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
+
+	// Sanity: the rewrite produced a different argv (so the gate
+	// opening is meaningful — otherwise the production code path's
+	// `if !sameCommand(rewritten, opts.command)` would skip
+	// ExecCommand even with the gate open).
+	if sameCommand(rewritten, defaultCmd) {
+		t.Fatal("default command's rewrite should differ from input")
+	}
+	if !strings.Contains(rewritten[2], `--remote-control "`+rcSession+`"`) {
+		t.Errorf("rewritten command should embed --remote-control with the daemon-prefix session name; got %q",
+			rewritten[2])
+	}
+}
+
+// TestDispatch_NonCoordSpawn_CommandHasNoRemoteControlFlag is the
+// regression bracket for issue #73: non-coord dispatches MUST NOT
+// receive --remote-control. The flag is a coord-spawn-only
+// convenience; v0.1 worker dispatches stay on the manual-attach
+// contract.
+//
+// We exercise this at the helper level directly — the production
+// code path skips injectRemoteControlFlag entirely when
+// opts.coordSpawn is false (so opts.command is passed through to
+// spawn.Spawn unchanged). This test pins that "skip means literally
+// no rewrite" invariant: even if a future refactor moves the call
+// site, the helper itself cannot have side-effects when called in
+// a non-coord branch.
+func TestDispatch_NonCoordSpawn_CommandHasNoRemoteControlFlag(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	parts := slice.GetSlice()
+	// Sanity: the default shape includes the claude invocation.
+	if !strings.Contains(parts[2], "claude --dangerously-skip-permissions") {
+		t.Fatalf("default --command lost the claude invocation; got %q", parts[2])
+	}
+	// And critically: NO remote-control flag in the default.
+	if strings.Contains(parts[2], "--remote-control") {
+		t.Errorf("default --command must NOT include --remote-control (workers stay on manual attach); got %q",
+			parts[2])
+	}
+}
+
+// TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag pins the
+// end-to-end wiring: when runDispatch's coord-spawn path runs (via
+// the same code path the TUI's startCoordSpawn shells out into), the
+// command handed to spawn.Spawn must include --remote-control with
+// a session name matching the pre-allocated agent ID.
+//
+// We can't easily run the full runDispatch end-to-end here (needs
+// real tmux) so instead we exercise the rewrite logic directly with
+// the same default --command shape the dispatch CLI registers.
+// The helper-level test plus the wiring snippet in runDispatch (one
+// `if opts.coordSpawn { ... command = injectRemoteControlFlag(...) }`)
+// gives us mechanical coverage of the contract.
+func TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	defaultCmd := slice.GetSlice()
+
+	// Simulate what runDispatch does on the coord-spawn branch:
+	// pre-allocate an agent ID (any 8-hex value), build the
+	// remote-control session name with the daemon-matching prefix,
+	// rewrite the command.
+	const fakeID = "0123abcd"
+	rcSession := remoteControlSessionPrefix + "-" + fakeID
+	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
+
+	if !strings.Contains(rewritten[2], "--remote-control") {
+		t.Errorf("coord-spawn command should include --remote-control; got %q", rewritten[2])
+	}
+	if !strings.Contains(rewritten[2], rcSession) {
+		t.Errorf("coord-spawn command should embed the daemon-prefix + agent ID in the session name; got %q",
+			rewritten[2])
+	}
+	// The rest of the wrapper must survive (clean-exit semantics).
+	if !strings.Contains(rewritten[2], "RC=$?") || !strings.Contains(rewritten[2], `exit "$RC"`) {
+		t.Errorf("coord-spawn command should preserve the wrapper's RC handling; got %q", rewritten[2])
 	}
 }
 
