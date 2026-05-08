@@ -14,9 +14,12 @@
 package tui
 
 import (
+	"os"
 	"sort"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // rowKind discriminates which payload the row carries.
@@ -119,7 +122,206 @@ func (m Model) unifiedProjects() []*ProjectRow {
 			RepoSlug: name,
 		})
 	}
+	// Issue #63: task_id fallback signal. When a project's CoordID is
+	// empty (lock body hasn't published yet — coord skill is still
+	// booting), look for an alive agent record tagged
+	// task_id=coord-<name> AND project=<name>. This is the first 10-30s
+	// after dispatch; without this fallback, the spawned coord shows on
+	// RIGHT under "v0.1 agents" until the skill ticks, and the operator
+	// sees a missing-coord row that begs another [a] press → zombie pile.
+	//
+	// Lock body wins when both signals are present (scanProject sets
+	// CoordID only inside the freshness gate); the fallback only fills
+	// when CoordID is empty. We clone any row we mutate so the shared
+	// snapshot pointer stays untouched (m.dashboard.Projects is read by
+	// every renderer + selectedRow, and silent mutation would surprise
+	// downstream callers).
+	for i, p := range out {
+		if p == nil || p.CoordID != "" {
+			continue
+		}
+		rec := findCoordByTaskID(m.records, p.Name)
+		if rec == nil {
+			continue
+		}
+		clone := *p
+		clone.CoordID = rec.ID
+		out[i] = &clone
+	}
 	return out
+}
+
+// coordBootWindow is the time window during which the task_id
+// fallback signal is allowed to bind a coord on LEFT. Beyond this,
+// the only valid coord identity signal is the lock-body branch in
+// scanProject (gated by coord-state.json mtime within
+// coordActiveWindow). The marker file's mtime is the freshness
+// reference: it's last written when the TUI dispatches the coord, so
+// it pins "the coord skill is still booting".
+//
+// Codex iter-4 P1: without a freshness gate the fallback would
+// resurrect any coord whose claude process exited (leaving the tmux
+// shell wrapper alive) — the marker plus the alive shell would re-
+// promote forever, hiding the dead agent from [a]/[x] recovery.
+// 60s is comfortable: the coord skill normally takes 10-30s to boot
+// + write its first coord-state.json. Past 60s either the lock-body
+// branch has taken over (coord is genuinely running) or the boot
+// failed and the operator should triage via the right column.
+const coordBootWindow = 60 * time.Second
+
+// findCoordByTaskID returns the first agent.Record whose task_id is
+// coordTaskID(projectName) AND project matches AND tmux session is
+// alive AND the per-project state tree exists at
+// ~/.fleet/projects/<name>/ AND the project's coord-spawn marker
+// (state.CoordSpawnMarkerPath) contains the candidate agent's ID
+// AND the marker's mtime is within coordBootWindow.
+//
+// Marker gate (codex iter-3 P2) closes the "operator runs `fleet
+// dispatch coord-<project> --project <project> --coord-spawn`" spoof:
+// the spoofer can write a record but cannot make the dashboard treat
+// it as the coord (the marker is written by the TUI's
+// coordSpawnDoneMsg handler post-dispatch and contains the agent ID
+// the TUI is in the middle of attaching to). Without the right
+// marker content, no promotion happens.
+//
+// Marker freshness gate (codex iter-4 P1) keeps the fallback from
+// resurrecting a stale coord whose claude process exited but whose
+// tmux shell wrapper is still alive — beyond the boot window, the
+// only authoritative identity signal is the lock-body branch in
+// scanProject (which requires a fresh coord-state.json tick).
+//
+// Project-tree gate (codex iter-2 P2) keeps legacy records (pre-PR
+// agents with the same task_id shape) from auto-promoting on first
+// upgrade — the TUI's post-issue-#63 auto-spawn always runs
+// state.EnsureProjectInitialized BEFORE dispatch, so post-PR records
+// always satisfy the gate.
+//
+// Distinct from findExistingCoordForProject in keys.go: this one is
+// the dashboard's binding signal (does this agent represent the
+// project's coord visually?); the keys.go counterpart is the [a]
+// idempotency signal. Same predicate; kept separate so the rendering
+// layer doesn't import keys.go's action wiring.
+func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
+	want := coordTaskID(projectName)
+	// Project-tree existence and marker read are 1-3 stats per call,
+	// fast enough to run inline in unifiedProjects on every render.
+	// Cache only if a future profile shows it's hot.
+	if !projectTreeExistsFn(projectName) {
+		return nil
+	}
+	wantID := coordSpawnMarkerFn(projectName)
+	if wantID == "" {
+		return nil
+	}
+	// Freshness gate (codex iter-4 P1): the marker's mtime must be
+	// within coordBootWindow. Beyond that, the lock-body branch in
+	// scanProject is the only valid identity signal.
+	mt, ok := coordSpawnMarkerMtimeFn(projectName)
+	if !ok {
+		return nil
+	}
+	if nowFn().Sub(mt) > coordBootWindow {
+		return nil
+	}
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != want {
+			continue
+		}
+		if r.Project != projectName {
+			continue
+		}
+		if r.ID != wantID {
+			// Marker content names a different agent — this record is
+			// either a duplicate spawn or a spoof. Don't promote.
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionAliveFn(r.TmuxSession) {
+			// codex iter-3 P2: tmux.HasSession returns false for both
+			// "session does not exist" AND transport errors (bad
+			// FLEET_TMUX_SOCKET, restarting server). Both cases are
+			// handled by sessionAliveFn (which is HasSession in
+			// production); a probe failure shouldn't refuse to bind a
+			// known coord. Use sessionProbeFn for the tristate read so
+			// errors fall through to "treat as alive" (don't drop the
+			// claim) rather than "definitively dead".
+			if !sessionProbeOrAliveFn(r.TmuxSession) {
+				continue
+			}
+		}
+		return r
+	}
+	return nil
+}
+
+// projectTreeExistsFn returns true when ~/.fleet/projects/<name>/ is
+// a directory on disk. var so tests can stub the disk check without
+// seeding a tmp tree. Production calls projectTreeExists.
+var projectTreeExistsFn = projectTreeExists
+
+// projectTreeExists is the production stat path used by
+// findCoordByTaskID's anti-promotion gate.
+func projectTreeExists(projectName string) bool {
+	dir, err := state.ProjectDir(projectName)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// coordSpawnMarkerFn returns the agent ID stored in the project's
+// coord-spawn marker file. var so tests can stub. Production calls
+// state.ReadCoordSpawnMarker.
+var coordSpawnMarkerFn = state.ReadCoordSpawnMarker
+
+// coordSpawnMarkerMtimeFn returns the marker file's modification time
+// + ok=true when present. var so tests can stub the freshness check
+// without timing-sensitive disk writes. Production stat-reads the
+// marker; missing returns ok=false.
+var coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+	path, err := state.CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
+}
+
+// nowFn returns the current wall-clock time. var so tests can pin
+// "now" deterministically without touching time.Now globally.
+var nowFn = time.Now
+
+// sessionProbeOrAliveFn returns true when the session is alive OR
+// when the probe failed (transport error — don't drop a claim on a
+// tmux hiccup). False only on a definitive "no such session" answer.
+//
+// Strategy: call sessionAliveFn first (the bool primitive most tests
+// stub). If it says alive, we're done. Only on a "false" answer do
+// we re-probe with the tristate sessionProbeFn to distinguish dead
+// from probe-error. This keeps unit tests that stub only
+// sessionAliveFn from needing to also stub sessionProbeFn for the
+// happy path. Codex iter-3 P2 / iter-6 P2.
+var sessionProbeOrAliveFn = func(session string) bool {
+	if sessionAliveFn(session) {
+		return true
+	}
+	alive, err := sessionProbeFn(session)
+	if err != nil {
+		return true // transport error → conservative: treat as alive
+	}
+	return alive
 }
 
 // dashboardRows assembles the unified row list from unifiedProjects() +

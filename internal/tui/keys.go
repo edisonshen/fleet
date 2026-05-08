@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -91,45 +90,51 @@ type rmDoneMsg struct {
 // coordSpawnDoneMsg is emitted after the project-row [a] auto-spawn
 // path completes. The flow runs as one tea.Cmd in a goroutine:
 //
-//  1. Shell out to `fleet dispatch coord-<UTC stamp> --project <name>
+//  1. Pre-flight: state.EnsureProjectInitialized creates
+//     ~/.fleet/projects/<name>/.locks/ so the spawned coord skill's
+//     first tick can publish coord-state.json + acquire the flock
+//     without racing on a missing parent directory.
+//  2. Shell out to `fleet dispatch coord-<name> --project <name>
 //     --cwd <repo> --prompt "Run the /coordinator skill loop for
-//     project <name>."` (uses dispatch's --prompt flag added in
-//     issue #60).
-//  2. Parse the new agent's ID from dispatch stdout ("agent <id>
-//     spawned" first line) so we know whose lock body to expect.
-//  3. Poll ~/.fleet/projects/<name>/.locks/coordinator.lock body via
-//     readCoordHolder up to lockPollAttempts at lockPollInterval each
-//     until the body equals the new agent ID (the coord skill writes
-//     it after acquiring LOCK_EX in _try_lock).
-//  4. Hand back the resulting tmux session name (and the project name
-//     for the flash) so Update sets pendingAttach + tea.Quit, the same
-//     way the agent-row [a] path does.
+//     project <name>."`. The task_id is STABLE per project (issue
+//     #63): a duplicate [a] press during the skill-boot window
+//     finds the in-flight record via findExistingCoordForProject
+//     and attaches instead of respawning.
+//  3. Parse the new agent's ID from dispatch stdout ("agent <id>
+//     spawned" first line). Compute the tmux session name from the
+//     ID (tmux.SessionName).
+//  4. Hand back projectName + agentID + session. Update sets
+//     pendingAttach + tea.Quit so Run() exec's tmux attach to the
+//     fresh coord — operator watches Claude boot + invoke
+//     /coordinator live.
 //
-// Failures at any step propagate as err: the dispatch failure (binary
-// missing, project name invalid), the agent-ID parse failure (dispatch
-// printed unexpected output), or the lock-poll timeout (dispatch
-// succeeded but the coord skill never acquired the lock — typically
-// the operator has /coordinator unconfigured or claude crashed before
-// the first turn). The agent record stays on disk in all timeout
-// cases; the operator can attach manually via [a] on its right-column
-// row to investigate.
+// Crucially we do NOT poll the coordinator.lock body before attaching
+// (issue #63 fix): the coord skill takes 10-30s to boot + type the
+// /coordinator slash + acquire LOCK_EX. The 2s lock-poll under PR #62
+// fired the spawn-timeout banner under normal operation. Now the lock
+// body publishes asynchronously; the dashboard's task_id-fallback
+// signal renders the agent under its project on LEFT immediately, and
+// the lock-body branch upgrades the freshness gate once the skill ticks.
+//
+// Failures propagate as err: init failure (mkdir denied), dispatch
+// failure (binary missing, invalid project name), or agent-ID parse
+// failure (dispatch printed unexpected output). The agent record stays
+// on disk on parse failure; operator can attach via [a] on its
+// right-column row to investigate.
 type coordSpawnDoneMsg struct {
 	projectName string
 	agentID     string
 	session     string
 	err         error
+	// promptDelivered is true when dispatch's stdout did NOT contain
+	// the dispatchPromptFailedMarker — i.e. SendInitialPrompt
+	// succeeded and /coordinator was actually typed into the pane.
+	// False when dispatch returned 0 but warned about a prompt
+	// delivery failure (the agent is alive but the coord skill never
+	// started; the TUI must not promote it to the project's coord via
+	// the marker file). Codex iter-5 P2.
+	promptDelivered bool
 }
-
-// lockPollInterval / lockPollAttempts bound the coord-spawn lock-
-// acquisition wait. 100ms × 20 = 2s total budget per the issue #60
-// spec ("Wait briefly (≤2s)"). The coord skill's first tick runs
-// immediately after claude boots + types the /coordinator slash —
-// well within 2s on a normal box. Slower environments fall through
-// to the timeout branch and surface a banner.
-const (
-	lockPollInterval = 100 * time.Millisecond
-	lockPollAttempts = 20
-)
 
 // fleetBinary is resolved once at startup via os.Executable() so the
 // TUI invokes ITSELF for sub-commands rather than depending on the
@@ -390,39 +395,40 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 	}
 }
 
-// actionAttachProject is the project-row branch of [a] (issue #60).
+// actionAttachProject is the project-row branch of [a] (issues #60, #63).
 //
-// Two paths:
+// Three paths, in order:
 //
-//   - Existing coord: project.CoordID is set (dashboard's freshness gate
+//  1. Lock-body match: project.CoordID is set (dashboard freshness gate
 //     passed: lock body + coord-state.json mtime within
-//     coordActiveWindow). Find the matching agent.Record by ID, attach
-//     to its tmux session — same machinery as the rowAgent branch.
+//     coordActiveWindow). Find the matching agent.Record by ID, attach.
 //
-//   - No coord: auto-spawn one. Shell out to `fleet dispatch` with
-//     --prompt "Run the /coordinator skill loop for project <name>.",
-//     then poll the project's coordinator.lock body up to 2s for a
-//     match against the new agent ID. On success, set pendingAttach to
-//     the new tmux session and tea.Quit (Run() exec's tmux attach
-//     post-program). On failure (init err, dispatch err, lock-poll
-//     timeout), surface a flash; the half-spawned agent (if dispatch
-//     succeeded but the lock body never published) stays on disk and
-//     the operator can attach via [a] on its right-column row.
+//  2. Task_id fallback: even when CoordID is empty, an agent record
+//     tagged task_id == coord-<project> AND project == <project> with
+//     an alive tmux session is the project's coord by intent — the
+//     skill just hasn't ticked yet (10-30s boot window). Attach to it
+//     instead of spawning a duplicate. This is the primary issue-#63
+//     idempotency mechanism: a second [a] press during the boot window
+//     finds the in-flight record here.
 //
-// Single-coord-per-project enforcement is upstream: the coord skill
-// itself NB-flocks coordinator.lock and exits if it can't acquire.
-// We rely on the dashboard's freshness gate (coord-state.json mtime)
-// to distinguish "alive coord" from "dead coord with stale lock body"
-// before deciding which path to take.
+//  3. No coord: pre-init the project tree, then spawn one. Stable
+//     task_id ("coord-<name>") so subsequent [a] presses route into
+//     path 2 instead of stacking duplicates. Attach immediately after
+//     dispatch returns — no lock-poll (PR #62's 2s budget fired the
+//     spawn-timeout banner under normal operation).
+//
+// Single-coord-per-project enforcement remains upstream: the coord
+// skill NB-flocks coordinator.lock at first tick and exits cleanly if
+// another coord beats it.
 func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
-	// Path 1: fresh coord exists. Look up the record by ID; verify the
-	// session is alive before committing to attach. A coord whose tmux
-	// session died but whose lock body wasn't yet stale would get
-	// dispatched to a dead session otherwise — same UX bug as the
-	// agent-row branch's "no sessions" failure mode.
+	// Path 1: fresh coord exists (lock body + freshness gate). Look up
+	// the record by ID; verify the session is alive before committing
+	// to attach. A coord whose tmux session died but whose lock body
+	// wasn't yet stale would get dispatched to a dead session otherwise
+	// — same UX bug as the agent-row branch's "no sessions" failure mode.
 	if p.CoordID != "" {
 		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
 			if !sessionAliveFn(rec.TmuxSession) {
@@ -439,10 +445,13 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		// CoordID set but no matching record loaded yet (race: dashboard
 		// snapshot picked up the lock body before agentsMsg refreshed).
-		// Fall through to the spawn path's flash on second press —
-		// avoiding the spawn here would leave [a] silently dead. But
-		// rather than spawning a duplicate, surface a hint that the
-		// operator should retry after the next refresh tick.
+		// codex review (P1): falling through to the spawn path here
+		// would launch a duplicate coord while a fresh one already
+		// holds the lock — the loadDashboardCmd / loadAgentsCmd race
+		// is normal under tea.Batch. Surface a retry hint so the
+		// operator can re-press [a] after the next refresh tick. The
+		// task_id fallback below is reachable only when CoordID is
+		// empty, so we don't accidentally route this case there.
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
 				"coord %s for project %s pending refresh — try [a] again in a moment",
@@ -451,7 +460,54 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
-	// Path 2: no coord. Spawn one.
+	// Path 2: task_id fallback. Idempotency for [a] during the
+	// skill-boot window — find the alive in-flight record by task_id
+	// and attach instead of spawning a duplicate (issue #63).
+	if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
+		m.pendingAttach = rec.TmuxSession
+		return m, tea.Quit, true
+	}
+	// Path 2.5: lock-body fallback (codex iter-7 P2). Recovery case
+	// after a prompt-delivery failure: the operator attached and
+	// manually typed /coordinator; the skill ran and wrote the lock
+	// body — but no coord-spawn marker exists (we deliberately
+	// skipped it on the failed dispatch). The dashboard's freshness
+	// gate may also lag if coord-state.json hasn't ticked yet.
+	// Reading the lock body directly bridges that gap: an ID written
+	// into coordinator.lock came from a coord that successfully
+	// acquired LOCK_EX, so it's authoritative regardless of marker
+	// state.
+	if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
+		m.pendingAttach = rec.TmuxSession
+		return m, tea.Quit, true
+	}
+	// Path 2.6: in-flight gate. coordSpawnInFlight tracks projects
+	// whose dispatch goroutine has launched but coordSpawnDoneMsg
+	// hasn't arrived yet. During this window the agent record + marker
+	// don't exist on disk, so paths 1/2/2.5 would all miss and
+	// we'd duplicate-spawn (codex iter-3 P2 follow-up).
+	if m.coordSpawnInFlight[p.Name] {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord spawn for project %s is in flight — wait a moment then re-press [a]",
+				p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	// Path 3: no coord. Pre-init the project tree (so the skill's first
+	// tick can write coord-state.json and acquire the flock), then spawn.
+	if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	if m.coordSpawnInFlight == nil {
+		m.coordSpawnInFlight = map[string]bool{}
+	}
+	m.coordSpawnInFlight[p.Name] = true
 	cwd := coordCwdForProject(m.records, p.Name)
 	return m, m.startCoordSpawn(p.Name, cwd), true
 }
@@ -466,6 +522,133 @@ func findRecordByID(records []*agent.Record, id string) *agent.Record {
 		}
 	}
 	return nil
+}
+
+// coordTaskID returns the canonical task_id used to mark an agent record
+// as the coordinator for projectName. The shape is a stable, deterministic
+// string — NOT a timestamp — so that:
+//
+//   - A second `[a]` press during the boot window finds the in-flight
+//     coord (idempotency: same project → same task_id → existing record
+//     wins, no duplicate spawn).
+//   - The dashboard can fall back to the task_id signal when the lock
+//     body hasn't published yet (issue #63: 10-30s boot window where the
+//     lock body is empty but the agent IS the project's coord by intent).
+//
+// Project names are validated upstream via state.ValidateProjectName,
+// so this never embeds a path-unsafe component.
+func coordTaskID(projectName string) string {
+	return "coord-" + projectName
+}
+
+// findCoordByLockBody returns the alive agent whose ID is written
+// into ~/.fleet/projects/<projectName>/.locks/coordinator.lock. var
+// for stub-ability; production reads the file via dashboard's
+// readCoordHolder helper. Returns (nil, false) when:
+//   - the lock file is missing / empty / malformed body,
+//   - no record has the matching ID,
+//   - the matching record's tmux session is not alive.
+//
+// Used by actionAttachProject's path 2.5 to handle the prompt-
+// delivery-recovery case (codex iter-7 P2): operator attached after
+// a prompt-failed dispatch, typed /coordinator manually, the skill
+// acquired LOCK_EX and wrote its ID into the lock body. The marker
+// file is absent (we skipped writing it), but the lock body is
+// authoritative — re-attach instead of spawning a duplicate.
+//
+// Differs from path 1 (project.CoordID-driven) in that it does NOT
+// require coord-state.json freshness. Lock body is set via LOCK_EX
+// in the coord skill's _try_lock; presence of an ID there means a
+// coord successfully acquired the lock at least once. flock doesn't
+// truncate on release, so a stale body is possible — but we gate on
+// the matching agent's tmux session being alive, which catches the
+// "coord crashed but lock body remains" case.
+var findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
+	root, err := state.Root()
+	if err != nil {
+		return nil, false
+	}
+	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
+	if holderID == "" {
+		return nil, false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != holderID {
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionProbeOrAliveFn(r.TmuxSession) {
+			continue
+		}
+		return r, true
+	}
+	return nil, false
+}
+
+// findExistingCoordForProject searches records for an alive agent
+// already tagged as the coord for projectName. "Tagged" means
+// task_id == coordTaskID(projectName) AND project == projectName
+// AND ID matches the project's coord-spawn marker. "Alive" uses the
+// tristate session probe so a tmux transport error doesn't drop a
+// live claim.
+//
+// Returns (record, true) on a match; (nil, false) when nothing matches
+// or every match has a dead session. Used by the project-row [a] handler
+// to skip a duplicate dispatch when a coord was already spawned for the
+// same project (issue #63's "[a] press during the 30s skill-boot window
+// piles up zombies" failure mode).
+//
+// Marker requirement (codex iter-6 P1): a coord whose initial-prompt
+// delivery FAILED has no marker on disk. The [a] re-attach path must
+// NOT bind that session — the operator's intent on second [a] is to
+// recover from the prompt failure, which means spawning fresh, not
+// dropping back into a plain Claude shell. The marker requirement
+// distinguishes "we successfully booted a coord here" from "we tried
+// to but the prompt didn't land".
+//
+// No freshness / project-tree gates here (codex iter-5 P1): a coord
+// stalled at a permissions prompt past 60s, or one whose project
+// tree got moved, must still be re-attached rather than respawned.
+// The dashboard's findCoordByTaskID is stricter because that's about
+// rendering identity; this is about "is the in-flight session still
+// the right thing to re-enter?"
+//
+// Tristate liveness (codex iter-6 P2): use sessionProbeOrAliveFn so a
+// tmux transport error (bad FLEET_TMUX_SOCKET, restarting server)
+// doesn't drop a live coord and force a duplicate spawn.
+func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
+	want := coordTaskID(projectName)
+	wantID := coordSpawnMarkerFn(projectName)
+	if wantID == "" {
+		// No marker → either no coord ever booted here, or the previous
+		// spawn's prompt failed (so we deliberately skipped writing
+		// the marker). Either way [a] should fall through to spawn.
+		return nil, false
+	}
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != want {
+			continue
+		}
+		if r.Project != projectName {
+			continue
+		}
+		if r.ID != wantID {
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionProbeOrAliveFn(r.TmuxSession) {
+			continue
+		}
+		return r, true
+	}
+	return nil, false
 }
 
 // coordCwdForProject best-guess resolves the working directory for a
@@ -498,25 +681,50 @@ func coordCwdForProject(records []*agent.Record, projectName string) string {
 	return ""
 }
 
+// writeCoordSpawnMarkerFn writes the coord-spawn marker file. var so
+// tests can stub the disk write. Production calls
+// state.WriteCoordSpawnMarker.
+var writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
+
 // dispatchAgentIDPattern matches the first line of `fleet dispatch`
 // stdout: "agent <8-hex-id> spawned". We extract the ID so the
 // follow-up lock-poll knows whose holder to expect. The stdout shape
 // is stable across v0.1 / v0.2 — see cmd/fleet/dispatch.go runDispatch.
 var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawned`)
 
-// startCoordSpawn shells out to `fleet dispatch` with the coord
-// auto-prompt + polls for lock acquisition. Runs entirely inside one
-// tea.Cmd's goroutine so the bubbletea event loop stays responsive
-// during the 2s lock-poll window.
+// dispatchPromptFailedMarker is the stdout sigil printed by
+// runDispatch when SendInitialPrompt failed. The dispatch CLI exits 0
+// in this case (the agent + tmux session ARE up; the operator just
+// has to type the prompt manually) but the coord skill never started
+// — so the TUI must NOT write the coord-spawn marker, which would
+// cause the dashboard to render a plain Claude session as the
+// project's verified coord (codex iter-5 P2).
 //
-// task ID format: "coord-<UTC YYYYMMDD-HHMMSS>" — sortable + unique
-// across rapid re-spawns. The meaningful identifier is the
-// agent.NewID() the spawn assigns; the task ID is just a label so the
-// agent record's TaskID isn't empty.
+// Stable across the dispatch.go output shape; the CLI test
+// TestDispatch_PromptFailureWarningShape pins the literal text.
+const dispatchPromptFailedMarker = "initial prompt not delivered"
+
+// startCoordSpawn shells out to `fleet dispatch` with the coord
+// auto-prompt and returns immediately (issue #63: no lock-poll). On
+// success the resulting coordSpawnDoneMsg carries the new agent's ID
+// + tmux session; Update sets pendingAttach + tea.Quit so Run() exec's
+// tmux attach and the operator watches Claude boot live.
+//
+// task ID format: "coord-<projectName>" — stable + deterministic per
+// project. A duplicate [a] press during the skill-boot window finds
+// the existing record via findExistingCoordForProject and attaches
+// without re-dispatching (idempotency). Project names pass through
+// state.ValidateProjectName upstream, so embedding the name is path-
+// safe.
 func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
-	taskID := fmt.Sprintf("coord-%s", time.Now().UTC().Format("20060102-150405"))
+	taskID := coordTaskID(projectName)
 	prompt := fmt.Sprintf("Run the /coordinator skill loop for project %s.", projectName)
-	args := []string{"dispatch", taskID, "--project", projectName, "--prompt", prompt}
+	// --coord-spawn whitelists the reserved "coord-" task_id prefix at
+	// the dispatch CLI (issue #63 codex iter-1 P2). Without it, an
+	// operator-supplied `fleet dispatch coord-foo` would create a
+	// worker the dashboard treats as the project's coord; with it,
+	// only this code path can write the prefix.
+	args := []string{"dispatch", taskID, "--project", projectName, "--coord-spawn", "--prompt", prompt}
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}
@@ -528,10 +736,11 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			}
 		}
 		// Parse the new agent's ID from dispatch stdout. Without it we
-		// can't tell which holder we're waiting for and would have to
+		// can't tell which session to attach to and would have to
 		// flash "spawned but can't track" — a bad UX. Treat parse
 		// failure as fatal so the operator notices the dispatch output
-		// drift before this becomes a silent "lock never matches" loop.
+		// drift; the agent record itself remains on disk and the
+		// operator can attach via [a] on its right-column row.
 		match := dispatchAgentIDPattern.FindStringSubmatch(out)
 		if len(match) != 2 {
 			return coordSpawnDoneMsg{
@@ -540,54 +749,17 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			}
 		}
 		agentID := match[1]
-		// Poll the coord lock for body == agentID. The coord skill writes
-		// it inside _try_lock after acquiring LOCK_EX | LOCK_NB; until
-		// the first tick fires, the body is empty (or carries a stale
-		// previous holder, dropped by the truncate-before-write in
-		// loop.py). On match → success; on timeout → return the agent
-		// ID anyway so the operator knows the spawn happened (and the
-		// agent shows up on the right column).
-		session := tmux.SessionName(agentID)
-		if pollCoordLock(projectName, agentID, lockPollAttempts, lockPollInterval) {
-			return coordSpawnDoneMsg{
-				projectName: projectName,
-				agentID:     agentID,
-				session:     session,
-			}
-		}
+		// Codex iter-5 P2: if dispatch's stdout warned about a prompt
+		// delivery failure, the coord skill never started — propagate
+		// the signal so model.Update skips the marker write.
+		promptOK := !bytes.Contains([]byte(out), []byte(dispatchPromptFailedMarker))
 		return coordSpawnDoneMsg{
-			projectName: projectName,
-			agentID:     agentID,
-			err: fmt.Errorf(
-				"coord spawn timed out — agent %s spawned but lock body never published; check tmux session %s",
-				agentID, session),
+			projectName:     projectName,
+			agentID:         agentID,
+			session:         tmux.SessionName(agentID),
+			promptDelivered: promptOK,
 		}
 	})
-}
-
-// pollCoordLock polls coordinator.lock every interval for up to attempts
-// iterations, returning true once readCoordHolder returns wantID. var so
-// tests can stub the timing-sensitive loop without sleeping for real.
-//
-// Sleeps BEFORE the read (except the first iteration), not after. Sleeping
-// after the last failed check would push the total budget 1×interval past
-// the documented "≤2s" without buying anything — the loop is about to
-// return false either way.
-var pollCoordLock = func(projectName, wantID string, attempts int, interval time.Duration) bool {
-	root, err := state.Root()
-	if err != nil {
-		return false
-	}
-	projectsRoot := filepath.Join(root, "projects")
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			time.Sleep(interval)
-		}
-		if got := readCoordHolder(projectsRoot, projectName); got == wantID {
-			return true
-		}
-	}
-	return false
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:

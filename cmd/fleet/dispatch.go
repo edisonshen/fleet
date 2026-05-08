@@ -29,7 +29,24 @@ type dispatchOpts struct {
 	// is bootstrapped non-interactively with `Run the /coordinator skill
 	// loop for project <name>.`
 	prompt string
+	// coordSpawn is the internal flag that whitelists the reserved
+	// "coord-<project>" task_id prefix. The dashboard's task_id
+	// fallback signal (issue #63) treats agents tagged with this
+	// prefix as the project's coord — without this gate, an operator
+	// could shell out `fleet dispatch coord-foo --project foo` and
+	// hijack the dashboard's coord-on-LEFT slot for a worker session.
+	// Set only by the TUI's startCoordSpawn shell-out.
+	coordSpawn bool
 }
+
+// CoordTaskIDPrefix is the reserved task_id prefix used to mark a
+// dispatch as a project's coordinator. The TUI's project-row [a]
+// auto-spawn flow writes "coord-<project>" via the --coord-spawn
+// CLI flag; the dashboard reads the prefix as a fallback identity
+// signal during the 10-30s skill-boot window before the lock body
+// publishes (issue #63). Operator-supplied dispatches with this
+// prefix are rejected by runDispatch unless --coord-spawn is set.
+const CoordTaskIDPrefix = "coord-"
 
 func newDispatchCmd() *cobra.Command {
 	opts := &dispatchOpts{}
@@ -88,6 +105,18 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// classic interactive dispatch flow).
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
 		"first-turn prompt to type into the spawned session (default: none)")
+	// --coord-spawn is the internal escape hatch for the TUI's project-
+	// row [a] auto-spawn flow. The "coord-<project>" task_id prefix is
+	// a sentinel the dashboard reads to identify the project's coord
+	// (issue #63 task_id-fallback signal). Without this gate, an
+	// operator-supplied `fleet dispatch coord-foo --project foo` would
+	// create a worker that the dashboard treats as the coord —
+	// hijacking [a] / [x] / coord-on-LEFT for a worker session. Hidden
+	// from --help so accidental use isn't encouraged; the TUI sets it
+	// when dispatching its own coord agents.
+	cmd.Flags().BoolVar(&opts.coordSpawn, "coord-spawn", false,
+		"internal: allow reserved coord-<project> task_id prefix (used by the TUI)")
+	_ = cmd.Flags().MarkHidden("coord-spawn")
 	return cmd
 }
 
@@ -104,6 +133,21 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// file name. Better to fail at dispatch.
 	if err := state.ValidateProjectName(opts.project); err != nil {
 		return fmt.Errorf("--project: %w", err)
+	}
+	// Reserve the EXACT "coord-<project>" task_id sentinel for the
+	// TUI's auto-spawn path (issue #63). The dashboard's task_id
+	// fallback signal treats agents tagged with task_id ==
+	// "coord-"+project AND project == <project> as the project's
+	// coord; without the gate, an operator-supplied
+	// `fleet dispatch coord-foo --project foo` would hijack the
+	// LEFT-column coord slot for a worker. We narrow the rejection
+	// to this exact form (codex iter-2 P2): a benign task name like
+	// `fleet dispatch coord-cache-warm --project ops` ("coord-cache-
+	// warm" != "coord-ops") is unaffected.
+	if !opts.coordSpawn && opts.taskID == CoordTaskIDPrefix+opts.project {
+		return fmt.Errorf(
+			"task_id %q is the reserved coord sentinel for project %q (the TUI uses this exact task_id to mark coordinator dispatches; rename the task)",
+			opts.taskID, opts.project)
 	}
 
 	rec, err := spawn.Spawn(spawn.Options{

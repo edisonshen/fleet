@@ -144,6 +144,103 @@ func (s *stubSessionAlive) install(t *testing.T) {
 	t.Cleanup(func() { sessionAliveFn = prev })
 }
 
+// stubProjectTreeExists replaces projectTreeExistsFn for tests so we
+// don't need to seed real directories under FLEET_HOME just to exercise
+// the dashboard task_id fallback signal. Default returnVal=true so
+// tests don't have to opt in to "yes the project tree exists" — the
+// gate exists to keep LEGACY records out, not to break ordinary tests.
+type stubProjectTreeExists struct {
+	missing map[string]bool // names where the gate should return false
+}
+
+func (s *stubProjectTreeExists) install(t *testing.T) {
+	t.Helper()
+	prev := projectTreeExistsFn
+	projectTreeExistsFn = func(projectName string) bool {
+		return !s.missing[projectName]
+	}
+	t.Cleanup(func() { projectTreeExistsFn = prev })
+}
+
+// stubCoordSpawnMarker replaces coordSpawnMarkerFn for tests. Map
+// projectName → agentID; missing key returns "". The dashboard's
+// task_id fallback requires the marker to match the candidate
+// agent's ID before promoting.
+//
+// Also installs a fresh-mtime stub so the boot-window freshness gate
+// (codex iter-4 P1) doesn't reject the test setup. Tests that need
+// to exercise the stale-marker path should use stubCoordSpawnMarkerStale.
+type stubCoordSpawnMarker struct {
+	markers map[string]string // project → agent ID
+}
+
+func (s *stubCoordSpawnMarker) install(t *testing.T) {
+	t.Helper()
+	prevContent := coordSpawnMarkerFn
+	coordSpawnMarkerFn = func(projectName string) string {
+		return s.markers[projectName]
+	}
+	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
+
+	// Default to "fresh" mtime (now) for all known projects so the
+	// freshness gate doesn't reject test fixtures by default.
+	prevMtime := coordSpawnMarkerMtimeFn
+	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+		if _, ok := s.markers[projectName]; !ok {
+			return time.Time{}, false
+		}
+		return time.Now(), true
+	}
+	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
+}
+
+// stubCoordSpawnMarkerStale installs a marker stub that returns a
+// stale mtime (older than coordBootWindow). Used to exercise codex
+// iter-4 P1's freshness gate.
+type stubCoordSpawnMarkerStale struct {
+	markers map[string]string // project → agent ID
+}
+
+func (s *stubCoordSpawnMarkerStale) install(t *testing.T) {
+	t.Helper()
+	prevContent := coordSpawnMarkerFn
+	coordSpawnMarkerFn = func(projectName string) string {
+		return s.markers[projectName]
+	}
+	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
+
+	prevMtime := coordSpawnMarkerMtimeFn
+	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+		if _, ok := s.markers[projectName]; !ok {
+			return time.Time{}, false
+		}
+		// 2× the boot window in the past — well outside.
+		return time.Now().Add(-2 * coordBootWindow), true
+	}
+	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
+}
+
+// stubWriteCoordSpawnMarker replaces writeCoordSpawnMarkerFn for
+// tests so we don't write to FLEET_HOME during unit tests. Captures
+// (project, id) tuples per call.
+type stubWriteCoordSpawnMarker struct {
+	calls map[string]string // project → agent ID
+	err   error             // returned from each write
+}
+
+func (s *stubWriteCoordSpawnMarker) install(t *testing.T) {
+	t.Helper()
+	prev := writeCoordSpawnMarkerFn
+	writeCoordSpawnMarkerFn = func(projectName, agentID string) error {
+		if s.calls == nil {
+			s.calls = map[string]string{}
+		}
+		s.calls[projectName] = agentID
+		return s.err
+	}
+	t.Cleanup(func() { writeCoordSpawnMarkerFn = prev })
+}
+
 // stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's
 // status cache). Distinguishes "definitively dead" (dead=true, no
 // err) from "probe failed" (errSessions=true, transport-style
@@ -759,5 +856,73 @@ func TestUpdate_RmDoneFailureSetsErrorFlash(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "rm failed") {
 		t.Errorf("error flash missing prefix: %q", mm.flash.text)
+	}
+}
+
+// TestKeyX_ArchiveCoord_CleansUpAgentAndSession pins issue #63's "fleet
+// manages it, user does management" rule: [x] on a coord-tagged agent
+// (task_id=coord-<project>) routes through the same `fleet rm` shell-
+// out as any other agent. The coord identity is purely metadata; rm
+// kills the tmux session + archives the record. The next dashboard
+// refresh sees no alive coord by EITHER signal (lock-body or task_id
+// fallback), so the project row's coord-row disappears organically —
+// no extra cleanup needed in [x] beyond what `fleet rm` already does.
+//
+// Test setup: cursor lands on the coord's agent row in the RIGHT
+// column. We construct the row list directly (m.dashboard nil + only
+// one record + cursor walked manually onto its rowAgent slot) so the
+// dashboard's task_id-fallback claim doesn't filter the coord out of
+// RIGHT before the test can act on it. In production, an operator
+// reaches this case when the coord's session has died (so the alive
+// gate fails and the row resurfaces on RIGHT) or when they explicitly
+// archive via `fleet rm <id>` from the shell.
+func TestKeyX_ArchiveCoord_CleansUpAgentAndSession(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// Dead session: the coord shows on RIGHT (alive-gate in the
+	// dashboard fallback claims fails) so the cursor can land on it.
+	// [x] still routes through to `fleet rm`; the rm command does the
+	// dead-session-tolerant cleanup itself (rm.go line 119 — skips kill
+	// when SessionAlive returns false, archives anyway).
+	(&stubSessionAlive{dead: map[string]bool{"fleet-c00bf001": true}}).install(t)
+
+	coord := agent.New("c00bf001")
+	coord.Project = "" // no project tag → no synthetic-project filter on RIGHT
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-c00bf001"
+
+	m := makeModelWithAgents(coord)
+	row := m.selectedRow()
+	if row == nil || row.kind != rowAgent || row.agent == nil || row.agent.ID != "c00bf001" {
+		t.Fatalf("cursor not on coord's agent row; got %+v", row)
+	}
+	// actionArchive's rowAgent branch is gated on deriveStatus != auto-red/
+	// precompact. With no handoff_type the coord status is "ok"/"dead";
+	// either passes the gate.
+	mm1, _, handled := m.actionArchive()
+	if !handled {
+		t.Fatal("[x] not handled by actionArchive on coord row")
+	}
+	if mm1.mode != modeConfirmArchive {
+		t.Fatalf("after [x], mode = %v; want modeConfirmArchive", mm1.mode)
+	}
+	if mm1.archiveCandidate != "c00bf001" {
+		t.Fatalf("archiveCandidate = %q; want c00bf001", mm1.archiveCandidate)
+	}
+	// Confirm via [y] — must shell out to `fleet rm c00bf001`.
+	updated, cmd := mm1.Update(keyMsg("y"))
+	if cmd == nil {
+		t.Fatal("expected rm cmd from [y] confirm")
+	}
+	mm2 := updated.(Model)
+	if mm2.mode != modeNav {
+		t.Errorf("mode after [y] = %v; want modeNav", mm2.mode)
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 fleet call (rm); got %d (%v)", len(stub.calls), stub.calls)
+	}
+	if stub.calls[0][0] != "rm" || stub.calls[0][1] != "c00bf001" {
+		t.Errorf("expected ['rm', 'c00bf001']; got %v", stub.calls[0])
 	}
 }

@@ -110,6 +110,17 @@ type Model struct {
 	// would draw on top of bubbletea's state.
 	pendingAttach string
 
+	// coordSpawnInFlight tracks projects whose [a] dispatch goroutine
+	// has been launched but coordSpawnDoneMsg hasn't returned yet.
+	// During this window the marker file isn't written and the agent
+	// record isn't on disk — without this gate, a second [a] press
+	// would launch a second `fleet dispatch coord-<project>` and we'd
+	// have two competing coord agents (issue #63 codex iter-3 P2
+	// follow-up). Map key is project name; value is irrelevant
+	// (presence == in-flight). Cleared when coordSpawnDoneMsg arrives
+	// or when the err branch fires.
+	coordSpawnInFlight map[string]bool
+
 	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
 	// chip when a newer release is on disk in the version cache.
 	// Empty means no banner — every failure mode in the version
@@ -410,27 +421,88 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, loadAgentsCmd() // refresh: agent should be archived
 
 	case coordSpawnDoneMsg:
-		// Issue #60: project-row [a] auto-spawn result. err non-nil
-		// covers init failures, dispatch failures, agent-ID parse
-		// failures, and lock-poll timeouts; surface as a flash so the
-		// operator can decide whether to retry. On success, set
-		// pendingAttach to the new coord's tmux session and tea.Quit
-		// — Run() exec's tmux attach after the program exits.
+		// Clear in-flight gate — regardless of success/error, this
+		// dispatch attempt is done. Subsequent [a] presses go through
+		// the full lookup path again (find existing → spawn).
+		if m.coordSpawnInFlight != nil {
+			delete(m.coordSpawnInFlight, msg.projectName)
+		}
+		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
+		// covers init failures, dispatch failures, and agent-ID parse
+		// failures; surface as a flash so the operator can decide
+		// whether to retry. On success, probe the session liveness
+		// before committing pendingAttach — a dispatch can return 0 +
+		// agent-ID line while claude exits seconds later (binary not
+		// found, --dangerously-skip-permissions denied, OOM). Without
+		// the probe the TUI quits and runs `tmux attach` against a
+		// dead session, regressing to the raw "no sessions" UX (codex
+		// review iter-1 P2). Trigger a refresh so the new (possibly
+		// dead) agent record appears on the right column for the
+		// operator to investigate via [x] or [a].
+		//
+		// Codex iter-3 P2: write the coord-spawn marker so the
+		// dashboard's task_id fallback can validate the agent ID
+		// matches our intent. Without this, an operator shelling out
+		// `fleet dispatch coord-X --project X --coord-spawn` could
+		// hijack the LEFT-column slot. The marker is best-effort: a
+		// write failure is logged in the flash but doesn't abort the
+		// attach (the agent is up; worst case the dashboard renders
+		// the coord on RIGHT until the lock body publishes).
 		if msg.err != nil {
 			m.flash = &flashMsg{
 				text:  fmt.Sprintf("project %s: %v", msg.projectName, msg.err),
 				isErr: true,
 			}
-			// Even on partial failure (dispatch ok but lock-poll timed
-			// out) we want the new agent to appear in the right column
-			// so the operator can [a] into it manually. Trigger an
-			// agent reload.
 			return m, loadAgentsCmd()
 		}
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"coord %s spawned for project %s — attaching to %s",
-				msg.agentID, msg.projectName, msg.session),
+		// Codex iter-6 P2: probe with the tristate primitive.
+		// sessionAliveFn is tmux.HasSession, which conflates "session
+		// is gone" with transport errors (bad FLEET_TMUX_SOCKET,
+		// restarting tmux server). Treating those as dead would skip
+		// a perfectly good attach. sessionProbeOrAliveFn returns true
+		// on probe error so we err toward attempting attach — the
+		// operator gets tmux's own clear error if it fails.
+		if msg.session != "" && !sessionProbeOrAliveFn(msg.session) {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s but session %s is not alive — claude likely exited at startup; check the agent record (right column) and re-press [a] to respawn after archiving",
+					msg.agentID, msg.projectName, msg.session),
+				isErr: true,
+			}
+			return m, loadAgentsCmd()
+		}
+		// Codex iter-5 P2: only write the coord-spawn marker when the
+		// dispatch actually delivered the /coordinator prompt to the
+		// pane. A prompt-delivery failure leaves a plain Claude
+		// session running with no coord skill — promoting it via the
+		// marker would render a healthy in-flight coord in the
+		// dashboard while the project is actually unowned. We still
+		// attach the operator to the session (they can type the
+		// prompt manually), but the dashboard's task_id fallback
+		// stays inactive until the operator re-presses [a] from a
+		// proper boot.
+		switch {
+		case !msg.promptDelivered:
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s but the /coordinator prompt failed to deliver — attaching so you can type it manually; project will not show as coord-bound until next [a]",
+					msg.agentID, msg.projectName),
+				isErr: true,
+			}
+		default:
+			if werr := writeCoordSpawnMarkerFn(msg.projectName, msg.agentID); werr != nil {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"coord %s spawned for project %s (marker write failed: %v) — attaching to %s",
+						msg.agentID, msg.projectName, werr, msg.session),
+				}
+			} else {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"coord %s spawned for project %s — attaching to %s",
+						msg.agentID, msg.projectName, msg.session),
+				}
+			}
 		}
 		m.pendingAttach = msg.session
 		return m, tea.Quit

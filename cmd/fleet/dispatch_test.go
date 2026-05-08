@@ -97,6 +97,73 @@ func TestDispatch_SendInitialPromptHookCalled(t *testing.T) {
 	}
 }
 
+// TestDispatch_RejectsCoordPrefixWithoutFlag pins issue #63 codex
+// iter-1 P2: an operator running `fleet dispatch coord-foo --project
+// foo` must be rejected. The "coord-" prefix is reserved for the TUI's
+// auto-spawn path (the dashboard's task_id-fallback identity signal
+// reads the prefix to identify a project's coord) and must not be
+// operator-claimable, or any worker could hijack the LEFT-column coord
+// slot.
+func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:  "coord-foo",
+		project: "foo",
+		// coordSpawn left at its zero value: false (operator path).
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatal("dispatch must reject coord- prefix without --coord-spawn")
+	}
+	if !strings.Contains(err.Error(), "reserved coord sentinel") {
+		t.Errorf("err should mention 'reserved coord sentinel'; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "rename the task") {
+		t.Errorf("err should suggest renaming; got %q", err.Error())
+	}
+}
+
+// TestDispatch_AllowsBenignCoordPrefix pins codex iter-2 P2: the
+// reservation is the EXACT "coord-<project>" sentinel, not the broad
+// "coord-*" prefix. A benign task name like `coord-cache-warm` for
+// project `ops` ("coord-cache-warm" != "coord-ops") must dispatch
+// normally.
+func TestDispatch_AllowsBenignCoordPrefix(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:  "coord-cache-warm",
+		project: "ops",
+	}
+	// We're not actually spawning here (would need tmux); we just
+	// verify the reservation gate doesn't fire. runDispatch will fail
+	// later at tmux.Available() or spawn.Spawn — that's fine; we only
+	// assert the error is NOT the reservation message.
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err != nil && strings.Contains(err.Error(), "reserved coord sentinel") {
+		t.Errorf("benign coord-* task must not trigger reservation gate; got %q", err.Error())
+	}
+}
+
+// TestDispatch_CoordSpawnFlag_Exposed pins the hidden flag's
+// existence — the TUI shell-out depends on it.
+func TestDispatch_CoordSpawnFlag_Exposed(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("coord-spawn")
+	if flag == nil {
+		t.Fatal("dispatch must expose --coord-spawn for the TUI auto-spawn path")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--coord-spawn default = %q; want false", flag.DefValue)
+	}
+	if !flag.Hidden {
+		t.Error("--coord-spawn should be marked Hidden so accidental operator use isn't encouraged")
+	}
+}
+
 // TestDispatch_PromptFailureWarnsButDoesNotAbort pins the production
 // behavior: a SendInitialPrompt failure must NOT bubble out as a
 // non-zero exit code. The agent record + tmux session are already on

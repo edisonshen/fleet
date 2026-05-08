@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -395,6 +396,104 @@ func ProjectStateLockPath(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, ".locks", "state.lock"), nil
+}
+
+// EnsureProjectInitialized creates ~/.fleet/projects/<safe-name>/.locks/
+// (and the parent <safe-name>/ dir) when missing. Idempotent — calling
+// twice is a no-op once the directories exist.
+//
+// The TUI's project-row [a] auto-spawn flow uses this as a pre-dispatch
+// step so the spawned coord skill's first tick can write coord-state.json
+// and acquire coordinator.lock without racing on a missing parent dir.
+// Without this step, fresh projects landed agents on disk with no lock
+// body ever published — the dashboard couldn't bind the agent to the
+// project, and repeated [a] presses piled up zombies (issue #63).
+//
+// Validation matches ProjectDir's rule (ValidateProjectName); empty
+// name resolves to "_default" via ProjectDir's backwards-compat branch.
+//
+// Returns the project root dir (no trailing separator) on success.
+func EnsureProjectInitialized(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	// ProjectDir appends a trailing separator; trim before MkdirAll
+	// so the .locks subdir resolves cleanly (filepath.Join already
+	// tolerates trailing separators, but stripping keeps the returned
+	// path symmetric with ProjectDir's other consumers).
+	dir = filepath.Clean(dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".locks"), 0o755); err != nil {
+		return "", fmt.Errorf("EnsureProjectInitialized: mkdir .locks: %w", err)
+	}
+	return dir, nil
+}
+
+// CoordSpawnMarkerPath returns
+// ~/.fleet/projects/<safe-name>/.locks/coord-spawn-marker.
+//
+// The TUI writes this file IMMEDIATELY AFTER `fleet dispatch` returns
+// the agent ID for a coord auto-spawn. The dashboard's task_id
+// fallback signal (rows.go:findCoordByTaskID) gates promotion on the
+// marker file's content matching the candidate agent's ID — so an
+// operator who shells out `fleet dispatch coord-<project> --project
+// <project> --coord-spawn` can write an agent record but cannot make
+// the dashboard treat it as the project's coord (they'd also have to
+// write this marker with the right ID).
+//
+// Marker is overwritten on each fresh coord-spawn (idempotent for
+// retries). It is NOT cleaned up on coord exit; the freshness gate
+// (alive session + project-tree exists) prevents stale markers from
+// hijacking a future coord. The marker can outlive its referent
+// agent, but the alive-gate keeps that from rendering as a coord.
+func CoordSpawnMarkerPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Clean(dir), ".locks", "coord-spawn-marker"), nil
+}
+
+// WriteCoordSpawnMarker atomically writes agentID into the coord-spawn
+// marker for projectName. The TUI calls this BEFORE shelling out to
+// `fleet dispatch` so the dashboard's task_id fallback can verify the
+// record originated from the TUI auto-spawn path.
+//
+// Idempotent: a second call overwrites the previous content (atomic
+// rename via WriteAtomic). Caller must have already run
+// EnsureProjectInitialized so the .locks/ parent exists.
+func WriteCoordSpawnMarker(projectName, agentID string) error {
+	path, err := CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return fmt.Errorf("WriteCoordSpawnMarker: %w", err)
+	}
+	return WriteAtomic(path, []byte(agentID+"\n"))
+}
+
+// ReadCoordSpawnMarker returns the agent ID stored in the coord-spawn
+// marker for projectName, or "" when the marker is absent / unreadable
+// / malformed. Used by the dashboard's task_id fallback to validate
+// that a candidate coord record was spawned via the TUI flow (rather
+// than hand-edited / CLI-spoofed).
+//
+// Reads only the first line and trims whitespace, so CRLF or trailing
+// blank lines from a hand-edit don't trip the comparison. Returns ""
+// silently rather than err — this is a best-effort gate, not a
+// load-bearing security boundary.
+func ReadCoordSpawnMarker(projectName string) string {
+	path, err := CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	// First line, whitespace-trimmed. SplitN+TrimSpace handles CRLF /
+	// trailing blank lines / leading-or-trailing spaces from a hand-
+	// edit without reimplementing the byte loop.
+	first := strings.SplitN(string(data), "\n", 2)[0]
+	return strings.TrimSpace(first)
 }
 
 // CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
