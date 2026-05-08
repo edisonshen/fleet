@@ -424,17 +424,21 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 //
 //   - <slug>
 //
-// Issue #75 — status-aware glyphs surface tasks that need operator
-// attention right in the expansion:
+// Issue #75 / #77 — status-aware glyph + color per task row mirrors the
+// project-header count-chip palette so a row reads as the same status
+// the header counts:
 //
-//	blocked → "⚠ <slug>" with attention color (red, bold). Drives the
-//	          "see attention → drill in" path: operator scans an
-//	          expanded project and the asking task is unmissable.
-//	done    → "✓ <slug>" with done color (green, dim). Defensive —
-//	          done tasks are filtered out of row.Tasks today
-//	          (dashboard.go:215), but if a task transitions while the
-//	          operator's looking, the prefix should be right.
-//	default → "• <slug>" (existing behavior).
+//	todo        → "○ <slug>"  dim       (matches projectCountTodoStyle)
+//	ready       → "◐ <slug>"  bright    (promote-eligible, no header chip)
+//	in-progress → "▶ <slug>"  amber     (matches projectCountInProgStyle)
+//	in-review   → "⟳ <slug>"  blue      (matches projectCountReviewStyle)
+//	blocked     → "⚠ <slug>"  bold red  (existing attentionChipStyle)
+//	done        → "✓ <slug>"  green     (existing projectCountDoneStyle)
+//	default     → "• <slug>"  dim       (abandoned / unknown — fallback)
+//
+// Done tasks are filtered out of row.Tasks today (dashboard.go:215),
+// but if a task transitions while the operator's looking, the prefix
+// should still be right — defensive coverage is cheap.
 //
 // Synthetic markers render as hint lines:
 //
@@ -442,11 +446,16 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 //	More=N      → "  +N more"
 //
 // The selected variant uses the cursor glyph "▶" in place of the
-// bullet so the operator can see which row is active. When the row
-// is a synthetic marker, the cursor glyph still anchors the line
-// even though there's no [⏎] action wired (operator can move past
-// it; per spec: cursor on task sub-rows is a navigation no-op for
-// actions in this PR).
+// status glyph so the operator can see which row is active. The label
+// color still tracks status, so a blocked task under the cursor still
+// reads as "needs attention" (PR #76's
+// TestRows_BlockedTaskUnderCursorKeepsCursorGlyph extended to all 7
+// statuses in this PR's tests).
+//
+// When the row is a synthetic marker, the cursor glyph still anchors
+// the line even though there's no [⏎] action wired (operator can
+// move past it; per spec: cursor on task sub-rows is a navigation
+// no-op for actions in this PR).
 func taskBlockLine(t *taskRow, w int, selected bool) string {
 	if t == nil {
 		return ""
@@ -470,29 +479,44 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		more := dimStyle.Render(fmt.Sprintf("+%d more", t.More))
 		return prefix + bulletStyle.Render(bullet) + " " + more
 	}
-	// Status-aware glyph + label styling (issue #75). Selection's cursor
-	// glyph wins over the status glyph so the operator's focus marker
-	// stays visible — but the label color still tracks status, so a
-	// blocked task under the cursor still reads as "needs attention".
+	// Status-aware glyph + label styling. Selection's cursor glyph wins
+	// over the status glyph; the label color still tracks status. Status
+	// strings are tasks.Status enum values — see internal/tasks/tasks.go.
+	statusGlyph, statusGlyphStyle, statusLabelStyle := taskStatusStyles(t.Status)
 	glyph := bullet
 	glyphStyle := bulletStyle
-	labelStyle := workerSlugStyle
-	switch t.Status {
-	case "blocked":
-		if !selected {
-			glyph = "⚠"
-			glyphStyle = attentionChipStyle
-		}
-		labelStyle = attentionChipStyle
-	case "done":
-		if !selected {
-			glyph = "✓"
-			glyphStyle = projectCountDoneStyle
-		}
-		labelStyle = projectCountDoneStyle
+	if !selected {
+		glyph = statusGlyph
+		glyphStyle = statusGlyphStyle
 	}
-	slug := labelStyle.Render(t.Slug)
+	slug := statusLabelStyle.Render(t.Slug)
 	return prefix + glyphStyle.Render(glyph) + " " + slug
+}
+
+// taskStatusStyles returns (glyph, glyphStyle, labelStyle) for the
+// given tasks.Status string. Falls back to "•" + dim + workerSlugStyle
+// for unknown values (e.g. "abandoned") so a future status still
+// renders something sensible.
+//
+// Pairing glyph color with label color makes the row read as one chip
+// rather than two unrelated tokens. Mirrors renderCountChips's per-
+// status palette so a task row's color matches the header count.
+func taskStatusStyles(status string) (string, lipgloss.Style, lipgloss.Style) {
+	switch status {
+	case "todo":
+		return "○", taskGlyphTodoStyle, taskLabelTodoStyle
+	case "ready":
+		return "◐", taskGlyphReadyStyle, taskLabelReadyStyle
+	case "in-progress":
+		return "▶", taskGlyphInProgressStyle, taskLabelInProgressStyle
+	case "in-review":
+		return "⟳", taskGlyphInReviewStyle, taskLabelInReviewStyle
+	case "blocked":
+		return "⚠", attentionChipStyle, attentionChipStyle
+	case "done":
+		return "✓", projectCountDoneStyle, projectCountDoneStyle
+	}
+	return "•", dimStyle, workerSlugStyle
 }
 
 // renderCountChips builds "⏳ 3  ▶ 1  👁 1  ⚠ 1  ✓ 12" with the

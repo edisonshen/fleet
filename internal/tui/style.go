@@ -88,6 +88,32 @@ var (
 	// cyan reads as the same affordance as v0.1's selectedRowStyle.
 	cursorGlyphStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
 
+	// Per-task-status glyph + label styles for the project-expansion
+	// task list (issue #77). Mirrors the project-header count chip
+	// palette (renderCountChips) so a task row's color reads as the
+	// same status the header counts. New entries below; PR #76's
+	// blocked/done reuse attentionChipStyle / projectCountDoneStyle.
+	//
+	//	todo       → ○ + dim       (matches projectCountTodoStyle)
+	//	ready      → ◐ + bright    (no header chip; promote-eligible)
+	//	in-progress → ▶ + amber    (matches projectCountInProgStyle)
+	//	in-review  → ⟳ + blue      (matches projectCountReviewStyle)
+	//	blocked    → ⚠ + bold red  (existing attentionChipStyle, PR #76)
+	//	done       → ✓ + green     (existing projectCountDoneStyle, PR #76)
+	//
+	// "ready" promotes off the dim baseline because its semantic — task
+	// is ready for the operator to promote — wants more attention than
+	// "todo" (waiting on dependencies). Bold bright matches the project
+	// name treatment, signaling "this row is actionable".
+	taskGlyphTodoStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDim))
+	taskLabelTodoStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDim))
+	taskGlyphReadyStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBright))
+	taskLabelReadyStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))
+	taskGlyphInProgressStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
+	taskLabelInProgressStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
+	taskGlyphInReviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+	taskLabelInReviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+
 	// Dashboard search/filter footer chip ("/foo · clear with esc").
 	searchFooterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
 

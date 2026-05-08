@@ -105,17 +105,18 @@ func TestRows_DoneTaskGetsCheckGlyph(t *testing.T) {
 	}
 }
 
-// TestRows_DefaultTaskGetsBulletGlyph pins the existing behavior
-// stays intact for non-attention tasks: pending tasks still render
-// with a • bullet, no ⚠ / ✓.
+// TestRows_DefaultTaskGetsBulletGlyph pins that the • bullet
+// remains the fallback glyph for unknown / abandoned statuses (issue
+// #77 swapped the per-status glyphs but kept • as the safe default
+// so a future status string still renders something sensible).
 func TestRows_DefaultTaskGetsBulletGlyph(t *testing.T) {
-	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "todo"}
+	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "abandoned"}
 	out := taskBlockLine(tr, 60, false)
-	if strings.Contains(out, "⚠") || strings.Contains(out, "✓") {
-		t.Errorf("todo task should NOT carry attention/done glyph, got: %q", out)
+	if strings.Contains(out, "⚠") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") {
+		t.Errorf("abandoned/unknown task should NOT carry status glyph, got: %q", out)
 	}
 	if !strings.Contains(out, "•") {
-		t.Errorf("todo task should render with • bullet, got: %q", out)
+		t.Errorf("abandoned/unknown task should render with • bullet fallback, got: %q", out)
 	}
 }
 
