@@ -426,23 +426,47 @@ func sameCommand(a, b []string) bool {
 }
 
 // remoteControlDaemonRunning is the dispatch coord-spawn gate for
-// `--remote-control` injection (codex review #73 iter-5 P1). Returns
-// true iff `pgrep -f "claude remote-control"` finds a running
-// daemon process. Var so tests can stub the production exec.
+// `--remote-control` injection (codex review #73 iter-5 P1, narrowed
+// in iter-6 P1). Returns true iff `pgrep -f` finds a running daemon
+// whose command-line carries the coord-prefix flag — i.e., a daemon
+// matching `--remote-control-session-name-prefix "fleet-coord"`.
+// Var so tests can stub the production exec.
 //
-// Why pgrep, not a lock file or unix socket: this matches the EXACT
-// guard already used by the bootstrap paths
-// (skills/coordinator/remote_control.py:spawn_daemon_if_needed AND
-// internal/handoff/handoff.go:FirstAction). Diverging here would
-// risk false-positives/negatives where the dispatch sees a daemon
-// the bootstrap doesn't (or vice-versa). A pgrep failure (binary
-// missing on the host, kernel hiccup) returns false — best-effort,
-// fall back to the inbox-relay path.
+// Why match the FULL prefix flag (not just "claude remote-control"):
+// the bootstrap paths in this codebase share the broad pgrep guard
+// — both fleet-coord (skills/coordinator/remote_control.py) and
+// fleet-handoff (internal/handoff/handoff.go) daemons trip the same
+// "is any claude remote-control running" check. A broad probe here
+// would treat a stale fleet-handoff daemon (from a prior handoff
+// flow) as usable; injecting --remote-control "fleet-coord-<id>"
+// against a fleet-handoff-prefix daemon's filter still fails to
+// auto-attach. We narrow on the literal flag value to only match
+// the fleet-coord daemon (codex review #73 iter-6 P1).
+//
+// A pgrep failure (binary missing on the host, kernel hiccup)
+// returns false — best-effort, fall back to the inbox-relay path.
+//
+// The substring keeps the regex inside pgrep's `-f` (basic regex)
+// safe-by-construction: the flag value is a literal string with
+// no metacharacters. If a future change introduces metas, switch
+// to `pgrep -fF` or migrate to /proc scanning.
 var remoteControlDaemonRunning = func() bool {
-	// pgrep -f matches the full command line. The "-f" + the literal
-	// "claude remote-control" mirrors the bootstrap's pgrep guard
-	// byte-for-byte. Any zero-exit means a match was found.
-	return execCommand("pgrep", "-f", "claude remote-control").Run() == nil
+	// pgrep -f matches the full argv string. We anchor with `^claude `
+	// to match ONLY the daemon process whose argv[0] is `claude` —
+	// not the transient `bash -c '... claude remote-control ...'`
+	// bootstrap subprocess that spawn_daemon_if_needed runs (codex
+	// review #73 iter-6 P1: a too-broad probe matches both bash AND
+	// the daemon, so a coord could see "daemon up" when only the
+	// bootstrap shell is running and the actual daemon hasn't
+	// forked yet).
+	//
+	// `^claude remote-control --remote-control-session-name-prefix "fleet-coord"`
+	// is the literal argv shape spawn_daemon_if_needed emits.
+	// pgrep's `-f` flag treats the pattern as a basic regex over the
+	// full command line; the literal flag value has no metacharacters
+	// so the anchoring is safe by construction.
+	return execCommand("pgrep", "-f",
+		`^claude remote-control --remote-control-session-name-prefix "`+remoteControlSessionPrefix+`"`).Run() == nil
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.

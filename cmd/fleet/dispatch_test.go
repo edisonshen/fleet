@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -571,6 +572,57 @@ func TestRemoteControlSessionPrefix_MatchesPythonDaemon(t *testing.T) {
 			"skills/coordinator/remote_control.py:spawn_daemon_if_needed). "+
 			"If you change one side, change both.",
 			remoteControlSessionPrefix, "fleet-coord")
+	}
+}
+
+// TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly pins
+// codex review #73 iter-6 P1: the daemon-presence probe must match
+// ONLY the live fleet-coord daemon, not (a) a fleet-handoff daemon
+// from internal/handoff.FirstAction nor (b) the transient
+// `bash -c '... nohup claude remote-control ... fleet-coord ...'`
+// bootstrap subprocess that spawn_daemon_if_needed runs.
+//
+// We can't run pgrep here (it would scan the host's actual process
+// table). Instead we exercise the pattern itself by capturing the
+// argv we'd hand to pgrep and asserting the shape.
+func TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly(t *testing.T) {
+	var capturedArgs []string
+	prev := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		capturedArgs = append([]string{name}, args...)
+		// Return an exec.Cmd that exits 1 (pgrep no-match) so the
+		// helper returns false; we only care about the captured args
+		// here.
+		return exec.Command("false")
+	}
+	t.Cleanup(func() { execCommand = prev })
+
+	_ = remoteControlDaemonRunning()
+
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected pgrep call with -f <pattern>; got %v", capturedArgs)
+	}
+	if capturedArgs[0] != "pgrep" || capturedArgs[1] != "-f" {
+		t.Errorf("expected pgrep -f ...; got %v", capturedArgs[:2])
+	}
+	pattern := capturedArgs[2]
+
+	// Must anchor on `^claude ` so the bash bootstrap subprocess
+	// doesn't match (its argv[0] is "bash").
+	if !strings.HasPrefix(pattern, "^claude ") {
+		t.Errorf("pattern must anchor on `^claude ` to exclude the bash bootstrap; got %q", pattern)
+	}
+	// Must reference the fleet-coord prefix specifically — not any
+	// `claude remote-control` (which would also match a fleet-handoff
+	// daemon).
+	if !strings.Contains(pattern, `"`+remoteControlSessionPrefix+`"`) {
+		t.Errorf("pattern must reference the literal fleet-coord prefix; got %q", pattern)
+	}
+	// Must reference --remote-control-session-name-prefix so a future
+	// daemon argv that happens to mention "fleet-coord" elsewhere
+	// (in a log path?) doesn't false-positive.
+	if !strings.Contains(pattern, "remote-control-session-name-prefix") {
+		t.Errorf("pattern must reference the prefix flag, not just the literal value; got %q", pattern)
 	}
 }
 
