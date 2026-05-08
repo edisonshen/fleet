@@ -141,16 +141,63 @@ class TestSeedInbox:
         target = fleet_home / "inbox" / "abcd1234.md"
         assert target.exists()
 
-    def test_body_contains_remote_control_slash_command(
+    def test_body_still_includes_remote_control_literal(
         self, fleet_home: Path,
     ) -> None:
-        """The agent must recognize and execute the slash command on
-        delivery. Body MUST include the literal `/remote-control`."""
+        """The body must still contain the literal `/remote-control`
+        substring so operators searching their inbox / docs / tmux
+        scrollback can find references to the slash command. Issue #69
+        reframed the body from imperative to notification, but the
+        literal must remain for discoverability."""
         remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
         body = (fleet_home / "inbox" / "abcd1234.md").read_text(
             encoding="utf-8",
         )
         assert "/remote-control" in body
+
+    def test_body_is_not_imperative(self, fleet_home: Path) -> None:
+        """Regression test for issue #69: the inbox body must NOT be
+        phrased as an imperative the agent can interpret as a Skill
+        invocation. The previous wording ("Run the slash command
+        `/remote-control` ...") caused Claude to call Skill(remote-
+        control) and error with "remote-control is a UI command, not a
+        skill". Reject any leading imperative verb that an LLM would
+        read as "do this now"."""
+        remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
+        body = (fleet_home / "inbox" / "abcd1234.md").read_text(
+            encoding="utf-8",
+        ).strip()
+        # First word must not be an imperative verb directed at the
+        # agent. fleet-guard's deliver() prepends "[OPERATOR] " on the
+        # delivered line, but the on-disk body itself starts the
+        # sentence — that's what the agent reads + acts on.
+        first_word = body.split(None, 1)[0].rstrip(":,.").lower()
+        forbidden_leads = {"run", "execute", "invoke", "please", "call"}
+        assert first_word not in forbidden_leads, (
+            f"inbox body starts with imperative-style verb {first_word!r}; "
+            "issue #69 requires status-notification framing"
+        )
+        # Defense in depth: the exact phrase that broke production must
+        # never reappear verbatim.
+        assert "Run the slash command" not in body
+
+    def test_body_mentions_daemon_started(self, fleet_home: Path) -> None:
+        """Regression test for issue #69: the new body must give the
+        agent real situational context — that the remote-control
+        daemon has been started for this session — rather than
+        ordering it to do something. Asserting "daemon" + a started/
+        running keyword keeps the change locked in even if future
+        wording tweaks happen."""
+        remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
+        body = (fleet_home / "inbox" / "abcd1234.md").read_text(
+            encoding="utf-8",
+        ).lower()
+        assert "daemon" in body
+        # At least one keyword indicating the daemon is up — protects
+        # against a future edit dropping the situational framing.
+        assert any(kw in body for kw in ("started", "running", "active")), (
+            "inbox body must indicate the daemon is started/running/active"
+        )
 
     def test_no_tmp_leftover_on_success(self, fleet_home: Path) -> None:
         """Atomic rename leaves no .tmp file in the inbox dir."""
