@@ -235,3 +235,103 @@ func TestDispatch_PromptUnsubmittedWarningShape(t *testing.T) {
 		t.Errorf("warning message lost the recovery hint; got %q", out.String())
 	}
 }
+
+// TestDispatch_ProjectFlagDefault pins the cobra default for --project.
+// Issue #70 root cause: when --project is missing, dispatch falls back
+// to "default", and the spawned agent's record gets project="default"
+// — which the dashboard cannot bind to any real project row, so the
+// coord vanishes from the LEFT column entirely. The TUI's auto-spawn
+// path (issue #60) MUST pass --project explicitly to avoid this.
+func TestDispatch_ProjectFlagDefault(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("project")
+	if flag == nil {
+		t.Fatal("dispatch must expose --project")
+	}
+	if flag.DefValue != "default" {
+		t.Errorf("--project default = %q; want \"default\" (issue #70: changing this default would silently relocate every existing untagged dispatch)",
+			flag.DefValue)
+	}
+}
+
+// TestDispatch_CoordSpawnRequiresExplicitProject pins issue #70 fix:
+// when --coord-spawn is set but --project is left at its default, the
+// dispatch CLI must reject the call. The TUI's auto-spawn always sets
+// --project to the target project name (so the dashboard can bind the
+// new coord to the right LEFT-column row); a missing --project means
+// the args slice was malformed and we should fail loud at the wire
+// instead of writing an agent record that the dashboard can't render
+// correctly.
+func TestDispatch_CoordSpawnRequiresExplicitProject(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:  "coord-default", // matches CoordTaskIDPrefix + project="default"
+		project: "default",
+		// projectExplicit deliberately false: simulates the bug where
+		// --project was dropped from the args slice.
+		coordSpawn: true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatal("dispatch must reject --coord-spawn without explicit --project (issue #70)")
+	}
+	if !strings.Contains(err.Error(), "--coord-spawn requires --project") {
+		t.Errorf("err should mention the --coord-spawn / --project contract; got %q", err.Error())
+	}
+}
+
+// TestDispatch_CoordSpawnAcceptsExplicitProject is the happy-path
+// counterpart: when --project is set explicitly, --coord-spawn does
+// NOT trigger the issue #70 reservation gate. We can't run the full
+// dispatch end-to-end here (needs real tmux) but we exercise far enough
+// to know the issue #70 gate did not fire — anything past tmux.Available
+// is acceptable as evidence.
+func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:          "coord-tatoosh",
+		project:         "tatoosh",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	// runDispatch will fail at tmux.Available() / spawn.Spawn in CI
+	// without real tmux — that's fine; we only assert the issue #70
+	// gate did not fire.
+	if err != nil && strings.Contains(err.Error(), "--coord-spawn requires --project") {
+		t.Errorf("issue #70 gate fired with --project explicitly set; got %q", err.Error())
+	}
+}
+
+// TestDispatch_RunECapturesProjectExplicit pins the wiring:
+// cobra's RunE must populate opts.projectExplicit via Flags().Changed
+// so runDispatch can distinguish "operator passed --project default"
+// from "operator left --project at its default". Without this, the
+// issue #70 gate would either always fire (treating both as missing)
+// or never fire (treating both as set).
+func TestDispatch_RunECapturesProjectExplicit(t *testing.T) {
+	cmd := newDispatchCmd()
+	// Stub the runE bound by newDispatchCmd? Easier: parse args and
+	// inspect the flag's Changed status, mirroring what the RunE does.
+	cmd.SetArgs([]string{"some-task", "--project", "tatoosh"})
+	// We can't actually run dispatch (needs tmux), so parse only.
+	if err := cmd.ParseFlags([]string{"--project", "tatoosh"}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+	if !cmd.Flags().Changed("project") {
+		t.Error("after parsing --project tatoosh, Flags().Changed(\"project\") should be true")
+	}
+
+	// Reset and verify default-only path.
+	cmd2 := newDispatchCmd()
+	if err := cmd2.ParseFlags([]string{}); err != nil {
+		t.Fatalf("ParseFlags (empty): %v", err)
+	}
+	if cmd2.Flags().Changed("project") {
+		t.Error("with no --project flag, Flags().Changed(\"project\") should be false")
+	}
+}

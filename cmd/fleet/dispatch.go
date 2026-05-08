@@ -15,11 +15,18 @@ import (
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
 type dispatchOpts struct {
-	taskID       string
-	project      string
-	cwd          string
-	command      []string
-	noAutoResume bool
+	taskID  string
+	project string
+	// projectExplicit tracks whether --project was set on the command
+	// line (vs left at its cobra default "default"). The defensive check
+	// for --coord-spawn requires this so a TUI bug that drops --project
+	// from the auto-spawn args fails loud at dispatch instead of writing
+	// an agent record with project="default" that the dashboard then
+	// can't bind to any project row (issue #70).
+	projectExplicit bool
+	cwd             string
+	command         []string
+	noAutoResume    bool
 	// prompt is the optional first-turn prompt to type into the
 	// freshly-spawned tmux session AFTER the pane stabilizes. Empty
 	// (default) → no prompt; the operator types one manually after
@@ -65,6 +72,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.taskID = args[0]
+			opts.projectExplicit = cmd.Flags().Changed("project")
 			return runDispatch(opts, cmd.OutOrStdout())
 		},
 	}
@@ -134,6 +142,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// file name. Better to fail at dispatch.
 	if err := state.ValidateProjectName(opts.project); err != nil {
 		return fmt.Errorf("--project: %w", err)
+	}
+	// Issue #70: when the TUI's auto-spawn shells out with --coord-spawn,
+	// it MUST also set --project explicitly to the target project name.
+	// The dashboard binds coords to project rows by matching record.Project
+	// against ProjectRow.Name; if --project is missing the agent record
+	// gets project="default" (the cobra flag default) and the coord shows
+	// up under no project row at all (or under a synthetic "default" row
+	// if other agents share that tag). Failing loud here turns a silent
+	// render bug into an immediate dispatch error so any future TUI
+	// regression that drops --project from the args slice is caught at
+	// the wire instead of the operator's screen.
+	if opts.coordSpawn && !opts.projectExplicit {
+		return fmt.Errorf(
+			"--coord-spawn requires --project to be set explicitly (the TUI's auto-spawn always passes the target project name; missing --project means the args slice was malformed)")
 	}
 	// Reserve the EXACT "coord-<project>" task_id sentinel for the
 	// TUI's auto-spawn path (issue #63). The dashboard's task_id
