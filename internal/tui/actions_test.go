@@ -2224,3 +2224,110 @@ func TestKeyA_ProjectRow_DispatchInvocationCarriesCoordSpawnFlag(t *testing.T) {
 		t.Errorf("dispatch args missing --coord-spawn (would be rejected by reserved-prefix gate): %v", stub.calls[0])
 	}
 }
+
+// TestKeyA_ProjectRow_DispatchPassesTargetProjectExplicitly pins the
+// issue #70 wire-level invariant: the [a] handler must always pass
+// --project <target> to fleet dispatch, where <target> is the project
+// name on the row under the cursor — NOT the operator's cwd-derived
+// project. Without this, dispatching a coord for projects/tatoosh from
+// inside the fleet repo cwd writes an agent record with project=fleet
+// (the cobra default falls through to "default", or worse a cwd-derived
+// tag) and the dashboard never binds the new coord to the tatoosh row.
+//
+// The cursor is on a project row whose Name is NOT what os.Getwd()
+// would derive — simulating the cross-project [a] press.
+func TestKeyA_ProjectRow_DispatchPassesTargetProjectExplicitly(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	const targetProject = "projects-tatoosh"
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: targetProject}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] on project row should produce a spawn cmd")
+	}
+	_ = cmd()
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 dispatch call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+
+	// --project MUST appear with the target project name verbatim. Any
+	// other value (operator's cwd-derived tag, "default", or absent
+	// flag) means the dashboard cannot bind the spawned coord to the
+	// projects/tatoosh row — the bug from issue #70.
+	got := argValue(args, "--project")
+	if got != targetProject {
+		t.Errorf("dispatch args missing --project %s; got %q in args %v",
+			targetProject, got, args)
+	}
+}
+
+// TestKeyA_ProjectRow_DispatchedAgentRecordHasTargetProject is the
+// end-to-end issue #70 regression: after [a] dispatch returns, the
+// coordSpawnDoneMsg's projectName MUST equal the target project (the
+// row under the cursor), NOT the operator's cwd-derived project. The
+// projectName field is what model.Update keys off of when writing the
+// coord-spawn marker — if it's wrong, the dashboard's marker-gated
+// findCoordByTaskID can't bind the new coord to the right row.
+func TestKeyA_ProjectRow_DispatchedAgentRecordHasTargetProject(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			// Dispatch's stdout pins the agent ID + project — mirror a
+			// well-formed record where the agent's project field equals
+			// what was passed via --project.
+			project := argValue(args, "--project")
+			out := fmt.Sprintf(
+				"agent abcd1234 spawned\n  task: %s\n  project: %s\n  tmux: fleet-abcd1234\n",
+				argString(args, 1), project)
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	const targetProject = "projects-tatoosh"
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: targetProject}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("expected spawn cmd")
+	}
+	msg := cmd()
+	doneMsg, ok := msg.(coordSpawnDoneMsg)
+	if !ok {
+		t.Fatalf("expected coordSpawnDoneMsg; got %T", msg)
+	}
+	if doneMsg.err != nil {
+		t.Fatalf("dispatch returned err: %v", doneMsg.err)
+	}
+	if doneMsg.projectName != targetProject {
+		t.Errorf("doneMsg.projectName = %q; want %q (issue #70: must equal the target row's project, not the operator's cwd)",
+			doneMsg.projectName, targetProject)
+	}
+}
