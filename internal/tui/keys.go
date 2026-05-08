@@ -206,7 +206,25 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		// again to press [a] — defeats "drill in → attach to respond"
 		// flow. Worker / agent / help panels still dismiss on [a]
 		// because their default behavior IS [a]-as-dismiss.
+		//
+		// Codex iter-2 P2: pre-dispatch tasks (todo/ready) get the
+		// same dispatch hint as the row-side [a] handler — without
+		// this gate, opening a todo task's detail and pressing [a]
+		// would flash the blocked-task recovery command, which is
+		// the wrong next step for a task that just hasn't been
+		// dispatched yet.
 		if key == "a" && m.detail != nil && m.detail.taskSlug != "" {
+			switch m.detail.taskStatus {
+			case "todo", "ready":
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"task %s has no worker yet (status=%s) — press [d] to dispatch one",
+						m.detail.taskSlug, m.detail.taskStatus),
+					isErr: true,
+				}
+				m.detail = nil
+				return m, nil, true
+			}
 			return m.attachToTaskWorker(m.detail.taskProject, m.detail.taskSlug)
 		}
 		m.showHelp = false
@@ -900,15 +918,19 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		body, title := readTaskDetail(row.parentProject, row.task.Slug)
-		// Issue #75: carry task identity so [a] inside the panel can
-		// route to the matching worker peek without rebuilding the
-		// row index. Non-task panels leave these empty and the [a]
-		// interceptor falls through to default attach behavior.
+		// Issue #75: carry task identity (project + slug + status) so
+		// [a] inside the panel routes to the matching worker peek for
+		// blocked/in-progress tasks AND to the dispatch hint for
+		// todo/ready tasks. Without status the panel-side [a] would
+		// regress on pre-dispatch tasks (codex iter-2 P2). Non-task
+		// panels leave these empty and the [a] interceptor falls
+		// through to default attach behavior.
 		m.detail = &detailView{
 			title:       title,
 			body:        body,
 			taskProject: row.parentProject,
 			taskSlug:    row.task.Slug,
+			taskStatus:  row.task.Status,
 		}
 	case rowWorker:
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)

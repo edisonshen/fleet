@@ -589,6 +589,82 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 	}
 }
 
+// TestKeyA_DetailPanel_TodoTask_PointsAtDispatch pins that pressing
+// [a] in a todo/ready task's detail panel flashes the dispatch hint
+// (NOT the missing-worker recovery command). Codex iter-2 P2 fix:
+// without preserving status on the detail view, the panel-side [a]
+// would regress on pre-dispatch tasks.
+func TestKeyA_DetailPanel_TodoTask_PointsAtDispatch(t *testing.T) {
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.detail = &detailView{
+		title:       "task: fleet/fresh-task-aaaa",
+		body:        "(prepopulated panel)",
+		taskProject: "fleet",
+		taskSlug:    "fresh-task-aaaa",
+		taskStatus:  "todo",
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.detail != nil {
+		t.Errorf("[a] on todo-task panel should dismiss, got %+v", mm.detail)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] should flash a hint, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "no worker yet") {
+		t.Errorf("flash should explain pre-dispatch state, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "[d]") {
+		t.Errorf("flash should point at [d] dispatch, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "status=ready") {
+		t.Errorf("todo-task panel must NOT suggest the recovery command, got %q", mm.flash.text)
+	}
+}
+
+// TestKeyEnter_TaskRow_PreservesStatusOnDetail pins that opening a
+// task detail captures the row's status so the panel-side [a]
+// handler can apply the same status-aware routing as the row-side
+// handler.
+func TestKeyEnter_TaskRow_PreservesStatusOnDetail(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "fresh-task-aaaa", tasks.StatusReady, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "fresh-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("enter"))
+	mm := updated.(Model)
+	if mm.detail == nil {
+		t.Fatalf("[⏎] should open detail panel")
+	}
+	if mm.detail.taskStatus != "ready" {
+		t.Errorf("detail.taskStatus should reflect row status, got %q", mm.detail.taskStatus)
+	}
+}
+
 // TestKeyA_DetailPanel_NonTask_StillDismisses pins the regression
 // case: pressing [a] in a worker / agent / help panel should still
 // dismiss the panel as before — the task-aware re-route only fires
