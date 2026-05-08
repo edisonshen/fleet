@@ -252,10 +252,13 @@ func SendPromptKeys(session, prompt string) error {
 
 // SendPromptKeysVerified is SendPromptKeys with the verification
 // outcome surfaced. submitted=true means we observed the prompt
-// leave the input box (success). submitted=false means EITHER the
-// retry path also failed to submit, OR pane capture failed and we
-// couldn't tell — either way the caller should treat the operator
-// as needing to manually press Enter after attach.
+// leave the input box (success), OR pane capture failed and we
+// couldn't tell — the latter is a conservative report so a transient
+// tmux glitch during verification doesn't drive a spurious retry
+// (see promptSubmittedWithDeps). submitted=false means we positively
+// observed the prompt sitting in Claude's input box even after the
+// retry — the caller should surface a "manual Enter needed" hint to
+// the operator.
 //
 // err is non-nil ONLY for the initial send-keys failures (the prompt
 // or first Enter never reached tmux). Verification failures DO NOT

@@ -586,9 +586,11 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "8888")
 	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "99")
 	t.Setenv("FLEET_POST_READY_BUFFER_MS", "1234")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "456")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "789")
 
 	cmd := []string{"sh", "-c",
-		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS; cat"}
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS; cat"}
 	rec, err := Spawn(Options{
 		TaskID:  "x",
 		Project: "y",
@@ -601,7 +603,8 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 
 	// Each marker is short enough to fit on a single tmux pane line.
 	wants := []string{
-		"STABLE=777", "MAX=8888", "DELAY=99", "BUF=1234",
+		"STABLE=777", "MAX=8888", "DELAY=99",
+		"BUF=1234", "VER=456", "RTY=789",
 		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
 	}
 	if got := os.Getenv("FLEET_HOME"); got != "" {
