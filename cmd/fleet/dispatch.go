@@ -19,6 +19,16 @@ type dispatchOpts struct {
 	cwd          string
 	command      []string
 	noAutoResume bool
+	// prompt is the optional first-turn prompt to type into the
+	// freshly-spawned tmux session AFTER the pane stabilizes. Empty
+	// (default) → no prompt; the operator types one manually after
+	// `fleet attach`. Non-empty → spawn calls
+	// spawn.SendInitialPrompt(session, prompt) so the agent boots with
+	// the prompt already executed. Used by the v0.2 dashboard's
+	// project-row [a] auto-spawn path (issue #60) where the coord agent
+	// is bootstrapped non-interactively with `Run the /coordinator skill
+	// loop for project <name>.`
+	prompt string
 }
 
 func newDispatchCmd() *cobra.Command {
@@ -70,6 +80,14 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// (codex review iter-7 P2). Inherited across handoffs.
 	cmd.Flags().BoolVar(&opts.noAutoResume, "no-auto-resume", false,
 		"skip auto-typing the resume prompt on handoff (use for non-claude --command argvs)")
+	// --prompt types `<text>` into the freshly-spawned session after the
+	// pane stabilizes. v0.2 use case: the TUI's project-row [a] auto-
+	// spawn path bootstraps a coord with `Run the /coordinator skill
+	// loop for project <name>.` so the agent is productive without the
+	// operator having to attach + type. Empty → no prompt typed (the
+	// classic interactive dispatch flow).
+	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
+		"first-turn prompt to type into the spawned session (default: none)")
 	return cmd
 }
 
@@ -103,6 +121,31 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)
 	_, _ = fmt.Fprintf(stdout, "  project: %s\n", rec.Project)
 	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", rec.TmuxSession)
+	if opts.prompt != "" {
+		// Best-effort: a SendInitialPrompt failure here logs a warning
+		// to stderr but does NOT fail the dispatch — the session is up,
+		// the operator can attach + type the prompt manually. The
+		// alternative (returning err) would orphan the agent record +
+		// tmux session, requiring a manual cleanup. The TUI's coord
+		// auto-spawn path (issue #60) reads dispatch's exit code to
+		// decide whether the spawn succeeded; treating prompt-delivery
+		// failure as fatal would mistakenly mark a running coord as
+		// failed.
+		if perr := sendInitialPrompt(rec.TmuxSession, opts.prompt); perr != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
+				perr)
+		} else {
+			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
+		}
+	}
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
 	return nil
+}
+
+// sendInitialPrompt is a var so tests can stub the tmux interaction.
+// Production calls spawn.SendInitialPrompt which polls the pane until
+// the wrapped claude is idle, then sends the prompt + Enter.
+var sendInitialPrompt = func(session, prompt string) error {
+	return spawn.SendInitialPrompt(session, prompt)
 }

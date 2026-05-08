@@ -573,15 +573,20 @@ func TestKeyJK_MovesCursor(t *testing.T) {
 
 // TestKey_RowTypeGatingForActions regresses the codex iter-1 fix in
 // 240a3b0, extended for issue #53 row-type discrimination: [h] only
-// applies to agent rows, [a] applies to agent OR worker rows, [x]
-// applies to agent (archive) or worker (kill) rows. When the cursor
-// lands on a project/task row, the action flashes "doesn't apply" and
-// does NOT shell out.
+// applies to agent rows, [x] applies to agent (archive) or worker
+// (kill) rows. When the cursor lands on a project row, [h]/[x] flash
+// "doesn't apply" and do NOT shell out.
+//
+// [a] is intentionally NOT covered here as of issue #60: [a] on a
+// project row now spawns / attaches a coord (see
+// TestKeyA_ProjectRow_SpawnsCoord and friends). The legacy "[a]
+// flashes on projects" assertion was removed when the keybind grew
+// project-row semantics.
 func TestKey_RowTypeGatingForActions(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
 
-	for _, key := range []string{"h", "x", "a"} {
+	for _, key := range []string{"h", "x"} {
 		stub := &stubFleetCmd{}
 		stub.install(t)
 
@@ -595,10 +600,7 @@ func TestKey_RowTypeGatingForActions(t *testing.T) {
 		updated, cmd := m.Update(keyMsg(key))
 		mm := updated.(Model)
 
-		// [h] strictly rejects non-agent rows; [a]/[x] reject project rows.
 		if cmd != nil {
-			// [a] on a project flashes; [x] on a project flashes; [h]
-			// on a project flashes. None should produce a cmd.
 			t.Errorf("[%s] on project row returned a cmd; expected nil (gated)", key)
 		}
 		if mm.mode != modeNav {

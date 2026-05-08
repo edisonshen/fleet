@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -82,6 +87,49 @@ type rmDoneMsg struct {
 	out string
 	err error
 }
+
+// coordSpawnDoneMsg is emitted after the project-row [a] auto-spawn
+// path completes. The flow runs as one tea.Cmd in a goroutine:
+//
+//  1. Shell out to `fleet dispatch coord-<UTC stamp> --project <name>
+//     --cwd <repo> --prompt "Run the /coordinator skill loop for
+//     project <name>."` (uses dispatch's --prompt flag added in
+//     issue #60).
+//  2. Parse the new agent's ID from dispatch stdout ("agent <id>
+//     spawned" first line) so we know whose lock body to expect.
+//  3. Poll ~/.fleet/projects/<name>/.locks/coordinator.lock body via
+//     readCoordHolder up to lockPollAttempts at lockPollInterval each
+//     until the body equals the new agent ID (the coord skill writes
+//     it after acquiring LOCK_EX in _try_lock).
+//  4. Hand back the resulting tmux session name (and the project name
+//     for the flash) so Update sets pendingAttach + tea.Quit, the same
+//     way the agent-row [a] path does.
+//
+// Failures at any step propagate as err: the dispatch failure (binary
+// missing, project name invalid), the agent-ID parse failure (dispatch
+// printed unexpected output), or the lock-poll timeout (dispatch
+// succeeded but the coord skill never acquired the lock — typically
+// the operator has /coordinator unconfigured or claude crashed before
+// the first turn). The agent record stays on disk in all timeout
+// cases; the operator can attach manually via [a] on its right-column
+// row to investigate.
+type coordSpawnDoneMsg struct {
+	projectName string
+	agentID     string
+	session     string
+	err         error
+}
+
+// lockPollInterval / lockPollAttempts bound the coord-spawn lock-
+// acquisition wait. 100ms × 20 = 2s total budget per the issue #60
+// spec ("Wait briefly (≤2s)"). The coord skill's first tick runs
+// immediately after claude boots + types the /coordinator slash —
+// well within 2s on a normal box. Slower environments fall through
+// to the timeout branch and surface a banner.
+const (
+	lockPollInterval = 100 * time.Millisecond
+	lockPollAttempts = 20
+)
 
 // fleetBinary is resolved once at startup via os.Executable() so the
 // TUI invokes ITSELF for sub-commands rather than depending on the
@@ -288,9 +336,10 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 
 // actionAttach dispatches [a] for the row under the cursor.
 //
-// Agent row → tmux attach to the agent's session.
-// Worker row → open the worker peek detail panel (output.log + state.json).
-// Other row types flash "doesn't apply".
+// Agent row   → tmux attach to the agent's session.
+// Worker row  → open the worker peek detail panel (output.log + state.json).
+// Project row → attach to existing coord OR auto-spawn one (issue #60).
+// Task row    → flash "doesn't apply" (no tmux + no peek surface).
 func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 	row := m.selectedRow()
 	if row == nil {
@@ -328,13 +377,217 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
 		m.detail = &detailView{title: title, body: body}
 		return m, nil, true
+	case rowProject:
+		return m.actionAttachProject(row.project)
 	default:
+		// Task rows (and any future row kinds) — neither tmux nor a
+		// peek surface fits. Flash so the operator sees the no-op.
 		m.flash = &flashMsg{
-			text:  "[a] attach applies to agents (tmux) or workers (peek); not to tasks/projects",
+			text:  "[a] attach applies to projects (coord), agents (tmux), or workers (peek); not to tasks",
 			isErr: true,
 		}
 		return m, nil, true
 	}
+}
+
+// actionAttachProject is the project-row branch of [a] (issue #60).
+//
+// Two paths:
+//
+//   - Existing coord: project.CoordID is set (dashboard's freshness gate
+//     passed: lock body + coord-state.json mtime within
+//     coordActiveWindow). Find the matching agent.Record by ID, attach
+//     to its tmux session — same machinery as the rowAgent branch.
+//
+//   - No coord: auto-spawn one. Shell out to `fleet dispatch` with
+//     --prompt "Run the /coordinator skill loop for project <name>.",
+//     then poll the project's coordinator.lock body up to 2s for a
+//     match against the new agent ID. On success, set pendingAttach to
+//     the new tmux session and tea.Quit (Run() exec's tmux attach
+//     post-program). On failure (init err, dispatch err, lock-poll
+//     timeout), surface a flash; the half-spawned agent (if dispatch
+//     succeeded but the lock body never published) stays on disk and
+//     the operator can attach via [a] on its right-column row.
+//
+// Single-coord-per-project enforcement is upstream: the coord skill
+// itself NB-flocks coordinator.lock and exits if it can't acquire.
+// We rely on the dashboard's freshness gate (coord-state.json mtime)
+// to distinguish "alive coord" from "dead coord with stale lock body"
+// before deciding which path to take.
+func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
+	if p == nil {
+		return m, nil, true
+	}
+	// Path 1: fresh coord exists. Look up the record by ID; verify the
+	// session is alive before committing to attach. A coord whose tmux
+	// session died but whose lock body wasn't yet stale would get
+	// dispatched to a dead session otherwise — same UX bug as the
+	// agent-row branch's "no sessions" failure mode.
+	if p.CoordID != "" {
+		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
+			if !sessionAliveFn(rec.TmuxSession) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"coord %s for project %s has a dead tmux session — press [x] on its agent row to archive, then [a] here to respawn",
+						rec.ID, p.Name),
+					isErr: true,
+				}
+				return m, nil, true
+			}
+			m.pendingAttach = rec.TmuxSession
+			return m, tea.Quit, true
+		}
+		// CoordID set but no matching record loaded yet (race: dashboard
+		// snapshot picked up the lock body before agentsMsg refreshed).
+		// Fall through to the spawn path's flash on second press —
+		// avoiding the spawn here would leave [a] silently dead. But
+		// rather than spawning a duplicate, surface a hint that the
+		// operator should retry after the next refresh tick.
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord %s for project %s pending refresh — try [a] again in a moment",
+				p.CoordID, p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	// Path 2: no coord. Spawn one.
+	cwd := coordCwdForProject(m.records, p.Name)
+	return m, m.startCoordSpawn(p.Name, cwd), true
+}
+
+// findRecordByID returns the first agent.Record with id, or nil.
+// Linear scan is fine: m.records is bounded by the operator's concurrent
+// agent count (single digits in practice).
+func findRecordByID(records []*agent.Record, id string) *agent.Record {
+	for _, r := range records {
+		if r != nil && r.ID == id {
+			return r
+		}
+	}
+	return nil
+}
+
+// coordCwdForProject best-guess resolves the working directory for a
+// freshly-spawned coord agent.
+//
+// Precedence:
+//  1. Any existing agent record tagged with the same Project — reuse
+//     its Cwd. Operators dispatch agents into the project's actual
+//     repo, so this is the most accurate signal.
+//  2. The TUI process's own cwd via os.Getwd() — works when the
+//     operator launched `fleet` from inside the project repo.
+//  3. Empty string — `fleet dispatch` resolves empty cwd to caller's
+//     wd, same as (2). Acceptable fallback.
+//
+// The coord skill operates on ~/.fleet/projects/<name>/, not on the
+// repo, so the cwd choice is mostly cosmetic — it sets where the
+// agent's tmux session lands and where /coordinator's first
+// directory-relative shell commands resolve. Wrong cwd doesn't break
+// correctness; it just nudges the agent toward the wrong starting
+// directory.
+func coordCwdForProject(records []*agent.Record, projectName string) string {
+	for _, r := range records {
+		if r != nil && r.Project == projectName && r.Cwd != "" {
+			return r.Cwd
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return ""
+}
+
+// dispatchAgentIDPattern matches the first line of `fleet dispatch`
+// stdout: "agent <8-hex-id> spawned". We extract the ID so the
+// follow-up lock-poll knows whose holder to expect. The stdout shape
+// is stable across v0.1 / v0.2 — see cmd/fleet/dispatch.go runDispatch.
+var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawned`)
+
+// startCoordSpawn shells out to `fleet dispatch` with the coord
+// auto-prompt + polls for lock acquisition. Runs entirely inside one
+// tea.Cmd's goroutine so the bubbletea event loop stays responsive
+// during the 2s lock-poll window.
+//
+// task ID format: "coord-<UTC YYYYMMDD-HHMMSS>" — sortable + unique
+// across rapid re-spawns. The meaningful identifier is the
+// agent.NewID() the spawn assigns; the task ID is just a label so the
+// agent record's TaskID isn't empty.
+func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
+	taskID := fmt.Sprintf("coord-%s", time.Now().UTC().Format("20060102-150405"))
+	prompt := fmt.Sprintf("Run the /coordinator skill loop for project %s.", projectName)
+	args := []string{"dispatch", taskID, "--project", projectName, "--prompt", prompt}
+	if cwd != "" {
+		args = append(args, "--cwd", cwd)
+	}
+	return runFleetCmd(args, func(out string, err error) tea.Msg {
+		if err != nil {
+			return coordSpawnDoneMsg{
+				projectName: projectName,
+				err:         fmt.Errorf("dispatch: %w\n%s", err, out),
+			}
+		}
+		// Parse the new agent's ID from dispatch stdout. Without it we
+		// can't tell which holder we're waiting for and would have to
+		// flash "spawned but can't track" — a bad UX. Treat parse
+		// failure as fatal so the operator notices the dispatch output
+		// drift before this becomes a silent "lock never matches" loop.
+		match := dispatchAgentIDPattern.FindStringSubmatch(out)
+		if len(match) != 2 {
+			return coordSpawnDoneMsg{
+				projectName: projectName,
+				err:         fmt.Errorf("dispatch output missing agent ID line:\n%s", out),
+			}
+		}
+		agentID := match[1]
+		// Poll the coord lock for body == agentID. The coord skill writes
+		// it inside _try_lock after acquiring LOCK_EX | LOCK_NB; until
+		// the first tick fires, the body is empty (or carries a stale
+		// previous holder, dropped by the truncate-before-write in
+		// loop.py). On match → success; on timeout → return the agent
+		// ID anyway so the operator knows the spawn happened (and the
+		// agent shows up on the right column).
+		session := tmux.SessionName(agentID)
+		if pollCoordLock(projectName, agentID, lockPollAttempts, lockPollInterval) {
+			return coordSpawnDoneMsg{
+				projectName: projectName,
+				agentID:     agentID,
+				session:     session,
+			}
+		}
+		return coordSpawnDoneMsg{
+			projectName: projectName,
+			agentID:     agentID,
+			err: fmt.Errorf(
+				"coord spawn timed out — agent %s spawned but lock body never published; check tmux session %s",
+				agentID, session),
+		}
+	})
+}
+
+// pollCoordLock polls coordinator.lock every interval for up to attempts
+// iterations, returning true once readCoordHolder returns wantID. var so
+// tests can stub the timing-sensitive loop without sleeping for real.
+//
+// Sleeps BEFORE the read (except the first iteration), not after. Sleeping
+// after the last failed check would push the total budget 1×interval past
+// the documented "≤2s" without buying anything — the loop is about to
+// return false either way.
+var pollCoordLock = func(projectName, wantID string, attempts int, interval time.Duration) bool {
+	root, err := state.Root()
+	if err != nil {
+		return false
+	}
+	projectsRoot := filepath.Join(root, "projects")
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(interval)
+		}
+		if got := readCoordHolder(projectsRoot, projectName); got == wantID {
+			return true
+		}
+	}
+	return false
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:
