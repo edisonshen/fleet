@@ -18,6 +18,10 @@ go.work.sum
 # Local fleet state (never commit user state)
 .fleet/
 
+# Python bytecode caches (skill tests run via pytest land __pycache__/)
+__pycache__/
+*.pyc
+
 # Secrets — block all .env files but keep .env.example / .env.sample committable
 .env
 .env.*

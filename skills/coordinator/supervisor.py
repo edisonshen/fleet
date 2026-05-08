@@ -451,12 +451,21 @@ class WorkerProbe:
     """Identifies a worker the supervisor should keep watching during
     one supervisor session. Built from tasks.md after the initial tick
     and refreshed on every reconcile pass.
+
+    `live_worker`: True iff a worker subprocess is expected to be writing
+    state.json. Tasks at status=in-progress have a live worker; tasks at
+    status=in-review do NOT — the worker exited after opening the PR
+    and the only thing left to advance the task is `gh pr` CI checks.
+    Stuck-detection only applies to live workers (no point nudging an
+    inbox owned by an exited agent); the periodic_full_reconcile hook
+    covers in-review tasks separately.
     """
 
     slug: str
     state_path: Path
     agent_id: str = ""
     tmux_session: str = ""
+    live_worker: bool = True
 
 
 def build_worker_probes(
@@ -478,11 +487,13 @@ def build_worker_probes(
         slug = t.slug
         state_path = home / "projects" / project / "workers" / slug / "state.json"
         agent_id = agent_id_map.get(slug, "")
+        live_worker = (t.status == "in-progress")
         probes.append(WorkerProbe(
             slug=slug,
             state_path=state_path,
             agent_id=agent_id,
             tmux_session=session_name_for_agent(agent_id),
+            live_worker=live_worker,
         ))
     return probes
 
@@ -504,6 +515,7 @@ def run_supervisor(
     refresh_probes: Callable[[], list[WorkerProbe]],
     reconcile_one: Callable[[WorkerProbe], None],
     write_state: Callable[[], None],
+    periodic_full_reconcile: Callable[[], None] | None = None,
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -602,12 +614,25 @@ def run_supervisor(
             except Exception as exc:  # noqa: BLE001
                 res.errors.append(f"write_state after reconcile: {exc}")
 
-        # Sparse stuck-check.
+        # Sparse stuck-check + periodic full reconcile. Both run on the
+        # same Nth-poll cadence — periodic_full_reconcile catches
+        # in-review CI flips that mtime polling misses (no live worker
+        # → no state.json mtime change), and stuck-check fires the
+        # nudge/escalate/block ladder for live workers.
         if (
             cfg.stuck_check_every > 0
             and poll_count % cfg.stuck_check_every == 0
         ):
             res.stuck_check_passes += 1
+            # Periodic full reconcile FIRST. Running before stuck-check
+            # means a worker that just transitioned to in-review (and
+            # would otherwise be stuck-flagged on the next pass) drops
+            # out of the live-worker probe set BEFORE we evaluate it.
+            if periodic_full_reconcile is not None:
+                try:
+                    periodic_full_reconcile()
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"periodic-reconcile: {exc}")
             try:
                 stuck_summary = _run_stuck_check_pass(
                     probes=probes,
@@ -669,6 +694,12 @@ def _run_stuck_check_pass(
     from loop import _read_worker_state  # type: ignore[attr-defined]
 
     for p in probes:
+        # codex iter-1 [P1]: in-review tasks have no live worker — the
+        # subprocess exited after opening the PR. Skip stuck-detection
+        # entirely. periodic_full_reconcile (called separately) handles
+        # the gh pr CI re-check that moves the task to done.
+        if not p.live_worker:
+            continue
         st = _read_worker_state(project, p.slug, home=home)
         # Honor agent IDs from coord-state if probe didn't carry one
         # (probe is rebuilt from tasks.md every loop pass; agent_id

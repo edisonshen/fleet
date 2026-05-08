@@ -393,29 +393,30 @@ def _run_supervisor(
             project=project, home=home, tasks=f2.tasks, agent_id_map=amap,
         )
 
-    def reconcile_one(probe):
-        # Re-run the FULL reconcile path against tasks.md — single-task
-        # reconcile would duplicate state.json + pr_url + CI logic that
-        # already lives in _reconcile_inflight. The reconcile is
-        # idempotent: tasks already in non-terminal-but-alive phases
-        # are no-ops, so pulling the whole tasks.md is correctness-
-        # equivalent and avoids drift between this code path and the
-        # primary tick. Cost is bounded by len(in-flight) which equals
-        # len(probes); the gh API calls only fire for workers whose
-        # state.json mtime advanced (the change detector already
-        # filtered).
+    def _reconcile_slugs(slugs):
+        """Run reconcile against the given slugs and apply actions.
+
+        Centralizes the read-tasks → reconcile → apply path used by
+        both the mtime-change hook (one slug) and the periodic full
+        sweep (all in-flight). Idempotent — running on slugs whose
+        worker is alive is a no-op.
+
+        Returns True if any slot was freed (action.new_status in the
+        terminal set) so the caller can re-run dispatch to backfill.
+        """
         try:
             f3 = parse.read(str(tasks_path))
         except Exception as exc:  # noqa: BLE001
-            result.errors.append(f"supervisor reconcile {probe.slug}: {exc}")
-            return
-        # Limit reconcile to the changed slug. _reconcile_inflight
-        # filters by status, so we hand it a one-element list.
-        scoped = [t for t in f3.tasks if t.slug == probe.slug]
+            result.errors.append(f"supervisor reconcile read: {exc}")
+            return False
+        scoped = [t for t in f3.tasks if t.slug in set(slugs)]
+        if not scoped:
+            return False
         actions = _reconcile_inflight(
             scoped, project, fleet_bin, home=home,
         )
         cs = _load_coord_state(state_path)
+        slot_freed = False
         for action in actions:
             try:
                 _apply_reconcile(
@@ -425,11 +426,85 @@ def _run_supervisor(
                 )
                 if action.clear_worker:
                     supervisor_mod.forget_agent_id(cs, action.slug)
+                # codex iter-1 [P1]: a worker leaving the in-flight
+                # set frees a dispatch slot. Without re-running
+                # _dispatch_ready, with cap=1 the next ready task
+                # waits hours for the supervisor to exit. Mark the
+                # transition so the outer caller dispatches.
+                if action.new_status in (
+                    "todo", "done", "in-review", "blocked",
+                ):
+                    slot_freed = True
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(
                     f"supervisor reconcile-apply {action.slug}: {exc}"
                 )
         _save_coord_state(state_path, cs)
+        return slot_freed
+
+    def _maybe_dispatch_after_reconcile():
+        """Re-run _dispatch_ready under the same lock when a slot freed.
+
+        codex iter-1 [P1] regress: the supervisor's per-worker reconcile
+        flipped a finished worker to in-review/done/todo but the next
+        ready task waited until supervisor exited because dispatch only
+        ran inside the FIRST tick. Re-running here keeps `cap` saturated
+        across the entire supervisor session.
+        """
+        try:
+            f4 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor dispatch read: {exc}")
+            return
+        new_dispatched = _dispatch_ready(
+            tasks=f4.tasks,
+            project=project,
+            cwd=cwd,
+            cap=cap,
+            fleet_bin=fleet_bin,
+            fleet_home=str(home),
+        )
+        cs = _load_coord_state(state_path)
+        for action in new_dispatched:
+            try:
+                _apply_dispatch(action, project, fleet_bin)
+                if action.agent_id:
+                    supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
+        _save_coord_state(state_path, cs)
+
+    def reconcile_one(probe):
+        # Reconcile one slug whose state.json mtime advanced. The full
+        # _reconcile_inflight path is idempotent and matches what the
+        # primary tick does, so we just hand it a one-element scope.
+        if _reconcile_slugs([probe.slug]):
+            _maybe_dispatch_after_reconcile()
+
+    def periodic_full_reconcile():
+        """Re-reconcile EVERY in-flight task (not just mtime-changed ones).
+
+        codex iter-1 [P1] regress: in-review tasks have no live worker,
+        so their state.json mtime never advances and the mtime-driven
+        hook never fires. Without this periodic sweep, the supervisor
+        would sit on the lock for hours while a PR's CI flips green
+        but tasks.md never advances to done. The sweep runs at the
+        same cadence as stuck-check (default every 5 min) and is
+        gated behind the same FLEET_COORD_STUCK_CHECK_EVERY knob;
+        cost is bounded by len(in-flight) gh API calls per cycle.
+        """
+        try:
+            f3 = parse.read(str(tasks_path))
+        except Exception:
+            return
+        slugs = [
+            t.slug for t in f3.tasks
+            if t.status in ("in-progress", "in-review")
+        ]
+        if not slugs:
+            return
+        if _reconcile_slugs(slugs):
+            _maybe_dispatch_after_reconcile()
 
     def write_state_hook():
         # Heartbeat publish. Re-load → no-op-write so any concurrent
@@ -445,6 +520,7 @@ def _run_supervisor(
         refresh_probes=refresh_probes,
         reconcile_one=reconcile_one,
         write_state=write_state_hook,
+        periodic_full_reconcile=periodic_full_reconcile,
     )
     # Surface supervisor stats as auxiliary tick result fields. We
     # don't mutate TickResult's primary counters because they describe

@@ -777,6 +777,131 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     assert cfg.poll_max_s == 60
 
 
+# ---------- codex iter-1 P1 regressions ----------
+
+
+def test_in_review_probe_skips_stuck_detection(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """codex iter-1 [P1]: in-review tasks have no live worker. Stuck-
+    check must NOT nudge them (the worker subprocess is gone — there's
+    no agent to deliver the inbox to).
+    """
+    coord_state_path = fleet_home / "projects" / "fleet" / "coord-state.json"
+    coord_state_path.parent.mkdir(parents=True, exist_ok=True)
+    coord_state_path.write_text(json.dumps({
+        "supervisor": {
+            "alpha-aaaa": {
+                "last_phase": "tdd-red",
+                "consecutive_stuck_polls": 5,  # would trigger if live
+                "nudged_at": 0.0, "escalated_at": 0.0,
+            }
+        },
+        "worker_agent_ids": {"alpha-aaaa": "aaaaaaaa"},
+    }), encoding="utf-8")
+    state_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(state_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+
+    # Note live_worker=False — this is the in-review probe shape.
+    probes = [supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=state_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+        live_worker=False,
+    )]
+    monkeypatch.setattr(supervisor, "tmux_session_alive", lambda s: True)
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        supervisor.subprocess, "run",
+        lambda cmd, *a, **kw: (
+            calls.append(list(cmd))
+            or subprocess.CompletedProcess(args=cmd, returncode=0)
+        ),
+    )
+
+    res = supervisor._run_stuck_check_pass(
+        probes=probes, project="fleet",
+        home=fleet_home, fleet_bin="fleet",
+        cfg=_cfg(stuck_polls=3, stuck_threshold_s=10),
+        now_unix=_now(),
+        log_stream=io.StringIO(),
+    )
+    assert res.nudges == 0
+    assert res.escalations == 0
+    assert res.blocks == 0
+    # No fleet CLI calls fired for the in-review task.
+    assert not any("alpha-aaaa" in str(c) for c in calls), calls
+
+
+def test_build_worker_probes_marks_in_review_as_non_live(
+    tmp_path: Path,
+) -> None:
+    """build_worker_probes flags in-review tasks live_worker=False."""
+    @dataclass
+    class FakeTask:
+        slug: str
+        status: str
+
+    probes = supervisor.build_worker_probes(
+        project="fleet", home=tmp_path,
+        tasks=[
+            FakeTask(slug="alpha-aaaa", status="in-progress"),
+            FakeTask(slug="beta-bbbb", status="in-review"),
+        ],
+        agent_id_map={"alpha-aaaa": "aaaaaaaa", "beta-bbbb": "bbbbbbbb"},
+    )
+    by_slug = {p.slug: p for p in probes}
+    assert by_slug["alpha-aaaa"].live_worker is True
+    assert by_slug["beta-bbbb"].live_worker is False
+
+
+def test_periodic_full_reconcile_runs_on_stuck_check_pass(
+    fleet_home: Path,
+) -> None:
+    """codex iter-1 [P1]: in-review CI checks must run on the periodic
+    full-reconcile sweep, not be gated on state.json mtime change."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+        live_worker=True,
+    )
+    full_reconcile_calls = {"n": 0}
+
+    def fake_full_reconcile():
+        full_reconcile_calls["n"] += 1
+
+    seq_iter = iter([[probe]] * 5 + [[]])  # 5 polls, then exit on iter 6
+    fake_now_state = {"t": 0.0}
+
+    def fake_refresh():
+        try:
+            return next(seq_iter)
+        except StopIteration:
+            return []
+
+    def fake_sleep(s):
+        fake_now_state["t"] += s
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(stuck_check_every=2),  # every 2 polls
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now_state["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        periodic_full_reconcile=fake_full_reconcile,
+        log_stream=io.StringIO(),
+    )
+    # 5 active polls, every 2 → poll 2, 4 = 2 full-reconcile calls.
+    assert full_reconcile_calls["n"] == 2
+
+
 def test_supervisor_config_negative_values_clamped(monkeypatch) -> None:
     """Negative env values fall back to defaults (don't disable
     accidentally — disabling is the explicit 0 case)."""
