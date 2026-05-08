@@ -455,7 +455,16 @@ func readTaskDetail(project, slug string) (body, title string, loaded bool) {
 			fmt.Fprintf(&b, "\n(active worker dir archived; `fleet peek %s --project %s` for full logs)\n", slug, project)
 			break
 		}
-		// No archive either. Show the no-worker recovery hint only
+		// Codex iter-9 P2 #2: workers/<slug>/ may exist while
+		// state.json hasn't landed yet (startup window). Mirror the
+		// [a] handler's tristate so the panel matches the "(no
+		// state.json yet)" peek path instead of suggesting retry.
+		if taskWorkerDirExists(project, slug) {
+			b.WriteString("\n### Worker\n")
+			b.WriteString("worker dir present, state.json pending — press [a] for the live peek\n")
+			break
+		}
+		// No archive, no dir. Show the no-worker recovery hint only
 		// when the task SHOULD have a worker. Codex iter-4 P2:
 		// include --project so a cross-project cwd doesn't update
 		// the wrong tasks.md.
@@ -516,28 +525,39 @@ var readArchivedWorkerState = func(project, slug string) *workers.State {
 // liveTaskStatus reads the current task status from tasks.md. Used by
 // the detail-panel [a] interceptor (codex iter-3 P2) so a status
 // transition between dashboard ticks doesn't strand the cached
-// taskStatus and route to the wrong hint. Returns "" on any read
-// failure — the caller falls back to the snapshot-cached status,
-// which is still better than a silent no-op.
+// taskStatus and route to the wrong hint.
+//
+// Codex iter-9 P2 #1: returns a tristate so callers can distinguish:
+//   - status non-empty: task exists at this status (override snapshot).
+//   - status "" + missing=true: tasks.md read OK, slug not found
+//     (task was archived/deleted). attachToTaskOrHint surfaces the
+//     "no longer exists" flash.
+//   - status "" + missing=false: tasks.md read failed (transient I/O,
+//     malformed). Caller MUST fall back to snapshot status rather
+//     than misclassify the task as deleted.
 //
 // var so tests can stub without seeding tasks.md on disk.
-var liveTaskStatus = func(project, slug string) string {
+var liveTaskStatus = func(project, slug string) (status string, missing bool) {
 	if project == "" || slug == "" {
-		return ""
+		return "", false
 	}
 	dir, err := state.ProjectDir(project)
 	if err != nil {
-		return ""
+		return "", false
 	}
 	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
 	if err != nil {
-		return ""
+		// Read error (transient I/O, parse failure). Don't claim the
+		// task is gone; caller falls back to snapshot.
+		return "", false
 	}
 	t, err := f.Get(slug)
 	if err != nil {
-		return ""
+		// tasks.md read OK but slug not found → task is genuinely
+		// archived or deleted.
+		return "", true
 	}
-	return string(t.Status)
+	return string(t.Status), false
 }
 
 // (projectDetail removed — issue #59: [⏎] on a project row now toggles

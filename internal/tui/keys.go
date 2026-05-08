@@ -562,15 +562,13 @@ func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, 
 	if taskWorkerArchiveExists(project, slug) {
 		return m.attachToTaskWorker(project, slug)
 	}
-	// No worker, active or archived. Codex iter-8 P2 #1: if the
-	// task itself is gone (liveTaskStatus empty), surface
-	// not-found instead of routing on stale snapshot status —
-	// suggesting promote/retry for a deleted slug is the same
-	// failure mode the detail-panel path was just hardened against.
-	live := liveTaskStatus(project, slug)
-	if live == "" && snapshotStatus != "" {
-		// snapshot says the task existed but the live read can't
-		// find it → archived/deleted between refreshes.
+	// No worker, active or archived. Codex iter-8 P2 #1 / iter-9 P2:
+	// if the task itself is genuinely missing from tasks.md, surface
+	// not-found. liveTaskStatus's missing=true flag is the
+	// authoritative signal — distinguishes "tasks.md read OK, slug
+	// gone" (deleted) from "tasks.md unreadable" (transient I/O).
+	live, missing := liveTaskStatus(project, slug)
+	if missing {
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
 				"task %s/%s no longer exists in tasks.md (archived or deleted) — refresh and pick a current task",

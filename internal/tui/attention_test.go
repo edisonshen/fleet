@@ -505,7 +505,7 @@ func TestKeyA_DetailPanel_TodoTaskWithExistingWorker_OpensPeek(t *testing.T) {
 	// liveTaskStatus stub returns the on-disk status (todo) — the
 	// fix must NOT use status to gate; worker existence wins.
 	origLive := liveTaskStatus
-	liveTaskStatus = func(project, slug string) string { return "todo" }
+	liveTaskStatus = func(project, slug string) (string, bool) { return "todo", false }
 	t.Cleanup(func() { liveTaskStatus = origLive })
 
 	m := New("test")
@@ -741,7 +741,7 @@ func TestKeyA_TaskRow_Done_PointsAtPeek(t *testing.T) {
 	taskWorkerArchiveExists = func(project, slug string) bool { return false }
 	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
 	origLive := liveTaskStatus
-	liveTaskStatus = func(project, slug string) string { return "done" }
+	liveTaskStatus = func(project, slug string) (string, bool) { return "done", false }
 	t.Cleanup(func() { liveTaskStatus = origLive })
 
 	m := New("test")
@@ -946,9 +946,13 @@ func TestKeyA_DetailPanel_RoutesToWorkerPeek(t *testing.T) {
 
 // TestKeyA_DetailPanel_NoWorker_DismissesWithFlash pins that the
 // detail-panel [a] interceptor still surfaces the no-worker hint
-// when the worker is gone. Panel dismisses (so the flash isn't
-// hidden behind a stale overlay).
+// when the worker is gone (but the task itself is still in
+// tasks.md and in a status that should have a worker). Panel
+// dismisses (so the flash isn't hidden behind a stale overlay).
 func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Task exists and is blocked → worker SHOULD exist, but doesn't.
+	seedBlockedTask(t, pdir, "fleet", "stale-aaaa", tasks.StatusBlocked, "")
 	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
 		return nil, nil
 	})
@@ -957,10 +961,11 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 	m.width = 130
 	m.height = 30
 	m.detail = &detailView{
-		title:       "task: fleet/stale",
+		title:       "task: fleet/stale-aaaa",
 		body:        "(prepopulated panel)",
 		taskProject: "fleet",
-		taskSlug:    "stale",
+		taskSlug:    "stale-aaaa",
+		taskStatus:  "blocked",
 	}
 
 	updated, _ := m.Update(keyMsg("a"))
@@ -1173,7 +1178,7 @@ func TestKeyA_TaskRow_TaskDeleted_FlashesNotFound(t *testing.T) {
 	taskWorkerDirExists = func(project, slug string) bool { return false }
 	t.Cleanup(func() { taskWorkerDirExists = origDir })
 	origLive := liveTaskStatus
-	liveTaskStatus = func(project, slug string) string { return "" } // task gone
+	liveTaskStatus = func(project, slug string) (string, bool) { return "", true } // task gone
 	t.Cleanup(func() { liveTaskStatus = origLive })
 
 	m := New("test")
@@ -1221,6 +1226,72 @@ func TestKeyA_TaskRow_WorkerDirWithoutStateJSON_OpensPeek(t *testing.T) {
 	}
 	if !strings.Contains(mm.detail.title, "worker") {
 		t.Errorf("panel should be the worker peek, got %q", mm.detail.title)
+	}
+}
+
+// TestKeyA_TaskRow_TasksMdReadError_FallsBackToSnapshot pins the
+// codex iter-9 P2 #1 fix: a transient tasks.md read failure must
+// NOT be misclassified as "task deleted". liveTaskStatus's tristate
+// missing flag distinguishes "tasks.md OK, slug not found" from
+// "tasks.md unreadable"; only the former triggers the not-found
+// flash. The latter falls back to snapshot status.
+func TestKeyA_TaskRow_TasksMdReadError_FallsBackToSnapshot(t *testing.T) {
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origArch := taskWorkerArchiveExists
+	taskWorkerArchiveExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
+	origDir := taskWorkerDirExists
+	taskWorkerDirExists = func(project, slug string) bool { return false }
+	t.Cleanup(func() { taskWorkerDirExists = origDir })
+	origLive := liveTaskStatus
+	// Read failure: status="" + missing=false → caller falls back
+	// to snapshotStatus. The not-found flash MUST NOT fire.
+	liveTaskStatus = func(project, slug string) (string, bool) { return "", false }
+	t.Cleanup(func() { liveTaskStatus = origLive })
+
+	m := New("test")
+	mm, _, _ := m.attachToTaskOrHint("fleet", "blocked-task-aaaa", "blocked")
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("blocked task should flash recovery, got %v", mm.flash)
+	}
+	if strings.Contains(mm.flash.text, "no longer exists") {
+		t.Errorf("read failure must NOT be misclassified as deleted, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "no worker for task") {
+		t.Errorf("blocked snapshot fallback should flash recovery, got %q", mm.flash.text)
+	}
+}
+
+// TestTaskDetail_WorkerDirWithoutStateJSON_PromptsPeek pins the
+// codex iter-9 P2 #2 fix: the detail panel's no-worker hint must
+// NOT fire when workers/<slug>/ exists but state.json hasn't
+// landed yet. Mirrors the [a] handler's startup-window peek path —
+// otherwise blocked/in-progress tasks read mid-startup would be
+// incorrectly shown the retry hint.
+func TestTaskDetail_WorkerDirWithoutStateJSON_PromptsPeek(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "starting-task-aaaa", tasks.StatusBlocked, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origDir := taskWorkerDirExists
+	taskWorkerDirExists = func(project, slug string) bool { return true }
+	t.Cleanup(func() { taskWorkerDirExists = origDir })
+	origArch := readArchivedWorkerState
+	readArchivedWorkerState = func(project, slug string) *workers.State { return nil }
+	t.Cleanup(func() { readArchivedWorkerState = origArch })
+
+	body, _, _ := readTaskDetail("fleet", "starting-task-aaaa")
+	if !strings.Contains(body, "state.json pending") {
+		t.Errorf("body should mention pending state.json (startup window), got:\n%s", body)
+	}
+	if strings.Contains(body, "no worker state on disk") {
+		t.Errorf("startup window must NOT show no-worker hint (worker dir exists), got:\n%s", body)
+	}
+	if strings.Contains(body, "fleet tasks set") {
+		t.Errorf("startup window must NOT suggest retry, got:\n%s", body)
 	}
 }
 
