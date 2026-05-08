@@ -316,6 +316,82 @@ func TestExpand_CapsAtMaxWithMoreTail(t *testing.T) {
 	}
 }
 
+// TestExpand_EnterOnSyntheticMarkerIsNoop pins that pressing [⏎]
+// on a synthetic Empty/More marker row does NOT open a detail
+// modal (those rows have no slug — readTaskDetail("") would
+// render a bogus "task not found" panel).
+func TestExpand_EnterOnSyntheticMarkerIsNoop(t *testing.T) {
+	withFleetHome(t)
+	// Synthetic project from an agent record → expansion emits a
+	// single Empty marker row.
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.records = []*agent.Record{
+		{
+			SchemaVersion: 1,
+			ID:            "agent01",
+			TmuxSession:   "fleet-agent01",
+			Project:       "scratch",
+			TaskID:        "scratch-task",
+			SpawnedAt:     time.Now().UTC(),
+		},
+	}
+	m.expanded = map[string]bool{"scratch": true}
+	// Find the marker row.
+	rows := m.dashboardRows()
+	markerIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Empty {
+			markerIdx = i
+			break
+		}
+	}
+	if markerIdx < 0 {
+		t.Fatalf("synthetic Empty marker row missing from rows: %+v", rows)
+	}
+	m.dashCursor = markerIdx
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(Model)
+	if mm.detail != nil {
+		t.Errorf("[⏎] on Empty marker should not open detail, got %+v", mm.detail)
+	}
+}
+
+// TestExpand_EnterOnMoreMarkerIsNoop pins the same no-op behavior
+// for the "+N more" tail row.
+func TestExpand_EnterOnMoreMarkerIsNoop(t *testing.T) {
+	pdir := withFleetHome(t)
+	// 12 tasks → 10 visible + "+2 more" tail.
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 12})
+
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	moreIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.More > 0 {
+			moreIdx = i
+			break
+		}
+	}
+	if moreIdx < 0 {
+		t.Fatalf("+more tail row missing from rows: %+v", rows)
+	}
+	m.dashCursor = moreIdx
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mm := updated.(Model)
+	if mm.detail != nil {
+		t.Errorf("[⏎] on +more marker should not open detail, got %+v", mm.detail)
+	}
+}
+
 // TestExpand_SearchKeepsTaskVisibleWithoutExpansion pins the search
 // override: when the active filter matches a task slug under a
 // collapsed project, the task row still renders so the operator

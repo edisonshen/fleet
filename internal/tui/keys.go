@@ -372,6 +372,15 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	case rowTask:
+		// Synthetic markers (the "no tasks yet" hint and "+N more"
+		// footer under expanded projects, issue #59) carry no slug —
+		// readTaskDetail("") would render an unhelpful "task not
+		// found" modal. Treat as a navigation no-op so j/k can pass
+		// through the marker without trapping the operator in a
+		// dead-end overlay.
+		if row.task == nil || row.task.Empty || row.task.More > 0 {
+			return m, nil, true
+		}
 		body, title := readTaskDetail(row.parentProject, row.task.Slug)
 		m.detail = &detailView{title: title, body: body}
 	case rowWorker:
