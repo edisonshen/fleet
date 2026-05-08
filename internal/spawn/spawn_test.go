@@ -1,11 +1,14 @@
 package spawn
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -266,9 +269,24 @@ func TestSendInitialPrompt_TypedAfterPaneStable(t *testing.T) {
 	setupFleetHome(t)
 
 	// Pin small windows so the test suite doesn't pay production's
-	// 500 ms stable / 30 s max waits.
+	// 500 ms stable / 30 s max waits. Issue #65: zero out the
+	// post-ready buffer (default 1.5s), the post-send verify/retry
+	// delays (defaults 0.5s/1.5s), and shrink the prompt-enter
+	// delay so this test continues to converge inside its 2 s
+	// deadline. The post-send verifier WILL falsely report
+	// "unsubmitted" here because the synthetic shell echoes
+	// `GOT:<prompt>` to the pane (the verifier can't distinguish
+	// "prompt in input box" from "prompt printed by a downstream
+	// shell command"); the retry's second Enter sends a literal
+	// newline to the now-blocked shell, which is harmless. Buffer
+	// + verifier behavior is verified separately in dedicated
+	// tests so we trade test fidelity here for runtime.
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "150")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
 
 	// `echo READY; read line; echo GOT:$line` prints a banner (so
 	// CapturePane has non-empty content), blocks on read (pane goes
@@ -312,6 +330,12 @@ func TestSendInitialPrompt_EmptyPromptIsNoOp(t *testing.T) {
 
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "150")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+	// Empty prompt should return BEFORE WaitForReadyToPrompt runs, so
+	// the post-ready buffer is irrelevant — but we pin it to 0
+	// defensively in case the helper call order changes.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
 
 	rec, err := Spawn(Options{
 		TaskID:  "no-prompt",
@@ -359,14 +383,28 @@ func TestSendInitialPrompt_EmptyPromptIsNoOp(t *testing.T) {
 // — proving the structural split is in place. A future refactor
 // that collapses back to a single send-keys call will fail this
 // test.
+//
+// Issue #65 update: defaultPromptEnterDelay was bumped from 200ms
+// to 1000ms because the original 200ms gap was too short on the
+// operator's box (Enter still landed inside Claude's paste-detection
+// window and was swallowed). The pinned env override was bumped to
+// 1100ms to keep the test deterministic while asserting the new
+// minimum.
 func TestSendPromptKeys_SeparatesPromptAndEnter(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 
-	// Pin the inter-key delay to something measurable but small
-	// enough to keep the test fast. 250 ms gives ~2x headroom over
-	// scheduling jitter on busy CI runners.
-	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "250")
+	// Pin the inter-key delay to a value above the new 1000ms
+	// default so the test asserts the floor without paying production-
+	// scale latency variability. 1100ms gives ~10% headroom over the
+	// new default.
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "1100")
+	// Zero verifier delays — this test exercises the prompt+Enter
+	// split, not the post-send verifier. The shell-echoes-prompt
+	// pattern would falsely trip verification anyway (see notes on
+	// TestSendInitialPrompt_TypedAfterPaneStable).
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
 
 	rec, err := Spawn(Options{
 		TaskID:  "split-send",
@@ -390,18 +428,18 @@ func TestSendPromptKeys_SeparatesPromptAndEnter(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Lower bound only — the pinned delay is a floor, not a ceiling.
-	// Two send-keys subprocess invocations + the 250 ms sleep land
-	// well above 200 ms; a single-call regression would return in a
-	// handful of milliseconds.
-	if elapsed < 200*time.Millisecond {
-		t.Errorf("SendPromptKeys returned in %s; expected ≥200 ms because the prompt and Enter must be sent as two send-keys calls separated by FLEET_PROMPT_ENTER_DELAY_MS to defeat Claude Code's bracketed-paste detection",
+	// Two send-keys subprocess invocations + the 1100 ms sleep land
+	// well above 1000 ms; a regression that drops below the new
+	// default (e.g., reverting to 200 ms) returns much faster.
+	if elapsed < 1000*time.Millisecond {
+		t.Errorf("SendPromptKeys returned in %s; expected ≥1000 ms because the prompt and Enter must be sent as two send-keys calls separated by FLEET_PROMPT_ENTER_DELAY_MS (default 1000ms post-#65) to defeat Claude Code's bracketed-paste detection",
 			elapsed)
 	}
 
 	// And the prompt still has to actually reach the session — the
 	// split must not have broken delivery.
 	want := "GOT:echo SPLIT_SEND_DELIVERED"
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	var lastOut []byte
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
@@ -426,6 +464,16 @@ func TestSendInitialPrompt_SendsAfterMaxWaitWhenPaneNeverStabilizes(t *testing.T
 	// SendInitialPrompt should log the timeout and send anyway.
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "200")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "300")
+	// Issue #65: zero out the post-ready buffer (default 1.5s),
+	// the post-send verify/retry delays, and shrink the
+	// prompt-enter delay so this test stays inside its 2 s
+	// deadline. WaitForReadyToPrompt SKIPS the buffer when
+	// stability errors out anyway, but pinning is defensive and
+	// the verify/retry zeros are mandatory regardless.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
 
 	rec, err := Spawn(Options{
 		TaskID:  "never-stable",
@@ -533,13 +581,16 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 
 	// Set every propagated var with a recognizable value. requireTmux
 	// already set FLEET_TMUX_SOCKET; setupFleetHome set FLEET_HOME.
-	// The two prompt-timing knobs we set explicitly here.
+	// The prompt-timing knobs we set explicitly here.
 	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "777")
 	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "8888")
 	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "99")
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "1234")
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "456")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "789")
 
 	cmd := []string{"sh", "-c",
-		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS; cat"}
+		"echo FH=$FLEET_HOME TMS=$FLEET_TMUX_SOCKET STABLE=$FLEET_INITIAL_PROMPT_STABLE_MS MAX=$FLEET_INITIAL_PROMPT_MAX_MS DELAY=$FLEET_PROMPT_ENTER_DELAY_MS BUF=$FLEET_POST_READY_BUFFER_MS VER=$FLEET_POST_SEND_VERIFY_MS RTY=$FLEET_POST_SEND_RETRY_MS; cat"}
 	rec, err := Spawn(Options{
 		TaskID:  "x",
 		Project: "y",
@@ -553,6 +604,7 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	// Each marker is short enough to fit on a single tmux pane line.
 	wants := []string{
 		"STABLE=777", "MAX=8888", "DELAY=99",
+		"BUF=1234", "VER=456", "RTY=789",
 		"TMS=" + os.Getenv("FLEET_TMUX_SOCKET"),
 	}
 	if got := os.Getenv("FLEET_HOME"); got != "" {
@@ -594,6 +646,387 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("expected all of %v in pane within deadline:\n%s", wants, string(lastOut))
+}
+
+// TestWaitForReadyToPrompt_AppliesPostReadyBuffer pins issue #65
+// Fix B: after waitForPaneStable converges, WaitForReadyToPrompt
+// MUST sleep an additional FLEET_POST_READY_BUFFER_MS (default 1500
+// ms) before returning. The buffer is the only deterministic line
+// of defense against Symptom B — pane is stable but Claude isn't
+// actually input-ready yet (splash, onboarding, version-update,
+// model-selection screens).
+//
+// We measure the elapsed time of two back-to-back WaitForReadyToPrompt
+// calls: one with buffer=0, one with buffer=N. The N-vs-0 difference
+// must be ≥ N (the buffer actually fires) and ≤ N+jitter.
+func TestWaitForReadyToPrompt_AppliesPostReadyBuffer(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Tight stability window — synthetic shell goes idle fast.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "100")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "3000")
+
+	rec, err := Spawn(Options{
+		TaskID:  "post-ready-buf",
+		Project: "p",
+		// Plain `read line` so the pane settles to idle quickly.
+		Command: []string{"sh", "-c",
+			"echo READY; read line; sleep 30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Wait for the shell to hit `read` so the pane is genuinely
+	// stable before either measurement.
+	time.Sleep(300 * time.Millisecond)
+
+	// Baseline: buffer=0.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "0")
+	startBase := time.Now()
+	if err := WaitForReadyToPrompt(rec.TmuxSession); err != nil {
+		t.Fatalf("WaitForReadyToPrompt baseline: %v", err)
+	}
+	baselineElapsed := time.Since(startBase)
+
+	// With buffer. Use a generous value so jitter in the stability
+	// poll's run-to-run variation doesn't swallow the assertion.
+	const bufferMS = 1500
+	t.Setenv("FLEET_POST_READY_BUFFER_MS",
+		strconv.Itoa(bufferMS))
+	startWithBuf := time.Now()
+	if err := WaitForReadyToPrompt(rec.TmuxSession); err != nil {
+		t.Fatalf("WaitForReadyToPrompt with buffer: %v", err)
+	}
+	withBufElapsed := time.Since(startWithBuf)
+
+	delta := withBufElapsed - baselineElapsed
+	// Allow 200ms slack to absorb stability-poll run-to-run jitter
+	// (capture-pane subprocess fork timing varies on busy CI runners).
+	if delta < (bufferMS-200)*time.Millisecond {
+		t.Errorf("post-ready buffer did not fire: baseline=%s with-buffer=%s delta=%s want ≥ %dms",
+			baselineElapsed, withBufElapsed, delta, bufferMS-200)
+	}
+	// Sanity: buffer shouldn't add WAY more than its configured
+	// value (allow 1s headroom for capture-pane jitter).
+	if delta > (bufferMS+1000)*time.Millisecond {
+		t.Errorf("post-ready buffer overshot: delta=%s configured=%dms",
+			delta, bufferMS)
+	}
+}
+
+// TestWaitForReadyToPrompt_SkipsBufferOnUnstable pins the design
+// choice: when waitForPaneStable returns an error (pane never
+// converged), WaitForReadyToPrompt SKIPS the buffer. The pane is
+// already long-late; adding more delay just makes the failure
+// path slower without helping. The error propagates so the caller
+// can still log + send-keys-anyway.
+func TestWaitForReadyToPrompt_SkipsBufferOnUnstable(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pin tiny windows so the unstable pane never converges and
+	// WaitForReadyToPrompt errors out fast.
+	t.Setenv("FLEET_INITIAL_PROMPT_STABLE_MS", "200")
+	t.Setenv("FLEET_INITIAL_PROMPT_MAX_MS", "300")
+	// Big buffer — if the skip-on-error path is broken, the test
+	// will time out paying this delay.
+	t.Setenv("FLEET_POST_READY_BUFFER_MS", "5000")
+
+	rec, err := Spawn(Options{
+		TaskID:  "never-stable-buf",
+		Project: "p",
+		// Constantly-printing shell so stability never converges.
+		Command: []string{"sh", "-c",
+			"while true; do echo TICK; sleep 0.05; done"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	start := time.Now()
+	err = WaitForReadyToPrompt(rec.TmuxSession)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected WaitForReadyToPrompt to error on unstable pane")
+	}
+	// The 5s buffer must NOT have fired. Allow 2s of slack for the
+	// stability poll itself (pinned at 300ms max) + scheduling jitter.
+	if elapsed > 2*time.Second {
+		t.Errorf("WaitForReadyToPrompt slept the buffer despite stability error: elapsed=%s; expected fast-fail without buffer",
+			elapsed)
+	}
+}
+
+// TestSendPromptKeys_VerifiesSubmittedHappyPath pins issue #65 Fix
+// C: when the prompt is no longer in the pane's bottom band after
+// Enter, the verifier reports "submitted" and does NOT send a retry
+// Enter.
+//
+// We exercise the testable core (verifyAndRetryWithDeps) directly
+// with stub send-keys + capture-pane functions so the assertion is
+// deterministic and doesn't depend on tmux behavior.
+func TestSendPromptKeys_VerifiesSubmittedHappyPath(t *testing.T) {
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+
+	const prompt = "Run the /coordinator skill loop for project demo."
+
+	// Capture stub: returns a pane with the prompt visible only in
+	// the SCROLLBACK (top), simulating "Claude submitted: prompt is
+	// in the transcript but the input box is now empty".
+	scrollbackOnly := []byte(
+		"> " + prompt + "\n" + // submitted echo, top of pane
+			strings.Repeat("padding line\n", 30) + // 30 lines of fluff
+			"╭───────────╮\n" +
+			"│ > _       │\n" + // empty input box
+			"╰───────────╯\n")
+
+	var sendKeysCalls int
+	stubSendKeys := func(session string, keys ...string) error {
+		sendKeysCalls++
+		return nil
+	}
+	stubCapture := func(session string) ([]byte, error) {
+		return scrollbackOnly, nil
+	}
+
+	var warn bytes.Buffer
+	submitted := verifyAndRetryWithDeps("fleet-x", prompt,
+		stubSendKeys, stubCapture, &warn)
+	if !submitted {
+		t.Errorf("submitted = false; want true (prompt is only in scrollback, not input box)")
+	}
+	if sendKeysCalls != 0 {
+		t.Errorf("sendKeysCalls = %d; want 0 (no retry Enter on happy path)",
+			sendKeysCalls)
+	}
+	if warn.Len() > 0 {
+		t.Errorf("unexpected warning on happy path: %q", warn.String())
+	}
+}
+
+// TestSendPromptKeys_RetriesOnUnsubmitted pins issue #65 Fix C: when
+// the prompt is still visible in the pane's bottom band after the
+// initial Enter, the verifier sends ONE additional Enter. If the
+// prompt clears on the second capture, the function reports
+// "submitted" and does NOT warn.
+func TestSendPromptKeys_RetriesOnUnsubmitted(t *testing.T) {
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+
+	const prompt = "Run the /coordinator skill loop for project demo."
+
+	// First capture: prompt is sitting in the input box (bottom).
+	stillInBox := []byte(
+		"some scrollback\n" +
+			"╭───────────╮\n" +
+			"│ > " + prompt + " │\n" + // bottom: input box has prompt
+			"╰───────────╯\n")
+	// Second capture (after retry Enter): input box cleared. The
+	// prompt appears as a submitted echo at the TOP of the pane,
+	// followed by enough filler that the bottom unsubmittedTailLines
+	// window contains only the empty input box. Mirrors how Claude
+	// Code actually renders post-submit: user message in scrollback
+	// + cleared input field at the bottom.
+	cleared := []byte(
+		"> " + prompt + "\n" + // submitted echo (top of pane)
+			strings.Repeat("filler\n", 30) + // push prompt out of tail band
+			"╭───────────╮\n" +
+			"│ > _       │\n" +
+			"╰───────────╯\n")
+
+	var captureCount int
+	stubCapture := func(session string) ([]byte, error) {
+		captureCount++
+		if captureCount == 1 {
+			return stillInBox, nil
+		}
+		return cleared, nil
+	}
+
+	var sendKeysCalls int
+	var lastKeys []string
+	stubSendKeys := func(session string, keys ...string) error {
+		sendKeysCalls++
+		lastKeys = keys
+		return nil
+	}
+
+	var warn bytes.Buffer
+	submitted := verifyAndRetryWithDeps("fleet-x", prompt,
+		stubSendKeys, stubCapture, &warn)
+	if !submitted {
+		t.Errorf("submitted = false; want true (retry Enter cleared the input box)")
+	}
+	if sendKeysCalls != 1 {
+		t.Errorf("sendKeysCalls = %d; want 1 (one retry Enter)", sendKeysCalls)
+	}
+	if len(lastKeys) != 1 || lastKeys[0] != "Enter" {
+		t.Errorf("retry sent %v; want [Enter]", lastKeys)
+	}
+	if captureCount != 2 {
+		t.Errorf("captureCount = %d; want 2 (initial + post-retry)", captureCount)
+	}
+	if warn.Len() > 0 {
+		t.Errorf("unexpected warning on retry-success path: %q", warn.String())
+	}
+}
+
+// TestSendPromptKeys_StillUnsubmittedAfterRetry_Warns pins issue
+// #65 Fix C tail: if the retry Enter ALSO fails to clear the prompt
+// from the input box, the verifier reports "unsubmitted" and writes
+// a warning. The dispatch CLI uses this signal to surface a stronger
+// "attach and press Enter manually" message (Fix D).
+func TestSendPromptKeys_StillUnsubmittedAfterRetry_Warns(t *testing.T) {
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+
+	const prompt = "Run the /coordinator skill loop for project demo."
+	stillInBox := []byte(
+		"some scrollback\n" +
+			"╭───────────╮\n" +
+			"│ > " + prompt + " │\n" +
+			"╰───────────╯\n")
+
+	stubCapture := func(session string) ([]byte, error) {
+		return stillInBox, nil
+	}
+	stubSendKeys := func(session string, keys ...string) error {
+		return nil
+	}
+
+	var warn bytes.Buffer
+	submitted := verifyAndRetryWithDeps("fleet-x", prompt,
+		stubSendKeys, stubCapture, &warn)
+	if submitted {
+		t.Errorf("submitted = true; want false (prompt still in input box after retry)")
+	}
+	if !strings.Contains(warn.String(), "unsubmitted after retry") {
+		t.Errorf("warning did not mention unsubmitted after retry; got %q",
+			warn.String())
+	}
+	if !strings.Contains(warn.String(), "fleet-x") {
+		t.Errorf("warning did not include session name; got %q", warn.String())
+	}
+	if !strings.Contains(warn.String(), "manually") {
+		t.Errorf("warning did not include the operator-facing recovery hint; got %q",
+			warn.String())
+	}
+}
+
+// TestSendPromptKeys_RetrySendKeysFailureWarns pins the edge case
+// where the retry Enter itself fails to reach tmux (session
+// disappeared, transient error). The verifier must still report
+// "unsubmitted" and write a distinguishable warning so operator
+// log analysis can tell "Enter swallowed by paste detection" from
+// "tmux died mid-retry".
+func TestSendPromptKeys_RetrySendKeysFailureWarns(t *testing.T) {
+	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
+	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
+
+	const prompt = "ping"
+	// Bottom of pane: prompt still in input box → triggers retry.
+	stillInBox := []byte("padding\n>" + prompt + "\n")
+
+	stubCapture := func(session string) ([]byte, error) {
+		return stillInBox, nil
+	}
+	stubSendKeys := func(session string, keys ...string) error {
+		return fmt.Errorf("session vanished")
+	}
+
+	var warn bytes.Buffer
+	submitted := verifyAndRetryWithDeps("fleet-x", prompt,
+		stubSendKeys, stubCapture, &warn)
+	if submitted {
+		t.Error("submitted = true; want false (retry send-keys errored)")
+	}
+	if !strings.Contains(warn.String(), "retry Enter failed") {
+		t.Errorf("warning did not mention retry Enter failed; got %q",
+			warn.String())
+	}
+}
+
+// TestPromptSubmitted_BottomBandHeuristic pins the design rationale
+// for the unsubmitted-tail-lines window: the verifier must NOT trip
+// when the prompt appears only in the scrollback / submitted-
+// transcript area higher up. Otherwise every Claude Code submission
+// (which echoes the prompt as a "user turn" line) would falsely
+// trigger a retry and the operator would see two duplicate /run-skill
+// invocations.
+func TestPromptSubmitted_BottomBandHeuristic(t *testing.T) {
+	const prompt = "Run the /coordinator skill loop"
+
+	// Scenario A: prompt appears at the top of pane (scrollback /
+	// transcript echo). Bottom band has only the empty input box.
+	// Expected: promptSubmittedWithDeps=true (NOT in tail band).
+	scrollbackEcho := bytes.Repeat([]byte("filler\n"), 20)
+	scrollbackEcho = append([]byte("> "+prompt+"\n"), scrollbackEcho...)
+	scrollbackEcho = append(scrollbackEcho, []byte(
+		"╭───╮\n│ > │\n╰───╯\n")...)
+
+	if !promptSubmittedWithDeps("x", prompt,
+		func(string) ([]byte, error) { return scrollbackEcho, nil }) {
+		t.Errorf("scrollback-only prompt should report submitted=true (input box is clear)")
+	}
+
+	// Scenario B: prompt sits in the input box at the bottom of the
+	// pane. Expected: promptSubmittedWithDeps=false (IS in tail band).
+	inBox := append(bytes.Repeat([]byte("filler\n"), 5),
+		[]byte("╭───╮\n│ > "+prompt+" │\n╰───╯\n")...)
+	if promptSubmittedWithDeps("x", prompt,
+		func(string) ([]byte, error) { return inBox, nil }) {
+		t.Errorf("prompt in input box should report submitted=false (still in tail band)")
+	}
+
+	// Scenario C: capture-pane errors. Verifier conservatively reports
+	// "submitted" so a transient tmux glitch doesn't drive a spurious
+	// retry.
+	capErr := func(string) ([]byte, error) {
+		return nil, fmt.Errorf("tmux gone")
+	}
+	if !promptSubmittedWithDeps("x", prompt, capErr) {
+		t.Errorf("capture-pane error should report submitted=true (avoid spurious retry)")
+	}
+}
+
+// TestTailLines pins tailLines's behavior: returns the last N lines
+// (or the whole buffer if fewer than N), and treats n<=0 as "the
+// whole buffer". The verifier depends on this to scope its prompt-in-
+// input-box check to the bottom of the pane.
+func TestTailLines(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []byte
+		n    int
+		want []byte
+	}{
+		{"empty", []byte(""), 5, []byte("")},
+		{"n_zero_returns_all", []byte("a\nb\nc\n"), 0, []byte("a\nb\nc\n")},
+		{"n_negative_returns_all", []byte("a\nb\nc\n"), -1, []byte("a\nb\nc\n")},
+		{"fewer_lines_than_n", []byte("only\n"), 5, []byte("only\n")},
+		{"exact_n_lines", []byte("a\nb\nc\n"), 3, []byte("a\nb\nc\n")},
+		{"more_lines_than_n", []byte("a\nb\nc\nd\n"), 2, []byte("c\nd\n")},
+		// No trailing newline: "a\nb\nc" has only 2 newlines, so
+		// tailLines can't find the (n+1)-th-from-end and returns
+		// the whole buffer. Acceptable for the verifier — Claude's
+		// real pane captures end with a newline, so this edge
+		// case doesn't fire in production.
+		{"no_trailing_newline_returns_all", []byte("a\nb\nc"), 2, []byte("a\nb\nc")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tailLines(tc.in, tc.n)
+			if !bytes.Equal(got, tc.want) {
+				t.Errorf("tailLines(%q, %d) = %q; want %q",
+					tc.in, tc.n, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
