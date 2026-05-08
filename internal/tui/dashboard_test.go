@@ -889,6 +889,142 @@ func TestView_NoCoordLineWhenCoordIDEmpty(t *testing.T) {
 	}
 }
 
+// TestDashboard_CoordSignal_LockBodyPrimaryWins pins issue #63's
+// precedence rule: when scanProject's lock-body branch sets CoordID
+// (freshness gate satisfied), unifiedProjects must NOT overwrite it
+// with a different agent that happens to carry coord-<project> task_id.
+// Lock body wins.
+func TestDashboard_CoordSignal_LockBodyPrimaryWins(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "demo", RepoSlug: "demo", CoordID: "aaaa1111", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	// A second record carrying coord-demo task_id — could happen on a
+	// stale spawn whose lock body never published; the freshness gate
+	// already kept it out of CoordID. Fallback must NOT promote it.
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-aaaa1111", SpawnedAt: time.Now()},
+		{ID: "bbbb2222", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-bbbb2222", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "aaaa1111" {
+		t.Errorf("lock body must win; got CoordID=%q (want aaaa1111)",
+			coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock pins the fallback:
+// when CoordID is empty (lock body not yet published — boot window),
+// an alive agent record tagged coord-<project> + project=<project>
+// fills CoordID so the dashboard renders the coord under its project
+// on LEFT immediately.
+func TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "demo", RepoSlug: "demo"}, // CoordID empty
+		},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "c00bf001", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-c00bf001", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "c00bf001" {
+		t.Errorf("task_id fallback must fill CoordID when lock body absent; got %q (want c00bf001)",
+			coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_CoordSignal_NoMatchNoCoord pins the negative path: no
+// lock body, no matching record → CoordID stays empty and the project
+// block renders without a coord line.
+func TestDashboard_CoordSignal_NoMatchNoCoord(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		// Record exists but task_id is wrong (regular worker).
+		{ID: "11111111", Project: "demo", TaskID: "regular-task", TmuxSession: "fleet-11111111", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("CoordID must remain empty when no match; got %q",
+			coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_CoordSignal_DeadSessionNotPromoted guards the fallback:
+// a record with the right task_id but a dead tmux session must NOT
+// promote to CoordID — that would render a ghost on LEFT and double
+// up on RIGHT (filtered then re-listed when the session check fails
+// downstream).
+func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "deadc0de", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-deadc0de", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("dead session must not promote to CoordID; got %q",
+			coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_FiltersClaimedCoordFromRight pins the filter
+// invariant: once unifiedProjects fills CoordID via the task_id
+// fallback, dashboardRows must NOT also list the same agent in the
+// right-column agents section. The coord renders on LEFT only.
+func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "c00bf001", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-c00bf001", SpawnedAt: time.Now()},
+		{ID: "bbbb2222", Project: "demo", TaskID: "regular-task", TmuxSession: "fleet-bbbb2222", SpawnedAt: time.Now()},
+	}
+	rows := m.dashboardRows()
+	var agentIDs []string
+	for _, r := range rows {
+		if r.kind == rowAgent && r.agent != nil {
+			agentIDs = append(agentIDs, r.agent.ID)
+		}
+	}
+	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
+		t.Errorf("coord must be filtered from RIGHT (claimed by LEFT); got %v want [bbbb2222]", agentIDs)
+	}
+}
+
+// coordIDOrEmpty extracts the first project's CoordID for error
+// messages. Returns "" when slice is empty.
+func coordIDOrEmpty(ps []*ProjectRow) string {
+	if len(ps) == 0 || ps[0] == nil {
+		return ""
+	}
+	return ps[0].CoordID
+}
+
 func TestFormatUptime(t *testing.T) {
 	cases := map[time.Duration]string{
 		0:                            "00:00",

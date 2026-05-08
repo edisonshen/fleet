@@ -119,7 +119,66 @@ func (m Model) unifiedProjects() []*ProjectRow {
 			RepoSlug: name,
 		})
 	}
+	// Issue #63: task_id fallback signal. When a project's CoordID is
+	// empty (lock body hasn't published yet — coord skill is still
+	// booting), look for an alive agent record tagged
+	// task_id=coord-<name> AND project=<name>. This is the first 10-30s
+	// after dispatch; without this fallback, the spawned coord shows on
+	// RIGHT under "v0.1 agents" until the skill ticks, and the operator
+	// sees a missing-coord row that begs another [a] press → zombie pile.
+	//
+	// Lock body wins when both signals are present (scanProject sets
+	// CoordID only inside the freshness gate); the fallback only fills
+	// when CoordID is empty. We clone any row we mutate so the shared
+	// snapshot pointer stays untouched (m.dashboard.Projects is read by
+	// every renderer + selectedRow, and silent mutation would surprise
+	// downstream callers).
+	for i, p := range out {
+		if p == nil || p.CoordID != "" {
+			continue
+		}
+		rec := findCoordByTaskID(m.records, p.Name)
+		if rec == nil {
+			continue
+		}
+		clone := *p
+		clone.CoordID = rec.ID
+		out[i] = &clone
+	}
 	return out
+}
+
+// findCoordByTaskID returns the first agent.Record whose task_id is
+// coordTaskID(projectName) AND project matches AND tmux session is
+// alive. Liveness uses sessionAliveFn (test-stubbable). Returns nil
+// when no record matches OR every match has a dead session.
+//
+// Distinct from findExistingCoordForProject in keys.go: this one is
+// the dashboard's binding signal (does this agent represent the
+// project's coord visually?); the keys.go counterpart is the [a]
+// idempotency signal. Same predicate; kept separate so the rendering
+// layer doesn't import keys.go's action wiring.
+func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
+	want := "coord-" + projectName
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != want {
+			continue
+		}
+		if r.Project != projectName {
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionAliveFn(r.TmuxSession) {
+			continue
+		}
+		return r
+	}
+	return nil
 }
 
 // dashboardRows assembles the unified row list from unifiedProjects() +

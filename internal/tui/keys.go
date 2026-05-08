@@ -489,7 +489,7 @@ func coordTaskID(projectName string) string {
 	return "coord-" + projectName
 }
 
-// findExistingCoordForProject searches m.records for an alive agent
+// findExistingCoordForProject searches records for an alive agent
 // already tagged as the coord for projectName. "Tagged" means
 // task_id == coordTaskID(projectName) AND project == projectName.
 // "Alive" means tmux session probe returns true.
@@ -500,31 +500,13 @@ func coordTaskID(projectName string) string {
 // same project (issue #63's "[a] press during the 30s skill-boot window
 // piles up zombies" failure mode).
 //
-// Liveness is checked via sessionAliveFn (test-stubbable); a probe
-// failure (transport error) is treated like alive — same conservative
-// reading as the [a]-on-agent-row branch (sessionAliveFn returns true on
-// probe failure so the operator gets the spawned coord, not a redundant
-// respawn). Strict liveness uses sessionProbeFn elsewhere; here we err on
-// the side of NOT spawning a duplicate.
+// Implementation note: delegates to findCoordByTaskID (rows.go) so the
+// dashboard's binding signal and the [a] idempotency signal share one
+// predicate. They differ only in return shape (this one wraps in a
+// (record, bool) tuple to match the caller's "found?" check).
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	want := coordTaskID(projectName)
-	for _, r := range records {
-		if r == nil {
-			continue
-		}
-		if r.TaskID != want {
-			continue
-		}
-		if r.Project != projectName {
-			continue
-		}
-		if r.TmuxSession == "" {
-			continue
-		}
-		if !sessionAliveFn(r.TmuxSession) {
-			continue
-		}
-		return r, true
+	if rec := findCoordByTaskID(records, projectName); rec != nil {
+		return rec, true
 	}
 	return nil, false
 }
