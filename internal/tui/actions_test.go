@@ -124,6 +124,9 @@ func TestKeyEnter_OpensTaskDetail(t *testing.T) {
 	m.width = 130
 	m.height = 30
 	m.dashboard = scanDashboard(time.Now())
+	// Issue #59: tasks render under their project only when the
+	// project is expanded. Pre-expand so the task row is in the list.
+	m.expanded = map[string]bool{"fleet": true}
 	// Find the task row index in dashboardRows().
 	rows := m.dashboardRows()
 	taskIdx := -1
@@ -252,6 +255,8 @@ func TestKeyA_AttachAgent_NotApplicableOnTaskRow(t *testing.T) {
 	m.width = 130
 	m.height = 30
 	m.dashboard = scanDashboard(time.Now())
+	// Issue #59: tasks only render under expanded projects.
+	m.expanded = map[string]bool{"fleet": true}
 	// Find a task row.
 	rows := m.dashboardRows()
 	taskIdx := -1

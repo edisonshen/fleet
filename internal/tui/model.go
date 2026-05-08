@@ -144,6 +144,17 @@ type Model struct {
 	// new task lands in the wrong tasks.md (codex iter-2 P1). Cleared
 	// when modePromptTaskAdd exits.
 	taskAddProjectFrozen string
+
+	// expanded tracks which project rows are showing their inline
+	// task list. Keyed by project name (matches ProjectRow.Name and
+	// dashboardRows()'s rowProject identity). [⏎] on a project row
+	// flips the bool; tasks render under the project header iff
+	// the bool is true OR the active search filter matches one of
+	// that project's tasks (so search keeps matching tasks visible
+	// regardless of the operator's expansion choice). Persists across
+	// dashboardMsg ticks — the map is never reset on refresh, so the
+	// 1s poll doesn't auto-collapse the operator's expansion.
+	expanded map[string]bool
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
