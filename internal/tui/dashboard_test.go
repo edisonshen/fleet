@@ -1111,6 +1111,46 @@ func TestDashboard_CoordSignal_TaskIDFallback_TmuxProbeErrorNotDead(t *testing.T
 	}
 }
 
+// TestDashboard_CoordSignal_TaskIDFallback_StaleMarkerSkipped pins
+// codex iter-4 P1: when the marker is older than coordBootWindow,
+// the fallback must NOT promote — even with a matching task_id +
+// project + alive session. Beyond the boot window, the only
+// authoritative coord identity signal is the lock-body branch
+// (gated by coord-state.json freshness). Without this gate, a
+// coord whose claude process exited but whose tmux shell wrapper
+// is still alive would be re-promoted forever from the marker.
+func TestDashboard_CoordSignal_TaskIDFallback_StaleMarkerSkipped(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarkerStale{markers: map[string]string{"demo": "stalecrd"}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "stalecrd", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-stalecrd", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("stale marker (>%s old) must block promotion; got CoordID=%q",
+			coordBootWindow, coordIDOrEmpty(got))
+	}
+	// Stale-marker coord must STAY on RIGHT for [a]/[x] triage.
+	rows := m.dashboardRows()
+	var seenRight bool
+	for _, r := range rows {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "stalecrd" {
+			seenRight = true
+			break
+		}
+	}
+	if !seenRight {
+		t.Error("stale-marker record should still appear in RIGHT column for triage")
+	}
+}
+
 // TestDashboard_CoordSignal_TaskIDFallbackGatedOnProjectTree pins
 // codex iter-2 P2: a record with the right task_id but NO
 // ~/.fleet/projects/<name>/ tree on disk (legacy / hand-edited /

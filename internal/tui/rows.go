@@ -16,6 +16,7 @@ package tui
 import (
 	"os"
 	"sort"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
@@ -150,14 +151,30 @@ func (m Model) unifiedProjects() []*ProjectRow {
 	return out
 }
 
+// coordBootWindow is the time window during which the task_id
+// fallback signal is allowed to bind a coord on LEFT. Beyond this,
+// the only valid coord identity signal is the lock-body branch in
+// scanProject (gated by coord-state.json mtime within
+// coordActiveWindow). The marker file's mtime is the freshness
+// reference: it's last written when the TUI dispatches the coord, so
+// it pins "the coord skill is still booting".
+//
+// Codex iter-4 P1: without a freshness gate the fallback would
+// resurrect any coord whose claude process exited (leaving the tmux
+// shell wrapper alive) — the marker plus the alive shell would re-
+// promote forever, hiding the dead agent from [a]/[x] recovery.
+// 60s is comfortable: the coord skill normally takes 10-30s to boot
+// + write its first coord-state.json. Past 60s either the lock-body
+// branch has taken over (coord is genuinely running) or the boot
+// failed and the operator should triage via the right column.
+const coordBootWindow = 60 * time.Second
+
 // findCoordByTaskID returns the first agent.Record whose task_id is
 // coordTaskID(projectName) AND project matches AND tmux session is
 // alive AND the per-project state tree exists at
 // ~/.fleet/projects/<name>/ AND the project's coord-spawn marker
-// (state.CoordSpawnMarkerPath) contains the candidate agent's ID.
-// Liveness uses sessionAliveFn (test-stubbable); the project-tree
-// and marker gates use projectTreeExistsFn / coordSpawnMarkerFn for
-// stub-ability. Returns nil when no record matches.
+// (state.CoordSpawnMarkerPath) contains the candidate agent's ID
+// AND the marker's mtime is within coordBootWindow.
 //
 // Marker gate (codex iter-3 P2) closes the "operator runs `fleet
 // dispatch coord-<project> --project <project> --coord-spawn`" spoof:
@@ -166,6 +183,12 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // coordSpawnDoneMsg handler post-dispatch and contains the agent ID
 // the TUI is in the middle of attaching to). Without the right
 // marker content, no promotion happens.
+//
+// Marker freshness gate (codex iter-4 P1) keeps the fallback from
+// resurrecting a stale coord whose claude process exited but whose
+// tmux shell wrapper is still alive — beyond the boot window, the
+// only authoritative identity signal is the lock-body branch in
+// scanProject (which requires a fresh coord-state.json tick).
 //
 // Project-tree gate (codex iter-2 P2) keeps legacy records (pre-PR
 // agents with the same task_id shape) from auto-promoting on first
@@ -180,7 +203,7 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // layer doesn't import keys.go's action wiring.
 func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
 	want := "coord-" + projectName
-	// Project-tree existence and marker read are 1-2 stats per call,
+	// Project-tree existence and marker read are 1-3 stats per call,
 	// fast enough to run inline in unifiedProjects on every render.
 	// Cache only if a future profile shows it's hot.
 	if !projectTreeExistsFn(projectName) {
@@ -188,6 +211,16 @@ func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Recor
 	}
 	wantID := coordSpawnMarkerFn(projectName)
 	if wantID == "" {
+		return nil
+	}
+	// Freshness gate (codex iter-4 P1): the marker's mtime must be
+	// within coordBootWindow. Beyond that, the lock-body branch in
+	// scanProject is the only valid identity signal.
+	mt, ok := coordSpawnMarkerMtimeFn(projectName)
+	if !ok {
+		return nil
+	}
+	if nowFn().Sub(mt) > coordBootWindow {
 		return nil
 	}
 	for _, r := range records {
@@ -249,6 +282,26 @@ func projectTreeExists(projectName string) bool {
 // coord-spawn marker file. var so tests can stub. Production calls
 // state.ReadCoordSpawnMarker.
 var coordSpawnMarkerFn = state.ReadCoordSpawnMarker
+
+// coordSpawnMarkerMtimeFn returns the marker file's modification time
+// + ok=true when present. var so tests can stub the freshness check
+// without timing-sensitive disk writes. Production stat-reads the
+// marker; missing returns ok=false.
+var coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+	path, err := state.CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
+}
+
+// nowFn returns the current wall-clock time. var so tests can pin
+// "now" deterministically without touching time.Now globally.
+var nowFn = time.Now
 
 // sessionProbeOrAliveFn re-probes a session using the tristate
 // SessionAlive primitive: returns true on alive, true on probe-error

@@ -166,17 +166,58 @@ func (s *stubProjectTreeExists) install(t *testing.T) {
 // projectName → agentID; missing key returns "". The dashboard's
 // task_id fallback requires the marker to match the candidate
 // agent's ID before promoting.
+//
+// Also installs a fresh-mtime stub so the boot-window freshness gate
+// (codex iter-4 P1) doesn't reject the test setup. Tests that need
+// to exercise the stale-marker path should use stubCoordSpawnMarkerStale.
 type stubCoordSpawnMarker struct {
 	markers map[string]string // project → agent ID
 }
 
 func (s *stubCoordSpawnMarker) install(t *testing.T) {
 	t.Helper()
-	prev := coordSpawnMarkerFn
+	prevContent := coordSpawnMarkerFn
 	coordSpawnMarkerFn = func(projectName string) string {
 		return s.markers[projectName]
 	}
-	t.Cleanup(func() { coordSpawnMarkerFn = prev })
+	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
+
+	// Default to "fresh" mtime (now) for all known projects so the
+	// freshness gate doesn't reject test fixtures by default.
+	prevMtime := coordSpawnMarkerMtimeFn
+	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+		if _, ok := s.markers[projectName]; !ok {
+			return time.Time{}, false
+		}
+		return time.Now(), true
+	}
+	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
+}
+
+// stubCoordSpawnMarkerStale installs a marker stub that returns a
+// stale mtime (older than coordBootWindow). Used to exercise codex
+// iter-4 P1's freshness gate.
+type stubCoordSpawnMarkerStale struct {
+	markers map[string]string // project → agent ID
+}
+
+func (s *stubCoordSpawnMarkerStale) install(t *testing.T) {
+	t.Helper()
+	prevContent := coordSpawnMarkerFn
+	coordSpawnMarkerFn = func(projectName string) string {
+		return s.markers[projectName]
+	}
+	t.Cleanup(func() { coordSpawnMarkerFn = prevContent })
+
+	prevMtime := coordSpawnMarkerMtimeFn
+	coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
+		if _, ok := s.markers[projectName]; !ok {
+			return time.Time{}, false
+		}
+		// 2× the boot window in the past — well outside.
+		return time.Now().Add(-2 * coordBootWindow), true
+	}
+	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prevMtime })
 }
 
 // stubWriteCoordSpawnMarker replaces writeCoordSpawnMarkerFn for
