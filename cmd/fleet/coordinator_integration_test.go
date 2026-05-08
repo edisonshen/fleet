@@ -295,6 +295,12 @@ print(json.dumps({
 		"HOME="+env.homeDir,
 		"FLEET_AGENT_ID="+env.coordID,
 		"PATH="+env.binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		// Disable the supervisor loop (issue #79). Integration tests
+		// drive runTick synchronously — they assert on the FIRST tick
+		// only. Without this, the supervisor enters its 30 s sleep
+		// loop and the test wedges until FLEET_COORD_POLL_MAX_S
+		// (default 4 h) elapses.
+		"FLEET_COORD_POLL_INTERVAL_S=0",
 	)
 	cmd.Dir = env.repoCwd
 	var out, errb bytes.Buffer
