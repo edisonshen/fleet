@@ -397,6 +397,37 @@ func ProjectStateLockPath(name string) (string, error) {
 	return filepath.Join(dir, ".locks", "state.lock"), nil
 }
 
+// EnsureProjectInitialized creates ~/.fleet/projects/<safe-name>/.locks/
+// (and the parent <safe-name>/ dir) when missing. Idempotent — calling
+// twice is a no-op once the directories exist.
+//
+// The TUI's project-row [a] auto-spawn flow uses this as a pre-dispatch
+// step so the spawned coord skill's first tick can write coord-state.json
+// and acquire coordinator.lock without racing on a missing parent dir.
+// Without this step, fresh projects landed agents on disk with no lock
+// body ever published — the dashboard couldn't bind the agent to the
+// project, and repeated [a] presses piled up zombies (issue #63).
+//
+// Validation matches ProjectDir's rule (ValidateProjectName); empty
+// name resolves to "_default" via ProjectDir's backwards-compat branch.
+//
+// Returns the project root dir (no trailing separator) on success.
+func EnsureProjectInitialized(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	// ProjectDir appends a trailing separator; trim before MkdirAll
+	// so the .locks subdir resolves cleanly (filepath.Join already
+	// tolerates trailing separators, but stripping keeps the returned
+	// path symmetric with ProjectDir's other consumers).
+	dir = filepath.Clean(dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".locks"), 0o755); err != nil {
+		return "", fmt.Errorf("EnsureProjectInitialized: mkdir .locks: %w", err)
+	}
+	return dir, nil
+}
+
 // CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
 //
 // Held by the running coordinator agent for the lifetime of one tick;

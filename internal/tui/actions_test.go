@@ -1127,25 +1127,6 @@ func TestRepoRootForCwd_StopsAtHome(t *testing.T) {
 	}
 }
 
-// stubPollCoordLock replaces pollCoordLock for tests so we don't sleep
-// for real. Tests that need the spawn flow to succeed install with
-// alwaysOK=true; tests that need the timeout branch install with
-// alwaysOK=false.
-type stubPollCoordLock struct {
-	calls    []string // captured wantIDs
-	alwaysOK bool
-}
-
-func (s *stubPollCoordLock) install(t *testing.T) {
-	t.Helper()
-	prev := pollCoordLock
-	pollCoordLock = func(projectName, wantID string, attempts int, interval time.Duration) bool {
-		s.calls = append(s.calls, wantID)
-		return s.alwaysOK
-	}
-	t.Cleanup(func() { pollCoordLock = prev })
-}
-
 // TestKeyA_ProjectRow_AttachesToExistingFreshCoord pins issue #60's
 // happy path: when a project's CoordID is set (dashboard freshness gate
 // passed) AND the matching agent record is loaded, [a] sets
@@ -1233,16 +1214,17 @@ func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
 // path: when project.CoordID is empty AND no matching record exists,
 // [a] shells out to `fleet dispatch` with --project, --cwd, --prompt,
 // then on success sets pendingAttach to the new coord's tmux session.
+// Issue #63: stable task_id = "coord-<project>" (no timestamp), no
+// lock-poll — attach immediately after dispatch returns.
 func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{}).install(t)
-	(&stubPollCoordLock{alwaysOK: true}).install(t)
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
 			// Mimic real `fleet dispatch` output so the regex parser
 			// finds the new agent ID.
-			out := "agent abcd1234 spawned\n  task: coord-X\n  project: demo\n  tmux: fleet-abcd1234\n"
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
 			return coordSpawnDoneMsgFromArgs(args, out, nil)
 		},
 	}
@@ -1263,8 +1245,9 @@ func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("[a] on project with no coord should produce a spawn cmd")
 	}
-	// Drain the cmd to fire the dispatch + lock-poll. coordSpawnDoneMsg
-	// is what we expect back.
+	// Drain the cmd to fire the dispatch. coordSpawnDoneMsg is what we
+	// expect back. Crucially: no lock-poll, so success requires only
+	// that dispatch returned the agent-ID line.
 	msg := cmd()
 	doneMsg, ok := msg.(coordSpawnDoneMsg)
 	if !ok {
@@ -1290,6 +1273,11 @@ func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	args := stub.calls[0]
 	if args[0] != "dispatch" {
 		t.Errorf("first arg = %q; want dispatch", args[0])
+	}
+	// Issue #63: task_id MUST be the stable "coord-<project>" form, not
+	// a timestamp. The parent agent at args[1] is the dispatch task_id.
+	if len(args) < 2 || args[1] != "coord-demo" {
+		t.Errorf("dispatch task_id (args[1]) = %q; want coord-demo (stable per-project)", argString(args, 1))
 	}
 	// Must carry --project demo, --prompt with the coordinator skill loop.
 	hasProject, hasPrompt := false, false
@@ -1322,13 +1310,18 @@ func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	}
 }
 
-// coordSpawnDoneMsgFromArgs is a test helper that mimics what the real
-// startCoordSpawn closure does inside runFleetCmd — calls the msgFn
-// passed to runFleetCmd. We can't easily get the msgFn from within a
-// stub, so instead we execute the same logic the production msgFn
-// runs: parse the agent ID, poll the (stubbed) lock, return the
-// resulting coordSpawnDoneMsg shape. This keeps the test honest about
-// the contract between startCoordSpawn and Update.
+// argString returns args[i] or "" when i is out of range.
+func argString(args []string, i int) string {
+	if i < 0 || i >= len(args) {
+		return ""
+	}
+	return args[i]
+}
+
+// coordSpawnDoneMsgFromArgs mimics the real startCoordSpawn closure
+// post-issue-#63: parse the agent ID and return the coordSpawnDoneMsg
+// shape. No lock-poll branch — if dispatch printed the agent line,
+// attach. If not, error.
 func coordSpawnDoneMsgFromArgs(args []string, out string, dispatchErr error) tea.Msg {
 	if dispatchErr != nil {
 		return coordSpawnDoneMsg{
@@ -1344,18 +1337,10 @@ func coordSpawnDoneMsgFromArgs(args []string, out string, dispatchErr error) tea
 		}
 	}
 	agentID := match[1]
-	session := "fleet-" + agentID
-	if pollCoordLock(argValue(args, "--project"), agentID, 1, 0) {
-		return coordSpawnDoneMsg{
-			projectName: argValue(args, "--project"),
-			agentID:     agentID,
-			session:     session,
-		}
-	}
 	return coordSpawnDoneMsg{
 		projectName: argValue(args, "--project"),
 		agentID:     agentID,
-		err:         fmt.Errorf("coord spawn timed out — agent %s spawned but lock body never published; check tmux session %s", agentID, session),
+		session:     "fleet-" + agentID,
 	}
 }
 
@@ -1380,7 +1365,6 @@ func TestKeyA_ProjectRow_DispatchErr(t *testing.T) {
 		},
 	}
 	stub.install(t)
-	(&stubPollCoordLock{alwaysOK: false}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1413,58 +1397,10 @@ func TestKeyA_ProjectRow_DispatchErr(t *testing.T) {
 	}
 }
 
-// TestKeyA_ProjectRow_LockTimeout regresses the lock-poll-timeout path:
-// dispatch succeeds (agent ID parsed) but pollCoordLock returns false
-// for the entire 2s window. The resulting coordSpawnDoneMsg carries
-// err with the "coord spawn timed out" hint — operator sees a banner
-// pointing at the tmux session they can attach to manually.
-func TestKeyA_ProjectRow_LockTimeout(t *testing.T) {
-	withFleetHome(t)
-	stub := &stubFleetCmd{
-		stubbed: func(args []string) tea.Msg {
-			out := "agent ff112233 spawned\n  tmux: fleet-ff112233\n"
-			return coordSpawnDoneMsgFromArgs(args, out, nil)
-		},
-	}
-	stub.install(t)
-	(&stubPollCoordLock{alwaysOK: false}).install(t)
-
-	m := New("test")
-	m.dashboard = &Snapshot{
-		Projects: []*ProjectRow{{Name: "demo"}},
-	}
-	for i, r := range m.dashboardRows() {
-		if r.kind == rowProject {
-			m.dashCursor = i
-			break
-		}
-	}
-	_, cmd := m.Update(keyMsg("a"))
-	doneMsg := cmd().(coordSpawnDoneMsg)
-	if doneMsg.err == nil {
-		t.Fatal("expected err on lock-poll timeout")
-	}
-	if !strings.Contains(doneMsg.err.Error(), "timed out") {
-		t.Errorf("err should mention 'timed out'; got %q", doneMsg.err.Error())
-	}
-	if doneMsg.agentID != "ff112233" {
-		t.Errorf("doneMsg.agentID = %q; want ff112233 (we still know who was spawned)",
-			doneMsg.agentID)
-	}
-	updated, _ := m.Update(doneMsg)
-	mm := updated.(Model)
-	if mm.flash == nil || !mm.flash.isErr {
-		t.Errorf("expected error flash; got %+v", mm.flash)
-	}
-	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach must NOT be set on lock-poll timeout; got %q", mm.pendingAttach)
-	}
-}
-
 // TestKeyA_ProjectRow_DispatchOutputUnparseable regresses the agent-ID
 // parse-failure path: dispatch returns 0 but stdout shape drifted (no
 // "agent <id> spawned" line). We must surface a parse error rather
-// than waiting forever for a lock that no one will ever publish.
+// than silently attaching to a wrong/empty session.
 func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
 	withFleetHome(t)
 	stub := &stubFleetCmd{
@@ -1473,7 +1409,6 @@ func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
 		},
 	}
 	stub.install(t)
-	(&stubPollCoordLock{alwaysOK: true}).install(t) // doesn't matter
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1492,45 +1427,6 @@ func TestKeyA_ProjectRow_DispatchOutputUnparseable(t *testing.T) {
 	}
 	if !strings.Contains(doneMsg.err.Error(), "missing agent ID") {
 		t.Errorf("err should reference missing agent ID; got %q", doneMsg.err.Error())
-	}
-}
-
-// TestPollCoordLock_MatchesHolderID exercises the production
-// pollCoordLock against a real coordinator.lock file. Asserts
-// readCoordHolder integration: when the lock body matches wantID,
-// poll returns true on the first iteration; otherwise it returns
-// false after attempts iterations.
-func TestPollCoordLock_MatchesHolderID(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("FLEET_HOME", root)
-	lockDir := filepath.Join(root, "projects", "demo", ".locks")
-	if err := os.MkdirAll(lockDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	lockPath := filepath.Join(lockDir, "coordinator.lock")
-
-	// Case 1: body matches → true.
-	if err := os.WriteFile(lockPath, []byte("abcd1234\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
-		t.Errorf("pollCoordLock should return true when body matches")
-	}
-
-	// Case 2: body mismatch → false after exhausting attempts.
-	if err := os.WriteFile(lockPath, []byte("zzzzzzzz\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
-		t.Errorf("pollCoordLock should return false on mismatched body")
-	}
-
-	// Case 3: missing lock file → false (readCoordHolder errors silently).
-	if err := os.Remove(lockPath); err != nil {
-		t.Fatal(err)
-	}
-	if pollCoordLock("demo", "abcd1234", 3, 1*time.Millisecond) {
-		t.Errorf("pollCoordLock should return false when lock file is missing")
 	}
 }
 
@@ -1630,7 +1526,6 @@ func TestCoordCwdForProject_FallsBackToWd(t *testing.T) {
 func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{}).install(t)
-	(&stubPollCoordLock{alwaysOK: true}).install(t)
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -1677,5 +1572,202 @@ func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 	}
 	if !hasCwd {
 		t.Errorf("dispatch args missing --cwd /Users/op/projects/demo: %v", args)
+	}
+}
+
+// TestFindExistingCoordForProject_ReturnsAliveMatch pins issue #63's
+// idempotency primitive: a record tagged task_id=coord-<project> with
+// project=<project> and an alive tmux session is the in-flight coord —
+// findExistingCoordForProject returns it (record, true).
+func TestFindExistingCoordForProject_ReturnsAliveMatch(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+
+	r := agent.New("c0ffeec0")
+	r.Project = "demo"
+	r.TaskID = "coord-demo"
+	r.TmuxSession = "fleet-c0ffeec0"
+
+	got, ok := findExistingCoordForProject([]*agent.Record{r}, "demo")
+	if !ok {
+		t.Fatal("expected found=true; got false")
+	}
+	if got != r {
+		t.Errorf("got record = %+v; want pointer to seeded r", got)
+	}
+}
+
+// TestFindExistingCoordForProject_ReturnsFalseOnNoMatch pins the
+// negative path: no record with the right task_id → no match.
+func TestFindExistingCoordForProject_ReturnsFalseOnNoMatch(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	other := agent.New("12345678")
+	other.Project = "demo"
+	other.TaskID = "regular-task"
+	other.TmuxSession = "fleet-12345678"
+
+	if _, ok := findExistingCoordForProject([]*agent.Record{other}, "demo"); ok {
+		t.Error("expected found=false when no record carries coord-<project> task_id")
+	}
+}
+
+// TestFindExistingCoordForProject_ReturnsFalseOnDeadSession pins that
+// dead-session matches are NOT counted — caller must spawn a fresh
+// coord rather than attaching to a graveyard.
+func TestFindExistingCoordForProject_ReturnsFalseOnDeadSession(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
+
+	r := agent.New("deadc0de")
+	r.Project = "demo"
+	r.TaskID = "coord-demo"
+	r.TmuxSession = "fleet-deadc0de"
+
+	if _, ok := findExistingCoordForProject([]*agent.Record{r}, "demo"); ok {
+		t.Error("dead session should not count as an in-flight coord match")
+	}
+}
+
+// TestFindExistingCoordForProject_ProjectMismatchedSkipped guards
+// against cross-project leakage: a record tagged coord-foo must NOT
+// match a search for "bar". Project prefix in task_id is the gate.
+func TestFindExistingCoordForProject_ProjectMismatchedSkipped(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	r := agent.New("11111111")
+	r.Project = "foo"
+	r.TaskID = "coord-foo"
+	r.TmuxSession = "fleet-11111111"
+
+	if _, ok := findExistingCoordForProject([]*agent.Record{r}, "bar"); ok {
+		t.Error("coord-foo record must not match bar")
+	}
+}
+
+// TestKeyA_ProjectRow_FindsExistingCoordByTaskID pins issue #63's
+// idempotency: a second [a] press during the skill-boot window
+// (CoordID empty because lock body hasn't published yet) finds the
+// in-flight record by task_id and attaches WITHOUT spawning a duplicate.
+func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Existing in-flight coord record: tagged coord-demo, alive session,
+	// no lock body yet (CoordID empty on the dashboard row).
+	coord := agent.New("c00bf001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-c00bf001"
+
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}}, // no CoordID
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if mm.pendingAttach != "fleet-c00bf001" {
+		t.Errorf("pendingAttach = %q; want fleet-c00bf001 (in-flight coord)", mm.pendingAttach)
+	}
+	if cmd == nil {
+		t.Error("expected tea.Quit cmd from task_id-fallback attach")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] on in-flight coord must NOT shell out to dispatch; got %v", stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch pins the new
+// flow: dispatch returns → coordSpawnDoneMsg has no err → Update sets
+// pendingAttach. No lock-poll, no timeout banner under normal operation.
+func TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] should produce spawn cmd")
+	}
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err != nil {
+		t.Fatalf("expected no err on successful dispatch; got %v", doneMsg.err)
+	}
+	updated, cmd2 := m.Update(doneMsg)
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-abcd1234" {
+		t.Errorf("pendingAttach = %q; want fleet-abcd1234 (immediate attach)", mm.pendingAttach)
+	}
+	if cmd2 == nil {
+		t.Error("expected tea.Quit cmd after coordSpawnDoneMsg")
+	}
+	// Banner must NOT mention "timed out" under the new flow.
+	if mm.flash != nil && strings.Contains(mm.flash.text, "timed out") {
+		t.Errorf("flash should not mention 'timed out'; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_ProjectRow_InitErrShowsBanner pins the init-failure path:
+// when state.EnsureProjectInitialized fails (e.g. permission denied
+// on parent dir), [a] must NOT shell out to dispatch — surface the
+// error as a banner so the operator sees what to fix.
+func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
+	// Force EnsureProjectInitialized to fail by pointing FLEET_HOME at
+	// a path where MkdirAll cannot succeed. A regular file as parent
+	// triggers ENOTDIR.
+	tmp := t.TempDir()
+	notDirPath := filepath.Join(tmp, "fleet-as-file")
+	if err := os.WriteFile(notDirPath, []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FLEET_HOME", notDirPath)
+
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("init failure should flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "init failed") {
+		t.Errorf("flash should mention 'init failed'; got %q", mm.flash.text)
+	}
+	if cmd != nil {
+		t.Error("init failure should not produce a cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("init failure must NOT shell out to dispatch; got %v", stub.calls)
 	}
 }
