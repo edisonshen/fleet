@@ -82,13 +82,25 @@ _COORD_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 # Inbox body delivered to the coord agent on the next Stop hook. The
 # fleet-guard relay wraps this with `[OPERATOR] ` prefix automatically
-# (see skills/fleet-guard/inbox.py:deliver). Body must include the
-# literal slash command `/remote-control` so the agent recognizes and
-# runs it.
+# (see skills/fleet-guard/inbox.py:deliver).
+#
+# IMPORTANT: this body must NOT be phrased as an imperative directed at
+# the agent. Earlier wording ("Run the slash command `/remote-control`
+# ...") caused Claude to interpret the message as a Skill invocation
+# and error out with "remote-control is a UI command, not a skill"
+# (issue #69). The fix: frame the message as a status notification
+# describing what the daemon is doing, with the slash-command phrasing
+# anchored to the operator. Constraints:
+#   1. NO leading imperative ("Run", "Execute", "Invoke", "Please run").
+#   2. Must contain the literal `/remote-control` so operators searching
+#      the inbox can find it.
+#   3. Must mention "daemon" so the agent gets real situational context.
+#   4. Must frame the slash command as something the OPERATOR types,
+#      not the agent.
 _INBOX_BODY = (
-    "Run the slash command `/remote-control` (in the chat, not bash) "
-    "to attach this coordinator session to its remote-control daemon. "
-    "This lets the operator pair the session via mobile / claude.ai."
+    "INFO: claude remote-control daemon started for this coordinator "
+    "session. To attach via mobile or claude.ai, the operator can type "
+    "/remote-control in this chat."
 )
 
 
