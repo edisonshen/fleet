@@ -214,35 +214,12 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		// the wrong next step for a task that just hasn't been
 		// dispatched yet.
 		if key == "a" && m.detail != nil && m.detail.taskSlug != "" {
-			// Codex iter-3 P2: re-read the live status so a task
-			// transitioning between snapshots (e.g. ready → in-progress
-			// when the coord picks it up) doesn't strand the panel on
-			// stale routing. Falls back to the cached row.task.Status
-			// if the re-read fails (filesystem error, slug gone) so
-			// the operator still gets SOME response rather than a no-op.
-			status := m.detail.taskStatus
-			if live := liveTaskStatus(m.detail.taskProject, m.detail.taskSlug); live != "" {
-				status = live
-			}
-			switch status {
-			case "todo":
-				m.flash = &flashMsg{
-					text:  noWorkerHintTodo(m.detail.taskProject, m.detail.taskSlug),
-					isErr: true,
-				}
-				m.detail = nil
-				return m, nil, true
-			case "ready":
-				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
-						m.detail.taskProject, m.detail.taskSlug),
-					isErr: true,
-				}
-				m.detail = nil
-				return m, nil, true
-			}
-			return m.attachToTaskWorker(m.detail.taskProject, m.detail.taskSlug)
+			// Codex iter-3 P2 + iter-5 P2: route through the unified
+			// attach-or-hint dispatcher. It peeks any existing worker
+			// (active or archived) regardless of status so reset-to-
+			// todo recovery cases retain log access; only when no
+			// worker exists does it surface the status-specific hint.
+			return m.attachToTaskOrHint(m.detail.taskProject, m.detail.taskSlug, m.detail.taskStatus)
 		}
 		m.showHelp = false
 		m.detail = nil
@@ -456,30 +433,20 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		//
 		// Codex iter-4 P3: re-read live status from tasks.md so a
 		// task transitioning between snapshots doesn't dead-end on
-		// stale routing. Mirrors the detail-panel branch which
-		// already had to add liveTaskStatus for this race. Falls
-		// back to the snapshot status when the live read fails.
-		status := row.task.Status
-		if live := liveTaskStatus(row.parentProject, row.task.Slug); live != "" {
-			status = live
-		}
-		switch status {
-		case "todo":
-			m.flash = &flashMsg{
-				text:  noWorkerHintTodo(row.parentProject, row.task.Slug),
-				isErr: true,
-			}
-			return m, nil, true
-		case "ready":
-			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
-					row.parentProject, row.task.Slug),
-				isErr: true,
-			}
-			return m, nil, true
-		}
-		return m.attachToTaskWorker(row.parentProject, row.task.Slug)
+		// stale routing.
+		//
+		// Codex iter-5 P2: prefer attaching to an existing worker
+		// peek even when status is todo/ready. The reconcile path
+		// flips failed workers back to todo by clearing only
+		// worker_pid; the worker dir + state.json + output.log are
+		// preserved for post-mortem. Routing on status alone would
+		// hide that history. attachToTaskWorker is the right
+		// dispatcher: it peeks when a worker exists (active or
+		// archived) and falls through to the no-worker hint when
+		// neither does, at which point the row-side handler still
+		// gets the chance to override with the more specific
+		// promote / wait-for-coord guidance.
+		return m.attachToTaskOrHint(row.parentProject, row.task.Slug, row.task.Status)
 	default:
 		// Future row kinds — neither tmux nor a peek surface fits. Flash
 		// so the operator sees the no-op.
@@ -505,10 +472,80 @@ func noWorkerHintTodo(project, slug string) string {
 		project, slug, slug, project)
 }
 
+func noWorkerHintReady(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+		project, slug)
+}
+
 func noWorkerRecoveryHint(project, slug string) string {
 	return fmt.Sprintf(
 		"no worker for task %s/%s — `fleet tasks set %s status=ready --project %s` to retry",
 		project, slug, slug, project)
+}
+
+// attachToTaskOrHint is the unified [a] dispatcher for task rows and
+// the task detail panel. Routes by worker existence, NOT by task
+// status:
+//
+//  1. Worker state.json exists OR worker archive dir exists
+//     → open peek panel via attachToTaskWorker (which handles the
+//     active+archive split internally via readWorkerDetail).
+//  2. No worker on disk
+//     → flash status-aware guidance (promote / wait-for-coord /
+//     retry) so the operator's next step matches the task's
+//     actual lifecycle position.
+//
+// Codex iter-5 P2 fix: the previous version short-circuited on
+// status BEFORE checking worker existence, hiding existing logs from
+// reset-to-todo recovery flows (e.g. when reconcile flips a failed
+// worker's task back to todo while preserving workers/<slug>/).
+//
+// Codex iter-3 P2 / iter-4 P3 are preserved here: live status read
+// overrides the snapshot status so a transition between refreshes
+// doesn't dead-end on stale routing. The status fallback is only
+// consulted when no worker exists, so the live-vs-snapshot race
+// can't accidentally suppress a peek.
+func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, tea.Cmd, bool) {
+	if slug == "" {
+		return m, nil, true
+	}
+	// Worker check first. Active state.json:
+	ws, err := readTaskWorker(project, slug)
+	if err == nil && ws != nil {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// Genuine read error (corrupt state.json, permission denied) —
+	// surface verbatim. attachToTaskWorker carries the same error
+	// rendering, so route through it for consistency.
+	if err != nil {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// ws == nil → ENOENT on active dir. Try the archive.
+	if taskWorkerArchiveExists(project, slug) {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// No worker, active or archived. Apply status-aware hint. Live
+	// re-read overrides the snapshot when available.
+	status := snapshotStatus
+	if live := liveTaskStatus(project, slug); live != "" {
+		status = live
+	}
+	switch status {
+	case "todo":
+		m.flash = &flashMsg{text: noWorkerHintTodo(project, slug), isErr: true}
+	case "ready":
+		m.flash = &flashMsg{text: noWorkerHintReady(project, slug), isErr: true}
+	default:
+		// blocked / in-progress / in-review / done / abandoned — the
+		// task should have a worker. Surface the recovery hint so the
+		// operator can re-dispatch.
+		m.flash = &flashMsg{text: noWorkerRecoveryHint(project, slug), isErr: true}
+	}
+	// Dismiss any open detail panel so the flash isn't hidden behind
+	// a stale overlay.
+	m.detail = nil
+	return m, nil, true
 }
 
 // attachToTaskWorker is the [a] handler for both task rows and the

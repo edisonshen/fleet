@@ -434,6 +434,101 @@ func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 	}
 }
 
+// TestKeyA_TaskRow_TodoTaskWithExistingWorker_OpensPeek pins the
+// codex iter-5 P2 fix: when a task is in todo status BUT the worker
+// dir + state.json + output.log are still on disk (e.g. reconcile
+// flipped the task back to todo by clearing only worker_pid), [a]
+// must open the existing peek so the operator can inspect WHY the
+// previous worker failed. Status-only routing would have hidden
+// that history behind the promote hint.
+func TestKeyA_TaskRow_TodoTaskWithExistingWorker_OpensPeek(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "reset-task-aaaa", tasks.StatusTodo, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return &workers.State{
+			Slug: slug, Project: project, Phase: workers.PhaseFailed, PID: 7777,
+		}, nil
+	})
+	// Seed an actual on-disk worker dir so readWorkerDetail succeeds.
+	seedWorker(t, pdir, "fleet", "reset-task-aaaa", workers.State{
+		Slug: "reset-task-aaaa", Project: "fleet",
+		Phase: workers.PhaseFailed, PID: 7777,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "reset-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash != nil && mm.flash.isErr {
+		t.Errorf("todo+worker should NOT flash; got %q", mm.flash.text)
+	}
+	if mm.detail == nil {
+		t.Fatalf("[a] on todo task with existing worker must open peek, got nil panel")
+	}
+	if !strings.Contains(mm.detail.title, "worker") {
+		t.Errorf("panel title should be the worker peek, got %q", mm.detail.title)
+	}
+}
+
+// TestKeyA_DetailPanel_TodoTaskWithExistingWorker_OpensPeek mirrors
+// the row-side test for the detail-panel branch. Pre-iter-5 the
+// panel-side [a] also short-circuited on status, hiding the peek.
+func TestKeyA_DetailPanel_TodoTaskWithExistingWorker_OpensPeek(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "reset-task-aaaa", tasks.StatusTodo, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return &workers.State{
+			Slug: slug, Project: project, Phase: workers.PhaseFailed, PID: 7777,
+		}, nil
+	})
+	seedWorker(t, pdir, "fleet", "reset-task-aaaa", workers.State{
+		Slug: "reset-task-aaaa", Project: "fleet",
+		Phase: workers.PhaseFailed, PID: 7777,
+	})
+	// liveTaskStatus stub returns the on-disk status (todo) — the
+	// fix must NOT use status to gate; worker existence wins.
+	origLive := liveTaskStatus
+	liveTaskStatus = func(project, slug string) string { return "todo" }
+	t.Cleanup(func() { liveTaskStatus = origLive })
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.detail = &detailView{
+		title:       "task: fleet/reset-task-aaaa",
+		body:        "(prepopulated)",
+		taskProject: "fleet",
+		taskSlug:    "reset-task-aaaa",
+		taskStatus:  "todo",
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.detail == nil {
+		t.Fatalf("[a] should open worker peek, got nil panel")
+	}
+	if !strings.Contains(mm.detail.title, "worker") {
+		t.Errorf("panel should switch to worker peek, got %q", mm.detail.title)
+	}
+}
+
 // TestKeyA_TaskRow_TodoTask_PointsAtPromote pins that [a] on a
 // todo task row points at `fleet tasks promote` — the actual
 // next-step (the coord auto-dispatches `ready` tasks). Codex iter-3
