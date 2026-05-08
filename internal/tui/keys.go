@@ -125,6 +125,14 @@ type coordSpawnDoneMsg struct {
 	agentID     string
 	session     string
 	err         error
+	// promptDelivered is true when dispatch's stdout did NOT contain
+	// the dispatchPromptFailedMarker — i.e. SendInitialPrompt
+	// succeeded and /coordinator was actually typed into the pane.
+	// False when dispatch returned 0 but warned about a prompt
+	// delivery failure (the agent is alive but the coord skill never
+	// started; the TUI must not promote it to the project's coord via
+	// the marker file). Codex iter-5 P2.
+	promptDelivered bool
 }
 
 // fleetBinary is resolved once at startup via os.Executable() so the
@@ -529,13 +537,34 @@ func coordTaskID(projectName string) string {
 // same project (issue #63's "[a] press during the 30s skill-boot window
 // piles up zombies" failure mode).
 //
-// Implementation note: delegates to findCoordByTaskID (rows.go) so the
-// dashboard's binding signal and the [a] idempotency signal share one
-// predicate. They differ only in return shape (this one wraps in a
-// (record, bool) tuple to match the caller's "found?" check).
+// Codex iter-5 P1: this predicate is intentionally LOOSER than the
+// dashboard's findCoordByTaskID — it does NOT require the coord-spawn
+// marker, the project tree, or marker freshness. Reason: if a coord
+// session is alive (e.g. stalled on a permissions prompt past 60s, or
+// started from an older flow without a marker), [a] should re-attach
+// to it rather than launch a duplicate. The dashboard's stricter
+// signal is about "is this the project's verified coord identity for
+// rendering" — a separate question from "is there an in-flight coord
+// I should re-attach to instead of double-spawning?"
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	if rec := findCoordByTaskID(records, projectName); rec != nil {
-		return rec, true
+	want := coordTaskID(projectName)
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != want {
+			continue
+		}
+		if r.Project != projectName {
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionAliveFn(r.TmuxSession) {
+			continue
+		}
+		return r, true
 	}
 	return nil, false
 }
@@ -580,6 +609,18 @@ var writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
 // follow-up lock-poll knows whose holder to expect. The stdout shape
 // is stable across v0.1 / v0.2 — see cmd/fleet/dispatch.go runDispatch.
 var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawned`)
+
+// dispatchPromptFailedMarker is the stdout sigil printed by
+// runDispatch when SendInitialPrompt failed. The dispatch CLI exits 0
+// in this case (the agent + tmux session ARE up; the operator just
+// has to type the prompt manually) but the coord skill never started
+// — so the TUI must NOT write the coord-spawn marker, which would
+// cause the dashboard to render a plain Claude session as the
+// project's verified coord (codex iter-5 P2).
+//
+// Stable across the dispatch.go output shape; the CLI test
+// TestDispatch_PromptFailureWarningShape pins the literal text.
+const dispatchPromptFailedMarker = "initial prompt not delivered"
 
 // startCoordSpawn shells out to `fleet dispatch` with the coord
 // auto-prompt and returns immediately (issue #63: no lock-poll). On
@@ -626,10 +667,15 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			}
 		}
 		agentID := match[1]
+		// Codex iter-5 P2: if dispatch's stdout warned about a prompt
+		// delivery failure, the coord skill never started — propagate
+		// the signal so model.Update skips the marker write.
+		promptOK := !bytes.Contains([]byte(out), []byte(dispatchPromptFailedMarker))
 		return coordSpawnDoneMsg{
-			projectName: projectName,
-			agentID:     agentID,
-			session:     tmux.SessionName(agentID),
+			projectName:     projectName,
+			agentID:         agentID,
+			session:         tmux.SessionName(agentID),
+			promptDelivered: promptOK,
 		}
 	})
 }

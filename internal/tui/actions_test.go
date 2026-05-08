@@ -1382,10 +1382,15 @@ func coordSpawnDoneMsgFromArgs(args []string, out string, dispatchErr error) tea
 		}
 	}
 	agentID := match[1]
+	// Mirror production: promptDelivered=false when stdout warned
+	// about an initial-prompt-delivery failure (dispatch CLI exits
+	// 0 in that case); true otherwise.
+	promptOK := !strings.Contains(out, dispatchPromptFailedMarker)
 	return coordSpawnDoneMsg{
-		projectName: argValue(args, "--project"),
-		agentID:     agentID,
-		session:     "fleet-" + agentID,
+		projectName:     argValue(args, "--project"),
+		agentID:         agentID,
+		session:         "fleet-" + agentID,
+		promptDelivered: promptOK,
 	}
 }
 
@@ -1865,7 +1870,7 @@ func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 // TestModel_CoordSpawnDoneMsg_WritesMarker pins that the success
 // path writes the coord-spawn marker before tea.Quit so the
 // dashboard's task_id fallback can validate the agent ID on its
-// next refresh.
+// next refresh. Requires promptDelivered=true (codex iter-5 P2).
 func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	markerStub := &stubWriteCoordSpawnMarker{}
@@ -1873,9 +1878,10 @@ func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
 
 	m := New("test")
 	updated, _ := m.Update(coordSpawnDoneMsg{
-		projectName: "demo",
-		agentID:     "abcd1234",
-		session:     "fleet-abcd1234",
+		projectName:     "demo",
+		agentID:         "abcd1234",
+		session:         "fleet-abcd1234",
+		promptDelivered: true,
 	})
 	mm := updated.(Model)
 	if mm.pendingAttach != "fleet-abcd1234" {
@@ -1883,6 +1889,40 @@ func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
 	}
 	if got := markerStub.calls["demo"]; got != "abcd1234" {
 		t.Errorf("marker call for demo = %q; want abcd1234", got)
+	}
+}
+
+// TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker pins codex
+// iter-5 P2: when SendInitialPrompt failed (dispatch warned, but
+// exited 0), the coord skill never started — the TUI must NOT write
+// the marker, otherwise the dashboard would render a plain Claude
+// session as the project's verified coord. Operator still attaches
+// (so they can type the prompt manually) but the project stays
+// visibly unowned until they retry.
+func TestModel_CoordSpawnDoneMsg_PromptFailed_SkipsMarker(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub.install(t)
+
+	m := New("test")
+	updated, _ := m.Update(coordSpawnDoneMsg{
+		projectName:     "demo",
+		agentID:         "abcd1234",
+		session:         "fleet-abcd1234",
+		promptDelivered: false,
+	})
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-abcd1234" {
+		t.Errorf("pendingAttach = %q; want fleet-abcd1234 (still attach)", mm.pendingAttach)
+	}
+	if _, wrote := markerStub.calls["demo"]; wrote {
+		t.Errorf("prompt-failed dispatch must NOT write marker; got call %v", markerStub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("flash should signal the prompt failure; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "prompt failed to deliver") {
+		t.Errorf("flash should mention prompt delivery failure; got %q", mm.flash.text)
 	}
 }
 
@@ -1983,6 +2023,83 @@ func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 		if _, isQuit := msg.(tea.QuitMsg); isQuit {
 			t.Error("expected loadAgentsCmd refresh, NOT tea.Quit on dead post-spawn session")
 		}
+	}
+}
+
+// TestFindExistingCoordForProject_AlivePastBootWindow_StillFound
+// pins codex iter-5 P1 separation: the [a] idempotency predicate is
+// LOOSER than the dashboard's findCoordByTaskID. Even when the
+// marker is missing / stale / the project tree gate would fail, an
+// alive in-flight coord must be re-attached rather than respawned.
+// Otherwise a coord stalled past 60s on a permissions prompt would
+// trigger duplicate spawns on every [a].
+func TestFindExistingCoordForProject_AlivePastBootWindow_StillFound(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// Marker missing — the dashboard fallback would refuse, but the
+	// [a] idempotency must still re-attach.
+	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	// Project tree gate would also block the dashboard fallback.
+	(&stubProjectTreeExists{missing: map[string]bool{"demo": true}}).install(t)
+
+	r := agent.New("stalled1")
+	r.Project = "demo"
+	r.TaskID = "coord-demo"
+	r.TmuxSession = "fleet-stalled1"
+
+	got, ok := findExistingCoordForProject([]*agent.Record{r}, "demo")
+	if !ok {
+		t.Fatal("[a] idempotency must re-attach to alive coord even with strict-gate failures")
+	}
+	if got.ID != "stalled1" {
+		t.Errorf("found wrong record: %+v", got)
+	}
+}
+
+// TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker pins codex
+// iter-5 P2 end-to-end: when dispatch's stdout warns "initial prompt
+// not delivered", the TUI must propagate promptDelivered=false in
+// coordSpawnDoneMsg, and the marker write must be skipped.
+func TestKeyA_ProjectRow_PromptFailedDispatch_NoMarker(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub.install(t)
+
+	// Production-shaped stdout: dispatch returned 0 (no err), printed
+	// the agent line AND the prompt-failure warning line. The TUI's
+	// parser must catch the warning and forward promptDelivered=false.
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n" +
+				"warning: initial prompt not delivered (boom) — attach to type it manually\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err != nil {
+		t.Fatalf("expected dispatch ok; got err %v", doneMsg.err)
+	}
+	if doneMsg.promptDelivered {
+		t.Error("promptDelivered must be false when stdout warned about prompt failure")
+	}
+	updated, _ := m.Update(doneMsg)
+	mm := updated.(Model)
+	if _, wrote := markerStub.calls["demo"]; wrote {
+		t.Errorf("prompt-failed dispatch must NOT write marker; got %v", markerStub.calls)
+	}
+	if mm.pendingAttach != "fleet-abcd1234" {
+		t.Errorf("operator must still attach (so they can type the prompt); pendingAttach = %q", mm.pendingAttach)
 	}
 }
 
