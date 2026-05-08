@@ -458,6 +458,20 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		m.pendingAttach = rec.TmuxSession
 		return m, tea.Quit, true
 	}
+	// Path 2.5: in-flight gate. coordSpawnInFlight tracks projects
+	// whose dispatch goroutine has launched but coordSpawnDoneMsg
+	// hasn't arrived yet. During this window the agent record + marker
+	// don't exist on disk, so paths 1/2/findCoord would all miss and
+	// we'd duplicate-spawn (codex iter-3 P2 follow-up).
+	if m.coordSpawnInFlight[p.Name] {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord spawn for project %s is in flight — wait a moment then re-press [a]",
+				p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
 	// Path 3: no coord. Pre-init the project tree (so the skill's first
 	// tick can write coord-state.json and acquire the flock), then spawn.
 	if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
@@ -467,6 +481,10 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
+	if m.coordSpawnInFlight == nil {
+		m.coordSpawnInFlight = map[string]bool{}
+	}
+	m.coordSpawnInFlight[p.Name] = true
 	cwd := coordCwdForProject(m.records, p.Name)
 	return m, m.startCoordSpawn(p.Name, cwd), true
 }
@@ -551,6 +569,11 @@ func coordCwdForProject(records []*agent.Record, projectName string) string {
 	}
 	return ""
 }
+
+// writeCoordSpawnMarkerFn writes the coord-spawn marker file. var so
+// tests can stub the disk write. Production calls
+// state.WriteCoordSpawnMarker.
+var writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
 
 // dispatchAgentIDPattern matches the first line of `fleet dispatch`
 // stdout: "agent <8-hex-id> spawned". We extract the ID so the

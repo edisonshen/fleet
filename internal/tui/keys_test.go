@@ -162,6 +162,44 @@ func (s *stubProjectTreeExists) install(t *testing.T) {
 	t.Cleanup(func() { projectTreeExistsFn = prev })
 }
 
+// stubCoordSpawnMarker replaces coordSpawnMarkerFn for tests. Map
+// projectName → agentID; missing key returns "". The dashboard's
+// task_id fallback requires the marker to match the candidate
+// agent's ID before promoting.
+type stubCoordSpawnMarker struct {
+	markers map[string]string // project → agent ID
+}
+
+func (s *stubCoordSpawnMarker) install(t *testing.T) {
+	t.Helper()
+	prev := coordSpawnMarkerFn
+	coordSpawnMarkerFn = func(projectName string) string {
+		return s.markers[projectName]
+	}
+	t.Cleanup(func() { coordSpawnMarkerFn = prev })
+}
+
+// stubWriteCoordSpawnMarker replaces writeCoordSpawnMarkerFn for
+// tests so we don't write to FLEET_HOME during unit tests. Captures
+// (project, id) tuples per call.
+type stubWriteCoordSpawnMarker struct {
+	calls map[string]string // project → agent ID
+	err   error             // returned from each write
+}
+
+func (s *stubWriteCoordSpawnMarker) install(t *testing.T) {
+	t.Helper()
+	prev := writeCoordSpawnMarkerFn
+	writeCoordSpawnMarkerFn = func(projectName, agentID string) error {
+		if s.calls == nil {
+			s.calls = map[string]string{}
+		}
+		s.calls[projectName] = agentID
+		return s.err
+	}
+	t.Cleanup(func() { writeCoordSpawnMarkerFn = prev })
+}
+
 // stubSessionProbe replaces sessionProbeFn (used by loadAgentsCmd's
 // status cache). Distinguishes "definitively dead" (dead=true, no
 // err) from "probe failed" (errSessions=true, transport-style

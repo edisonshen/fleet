@@ -359,6 +359,87 @@ func TestEnsureProjectInitialized_NoOpWhenPresent(t *testing.T) {
 	}
 }
 
+// TestCoordSpawnMarker_RoundTrip pins issue #63 codex iter-3 P2: the
+// TUI writes the marker after dispatch with the new coord agent's ID;
+// the dashboard reads it to validate the candidate record matches.
+// Atomic write + first-line read with whitespace trim.
+func TestCoordSpawnMarker_RoundTrip(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+
+	if _, err := EnsureProjectInitialized("demo"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := WriteCoordSpawnMarker("demo", "abcd1234"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := ReadCoordSpawnMarker("demo")
+	if got != "abcd1234" {
+		t.Errorf("read = %q; want abcd1234", got)
+	}
+}
+
+// TestCoordSpawnMarker_OverwritesExisting confirms marker writes are
+// last-writer-wins (idempotent for retries / re-spawns).
+func TestCoordSpawnMarker_OverwritesExisting(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+
+	if _, err := EnsureProjectInitialized("demo"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	for _, id := range []string{"oldold01", "newnew02", "latest03"} {
+		if err := WriteCoordSpawnMarker("demo", id); err != nil {
+			t.Fatalf("write %q: %v", id, err)
+		}
+	}
+	got := ReadCoordSpawnMarker("demo")
+	if got != "latest03" {
+		t.Errorf("read = %q; want latest03 (last write)", got)
+	}
+}
+
+// TestCoordSpawnMarker_AbsentReturnsEmpty pins read robustness — a
+// missing marker returns "" silently rather than err. The dashboard
+// fallback uses "" as "no in-flight coord; don't promote".
+func TestCoordSpawnMarker_AbsentReturnsEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if got := ReadCoordSpawnMarker("nonexistent"); got != "" {
+		t.Errorf("absent marker = %q; want empty string", got)
+	}
+}
+
+// TestCoordSpawnMarker_TrimsWhitespaceAndCRLF pins read tolerance:
+// hand-edited markers with CRLF / trailing whitespace must still
+// produce the bare agent ID.
+func TestCoordSpawnMarker_TrimsWhitespaceAndCRLF(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := EnsureProjectInitialized("demo"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	path, err := CoordSpawnMarkerPath("demo")
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	cases := map[string]string{
+		"abcd1234":            "abcd1234",
+		"abcd1234\n":          "abcd1234",
+		"abcd1234\r\n":        "abcd1234",
+		"  abcd1234  \n":      "abcd1234",
+		"abcd1234\nextrajunk": "abcd1234",
+	}
+	for content, want := range cases {
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %q: %v", content, err)
+		}
+		if got := ReadCoordSpawnMarker("demo"); got != want {
+			t.Errorf("ReadCoordSpawnMarker for %q = %q; want %q", content, got, want)
+		}
+	}
+}
+
 // TestEnsureProjectInitialized_RejectsInvalidName ensures the validator
 // fires (no path-traversal via "../" or absolute-path injection). Same
 // rule as ProjectDir; no silent mapping.

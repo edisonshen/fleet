@@ -428,6 +428,85 @@ func EnsureProjectInitialized(name string) (string, error) {
 	return dir, nil
 }
 
+// CoordSpawnMarkerPath returns
+// ~/.fleet/projects/<safe-name>/.locks/coord-spawn-marker.
+//
+// The TUI writes this file IMMEDIATELY AFTER `fleet dispatch` returns
+// the agent ID for a coord auto-spawn. The dashboard's task_id
+// fallback signal (rows.go:findCoordByTaskID) gates promotion on the
+// marker file's content matching the candidate agent's ID — so an
+// operator who shells out `fleet dispatch coord-<project> --project
+// <project> --coord-spawn` can write an agent record but cannot make
+// the dashboard treat it as the project's coord (they'd also have to
+// write this marker with the right ID).
+//
+// Marker is overwritten on each fresh coord-spawn (idempotent for
+// retries). It is NOT cleaned up on coord exit; the freshness gate
+// (alive session + project-tree exists) prevents stale markers from
+// hijacking a future coord. The marker can outlive its referent
+// agent, but the alive-gate keeps that from rendering as a coord.
+func CoordSpawnMarkerPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Clean(dir), ".locks", "coord-spawn-marker"), nil
+}
+
+// WriteCoordSpawnMarker atomically writes agentID into the coord-spawn
+// marker for projectName. The TUI calls this BEFORE shelling out to
+// `fleet dispatch` so the dashboard's task_id fallback can verify the
+// record originated from the TUI auto-spawn path.
+//
+// Idempotent: a second call overwrites the previous content (atomic
+// rename via WriteAtomic). Caller must have already run
+// EnsureProjectInitialized so the .locks/ parent exists.
+func WriteCoordSpawnMarker(projectName, agentID string) error {
+	path, err := CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return fmt.Errorf("WriteCoordSpawnMarker: %w", err)
+	}
+	return WriteAtomic(path, []byte(agentID+"\n"))
+}
+
+// ReadCoordSpawnMarker returns the agent ID stored in the coord-spawn
+// marker for projectName, or "" when the marker is absent / unreadable
+// / malformed. Used by the dashboard's task_id fallback to validate
+// that a candidate coord record was spawned via the TUI flow (rather
+// than hand-edited / CLI-spoofed).
+//
+// Reads only the first line and trims whitespace, so CRLF or trailing
+// blank lines from a hand-edit don't trip the comparison. Returns ""
+// silently rather than err — this is a best-effort gate, not a
+// load-bearing security boundary.
+func ReadCoordSpawnMarker(projectName string) string {
+	path, err := CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	// First line, trimmed.
+	line := data
+	for i, b := range line {
+		if b == '\n' || b == '\r' {
+			line = line[:i]
+			break
+		}
+	}
+	s := string(line)
+	// Trim whitespace.
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
 // CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
 //
 // Held by the running coordinator agent for the lifetime of one tick;

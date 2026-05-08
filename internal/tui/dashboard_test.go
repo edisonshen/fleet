@@ -927,6 +927,7 @@ func TestDashboard_CoordSignal_LockBodyPrimaryWins(t *testing.T) {
 func TestDashboard_CoordSignal_TaskIDFallbackWhenNoLock(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -975,7 +976,9 @@ func TestDashboard_CoordSignal_NoMatchNoCoord(t *testing.T) {
 // downstream).
 func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "deadc0de"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -999,6 +1002,7 @@ func TestDashboard_CoordSignal_DeadSessionNotPromoted(t *testing.T) {
 func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 
 	m := New("test")
 	m.dashboard = &Snapshot{
@@ -1018,6 +1022,92 @@ func TestDashboard_FiltersClaimedCoordFromRight(t *testing.T) {
 	}
 	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
 		t.Errorf("coord must be filtered from RIGHT (claimed by LEFT); got %v want [bbbb2222]", agentIDs)
+	}
+}
+
+// TestDashboard_CoordSignal_TaskIDFallbackGatedOnMarker pins codex
+// iter-3 P2: a record matching task_id + project + alive session
+// must ALSO match the coord-spawn marker file's content before
+// promotion. Without this, an operator running `fleet dispatch
+// coord-X --project X --coord-spawn` could write a record that
+// hijacks the LEFT-column slot. The TUI writes the marker post-
+// dispatch with the agent ID it's about to attach to; a spoof
+// dispatch can't replicate that without ALSO editing the marker file
+// directly (which is editing internal state — outside the trust
+// boundary regardless).
+func TestDashboard_CoordSignal_TaskIDFallbackGatedOnMarker(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	// Marker file is missing for "demo" — no promotion.
+	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "spoofyid", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-spoofyid", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("missing marker must block promotion; got CoordID=%q", coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_CoordSignal_TaskIDFallback_MarkerMismatchSkipped
+// guards against a stale marker matching a different agent ID:
+// e.g. previous coord crashed, marker still names the dead one,
+// and a new (genuinely-spoofed) record has a different ID. The
+// fallback must NOT promote the spoofer just because both share
+// the task_id sentinel.
+func TestDashboard_CoordSignal_TaskIDFallback_MarkerMismatchSkipped(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	// Marker names a different agent than the record below.
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "realone1"}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "spoofyid", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-spoofyid", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "" {
+		t.Errorf("marker mismatch must block promotion; got CoordID=%q", coordIDOrEmpty(got))
+	}
+}
+
+// TestDashboard_CoordSignal_TaskIDFallback_TmuxProbeErrorNotDead
+// pins codex iter-3 P2 #2: tmux probe transport errors (bad socket,
+// restarting server) must NOT be conflated with "definitively dead".
+// The tristate sessionProbeFn distinguishes them; on probe-error,
+// findCoordByTaskID's re-check (sessionProbeOrAliveFn) treats the
+// session as alive and the coord stays bound on LEFT.
+func TestDashboard_CoordSignal_TaskIDFallback_TmuxProbeErrorNotDead(t *testing.T) {
+	// First-pass alive returns false (HasSession says no), but the
+	// re-probe via SessionAlive returns (false, transport-err) →
+	// sessionProbeOrAliveFn returns true → coord stays bound.
+	(&stubSessionAlive{dead: map[string]bool{"fleet-realcoord": true}}).install(t)
+	(&stubSessionProbe{errSessions: map[string]bool{"fleet-realcoord": true}}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "realcoord"}}).install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", RepoSlug: "demo"}},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "realcoord", Project: "demo", TaskID: "coord-demo", TmuxSession: "fleet-realcoord", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 || got[0].CoordID != "realcoord" {
+		t.Errorf("tmux probe error must be conservative-alive (don't drop coord); got CoordID=%q",
+			coordIDOrEmpty(got))
 	}
 }
 

@@ -110,6 +110,17 @@ type Model struct {
 	// would draw on top of bubbletea's state.
 	pendingAttach string
 
+	// coordSpawnInFlight tracks projects whose [a] dispatch goroutine
+	// has been launched but coordSpawnDoneMsg hasn't returned yet.
+	// During this window the marker file isn't written and the agent
+	// record isn't on disk — without this gate, a second [a] press
+	// would launch a second `fleet dispatch coord-<project>` and we'd
+	// have two competing coord agents (issue #63 codex iter-3 P2
+	// follow-up). Map key is project name; value is irrelevant
+	// (presence == in-flight). Cleared when coordSpawnDoneMsg arrives
+	// or when the err branch fires.
+	coordSpawnInFlight map[string]bool
+
 	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
 	// chip when a newer release is on disk in the version cache.
 	// Empty means no banner — every failure mode in the version
@@ -410,6 +421,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, loadAgentsCmd() // refresh: agent should be archived
 
 	case coordSpawnDoneMsg:
+		// Clear in-flight gate — regardless of success/error, this
+		// dispatch attempt is done. Subsequent [a] presses go through
+		// the full lookup path again (find existing → spawn).
+		if m.coordSpawnInFlight != nil {
+			delete(m.coordSpawnInFlight, msg.projectName)
+		}
 		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
 		// covers init failures, dispatch failures, and agent-ID parse
 		// failures; surface as a flash so the operator can decide
@@ -422,6 +439,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// review iter-1 P2). Trigger a refresh so the new (possibly
 		// dead) agent record appears on the right column for the
 		// operator to investigate via [x] or [a].
+		//
+		// Codex iter-3 P2: write the coord-spawn marker so the
+		// dashboard's task_id fallback can validate the agent ID
+		// matches our intent. Without this, an operator shelling out
+		// `fleet dispatch coord-X --project X --coord-spawn` could
+		// hijack the LEFT-column slot. The marker is best-effort: a
+		// write failure is logged in the flash but doesn't abort the
+		// attach (the agent is up; worst case the dashboard renders
+		// the coord on RIGHT until the lock body publishes).
 		if msg.err != nil {
 			m.flash = &flashMsg{
 				text:  fmt.Sprintf("project %s: %v", msg.projectName, msg.err),
@@ -438,10 +464,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadAgentsCmd()
 		}
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"coord %s spawned for project %s — attaching to %s",
-				msg.agentID, msg.projectName, msg.session),
+		if werr := writeCoordSpawnMarkerFn(msg.projectName, msg.agentID); werr != nil {
+			// Best-effort. Log via flash but proceed with the attach.
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s (marker write failed: %v) — attaching to %s",
+					msg.agentID, msg.projectName, werr, msg.session),
+			}
+		} else {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s — attaching to %s",
+					msg.agentID, msg.projectName, msg.session),
+			}
 		}
 		m.pendingAttach = msg.session
 		return m, tea.Quit

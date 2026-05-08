@@ -153,19 +153,25 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // findCoordByTaskID returns the first agent.Record whose task_id is
 // coordTaskID(projectName) AND project matches AND tmux session is
 // alive AND the per-project state tree exists at
-// ~/.fleet/projects/<name>/. Liveness uses sessionAliveFn
-// (test-stubbable); the project-tree gate uses projectTreeExistsFn
-// so tests can stub the disk check. Returns nil when no record
-// matches.
+// ~/.fleet/projects/<name>/ AND the project's coord-spawn marker
+// (state.CoordSpawnMarkerPath) contains the candidate agent's ID.
+// Liveness uses sessionAliveFn (test-stubbable); the project-tree
+// and marker gates use projectTreeExistsFn / coordSpawnMarkerFn for
+// stub-ability. Returns nil when no record matches.
 //
-// The project-tree gate (codex iter-2 P2) prevents a legacy / hand-
-// edited record with task_id=coord-<project> + project=<project> from
-// being auto-promoted to the project's coord. The TUI's auto-spawn
-// flow always runs state.EnsureProjectInitialized BEFORE dispatch, so
-// any record produced post-issue-#63 satisfies the gate. Records from
-// older builds — which never went through that path — will lack the
-// project tree and stay on the RIGHT column where the operator can
-// triage them via [a] / [x] like any worker.
+// Marker gate (codex iter-3 P2) closes the "operator runs `fleet
+// dispatch coord-<project> --project <project> --coord-spawn`" spoof:
+// the spoofer can write a record but cannot make the dashboard treat
+// it as the coord (the marker is written by the TUI's
+// coordSpawnDoneMsg handler post-dispatch and contains the agent ID
+// the TUI is in the middle of attaching to). Without the right
+// marker content, no promotion happens.
+//
+// Project-tree gate (codex iter-2 P2) keeps legacy records (pre-PR
+// agents with the same task_id shape) from auto-promoting on first
+// upgrade — the TUI's post-issue-#63 auto-spawn always runs
+// state.EnsureProjectInitialized BEFORE dispatch, so post-PR records
+// always satisfy the gate.
 //
 // Distinct from findExistingCoordForProject in keys.go: this one is
 // the dashboard's binding signal (does this agent represent the
@@ -174,10 +180,14 @@ func (m Model) unifiedProjects() []*ProjectRow {
 // layer doesn't import keys.go's action wiring.
 func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
 	want := "coord-" + projectName
-	// Project-tree existence is a single stat per call, fast enough to
-	// run inline in unifiedProjects on every render. Cache only if a
-	// future profile shows it's hot.
+	// Project-tree existence and marker read are 1-2 stats per call,
+	// fast enough to run inline in unifiedProjects on every render.
+	// Cache only if a future profile shows it's hot.
 	if !projectTreeExistsFn(projectName) {
+		return nil
+	}
+	wantID := coordSpawnMarkerFn(projectName)
+	if wantID == "" {
 		return nil
 	}
 	for _, r := range records {
@@ -190,11 +200,26 @@ func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Recor
 		if r.Project != projectName {
 			continue
 		}
+		if r.ID != wantID {
+			// Marker content names a different agent — this record is
+			// either a duplicate spawn or a spoof. Don't promote.
+			continue
+		}
 		if r.TmuxSession == "" {
 			continue
 		}
 		if !sessionAliveFn(r.TmuxSession) {
-			continue
+			// codex iter-3 P2: tmux.HasSession returns false for both
+			// "session does not exist" AND transport errors (bad
+			// FLEET_TMUX_SOCKET, restarting server). Both cases are
+			// handled by sessionAliveFn (which is HasSession in
+			// production); a probe failure shouldn't refuse to bind a
+			// known coord. Use sessionProbeFn for the tristate read so
+			// errors fall through to "treat as alive" (don't drop the
+			// claim) rather than "definitively dead".
+			if !sessionProbeOrAliveFn(r.TmuxSession) {
+				continue
+			}
 		}
 		return r
 	}
@@ -218,6 +243,24 @@ func projectTreeExists(projectName string) bool {
 		return false
 	}
 	return info.IsDir()
+}
+
+// coordSpawnMarkerFn returns the agent ID stored in the project's
+// coord-spawn marker file. var so tests can stub. Production calls
+// state.ReadCoordSpawnMarker.
+var coordSpawnMarkerFn = state.ReadCoordSpawnMarker
+
+// sessionProbeOrAliveFn re-probes a session using the tristate
+// SessionAlive primitive: returns true on alive, true on probe-error
+// (transport failure — don't drop a claim on a tmux hiccup), and
+// false only on a definitive "no such session" answer. var for
+// stub-ability. Codex iter-3 P2.
+var sessionProbeOrAliveFn = func(session string) bool {
+	alive, err := sessionProbeFn(session)
+	if err != nil {
+		return true // probe failed → conservative: treat as alive
+	}
+	return alive
 }
 
 // dashboardRows assembles the unified row list from unifiedProjects() +

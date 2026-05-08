@@ -1627,6 +1627,7 @@ func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
 func TestFindExistingCoordForProject_ReturnsAliveMatch(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c0ffeec0"}}).install(t)
 
 	r := agent.New("c0ffeec0")
 	r.Project = "demo"
@@ -1663,6 +1664,11 @@ func TestFindExistingCoordForProject_ReturnsFalseOnNoMatch(t *testing.T) {
 func TestFindExistingCoordForProject_ReturnsFalseOnDeadSession(t *testing.T) {
 	(&stubSessionAlive{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "deadc0de"}}).install(t)
+	// Also stub session probe so the conservative re-probe path
+	// (sessionProbeOrAliveFn) returns "definitively dead" rather than
+	// "probe error → alive".
+	(&stubSessionProbe{dead: map[string]bool{"fleet-deadc0de": true}}).install(t)
 
 	r := agent.New("deadc0de")
 	r.Project = "demo"
@@ -1697,6 +1703,7 @@ func TestFindExistingCoordForProject_ProjectMismatchedSkipped(t *testing.T) {
 func TestKeyA_ProjectRow_FindsExistingCoordByTaskID(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
 	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "c00bf001"}}).install(t)
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
@@ -1775,6 +1782,107 @@ func TestKeyA_ProjectRow_AttachesImmediatelyAfterDispatch(t *testing.T) {
 	// Banner must NOT mention "timed out" under the new flow.
 	if mm.flash != nil && strings.Contains(mm.flash.text, "timed out") {
 		t.Errorf("flash should not mention 'timed out'; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate pins codex
+// iter-3 P2 follow-up: while a coord-spawn dispatch is in flight (cmd
+// goroutine launched but coordSpawnDoneMsg hasn't arrived yet), the
+// agent record + marker file don't exist on disk. A second [a] press
+// during this window must NOT launch a duplicate dispatch — it should
+// flash a "spawn in flight" hint and let the operator wait.
+func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			// Don't return — leave the cmd hanging so we can probe the
+			// in-flight state. Tests don't actually run the goroutine.
+			return coordSpawnDoneMsgFromArgs(args, "agent abcd1234 spawned\n", nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	// First [a] launches the cmd.
+	updated, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("first [a] should produce a spawn cmd")
+	}
+	mm := updated.(Model)
+	if !mm.coordSpawnInFlight["demo"] {
+		t.Fatal("after first [a], coordSpawnInFlight[demo] should be true")
+	}
+	// Second [a] WITHOUT draining the first cmd. Should be rejected.
+	beforeCalls := len(stub.calls)
+	updated2, cmd2 := mm.Update(keyMsg("a"))
+	mm2 := updated2.(Model)
+	if cmd2 != nil {
+		t.Error("second [a] during in-flight should not produce a cmd")
+	}
+	if mm2.flash == nil || !mm2.flash.isErr {
+		t.Fatalf("second [a] should flash; got %+v", mm2.flash)
+	}
+	if !strings.Contains(mm2.flash.text, "in flight") {
+		t.Errorf("flash should mention 'in flight'; got %q", mm2.flash.text)
+	}
+	if len(stub.calls) != beforeCalls {
+		t.Errorf("second [a] must NOT shell out; got %d calls (was %d)", len(stub.calls), beforeCalls)
+	}
+}
+
+// TestModel_CoordSpawnDoneMsg_ClearsInFlight pins that the in-flight
+// gate clears regardless of err/success — once the dispatch attempt
+// resolves, subsequent [a] presses go through the full lookup again.
+func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// Marker stub so writeCoordSpawnMarkerFn doesn't hit FLEET_HOME.
+	(&stubWriteCoordSpawnMarker{}).install(t)
+
+	m := New("test")
+	m.coordSpawnInFlight = map[string]bool{"demo": true}
+
+	updated, _ := m.Update(coordSpawnDoneMsg{
+		projectName: "demo",
+		agentID:     "abcd1234",
+		session:     "fleet-abcd1234",
+	})
+	mm := updated.(Model)
+	if mm.coordSpawnInFlight["demo"] {
+		t.Error("coordSpawnInFlight[demo] should be cleared after coordSpawnDoneMsg")
+	}
+}
+
+// TestModel_CoordSpawnDoneMsg_WritesMarker pins that the success
+// path writes the coord-spawn marker before tea.Quit so the
+// dashboard's task_id fallback can validate the agent ID on its
+// next refresh.
+func TestModel_CoordSpawnDoneMsg_WritesMarker(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	markerStub := &stubWriteCoordSpawnMarker{}
+	markerStub.install(t)
+
+	m := New("test")
+	updated, _ := m.Update(coordSpawnDoneMsg{
+		projectName: "demo",
+		agentID:     "abcd1234",
+		session:     "fleet-abcd1234",
+	})
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-abcd1234" {
+		t.Errorf("pendingAttach = %q; want fleet-abcd1234", mm.pendingAttach)
+	}
+	if got := markerStub.calls["demo"]; got != "abcd1234" {
+		t.Errorf("marker call for demo = %q; want abcd1234", got)
 	}
 }
 
