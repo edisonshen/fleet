@@ -128,7 +128,7 @@ def tick(
     locks_dir = project_dir / ".locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_path = locks_dir / "coordinator.lock"
-    lock_fd = _try_lock(lock_path)
+    lock_fd = _try_lock(lock_path, holder_id=coord_id)
     if lock_fd is None:
         result.skipped = True
         result.reason = "lock-busy"
@@ -279,13 +279,28 @@ def _tick_locked(
 # ---------- lock helpers ----------
 
 
-def _try_lock(path: Path) -> int | None:
+def _try_lock(path: Path, *, holder_id: str = "") -> int | None:
     """Acquire LOCK_EX | LOCK_NB on path. Returns the open fd or None.
 
     Caller is responsible for unlocking + closing on the success path.
     Re-acquiring across hook fires is the documented pattern (ENG §4.3
     "Coordinator-lock lifecycle") — short-lived Python procs release
     the flock automatically on exit.
+
+    holder_id (optional): when non-empty, write `<holder_id>\\n` into
+    the lock-file body after acquiring the flock. The Go-side dashboard
+    reader (internal/tui/dashboard.go:readCoordHolder) consumes this to
+    distinguish "this project's coord agent" from "loose v0.1 agents"
+    on the LEFT column of the v0.2 ops console (issue #55).
+
+    Lock-body publication is invariant-safe because:
+      - we hold LOCK_EX | LOCK_NB; only this process can write the file,
+      - the write is bounded (holder_id is an 8-hex-char agent ID + \\n),
+      - kernel-side flock(2) does NOT touch the file body, so a stale
+        body persists after the holder exits without re-acquiring; the
+        Go reader gates "is this body current?" on coord-state.json's
+        mtime within coordActiveWindow (5 min) instead of trusting the
+        body alone.
     """
     try:
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
@@ -298,6 +313,20 @@ def _try_lock(path: Path) -> int | None:
         if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
             return None
         raise
+    # Best-effort write of the holder ID into the lock body. Truncate
+    # first so a previous holder's longer ID can't leave trailing bytes.
+    # On any I/O error we keep the lock and let the Go reader fall
+    # through to the "no holder" branch — the freshness gate on
+    # coord-state.json's mtime is the load-bearing safeguard, body
+    # publication is purely an aid.
+    if holder_id:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, (holder_id + "\n").encode("ascii"))
+            os.fsync(fd)
+        except OSError:
+            pass
     return fd
 
 

@@ -1049,3 +1049,101 @@ def test_main_writes_json_summary_on_run(
     parsed = json.loads(out)
     assert parsed["dispatched"] == 1
     assert parsed["skipped"] is False
+
+
+# ---------- coord_id published into coordinator.lock body (issue #55) ----------
+
+
+def test_try_lock_writes_holder_id_into_body(tmp_path: Path) -> None:
+    """_try_lock writes <coord_id>\\n into the lock body so the Go-side
+    dashboard can identify which agent record is the project's coord.
+
+    Lock-body publication is the v0.2 issue-#55 mechanism: the LEFT
+    column of the ops console pulls the holder ID from the lock body
+    and looks up the matching agent record to render coord-on-project.
+    """
+    lock_path = tmp_path / "coordinator.lock"
+    fd = loop._try_lock(lock_path, holder_id="cafef00d")
+    assert fd is not None
+    try:
+        body = lock_path.read_bytes()
+        assert body == b"cafef00d\n", f"unexpected lock body: {body!r}"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_try_lock_no_holder_id_leaves_body_empty(tmp_path: Path) -> None:
+    """When holder_id is empty (legacy callers, or coord_id unset), the
+    lock file body must remain empty. The Go-side reader treats empty
+    body as "unknown holder" and renders ○ no coord.
+    """
+    lock_path = tmp_path / "coordinator.lock"
+    fd = loop._try_lock(lock_path)  # default holder_id=""
+    assert fd is not None
+    try:
+        body = lock_path.read_bytes()
+        assert body == b"", f"expected empty body, got: {body!r}"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_try_lock_truncates_previous_holder_body(tmp_path: Path) -> None:
+    """A prior holder may have written a longer ID into the body. The
+    new holder must truncate before writing so trailing bytes from the
+    old holder don't shadow the new one.
+    """
+    lock_path = tmp_path / "coordinator.lock"
+    # Pre-seed with a longer body that the new holder must overwrite.
+    lock_path.write_bytes(b"deadbeefdeadbeef\n")
+    fd = loop._try_lock(lock_path, holder_id="aaaa1111")
+    assert fd is not None
+    try:
+        body = lock_path.read_bytes()
+        assert body == b"aaaa1111\n", f"unexpected lock body: {body!r}"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_try_lock_returns_none_when_already_held(tmp_path: Path) -> None:
+    """A second _try_lock on a held lock returns None (LOCK_NB
+    semantics). Body publication must NOT clobber the live holder's
+    body when the second call fails.
+    """
+    lock_path = tmp_path / "coordinator.lock"
+    fd1 = loop._try_lock(lock_path, holder_id="aaaa1111")
+    assert fd1 is not None
+    try:
+        body_after_first = lock_path.read_bytes()
+        # Second acquisition fails — must not touch the body.
+        fd2 = loop._try_lock(lock_path, holder_id="bbbb2222")
+        assert fd2 is None
+        body_after_second = lock_path.read_bytes()
+        assert body_after_second == body_after_first
+        assert body_after_second == b"aaaa1111\n"
+    finally:
+        fcntl.flock(fd1, fcntl.LOCK_UN)
+        os.close(fd1)
+
+
+def test_tick_publishes_coord_id_in_lock_body(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """End-to-end: a tick() with non-empty coord_id leaves the project's
+    coordinator.lock with that ID in its body, so the dashboard can read
+    it on the next refresh.
+    """
+    _write_tasks(project_dir, [_make_task("ready-bbbb", status="ready")])
+    dispatch_subprocess.append("dddddd02")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    lock_path = project_dir / ".locks" / "coordinator.lock"
+    assert lock_path.exists()
+    assert lock_path.read_bytes() == b"cccccc01\n"

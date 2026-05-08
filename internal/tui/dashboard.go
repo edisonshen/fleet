@@ -19,6 +19,7 @@
 package tui
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -58,6 +59,16 @@ type ProjectRow struct {
 	BlockedQ  string     // first blocked worker's reason (for raise-hand expansion P2)
 	BlockedID string     // first blocked worker's ID
 	Tasks     []*taskRow // task rows for [j/k] navigation + [⏎] open
+	// CoordID is the agent ID currently holding coordinator.lock for
+	// this project, when freshness-gated by coord-state.json's mtime
+	// (within coordActiveWindow). Empty when no coord is active OR the
+	// lock body wasn't populated (legacy coords pre-issue #55).
+	//
+	// Render path: the LEFT column attaches the matching agent record
+	// (by Record.ID == CoordID) directly under the project block; the
+	// RIGHT column filters that same agent out of its loose-agents
+	// section so a coord doesn't double-render.
+	CoordID string
 }
 
 // TaskCounts mirrors the columns in the mockup:
@@ -234,6 +245,14 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 		// at some point but never reached the first state-write. Treat
 		// as auto-stopped so the operator sees the project at all.
 		row.IdleStop = true
+	}
+	// Holder ID is only trusted when the coord is fresh (Active). flock
+	// doesn't truncate on release, so a stale lock body would otherwise
+	// promote a dead coord to LEFT-column rendering. The freshness gate
+	// is the load-bearing safeguard from the issue-#55 design — without
+	// it the body alone is unreliable.
+	if row.Active {
+		row.CoordID = readCoordHolder(projectsRoot, name)
 	}
 
 	// Workers under workers/<slug>/state.json.
@@ -419,6 +438,58 @@ func deriveRepoSlug(projectDir, name string) string {
 		}
 	}
 	return name
+}
+
+// readCoordHolder returns the agent ID currently holding
+// coordinator.lock for the given project, or "" when unknown.
+//
+// The Python coord skill writes <coord_id>\n into the lock-file body
+// after acquiring LOCK_EX (skills/coordinator/loop.py:_try_lock,
+// issue #55). We read the body, take the first line, and validate it
+// shape-matches an 8-char lower-hex agent ID — anything else (legacy
+// zero-byte lock, hand-edit, garbage) returns "" so the caller falls
+// through to the no-coord render path.
+//
+// Important: this function does NOT validate freshness. flock(2) does
+// not truncate the body on release, so a stale lock from a dead coord
+// can still report a valid-shape ID. Callers gate "is this current?"
+// on coord-state.json's mtime within coordActiveWindow before
+// trusting the holder. See projectsRoot/<name>/coord-state.json.
+func readCoordHolder(projectsRoot, projectName string) string {
+	path := filepath.Join(projectsRoot, projectName, ".locks", "coordinator.lock")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	// Take the first line only; Python writes "<id>\n", but be tolerant
+	// of CRLF or operator hand-edits with extra trailing lines.
+	line := data
+	if i := bytes.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	if i := bytes.IndexByte(line, '\r'); i >= 0 {
+		line = line[:i]
+	}
+	s := strings.TrimSpace(string(line))
+	if !isAgentIDShape(s) {
+		return ""
+	}
+	return s
+}
+
+// isAgentIDShape returns true when s looks like an 8-char lower-hex
+// agent ID (the shape agent.NewID generates). Anything else — empty
+// string, wrong length, mixed case, non-hex chars — returns false.
+func isAgentIDShape(s string) bool {
+	if len(s) != 8 {
+		return false
+	}
+	for _, c := range s {
+		if !isHexLower(c) {
+			return false
+		}
+	}
+	return true
 }
 
 // CIRunning counts workers waiting on CI signals. Used by the header

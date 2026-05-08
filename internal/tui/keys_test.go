@@ -31,10 +31,20 @@ func makeModelWithAgents(records ...*agent.Record) Model {
 	m := New("test")
 	// v0.2 dashboard is the only view (issue #53). Records appear in the
 	// right column under "v0.1 agents — N active"; dashCursor must land
-	// on the first agent row for [h]/[x]/[a] to dispatch to it. With no
-	// projects/workers seeded, dashboardRows() yields exactly len(records)
-	// rows so dashCursor=0 points at the first agent.
+	// on the first agent row for [h]/[x]/[a] to dispatch to it.
+	//
+	// Issue #55 union: unifiedProjects() now synthesizes a project row
+	// for any agent.Project tag absent from m.dashboard. We snap the
+	// cursor onto the first rowAgent rather than assuming index 0 —
+	// the synthetic-project-row offset is implementation detail the
+	// action tests don't care about.
 	m.records = records
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent {
+			m.dashCursor = i
+			return m
+		}
+	}
 	m.dashCursor = 0
 	return m
 }
@@ -77,9 +87,15 @@ func TestKey_HandoffShellsOutWithSelectedID(t *testing.T) {
 	stub.install(t)
 
 	m := makeModelWithAgents(sampleAgent("agent01"), sampleAgent("agent02"))
-	// dashCursor=1 lands on the second agent in dashboardRows()
-	// (no projects/workers, so rows are agents in order).
-	m.dashCursor = 1
+	// Locate agent02 by identity (issue #55: a synthetic project row
+	// from the shared Project tag now precedes the agent rows, so
+	// numeric index 1 no longer maps to "second agent").
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "agent02" {
+			m.dashCursor = i
+			break
+		}
+	}
 
 	updated, cmd := m.Update(keyMsg("h"))
 	if cmd == nil {
@@ -535,22 +551,23 @@ func TestUpdate_DrainDoneFailureSetsErrorFlash(t *testing.T) {
 // -- nav still works alongside actions --------------------------------
 
 // TestKeyJK_MovesCursor pins issue #53 spec: [j/k] moves the
-// dashCursor across all rows. With three agent records and no
-// projects/workers, dashboardRows() returns three rows in order, so j
-// twice moves dashCursor 0→2 and k pulls back to 1.
+// dashCursor across all rows. makeModelWithAgents drops the cursor
+// onto the first rowAgent (issue #55 union puts a synthetic project
+// row above the agents); j advances by one row, k pulls back.
 func TestKeyJK_MovesCursor(t *testing.T) {
 	m := makeModelWithAgents(sampleAgent("a"), sampleAgent("b"), sampleAgent("c"))
+	start := m.dashCursor
 	mm, _ := m.Update(keyMsg("j"))
-	if mm.(Model).dashCursor != 1 {
-		t.Errorf("after j: dashCursor=%d want 1", mm.(Model).dashCursor)
+	if mm.(Model).dashCursor != start+1 {
+		t.Errorf("after j: dashCursor=%d want %d", mm.(Model).dashCursor, start+1)
 	}
 	mm, _ = mm.Update(keyMsg("j"))
-	if mm.(Model).dashCursor != 2 {
-		t.Errorf("after jj: dashCursor=%d want 2", mm.(Model).dashCursor)
+	if mm.(Model).dashCursor != start+2 {
+		t.Errorf("after jj: dashCursor=%d want %d", mm.(Model).dashCursor, start+2)
 	}
 	mm, _ = mm.Update(keyMsg("k"))
-	if mm.(Model).dashCursor != 1 {
-		t.Errorf("after jjk: dashCursor=%d want 1", mm.(Model).dashCursor)
+	if mm.(Model).dashCursor != start+1 {
+		t.Errorf("after jjk: dashCursor=%d want %d", mm.(Model).dashCursor, start+1)
 	}
 }
 

@@ -489,8 +489,10 @@ func TestUpdate_DashboardMsg_Stores(t *testing.T) {
 
 // TestView_DashboardEmptyShowsHint pins that an empty projects tree
 // renders a coachmark instead of a blank column. The hint nudges to
-// [d] dispatch — that's the working bootstrap path; [n] would refuse
-// because there's no project to add the task to yet (codex iter-7 P2).
+// [n] task — matches the footer keybind chip (issue #55). The earlier
+// [d] text was introduced in codex iter-7 to dodge the "no project
+// context" flash on fresh installs; the operator clarified that hint
+// + footer must agree on a single key, so we revert to [n].
 func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
@@ -501,8 +503,11 @@ func TestView_DashboardEmptyShowsHint(t *testing.T) {
 	if !strings.Contains(out, "no projects yet") {
 		t.Errorf("empty dashboard should hint, got:\n%s", out)
 	}
-	if !strings.Contains(out, "[d]") {
-		t.Errorf("empty dashboard should nudge to [d], got:\n%s", out)
+	if !strings.Contains(out, "[n]") {
+		t.Errorf("empty dashboard should nudge to [n], got:\n%s", out)
+	}
+	if strings.Contains(out, "[d] to dispatch") {
+		t.Errorf("empty dashboard must not advertise [d] (footer is [n]); got:\n%s", out)
 	}
 }
 
@@ -555,6 +560,332 @@ func TestView_FooterShowsKeybinds(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer should include %q, got:\n%s", want, out)
 		}
+	}
+}
+
+// TestReadCoordHolder pins the lock-body parsing rules: 8-char
+// lower-hex passes, anything else returns "" so the dashboard falls
+// through to the no-coord render path.
+func TestReadCoordHolder(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"valid 8-hex with newline", []byte("cafef00d\n"), "cafef00d"},
+		{"valid 8-hex no newline", []byte("abcd1234"), "abcd1234"},
+		{"valid 8-hex with CRLF", []byte("12345678\r\n"), "12345678"},
+		{"empty body", []byte(""), ""},
+		{"too short", []byte("abc12\n"), ""},
+		{"too long", []byte("abcdef01abcdef01\n"), ""},
+		{"uppercase rejected", []byte("CAFEF00D\n"), ""},
+		{"non-hex chars", []byte("zzzzzzzz\n"), ""},
+		{"whitespace stripped, then valid", []byte("  cafef00d  \n"), "cafef00d"},
+		{"multi-line takes first", []byte("aaaa1111\nbbbb2222\n"), "aaaa1111"},
+		{"first line garbage, second valid", []byte("garbage\naaaa1111\n"), ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pdir := t.TempDir()
+			locksDir := filepath.Join(pdir, "demo", ".locks")
+			if err := os.MkdirAll(locksDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			lockPath := filepath.Join(locksDir, "coordinator.lock")
+			if err := os.WriteFile(lockPath, c.body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got := readCoordHolder(pdir, "demo")
+			if got != c.want {
+				t.Errorf("readCoordHolder(%q) = %q, want %q", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReadCoordHolder_MissingFile pins the missing-lock case: returns
+// "" without surfacing the I/O error to the caller.
+func TestReadCoordHolder_MissingFile(t *testing.T) {
+	pdir := t.TempDir()
+	if got := readCoordHolder(pdir, "nope"); got != "" {
+		t.Errorf("missing lock should yield \"\", got %q", got)
+	}
+}
+
+// TestScanProject_AttachesCoordIDWhenFresh pins that scanProject
+// populates row.CoordID when the lock body has a valid 8-hex ID AND
+// coord-state.json is fresh enough to mark the project Active.
+func TestScanProject_AttachesCoordIDWhenFresh(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	now := time.Now()
+	touchCoordLock(t, pdir, "demo", now.Add(-30*time.Second))
+	// Overwrite the lock body with a valid coord ID. touchCoordLock
+	// writes a zero-byte lock; we want the v0.2 lock-body protocol.
+	lockPath := filepath.Join(pdir, "demo", ".locks", "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("c0ffee01\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Re-stamp the mtime since WriteFile bumped it; freshness gate
+	// reads from coord-state.json's mtime, but be paranoid.
+	if err := os.Chtimes(filepath.Join(pdir, "demo", "coord-state.json"),
+		now.Add(-30*time.Second), now.Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(now)
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	p := snap.Projects[0]
+	if p.CoordID != "c0ffee01" {
+		t.Errorf("expected CoordID=c0ffee01, got %q (Active=%v)", p.CoordID, p.Active)
+	}
+}
+
+// TestScanProject_StaleCoordLockHasNoCoordID pins the freshness gate.
+// A stale coord-state.json (Active=false) must NOT publish a CoordID,
+// even when the lock body still carries a valid-shape ID. flock(2)
+// doesn't truncate on release, so a body alone is not trustworthy.
+func TestScanProject_StaleCoordLockHasNoCoordID(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	now := time.Now()
+	// 2h old → outside coordActiveWindow.
+	touchCoordLock(t, pdir, "demo", now.Add(-2*time.Hour))
+	lockPath := filepath.Join(pdir, "demo", ".locks", "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("c0ffee01\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(pdir, "demo", "coord-state.json"),
+		now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(now)
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	p := snap.Projects[0]
+	if p.CoordID != "" {
+		t.Errorf("stale coord-state.json must zero CoordID, got %q", p.CoordID)
+	}
+	if p.Active {
+		t.Errorf("stale coord must not be Active")
+	}
+}
+
+// TestUnifiedProjects_UnionsAgentTagsWithDashboardDirs pins the LEFT
+// column union (issue #55): projects on disk under
+// ~/.fleet/projects/<tag>/ AND project tags carried by agent records
+// both surface as project rows. Without this, an operator with active
+// agents on non-v0.2-init'd repos sees a blank PROJECTS column.
+func TestUnifiedProjects_UnionsAgentTagsWithDashboardDirs(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()},
+		{ID: "bbbb2222", Project: "rainier", SpawnedAt: time.Now()},
+		{ID: "cccc3333", Project: "spark", SpawnedAt: time.Now()},
+		// Duplicate project tag dedupes.
+		{ID: "dddd4444", Project: "rainier", SpawnedAt: time.Now()},
+		// Empty project skipped.
+		{ID: "eeee5555", Project: "", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	names := make([]string, 0, len(got))
+	for _, p := range got {
+		names = append(names, p.Name)
+	}
+	// Expected order: real (v0.2) first → "fleet", then synthetic
+	// alpha-sorted → "rainier", "spark".
+	want := []string{"fleet", "rainier", "spark"}
+	if len(names) != len(want) {
+		t.Fatalf("unifiedProjects names = %v, want %v", names, want)
+	}
+	for i, n := range names {
+		if n != want[i] {
+			t.Errorf("unifiedProjects[%d] = %q, want %q", i, n, want[i])
+		}
+	}
+	// Synthetic rows must carry RepoSlug == Name as a sane fallback.
+	for _, p := range got[1:] {
+		if p.RepoSlug != p.Name {
+			t.Errorf("synthetic project %q RepoSlug = %q, want %q",
+				p.Name, p.RepoSlug, p.Name)
+		}
+	}
+}
+
+// TestUnifiedProjects_RealProjectTakesPrecedenceOverAgentTag pins the
+// dedup rule: when an agent's Project tag matches a real v0.2-init'd
+// project, the real ProjectRow is preserved (with its tasks/counts/
+// coord status) — we don't overwrite it with a synthetic.
+func TestUnifiedProjects_RealProjectTakesPrecedenceOverAgentTag(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 3, InProgress: 1, Done: 5})
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()},
+	}
+	got := m.unifiedProjects()
+	if len(got) != 1 {
+		t.Fatalf("expected 1 project (deduped), got %d", len(got))
+	}
+	if got[0].Counts.Todo != 3 || got[0].Counts.InProgress != 1 || got[0].Counts.Done != 5 {
+		t.Errorf("real project's counts must survive dedup: got %+v", got[0].Counts)
+	}
+}
+
+// TestColumnHeading_ProjectsCountUsesUnion pins the rendered header
+// reflects the unioned count, not just v0.2 dirs (issue #55).
+func TestColumnHeading_ProjectsCountUsesUnion(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "rainier", SpawnedAt: time.Now()},
+		{ID: "bbbb2222", Project: "spark", SpawnedAt: time.Now()},
+		{ID: "cccc3333", Project: "tatoosh", SpawnedAt: time.Now()},
+	}
+	out := m.View()
+	if !strings.Contains(out, "PROJECTS · 4 ACTIVE") {
+		t.Errorf("PROJECTS heading should show 4 (1 real + 3 synthetic), got:\n%s", out)
+	}
+	if !strings.Contains(out, "4 projects") {
+		t.Errorf("header totalizer should show 4 projects, got:\n%s", out)
+	}
+}
+
+// TestDashboardRows_RendersSyntheticProjectFromAgent pins that a
+// synthetic ProjectRow appears in the row list (so the cursor walks
+// it) when only agents pin the project tag.
+func TestDashboardRows_RendersSyntheticProjectFromAgent(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.dashboard = scanDashboard(time.Now())
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "rainier", SpawnedAt: time.Now()},
+	}
+	rows := m.dashboardRows()
+	var foundProject bool
+	for _, r := range rows {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "rainier" {
+			foundProject = true
+			break
+		}
+	}
+	if !foundProject {
+		t.Errorf("expected a rowProject for 'rainier' synthesized from agent record")
+	}
+}
+
+// TestDashboardRows_CoordAttachedToProjectFiltersFromRight pins that
+// when a coord is identified for a project, the matching agent record
+// is filtered out of the right-column agents section so it doesn't
+// double-render. The coord-on-LEFT visual is owned by the project
+// block; the right column lists only loose / non-coord agents.
+func TestDashboardRows_CoordAttachedToProjectFiltersFromRight(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	// Build a project with CoordID attached directly (avoids needing
+	// to seed coord-state.json + lock body in this row-level test).
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", CoordID: "aaaa1111", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()}, // coord
+		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // worker
+	}
+	rows := m.dashboardRows()
+	var agentIDs []string
+	for _, r := range rows {
+		if r.kind == rowAgent && r.agent != nil {
+			agentIDs = append(agentIDs, r.agent.ID)
+		}
+	}
+	if len(agentIDs) != 1 || agentIDs[0] != "bbbb2222" {
+		t.Errorf("right column should list only non-coord agents (bbbb2222), got %v", agentIDs)
+	}
+}
+
+// TestColumnHeading_AgentCountExcludesCoord pins the AGENTS sub-heading
+// counter: the coord doesn't count toward right-column "AGENTS N"
+// because it renders on the LEFT under its project (issue #55).
+func TestColumnHeading_AgentCountExcludesCoord(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", CoordID: "aaaa1111", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	m.records = []*agent.Record{
+		{ID: "aaaa1111", Project: "fleet", SpawnedAt: time.Now()}, // coord
+		{ID: "bbbb2222", Project: "fleet", SpawnedAt: time.Now()}, // worker
+		{ID: "cccc3333", Project: "fleet", SpawnedAt: time.Now()}, // worker
+	}
+	// Stub aliveByID so deriveStatus doesn't read all as dead.
+	m.aliveByID = map[string]bool{
+		"aaaa1111": true, "bbbb2222": true, "cccc3333": true,
+	}
+	out := m.View()
+	// 2 non-coord agents alive → "AGENTS 2".
+	if !strings.Contains(out, "AGENTS 2") {
+		t.Errorf("coord must be excluded from right-column AGENTS count; expected 'AGENTS 2', got:\n%s", out)
+	}
+}
+
+// TestView_CoordRendersOnLeftUnderProject pins the LEFT-column coord
+// indicator (issue #55): when ProjectRow.CoordID is set, the rendered
+// project block carries a "coord <id>" line.
+func TestView_CoordRendersOnLeftUnderProject(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", CoordID: "abcd1234", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	out := m.View()
+	if !strings.Contains(out, "coord ") {
+		t.Errorf("coord label missing from project block, got:\n%s", out)
+	}
+	if !strings.Contains(out, "abcd1234") {
+		t.Errorf("coord ID missing from project block, got:\n%s", out)
+	}
+}
+
+// TestView_NoCoordLineWhenCoordIDEmpty pins that an unset CoordID
+// keeps the project block at its original 3-line shape — no empty
+// "coord " line.
+func TestView_NoCoordLineWhenCoordIDEmpty(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet"}, // CoordID empty
+		},
+		LoadedAt: time.Now(),
+	}
+	out := m.View()
+	if strings.Contains(out, "coord ") {
+		t.Errorf("coord label should be absent when CoordID empty, got:\n%s", out)
 	}
 }
 

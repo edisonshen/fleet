@@ -83,8 +83,11 @@ func splitColumns(usable int) (int, int) {
 func renderDashboardHeader(m Model, usable int) string {
 	snap := m.dashboard
 	pCount, wCount, aCount, ciCount := 0, 0, 0, 0
+	// Project count uses the unioned list so loose-agent projects
+	// (no ~/.fleet/projects/<tag>/ tree yet) still register in the
+	// header total (issue #55).
+	pCount = len(m.unifiedProjects())
 	if snap != nil {
-		pCount = len(snap.Projects)
 		wCount = len(snap.Workers)
 		aCount = snap.AttentionProjects()
 		ciCount = snap.CIRunning()
@@ -133,13 +136,28 @@ func renderDashboardHeader(m Model, usable int) string {
 // present, matching issue #53 part A's agents-folded-into-dashboard
 // intent.
 func renderColumnHeadings(m Model, leftW, rightW int) string {
-	pn, wn := 0, 0
+	// LEFT count uses the unioned project list so agents dispatched on
+	// a non-v0.2-init'd repo show up in the heading total too (issue
+	// #55). Without this, "PROJECTS · 0 ACTIVE" while the operator has
+	// agents running on rainier/spark/tatoosh.
+	pn := len(m.unifiedProjects())
+	wn := 0
 	if m.dashboard != nil {
-		pn = len(m.dashboard.Projects)
 		wn = len(m.dashboard.Workers)
+	}
+	// Coord IDs are rendered as part of the project block on the LEFT,
+	// so they shouldn't count toward the RIGHT-column agents header.
+	coordIDs := map[string]bool{}
+	for _, p := range m.unifiedProjects() {
+		if p.CoordID != "" {
+			coordIDs[p.CoordID] = true
+		}
 	}
 	an := 0
 	for _, r := range m.records {
+		if r != nil && coordIDs[r.ID] {
+			continue
+		}
 		if deriveStatus(r, m.aliveByID) != "dead" {
 			an++
 		}
@@ -224,15 +242,17 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 
 	// Left column: project + task rows.
 	var left []string
-	if (m.dashboard == nil || len(m.dashboard.Projects) == 0) && !rowsHaveLeft(rows) {
-		// Don't advertise [n] here: taskAddProject refuses to create a
-		// brand-new project from a random cwd, so on a fresh install
-		// pressing [n] would just flash "no project context" (codex
-		// iter-7 P2). [d] dispatch is the working bootstrap — it
-		// creates ~/.fleet/projects/<tag>/ as a side effect of
-		// spawning the first agent, after which [n] works.
+	if len(m.unifiedProjects()) == 0 && !rowsHaveLeft(rows) {
+		// Empty-state hint nudges [n] task to match the footer keybind
+		// chip (issue #55). The earlier hint pointed at [d] dispatch
+		// (introduced in codex iter-7 to dodge the "no project context"
+		// flash on truly-fresh installs); the operator clarified that
+		// the hint must agree with the advertised footer key, even at
+		// the cost of that bootstrap edge case. On a non-fresh install
+		// (cwd is a known v0.2 project, or cursor is on a project row)
+		// [n] resolves correctly and adds the task.
 		left = append(left, "",
-			columnHeadingStyle.Render("  no projects yet — press [d] to dispatch one"))
+			columnHeadingStyle.Render("  no projects yet — press [n] to add a task"))
 	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
@@ -308,16 +328,27 @@ func rowsHaveLeft(rows []dashRow) bool {
 	return false
 }
 
-// projectBlockLines renders one project's three-line block:
+// projectBlockLines renders one project's three-line (or four-line)
+// block:
 //
 //	<name>                                     [● N attn]
 //	<repo>
 //	⏳ N ▶ N 👁 N ⚠ N ✓ N    ● active     last-tick
+//	  coord <coord-id>                          (issue #55)
 //
 // Attention rows get a leading "▌ " accent (red bold) on every line of
 // the block to mirror the mockup's left-border treatment. The
 // selected variant prefixes line 1 with the cursor glyph "▶" so the
 // operator can see which row [⏎]/[a] etc. will act on.
+//
+// Coord line (issue #55): when ProjectRow.CoordID is set (the project's
+// coord skill currently holds the lock AND its coord-state.json is
+// fresh), we render a compact "coord <id>" line below the counts row.
+// The line is purely informational; the cursor doesn't land on it
+// (coord-as-row-target is out of scope for this PR — operator attaches
+// via the agent record on the RIGHT only when a coord is also a
+// loose-agent-tagged record, which is the v0.2 norm). When CoordID is
+// empty, the block stays at three lines and we skip the coord row.
 func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 	prefix := "  "
 	if p.Attention > 0 {
@@ -367,6 +398,16 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 			gap = 1
 		}
 		line3 = line3 + strings.Repeat(" ", gap) + status
+	}
+
+	// Optional Line 4: coord identifier (issue #55). Rendered only when
+	// the project's coord is freshly publishing into the lock body —
+	// operators want to see WHICH agent is coordinating without leaving
+	// the dashboard for `fleet attach`.
+	if p.CoordID != "" {
+		coordLabel := dimStyle.Render("coord ") + workerIDStyle.Render(p.CoordID)
+		line4 := prefix + coordLabel
+		return []string{line1, line2, line3, line4, ""}
 	}
 
 	return []string{line1, line2, line3, ""}
