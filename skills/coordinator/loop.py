@@ -240,7 +240,6 @@ def _tick_locked(
             result.errors.append(f"sentinel {action.slug}: {exc}")
     if last_seen:
         state["last_archive_scan_ts"] = last_seen
-        _save_coord_state(state_path, state)
 
     # 5. Dispatch ready tasks under cap.
     # Re-read tasks.md after reconcile/drain so the dispatch-side filter
@@ -265,6 +264,15 @@ def _tick_locked(
             result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
+
+    # Heartbeat: rewrite coord-state.json on EVERY tick, even when nothing
+    # was drained or dispatched. The Variant A dashboard reads this file's
+    # mtime as the per-tick liveness signal — gating the write on
+    # last_seen (issue #50) made dispatch-only ticks invisible to the TUI
+    # and surfaced as `○ idle · auto-stopped` while the coord was actually
+    # working. tmp+rename is cheap and idempotent on identical state, so
+    # the unconditional refresh is correct.
+    _save_coord_state(state_path, state)
     return result
 
 
