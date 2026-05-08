@@ -303,15 +303,23 @@ var coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
 // "now" deterministically without touching time.Now globally.
 var nowFn = time.Now
 
-// sessionProbeOrAliveFn re-probes a session using the tristate
-// SessionAlive primitive: returns true on alive, true on probe-error
-// (transport failure — don't drop a claim on a tmux hiccup), and
-// false only on a definitive "no such session" answer. var for
-// stub-ability. Codex iter-3 P2.
+// sessionProbeOrAliveFn returns true when the session is alive OR
+// when the probe failed (transport error — don't drop a claim on a
+// tmux hiccup). False only on a definitive "no such session" answer.
+//
+// Strategy: call sessionAliveFn first (the bool primitive most tests
+// stub). If it says alive, we're done. Only on a "false" answer do
+// we re-probe with the tristate sessionProbeFn to distinguish dead
+// from probe-error. This keeps unit tests that stub only
+// sessionAliveFn from needing to also stub sessionProbeFn for the
+// happy path. Codex iter-3 P2 / iter-6 P2.
 var sessionProbeOrAliveFn = func(session string) bool {
+	if sessionAliveFn(session) {
+		return true
+	}
 	alive, err := sessionProbeFn(session)
 	if err != nil {
-		return true // probe failed → conservative: treat as alive
+		return true // transport error → conservative: treat as alive
 	}
 	return alive
 }

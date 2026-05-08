@@ -528,8 +528,10 @@ func coordTaskID(projectName string) string {
 
 // findExistingCoordForProject searches records for an alive agent
 // already tagged as the coord for projectName. "Tagged" means
-// task_id == coordTaskID(projectName) AND project == projectName.
-// "Alive" means tmux session probe returns true.
+// task_id == coordTaskID(projectName) AND project == projectName
+// AND ID matches the project's coord-spawn marker. "Alive" uses the
+// tristate session probe so a tmux transport error doesn't drop a
+// live claim.
 //
 // Returns (record, true) on a match; (nil, false) when nothing matches
 // or every match has a dead session. Used by the project-row [a] handler
@@ -537,17 +539,33 @@ func coordTaskID(projectName string) string {
 // same project (issue #63's "[a] press during the 30s skill-boot window
 // piles up zombies" failure mode).
 //
-// Codex iter-5 P1: this predicate is intentionally LOOSER than the
-// dashboard's findCoordByTaskID — it does NOT require the coord-spawn
-// marker, the project tree, or marker freshness. Reason: if a coord
-// session is alive (e.g. stalled on a permissions prompt past 60s, or
-// started from an older flow without a marker), [a] should re-attach
-// to it rather than launch a duplicate. The dashboard's stricter
-// signal is about "is this the project's verified coord identity for
-// rendering" — a separate question from "is there an in-flight coord
-// I should re-attach to instead of double-spawning?"
+// Marker requirement (codex iter-6 P1): a coord whose initial-prompt
+// delivery FAILED has no marker on disk. The [a] re-attach path must
+// NOT bind that session — the operator's intent on second [a] is to
+// recover from the prompt failure, which means spawning fresh, not
+// dropping back into a plain Claude shell. The marker requirement
+// distinguishes "we successfully booted a coord here" from "we tried
+// to but the prompt didn't land".
+//
+// No freshness / project-tree gates here (codex iter-5 P1): a coord
+// stalled at a permissions prompt past 60s, or one whose project
+// tree got moved, must still be re-attached rather than respawned.
+// The dashboard's findCoordByTaskID is stricter because that's about
+// rendering identity; this is about "is the in-flight session still
+// the right thing to re-enter?"
+//
+// Tristate liveness (codex iter-6 P2): use sessionProbeOrAliveFn so a
+// tmux transport error (bad FLEET_TMUX_SOCKET, restarting server)
+// doesn't drop a live coord and force a duplicate spawn.
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	want := coordTaskID(projectName)
+	wantID := coordSpawnMarkerFn(projectName)
+	if wantID == "" {
+		// No marker → either no coord ever booted here, or the previous
+		// spawn's prompt failed (so we deliberately skipped writing
+		// the marker). Either way [a] should fall through to spawn.
+		return nil, false
+	}
 	for _, r := range records {
 		if r == nil {
 			continue
@@ -558,10 +576,13 @@ func findExistingCoordForProject(records []*agent.Record, projectName string) (*
 		if r.Project != projectName {
 			continue
 		}
+		if r.ID != wantID {
+			continue
+		}
 		if r.TmuxSession == "" {
 			continue
 		}
-		if !sessionAliveFn(r.TmuxSession) {
+		if !sessionProbeOrAliveFn(r.TmuxSession) {
 			continue
 		}
 		return r, true

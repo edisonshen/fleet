@@ -455,7 +455,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadAgentsCmd()
 		}
-		if msg.session != "" && !sessionAliveFn(msg.session) {
+		// Codex iter-6 P2: probe with the tristate primitive.
+		// sessionAliveFn is tmux.HasSession, which conflates "session
+		// is gone" with transport errors (bad FLEET_TMUX_SOCKET,
+		// restarting tmux server). Treating those as dead would skip
+		// a perfectly good attach. sessionProbeOrAliveFn returns true
+		// on probe error so we err toward attempting attach — the
+		// operator gets tmux's own clear error if it fails.
+		if msg.session != "" && !sessionProbeOrAliveFn(msg.session) {
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"coord %s spawned for project %s but session %s is not alive — claude likely exited at startup; check the agent record (right column) and re-press [a] to respawn after archiving",

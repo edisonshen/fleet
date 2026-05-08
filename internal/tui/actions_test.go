@@ -2026,18 +2026,22 @@ func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
 	}
 }
 
-// TestFindExistingCoordForProject_AlivePastBootWindow_StillFound
-// pins codex iter-5 P1 separation: the [a] idempotency predicate is
-// LOOSER than the dashboard's findCoordByTaskID. Even when the
-// marker is missing / stale / the project tree gate would fail, an
-// alive in-flight coord must be re-attached rather than respawned.
-// Otherwise a coord stalled past 60s on a permissions prompt would
-// trigger duplicate spawns on every [a].
-func TestFindExistingCoordForProject_AlivePastBootWindow_StillFound(t *testing.T) {
+// TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent
+// pins codex iter-5/iter-6 P1: the [a] idempotency predicate is
+// LOOSER than the dashboard's findCoordByTaskID for project-tree
+// existence and marker-mtime freshness, but it DOES require the
+// marker to be present (codex iter-6 P1 — without that gate, a
+// prompt-failed coord would auto-attach instead of allowing a
+// recovery respawn).
+//
+// This test exercises the "stalled past 60s" recovery: alive coord,
+// marker present, but stale-mtime + project-tree-missing. The [a]
+// path re-attaches; the dashboard would NOT (correct: it wants
+// freshness for rendering identity).
+func TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent(t *testing.T) {
 	(&stubSessionAlive{}).install(t)
-	// Marker missing — the dashboard fallback would refuse, but the
-	// [a] idempotency must still re-attach.
-	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	// Stale marker — older than coordBootWindow.
+	(&stubCoordSpawnMarkerStale{markers: map[string]string{"demo": "stalled1"}}).install(t)
 	// Project tree gate would also block the dashboard fallback.
 	(&stubProjectTreeExists{missing: map[string]bool{"demo": true}}).install(t)
 
@@ -2048,10 +2052,30 @@ func TestFindExistingCoordForProject_AlivePastBootWindow_StillFound(t *testing.T
 
 	got, ok := findExistingCoordForProject([]*agent.Record{r}, "demo")
 	if !ok {
-		t.Fatal("[a] idempotency must re-attach to alive coord even with strict-gate failures")
+		t.Fatal("[a] idempotency must re-attach to alive coord with present marker, regardless of staleness/tree gates")
 	}
 	if got.ID != "stalled1" {
 		t.Errorf("found wrong record: %+v", got)
+	}
+}
+
+// TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn pins
+// codex iter-6 P1: when the marker is missing (either no coord ever
+// booted here OR the previous spawn's prompt failed and we
+// deliberately skipped the marker write), [a] must NOT re-attach.
+// The operator's intent is to recover via spawn.
+func TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t) // empty
+	(&stubProjectTreeExists{}).install(t)
+
+	r := agent.New("phantom1")
+	r.Project = "demo"
+	r.TaskID = "coord-demo"
+	r.TmuxSession = "fleet-phantom1"
+
+	if _, ok := findExistingCoordForProject([]*agent.Record{r}, "demo"); ok {
+		t.Error("missing marker must NOT re-attach (would trap operator on a prompt-failed coord)")
 	}
 }
 
