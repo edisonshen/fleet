@@ -73,8 +73,15 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 		}
 
 		out, snap := tui.RenderDashboardForTest(time.Now(), 140, 40, "test")
-		if !strings.Contains(out, env.project) {
-			t.Errorf("dashboard should include project name %q, got:\n%s", env.project, out)
+		// Issue #66: dashboard header renders the project name with the
+		// first hyphen flipped to a slash for readability. env.project is
+		// the encoded form "fleet-e2e"; the rendered header reads
+		// "fleet/e2e". Identity (file paths, search, agent records) still
+		// uses the encoded form — only the visible header changed.
+		wantHeader := "fleet/e2e"
+		if !strings.Contains(out, wantHeader) {
+			t.Errorf("dashboard should include project header %q (display form of %q), got:\n%s",
+				wantHeader, env.project, out)
 		}
 		// One ⏳ todo visible (the ready task rolls into todo).
 		if !strings.Contains(out, "⏳ 1") {

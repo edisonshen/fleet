@@ -365,8 +365,12 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 		}
 	}
 
-	// Line 1: name + (right-flushed) attention chip.
-	name := projectNameStyle.Render(p.Name)
+	// Line 1: name + (right-flushed) attention chip. The encoded p.Name
+	// (cwd-derived, hyphen-separated) is rewritten by projectDisplayName
+	// for visual clarity — first hyphen becomes a slash so cwd-derived
+	// names like "projects-fleet" render as "projects/fleet" (issue #66).
+	// All identity uses (lookups, file paths, search) still consume p.Name.
+	name := projectNameStyle.Render(projectDisplayName(p.Name))
 	var attnRight string
 	if p.Attention > 0 {
 		attnRight = attentionChipStyle.Render(fmt.Sprintf("● %d attn", p.Attention))
