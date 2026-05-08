@@ -277,6 +277,9 @@ func TestTaskDetail_HandlesNoWorker(t *testing.T) {
 	if !strings.Contains(body, "status=ready") {
 		t.Errorf("body should suggest the real `status=<value>` syntax, got:\n%s", body)
 	}
+	if !strings.Contains(body, "--project fleet") {
+		t.Errorf("body should include --project (cross-project safety), got:\n%s", body)
+	}
 	if strings.Contains(body, "--status pending") {
 		t.Errorf("body must not suggest the invalid `--status pending` form, got:\n%s", body)
 	}
@@ -423,6 +426,9 @@ func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 	if !strings.Contains(mm.flash.text, "status=ready") {
 		t.Errorf("flash should use real `status=<value>` syntax, got %q", mm.flash.text)
 	}
+	if !strings.Contains(mm.flash.text, "--project fleet") {
+		t.Errorf("flash should include --project (cross-project safety), got %q", mm.flash.text)
+	}
 	if strings.Contains(mm.flash.text, "--status pending") {
 		t.Errorf("flash must not suggest invalid `--status pending`, got %q", mm.flash.text)
 	}
@@ -434,6 +440,10 @@ func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 // P1 fix: an earlier hint pointed at [d], but [d] opens the loose-
 // agent repo picker, NOT the per-task dispatch flow. Following [d]
 // from a todo task hint would send the operator into the wrong flow.
+//
+// Codex iter-4 P2: hint must include --project so a cross-project
+// cwd doesn't update the wrong tasks.md when the operator copy-
+// pastes the command.
 func TestKeyA_TaskRow_TodoTask_PointsAtPromote(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "fresh-task-aaaa", tasks.StatusTodo, "")
@@ -465,11 +475,70 @@ func TestKeyA_TaskRow_TodoTask_PointsAtPromote(t *testing.T) {
 	if !strings.Contains(mm.flash.text, "fleet tasks promote") {
 		t.Errorf("todo flash should suggest `fleet tasks promote`, got %q", mm.flash.text)
 	}
+	if !strings.Contains(mm.flash.text, "--project fleet") {
+		t.Errorf("todo flash should include --project (cross-project safety), got %q", mm.flash.text)
+	}
 	if strings.Contains(mm.flash.text, "[d]") {
 		t.Errorf("todo flash must NOT point at [d] (loose-agent picker, wrong flow), got %q", mm.flash.text)
 	}
 	if strings.Contains(mm.flash.text, "no worker for task") {
 		t.Errorf("todo task must NOT use the missing-worker phrasing (it's pre-dispatch, not failure), got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_LiveStatusOverridesSnapshot pins the codex iter-4
+// P3 fix: when the dashboard snapshot lags a real status transition
+// (e.g. ready → in-progress as the coord dispatches), [a] on the
+// task row must read the LIVE status from tasks.md and route to the
+// worker peek instead of the stale "ready" wait hint.
+func TestKeyA_TaskRow_LiveStatusOverridesSnapshot(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Seed task as in-progress (live state); the dashboard snapshot
+	// happens AFTER, so row.task.Status will already be in-progress.
+	// To simulate the race, we hand-build a row with stale "ready"
+	// status — same shape unifiedProjects would emit if the seed
+	// happened mid-snapshot — and verify routing reads live.
+	seedBlockedTask(t, pdir, "fleet", "race-task-aaaa", tasks.StatusInProgress, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return &workers.State{
+			Slug: slug, Project: project, Phase: workers.PhaseTDDGreen, PID: 9999,
+		}, nil
+	})
+	seedWorker(t, pdir, "fleet", "race-task-aaaa", workers.State{
+		Slug: "race-task-aaaa", Project: "fleet",
+		Phase: workers.PhaseTDDGreen, PID: 9999,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	// Find the task row, then inject a stale status into the cached
+	// row (mimicking a snapshot that pre-dates the transition).
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "race-task-aaaa" {
+			taskIdx = i
+			r.task.Status = "ready" // stale snapshot
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	// Live read sees in-progress → worker peek opens.
+	if mm.detail == nil {
+		t.Fatalf("[a] should consult live status and open peek, got nil panel")
+	}
+	if !strings.Contains(mm.detail.title, "worker") {
+		t.Errorf("panel should be the worker peek, got %q", mm.detail.title)
 	}
 }
 
@@ -736,6 +805,9 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 	if !strings.Contains(mm.flash.text, "status=ready") {
 		t.Errorf("flash should suggest the real `status=<value>` syntax, got %q", mm.flash.text)
 	}
+	if !strings.Contains(mm.flash.text, "--project fleet") {
+		t.Errorf("flash should include --project, got %q", mm.flash.text)
+	}
 }
 
 // TestKeyA_DetailPanel_TodoTask_PointsAtPromote pins that pressing
@@ -772,6 +844,9 @@ func TestKeyA_DetailPanel_TodoTask_PointsAtPromote(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "fleet tasks promote") {
 		t.Errorf("todo flash should suggest promote, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "--project fleet") {
+		t.Errorf("todo flash should include --project, got %q", mm.flash.text)
 	}
 	if strings.Contains(mm.flash.text, "[d]") {
 		t.Errorf("todo flash must NOT point at [d] (loose-agent picker), got %q", mm.flash.text)

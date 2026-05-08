@@ -435,10 +435,12 @@ func readTaskDetail(project, slug string) (string, string) {
 		fmt.Fprintf(&b, "error reading worker state: %v\n", werr)
 	default:
 		// werr == nil && ws == nil → ErrNotFound. Show the no-worker
-		// hint only when the task SHOULD have a worker.
+		// hint only when the task SHOULD have a worker. Codex iter-4
+		// P2: include --project so a cross-project cwd doesn't update
+		// the wrong tasks.md.
 		if t.Status == tasks.StatusBlocked || t.Status == tasks.StatusInProgress {
 			b.WriteString("\n### Worker\n")
-			fmt.Fprintf(&b, "no worker state on disk — `fleet tasks set %s status=ready` to retry\n", slug)
+			fmt.Fprintf(&b, "no worker state on disk — `fleet tasks set %s status=ready --project %s` to retry\n", slug, project)
 		}
 	}
 

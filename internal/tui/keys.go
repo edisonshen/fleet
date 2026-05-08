@@ -227,9 +227,7 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 			switch status {
 			case "todo":
 				m.flash = &flashMsg{
-					text: fmt.Sprintf(
-						"task %s is todo — `fleet tasks promote %s` to make it eligible for the coord",
-						m.detail.taskSlug, m.detail.taskSlug),
+					text:  noWorkerHintTodo(m.detail.taskProject, m.detail.taskSlug),
 					isErr: true,
 				}
 				m.detail = nil
@@ -237,8 +235,8 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 			case "ready":
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"task %s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
-						m.detail.taskSlug),
+						"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+						m.detail.taskProject, m.detail.taskSlug),
 					isErr: true,
 				}
 				m.detail = nil
@@ -455,20 +453,28 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		//   - ready → wait for the coord to pick it up (or check that
 		//             a coord exists for this project via [a] on the
 		//             project row).
-		switch row.task.Status {
+		//
+		// Codex iter-4 P3: re-read live status from tasks.md so a
+		// task transitioning between snapshots doesn't dead-end on
+		// stale routing. Mirrors the detail-panel branch which
+		// already had to add liveTaskStatus for this race. Falls
+		// back to the snapshot status when the live read fails.
+		status := row.task.Status
+		if live := liveTaskStatus(row.parentProject, row.task.Slug); live != "" {
+			status = live
+		}
+		switch status {
 		case "todo":
 			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"task %s is todo — `fleet tasks promote %s` to make it eligible for the coord",
-					row.task.Slug, row.task.Slug),
+				text:  noWorkerHintTodo(row.parentProject, row.task.Slug),
 				isErr: true,
 			}
 			return m, nil, true
 		case "ready":
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
-					"task %s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
-					row.task.Slug),
+					"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+					row.parentProject, row.task.Slug),
 				isErr: true,
 			}
 			return m, nil, true
@@ -483,6 +489,26 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
+}
+
+// noWorkerHintTodo and noWorkerRecoveryHint emit the operator-facing
+// flash text for [a] on a task with no worker. Codex iter-4 P2: both
+// shapes embed the project name + --project flag because the
+// dashboard cursor can be on a project different from the operator's
+// shell cwd. Without --project, `fleet tasks promote <slug>` resolves
+// against cwd's project tag and updates the wrong tasks.md (or
+// errors). Rendering the project explicitly lets the operator copy-
+// paste the command without tripping over cross-project context.
+func noWorkerHintTodo(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is todo — `fleet tasks promote %s --project %s` to make it eligible for the coord",
+		project, slug, slug, project)
+}
+
+func noWorkerRecoveryHint(project, slug string) string {
+	return fmt.Sprintf(
+		"no worker for task %s/%s — `fleet tasks set %s status=ready --project %s` to retry",
+		project, slug, slug, project)
 }
 
 // attachToTaskWorker is the [a] handler for both task rows and the
@@ -537,9 +563,7 @@ func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 		// whether SOME state exists for the slug.
 		if !taskWorkerArchiveExists(project, slug) {
 			m.flash = &flashMsg{
-				text: fmt.Sprintf(
-					"no worker for task %s — `fleet tasks set %s status=ready` to retry",
-					slug, slug),
+				text:  noWorkerRecoveryHint(project, slug),
 				isErr: true,
 			}
 			// Dismiss the detail panel if it was open: the flash carries
