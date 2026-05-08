@@ -410,21 +410,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, loadAgentsCmd() // refresh: agent should be archived
 
 	case coordSpawnDoneMsg:
-		// Issue #60: project-row [a] auto-spawn result. err non-nil
-		// covers init failures, dispatch failures, agent-ID parse
-		// failures, and lock-poll timeouts; surface as a flash so the
-		// operator can decide whether to retry. On success, set
-		// pendingAttach to the new coord's tmux session and tea.Quit
-		// — Run() exec's tmux attach after the program exits.
+		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
+		// covers init failures, dispatch failures, and agent-ID parse
+		// failures; surface as a flash so the operator can decide
+		// whether to retry. On success, probe the session liveness
+		// before committing pendingAttach — a dispatch can return 0 +
+		// agent-ID line while claude exits seconds later (binary not
+		// found, --dangerously-skip-permissions denied, OOM). Without
+		// the probe the TUI quits and runs `tmux attach` against a
+		// dead session, regressing to the raw "no sessions" UX (codex
+		// review iter-1 P2). Trigger a refresh so the new (possibly
+		// dead) agent record appears on the right column for the
+		// operator to investigate via [x] or [a].
 		if msg.err != nil {
 			m.flash = &flashMsg{
 				text:  fmt.Sprintf("project %s: %v", msg.projectName, msg.err),
 				isErr: true,
 			}
-			// Even on partial failure (dispatch ok but lock-poll timed
-			// out) we want the new agent to appear in the right column
-			// so the operator can [a] into it manually. Trigger an
-			// agent reload.
+			return m, loadAgentsCmd()
+		}
+		if msg.session != "" && !sessionAliveFn(msg.session) {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s spawned for project %s but session %s is not alive — claude likely exited at startup; check the agent record (right column) and re-press [a] to respawn after archiving",
+					msg.agentID, msg.projectName, msg.session),
+				isErr: true,
+			}
 			return m, loadAgentsCmd()
 		}
 		m.flash = &flashMsg{

@@ -436,9 +436,20 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		// CoordID set but no matching record loaded yet (race: dashboard
 		// snapshot picked up the lock body before agentsMsg refreshed).
-		// Fall through to the task_id branch below — that path uses the
-		// agent record list directly, so we'd find the same record one
-		// tick earlier than the dashboard does.
+		// codex review (P1): falling through to the spawn path here
+		// would launch a duplicate coord while a fresh one already
+		// holds the lock — the loadDashboardCmd / loadAgentsCmd race
+		// is normal under tea.Batch. Surface a retry hint so the
+		// operator can re-press [a] after the next refresh tick. The
+		// task_id fallback below is reachable only when CoordID is
+		// empty, so we don't accidentally route this case there.
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord %s for project %s pending refresh — try [a] again in a moment",
+				p.CoordID, p.Name),
+			isErr: true,
+		}
+		return m, nil, true
 	}
 	// Path 2: task_id fallback. Idempotency for [a] during the
 	// skill-boot window — find the alive in-flight record by task_id
@@ -562,7 +573,12 @@ var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawne
 func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	taskID := coordTaskID(projectName)
 	prompt := fmt.Sprintf("Run the /coordinator skill loop for project %s.", projectName)
-	args := []string{"dispatch", taskID, "--project", projectName, "--prompt", prompt}
+	// --coord-spawn whitelists the reserved "coord-" task_id prefix at
+	// the dispatch CLI (issue #63 codex iter-1 P2). Without it, an
+	// operator-supplied `fleet dispatch coord-foo` would create a
+	// worker the dashboard treats as the project's coord; with it,
+	// only this code path can write the prefix.
+	args := []string{"dispatch", taskID, "--project", projectName, "--coord-spawn", "--prompt", prompt}
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}

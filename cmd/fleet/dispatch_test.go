@@ -97,6 +97,50 @@ func TestDispatch_SendInitialPromptHookCalled(t *testing.T) {
 	}
 }
 
+// TestDispatch_RejectsCoordPrefixWithoutFlag pins issue #63 codex
+// iter-1 P2: an operator running `fleet dispatch coord-foo --project
+// foo` must be rejected. The "coord-" prefix is reserved for the TUI's
+// auto-spawn path (the dashboard's task_id-fallback identity signal
+// reads the prefix to identify a project's coord) and must not be
+// operator-claimable, or any worker could hijack the LEFT-column coord
+// slot.
+func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	opts := &dispatchOpts{
+		taskID:  "coord-foo",
+		project: "foo",
+		// coordSpawn left at its zero value: false (operator path).
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatal("dispatch must reject coord- prefix without --coord-spawn")
+	}
+	if !strings.Contains(err.Error(), "reserved prefix") {
+		t.Errorf("err should mention 'reserved prefix'; got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), `"coord-"`) {
+		t.Errorf("err should reference the literal coord- prefix; got %q", err.Error())
+	}
+}
+
+// TestDispatch_CoordSpawnFlag_Exposed pins the hidden flag's
+// existence — the TUI shell-out depends on it.
+func TestDispatch_CoordSpawnFlag_Exposed(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("coord-spawn")
+	if flag == nil {
+		t.Fatal("dispatch must expose --coord-spawn for the TUI auto-spawn path")
+	}
+	if flag.DefValue != "false" {
+		t.Errorf("--coord-spawn default = %q; want false", flag.DefValue)
+	}
+	if !flag.Hidden {
+		t.Error("--coord-spawn should be marked Hidden so accidental operator use isn't encouraged")
+	}
+}
+
 // TestDispatch_PromptFailureWarnsButDoesNotAbort pins the production
 // behavior: a SendInitialPrompt failure must NOT bubble out as a
 // non-zero exit code. The agent record + tmux session are already on

@@ -1171,6 +1171,51 @@ func TestKeyA_ProjectRow_AttachesToExistingFreshCoord(t *testing.T) {
 	}
 }
 
+// TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry pins
+// codex iter-1 P1: when the dashboard snapshot has CoordID set
+// (loadDashboardCmd ran) but the matching agent record isn't in
+// m.records yet (loadAgentsCmd hasn't fired), a duplicate spawn would
+// race against the live coord. The handler must flash a retry hint
+// rather than fall through to the spawn path. This race is normal
+// under tea.Batch and is not a bug — but spawning a duplicate coord IS
+// a bug.
+func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := New("test")
+	// CoordID set, but m.records is empty — the loadAgentsCmd refresh
+	// hasn't published the record yet.
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "missingrec"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash for refresh-race; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "pending refresh") {
+		t.Errorf("flash should mention 'pending refresh'; got %q", mm.flash.text)
+	}
+	if cmd != nil {
+		t.Error("refresh-race must NOT produce a cmd (no spawn)")
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set; got %q", mm.pendingAttach)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("refresh-race must NOT shell out (would dup-spawn); got %v", stub.calls)
+	}
+}
+
 // TestKeyA_ProjectRow_DeadCoordSessionFlashes regresses the case where
 // project.CoordID is set but the tmux session has died. We must not
 // silently exec tmux on a dead session; flash a clear hint instead.
@@ -1769,5 +1814,103 @@ func TestKeyA_ProjectRow_InitErrShowsBanner(t *testing.T) {
 	}
 	if len(stub.calls) != 0 {
 		t.Errorf("init failure must NOT shell out to dispatch; got %v", stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach pins codex
+// iter-1 P2: dispatch returns 0 with the agent-ID line, but the new
+// tmux session is dead by the time coordSpawnDoneMsg arrives (claude
+// exited at startup — bad --command flag, OOM, missing binary). We
+// must NOT pendingAttach + tea.Quit and exec tmux against a dead
+// session — surface a flash and stay in the TUI.
+func TestKeyA_ProjectRow_DeadSessionAfterSpawn_FlashesNoAttach(t *testing.T) {
+	withFleetHome(t)
+	// Spawn writes a session name, but our liveness probe says it's
+	// already dead — claude exited between dispatch returning and the
+	// coordSpawnDoneMsg arriving in Update.
+	(&stubSessionAlive{dead: map[string]bool{"fleet-deadbeef": true}}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent deadbeef spawned\n  tmux: fleet-deadbeef\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	doneMsg := cmd().(coordSpawnDoneMsg)
+	if doneMsg.err != nil {
+		t.Fatalf("expected dispatch ok; got err %v", doneMsg.err)
+	}
+	updated, cmd2 := m.Update(doneMsg)
+	mm := updated.(Model)
+
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must NOT be set when post-spawn session is dead; got %q", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "not alive") {
+		t.Errorf("flash should mention 'not alive'; got %q", mm.flash.text)
+	}
+	// Refresh cmd is fine (loadAgentsCmd) — operator can investigate
+	// via the right-column row. Just must not be tea.Quit.
+	if cmd2 != nil {
+		msg := cmd2()
+		if _, isQuit := msg.(tea.QuitMsg); isQuit {
+			t.Error("expected loadAgentsCmd refresh, NOT tea.Quit on dead post-spawn session")
+		}
+	}
+}
+
+// TestKeyA_ProjectRow_DispatchInvocationCarriesCoordSpawnFlag pins
+// codex iter-1 P2: the TUI's auto-spawn shells out with --coord-spawn
+// so the dispatch CLI accepts the reserved "coord-<project>" task_id
+// prefix. Without the flag, runDispatch rejects the prefix.
+func TestKeyA_ProjectRow_DispatchInvocationCarriesCoordSpawnFlag(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent c0c0c0c0 spawned\n  tmux: fleet-c0c0c0c0\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	_, cmd := m.Update(keyMsg("a"))
+	_ = cmd()
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 dispatch call; got %d", len(stub.calls))
+	}
+	hasCoordSpawn := false
+	for _, a := range stub.calls[0] {
+		if a == "--coord-spawn" {
+			hasCoordSpawn = true
+			break
+		}
+	}
+	if !hasCoordSpawn {
+		t.Errorf("dispatch args missing --coord-spawn (would be rejected by reserved-prefix gate): %v", stub.calls[0])
 	}
 }
