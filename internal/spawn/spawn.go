@@ -497,6 +497,25 @@ type Options struct {
 	// operator can override via `--no-auto-resume` when handing off
 	// into a different command class (codex review iter-8 P2).
 	DisableAutoResume bool
+
+	// ExecCommand is the argv tmux actually runs IF non-empty,
+	// overriding Command for execution only. The persisted agent
+	// record keeps Command (the "clean" form) so handoff successors
+	// don't inherit per-spawn substitutions like a session-bound
+	// `--remote-control "fleet-<id>"` flag.
+	//
+	// Populated by the dispatch coord-spawn path: opts.Command stays
+	// the operator's --command default (or override), and ExecCommand
+	// carries the same argv with `--remote-control "fleet-<id>"`
+	// injected into the shell wrapper. A subsequent handoff that
+	// reads oldRec.Command → spawn.Options.Command sees the clean
+	// form; the replacement starts WITHOUT auto-attach until/unless
+	// the caller opts back in by setting ExecCommand again. This
+	// keeps the v0.1 contract (coord auto-spawn = remote-control;
+	// handoff = manual /remote-control) explicit at the call site.
+	//
+	// Empty (the common case) means tmux runs Command verbatim.
+	ExecCommand []string
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -634,7 +653,18 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// resolve to a different one inside tmux (especially with an
 	// existing tmux server), and a future handoff would land the
 	// replacement in the wrong checkout.
-	if err := tmux.Spawn(session, cwd, opts.Command, extraEnv); err != nil {
+	//
+	// ExecCommand (when non-empty) is the per-spawn substituted argv
+	// — used by the dispatch coord-spawn path to inject
+	// `--remote-control "fleet-<id>"` for THIS spawn only. The
+	// persisted record at rec.Command above stays the clean Command,
+	// so a later handoff that reads oldRec.Command doesn't inherit
+	// the stale session-name flag (codex review #73 iter-1 P1).
+	execArgv := opts.Command
+	if len(opts.ExecCommand) > 0 {
+		execArgv = opts.ExecCommand
+	}
+	if err := tmux.Spawn(session, cwd, execArgv, extraEnv); err != nil {
 		return nil, err
 	}
 	// Best-effort: pin a "Ctrl-b d to detach" hint into this session's

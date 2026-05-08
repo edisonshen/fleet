@@ -188,6 +188,12 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// Options.PreAllocatedID — used by the handoff path for the same
 	// "ID needed before spawn" reason.
 	//
+	// We pass the rewritten argv via Options.ExecCommand (used for
+	// THIS tmux exec only); the persisted agent.Record.Command stays
+	// the clean opts.command so a future handoff that reads
+	// oldRec.Command doesn't inherit a stale `--remote-control
+	// "fleet-<old-id>"` flag (codex review #73 iter-1 P1).
+	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
 	// matching v0.1's manual-attach contract.
@@ -197,18 +203,26 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// we only rewrite the documented default shell-wrapped claude
 	// shape. Custom argvs are out of scope.
 	preAllocatedID := ""
-	command := opts.command
+	var execCommand []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
 		sessionName := tmux.SessionName(preAllocatedID)
-		command = injectRemoteControlFlag(command, sessionName)
+		rewritten := injectRemoteControlFlag(opts.command, sessionName)
+		// Only set ExecCommand when the rewrite actually changed
+		// something — passing through an unchanged custom --command
+		// avoids a no-op divergence between Command and ExecCommand
+		// in spawn.Options.
+		if !sameCommand(rewritten, opts.command) {
+			execCommand = rewritten
+		}
 	}
 
 	rec, err := spawn.Spawn(spawn.Options{
 		TaskID:            opts.taskID,
 		Project:           opts.project,
 		Cwd:               opts.cwd,
-		Command:           command,
+		Command:           opts.command,
+		ExecCommand:       execCommand,
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: opts.noAutoResume,
 	})
@@ -302,16 +316,42 @@ func injectRemoteControlFlag(command []string, sessionName string) []string {
 	// CLI usage is written; sessionName is hex (agent ID) plus the
 	// "fleet-" prefix so quoting is mostly defensive (no spaces, no
 	// shell metas) but cheap to keep.
-	replaced := strings.Replace(
+	//
+	// ReplaceAll (not Replace n=1) is deliberate: the default wrapper
+	// contains the literal `claude --dangerously-skip-permissions`
+	// TWICE — once as the launch command, once inside the
+	// "[fleet] claude exited cleanly — rerun ..." banner that prints
+	// when claude exits 0. Rewriting only the first occurrence would
+	// leave the banner suggesting a rerun command without remote-
+	// control, so an operator who follows the banner restarts WITHOUT
+	// auto-attach (codex review #73 iter-1 P3). Replacing both keeps
+	// the banner accurate.
+	replaced := strings.ReplaceAll(
 		script,
 		defaultClaudeInvocation,
 		defaultClaudeInvocation+` --remote-control "`+sessionName+`"`,
-		1,
 	)
 	out := make([]string, len(command))
 	copy(out, command)
 	out[2] = replaced
 	return out
+}
+
+// sameCommand returns true iff the two argvs are identical
+// element-for-element. Used by the dispatch coord-spawn path to
+// detect when injectRemoteControlFlag returned an unchanged slice
+// (operator-overridden custom --command), so we don't pollute
+// spawn.Options.ExecCommand with a no-op duplicate of Command.
+func sameCommand(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.

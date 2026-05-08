@@ -345,6 +345,49 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	}
 }
 
+// TestInjectRemoteControlFlag_RewritesRerunBanner pins codex review
+// #73 iter-1 P3: the wrapper script's "claude exited cleanly — rerun
+// claude --dangerously-skip-permissions" banner must also be
+// rewritten to include --remote-control. Otherwise an operator who
+// follows the banner instructions to restart claude after a clean
+// exit gets a session WITHOUT auto-attach. Both the launch command
+// AND the banner must reference the SAME flag-set.
+func TestInjectRemoteControlFlag_RewritesRerunBanner(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	original := slice.GetSlice()
+	const sessionName = "fleet-cafebabe"
+
+	got := injectRemoteControlFlag(original, sessionName)
+
+	// Sanity: original wrapper has TWO occurrences of the literal
+	// claude invocation (the launch command and the rerun banner).
+	if c := strings.Count(original[2],
+		"claude --dangerously-skip-permissions"); c != 2 {
+		t.Fatalf("default wrapper should have 2 occurrences of "+
+			"`claude --dangerously-skip-permissions`; got %d — test fixture is stale",
+			c)
+	}
+	// Both occurrences should now carry the --remote-control flag.
+	if c := strings.Count(got[2],
+		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`"`); c != 2 {
+		t.Errorf("rewritten wrapper should have 2 occurrences of the "+
+			"rewritten claude invocation (launch + rerun banner); got %d in %q",
+			c, got[2])
+	}
+	// And NO bare claude invocation should remain (regression: a
+	// strings.Replace n=1 leaves the banner stale).
+	bareInvocation := "claude --dangerously-skip-permissions or"
+	if !strings.Contains(got[2],
+		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`" or`) {
+		t.Errorf("rerun banner still suggests bare claude invocation; "+
+			"want banner to reference the rewritten flag-set; got %q",
+			got[2])
+	}
+	_ = bareInvocation
+}
+
 // TestInjectRemoteControlFlag_NoOpForCustomCommand pins the contract
 // that custom operator-supplied --command argvs are LEFT UNTOUCHED.
 // Fleet doesn't know the flag conventions for arbitrary engines /

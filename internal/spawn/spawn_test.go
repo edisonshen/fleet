@@ -1062,3 +1062,74 @@ func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 	}
 	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
 }
+
+// TestSpawn_ExecCommandRunsButPersistsCleanCommand pins issue #73's
+// codex-iter-1 P1 fix: when ExecCommand is non-empty, the tmux
+// session runs ExecCommand, but the persisted agent.Record.Command
+// keeps the (clean) Command. The dispatch coord-spawn path uses
+// this so a future handoff that respawns from oldRec.Command does
+// NOT inherit a stale `--remote-control "fleet-<old-id>"` flag —
+// the successor gets the original operator-supplied command and
+// can opt back into auto-attach explicitly if it's also a coord.
+//
+// The test exercises BOTH halves: (a) tmux ran ExecCommand (we
+// look for a sentinel only that argv prints), and (b) the on-disk
+// record's Command field equals the clean Command argv.
+func TestSpawn_ExecCommandRunsButPersistsCleanCommand(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cleanCmd := []string{"sh", "-c", "echo CLEAN; cat"}
+	execCmd := []string{"sh", "-c", "echo EXEC_VARIANT; cat"}
+
+	rec, err := Spawn(Options{
+		TaskID:      "t",
+		Project:     "p",
+		Command:     cleanCmd,
+		ExecCommand: execCmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// (a) Persisted record carries the CLEAN command.
+	if len(rec.Command) != len(cleanCmd) {
+		t.Fatalf("rec.Command length: got %d want %d", len(rec.Command), len(cleanCmd))
+	}
+	for i := range cleanCmd {
+		if rec.Command[i] != cleanCmd[i] {
+			t.Errorf("rec.Command[%d]: got %q want %q", i, rec.Command[i], cleanCmd[i])
+		}
+	}
+	loaded, err := agent.Load(rec.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for i := range cleanCmd {
+		if loaded.Command[i] != cleanCmd[i] {
+			t.Errorf("loaded.Command[%d]: got %q want %q (the on-disk record must store the clean form so handoff successors don't inherit per-spawn substitutions)",
+				i, loaded.Command[i], cleanCmd[i])
+		}
+	}
+
+	// (b) tmux actually ran the EXEC variant — poll for its sentinel.
+	want := "EXEC_VARIANT"
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, capErr := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if capErr == nil {
+			lastOut = out
+			if strings.Contains(string(out), want) {
+				// And the clean variant's sentinel must NOT have run.
+				if strings.Contains(string(out), "CLEAN") {
+					t.Errorf("pane shows both CLEAN and EXEC_VARIANT — tmux ran the wrong command:\n%s", string(out))
+				}
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
