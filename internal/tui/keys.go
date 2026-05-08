@@ -508,10 +508,10 @@ var dispatchAgentIDPattern = regexp.MustCompile(`(?m)^agent ([0-9a-f]{8}) spawne
 // tea.Cmd's goroutine so the bubbletea event loop stays responsive
 // during the 2s lock-poll window.
 //
-// task ID format: "coord-<8hex>" — distinct from operator-named tasks
-// to prevent collisions in tasks-archive.md. The 8-hex tail is just
-// time-derived noise; the meaningful identifier is the agent.NewID()
-// the spawn assigns.
+// task ID format: "coord-<UTC YYYYMMDD-HHMMSS>" — sortable + unique
+// across rapid re-spawns. The meaningful identifier is the
+// agent.NewID() the spawn assigns; the task ID is just a label so the
+// agent record's TaskID isn't empty.
 func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	taskID := fmt.Sprintf("coord-%s", time.Now().UTC().Format("20060102-150405"))
 	prompt := fmt.Sprintf("Run the /coordinator skill loop for project %s.", projectName)
