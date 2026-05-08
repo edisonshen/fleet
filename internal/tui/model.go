@@ -171,9 +171,17 @@ type Model struct {
 // detailView is the inline detail panel shown by [⏎] open. The kind
 // hints at the source row type (only used for the panel title); body
 // is the pre-rendered multi-line text the panel displays.
+//
+// Issue #75: when the panel opened from a task row, we carry the
+// task's project + slug so [a] inside the panel can route to the
+// matching worker peek without rebuilding the row index. taskProject
+// is "" for non-task panels, which the [a] interceptor reads as "fall
+// through to default attach behavior".
 type detailView struct {
-	title string
-	body  string
+	title       string
+	body        string
+	taskProject string
+	taskSlug    string
 }
 
 // PendingAttach returns the tmux session to attach to after the

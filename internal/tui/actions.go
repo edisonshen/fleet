@@ -21,6 +21,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // taskAddDoneMsg is emitted after the in-process tasks.Add call
@@ -350,6 +351,24 @@ func addTask(project, spec string) (string, error) {
 // when a task row is selected. Best-effort: a missing tasks.md or
 // missing slug surfaces the error in the panel rather than blocking
 // the open.
+//
+// Issue #75 — for blocked tasks, surface enough context for the
+// operator to "see attention → drill in → see question → respond":
+//
+//   - The question itself: worker.BlockedReason (the worker explicitly
+//     wrote what it's blocked on) and the task's Notes blob (operator/
+//     coord-edited markdown). Show both when present, BlockedReason
+//     first because it's the structured signal.
+//   - Worker handle: slug, phase, PID, age. So the operator knows
+//     which `claude --print` subprocess wrote the question and whether
+//     it's still alive (PID alive → [a] peeks output.log; dead → flash
+//     "no worker for task").
+//   - Action hint: [a] hint stays in the overlay's footer ("press [esc]
+//     or [⏎] to close") — the keys.go interceptor handles [a] routing.
+//
+// We render the worker block ABOVE the task spec when present so a
+// blocked task's question reads first. Spec/Acceptance/Notes follow
+// for full task context.
 func readTaskDetail(project, slug string) (string, string) {
 	title := fmt.Sprintf("task: %s/%s", project, slug)
 	dir, err := state.ProjectDir(project)
@@ -378,6 +397,40 @@ func readTaskDetail(project, slug string) (string, string) {
 	if len(t.DependsOn) > 0 {
 		fmt.Fprintf(&b, "depends:   %s\n", strings.Join(t.DependsOn, ", "))
 	}
+
+	// Worker context (issue #75). Best-effort: ENOENT collapses to a
+	// "no worker for this task" hint so a blocked task without a worker
+	// (operator-edited tasks.md, or worker dir was already archived)
+	// still reads cleanly.
+	ws, werr := readTaskWorker(project, slug)
+	switch {
+	case werr == nil && ws != nil:
+		b.WriteString("\n### Worker\n")
+		fmt.Fprintf(&b, "slug:      %s\n", ws.Slug)
+		fmt.Fprintf(&b, "phase:     %s\n", ws.Phase)
+		if ws.PID > 0 {
+			fmt.Fprintf(&b, "pid:       %d\n", ws.PID)
+		}
+		if !ws.UpdatedAt.IsZero() {
+			fmt.Fprintf(&b, "updated:   %s\n", ws.UpdatedAt.UTC().Format(time.RFC3339))
+		}
+		if reason := strings.TrimSpace(ws.BlockedReason); reason != "" {
+			b.WriteString("\nquestion (worker blocked_reason):\n")
+			b.WriteString(reason)
+			b.WriteString("\n")
+		}
+	default:
+		// Surface only when the task is in a status where the operator
+		// would expect a worker. For todo/ready, an absent worker is
+		// the normal pre-dispatch state and the hint would be noise.
+		if t.Status == tasks.StatusBlocked || t.Status == tasks.StatusInProgress {
+			b.WriteString("\n### Worker\n")
+			b.WriteString("no worker state on disk — `fleet tasks set ")
+			b.WriteString(slug)
+			b.WriteString(" --status pending` to retry\n")
+		}
+	}
+
 	b.WriteString("\n### Spec\n")
 	b.WriteString(strings.TrimSpace(t.Spec))
 	if t.Acceptance != "" {
@@ -389,6 +442,19 @@ func readTaskDetail(project, slug string) (string, string) {
 		b.WriteString(strings.TrimSpace(t.Notes))
 	}
 	return b.String(), title
+}
+
+// readTaskWorker is the var-stub-able worker.ReadState wrapper used by
+// the task detail panel. Returns (nil, nil) when no worker exists for
+// the task — distinguished from (nil, err) for genuine read errors so
+// the caller can render the right hint. Tests can stub the var to seed
+// the panel without touching disk.
+var readTaskWorker = func(project, slug string) (*workers.State, error) {
+	s, err := workers.ReadState(project, slug)
+	if errors.Is(err, workers.ErrNotFound) {
+		return nil, nil
+	}
+	return s, err
 }
 
 // (projectDetail removed — issue #59: [⏎] on a project row now toggles

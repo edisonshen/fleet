@@ -19,7 +19,7 @@ var helpEntries = []helpEntry{
 	{"j/k or ↓/↑", "move cursor up/down across all rows (wraps)"},
 	{"⏎ enter", "expand/collapse project (on a project row) or open detail (other rows)"},
 	{"n", "add a new task to the current project"},
-	{"a", "attach coord (projects), tmux (agents), or peek (workers)"},
+	{"a", "attach coord (projects), tmux (agents), peek (workers/tasks)"},
 	{"h", "handoff (agents only)"},
 	{"x", "archive (agents) — worker kill ships in v0.2.x"},
 	{"d", "dispatch a new agent (opens repo picker)"},

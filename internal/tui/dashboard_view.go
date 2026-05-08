@@ -424,6 +424,18 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 //
 //   - <slug>
 //
+// Issue #75 — status-aware glyphs surface tasks that need operator
+// attention right in the expansion:
+//
+//	blocked → "⚠ <slug>" with attention color (red, bold). Drives the
+//	          "see attention → drill in" path: operator scans an
+//	          expanded project and the asking task is unmissable.
+//	done    → "✓ <slug>" with done color (green, dim). Defensive —
+//	          done tasks are filtered out of row.Tasks today
+//	          (dashboard.go:215), but if a task transitions while the
+//	          operator's looking, the prefix should be right.
+//	default → "• <slug>" (existing behavior).
+//
 // Synthetic markers render as hint lines:
 //
 //	Empty=true  → "  no tasks yet — `fleet init` to create tasks.md"
@@ -458,8 +470,29 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		more := dimStyle.Render(fmt.Sprintf("+%d more", t.More))
 		return prefix + bulletStyle.Render(bullet) + " " + more
 	}
-	slug := workerSlugStyle.Render(t.Slug)
-	return prefix + bulletStyle.Render(bullet) + " " + slug
+	// Status-aware glyph + label styling (issue #75). Selection's cursor
+	// glyph wins over the status glyph so the operator's focus marker
+	// stays visible — but the label color still tracks status, so a
+	// blocked task under the cursor still reads as "needs attention".
+	glyph := bullet
+	glyphStyle := bulletStyle
+	labelStyle := workerSlugStyle
+	switch t.Status {
+	case "blocked":
+		if !selected {
+			glyph = "⚠"
+			glyphStyle = attentionChipStyle
+		}
+		labelStyle = attentionChipStyle
+	case "done":
+		if !selected {
+			glyph = "✓"
+			glyphStyle = projectCountDoneStyle
+		}
+		labelStyle = projectCountDoneStyle
+	}
+	slug := labelStyle.Render(t.Slug)
+	return prefix + glyphStyle.Render(glyph) + " " + slug
 }
 
 // renderCountChips builds "⏳ 3  ▶ 1  👁 1  ⚠ 1  ✓ 12" with the

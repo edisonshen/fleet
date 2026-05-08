@@ -200,6 +200,15 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		if key == "q" || key == "ctrl+c" {
 			return m, nil, false
 		}
+		// Issue #75: [a] inside a task detail panel re-routes to the
+		// task's worker peek. Without this interceptor the panel would
+		// dismiss and the operator would have to find the task row
+		// again to press [a] — defeats "drill in → attach to respond"
+		// flow. Worker / agent / help panels still dismiss on [a]
+		// because their default behavior IS [a]-as-dismiss.
+		if key == "a" && m.detail != nil && m.detail.taskSlug != "" {
+			return m.attachToTaskWorker(m.detail.taskProject, m.detail.taskSlug)
+		}
 		m.showHelp = false
 		m.detail = nil
 		return m, nil, true
@@ -384,15 +393,64 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case rowProject:
 		return m.actionAttachProject(row.project)
+	case rowTask:
+		// Issue #75: [a] on a task row routes to the task's worker
+		// peek panel — same path as [a] on a worker row. Workers in
+		// v0.2 are `claude --print` subprocesses (no tmux), so
+		// "attach" maps to opening the worker peek (state.json +
+		// output.log tail) which IS where the operator sees what the
+		// worker is asking. When no worker exists for the task, flash
+		// the actionable retry hint.
+		if row.task == nil || row.task.Empty || row.task.More > 0 {
+			return m, nil, true
+		}
+		return m.attachToTaskWorker(row.parentProject, row.task.Slug)
 	default:
-		// Task rows (and any future row kinds) — neither tmux nor a
-		// peek surface fits. Flash so the operator sees the no-op.
+		// Future row kinds — neither tmux nor a peek surface fits. Flash
+		// so the operator sees the no-op.
 		m.flash = &flashMsg{
-			text:  "[a] attach applies to projects (coord), agents (tmux), or workers (peek); not to tasks",
+			text:  "[a] attach applies to projects (coord), agents (tmux), workers (peek), or tasks (worker peek)",
 			isErr: true,
 		}
 		return m, nil, true
 	}
+}
+
+// attachToTaskWorker is the [a] handler for both task rows and the
+// task detail panel. Routes to the task's worker peek panel when a
+// worker exists; flashes a retry hint otherwise.
+//
+// Workers in v0.2 are `claude --print` subprocesses, NOT tmux
+// sessions — so "attach" here means "open the same peek panel that
+// [a] on a worker row opens" (state.json + last 50 lines of
+// output.log via readWorkerDetail). That's the v0.2 surface where
+// the operator sees what the worker wrote when it transitioned to
+// blocked.
+//
+// readTaskWorker is the indirection layer — same stub used by
+// readTaskDetail — so tests can seed a worker without a real
+// state.json file.
+func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
+	if slug == "" {
+		return m, nil, true
+	}
+	ws, err := readTaskWorker(project, slug)
+	if err != nil || ws == nil {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"no worker for task %s — `fleet tasks set %s --status pending` to retry",
+				slug, slug),
+			isErr: true,
+		}
+		// Dismiss the detail panel if it was open: the flash carries
+		// the actionable hint and a stale panel under it would just
+		// confuse the operator.
+		m.detail = nil
+		return m, nil, true
+	}
+	body, title := readWorkerDetail(project, slug)
+	m.detail = &detailView{title: title, body: body}
+	return m, nil, true
 }
 
 // actionAttachProject is the project-row branch of [a] (issues #60, #63).
@@ -807,7 +865,16 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		body, title := readTaskDetail(row.parentProject, row.task.Slug)
-		m.detail = &detailView{title: title, body: body}
+		// Issue #75: carry task identity so [a] inside the panel can
+		// route to the matching worker peek without rebuilding the
+		// row index. Non-task panels leave these empty and the [a]
+		// interceptor falls through to default attach behavior.
+		m.detail = &detailView{
+			title:       title,
+			body:        body,
+			taskProject: row.parentProject,
+			taskSlug:    row.task.Slug,
+		}
 	case rowWorker:
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
 		m.detail = &detailView{title: title, body: body}
