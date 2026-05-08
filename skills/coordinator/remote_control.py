@@ -60,6 +60,7 @@ ASCII diagram of the fresh-coord flow:
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,14 @@ from pathlib import Path
 # /tmp/claude-rc-handoff.log naming so log inspection by the operator
 # stays predictable; fresh-coord vs handoff is encoded in the suffix.
 _DAEMON_LOG = "/tmp/claude-rc-coord.log"
+
+# Strict 8-lowercase-hex shape for coord_id, matching the format
+# emitted by skills/fleet-guard/ids.py:new_id (`secrets.token_hex(4)`)
+# and the validator in skills/coordinator/dispatch.py:_AGENT_ID_FULL_RE.
+# Any caller passing a coord_id outside this shape is a bug; we refuse
+# to use it as a path component (defense in depth: a coord_id of
+# "../foo" would otherwise traverse out of ~/.fleet/inbox/).
+_COORD_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 
 # Inbox body delivered to the coord agent on the next Stop hook. The
 # fleet-guard relay wraps this with `[OPERATOR] ` prefix automatically
@@ -107,6 +116,28 @@ def bootstrap_remote_control(
     may have started the daemon manually, or it's not on PATH yet).
     """
     if not project or not coord_id:
+        return False
+    # Defense in depth: refuse to use a coord_id that doesn't match the
+    # canonical 8-hex shape. In production the value comes from
+    # FLEET_AGENT_ID (always 8-hex via secrets.token_hex(4)), so this
+    # never trips; a future caller passing user-controlled input would
+    # otherwise land path traversal via the marker / inbox filenames.
+    if not _COORD_ID_RE.match(coord_id):
+        print(
+            f"coord remote-control: refusing invalid coord_id {coord_id!r}",
+            file=sys.stderr,
+        )
+        return False
+    # Project also gets a strict guard: it's used as a filesystem path
+    # component, and a project of "../" would put the marker outside
+    # ~/.fleet/projects/. The Go side already validates project names
+    # at dispatch time, so a non-conforming value here is a bug — log
+    # and refuse rather than silently traverse.
+    if "/" in project or "\\" in project or project in (".", ".."):
+        print(
+            f"coord remote-control: refusing invalid project {project!r}",
+            file=sys.stderr,
+        )
         return False
     home = _resolve_home(fleet_home)
     marker = _marker_path(home, project, coord_id)
@@ -210,6 +241,15 @@ def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:
     operator context is much higher than the cost of one extra tick of
     /remote-control delay.
     """
+    # Same coord_id guard as bootstrap_remote_control: this function is
+    # also called directly from tests, and a non-conforming coord_id
+    # would land path traversal via f"{coord_id}.md".
+    if not coord_id or not _COORD_ID_RE.match(coord_id):
+        print(
+            f"coord remote-control: refusing invalid coord_id {coord_id!r}",
+            file=sys.stderr,
+        )
+        return False
     home = _resolve_home(fleet_home)
     inbox_dir = home / "inbox"
     target = inbox_dir / f"{coord_id}.md"

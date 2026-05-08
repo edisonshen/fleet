@@ -229,6 +229,33 @@ class TestSeedInbox:
         ok = remote_control.seed_inbox("abcd1234", fleet_home=fleet_home)
         assert ok is False
 
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "",
+            "ABCD1234",          # uppercase rejected
+            "abcd123",           # 7 chars
+            "abcd12345",         # 9 chars
+            "../etc",            # path traversal
+            "abcd/1234",         # slash
+            "abcd\x001234",      # null byte
+            "ghij1234",          # non-hex
+        ],
+    )
+    def test_rejects_invalid_coord_id(
+        self, fleet_home: Path, bad_id: str,
+    ) -> None:
+        """Defense-in-depth: a coord_id that doesn't match the canonical
+        8-lowercase-hex shape is refused. In production FLEET_AGENT_ID
+        always conforms (secrets.token_hex(4)); a non-conforming value
+        is a bug or a hostile caller. Either way: refuse, don't traverse.
+        """
+        ok = remote_control.seed_inbox(bad_id, fleet_home=fleet_home)
+        assert ok is False
+        # No file written under inbox/ for the bad ID.
+        if (fleet_home / "inbox").exists():
+            assert not list((fleet_home / "inbox").iterdir())
+
 
 # ---------- bootstrap_remote_control ----------
 
@@ -312,6 +339,39 @@ class TestBootstrap:
         """Empty coord_id arg: silent noop, returns False."""
         ok = remote_control.bootstrap_remote_control(
             "myproj", "", fleet_home=fleet_home,
+        )
+        assert ok is False
+        assert fake_popen.calls == []
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        ["GHIJ1234", "abcd123", "../sneaky", "abcd/1234"],
+    )
+    def test_rejects_invalid_coord_id(
+        self, fleet_home: Path, fake_popen: _FakePopen, bad_id: str,
+    ) -> None:
+        """Bootstrap refuses non-canonical coord_ids: no daemon spawn,
+        no inbox seed, no marker, no path traversal."""
+        ok = remote_control.bootstrap_remote_control(
+            "myproj", bad_id, fleet_home=fleet_home,
+        )
+        assert ok is False
+        assert fake_popen.calls == []
+        if (fleet_home / "inbox").exists():
+            assert not list((fleet_home / "inbox").iterdir())
+
+    @pytest.mark.parametrize(
+        "bad_project",
+        ["..", ".", "../etc", "foo/bar", "foo\\bar"],
+    )
+    def test_rejects_invalid_project(
+        self, fleet_home: Path, fake_popen: _FakePopen, bad_project: str,
+    ) -> None:
+        """Bootstrap refuses project values that contain path separators
+        or are dotted directory references — they'd traverse out of
+        ~/.fleet/projects/ when used as a path component."""
+        ok = remote_control.bootstrap_remote_control(
+            bad_project, "abcd1234", fleet_home=fleet_home,
         )
         assert ok is False
         assert fake_popen.calls == []
