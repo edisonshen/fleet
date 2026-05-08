@@ -41,6 +41,7 @@ from typing import Iterable
 import conflict
 import dispatch as dispatch_mod
 import parse
+import remote_control
 import worktree as worktree_mod
 
 
@@ -165,6 +166,23 @@ def _tick_locked(
     now_unix: float,
 ) -> TickResult:
     """Body of the tick once we hold the coord lock."""
+    # 1.1. Auto-inject /remote-control on first tick per coord (issue #56).
+    # Fresh coordinator agents need to attach to `claude remote-control`
+    # so the operator's mobile / claude.ai pairing follows the agent.
+    # Handoff replacements get this via internal/handoff.FirstAction;
+    # this call covers the FRESH path (first dispatch, no prior doc).
+    # Idempotent + fail-soft: bootstrap_remote_control short-circuits
+    # on the per-coord marker file, and any I/O failure is logged + the
+    # tick continues. NEVER blocks the coord; matches fleet-guard
+    # discipline.
+    try:
+        remote_control.bootstrap_remote_control(project, coord_id, fleet_home=home)
+    except Exception as exc:
+        # bootstrap_remote_control already wraps each side-effect in
+        # try/except, but a programming error in this module shouldn't
+        # take down the tick. Caller's TickResult.errors records it.
+        result.errors.append(f"remote-control bootstrap: {exc}")
+
     # 1.5. Orphan-worktree cleanup. A coord that crashed mid-tick can
     # leave a worktree directory + its git registry entry behind; the
     # next dispatch then trips on "already exists" and the task is
