@@ -6,14 +6,46 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.2.0] - TBD
+## [0.2.0] - 2026-05-08
 
 Per-project autonomous coordinator. Brings tasks/learnings/standards
 primitives, a coordinator skill that dispatches and reconciles workers
 under `fleet dispatch`, and the operator-facing CLI to drive it.
+Ships with a v0.2 TUI dashboard ("Ops Console") that surfaces projects
+on the left and workers/agents on the right, with one-keypress coord
+spawn + attach.
 
 ### Added
 
+- v0.2 TUI dashboard ("Ops Console", `internal/tui/`) — 2-column
+  layout: PROJECTS on left (with task counts and coord status),
+  WORKERS · AGENTS on right. Keybinds: `[j/k]` nav, `[enter]` expand
+  project to inline task list, `[a]` attach (or auto-spawn coord on
+  empty project), `[h]` handoff, `[x]` archive, `[/]` search, `[?]`
+  help, `[n]` task-add inline (no shell-out), `[q]` quit. Project
+  rows derived from union of v0.2-initialized dirs and v0.1 agent
+  project tags.
+- Coord identification — agents holding `coordinator.lock` write
+  their `coord_id` into the lock body and publish freshness via
+  `coord-state.json` mtime. Dashboard renders coord under its
+  project's row; freshness gated by `coordActiveWindow` (5 min).
+  Task_id `coord-<project>` is a fallback signal for the boot
+  window before the lock body publishes.
+- `[a]` on a project row auto-spawns a coord agent if none exists:
+  runs `fleet init` for the project, dispatches with stable task_id
+  `coord-<project>`, and attaches immediately. Idempotent — second
+  press attaches to the same coord.
+- Coord agents auto-attach to remote-control via Claude Code's
+  `--remote-control "fleet-coord-<id>"` flag (no manual
+  `/remote-control` typing needed). Gated on the daemon already
+  being up.
+- Project name display transform: encoded `projects-fleet` renders
+  as `projects/fleet` (replaces first hyphen with slash).
+- Robust prompt-send for the `/coordinator` first-turn prompt:
+  post-ready buffer (1.5s default, env-overridable via
+  `FLEET_POST_READY_BUFFER_MS`), prompt+Enter delay (1s default
+  via `FLEET_PROMPT_ENTER_DELAY_MS`), post-send verifier with one
+  retry, structured warning on still-unsubmitted.
 - Per-project coordinator skill (`skills/coordinator/`) — autonomous
   worker dispatch, status reconciliation via `gh pr checks` +
   `gh pr view`, single-tick design (no daemon), one coordinator per
