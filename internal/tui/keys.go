@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -466,6 +467,20 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		m.pendingAttach = rec.TmuxSession
 		return m, tea.Quit, true
 	}
+	// Path 2.5: lock-body fallback (codex iter-7 P2). Recovery case
+	// after a prompt-delivery failure: the operator attached and
+	// manually typed /coordinator; the skill ran and wrote the lock
+	// body — but no coord-spawn marker exists (we deliberately
+	// skipped it on the failed dispatch). The dashboard's freshness
+	// gate may also lag if coord-state.json hasn't ticked yet.
+	// Reading the lock body directly bridges that gap: an ID written
+	// into coordinator.lock came from a coord that successfully
+	// acquired LOCK_EX, so it's authoritative regardless of marker
+	// state.
+	if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
+		m.pendingAttach = rec.TmuxSession
+		return m, tea.Quit, true
+	}
 	// Path 2.5: in-flight gate. coordSpawnInFlight tracks projects
 	// whose dispatch goroutine has launched but coordSpawnDoneMsg
 	// hasn't arrived yet. During this window the agent record + marker
@@ -524,6 +539,52 @@ func findRecordByID(records []*agent.Record, id string) *agent.Record {
 // so this never embeds a path-unsafe component.
 func coordTaskID(projectName string) string {
 	return "coord-" + projectName
+}
+
+// findCoordByLockBody returns the alive agent whose ID is written
+// into ~/.fleet/projects/<projectName>/.locks/coordinator.lock. var
+// for stub-ability; production reads the file via dashboard's
+// readCoordHolder helper. Returns (nil, false) when:
+//   - the lock file is missing / empty / malformed body,
+//   - no record has the matching ID,
+//   - the matching record's tmux session is not alive.
+//
+// Used by actionAttachProject's path 2.5 to handle the prompt-
+// delivery-recovery case (codex iter-7 P2): operator attached after
+// a prompt-failed dispatch, typed /coordinator manually, the skill
+// acquired LOCK_EX and wrote its ID into the lock body. The marker
+// file is absent (we skipped writing it), but the lock body is
+// authoritative — re-attach instead of spawning a duplicate.
+//
+// Differs from path 1 (project.CoordID-driven) in that it does NOT
+// require coord-state.json freshness. Lock body is set via LOCK_EX
+// in the coord skill's _try_lock; presence of an ID there means a
+// coord successfully acquired the lock at least once. flock doesn't
+// truncate on release, so a stale body is possible — but we gate on
+// the matching agent's tmux session being alive, which catches the
+// "coord crashed but lock body remains" case.
+var findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
+	root, err := state.Root()
+	if err != nil {
+		return nil, false
+	}
+	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
+	if holderID == "" {
+		return nil, false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != holderID {
+			continue
+		}
+		if r.TmuxSession == "" {
+			continue
+		}
+		if !sessionProbeOrAliveFn(r.TmuxSession) {
+			continue
+		}
+		return r, true
+	}
+	return nil, false
 }
 
 // findExistingCoordForProject searches records for an alive agent

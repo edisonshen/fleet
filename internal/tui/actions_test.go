@@ -2059,6 +2059,62 @@ func TestFindExistingCoordForProject_AlivePastBootWindow_MarkerPresent(t *testin
 	}
 }
 
+// TestKeyA_ProjectRow_PromptRecoveryDoesNotDuplicateSpawn pins
+// codex iter-7 P2: after a prompt-failed dispatch, the operator
+// attached and manually typed /coordinator; the skill ran, acquired
+// LOCK_EX, and wrote the agent ID into coordinator.lock. The marker
+// file is absent (we skipped it on the failed dispatch). A second
+// [a] press must re-attach via the lock-body fallback (path 2.5)
+// instead of double-spawning.
+func TestKeyA_ProjectRow_PromptRecoveryDoesNotDuplicateSpawn(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Stub the lock-body lookup to point at the recovered coord.
+	prev := findCoordByLockBody
+	findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
+		if projectName != "demo" {
+			return nil, false
+		}
+		for _, r := range records {
+			if r != nil && r.ID == "recovrd1" {
+				return r, true
+			}
+		}
+		return nil, false
+	}
+	t.Cleanup(func() { findCoordByLockBody = prev })
+
+	rec := agent.New("recovrd1")
+	rec.Project = "demo"
+	rec.TaskID = "coord-demo"
+	rec.TmuxSession = "fleet-recovrd1"
+
+	m := New("test")
+	m.records = []*agent.Record{rec}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}}, // CoordID empty, no freshness yet
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-recovrd1" {
+		t.Errorf("lock-body fallback must re-attach to recovered coord; pendingAttach=%q", mm.pendingAttach)
+	}
+	if cmd == nil {
+		t.Error("expected tea.Quit cmd after lock-body fallback attach")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("recovered coord must NOT shell out (would dup-spawn); got %v", stub.calls)
+	}
+}
+
 // TestFindExistingCoordForProject_NoMarker_FallsThroughToSpawn pins
 // codex iter-6 P1: when the marker is missing (either no coord ever
 // booted here OR the previous spawn's prompt failed and we
