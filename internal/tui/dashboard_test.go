@@ -558,6 +558,116 @@ func TestView_FooterShowsKeybinds(t *testing.T) {
 	}
 }
 
+// TestReadCoordHolder pins the lock-body parsing rules: 8-char
+// lower-hex passes, anything else returns "" so the dashboard falls
+// through to the no-coord render path.
+func TestReadCoordHolder(t *testing.T) {
+	cases := []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{"valid 8-hex with newline", []byte("cafef00d\n"), "cafef00d"},
+		{"valid 8-hex no newline", []byte("abcd1234"), "abcd1234"},
+		{"valid 8-hex with CRLF", []byte("12345678\r\n"), "12345678"},
+		{"empty body", []byte(""), ""},
+		{"too short", []byte("abc12\n"), ""},
+		{"too long", []byte("abcdef01abcdef01\n"), ""},
+		{"uppercase rejected", []byte("CAFEF00D\n"), ""},
+		{"non-hex chars", []byte("zzzzzzzz\n"), ""},
+		{"whitespace stripped, then valid", []byte("  cafef00d  \n"), "cafef00d"},
+		{"multi-line takes first", []byte("aaaa1111\nbbbb2222\n"), "aaaa1111"},
+		{"first line garbage, second valid", []byte("garbage\naaaa1111\n"), ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pdir := t.TempDir()
+			locksDir := filepath.Join(pdir, "demo", ".locks")
+			if err := os.MkdirAll(locksDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			lockPath := filepath.Join(locksDir, "coordinator.lock")
+			if err := os.WriteFile(lockPath, c.body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got := readCoordHolder(pdir, "demo")
+			if got != c.want {
+				t.Errorf("readCoordHolder(%q) = %q, want %q", c.body, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReadCoordHolder_MissingFile pins the missing-lock case: returns
+// "" without surfacing the I/O error to the caller.
+func TestReadCoordHolder_MissingFile(t *testing.T) {
+	pdir := t.TempDir()
+	if got := readCoordHolder(pdir, "nope"); got != "" {
+		t.Errorf("missing lock should yield \"\", got %q", got)
+	}
+}
+
+// TestScanProject_AttachesCoordIDWhenFresh pins that scanProject
+// populates row.CoordID when the lock body has a valid 8-hex ID AND
+// coord-state.json is fresh enough to mark the project Active.
+func TestScanProject_AttachesCoordIDWhenFresh(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	now := time.Now()
+	touchCoordLock(t, pdir, "demo", now.Add(-30*time.Second))
+	// Overwrite the lock body with a valid coord ID. touchCoordLock
+	// writes a zero-byte lock; we want the v0.2 lock-body protocol.
+	lockPath := filepath.Join(pdir, "demo", ".locks", "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("c0ffee01\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Re-stamp the mtime since WriteFile bumped it; freshness gate
+	// reads from coord-state.json's mtime, but be paranoid.
+	if err := os.Chtimes(filepath.Join(pdir, "demo", "coord-state.json"),
+		now.Add(-30*time.Second), now.Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(now)
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	p := snap.Projects[0]
+	if p.CoordID != "c0ffee01" {
+		t.Errorf("expected CoordID=c0ffee01, got %q (Active=%v)", p.CoordID, p.Active)
+	}
+}
+
+// TestScanProject_StaleCoordLockHasNoCoordID pins the freshness gate.
+// A stale coord-state.json (Active=false) must NOT publish a CoordID,
+// even when the lock body still carries a valid-shape ID. flock(2)
+// doesn't truncate on release, so a body alone is not trustworthy.
+func TestScanProject_StaleCoordLockHasNoCoordID(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	now := time.Now()
+	// 2h old → outside coordActiveWindow.
+	touchCoordLock(t, pdir, "demo", now.Add(-2*time.Hour))
+	lockPath := filepath.Join(pdir, "demo", ".locks", "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("c0ffee01\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(pdir, "demo", "coord-state.json"),
+		now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(now)
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	p := snap.Projects[0]
+	if p.CoordID != "" {
+		t.Errorf("stale coord-state.json must zero CoordID, got %q", p.CoordID)
+	}
+	if p.Active {
+		t.Errorf("stale coord must not be Active")
+	}
+}
+
 func TestFormatUptime(t *testing.T) {
 	cases := map[time.Duration]string{
 		0:                            "00:00",
