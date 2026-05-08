@@ -525,6 +525,65 @@ def test_tick_does_not_re_drain_seen_archive(
     assert all("a-aaaa" not in str(c) or "set" not in c[1:3] or "pr_url=" not in c[-1] for c in after)
 
 
+# ---------- coord-state.json heartbeat (issue #50) ----------
+
+
+def test_tick_writes_coord_state_even_on_empty_dispatch(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Empty tick (no ready tasks, no inbox sentinels) must still
+    refresh coord-state.json — the Variant A dashboard reads this
+    file's mtime as the per-tick heartbeat. Gating the write on
+    last_seen (issue #50) made empty + dispatch-only ticks invisible
+    to the TUI as `○ idle · auto-stopped`.
+    """
+    # No ready tasks → dispatch path is a no-op. No archive files →
+    # drain path is a no-op. The tick is otherwise an empty cycle.
+    _write_tasks(project_dir, [_make_task("idle-aaaa", status="todo")])
+    state_path = project_dir / "coord-state.json"
+    assert not state_path.exists()
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert not result.skipped
+    assert result.dispatched == 0
+    assert result.drained == 0
+    # Regression gate for #50: the file MUST appear after a tick, even
+    # with nothing to apply.
+    assert state_path.exists()
+
+
+def test_tick_writes_coord_state_on_dispatch_only(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Dispatch-only tick (one ready task, no inbox sentinels) must
+    refresh coord-state.json. Before the fix, _save_coord_state only
+    fired when last_seen was set on the drain path, so a fresh project
+    that just dispatched its first worker showed `○ idle` until the
+    first sentinel landed.
+    """
+    _write_tasks(project_dir, [_make_task("ready-aaaa", status="ready")])
+    dispatch_subprocess.append("abcdef01")
+    state_path = project_dir / "coord-state.json"
+    assert not state_path.exists()
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert not result.skipped
+    assert result.dispatched == 1
+    assert result.drained == 0
+    # File written even though no sentinel was drained.
+    assert state_path.exists()
+
+
 # ---------- sentinel grammar ----------
 
 
