@@ -58,6 +58,19 @@ type dispatchOpts struct {
 // prefix are rejected by runDispatch unless --coord-spawn is set.
 const CoordTaskIDPrefix = "coord-"
 
+// remoteControlSessionPrefix is the literal prefix that
+// `skills/coordinator/remote_control.py:spawn_daemon_if_needed`
+// passes to `claude remote-control --remote-control-session-name-prefix`.
+// Coord-spawn dispatches inject `--remote-control "<prefix>-<agent_id>"`
+// at session start (issue #73) so the agent registers under a name
+// the daemon will actually accept; any other prefix wouldn't match
+// the daemon's filter (codex review #73 iter-2 P1).
+//
+// Keep byte-identical with the Python side. There's no shared schema
+// file yet (the Python skill doesn't import Go); a string-equality
+// test pins the contract.
+const remoteControlSessionPrefix = "fleet-coord"
+
 func newDispatchCmd() *cobra.Command {
 	opts := &dispatchOpts{}
 	cmd := &cobra.Command{
@@ -178,9 +191,15 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// Issue #73: coord-spawn dispatches inject Claude Code's documented
 	// `--remote-control "<session>"` flag so the operator's `[a]`
 	// re-attach can reach the coord's tools without manually running
-	// `/remote-control` inside the session. The remote-control name is
-	// the tmux session name ("fleet-<agent_id>") so it's stable +
-	// discoverable.
+	// `/remote-control` inside the session.
+	//
+	// Session-name prefix MUST be "fleet-coord" — that's the prefix
+	// `bootstrap_remote_control` (skills/coordinator/remote_control.py)
+	// passes via `--remote-control-session-name-prefix` when it spawns
+	// the daemon on the coord's first tick. Names that don't share
+	// this prefix would never attach to the daemon (codex review #73
+	// iter-2 P1). We append the agent_id so each coord registers as
+	// a unique session within the same daemon scope.
 	//
 	// Pre-allocate the agent ID HERE (instead of letting spawn.Spawn
 	// call agent.NewID()) so we can interpolate it into the shell
@@ -192,7 +211,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// THIS tmux exec only); the persisted agent.Record.Command stays
 	// the clean opts.command so a future handoff that reads
 	// oldRec.Command doesn't inherit a stale `--remote-control
-	// "fleet-<old-id>"` flag (codex review #73 iter-1 P1).
+	// "fleet-coord-<old-id>"` flag (codex review #73 iter-1 P1).
+	//
+	// Cold-start gap (codex review #73 iter-2 P1 (a), accepted as
+	// known limitation): the daemon isn't running yet on the very
+	// first coord dispatch — `bootstrap_remote_control` spawns it on
+	// the coord's first tick. claude's startup `--remote-control` may
+	// or may not retry once the daemon comes up; the inbox-relay
+	// fallback (skills/coordinator/remote_control.py:seed_inbox)
+	// still runs `/remote-control` via the slash command on the next
+	// Stop hook fire, so the auto-attach is best-effort at the launch
+	// site and the relay carries the recovery path. Re-attach (`[a]`
+	// on an existing coord) is the common case the operator was
+	// hitting in #73 — there the daemon is already up from the
+	// coord's prior boot, so this flag connects immediately.
 	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
@@ -206,8 +238,11 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	var execCommand []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
-		sessionName := tmux.SessionName(preAllocatedID)
-		rewritten := injectRemoteControlFlag(opts.command, sessionName)
+		// Match the daemon prefix from skills/coordinator/remote_control.py
+		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
+		// without this prefix wouldn't attach to the daemon.
+		rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
+		rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
 		// Only set ExecCommand when the rewrite actually changed
 		// something — passing through an unchanged custom --command
 		// avoids a no-op divergence between Command and ExecCommand

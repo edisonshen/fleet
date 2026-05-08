@@ -322,7 +322,7 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	}
 	original := slice.GetSlice()
 
-	got := injectRemoteControlFlag(original, "fleet-abcd1234")
+	got := injectRemoteControlFlag(original, "fleet-coord-abcd1234")
 
 	if len(got) != 3 {
 		t.Fatalf("rewritten command should still be [sh -c <script>]; got len=%d", len(got))
@@ -330,7 +330,7 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	if got[0] != "sh" || got[1] != "-c" {
 		t.Errorf("rewritten command should keep sh -c prefix; got %v", got[:2])
 	}
-	want := `claude --dangerously-skip-permissions --remote-control "fleet-abcd1234"`
+	want := `claude --dangerously-skip-permissions --remote-control "fleet-coord-abcd1234"`
 	if !strings.Contains(got[2], want) {
 		t.Errorf("script should contain %q; got %q", want, got[2])
 	}
@@ -357,7 +357,7 @@ func TestInjectRemoteControlFlag_RewritesRerunBanner(t *testing.T) {
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
 	original := slice.GetSlice()
-	const sessionName = "fleet-cafebabe"
+	const sessionName = "fleet-coord-cafebabe"
 
 	got := injectRemoteControlFlag(original, sessionName)
 
@@ -407,7 +407,7 @@ func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
 		{},
 	}
 	for _, c := range cases {
-		got := injectRemoteControlFlag(c, "fleet-deadbeef")
+		got := injectRemoteControlFlag(c, "fleet-coord-deadbeef")
 		if len(got) != len(c) {
 			t.Errorf("custom command %v should be returned unchanged; got %v", c, got)
 			continue
@@ -430,7 +430,7 @@ func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
 	original := append([]string(nil), in...)
 	originalScript := in[2]
 
-	_ = injectRemoteControlFlag(in, "fleet-abcd1234")
+	_ = injectRemoteControlFlag(in, "fleet-coord-abcd1234")
 
 	if len(in) != len(original) {
 		t.Fatalf("input slice length mutated: %d → %d", len(original), len(in))
@@ -446,27 +446,44 @@ func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
 }
 
 // TestInjectRemoteControlFlag_SessionNameMatchesAgentID pins the
-// naming contract: the remote-control session name must match the
-// tmux session name (tmux.SessionName(agentID) → "fleet-<agentID>"),
-// so an operator who knows the agent ID can predict + verify the
-// remote-control attachment without checking a separate registry.
+// naming contract: the remote-control session name must use the
+// "fleet-coord" prefix (matching the daemon's
+// `--remote-control-session-name-prefix` from
+// skills/coordinator/remote_control.py:spawn_daemon_if_needed) plus
+// the agent_id, so the registered session is unique per coord and
+// matches the daemon's filter (codex review #73 iter-2 P1).
 func TestInjectRemoteControlFlag_SessionNameMatchesAgentID(t *testing.T) {
-	// Synthesize the same session-name shape that runDispatch passes
-	// in. We can't import internal/tmux from this _test.go without a
-	// dep cycle risk, but the shape is "fleet-" + 8-hex agent ID; we
-	// pin the literal here so a future SessionName change forces a
-	// deliberate test update.
 	const agentID = "1a2b3c4d"
-	sessionName := "fleet-" + agentID
+	sessionName := remoteControlSessionPrefix + "-" + agentID
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
 	got := injectRemoteControlFlag(slice.GetSlice(), sessionName)
 
-	want := `--remote-control "fleet-1a2b3c4d"`
+	want := `--remote-control "fleet-coord-1a2b3c4d"`
 	if !strings.Contains(got[2], want) {
-		t.Errorf("script should reference the agent's tmux session name verbatim (%q); got %q",
+		t.Errorf("script should reference the daemon-matching prefix + agent ID (%q); got %q",
 			want, got[2])
+	}
+}
+
+// TestRemoteControlSessionPrefix_MatchesPythonDaemon pins the
+// byte-equality contract between this Go side and
+// skills/coordinator/remote_control.py:spawn_daemon_if_needed which
+// passes `--remote-control-session-name-prefix "fleet-coord"` to the
+// daemon. Drift between the two would silently break auto-attach
+// (codex review #73 iter-2 P1): the daemon would refuse sessions
+// with a mismatched prefix.
+//
+// If you change either side, change both. The Python skill currently
+// hard-codes the literal in spawn_daemon_if_needed's bash block.
+func TestRemoteControlSessionPrefix_MatchesPythonDaemon(t *testing.T) {
+	if remoteControlSessionPrefix != "fleet-coord" {
+		t.Errorf("remoteControlSessionPrefix = %q; want %q (must match the literal "+
+			"`--remote-control-session-name-prefix` value in "+
+			"skills/coordinator/remote_control.py:spawn_daemon_if_needed). "+
+			"If you change one side, change both.",
+			remoteControlSessionPrefix, "fleet-coord")
 	}
 }
 
@@ -518,16 +535,18 @@ func TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag(t *testing.T) {
 	defaultCmd := slice.GetSlice()
 
 	// Simulate what runDispatch does on the coord-spawn branch:
-	// pre-allocate an agent ID (any 8-hex value), build the tmux
-	// session name, rewrite the command.
+	// pre-allocate an agent ID (any 8-hex value), build the
+	// remote-control session name with the daemon-matching prefix,
+	// rewrite the command.
 	const fakeID = "0123abcd"
-	rewritten := injectRemoteControlFlag(defaultCmd, "fleet-"+fakeID)
+	rcSession := remoteControlSessionPrefix + "-" + fakeID
+	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
 
 	if !strings.Contains(rewritten[2], "--remote-control") {
 		t.Errorf("coord-spawn command should include --remote-control; got %q", rewritten[2])
 	}
-	if !strings.Contains(rewritten[2], "fleet-"+fakeID) {
-		t.Errorf("coord-spawn command should embed the pre-allocated agent ID in the session name; got %q",
+	if !strings.Contains(rewritten[2], rcSession) {
+		t.Errorf("coord-spawn command should embed the daemon-prefix + agent ID in the session name; got %q",
 			rewritten[2])
 	}
 	// The rest of the wrapper must survive (clean-exit semantics).
