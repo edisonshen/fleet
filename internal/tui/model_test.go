@@ -118,12 +118,17 @@ func TestKey_Quit(t *testing.T) {
 	}
 }
 
-// TestKey_Navigation walks the dashCursor across agent rows. With 3
-// records and no projects/workers, dashboardRows() returns 3 agent
-// rows, so j/k moves dashCursor 0→1→2.
+// TestKey_Navigation walks the dashCursor across the unified row list.
+// fakeRecords gives every record Project="demo" so unifiedProjects()
+// synthesizes one project row in front of the agents — total rows =
+// 1 (synthetic project) + 3 (agents). j moves down, k moves up.
 func TestKey_Navigation(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(3)
+	total := len(m.dashboardRows())
+	if total < 2 {
+		t.Fatalf("expected at least 2 rows, got %d", total)
+	}
 
 	// j moves cursor down
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
@@ -131,30 +136,35 @@ func TestKey_Navigation(t *testing.T) {
 		t.Errorf("j: dashCursor got %d, want 1", updated.(Model).dashCursor)
 	}
 
-	// k moves cursor back up
-	m.dashCursor = 2
+	// k from a non-zero position moves cursor back up by one
+	m.dashCursor = total - 1
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
-	if updated.(Model).dashCursor != 1 {
-		t.Errorf("k: dashCursor got %d, want 1", updated.(Model).dashCursor)
+	if updated.(Model).dashCursor != total-2 {
+		t.Errorf("k: dashCursor got %d, want %d", updated.(Model).dashCursor, total-2)
 	}
 }
 
 // TestKey_NavigationWrapsAtBounds pins the issue #53 spec: "Wraps at
 // boundaries". j at the bottom returns to the top; k at the top wraps
-// to the bottom. This differs from v0.1's clamping behavior.
+// to the bottom.
 func TestKey_NavigationWrapsAtBounds(t *testing.T) {
 	m := New("test")
 	m.records = fakeRecords(3)
+	total := len(m.dashboardRows())
+	if total < 2 {
+		t.Fatalf("expected at least 2 rows, got %d", total)
+	}
+	last := total - 1
 
-	// k at top wraps to bottom (index 2).
+	// k at top wraps to bottom.
 	m.dashCursor = 0
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
-	if updated.(Model).dashCursor != 2 {
-		t.Errorf("k at top: dashCursor got %d, want 2 (wraps)", updated.(Model).dashCursor)
+	if updated.(Model).dashCursor != last {
+		t.Errorf("k at top: dashCursor got %d, want %d (wraps)", updated.(Model).dashCursor, last)
 	}
 
 	// j at bottom wraps to top.
-	m.dashCursor = 2
+	m.dashCursor = last
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
 	if updated.(Model).dashCursor != 0 {
 		t.Errorf("j at bottom: dashCursor got %d, want 0 (wraps)", updated.(Model).dashCursor)

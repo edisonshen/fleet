@@ -318,7 +318,15 @@ func TestRowTypeGating_AgentActionsOnAgentRows(t *testing.T) {
 	m.width = 130
 	m.height = 30
 	m.records = []*agent.Record{sampleAgent("agent01")}
-	m.dashCursor = 0 // agent row
+	// Position cursor on the agent row by identity. Issue #55 added a
+	// synthetic project row when m.records carries a Project tag; the
+	// cursor positional index is implementation detail.
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent {
+			m.dashCursor = i
+			break
+		}
+	}
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
@@ -725,11 +733,23 @@ func TestCursor_StableAcrossDashboardRefresh(t *testing.T) {
 
 // TestCursor_StableAcrossAgentsMsgRefresh covers the agentsMsg path
 // — a new agent landing must not bump the cursor onto a different row.
+//
+// Layout note (issue #55): unifiedProjects() now synthesizes a project
+// row for any agent.Project tag absent from m.dashboard. sampleAgent
+// pins Project = "proj", so both records dedupe into one synthetic
+// project row preceding the two agent rows. We locate "agent b" by
+// identity rather than hardcoding an index.
 func TestCursor_StableAcrossAgentsMsgRefresh(t *testing.T) {
 	m := New("test")
 	m.records = []*agent.Record{sampleAgent("a"), sampleAgent("b")}
-	// Cursor on the second agent (the only place where reorder can hurt).
-	m.dashCursor = 1
+	// Locate agent "b" by walking the row list (positional index changed
+	// when we added the synthetic-project union).
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "b" {
+			m.dashCursor = i
+			break
+		}
+	}
 	if row := m.selectedRow(); row == nil || row.kind != rowAgent || row.agent.ID != "b" {
 		t.Fatalf("cursor should be on agent b initially; got %+v", row)
 	}
@@ -756,16 +776,23 @@ func TestCursor_StableAcrossAgentsMsgRefresh(t *testing.T) {
 func TestCursor_ResetsWhenSelectedRowDisappears(t *testing.T) {
 	m := New("test")
 	// fakeRecords spaces records 1 minute apart; sortRecordsBy puts
-	// newest first → after sort the list is [a2, a1, a0]. dashCursor=1
-	// lands on a1.
+	// newest first → after sort the list is [a2, a1, a0]. Locate a1's
+	// row by identity (issue #55 added a synthetic project row when
+	// records share a Project tag, so positional indexing into
+	// m.records would no longer match dashboardRows() indexing).
 	m.records = sortRecords(fakeRecords(3))
 	if m.records[1].ID != "a1" {
 		t.Fatalf("test setup: expected a1 at index 1, got %s", m.records[1].ID)
 	}
-	m.dashCursor = 1
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "a1" {
+			m.dashCursor = i
+			break
+		}
+	}
 
-	// Refresh: remove a1. With raw clamping, dashCursor=1 would
-	// silently land on whatever's now at numeric index 1 (the wrong
+	// Refresh: remove a1. With raw clamping, dashCursor would silently
+	// land on whatever's now at the same numeric index (the wrong
 	// agent). With identity-aware refresh, dashCursor resets to 0.
 	all := fakeRecords(3)
 	updated, _ := m.Update(agentsMsg{records: []*agent.Record{all[0], all[2]}})

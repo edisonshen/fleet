@@ -13,7 +13,11 @@
 // column. That mirrors the cursor visiting "rows in reading order".
 package tui
 
-import "github.com/edisonshen/fleet/internal/agent"
+import (
+	"sort"
+
+	"github.com/edisonshen/fleet/internal/agent"
+)
 
 // rowKind discriminates which payload the row carries.
 type rowKind int
@@ -52,7 +56,55 @@ type taskRow struct {
 	Status string // tasks.Status as a string — kept stringly so render doesn't import the enum
 }
 
-// dashboardRows assembles the unified row list from m.dashboard +
+// unifiedProjects returns the LEFT-column project list: the union of
+// v0.2-initialized project dirs (m.dashboard.Projects) plus synthetic
+// rows for any project tag carried by an agent record (m.records[*].
+// Project) that isn't already represented.
+//
+// Rationale (issue #55): agents dispatched against a non-v0.2 repo
+// (no ~/.fleet/projects/<tag>/ tree) still belong to a project
+// conceptually. Without this union the LEFT column would only show
+// v0.2-init'd projects, leaving operators with active workers on
+// regular repos staring at a blank PROJECTS column.
+//
+// Synthetic rows carry only Name + RepoSlug — no task counts, no
+// coord status, no LastTick. The right-column agent block continues
+// to render the agent record itself.
+//
+// Output is stable: real (v0.2-init'd) projects retain m.dashboard's
+// original sort order; synthetic rows append after, alpha-sorted.
+func (m Model) unifiedProjects() []*ProjectRow {
+	var out []*ProjectRow
+	seen := map[string]bool{}
+	if m.dashboard != nil {
+		for _, p := range m.dashboard.Projects {
+			out = append(out, p)
+			seen[p.Name] = true
+		}
+	}
+	// Collect synthetic project tags from agent records, dedupe, sort.
+	syntheticNames := make([]string, 0, len(m.records))
+	for _, r := range m.records {
+		if r == nil || r.Project == "" {
+			continue
+		}
+		if seen[r.Project] {
+			continue
+		}
+		seen[r.Project] = true
+		syntheticNames = append(syntheticNames, r.Project)
+	}
+	sort.Strings(syntheticNames)
+	for _, name := range syntheticNames {
+		out = append(out, &ProjectRow{
+			Name:     name,
+			RepoSlug: name,
+		})
+	}
+	return out
+}
+
+// dashboardRows assembles the unified row list from unifiedProjects() +
 // m.records, applying the search filter when set. Always returns left-
 // column rows (projects + tasks) before right-column rows (workers +
 // agents) so cursor reading order matches visual reading order.
@@ -63,40 +115,53 @@ type taskRow struct {
 // rendered alongside the matching tasks so a task-slug query like
 // "/fix-toolbar-1a2b" surfaces a navigable row instead of silently
 // dropping the whole block (codex iter-1 P2).
+//
+// Coord-on-LEFT (issue #55): a coord agent (record whose ID matches
+// some ProjectRow.CoordID) is filtered out of the right-column agents
+// section. The project-side render attaches the coord visually under
+// the project block; double-rendering it on the right would create
+// the appearance of two agents for one underlying record.
 func (m Model) dashboardRows() []dashRow {
 	var rows []dashRow
-	if m.dashboard != nil {
-		for _, p := range m.dashboard.Projects {
-			projectMatches := m.matchesFilter(p.Name) || m.matchesFilter(p.RepoSlug)
-			// Pre-check: do any tasks match? If yes, render the parent
-			// project header even though its name didn't match.
-			anyTaskMatches := false
-			if !projectMatches {
-				for _, t := range p.Tasks {
-					if m.matchesFilter(t.Slug) {
-						anyTaskMatches = true
-						break
-					}
-				}
-			}
-			if !projectMatches && !anyTaskMatches {
-				continue
-			}
-			rows = append(rows, dashRow{kind: rowProject, project: p})
+	projects := m.unifiedProjects()
+	coordIDs := map[string]bool{}
+	for _, p := range projects {
+		if p.CoordID != "" {
+			coordIDs[p.CoordID] = true
+		}
+	}
+	for _, p := range projects {
+		projectMatches := m.matchesFilter(p.Name) || m.matchesFilter(p.RepoSlug)
+		// Pre-check: do any tasks match? If yes, render the parent
+		// project header even though its name didn't match.
+		anyTaskMatches := false
+		if !projectMatches {
 			for _, t := range p.Tasks {
-				// When the project itself matched, include all tasks
-				// (operator can scan the block fully). When only tasks
-				// matched, restrict to the matching subset.
-				if !projectMatches && !m.matchesFilter(t.Slug) {
-					continue
+				if m.matchesFilter(t.Slug) {
+					anyTaskMatches = true
+					break
 				}
-				rows = append(rows, dashRow{
-					kind:          rowTask,
-					task:          t,
-					parentProject: p.Name,
-				})
 			}
 		}
+		if !projectMatches && !anyTaskMatches {
+			continue
+		}
+		rows = append(rows, dashRow{kind: rowProject, project: p})
+		for _, t := range p.Tasks {
+			// When the project itself matched, include all tasks
+			// (operator can scan the block fully). When only tasks
+			// matched, restrict to the matching subset.
+			if !projectMatches && !m.matchesFilter(t.Slug) {
+				continue
+			}
+			rows = append(rows, dashRow{
+				kind:          rowTask,
+				task:          t,
+				parentProject: p.Name,
+			})
+		}
+	}
+	if m.dashboard != nil {
 		for _, w := range m.dashboard.Workers {
 			if !m.matchesFilter(w.Slug) && !m.matchesFilter(w.Project) {
 				continue
@@ -105,6 +170,11 @@ func (m Model) dashboardRows() []dashRow {
 		}
 	}
 	for _, r := range m.records {
+		if r != nil && coordIDs[r.ID] {
+			// Coord renders on the LEFT under its project row; skip it
+			// here so the right-column doesn't double-count.
+			continue
+		}
 		if !m.matchesFilter(r.ID) && !m.matchesFilter(r.TaskID) && !m.matchesFilter(r.Project) {
 			continue
 		}
