@@ -1620,3 +1620,62 @@ func TestCoordCwdForProject_FallsBackToWd(t *testing.T) {
 			got, wd)
 	}
 }
+
+// TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord pins the wiring:
+// when an existing agent record carries a Cwd matching the project,
+// the spawned coord's `fleet dispatch` invocation must include
+// --cwd <that path>. Otherwise the coord lands in the TUI's cwd
+// (often a worktree dir for fleet developers) and /coordinator's
+// directory-relative shell calls resolve to the wrong place.
+func TestKeyA_ProjectRow_ForwardsCwdFromAgentRecord(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	(&stubPollCoordLock{alwaysOK: true}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent feedface spawned\n  tmux: fleet-feedface\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	// Existing worker agent for "demo" carries Cwd = a known path.
+	// coordCwdForProject should pick this path and forward it as --cwd.
+	worker := sampleAgent("worker01")
+	worker.Project = "demo"
+	worker.Cwd = "/Users/op/projects/demo"
+
+	m := New("test")
+	m.records = []*agent.Record{worker}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}}, // no CoordID — spawn path
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] should produce a spawn cmd")
+	}
+	_ = cmd() // drain so stub.calls populates
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+	hasCwd := false
+	for i, a := range args {
+		if a == "--cwd" && i+1 < len(args) && args[i+1] == "/Users/op/projects/demo" {
+			hasCwd = true
+			break
+		}
+	}
+	if !hasCwd {
+		t.Errorf("dispatch args missing --cwd /Users/op/projects/demo: %v", args)
+	}
+}

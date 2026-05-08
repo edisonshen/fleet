@@ -91,9 +91,10 @@ type rmDoneMsg struct {
 // coordSpawnDoneMsg is emitted after the project-row [a] auto-spawn
 // path completes. The flow runs as one tea.Cmd in a goroutine:
 //
-//  1. Shell out to `fleet dispatch coord-<8hex> --project <name> --cwd
-//     <repo> --prompt "Run the /coordinator skill loop for project
-//     <name>."` (uses dispatch's --prompt flag added in issue #60).
+//  1. Shell out to `fleet dispatch coord-<UTC stamp> --project <name>
+//     --cwd <repo> --prompt "Run the /coordinator skill loop for
+//     project <name>."` (uses dispatch's --prompt flag added in
+//     issue #60).
 //  2. Parse the new agent's ID from dispatch stdout ("agent <id>
 //     spawned" first line) so we know whose lock body to expect.
 //  3. Poll ~/.fleet/projects/<name>/.locks/coordinator.lock body via
@@ -567,6 +568,11 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 // pollCoordLock polls coordinator.lock every interval for up to attempts
 // iterations, returning true once readCoordHolder returns wantID. var so
 // tests can stub the timing-sensitive loop without sleeping for real.
+//
+// Sleeps BEFORE the read (except the first iteration), not after. Sleeping
+// after the last failed check would push the total budget 1×interval past
+// the documented "≤2s" without buying anything — the loop is about to
+// return false either way.
 var pollCoordLock = func(projectName, wantID string, attempts int, interval time.Duration) bool {
 	root, err := state.Root()
 	if err != nil {
@@ -574,10 +580,12 @@ var pollCoordLock = func(projectName, wantID string, attempts int, interval time
 	}
 	projectsRoot := filepath.Join(root, "projects")
 	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(interval)
+		}
 		if got := readCoordHolder(projectsRoot, projectName); got == wantID {
 			return true
 		}
-		time.Sleep(interval)
 	}
 	return false
 }
