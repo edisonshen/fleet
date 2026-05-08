@@ -214,12 +214,31 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		// the wrong next step for a task that just hasn't been
 		// dispatched yet.
 		if key == "a" && m.detail != nil && m.detail.taskSlug != "" {
-			switch m.detail.taskStatus {
-			case "todo", "ready":
+			// Codex iter-3 P2: re-read the live status so a task
+			// transitioning between snapshots (e.g. ready → in-progress
+			// when the coord picks it up) doesn't strand the panel on
+			// stale routing. Falls back to the cached row.task.Status
+			// if the re-read fails (filesystem error, slug gone) so
+			// the operator still gets SOME response rather than a no-op.
+			status := m.detail.taskStatus
+			if live := liveTaskStatus(m.detail.taskProject, m.detail.taskSlug); live != "" {
+				status = live
+			}
+			switch status {
+			case "todo":
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"task %s has no worker yet (status=%s) — press [d] to dispatch one",
-						m.detail.taskSlug, m.detail.taskStatus),
+						"task %s is todo — `fleet tasks promote %s` to make it eligible for the coord",
+						m.detail.taskSlug, m.detail.taskSlug),
+					isErr: true,
+				}
+				m.detail = nil
+				return m, nil, true
+			case "ready":
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"task %s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+						m.detail.taskSlug),
 					isErr: true,
 				}
 				m.detail = nil
@@ -428,12 +447,28 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		if row.task == nil || row.task.Empty || row.task.More > 0 {
 			return m, nil, true
 		}
+		// Codex iter-3 P1: pre-dispatch tasks need accurate next-step
+		// guidance. Workers are spawned by the coord, NOT by [d] (which
+		// is the loose-agent repo picker). The coord auto-dispatches
+		// tasks in `ready` status, so the right operator action is:
+		//   - todo  → `fleet tasks promote <slug>` to flip to ready.
+		//   - ready → wait for the coord to pick it up (or check that
+		//             a coord exists for this project via [a] on the
+		//             project row).
 		switch row.task.Status {
-		case "todo", "ready":
+		case "todo":
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
-					"task %s has no worker yet (status=%s) — press [d] to dispatch one",
-					row.task.Slug, row.task.Status),
+					"task %s is todo — `fleet tasks promote %s` to make it eligible for the coord",
+					row.task.Slug, row.task.Slug),
+				isErr: true,
+			}
+			return m, nil, true
+		case "ready":
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"task %s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+					row.task.Slug),
 				isErr: true,
 			}
 			return m, nil, true
@@ -452,7 +487,8 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 
 // attachToTaskWorker is the [a] handler for both task rows and the
 // task detail panel. Routes to the task's worker peek panel when a
-// worker exists; flashes a context-appropriate hint otherwise.
+// worker exists (active OR archived); flashes a context-appropriate
+// hint otherwise.
 //
 // Workers in v0.2 are `claude --print` subprocesses, NOT tmux
 // sessions — so "attach" here means "open the same peek panel that
@@ -472,6 +508,13 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 // todo|ready|in-progress|in-review|done|blocked|abandoned (no
 // "pending"). Suggesting an invalid command would just fail validation
 // and leave the operator stuck.
+//
+// Codex iter-3 P2: when the active worker dir is gone but an archive
+// dir exists for the slug, route to readWorkerDetail anyway —
+// readWorkerDetail's archive fallback (newestArchiveWorkerDir) will
+// surface the archived state.json + output.log. Without this, [a] on
+// a task whose worker was archived between snapshots would dead-end at
+// the retry hint while the worker's row still has a live peek path.
 func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 	if slug == "" {
 		return m, nil, true
@@ -488,22 +531,42 @@ func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
 		m.detail = nil
 		return m, nil, true
 	case ws == nil:
-		// ErrNotFound (no state.json on disk).
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"no worker for task %s — `fleet tasks set %s status=ready` to retry",
-				slug, slug),
-			isErr: true,
+		// ErrNotFound on the active worker dir. Try archive fallback
+		// before declaring "no worker" — readWorkerDetail handles the
+		// active + archive split internally; we only need to know
+		// whether SOME state exists for the slug.
+		if !taskWorkerArchiveExists(project, slug) {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"no worker for task %s — `fleet tasks set %s status=ready` to retry",
+					slug, slug),
+				isErr: true,
+			}
+			// Dismiss the detail panel if it was open: the flash carries
+			// the actionable hint and a stale panel under it would just
+			// confuse the operator.
+			m.detail = nil
+			return m, nil, true
 		}
-		// Dismiss the detail panel if it was open: the flash carries
-		// the actionable hint and a stale panel under it would just
-		// confuse the operator.
-		m.detail = nil
-		return m, nil, true
+		// Fall through to readWorkerDetail — its archive fallback
+		// (newestArchiveWorkerDir) reads from workers/archive/<slug>-<stamp>/.
 	}
 	body, title := readWorkerDetail(project, slug)
 	m.detail = &detailView{title: title, body: body}
 	return m, nil, true
+}
+
+// taskWorkerArchiveExists returns true when ~/.fleet/projects/<project>/
+// workers/archive/ contains at least one entry whose stripped name
+// matches the slug. Wraps newestArchiveWorkerDir's existing detection so
+// attachToTaskWorker can decide whether to peek (active or archived) or
+// flash the no-worker hint. Codex iter-3 P2.
+//
+// var so tests can stub the archive presence without seeding archive
+// dirs. Production calls newestArchiveWorkerDir which is the same
+// helper readWorkerDetail uses, keeping the two paths in sync.
+var taskWorkerArchiveExists = func(project, slug string) bool {
+	return newestArchiveWorkerDir(project, slug) != ""
 }
 
 // actionAttachProject is the project-row branch of [a] (issues #60, #63).

@@ -468,6 +468,33 @@ var readTaskWorker = func(project, slug string) (*workers.State, error) {
 	return s, err
 }
 
+// liveTaskStatus reads the current task status from tasks.md. Used by
+// the detail-panel [a] interceptor (codex iter-3 P2) so a status
+// transition between dashboard ticks doesn't strand the cached
+// taskStatus and route to the wrong hint. Returns "" on any read
+// failure — the caller falls back to the snapshot-cached status,
+// which is still better than a silent no-op.
+//
+// var so tests can stub without seeding tasks.md on disk.
+var liveTaskStatus = func(project, slug string) string {
+	if project == "" || slug == "" {
+		return ""
+	}
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return ""
+	}
+	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		return ""
+	}
+	t, err := f.Get(slug)
+	if err != nil {
+		return ""
+	}
+	return string(t.Status)
+}
+
 // (projectDetail removed — issue #59: [⏎] on a project row now toggles
 // inline task-list expansion under the project header instead of
 // opening a modal panel. The expanded task rows take the place of

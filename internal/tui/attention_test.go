@@ -8,6 +8,7 @@ package tui
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -427,13 +428,13 @@ func TestKeyA_TaskRow_NoWorker_ShowsInlineMessage(t *testing.T) {
 	}
 }
 
-// TestKeyA_TaskRow_TodoTask_PointsAtDispatch pins that [a] on a
-// todo / ready task row flashes the dispatch hint, NOT the
-// no-worker error. todo/ready tasks legitimately have no worker
-// yet — the right next step is dispatch, not retry. Codex iter-1
-// P2 fix: previous behavior incorrectly reported a normal state as
-// a missing-worker failure.
-func TestKeyA_TaskRow_TodoTask_PointsAtDispatch(t *testing.T) {
+// TestKeyA_TaskRow_TodoTask_PointsAtPromote pins that [a] on a
+// todo task row points at `fleet tasks promote` — the actual
+// next-step (the coord auto-dispatches `ready` tasks). Codex iter-3
+// P1 fix: an earlier hint pointed at [d], but [d] opens the loose-
+// agent repo picker, NOT the per-task dispatch flow. Following [d]
+// from a todo task hint would send the operator into the wrong flow.
+func TestKeyA_TaskRow_TodoTask_PointsAtPromote(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "fresh-task-aaaa", tasks.StatusTodo, "")
 
@@ -461,14 +462,162 @@ func TestKeyA_TaskRow_TodoTask_PointsAtDispatch(t *testing.T) {
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("[a] on todo task should flash a hint, got %v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "no worker yet") {
-		t.Errorf("todo flash should explain there's no worker yet, got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "fleet tasks promote") {
+		t.Errorf("todo flash should suggest `fleet tasks promote`, got %q", mm.flash.text)
 	}
-	if !strings.Contains(mm.flash.text, "[d]") {
-		t.Errorf("todo flash should point at [d] dispatch, got %q", mm.flash.text)
+	if strings.Contains(mm.flash.text, "[d]") {
+		t.Errorf("todo flash must NOT point at [d] (loose-agent picker, wrong flow), got %q", mm.flash.text)
 	}
 	if strings.Contains(mm.flash.text, "no worker for task") {
 		t.Errorf("todo task must NOT use the missing-worker phrasing (it's pre-dispatch, not failure), got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_TaskRow_ReadyTask_PointsAtCoord pins that [a] on a ready
+// task points at "the coord will pick it up" — the operator's right
+// next-step is to verify a coord exists, not to retry-dispatch.
+// Codex iter-3 P1.
+func TestKeyA_TaskRow_ReadyTask_PointsAtCoord(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "ready-task-aaaa", tasks.StatusReady, "")
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "ready-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] on ready task should flash a hint, got %v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "ready") {
+		t.Errorf("ready flash should mention status=ready, got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "coord") {
+		t.Errorf("ready flash should reference the coord, got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "[d]") {
+		t.Errorf("ready flash must NOT point at [d], got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_DetailPanel_LiveStatusOverridesCachedStatus pins the
+// codex iter-3 P2 fix: a task that transitioned ready → in-progress
+// between snapshots must route on the LIVE status (not the cached
+// detailView.taskStatus). Without this, [a] in the detail panel
+// would dead-end on the stale "ready" branch even though the
+// active worker now exists.
+func TestKeyA_DetailPanel_LiveStatusOverridesCachedStatus(t *testing.T) {
+	pdir := withFleetHome(t)
+	// On-disk task is in-progress; the cached detail view says ready.
+	seedBlockedTask(t, pdir, "fleet", "race-task-aaaa", tasks.StatusInProgress, "")
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return &workers.State{
+			Slug: slug, Project: project, Phase: workers.PhaseTDDGreen, PID: 9999,
+		}, nil
+	})
+	// Seed a worker dir so readWorkerDetail succeeds.
+	seedWorker(t, pdir, "fleet", "race-task-aaaa", workers.State{
+		Slug: "race-task-aaaa", Project: "fleet", Phase: workers.PhaseTDDGreen, PID: 9999,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.detail = &detailView{
+		title:       "task: fleet/race-task-aaaa",
+		body:        "(prepopulated)",
+		taskProject: "fleet",
+		taskSlug:    "race-task-aaaa",
+		taskStatus:  "ready", // stale cached snapshot value
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	// Live status (in-progress) drives routing → worker peek opens.
+	if mm.detail == nil {
+		t.Fatalf("[a] should open worker peek using live status, got nil panel")
+	}
+	if !strings.Contains(mm.detail.title, "worker") {
+		t.Errorf("panel should switch to worker peek, got %q", mm.detail.title)
+	}
+}
+
+// TestKeyA_TaskRow_ArchivedWorker_OpensPeek pins the codex iter-3
+// P2 fix: when the active worker dir was archived between snapshots
+// but the task row still shows, [a] must surface the archived
+// state.json + output.log via readWorkerDetail's archive fallback —
+// not flash the no-worker hint.
+func TestKeyA_TaskRow_ArchivedWorker_OpensPeek(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedBlockedTask(t, pdir, "fleet", "archived-task-aaaa", tasks.StatusBlocked, "")
+	// readTaskWorker reports ENOENT (active dir is gone) but the
+	// archive presence stub says we have one.
+	stubReadTaskWorker(t, func(project, slug string) (*workers.State, error) {
+		return nil, nil
+	})
+	origArch := taskWorkerArchiveExists
+	taskWorkerArchiveExists = func(project, slug string) bool {
+		return project == "fleet" && slug == "archived-task-aaaa"
+	}
+	t.Cleanup(func() { taskWorkerArchiveExists = origArch })
+	// Seed an actual archive dir on disk so readWorkerDetail's
+	// fallback finds something to render. Without a real dir, the
+	// peek body would just say "no state.json yet" — still a peek
+	// (no flash), which is what the contract requires.
+	archDir := filepath.Join(pdir, "fleet", "workers", "archive", "archived-task-aaaa-20260101-000000")
+	if err := stateMkdir(archDir); err != nil {
+		t.Fatal(err)
+	}
+	stateJSON := []byte(`{"slug":"archived-task-aaaa","project":"fleet","phase":"done"}`)
+	if err := os.WriteFile(filepath.Join(archDir, "state.json"), stateJSON, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	taskIdx := -1
+	for i, r := range rows {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "archived-task-aaaa" {
+			taskIdx = i
+			break
+		}
+	}
+	if taskIdx < 0 {
+		t.Fatalf("task row missing; rows=%+v", rows)
+	}
+	m.dashCursor = taskIdx
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash != nil && mm.flash.isErr {
+		t.Errorf("archived worker should NOT flash no-worker, got %q", mm.flash.text)
+	}
+	if mm.detail == nil {
+		t.Fatalf("[a] with archived worker should open peek, got nil")
+	}
+	if !strings.Contains(mm.detail.title, "archived") {
+		t.Errorf("title should reflect archived peek, got %q", mm.detail.title)
 	}
 }
 
@@ -589,12 +738,19 @@ func TestKeyA_DetailPanel_NoWorker_DismissesWithFlash(t *testing.T) {
 	}
 }
 
-// TestKeyA_DetailPanel_TodoTask_PointsAtDispatch pins that pressing
-// [a] in a todo/ready task's detail panel flashes the dispatch hint
-// (NOT the missing-worker recovery command). Codex iter-2 P2 fix:
-// without preserving status on the detail view, the panel-side [a]
-// would regress on pre-dispatch tasks.
-func TestKeyA_DetailPanel_TodoTask_PointsAtDispatch(t *testing.T) {
+// TestKeyA_DetailPanel_TodoTask_PointsAtPromote pins that pressing
+// [a] in a todo task's detail panel flashes the promote hint
+// (NOT the missing-worker recovery command, NOT the [d] hint).
+// Codex iter-3 P1: [d] is the loose-agent picker, not a per-task
+// dispatch — promote is the correct next step.
+func TestKeyA_DetailPanel_TodoTask_PointsAtPromote(t *testing.T) {
+	// liveTaskStatus stub: no on-disk task → returns "" so the
+	// cached taskStatus drives routing. Tests for the live-override
+	// path live separately.
+	origLive := liveTaskStatus
+	liveTaskStatus = func(project, slug string) string { return "" }
+	t.Cleanup(func() { liveTaskStatus = origLive })
+
 	m := New("test")
 	m.width = 130
 	m.height = 30
@@ -614,14 +770,14 @@ func TestKeyA_DetailPanel_TodoTask_PointsAtDispatch(t *testing.T) {
 	if mm.flash == nil || !mm.flash.isErr {
 		t.Fatalf("[a] should flash a hint, got %v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "no worker yet") {
-		t.Errorf("flash should explain pre-dispatch state, got %q", mm.flash.text)
+	if !strings.Contains(mm.flash.text, "fleet tasks promote") {
+		t.Errorf("todo flash should suggest promote, got %q", mm.flash.text)
 	}
-	if !strings.Contains(mm.flash.text, "[d]") {
-		t.Errorf("flash should point at [d] dispatch, got %q", mm.flash.text)
+	if strings.Contains(mm.flash.text, "[d]") {
+		t.Errorf("todo flash must NOT point at [d] (loose-agent picker), got %q", mm.flash.text)
 	}
 	if strings.Contains(mm.flash.text, "status=ready") {
-		t.Errorf("todo-task panel must NOT suggest the recovery command, got %q", mm.flash.text)
+		t.Errorf("todo-task panel must NOT suggest the blocked recovery command, got %q", mm.flash.text)
 	}
 }
 
