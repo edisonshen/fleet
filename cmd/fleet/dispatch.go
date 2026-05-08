@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -13,6 +14,11 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// execCommand is a thin alias for exec.Command so test code can
+// stub remoteControlDaemonRunning's pgrep call without reaching for
+// process-fork primitives.
+var execCommand = exec.Command
 
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
@@ -213,32 +219,33 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// oldRec.Command doesn't inherit a stale `--remote-control
 	// "fleet-coord-<old-id>"` flag (codex review #73 iter-1 P1).
 	//
-	// Cold-start gap (codex review #73 iter-2 P1 (a), accepted as
-	// known limitation): the daemon isn't running yet on the very
-	// first coord dispatch — `bootstrap_remote_control` spawns it on
-	// the coord's first tick. claude's startup `--remote-control` may
-	// or may not retry once the daemon comes up; the inbox-relay
-	// fallback (skills/coordinator/remote_control.py:seed_inbox)
-	// still runs `/remote-control` via the slash command on the next
-	// Stop hook fire, so the auto-attach is best-effort at the launch
-	// site and the relay carries the recovery path. Re-attach (`[a]`
-	// on an existing coord) is the common case the operator was
-	// hitting in #73 — there the daemon is already up from the
-	// coord's prior boot, so this flag connects immediately.
+	// Cold-start gate (codex review #73 iter-5 P1): only inject the
+	// flag when a `claude remote-control` daemon is already running.
+	// On a brand-new coord dispatch the daemon isn't up yet
+	// (`bootstrap_remote_control` spawns it on the coord's first
+	// tick), and Claude Code may treat "no daemon listening" as a
+	// startup failure — which the default wrapper script then
+	// propagates as a non-zero exit, killing the tmux session
+	// before the operator even sees the agent. The inbox-relay
+	// path (skills/coordinator/remote_control.py:seed_inbox) still
+	// runs `/remote-control` via the slash command on the next
+	// Stop hook fire, so the cold-start case falls back to the
+	// existing v0.2 flow with no regression.
 	//
-	// Mixed-daemon caveat (codex review #73 iter-4 P1, accepted as
-	// known limitation): if a `fleet-handoff`-prefix daemon is
-	// already running on the host (from a prior handoff flow,
-	// internal/handoff.FirstAction), the broad pgrep guard in
-	// `bootstrap_remote_control` short-circuits and a `fleet-coord`
-	// daemon is never spawned. Our injected --remote-control name
-	// would then fail to attach to the live daemon (prefix mismatch).
-	// The slash-command inbox-relay path has the same brittleness
-	// against the running prefix; both should be addressed by a
-	// daemon-prefix unification refactor in a follow-up PR
-	// (out-of-scope per dispatch brief: "Don't touch daemon spawn").
-	// In a pure-coord environment (the v0.2 dogfood case), this PR
-	// works as designed.
+	// Re-attach (`[a]` on an existing coord) — the operator's
+	// reported failure mode in #73 — is the common case where the
+	// daemon IS up (from the coord's prior boot), and there this
+	// flag connects immediately.
+	//
+	// Mixed-daemon caveat: if a `fleet-handoff`-prefix daemon is
+	// running (from a prior handoff flow), the pgrep check below
+	// matches it and we'd inject `fleet-coord-<id>` against a
+	// daemon that filters on `fleet-handoff`. That's a stale-prefix
+	// case the inbox-relay path also doesn't handle perfectly; a
+	// daemon-prefix unification refactor (out-of-scope per dispatch
+	// brief: "Don't touch daemon spawn") would close it. In a
+	// pure-coord environment (the v0.2 dogfood case), this PR works
+	// as designed.
 	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
@@ -250,7 +257,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// shape. Custom argvs are out of scope.
 	preAllocatedID := ""
 	var execCommand []string
-	if opts.coordSpawn {
+	if opts.coordSpawn && remoteControlDaemonRunning() {
 		preAllocatedID = agent.NewID()
 		// Match the daemon prefix from skills/coordinator/remote_control.py
 		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
@@ -416,6 +423,26 @@ func sameCommand(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// remoteControlDaemonRunning is the dispatch coord-spawn gate for
+// `--remote-control` injection (codex review #73 iter-5 P1). Returns
+// true iff `pgrep -f "claude remote-control"` finds a running
+// daemon process. Var so tests can stub the production exec.
+//
+// Why pgrep, not a lock file or unix socket: this matches the EXACT
+// guard already used by the bootstrap paths
+// (skills/coordinator/remote_control.py:spawn_daemon_if_needed AND
+// internal/handoff/handoff.go:FirstAction). Diverging here would
+// risk false-positives/negatives where the dispatch sees a daemon
+// the bootstrap doesn't (or vice-versa). A pgrep failure (binary
+// missing on the host, kernel hiccup) returns false — best-effort,
+// fall back to the inbox-relay path.
+var remoteControlDaemonRunning = func() bool {
+	// pgrep -f matches the full command line. The "-f" + the literal
+	// "claude remote-control" mirrors the bootstrap's pgrep guard
+	// byte-for-byte. Any zero-exit means a match was found.
+	return execCommand("pgrep", "-f", "claude remote-control").Run() == nil
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.
