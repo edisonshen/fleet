@@ -256,7 +256,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// we only rewrite the documented default shell-wrapped claude
 	// shape. Custom argvs are out of scope.
 	preAllocatedID := ""
-	var execCommand []string
+	var rewrittenExecArgv []string
 	if opts.coordSpawn && remoteControlDaemonRunning() {
 		preAllocatedID = agent.NewID()
 		// Match the daemon prefix from skills/coordinator/remote_control.py
@@ -269,7 +269,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// avoids a no-op divergence between Command and ExecCommand
 		// in spawn.Options.
 		if !sameCommand(rewritten, opts.command) {
-			execCommand = rewritten
+			rewrittenExecArgv = rewritten
 		}
 	}
 
@@ -278,7 +278,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Project:           opts.project,
 		Cwd:               opts.cwd,
 		Command:           opts.command,
-		ExecCommand:       execCommand,
+		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: opts.noAutoResume,
 	})
