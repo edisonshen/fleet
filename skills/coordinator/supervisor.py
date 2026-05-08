@@ -111,6 +111,15 @@ def env_poll_max_s() -> int:
 TERMINAL_WORKER_PHASES = frozenset({"done", "blocked", "failed"})
 
 
+# Fallback cadence for periodic_full_reconcile when stuck_check_every=0
+# disables the recovery ladder. PR/CI sweeps for in-review tasks must
+# keep running even with the ladder off — otherwise an operator who
+# tunes off recovery (e.g., for a long manual-review session) silently
+# loses CI-merge-driven status flips. 10 polls = 5 min on the default
+# 30 s base; matches the recovery cadence default for parity.
+_PERIODIC_RECONCILE_FALLBACK_EVERY = 10
+
+
 # ---------- data classes ----------
 
 
@@ -614,40 +623,55 @@ def run_supervisor(
             except Exception as exc:  # noqa: BLE001
                 res.errors.append(f"write_state after reconcile: {exc}")
 
-        # Sparse stuck-check + periodic full reconcile. Both run on the
-        # same Nth-poll cadence — periodic_full_reconcile catches
-        # in-review CI flips that mtime polling misses (no live worker
-        # → no state.json mtime change), and stuck-check fires the
-        # nudge/escalate/block ladder for live workers.
-        if (
+        # Periodic full reconcile + sparse stuck-check. Decoupled
+        # cadences: periodic_full_reconcile runs at every
+        # `stuck_check_every` poll (or fallback _PERIODIC_RECONCILE_FALLBACK
+        # when stuck_check_every=0 disables the ladder); stuck-check
+        # ladder runs only when stuck_check_every > 0. codex iter-2 [P2]:
+        # without the decoupling, an operator who set stuck_check_every=0
+        # to disable the recovery ladder ALSO killed the in-review PR/CI
+        # sweep — leaving merged-but-not-reconciled tasks frozen in
+        # in-review until the supervisor exited.
+        reconcile_cadence = (
+            cfg.stuck_check_every if cfg.stuck_check_every > 0
+            else _PERIODIC_RECONCILE_FALLBACK_EVERY
+        )
+        run_periodic = (
+            periodic_full_reconcile is not None
+            and reconcile_cadence > 0
+            and poll_count % reconcile_cadence == 0
+        )
+        run_stuck = (
             cfg.stuck_check_every > 0
             and poll_count % cfg.stuck_check_every == 0
-        ):
-            res.stuck_check_passes += 1
+        )
+        if run_periodic or run_stuck:
             # Periodic full reconcile FIRST. Running before stuck-check
             # means a worker that just transitioned to in-review (and
             # would otherwise be stuck-flagged on the next pass) drops
             # out of the live-worker probe set BEFORE we evaluate it.
-            if periodic_full_reconcile is not None:
+            if run_periodic:
                 try:
                     periodic_full_reconcile()
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"periodic-reconcile: {exc}")
-            try:
-                stuck_summary = _run_stuck_check_pass(
-                    probes=probes,
-                    project=project,
-                    home=home,
-                    fleet_bin=fleet_bin,
-                    cfg=cfg,
-                    now_unix=now_fn(),
-                    log_stream=log_stream,
-                )
-                res.nudges_sent += stuck_summary.nudges
-                res.escalations += stuck_summary.escalations
-                res.blocks += stuck_summary.blocks
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"stuck-check: {exc}")
+            if run_stuck:
+                res.stuck_check_passes += 1
+                try:
+                    stuck_summary = _run_stuck_check_pass(
+                        probes=probes,
+                        project=project,
+                        home=home,
+                        fleet_bin=fleet_bin,
+                        cfg=cfg,
+                        now_unix=now_fn(),
+                        log_stream=log_stream,
+                    )
+                    res.nudges_sent += stuck_summary.nudges
+                    res.escalations += stuck_summary.escalations
+                    res.blocks += stuck_summary.blocks
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"stuck-check: {exc}")
             try:
                 write_state()
             except Exception as exc:  # noqa: BLE001
@@ -709,12 +733,17 @@ def _run_stuck_check_pass(
         sup_states[p.slug] = sup
 
         cur_phase = str(st.get("phase", "") or "") if st else ""
-        # Phase change resets the stuck counter — the worker is making
-        # progress (a transition counts as activity even if heartbeat
-        # is stale).
+        # Phase change resets the FULL recovery ladder — the worker is
+        # making progress (a transition counts as activity even if
+        # heartbeat is stale). codex iter-2 [P1]: leaving nudged_at /
+        # escalated_at populated meant a recovered worker that idled
+        # later jumped straight to escalate/block on the next stall,
+        # skipping the operator-friendly nudge.
         if cur_phase and cur_phase != sup.last_phase:
             sup.consecutive_stuck_polls = 0
             sup.last_phase = cur_phase
+            sup.nudged_at = 0.0
+            sup.escalated_at = 0.0
 
         # Pre-classify: would the worker BE stuck if we incremented the
         # counter? The classifier requires sup.consecutive_stuck_polls
@@ -726,8 +755,16 @@ def _run_stuck_check_pass(
         if meets_pre_conditions:
             sup.consecutive_stuck_polls += 1
         else:
-            # Recently progressing or terminal — reset.
+            # Recently progressing or terminal — reset the FULL recovery
+            # ladder. codex iter-2 [P1]: a worker that recovered (fresh
+            # heartbeat) but kept its old nudged_at/escalated_at would
+            # jump straight to escalate/block on its next stall instead
+            # of starting at "nudge" again. Treat any pre-condition
+            # failure (heartbeat caught up, terminal phase) as the
+            # equivalent of a phase change for ladder-reset purposes.
             sup.consecutive_stuck_polls = 0
+            sup.nudged_at = 0.0
+            sup.escalated_at = 0.0
             continue
 
         session_alive = tmux_session_alive(p.tmux_session)

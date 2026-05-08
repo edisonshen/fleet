@@ -777,6 +777,160 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     assert cfg.poll_max_s == 60
 
 
+# ---------- codex iter-2 P1/P2 regressions ----------
+
+
+def test_phase_change_resets_recovery_ladder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """codex iter-2 [P1]: a worker that recovered (phase advanced)
+    must reset the FULL recovery ladder, not just the counter. Otherwise
+    a later stall jumps straight to escalate/block."""
+    coord_state_path = fleet_home / "projects" / "fleet" / "coord-state.json"
+    coord_state_path.parent.mkdir(parents=True, exist_ok=True)
+    coord_state_path.write_text(json.dumps({
+        "supervisor": {
+            "alpha-aaaa": {
+                "last_phase": "tdd-red",
+                "consecutive_stuck_polls": 3,
+                "nudged_at": _now() - 1000,         # already nudged
+                "escalated_at": _now() - 500,       # already escalated
+            }
+        },
+        "worker_agent_ids": {"alpha-aaaa": "aaaaaaaa"},
+    }), encoding="utf-8")
+    state_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    # Worker advanced to phase tdd-green (different from last_phase).
+    _write_state_json(state_path, phase="tdd-green", updated_at="1970-01-01T00:00:00Z")
+
+    probes = [supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=state_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+        live_worker=True,
+    )]
+    monkeypatch.setattr(supervisor, "tmux_session_alive", lambda s: True)
+    monkeypatch.setattr(
+        supervisor.subprocess, "run",
+        lambda cmd, *a, **kw: subprocess.CompletedProcess(args=cmd, returncode=0),
+    )
+
+    supervisor._run_stuck_check_pass(
+        probes=probes, project="fleet",
+        home=fleet_home, fleet_bin="fleet",
+        cfg=_cfg(stuck_polls=3, stuck_threshold_s=10),
+        now_unix=_now(),
+        log_stream=io.StringIO(),
+    )
+    after = json.loads(coord_state_path.read_text())
+    sup = after["supervisor"]["alpha-aaaa"]
+    # Phase change → counter, nudged_at, escalated_at all reset.
+    assert sup["consecutive_stuck_polls"] in (0, 1)  # may have re-incremented
+    assert sup["nudged_at"] == 0.0
+    assert sup["escalated_at"] == 0.0
+    assert sup["last_phase"] == "tdd-green"
+
+
+def test_fresh_heartbeat_resets_recovery_ladder(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """codex iter-2 [P1]: heartbeat caught up (within threshold) →
+    treat the same as phase change for ladder-reset purposes."""
+    coord_state_path = fleet_home / "projects" / "fleet" / "coord-state.json"
+    coord_state_path.parent.mkdir(parents=True, exist_ok=True)
+    coord_state_path.write_text(json.dumps({
+        "supervisor": {
+            "alpha-aaaa": {
+                "last_phase": "tdd-red",
+                "consecutive_stuck_polls": 5,
+                "nudged_at": _now() - 1000,
+                "escalated_at": _now() - 500,
+            }
+        },
+        "worker_agent_ids": {"alpha-aaaa": "aaaaaaaa"},
+    }), encoding="utf-8")
+    state_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    # Heartbeat fresh (within threshold) — same phase, but progressing.
+    from datetime import datetime, timezone
+    fresh = datetime.fromtimestamp(_now(), tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    _write_state_json(state_path, phase="tdd-red", updated_at=fresh)
+
+    probes = [supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=state_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+        live_worker=True,
+    )]
+    monkeypatch.setattr(supervisor, "tmux_session_alive", lambda s: True)
+
+    supervisor._run_stuck_check_pass(
+        probes=probes, project="fleet",
+        home=fleet_home, fleet_bin="fleet",
+        cfg=_cfg(stuck_polls=3, stuck_threshold_s=180),
+        now_unix=_now(),
+        log_stream=io.StringIO(),
+    )
+    after = json.loads(coord_state_path.read_text())
+    sup = after["supervisor"]["alpha-aaaa"]
+    assert sup["consecutive_stuck_polls"] == 0
+    assert sup["nudged_at"] == 0.0
+    assert sup["escalated_at"] == 0.0
+
+
+def test_periodic_reconcile_fires_when_stuck_check_disabled(
+    fleet_home: Path,
+) -> None:
+    """codex iter-2 [P2]: setting FLEET_COORD_STUCK_CHECK_EVERY=0 must
+    NOT also disable periodic_full_reconcile. PR/CI sweeps for in-review
+    tasks need to keep running even with the recovery ladder off."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+        live_worker=True,
+    )
+    full_reconcile_calls = {"n": 0}
+
+    def fake_full_reconcile():
+        full_reconcile_calls["n"] += 1
+
+    # 11 active polls + exit. Fallback cadence is 10 → exactly 1 call.
+    seq_iter = iter([[probe]] * 11 + [[]])
+    fake_now_state = {"t": 0.0}
+
+    def fake_refresh():
+        try:
+            return next(seq_iter)
+        except StopIteration:
+            return []
+
+    def fake_sleep(s):
+        fake_now_state["t"] += s
+
+    res = supervisor.run_supervisor(
+        # stuck_check_every=0 disables the recovery ladder, but the
+        # periodic_full_reconcile fallback cadence (10 polls) still
+        # fires.
+        cfg=_cfg(stuck_check_every=0),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now_state["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        periodic_full_reconcile=fake_full_reconcile,
+        log_stream=io.StringIO(),
+    )
+    assert res.stuck_check_passes == 0  # ladder disabled
+    assert full_reconcile_calls["n"] >= 1  # PR/CI sweep still ran
+
+
 # ---------- codex iter-1 P1 regressions ----------
 
 
