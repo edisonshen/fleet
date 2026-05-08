@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -173,11 +175,41 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			opts.taskID, opts.project)
 	}
 
+	// Issue #73: coord-spawn dispatches inject Claude Code's documented
+	// `--remote-control "<session>"` flag so the operator's `[a]`
+	// re-attach can reach the coord's tools without manually running
+	// `/remote-control` inside the session. The remote-control name is
+	// the tmux session name ("fleet-<agent_id>") so it's stable +
+	// discoverable.
+	//
+	// Pre-allocate the agent ID HERE (instead of letting spawn.Spawn
+	// call agent.NewID()) so we can interpolate it into the shell
+	// wrapper's claude argv. Spawn already supports this surface via
+	// Options.PreAllocatedID — used by the handoff path for the same
+	// "ID needed before spawn" reason.
+	//
+	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
+	// keep the original command unchanged: they don't get auto-attach,
+	// matching v0.1's manual-attach contract.
+	//
+	// If the operator overrode --command (scripted pipeline, alt
+	// engine), injectRemoteControlFlag returns the slice unchanged —
+	// we only rewrite the documented default shell-wrapped claude
+	// shape. Custom argvs are out of scope.
+	preAllocatedID := ""
+	command := opts.command
+	if opts.coordSpawn {
+		preAllocatedID = agent.NewID()
+		sessionName := tmux.SessionName(preAllocatedID)
+		command = injectRemoteControlFlag(command, sessionName)
+	}
+
 	rec, err := spawn.Spawn(spawn.Options{
 		TaskID:            opts.taskID,
 		Project:           opts.project,
 		Cwd:               opts.cwd,
-		Command:           opts.command,
+		Command:           command,
+		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: opts.noAutoResume,
 	})
 	if err != nil {
@@ -226,6 +258,60 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
 	return nil
+}
+
+// defaultClaudeInvocation is the literal claude argv inside the shell
+// wrapper that --command defaults to. We rewrite this exact substring
+// when injecting --remote-control so an operator-supplied --command
+// (scripted pipeline, alt engine) is left untouched. See
+// injectRemoteControlFlag.
+const defaultClaudeInvocation = "claude --dangerously-skip-permissions"
+
+// injectRemoteControlFlag rewrites a shell-wrapped claude command to
+// include `--remote-control "<sessionName>"` so the spawned Claude
+// Code session auto-attaches to the remote-control daemon at startup.
+// Returns the slice unchanged if the command does NOT match the
+// documented default shape (custom --command argvs are out of scope —
+// fleet doesn't know their flag conventions).
+//
+// Default shape from newDispatchCmd's --command default:
+//
+//	["sh", "-c", "claude --dangerously-skip-permissions; RC=$?; ..."]
+//
+// We replace the literal "claude --dangerously-skip-permissions" with
+// "claude --dangerously-skip-permissions --remote-control \"<name>\""
+// inside the shell-script element. The trailing arguments (`; RC=$?;
+// ...`) are preserved so the wrapper's clean-exit semantics still
+// apply.
+//
+// Source: Claude Code remote-control CLI flag, documented at
+// https://code.claude.com/docs/en/remote-control.md (issue #73 research
+// finding).
+func injectRemoteControlFlag(command []string, sessionName string) []string {
+	// Default shape: ["sh", "-c", "<script>"]. Reject anything else.
+	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
+		return command
+	}
+	script := command[2]
+	if !strings.Contains(script, defaultClaudeInvocation) {
+		return command
+	}
+	// Inject the flag IMMEDIATELY after the matched substring so the
+	// rest of the script (`; RC=$?; ...`) keeps its position. Quoting
+	// the session name with double quotes mirrors how the documented
+	// CLI usage is written; sessionName is hex (agent ID) plus the
+	// "fleet-" prefix so quoting is mostly defensive (no spaces, no
+	// shell metas) but cheap to keep.
+	replaced := strings.Replace(
+		script,
+		defaultClaudeInvocation,
+		defaultClaudeInvocation+` --remote-control "`+sessionName+`"`,
+		1,
+	)
+	out := make([]string, len(command))
+	copy(out, command)
+	out[2] = replaced
+	return out
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.
