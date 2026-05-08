@@ -67,6 +67,23 @@ func TestRender_FirstActionCarriesRemoteControlInvocation(t *testing.T) {
 	}
 }
 
+// TestRender_FirstActionCarriesRemoteControlSlashCommand pins the
+// issue #56 paragraph that tells the resuming agent to run the
+// `/remote-control` slash command after the daemon is up. Without it,
+// the daemon listens but the chat session never attaches and the
+// operator's mobile pairing is lost across handoff. The byte-golden
+// (TestRender_SkillByteGolden) covers exact-byte verification; this
+// test gives a focused regression signal that's easier to read when
+// the paragraph drifts.
+func TestRender_FirstActionCarriesRemoteControlSlashCommand(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
+	got := string(Render(d))
+	want := "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session."
+	if !strings.Contains(got, want) {
+		t.Errorf("First Action body missing /remote-control slash command instruction:\n%s", got)
+	}
+}
+
 func TestRender_StubBodyIsPlaceholder(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))

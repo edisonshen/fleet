@@ -110,9 +110,17 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // claude.ai pairing carries through the fleet-guard handoff. Idempotent
 // (pgrep guards re-launch when the daemon is already up).
 //
-// Issue #31. Must stay byte-identical with skills/fleet-guard/handoff.py
-// FIRST_ACTION constant — the Python skill writes the same handoff doc
-// shape on auto-handoff and renderers are tested for byte-equality.
+// The middle paragraph (issue #56) tells the agent to run the
+// `/remote-control` slash command after the daemon is up. Without that
+// the daemon is listening but the freshly-spawned chat session never
+// attaches to it — the operator's mobile pairing is lost across handoff.
+// Slash command runs in chat (not bash), so it's a separate paragraph
+// after the bash block, not a piped continuation of it.
+//
+// Issue #31, #56. Must stay byte-identical with
+// skills/fleet-guard/handoff.py FIRST_ACTION constant — the Python skill
+// writes the same handoff doc shape on auto-handoff and renderers are
+// tested for byte-equality.
 const FirstAction = "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
 	"\n" +
 	"```bash\n" +
@@ -122,7 +130,11 @@ const FirstAction = "**Run this BEFORE anything else** to reconnect the new inst
 	"    > /tmp/claude-rc-handoff.log 2>&1 & )\n" +
 	"```\n" +
 	"\n" +
-	"Use the Bash tool with run_in_background: true. Then continue with the sections below."
+	"Use the Bash tool with run_in_background: true.\n" +
+	"\n" +
+	"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n" +
+	"\n" +
+	"Then continue with the sections below."
 
 // Render produces the markdown+frontmatter bytes for d.
 //

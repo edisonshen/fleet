@@ -187,7 +187,11 @@ EXPECTED_GOLDEN = (
     b"    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
     b"```\n"
     b"\n"
-    b"Use the Bash tool with run_in_background: true. Then continue with the sections below.\n"
+    b"Use the Bash tool with run_in_background: true.\n"
+    b"\n"
+    b"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
+    b"\n"
+    b"Then continue with the sections below.\n"
     b"\n"
     b"## Completed\n"
     b"Wrote tests for foo\n"
@@ -240,6 +244,38 @@ class TestRenderByteGolden:
         # Empty recent_activity falls back to the canonical placeholder so
         # the body never has a literal blank section.
         assert handoff.PLACEHOLDER.encode("utf-8") in got
+
+    def test_first_action_carries_remote_control_slash_command(self) -> None:
+        """Issue #56 regression: the FIRST_ACTION paragraph telling the
+        agent to run the `/remote-control` slash command must be present
+        on every rendered doc. Without it, the daemon (started by the
+        bash block above) is listening but the chat session never
+        attaches — operator's mobile pairing is lost across handoff.
+        The byte-golden above covers exact-byte verification; this test
+        gives a focused regression signal that's easy to read when the
+        paragraph drifts."""
+        want = (
+            b"Then run the slash command `/remote-control` "
+            b"(in the chat, not bash) to connect this fresh session "
+            b"to your remote-control session."
+        )
+        assert want in handoff.FIRST_ACTION.encode("utf-8")
+        # Also confirm the rendered doc carries it (covers the scenario
+        # where someone duplicates the constant but skips wiring it
+        # through the renderer).
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234",
+            task_id="demo-task",
+            project="myproj",
+            handoff_type="auto-yellow",
+            number=1,
+            prev_path=None,
+            context_pct=50.0,
+            ts=ts,
+            recent_activity="x",
+        )
+        assert want in got
 
 
 def _diff_first_byte(got: bytes, want: bytes) -> str:
