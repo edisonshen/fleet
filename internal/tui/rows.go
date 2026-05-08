@@ -202,7 +202,7 @@ const coordBootWindow = 60 * time.Second
 // idempotency signal. Same predicate; kept separate so the rendering
 // layer doesn't import keys.go's action wiring.
 func findCoordByTaskID(records []*agent.Record, projectName string) *agent.Record {
-	want := "coord-" + projectName
+	want := coordTaskID(projectName)
 	// Project-tree existence and marker read are 1-3 stats per call,
 	// fast enough to run inline in unifiedProjects on every render.
 	// Cache only if a future profile shows it's hot.

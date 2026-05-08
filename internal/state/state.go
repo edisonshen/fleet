@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -488,23 +489,11 @@ func ReadCoordSpawnMarker(projectName string) string {
 	if err != nil {
 		return ""
 	}
-	// First line, trimmed.
-	line := data
-	for i, b := range line {
-		if b == '\n' || b == '\r' {
-			line = line[:i]
-			break
-		}
-	}
-	s := string(line)
-	// Trim whitespace.
-	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
-		s = s[1:]
-	}
-	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
-		s = s[:len(s)-1]
-	}
-	return s
+	// First line, whitespace-trimmed. SplitN+TrimSpace handles CRLF /
+	// trailing blank lines / leading-or-trailing spaces from a hand-
+	// edit without reimplementing the byte loop.
+	first := strings.SplitN(string(data), "\n", 2)[0]
+	return strings.TrimSpace(first)
 }
 
 // CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.

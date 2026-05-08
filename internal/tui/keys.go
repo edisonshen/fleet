@@ -481,10 +481,10 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		m.pendingAttach = rec.TmuxSession
 		return m, tea.Quit, true
 	}
-	// Path 2.5: in-flight gate. coordSpawnInFlight tracks projects
+	// Path 2.6: in-flight gate. coordSpawnInFlight tracks projects
 	// whose dispatch goroutine has launched but coordSpawnDoneMsg
 	// hasn't arrived yet. During this window the agent record + marker
-	// don't exist on disk, so paths 1/2/findCoord would all miss and
+	// don't exist on disk, so paths 1/2/2.5 would all miss and
 	// we'd duplicate-spawn (codex iter-3 P2 follow-up).
 	if m.coordSpawnInFlight[p.Name] {
 		m.flash = &flashMsg{
