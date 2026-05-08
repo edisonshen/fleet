@@ -90,9 +90,17 @@ PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 # claude.ai pairing carries through the fleet-guard handoff. Idempotent
 # (pgrep guards re-launch when the daemon is already up).
 #
-# Issue #31. MUST stay byte-identical with internal/handoff.FirstAction
-# (Go side) — auto-handoffs (this file) and operator-triggered handoffs
-# (Go) emit the same doc shape, and renderers are tested for equality.
+# The middle paragraph (issue #56) tells the agent to run the
+# `/remote-control` slash command after the daemon is up. Without that
+# the daemon is listening but the freshly-spawned chat session never
+# attaches to it — the operator's mobile pairing is lost across handoff.
+# Slash command runs in chat (not bash), so it's a separate paragraph
+# after the bash block, not a piped continuation of it.
+#
+# Issue #31, #56. MUST stay byte-identical with
+# internal/handoff.FirstAction (Go side) — auto-handoffs (this file) and
+# operator-triggered handoffs (Go) emit the same doc shape, and
+# renderers are tested for byte-equality.
 FIRST_ACTION = (
     "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
     "\n"
@@ -103,7 +111,11 @@ FIRST_ACTION = (
     "    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
     "```\n"
     "\n"
-    "Use the Bash tool with run_in_background: true. Then continue with the sections below."
+    "Use the Bash tool with run_in_background: true.\n"
+    "\n"
+    "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
+    "\n"
+    "Then continue with the sections below."
 )
 
 # Modes where auto-handoff is disabled — see SKILL.md Handoff thresholds.
