@@ -247,14 +247,22 @@ END_DISPATCH
    - `prompt` = the full content of the prompt file (the body, verbatim).
    - `subagent_type` = the value on the `subagent_type:` line (currently `general-purpose`).
    - `run_in_background` = `true` (workers are async; they write progress to `state.json` and the supervisor loop reconciles).
-3. One Agent call per DISPATCH block. Do this BEFORE the next assistant turn — the dispatch contract is "tick output → spawn subagent" with no detour through prose, design discussion, or other tool calls.
-4. The skill has already written the inbox file, minted the `agent_id`, flipped tasks.md to `status=in-progress`, and recorded the agent_id as a note. You are NOT responsible for any of that bookkeeping — only for invoking the Agent tool.
+3. **Capture the Agent tool's return `subagent_id`** (the opaque token the host Claude session generates per Agent call — visible in the Agent call's response object). Immediately register it so the fleet TUI can cross-reference its worker rows with Claude's "N local agents" indicator (issue #94 Phase C):
+
+   ```bash
+   python3 /path/to/skills/coordinator/register_subagent.py \
+     --project <project> <slug> <subagent_id>
+   ```
+
+   Use `Bash(run_in_background=false)` — the call is brief (it RMW's `coord-state.json` under the project's coord lock and exits). On rare contention failures (`coord lock busy after N attempts`) the chip simply stays empty and the worker still runs; do NOT block dispatch on a register failure. Skip this step only when the host Claude does not surface a `subagent_id` for the dispatch (offline mode, mocking).
+4. One Agent call per DISPATCH block (and one register_subagent call per Agent call). Do this BEFORE the next assistant turn — the dispatch contract is "tick output → spawn subagent" with no detour through prose, design discussion, or other tool calls.
+5. The skill has already written the inbox file, minted the `agent_id`, flipped tasks.md to `status=in-progress`, and recorded the agent_id as a note. You are NOT responsible for any of that bookkeeping — only for invoking the Agent tool and registering the returned subagent_id.
 
 If you see N DISPATCH blocks in one tick output, you make N Agent calls (one per block) on this turn before doing anything else.
 
 **Why this matters:** if you skip the Agent call, the worker subagent never spawns. The task sits in `status=in-progress` in tasks.md and the supervisor loop tries to reconcile a worker that doesn't exist. Reliability of this protocol depends on you following it every time without fail. The supervisor will eventually flip the task back to `todo` after stuck-check timeout, but that's hours of lost time.
 
-Phase B (issue #93) covers the `[a]` task-attach replacement on the TUI side and coord-handoff continuity (see "## Resume after handoff" below). Phase C (deferred): TUI subagent_id rendering.
+Phase B (issue #93) covered the `[a]` task-attach replacement on the TUI side and coord-handoff continuity (see "## Resume after handoff" below). Phase C (issue #94) added the `register_subagent` step above + TUI subagent_id rendering.
 
 ## Resume after handoff (issue #93 Phase B2)
 

@@ -374,6 +374,31 @@ def emit(line: str, *, stream=None) -> None:
 
 _SUPERVISOR_KEY = "supervisor"
 _AGENT_IDS_KEY = "worker_agent_ids"
+_SUBAGENT_IDS_KEY = "worker_subagent_ids"
+
+# Claude Agent-tool subagent IDs are opaque strings produced by the host
+# Claude Code session. Phase C only needs them as display tokens — we
+# truncate to the first 8 chars on the TUI — so we don't pin a strict
+# shape here. Defensive bounds keep a malformed coord-state from blowing
+# up the supervisor: empty / over-long / non-printable rejected.
+_SUBAGENT_ID_MAX_LEN = 128
+
+
+def _is_subagent_id(s: str) -> bool:
+    """Loose validation for an Agent-tool subagent_id token. The host
+    Claude doesn't document the exact shape, so we accept any non-empty
+    printable string under the length cap. Whitespace is rejected (the
+    coord agent strips before passing the token in)."""
+    if not isinstance(s, str):
+        return False
+    if not s or len(s) > _SUBAGENT_ID_MAX_LEN:
+        return False
+    for ch in s:
+        if ch.isspace():
+            return False
+        if not ch.isprintable():
+            return False
+    return True
 
 
 def load_supervisor_states(coord_state: dict) -> dict[str, WorkerSupervisorState]:
@@ -435,6 +460,59 @@ def forget_agent_id(coord_state: dict, slug: str) -> None:
     if isinstance(raw, dict) and slug in raw:
         del raw[slug]
         coord_state[_AGENT_IDS_KEY] = raw
+    # Drop the parallel subagent_id mapping at the same beat — the
+    # supervisor never wants to render a stale subagent chip on a
+    # terminal task. Keys diverge only when a coord forgets to call
+    # register_subagent (silent miss → empty chip), never when forgetting.
+    forget_subagent_id(coord_state, slug)
+
+
+def load_subagent_id_map(coord_state: dict) -> dict[str, str]:
+    """Pull the slug → Claude Agent-tool subagent_id mapping written by
+    the coord agent immediately after each Agent tool dispatch. Used by
+    the TUI to render `· <8-char>` cross-reference chips on worker rows
+    so the operator can correlate a fleet row with Claude's "N local
+    agents" indicator (issue #94).
+
+    Returns an empty dict on any malformed shape — the chip simply
+    disappears from the row, no crash.
+    """
+    raw = coord_state.get(_SUBAGENT_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and _is_subagent_id(v):
+            out[k] = v
+    return out
+
+
+def remember_subagent_id(coord_state: dict, slug: str, subagent_id: str) -> None:
+    """Persist a slug → subagent_id mapping inside coord-state.
+
+    Called from the `register_subagent` helper after the coord agent
+    captures the Agent tool's response. Silently no-ops on bad input
+    (caller has already done its own validation; this is the last
+    line of defense before disk).
+    """
+    if not slug or not _is_subagent_id(subagent_id):
+        return
+    raw = coord_state.get(_SUBAGENT_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    raw[slug] = subagent_id
+    coord_state[_SUBAGENT_IDS_KEY] = raw
+
+
+def forget_subagent_id(coord_state: dict, slug: str) -> None:
+    """Drop the subagent_id mapping when a task transitions to terminal.
+    Idempotent. Coord skill calls this implicitly via forget_agent_id —
+    direct calls are reserved for tests + the register_subagent CLI's
+    `--clear` mode (future)."""
+    raw = coord_state.get(_SUBAGENT_IDS_KEY, {})
+    if isinstance(raw, dict) and slug in raw:
+        del raw[slug]
+        coord_state[_SUBAGENT_IDS_KEY] = raw
 
 
 # ---------- the loop driver ----------
