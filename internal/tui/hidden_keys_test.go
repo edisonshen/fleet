@@ -357,4 +357,3 @@ func TestKeyC_DoesNotCollideWithOtherKeys(t *testing.T) {
 		t.Errorf("[c] should keep modeNav, got %v", mm.(Model).mode)
 	}
 }
-

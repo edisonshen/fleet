@@ -119,6 +119,20 @@ var (
 
 	// Box / divider / border characters.
 	boxBorderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBox))
+
+	// Group separator styles (issue #98). The "─── N idle ───" /
+	// "─── N hidden ───" rows are dim by default and brighter when
+	// the cursor selects them. Hidden rows themselves render dim too
+	// so the operator's eye reads "this isn't first-class content".
+	separatorDimStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(colorDim))
+	separatorCursorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("117"))
+	hiddenProjectStyle   = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color(colorDim))
+
+	// hiddenChipStyle — the "<N> hidden — [c] view" footer chip.
+	// Brighter than separatorDimStyle so the chip reads as a nudge,
+	// not noise. Sits between the search-filter chip and uptime in
+	// renderDashboardFooter (issue #98).
+	hiddenChipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
 )
 
 // workerDotStyle picks the leading-dot style for a worker color code.

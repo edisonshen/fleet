@@ -24,7 +24,6 @@ package tui
 
 import (
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -200,21 +199,4 @@ func hiddenProjectsSet() map[string]bool {
 		out[n] = true
 	}
 	return out
-}
-
-// hiddenProjectsCount returns the number of hidden projects on disk.
-// Used by the footer chip's "<N> hidden — [c] view" rendering.
-func hiddenProjectsCount() int {
-	return len(readHiddenProjectsFn())
-}
-
-// hiddenProjectsCacheFile is the absolute path to the on-disk hidden
-// list. Exposed only for test diagnostics; production code routes
-// through readHiddenProjectsFn / writeHiddenProjectsFn.
-func hiddenProjectsCacheFile() string {
-	root, err := state.Root()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(root, "hidden-projects.json")
 }

@@ -30,10 +30,6 @@ func stubHidden(names ...string) {
 	}
 }
 
-// stringPtr is a small util — turns a literal into *string for record
-// fields where the codebase uses pointers.
-func stringPtr(s string) *string { return &s }
-
 func TestUnifiedProjects_FiltersHidden(t *testing.T) {
 	defer resetHiddenStubs()()
 	stubHidden("projects-fleet")

@@ -845,7 +845,35 @@ func (m Model) renderFooter() string {
 		b.WriteString(dimStyle.Render("[esc] clear  [enter] keep filter"))
 		b.WriteString("\n")
 	default:
-		b.WriteString(renderDashboardFooter(time.Since(m.startedAt), usable, m.searchFilter))
+		// Hidden-projects chip data (issue #98). hiddenWith is the
+		// count of hidden projects that DO have fresh activity — the
+		// nudge tells operators the hidden list isn't dormant without
+		// overriding the hide.
+		hiddenSet := hiddenProjectsSet()
+		hiddenCount := len(hiddenSet)
+		hiddenWith := 0
+		if hiddenCount > 0 {
+			window := m.activeWindow
+			if window <= 0 {
+				window = activeWindowDefault
+			}
+			var workers []*WorkerRow
+			if m.dashboard != nil {
+				workers = m.dashboard.Workers
+			}
+			hiddenWith = hiddenWithActivity(
+				m.unifiedProjectsAll(),
+				hiddenSet,
+				workers,
+				m.records,
+				nowFn(),
+				window,
+			)
+		}
+		b.WriteString(renderDashboardFooterWithHidden(
+			time.Since(m.startedAt), usable, m.searchFilter,
+			hiddenCount, hiddenWith,
+		))
 		b.WriteString("\n")
 	}
 	return b.String()
