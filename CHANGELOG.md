@@ -6,6 +6,16 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-09
+
+Coordinator workflow + active PR shepherding ship as fleet-blessed
+standards. Plus operator-facing TUI polish (title shows live binary
+version, count-chip glyphs swap to flat monochrome unicode, expanded
+task list now reads above the status-icons row) and a critical P0
+fix: remote-control flag injection was silently broken across both
+the coord-spawn path AND the handoff-replacement path, so mobile
+claude.ai pairing couldn't see fleet-coord-* sessions at all.
+
 ### Added
 
 - Active PR shepherding SOP in the bundled `~/.fleet/standards.md`
@@ -48,6 +58,66 @@ follows [SemVer](https://semver.org/).
   exists). New reference doc at `docs/STANDARDS-BASELINE.md` documents
   the full baseline + cite trail. Closes
   [#105](https://github.com/edisonshen/fleet/issues/105).
+
+### Changed
+
+- TUI title now uses the injected binary version (`FLEET — v0.6.0
+  Ops Console`) instead of a hardcoded `v0.2 Ops Console` label.
+  Fixes the "is my fleet up to date?" confusion the operator hit
+  when the brew binary was at v0.5.0 but the title still read v0.2.
+  Dev / unset versions render `FLEET — Ops Console` (bare) so a
+  `go run` build doesn't lie about its provenance.
+- TUI count-chip glyphs swap from emoji presentation
+  (`⏳ ▶ 👁 ⚠ ✓`) to flat monochrome unicode (geometric shapes,
+  Apple-flat aesthetic). Renders cleanly in Ghostty + iTerm + tmux
+  without the 3D color emoji that broke the otherwise-monochrome
+  Ops Console palette. Test pinning preserved per-glyph so the
+  contract can't drift silently.
+- TUI: expanded task list now renders ABOVE the count-chips row,
+  not below. Reading order: project name → tasks (the actionable
+  rows) → count chips (the summary). Operator dogfood: count chips
+  are the summary, tasks are the action; eyes should land on the
+  action first. Collapsed projects are byte-identical to today.
+  New `TestProjectRow_TaskListRendersBeforeCountChips` pins the
+  byte-order contract.
+
+### Fixed
+
+- Stuck-marker self-heal now also fires when the agent record is
+  fresh (heartbeat within `2 × coordActiveWindow`), independent of
+  tmux-session liveness. Previously the v0.4.0 self-heal only
+  caught the dead-tmux case (issue #96 gap 1); a fresh-coord case
+  with a stale `coord-spawn-marker` left the `⚠ coord spawn stuck`
+  warning rendered forever even though the coord was happily
+  ticking. The dashboard now cross-references `~/.fleet/agents/<id>.json`
+  and clears the marker the moment the spawn is provably alive.
+  Two heal paths (Path A: dead-tmux, Path B: fresh-record) live
+  side-by-side in `internal/tui/coord_spawn.go` with five new
+  regression tests pinning each.
+- **P0** — fleet-coord remote-control daemon launch + flag
+  injection were both silently broken, so mobile claude.ai pairing
+  couldn't see fleet-coord-* sessions at all. Three concrete bugs:
+  (1) `skills/coordinator/remote_control.py:spawn_daemon_if_needed`
+  used a too-coarse `pgrep -f "claude.*remote-control"` regex that
+  matched the always-running `fleet-handoff` daemon and silently
+  skipped its own coord-daemon launch; now anchors `^claude` plus
+  the `fleet-coord` prefix to mirror the Go-side regex; (2)
+  `cmd/fleet/dispatch.go` gated `--remote-control` flag injection
+  on the coord daemon being already-running, so coord-spawned
+  agents were dispatched without the flag whenever the daemon
+  hadn't booted yet (which was always, due to bug 1); injection is
+  now unconditional for coord-spawn paths since `claude
+  --remote-control "<name>"` retries connection if the daemon
+  comes up later; (3) `internal/handoffop/handoffop.go` and
+  `cmd/fleet/handoff.go` re-spawn paths for handoff-replacement
+  agents also didn't inject the flag, so handed-off coords
+  silently dropped off remote-control; both paths now share the
+  new `internal/spawn/argv.go` helper. Plus `bootstrap_remote_control`
+  no longer fails silently — returns a status enum that bubbles
+  failures into the coord tick's `errors` channel and logs to
+  `/tmp/fleet-bootstrap.log`. The load-bearing regression pin
+  `test_pgrep_pattern_does_not_match_fleet_handoff_daemon`
+  guards against the original misshape.
 
 ## [0.5.0] - 2026-05-09
 
