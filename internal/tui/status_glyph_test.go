@@ -7,6 +7,8 @@ package tui
 import (
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // TestRows_TodoTaskGlyph pins ○ for tasks at status=todo. ○ is the
@@ -69,18 +71,56 @@ func TestRows_InReviewTaskGlyph(t *testing.T) {
 	}
 }
 
-// TestRows_BlockedTaskGlyph pins ⚠ for blocked tasks. PR #76 already
-// covers this via TestRows_AskingTaskGetsAttentionGlyph (full integration
-// path); this is the unit-level mirror of the other status tests so
-// the per-status table is consistent.
+// TestRows_BlockedTaskGlyph pins ⏸ for blocked tasks (issue #103).
+// "Blocked" on a task is a planning state — operator-set when
+// sequencing work — not a worker raise-hand. The ⏸ pause glyph signals
+// "parked, not asking"; the dim/faint label color makes the row recede
+// rather than shout. Compare with worker phase=blocked, which keeps
+// the red row-level attention chip via the project header.
+//
+// Pre-#103 this test asserted ⚠ + red — same code path, different
+// visual semantics.
 func TestRows_BlockedTaskGlyph(t *testing.T) {
 	tr := &taskRow{Slug: "blocked-task-eeee", Status: "blocked"}
 	out := taskBlockLine(tr, 60, false)
-	if !strings.Contains(out, "⚠") {
-		t.Errorf("blocked task line should carry ⚠ glyph, got: %q", out)
+	if !strings.Contains(out, "⏸") {
+		t.Errorf("blocked task line should carry ⏸ glyph, got: %q", out)
+	}
+	if strings.Contains(out, "⚠") {
+		t.Errorf("blocked task line must NOT carry the ⚠ red-alert glyph (issue #103), got: %q", out)
 	}
 	if !strings.Contains(out, "blocked-task-eeee") {
 		t.Errorf("blocked task line should still render slug, got: %q", out)
+	}
+}
+
+// TestTaskStatusStyles_BlockedIsDimAndFaint pins the issue #103 visual
+// contract: the blocked-task glyph + label both render in faint dim
+// style — not bold/red. The previous attentionChipStyle treatment
+// conflated planning-blocked tasks with worker phase=blocked
+// (raise-hand). With the styles dim, the row recedes; the chip-level
+// attention signal (worker-driven) is the only red-alert surface left.
+//
+// Asserting the lipgloss Style fields directly (Faint + Foreground)
+// avoids depending on a TTY profile in unit tests — lipgloss strips
+// ANSI in non-TTY runs, so a substring check on the raw rendered
+// output can't see the color.
+func TestTaskStatusStyles_BlockedIsDimAndFaint(t *testing.T) {
+	glyph, glyphStyle, labelStyle := taskStatusStyles("blocked")
+	if glyph != "⏸" {
+		t.Errorf("blocked glyph want ⏸, got %q", glyph)
+	}
+	if !glyphStyle.GetFaint() {
+		t.Errorf("blocked glyph style must be faint (issue #103: planning state should recede)")
+	}
+	if !labelStyle.GetFaint() {
+		t.Errorf("blocked label style must be faint (issue #103: planning state should recede)")
+	}
+	// colorDim ("243") is the dim foreground used across the dim
+	// statuses (todo glyph, footer subtle text, etc). Pin it so a
+	// future refactor that quietly swaps blocked back to red gets caught.
+	if got := glyphStyle.GetForeground(); got != lipgloss.Color("243") {
+		t.Errorf("blocked glyph foreground want colorDim (243), got %v", got)
 	}
 }
 
@@ -109,7 +149,7 @@ func TestRows_CursorOverridesStatusGlyph_AllStatuses(t *testing.T) {
 		{"ready", "ready", "◐"},
 		{"in-progress", "in-progress", "▶"},
 		{"in-review", "in-review", "⟳"},
-		{"blocked", "blocked", "⚠"},
+		{"blocked", "blocked", "⏸"}, // issue #103: ⏸ replaces ⚠
 		{"done", "done", "✓"},
 		{"abandoned", "abandoned", "•"},
 	}
