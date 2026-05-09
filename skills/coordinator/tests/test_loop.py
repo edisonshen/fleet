@@ -87,17 +87,49 @@ def fleet_run_recorder():
         yield calls
 
 
+class _DispatchSubprocessHandle(list):
+    """A list subclass that doubles as a fixture handle.
+
+    `append` / `pop` / `__iter__` work like a normal list of agent_ids
+    (the legacy contract: pop the next id off the stack to override
+    mint_agent_id). The .seen_cmds attribute carries the recorder for
+    `dispatch.subprocess.run` invocations so tests can assert no
+    `fleet dispatch` shell-out happened (issue #84 Phase A).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_cmds: list[list[str]] = []
+
+
 @pytest.fixture
 def dispatch_subprocess(monkeypatch):
-    """Stub dispatch.subprocess.run to mimic `fleet dispatch` success.
+    """Stub dispatch.subprocess.run for fetch_standards / fetch_learnings.
 
-    Returns a stack of agent IDs to hand out — each call pops one.
+    Issue #84 Phase A: the coord skill no longer calls `fleet dispatch`
+    via subprocess. Workers spawn as Agent-tool subagents; the skill
+    mints agent_ids itself (dispatch.mint_agent_id). The fixture's
+    legacy "ids" stack is now used to override mint_agent_id so tests
+    can pin a specific agent_id (was previously the dispatch stdout
+    parse target).
+
+    Two responsibilities:
+      1. mock subprocess.run to return canned stdout for the only
+         remaining shell-outs in dispatch.py — `fleet standards show`
+         and `fleet learnings list`. Anything else returns 0/empty
+         (loop.py's _run_fleet is patched separately by
+         fleet_run_recorder).
+      2. monkeypatch dispatch.mint_agent_id to consume the `ids`
+         list — preserves test-determinism. Empty list → falls back
+         to the production secrets.token_hex implementation.
+
+    A test that asserts "subprocess.run was NOT called for `fleet
+    dispatch`" can inspect `<fixture>.seen_cmds`.
     """
-    ids: list[str] = []
+    ids = _DispatchSubprocessHandle()
 
     def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
-        # Distinguish CLI calls inside dispatch.py: dispatch_worker /
-        # fetch_standards / fetch_learnings all route through subprocess.run.
+        ids.seen_cmds.append(list(cmd))
         if cmd[1:3] == ["standards", "show"]:
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="# Standards\n", stderr="",
@@ -106,17 +138,22 @@ def dispatch_subprocess(monkeypatch):
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr="",
             )
-        if cmd[1] == "dispatch":
-            agent_id = ids.pop(0) if ids else "abcdef01"
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout=f"agent {agent_id} dispatched\n", stderr="",
-            )
         return subprocess.CompletedProcess(
             args=cmd, returncode=0, stdout="", stderr="",
         )
 
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
+
+    # mint_agent_id override: pop the next id off the test-supplied
+    # stack; fall through to the production helper when empty.
+    real_mint = dispatch.mint_agent_id
+
+    def fake_mint() -> str:
+        if ids:
+            return ids.pop(0)
+        return real_mint()
+
+    monkeypatch.setattr(dispatch, "mint_agent_id", fake_mint)
     return ids
 
 
@@ -148,6 +185,47 @@ def test_tick_dispatches_ready_task(
     assert len(statuses) == 1
     notes = [c for c in fleet_run_recorder if "note" in c]
     assert any("abcdef01" in (c[-1] if c else "") for c in notes)
+    # Issue #84 Phase A: a DISPATCH block is emitted for the coord
+    # agent to act on (Agent tool invocation). One block per dispatch.
+    assert len(result.dispatch_instructions) == 1
+    block = result.dispatch_instructions[0]
+    assert block.startswith("DISPATCH: ready-aaaa")
+    assert "agent_id: abcdef01" in block
+    assert "run_in_background: true" in block
+    assert "subagent_type: general-purpose" in block
+    assert str(inbox_file) in block
+    assert block.rstrip().endswith("END_DISPATCH")
+    # Issue #84 Phase A regression guard: status flip is durable
+    # BEFORE the DISPATCH block is surfaced. Without this ordering,
+    # a coord that reads the block, calls Agent tool, and the worker
+    # races to `fleet workers update` before the status=in-progress
+    # write lands could cause the next tick's _dispatch_ready to
+    # pick the same task again — duplicate dispatch, two subagents
+    # for one slug. Codex iter-4 [P1] regress for the legacy
+    # subprocess path; same invariant applies here.
+    in_progress_idx = next(
+        i for i, c in enumerate(fleet_run_recorder)
+        if c[1:3] == ["tasks", "set"] and "status=in-progress" in c
+    )
+    note_idx = next(
+        i for i, c in enumerate(fleet_run_recorder)
+        if c[1:3] == ["tasks", "note"]
+        and any("abcdef01" in arg for arg in c)
+    )
+    # status flip happens FIRST (smallest index), note happens LAST
+    # (largest index) — confirms _apply_dispatch ran the full
+    # mutation chain before result.dispatch_instructions accumulates.
+    assert in_progress_idx < note_idx, (
+        f"status flip must precede note: idx {in_progress_idx} >= {note_idx}"
+    )
+    # Issue #84 Phase A: subprocess.run MUST NOT be called for
+    # `fleet dispatch`. fetch_standards + fetch_learnings still
+    # route through subprocess.run, but the dispatch shell-out is
+    # gone — workers spawn via the coord agent's Agent tool.
+    seen_cmds = dispatch_subprocess.seen_cmds
+    assert all(
+        cmd[1:2] != ["dispatch"] for cmd in seen_cmds
+    ), f"unexpected `fleet dispatch` subprocess call: {seen_cmds!r}"
 
 
 # ---------- reconcile: dead worker, no PR ----------
@@ -1033,10 +1111,10 @@ def test_main_writes_json_summary_on_run(
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     monkeypatch.setenv("FLEET_AGENT_ID", "cccccc01")
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
-    # Patch dispatch's subprocess to satisfy the dispatch chain.
+    # Issue #84 Phase A: dispatch.subprocess.run still gets called
+    # for fetch_standards / fetch_learnings; mock it to a no-op.
     fake = subprocess.CompletedProcess(
-        args=[], returncode=0,
-        stdout="agent abcdef01 dispatched\n", stderr="",
+        args=[], returncode=0, stdout="", stderr="",
     )
 
     def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
@@ -1045,10 +1123,22 @@ def test_main_writes_json_summary_on_run(
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)
     rc = loop.main([])
     assert rc == 0
-    out = capsys.readouterr().out.strip()
-    parsed = json.loads(out)
+    out = capsys.readouterr().out
+    # Issue #84 Phase A: main() prints the DISPATCH block(s) BEFORE
+    # the JSON summary so the coord agent (Claude) sees them as
+    # parseable plain text. The summary is the LAST line of stdout.
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    assert lines, f"main() emitted no output: {out!r}"
+    # Locate the JSON line — it's the only one that parses as JSON.
+    json_line = lines[-1]
+    parsed = json.loads(json_line)
     assert parsed["dispatched"] == 1
     assert parsed["skipped"] is False
+    # The DISPATCH block precedes the JSON line.
+    assert any(ln.startswith("DISPATCH: ready-aaaa") for ln in lines), (
+        f"main() must emit DISPATCH block before JSON summary; saw: {lines}"
+    )
+    assert any(ln.strip() == "END_DISPATCH" for ln in lines)
 
 
 # ---------- coord_id published into coordinator.lock body (issue #55) ----------

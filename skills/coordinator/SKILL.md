@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Per-project coordinator that owns tasks.md, dispatches workers under fleet dispatch, monitors PR/CI via gh, and raises hand to the operator only when human input is needed. Reads tasks.md (read-only via parse.py) and mutates exclusively through the fleet CLI (`fleet tasks set`, `fleet tasks note`, etc.) — Go remains the authoritative writer. One coordinator per project enforced via NB-flock on coordinator.lock. v0.2 single-worker mode by default; cap > 1 enabled when worktrees land in v0.2.x.
+description: Per-project coordinator that owns tasks.md, dispatches workers as Claude Agent-tool subagents (run_in_background), monitors PR/CI via gh, and raises hand to the operator only when human input is needed. Reads tasks.md (read-only via parse.py) and mutates exclusively through the fleet CLI (`fleet tasks set`, `fleet tasks note`, etc.) — Go remains the authoritative writer. One coordinator per project enforced via NB-flock on coordinator.lock. v0.2 single-worker mode by default; cap > 1 enabled when worktrees land in v0.2.x.
 ---
 
 # coordinator
@@ -37,6 +37,41 @@ This section mirrors the first-turn dispatch prompt (`coordSpawnPrompt` in `inte
 - Talk to the operator about design, scope, priority.
 
 If the operator says "implement X" or "fix this bug", the right response is "that's worker work — let me file the task and dispatch", NOT to start editing files. The coord is a manager; a coord that does the work itself burns the operator's main context on what should be a detached session.
+
+## Worker dispatch protocol (issue #84 Phase A)
+
+Workers are spawned as **Agent-tool subagents** of this coord agent's Claude session — NOT as detached tmux sessions. They appear in the operator's chat as "N local agents" (Claude-native indicator) and the coord supervisor reads their `state.json` files identically to the v0.2.0 detached-tmux flow.
+
+The Python skill (`/coordinator`) cannot invoke Claude's Agent tool directly — Agent is a Claude tool, not a Python API. Instead, the skill emits structured `DISPATCH:` blocks on stdout and YOU (the coord agent) act on them.
+
+**Block format the skill emits:**
+
+```
+DISPATCH: <slug>
+  agent_id: <8hex>
+  description: <short>
+  prompt_file: <abs path>
+  run_in_background: true
+  subagent_type: general-purpose
+END_DISPATCH
+```
+
+**What you (the coord agent) MUST do every time you see a DISPATCH block:**
+
+1. Read the file at `prompt_file` (absolute path under `~/.fleet/inbox/<agent_id>.md`).
+2. Invoke the Agent tool exactly once with these parameters:
+   - `description` = the value on the `description:` line.
+   - `prompt` = the full content of the prompt file (the body, verbatim).
+   - `subagent_type` = the value on the `subagent_type:` line (currently `general-purpose`).
+   - `run_in_background` = `true` (workers are async; they write progress to `state.json` and the supervisor loop reconciles).
+3. One Agent call per DISPATCH block. Do this BEFORE the next assistant turn — the dispatch contract is "tick output → spawn subagent" with no detour through prose, design discussion, or other tool calls.
+4. The skill has already written the inbox file, minted the `agent_id`, flipped tasks.md to `status=in-progress`, and recorded the agent_id as a note. You are NOT responsible for any of that bookkeeping — only for invoking the Agent tool.
+
+If you see N DISPATCH blocks in one tick output, you make N Agent calls (one per block) on this turn before doing anything else.
+
+**Why this matters:** if you skip the Agent call, the worker subagent never spawns. The task sits in `status=in-progress` in tasks.md and the supervisor loop tries to reconcile a worker that doesn't exist. Reliability of this protocol depends on you following it every time without fail. The supervisor will eventually flip the task back to `todo` after stuck-check timeout, but that's hours of lost time.
+
+Phase B (deferred): `[a]` task-attach replacement (no tmux to attach to), coord-handoff lifecycle for surviving Agent subagents. Phase C (deferred): TUI subagent_id rendering. This protocol covers Phase A only — dispatch mechanism.
 
 ## Invocation
 
@@ -139,8 +174,14 @@ The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet
      else:
        worker_cwd = repo
      prompt = build_worker_prompt(t, stds, learn, branch=worker/<slug>)
-     agent_id = `fleet dispatch <slug> --project <p> --cwd <worker_cwd>`
+     # Issue #84 Phase A: skill mints agent_id, writes inbox, emits a
+     # DISPATCH block. Coord agent (Claude session) reads the block
+     # and invokes the Agent tool with run_in_background=true. The
+     # Python skill no longer shells out to `fleet dispatch` for
+     # workers — that path stayed for v0.1 manual use only.
+     agent_id = mint_agent_id()                           # 8-hex token
      write_worker_inbox(agent_id, prompt)                # ~/.fleet/inbox/<agent>.md
+     emit DISPATCH block on stdout                        # coord acts on it
      `fleet tasks set <slug> status=in-progress`
      `fleet tasks set <slug> branch=worker/<slug>`
      `fleet tasks set <slug> worktree=<wt>`               # cap > 1 only
@@ -218,7 +259,7 @@ Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
 
 Every `fleet workers update` invocation in the rendered prompt includes `--project <project>` so heartbeats land in the right `~/.fleet/projects/<project>/workers/...` tree even when the worker's cwd basename differs from the project name.
 
-`dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. fleet-guard's SessionStart hook reads that file on the worker's first turn and injects it as `[OPERATOR] <body>`.
+`dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. The coord agent (Claude session) reads that file and passes the body verbatim as the Agent tool's `prompt` parameter (issue #84 Phase A). fleet-guard's SessionStart hook injection from the v0.1/v0.2.0 era still works for any tmux-spawned worker (e.g., a manual `fleet dispatch` invocation), but the coord skill itself no longer takes that path — workers are Agent subagents now.
 
 ## Sentinel grammar (worker → coord)
 
@@ -268,7 +309,8 @@ The skill's tick lifecycle is intentionally lean (no in-process state survives a
 |---------|----------|
 | tasks.md parse error | `tick()` returns `skipped=True, reason="parse-error"` and records the error. Coord logs to stderr; operator fixes manually. |
 | Two coordinators race | NB-flock makes the second exit cleanly. |
-| `fleet dispatch` exits non-zero | Recorded in `TickResult.errors`; the candidate task stays in ready, retried next tick. |
+| Coord agent skips a DISPATCH block | Worker never spawns. Task stays in `status=in-progress`; supervisor stuck-check eventually flips to `todo` and re-dispatches. Mitigation: SKILL.md "Worker dispatch protocol" pins the contract; review skipping behavior on every coord handoff. |
+| Inbox write fails (permissions, disk full) | Recorded in `TickResult.errors`; the candidate task stays in ready, retried next tick. No DISPATCH block emitted, no Agent call attempted. |
 | `fleet tasks set` exits non-zero | Recorded; partial mutations possible (e.g. status set but note not). Next reconcile catches it. |
 | `gh pr checks` errors / not installed | `_CIResult(error=...)` — caller leaves the task as-is until next tick. |
 | Inbox archive scan finds nothing | Tick proceeds normally. |
@@ -278,7 +320,7 @@ The skill's tick lifecycle is intentionally lean (no in-process state survives a
 ## Tools used
 
 - `python3` ≥ 3.9 (stdlib only — `subprocess`, `pathlib`, `re`, `tempfile`, `fcntl`, `json`).
-- `fleet` binary on PATH (provides Phase B CLI: `fleet tasks ...`, `fleet learnings ...`, `fleet standards ...`, `fleet dispatch`, `fleet message`).
+- `fleet` binary on PATH (provides Phase B CLI: `fleet tasks ...`, `fleet learnings ...`, `fleet standards ...`, `fleet message`, `fleet workers update`). Issue #84 Phase A: the coord skill no longer shells out to `fleet dispatch` for worker spawn — that path stays for v0.1 manual use only.
 - `gh` binary on PATH for PR-status checks. Optional: when missing, the reconcile path skips CI evaluation and leaves PR'd tasks as in-review.
 
 ## Hook bindings
@@ -292,7 +334,7 @@ Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/
 | `SKILL.md` | This document. Frontmatter + invocation + loop-in-prose + worker prompt template. |
 | `loop.py` | One-tick driver. Public entry: `tick(project, ...)` and `main(argv)`. |
 | `parse.py` | Python mirror of `internal/tasks` — read-only inside the skill, byte-equal with Go. |
-| `dispatch.py` | Worker prompt assembly + `fleet dispatch` caller + inbox stub writer. |
+| `dispatch.py` | Worker prompt assembly + `mint_agent_id` + DISPATCH-block formatter + inbox writer (issue #84 Phase A — no longer shells out to `fleet dispatch`). |
 | `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). Optimistic on no-paths inputs. |
 | `loop._has_conflict_with_inflight` | Conservative loop-side wrapper: a task with no `Files:` line is treated as matching every in-flight task. Operators opt out per task by adding `Files: <real-path>`. |
 

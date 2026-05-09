@@ -313,21 +313,21 @@ def _ready_task(slug: str = "alpha-1234") -> parse.Task:
 
 
 def test_dispatch_ready_cap1_does_not_invoke_worktree(tmp_path) -> None:
-    """Single-worker mode is byte-identical to v0.2.0 — no git, no
-    worktree resolution, no worktree field on the dispatch action.
+    """Single-worker mode is byte-identical to v0.2.0-style behavior
+    minus the `fleet dispatch` shell-out (issue #84 Phase A): no git,
+    no worktree resolution, no worktree field on the dispatch action.
 
-    `dispatch_mod.subprocess` and `worktree_mod.subprocess` are the
-    SAME `subprocess` module reference, so we patch once globally and
-    track invocations to assert no git was called.
+    Since the skill no longer calls `fleet dispatch`, we assert via
+    the rendered DISPATCH instruction (one per dispatched task) and
+    by checking subprocess never receives a `dispatch` argv.
     """
     t = _ready_task()
-    fake_dispatch = _ok(stdout="agent abcdef01 dispatched\n")
 
     calls: list[list[str]] = []
 
     def _runner(cmd, *args, **kwargs):
         calls.append(list(cmd))
-        return fake_dispatch
+        return _ok()
 
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
          patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
@@ -340,17 +340,18 @@ def test_dispatch_ready_cap1_does_not_invoke_worktree(tmp_path) -> None:
     assert len(actions) == 1
     assert actions[0].error == ""
     assert actions[0].worktree == ""  # cap=1 → no worktree field
+    # Issue #84 Phase A: dispatch instruction is the new spawn signal.
+    assert actions[0].dispatch_instruction.startswith("DISPATCH:")
     # No git invocations in cap=1 mode.
     assert not any(c[0] == "git" for c in calls), f"unexpected git: {calls}"
     # No `fleet workers worktree-path` invocations either.
     assert not any(
         len(c) >= 3 and c[1] == "workers" and c[2] == "worktree-path" for c in calls
     ), f"unexpected worktree-path resolve: {calls}"
-    # fleet dispatch's --cwd is the repo, not a worktree path.
-    dispatch_calls = [c for c in calls if len(c) >= 2 and c[1] == "dispatch"]
-    assert dispatch_calls
-    cmd = dispatch_calls[0]
-    assert cmd[cmd.index("--cwd") + 1] == "/repo"
+    # Issue #84 Phase A: NO `fleet dispatch` subprocess shell-out.
+    assert not any(
+        len(c) >= 2 and c[1] == "dispatch" for c in calls
+    ), f"unexpected `fleet dispatch` call: {calls}"
 
 
 # ---------- loop.py: cap=2 worktree-mode dispatch ----------
@@ -380,8 +381,9 @@ def _make_subprocess_router(routes: dict, calls: list | None = None):
 def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     """cap > 1: each task gets a worktree at the path returned by
     `fleet workers worktree-path`, `git worktree add` runs with the
-    expected argv, and `fleet dispatch --cwd <worktree>` is the
-    worker's cwd (NOT the repo root)."""
+    expected argv, and the rendered DISPATCH block points at the
+    inbox file written for that worker (issue #84 Phase A — no more
+    `fleet dispatch` subprocess)."""
     t = _ready_task("alpha-1234")
     wt_path = str(tmp_path / ".fleet" / "projects" / "proj" / "worktrees" / "alpha-1234")
     repo = "/repo"
@@ -389,8 +391,6 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_path + "\n"),
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -419,11 +419,19 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
         for c in git_calls
     ), f"expected `git worktree add` call missing; saw: {git_calls}"
 
-    # `fleet dispatch --cwd <worktree>` (NOT the repo root).
-    disp_calls = [c for c in calls if len(c) >= 2 and c[1] == "dispatch"]
-    assert disp_calls, "fleet dispatch was not invoked"
-    cmd = disp_calls[0]
-    assert cmd[cmd.index("--cwd") + 1] == wt_path
+    # Issue #84 Phase A: no `fleet dispatch` shell-out. The DISPATCH
+    # block is the spawn signal; agent_id is minted in-process.
+    assert not any(
+        len(c) >= 2 and c[1] == "dispatch" for c in calls
+    ), f"unexpected `fleet dispatch` call: {calls}"
+    block = actions[0].dispatch_instruction
+    assert block.startswith("DISPATCH: alpha-1234")
+    assert "agent_id: " in block
+    assert "run_in_background: true" in block
+    # The prompt_file path is what the coord agent reads + passes to
+    # the Agent tool — must point at the inbox under fleet_home.
+    assert str(tmp_path) in block
+    assert "/inbox/" in block
 
 
 def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None:
@@ -441,8 +449,6 @@ def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_path + "\n"),
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     fleet_home_dir = str(tmp_path / "fleet_home")
@@ -460,8 +466,11 @@ def test_dispatch_ready_cap2_marks_prompt_worktree_pre_created(tmp_path) -> None
         )
     assert len(actions) == 1
     assert actions[0].error == ""
-    # Read the inbox file the dispatch path wrote.
-    inbox_path = os.path.join(fleet_home_dir, "inbox", "abcdef01.md")
+    # Read the inbox file the dispatch path wrote (issue #84 Phase A:
+    # the agent_id is minted by dispatch.mint_agent_id; we look up
+    # the path on the action rather than guessing the token).
+    assert actions[0].agent_id, "dispatch action missing minted agent_id"
+    inbox_path = os.path.join(fleet_home_dir, "inbox", f"{actions[0].agent_id}.md")
     with open(inbox_path, "r", encoding="utf-8") as fh:
         prompt = fh.read()
     assert "git checkout -b worker/alpha-1234" not in prompt, \
@@ -491,7 +500,11 @@ def test_dispatch_ready_cap2_skips_when_worktree_path_unresolvable(tmp_path) -> 
         )
     assert len(actions) == 1
     assert "worktree-path resolution failed" in actions[0].error
-    # No fleet dispatch attempted.
+    # Issue #84 Phase A: the path bails out before minting an
+    # agent_id, so no DISPATCH instruction is emitted.
+    assert actions[0].dispatch_instruction == ""
+    # No fleet dispatch attempted (it's been removed entirely; pin
+    # the no-shell-out invariant here too).
     assert not any(len(c) >= 2 and c[1] == "dispatch" for c in calls), calls
     # No git worktree add either.
     assert not any(c[:1] == ["git"] for c in calls), calls
@@ -521,7 +534,12 @@ def test_dispatch_ready_cap2_skips_when_git_worktree_add_fails(tmp_path) -> None
         )
     assert len(actions) == 1
     assert "not a git repository" in actions[0].error
-    # No fleet dispatch attempted when worktree create fails.
+    # Issue #84 Phase A: no DISPATCH instruction when worktree create
+    # fails — agent_id mint + inbox write are both downstream of the
+    # worktree gate.
+    assert actions[0].dispatch_instruction == ""
+    # No fleet dispatch attempted (the shell-out is gone; assertion
+    # remains for future regression).
     assert not any(len(c) >= 2 and c[1] == "dispatch" for c in calls), calls
 
 
