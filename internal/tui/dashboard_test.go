@@ -547,8 +547,10 @@ func TestView_DashboardSurfacesBanners(t *testing.T) {
 	}
 }
 
-// TestView_FooterShowsKeybinds pins the footer renders the mockup's
-// chip strip + uptime indicator.
+// TestView_FooterShowsKeybinds pins the footer renders the action
+// chip strip + uptime indicator. Issue #90: nav (j/k) and panel
+// (←/→) chips are intentionally absent — they're documented in the
+// [?] help overlay only.
 func TestView_FooterShowsKeybinds(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
@@ -556,7 +558,7 @@ func TestView_FooterShowsKeybinds(t *testing.T) {
 	m.height = 30
 	m.dashboard = scanDashboard(time.Now())
 	out := m.View()
-	for _, want := range []string{"j/k", "nav", "uptime"} {
+	for _, want := range []string{"⏎", "open", "uptime"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer should include %q, got:\n%s", want, out)
 		}
