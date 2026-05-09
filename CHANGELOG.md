@@ -6,6 +6,19 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Coordinator workflow runbook: the six-step engagement flow
+  (DISCUSS → SPLIT → TASK LIST → IMPLEMENT → PR-TRACK → DONE) is now
+  codified in `skills/coordinator/SKILL.md` and mirrored at
+  `docs/COORDINATOR-WORKFLOW.md` for operators. Locks in approval-gate
+  semantics, fix-/rebase-subagent dispatch templates, and the G5
+  progress-doc schema (`~/.fleet/projects/<p>/workflow.md`).
+- `skills/coordinator/workflow_state.py`: atomic-publish writer for
+  the per-project progress doc — tmp-fd → fsync → `os.replace`,
+  schema v1, with 28 unit tests covering validation and overwrite
+  atomicity.
+
 ## [0.5.0] - 2026-05-09
 
 Worker lifecycle hygiene + attention-chip accuracy. Workers reaching a

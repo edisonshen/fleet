@@ -23,8 +23,8 @@ You hand a coord a problem. It plans with you, splits, dispatches workers, watch
                                                                                 │
                                                                                 ▼
                                                                           6. DONE
-                                                                          fleet tasks set
-                                                                          status=done pr_url=…
+                                                                          fleet tasks set pr_url=…
+                                                                          fleet tasks set status=done
                                                                           advance; loop until empty
 ```
 
@@ -85,7 +85,7 @@ The impl-subagent returns a PR URL. The coord:
 
 ### 6. DONE
 
-CI green + PR merged → `fleet tasks set <slug> status=done pr_url=<url>`. Coord advances to the next task.
+CI green + PR merged → coord runs `fleet tasks set <slug> pr_url=<url>` followed by `fleet tasks set <slug> status=done` (the CLI accepts one `key=value` per call). Coord advances to the next task.
 
 When the task list is empty: `"all tasks done; next direction?"` — and the coord waits.
 
