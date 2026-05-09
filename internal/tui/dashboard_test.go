@@ -337,7 +337,16 @@ func TestScanDashboard_SkipsLocksDir(t *testing.T) {
 func TestScanDashboard_AttentionProjectsSortedFirst(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "alpha", TaskCounts{Todo: 1})
-	seedTasks(t, pdir, "zulu", TaskCounts{Todo: 1, Blocked: 1})
+	// Issue #103: attention is fired by worker phase=blocked only —
+	// task status=blocked is planning state and no longer contributes.
+	// Seed zulu with a worker raising its hand so the sort-first
+	// invariant ("attention projects rise to the top") still has a
+	// signal to assert against.
+	seedTasks(t, pdir, "zulu", TaskCounts{Todo: 1})
+	seedWorker(t, pdir, "zulu", "needs-input-aaaa", workers.State{
+		Phase:         workers.PhaseBlocked,
+		BlockedReason: "operator clarification on API shape",
+	})
 
 	snap := scanDashboard(time.Now())
 	if len(snap.Projects) != 2 {

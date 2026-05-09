@@ -58,14 +58,20 @@ func seedBlockedTask(t *testing.T, projectsRoot, project, slug string, status ta
 	}
 }
 
-// TestRows_AskingTaskGetsAttentionGlyph pins that a blocked-status
-// task row renders the ⚠ attention glyph in the expansion. Without
-// this signal the operator sees "1 attn" on the project chip but
-// can't tell WHICH task is asking.
-func TestRows_AskingTaskGetsAttentionGlyph(t *testing.T) {
+// TestRows_BlockedTaskGetsPauseGlyph pins that a blocked-status task
+// row renders the ⏸ pause glyph in the expansion (issue #103). The
+// glyph distinguishes "planning state — task is paused on a sequencing
+// dep" from worker phase=blocked, which is the actionable raise-hand
+// signal and gets the row-level attention chip instead. Operators
+// expanding a project should still see WHICH task is parked; they
+// shouldn't read it as a red-alert "answer me".
+//
+// Pre-#103 this test asserted ⚠ for blocked tasks — same code path,
+// different visual semantics.
+func TestRows_BlockedTaskGetsPauseGlyph(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "needs-input-aaaa", tasks.StatusBlocked,
-		"blocked because: need operator clarification on the API shape")
+		"blocked because: waiting on upstream API spec sign-off")
 
 	m := New("test")
 	m.width = 130
@@ -77,13 +83,16 @@ func TestRows_AskingTaskGetsAttentionGlyph(t *testing.T) {
 	if !strings.Contains(out, "needs-input-aaaa") {
 		t.Fatalf("blocked task slug should render in expansion, got:\n%s", out)
 	}
-	// The ⚠ glyph must appear ahead of the slug on the same line. We
-	// don't pin the exact column (lipgloss escapes around it shift
-	// with palette/bold rendering) — substring on the line is enough.
+	// The ⏸ glyph must appear ahead of the slug on the same line. We
+	// don't pin the exact column (lipgloss escapes around it shift with
+	// palette/bold rendering) — substring on the line is enough.
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "needs-input-aaaa") {
-			if !strings.Contains(line, "⚠") {
-				t.Errorf("blocked task line should carry ⚠ attention glyph, got:\n%s", line)
+			if !strings.Contains(line, "⏸") {
+				t.Errorf("blocked task line should carry ⏸ pause glyph, got:\n%s", line)
+			}
+			if strings.Contains(line, "⚠") {
+				t.Errorf("blocked task line must NOT carry the ⚠ red-alert glyph (issue #103: planning state, not actionable), got:\n%s", line)
 			}
 			return
 		}
@@ -114,7 +123,7 @@ func TestRows_DoneTaskGetsCheckGlyph(t *testing.T) {
 func TestRows_DefaultTaskGetsBulletGlyph(t *testing.T) {
 	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "future-unknown"}
 	out := taskBlockLine(tr, 60, false)
-	if strings.Contains(out, "⚠") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") || strings.Contains(out, "✗") {
+	if strings.Contains(out, "⚠") || strings.Contains(out, "⏸") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") || strings.Contains(out, "✗") {
 		t.Errorf("unknown-status task should NOT carry status glyph, got: %q", out)
 	}
 	if !strings.Contains(out, "•") {
@@ -1329,41 +1338,76 @@ func TestKeyA_DetailPanel_NonTask_StillDismisses(t *testing.T) {
 	}
 }
 
-// TestDashboard_AttentionCount_DecrementsOnTaskStatusChange pins the
-// regression: after a task transitions out of blocked, a fresh
-// scanDashboard must drop the ⚠ count. Without this the project
-// chip would lie about the attention state until the operator
-// restarts.
-func TestDashboard_AttentionCount_DecrementsOnTaskStatusChange(t *testing.T) {
+// TestDashboard_TaskBlocked_DoesNotFireAttention pins issue #103: a
+// task at status=blocked is a planning state (operator-set when
+// sequencing work) and must NOT contribute to row.Attention. Only
+// worker phase=blocked fires the chip. Counts.Blocked still
+// increments — diagnostics + future filtering depend on it — but
+// the rollup into Attention is gone.
+//
+// Pre-#103 this test asserted Attention=1 for a blocked task; the
+// inverted assertion is the regression guard.
+func TestDashboard_TaskBlocked_DoesNotFireAttention(t *testing.T) {
 	pdir := withFleetHome(t)
-	// Start with a blocked task — Attention should be 1.
 	seedBlockedTask(t, pdir, "fleet", "needs-input-aaaa", tasks.StatusBlocked, "")
 	snap := scanDashboard(time.Now())
 	if snap == nil || len(snap.Projects) != 1 {
 		t.Fatalf("expected 1 project, got %+v", snap)
 	}
-	if snap.Projects[0].Attention != 1 {
-		t.Errorf("blocked task should yield Attention=1, got %d", snap.Projects[0].Attention)
+	if snap.Projects[0].Attention != 0 {
+		t.Errorf("issue #103: task status=blocked is planning state and must NOT fire attention; got Attention=%d", snap.Projects[0].Attention)
 	}
 	if snap.Projects[0].Counts.Blocked != 1 {
-		t.Errorf("blocked task should yield Counts.Blocked=1, got %d", snap.Projects[0].Counts.Blocked)
+		t.Errorf("Counts.Blocked must still increment for diagnostics, got %d", snap.Projects[0].Counts.Blocked)
 	}
 
-	// Transition the task out of blocked → in-progress. Re-write
-	// tasks.md and re-scan; the new snapshot must show 0 attention.
+	// Transition the task out of blocked → in-progress. Re-scan; both
+	// the count and (still-zero) attention must reflect the new state.
 	seedBlockedTask(t, pdir, "fleet", "needs-input-aaaa", tasks.StatusInProgress, "")
 	snap2 := scanDashboard(time.Now())
 	if snap2 == nil || len(snap2.Projects) != 1 {
 		t.Fatalf("expected 1 project after transition, got %+v", snap2)
 	}
 	if snap2.Projects[0].Attention != 0 {
-		t.Errorf("after transition, Attention should be 0, got %d", snap2.Projects[0].Attention)
+		t.Errorf("after transition, Attention should remain 0, got %d", snap2.Projects[0].Attention)
 	}
 	if snap2.Projects[0].Counts.Blocked != 0 {
 		t.Errorf("after transition, Counts.Blocked should be 0, got %d", snap2.Projects[0].Counts.Blocked)
 	}
 	if snap2.Projects[0].Counts.InProgress != 1 {
 		t.Errorf("after transition, Counts.InProgress should be 1, got %d", snap2.Projects[0].Counts.InProgress)
+	}
+}
+
+// TestDashboard_TaskBlockedPlusWorkerBlocked_AttentionEqualsWorkerCount
+// pins the second leg of issue #103: with N task-blocked AND M
+// worker-blocked, Attention must equal M (the actionable count) — the
+// task-blocked entries don't pile on. Without this guard a future
+// refactor could re-conflate the two signals and quietly inflate the
+// chip.
+func TestDashboard_TaskBlockedPlusWorkerBlocked_AttentionEqualsWorkerCount(t *testing.T) {
+	pdir := withFleetHome(t)
+	// 3 task-blocked, 2 worker-blocked → Attention must be 2.
+	seedTasks(t, pdir, "fleet", TaskCounts{Blocked: 3})
+	seedWorker(t, pdir, "fleet", "raise-1-aaaa", workers.State{
+		Slug: "raise-1-aaaa", Project: "fleet",
+		Phase: workers.PhaseBlocked, BlockedReason: "Q1",
+	})
+	seedWorker(t, pdir, "fleet", "raise-2-bbbb", workers.State{
+		Slug: "raise-2-bbbb", Project: "fleet",
+		Phase: workers.PhaseBlocked, BlockedReason: "Q2",
+	})
+
+	snap := scanDashboard(time.Now())
+	if snap == nil || len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %+v", snap)
+	}
+	p := snap.Projects[0]
+	if p.Attention != 2 {
+		t.Errorf("issue #103: Attention must equal worker-blocked count (2), got %d", p.Attention)
+	}
+	if p.Counts.Blocked != 3 {
+		t.Errorf("Counts.Blocked must reflect all 3 planning-blocked tasks, got %d", p.Counts.Blocked)
 	}
 }
 

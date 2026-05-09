@@ -98,7 +98,10 @@ var (
 	//	ready      → ◐ + bright    (no header chip; promote-eligible)
 	//	in-progress → ▶ + amber    (matches projectCountInProgStyle)
 	//	in-review  → ⟳ + blue      (matches projectCountReviewStyle)
-	//	blocked    → ⚠ + bold red  (existing attentionChipStyle, PR #76)
+	//	blocked    → ⏸ + faint dim (issue #103; planning state, NOT
+	//	                            actionable — distinct from worker
+	//	                            phase=blocked which keeps the red
+	//	                            attention treatment via the row chip)
 	//	done       → ✓ + green     (existing projectCountDoneStyle, PR #76)
 	//
 	// "ready" promotes off the dim baseline because its semantic — task
@@ -113,6 +116,14 @@ var (
 	taskLabelInProgressStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
 	taskGlyphInReviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 	taskLabelInReviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
+
+	// Issue #103: blocked-as-planning-state glyph + label. Distinct from
+	// the worker-side red ⚠/attentionChipStyle so the operator can read
+	// "this task is paused on a sequencing dep" without confusing it for
+	// a worker raise-hand. Both faint + dim — the row should recede, not
+	// shout.
+	taskGlyphBlockedStyle = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color(colorDim))
+	taskLabelBlockedStyle = lipgloss.NewStyle().Faint(true).Foreground(lipgloss.Color(colorDim))
 
 	// Dashboard search/filter footer chip ("/foo · clear with esc").
 	searchFooterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))

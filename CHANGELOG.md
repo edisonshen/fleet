@@ -33,6 +33,21 @@ follows [SemVer](https://semver.org/).
   `archive`). Used by the coord skill's lifecycle cleanup path; safe
   for operator manual use too.
 
+### Fixed
+
+- Attention chip no longer overcounts on planning-blocked tasks. The
+  `row.Attention` rollup at `internal/tui/dashboard.go` previously
+  added `row.Counts.Blocked` (operator-set planning state — "blocked
+  by external dep / sequencing") on top of the worker-side
+  raise-hand count, training the operator to ignore "1 need
+  attention" because most of the time nothing was actionable. Only
+  worker phase=blocked (the actual raise-hand) now drives the chip.
+  Task `status=blocked` rows render with a distinct `⏸` (pause) glyph
+  in faint dim style — visible "this task is parked" without the
+  red-alert that the worker-blocked path keeps. `Counts.Blocked`
+  still increments on scan for diagnostics + future filtering.
+  Closes [#103](https://github.com/edisonshen/fleet/issues/103).
+
 ## [0.4.0] - 2026-05-09
 
 Project-list quality-of-life pass: operator can `[c]` hide projects

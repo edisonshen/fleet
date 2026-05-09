@@ -55,7 +55,7 @@ type ProjectRow struct {
 	Active    bool       // coord lock mtime within window
 	IdleStop  bool       // file present but stale → "auto-stopped" pill
 	LastTick  time.Time  // coord-state.json mtime; zero if missing
-	Attention int        // count of blocked workers + raise-hand items
+	Attention int        // count of workers in phase=blocked (raise-hand). Issue #103: task status=blocked is planning state, not actionable, and is excluded.
 	BlockedQ  string     // first blocked worker's reason (for raise-hand expansion P2)
 	BlockedID string     // first blocked worker's ID
 	Tasks     []*taskRow // task rows for [j/k] navigation + [⏎] open
@@ -262,9 +262,22 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// Workers under workers/<slug>/state.json.
 	wrows := scanWorkers(dir, name, now)
 
-	// Attention math: blocked workers OR blocked tasks. Coord raise-hand
-	// inbox is read separately (P2); for v1 we surface the worker-side
-	// blocked signal which IS the operator's job to answer.
+	// Attention math: ONLY worker phase=blocked fires the attention chip.
+	//
+	// Issue #103: task status=blocked is a planning state — operators set
+	// it when sequencing work ("blocked by external dep / other task"),
+	// not when something needs answering. Rolling task-blocked into
+	// row.Attention overcounted "1 need attention" on projects whose only
+	// "blocked" was the planning signal, training the operator to ignore
+	// the chip. Worker phase=blocked (the loop below) is the load-bearing
+	// signal — that's the path a worker raises a question through, and
+	// v0.2 Agent-tool subagents share the same code path.
+	//
+	// Counts.Blocked stays populated on row scan above (line 217) for
+	// diagnostics + future filtering; only the attention rollup is
+	// dropped. The visual signal for a planning-blocked task is the
+	// distinct ⏸ glyph in the per-task expansion (taskStatusStyles), not
+	// the row-level attention chip.
 	var firstBlocked *WorkerRow
 	for _, w := range wrows {
 		if w.Blocked {
@@ -274,7 +287,6 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 			}
 		}
 	}
-	row.Attention += row.Counts.Blocked
 	if firstBlocked != nil {
 		row.BlockedID = firstBlocked.ID
 		row.BlockedQ = firstBlocked.Reason
@@ -601,7 +613,8 @@ func (s *Snapshot) CIRunning() int {
 }
 
 // AttentionProjects counts projects with at least one attention item
-// (blocked worker or blocked task).
+// (worker in phase=blocked). Issue #103: task status=blocked is a
+// planning state and does NOT contribute to attention.
 func (s *Snapshot) AttentionProjects() int {
 	if s == nil {
 		return 0

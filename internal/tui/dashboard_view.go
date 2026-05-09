@@ -607,7 +607,11 @@ func tmuxSessionName(agentID string) string {
 //	ready       → "◐ <slug>"  bright    (promote-eligible, no header chip)
 //	in-progress → "▶ <slug>"  amber     (matches projectCountInProgStyle)
 //	in-review   → "⟳ <slug>"  blue      (matches projectCountReviewStyle)
-//	blocked     → "⚠ <slug>"  bold red  (existing attentionChipStyle)
+//	blocked     → "⏸ <slug>"  faint dim (issue #103; planning state — NOT
+//	                                    actionable. Worker phase=blocked
+//	                                    is the actionable signal and is
+//	                                    surfaced via the row attention
+//	                                    chip, not the per-task glyph.)
 //	done        → "✓ <slug>"  green     (existing projectCountDoneStyle)
 //	default     → "• <slug>"  dim       (abandoned / unknown — fallback)
 //
@@ -731,7 +735,14 @@ func taskStatusStyles(status string) (string, lipgloss.Style, lipgloss.Style) {
 	case "in-review":
 		return "⟳", taskGlyphInReviewStyle, taskLabelInReviewStyle
 	case "blocked":
-		return "⚠", attentionChipStyle, attentionChipStyle
+		// Issue #103: ⏸ (pause) + dim/faint signals "task is paused on a
+		// sequencing dep" — a planning state. The previous ⚠ + red
+		// treatment conflated planning-blocked with worker phase=blocked
+		// (the actual raise-hand signal); operators saw "1 attn" on a
+		// project whose only "blocked" was an external-dep marker. Worker
+		// phase=blocked still drives the row-level attention chip via
+		// scanProject's attention loop, which is the load-bearing signal.
+		return "⏸", taskGlyphBlockedStyle, taskLabelBlockedStyle
 	case "done":
 		return "✓", projectCountDoneStyle, projectCountDoneStyle
 	}
