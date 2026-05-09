@@ -141,6 +141,20 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("project add: init project tree: %w", err)
 	}
 
+	// (7-9) under the project's state lock. Without the lock, a
+	// concurrent `fleet tasks add <task> --project <tag>` could race:
+	//   - tasks.add takes the lock, writes tasks.md with the new task.
+	//   - project add (no lock) sees ENOENT before tasks.add's write
+	//     lands, then overwrites with an empty file — losing the task.
+	// Holding the same lock that tasks.add holds across the bootstrap +
+	// meta.json write closes the window. The body is short (a few stat
+	// + write calls); other tasks/learnings writers wait briefly.
+	release, err := state.LockProjectState(tag)
+	if err != nil {
+		return fmt.Errorf("project add: lock project state: %w", err)
+	}
+	defer release()
+
 	// (7) lazy-create tasks.md with frontmatter. Preserves any existing
 	// content on re-add — operator's task list must NOT be wiped by a
 	// repeat `fleet project add`.
@@ -163,16 +177,21 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 	// (8) collision detection. Read existing meta.json if any so the
 	// re-add path can warn on a different repo_path landing on the
 	// same tag (parent-basename sanitization is lossy — see
-	// internal/tui/discover.go's Known limitation note).
+	// projects.TagForPath's Known limitation note).
 	prev, prevErr := projects.Read(tag)
-	hadPrev := prevErr == nil
-	collision := hadPrev && prev.RepoPath != "" && prev.RepoPath != abs
-	if !hadPrev && prevErr != nil && !errors.Is(prevErr, projects.ErrNotFound) {
-		// Real read error — surface it. Fresh-add is fine on
-		// ErrNotFound but a malformed meta.json is a hand-edit
-		// problem the operator should see.
+	switch {
+	case prevErr == nil:
+		// existing meta — fall through; collision check below.
+	case errors.Is(prevErr, projects.ErrNotFound):
+		// fresh add — fall through; collision stays false.
+	default:
+		// Real read error (malformed JSON, permission denied) —
+		// surface it. The operator should see exactly what's broken
+		// instead of having us silently overwrite their hand-edit.
 		return fmt.Errorf("project add: read existing meta.json: %w", prevErr)
 	}
+	hadPrev := prevErr == nil
+	collision := hadPrev && prev.RepoPath != "" && prev.RepoPath != abs
 
 	// (9) write meta.json. Use UTC so timestamps are stable across
 	// machines / timezones (matches state.HandoffPath's UTC choice).

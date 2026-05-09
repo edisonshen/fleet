@@ -18,10 +18,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
-	"github.com/edisonshen/fleet/internal/tui"
 )
 
 // Meta is the parsed shape of meta.json. Only the three fields the
@@ -122,15 +122,72 @@ func Write(project string, m Meta) error {
 	return nil
 }
 
-// TagForPath is the canonical project-tag derivation used by the
-// `fleet project add` CLI and the TUI's [+] picker. Wraps
-// internal/tui.ProjectTag so the two callers stay in sync without
-// duplicating sanitization rules.
+// TagForPath returns the project tag to register a repo at p as.
+// Last-two-segments form (parent-basename) keeps two checkouts with
+// the same basename distinct: ~/work/fleet → "work-fleet",
+// ~/personal/fleet → "personal-fleet". Without this both would tag
+// as "fleet" and fleet-guard's per-project locking would serialize
+// unrelated work.
 //
-// Re-exporting via this package (rather than asking each consumer to
-// import internal/tui) avoids dragging the bubbletea dep tree into
-// places that only care about the path → tag mapping. The TUI keeps
-// the implementation; this is a thin wrapper.
+// Output is always safe for state.ValidateProjectName: characters
+// outside [a-z0-9._-] are replaced with "-", runs of "-" are
+// collapsed, and leading/trailing punctuation is stripped. Falls back
+// to "fleet" when every segment sanitizes to empty (e.g. path was "/").
+//
+// Known limitation: sanitization is lossy, so two distinct paths
+// whose parent-basename collapses identically after sanitizing share
+// a project tag. Example: "~/foo bar/api" and "~/foo-bar/api" both
+// → "foo-bar-api". Operators who hit this case can override per-
+// dispatch via `fleet dispatch --project <unique>`. A path-derived
+// hash suffix would solve it but breaks tag stability across builds
+// for in-flight agents, which is a worse practical regression for a
+// pre-1.0 project. Revisit at v1.0 with a documented migration path.
+//
+// Lives here (not in internal/tui) so callers that only care about
+// the path → tag mapping don't drag the bubbletea dep tree. The TUI
+// re-exports this via internal/tui.ProjectTag.
 func TagForPath(p string) string {
-	return tui.ProjectTag(p)
+	p = filepath.Clean(p)
+	base := filepath.Base(p)
+	parent := filepath.Base(filepath.Dir(p))
+	var raw string
+	if parent == "" || parent == "." || parent == string(filepath.Separator) {
+		raw = base
+	} else {
+		raw = parent + "-" + base
+	}
+	return sanitizeTag(raw)
+}
+
+// sanitizeTag forces s into the state.ValidateProjectName allowlist
+// ([a-z0-9._-]). Anything else becomes "-"; runs collapse;
+// leading/trailing "-" and "." are trimmed because
+// state.ValidateProjectName rejects "." and "..". Uppercase is
+// lowercased because case-insensitive filesystems would otherwise
+// alias case-only variants onto the same project tree.
+// Returns "fleet" when the result would otherwise be empty or reserved.
+func sanitizeTag(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r + ('a' - 'A'))
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := b.String()
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-.")
+	if out == "" || out == "." || out == ".." {
+		return "fleet"
+	}
+	return out
 }

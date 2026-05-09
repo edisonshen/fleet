@@ -233,6 +233,44 @@ func TestProjectAdd_TagCollisionDifferentPath_RefreshesRepoPath(t *testing.T) {
 	}
 }
 
+// TestProjectAdd_PreservesExistingTasksMd regresses the lock contract:
+// when tasks.md already exists with content (e.g. a `fleet tasks add`
+// landed first), `fleet project add` must NOT clobber it. Pre-lock
+// implementations could TOCTOU-race tasks.add and overwrite the file
+// with empty frontmatter.
+func TestProjectAdd_PreservesExistingTasksMd(t *testing.T) {
+	root := setupFleetHome(t)
+	repo := makeRepo(t, "dir")
+
+	out := &bytes.Buffer{}
+	if err := runProjectAdd(repo, out, out); err != nil {
+		t.Fatalf("first add: %v", err)
+	}
+
+	tag := projectTagForTest(t, repo)
+	tasksPath := filepath.Join(root, "projects", tag, "tasks.md")
+
+	// Seed tasks.md with a fake operator-added task. project add must
+	// not overwrite this on re-add.
+	seed := "---\nschema: v1\n---\n\n## task: real-task-abcd\n\n- status: todo\n- priority: P2\n- created: 2026-05-09T20:00:00Z\n- updated: 2026-05-09T20:00:00Z\n"
+	if err := os.WriteFile(tasksPath, []byte(seed), 0o644); err != nil {
+		t.Fatalf("seed tasks.md: %v", err)
+	}
+
+	out.Reset()
+	if err := runProjectAdd(repo, out, out); err != nil {
+		t.Fatalf("re-add: %v", err)
+	}
+
+	got, err := os.ReadFile(tasksPath)
+	if err != nil {
+		t.Fatalf("read tasks.md: %v", err)
+	}
+	if !strings.Contains(string(got), "real-task-abcd") {
+		t.Errorf("project add wiped seeded task; got:\n%s", got)
+	}
+}
+
 // TestProjectAdd_RelativePath_IsResolvedToAbsolute exercises the spec
 // "absolute or relative path" — when the operator passes a relative
 // path, meta.json must store the absolute form (so the dashboard's
