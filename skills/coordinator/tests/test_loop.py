@@ -195,6 +195,29 @@ def test_tick_dispatches_ready_task(
     assert "subagent_type: general-purpose" in block
     assert str(inbox_file) in block
     assert block.rstrip().endswith("END_DISPATCH")
+    # Issue #84 Phase A regression guard: status flip is durable
+    # BEFORE the DISPATCH block is surfaced. Without this ordering,
+    # a coord that reads the block, calls Agent tool, and the worker
+    # races to `fleet workers update` before the status=in-progress
+    # write lands could cause the next tick's _dispatch_ready to
+    # pick the same task again — duplicate dispatch, two subagents
+    # for one slug. Codex iter-4 [P1] regress for the legacy
+    # subprocess path; same invariant applies here.
+    in_progress_idx = next(
+        i for i, c in enumerate(fleet_run_recorder)
+        if c[1:3] == ["tasks", "set"] and "status=in-progress" in c
+    )
+    note_idx = next(
+        i for i, c in enumerate(fleet_run_recorder)
+        if c[1:3] == ["tasks", "note"]
+        and any("abcdef01" in arg for arg in c)
+    )
+    # status flip happens FIRST (smallest index), note happens LAST
+    # (largest index) — confirms _apply_dispatch ran the full
+    # mutation chain before result.dispatch_instructions accumulates.
+    assert in_progress_idx < note_idx, (
+        f"status flip must precede note: idx {in_progress_idx} >= {note_idx}"
+    )
     # Issue #84 Phase A: subprocess.run MUST NOT be called for
     # `fleet dispatch`. fetch_standards + fetch_learnings still
     # route through subprocess.run, but the dispatch shell-out is
