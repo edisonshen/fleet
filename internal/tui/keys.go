@@ -556,7 +556,15 @@ func (m Model) actionArchiveProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 // actionAttach dispatches [a] for the row under the cursor.
 //
 // Agent row   → tmux attach to the agent's session.
-// Worker row  → open the worker peek detail panel (output.log + state.json).
+// Worker row  → tmux attach to the coord's session (issue #93 Phase B1):
+//
+//	workers in v0.2.x are Agent-tool subagents of the
+//	project's coord, so the only live surface is the coord's
+//	chat. Falls back to a "no attachable session" flash when
+//	the coord can't be found / its session is dead. [⏎]
+//	still opens the read-only peek panel for state.json +
+//	output.log tail.
+//
 // Project row → attach to existing coord OR auto-spawn one (issue #60).
 // Task row    → flash "doesn't apply" (no tmux + no peek surface).
 func (m Model) actionAttach() (Model, tea.Cmd, bool) {
@@ -590,12 +598,53 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		if row.worker == nil {
 			return m, nil, true
 		}
-		// [a] on a worker = peek (no tmux session to attach to —
-		// workers run as `claude --print` subprocesses). Open the
-		// detail panel inline; same path as [⏎] open on a worker.
-		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
-		m.detail = &detailView{title: title, body: body}
-		return m, nil, true
+		// Issue #93 Phase B1: workers in v0.2.x are Agent-tool subagents
+		// of the project's coord — they have NO tmux session of their
+		// own. Their "live" surface is the coord's chat window (where
+		// the Agent tool renders the subagent's output as the
+		// "N local agents" indicator). So [a] on a worker row routes to
+		// the COORD's tmux session, not a per-worker session.
+		//
+		// Routing decision tree (in order):
+		//
+		//   coord found (alive)    → attach to coord (the place where
+		//                             the operator can actually interact
+		//                             with the worker subagent)
+		//   no live coord found    → flash "no attachable session for
+		//                             <slug>" — the worker is orphaned
+		//                             (its parent coord exited or its
+		//                             session is dead). [⏎] still opens
+		//                             the peek panel as before.
+		//
+		// findExistingCoordForProject already gates on a live tmux
+		// session via sessionProbeOrAliveFn, so the dead-session case
+		// folds into the same orphan flash — no separate branch.
+		//
+		// The peek panel ([⏎]) path is preserved untouched — operators
+		// who want state.json + output.log tail still get it via Enter.
+		// [a] is now consistently "attach to a live session" across
+		// agent / project / worker rows (no tmux means no attach).
+		w := row.worker
+		coord, ok := findExistingCoordForProject(m.records, w.Project)
+		if !ok {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"no attachable session for worker %s — its coord exited or its session is dead; press [⏎] for the worker peek panel",
+					w.Slug),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		// Successful coord attach — surface the routing so the operator
+		// knows they're landing in the coord chat (where the worker's
+		// Agent-tool output renders), not in a per-worker session.
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"viewing coord chat for project %s (worker %s renders as a local agent there)",
+				w.Project, w.Slug),
+		}
+		m.pendingAttach = coord.TmuxSession
+		return m, tea.Quit, true
 	case rowProject:
 		return m.actionAttachProject(row.project)
 	case rowTask:
