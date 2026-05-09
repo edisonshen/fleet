@@ -107,6 +107,18 @@ func renderDashboardHeader(m Model, usable int) string {
 		parts = append(parts, headerCIStyle.Render(fmt.Sprintf("%d ci running", ciCount)))
 	}
 	parts = append(parts, headerLabelStyle.Render(fmt.Sprintf("%d", wCount))+headerTextStyle.Render(" workers active"))
+
+	// Hot-count chips (issue #89): "<N> yellow · <M> red" appears
+	// after "workers active" when at least one alive agent or worker
+	// has crossed the 50%/70% threshold. Skipped when both are zero so
+	// the strip stays clean for the all-green common case.
+	var workers []*WorkerRow
+	if snap != nil {
+		workers = snap.Workers
+	}
+	if y, r := hotCounts(m.records, m.aliveByID, workers); y > 0 || r > 0 {
+		parts = append(parts, renderHotCounts(y, r))
+	}
 	left := strings.Join(parts, dot)
 
 	// Right side: "user · vX.Y.Z". userName is captured at New().
@@ -275,7 +287,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		if row.kind == rowWorker {
-			right = append(right, workerBlockLines(row.worker, rightW, selected)...)
+			right = append(right, workerBlockLines(row.worker, m.records, rightW, selected)...)
 			hasWorkers = true
 		}
 	}
@@ -592,18 +604,46 @@ func renderCoordStatus(p *ProjectRow) string {
 
 // workerBlockLines renders one worker's two-line block:
 //
-//	● <id>
-//	  <project>:<slug>      <age> <state>
+//	● <id>           ▰▰▱▱▱ 32% ◐ HANDOFF
+//	  <project>:<slug>                       <age> <state>
 //
 // The selected variant replaces the leading status dot with the
 // cursor glyph "▶" so the row reads as "next [⏎]/[a]/[x] target".
-func workerBlockLines(w *WorkerRow, width int, selected bool) []string {
+//
+// Issue #89: the worker's context-pct + handoff state is sourced from
+// the matching agent record (looked up by workerContextRecord). Workers
+// don't write their own context_pct — under PR #87, Agent-tool subagents
+// inherit FLEET_AGENT_ID from the coord and the Stop hook writes to the
+// coord's record. The chip therefore reflects the coord's session
+// pressure, which is the operator-actionable signal for "this worker's
+// containing coord is filling up". Lookup miss → omit the chip.
+func workerBlockLines(w *WorkerRow, records []*agent.Record, width int, selected bool) []string {
 	dot := workerDotStyle(w.Color).Render("●")
 	if selected {
 		dot = cursorGlyphStyle.Render("▶")
 	}
 	id := workerIDStyle.Render(w.ID)
 	line1 := "  " + dot + " " + id
+
+	// Look up the agent record whose context_pct represents this worker.
+	// records may be nil when the dashboard has no agent records yet
+	// (early renders) — workerContextRecord handles that and the chips
+	// stay empty.
+	var bar, tag string
+	if rec := workerContextRecord(records, w); rec != nil {
+		bar = renderContextBar(rec.ContextPct)
+		tag = renderHandoffTag(rec.HandoffType)
+	}
+	chips := joinChips(bar, tag)
+	if chips != "" {
+		// Right-flush the chips on line 1 with a 2-cell trailing margin
+		// matching the rest of the column's right-edge convention.
+		gap1 := width - lipgloss.Width(line1) - lipgloss.Width(chips) - 2
+		if gap1 < 1 {
+			gap1 = 1
+		}
+		line1 = line1 + strings.Repeat(" ", gap1) + chips
+	}
 
 	slug := workerSlugStyle.Render(fmt.Sprintf("%s:%s", w.Project, trimSlug(w.Slug)))
 	stateLabel := workerStateStyle(w.Color).Render(fmt.Sprintf("%s %s", w.Age, w.State))
@@ -619,8 +659,13 @@ func workerBlockLines(w *WorkerRow, width int, selected bool) []string {
 // "v0.1 agents" sub-heading. Same shape as workerBlockLines so the
 // right column reads consistently.
 //
-//	● <agent-id-short>                       <status>
-//	  <project>:<task>                       <age>
+//	● <agent-id-short>          ▰▰▱▱▱ 32% ◐ HANDOFF      <status>
+//	  <project>:<task>                                    <age>
+//
+// Issue #89: line 1 picks up an inline context-pct bar + handoff tag
+// when the record carries them; nil values omit the chips. The chips
+// sit between the agent ID and the right-flushed status so the row
+// reads left-to-right as "id → context → handoff state → status".
 func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected bool) []string {
 	if r == nil {
 		return nil
@@ -637,7 +682,19 @@ func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected
 	}
 	id := workerIDStyle.Render(idShort)
 	statusLab := statusStyleFor(status).Render(statusLabel(status))
+
+	// Context-pct bar + handoff tag — issue #89. Both omit cleanly
+	// when the record has nil values, so non-fleet-guarded agents
+	// (legacy v0.1 records or pre-bootstrap dispatches) render the
+	// row exactly as before.
+	bar := renderContextBar(r.ContextPct)
+	tag := renderHandoffTag(r.HandoffType)
+	chips := joinChips(bar, tag)
+
 	line1raw := "  " + gStyle.Render(glyph) + " " + id
+	if chips != "" {
+		line1raw = line1raw + "  " + chips
+	}
 	gap1 := width - lipgloss.Width(line1raw) - lipgloss.Width(statusLab) - 2
 	if gap1 < 1 {
 		gap1 = 1
@@ -660,6 +717,22 @@ func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected
 	}
 	line2 := "    " + slug + strings.Repeat(" ", gap2) + age
 	return []string{line1, line2, ""}
+}
+
+// joinChips concatenates a context-pct bar + handoff tag with a single
+// space when both are present, returns the non-empty one when only
+// one is present, or "" when neither. Avoids ugly leading/trailing
+// spaces inside row format strings.
+func joinChips(bar, tag string) string {
+	switch {
+	case bar != "" && tag != "":
+		return bar + " " + tag
+	case bar != "":
+		return bar
+	case tag != "":
+		return tag
+	}
+	return ""
 }
 
 // trimSlug drops the trailing "-<4hex>" suffix from a slug for compact
