@@ -254,11 +254,16 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		left = append(left, "",
 			columnHeadingStyle.Render("  no projects yet — press [n] to add a task"))
 	}
+	spawnCtx := coordSpawnCtx{
+		now:          time.Now(),
+		tickFrame:    m.tickCount,
+		spawnTimeout: m.coordSpawnTimeout,
+	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowProject:
-			left = append(left, projectBlockLines(row.project, leftW, selected)...)
+			left = append(left, projectBlockLines(row.project, leftW, selected, spawnCtx)...)
 		case rowTask:
 			left = append(left, taskBlockLine(row.task, leftW, selected))
 		}
@@ -349,7 +354,15 @@ func rowsHaveLeft(rows []dashRow) bool {
 // via the agent record on the RIGHT only when a coord is also a
 // loose-agent-tagged record, which is the v0.2 norm). When CoordID is
 // empty, the block stays at three lines and we skip the coord row.
-func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
+//
+// Spawning indicator (issue #86): when the coord-spawn marker exists
+// AND coord-state.json hasn't published a fresh tick yet, we render
+// "⠋ spawning coord... 1m 23s" in the same slot as the coord-id line.
+// Beyond ctx.spawnTimeout, the slot flips to a red "⚠ coord spawn
+// stuck — check tmux session fleet-<name>" warning. State derivation
+// lives in deriveCoordSpawnState (coord_spawn.go) so it can be tested
+// in isolation; this function just renders the result.
+func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) []string {
 	prefix := "  "
 	if p.Attention > 0 {
 		prefix = attentionBorderStyle.Render("▌ ") + " "
@@ -412,6 +425,26 @@ func projectBlockLines(p *ProjectRow, w int, selected bool) []string {
 		coordLabel := dimStyle.Render("coord ") + workerIDStyle.Render(p.CoordID)
 		line4 := prefix + coordLabel
 		return []string{line1, line2, line3, line4, ""}
+	}
+
+	// Optional Line 4 alt: coord-spawn indicator (issue #86). When the
+	// coord-spawn marker exists but coord-state.json hasn't published
+	// a fresh tick yet, render "⠋ spawning coord... 1m 23s" so the
+	// 3-5min cold start isn't a silent wait. The stale/missing branch
+	// fires when scanProject sees no fresh coord-state.json — i.e.
+	// !p.Active (Active is set iff now-stateMtime ≤ coordActiveWindow).
+	// Beyond ctx.spawnTimeout the line flips to a red stuck warning.
+	markerMtime, markerOK := coordSpawnMarkerMtimeFn(p.Name)
+	st := deriveCoordSpawnState(
+		markerOK, markerMtime,
+		!p.LastTick.IsZero(), p.LastTick,
+		ctx.now,
+		coordActiveWindow, ctx.spawnTimeout,
+	)
+	if line, ok := renderCoordSpawnLineForProject(
+		st, prefix, p.Name, ctx.now, markerMtime, ctx.tickFrame,
+	); ok {
+		return []string{line1, line2, line3, line, ""}
 	}
 
 	return []string{line1, line2, line3, ""}

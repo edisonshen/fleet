@@ -168,6 +168,20 @@ type Model struct {
 	// dashboardMsg ticks — the map is never reset on refresh, so the
 	// 1s poll doesn't auto-collapse the operator's expansion.
 	expanded map[string]bool
+
+	// tickCount is the rolling count of tickMsg events received since
+	// program start. Used as the spinner-frame index for the coord-
+	// spawn indicator (issue #86) so its glyph rotates once per
+	// pollInterval. Wraps modulo len(coordSpawnGlyphs) at render time.
+	tickCount int
+
+	// coordSpawnTimeout is the age past which a coord-spawn marker is
+	// declared "stuck" and the project row flips from the spawning
+	// spinner to the red warning. Resolved once at New() from the
+	// FLEET_COORD_SPAWN_TIMEOUT_S env var, defaulting to
+	// coordSpawnTimeoutDefault (10 minutes). Cached here so the env
+	// isn't re-parsed on every render.
+	coordSpawnTimeout time.Duration
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
@@ -197,9 +211,10 @@ func (m Model) PendingAttach() string { return m.pendingAttach }
 // New returns a Model ready to be passed to tea.NewProgram.
 func New(version string) Model {
 	return Model{
-		version:   version,
-		userName:  currentUserName(),
-		startedAt: time.Now(),
+		version:           version,
+		userName:          currentUserName(),
+		startedAt:         time.Now(),
+		coordSpawnTimeout: resolveCoordSpawnTimeout(),
 	}
 }
 
@@ -363,6 +378,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Polling fallback: re-read agents/ AND the v0.2 dashboard
 		// snapshot every pollInterval, then schedule the next tick.
+		// Bump tickCount so the coord-spawn spinner advances one frame
+		// per pollInterval (issue #86). Wraps naturally at render time
+		// via coordSpawnSpinnerGlyph's modulo arithmetic — no need to
+		// reset here.
+		m.tickCount++
 		return m, tea.Batch(loadAgentsCmd(), loadDashboardCmd(), tickCmd())
 
 	case fsEventMsg:
