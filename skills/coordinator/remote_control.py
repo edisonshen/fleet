@@ -11,9 +11,9 @@ Mechanism (two parts, both gated by one per-coord marker file so we only
 do it once per coord lifetime):
 
   1. spawn_daemon_if_needed() — start `claude remote-control` in the
-     background, idempotent across the whole machine via `pgrep -f`.
-     Same exact bash form that internal/handoff.FirstAction emits, so
-     fresh-coord and handoff-replacement converge on the same daemon.
+     background, idempotent at the **fleet-coord-prefix** level via
+     `pgrep -f`. This is *intentionally* narrower than the handoff
+     daemon's pgrep guard. See below for the bug history.
      Log: /tmp/claude-rc-coord.log.
 
   2. seed_inbox() — write a one-shot inbox message at
@@ -27,19 +27,20 @@ do it once per coord lifetime):
 Both gated by the marker file
 ~/.fleet/projects/<project>/.remote-control-bootstrap-<coord_id>; once
 written, subsequent ticks short-circuit. Idempotent + fail-soft: any
-I/O failure logs to stderr and proceeds. The bootstrap NEVER blocks the
-coord tick — same discipline as fleet-guard.
+I/O failure logs to stderr AND to BOOTSTRAP_LOG and proceeds. The
+bootstrap NEVER blocks the coord tick — same discipline as fleet-guard.
 
 ASCII diagram of the fresh-coord flow:
 
     coord agent boots → first loop.tick() → bootstrap_remote_control(p, id)
                                               │
                                               ▼
-                          marker exists? ── yes ─► return (no-op)
+                          marker exists? ── yes ─► return STATUS_SKIPPED_MARKER
                                               │ no
                                               ▼
                        spawn_daemon_if_needed()
-                          (pgrep guards re-launch)
+                          (pgrep narrowly guards re-launch of
+                           the fleet-coord-prefix daemon ONLY)
                                               │
                                               ▼
                        seed_inbox(coord_id, project)
@@ -51,14 +52,58 @@ ASCII diagram of the fresh-coord flow:
                                               │
                                               ▼
                        next Stop hook fires → fleet-guard inbox.deliver()
-                          injects [OPERATOR] Run `/remote-control` ...
+                          injects [OPERATOR] INFO: claude remote-control ...
                                               │
                                               ▼
                        agent runs /remote-control slash command
                           → session attaches to daemon
+
+
+Status enum (returned by bootstrap_remote_control). Stable strings —
+operators / log scrapers may grep for these:
+
+  - STATUS_OK                 daemon spawn fired, inbox seeded, marker
+                              written. Quiet success; no log line.
+  - STATUS_SKIPPED_MARKER     marker already present; this is the
+                              steady-state after the first successful
+                              bootstrap. Quiet; no log line.
+  - STATUS_SKIPPED_NO_ARGS    empty project / coord_id (caller's signal
+                              that we're not under fleet supervision
+                              yet, e.g. tests with FLEET_AGENT_ID
+                              unset). Quiet; no log line.
+  - STATUS_SKIPPED_INVALID    project or coord_id failed the canonical
+                              shape check (defense in depth). Logged
+                              to stderr AND BOOTSTRAP_LOG.
+  - STATUS_FAILED_SEED        seed_inbox returned False — mkdir/mkstemp
+                              failed, OR an existing-inbox file was
+                              detected (don't clobber operator content).
+                              Marker NOT written; next tick retries.
+                              Logged.
+  - STATUS_FAILED_MARKER      seed succeeded but marker write failed.
+                              Next tick retries (seed is idempotent).
+                              Logged.
+
+The previous return type was bool ("True iff this call did the
+bootstrap"). The new enum form preserves the truth-table:
+  old True  → STATUS_OK
+  old False → any of the SKIPPED_*/FAILED_* values.
+
+PRIOR BUG (this module's regression pin, fixed alongside the dispatch
+flag injection in fix/remote-control-coord-injection): the previous
+pgrep pattern was the broad `claude remote-control` match, which ALSO
+matched a `fleet-handoff`-prefixed daemon (started by
+internal/handoff.FirstAction's bash bootstrap). When the operator had
+a handoff daemon running, the coord skill would silently skip its own
+daemon spawn — so mobile claude.ai pairing for fleet-coord-* sessions
+never worked. The new pattern anchors on `^claude` AND the
+`--remote-control-session-name-prefix fleet-coord` literal so
+fleet-handoff daemons no longer mask the coord launch. This pattern is
+intentionally kept symmetric with cmd/fleet/dispatch.go's
+remoteControlDaemonRunning regex to ease audits.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import re
 import subprocess
@@ -71,6 +116,27 @@ from pathlib import Path
 # /tmp/claude-rc-handoff.log naming so log inspection by the operator
 # stays predictable; fresh-coord vs handoff is encoded in the suffix.
 _DAEMON_LOG = "/tmp/claude-rc-coord.log"
+
+# Bootstrap status log — failures + non-default skips append a single
+# JSON-ish line here. Quiet success is silent. Operator-facing breadcrumb:
+# when mobile pairing breaks, `tail /tmp/fleet-bootstrap.log` shows
+# whether bootstrap_remote_control ever ran for the missing coord and
+# where it failed. Override via FLEET_BOOTSTRAP_LOG for tests / non-
+# default homes (the env-var read happens at import time, but tests
+# manipulate it via monkeypatch on the module attribute below).
+BOOTSTRAP_LOG = os.environ.get(
+    "FLEET_BOOTSTRAP_LOG",
+    "/tmp/fleet-bootstrap.log",
+)
+
+# Status enum constants. Return values from bootstrap_remote_control.
+# Stable strings — callers may grep logs.
+STATUS_OK = "ok"
+STATUS_SKIPPED_MARKER = "skipped_marker"
+STATUS_SKIPPED_INVALID = "skipped_invalid"
+STATUS_SKIPPED_NO_ARGS = "skipped_no_args"
+STATUS_FAILED_SEED = "failed_seed"
+STATUS_FAILED_MARKER = "failed_marker"
 
 # Strict 8-lowercase-hex shape for coord_id, matching the format
 # emitted by skills/fleet-guard/ids.py:new_id (`secrets.token_hex(4)`)
@@ -109,16 +175,13 @@ def bootstrap_remote_control(
     coord_id: str,
     *,
     fleet_home: Path | None = None,
-) -> bool:
+) -> str:
     """One-shot bootstrap for fresh coordinator agents.
 
-    Returns True iff this call did the bootstrap (daemon-spawn attempt +
-    inbox-seed + marker write). Returns False on any of:
-      - missing project / coord_id (silently noop — caller's signal that
-        we're not under fleet supervision yet),
-      - marker file already present (we already bootstrapped),
-      - I/O failure writing the marker (logged; treated as "tried but
-        couldn't persist", so the next tick retries).
+    Returns a status string (see module docstring). Quiet success is
+    STATUS_OK; the SKIPPED_*/FAILED_* paths each write a structured
+    line to BOOTSTRAP_LOG so an operator post-mortem can grep for
+    "why didn't bootstrap fire for coord <id>?".
 
     Failures in spawn_daemon_if_needed / seed_inbox do NOT abort the
     bootstrap: each is independently fail-soft. The marker is written
@@ -128,7 +191,11 @@ def bootstrap_remote_control(
     may have started the daemon manually, or it's not on PATH yet).
     """
     if not project or not coord_id:
-        return False
+        # Caller's signal that we're not under fleet supervision yet
+        # (e.g. tests with FLEET_AGENT_ID unset). Don't log: the
+        # no-args path fires every tick under those conditions and
+        # would spam the log file.
+        return STATUS_SKIPPED_NO_ARGS
     # Defense in depth: refuse to use a coord_id that doesn't match the
     # canonical 8-hex shape. In production the value comes from
     # FLEET_AGENT_ID (always 8-hex via secrets.token_hex(4)), so this
@@ -139,7 +206,13 @@ def bootstrap_remote_control(
             f"coord remote-control: refusing invalid coord_id {coord_id!r}",
             file=sys.stderr,
         )
-        return False
+        _bootstrap_log(
+            STATUS_SKIPPED_INVALID,
+            project=project,
+            coord_id=coord_id,
+            detail="invalid coord_id (not 8-lowercase-hex)",
+        )
+        return STATUS_SKIPPED_INVALID
     # Project also gets a strict guard: it's used as a filesystem path
     # component, and a project of "../" would put the marker outside
     # ~/.fleet/projects/. The Go side already validates project names
@@ -150,11 +223,17 @@ def bootstrap_remote_control(
             f"coord remote-control: refusing invalid project {project!r}",
             file=sys.stderr,
         )
-        return False
+        _bootstrap_log(
+            STATUS_SKIPPED_INVALID,
+            project=project,
+            coord_id=coord_id,
+            detail="invalid project (path traversal / separator)",
+        )
+        return STATUS_SKIPPED_INVALID
     home = _resolve_home(fleet_home)
     marker = _marker_path(home, project, coord_id)
     if marker.exists():
-        return False
+        return STATUS_SKIPPED_MARKER
     # Order: daemon first, inbox second. The inbox message tells the
     # agent to run /remote-control which connects to a daemon — if we
     # seed the inbox before launching the daemon, there's a small
@@ -168,34 +247,77 @@ def bootstrap_remote_control(
         # Don't write the marker — we want to retry the inbox seed on
         # the next tick. Daemon was already attempted; pgrep guards
         # the re-launch.
-        return False
+        _bootstrap_log(
+            STATUS_FAILED_SEED,
+            project=project,
+            coord_id=coord_id,
+            detail="seed_inbox returned False (see stderr for cause)",
+        )
+        return STATUS_FAILED_SEED
     if not _write_marker(marker):
-        return False
-    return True
+        _bootstrap_log(
+            STATUS_FAILED_MARKER,
+            project=project,
+            coord_id=coord_id,
+            detail="marker write failed (see stderr for cause)",
+        )
+        return STATUS_FAILED_MARKER
+    return STATUS_OK
 
 
 def spawn_daemon_if_needed() -> bool:
-    """Spawn `claude remote-control` in the background if not already
-    running. Idempotent across the whole machine: pgrep guards re-launch.
+    """Spawn `claude remote-control` (fleet-coord prefix) in the
+    background if not already running. Idempotent at the **fleet-coord
+    daemon level**: pgrep guards only re-launch when a daemon with the
+    SAME `fleet-coord` session-name-prefix is already up.
 
     Returns True if the spawn shell command ran without raising
     (regardless of whether pgrep matched — the shell handles both
-    branches). Returns False if subprocess.run itself failed (no shell,
-    no claude binary, etc.). Logs to /tmp/claude-rc-coord.log.
+    branches). Returns False if subprocess.Popen itself failed (no
+    shell, no claude binary, etc.). Logs to /tmp/claude-rc-coord.log.
 
-    Mirrors the byte-shape of internal/handoff.FirstAction's bash block
-    (with the suffix swapped: `fleet-coord` prefix, coord log path) so
-    the daemon process surface stays consistent.
+    PRIOR BUG (this fix's regression pin): the previous pgrep pattern
+    was the broad `claude remote-control` match, which ALSO matched a
+    `fleet-handoff`-prefixed daemon (started by
+    internal/handoff.FirstAction). When the operator had a handoff
+    daemon running, the coord skill would silently skip its own daemon
+    spawn — so mobile claude.ai pairing for fleet-coord-* sessions
+    never worked. Mirror cmd/fleet/dispatch.go:remoteControlDaemonRunning
+    by anchoring the regex on `^claude` AND the
+    `--remote-control-session-name-prefix fleet-coord` literal so
+    fleet-handoff daemons no longer mask the coord launch.
     """
-    # Same form as handoff.FIRST_ACTION's bash block in
-    # skills/fleet-guard/handoff.py. nohup + & + disowned subshell
-    # detaches from the coord tick's process group; the daemon survives
-    # tick exit. pgrep -f matches the full command line.
+    # ASCII flow:
+    #
+    #   pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-coord( |$)'
+    #     |
+    #     +-- no match (or pgrep itself missing)
+    #     |     -> launch nohup ... fleet-coord daemon
+    #     |
+    #     +-- match (fleet-coord daemon already up)
+    #           -> silent no-op (the `||` short-circuits)
+    #
+    # Regex anchors:
+    #   ^claude     — argv[0] must literally be `claude`. Excludes the
+    #                 transient `bash -c '... nohup claude ...'`
+    #                 bootstrap subprocess this very function spawns.
+    #   fleet-coord — daemon session-name-prefix flag value. UNQUOTED:
+    #                 shell quotes around the value (we still write
+    #                 them on the launch command for legibility) are
+    #                 stripped before exec, so the live daemon's argv
+    #                 carries the bare `fleet-coord` token.
+    #   ( |$)       — terminate at a word boundary so a hypothetical
+    #                 longer prefix like "fleet-coordX" does NOT
+    #                 false-positive.
+    pgrep_pattern = (
+        r"^claude remote-control "
+        r"--remote-control-session-name-prefix fleet-coord( |$)"
+    )
     cmd = (
-        'pgrep -f "claude remote-control" >/dev/null 2>&1 || '
-        'nohup claude remote-control '
+        f"pgrep -f '{pgrep_pattern}' >/dev/null 2>&1 || "
+        "nohup claude remote-control "
         '--remote-control-session-name-prefix "fleet-coord" '
-        f'> {_DAEMON_LOG} 2>&1 &'
+        f"> {_DAEMON_LOG} 2>&1 &"
     )
     try:
         # start_new_session detaches the spawned shell from our process
@@ -313,6 +435,51 @@ def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:
 # ---------- internals ----------
 
 
+def _bootstrap_log(
+    status: str,
+    *,
+    project: str,
+    coord_id: str,
+    detail: str = "",
+) -> None:
+    """Append one structured line to BOOTSTRAP_LOG. Best-effort: any
+    log-write failure is itself swallowed — we don't want logging to
+    crash the tick (that's the whole point of the fail-soft posture).
+
+    Format (one line):
+      <ISO-8601-UTC> [fleet-bootstrap] status=<status> project=<p> coord=<id> detail="<msg>"
+
+    Stable enough to grep, free-form enough that future fields slot in
+    without breaking parsers. The detail string is sanitized so a stray
+    newline doesn't break tail-based log readers.
+    """
+    try:
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        safe_detail = detail.replace("\n", " ").replace("\r", " ")
+        line = (
+            f"{ts} [fleet-bootstrap] status={status} "
+            f"project={project} coord={coord_id} "
+            f'detail="{safe_detail}"\n'
+        )
+        # Append-only. mode "a" creates the file on first write; we
+        # don't fsync — operator-visible diagnostics, not durable state.
+        with open(BOOTSTRAP_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        # Log path unwritable (e.g., /tmp full, permissions); fall back
+        # to stderr so the operator at least sees the status when they
+        # tail the coord's tmux pane.
+        try:
+            print(
+                f"[fleet-bootstrap] status={status} project={project} "
+                f"coord={coord_id} detail={detail!r}",
+                file=sys.stderr,
+            )
+        except Exception:
+            # Truly nothing we can do.
+            pass
+
+
 def _resolve_home(fleet_home: Path | None) -> Path:
     if fleet_home is not None:
         return fleet_home
@@ -382,4 +549,11 @@ __all__ = [
     "bootstrap_remote_control",
     "spawn_daemon_if_needed",
     "seed_inbox",
+    "BOOTSTRAP_LOG",
+    "STATUS_OK",
+    "STATUS_SKIPPED_MARKER",
+    "STATUS_SKIPPED_INVALID",
+    "STATUS_SKIPPED_NO_ARGS",
+    "STATUS_FAILED_SEED",
+    "STATUS_FAILED_MARKER",
 ]

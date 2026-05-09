@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
-	"os/exec"
-	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/spf13/pflag"
+
+	"github.com/edisonshen/fleet/internal/handoff"
 )
 
 // TestDispatch_DefaultCommandWrapsAndSkipsPermissions locks in two
@@ -576,187 +576,92 @@ func TestRemoteControlSessionPrefix_MatchesPythonDaemon(t *testing.T) {
 	}
 }
 
-// TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly pins
-// codex review #73 iter-6 P1: the daemon-presence probe must match
-// ONLY the live fleet-coord daemon, not (a) a fleet-handoff daemon
-// from internal/handoff.FirstAction nor (b) the transient
-// `bash -c '... nohup claude remote-control ... fleet-coord ...'`
-// bootstrap subprocess that spawn_daemon_if_needed runs.
+// TestHandoffSessionPrefix_MatchesFirstActionDaemon pins the
+// byte-equality contract between handoffSessionPrefix in this
+// package's handoff.go and internal/handoff.FirstAction's bash
+// block. The replacement-spawn injection in cmd/fleet/handoff.go
+// (and internal/handoffop/handoffop.go) writes the literal
+// `fleet-handoff-<new-id>` session name; the FirstAction bash
+// bootstrap launches a daemon with
+// `--remote-control-session-name-prefix "fleet-handoff"`. Drift
+// between them would silently break mobile pairing on handoff.
+func TestHandoffSessionPrefix_MatchesFirstActionDaemon(t *testing.T) {
+	if handoffSessionPrefix != "fleet-handoff" {
+		t.Errorf("handoffSessionPrefix = %q; want %q (must match "+
+			"internal/handoff.FirstAction's "+
+			"--remote-control-session-name-prefix value)",
+			handoffSessionPrefix, "fleet-handoff")
+	}
+	// Belt-and-braces: the FirstAction body must literally contain
+	// the prefix value so a future docs/style refactor doesn't drop
+	// it. We import handoff.FirstAction here to keep both ends in one
+	// test.
+	if !strings.Contains(handoff.FirstAction, `"`+handoffSessionPrefix+`"`) {
+		t.Errorf("handoff.FirstAction must reference the quoted "+
+			"%q session-name-prefix value; got body that doesn't "+
+			"include it: %q", handoffSessionPrefix, handoff.FirstAction)
+	}
+}
+
+// TestHandoffReplacement_InjectsRemoteControlFlag pins the new contract
+// (fix/remote-control-coord-injection P0): the operator-triggered
+// handoff path must rewrite the replacement's claude argv to include
+// `--remote-control "fleet-handoff-<new-id>"` so mobile / claude.ai
+// pairing carries through automatically. Previously the replacement
+// command was passed through unchanged; the agent only paired after
+// running FirstAction's manual `/remote-control` slash command.
 //
-// We can't run pgrep here (it would scan the host's actual process
-// table). Instead we exercise the pattern itself by capturing the
-// argv we'd hand to pgrep and asserting the shape.
-func TestRemoteControlDaemonRunning_PgrepPatternIsCoordOnly(t *testing.T) {
-	var capturedArgs []string
-	prev := execCommand
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		capturedArgs = append([]string{name}, args...)
-		// Return an exec.Cmd that exits 1 (pgrep no-match) so the
-		// helper returns false; we only care about the captured args
-		// here.
-		return exec.Command("false")
-	}
-	t.Cleanup(func() { execCommand = prev })
+// We exercise the helper directly with the same default --command
+// shape registered by newDispatchCmd. The helper is the same one
+// dispatch.go's coord-spawn path uses, so this also pins the
+// invariant that fleet-handoff and fleet-coord rewrites are produced
+// by a single code path.
+func TestHandoffReplacement_InjectsRemoteControlFlag(t *testing.T) {
+	cmd := newDispatchCmd()
+	flag := cmd.Flag("command")
+	slice := flag.Value.(pflag.SliceValue)
+	defaultCmd := slice.GetSlice()
 
-	_ = remoteControlDaemonRunning()
+	const newID = "deadbeef"
+	rcSession := handoffSessionPrefix + "-" + newID
+	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
 
-	if len(capturedArgs) < 3 {
-		t.Fatalf("expected pgrep call with -f <pattern>; got %v", capturedArgs)
+	if sameCommand(rewritten, defaultCmd) {
+		t.Fatal("default command's rewrite should differ from input " +
+			"(handoffSessionPrefix integration regressed)")
 	}
-	if capturedArgs[0] != "pgrep" || capturedArgs[1] != "-f" {
-		t.Errorf("expected pgrep -f ...; got %v", capturedArgs[:2])
-	}
-	pattern := capturedArgs[2]
-
-	// Must anchor on `^claude ` so the bash bootstrap subprocess
-	// doesn't match (its argv[0] is "bash").
-	if !strings.HasPrefix(pattern, "^claude ") {
-		t.Errorf("pattern must anchor on `^claude ` to exclude the bash bootstrap; got %q", pattern)
-	}
-	// Must reference the fleet-coord prefix specifically — not any
-	// `claude remote-control` (which would also match a fleet-handoff
-	// daemon).
-	//
-	// Critically: the prefix appears UNQUOTED in the pattern. Shell
-	// quotes (`"fleet-coord"`) are stripped by the bootstrap's bash
-	// before exec, so the live daemon's argv carries the bare
-	// `fleet-coord` token. A pattern with embedded double quotes
-	// would never match (codex review #73 iter-7 P1).
-	if !strings.Contains(pattern, " "+remoteControlSessionPrefix) {
-		t.Errorf("pattern must reference the unquoted fleet-coord prefix (shell quotes don't survive exec); got %q", pattern)
-	}
-	if strings.Contains(pattern, `"`+remoteControlSessionPrefix+`"`) {
-		t.Errorf("pattern must NOT include shell-quote characters around the prefix — those are stripped before exec, so the live daemon's argv has unquoted fleet-coord; got %q",
-			pattern)
-	}
-	// Must reference --remote-control-session-name-prefix so a future
-	// daemon argv that happens to mention "fleet-coord" elsewhere
-	// (in a log path?) doesn't false-positive.
-	if !strings.Contains(pattern, "remote-control-session-name-prefix") {
-		t.Errorf("pattern must reference the prefix flag, not just the literal value; got %q", pattern)
+	want := `--remote-control "fleet-handoff-deadbeef"`
+	if !strings.Contains(rewritten[2], want) {
+		t.Errorf("rewritten command should embed %q for handoff replacement; got %q",
+			want, rewritten[2])
 	}
 }
 
-// TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv pins
-// the regex contract end-to-end: when fed a representative daemon
-// argv (post-shell-strip), the regex must match. When fed the
-// bootstrap bash subprocess's argv (which still has shell-quote
-// chars baked in via `bash -c`), it must NOT match. We compile the
-// pattern with regexp.MustCompile and assert directly — that way
-// drift in the pattern is caught at test time, not in the wild.
-func TestRemoteControlDaemonRunning_PatternMatchesRealDaemonArgv(t *testing.T) {
-	var capturedArgs []string
-	prev := execCommand
-	execCommand = func(name string, args ...string) *exec.Cmd {
-		capturedArgs = append([]string{name}, args...)
-		return exec.Command("false")
-	}
-	t.Cleanup(func() { execCommand = prev })
-
-	_ = remoteControlDaemonRunning()
-	if len(capturedArgs) < 3 {
-		t.Fatalf("expected pgrep call; got %v", capturedArgs)
-	}
-	pattern := capturedArgs[2]
-
-	// pgrep -f uses POSIX extended regex by default on macOS/BSD and
-	// extended on most pgrep implementations; Go's regexp is RE2.
-	// The relevant features here (^, character class, alternation
-	// inside ()) work in both. Compile + test fixtures.
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		t.Fatalf("pgrep pattern must compile as a regex; got %q (%v)", pattern, err)
-	}
-
-	// Representative argv strings as they'd appear in /proc/<pid>/cmdline
-	// after the shell strips quotes. Spaces are the actual separator
-	// here; pgrep -f sees the joined-with-space form.
-	cases := []struct {
-		name      string
-		cmdline   string
-		wantMatch bool
-	}{
-		{
-			name:      "live fleet-coord daemon, default log path",
-			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord",
-			wantMatch: true,
-		},
-		{
-			name:      "live fleet-coord daemon with trailing args",
-			cmdline:   "claude remote-control --remote-control-session-name-prefix fleet-coord --some-other-flag",
-			wantMatch: true,
-		},
-		{
-			name: "live fleet-handoff daemon — must NOT match (different prefix)",
-			cmdline: "claude remote-control --remote-control-session-name-prefix " +
-				"fleet-handoff",
-			wantMatch: false,
-		},
-		{
-			name:      "transient bash bootstrap subprocess — argv[0] is bash, must NOT match",
-			cmdline:   `bash -c ( pgrep -f "claude remote-control" >/dev/null 2>&1 || nohup claude remote-control --remote-control-session-name-prefix "fleet-coord" > /tmp/claude-rc-coord.log 2>&1 & )`,
-			wantMatch: false,
-		},
-		{
-			name:      "spurious process that mentions fleet-coord elsewhere in argv — must NOT match without the flag-name match",
-			cmdline:   "tail -f /tmp/fleet-coord.log",
-			wantMatch: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := re.MatchString(tc.cmdline)
-			if got != tc.wantMatch {
-				t.Errorf("pattern %q against argv %q: got match=%v, want %v",
-					pattern, tc.cmdline, got, tc.wantMatch)
-			}
-		})
-	}
-}
-
-// TestDispatch_CoordSpawn_SkipsRemoteControlWhenDaemonAbsent pins
-// codex review #73 iter-5 P1: when no `claude remote-control`
-// daemon is running, the coord-spawn path MUST NOT inject
-// --remote-control into the command. Otherwise Claude Code's
-// startup may treat "no daemon listening" as a startup error, which
-// the wrapper script propagates as a non-zero exit — killing the
-// tmux session before the operator sees the agent at all.
+// REGRESSION PIN — fix/remote-control-coord-injection (P0):
+// the daemon-presence gate (formerly remoteControlDaemonRunning) has
+// been REMOVED from runDispatch. Coord-spawn dispatches now ALWAYS
+// inject --remote-control regardless of whether a fleet-coord daemon
+// is up at the moment of dispatch. The previous gate was the source
+// of the operator's "every coord missing the flag" failure: the
+// Python skill's broad pgrep guard silently skipped the fleet-coord
+// daemon launch whenever a fleet-handoff daemon was running, so the
+// gate's narrow probe always saw "no fleet-coord daemon" → flag was
+// never injected.
 //
-// We exercise the runDispatch coord-spawn branch by stubbing
-// remoteControlDaemonRunning to return false and verifying that
-// runDispatch's pre-spawn rewrite logic does not produce an
-// ExecCommand. (We can't run runDispatch end-to-end without real
-// tmux, but we can pin the exact rewrite-or-skip decision via a
-// helper-level test.)
-func TestDispatch_CoordSpawn_SkipsRemoteControlWhenDaemonAbsent(t *testing.T) {
-	prev := remoteControlDaemonRunning
-	remoteControlDaemonRunning = func() bool { return false }
-	t.Cleanup(func() { remoteControlDaemonRunning = prev })
-
-	if remoteControlDaemonRunning() {
-		t.Fatal("test stub failed to install — daemon-running gate did not return false")
-	}
-
-	// The production code path: `if opts.coordSpawn && remoteControlDaemonRunning() { ... }`
-	// — with the stub returning false, the inner block must not run,
-	// so no ExecCommand is produced.
-	coordSpawnGateOpen := true && remoteControlDaemonRunning()
-	if coordSpawnGateOpen {
-		t.Error("coord-spawn gate should be CLOSED when daemon is absent — " +
-			"injecting --remote-control with no daemon listening risks claude " +
-			"exiting non-zero on startup, killing the tmux session before the " +
-			"operator sees the agent")
-	}
-}
-
-// TestDispatch_CoordSpawn_InjectsRemoteControlWhenDaemonRunning is
-// the happy-path counterpart: when the daemon IS running, the gate
-// opens and the rewrite produces an ExecCommand.
-func TestDispatch_CoordSpawn_InjectsRemoteControlWhenDaemonRunning(t *testing.T) {
-	prev := remoteControlDaemonRunning
-	remoteControlDaemonRunning = func() bool { return true }
-	t.Cleanup(func() { remoteControlDaemonRunning = prev })
-
+// This test pins the new contract: at the helper level, the
+// rewrite is unconditional for coord-spawn dispatches. The previous
+// "skip when daemon absent" test (TestDispatch_CoordSpawn_Skips...)
+// pinned the buggy behavior and has been deleted (CLAUDE.md §8: "If
+// you find existing tests that pin the old (buggy) behavior, REMOVE
+// them — don't preserve a passing test that codifies the bug.").
+//
+// claude --remote-control "<name>" handles transient daemon-absent
+// states with its own internal retry loop; the wrapper's RC=$?
+// branch only fires on real claude process exits, not on connection
+// retries. The fleet-coord daemon comes up within seconds of the
+// agent's first tick so worst-case is brief. The seed_inbox path
+// remains as a belt-and-braces fallback.
+func TestDispatch_CoordSpawn_AlwaysInjectsRemoteControl(t *testing.T) {
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -766,16 +671,24 @@ func TestDispatch_CoordSpawn_InjectsRemoteControlWhenDaemonRunning(t *testing.T)
 	rcSession := remoteControlSessionPrefix + "-" + fakeID
 	rewritten := injectRemoteControlFlag(defaultCmd, rcSession)
 
-	// Sanity: the rewrite produced a different argv (so the gate
-	// opening is meaningful — otherwise the production code path's
-	// `if !sameCommand(rewritten, opts.command)` would skip
-	// ExecCommand even with the gate open).
+	// Sanity: the rewrite produced a different argv. If this fails,
+	// either the default --command shape changed (update the helper's
+	// strict-shape match in injectRemoteControlFlag) or the helper
+	// itself regressed.
 	if sameCommand(rewritten, defaultCmd) {
-		t.Fatal("default command's rewrite should differ from input")
+		t.Fatal("default command's rewrite should differ from input — " +
+			"injectRemoteControlFlag's strict-shape match may have drifted")
 	}
 	if !strings.Contains(rewritten[2], `--remote-control "`+rcSession+`"`) {
-		t.Errorf("rewritten command should embed --remote-control with the daemon-prefix session name; got %q",
-			rewritten[2])
+		t.Errorf("rewritten command should embed --remote-control with the "+
+			"daemon-prefix session name; got %q", rewritten[2])
+	}
+	// Belt-and-braces: assert that the script still terminates the
+	// flag value with a closing double-quote (operator-eyeballed
+	// regression: a missing close quote would smuggle the rest of the
+	// wrapper into the session name).
+	if !strings.Contains(rewritten[2], `"`+rcSession+`"`) {
+		t.Errorf("session name should be wrapped in double quotes; got %q", rewritten[2])
 	}
 }
 
