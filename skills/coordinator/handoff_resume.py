@@ -1,0 +1,318 @@
+"""Coord handoff resume — Phase B2 (issue #93).
+
+When fleet-guard hands off the coord at 50/70% context, any in-flight
+worker subagents the coord had spawned via Claude's Agent tool die with
+the parent process. Phase B2 carries enough state in the handoff doc
+that the successor coord can re-issue the Agent calls on its first
+turn.
+
+This module is the successor's helper:
+
+  1. parse_handoff_doc(path) — read the handoff doc and extract the
+     `## Active Subagents` section as a typed list. Mirrors the Go
+     side's handoff.ParseActiveSubagents — both sides round-trip the
+     same byte shape (golden tests pin this).
+  2. build_resume_dispatches(subs, wip_dir, fleet_home) — for each
+     active subagent whose WIP file exists, render a DISPATCH block
+     the coord agent (Claude) can act on by invoking the Agent tool.
+     The prompt body is the worker's existing inbox file (the original
+     prompt) PLUS a "RESUMING" preamble pointing at the WIP path so
+     the worker reads its checkpoint before doing any new work.
+
+The contract: the coord agent's SKILL.md "Resume after handoff"
+section instructs Claude to call:
+
+    python3 -m coordinator.handoff_resume <handoff_doc_path>
+
+on its first turn. The script emits zero or more DISPATCH blocks on
+stdout — same format as loop.py's tick output — so the existing
+"Worker dispatch protocol" reading the coord agent already does covers
+re-dispatch identically to first-spawn.
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# Local sibling module — keep imports stable when running as a script
+# under sys.path = [skills/coordinator].
+import dispatch as dispatch_mod
+
+
+# Resume preamble injected into the worker's prompt when re-dispatched
+# after a coord handoff. The body of the original inbox file appears
+# AFTER this preamble so the worker has full task context but starts
+# from the WIP checkpoint (CLAUDE.md §2 Subagent Dispatch Contract).
+_RESUME_PREAMBLE_TEMPLATE = (
+    "**RESUMING after coord handoff.** Your previous instance died when the\n"
+    "outgoing coord handed off its context. Read your WIP checkpoint at:\n"
+    "\n"
+    "  {wip_path}\n"
+    "\n"
+    "and continue from `next_steps`. Do NOT redo `phases_completed`.\n"
+    "After each phase boundary, update the WIP atomically as before.\n"
+    "\n"
+    "Your task brief follows verbatim:\n"
+    "\n"
+    "---\n"
+    "\n"
+)
+
+
+@dataclass
+class ResumeEntry:
+    """One in-flight worker carried across coord handoff."""
+
+    task_id: str           # task slug
+    branch: str            # worker/<slug>
+    phase: str             # last-known phase (triage context only)
+    agent_id: str          # 8-hex Fleet agent ID; inbox file key
+    subagent_id: str       # Claude Agent tool subagent ID; may be empty
+
+
+def parse_handoff_doc(path: str | os.PathLike) -> list[ResumeEntry]:
+    """Read a handoff doc from `path` and extract the Active Subagents
+    section as a typed list. Returns [] when the section is missing or
+    empty. Raises FileNotFoundError when the doc itself is missing.
+
+    Mirror of internal/handoff.ParseActiveSubagents — the line shape is
+    `- task=<q> branch=<q> phase=<q> agent_id=<q> subagent_id=<q>` with
+    Go-quoted values. We use a small in-process parser rather than
+    shelling out to a Go helper to keep the resume path zero-dep.
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    return _parse_active_subagents(text)
+
+
+# Section header constant — must match the Go renderer.
+_ACTIVE_SUBAGENTS_HEADER = "## Active Subagents"
+_NONE_PLACEHOLDER = "_(none)_"
+
+
+def _parse_active_subagents(doc: str) -> list[ResumeEntry]:
+    """Walk the doc line-by-line, isolate the section body, parse each
+    entry. Whitespace-only and placeholder bodies return []."""
+    in_section = False
+    entries: list[ResumeEntry] = []
+    for raw in doc.splitlines():
+        if not in_section:
+            if raw.strip() == _ACTIVE_SUBAGENTS_HEADER:
+                in_section = True
+            continue
+        # In section. Stop on next ## heading (forward-compat).
+        if raw.startswith("## "):
+            break
+        line = raw.strip()
+        if not line or line == _NONE_PLACEHOLDER:
+            continue
+        entry = _parse_entry_line(line)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+# Match `key="<go-quoted-value>"` segments. `go-quoted` values may
+# contain escaped quotes (`\"`), backslashes (`\\`), and other
+# strconv.Quote escapes; the regex captures the full quoted lexeme.
+_KV_RE = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
+
+
+def _parse_entry_line(line: str) -> ResumeEntry | None:
+    """Parse one `- task=... branch=... ...` body line. Returns None on
+    structural failure; the caller drops the line and continues."""
+    if not line.startswith("- "):
+        return None
+    rest = line[2:]
+    fields: dict[str, str] = {}
+    for m in _KV_RE.finditer(rest):
+        key = m.group(1)
+        value = _unquote_go(m.group(2))
+        fields[key] = value
+    task = fields.get("task", "")
+    if not task:
+        return None
+    return ResumeEntry(
+        task_id=task,
+        branch=fields.get("branch", ""),
+        phase=fields.get("phase", ""),
+        agent_id=fields.get("agent_id", ""),
+        subagent_id=fields.get("subagent_id", ""),
+    )
+
+
+def _unquote_go(s: str) -> str:
+    """Reverse the strconv.Quote escape set _go_quote uses on the
+    fleet-guard side. Limited to the ASCII subset agent_ids/slugs/paths
+    populate in practice plus the danger characters (\\, \", newline,
+    tab, control codes \\xNN).
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(s):
+            out.append(ch)
+            break
+        esc = s[i + 1]
+        if esc == '"':
+            out.append('"')
+            i += 2
+        elif esc == "\\":
+            out.append("\\")
+            i += 2
+        elif esc == "n":
+            out.append("\n")
+            i += 2
+        elif esc == "r":
+            out.append("\r")
+            i += 2
+        elif esc == "t":
+            out.append("\t")
+            i += 2
+        elif esc == "x" and i + 3 < len(s):
+            try:
+                out.append(chr(int(s[i + 2 : i + 4], 16)))
+            except ValueError:
+                out.append(s[i : i + 4])
+            i += 4
+        else:
+            out.append(s[i : i + 2])
+            i += 2
+    return "".join(out)
+
+
+def build_resume_dispatches(
+    entries: list[ResumeEntry],
+    *,
+    wip_dir: str | os.PathLike,
+    fleet_home: str | os.PathLike,
+) -> tuple[list[str], list[str]]:
+    """Build DISPATCH blocks the coord agent can act on to re-spawn
+    each Active Subagent whose WIP file exists.
+
+    Returns (blocks, skipped). `blocks` is the list of rendered
+    DISPATCH strings (one per resume target); `skipped` is a list of
+    one-line human-readable reasons for entries that were NOT
+    re-dispatched (missing WIP, missing inbox, malformed agent_id).
+
+    Resume protocol:
+      - WIP at <wip_dir>/<task_id>.md — required. Without a checkpoint,
+        re-dispatching would restart the work from scratch and risk
+        duplicating commits / PRs already in flight.
+      - Inbox at <fleet_home>/inbox/<agent_id>.md — required. The
+        worker prompt template inlines task spec/acceptance/standards;
+        if the inbox is gone we'd have to rebuild from tasks.md, which
+        is a Phase C concern (cleaner, but invasive).
+
+    The successor coord re-uses the agent_id from the handoff doc so
+    tasks.md notes (`dispatched as agent <id>`) stay coherent across
+    handoffs.
+    """
+    wip_dir_p = Path(wip_dir)
+    fleet_home_p = Path(fleet_home)
+    blocks: list[str] = []
+    skipped: list[str] = []
+    for e in entries:
+        if not e.task_id:
+            skipped.append("entry missing task_id; skip")
+            continue
+        if not e.agent_id:
+            skipped.append(f"task {e.task_id}: missing agent_id; skip")
+            continue
+        wip_path = wip_dir_p / f"{e.task_id}.md"
+        if not wip_path.exists():
+            skipped.append(
+                f"task {e.task_id}: WIP {wip_path} missing; skip "
+                "(worker likely finished or never started)",
+            )
+            continue
+        inbox_path = fleet_home_p / "inbox" / f"{e.agent_id}.md"
+        if not inbox_path.exists():
+            skipped.append(
+                f"task {e.task_id}: inbox {inbox_path} missing; skip "
+                "(rebuild from tasks.md is Phase C)",
+            )
+            continue
+        # Build the resume prompt: WIP-aware preamble + original inbox
+        # body. Write it to the SAME inbox path so the agent_id stays
+        # stable across handoff (tasks.md notes don't need re-stitching).
+        original_body = inbox_path.read_text(encoding="utf-8")
+        resume_body = (
+            _RESUME_PREAMBLE_TEMPLATE.format(wip_path=str(wip_path))
+            + original_body
+        )
+        try:
+            dispatch_mod.write_worker_inbox(
+                e.agent_id, resume_body, fleet_home=str(fleet_home_p),
+            )
+        except (ValueError, OSError) as exc:
+            skipped.append(
+                f"task {e.task_id}: inbox rewrite failed: {exc}; skip",
+            )
+            continue
+        try:
+            block = dispatch_mod.format_dispatch_instruction(
+                agent_id=e.agent_id,
+                slug=e.task_id,
+                prompt_file=str(inbox_path),
+                description=f"fleet worker {e.task_id} (resume)",
+            )
+        except ValueError as exc:
+            skipped.append(
+                f"task {e.task_id}: dispatch format failed: {exc}; skip",
+            )
+            continue
+        blocks.append(block)
+    return blocks, skipped
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: `python3 -m coordinator.handoff_resume <handoff_doc>`.
+
+    Emits zero or more DISPATCH blocks on stdout — same shape the coord
+    agent already acts on for first-spawn dispatches. Skipped entries
+    write to stderr (operator visibility). Always exits 0 unless the
+    handoff doc itself is unreadable (exit 1) — partial resumes are
+    better than aborting the whole successor.
+    """
+    args = list(argv) if argv is not None else sys.argv[1:]
+    if not args:
+        print("usage: handoff_resume <handoff_doc_path>", file=sys.stderr)
+        return 2
+    doc_path = args[0]
+    try:
+        entries = parse_handoff_doc(doc_path)
+    except FileNotFoundError:
+        print(f"handoff_resume: doc not found: {doc_path}", file=sys.stderr)
+        return 1
+    fleet_home = os.environ.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+    wip_dir = os.environ.get(
+        "FLEET_SUBAGENT_WIP_DIR",
+    ) or os.path.expanduser("~/.fleet/subagent-wip")
+    blocks, skipped = build_resume_dispatches(
+        entries, wip_dir=wip_dir, fleet_home=fleet_home,
+    )
+    for line in skipped:
+        print(f"# {line}", file=sys.stderr)
+    for b in blocks:
+        print(b)
+        print()
+    if not blocks:
+        print(
+            "# handoff_resume: no resumable subagents "
+            f"(parsed={len(entries)} skipped={len(skipped)})",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

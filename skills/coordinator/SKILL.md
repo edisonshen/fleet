@@ -254,7 +254,37 @@ If you see N DISPATCH blocks in one tick output, you make N Agent calls (one per
 
 **Why this matters:** if you skip the Agent call, the worker subagent never spawns. The task sits in `status=in-progress` in tasks.md and the supervisor loop tries to reconcile a worker that doesn't exist. Reliability of this protocol depends on you following it every time without fail. The supervisor will eventually flip the task back to `todo` after stuck-check timeout, but that's hours of lost time.
 
-Phase B (deferred): `[a]` task-attach replacement (no tmux to attach to), coord-handoff lifecycle for surviving Agent subagents. Phase C (deferred): TUI subagent_id rendering. This protocol covers Phase A only — dispatch mechanism.
+Phase B (issue #93) covers the `[a]` task-attach replacement on the TUI side and coord-handoff continuity (see "## Resume after handoff" below). Phase C (deferred): TUI subagent_id rendering.
+
+## Resume after handoff (issue #93 Phase B2)
+
+When fleet-guard hands off the coord at 50/70% context, any in-flight worker subagents the outgoing coord had spawned via the Agent tool die with the parent process. The successor coord (a freshly-spawned Claude session inheriting the role) MUST re-issue the Agent calls for those workers on its first turn — otherwise the workers' WIP files sit orphaned and the operator's next `fleet tasks` poll surfaces stuck-in-progress rows.
+
+The handoff doc carries enough state for this to be deterministic:
+
+- Frontmatter `previous_handoff: <path>` — the chain pointer. Empty / null on the first handoff for the agent.
+- `## Active Subagents` body section — one machine-readable line per in-flight worker, written by `fleet-guard/handoff.py` from the outgoing coord's `coord-state.json:worker_agent_ids` map.
+
+**What you (the coord agent) MUST do on first turn after a handoff:**
+
+1. Read your handoff doc (the `## First Action (auto)` section already directs you there). The doc path is in your spawn prompt or in tasks.md.
+2. Run the resume helper:
+
+   ```bash
+   python3 /path/to/skills/coordinator/handoff_resume.py <handoff-doc-path>
+   ```
+
+   The helper:
+   - Parses the `## Active Subagents` section into a typed list.
+   - For each entry, checks `~/.fleet/subagent-wip/<task-tag>.md` exists.
+   - For each (entry, WIP) pair, rewrites the worker's inbox file (`~/.fleet/inbox/<agent_id>.md`) with a "RESUMING" preamble that points the worker at its WIP, then emits a DISPATCH block on stdout in the same format as `loop.py`'s tick output.
+3. For each DISPATCH block in the helper's stdout, follow the exact same protocol as "## Worker dispatch protocol" above — one Agent tool invocation per block, `run_in_background: true`, `prompt` = the body of the inbox file referenced in the block.
+
+The resume preamble explicitly tells the worker subagent to read its WIP first and continue from `next_steps` rather than restart — this is the CLAUDE.md §2 contract (Subagent Dispatch — bake in WIP checkpoints + resumability) operationalized across coord handoff.
+
+If the helper emits zero DISPATCH blocks, the outgoing coord had no in-flight workers (the steady-state case) — proceed with the regular `/coordinator` tick. The helper writes a one-line footer to stderr in this case so the absence is observable.
+
+**Skipped entries** (helper writes them to stderr as `# task <slug>: ...`) are not errors — they're entries whose WIP or inbox files have been pruned (worker finished cleanly) or whose `agent_id` was malformed. The successor coord moves on; the supervisor stuck-check will catch any task that stayed in-progress without a worker.
 
 ## Invocation
 

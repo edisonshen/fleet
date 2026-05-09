@@ -106,6 +106,38 @@ def test_skill_md_dispatch_protocol_explains_agent_tool_invocation():
         )
 
 
+# ---------- Resume after handoff (issue #93 Phase B2) ----------
+
+
+def test_skill_md_has_resume_after_handoff_section():
+    """The successor coord re-reads SKILL.md on first turn — without a
+    'Resume after handoff' section it has no instructions for picking
+    up the outgoing coord's in-flight worker subagents (issue #93)."""
+    body = _read_skill_md()
+    assert "## Resume after handoff" in body, (
+        "SKILL.md missing '## Resume after handoff' section — "
+        "successor coord won't re-dispatch surviving workers (issue #93 Phase B2)."
+    )
+
+
+def test_skill_md_resume_section_names_helper_module():
+    """The section must point at handoff_resume.py + the explicit
+    DISPATCH-block protocol so the coord can follow the existing
+    Worker dispatch protocol pattern verbatim."""
+    body = _read_skill_md()
+    for marker in (
+        "handoff_resume",
+        "Active Subagents",
+        "previous_handoff",
+        "DISPATCH",
+        "WIP",
+    ):
+        assert marker in body, (
+            f"SKILL.md Resume section missing {marker!r} — coord agent "
+            f"can't execute the resume protocol (issue #93 Phase B2)."
+        )
+
+
 def test_skill_md_dispatch_protocol_pins_one_call_per_block():
     """The contract is exactly one Agent call per DISPATCH block — N
     blocks → N calls. Drift to "one call per tick" would silently
