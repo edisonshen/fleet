@@ -271,6 +271,11 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		now:          time.Now(),
 		tickFrame:    m.tickCount,
 		spawnTimeout: m.coordSpawnTimeout,
+		// m.records feeds the Path B "fresh agent record" check inside
+		// applyStuckSelfHeal — see coord_spawn.go's two-path heal logic.
+		// Loaded once via loadAgentsCmd; nil on cold start (Path B no-ops
+		// until the first agent load completes, Path A still fires).
+		records: m.records,
 	}
 	// Activity-grouping helper — when a project block follows the
 	// hidden separator AND that separator is expanded, render the
@@ -571,7 +576,12 @@ func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) [
 	if st == coordSpawnStuck && markerAgentID != "" {
 		sess := tmuxSessionName(markerAgentID)
 		alive := sessionAliveFn(sess)
-		st, _ = applyStuckSelfHeal(st, markerAgentID, alive, func() error {
+		// Path B probe: does the agent record on disk show a recent
+		// last_activity_ts? If yes, the spawn already succeeded and the
+		// marker is stale — heal regardless of tmux state. Path A still
+		// covers the dead-tmux + no-record case for silent spawn deaths.
+		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+		st, _ = applyStuckSelfHeal(st, markerAgentID, alive, fresh, func() error {
 			return removeCoordSpawnMarkerFn(p.Name)
 		})
 	}
