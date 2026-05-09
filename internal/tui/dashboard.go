@@ -72,7 +72,7 @@ type ProjectRow struct {
 }
 
 // TaskCounts mirrors the columns in the mockup:
-// ⏳ todo  ▶ in-progress  👁 in-review  ⚠ blocked  ✓ done.
+// ◌ todo  ▶ in-progress  ◇ in-review  ▲ blocked  ✓ done.
 // "ready" rolls into todo (operator hasn't dispatched yet).
 type TaskCounts struct {
 	Todo       int
@@ -276,7 +276,7 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// Counts.Blocked stays populated on row scan above (line 217) for
 	// diagnostics + future filtering; only the attention rollup is
 	// dropped. The visual signal for a planning-blocked task is the
-	// distinct ⏸ glyph in the per-task expansion (taskStatusStyles), not
+	// distinct ‖ glyph in the per-task expansion (taskStatusStyles), not
 	// the row-level attention chip.
 	var firstBlocked *WorkerRow
 	for _, w := range wrows {

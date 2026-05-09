@@ -154,7 +154,7 @@ func TestView_ProjectShowsTaskCounts(t *testing.T) {
 	m.dashboard = scanDashboard(time.Now())
 
 	out := m.View()
-	for _, want := range []string{"⏳ 3", "▶ 1", "👁 2", "✓ 7"} {
+	for _, want := range []string{"◌ 3", "▶ 1", "◇ 2", "✓ 7"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("dashboard should include count chip %q, got:\n%s", want, out)
 		}

@@ -139,7 +139,20 @@ func renderDashboardHeader(m Model, usable int) string {
 	// separate line above the totals strip — matches mockup vertical
 	// rhythm without a box-drawing border (cleaner integration with
 	// the existing v0.1 title row idiom).
-	title := headerLabelStyle.Render("FLEET") + headerSepStyle.Render(" — ") + headerTextStyle.Render("v0.2 Ops Console")
+	// Title suffix uses the injected Version (cmd/fleet/main.go:40
+	// passes it through tui.Run → New → m.version). Released builds
+	// render "FLEET — vX.Y.Z Ops Console"; dev builds (Version="dev",
+	// the default in main.go:20 when goreleaser hasn't injected -X
+	// main.Version=<tag>) render the bare "FLEET — Ops Console" so
+	// the operator's title bar doesn't carry a meaningless "vdev"
+	// chip. m.version is "" in pathological constructs only — fall
+	// back to the bare form there too rather than rendering a stray
+	// "v Ops Console".
+	suffix := "Ops Console"
+	if m.version != "" && m.version != "dev" {
+		suffix = "v" + m.version + " Ops Console"
+	}
+	title := headerLabelStyle.Render("FLEET") + headerSepStyle.Render(" — ") + headerTextStyle.Render(suffix)
 	return title + "\n" + row
 }
 
@@ -453,7 +466,7 @@ func rowsHaveLeft(rows []dashRow) bool {
 //
 //	<name>                                     [● N attn]
 //	<repo>
-//	⏳ N ▶ N 👁 N ⚠ N ✓ N    ● active     last-tick
+//	◌ N ▶ N ◇ N ▲ N ✓ N    ● active     last-tick
 //	  coord <coord-id>                          (issue #55)
 //
 // Attention rows get a leading "▌ " accent (red bold) on every line of
@@ -473,7 +486,7 @@ func rowsHaveLeft(rows []dashRow) bool {
 // Spawning indicator (issue #86): when the coord-spawn marker exists
 // AND coord-state.json hasn't published a fresh tick yet, we render
 // "⠋ spawning coord... 1m 23s" in the same slot as the coord-id line.
-// Beyond ctx.spawnTimeout, the slot flips to a red "⚠ coord spawn
+// Beyond ctx.spawnTimeout, the slot flips to a red "▲ coord spawn
 // stuck — check tmux session fleet-<name>" warning. State derivation
 // lives in deriveCoordSpawnState (coord_spawn.go) so it can be tested
 // in isolation; this function just renders the result.
@@ -617,7 +630,7 @@ func tmuxSessionName(agentID string) string {
 //	ready       → "◐ <slug>"  bright    (promote-eligible, no header chip)
 //	in-progress → "▶ <slug>"  amber     (matches projectCountInProgStyle)
 //	in-review   → "⟳ <slug>"  blue      (matches projectCountReviewStyle)
-//	blocked     → "⏸ <slug>"  faint dim (issue #103; planning state — NOT
+//	blocked     → "‖ <slug>"  faint dim (issue #103; planning state — NOT
 //	                                    actionable. Worker phase=blocked
 //	                                    is the actionable signal and is
 //	                                    surfaced via the row attention
@@ -745,36 +758,51 @@ func taskStatusStyles(status string) (string, lipgloss.Style, lipgloss.Style) {
 	case "in-review":
 		return "⟳", taskGlyphInReviewStyle, taskLabelInReviewStyle
 	case "blocked":
-		// Issue #103: ⏸ (pause) + dim/faint signals "task is paused on a
-		// sequencing dep" — a planning state. The previous ⚠ + red
+		// Issue #103: pause-style glyph + dim/faint signals "task is paused
+		// on a sequencing dep" — a planning state. The previous ⚠ + red
 		// treatment conflated planning-blocked with worker phase=blocked
 		// (the actual raise-hand signal); operators saw "1 attn" on a
 		// project whose only "blocked" was an external-dep marker. Worker
 		// phase=blocked still drives the row-level attention chip via
 		// scanProject's attention loop, which is the load-bearing signal.
-		return "⏸", taskGlyphBlockedStyle, taskLabelBlockedStyle
+		//
+		// Glyph polish: was ⏸ (DOUBLE VERTICAL BAR U+23F8, color-emoji in
+		// modern terminals); replaced with ‖ (DOUBLE VERTICAL LINE U+2016,
+		// text-presentation only) so the row stays flat/monochrome to
+		// match the Apple-design feel the operator asked for.
+		return "‖", taskGlyphBlockedStyle, taskLabelBlockedStyle
 	case "done":
 		return "✓", projectCountDoneStyle, projectCountDoneStyle
 	}
 	return "•", dimStyle, workerSlugStyle
 }
 
-// renderCountChips builds "⏳ 3  ▶ 1  👁 1  ⚠ 1  ✓ 12" with the
+// renderCountChips builds "◌ 3  ▶ 1  ◇ 1  ▲ 1  ✓ 12" with the
 // per-status colors. Zero counts are omitted so the row stays compact
-// — except for ⏳ todo + ✓ done which always show because they're the
+// — except for ◌ todo + ✓ done which always show because they're the
 // most common signals.
+//
+// Flat-glyph polish (operator request): the chips used to be ⏳ / 👁 /
+// ⚠, all of which have emoji-presentation defaults in modern terminals
+// (Ghostty rendered them as 3D color emoji). Swapped for monochrome
+// text-presentation glyphs in the Geometric Shapes block — ◌ (DOTTED
+// CIRCLE U+25CC) for "queue/pending" without colliding with the task-
+// row ○ (white circle, the at-rest task glyph) or the active-coord ●,
+// ◇ (WHITE DIAMOND U+25C7) for "in-review/observation", and ▲ (BLACK
+// UP-POINTING TRIANGLE U+25B2) for "warning" matching Apple's flat
+// hazard idiom.
 func renderCountChips(c TaskCounts) string {
 	parts := []string{
-		projectCountTodoStyle.Render(fmt.Sprintf("⏳ %d", c.Todo)),
+		projectCountTodoStyle.Render(fmt.Sprintf("◌ %d", c.Todo)),
 	}
 	if c.InProgress > 0 {
 		parts = append(parts, projectCountInProgStyle.Render(fmt.Sprintf("▶ %d", c.InProgress)))
 	}
 	if c.InReview > 0 {
-		parts = append(parts, projectCountReviewStyle.Render(fmt.Sprintf("👁 %d", c.InReview)))
+		parts = append(parts, projectCountReviewStyle.Render(fmt.Sprintf("◇ %d", c.InReview)))
 	}
 	if c.Blocked > 0 {
-		parts = append(parts, projectCountBlockedStyle.Render(fmt.Sprintf("⚠ %d", c.Blocked)))
+		parts = append(parts, projectCountBlockedStyle.Render(fmt.Sprintf("▲ %d", c.Blocked)))
 	}
 	parts = append(parts, projectCountDoneStyle.Render(fmt.Sprintf("✓ %d", c.Done)))
 	return strings.Join(parts, "  ")

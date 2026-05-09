@@ -15,7 +15,7 @@
 //	│ marker, fresh                                               │
 //	│   coord-state stale → coordSpawnSpawning  ("⠋ spawning…")  │
 //	│   coord-state fresh → coordSpawnActive    (existing ● live) │
-//	│ marker, elapsed > timeout → coordSpawnStuck  ("⚠ stuck…")  │
+//	│ marker, elapsed > timeout → coordSpawnStuck  ("▲ stuck…")  │
 //	└────────────────────────────────────────────────────────────┘
 //
 // "Fresh coord-state.json" reuses coordActiveWindow from dashboard.go
@@ -255,14 +255,14 @@ func renderCoordSpawnLineForProject(
 	if st == coordSpawnStuck {
 		var msg string
 		if markerAgentID != "" {
-			msg = "⚠ coord spawn stuck — check tmux session fleet-" + markerAgentID
+			msg = "▲ coord spawn stuck — check tmux session fleet-" + markerAgentID
 		} else {
 			// Marker is on disk (we wouldn't be in Stuck otherwise) but
 			// its body read returned empty — likely a concurrent rewrite
 			// or a hand-edited zero-byte file. Fall back to the project
 			// shape with softer wording so the operator knows the agent
 			// ID couldn't be resolved.
-			msg = "⚠ coord spawn stuck for project " + projectName + " — no agent ID in marker; check `tmux ls`"
+			msg = "▲ coord spawn stuck for project " + projectName + " — no agent ID in marker; check `tmux ls`"
 		}
 		body := attentionChipStyle.Render(msg)
 		return prefix + body, true

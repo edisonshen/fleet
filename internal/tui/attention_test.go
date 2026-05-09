@@ -59,7 +59,7 @@ func seedBlockedTask(t *testing.T, projectsRoot, project, slug string, status ta
 }
 
 // TestRows_BlockedTaskGetsPauseGlyph pins that a blocked-status task
-// row renders the ⏸ pause glyph in the expansion (issue #103). The
+// row renders the ‖ pause glyph in the expansion (issue #103). The
 // glyph distinguishes "planning state — task is paused on a sequencing
 // dep" from worker phase=blocked, which is the actionable raise-hand
 // signal and gets the row-level attention chip instead. Operators
@@ -67,7 +67,8 @@ func seedBlockedTask(t *testing.T, projectsRoot, project, slug string, status ta
 // shouldn't read it as a red-alert "answer me".
 //
 // Pre-#103 this test asserted ⚠ for blocked tasks — same code path,
-// different visual semantics.
+// different visual semantics. Glyph polish: was ⏸ (color-emoji);
+// replaced with ‖ DOUBLE VERTICAL LINE for monochrome rendering.
 func TestRows_BlockedTaskGetsPauseGlyph(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedBlockedTask(t, pdir, "fleet", "needs-input-aaaa", tasks.StatusBlocked,
@@ -83,16 +84,16 @@ func TestRows_BlockedTaskGetsPauseGlyph(t *testing.T) {
 	if !strings.Contains(out, "needs-input-aaaa") {
 		t.Fatalf("blocked task slug should render in expansion, got:\n%s", out)
 	}
-	// The ⏸ glyph must appear ahead of the slug on the same line. We
+	// The ‖ glyph must appear ahead of the slug on the same line. We
 	// don't pin the exact column (lipgloss escapes around it shift with
 	// palette/bold rendering) — substring on the line is enough.
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "needs-input-aaaa") {
-			if !strings.Contains(line, "⏸") {
-				t.Errorf("blocked task line should carry ⏸ pause glyph, got:\n%s", line)
+			if !strings.Contains(line, "‖") {
+				t.Errorf("blocked task line should carry ‖ pause glyph, got:\n%s", line)
 			}
-			if strings.Contains(line, "⚠") {
-				t.Errorf("blocked task line must NOT carry the ⚠ red-alert glyph (issue #103: planning state, not actionable), got:\n%s", line)
+			if strings.Contains(line, "⚠") || strings.Contains(line, "▲") {
+				t.Errorf("blocked task line must NOT carry the warning glyph (issue #103: planning state, not actionable), got:\n%s", line)
 			}
 			return
 		}
@@ -123,7 +124,7 @@ func TestRows_DoneTaskGetsCheckGlyph(t *testing.T) {
 func TestRows_DefaultTaskGetsBulletGlyph(t *testing.T) {
 	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "future-unknown"}
 	out := taskBlockLine(tr, 60, false)
-	if strings.Contains(out, "⚠") || strings.Contains(out, "⏸") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") || strings.Contains(out, "✗") {
+	if strings.Contains(out, "▲") || strings.Contains(out, "‖") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") || strings.Contains(out, "✗") {
 		t.Errorf("unknown-status task should NOT carry status glyph, got: %q", out)
 	}
 	if !strings.Contains(out, "•") {

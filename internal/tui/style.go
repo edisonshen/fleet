@@ -98,10 +98,12 @@ var (
 	//	ready      → ◐ + bright    (no header chip; promote-eligible)
 	//	in-progress → ▶ + amber    (matches projectCountInProgStyle)
 	//	in-review  → ⟳ + blue      (matches projectCountReviewStyle)
-	//	blocked    → ⏸ + faint dim (issue #103; planning state, NOT
+	//	blocked    → ‖ + faint dim (issue #103; planning state, NOT
 	//	                            actionable — distinct from worker
 	//	                            phase=blocked which keeps the red
-	//	                            attention treatment via the row chip)
+	//	                            attention treatment via the row chip.
+	//	                            Polish: was ⏸ — replaced with ‖
+	//	                            DOUBLE VERTICAL LINE for monochrome.)
 	//	done       → ✓ + green     (existing projectCountDoneStyle, PR #76)
 	//
 	// "ready" promotes off the dim baseline because its semantic — task
@@ -118,7 +120,7 @@ var (
 	taskLabelInReviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorBlue))
 
 	// Issue #103: blocked-as-planning-state glyph + label. Distinct from
-	// the worker-side red ⚠/attentionChipStyle so the operator can read
+	// the worker-side red ▲/attentionChipStyle so the operator can read
 	// "this task is paused on a sequencing dep" without confusing it for
 	// a worker raise-hand. Both faint + dim — the row should recede, not
 	// shout.
