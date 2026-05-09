@@ -120,6 +120,16 @@ func renderDashboardHeader(m Model, usable int) string {
 	if y, r := hotCounts(m.records, m.aliveByID, workers); y > 0 || r > 0 {
 		parts = append(parts, renderHotCounts(y, r))
 	}
+	// Local-agents chip (issue #94 Phase C): "<N> agents" when any coord
+	// has live Agent-tool subagents registered. Mirrors the hide-at-zero
+	// shape of the hot-count chips above so the strip stays clean for
+	// projects that haven't dispatched anything yet (or whose dispatches
+	// are pre-Phase-C). Pluralization: "1 agent" vs "2 agents".
+	if snap != nil {
+		if n := snap.SubagentsRunning(); n > 0 {
+			parts = append(parts, renderSubagentCount(n))
+		}
+	}
 	left := strings.Join(parts, dot)
 
 	// Right side: "user · vX.Y.Z". userName is captured at New().
@@ -973,6 +983,18 @@ func workerBlockLines(w *WorkerRow, records []*agent.Record, width int, selected
 	}
 	id := workerIDStyle.Render(w.ID)
 	line1 := "  " + dot + " " + id
+
+	// Issue #94 Phase C: append the Claude Agent-tool subagent_id as a
+	// short hash chip directly after the worker ID, dim. The chip is
+	// the operator's cross-reference between this row and Claude's
+	// chat-side "N local agents" indicator. Renders only when the
+	// coord agent has registered an id; pre-Phase-C dispatches and
+	// register_subagent failures collapse to the existing 2-token
+	// `dot id` shape with no leftover separator (codex regression
+	// guard — empty hash must NOT print `· `).
+	if hash := shortSubagentHash(w.SubagentID); hash != "" {
+		line1 += " " + dimStyle.Render("· "+hash)
+	}
 
 	// Look up the agent record whose context_pct represents this worker.
 	// records may be nil when the dashboard has no agent records yet

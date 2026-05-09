@@ -347,6 +347,147 @@ func TestView_HeaderShowsTotals(t *testing.T) {
 	}
 }
 
+// TestView_HeaderShowsAgentsChipWhenSubagentsRegistered pins the issue
+// #94 Phase C "<N> agents" top-status chip. When at least one worker
+// row carries a SubagentID, the strip renders "<N> agent[s]" alongside
+// the existing yellow / red chips. Mirrors hide-at-zero so the strip
+// stays clean for projects without registered subagents.
+func TestView_HeaderShowsAgentsChipWhenSubagentsRegistered(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Seed two workers with state.json, register subagents for both.
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
+	seedWorker(t, pdir, "fleet", "beta-bbbb", workers.State{Phase: workers.PhaseTDDGreen})
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
+		"alpha-aaaa": "claude-sub-1",
+		"beta-bbbb":  "claude-sub-2",
+	}, false, "")
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	out := m.View()
+	if !strings.Contains(out, "2 agents") {
+		t.Errorf("header should show '2 agents' chip; got:\n%s", out)
+	}
+}
+
+func TestView_HeaderHidesAgentsChipWhenNoneRegistered(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Worker exists but no subagent_ids registered. Chip must NOT render.
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	out := m.View()
+	if strings.Contains(out, " agents") || strings.Contains(out, "1 agent") {
+		// Defensive — no `agents` substring with a count prefix anywhere
+		// in the header. (Other "agents" strings in the body — like the
+		// v0.1 sub-heading — render with a different format.)
+		if strings.Contains(out, "0 agent") || strings.Contains(out, "1 agent ") {
+			t.Errorf("agents chip should be hidden at 0; got:\n%s", out)
+		}
+	}
+}
+
+func TestView_HeaderShowsSingularAgentChip(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{Phase: workers.PhaseTDDRed})
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
+		"alpha-aaaa": "claude-sub-1",
+	}, false, "")
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	out := m.View()
+	if !strings.Contains(out, "1 agent") {
+		t.Errorf("header should show '1 agent' (singular); got:\n%s", out)
+	}
+	// Must NOT pluralize on N=1.
+	if strings.Contains(out, "1 agents") {
+		t.Errorf("singular form drift: header rendered '1 agents'; got:\n%s", out)
+	}
+}
+
+// TestWorkerBlockLines_RendersSubagentChip pins per-row rendering.
+// When a WorkerRow carries SubagentID, the first 8 chars render as a
+// `· <hash>` chip directly after the worker ID. Empty SubagentID
+// yields no chip — the row keeps its 2-token "<dot> <id>" head shape.
+func TestWorkerBlockLines_RendersSubagentChip(t *testing.T) {
+	w := &WorkerRow{
+		ID:         "1a2b",
+		Project:    "fleet",
+		Slug:       "alpha-1a2b",
+		Phase:      workers.PhaseTDDRed,
+		Color:      "green",
+		Age:        "2m",
+		State:      "ok",
+		SubagentID: "claude-sub-1",
+	}
+	lines := workerBlockLines(w, nil, 60, false)
+	if len(lines) < 2 {
+		t.Fatalf("expected ≥2 lines, got %d", len(lines))
+	}
+	// First 8 chars of "claude-sub-1" → "claude-s".
+	if !strings.Contains(lines[0], "claude-s") {
+		t.Errorf("expected truncated subagent chip in line 1, got:\n%s", lines[0])
+	}
+	if !strings.Contains(lines[0], "·") {
+		t.Errorf("expected `·` separator in line 1, got:\n%s", lines[0])
+	}
+}
+
+func TestWorkerBlockLines_OmitsChipWhenSubagentEmpty(t *testing.T) {
+	// Codex regression guard: an empty SubagentID must NOT print a stray
+	// `· ` prefix. The row keeps its existing head shape.
+	w := &WorkerRow{
+		ID:      "1a2b",
+		Project: "fleet",
+		Slug:    "alpha-1a2b",
+		Phase:   workers.PhaseTDDRed,
+		Color:   "green",
+		Age:     "2m",
+		State:   "ok",
+		// SubagentID intentionally blank.
+	}
+	lines := workerBlockLines(w, nil, 60, false)
+	if len(lines) < 2 {
+		t.Fatalf("expected ≥2 lines, got %d", len(lines))
+	}
+	// The leading 4-char-id segment "1a2b" must NOT be followed by a `·`
+	// before the chip area. The slug "fleet:alpha" appears in line 2,
+	// not line 1, so check line 1 specifically.
+	// "·" appears for the line-2 :slug separator? No, that uses ":". So
+	// line 1 with empty SubagentID should never carry `·`.
+	if strings.Contains(lines[0], "·") {
+		t.Errorf("empty SubagentID should NOT print `·` separator; got:\n%s", lines[0])
+	}
+}
+
+func TestWorkerBlockLines_TruncatesLongSubagentID(t *testing.T) {
+	// Long Claude tokens render the first 8 runes only — keeps the row
+	// width predictable across operator-set wide terminals.
+	w := &WorkerRow{
+		ID:         "1a2b",
+		Project:    "fleet",
+		Slug:       "alpha-1a2b",
+		Phase:      workers.PhaseTDDRed,
+		Color:      "green",
+		Age:        "2m",
+		State:      "ok",
+		SubagentID: "verylongclaudesubagentid123",
+	}
+	lines := workerBlockLines(w, nil, 80, false)
+	if !strings.Contains(lines[0], "verylong") {
+		t.Errorf("expected first 8 chars of long token, got:\n%s", lines[0])
+	}
+	// Should NOT carry the 9th char ('c').
+	if strings.Contains(lines[0], "verylongc") {
+		t.Errorf("truncation failed — 9th char leaked, got:\n%s", lines[0])
+	}
+}
+
 // TestView_AgentsRenderInDashboard_NoGToggle pins issue #53 part A:
 // agent records appear inside the dashboard's right column under the
 // "v0.1 agents — N active" sub-heading, NOT behind a [g] toggle. The
@@ -1306,7 +1447,7 @@ func TestScanWorkers_DeletesDoneWorkerDir(t *testing.T) {
 		PRURL: "https://example.invalid/pr/1",
 		Exit:  &exit,
 	})
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	for _, r := range rows {
 		if r.Slug == "done-1a2b" {
 			t.Fatalf("done worker should be filtered from rows; got %+v", r)
@@ -1327,7 +1468,7 @@ func TestScanWorkers_DeletesFailedWorkerDir(t *testing.T) {
 		BlockedReason: "exit 1",
 		Exit:          &exit,
 	})
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	for _, r := range rows {
 		if r.Slug == "failed-cd34" {
 			t.Fatalf("failed worker should be filtered from rows; got %+v", r)
@@ -1347,7 +1488,7 @@ func TestScanWorkers_KeepsBlockedWorkerDir(t *testing.T) {
 		Phase:         workers.PhaseBlocked,
 		BlockedReason: "needs operator clarification",
 	})
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	found := false
 	for _, r := range rows {
 		if r.Slug == "blocked-1a2b" {
@@ -1369,7 +1510,7 @@ func TestScanWorkers_KeepsActiveWorkerDir(t *testing.T) {
 	seedWorker(t, pdir, "fleet", "active-1a2b", workers.State{
 		Phase: workers.PhaseTDDRed,
 	})
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	found := false
 	for _, r := range rows {
 		if r.Slug == "active-1a2b" {
@@ -1396,7 +1537,7 @@ func TestScanWorkers_SkipsDeletingStagingDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(staging, "state.json"), []byte(`{"slug":"tgt-1a2b","phase":"done","pr_url":"https://x"}`), 0o644); err != nil {
 		t.Fatalf("write state.json in staging: %v", err)
 	}
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	for _, r := range rows {
 		if strings.Contains(r.Slug, "deleting") {
 			t.Fatalf("staging dir should not surface; got row %+v", r)
@@ -1449,7 +1590,7 @@ func TestScanWorkers_DoesNotMisclassifyLegitimateSlug(t *testing.T) {
 	seedWorker(t, pdir, "fleet", "phase.deleting-stage-1a2b", workers.State{
 		Phase: workers.PhaseTDDRed,
 	})
-	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
 	found := false
 	for _, r := range rows {
 		if r.Slug == "phase.deleting-stage-1a2b" {
@@ -1458,5 +1599,203 @@ func TestScanWorkers_DoesNotMisclassifyLegitimateSlug(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("legitimate slug containing `.deleting-` substring should render normally")
+	}
+}
+
+// ---------- Phase C — subagent_id rendering (issue #94) ----------
+
+// writeCoordStateWithSubagentMap drops a coord-state.json at the
+// expected path with `worker_subagent_ids` populated. mtime is fresh
+// (now) so scanProject reads it as Active and the subagent map flows
+// through to the row scan. raw=true bypasses the JSON encoder for the
+// "malformed file" test.
+func writeCoordStateWithSubagentMap(t *testing.T, projectsRoot, project string, m map[string]string, raw bool, body string) {
+	t.Helper()
+	dir := filepath.Join(projectsRoot, project)
+	if err := os.MkdirAll(filepath.Join(dir, ".locks"), 0o755); err != nil {
+		t.Fatalf("mkdir locks: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".locks", "coordinator.lock"), nil, 0o644); err != nil {
+		t.Fatalf("write coord lock: %v", err)
+	}
+	path := filepath.Join(dir, "coord-state.json")
+	if raw {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("write raw coord-state: %v", err)
+		}
+		return
+	}
+	payload := map[string]any{}
+	if len(m) > 0 {
+		payload["worker_subagent_ids"] = m
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal coord-state: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+}
+
+func TestReadWorkerSubagentMap_ReadsValidEntries(t *testing.T) {
+	pdir := withFleetHome(t)
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
+		"alpha-aaaa": "claude-sub-1",
+		"beta-bbbb":  "claude-sub-2",
+	}, false, "")
+	got := readWorkerSubagentMap(filepath.Join(pdir, "fleet", "coord-state.json"))
+	if got["alpha-aaaa"] != "claude-sub-1" || got["beta-bbbb"] != "claude-sub-2" {
+		t.Fatalf("unexpected map: %v", got)
+	}
+}
+
+func TestReadWorkerSubagentMap_ReturnsNilOnMissing(t *testing.T) {
+	pdir := withFleetHome(t)
+	if got := readWorkerSubagentMap(filepath.Join(pdir, "no-such-project", "coord-state.json")); got != nil {
+		t.Fatalf("missing file should return nil, got %v", got)
+	}
+}
+
+func TestReadWorkerSubagentMap_ReturnsNilOnMalformed(t *testing.T) {
+	pdir := withFleetHome(t)
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", nil, true, "{ not valid json")
+	got := readWorkerSubagentMap(filepath.Join(pdir, "fleet", "coord-state.json"))
+	if got != nil {
+		t.Fatalf("malformed JSON should return nil, got %v", got)
+	}
+}
+
+func TestReadWorkerSubagentMap_ReturnsNilOnEmptyMap(t *testing.T) {
+	pdir := withFleetHome(t)
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", nil, true, `{"worker_subagent_ids": {}}`)
+	got := readWorkerSubagentMap(filepath.Join(pdir, "fleet", "coord-state.json"))
+	if got != nil {
+		t.Fatalf("empty map should return nil, got %v", got)
+	}
+}
+
+func TestReadWorkerSubagentMap_FiltersWhitespaceValues(t *testing.T) {
+	pdir := withFleetHome(t)
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
+		"good-aaaa":  "claude-sub-1",
+		"empty-bbbb": "",
+		"space-cccc": "   ",
+	}, false, "")
+	got := readWorkerSubagentMap(filepath.Join(pdir, "fleet", "coord-state.json"))
+	if len(got) != 1 || got["good-aaaa"] != "claude-sub-1" {
+		t.Fatalf("filter expected only 'good-aaaa' entry, got %v", got)
+	}
+}
+
+func TestScanWorkers_AttachesSubagentID(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	subMap := map[string]string{"alpha-aaaa": "claude-sub-1"}
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), subMap)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0].SubagentID != "claude-sub-1" {
+		t.Fatalf("SubagentID = %q, want %q", rows[0].SubagentID, "claude-sub-1")
+	}
+}
+
+func TestScanWorkers_NoSubagentMapYieldsEmptyID(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now(), nil)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if rows[0].SubagentID != "" {
+		t.Fatalf("SubagentID should be empty without map, got %q", rows[0].SubagentID)
+	}
+}
+
+func TestScanProject_PlumbsSubagentMap(t *testing.T) {
+	// End-to-end: scanProject reads coord-state.json, scanWorkers
+	// gets the map, the resulting WorkerRow carries the SubagentID.
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "alpha-aaaa", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	writeCoordStateWithSubagentMap(t, pdir, "fleet", map[string]string{
+		"alpha-aaaa": "claude-sub-1",
+	}, false, "")
+	_, wrows := scanProject(pdir, "fleet", time.Now())
+	if len(wrows) != 1 {
+		t.Fatalf("expected 1 worker row, got %d", len(wrows))
+	}
+	if wrows[0].SubagentID != "claude-sub-1" {
+		t.Fatalf("scanProject failed to plumb SubagentID; got %q", wrows[0].SubagentID)
+	}
+}
+
+func TestShortSubagentHash_Truncates(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{"a", "a"},
+		{"abcd", "abcd"},
+		{"abcdefgh", "abcdefgh"},
+		{"abcdefghi", "abcdefgh"},        // 9 → 8
+		{"abcdefghijklmnop", "abcdefgh"}, // long → 8
+		{"  abc12345  ", "abc12345"},     // trim then truncate
+	}
+	for _, c := range cases {
+		if got := shortSubagentHash(c.in); got != c.want {
+			t.Errorf("shortSubagentHash(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestShortSubagentHash_RuneSafeTruncation(t *testing.T) {
+	// Multi-byte runes must not split a code point on truncation.
+	in := "αβγδεζηθικ" // 10 runes, > 8
+	got := shortSubagentHash(in)
+	want := "αβγδεζηθ" // first 8 runes
+	if got != want {
+		t.Fatalf("rune truncation failed: got %q, want %q", got, want)
+	}
+}
+
+func TestSnapshot_SubagentsRunning(t *testing.T) {
+	cases := []struct {
+		name string
+		s    *Snapshot
+		want int
+	}{
+		{"nil snapshot", nil, 0},
+		{"no workers", &Snapshot{}, 0},
+		{"all empty", &Snapshot{Workers: []*WorkerRow{
+			{ID: "a"}, {ID: "b"},
+		}}, 0},
+		{"one populated", &Snapshot{Workers: []*WorkerRow{
+			{ID: "a", SubagentID: "x"},
+			{ID: "b"},
+		}}, 1},
+		{"multiple", &Snapshot{Workers: []*WorkerRow{
+			{ID: "a", SubagentID: "x"},
+			{ID: "b", SubagentID: "y"},
+			{ID: "c", SubagentID: "z"},
+		}}, 3},
+		{"nil row tolerated", &Snapshot{Workers: []*WorkerRow{
+			nil,
+			{ID: "a", SubagentID: "x"},
+		}}, 1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.s.SubagentsRunning(); got != c.want {
+				t.Fatalf("got %d, want %d", got, c.want)
+			}
+		})
 	}
 }
