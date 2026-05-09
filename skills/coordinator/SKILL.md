@@ -48,7 +48,7 @@ This is the load-bearing description of how a coord runs an end-to-end engagemen
 3. TASK LIST         one-line goal per task; status lives in structured fields (G5)
 4. IMPLEMENT         dispatch one impl-subagent per task; cap=1 (G7); subagents follow §4
 5. PR-TRACK          poll CI via async-waits (G4); on fail → fix-subagent (cap=3) (G3)
-6. DONE              fleet tasks set status=done pr_url=<url>; advance; raise-hand if empty
+6. DONE              fleet tasks set pr_url=<url> + status=done; advance; raise-hand if empty
 ```
 
 ### Step 1 — DISCUSS
@@ -125,10 +125,11 @@ lease, return the PR URL.
 
 ### Step 6 — DONE
 
-CI green + PR merged → coord runs:
+CI green + PR merged → coord runs (`fleet tasks set` accepts one `key=value` per call, so this is two invocations):
 
 ```bash
-fleet tasks set <slug> status=done pr_url=<url>
+fleet tasks set <slug> pr_url=<url>
+fleet tasks set <slug> status=done
 ```
 
 Advance to the next task in priority order. When the task list is empty, the coord raises hand: `"all tasks done; next direction?"` and waits.
