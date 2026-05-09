@@ -92,6 +92,20 @@ type Model struct {
 	// the prompt resolves either way.
 	archiveCandidate string
 
+	// dismissProjectCandidate is the project name the operator pressed
+	// [x] on for the legacy-row dismiss path (issue #96 gap 3). Cleared
+	// when modeConfirmDismissProject resolves. Paired with the dead-
+	// agent-IDs slice below so the confirm handler dispatches `fleet rm`
+	// against the SAME records that were on disk at press time — without
+	// this freeze, a refresh between press and confirm could mutate
+	// m.records out from under the operator and we'd archive different
+	// (or zero) records than the prompt advertised.
+	dismissProjectCandidate string
+	// dismissProjectDeadAgents is the snapshot of dead-agent IDs tagged
+	// with dismissProjectCandidate at the moment the operator pressed
+	// [x]. Empty slice on any non-dismiss flow.
+	dismissProjectDeadAgents []string
+
 	// aliveByID is the cached tmux liveness snapshot from the most
 	// recent agentsMsg. Populated off the render path by
 	// loadAgentsCmd; deriveStatus reads from it. Nil/empty means no
@@ -793,6 +807,16 @@ func (m Model) renderFooter() string {
 		b.WriteString(promptStyle.Render(fmt.Sprintf(
 			"Archive agent %s? Kills tmux session + deletes record (no replacement). [y/N]",
 			m.archiveCandidate)))
+		b.WriteString("\n")
+	case modeConfirmDismissProject:
+		// Surface the dead-agent count so the operator sees how many
+		// records the [y] confirm will archive (issue #96 gap 3). Zero
+		// is fine — the row exists only as a synthetic and will drop
+		// from view after refresh.
+		count := len(m.dismissProjectDeadAgents)
+		b.WriteString(promptStyle.Render(fmt.Sprintf(
+			"Dismiss legacy project %s? Archives %d dead agent record(s) — no live agents will be touched. [y/N]",
+			m.dismissProjectCandidate, count)))
 		b.WriteString("\n")
 	case modePromptTaskAdd:
 		b.WriteString(promptStyle.Render("task spec: " + m.promptBuf + "█"))

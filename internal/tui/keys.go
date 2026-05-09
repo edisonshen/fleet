@@ -59,6 +59,13 @@ const (
 	modeConfirmArchive
 	modePromptTaskAdd
 	modePromptSearch
+	// modeConfirmDismissProject holds the y/N confirmation prompt for
+	// the legacy-v0.1 project-row dismiss path (issue #96 gap 3). Distinct
+	// from modeConfirmArchive because the destructive action is plural
+	// (one `fleet rm` per dead agent record tagged with the project) and
+	// the prompt copy must surface that count so the operator knows how
+	// many records will be archived.
+	modeConfirmDismissProject
 )
 
 // flash is the banner surfaced under the table after a keybind action
@@ -187,6 +194,8 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m.handlePromptKey(key)
 	case modeConfirmArchive:
 		return m.handleConfirmArchiveKey(key)
+	case modeConfirmDismissProject:
+		return m.handleConfirmDismissProjectKey(key)
 	case modePromptTaskAdd:
 		return m.handleTaskAddKey(key)
 	case modePromptSearch:
@@ -353,6 +362,8 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 			isErr: true,
 		}
 		return m, nil, true
+	case rowProject:
+		return m.actionArchiveProject(row.project)
 	default:
 		m.flash = &flashMsg{
 			text:  "[x] applies only to v0.1 agents in this version — worker kill ships in v0.2.x",
@@ -360,6 +371,86 @@ func (m Model) actionArchive() (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
+}
+
+// actionArchiveProject is the project-row branch of [x] (issue #96 gap 3).
+//
+// Decision tree:
+//
+//	v0.2 project (~/.fleet/projects/<name>/ exists)
+//	  → preserve existing behavior: flash that [x] doesn't apply.
+//	    Task archival on project rows is out of scope for this PR.
+//
+//	pure-legacy v0.1 row (no v0.2 dir)
+//	  ├─ at least one live agent tagged with project
+//	  │   → refuse with operator-safety hint (mass-archive while a
+//	  │     live agent is running risks killing in-flight work).
+//	  └─ all tagged agents are dead
+//	      → collect their IDs, enter modeConfirmDismissProject.
+//	        y → fan out `fleet rm <id>` for each (existing CLI path);
+//	        the rows naturally drop off the dashboard once all dead
+//	        records are archived AND no live record carries the tag
+//	        (unifiedProjects synthesizes rows from agent records — no
+//	        records, no row).
+//
+// "Live" = deriveStatus(record, aliveByID) != "dead". The aliveByID
+// cache is the same one the right-column status pills consume, so a
+// project row dismissed here matches the operator's visible state.
+//
+// We intentionally do NOT mass-archive when ANY live agent is present.
+// Surfacing the live-agent count in the flash gives the operator the
+// information they need to either let the agent finish or [x] each
+// agent individually first.
+func (m Model) actionArchiveProject(p *ProjectRow) (Model, tea.Cmd, bool) {
+	if p == nil {
+		return m, nil, true
+	}
+	// v0.2 project? Preserve existing flash semantics. Worker-kill /
+	// task-archive on project rows is a future PR; today this branch is
+	// a no-op for live v0.2 projects.
+	if projectTreeExistsFn(p.Name) {
+		m.flash = &flashMsg{
+			text:  "[x] applies only to v0.1 agents in this version — worker kill ships in v0.2.x",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	// Pure-legacy row. Compute live + dead agents tagged with this
+	// project. We tolerate nil records (early renders before the first
+	// agentsMsg) — the row may have been synthesized by another signal
+	// (e.g. unifiedProjects from a stale snapshot); we still let the
+	// operator dismiss it cleanly when there are zero dead records too,
+	// because the absence of agent records means there's nothing to
+	// hold the row visible after the next refresh anyway.
+	var live, dead []string
+	for _, r := range m.records {
+		if r == nil || r.Project != p.Name {
+			continue
+		}
+		if deriveStatus(r, m.aliveByID) == "dead" {
+			dead = append(dead, r.ID)
+		} else {
+			live = append(live, r.ID)
+		}
+	}
+	if len(live) > 0 {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"[x] refused: project %s still has %d live agent(s) — archive them first via [x] on each agent row",
+				p.Name, len(live)),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	// Fully dead (or zero records). Enter the dismiss confirmation.
+	// Empty dead-agent list is fine: the confirm handler's `fleet rm`
+	// fan-out is a no-op and the next dashboard refresh drops the
+	// synthetic row naturally because there's no agent record to keep
+	// it visible.
+	m.dismissProjectCandidate = p.Name
+	m.dismissProjectDeadAgents = append(m.dismissProjectDeadAgents[:0], dead...)
+	m.mode = modeConfirmDismissProject
+	return m, nil, true
 }
 
 // actionAttach dispatches [a] for the row under the cursor.
@@ -1208,6 +1299,60 @@ func (m Model) handleConfirmArchiveKey(key string) (Model, tea.Cmd, bool) {
 	case "esc", "n", "N":
 		m.mode = modeNav
 		m.archiveCandidate = ""
+		return m, nil, true
+	}
+	return m, nil, true
+}
+
+// handleConfirmDismissProjectKey runs while modeConfirmDismissProject
+// is active (issue #96 gap 3). Same y/N/esc swallow-rest contract as
+// modeConfirmArchive — j/k while the prompt is up must not move the
+// cursor or change WHICH project the next [y] would dismiss.
+//
+// On confirm: dispatch one `fleet rm <id>` per dead-agent ID captured
+// at press time. The CLI is the existing destructive path; we don't
+// reimplement archive here. Returns a tea.Batch so the operator's
+// confirm produces a single observable event boundary even when the
+// project had multiple dead records.
+//
+// On a row with zero dead records (operator dismissed a synthetic row
+// kept alive only by a transient render-time fluke), confirm is a
+// no-op + a refresh — the next dashboardMsg / agentsMsg will drop the
+// row naturally.
+func (m Model) handleConfirmDismissProjectKey(key string) (Model, tea.Cmd, bool) {
+	switch key {
+	case "y", "Y":
+		project := m.dismissProjectCandidate
+		dead := m.dismissProjectDeadAgents
+		m.mode = modeNav
+		m.dismissProjectCandidate = ""
+		m.dismissProjectDeadAgents = nil
+		if len(dead) == 0 {
+			// Nothing to archive — just nudge the loaders so the
+			// synthetic row drops on the next render.
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"project %s dismissed (no agent records to archive)", project),
+			}
+			return m, loadAgentsCmd(), true
+		}
+		cmds := make([]tea.Cmd, 0, len(dead))
+		for _, id := range dead {
+			cmds = append(cmds, m.startRm(id))
+		}
+		// Surface the count so the operator sees the fan-out is
+		// progressing; per-agent rmDoneMsg banners still arrive
+		// individually as each `fleet rm` completes.
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"dismissing project %s — archiving %d dead agent record(s)",
+				project, len(dead)),
+		}
+		return m, tea.Batch(cmds...), true
+	case "esc", "n", "N":
+		m.mode = modeNav
+		m.dismissProjectCandidate = ""
+		m.dismissProjectDeadAgents = nil
 		return m, nil, true
 	}
 	return m, nil, true
