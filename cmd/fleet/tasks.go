@@ -935,18 +935,18 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 //	* → done|abandoned              finished_at = now (overwrite OK)
 //	done|abandoned → !{done,aband}  finished_at = zero (reopen)
 //	other                           no-op
-func stampLifecycleTransition(t *tasks.Task, old, new tasks.Status, now time.Time) {
-	if new == tasks.StatusInProgress && t.StartedAt.IsZero() {
+func stampLifecycleTransition(t *tasks.Task, oldStatus, newStatus tasks.Status, now time.Time) {
+	if newStatus == tasks.StatusInProgress && t.StartedAt.IsZero() {
 		t.StartedAt = now
 	}
-	if new == tasks.StatusDone || new == tasks.StatusAbandoned {
+	if newStatus == tasks.StatusDone || newStatus == tasks.StatusAbandoned {
 		t.FinishedAt = now
 		return
 	}
 	// Reopen path: leaving the terminal set clears finished_at so the
 	// next finish stamps fresh. started_at stays sticky — the task's
 	// "first start" is still the original.
-	if old == tasks.StatusDone || old == tasks.StatusAbandoned {
+	if oldStatus == tasks.StatusDone || oldStatus == tasks.StatusAbandoned {
 		t.FinishedAt = time.Time{}
 	}
 }
