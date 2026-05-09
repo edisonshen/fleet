@@ -6,6 +6,17 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-09
+
+Worker lifecycle hygiene + attention-chip accuracy. Workers reaching a
+terminal phase (done / failed) now auto-delete their on-disk dir — no
+archive, no grace period — and tasks split into active vs history under
+a collapsible `─── N done ───` separator that keeps the active list
+lean while preserving shipped + abandoned work. The attention chip no
+longer overcounts on planning-blocked tasks: only worker phase=blocked
+(the actual raise-hand) drives the red-alert; task `status=blocked`
+rows render with a distinct `⏸` glyph in dim style.
+
 ### Added
 
 - Lifecycle hygiene: a new `internal/lifecycle/` package classifies
