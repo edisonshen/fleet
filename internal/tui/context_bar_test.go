@@ -339,6 +339,33 @@ func TestRenderHotCounts_Both(t *testing.T) {
 	}
 }
 
+// -- renderSubagentCount (issue #94 Phase C) ---------------------------
+
+func TestRenderSubagentCount_HiddenWhenZero(t *testing.T) {
+	if got := renderSubagentCount(0); got != "" {
+		t.Errorf("0 should render empty, got %q", got)
+	}
+	if got := renderSubagentCount(-3); got != "" {
+		t.Errorf("negative should render empty, got %q", got)
+	}
+}
+
+func TestRenderSubagentCount_SingularPlural(t *testing.T) {
+	// Pluralization mirrors Claude's chat-side "N local agents" wording.
+	got1 := renderSubagentCount(1)
+	if !strings.Contains(got1, "1 agent") || strings.Contains(got1, "agents") {
+		t.Errorf("expected '1 agent' (singular), got %q", got1)
+	}
+	got2 := renderSubagentCount(2)
+	if !strings.Contains(got2, "2 agents") {
+		t.Errorf("expected '2 agents' (plural), got %q", got2)
+	}
+	got10 := renderSubagentCount(10)
+	if !strings.Contains(got10, "10 agents") {
+		t.Errorf("expected '10 agents', got %q", got10)
+	}
+}
+
 // -- Phase 4: workerContextRecord lookup --------------------------------
 
 func TestWorkerContextRecord_PrefersCoord(t *testing.T) {

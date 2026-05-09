@@ -235,6 +235,32 @@ func hotCounts(records []*agent.Record, alive map[string]bool, workers []*Worker
 	return yellow, red
 }
 
+// renderSubagentCount formats the live Agent-tool subagent count as a
+// dim non-bold chip. Returns "" when n ≤ 0 so the top status line
+// stays clean. Pluralization is single-vs-plural ("1 agent" / "N
+// agents") — matches the chat-side "N local agents" wording in
+// Claude's UI so operators read the two indicators as the same data
+// (issue #94 Phase C).
+//
+//	0  → ""           hidden
+//	1  → "1 agent"    dim, no bold
+//	N  → "N agents"   dim, no bold
+//
+// Style is intentionally not bold so the chip reads as informational —
+// the bold yellow/red hot-counts above carry the operator-actionable
+// signal (handoff pressure). subagent count is "how many local agents
+// are alive right now"; informational, not actionable.
+func renderSubagentCount(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	noun := "agents"
+	if n == 1 {
+		noun = "agent"
+	}
+	return headerSubtleStyle.Render(fmt.Sprintf("%d %s", n, noun))
+}
+
 // renderHotCounts formats the (yellow, red) counts as bold pills. Returns
 // "" when both are zero so the top status line stays clean for the
 // happy-path "every agent under 50%" case.
