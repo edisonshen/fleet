@@ -1,21 +1,23 @@
-// Context-pct bar glyph + handoff-tag rendering for the dashboard.
+// Context-pct chip + handoff-tag rendering for the dashboard.
 //
-// Issue #89: the v0.2 TUI dropped context_pct visibility that v0.1 had.
-// This file restores it as a 5-segment bar chip rendered alongside
-// each agent / worker row, plus a handoff state tag and per-color
-// "hot count" pills in the top status line.
+// Issue #89 restored context_pct visibility (lost between v0.1 and v0.2)
+// as a 5-segment bar plus an integer-percent label. Issue #95 then
+// dropped the bar glyph — the segment chunks read as visual noise next
+// to the colored percentage, which already carries the same gradient
+// signal at glance distance. We keep the colored number, the per-zone
+// thresholds, the hot-count pills, and the handoff tag.
 //
 //	rendering shape
 //	────────────────────────────────────────────────────────────
-//	bar:  ▰▰▱▱▱ 32%   ← 5 segments, 20% each, integer pct
-//	      ▰▰▰▱▱ 50%   ← amber threshold (50%-69%)
-//	      ▰▰▰▰▰ 95%   ← red threshold (≥70%)
+//	pct:  32%         ← green zone (<50%)
+//	      50%         ← amber threshold (50%-69%)
+//	      95%         ← red threshold (≥70%)
 //	tag:  ◐ HANDOFF   ← when HandoffType is set
 //	      ◐ COMPACT   ← when HandoffType is "precompact"
 //
-// Layer 1 (renderContextBar): per-row bar chip. Pure function, no I/O.
+// Layer 1 (renderContextBar): per-row colored percent. Pure function, no I/O.
 // Layer 2 (renderHotCounts):  top-status "N yellow · M red" pills.
-// Layer 3 (renderHandoffTag): small handoff tag right of the bar.
+// Layer 3 (renderHandoffTag): small handoff tag right of the percent.
 // Layer 4 (worker coverage):  workerContextRecord lookup heuristic.
 //
 // Color thresholds match fleet-guard's Yellow (50%) / Red (70%) zones
@@ -38,20 +40,10 @@ import (
 const (
 	contextYellowThreshold = 50.0
 	contextRedThreshold    = 70.0
-	contextBarSegments     = 5 // each segment = 20%
 )
 
-// Bar glyphs. Filled (▰) and empty (▱) — block-friendly Unicode that
-// renders cleanly in monospace fonts and survives terminals that don't
-// support double-width emoji. Same pair as the rest of the codebase
-// uses for status glyphs.
-const (
-	contextBarFilled = "▰"
-	contextBarEmpty  = "▱"
-)
-
-// Per-zone bar styles. Foreground only — no bold, so the bar reads as
-// "informational" against the existing bold cursor / attention rows.
+// Per-zone label styles. Foreground only — no bold, so the chip reads
+// as "informational" against the existing bold cursor / attention rows.
 var (
 	contextBarGreenStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorGreen))
 	contextBarAmberStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(colorAmber))
@@ -72,26 +64,26 @@ var (
 	hotCountRedStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorRed))
 )
 
-// renderContextBar formats a context_pct value as a colored 5-segment
-// bar plus integer-percent label. Returns "" when pct is nil so callers
-// can splice the result into a row without "N/A" placeholders.
+// renderContextBar formats a context_pct value as a colored integer-
+// percent label. Returns "" when pct is nil so callers can splice the
+// result into a row without "N/A" placeholders.
 //
 //	nil           → ""
-//	0%            → "▱▱▱▱▱  0%" green (zero filled, still green zone)
-//	12%           → "▰▱▱▱▱ 12%" green
-//	48%           → "▰▰▱▱▱ 48%" green (still <50)
-//	50%           → "▰▰▰▱▱ 50%" amber (yellow threshold)
-//	69%           → "▰▰▰▱▱ 69%" amber
-//	70%           → "▰▰▰▰▱ 70%" red   (red threshold)
-//	95%           → "▰▰▰▰▰ 95%" red
-//	100%          → "▰▰▰▰▰ 100%" red
+//	0%            → "0%"   green (still green zone)
+//	12%           → "12%"  green
+//	48%           → "48%"  green (still <50)
+//	50%           → "50%"  amber (yellow threshold)
+//	69%           → "69%"  amber
+//	70%           → "70%"  red   (red threshold)
+//	95%           → "95%"  red
+//	100%          → "100%" red
 //	negative/NaN  → defensive clamp to 0
 //	>100          → defensive clamp to 100
 //
-// We floor segments at pct/20 so 49% → 2 filled (still green-zone), 50%
-// → 3 filled (steps up exactly at the yellow threshold). Output is
-// width-stable except for the 100% case (3 digits vs 2) — render code
-// budgets +5 cells for the chip and one extra for the optional digit.
+// Issue #95: the 5-segment bar glyph (▰▰▰▱▱) was dropped. The colored
+// percentage carries the same threshold signal without the visual
+// noise — operators read the gradient color at glance distance and
+// the exact integer when they want detail.
 func renderContextBar(pct *float64) string {
 	if pct == nil {
 		return ""
@@ -106,17 +98,8 @@ func renderContextBar(pct *float64) string {
 	if v > 100 {
 		v = 100
 	}
-	filled := int(v / 20.0)
-	if filled > contextBarSegments {
-		filled = contextBarSegments
-	}
-	if filled < 0 {
-		filled = 0
-	}
-	bar := strings.Repeat(contextBarFilled, filled) +
-		strings.Repeat(contextBarEmpty, contextBarSegments-filled)
 	style := contextBarStyleFor(v)
-	return style.Render(fmt.Sprintf("%s %d%%", bar, int(v)))
+	return style.Render(fmt.Sprintf("%d%%", int(v)))
 }
 
 // contextZone returns the threshold zone label for a context_pct
@@ -140,8 +123,8 @@ func contextZone(pct float64) string {
 	}
 }
 
-// contextBarStyleFor picks the bar/label color based on threshold zone.
-// Mirrors fleet-guard's Yellow (50%) / Red (70%) zones exactly.
+// contextBarStyleFor picks the percent-label color based on threshold
+// zone. Mirrors fleet-guard's Yellow (50%) / Red (70%) zones exactly.
 func contextBarStyleFor(pct float64) lipgloss.Style {
 	switch contextZone(pct) {
 	case "red":

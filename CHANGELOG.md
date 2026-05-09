@@ -6,6 +6,14 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Context indicator drops the 5-segment bar glyph (`▰▰▰▱▱`); only the
+  colored integer percent remains (e.g. `48%`). Threshold colors and
+  the handoff tag (`◐ HANDOFF` / `◐ COMPACT`) are unchanged. The bar
+  read as visual noise next to the percentage at glance distance.
+  Closes [#95](https://github.com/edisonshen/fleet/issues/95).
+
 ## [0.3.0] - 2026-05-09
 
 Worker dispatch shifts from `fleet dispatch` subprocess to Claude's
