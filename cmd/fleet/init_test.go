@@ -435,6 +435,42 @@ func TestRunInit_SeedsStandardsTemplate(t *testing.T) {
 	if !strings.Contains(body, "## Code review") {
 		t.Errorf("seed missing '## Code review' section:\n%s", body)
 	}
+	// Async waits section is the v0.5+ baseline. Without it, every
+	// freshly-spawned worker re-discovers the foreground-sleep / operator-
+	// ping anti-patterns issue #105 calls out. Pin it so a future template
+	// edit can't silently regress the contract.
+	if !strings.Contains(body, "## Async waits") {
+		t.Errorf("seed missing '## Async waits' section:\n%s", body)
+	}
+	if !strings.Contains(body, "run_in_background") {
+		t.Errorf("Async waits section missing run_in_background recipe:\n%s", body)
+	}
+	if !strings.Contains(body, "until") {
+		t.Errorf("Async waits section missing until-loop pattern:\n%s", body)
+	}
+}
+
+// TestStandardsTemplate_EmbedsAsyncWaitsSection — issue #105 baseline:
+// the embedded template bytes (the source of truth `seedStandardsTemplate`
+// writes on first init) carry the `## Async waits` recipe so every
+// fleet operator inherits it without manual editing. Mirrors the
+// per-element checks in TestRunInit_SeedsStandardsTemplate but bypasses
+// the install path so a regression in the embed.go directive surfaces
+// independently of init plumbing.
+func TestStandardsTemplate_EmbedsAsyncWaitsSection(t *testing.T) {
+	body := string(fleet.StandardsTemplate())
+	for _, want := range []string{
+		"## Async waits",
+		"run_in_background: true",
+		"until <single check that returns truthy when done>",
+		"task-notification",
+		"270s",
+		"gh pr view",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("StandardsTemplate missing %q:\n%s", want, body)
+		}
+	}
 }
 
 // TestRunInit_UpgradePreservesStandards — the load-bearing rule of

@@ -260,6 +260,7 @@ Two Claude Code skills ship inside the binary and install to `~/.claude/skills/`
 | [`docs/COORDINATOR-WORKFLOW.md`](docs/COORDINATOR-WORKFLOW.md) | Operator-facing six-step coord workflow (DISCUSS → SPLIT → TASK LIST → IMPLEMENT → PR-TRACK → DONE). |
 | [`skills/fleet-guard/SKILL.md`](skills/fleet-guard/SKILL.md) | Agent-side Claude Code skill that watches context % and triggers handoffs. |
 | [`skills/coordinator/SKILL.md`](skills/coordinator/SKILL.md) | Per-project autonomous coordinator (v0.2) — task dispatch, reconcile, gh polling. |
+| [`docs/STANDARDS-BASELINE.md`](docs/STANDARDS-BASELINE.md) | Baseline `~/.fleet/standards.md` shipped to every operator on `fleet init` — Testing, Code review, Async waits. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-release additions, changes, fixes. |
 
 ## License
