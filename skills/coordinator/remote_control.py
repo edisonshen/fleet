@@ -74,9 +74,14 @@ operators / log scrapers may grep for these:
   - STATUS_SKIPPED_INVALID    project or coord_id failed the canonical
                               shape check (defense in depth). Logged
                               to stderr AND BOOTSTRAP_LOG.
-  - STATUS_FAILED_SEED        seed_inbox returned False — mkdir/mkstemp
-                              failed, OR an existing-inbox file was
-                              detected (don't clobber operator content).
+  - STATUS_SKIPPED_INBOX_BUSY operator queued an inbox message via
+                              `fleet message <coord_id>` between
+                              dispatch and this tick. Not a failure;
+                              fleet-guard's Stop hook archives the
+                              message on next fire and the path frees
+                              up for our seed. Quiet; self-healing.
+  - STATUS_FAILED_SEED        seed_inbox returned False from a real
+                              I/O failure (mkdir/mkstemp/disk full).
                               Marker NOT written; next tick retries.
                               Logged.
   - STATUS_FAILED_MARKER      seed succeeded but marker write failed.
@@ -135,6 +140,12 @@ STATUS_OK = "ok"
 STATUS_SKIPPED_MARKER = "skipped_marker"
 STATUS_SKIPPED_INVALID = "skipped_invalid"
 STATUS_SKIPPED_NO_ARGS = "skipped_no_args"
+# Inbox path was occupied (operator pre-queued a message via
+# `fleet message <coord_id>` between dispatch and first tick). Don't
+# clobber — retry next tick after fleet-guard's Stop hook delivers +
+# archives the operator's message. NOT a failure: the bootstrap is
+# self-healing across ticks; surface as skipped, not failed.
+STATUS_SKIPPED_INBOX_BUSY = "skipped_inbox_busy"
 STATUS_FAILED_SEED = "failed_seed"
 STATUS_FAILED_MARKER = "failed_marker"
 
@@ -234,6 +245,19 @@ def bootstrap_remote_control(
     marker = _marker_path(home, project, coord_id)
     if marker.exists():
         return STATUS_SKIPPED_MARKER
+    # Pre-check the inbox path: if an operator queued a message via
+    # `fleet message <coord_id>` between dispatch and this tick, the
+    # path is occupied. seed_inbox handles this internally by
+    # returning False (don't clobber operator content), but bootstrap
+    # needs to distinguish "operator queued a message" (transient,
+    # self-healing — fleet-guard archives the file on next Stop hook)
+    # from "real I/O failure" (persistent — needs operator attention).
+    # Without this pre-check, every operator-queued-message lands as
+    # STATUS_FAILED_SEED + a noisy tick error, which the operator
+    # would see as a regression even though it's normal operation.
+    inbox_target = home / "inbox" / f"{coord_id}.md"
+    if inbox_target.exists():
+        return STATUS_SKIPPED_INBOX_BUSY
     # Order: daemon first, inbox second. The inbox message tells the
     # agent to run /remote-control which connects to a daemon — if we
     # seed the inbox before launching the daemon, there's a small
@@ -244,9 +268,11 @@ def bootstrap_remote_control(
     spawn_daemon_if_needed()
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:
-        # Don't write the marker — we want to retry the inbox seed on
-        # the next tick. Daemon was already attempted; pgrep guards
-        # the re-launch.
+        # Pre-check above already eliminated the "inbox path exists"
+        # case, so reaching here means a real I/O failure
+        # (mkdir/mkstemp/disk-full/permissions). Don't write the
+        # marker — we want to retry the inbox seed on the next tick.
+        # Daemon was already attempted; pgrep guards the re-launch.
         _bootstrap_log(
             STATUS_FAILED_SEED,
             project=project,
@@ -554,6 +580,7 @@ __all__ = [
     "STATUS_SKIPPED_MARKER",
     "STATUS_SKIPPED_INVALID",
     "STATUS_SKIPPED_NO_ARGS",
+    "STATUS_SKIPPED_INBOX_BUSY",
     "STATUS_FAILED_SEED",
     "STATUS_FAILED_MARKER",
 ]
