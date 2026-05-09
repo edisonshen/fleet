@@ -58,8 +58,8 @@ func TestRows_DoingTaskGlyph(t *testing.T) {
 
 // TestRows_InReviewTaskGlyph pins ⟳ for tasks at status=in-review.
 // ⟳ ("rotating arrow") evokes an iterative review cycle. The header
-// count uses 👁 (visibility) but ⟳ reads cleaner inline next to the
-// slug; both share the blue color family.
+// count uses ◇ (white diamond, observation) but ⟳ reads cleaner inline
+// next to the slug; both share the blue color family.
 func TestRows_InReviewTaskGlyph(t *testing.T) {
 	tr := &taskRow{Slug: "review-task-dddd", Status: "in-review"}
 	out := taskBlockLine(tr, 60, false)
@@ -71,23 +71,24 @@ func TestRows_InReviewTaskGlyph(t *testing.T) {
 	}
 }
 
-// TestRows_BlockedTaskGlyph pins ⏸ for blocked tasks (issue #103).
+// TestRows_BlockedTaskGlyph pins ‖ for blocked tasks (issue #103).
 // "Blocked" on a task is a planning state — operator-set when
-// sequencing work — not a worker raise-hand. The ⏸ pause glyph signals
+// sequencing work — not a worker raise-hand. The ‖ pause glyph signals
 // "parked, not asking"; the dim/faint label color makes the row recede
 // rather than shout. Compare with worker phase=blocked, which keeps
 // the red row-level attention chip via the project header.
 //
 // Pre-#103 this test asserted ⚠ + red — same code path, different
-// visual semantics.
+// visual semantics. Glyph polish: was ⏸ (color-emoji); replaced with ‖
+// DOUBLE VERTICAL LINE for monochrome rendering.
 func TestRows_BlockedTaskGlyph(t *testing.T) {
 	tr := &taskRow{Slug: "blocked-task-eeee", Status: "blocked"}
 	out := taskBlockLine(tr, 60, false)
-	if !strings.Contains(out, "⏸") {
-		t.Errorf("blocked task line should carry ⏸ glyph, got: %q", out)
+	if !strings.Contains(out, "‖") {
+		t.Errorf("blocked task line should carry ‖ glyph, got: %q", out)
 	}
-	if strings.Contains(out, "⚠") {
-		t.Errorf("blocked task line must NOT carry the ⚠ red-alert glyph (issue #103), got: %q", out)
+	if strings.Contains(out, "⚠") || strings.Contains(out, "▲") {
+		t.Errorf("blocked task line must NOT carry the warning glyph (issue #103), got: %q", out)
 	}
 	if !strings.Contains(out, "blocked-task-eeee") {
 		t.Errorf("blocked task line should still render slug, got: %q", out)
@@ -107,8 +108,8 @@ func TestRows_BlockedTaskGlyph(t *testing.T) {
 // output can't see the color.
 func TestTaskStatusStyles_BlockedIsDimAndFaint(t *testing.T) {
 	glyph, glyphStyle, labelStyle := taskStatusStyles("blocked")
-	if glyph != "⏸" {
-		t.Errorf("blocked glyph want ⏸, got %q", glyph)
+	if glyph != "‖" {
+		t.Errorf("blocked glyph want ‖, got %q", glyph)
 	}
 	if !glyphStyle.GetFaint() {
 		t.Errorf("blocked glyph style must be faint (issue #103: planning state should recede)")
@@ -149,7 +150,7 @@ func TestRows_CursorOverridesStatusGlyph_AllStatuses(t *testing.T) {
 		{"ready", "ready", "◐"},
 		{"in-progress", "in-progress", "▶"},
 		{"in-review", "in-review", "⟳"},
-		{"blocked", "blocked", "⏸"}, // issue #103: ⏸ replaces ⚠
+		{"blocked", "blocked", "‖"}, // issue #103 + glyph polish: ‖ replaces ⏸ (which replaced ⚠)
 		{"done", "done", "✓"},
 		{"abandoned", "abandoned", "•"},
 	}

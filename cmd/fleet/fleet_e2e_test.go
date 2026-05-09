@@ -22,9 +22,9 @@ package main
 //
 // Scenarios (run as t.Run subtests of TestFleetE2E_FullWorkflow):
 //
-//	1. cold start → tasks add → dashboard shows ⏳ 1 + ○ idle
+//	1. cold start → tasks add → dashboard shows ◌ 1 + ○ idle
 //	2. coord tick → dispatch → dashboard shows ▶ 1 + worker row + ● active
-//	3. worker DONE_PR sentinel → drain → dashboard shows 👁 1 + still
+//	3. worker DONE_PR sentinel → drain → dashboard shows ◇ 1 + still
 //	   in-flight worker (state.json phase=done, archive happens later)
 //	4. archive → dashboard shows decremented counts; worker row gone
 //	   after worker prune
@@ -61,7 +61,7 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 
 	// ---------- Scenario 1: cold start → tasks add → todo + idle ----------
 	t.Run("cold_start_shows_todo_and_idle", func(t *testing.T) {
-		// Seed one ready task. The dashboard counts ready as ⏳ todo so
+		// Seed one ready task. The dashboard counts ready as ◌ todo so
 		// the operator sees one chip regardless of dispatch state.
 		slug := env.addReadyTask(t, "example-task",
 			"do the thing.\nFiles: example.go")
@@ -83,9 +83,9 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 			t.Errorf("dashboard should include project header %q (display form of %q), got:\n%s",
 				wantHeader, env.project, out)
 		}
-		// One ⏳ todo visible (the ready task rolls into todo).
-		if !strings.Contains(out, "⏳ 1") {
-			t.Errorf("dashboard should show ⏳ 1, got:\n%s", out)
+		// One ◌ todo visible (the ready task rolls into todo).
+		if !strings.Contains(out, "◌ 1") {
+			t.Errorf("dashboard should show ◌ 1, got:\n%s", out)
 		}
 		// No coord ticks have run yet → no coord-state.json → ○ idle.
 		if !strings.Contains(out, "○ idle") {
@@ -232,11 +232,11 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 		}
 
 		rendered, snap := tui.RenderDashboardForTest(time.Now(), 140, 40, "test")
-		// 👁 1 because in-review counts get their own chip; ▶ 0 means
-		// the in-progress chip drops (it's omitted when 0). ⏳ 0
+		// ◇ 1 because in-review counts get their own chip; ▶ 0 means
+		// the in-progress chip drops (it's omitted when 0). ◌ 0
 		// always shows.
-		if !strings.Contains(rendered, "👁 1") {
-			t.Errorf("dashboard should show 👁 1 post-drain, got:\n%s", rendered)
+		if !strings.Contains(rendered, "◇ 1") {
+			t.Errorf("dashboard should show ◇ 1 post-drain, got:\n%s", rendered)
 		}
 		// In-progress chip omitted when 0.
 		if strings.Contains(rendered, "▶ 1") {
@@ -286,13 +286,13 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 
 		rendered, snap := tui.RenderDashboardForTest(time.Now(), 140, 40, "test")
 
-		// All count chips at zero. ⏳ 0 always renders; in-progress and
+		// All count chips at zero. ◌ 0 always renders; in-progress and
 		// in-review chips are omitted when 0.
-		if !strings.Contains(rendered, "⏳ 0") {
-			t.Errorf("dashboard should show ⏳ 0 post-archive, got:\n%s", rendered)
+		if !strings.Contains(rendered, "◌ 0") {
+			t.Errorf("dashboard should show ◌ 0 post-archive, got:\n%s", rendered)
 		}
-		if strings.Contains(rendered, "👁 1") {
-			t.Errorf("dashboard should NOT show 👁 1 post-archive:\n%s", rendered)
+		if strings.Contains(rendered, "◇ 1") {
+			t.Errorf("dashboard should NOT show ◇ 1 post-archive:\n%s", rendered)
 		}
 		// Snapshot: project row still present (project dir exists),
 		// but counts are zero and no workers.
