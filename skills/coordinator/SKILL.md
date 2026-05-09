@@ -88,19 +88,47 @@ The coord does NOT foreground-poll the subagent. The harness fires a `<task-noti
 
 ### Step 5 — PR-TRACK
 
-When the impl-subagent returns with a PR URL, the coord:
+When the impl-subagent returns with a PR URL, the coord **shepherds**
+the PR to merge — does not just watch it. A PR you own does not stop at
+a single terminal event between open and merge: it can flip BEHIND
+(another PR landed), DIRTY (conflict), CI-red, or CHANGES_REQUESTED.
+The coord wakes on **any** of those, acts, and re-spawns the watch.
 
-1. **Notifies the operator** by writing the URL into the chat (push, don't ask). No "should I open the PR?" dialog — that ship sailed at step 1.
-2. **Watches CI** using the standards.md `## Async waits` pattern (G4). Run a single background bash:
-   ```bash
-   # Bash tool, run_in_background: true, timeout proportional to slowest CI step
-   until gh pr view <N> --json state -q '.state' | grep -q MERGED; do sleep 30; done
-   echo "MERGED at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-   ```
-   The harness `<task-notification>` resumes the coord when the loop exits. **No foreground polling, no operator hand-holding, no prompt-cache thrash.**
-3. **On CI fail** (G3): dispatch a **fix-subagent** against the SAME branch with the failure log. Fix-subagent has the same §4 review contract as the impl-subagent. Cap = 3 attempts per task. On the 4th failure, raise-hand to the operator with WIP path + failure log.
-4. **On rebase conflict** (G3): if the conflict is mechanical (e.g., parallel-edited CHANGELOG.md), dispatch a **rebase-subagent** with explicit "rebase only, no scope changes" instructions. If the conflict crosses into business logic, raise-hand — operators decide rebase semantics, not coords.
-5. **On merge** → step 6.
+The full polling pattern + per-state action matrix + worktree-isolation
+rule live in the `## Async waits` → `### PR shepherding` subsection of
+`~/.fleet/standards.md` (mirror at
+[`docs/STANDARDS-BASELINE.md`](../../docs/STANDARDS-BASELINE.md)) — the
+coord inherits that subsection through the merged standards block.
+**Read it.** The short form below references it; the matrix lives
+there.
+
+1. **Notify the operator** with the PR URL (push, don't ask). No
+   "should I open the PR?" dialog — that ship sailed at step 1.
+2. **Shepherd the PR** with one background `until` loop per PR
+   (`Bash(run_in_background=true)`), waking on actionable states:
+   `state != OPEN` OR `mergeStateStatus == BEHIND` OR
+   `mergeStateStatus == DIRTY` OR any `statusCheckRollup[].conclusion
+   == FAILURE` OR `reviewDecision == CHANGES_REQUESTED`. The harness
+   `<task-notification>` resumes the coord when the loop exits. On
+   wake, dispatch by predicate (matrix below) and **re-spawn the
+   loop** so the PR is always under an active watch. (G4 — async
+   waits.)
+3. **On CI fail** (G3): dispatch a **fix-subagent** against the SAME
+   branch with the failure log. Fix-subagent has the same §4 review
+   contract as the impl-subagent. Cap = 3 attempts per task. On the
+   4th failure, raise-hand with WIP path + failure log.
+4. **On BEHIND or DIRTY**: dispatch a **rebase-subagent** on an
+   isolated git worktree (`git worktree add /tmp/fleet-<task>-<pr>
+   <branch>`) with explicit "rebase only, no scope changes"
+   instructions. Markdown conflicts resolve as additive (keep both
+   sides). Substantive Go-code business-logic conflicts: abort +
+   raise-hand — operators decide merge semantics, not coords.
+5. **On CHANGES_REQUESTED**: address straightforward feedback (typo /
+   style) inline; raise-hand for substantive design feedback or
+   scope-change requests.
+6. **On TERMINAL MERGED** → step 6 (DONE).
+7. **On TERMINAL CLOSED-without-merge**: raise-hand — was the work
+   abandoned?
 
 **Fix-subagent dispatch template (skeleton):**
 

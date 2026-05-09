@@ -8,6 +8,24 @@ follows [SemVer](https://semver.org/).
 
 ### Added
 
+- Active PR shepherding SOP in the bundled `~/.fleet/standards.md`
+  template (`templates/standards.md` `## Async waits` → new
+  `### PR shepherding` subsection; mirrored in
+  `docs/STANDARDS-BASELINE.md`; cross-linked from the coordinator
+  skill's Step 5 PR-TRACK runbook). Encodes the operator directive —
+  *"if the pr is out of date, trigger it update, if the pr is ci
+  failed, fix ci, if there are some comments, try to give solution.
+  if there are some conflicts, resolve it, rebase it, push it again.
+  not just watch and do nothing"* — as a per-PR background `until`
+  loop that wakes on actionable states (BEHIND, DIRTY, CI failure,
+  CHANGES_REQUESTED) in addition to terminal MERGED, with a per-state
+  action matrix (rebase-shepherd / fix-subagent / inline-fix /
+  operator-escalate) and a mandatory git-worktree-isolation rule for
+  rebases. Motivated by live demonstration in fleet's own dogfooding
+  (PR #106 merge → 3 PRs flipped BEHIND → rebase-shepherd round 1 →
+  PR #108 merge → 2 PRs flipped BEHIND → rebase-shepherd round 2);
+  without the actionable-state predicates a watcher polling only on
+  `state != OPEN` slept through both rounds.
 - Coordinator workflow runbook: the six-step engagement flow
   (DISCUSS → SPLIT → TASK LIST → IMPLEMENT → PR-TRACK → DONE) is now
   codified in `skills/coordinator/SKILL.md` and mirrored at

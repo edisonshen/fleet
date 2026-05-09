@@ -457,15 +457,48 @@ func TestRunInit_SeedsStandardsTemplate(t *testing.T) {
 // per-element checks in TestRunInit_SeedsStandardsTemplate but bypasses
 // the install path so a regression in the embed.go directive surfaces
 // independently of init plumbing.
+//
+// Also pins the `### PR shepherding` subsection that ships under Async
+// waits — the active-shepherd SOP encoded in the bundled standards. A
+// future template edit that drops the actionable-state predicates, the
+// per-state action matrix, or the worktree-isolation rule silently
+// regresses every coord that inherits the merged standards block; the
+// assertions here are the only on-disk guard.
 func TestStandardsTemplate_EmbedsAsyncWaitsSection(t *testing.T) {
 	body := string(fleet.StandardsTemplate())
 	for _, want := range []string{
+		// Async waits base recipe — issue #105.
 		"## Async waits",
 		"run_in_background: true",
 		"until <single check that returns truthy when done>",
 		"task-notification",
 		"270s",
 		"gh pr view",
+		// PR shepherding subsection — operator directive: "not just
+		// watch and do nothing". Pinning these strings prevents a
+		// silent regression of the actionable-state predicates +
+		// per-state action matrix + worktree-isolation rule.
+		"### PR shepherding",
+		"BEHIND",
+		"DIRTY",
+		"CHANGES_REQUESTED",
+		"FAILURE",
+		"mergeStateStatus",
+		"statusCheckRollup",
+		"reviewDecision",
+		// Per-state action matrix header — the matrix is the
+		// load-bearing artifact, not just narrative prose.
+		"| Wake reason | Action | Cap | Escalate to operator on |",
+		"rebase-shepherd",
+		"fix-subagent",
+		// Worktree-isolation rule — observed-twice failure mode in
+		// fleet's own dogfooding; a regression here re-creates the
+		// shared-checkout cwd-flip / stash-interference bug.
+		"git worktree add /tmp/fleet-",
+		"--force-with-lease",
+		// Re-spawn loop — the difference between watch (one-shot)
+		// and shepherd (always under active watch).
+		"re-spawn",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("StandardsTemplate missing %q:\n%s", want, body)
