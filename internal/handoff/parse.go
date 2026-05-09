@@ -179,6 +179,13 @@ func splitKeyValuePairs(s string) ([]kvPair, bool) {
 			if s[end] == '\\' {
 				// Skip the escape's next char (covers `\"`, `\\`,
 				// `\n`, `\xNN`, etc. — strconv.Unquote validates).
+				// Bounds-check the +2 jump so a malformed trailing
+				// backslash (`"foo\`) doesn't index past len(s) in
+				// the strconv.Unquote call below — return false
+				// instead and let the caller drop the line.
+				if end+1 >= len(s) {
+					return nil, false
+				}
 				end += 2
 				continue
 			}
