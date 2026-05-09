@@ -6,6 +6,15 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-09
+
+Project-list quality-of-life pass: operator can `[c]` hide projects
+they're not working on, idle projects auto-collapse under a separator
+group, and the context indicator drops its bar glyph in favor of the
+colored percentage alone. Plus three coord-spawn-marker bugs that
+were producing a "stuck" warning even after the underlying tmux
+session had died.
+
 ### Added
 
 - Project-list cleanup: `[c]` hides a project from the LEFT column
@@ -24,6 +33,12 @@ follows [SemVer](https://semver.org/).
   and agents tagged with a hidden project still appear in the RIGHT
   column under `v0.1 agents`. Closes
   [#98](https://github.com/edisonshen/fleet/issues/98).
+- `[x]` on a fully-dead v0.1 project row (no live agents, no v0.2
+  project dir) archives the dead-agent records tagged with that
+  project and removes the row. v0.2 project rows preserve the
+  existing `[x]` task-archive behavior — only fully-dead legacy rows
+  get the new dismiss path. Closes
+  [#96](https://github.com/edisonshen/fleet/issues/96) gap 3.
 
 ### Changed
 
@@ -32,6 +47,31 @@ follows [SemVer](https://semver.org/).
   the handoff tag (`◐ HANDOFF` / `◐ COMPACT`) are unchanged. The bar
   read as visual noise next to the percentage at glance distance.
   Closes [#95](https://github.com/edisonshen/fleet/issues/95).
+
+### Fixed
+
+- Stale coord-spawn marker now self-heals when the tmux session it
+  was tracking is gone. Previously the "⚠ coord spawn stuck" warning
+  rendered forever once the marker aged past `FLEET_COORD_SPAWN_TIMEOUT_S`,
+  even when the spawning agent had long died. The dashboard now reads
+  the agent ID from the marker contents, probes
+  `tmux SessionExists("fleet-<id>")`, and removes the marker (state
+  flips to Idle) when the session is gone. Closes
+  [#96](https://github.com/edisonshen/fleet/issues/96) gap 1.
+- Stuck-spawn hint text now points at the correct tmux session name.
+  Previously the warning suggested `fleet-<projectName>`, but real
+  tmux sessions are `fleet-<agentID>` (8-char). The marker contents
+  carry the agent ID; the hint now reads it and renders
+  `fleet-<agentID>` so the operator can grep their tmux list and
+  actually find the session. Falls back to the project-name framing
+  when the marker is empty or unreadable. Closes
+  [#96](https://github.com/edisonshen/fleet/issues/96) gap 2.
+
+### Deferred
+
+- Codex review SKIPPED across this release — rate-limited at
+  2026-05-08; quota resets 2026-05-13 05:31 UTC. `/review` (gstack
+  skill) PASSED on every PR. Codex re-runs queued for post-reset.
 
 ## [0.3.0] - 2026-05-09
 
@@ -290,7 +330,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/edisonshen/fleet/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/edisonshen/fleet/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edisonshen/fleet/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edisonshen/fleet/compare/v0.1.2...v0.1.3
