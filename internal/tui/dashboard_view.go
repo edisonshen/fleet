@@ -695,6 +695,13 @@ func isHexLower(c rune) bool {
 // ← jumps to the first PROJECTS row, → jumps to the first
 // WORKERS/agents row — both unchanged since PR #85, just no longer
 // advertised in the footer.
+//
+// Inter-chip separator is one space (was two pre-#90). Adding the
+// [h] handoff and [x] archive chips pushed the legend past the
+// usable-width budget on common 100-cell split panes; tightening
+// the separator keeps the line on a single row at width >= 96
+// without sacrificing readability — chips are still bracketed,
+// which carries enough visual separation on its own.
 func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string) string {
 	chips := []struct{ key, label string }{
 		{"⏎", "open"},
@@ -715,7 +722,7 @@ func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string
 				footerLabelStyle.Render(c.label),
 		)
 	}
-	left := strings.Join(parts, "  ")
+	left := strings.Join(parts, " ")
 	rightParts := []string{}
 	if searchFilter != "" {
 		rightParts = append(rightParts, searchFooterStyle.Render(

@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 // Issue #90: Up/Down arrows are silent aliases for k/j; footer drops
@@ -118,5 +120,27 @@ func TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("help overlay missing nav key %q, got:\n%s", want, out)
 		}
+	}
+}
+
+// TestFooter_FitsCommonSplitPaneWidth pins codex iter-1 P2: adding
+// [h] handoff + [x] archive chips pushed the legend past the
+// renderFooter() usable-width budget (m.width - 1) on 100-column
+// split panes. The fix tightens the inter-chip separator from two
+// spaces to one. Regress this here so a future "make it pretty"
+// pass that re-widens the gap can't silently re-introduce wrap.
+//
+// Anchor: a 100-column terminal hits usable=99; the rendered legend
+// (left chips + 1-cell gap + right uptime) must fit in that budget
+// without truncation.
+func TestFooter_FitsCommonSplitPaneWidth(t *testing.T) {
+	const splitPaneWidth = 99 // m.width=100 → usable = m.width - 1
+	out := renderDashboardFooter(0, splitPaneWidth, "")
+	// renderDashboardFooter pads with spaces to reach `usable`; if the
+	// content alone exceeds that budget, gap collapses to 1 and the
+	// rendered string overruns. Width should be exactly splitPaneWidth.
+	if got := lipgloss.Width(out); got > splitPaneWidth {
+		t.Errorf("footer rendered %d cells wide; must fit in %d (100-col terminal)",
+			got, splitPaneWidth)
 	}
 }
