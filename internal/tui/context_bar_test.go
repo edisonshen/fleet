@@ -1,4 +1,4 @@
-// Tests for the context-pct bar glyph + handoff tag (issue #89).
+// Tests for the context-pct chip + handoff tag (issues #89, #95).
 package tui
 
 import (
@@ -16,16 +16,11 @@ func floatPtr(v float64) *float64 { return &v }
 // strPtr matches floatPtr for the *string handoff_type cases.
 func strPtr(s string) *string { return &s }
 
-// pctSegments counts how many filled (▰) glyphs the rendered bar has.
-// The lipgloss style wrapping is irrelevant — we only care about the
-// underlying glyph composition + percent label.
-func pctSegments(rendered string) (filled int, empty int) {
-	filled = strings.Count(rendered, contextBarFilled)
-	empty = strings.Count(rendered, contextBarEmpty)
-	return
-}
-
-// -- Phase 2: bar renderer ---------------------------------------------
+// -- Phase 2: percent renderer ----------------------------------------
+//
+// Issue #95 dropped the 5-segment bar glyph. The renderer now emits
+// a colored "<int>%" only — tests assert on the integer label and the
+// threshold zone, not on segment counts (the bar is gone).
 
 func TestContextBar_NilOmitsChip(t *testing.T) {
 	got := renderContextBar(nil)
@@ -34,15 +29,23 @@ func TestContextBar_NilOmitsChip(t *testing.T) {
 	}
 }
 
+func TestContextBar_NoBarGlyphsRendered(t *testing.T) {
+	// Issue #95: the bar (▰/▱) was dropped. Make sure no rendered
+	// chip ever carries either glyph again — guards against a
+	// regression that re-introduces the segment chunks.
+	for _, v := range []float64{0, 12, 48, 50, 69, 70, 95, 100} {
+		got := renderContextBar(floatPtr(v))
+		if strings.ContainsAny(got, "▰▱") { // ▰ ▱
+			t.Errorf("%v%%: chip should not contain bar glyphs, got %q", v, got)
+		}
+	}
+}
+
 func TestContextBar_Empty(t *testing.T) {
-	// 0% — every segment empty, "0%" label, green zone.
+	// 0% — green zone, "0%" label.
 	got := renderContextBar(floatPtr(0))
 	if got == "" {
-		t.Fatal("0% should still render a chip (empty bar + 0% label)")
-	}
-	filled, empty := pctSegments(got)
-	if filled != 0 || empty != contextBarSegments {
-		t.Errorf("0%%: want 0 filled / %d empty; got %d / %d", contextBarSegments, filled, empty)
+		t.Fatal("0%% should still render a chip (0%% label)")
 	}
 	if !strings.Contains(got, "0%") {
 		t.Errorf("0%% chip should contain literal \"0%%\", got %q", got)
@@ -56,11 +59,6 @@ func TestContextBar_Empty(t *testing.T) {
 
 func TestContextBar_Green_Low(t *testing.T) {
 	got := renderContextBar(floatPtr(12))
-	filled, empty := pctSegments(got)
-	if filled != 0 || empty != 5 {
-		// 12/20 = 0.6 → floor → 0 filled
-		t.Errorf("12%%: want 0/5; got %d/%d", filled, empty)
-	}
 	if !strings.Contains(got, "12%") {
 		t.Errorf("12%% chip should contain \"12%%\", got %q", got)
 	}
@@ -70,12 +68,8 @@ func TestContextBar_Green_Low(t *testing.T) {
 }
 
 func TestContextBar_Green_High(t *testing.T) {
-	// 48% — under yellow threshold, 2 filled (48/20=2.4 → floor → 2).
+	// 48% — under yellow threshold, still green zone.
 	got := renderContextBar(floatPtr(48))
-	filled, empty := pctSegments(got)
-	if filled != 2 || empty != 3 {
-		t.Errorf("48%%: want 2/3; got %d/%d", filled, empty)
-	}
 	if !strings.Contains(got, "48%") {
 		t.Errorf("48%% chip missing label: %q", got)
 	}
@@ -85,9 +79,7 @@ func TestContextBar_Green_High(t *testing.T) {
 }
 
 func TestContextBar_AmberThreshold(t *testing.T) {
-	// 50% — exact yellow threshold; zone flips to amber. Segment count
-	// stays floor(50/20) = 2 — the load-bearing signal at threshold is
-	// the COLOR change, not the segment delta.
+	// 50% — exact yellow threshold; zone flips to amber.
 	if z := contextZone(50); z != "amber" {
 		t.Errorf("50%% zone want amber; got %q", z)
 	}
@@ -103,9 +95,8 @@ func TestContextBar_Amber_High(t *testing.T) {
 		t.Errorf("69%% zone want amber; got %q", z)
 	}
 	got := renderContextBar(floatPtr(69))
-	filled, _ := pctSegments(got)
-	if filled != 3 { // 69/20 = 3.45 → floor → 3
-		t.Errorf("69%%: want 3 filled; got %d", filled)
+	if !strings.Contains(got, "69%") {
+		t.Errorf("69%% chip missing label: %q", got)
 	}
 }
 
@@ -122,9 +113,8 @@ func TestContextBar_RedThreshold(t *testing.T) {
 
 func TestContextBar_Red_High(t *testing.T) {
 	got := renderContextBar(floatPtr(95))
-	filled, _ := pctSegments(got)
-	if filled != 4 { // 95/20 = 4.75 → floor → 4
-		t.Errorf("95%%: want 4 filled; got %d", filled)
+	if !strings.Contains(got, "95%") {
+		t.Errorf("95%% chip missing label: %q", got)
 	}
 	if z := contextZone(95); z != "red" {
 		t.Errorf("95%% zone want red; got %q", z)
@@ -132,12 +122,8 @@ func TestContextBar_Red_High(t *testing.T) {
 }
 
 func TestContextBar_Full(t *testing.T) {
-	// 100% — saturate at 5 filled, 0 empty. Label is "100%" (3 digits).
+	// 100% — red zone, label is "100%" (3 digits).
 	got := renderContextBar(floatPtr(100))
-	filled, empty := pctSegments(got)
-	if filled != 5 || empty != 0 {
-		t.Errorf("100%%: want 5/0; got %d/%d", filled, empty)
-	}
 	if !strings.Contains(got, "100%") {
 		t.Errorf("100%% chip missing label: %q", got)
 	}
@@ -148,12 +134,20 @@ func TestContextBar_Full(t *testing.T) {
 
 func TestContextBar_OutOfRangeClamps(t *testing.T) {
 	// Defensive: hand-edited or future-schema records can deliver junk.
-	// Bar shouldn't crash; clamp into the displayable band.
-	for _, v := range []float64{-1, -50, 150, 999} {
-		got := renderContextBar(floatPtr(v))
-		filled, empty := pctSegments(got)
-		if filled+empty != contextBarSegments {
-			t.Errorf("clamp %v: total segments must be %d; got %d", v, contextBarSegments, filled+empty)
+	// Renderer should clamp into 0..100 instead of emitting "-50%" /
+	// "999%". Negative + NaN clamp to 0%; >100 clamps to 100%.
+	for _, c := range []struct {
+		in   float64
+		want string
+	}{
+		{-1, "0%"},
+		{-50, "0%"},
+		{150, "100%"},
+		{999, "100%"},
+	} {
+		got := renderContextBar(floatPtr(c.in))
+		if !strings.Contains(got, c.want) {
+			t.Errorf("clamp %v: want chip containing %q, got %q", c.in, c.want, got)
 		}
 	}
 }
@@ -404,7 +398,7 @@ func TestWorkerContextRecord_NilWorkerReturnsNil(t *testing.T) {
 
 // -- Phase 3: agent row integration ------------------------------------
 
-func TestRows_AgentRowRendersContextBar(t *testing.T) {
+func TestRows_AgentRowRendersContextPct(t *testing.T) {
 	r := agent.New("aaaa1111")
 	r.Project = "demo"
 	r.TaskID = "feat-1a2b"
@@ -413,29 +407,29 @@ func TestRows_AgentRowRendersContextBar(t *testing.T) {
 	if !strings.Contains(out, "48%") {
 		t.Errorf("agent row should carry the 48%% chip, got:\n%s", out)
 	}
-	if !strings.Contains(out, contextBarFilled) {
-		t.Errorf("agent row should carry filled bar glyphs (%s), got:\n%s", contextBarFilled, out)
+	// Issue #95: no bar glyphs anywhere in the row.
+	if strings.ContainsAny(out, "▰▱") { // ▰ ▱
+		t.Errorf("agent row should not carry bar glyphs, got:\n%s", out)
 	}
 }
 
-func TestRows_AgentRowOmitsBarWhenContextPctNil(t *testing.T) {
+func TestRows_AgentRowOmitsChipWhenContextPctNil(t *testing.T) {
 	r := agent.New("aaaa1111")
 	r.Project = "demo"
 	r.TaskID = "feat-1a2b"
 	r.ContextPct = nil
 	out := strings.Join(agentBlockLines(r, map[string]bool{r.ID: true}, 80, false), "\n")
-	// No bar glyphs at all when context_pct is nil.
-	if strings.Contains(out, contextBarFilled) || strings.Contains(out, contextBarEmpty) {
-		t.Errorf("nil context_pct should not render bar glyphs, got:\n%s", out)
-	}
 	if strings.Contains(out, "%") {
 		t.Errorf("nil context_pct should not render a percent label, got:\n%s", out)
+	}
+	if strings.ContainsAny(out, "▰▱") {
+		t.Errorf("nil context_pct should not render bar glyphs, got:\n%s", out)
 	}
 }
 
 // -- Phase 4: worker row integration -----------------------------------
 
-func TestRows_WorkerRowRendersContextBarFromAgentRecordLookup(t *testing.T) {
+func TestRows_WorkerRowRendersContextPctFromAgentRecordLookup(t *testing.T) {
 	// PR #87 architecture: worker subagent shares FLEET_AGENT_ID with
 	// its coord. So the worker's context_pct lives on the COORD's
 	// record. Lookup by project + coord task_id finds the right one.
@@ -455,12 +449,12 @@ func TestRows_WorkerRowRendersContextBarFromAgentRecordLookup(t *testing.T) {
 	if !strings.Contains(out, "72%") {
 		t.Errorf("worker row should pick up coord's 72%% chip, got:\n%s", out)
 	}
-	if !strings.Contains(out, contextBarFilled) {
-		t.Errorf("worker row should render bar glyphs from coord lookup, got:\n%s", out)
+	if strings.ContainsAny(out, "▰▱") {
+		t.Errorf("worker row should not carry bar glyphs, got:\n%s", out)
 	}
 }
 
-func TestRows_WorkerRowOmitsBarOnLookupMiss(t *testing.T) {
+func TestRows_WorkerRowOmitsChipOnLookupMiss(t *testing.T) {
 	// No matching agent record → no chip. Defensive: workers spawned
 	// before the coord's first Stop hook fires (early-spawn race) hit
 	// this path.
@@ -479,12 +473,9 @@ func TestRows_WorkerRowOmitsBarOnLookupMiss(t *testing.T) {
 	if strings.Contains(out, "%") {
 		t.Errorf("lookup miss should not render a chip, got:\n%s", out)
 	}
-	if strings.Contains(out, contextBarFilled) {
-		t.Errorf("lookup miss should not render bar glyphs, got:\n%s", out)
-	}
 }
 
-func TestRows_WorkerRowOmitsBarOnNilRecords(t *testing.T) {
+func TestRows_WorkerRowOmitsChipOnNilRecords(t *testing.T) {
 	// Defensive: early renders before agentsMsg lands have nil records.
 	w := &WorkerRow{
 		ID:      "1a2b",
@@ -495,8 +486,8 @@ func TestRows_WorkerRowOmitsBarOnNilRecords(t *testing.T) {
 		State:   "ok",
 	}
 	out := strings.Join(workerBlockLines(w, nil, 80, false), "\n")
-	if strings.Contains(out, contextBarFilled) {
-		t.Errorf("nil records should not render bar glyphs, got:\n%s", out)
+	if strings.Contains(out, "%") {
+		t.Errorf("nil records should not render a chip, got:\n%s", out)
 	}
 }
 

@@ -604,7 +604,7 @@ func renderCoordStatus(p *ProjectRow) string {
 
 // workerBlockLines renders one worker's two-line block:
 //
-//	● <id>           ▰▰▱▱▱ 32% ◐ HANDOFF
+//	● <id>           32% ◐ HANDOFF
 //	  <project>:<slug>                       <age> <state>
 //
 // The selected variant replaces the leading status dot with the
@@ -659,13 +659,14 @@ func workerBlockLines(w *WorkerRow, records []*agent.Record, width int, selected
 // "v0.1 agents" sub-heading. Same shape as workerBlockLines so the
 // right column reads consistently.
 //
-//	● <agent-id-short>          ▰▰▱▱▱ 32% ◐ HANDOFF      <status>
+//	● <agent-id-short>          32% ◐ HANDOFF      <status>
 //	  <project>:<task>                                    <age>
 //
-// Issue #89: line 1 picks up an inline context-pct bar + handoff tag
+// Issue #89: line 1 picks up an inline colored context-pct + handoff tag
 // when the record carries them; nil values omit the chips. The chips
 // sit between the agent ID and the right-flushed status so the row
 // reads left-to-right as "id → context → handoff state → status".
+// Issue #95 dropped the bar glyph; only the colored percent remains.
 func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected bool) []string {
 	if r == nil {
 		return nil
