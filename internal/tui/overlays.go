@@ -17,6 +17,7 @@ type helpEntry struct{ key, desc string }
 
 var helpEntries = []helpEntry{
 	{"j/k or ↓/↑", "move cursor up/down across all rows (wraps)"},
+	{"← / →", "jump cursor to first row of left (PROJECTS) / right (WORKERS) panel"},
 	{"⏎ enter", "expand/collapse project (on a project row) or open detail (other rows)"},
 	{"n", "add a new task to the current project"},
 	{"a", "attach coord (projects), tmux (agents), peek (workers/tasks)"},
