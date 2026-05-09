@@ -182,6 +182,45 @@ type Model struct {
 	// coordSpawnTimeoutDefault (10 minutes). Cached here so the env
 	// isn't re-parsed on every render.
 	coordSpawnTimeout time.Duration
+
+	// activeWindow is the threshold past which an agent/worker signal
+	// no longer counts toward "ACTIVE" classification (issue #98).
+	// Resolved once at New() from FLEET_ACTIVE_WINDOW_DAYS env (default
+	// 7 days). Cached so the env isn't re-parsed on every render.
+	activeWindow time.Duration
+
+	// showHidden, when true, renders the hidden-projects group ("─── N
+	// hidden ───") in the LEFT column with the hidden rows visible
+	// (dim) when expanded (issue #98). Toggled via [c] off-row (cursor
+	// on a separator or no row selected). Default false — operator
+	// never sees the hidden group unless they ask for it.
+	showHidden bool
+
+	// idleExpanded, when true, expands the "─── N idle ───" group so
+	// each idle project's row renders below the separator. Toggled via
+	// [enter] on the idle separator. Default false — idle projects
+	// stay collapsed so the dashboard prioritizes ACTIVE work (issue
+	// #98).
+	//
+	// See dashboardRows for the default-expand fallback when zero
+	// projects are ACTIVE: the spec's "─── N idle ───" wall isn't the
+	// right first impression for an operator with one stale-but-still-
+	// relevant project. idleCollapseExplicit (below) tracks whether
+	// the operator pressed [enter] on the separator, so the auto-
+	// expand only kicks in until the operator chooses.
+	idleExpanded bool
+
+	// idleCollapseExplicit tracks whether the operator has explicitly
+	// pressed [enter] on the idle separator. Once true, the
+	// auto-expand-when-no-active default no longer overrides
+	// idleExpanded. Issue #98 ergonomic refinement.
+	idleCollapseExplicit bool
+
+	// hiddenExpanded, when true, expands the "─── N hidden ───" group
+	// (only visible when showHidden=true) so each hidden project's row
+	// renders below the separator. Toggled via [enter] on the hidden
+	// separator. Default false (issue #98).
+	hiddenExpanded bool
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
@@ -215,6 +254,7 @@ func New(version string) Model {
 		userName:          currentUserName(),
 		startedAt:         time.Now(),
 		coordSpawnTimeout: resolveCoordSpawnTimeout(),
+		activeWindow:      resolveActiveWindow(),
 	}
 }
 
@@ -616,9 +656,16 @@ func (m *Model) moveCursor(delta int) {
 // ordering contract), so the first row of kind rowProject is the
 // LEFT-panel anchor.
 //
-// No-op when no project row exists (synthetic-only dashboards or
-// empty state) — leaves the cursor where it is rather than hopping to
-// 0, which could be a worker/agent row in pathological layouts.
+// Issue #98: when every project is idle AND the operator has explicitly
+// collapsed the idle group, the LEFT column starts with a separator
+// (no project rows visible). Fall back to the first rowSeparator so the
+// operator can still ← into the LEFT panel and press [enter] to expand.
+// Without this fallback, ← would no-op and cursor would stay stuck on
+// the right column, hiding the separator from keyboard access.
+//
+// No-op only when truly no LEFT-column row exists — leaves the cursor
+// where it is rather than hopping to 0, which could be a worker/agent
+// row in pathological layouts.
 //
 // j/k behavior is unchanged: this is an additive shortcut, not a
 // rebinding. Idempotent — pressing ← when already on the first project
@@ -627,6 +674,14 @@ func (m *Model) jumpToLeftPanel() {
 	rows := m.dashboardRows()
 	for i, r := range rows {
 		if r.kind == rowProject {
+			m.dashCursor = i
+			return
+		}
+	}
+	// Fallback: first rowSeparator (issue #98). Reachable when every
+	// project is idle + explicitly collapsed.
+	for i, r := range rows {
+		if r.kind == rowSeparator {
 			m.dashCursor = i
 			return
 		}
@@ -805,7 +860,35 @@ func (m Model) renderFooter() string {
 		b.WriteString(dimStyle.Render("[esc] clear  [enter] keep filter"))
 		b.WriteString("\n")
 	default:
-		b.WriteString(renderDashboardFooter(time.Since(m.startedAt), usable, m.searchFilter))
+		// Hidden-projects chip data (issue #98). hiddenWith is the
+		// count of hidden projects that DO have fresh activity — the
+		// nudge tells operators the hidden list isn't dormant without
+		// overriding the hide.
+		hiddenSet := hiddenProjectsSet()
+		hiddenCount := len(hiddenSet)
+		hiddenWith := 0
+		if hiddenCount > 0 {
+			window := m.activeWindow
+			if window <= 0 {
+				window = activeWindowDefault
+			}
+			var workers []*WorkerRow
+			if m.dashboard != nil {
+				workers = m.dashboard.Workers
+			}
+			hiddenWith = hiddenWithActivity(
+				m.unifiedProjectsAll(),
+				hiddenSet,
+				workers,
+				m.records,
+				nowFn(),
+				window,
+			)
+		}
+		b.WriteString(renderDashboardFooterWithHidden(
+			time.Since(m.startedAt), usable, m.searchFilter,
+			hiddenCount, hiddenWith,
+		))
 		b.WriteString("\n")
 	}
 	return b.String()

@@ -275,8 +275,108 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		m.pickerCursor = 0
 		m.mode = modePickRepo
 		return m, nil, true
+	case "c":
+		return m.actionToggleHide()
 	}
 	return m, nil, false
+}
+
+// actionToggleHide implements [c] (issue #98). Three branches by
+// cursor context:
+//
+//  1. Project row → toggle that project's membership in the hidden
+//     list and surface a flash. Hide is HARD: fresh activity does not
+//     auto-unhide; only [c] on the row again (with show-hidden mode
+//     on, so the row is reachable) un-hides.
+//
+//  2. Separator row OR no-row → toggle show-hidden mode. The hidden
+//     group renders dim under "─── N hidden ───" when on; vanishes
+//     when off. Off-separator toggle is the operator's main lever to
+//     reach hidden rows again without having to remember which
+//     project they hid.
+//
+//  3. Other row kinds (task / worker / agent) → flash a "doesn't
+//     apply" hint. [c] is project-scoped; we don't repurpose it for
+//     task/worker hiding (which would need separate persistence).
+func (m Model) actionToggleHide() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil {
+		// No row selected (empty dashboard) → toggle show-hidden so
+		// the operator can still discover hidden projects on a fresh
+		// install.
+		m.showHidden = !m.showHidden
+		m = clampDashCursor(m)
+		return m, nil, true
+	}
+	switch row.kind {
+	case rowProject:
+		if row.project == nil {
+			return m, nil, true
+		}
+		name := row.project.Name
+		nowHidden, err := toggleHiddenProjectFn(name)
+		if err != nil {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("hide toggle for %s failed: %v", name, err),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		if nowHidden {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf("project %s hidden — [c] off-row to view; [c] on the hidden row to un-hide", name),
+			}
+		} else {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf("project %s un-hidden", name),
+			}
+		}
+		// Cursor may now point past the end of the row list (we just
+		// removed a project). Clamp to keep selection sane.
+		m = clampDashCursor(m)
+		return m, nil, true
+	case rowSeparator:
+		// Off-row toggle of show-hidden mode. Cursor stays on the
+		// separator (or wherever it ends up after the row list shifts).
+		m.showHidden = !m.showHidden
+		// When toggling on, default the hidden group to expanded so
+		// the operator immediately sees the rows they wanted to view.
+		// Toggling off resets the expansion so a future [c] starts
+		// from a clean state.
+		if m.showHidden {
+			m.hiddenExpanded = true
+		} else {
+			m.hiddenExpanded = false
+		}
+		m = clampDashCursor(m)
+		return m, nil, true
+	default:
+		m.flash = &flashMsg{
+			text:  "[c] hides projects — move cursor onto a project row, or off-row to toggle show-hidden mode",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+}
+
+// clampDashCursor pulls the cursor back into the valid row range when
+// a hide-toggle / show-hidden flip changes the row count. Without this
+// the cursor could dangle past the end and selectedRow() returns nil
+// for the next keypress, making [j]/[k] feel unresponsive until the
+// operator notices.
+func clampDashCursor(m Model) Model {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		m.dashCursor = 0
+		return m
+	}
+	if m.dashCursor >= len(rows) {
+		m.dashCursor = len(rows) - 1
+	}
+	if m.dashCursor < 0 {
+		m.dashCursor = 0
+	}
+	return m
 }
 
 // actionHandoff dispatches [h] to the agent at the dashboard cursor.
@@ -1186,6 +1286,25 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 	case rowAgent:
 		body, title := readAgentDetail(row.agent)
 		m.detail = &detailView{title: title, body: body}
+	case rowSeparator:
+		// Issue #98: [enter] on a separator toggles its group's
+		// expansion. Cursor stays on the separator so [j]/[k] can
+		// walk into the newly-revealed rows.
+		if row.separator == nil {
+			return m, nil, true
+		}
+		switch row.separator.kind {
+		case separatorIdle:
+			m.idleExpanded = !m.idleExpanded
+			// Mark explicit so the auto-suppress logic in
+			// dashboardRows doesn't override the operator's choice on
+			// the next render (an explicit collapse should stick even
+			// when zero projects are active).
+			m.idleCollapseExplicit = true
+		case separatorHidden:
+			m.hiddenExpanded = !m.hiddenExpanded
+		}
+		m = clampDashCursor(m)
 	}
 	return m, nil, true
 }

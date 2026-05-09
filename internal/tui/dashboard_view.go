@@ -271,13 +271,36 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		tickFrame:    m.tickCount,
 		spawnTimeout: m.coordSpawnTimeout,
 	}
+	// Activity-grouping helper — when a project block follows the
+	// hidden separator AND that separator is expanded, render the
+	// project lines dim so the operator's eye reads the rows as
+	// secondary content (issue #98).
+	insideHiddenGroup := false
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowProject:
-			left = append(left, projectBlockLines(row.project, leftW, selected, spawnCtx)...)
+			lines := projectBlockLines(row.project, leftW, selected, spawnCtx)
+			if insideHiddenGroup {
+				lines = applyHiddenStyle(lines)
+			}
+			left = append(left, lines...)
 		case rowTask:
-			left = append(left, taskBlockLine(row.task, leftW, selected))
+			line := taskBlockLine(row.task, leftW, selected)
+			if insideHiddenGroup {
+				line = hiddenProjectStyle.Render(line)
+			}
+			left = append(left, line)
+		case rowSeparator:
+			left = append(left, separatorBlockLine(row.separator, leftW, selected))
+			// Empty trailing line keeps spacing consistent with the
+			// project blocks (which end with "" for visual rhythm).
+			left = append(left, "")
+			if row.separator != nil && row.separator.kind == separatorHidden {
+				insideHiddenGroup = true
+			} else {
+				insideHiddenGroup = false
+			}
 		}
 	}
 
@@ -334,11 +357,77 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	return left, right
 }
 
+// separatorBlockLine renders one "─── N idle ───" / "─── N hidden ───"
+// line for the LEFT column (issue #98). The line carries the count + a
+// hint about the operator's next move; the cursor glyph "▶" replaces
+// the leading dashes when the row is selected.
+//
+// Width target = leftW. We pad the trailing dashes so the line spans
+// the column visually. Lipgloss handles the cell math.
+func separatorBlockLine(sep *separatorRow, w int, selected bool) string {
+	if sep == nil {
+		return ""
+	}
+	var label string
+	switch sep.kind {
+	case separatorIdle:
+		if sep.expanded {
+			label = fmt.Sprintf("%d idle (expanded — [enter] to collapse)", sep.count)
+		} else {
+			label = fmt.Sprintf("%d idle — [enter] to expand", sep.count)
+		}
+	case separatorHidden:
+		if sep.expanded {
+			label = fmt.Sprintf("%d hidden (expanded — [c] to view-toggle)", sep.count)
+		} else {
+			label = fmt.Sprintf("%d hidden — [enter] to expand, [c] to view-toggle", sep.count)
+		}
+	default:
+		return ""
+	}
+	style := separatorDimStyle
+	cursor := "  "
+	if selected {
+		style = separatorCursorStyle
+		cursor = separatorCursorStyle.Render("▶ ")
+	}
+	// "─── label ───" — the dash runs flank the label so the row reads
+	// as a group divider regardless of label length.
+	const prefixDashes = "─── "
+	const suffixSeed = " ───"
+	body := prefixDashes + label + suffixSeed
+	rendered := cursor + style.Render(body)
+	// Pad with extra dashes to fill the column. This makes wider
+	// terminals show a visible run-out — avoids the row reading as a
+	// short floating pill on a wide screen.
+	used := lipgloss.Width(rendered)
+	if w > used+2 {
+		extra := w - used - 2
+		rendered += style.Render(strings.Repeat("─", extra))
+	}
+	return rendered
+}
+
+// applyHiddenStyle wraps each non-empty line in the hidden-project dim
+// style so a hidden project's block reads as secondary content. Empty
+// strings (block-spacing rows) pass through unchanged.
+func applyHiddenStyle(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, ln := range lines {
+		if ln == "" {
+			out[i] = ln
+			continue
+		}
+		out[i] = hiddenProjectStyle.Render(ln)
+	}
+	return out
+}
+
 // rowsHaveLeft returns true when at least one row would render in the
 // left column. Used to decide whether to emit the empty-projects hint.
 func rowsHaveLeft(rows []dashRow) bool {
 	for _, r := range rows {
-		if r.kind == rowProject || r.kind == rowTask {
+		if r.kind == rowProject || r.kind == rowTask || r.kind == rowSeparator {
 			return true
 		}
 	}
@@ -777,6 +866,18 @@ func isHexLower(c rune) bool {
 // without sacrificing readability — chips are still bracketed,
 // which carries enough visual separation on its own.
 func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string) string {
+	return renderDashboardFooterWithHidden(uptime, usable, searchFilter, 0, 0)
+}
+
+// renderDashboardFooterWithHidden is the issue #98 extension that
+// surfaces a "<N> hidden — [c] view" chip on the right side when N > 0.
+// "hiddenWith" appends " · M with activity" when at least one hidden
+// project has fresh activity, so operators see the hidden list isn't
+// dormant without overriding the hide.
+//
+// The chip sits between the search filter (when set) and the uptime
+// counter so the right edge keeps a consistent layout shape.
+func renderDashboardFooterWithHidden(uptime time.Duration, usable int, searchFilter string, hiddenCount, hiddenWith int) string {
 	chips := []struct{ key, label string }{
 		{"⏎", "open"},
 		{"n", "task"},
@@ -801,6 +902,13 @@ func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string
 	if searchFilter != "" {
 		rightParts = append(rightParts, searchFooterStyle.Render(
 			fmt.Sprintf("/%s · esc clears", searchFilter)))
+	}
+	if hiddenCount > 0 {
+		body := fmt.Sprintf("%d hidden — [c] view", hiddenCount)
+		if hiddenWith > 0 {
+			body += fmt.Sprintf(" · %d with activity", hiddenWith)
+		}
+		rightParts = append(rightParts, hiddenChipStyle.Render(body))
 	}
 	rightParts = append(rightParts, headerSubtleStyle.Render(
 		fmt.Sprintf("uptime %s", formatUptime(uptime))))
