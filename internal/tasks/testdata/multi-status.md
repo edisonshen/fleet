@@ -12,6 +12,8 @@ schema: v1
 - branch:
 - created: 2026-05-01T10:00:00Z
 - updated: 2026-05-01T10:00:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -36,6 +38,8 @@ Alpha done.
 - branch:
 - created: 2026-05-02T10:00:00Z
 - updated: 2026-05-02T10:00:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -60,6 +64,8 @@ Beta done.
 - branch: worker/gamma
 - created: 2026-05-03T10:00:00Z
 - updated: 2026-05-03T11:00:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -84,6 +90,8 @@ Gamma done.
 - branch: worker/delta
 - created: 2026-05-04T10:00:00Z
 - updated: 2026-05-04T12:00:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -108,6 +116,8 @@ Delta done.
 - branch: worker/epsilon
 - created: 2026-05-05T10:00:00Z
 - updated: 2026-05-05T13:00:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -132,6 +142,8 @@ Epsilon done.
 - branch:
 - created: 2026-05-06T10:00:00Z
 - updated: 2026-05-06T10:30:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 
@@ -156,6 +168,8 @@ Zeta done.
 - branch:
 - created: 2026-05-06T11:00:00Z
 - updated: 2026-05-06T11:30:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 

@@ -12,6 +12,8 @@ schema: v1
 - branch: worker/noisy
 - created: 2026-05-06T09:00:00Z
 - updated: 2026-05-06T11:30:00Z
+- started_at:
+- finished_at:
 - depends_on: []
 - spawned_by: user
 

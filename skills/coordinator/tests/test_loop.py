@@ -1504,3 +1504,55 @@ def test_workers_delete_failure_does_not_abort_tick(
     )
     captured = capsys.readouterr()
     assert "workers delete failed" in captured.err
+
+
+# ---------- auto-archive integration ----------
+
+
+def test_tick_auto_archives_when_over_threshold(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """End-of-tick auto-archive: tasks.md > threshold → archive shell.
+
+    50 done rows + 1 todo (51 total) under the default threshold = 50
+    triggers exactly one `fleet tasks archive` shell for the oldest
+    done slug. Active task is never archived regardless of count.
+    """
+    monkeypatch.delenv("FLEET_AUTO_ARCHIVE_THRESHOLD", raising=False)
+    base = _dt.datetime(2026, 5, 6, 10, 0, 0, tzinfo=_dt.timezone.utc)
+
+    rows: list[parse.Task] = []
+    for i in range(50):
+        # Done rows with ascending finished_at — index 0 is oldest.
+        t = parse.Task(
+            slug=f"done-{i:03d}", status="done", priority="P2",
+            worker_pid=0,
+            created=base, updated=base + _dt.timedelta(hours=i),
+            finished_at=base + _dt.timedelta(hours=i),
+            spawned_by="user", depends_on=[],
+            spec="s", acceptance="a", notes="",
+        )
+        rows.append(t)
+    # One non-terminal task — must NOT be archived.
+    rows.append(_make_task("active-stay", status="todo"))
+    _write_tasks(project_dir, rows)
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    assert not result.skipped
+    archive_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "archive"]]
+    assert len(archive_calls) == 1, (
+        f"expected exactly 1 archive shell, got {len(archive_calls)}: "
+        + repr(archive_calls)
+    )
+    # Oldest done slug = done-000.
+    assert archive_calls[0][-1] == "done-000"
+    # Active task slug must NEVER appear in any archive shell.
+    for c in archive_calls:
+        assert c[-1] != "active-stay", (
+            f"active task should not be archived: {c}"
+        )

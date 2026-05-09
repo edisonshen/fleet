@@ -181,6 +181,27 @@ func archivedSlugList(project string) ([]string, error) {
 	return out, nil
 }
 
+// readArchiveTasks loads tasks-archive.md (or empty if missing) and
+// returns its Task slice. Used by `tasks list` to merge done/abandoned
+// rows from the archive into the recent-activity view. Missing file is
+// NOT an error — most projects archive lazily and won't have one until
+// the first archive run.
+func readArchiveTasks(project string) ([]*tasks.Task, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	archPath := filepath.Join(dir, "tasks-archive.md")
+	if _, err := os.Stat(archPath); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	f, err := tasks.Read(archPath)
+	if err != nil {
+		return nil, err
+	}
+	return f.Tasks, nil
+}
+
 // isFullSlug mirrors internal/tasks.isFullSlug — `<short>-<4hex>`.
 // Used to decide whether a `--slug` value passed by the operator is
 // already a final slug (so we should refuse on archive collision)
@@ -457,24 +478,97 @@ func nonEmptyStrings(s []string) []string {
 
 // ---------- fleet tasks list ----------
 
+// listDefaultCap is the per-list default ceiling — active tasks are
+// always shown in full, then up to (cap - active_count) most-recent
+// done/abandoned rows fill the remainder. Total visible rows =
+// max(cap, active_count). Override with --limit / --all.
+const listDefaultCap = 10
+
 type tasksListOpts struct {
-	project string
-	status  string
+	project   string
+	status    string
+	limit     int  // -1 = use default cap (listDefaultCap); 0 = no cap.
+	all       bool // alias for --limit 0.
+	noArchive bool // skip reading tasks-archive.md.
 }
 
 func newTasksListCmd() *cobra.Command {
-	opts := &tasksListOpts{}
+	opts := &tasksListOpts{limit: -1}
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List tasks in the per-project tasks.md",
-		Args:  cobra.NoArgs,
+		Short: "List tasks (active + recent done/abandoned, recency-merged with archive)",
+		Long: `list shows the project's task registry as a recent-activity view.
+
+Default behavior (no flags):
+  - All ACTIVE tasks (status in {todo, ready, in-progress, in-review,
+    blocked}) shown in priority asc + created asc order.
+  - If active count < ` + strconv.Itoa(listDefaultCap) + `, fill remaining slots with the most-
+    recent done/abandoned tasks sorted by finished_at desc (falls back
+    to updated desc when finished_at is missing on older rows; tie-
+    break by created desc).
+  - Total visible rows = max(` + strconv.Itoa(listDefaultCap) + `, active_count).
+  - Sources merged: tasks.md + tasks-archive.md (skip the archive with
+    --no-archive).
+
+Flags:
+  --limit N      Override the cap. --limit 0 = unbounded.
+  --all          Alias for --limit 0.
+  --no-archive   Read tasks.md only; skip tasks-archive.md.
+  --status S     Status filter; ignores cap and returns the exact set
+                 across both files.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runTasksList(opts, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
 	cmd.Flags().StringVar(&opts.status, "status", "", "filter by status (todo|ready|in-progress|in-review|done|blocked|abandoned)")
+	cmd.Flags().IntVar(&opts.limit, "limit", -1, "max rows shown (default 10; 0 = no cap; ignored under --status)")
+	cmd.Flags().BoolVar(&opts.all, "all", false, "show every task (alias for --limit 0)")
+	cmd.Flags().BoolVar(&opts.noArchive, "no-archive", false, "skip tasks-archive.md (default reads it)")
 	return cmd
+}
+
+// listIsActive distinguishes the always-visible active set from the
+// recency-tail backfill set. Active = anything not yet finished;
+// done/abandoned populate the tail.
+func listIsActive(s tasks.Status) bool {
+	switch s {
+	case tasks.StatusTodo, tasks.StatusReady, tasks.StatusInProgress,
+		tasks.StatusInReview, tasks.StatusBlocked:
+		return true
+	}
+	return false
+}
+
+// finishedAtForSort returns the timestamp used to rank a done/abandoned
+// task in the recency tail. Order of precedence (per task spec):
+//  1. finished_at (new lifecycle bullet)
+//  2. updated   (fallback for old rows missing finished_at)
+//
+// Tie-breaks happen on Created in the caller.
+func finishedAtForSort(t *tasks.Task) time.Time {
+	if !t.FinishedAt.IsZero() {
+		return t.FinishedAt
+	}
+	return t.Updated
+}
+
+// resolveListLimit converts the flag combination into the effective
+// cap. Returns -1 to mean "unbounded".
+//
+//	--all                → -1 (unbounded)
+//	--limit 0            → -1 (unbounded)
+//	--limit N (N > 0)    → N
+//	--limit -1 (default) → listDefaultCap
+func resolveListLimit(opts *tasksListOpts) int {
+	if opts.all || opts.limit == 0 {
+		return -1
+	}
+	if opts.limit < 0 {
+		return listDefaultCap
+	}
+	return opts.limit
 }
 
 func runTasksList(opts *tasksListOpts, stdout io.Writer) error {
@@ -486,24 +580,127 @@ func runTasksList(opts *tasksListOpts, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	rows := f.Tasks
+	live := f.Tasks
+	var archive []*tasks.Task
+	if !opts.noArchive {
+		archive, err = readArchiveTasks(project)
+		if err != nil {
+			return fmt.Errorf("read tasks-archive.md: %w", err)
+		}
+	}
+
+	// --status overrides the cap and merges across both files. Operators
+	// asking "show every done task" expect to see them all.
 	if opts.status != "" {
-		filtered := make([]*tasks.Task, 0, len(rows))
-		for _, t := range rows {
+		liveSlugs := make(map[string]struct{}, len(live))
+		filtered := make([]*tasks.Task, 0, len(live)+len(archive))
+		for _, t := range live {
+			liveSlugs[t.Slug] = struct{}{}
 			if string(t.Status) == opts.status {
 				filtered = append(filtered, t)
 			}
 		}
-		rows = filtered
-	}
-	// Sort: priority ascending (P0 first), then slug. Stable so ties
-	// preserve file order.
-	sort.SliceStable(rows, func(i, j int) bool {
-		if rows[i].Priority != rows[j].Priority {
-			return rows[i].Priority < rows[j].Priority
+		// Archive entries with the same slug as a live row are dropped
+		// — Archive's "tasks.md is source of truth" rule. Without
+		// dedup, a retry-recovery window (slug temporarily in BOTH
+		// files) would produce duplicate rows in --status output.
+		for _, t := range archive {
+			if _, dup := liveSlugs[t.Slug]; dup {
+				continue
+			}
+			if string(t.Status) == opts.status {
+				filtered = append(filtered, t)
+			}
 		}
-		return rows[i].Slug < rows[j].Slug
+		// Sort done/abandoned by finished_at desc for consistency with
+		// the recency tail; non-terminal statuses fall back to priority
+		// asc + slug asc (matches the legacy unfiltered ordering).
+		switch tasks.Status(opts.status) {
+		case tasks.StatusDone, tasks.StatusAbandoned:
+			sort.SliceStable(filtered, func(i, j int) bool {
+				ti := finishedAtForSort(filtered[i])
+				tj := finishedAtForSort(filtered[j])
+				if !ti.Equal(tj) {
+					return ti.After(tj)
+				}
+				return filtered[i].Created.After(filtered[j].Created)
+			})
+		default:
+			sort.SliceStable(filtered, func(i, j int) bool {
+				if filtered[i].Priority != filtered[j].Priority {
+					return filtered[i].Priority < filtered[j].Priority
+				}
+				return filtered[i].Slug < filtered[j].Slug
+			})
+		}
+		return writeTaskListRows(stdout, filtered)
+	}
+
+	// Default recency view: all active first, then most-recent
+	// done/abandoned fill the cap.
+	//
+	// Sort order:
+	//   active rows  → priority asc, then created asc
+	//   done/abandoned → finished_at desc, fallback updated desc, tie created desc
+	activeRows := make([]*tasks.Task, 0, len(live))
+	doneRows := make([]*tasks.Task, 0, len(live)+len(archive))
+	liveSlugs := make(map[string]struct{}, len(live))
+	for _, t := range live {
+		liveSlugs[t.Slug] = struct{}{}
+		switch {
+		case listIsActive(t.Status):
+			activeRows = append(activeRows, t)
+		case t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned:
+			doneRows = append(doneRows, t)
+		}
+	}
+	for _, t := range archive {
+		if _, dup := liveSlugs[t.Slug]; dup {
+			continue // live row wins on retry-recovery overlap
+		}
+		if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
+			doneRows = append(doneRows, t)
+		}
+	}
+	sort.SliceStable(activeRows, func(i, j int) bool {
+		if activeRows[i].Priority != activeRows[j].Priority {
+			return activeRows[i].Priority < activeRows[j].Priority
+		}
+		return activeRows[i].Created.Before(activeRows[j].Created)
 	})
+	sort.SliceStable(doneRows, func(i, j int) bool {
+		ti := finishedAtForSort(doneRows[i])
+		tj := finishedAtForSort(doneRows[j])
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return doneRows[i].Created.After(doneRows[j].Created)
+	})
+
+	limit := resolveListLimit(opts)
+	rows := make([]*tasks.Task, 0, len(activeRows)+len(doneRows))
+	rows = append(rows, activeRows...)
+	if limit < 0 {
+		// Unbounded: include every done row.
+		rows = append(rows, doneRows...)
+	} else {
+		// Active is never truncated. Total cap = max(cap, len(active));
+		// done backfill fills the remaining slots.
+		remaining := limit - len(activeRows)
+		if remaining > 0 {
+			if remaining > len(doneRows) {
+				remaining = len(doneRows)
+			}
+			rows = append(rows, doneRows[:remaining]...)
+		}
+	}
+	return writeTaskListRows(stdout, rows)
+}
+
+// writeTaskListRows emits the canonical tabwriter output. Empty rows
+// produce the legacy "no tasks" hint so existing operators / scripts
+// see the same shape.
+func writeTaskListRows(stdout io.Writer, rows []*tasks.Task) error {
 	if len(rows) == 0 {
 		_, _ = fmt.Fprintf(stdout, "no tasks (run `fleet tasks add` to create one)\n")
 		return nil
@@ -588,6 +785,8 @@ func renderTaskMarkdown(w io.Writer, t *tasks.Task) error {
 	writeOptionalBullet(&b, "branch", t.Branch)
 	writeOptionalBullet(&b, "created", formatTimeRFC3339(t.Created))
 	writeOptionalBullet(&b, "updated", formatTimeRFC3339(t.Updated))
+	writeOptionalBullet(&b, "started_at", formatTimeRFC3339(t.StartedAt))
+	writeOptionalBullet(&b, "finished_at", formatTimeRFC3339(t.FinishedAt))
 	fmt.Fprintf(&b, "- depends_on: %s\n", formatDepsList(t.DependsOn))
 	writeOptionalBullet(&b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')
@@ -690,16 +889,66 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
+		// Capture pre-mutation status so a status= transition can trigger
+		// the lifecycle stamping rules below. Other key= mutations leave
+		// status unchanged and skip the stamping path.
+		oldStatus := t.Status
 		if err := setTaskField(t, key, value); err != nil {
 			return err
 		}
-		t.Updated = time.Now().UTC()
+		now := time.Now().UTC()
+		// Lifecycle transitions stamp started_at / finished_at in the
+		// SAME transaction as the status flip — readers don't see a
+		// half-stamped row. Rules (per task spec):
+		//
+		//   to=in-progress AND started_at zero → stamp started_at = now
+		//   (started_at is sticky: once set, never cleared, even on
+		//   bounce-and-redispatch)
+		//
+		//   to ∈ {done, abandoned} → stamp finished_at = now
+		//   (overwrite on re-finish so reopens reflect the latest)
+		//
+		//   from ∈ {done, abandoned} AND to ∉ {done, abandoned}
+		//     → clear finished_at (reopen / re-dispatch)
+		if key == "status" && t.Status != oldStatus {
+			stampLifecycleTransition(t, oldStatus, t.Status, now)
+		}
+		t.Updated = now
 		if err := tasks.Write(path, f); err != nil {
 			return fmt.Errorf("write: %w", err)
 		}
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
+}
+
+// stampLifecycleTransition applies the lifecycle stamping rules in one
+// place so the state machine is auditable. Called only when status
+// actually changed (no-op transitions skip stamping — re-running
+// `tasks set <slug> status=in-progress` on an already-in-progress task
+// must NOT bump started_at; otherwise sticky-on-first semantics break).
+//
+//	old → new                       effect
+//	-------------------------------- -------------------------------------
+//	* → in-progress (started zero)  started_at = now
+//	* → in-progress (started set)   no-op (sticky)
+//	* → done|abandoned              finished_at = now (overwrite OK)
+//	done|abandoned → !{done,aband}  finished_at = zero (reopen)
+//	other                           no-op
+func stampLifecycleTransition(t *tasks.Task, oldStatus, newStatus tasks.Status, now time.Time) {
+	if newStatus == tasks.StatusInProgress && t.StartedAt.IsZero() {
+		t.StartedAt = now
+	}
+	if newStatus == tasks.StatusDone || newStatus == tasks.StatusAbandoned {
+		t.FinishedAt = now
+		return
+	}
+	// Reopen path: leaving the terminal set clears finished_at so the
+	// next finish stamps fresh. started_at stays sticky — the task's
+	// "first start" is still the original.
+	if oldStatus == tasks.StatusDone || oldStatus == tasks.StatusAbandoned {
+		t.FinishedAt = time.Time{}
+	}
 }
 
 // setTaskField applies key=value to t with the same enum/format

@@ -34,6 +34,14 @@ REQUIRED_TASK_BULLETS = (
     "created", "updated", "depends_on", "spawned_by",
 )
 
+# started_at + finished_at are recognized on read but tolerated as missing
+# on existing rows (additive change in v0.6.x). The writer ALWAYS emits
+# them so re-saved rows pick up the new shape. Old rows that never get
+# re-saved stay un-stamped — acceptable per the dispatch brief
+# ("Backward compat: parsers tolerate missing started_at/finished_at on
+# existing rows; new transitions stamp going forward").
+OPTIONAL_LIFECYCLE_BULLETS = ("started_at", "finished_at")
+
 RESERVED_H3 = ("Spec", "Acceptance", "Notes")
 
 # Slug validation mirrors state.ValidateSlug: lowercase letters, digits,
@@ -90,6 +98,13 @@ class Task:
     branch: str = ""
     created: _dt.datetime | None = None
     updated: _dt.datetime | None = None
+    # Lifecycle stamps. None == zero/unset. started_at is sticky (set on
+    # the first todo→in-progress flip, never cleared). finished_at is
+    # rewritten on every flip into done/abandoned and CLEARED on a flip
+    # back out of those states. See cmd/fleet/tasks.go runTasksSet for
+    # the authoritative state machine.
+    started_at: _dt.datetime | None = None
+    finished_at: _dt.datetime | None = None
     depends_on: list[str] = field(default_factory=list)
     spawned_by: str = ""
     spec: str = ""
@@ -437,6 +452,13 @@ def _set_kv(t: Task, k: str, v: str, lineno: int, raw: str) -> None:
         t.created = _parse_time(v, lineno, raw, "created")
     elif k == "updated":
         t.updated = _parse_time(v, lineno, raw, "updated")
+    elif k == "started_at":
+        # Optional lifecycle bullet (v0.6.x). Tolerated as missing on
+        # old rows; setKV-side dispatch only sees this when the bullet
+        # is present in the file.
+        t.started_at = _parse_time(v, lineno, raw, "started_at")
+    elif k == "finished_at":
+        t.finished_at = _parse_time(v, lineno, raw, "finished_at")
     elif k == "depends_on":
         t.depends_on = _parse_deps(v, lineno, raw)
     elif k == "spawned_by":
@@ -553,6 +575,10 @@ def _render_task(t: Task) -> str:
     parts.append(_optional("branch", t.branch))
     parts.append(_optional("created", _format_time(t.created)))
     parts.append(_optional("updated", _format_time(t.updated)))
+    # Always emit lifecycle bullets (empty for unset) so re-saved old
+    # rows pick up the new shape. Matches Go's renderTask order.
+    parts.append(_optional("started_at", _format_time(t.started_at)))
+    parts.append(_optional("finished_at", _format_time(t.finished_at)))
     parts.append(f"- depends_on: {_format_deps(t.depends_on)}\n")
     parts.append(_optional("spawned_by", t.spawned_by))
     parts.append("\n")

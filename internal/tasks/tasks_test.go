@@ -1044,6 +1044,126 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 	wg.Wait()
 }
 
+// TestLifecycle_RoundTripWithStamps confirms StartedAt + FinishedAt
+// round-trip through the writer + parser when present on a row.
+func TestLifecycle_RoundTripWithStamps(t *testing.T) {
+	created := time.Date(2026, 5, 6, 10, 0, 0, 0, time.UTC)
+	started := time.Date(2026, 5, 6, 11, 0, 0, 0, time.UTC)
+	finished := time.Date(2026, 5, 6, 12, 30, 0, 0, time.UTC)
+	tk := &Task{
+		Slug: "lifecycle-1234", Status: StatusDone, Priority: PriorityP1,
+		Created: created, Updated: finished,
+		StartedAt: started, FinishedAt: finished,
+		SpawnedBy: "user", Spec: "s", Acceptance: "a", Notes: "",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "lc.md")
+	if err := Write(tmp, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(got.Tasks))
+	}
+	if !got.Tasks[0].StartedAt.Equal(started) {
+		t.Errorf("StartedAt=%v; want %v", got.Tasks[0].StartedAt, started)
+	}
+	if !got.Tasks[0].FinishedAt.Equal(finished) {
+		t.Errorf("FinishedAt=%v; want %v", got.Tasks[0].FinishedAt, finished)
+	}
+}
+
+// TestLifecycle_TolerateMissingBullets verifies that a hand-written
+// task block lacking `- started_at:` / `- finished_at:` parses cleanly
+// (additive bullets are NOT in requiredTaskBullets). The next Write
+// re-emits both bullets in canonical order.
+func TestLifecycle_TolerateMissingBullets(t *testing.T) {
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: legacy-1234\n\n" +
+		"- status: todo\n" +
+		"- priority: P1\n" +
+		"- worker_pid: 0\n" +
+		"- worktree:\n" +
+		"- pr_url:\n" +
+		"- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n" +
+		"- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n" +
+		"- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "legacy.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read legacy file (missing lifecycle bullets): %v", err)
+	}
+	if len(f.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(f.Tasks))
+	}
+	if !f.Tasks[0].StartedAt.IsZero() {
+		t.Errorf("StartedAt should be zero on legacy row, got %v", f.Tasks[0].StartedAt)
+	}
+	if !f.Tasks[0].FinishedAt.IsZero() {
+		t.Errorf("FinishedAt should be zero on legacy row, got %v", f.Tasks[0].FinishedAt)
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	// Re-saved row carries empty lifecycle bullets in the canonical
+	// position (immediately after `- updated:`).
+	wantLines := []string{
+		"- updated: 2026-05-06T10:00:00Z\n",
+		"- started_at:\n",
+		"- finished_at:\n",
+	}
+	want := strings.Join(wantLines, "")
+	if !strings.Contains(string(got), want) {
+		t.Errorf("re-saved file missing canonical lifecycle bullets:\n--- got ---\n%s\n--- want substring ---\n%s",
+			got, want)
+	}
+}
+
+// TestLifecycle_RejectsBadStartedAt — invalid RFC3339 in started_at
+// surfaces a ParseError rather than silently zero-valuing the field.
+func TestLifecycle_RejectsBadStartedAt(t *testing.T) {
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: badts-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- started_at: not-a-timestamp\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "badts.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err := Read(tmp)
+	if err == nil {
+		t.Fatal("Read accepted bad started_at; want ParseError")
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Errorf("got %T %v; want *ParseError", err, err)
+	}
+	if !strings.Contains(pe.Msg, "started_at") {
+		t.Errorf("Msg=%q; want substring 'started_at'", pe.Msg)
+	}
+}
+
 // helpers -----------------------------------------------------------
 
 func slugList(ts []*Task) []string {
