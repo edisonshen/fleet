@@ -161,6 +161,73 @@ func TestView_ProjectShowsTaskCounts(t *testing.T) {
 	}
 }
 
+// TestProjectRow_TaskListRendersBeforeCountChips pins the issue #111
+// reading-order: when a project is expanded with at least one task,
+// the inline task slug must appear ABOVE the count-chip summary in
+// the rendered view. Operator dogfood feedback: action first
+// (the actual tasks), summary second (the count chips). Without this
+// guard the bottom-up refactor in dashboard_view.go could silently
+// regress to the old "counts above tasks" layout on a future tweak.
+func TestProjectRow_TaskListRendersBeforeCountChips(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Seed a project with a known-content tasks.md so we can grep the
+	// rendered slug deterministically. Counts include all five chip
+	// categories so the count-chip line is unambiguously identifiable
+	// in the output.
+	dir := filepath.Join(pdir, "fleet")
+	if err := stateMkdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	f := &tasks.File{Schema: tasks.SchemaVersion}
+	const knownSlug = "reading-order-zzzz"
+	if err := f.Add(&tasks.Task{
+		Slug:     knownSlug,
+		Status:   tasks.StatusInProgress,
+		Priority: tasks.PriorityP2,
+		Created:  now,
+		Updated:  now,
+		Spec:     "spec",
+	}); err != nil {
+		t.Fatalf("add %s: %v", knownSlug, err)
+	}
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	m.expanded = map[string]bool{"fleet": true}
+
+	out := m.View()
+	taskIdx := strings.Index(out, knownSlug)
+	if taskIdx < 0 {
+		t.Fatalf("expanded view missing task slug %q:\n%s", knownSlug, out)
+	}
+	// The count-chip line is identifiable by the in-progress chip
+	// "▶ 1" (this project has exactly one in-progress task). Use the
+	// LAST occurrence so we land on the project's count chip, not on
+	// some unrelated-line chip earlier in the output.
+	chipIdx := strings.LastIndex(out, "▶ 1")
+	if chipIdx < 0 {
+		t.Fatalf("expanded view missing count chip '▶ 1':\n%s", out)
+	}
+	// The task glyph for in-progress is also "▶". The line containing
+	// the slug starts with that glyph; we want chipIdx to point at the
+	// SUMMARY ▶, not the task-row ▶. Distinguish by indentation: the
+	// task row uses a 4-space indent + "▶ slug"; the count chip uses
+	// the project's 2-space prefix + "◌ N  ▶ N …". The cheapest pin
+	// that won't fight the lipgloss escape codes: assert the slug's
+	// occurrence appears BEFORE the LAST "▶ 1" — and the last "▶ 1"
+	// must be on a different line than the slug.
+	if taskIdx >= chipIdx {
+		t.Errorf("task row must render before count-chip line\n  task slug %q at byte %d\n  count chip '▶ 1' at byte %d\nfull view:\n%s",
+			knownSlug, taskIdx, chipIdx, out)
+	}
+}
+
 func TestView_AttentionBadgeAppearsForBlockedWorker(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "gstack", TaskCounts{Todo: 1})
