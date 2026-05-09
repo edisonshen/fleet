@@ -6,6 +6,80 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-09
+
+Worker dispatch shifts from `fleet dispatch` subprocess to Claude's
+Agent tool (`run_in_background`), so coord-spawned workers appear in
+the coord's chat as the native "N local agents" indicator. Coord
+agent role hard-constrained to discuss + dispatch (no inline
+implementation). TUI polish wave: context bar with handoff threshold
+colors, spawning-coord spinner, status glyphs per phase, arrow-key
+navigation across rows and panels.
+
+### Added
+
+- Worker dispatch via Claude Agent tool (`skills/coordinator/`,
+  Phase A) — coords now spawn workers as Agent-tool subagents with
+  `run_in_background=true` instead of forking `fleet dispatch`.
+  Workers surface in coord's chat as the Claude-native "N local
+  agents" indicator. Phase B (lifecycle for surviving subagents
+  across coord handoff) and Phase C (TUI subagent_id rendering +
+  top-status `<N> agents` chip) tracked as
+  [#93](https://github.com/edisonshen/fleet/issues/93) and
+  [#94](https://github.com/edisonshen/fleet/issues/94).
+- Context bar (`▰▰▰▱▱ 48%`) and handoff tag on every agent and
+  worker row in the TUI. Five-segment bar with green/amber/red
+  zones at fleet-guard's 50% / 70% thresholds. Inline handoff tag
+  (`◐ HANDOFF` / `◐ COMPACT`) per `HandoffType`. Top-status hot
+  counts (`<N> yellow · <M> red`) hidden when both zero. Worker
+  rows look up their coord's record (`task_id == "coord-<project>"`)
+  for the context_pct, deduped on agent record ID so coord +
+  N subagents don't N+1 multiply-count.
+- Spawning-coord indicator on project rows during the 3–5 min
+  cold-start wait. State machine on `coord-spawn-marker`:
+  marker absent → idle, marker fresh + no coord-state →
+  spawning (10-frame braille spinner + `1m 23s` elapsed),
+  coord-state fresh → active, marker stale past 10 min → stuck
+  warning. Closes
+  [#86](https://github.com/edisonshen/fleet/issues/86).
+- Distinct glyph + color per task status in the inline expansion:
+  `◌` queued, `◐` working, `◉` in-review, `✓` done, `✗` failed,
+  `?` asking. Closes
+  [#77](https://github.com/edisonshen/fleet/issues/77).
+- Drill-into-need-attention task detail panel with `[a]` attach
+  to that task's worker. Single-keypress path from the
+  attention banner to the live worker tmux session. Closes
+  [#75](https://github.com/edisonshen/fleet/issues/75).
+- `←` / `→` jump cursor between PROJECTS and WORKERS · AGENTS
+  panels; `↑` / `↓` are silent aliases for `j` / `k` row nav.
+  Closes
+  [#83](https://github.com/edisonshen/fleet/issues/83) and
+  [#90](https://github.com/edisonshen/fleet/issues/90).
+- Coord supervisor loop — event-driven reconcile + sparse
+  stuck-check (2 min cadence vs the prior tight loop). Closes
+  [#79](https://github.com/edisonshen/fleet/issues/79).
+
+### Changed
+
+- Coord agent role hard-constrained: discuss + dispatch only,
+  no inline implementation. SKILL.md, system prompt, and the
+  guard test pin the contract. Closes
+  [#80](https://github.com/edisonshen/fleet/issues/80).
+- TUI footer drops `[j/k] nav` and `[←/→] panel` chips
+  (intuitive keys go silent), adds `[h] handoff` and
+  `[x] archive`. Help overlay (`[?]`) is now the canonical
+  discoverability surface for arrows + j/k + ←/→. Footer
+  width pinned by regression test against 100-col split panes.
+
+### Deferred
+
+- Codex review SKIPPED — rate-limited at 2026-05-08; quota
+  resets 2026-05-13. `/review` (gstack skill) PASSED on every
+  PR in this release. Codex re-runs queued for post-reset.
+- Phase B / Phase C of #84 (Agent-tool dispatch follow-ups)
+  — see [#93](https://github.com/edisonshen/fleet/issues/93)
+  and [#94](https://github.com/edisonshen/fleet/issues/94).
+
 ## [0.2.0] - 2026-05-08
 
 Per-project autonomous coordinator. Brings tasks/learnings/standards
@@ -189,7 +263,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/edisonshen/fleet/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edisonshen/fleet/compare/v0.1.3...v0.2.0
 [0.1.3]: https://github.com/edisonshen/fleet/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/edisonshen/fleet/compare/v0.1.1...v0.1.2
