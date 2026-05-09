@@ -66,6 +66,13 @@ const (
 	// the prompt copy must surface that count so the operator knows how
 	// many records will be archived.
 	modeConfirmDismissProject
+	// modeAddProject is the [+] hotkey's repo picker for "register a
+	// cloned repo as a fleet project" (no dispatch, no coord). Reuses
+	// discoverRepos for the candidate list — same picker UX as [d] —
+	// but on enter shells out to `fleet project add <path>` instead of
+	// advancing to the dispatch-prompt mode. Refer to the project-add
+	// CLI for the disk-mutation contract.
+	modeAddProject
 )
 
 // flash is the banner surfaced under the table after a keybind action
@@ -93,6 +100,21 @@ type drainDoneMsg struct {
 type rmDoneMsg struct {
 	out string
 	err error
+}
+
+// addProjectDoneMsg is emitted after the [+] picker's shell-out to
+// `fleet project add <path>` returns. On err == nil the picker closes
+// and the dashboard refreshes so the new project appears in alpha
+// order; on err != nil the picker stays open with an error flash so
+// the operator can pick a different row.
+//
+// path carries the absolute repo path the operator selected — used in
+// the success flash and (on failure) lets the operator see which row
+// errored.
+type addProjectDoneMsg struct {
+	path string
+	out  string
+	err  error
 }
 
 // coordSpawnDoneMsg is emitted after the project-row [a] auto-spawn
@@ -190,6 +212,8 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 	switch m.mode {
 	case modePickRepo:
 		return m.handlePickerKey(key)
+	case modeAddProject:
+		return m.handleAddProjectKey(key)
 	case modePromptDispatch:
 		return m.handlePromptKey(key)
 	case modeConfirmArchive:
@@ -283,6 +307,17 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		m.pickerFilter = ""
 		m.pickerCursor = 0
 		m.mode = modePickRepo
+		return m, nil, true
+	case "+":
+		// [+] enters the add-project picker — same candidate list as
+		// [d] but on enter shells out to `fleet project add <path>`
+		// instead of advancing to the dispatch prompt. The new project
+		// shows up on the dashboard via loadDashboardCmd refresh
+		// returned by addProjectDoneMsg.
+		m.repoCandidates = discoverRepos()
+		m.pickerFilter = ""
+		m.pickerCursor = 0
+		m.mode = modeAddProject
 		return m, nil, true
 	case "c":
 		return m.actionToggleHide()
@@ -1586,6 +1621,66 @@ func (m Model) handlePickerKey(key string) (Model, tea.Cmd, bool) {
 	// nav (otherwise [j/k] would also move the agent table cursor under
 	// the picker).
 	return m, nil, true
+}
+
+// handleAddProjectKey processes keystrokes while the [+] add-project
+// picker is active. Behavior mirrors handlePickerKey (same nav rules,
+// same filter typing) but on enter shells out to
+// `fleet project add <path>` instead of advancing to the dispatch
+// prompt. The picker stays open on a fleet-side failure so the operator
+// can pick a different row without re-pressing [+].
+func (m Model) handleAddProjectKey(key string) (Model, tea.Cmd, bool) {
+	filtered := filterCandidates(m.repoCandidates, m.pickerFilter)
+	switch key {
+	case "esc":
+		m.mode = modeNav
+		m.pickerFilter = ""
+		m.repoCandidates = nil
+		return m, nil, true
+	case "enter":
+		if len(filtered) == 0 || m.pickerCursor >= len(filtered) {
+			return m, nil, true
+		}
+		picked := m.repoCandidates[filtered[m.pickerCursor]]
+		// Drop to nav immediately. The shell-out runs in a goroutine
+		// (returned tea.Cmd); addProjectDoneMsg's failure branch
+		// re-opens the picker if the add errored.
+		m.mode = modeNav
+		m.pickerFilter = ""
+		m.repoCandidates = nil
+		return m, m.startAddProject(picked.Path), true
+	case "down", "ctrl+n":
+		if m.pickerCursor < len(filtered)-1 {
+			m.pickerCursor++
+		}
+		return m, nil, true
+	case "up", "ctrl+p":
+		if m.pickerCursor > 0 {
+			m.pickerCursor--
+		}
+		return m, nil, true
+	case "backspace":
+		if len(m.pickerFilter) > 0 {
+			m.pickerFilter = m.pickerFilter[:len(m.pickerFilter)-1]
+			m.pickerCursor = 0
+		}
+		return m, nil, true
+	}
+	if len(key) == 1 && key[0] >= 0x20 && key[0] < 0x7f {
+		m.pickerFilter += key
+		m.pickerCursor = 0
+		return m, nil, true
+	}
+	return m, nil, true
+}
+
+// startAddProject returns a tea.Cmd that runs
+// `fleet project add <path>` and emits addProjectDoneMsg on completion.
+// path is the absolute path captured from the picker row.
+func (m Model) startAddProject(path string) tea.Cmd {
+	return runFleetCmd([]string{"project", "add", path}, func(out string, err error) tea.Msg {
+		return addProjectDoneMsg{path: path, out: out, err: err}
+	})
 }
 
 // handlePromptKey processes keystrokes while the dispatch prompt is

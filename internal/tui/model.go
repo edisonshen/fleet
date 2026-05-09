@@ -517,6 +517,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: agent should be archived
 
+	case addProjectDoneMsg:
+		// On error: re-open the picker (operator picks a different row)
+		// and surface the underlying CLI message verbatim. Picker state
+		// (candidates, filter, cursor) was cleared on enter; rebuild it
+		// here so the operator sees the same candidate list they just
+		// picked from. dashboardLoadCmd is NOT triggered on failure —
+		// the on-disk state is unchanged.
+		if msg.err != nil {
+			m.flash = &flashMsg{
+				text:  fmt.Sprintf("project add failed (%s): %v\n%s", msg.path, msg.err, msg.out),
+				isErr: true,
+			}
+			m.repoCandidates = discoverRepos()
+			m.pickerFilter = ""
+			m.pickerCursor = 0
+			m.mode = modeAddProject
+			return m, nil
+		}
+		// Success: project is on disk. Surface the CLI's stdout (which
+		// already says "added project <tag>" or "refreshed project <tag>")
+		// and refresh the dashboard so the new row appears.
+		// Also force-clear picker state — the enter handler already
+		// dropped to modeNav, but explicitly resetting here makes the
+		// success path robust against any edge case where the message
+		// arrives while the picker is still open.
+		text := strings.TrimRight(msg.out, "\n")
+		if text == "" {
+			text = "added project"
+		}
+		m.flash = &flashMsg{text: text}
+		m.mode = modeNav
+		m.pickerFilter = ""
+		m.repoCandidates = nil
+		m.pickerCursor = 0
+		return m, loadDashboardCmd()
+
 	case coordSpawnDoneMsg:
 		// Clear in-flight gate — regardless of success/error, this
 		// dispatch attempt is done. Subsequent [a] presses go through
@@ -858,6 +894,8 @@ func (m Model) renderFooter() string {
 	switch m.mode {
 	case modePickRepo:
 		b.WriteString(renderPicker(m))
+	case modeAddProject:
+		b.WriteString(renderAddProjectPicker(m))
 	case modePromptDispatch:
 		header := "dispatch task"
 		if m.pickedRepo.Display != "" {
@@ -994,6 +1032,54 @@ func visualRows(s string, termWidth int) int {
 		rows += (w + termWidth - 1) / termWidth
 	}
 	return rows
+}
+
+// renderAddProjectPicker draws the [+] add-project picker. Same shape
+// as renderPicker but with a header that names the action ("add
+// project") so the operator doesn't confuse it with [d] dispatch when
+// glancing at a screenshot.
+func renderAddProjectPicker(m Model) string {
+	var b strings.Builder
+	b.WriteString(promptStyle.Render("add project: " + m.pickerFilter + "█"))
+	b.WriteString("\n")
+
+	filtered := filterCandidates(m.repoCandidates, m.pickerFilter)
+	switch {
+	case len(m.repoCandidates) == 0:
+		b.WriteString(dimStyle.Render(
+			"  no repos found — set $FLEET_PROJECT_DIRS or run from a repo dir"))
+		b.WriteString("\n")
+	case len(filtered) == 0:
+		b.WriteString(dimStyle.Render("  (no matches)"))
+		b.WriteString("\n")
+	default:
+		start := 0
+		if m.pickerCursor >= pickerVisibleRows {
+			start = m.pickerCursor - pickerVisibleRows + 1
+		}
+		end := start + pickerVisibleRows
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		for i := start; i < end; i++ {
+			line := m.repoCandidates[filtered[i]].Display
+			if i == m.pickerCursor {
+				b.WriteString(cursorStyle.Render("▸ " + line))
+			} else {
+				b.WriteString("  " + line)
+			}
+			b.WriteString("\n")
+		}
+		if remaining := len(filtered) - end; remaining > 0 {
+			b.WriteString(dimStyle.Render(
+				fmt.Sprintf("  (%d more — type to filter)", remaining)))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString(dimStyle.Render(
+		"[↑/↓] navigate  [enter] add  [esc] cancel  type to filter"))
+	b.WriteString("\n")
+	return b.String()
 }
 
 // pickerVisibleRows caps how many repos are listed at once. Anything
