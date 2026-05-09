@@ -414,6 +414,8 @@ Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
 
 Every `fleet workers update` invocation in the rendered prompt includes `--project <project>` so heartbeats land in the right `~/.fleet/projects/<project>/workers/...` tree even when the worker's cwd basename differs from the project name.
 
+The `## Standards (the bar — non-negotiable)` block in the rendered prompt inlines whatever `fleet standards show --merged` emits. The fleet-shipped baseline (seeded by `fleet init`) carries Testing, Code review, and Async waits sections — see [`docs/STANDARDS-BASELINE.md`](../../docs/STANDARDS-BASELINE.md). The Async waits section is the canonical recipe workers should reach for when reconcile or post-push paths need to wait on PR-merge / CI-green / deploy-finish state changes (issue [#105](https://github.com/edisonshen/fleet/issues/105)): a `Bash(run_in_background=true)` call running an `until <check>; do sleep 30; done` loop fires a `<task-notification>` on exit so the worker resumes without foreground sleep chains, operator pings, or prompt-cache thrash.
+
 `dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. The coord agent (Claude session) reads that file and passes the body verbatim as the Agent tool's `prompt` parameter (issue #84 Phase A). fleet-guard's SessionStart hook injection from the v0.1/v0.2.0 era still works for any tmux-spawned worker (e.g., a manual `fleet dispatch` invocation), but the coord skill itself no longer takes that path — workers are Agent subagents now.
 
 ## Sentinel grammar (worker → coord)

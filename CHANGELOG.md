@@ -18,6 +18,18 @@ follows [SemVer](https://semver.org/).
   the per-project progress doc — tmp-fd → fsync → `os.replace`,
   schema v1, with 28 unit tests covering validation and overwrite
   atomicity.
+- Async-waits baseline in the bundled `~/.fleet/standards.md` template
+  (`templates/standards.md`). Every freshly-spawned worker now inherits a
+  blessed recipe for polling external state changes (PR merges, CI
+  completion, deploys, file arrivals) — `Bash(run_in_background=true)`
+  running an `until <check>; do sleep 30; done` loop, with the harness
+  firing a `<task-notification>` on exit. Codifies the pattern so workers
+  stop re-discovering foreground sleep chains, operator pings, and fixed-
+  interval cron polling. Existing operators with hand-edited standards.md
+  are untouched (`fleet init --upgrade` skips the seed when the file
+  exists). New reference doc at `docs/STANDARDS-BASELINE.md` documents
+  the full baseline + cite trail. Closes
+  [#105](https://github.com/edisonshen/fleet/issues/105).
 
 ## [0.5.0] - 2026-05-09
 
