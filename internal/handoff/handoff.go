@@ -63,6 +63,13 @@ const (
 // PreviousPath is nil for the first handoff on a task.
 // ContextPctAtHandoff is nil when the handoff was operator-triggered
 // without a context measurement (4a's path).
+//
+// ActiveSubagents (issue #93 Phase B2) is the list of in-flight worker
+// subagents the outgoing coord had spawned via the Agent tool. Empty
+// when the agent isn't a coord (worker handoffs / single-agent
+// handoffs) or when the coord has no in-flight workers. The successor
+// coord parses this section on its first turn and re-dispatches each
+// worker whose WIP file still exists.
 type Doc struct {
 	AgentID             string
 	TaskID              string
@@ -73,11 +80,39 @@ type Doc struct {
 	ContextPctAtHandoff *float64
 	Timestamp           time.Time
 
-	Completed     string
-	KeyDecisions  string
-	FilesModified string
-	OpenQuestions string
-	NextSteps     string
+	Completed       string
+	KeyDecisions    string
+	FilesModified   string
+	OpenQuestions   string
+	NextSteps       string
+	ActiveSubagents []ActiveSubagent
+}
+
+// ActiveSubagent is one in-flight worker the outgoing coord had spawned
+// via Claude's Agent tool. Rendered (and parsed back) as a single
+// machine-readable line in the `## Active Subagents` section so the
+// successor coord can re-dispatch deterministically — no free-form
+// prose for the resume path.
+//
+// AgentID is the 8-hex Fleet agent ID minted by the skill's
+// mint_agent_id() — it doubles as the inbox filename
+// (~/.fleet/inbox/<agent_id>.md) where the worker prompt lives.
+//
+// SubagentID is the Claude internal subagent identifier returned by
+// the Agent tool. Empty when the coord skill hasn't captured it (Phase
+// A's DISPATCH-block flow doesn't feed the captured ID back to the
+// skill); in that case the successor re-dispatches via the AgentID's
+// inbox file regardless. Carried for forward-compat.
+//
+// LastPhase mirrors workers/<slug>/state.json's phase field at the
+// time of handoff. Useful as triage context for the successor; the
+// re-dispatch decision is gated on WIP-file existence + status.
+type ActiveSubagent struct {
+	TaskID     string // task slug (the worker's task)
+	Branch     string // worker/<slug>
+	LastPhase  string // tdd-green / push / blocked / etc.
+	AgentID    string // 8-hex Fleet agent ID (inbox file key)
+	SubagentID string // Claude Agent tool subagent ID; empty when not captured
 }
 
 // NewManualStub builds a Doc with all five body sections set to
@@ -153,6 +188,7 @@ const FirstAction = "**Run this BEFORE anything else** to reconnect the new inst
 //  4. ## Files Modified             — Doc.FilesModified
 //  5. ## Open Questions             — Doc.OpenQuestions
 //  6. ## Next Steps (prioritized)   — Doc.NextSteps
+//  7. ## Active Subagents           — Doc.ActiveSubagents (issue #93 Phase B2)
 //
 // Pure function — no I/O, no globals. Use Write to persist.
 func Render(d *Doc) []byte {
@@ -182,8 +218,45 @@ func Render(d *Doc) []byte {
 	fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", d.KeyDecisions)
 	fmt.Fprintf(&b, "## Files Modified\n%s\n\n", d.FilesModified)
 	fmt.Fprintf(&b, "## Open Questions\n%s\n\n", d.OpenQuestions)
-	fmt.Fprintf(&b, "## Next Steps (prioritized)\n%s\n", d.NextSteps)
+	fmt.Fprintf(&b, "## Next Steps (prioritized)\n%s\n\n", d.NextSteps)
+	fmt.Fprintf(&b, "## Active Subagents\n%s\n", renderActiveSubagents(d.ActiveSubagents))
 	return b.Bytes()
+}
+
+// ActiveSubagentsNonePlaceholder is the body of the Active Subagents
+// section when the outgoing agent had zero in-flight workers (or
+// wasn't a coord). The placeholder makes the section presence
+// invariant — successor coord parsers always find the section header
+// and produce zero entries on this body.
+const ActiveSubagentsNonePlaceholder = "_(none)_"
+
+// renderActiveSubagents emits the body of the Active Subagents
+// section. Empty list → ActiveSubagentsNonePlaceholder. Non-empty →
+// one structured line per worker, key=value form, deterministic order.
+//
+// Format per entry:
+//
+//	- task=<slug> branch=<branch> phase=<phase> agent_id=<hex> subagent_id=<id>
+//
+// Empty fields render as `key=""`. The line is a single physical line
+// (no embedded newlines) so the parser can split on '\n' without
+// re-joining. Subagent_id appears even when empty so the parser
+// can rely on the field-set being uniform across rows.
+func renderActiveSubagents(subs []ActiveSubagent) string {
+	if len(subs) == 0 {
+		return ActiveSubagentsNonePlaceholder
+	}
+	var b bytes.Buffer
+	for i, s := range subs {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		fmt.Fprintf(&b,
+			"- task=%q branch=%q phase=%q agent_id=%q subagent_id=%q",
+			s.TaskID, s.Branch, s.LastPhase, s.AgentID, s.SubagentID,
+		)
+	}
+	return b.String()
 }
 
 // Write atomically publishes Render(d) at path. Path comes from
