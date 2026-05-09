@@ -23,7 +23,11 @@ mode the coordinator's worker prompts kept stepping on:
   finish, file arrival). Codifies the pattern issue
   [#105](https://github.com/edisonshen/fleet/issues/105) calls out so
   workers stop re-discovering foreground-sleep chains and operator-
-  ping anti-patterns.
+  ping anti-patterns. Includes a `### PR shepherding` subsection that
+  upgrades the single-terminal-event recipes (MERGED / CI GREEN) into
+  an active per-PR loop that wakes on every actionable state change
+  (BEHIND, DIRTY, CI fail, CHANGES_REQUESTED) and acts immediately —
+  the coord doesn't watch the PR rot, it shepherds the PR to merge.
 
 ## How workers see it
 
@@ -66,6 +70,42 @@ foreground cap on a single tool call) does not apply here because
 background `until` loops do not hold the prompt cache — they sleep,
 poll, sleep, poll, and the agent's main turn is free to do other work
 or simply idle until the notification lands.
+
+## Why the PR shepherding subsection matters
+
+The base async-waits recipes wake on a single terminal event —
+`state==MERGED` or all checks `==pass`. That's correct for one-shot
+waits ("ping me when CI finishes"). It's wrong for a PR you own
+between open and merge.
+
+Live demo from fleet's own dogfooding (the session that motivated this
+section): four PRs were OPEN; PR #106 merged → the other three flipped
+to `mergeStateStatus: BEHIND`. A custom diff-detect watcher running in
+the background didn't notice because it was waking only on
+`state != OPEN`. The PRs sat in BEHIND for 18 minutes while the watcher
+slept on the wrong predicate. Operator corrected the pattern; a
+rebase-shepherd dispatched on isolated worktrees brought all three
+back to CLEAN. PR #108 merged → two more PRs flipped BEHIND → round-2
+rebase-shepherd dispatched. Same shape, different instance.
+
+The operator's directive (verbatim): *"if the pr is out of date,
+trigger it update, if the pr is ci failed, fix ci, if there are some
+comments, try to give solution. if there are some conflicts, resolve
+it, rebase it, push it again. not just watch and do nothing."*
+
+The shipped subsection encodes that as a per-PR background loop with
+**actionable-state predicates** (BEHIND / DIRTY / CI failure /
+CHANGES_REQUESTED in addition to terminal `state != OPEN`), a per-state
+action matrix (rebase-shepherd / fix-subagent / inline-fix /
+operator-escalate), and a worktree-isolation rule (concurrent agents on
+the shared checkout cause cwd flips and stash interference — observed
+twice in the motivating session).
+
+The re-spawn loop is the other load-bearing piece: after each
+successful action the coord re-spawns the same poll so the PR is always
+under an active watch, not "watched once and forgotten." Re-spawn
+applies to harness timeouts too (the 10-min cap is a watchdog, not a
+state change).
 
 ## Operator workflow
 
