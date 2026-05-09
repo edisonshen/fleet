@@ -13,7 +13,11 @@ import (
 
 // keyMsg constructs a tea.KeyMsg matching what bubbletea emits for a
 // given printable key — without bubbletea, "h" comes through as
-// {Type: KeyRunes, Runes: ['h']}.
+// {Type: KeyRunes, Runes: ['h']}. Arrow keys are dedicated KeyType
+// constants (their String() resolves to "up"/"down"/"left"/"right"),
+// not runes; tests that simulate arrow keys must construct them with
+// the matching Type so handleKey's switch lands on the arrow case
+// rather than fall through to the runes branch.
 func keyMsg(s string) tea.KeyMsg {
 	switch s {
 	case "enter":
@@ -22,6 +26,14 @@ func keyMsg(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyEsc}
 	case "backspace":
 		return tea.KeyMsg{Type: tea.KeyBackspace}
+	case "up":
+		return tea.KeyMsg{Type: tea.KeyUp}
+	case "down":
+		return tea.KeyMsg{Type: tea.KeyDown}
+	case "left":
+		return tea.KeyMsg{Type: tea.KeyLeft}
+	case "right":
+		return tea.KeyMsg{Type: tea.KeyRight}
 	default:
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
 	}

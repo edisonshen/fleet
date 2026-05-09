@@ -652,12 +652,16 @@ func isHexLower(c rune) bool {
 }
 
 // renderDashboardFooter draws the bottom keybind legend line.
-// Matches the mockup's `[j/k] nav  [⏎] open  [n] task  [a] attach
-// [/] search  [?] help`. The right side carries an uptime indicator
-// and (when set) the active search filter.
+// Matches the mockup's `[j/k] nav  [←/→] panel  [⏎] open  [n] task
+// [a] attach  [/] search  [?] help`. The right side carries an uptime
+// indicator and (when set) the active search filter. Issue #83 added
+// the [←/→] panel chip — Left jumps the cursor to the first PROJECTS
+// row, Right jumps to the first WORKERS / agents row, so operators
+// don't have to walk j/k across long task expansions to switch panels.
 func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string) string {
 	chips := []struct{ key, label string }{
 		{"j/k", "nav"},
+		{"←/→", "panel"},
 		{"⏎", "open"},
 		{"n", "task"},
 		{"a", "attach"},
