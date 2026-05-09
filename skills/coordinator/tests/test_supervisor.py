@@ -758,6 +758,96 @@ def test_remember_agent_id_rejects_invalid() -> None:
     assert "worker_agent_ids" not in state or state["worker_agent_ids"] == {}
 
 
+# ---------- subagent_id helpers (issue #94 Phase C) ----------
+
+
+def test_remember_and_forget_subagent_id_round_trip() -> None:
+    """Mapping survives a remember → forget cycle and ends empty."""
+    state: dict = {}
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "claude-sub-1")
+    assert state["worker_subagent_ids"] == {"alpha-aaaa": "claude-sub-1"}
+    supervisor.forget_subagent_id(state, "alpha-aaaa")
+    assert state["worker_subagent_ids"] == {}
+
+
+def test_remember_subagent_id_rejects_invalid() -> None:
+    """Empty / whitespace / over-long subagent_ids are silent no-ops.
+    Loose validation (printable, non-whitespace, ≤128 chars) — Claude
+    doesn't pin a strict shape so we only filter the obviously malformed."""
+    state: dict = {}
+    # Empty + whitespace inputs.
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "")
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "   ")
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "has space")
+    # Empty slug.
+    supervisor.remember_subagent_id(state, "", "claude-sub-1")
+    # Over the 128-char cap.
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "x" * 129)
+    # Control / non-printable.
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "claude\x00sub")
+    assert state.get("worker_subagent_ids", {}) == {}
+
+
+def test_load_subagent_id_map_filters_malformed_entries() -> None:
+    """Hand-crafted state with mixed valid + invalid entries — loader
+    drops the bad ones, keeps the good ones, never raises."""
+    state = {
+        "worker_subagent_ids": {
+            "good-aaaa": "claude-sub-1",
+            "spaces-bbbb": "has space",  # invalid: whitespace inside
+            123: "wrong-key-type",       # invalid: non-str key
+            "control-cccc": "x\x00y",   # invalid: non-printable
+            "long-dddd": "y" * 200,      # invalid: > 128 chars
+            "ok-eeee": "claude-sub-2",
+        },
+    }
+    got = supervisor.load_subagent_id_map(state)
+    assert got == {"good-aaaa": "claude-sub-1", "ok-eeee": "claude-sub-2"}
+
+
+def test_load_subagent_id_map_handles_missing_key() -> None:
+    """Empty / missing / wrong-type top-level all return {} cleanly."""
+    assert supervisor.load_subagent_id_map({}) == {}
+    assert supervisor.load_subagent_id_map({"worker_subagent_ids": None}) == {}
+    assert supervisor.load_subagent_id_map({"worker_subagent_ids": []}) == {}
+    assert supervisor.load_subagent_id_map({"worker_subagent_ids": "x"}) == {}
+
+
+def test_forget_agent_id_clears_subagent_id_too() -> None:
+    """When the upstream forget_agent_id fires (worker reaches terminal),
+    the parallel subagent_id mapping must drop too — otherwise stale
+    chips would render on archived workers."""
+    state: dict = {}
+    supervisor.remember_agent_id(state, "alpha-aaaa", "aaaaaaaa")
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "claude-sub-1")
+    supervisor.forget_agent_id(state, "alpha-aaaa")
+    assert state.get("worker_agent_ids", {}) == {}
+    assert state.get("worker_subagent_ids", {}) == {}
+
+
+def test_remember_subagent_id_preserves_other_slugs() -> None:
+    """A second remember_subagent_id call must not clobber an existing
+    map entry for a different slug."""
+    state: dict = {}
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "claude-sub-1")
+    supervisor.remember_subagent_id(state, "beta-bbbb", "claude-sub-2")
+    assert state["worker_subagent_ids"] == {
+        "alpha-aaaa": "claude-sub-1",
+        "beta-bbbb": "claude-sub-2",
+    }
+    supervisor.forget_subagent_id(state, "alpha-aaaa")
+    assert state["worker_subagent_ids"] == {"beta-bbbb": "claude-sub-2"}
+
+
+def test_remember_subagent_id_repairs_corrupt_top_level() -> None:
+    """If a malformed coord-state has worker_subagent_ids set to a non-dict
+    (operator hand-edit, schema drift), remember_subagent_id replaces it
+    with a fresh dict rather than crashing on .get()."""
+    state = {"worker_subagent_ids": "not-a-dict"}
+    supervisor.remember_subagent_id(state, "alpha-aaaa", "claude-sub-1")
+    assert state["worker_subagent_ids"] == {"alpha-aaaa": "claude-sub-1"}
+
+
 # ---------- config from env ----------
 
 

@@ -154,3 +154,24 @@ def test_skill_md_dispatch_protocol_pins_one_call_per_block():
             "the coord agent doesn't collapse multi-block ticks into a "
             "single Agent call (issue #84 Phase A)."
         )
+
+
+# ---------- register_subagent step (issue #94 Phase C) ----------
+
+
+def test_skill_md_dispatch_protocol_names_register_subagent():
+    """The Worker dispatch protocol must instruct the coord agent to
+    capture the Agent tool's `subagent_id` and run register_subagent.py
+    so the fleet TUI can render `· <8-char>` cross-reference chips
+    (issue #94 Phase C). Drift here silently leaves the chip empty."""
+    body = _read_skill_md()
+    for marker in (
+        "register_subagent",
+        "subagent_id",
+        # CLI usage pattern — operators can grep this in handoff docs.
+        "register_subagent.py",
+    ):
+        assert marker in body, (
+            f"SKILL.md Worker dispatch protocol missing {marker!r} — "
+            f"coord agent skips Phase C subagent_id capture (issue #94)."
+        )
