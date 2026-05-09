@@ -1394,6 +1394,20 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 			m.idleCollapseExplicit = true
 		case separatorHidden:
 			m.hiddenExpanded = !m.hiddenExpanded
+		case separatorHistory:
+			// Issue #101: [enter] on the `─── N done ───` separator
+			// toggles the history group expansion for the parent
+			// project. Cursor stays on the separator so [j] walks
+			// into newly-revealed history rows.
+			if m.historyExpanded == nil {
+				m.historyExpanded = map[string]bool{}
+			}
+			proj := row.separator.project
+			if m.historyExpanded[proj] {
+				delete(m.historyExpanded, proj)
+			} else {
+				m.historyExpanded[proj] = true
+			}
 		}
 		m = clampDashCursor(m)
 	}

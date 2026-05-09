@@ -41,15 +41,20 @@ const (
 type separatorKind int
 
 const (
-	separatorIdle   separatorKind = iota // "─── N idle ───"
-	separatorHidden                      // "─── N hidden ───" (only when show-hidden mode is on)
+	separatorIdle    separatorKind = iota // "─── N idle ───"
+	separatorHidden                       // "─── N hidden ───" (only when show-hidden mode is on)
+	separatorHistory                      // "─── N done ───" inside an expanded project block (issue #101)
 )
 
 // separatorRow carries the per-group state for rowSeparator.
 type separatorRow struct {
 	kind     separatorKind
-	count    int  // number of collapsed projects under this separator
-	expanded bool // when true, the group's projects render after the separator
+	count    int  // number of collapsed projects (or tasks, for separatorHistory) under this separator
+	expanded bool // when true, the group's contents render after the separator
+	// project is set for separatorHistory: the parent project whose
+	// done/abandoned tasks the separator gates. Empty for idle/hidden
+	// separators (those operate at the project-list level).
+	project string
 }
 
 // dashRow is one navigable row. Exactly one of project / task /
@@ -79,6 +84,12 @@ type dashRow struct {
 type taskRow struct {
 	Slug   string
 	Status string // tasks.Status as a string — kept stringly so render doesn't import the enum
+	// PRURL is the task entry's pr_url (from tasks.md). Carried through
+	// to the rendering layer for the issue #101 history group: a done
+	// task with a PR URL renders as `✓ slug · PR #N` so the operator
+	// can see the link without opening the detail panel. Empty for
+	// non-history rows + history rows whose task never opened a PR.
+	PRURL string
 	// Synthetic markers — set when the row is not a real task entry
 	// but a hint line shown under an expanded project (issue #59):
 	//
@@ -629,18 +640,31 @@ func (m Model) appendProjectRows(rows []dashRow, projects []*ProjectRow) []dashR
 		// show (passes the filter), then emit up to N + a "+more"
 		// tail. Single-pass with a running counter would
 		// mis-attribute "+more" to filtered-out rows below the cap.
-		var eligible []*taskRow
+		//
+		// Issue #101 lifecycle hygiene: split eligible tasks into
+		// active (lifecycle Prerun/Active/Waiting) and history
+		// (lifecycle TerminalSuccess/TerminalFailure). Active
+		// renders inline as before; history collapses under a
+		// `─── N done ───` separator that the operator [enter]s
+		// to expand. Search overrides the split — when a task slug
+		// matches the active filter, surface it inline regardless
+		// of lifecycle so / search keeps working as before.
+		var activeEligible, historyEligible []*taskRow
 		for _, t := range p.Tasks {
 			if !projectMatches && !expanded && !m.matchesFilter(t.Slug) {
 				continue
 			}
-			eligible = append(eligible, t)
+			if isHistoryTaskRow(t) && m.searchFilter == "" {
+				historyEligible = append(historyEligible, t)
+				continue
+			}
+			activeEligible = append(activeEligible, t)
 		}
-		shown := eligible
+		shown := activeEligible
 		var more int
-		if len(eligible) > maxExpandedTasks {
-			shown = eligible[:maxExpandedTasks]
-			more = len(eligible) - maxExpandedTasks
+		if len(activeEligible) > maxExpandedTasks {
+			shown = activeEligible[:maxExpandedTasks]
+			more = len(activeEligible) - maxExpandedTasks
 		}
 		for _, t := range shown {
 			rows = append(rows, dashRow{
@@ -656,8 +680,61 @@ func (m Model) appendProjectRows(rows []dashRow, projects []*ProjectRow) []dashR
 				parentProject: p.Name,
 			})
 		}
+		// History group (issue #101). Only renders when the project
+		// has at least one done/abandoned task AND we're not inside
+		// an active search (search merges everything inline).
+		if len(historyEligible) > 0 {
+			histExpanded := m.historyExpanded != nil && m.historyExpanded[p.Name]
+			rows = append(rows, dashRow{
+				kind:          rowSeparator,
+				parentProject: p.Name,
+				separator: &separatorRow{
+					kind:     separatorHistory,
+					count:    len(historyEligible),
+					expanded: histExpanded,
+					project:  p.Name,
+				},
+			})
+			if histExpanded {
+				// Reuse the same maxExpandedTasks cap so a project
+				// with hundreds of done tasks doesn't blow out the
+				// column. "+N more" tail is identical to the active
+				// path above; both lists wear the cap independently.
+				histShown := historyEligible
+				var histMore int
+				if len(historyEligible) > maxExpandedTasks {
+					histShown = historyEligible[:maxExpandedTasks]
+					histMore = len(historyEligible) - maxExpandedTasks
+				}
+				for _, t := range histShown {
+					rows = append(rows, dashRow{
+						kind:          rowTask,
+						task:          t,
+						parentProject: p.Name,
+					})
+				}
+				if histMore > 0 {
+					rows = append(rows, dashRow{
+						kind:          rowTask,
+						task:          &taskRow{More: histMore},
+						parentProject: p.Name,
+					})
+				}
+			}
+		}
 	}
 	return rows
+}
+
+// isHistoryTaskRow reports whether t belongs in the project's history
+// (done / abandoned) group. Synthetic markers (Empty / More) are NOT
+// history — they're navigation aids that always render in the active
+// section. Issue #101.
+func isHistoryTaskRow(t *taskRow) bool {
+	if t == nil || t.Empty || t.More > 0 {
+		return false
+	}
+	return t.Status == "done" || t.Status == "abandoned"
 }
 
 // matchesFilter returns true when the search filter is empty OR s
@@ -735,6 +812,8 @@ func rowIdentity(r dashRow) string {
 				return "S:idle"
 			case separatorHidden:
 				return "S:hidden"
+			case separatorHistory:
+				return "S:history:" + r.separator.project
 			}
 		}
 	}

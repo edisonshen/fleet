@@ -195,9 +195,15 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 
 	// Task counts + per-task rows. Read errors collapse to zero counts
 	// + nil Tasks — the row still renders so the operator can see the
-	// project exists. Per-task rows feed [j/k] navigation + [⏎] open;
-	// done tasks are filtered out so the dashboard doesn't drown in
-	// completed work (operator can see them via fleet tasks list).
+	// project exists. Per-task rows feed [j/k] navigation + [⏎] open.
+	//
+	// Issue #101 lifecycle hygiene: done + abandoned tasks ARE included
+	// here (previously filtered out). The row split between active +
+	// history happens in the row-list assembly path so the operator
+	// can collapse history under a `─── N done ───` separator without
+	// losing the entries entirely. This keeps tasks.md as the durable
+	// source of truth for task history while the TUI surface stays
+	// uncluttered by default.
 	if f, err := tasks.Read(filepath.Join(dir, "tasks.md")); err == nil {
 		for _, t := range f.Tasks {
 			switch t.Status {
@@ -212,12 +218,10 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 			case tasks.StatusDone:
 				row.Counts.Done++
 			}
-			if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
-				continue
-			}
 			row.Tasks = append(row.Tasks, &taskRow{
 				Slug:   t.Slug,
 				Status: string(t.Status),
+				PRURL:  t.PRURL,
 			})
 		}
 	}
@@ -286,6 +290,24 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 // scanWorkers reads <project>/workers/<slug>/state.json for every
 // active worker (skips archive/). Returns rows in undefined order; the
 // caller sorts.
+//
+// Lifecycle defense-in-depth (issue #101): when a worker dir's
+// state.json reports a TerminalSuccess (phase=done) or TerminalFailure
+// (phase=failed) phase, scanWorkers fires `workers.Delete` to rm-rf
+// the dir before returning the row. The deleted worker is omitted
+// from the returned slice so the dashboard renders the snapshot it
+// would see on the next tick (no row), avoiding a one-tick flicker
+// of the soon-to-disappear worker.
+//
+// Blocked is Waiting in the lifecycle classification — the worker dir
+// is intentionally kept (operator may inspect blocked_reason) and a
+// row is returned so the operator sees the blocked signal in the
+// right column.
+//
+// Coord skill is the primary trigger; this scan is the catch-all for
+// orphan dirs (coord crash, manual `fleet workers update`, dirs left
+// behind from before issue #101 landed). Both call the same Delete;
+// idempotent on ENOENT, so a coord-then-TUI race is safe.
 func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 	wDir := filepath.Join(projectDir, "workers")
 	entries, err := os.ReadDir(wDir)
@@ -297,6 +319,12 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		if !e.IsDir() || e.Name() == "archive" {
 			continue
 		}
+		// Skip in-flight delete-staging dirs (workers.Delete renames
+		// to <slug>.deleting-<stamp>/ before RemoveAll). Treating one
+		// as a worker would surface a row for a soon-to-vanish dir.
+		if strings.Contains(e.Name(), ".deleting-") {
+			continue
+		}
 		path := filepath.Join(wDir, e.Name(), "state.json")
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -306,6 +334,16 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		if err := json.Unmarshal(data, &s); err != nil {
 			continue
 		}
+		// Defense-in-depth: rm-rf done/failed worker dirs the coord
+		// skill missed. Skip the row so the snapshot matches what the
+		// next render will see (the dir is gone). Errors are
+		// swallowed — the operator's visible state is correct
+		// either way; logging here would spam the TUI's stdout
+		// (which lipgloss has already painted over).
+		if s.Phase == workers.PhaseDone || s.Phase == workers.PhaseFailed {
+			_ = workersDeleteFn(project, s.Slug)
+			continue
+		}
 		row := workerRowFor(&s, project, now)
 		if row != nil {
 			out = append(out, row)
@@ -313,6 +351,11 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 	}
 	return out
 }
+
+// workersDeleteFn is the Delete function the dashboard scan calls.
+// var so tests can stub the disk write without seeding a real worker
+// tree. Production calls workers.Delete.
+var workersDeleteFn = workers.Delete
 
 // workerRowFor maps one State into a WorkerRow with display fields.
 // The Color drives the leading dot; the State 2-letter code is the

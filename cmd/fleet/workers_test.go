@@ -374,3 +374,83 @@ func TestWorkersPrune_RemovesOldArchive(t *testing.T) {
 		t.Errorf("fresh archive should remain: %v", err)
 	}
 }
+
+// ---------- fleet workers delete (issue #101) ----------
+
+// TestWorkersDelete_RemovesActiveDir verifies the CLI wrapper around
+// workers.Delete clears workers/<slug>/ on disk and prints the
+// "removed" line.
+func TestWorkersDelete_RemovesActiveDir(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+
+	slug := "del-active-1a2b"
+	seedWorker(t, project, slug, workers.PhaseDone, os.Getpid())
+	dir := filepath.Join(fleetHome, "projects", project, "workers", slug)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("seeded dir missing: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	cmd := newWorkersDeleteCmd()
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"--project", project, slug})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Errorf("dir still present: %v", err)
+	}
+	if !strings.Contains(out.String(), "removed") {
+		t.Errorf("expected `removed` in output, got %q", out.String())
+	}
+}
+
+// TestWorkersDelete_IdempotentMissingDir — running delete on a slug
+// whose dir was never created (or was already removed) returns 0 and
+// prints `already gone`. The coord skill + TUI defense-in-depth path
+// can both fire without tripping over each other.
+func TestWorkersDelete_IdempotentMissingDir(t *testing.T) {
+	_, project := setupTasksHome(t)
+
+	out := &bytes.Buffer{}
+	cmd := newWorkersDeleteCmd()
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"--project", project, "never-was-1234"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("delete missing: %v", err)
+	}
+	if !strings.Contains(out.String(), "already gone") {
+		t.Errorf("expected `already gone`, got %q", out.String())
+	}
+}
+
+// TestWorkersDelete_RejectsArchiveSlug — the literal slug "archive"
+// would resolve to workers/archive/ and blow away the entire archive
+// retention tree. The CLI must refuse it. Also confirms the operator-
+// visible archive dir survives untouched.
+func TestWorkersDelete_RejectsArchiveSlug(t *testing.T) {
+	fleetHome, project := setupTasksHome(t)
+
+	archRoot := filepath.Join(fleetHome, "projects", project, "workers", "archive")
+	if err := os.MkdirAll(archRoot, 0o755); err != nil {
+		t.Fatalf("mkdir arch: %v", err)
+	}
+	canary := filepath.Join(archRoot, "stale-1111-20200101-000000")
+	if err := os.MkdirAll(canary, 0o755); err != nil {
+		t.Fatalf("mkdir canary: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	cmd := newWorkersDeleteCmd()
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	cmd.SetArgs([]string{"--project", project, "archive"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if _, err := os.Stat(canary); err != nil {
+		t.Errorf("canary archive disturbed: %v", err)
+	}
+}

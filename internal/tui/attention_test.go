@@ -106,17 +106,30 @@ func TestRows_DoneTaskGetsCheckGlyph(t *testing.T) {
 }
 
 // TestRows_DefaultTaskGetsBulletGlyph pins that the • bullet
-// remains the fallback glyph for unknown / abandoned statuses (issue
-// #77 swapped the per-status glyphs but kept • as the safe default
-// so a future status string still renders something sensible).
+// remains the fallback glyph for genuinely unknown statuses (issue
+// #77 kept • as the safe default for future statuses we don't yet
+// know about). Issue #101 separately gave abandoned its own ✗ glyph
+// in the history group — abandoned no longer falls through to •, so
+// this test pins an unrecognized status string instead.
 func TestRows_DefaultTaskGetsBulletGlyph(t *testing.T) {
-	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "abandoned"}
+	tr := &taskRow{Slug: "ordinary-z-cccc", Status: "future-unknown"}
 	out := taskBlockLine(tr, 60, false)
-	if strings.Contains(out, "⚠") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") {
-		t.Errorf("abandoned/unknown task should NOT carry status glyph, got: %q", out)
+	if strings.Contains(out, "⚠") || strings.Contains(out, "✓") || strings.Contains(out, "○") || strings.Contains(out, "◐") || strings.Contains(out, "⟳") || strings.Contains(out, "✗") {
+		t.Errorf("unknown-status task should NOT carry status glyph, got: %q", out)
 	}
 	if !strings.Contains(out, "•") {
-		t.Errorf("abandoned/unknown task should render with • bullet fallback, got: %q", out)
+		t.Errorf("unknown-status task should render with • bullet fallback, got: %q", out)
+	}
+}
+
+// TestRows_AbandonedTaskGetsCrossGlyph pins issue #101's history
+// rendering: abandoned tasks get a ✗ glyph (distinct from done's ✓
+// and the • fallback for genuinely unknown statuses).
+func TestRows_AbandonedTaskGetsCrossGlyph(t *testing.T) {
+	tr := &taskRow{Slug: "abandoned-z-cccc", Status: "abandoned"}
+	out := taskBlockLine(tr, 60, false)
+	if !strings.Contains(out, "✗") {
+		t.Errorf("abandoned task should carry ✗ glyph, got: %q", out)
 	}
 }
 

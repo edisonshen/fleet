@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -36,7 +37,79 @@ For tailing one worker's logs, use ` + "`fleet peek <slug> --logs`" + `.`,
 		newWorkersPruneCmd(),
 		newWorkersUpdateCmd(),
 		newWorkersWorktreePathCmd(),
+		newWorkersDeleteCmd(),
 	)
+	return cmd
+}
+
+// ---------- fleet workers delete ----------
+
+// newWorkersDeleteCmd is the lifecycle-hygiene cleanup hook (issue
+// #101). The Python coord skill calls it after the worker subagent
+// returns terminal — the PR URL is already persisted on the task entry
+// at that point, so the worker dir contributes no extra information
+// and is rm-rf'd outright (no archive, per issue #101 "Cleanup rules").
+//
+// Idempotent on missing dir — repeated calls return 0 with the
+// "already gone" line so the coord skill + TUI defense-in-depth path
+// can both fire without tripping over each other (first mover wins;
+// second sees ENOENT).
+//
+// Slug + path validation lives in workers.Delete; this CLI wrapper is
+// a thin shell. Refusing the literal slug "archive" prevents an
+// operator typo from blowing away the archive root.
+func newWorkersDeleteCmd() *cobra.Command {
+	var project string
+	cmd := &cobra.Command{
+		Use:   "delete <slug>",
+		Short: "Remove ~/.fleet/projects/<project>/workers/<slug>/ (rm -rf, no archive)",
+		Long: `delete removes the worker dir for one (project, slug) pair entirely.
+The worker's state.json, output log, and any nested files are gone.
+This is the issue #101 lifecycle cleanup path: a worker at terminal
+phase (done|failed) has nothing the coordinator or operator needs to
+read again — the PR URL has already been persisted on the task entry.
+
+Idempotent: a missing dir returns 0 with the "already gone" message.
+
+NOTE: this is NOT the same as ` + "`fleet workers prune`" + ` (which targets archived
+dirs by age). Delete is the active-dir cleanup; Prune is the
+archive-dir retention path (which v0.5+ doesn't populate, so prune
+is mostly a v0.1 / pre-#101 hand-archive janitor).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			slug := strings.TrimSpace(args[0])
+			if slug == "" {
+				return errors.New("slug must be non-empty")
+			}
+			if _, err := state.Bootstrap(); err != nil {
+				return fmt.Errorf("bootstrap: %w", err)
+			}
+			proj, err := resolveProject(project)
+			if err != nil {
+				return err
+			}
+			// Stat first so the success line distinguishes "removed"
+			// from "already gone". workers.Delete is idempotent either
+			// way; the operator-visible message is informational only.
+			workerDir, derr := state.WorkerDir(proj, slug)
+			pre := ""
+			if derr == nil {
+				if _, sErr := os.Stat(workerDir); sErr == nil {
+					pre = "removed"
+				}
+			}
+			if err := workers.Delete(proj, slug); err != nil {
+				return fmt.Errorf("delete: %w", err)
+			}
+			if pre == "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "worker %s already gone\n", slug)
+			} else {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "worker %s removed\n", slug)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&project, "project", "", "project name (default: cwd basename)")
 	return cmd
 }
 

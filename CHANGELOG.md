@@ -6,6 +6,33 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Lifecycle hygiene: a new `internal/lifecycle/` package classifies
+  tasks, workers, and coord agent records onto a shared 5-state enum
+  (Prerun / Active / Waiting / TerminalSuccess / TerminalFailure),
+  and the cleanup orchestrator owns per-entity terminal actions.
+  Workers reaching phase=done or phase=failed get their on-disk dir
+  rm-rf'd via the new `workers.Delete` helper (no archive, no grace
+  period — the operator-visible PR URL is already persisted on the
+  task entry by then). The coord skill fires the cleanup after every
+  reconcile/sentinel apply path that transitions the worker out of
+  in-flight; the TUI's `scanWorkers` pass cleans any orphan dir the
+  coord missed (defense-in-depth). Tasks split into active vs
+  history under each project's expansion: a collapsible
+  `─── N done ───` separator (toggled with `[enter]`) keeps the
+  active list lean while preserving the operator-visible record of
+  shipped + abandoned work. Done tasks render `✓ slug · PR #N`
+  when a PR URL is on file; abandoned tasks render `✗ slug`. Worker
+  blocked phase stays Waiting (dir is preserved so the operator can
+  inspect `blocked_reason`). Coord agent records remain untouched —
+  the coord skill's own 4h auto-idle-stop owns that lifecycle.
+  Closes [#101](https://github.com/edisonshen/fleet/issues/101).
+- New CLI: `fleet workers delete <slug>` removes the worker dir
+  outright (idempotent on missing dir; refuses the literal slug
+  `archive`). Used by the coord skill's lifecycle cleanup path; safe
+  for operator manual use too.
+
 ## [0.4.0] - 2026-05-09
 
 Project-list quality-of-life pass: operator can `[c]` hide projects

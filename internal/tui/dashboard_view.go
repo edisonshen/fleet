@@ -383,6 +383,14 @@ func separatorBlockLine(sep *separatorRow, w int, selected bool) string {
 		} else {
 			label = fmt.Sprintf("%d hidden — [enter] to expand, [c] to view-toggle", sep.count)
 		}
+	case separatorHistory:
+		// Issue #101: collapsible "─── N done ───" group inside an
+		// expanded project. Operator [enter]s the row to toggle.
+		if sep.expanded {
+			label = fmt.Sprintf("%d done (expanded — [enter] to collapse)", sep.count)
+		} else {
+			label = fmt.Sprintf("%d done — [enter] to expand", sep.count)
+		}
 	default:
 		return ""
 	}
@@ -657,7 +665,51 @@ func taskBlockLine(t *taskRow, w int, selected bool) string {
 		glyphStyle = statusGlyphStyle
 	}
 	slug := statusLabelStyle.Render(t.Slug)
-	return prefix + glyphStyle.Render(glyph) + " " + slug
+	// Issue #101 history rendering: done + abandoned tasks live in the
+	// `─── N done ───` history group. Append the PR number tail when
+	// the task entry carries a pr_url so the operator can see the PR
+	// from the row without opening the detail panel. Abandoned tasks
+	// render with the ✗ glyph (overridden from the default ✓ for done)
+	// — taskStatusStyles falls through for "abandoned" so we patch the
+	// glyph here.
+	tail := ""
+	if t.Status == "done" && t.PRURL != "" {
+		if num := prNumberFromURL(t.PRURL); num != "" {
+			tail = " " + dimStyle.Render("· PR "+num)
+		}
+	}
+	if t.Status == "abandoned" && !selected {
+		glyph = "✗"
+		glyphStyle = dimStyle
+	}
+	return prefix + glyphStyle.Render(glyph) + " " + slug + tail
+}
+
+// prNumberFromURL extracts the trailing /pull/<N> number from a PR
+// URL. Returns "#N" on success, empty string on any parse failure.
+// Designed for the issue #101 history row tail render — fallible
+// gracefully so a missing parse just omits the tail rather than
+// crashing the dashboard.
+func prNumberFromURL(url string) string {
+	const marker = "/pull/"
+	i := strings.LastIndex(url, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := url[i+len(marker):]
+	// Trim anything after the number (query, fragment, trailing path).
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if c < '0' || c > '9' {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return ""
+	}
+	return "#" + rest[:end]
 }
 
 // taskStatusStyles returns (glyph, glyphStyle, labelStyle) for the

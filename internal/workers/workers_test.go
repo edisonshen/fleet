@@ -635,3 +635,166 @@ func slugs(ss []*State) []string {
 	}
 	return out
 }
+
+// ---------- Delete (issue #101) ----------
+
+func TestDelete_RemovesDir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	dir, err := state.WorkerDir("fleet", "del-test-1a2b")
+	if err != nil {
+		t.Fatalf("WorkerDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Drop in a couple files including a nested dir to exercise rm -rf.
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "output.log"), []byte("logs"), 0o644); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+	nested := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatalf("nested mkdir: %v", err)
+	}
+
+	if err := Delete("fleet", "del-test-1a2b"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("dir still exists: %v", err)
+	}
+}
+
+func TestDelete_IdempotentOnMissing(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	// First call on a never-existed slug returns nil.
+	if err := Delete("fleet", "never-existed-9999"); err != nil {
+		t.Fatalf("first Delete: %v", err)
+	}
+	// Same slug again — still nil.
+	if err := Delete("fleet", "never-existed-9999"); err != nil {
+		t.Fatalf("second Delete: %v", err)
+	}
+}
+
+func TestDelete_RejectsInvalidSlug(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	cases := []string{"", "..", "../escape", "/abs", "with/slash"}
+	for _, slug := range cases {
+		t.Run(slug, func(t *testing.T) {
+			err := Delete("fleet", slug)
+			if err == nil {
+				t.Fatalf("Delete(%q) succeeded; want error", slug)
+			}
+			if !errors.Is(err, ErrInvalidSlug) {
+				t.Fatalf("got %v; want ErrInvalidSlug", err)
+			}
+		})
+	}
+}
+
+func TestDelete_RefusesArchiveSlug(t *testing.T) {
+	// "archive" as a slug would resolve to workers/archive/, blowing
+	// away every archived worker. Refuse explicitly.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	// Plant an archive dir to confirm Delete doesn't touch it.
+	pdir, err := state.ProjectDir("fleet")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	archDir := filepath.Join(pdir, "workers", "archive", "old-1234-20260101-000000")
+	if err := os.MkdirAll(archDir, 0o755); err != nil {
+		t.Fatalf("mkdir archive: %v", err)
+	}
+
+	err = Delete("fleet", "archive")
+	if err == nil {
+		t.Fatalf("Delete(archive) succeeded; want error")
+	}
+	if _, statErr := os.Stat(archDir); statErr != nil {
+		t.Fatalf("archive dir was disturbed: %v", statErr)
+	}
+}
+
+func TestDelete_LeavesProjectDirIntact(t *testing.T) {
+	// After Delete, the project dir + workers/ root must still exist.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	dir, err := state.WorkerDir("fleet", "leave-1a2b")
+	if err != nil {
+		t.Fatalf("WorkerDir: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if err := Delete("fleet", "leave-1a2b"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	pdir, err := state.ProjectDir("fleet")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if _, err := os.Stat(pdir); err != nil {
+		t.Fatalf("project dir gone: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "workers")); err != nil {
+		t.Fatalf("workers root gone: %v", err)
+	}
+}
+
+func TestDelete_LeavesSiblingsAlone(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.EnsureProjectInitialized("fleet"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	d1, err := state.WorkerDir("fleet", "tgt-1a2b")
+	if err != nil {
+		t.Fatalf("WorkerDir 1: %v", err)
+	}
+	d2, err := state.WorkerDir("fleet", "keep-cd34")
+	if err != nil {
+		t.Fatalf("WorkerDir 2: %v", err)
+	}
+	for _, d := range []string{d1, d2} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "state.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", d, err)
+		}
+	}
+
+	if err := Delete("fleet", "tgt-1a2b"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := os.Stat(d1); !os.IsNotExist(err) {
+		t.Fatalf("target still present: %v", err)
+	}
+	if _, err := os.Stat(d2); err != nil {
+		t.Fatalf("sibling was removed: %v", err)
+	}
+}

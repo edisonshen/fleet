@@ -435,3 +435,223 @@ func TestExpand_SearchKeepsTaskVisibleWithoutExpansion(t *testing.T) {
 		t.Errorf("search filter on task slug must surface the task row even when project is collapsed; rows=%+v", rows)
 	}
 }
+
+// TestRows_HistoryGroup_CollapsedByDefault — issue #101: when a
+// project has done/abandoned tasks, an expanded project block shows
+// the active tasks inline AND a `─── N done ───` separator below.
+// History tasks themselves stay hidden until the operator [enter]s
+// the separator.
+func TestRows_HistoryGroup_CollapsedByDefault(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "active-1", Status: "todo"},
+				{Slug: "shipped-1", Status: "done", PRURL: "https://github.com/x/y/pull/42"},
+				{Slug: "abandoned-1", Status: "abandoned"},
+			}},
+		},
+	}
+	m.expanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	var seenSeparator, seenHistoryTask, seenActiveTask bool
+	for _, r := range rows {
+		if r.kind == rowSeparator && r.separator != nil && r.separator.kind == separatorHistory {
+			seenSeparator = true
+			if r.separator.count != 2 {
+				t.Errorf("history separator count=%d; want 2", r.separator.count)
+			}
+			if r.separator.expanded {
+				t.Errorf("default history separator should be collapsed")
+			}
+			if r.separator.project != "fleet" {
+				t.Errorf("history separator project=%q; want fleet", r.separator.project)
+			}
+		}
+		if r.kind == rowTask && r.task != nil {
+			switch r.task.Slug {
+			case "active-1":
+				seenActiveTask = true
+			case "shipped-1", "abandoned-1":
+				seenHistoryTask = true
+			}
+		}
+	}
+	if !seenActiveTask {
+		t.Errorf("active task should still render inline")
+	}
+	if !seenSeparator {
+		t.Errorf("history separator should render when project has done/abandoned tasks")
+	}
+	if seenHistoryTask {
+		t.Errorf("history tasks should NOT render when separator is collapsed")
+	}
+}
+
+// TestRows_HistoryGroup_ExpandedShowsTasks — once the operator opens
+// the history group via [enter], done + abandoned task rows render
+// below the separator.
+func TestRows_HistoryGroup_ExpandedShowsTasks(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "active-1", Status: "todo"},
+				{Slug: "shipped-1", Status: "done", PRURL: "https://github.com/x/y/pull/42"},
+				{Slug: "abandoned-1", Status: "abandoned"},
+			}},
+		},
+	}
+	m.expanded = map[string]bool{"fleet": true}
+	m.historyExpanded = map[string]bool{"fleet": true}
+
+	rows := m.dashboardRows()
+	var seenShipped, seenAbandoned bool
+	for _, r := range rows {
+		if r.kind == rowTask && r.task != nil {
+			if r.task.Slug == "shipped-1" {
+				seenShipped = true
+			}
+			if r.task.Slug == "abandoned-1" {
+				seenAbandoned = true
+			}
+		}
+	}
+	if !seenShipped {
+		t.Errorf("expanded history should show done task")
+	}
+	if !seenAbandoned {
+		t.Errorf("expanded history should show abandoned task")
+	}
+}
+
+// TestRows_HistoryGroup_NoSeparatorWhenAllActive — projects without
+// any done/abandoned tasks must NOT render a separator.
+func TestRows_HistoryGroup_NoSeparatorWhenAllActive(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "active-1", Status: "todo"},
+				{Slug: "active-2", Status: "in-progress"},
+			}},
+		},
+	}
+	m.expanded = map[string]bool{"fleet": true}
+
+	for _, r := range m.dashboardRows() {
+		if r.kind == rowSeparator && r.separator != nil && r.separator.kind == separatorHistory {
+			t.Fatalf("no history separator should appear; got %+v", r.separator)
+		}
+	}
+}
+
+// TestRows_HistoryGroup_HiddenWhenProjectCollapsed — history group
+// only renders inside an expanded project block. When the project
+// header is collapsed (no [enter] yet), neither active nor history
+// tasks render.
+func TestRows_HistoryGroup_HiddenWhenProjectCollapsed(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "active-1", Status: "todo"},
+				{Slug: "shipped-1", Status: "done"},
+			}},
+		},
+	}
+	// expanded NOT set
+	for _, r := range m.dashboardRows() {
+		if r.kind == rowSeparator && r.separator != nil && r.separator.kind == separatorHistory {
+			t.Fatalf("history separator should not render when project is collapsed")
+		}
+	}
+}
+
+// TestRows_HistoryGroup_SearchOverridesSplit — an active search
+// filter merges history tasks back into the inline list so a slug
+// query matches done tasks too.
+func TestRows_HistoryGroup_SearchOverridesSplit(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "shipped-target", Status: "done"},
+			}},
+		},
+	}
+	m.expanded = map[string]bool{"fleet": true}
+	m.searchFilter = "shipped-target"
+
+	var foundInline bool
+	for _, r := range m.dashboardRows() {
+		if r.kind == rowTask && r.task != nil && r.task.Slug == "shipped-target" {
+			foundInline = true
+		}
+		if r.kind == rowSeparator && r.separator != nil && r.separator.kind == separatorHistory {
+			t.Fatalf("search mode should suppress the history separator")
+		}
+	}
+	if !foundInline {
+		t.Errorf("search match should surface the history task inline")
+	}
+}
+
+// TestKey_HistorySeparatorEnter_TogglesExpansion — [enter] on the
+// `─── N done ───` separator flips m.historyExpanded[<project>].
+func TestKey_HistorySeparatorEnter_TogglesExpansion(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Tasks: []*taskRow{
+				{Slug: "shipped-1", Status: "done"},
+			}},
+		},
+	}
+	m.expanded = map[string]bool{"fleet": true}
+	// Locate the history separator's index.
+	idx := -1
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowSeparator && r.separator != nil && r.separator.kind == separatorHistory {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("no history separator found")
+	}
+	m.dashCursor = idx
+
+	mm, _, _ := m.openDetail()
+	if !mm.historyExpanded["fleet"] {
+		t.Errorf("expected historyExpanded[fleet]=true after [enter]")
+	}
+	// Second press collapses.
+	mm.dashCursor = idx
+	mm2, _, _ := mm.openDetail()
+	if mm2.historyExpanded["fleet"] {
+		t.Errorf("expected historyExpanded[fleet] cleared after second [enter]")
+	}
+}
+
+// TestRender_DonePRTail — done tasks with a PR URL render the
+// "✓ slug · PR #42" tail; without a URL they render just "✓ slug".
+func TestRender_DonePRTail(t *testing.T) {
+	withURL := taskBlockLine(&taskRow{
+		Slug: "done-x-1234", Status: "done",
+		PRURL: "https://github.com/x/y/pull/42",
+	}, 60, false)
+	if !strings.Contains(withURL, "PR #42") {
+		t.Errorf("done task with PR URL should carry tail; got %q", withURL)
+	}
+	withoutURL := taskBlockLine(&taskRow{
+		Slug: "done-y-5678", Status: "done",
+	}, 60, false)
+	if strings.Contains(withoutURL, "PR #") {
+		t.Errorf("done task without PR URL should NOT carry tail; got %q", withoutURL)
+	}
+	if !strings.Contains(withoutURL, "✓") {
+		t.Errorf("done task should still carry ✓ glyph; got %q", withoutURL)
+	}
+}

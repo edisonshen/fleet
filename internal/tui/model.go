@@ -235,6 +235,15 @@ type Model struct {
 	// renders below the separator. Toggled via [enter] on the hidden
 	// separator. Default false (issue #98).
 	hiddenExpanded bool
+
+	// historyExpanded tracks per-project whether the `─── N done ───`
+	// task-history separator inside the project's expansion is open
+	// (issue #101). Keyed by project name. Default closed; the active
+	// task list still renders above the separator regardless. Toggled
+	// via [enter] on the history separator row. Persists across
+	// dashboardMsg ticks so the 1s poll doesn't auto-collapse the
+	// operator's choice (mirrors the `expanded` map's persistence).
+	historyExpanded map[string]bool
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
