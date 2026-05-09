@@ -544,6 +544,117 @@ func TestOverlay_DismissedKeyAbsorbed(t *testing.T) {
 	}
 }
 
+// TestKeyA_WorkerRow_RoutesToCoordTmux pins issue #93 Phase B1: in
+// v0.2.x, workers are Agent-tool subagents of the project's coord —
+// they have NO tmux session of their own. [a] on a worker row must
+// route to the coord's tmux session, where the worker subagent's
+// output renders as a "local agent" indicator.
+func TestKeyA_WorkerRow_RoutesToCoordTmux(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// findExistingCoordForProject also requires a coord-spawn marker
+	// on disk. Stub the marker so the test doesn't need to seed real
+	// marker files.
+	(&stubCoordSpawnMarker{markers: map[string]string{"fleet": "c0fdc0ff"}}).install(t)
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	seedWorker(t, pdir, "fleet", "do-x-1a2b", workers.State{
+		Phase: workers.PhaseTDDGreen,
+	})
+
+	// Seed an alive coord agent record for the project. Coord identity
+	// convention: TaskID == "coord-<project>" (mirrors keys.go
+	// coordTaskID). The worker row's [a] handler looks up the coord
+	// via findExistingCoordForProject(records, project).
+	coord := agent.New("c0fdc0ff")
+	coord.TaskID = "coord-fleet"
+	coord.Project = "fleet"
+	coord.TmuxSession = "fleet-c0fdc0ff"
+	coord.SpawnedAt = time.Now().UTC()
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.records = []*agent.Record{coord}
+	m.dashboard = scanDashboard(time.Now())
+	rows := m.dashboardRows()
+	idx := -1
+	for i, r := range rows {
+		if r.kind == rowWorker && r.worker != nil && r.worker.Slug == "do-x-1a2b" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("worker row not found")
+	}
+	m.dashCursor = idx
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.pendingAttach != coord.TmuxSession {
+		t.Errorf("[a] on worker should attach to coord's tmux session, got pendingAttach=%q want=%q",
+			mm.pendingAttach, coord.TmuxSession)
+	}
+	if cmd == nil {
+		t.Errorf("[a] on worker with live coord should produce tea.Quit cmd")
+	}
+	// Detail panel must NOT be opened — that path is now exclusive
+	// to [⏎] (TestKeyEnter_OpensWorkerPeek already covers it).
+	if mm.detail != nil {
+		t.Errorf("[a] on worker should not open detail panel, got %+v", mm.detail)
+	}
+}
+
+// TestKeyA_WorkerRow_OrphanFlashesHint regresses the no-coord case:
+// when the worker's parent coord has exited, [a] flashes
+// "no attachable session for <slug>" with a hint to use [⏎] for the
+// peek panel instead. No tmux attach is attempted.
+func TestKeyA_WorkerRow_OrphanFlashesHint(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	seedWorker(t, pdir, "fleet", "orphan-9999", workers.State{
+		Phase: workers.PhaseTDDGreen,
+	})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	// No agent records — simulates the worker outliving its coord.
+	m.records = nil
+	m.dashboard = scanDashboard(time.Now())
+	rows := m.dashboardRows()
+	idx := -1
+	for i, r := range rows {
+		if r.kind == rowWorker && r.worker != nil && r.worker.Slug == "orphan-9999" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("worker row not found")
+	}
+	m.dashCursor = idx
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[a] on orphan worker should NOT produce a cmd, got non-nil")
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("[a] on orphan worker should not set pendingAttach, got %q", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] on orphan worker should flash error, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "no attachable session") {
+		t.Errorf("flash should mention 'no attachable session', got %q", mm.flash.text)
+	}
+	if !strings.Contains(mm.flash.text, "orphan-9999") {
+		t.Errorf("flash should embed worker slug 'orphan-9999', got %q", mm.flash.text)
+	}
+}
+
 // TestKeyX_WorkerRow_FlashesNotImplemented regresses codex iter-3 P1:
 // the worker [x] path used to shell out to `fleet workers kill`,
 // which doesn't exist. Until kill is wired, [x] on a worker must
