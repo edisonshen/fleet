@@ -1237,3 +1237,270 @@ def test_tick_publishes_coord_id_in_lock_body(
     lock_path = project_dir / ".locks" / "coordinator.lock"
     assert lock_path.exists()
     assert lock_path.read_bytes() == b"cccccc01\n"
+
+
+# ---------- Lifecycle hygiene (issue #101) ----------
+
+
+def test_reconcile_done_phase_triggers_workers_delete(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: when reconcile sees a worker at phase=done with a
+    PR URL, the apply path must shell out to `fleet workers delete`
+    AFTER persisting the pr_url. Order is load-bearing — the operator-
+    visible PR URL must outlive the worker dir cleanup.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "shipper-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "shipper-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/7",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipper-aaaa", status="in-progress",
+            worker_pid=99999, pr_url="",
+        ),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    pr_idx = -1
+    delete_idx = -1
+    for i, c in enumerate(fleet_run_recorder):
+        if c[1:3] == ["tasks", "set"] and any("pr_url=https://" in p for p in c):
+            pr_idx = i
+        if c[1:3] == ["workers", "delete"]:
+            delete_idx = i
+    assert delete_idx > 0, f"workers delete not invoked: {fleet_run_recorder}"
+    assert pr_idx > 0, f"pr_url set not invoked: {fleet_run_recorder}"
+    assert pr_idx < delete_idx, "pr_url must be persisted BEFORE workers delete"
+
+
+def test_reconcile_blocked_phase_keeps_worker_dir(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: a worker at phase=blocked is in lifecycle Waiting,
+    not Terminal. The dir must NOT be deleted (the operator may un-
+    block and resume).
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "stuck-bbbb"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "stuck-bbbb", "project": project,
+        "phase": "blocked", "updated_at": fresh,
+        "blocked_reason": "needs operator clarification",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("stuck-bbbb", status="in-progress", worker_pid=99998),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    delete_calls = [c for c in fleet_run_recorder if c[1:3] == ["workers", "delete"]]
+    assert delete_calls == [], (
+        "blocked worker dir must NOT be deleted; got " + repr(delete_calls)
+    )
+
+
+def test_reconcile_failed_phase_triggers_workers_delete(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: phase=failed is lifecycle TerminalFailure → delete.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "broken-cccc"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "broken-cccc", "project": project,
+        "phase": "failed", "updated_at": fresh,
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("broken-cccc", status="in-progress", worker_pid=99997),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    delete_calls = [c for c in fleet_run_recorder if c[1:3] == ["workers", "delete"]]
+    assert delete_calls, "failed worker dir should be deleted"
+
+
+def test_sentinel_task_done_pr_triggers_workers_delete(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: TASK_DONE_PR sentinel = lifecycle TerminalSuccess.
+    Apply order must be: pr_url set → status flip → workers delete.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    # Plant a sentinel archive file.
+    archive = fleet_home / "inbox" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "cccccc01-20260509-100000.md").write_text(
+        "TASK_DONE_PR=task-1234 https://github.com/x/y/pull/8\n",
+        encoding="utf-8",
+    )
+
+    _write_tasks(project_dir, [
+        _make_task("task-1234", status="ready"),
+    ])
+    loop.tick(
+        project, coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Find indices.
+    pr_idx = -1
+    delete_idx = -1
+    for i, c in enumerate(fleet_run_recorder):
+        if c[1:3] == ["tasks", "set"] and any("pr_url=https://" in p for p in c):
+            pr_idx = i
+        if c[1:3] == ["workers", "delete"]:
+            delete_idx = i
+    assert delete_idx > 0, f"workers delete not invoked: {fleet_run_recorder}"
+    assert pr_idx >= 0
+    assert pr_idx < delete_idx, "pr_url must be persisted before delete"
+
+
+def test_sentinel_blocked_question_keeps_worker_dir(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: BLOCKED_QUESTION sentinel = lifecycle Waiting; the
+    worker dir is preserved so the operator can inspect blocked_reason.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    archive = fleet_home / "inbox" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "cccccc01-20260509-100001.md").write_text(
+        "BLOCKED_QUESTION=task-1234 should I use foo or bar?\n",
+        encoding="utf-8",
+    )
+
+    _write_tasks(project_dir, [_make_task("task-1234", status="ready")])
+    loop.tick(
+        project, coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    delete_calls = [c for c in fleet_run_recorder if c[1:3] == ["workers", "delete"]]
+    assert delete_calls == [], (
+        "blocked-question must NOT delete worker dir; got " + repr(delete_calls)
+    )
+
+
+def test_sentinel_worker_failed_triggers_workers_delete(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Issue #101: WORKER_FAILED sentinel = lifecycle TerminalFailure
+    → worker dir deleted.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    archive = fleet_home / "inbox" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "cccccc01-20260509-100002.md").write_text(
+        "WORKER_FAILED=task-1234 panic in main\n",
+        encoding="utf-8",
+    )
+
+    _write_tasks(project_dir, [_make_task("task-1234", status="ready")])
+    loop.tick(
+        project, coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    delete_calls = [c for c in fleet_run_recorder if c[1:3] == ["workers", "delete"]]
+    assert delete_calls, "failed worker dir should be deleted via sentinel apply"
+
+
+def test_workers_delete_failure_does_not_abort_tick(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch, capsys,
+) -> None:
+    """Issue #101: workers delete is best-effort. A failing CLI must
+    log to stderr but NOT roll back the tasks.md mutations or abort
+    the tick.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "shipper-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "shipper-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/7",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipper-aaaa", status="in-progress",
+            worker_pid=99996, pr_url="",
+        ),
+    ])
+
+    # Make `fleet workers delete` fail; everything else passes.
+    def fake_run(cmd, timeout_s=30.0):
+        if cmd[1:3] == ["workers", "delete"]:
+            raise RuntimeError("simulated delete failure")
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_run_fleet", side_effect=fake_run):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    # Tick must record the reconcile but NOT raise.
+    assert result.reconciled == 1
+    assert result.errors == [], (
+        "delete failures should be best-effort, not bubble into errors[]: "
+        + repr(result.errors)
+    )
+    captured = capsys.readouterr()
+    assert "workers delete failed" in captured.err

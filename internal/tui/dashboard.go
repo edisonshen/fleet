@@ -195,9 +195,15 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 
 	// Task counts + per-task rows. Read errors collapse to zero counts
 	// + nil Tasks — the row still renders so the operator can see the
-	// project exists. Per-task rows feed [j/k] navigation + [⏎] open;
-	// done tasks are filtered out so the dashboard doesn't drown in
-	// completed work (operator can see them via fleet tasks list).
+	// project exists. Per-task rows feed [j/k] navigation + [⏎] open.
+	//
+	// Issue #101 lifecycle hygiene: done + abandoned tasks ARE included
+	// here (previously filtered out). The row split between active +
+	// history happens in the row-list assembly path so the operator
+	// can collapse history under a `─── N done ───` separator without
+	// losing the entries entirely. This keeps tasks.md as the durable
+	// source of truth for task history while the TUI surface stays
+	// uncluttered by default.
 	if f, err := tasks.Read(filepath.Join(dir, "tasks.md")); err == nil {
 		for _, t := range f.Tasks {
 			switch t.Status {
@@ -212,12 +218,10 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 			case tasks.StatusDone:
 				row.Counts.Done++
 			}
-			if t.Status == tasks.StatusDone || t.Status == tasks.StatusAbandoned {
-				continue
-			}
 			row.Tasks = append(row.Tasks, &taskRow{
 				Slug:   t.Slug,
 				Status: string(t.Status),
+				PRURL:  t.PRURL,
 			})
 		}
 	}
@@ -286,6 +290,24 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 // scanWorkers reads <project>/workers/<slug>/state.json for every
 // active worker (skips archive/). Returns rows in undefined order; the
 // caller sorts.
+//
+// Lifecycle defense-in-depth (issue #101): when a worker dir's
+// state.json reports a TerminalSuccess (phase=done) or TerminalFailure
+// (phase=failed) phase, scanWorkers fires `workers.Delete` to rm-rf
+// the dir before returning the row. The deleted worker is omitted
+// from the returned slice so the dashboard renders the snapshot it
+// would see on the next tick (no row), avoiding a one-tick flicker
+// of the soon-to-disappear worker.
+//
+// Blocked is Waiting in the lifecycle classification — the worker dir
+// is intentionally kept (operator may inspect blocked_reason) and a
+// row is returned so the operator sees the blocked signal in the
+// right column.
+//
+// Coord skill is the primary trigger; this scan is the catch-all for
+// orphan dirs (coord crash, manual `fleet workers update`, dirs left
+// behind from before issue #101 landed). Both call the same Delete;
+// idempotent on ENOENT, so a coord-then-TUI race is safe.
 func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 	wDir := filepath.Join(projectDir, "workers")
 	entries, err := os.ReadDir(wDir)
@@ -297,6 +319,20 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		if !e.IsDir() || e.Name() == "archive" {
 			continue
 		}
+		// Skip in-flight delete-staging dirs. workers.Delete renames
+		// to `<slug>.deleting-YYYYMMDD-HHMMSS[-N]` before RemoveAll;
+		// the dir is short-lived (microseconds on POSIX same-fs)
+		// but a tick that catches one mid-rename would otherwise
+		// surface a row for a soon-to-vanish worker.
+		//
+		// We anchor on the shape `*.deleting-<UTCstamp>` rather than
+		// a bare substring match so an operator-authored slug whose
+		// text happens to contain `.deleting-` (allowed by
+		// state.ValidateSlug — periods + hyphens are valid runes)
+		// still renders normally.
+		if isDeletingStagingName(e.Name()) {
+			continue
+		}
 		path := filepath.Join(wDir, e.Name(), "state.json")
 		data, err := os.ReadFile(path)
 		if err != nil {
@@ -306,12 +342,68 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		if err := json.Unmarshal(data, &s); err != nil {
 			continue
 		}
+		// Defense-in-depth: rm-rf done/failed worker dirs the coord
+		// skill missed. Skip the row so the snapshot matches what the
+		// next render will see (the dir is gone). Errors are
+		// swallowed — the operator's visible state is correct
+		// either way; logging here would spam the TUI's stdout
+		// (which lipgloss has already painted over).
+		if s.Phase == workers.PhaseDone || s.Phase == workers.PhaseFailed {
+			_ = workersDeleteFn(project, s.Slug)
+			continue
+		}
 		row := workerRowFor(&s, project, now)
 		if row != nil {
 			out = append(out, row)
 		}
 	}
 	return out
+}
+
+// workersDeleteFn is the Delete function the dashboard scan calls.
+// var so tests can stub the disk write without seeding a real worker
+// tree. Production calls workers.Delete.
+var workersDeleteFn = workers.Delete
+
+// isDeletingStagingName reports whether name matches the shape
+// workers.Delete renames to before RemoveAll:
+//
+//	<base>.deleting-YYYYMMDD-HHMMSS
+//	<base>.deleting-YYYYMMDD-HHMMSS-<digit>   (collision-retry suffix)
+//
+// We anchor on the trailing 15-char timestamp + optional `-<digit>` so
+// an operator-authored slug whose text legitimately contains the
+// substring `.deleting-` (allowed by state.ValidateSlug) still passes.
+// Returns false on any pattern mismatch.
+func isDeletingStagingName(name string) bool {
+	const marker = ".deleting-"
+	const stampLen = len("YYYYMMDD-HHMMSS") // 15
+	i := strings.LastIndex(name, marker)
+	if i < 0 {
+		return false
+	}
+	rest := name[i+len(marker):]
+	// Strip optional `-<digit>` collision suffix.
+	if len(rest) >= 2 && rest[len(rest)-2] == '-' && rest[len(rest)-1] >= '0' && rest[len(rest)-1] <= '9' {
+		rest = rest[:len(rest)-2]
+	}
+	if len(rest) != stampLen {
+		return false
+	}
+	// Validate stamp shape: 8 digits, hyphen, 6 digits.
+	for k, c := range rest {
+		switch k {
+		case 8:
+			if c != '-' {
+				return false
+			}
+		default:
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // workerRowFor maps one State into a WorkerRow with display fields.

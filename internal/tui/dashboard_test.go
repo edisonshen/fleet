@@ -1217,3 +1217,170 @@ func TestFormatUptime(t *testing.T) {
 		}
 	}
 }
+
+// TestScanWorkers_DeletesDoneWorkerDir — issue #101 lifecycle hygiene
+// defense-in-depth. A worker dir whose state.json shows phase=done
+// is rm-rf'd during the scan AND omitted from the returned rows so
+// the dashboard renders the snapshot it would see on the next tick.
+func TestScanWorkers_DeletesDoneWorkerDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	exit := 0
+	seedWorker(t, pdir, "fleet", "done-1a2b", workers.State{
+		Phase: workers.PhaseDone,
+		PRURL: "https://example.invalid/pr/1",
+		Exit:  &exit,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	for _, r := range rows {
+		if r.Slug == "done-1a2b" {
+			t.Fatalf("done worker should be filtered from rows; got %+v", r)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "fleet", "workers", "done-1a2b")); !os.IsNotExist(err) {
+		t.Fatalf("done worker dir should be removed; stat err=%v", err)
+	}
+}
+
+// TestScanWorkers_DeletesFailedWorkerDir mirrors the done case for
+// the TerminalFailure path.
+func TestScanWorkers_DeletesFailedWorkerDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	exit := 1
+	seedWorker(t, pdir, "fleet", "failed-cd34", workers.State{
+		Phase:         workers.PhaseFailed,
+		BlockedReason: "exit 1",
+		Exit:          &exit,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	for _, r := range rows {
+		if r.Slug == "failed-cd34" {
+			t.Fatalf("failed worker should be filtered from rows; got %+v", r)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "fleet", "workers", "failed-cd34")); !os.IsNotExist(err) {
+		t.Fatalf("failed worker dir should be removed; stat err=%v", err)
+	}
+}
+
+// TestScanWorkers_KeepsBlockedWorkerDir — Blocked is Waiting in the
+// lifecycle classification. Dir must survive AND row must render so
+// the operator sees the blocked signal in the right column.
+func TestScanWorkers_KeepsBlockedWorkerDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "blocked-1a2b", workers.State{
+		Phase:         workers.PhaseBlocked,
+		BlockedReason: "needs operator clarification",
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	found := false
+	for _, r := range rows {
+		if r.Slug == "blocked-1a2b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("blocked worker should appear in rows")
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "fleet", "workers", "blocked-1a2b")); err != nil {
+		t.Fatalf("blocked worker dir should survive: %v", err)
+	}
+}
+
+// TestScanWorkers_KeepsActiveWorkerDir — running workers are obviously
+// preserved.
+func TestScanWorkers_KeepsActiveWorkerDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedWorker(t, pdir, "fleet", "active-1a2b", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	found := false
+	for _, r := range rows {
+		if r.Slug == "active-1a2b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("active worker should appear in rows")
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "fleet", "workers", "active-1a2b")); err != nil {
+		t.Fatalf("active worker dir should survive: %v", err)
+	}
+}
+
+// TestScanWorkers_SkipsDeletingStagingDir — workers.Delete renames
+// to <slug>.deleting-<stamp>/ before RemoveAll. A staging dir caught
+// mid-rm must not surface as a worker row.
+func TestScanWorkers_SkipsDeletingStagingDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	staging := filepath.Join(pdir, "fleet", "workers", "tgt-1a2b.deleting-20260509-100000")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("mkdir staging: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "state.json"), []byte(`{"slug":"tgt-1a2b","phase":"done","pr_url":"https://x"}`), 0o644); err != nil {
+		t.Fatalf("write state.json in staging: %v", err)
+	}
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	for _, r := range rows {
+		if strings.Contains(r.Slug, "deleting") {
+			t.Fatalf("staging dir should not surface; got row %+v", r)
+		}
+	}
+}
+
+// TestIsDeletingStagingName — issue #101 regression. Anchor the
+// staging-dir filter on the exact shape `<base>.deleting-<UTCstamp>`
+// so a legitimate slug whose text contains the substring `.deleting-`
+// still renders normally. ValidateSlug allows periods + hyphens, so
+// `phase.deleting-stage-1a2b` is a valid slug today.
+func TestIsDeletingStagingName(t *testing.T) {
+	t.Run("matches canonical", func(t *testing.T) {
+		if !isDeletingStagingName("foo-1a2b.deleting-20260509-100000") {
+			t.Fatal("canonical staging name should match")
+		}
+	})
+	t.Run("matches collision suffix", func(t *testing.T) {
+		if !isDeletingStagingName("foo-1a2b.deleting-20260509-100000-1") {
+			t.Fatal("collision-suffixed staging name should match")
+		}
+	})
+	t.Run("rejects bare substring", func(t *testing.T) {
+		// Legitimate slug; not a staging dir.
+		if isDeletingStagingName("phase.deleting-stage-1a2b") {
+			t.Fatal("legitimate slug containing `.deleting-` should NOT match")
+		}
+	})
+	t.Run("rejects non-stamp tail", func(t *testing.T) {
+		if isDeletingStagingName("foo.deleting-not-a-stamp") {
+			t.Fatal("non-stamp tail should NOT match")
+		}
+	})
+	t.Run("rejects missing marker", func(t *testing.T) {
+		if isDeletingStagingName("foo-1a2b") {
+			t.Fatal("regular slug without marker should NOT match")
+		}
+	})
+}
+
+// TestScanWorkers_DoesNotMisclassifyLegitimateSlug — defense-in-depth
+// regression. A worker slug whose text contains `.deleting-` (allowed
+// by state.ValidateSlug) must still render normally — not be silently
+// dropped by the staging-dir filter.
+func TestScanWorkers_DoesNotMisclassifyLegitimateSlug(t *testing.T) {
+	pdir := withFleetHome(t)
+	// `phase.deleting-stage-1a2b` is a legitimate slug per
+	// state.ValidateSlug (lowercase + digits + . / - / _ allowed).
+	seedWorker(t, pdir, "fleet", "phase.deleting-stage-1a2b", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	found := false
+	for _, r := range rows {
+		if r.Slug == "phase.deleting-stage-1a2b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("legitimate slug containing `.deleting-` substring should render normally")
+	}
+}

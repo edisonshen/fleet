@@ -826,6 +826,14 @@ class _ReconcileAction:
                                 # attached and the next reconcile keeps
                                 # polling the dead PR (codex iter-3
                                 # [P2]).
+    delete_worker_dir: bool = False  # issue #101 lifecycle hygiene:
+                                     # set when the worker reached a
+                                     # terminal phase (done|failed). The
+                                     # apply step rm-rf's the worker dir
+                                     # AFTER persisting set_pr_url +
+                                     # status onto tasks.md, so the
+                                     # operator-visible PR URL outlives
+                                     # the dir cleanup.
 
 
 def _reconcile_inflight(
@@ -884,9 +892,17 @@ def _reconcile_inflight(
                     # leaving the stale PR URL would have the next
                     # reconcile poll the wrong PR (codex iter-3 [P2]).
                     action.set_pr_url = pr_url
+                    # Issue #101 lifecycle hygiene: worker reached
+                    # TerminalSuccess. set_pr_url runs first in
+                    # _apply_reconcile so the operator-visible PR
+                    # URL outlives the dir cleanup.
+                    action.delete_worker_dir = True
                     actions.append(action)
                     continue
                 if phase == "blocked" and blocked_reason:
+                    # Lifecycle Waiting — operator may unblock the
+                    # task; the dir's blocked_reason is still useful
+                    # context. KEEP the dir (no delete_worker_dir).
                     actions.append(_ReconcileAction(
                         slug=t.slug, new_status="blocked",
                         clear_worker=True,
@@ -896,12 +912,14 @@ def _reconcile_inflight(
                     ))
                     continue
                 if phase == "failed":
+                    # Lifecycle TerminalFailure — delete the dir.
                     actions.append(_ReconcileAction(
                         slug=t.slug, new_status="todo", clear_worker=True,
                         clear_pr_url=True,
                         note="worker failed",
                         raised_to_user=True,
                         raise_text=f"{t.slug} worker failed",
+                        delete_worker_dir=True,
                     ))
                     continue
                 # phase=done without pr_url, or phase=blocked
@@ -910,23 +928,32 @@ def _reconcile_inflight(
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:
+                # Task done; any lingering worker dir (likely
+                # phase=done from earlier) is deletable.
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="done", clear_worker=True,
+                    delete_worker_dir=True,
                 ))
             elif ci.all_green and not ci.merged:
+                # Worker exited done; tasks.md already at in-review.
+                # Dir is no-longer-needed read-only state from the
+                # worker — delete to keep the tree neat.
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="in-review",
                     raised_to_user=True,
                     raise_text=f"CI green for {t.slug}, ready to merge",
+                    delete_worker_dir=True,
                 ))
             elif not ci.mergeable:
                 # Rebase needed — keep the existing pr_url; the
                 # operator (or a re-dispatch) will rebase the SAME
                 # branch onto main, so the PR URL is still the right
-                # poll target.
+                # poll target. Worker that opened the PR is gone;
+                # the dir on disk is junk now → delete.
                 actions.append(_ReconcileAction(
                     slug=t.slug, new_status="todo", clear_worker=True,
                     note="rebase needed",
+                    delete_worker_dir=True,
                 ))
             elif ci.failed:
                 # CI red — clear pr_url so a re-dispatched worker's
@@ -941,14 +968,19 @@ def _reconcile_inflight(
                     note=f"CI red {t.pr_url}",
                     raised_to_user=True,
                     raise_text=f"CI red for {t.slug}",
+                    delete_worker_dir=True,
                 ))
             else:
                 # CI pending — leave as-is until next tick.
                 continue
         else:
+            # Worker died without PR. Dir might exist with stale
+            # state.json or might be missing entirely; delete is
+            # idempotent on ENOENT, so it's safe to fire.
             actions.append(_ReconcileAction(
                 slug=t.slug, new_status="todo", clear_worker=True,
                 note="worker died without PR",
+                delete_worker_dir=True,
             ))
     return actions
 
@@ -1099,6 +1131,10 @@ def _apply_reconcile(
     effort semantics as the sentinel-side cleanup — failures stay out
     of the reconcile result.
     """
+    # Order is load-bearing for the lifecycle hygiene contract (issue
+    # #101): the PR URL MUST land on tasks.md BEFORE the worker dir is
+    # rm-rf'd. set_pr_url runs ahead of delete_worker_dir; otherwise a
+    # crash between them would lose the operator-visible PR link.
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     if action.clear_pr_url:
@@ -1117,6 +1153,13 @@ def _apply_reconcile(
     # checkout.
     if action.new_status in ("done", "todo"):
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
+    # Issue #101 lifecycle hygiene: rm-rf workers/<slug>/ on terminal
+    # transitions (done/failed). Delete is idempotent on missing dir
+    # so a coord-then-TUI race is safe — first mover wins. Best-effort:
+    # any failure logs to stderr and does NOT roll back the tasks.md
+    # mutations above, matching the worktree-cleanup discipline.
+    if action.delete_worker_dir:
+        _maybe_delete_worker_dir(action.slug, fleet_bin, project)
     # Note: action.raised_to_user is informational; the operator sees
     # the raise via the agent record's needs_input + the appended note.
     # The skill doesn't fan out a separate inbox message — the next
@@ -1133,6 +1176,11 @@ class _SentinelAction:
     payload: str = ""
     raised_to_user: bool = False
     raise_text: str = ""
+    # delete_worker_dir is set in _apply_sentinel based on `kind`
+    # (task_done_pr / worker_failed → True; blocked_question /
+    # new_task → False). It's not part of the parsed sentinel grammar
+    # — the field lives on the action so the apply path can drive
+    # the lifecycle cleanup uniformly with _ReconcileAction.
 
 
 def _drain_archive(
@@ -1258,10 +1306,18 @@ def _apply_sentinel(
     log to stderr but don't roll back the tasks.md mutation.
     """
     if action.kind == "task_done_pr":
+        # Order matters for issue #101: pr_url onto tasks.md FIRST,
+        # then status flip, then worker dir delete. The PR URL must
+        # be durable on the task entry before the worker dir (the
+        # only on-disk source of the URL pre-persist) is rm-rf'd.
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.payload}"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-review"])
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
+        # Worker reached TerminalSuccess — rm-rf workers/<slug>/.
+        _maybe_delete_worker_dir(action.slug, fleet_bin, project)
     elif action.kind == "blocked_question":
+        # Lifecycle Waiting — operator may un-block the task; KEEP
+        # the worker dir (its blocked_reason is still useful context).
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=blocked"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"BLOCKED_QUESTION: {action.payload}"])
@@ -1271,11 +1327,39 @@ def _apply_sentinel(
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
+        # Worker reached TerminalFailure — rm-rf workers/<slug>/.
+        _maybe_delete_worker_dir(action.slug, fleet_bin, project)
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
         # was the wake; dispatch_ready in the same tick will pick up
         # the new task if it's ready.
         return
+
+
+def _maybe_delete_worker_dir(slug: str, fleet_bin: str, project: str) -> None:
+    """Best-effort `fleet workers delete` for the named slug.
+
+    Issue #101 lifecycle hygiene path. Fired on terminal-phase
+    transitions (done/failed) AFTER the operator-visible PR URL has
+    been persisted onto the task entry. Idempotent on already-gone
+    dirs (the Go-side workers.Delete returns nil on ENOENT).
+
+    Failures are logged to stderr but do NOT bubble up. The worker
+    dir may persist on disk; the TUI defense-in-depth `scanWorkers`
+    pass picks up any orphan on the next render. Aborting the
+    reconcile/sentinel apply on a cleanup failure would leave
+    tasks.md inconsistent with reality.
+    """
+    if not slug or not project:
+        return
+    try:
+        _run_fleet([fleet_bin, "workers", "delete", "--project", project, slug])
+    except Exception as exc:  # noqa: BLE001
+        import sys
+        print(
+            f"coord: workers delete failed for {slug}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _maybe_remove_worktree(

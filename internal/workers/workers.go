@@ -433,6 +433,105 @@ func isTerminalPhase(p Phase) bool {
 	return false
 }
 
+// Delete removes workers/<slug>/ entirely (rm -rf, no archive). Used
+// by the lifecycle hygiene path (issue #101) when a worker reaches a
+// terminal phase (done | failed) — the operator-visible PR URL is
+// already persisted on the task entry, so the worker dir contributes
+// no extra information and just clutters the project tree.
+//
+// Validation:
+//   - slug must pass state.ValidateSlug (rejects "..", "/", empty, etc).
+//   - destination MUST resolve under
+//     ~/.fleet/projects/<project>/workers/ — defense against a
+//     bug-introduced path traversal that could otherwise let a
+//     mis-routed Delete recurse into something operator-owned.
+//   - the archive/ subdir is NOT a valid target. Archive entries are
+//     pruned via PruneArchive's age-based path; a slug parameter that
+//     literally equals "archive" would resolve to workers/archive/ and
+//     blow away every archived worker. Refuse explicitly.
+//
+// Idempotency: returns nil when the dir is already gone (ENOENT). The
+// design's "first mover wins; second sees ENOENT" contract for the
+// dual-trigger TUI/coord cleanup flow depends on this.
+//
+// Atomicity: rename to a sibling `<slug>.deleting-<UTCstamp>/` first,
+// then RemoveAll on the staged path. A crash mid-delete leaves at most
+// a `.deleting-...` directory, never a partial slug dir that a future
+// Read would mistake for live state. Stamp-suffix avoids collisions if
+// Delete is retried after a partial crash. Best-effort: rename failure
+// (cross-filesystem, permissions) falls back to direct RemoveAll —
+// less crash-safe but still gets the dir gone in the common case.
+//
+// NB: Delete does NOT take the per-worker flock that Archive holds.
+// The intended caller is the coord skill (post-Agent-tool-return) and
+// the TUI defense-in-depth scan, both of which run AFTER the worker
+// process has exited and the task entry has the PR URL persisted. A
+// concurrent UpdateState landing during a Delete would recreate the
+// dir; that's the operator's bug to surface (writing to a worker the
+// caller already declared terminal), not a state we work around here.
+// Future: layer the same lock + precondition pattern as Archive if
+// we observe the race in practice.
+func Delete(project, slug string) error {
+	if err := state.ValidateSlug(slug); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidSlug, err)
+	}
+	if slug == "archive" {
+		return fmt.Errorf("%w: refusing to delete archive directory", ErrInvalidSlug)
+	}
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return err
+	}
+	src, err := state.WorkerDir(project, slug)
+	if err != nil {
+		return err
+	}
+	src = strings.TrimSuffix(src, string(filepath.Separator))
+
+	// Path-traversal safety net. state.WorkerDir already constructs the
+	// path from validated components, but a future refactor could
+	// silently change that — keep an independent boundary check here so
+	// a regression surfaces before it lets us recurse into something
+	// outside workers/.
+	workersRoot := filepath.Join(pdir, "workers")
+	rel, relErr := filepath.Rel(workersRoot, src)
+	if relErr != nil || strings.HasPrefix(rel, "..") || rel == "." {
+		return fmt.Errorf("%w: resolved path %q escapes workers root", ErrInvalidSlug, src)
+	}
+
+	if _, statErr := os.Stat(src); os.IsNotExist(statErr) {
+		return nil
+	} else if statErr != nil {
+		return fmt.Errorf("stat worker dir: %w", statErr)
+	}
+
+	// Stage rename to a sibling `<slug>.deleting-<UTCstamp>` so a crash
+	// can't leave the operator wondering whether `workers/<slug>/` is
+	// half-deleted. Stamp avoids EEXIST on retry-after-crash.
+	stamp := time.Now().UTC().Format("20060102-150405")
+	staged := filepath.Join(workersRoot, slug+".deleting-"+stamp)
+	for attempt := 0; attempt < 4; attempt++ {
+		err := os.Rename(src, staged)
+		if err == nil {
+			return os.RemoveAll(staged)
+		}
+		if os.IsNotExist(err) {
+			// Won the race against another Delete. Idempotent — fine.
+			return nil
+		}
+		// EEXIST on the staged target — bump suffix and retry.
+		if os.IsExist(err) {
+			staged = filepath.Join(workersRoot, fmt.Sprintf("%s.deleting-%s-%d", slug, stamp, attempt+1))
+			continue
+		}
+		// Cross-filesystem rename or permission — fall back to direct
+		// RemoveAll. Less crash-safe but the common-case POSIX same-fs
+		// path already returned by now.
+		return os.RemoveAll(src)
+	}
+	return fmt.Errorf("rename %s → %s after 4 attempts", src, staged)
+}
+
 // PruneArchive removes archive directories older than olderThan.
 // Decision is based on the UTC timestamp embedded in the directory
 // name (`<slug>-YYYYMMDD-HHMMSS`). We do NOT use mtime because
