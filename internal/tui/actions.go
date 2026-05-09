@@ -21,6 +21,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // taskAddDoneMsg is emitted after the in-process tasks.Add call
@@ -350,19 +351,37 @@ func addTask(project, spec string) (string, error) {
 // when a task row is selected. Best-effort: a missing tasks.md or
 // missing slug surfaces the error in the panel rather than blocking
 // the open.
-func readTaskDetail(project, slug string) (string, string) {
-	title := fmt.Sprintf("task: %s/%s", project, slug)
+//
+// Issue #75 — for blocked tasks, surface enough context for the
+// operator to "see attention → drill in → see question → respond":
+//
+//   - The question itself: worker.BlockedReason (the worker explicitly
+//     wrote what it's blocked on) and the task's Notes blob (operator/
+//     coord-edited markdown). Show both when present, BlockedReason
+//     first because it's the structured signal.
+//   - Worker handle: slug, phase, PID, age. So the operator knows
+//     which `claude --print` subprocess wrote the question and whether
+//     it's still alive (PID alive → [a] peeks output.log; dead → flash
+//     "no worker for task").
+//   - Action hint: [a] hint stays in the overlay's footer ("press [esc]
+//     or [⏎] to close") — the keys.go interceptor handles [a] routing.
+//
+// We render the worker block ABOVE the task spec when present so a
+// blocked task's question reads first. Spec/Acceptance/Notes follow
+// for full task context.
+func readTaskDetail(project, slug string) (body, title string, loaded bool) {
+	title = fmt.Sprintf("task: %s/%s", project, slug)
 	dir, err := state.ProjectDir(project)
 	if err != nil {
-		return fmt.Sprintf("error: %v", err), title
+		return fmt.Sprintf("error: %v", err), title, false
 	}
 	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
 	if err != nil {
-		return fmt.Sprintf("error reading tasks.md: %v", err), title
+		return fmt.Sprintf("error reading tasks.md: %v", err), title, false
 	}
 	t, err := f.Get(slug)
 	if err != nil {
-		return fmt.Sprintf("task not found: %v", err), title
+		return fmt.Sprintf("task not found: %v", err), title, false
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "status:    %s\n", t.Status)
@@ -378,6 +397,83 @@ func readTaskDetail(project, slug string) (string, string) {
 	if len(t.DependsOn) > 0 {
 		fmt.Fprintf(&b, "depends:   %s\n", strings.Join(t.DependsOn, ", "))
 	}
+
+	// Worker context (issue #75). Branches:
+	//   1. active worker present — render slug/phase/PID +
+	//      BlockedReason as the "current question" when blocked.
+	//   2. worker-state read FAILED with a non-ENOENT error —
+	//      surface verbatim so the underlying issue is visible
+	//      rather than masked as "no worker" (codex iter-1 P2).
+	//   3. active dir gone but archive present — codex iter-7 P2:
+	//      one-tick lag after the coord archives a finished worker
+	//      means the task row still shows; surface the archived
+	//      state so the operator sees the last question/log
+	//      instead of a misleading retry hint.
+	//   4. active and archive both absent AND task is in a state
+	//      that should have one (blocked/in-progress) — render the
+	//      no-worker recovery hint.
+	ws, werr := readTaskWorker(project, slug)
+	switch {
+	case werr == nil && ws != nil:
+		b.WriteString("\n### Worker\n")
+		fmt.Fprintf(&b, "slug:      %s\n", ws.Slug)
+		fmt.Fprintf(&b, "phase:     %s\n", ws.Phase)
+		if ws.PID > 0 {
+			fmt.Fprintf(&b, "pid:       %d\n", ws.PID)
+		}
+		if !ws.UpdatedAt.IsZero() {
+			fmt.Fprintf(&b, "updated:   %s\n", ws.UpdatedAt.UTC().Format(time.RFC3339))
+		}
+		if reason := strings.TrimSpace(ws.BlockedReason); reason != "" {
+			b.WriteString("\nquestion (worker blocked_reason):\n")
+			b.WriteString(reason)
+			b.WriteString("\n")
+		}
+	case werr != nil:
+		// Genuine read failure — surface so the operator sees the
+		// underlying problem rather than a misleading "no worker" hint.
+		b.WriteString("\n### Worker\n")
+		fmt.Fprintf(&b, "error reading worker state: %v\n", werr)
+	default:
+		// werr == nil && ws == nil → ErrNotFound on the active dir.
+		// Codex iter-7 P2: try archive before suggesting retry.
+		if archS := readArchivedWorkerState(project, slug); archS != nil {
+			b.WriteString("\n### Worker (archived)\n")
+			fmt.Fprintf(&b, "slug:      %s\n", archS.Slug)
+			fmt.Fprintf(&b, "phase:     %s\n", archS.Phase)
+			if archS.PID > 0 {
+				fmt.Fprintf(&b, "pid:       %d\n", archS.PID)
+			}
+			if !archS.UpdatedAt.IsZero() {
+				fmt.Fprintf(&b, "updated:   %s\n", archS.UpdatedAt.UTC().Format(time.RFC3339))
+			}
+			if reason := strings.TrimSpace(archS.BlockedReason); reason != "" {
+				b.WriteString("\nlast question (worker blocked_reason):\n")
+				b.WriteString(reason)
+				b.WriteString("\n")
+			}
+			fmt.Fprintf(&b, "\n(active worker dir archived; `fleet peek %s --project %s` for full logs)\n", slug, project)
+			break
+		}
+		// Codex iter-9 P2 #2: workers/<slug>/ may exist while
+		// state.json hasn't landed yet (startup window). Mirror the
+		// [a] handler's tristate so the panel matches the "(no
+		// state.json yet)" peek path instead of suggesting retry.
+		if taskWorkerDirExists(project, slug) {
+			b.WriteString("\n### Worker\n")
+			b.WriteString("worker dir present, state.json pending — press [a] for the live peek\n")
+			break
+		}
+		// No archive, no dir. Show the no-worker recovery hint only
+		// when the task SHOULD have a worker. Codex iter-4 P2:
+		// include --project so a cross-project cwd doesn't update
+		// the wrong tasks.md.
+		if t.Status == tasks.StatusBlocked || t.Status == tasks.StatusInProgress {
+			b.WriteString("\n### Worker\n")
+			fmt.Fprintf(&b, "no worker state on disk — `fleet tasks set %s status=ready --project %s` to retry\n", slug, project)
+		}
+	}
+
 	b.WriteString("\n### Spec\n")
 	b.WriteString(strings.TrimSpace(t.Spec))
 	if t.Acceptance != "" {
@@ -388,7 +484,80 @@ func readTaskDetail(project, slug string) (string, string) {
 		b.WriteString("\n\n### Notes\n")
 		b.WriteString(strings.TrimSpace(t.Notes))
 	}
-	return b.String(), title
+	return b.String(), title, true
+}
+
+// readTaskWorker is the var-stub-able worker.ReadState wrapper used by
+// the task detail panel. Returns (nil, nil) when no worker exists for
+// the task — distinguished from (nil, err) for genuine read errors so
+// the caller can render the right hint. Tests can stub the var to seed
+// the panel without touching disk.
+var readTaskWorker = func(project, slug string) (*workers.State, error) {
+	s, err := workers.ReadState(project, slug)
+	if errors.Is(err, workers.ErrNotFound) {
+		return nil, nil
+	}
+	return s, err
+}
+
+// readArchivedWorkerState reads state.json from the most recent
+// archive directory matching slug. Returns nil when no archive
+// exists or the file is unreadable. Used by readTaskDetail (codex
+// iter-7 P2) to surface the last known worker context for a task
+// whose active worker dir has been archived but whose row still
+// shows on the dashboard. var so tests can stub.
+var readArchivedWorkerState = func(project, slug string) *workers.State {
+	dir := newestArchiveWorkerDir(project, slug)
+	if dir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		return nil
+	}
+	var s workers.State
+	if jerr := json.Unmarshal(data, &s); jerr != nil {
+		return nil
+	}
+	return &s
+}
+
+// liveTaskStatus reads the current task status from tasks.md. Used by
+// the detail-panel [a] interceptor (codex iter-3 P2) so a status
+// transition between dashboard ticks doesn't strand the cached
+// taskStatus and route to the wrong hint.
+//
+// Codex iter-9 P2 #1: returns a tristate so callers can distinguish:
+//   - status non-empty: task exists at this status (override snapshot).
+//   - status "" + missing=true: tasks.md read OK, slug not found
+//     (task was archived/deleted). attachToTaskOrHint surfaces the
+//     "no longer exists" flash.
+//   - status "" + missing=false: tasks.md read failed (transient I/O,
+//     malformed). Caller MUST fall back to snapshot status rather
+//     than misclassify the task as deleted.
+//
+// var so tests can stub without seeding tasks.md on disk.
+var liveTaskStatus = func(project, slug string) (status string, missing bool) {
+	if project == "" || slug == "" {
+		return "", false
+	}
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", false
+	}
+	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		// Read error (transient I/O, parse failure). Don't claim the
+		// task is gone; caller falls back to snapshot.
+		return "", false
+	}
+	t, err := f.Get(slug)
+	if err != nil {
+		// tasks.md read OK but slug not found → task is genuinely
+		// archived or deleted.
+		return "", true
+	}
+	return string(t.Status), false
 }
 
 // (projectDetail removed — issue #59: [⏎] on a project row now toggles

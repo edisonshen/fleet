@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -200,6 +201,27 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		if key == "q" || key == "ctrl+c" {
 			return m, nil, false
 		}
+		// Issue #75: [a] inside a task detail panel re-routes to the
+		// task's worker peek. Without this interceptor the panel would
+		// dismiss and the operator would have to find the task row
+		// again to press [a] — defeats "drill in → attach to respond"
+		// flow. Worker / agent / help panels still dismiss on [a]
+		// because their default behavior IS [a]-as-dismiss.
+		//
+		// Codex iter-2 P2: pre-dispatch tasks (todo/ready) get the
+		// same dispatch hint as the row-side [a] handler — without
+		// this gate, opening a todo task's detail and pressing [a]
+		// would flash the blocked-task recovery command, which is
+		// the wrong next step for a task that just hasn't been
+		// dispatched yet.
+		if key == "a" && m.detail != nil && m.detail.taskSlug != "" {
+			// Codex iter-3 P2 + iter-5 P2: route through the unified
+			// attach-or-hint dispatcher. It peeks any existing worker
+			// (active or archived) regardless of status so reset-to-
+			// todo recovery cases retain log access; only when no
+			// worker exists does it surface the status-specific hint.
+			return m.attachToTaskOrHint(m.detail.taskProject, m.detail.taskSlug, m.detail.taskStatus)
+		}
 		m.showHelp = false
 		m.detail = nil
 		return m, nil, true
@@ -384,15 +406,308 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		return m, nil, true
 	case rowProject:
 		return m.actionAttachProject(row.project)
+	case rowTask:
+		// Issue #75: [a] on a task row routes to the task's worker
+		// peek panel — same path as [a] on a worker row. Workers in
+		// v0.2 are `claude --print` subprocesses (no tmux), so
+		// "attach" maps to opening the worker peek (state.json +
+		// output.log tail) which IS where the operator sees what the
+		// worker is asking. When no worker exists for the task, flash
+		// the actionable retry hint.
+		//
+		// Codex iter-1 P2: gate on task status so todo/ready tasks
+		// don't get a misleading "no worker" error. Those tasks
+		// legitimately have no worker yet (operator hasn't dispatched);
+		// flash a different hint that points at the right next step
+		// (`fleet dispatch <task>`).
+		if row.task == nil || row.task.Empty || row.task.More > 0 {
+			return m, nil, true
+		}
+		// Codex iter-3 P1: pre-dispatch tasks need accurate next-step
+		// guidance. Workers are spawned by the coord, NOT by [d] (which
+		// is the loose-agent repo picker). The coord auto-dispatches
+		// tasks in `ready` status, so the right operator action is:
+		//   - todo  → `fleet tasks promote <slug>` to flip to ready.
+		//   - ready → wait for the coord to pick it up (or check that
+		//             a coord exists for this project via [a] on the
+		//             project row).
+		//
+		// Codex iter-4 P3: re-read live status from tasks.md so a
+		// task transitioning between snapshots doesn't dead-end on
+		// stale routing.
+		//
+		// Codex iter-5 P2: prefer attaching to an existing worker
+		// peek even when status is todo/ready. The reconcile path
+		// flips failed workers back to todo by clearing only
+		// worker_pid; the worker dir + state.json + output.log are
+		// preserved for post-mortem. Routing on status alone would
+		// hide that history. attachToTaskWorker is the right
+		// dispatcher: it peeks when a worker exists (active or
+		// archived) and falls through to the no-worker hint when
+		// neither does, at which point the row-side handler still
+		// gets the chance to override with the more specific
+		// promote / wait-for-coord guidance.
+		return m.attachToTaskOrHint(row.parentProject, row.task.Slug, row.task.Status)
 	default:
-		// Task rows (and any future row kinds) — neither tmux nor a
-		// peek surface fits. Flash so the operator sees the no-op.
+		// Future row kinds — neither tmux nor a peek surface fits. Flash
+		// so the operator sees the no-op.
 		m.flash = &flashMsg{
-			text:  "[a] attach applies to projects (coord), agents (tmux), or workers (peek); not to tasks",
+			text:  "[a] attach applies to projects (coord), agents (tmux), workers (peek), or tasks (worker peek)",
 			isErr: true,
 		}
 		return m, nil, true
 	}
+}
+
+// noWorkerHintTodo and noWorkerRecoveryHint emit the operator-facing
+// flash text for [a] on a task with no worker. Codex iter-4 P2: both
+// shapes embed the project name + --project flag because the
+// dashboard cursor can be on a project different from the operator's
+// shell cwd. Without --project, `fleet tasks promote <slug>` resolves
+// against cwd's project tag and updates the wrong tasks.md (or
+// errors). Rendering the project explicitly lets the operator copy-
+// paste the command without tripping over cross-project context.
+func noWorkerHintTodo(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is todo — `fleet tasks promote %s --project %s` to make it eligible for the coord",
+		project, slug, slug, project)
+}
+
+func noWorkerHintReady(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is ready — waiting for the coord to dispatch a worker; check coord on the project row",
+		project, slug)
+}
+
+// noWorkerHintInReview emits the post-completion holding-state hint.
+// Codex iter-6 P2: in-review tasks have no active worker BY DESIGN —
+// the coord archives the worker dir on phase=done and the task
+// status flips to in-review pending CI / merge. Suggesting
+// status=ready would silently re-dispatch already-completed work.
+// `fleet peek <slug>` reads from the active dir then falls back to
+// archive automatically (peek.go's readWorkerStateAnywhere).
+func noWorkerHintInReview(project, slug string) string {
+	return fmt.Sprintf(
+		"task %s/%s is in-review — work is done, awaiting CI / merge; `fleet peek %s --project %s` for the archived worker logs",
+		project, slug, slug, project)
+}
+
+// noWorkerHintTerminal covers done / abandoned. Worker dir is archived
+// and may have been pruned (default 7d). No re-dispatch path applies.
+func noWorkerHintTerminal(project, slug, status string) string {
+	return fmt.Sprintf(
+		"task %s/%s is %s — terminal state, no worker to attach to; `fleet peek %s --project %s` for archived logs (if not yet pruned)",
+		project, slug, status, slug, project)
+}
+
+func noWorkerRecoveryHint(project, slug string) string {
+	return fmt.Sprintf(
+		"no worker for task %s/%s — `fleet tasks set %s status=ready --project %s` to retry",
+		project, slug, slug, project)
+}
+
+// attachToTaskOrHint is the unified [a] dispatcher for task rows and
+// the task detail panel. Routes by worker existence, NOT by task
+// status:
+//
+//  1. Worker state.json exists OR worker dir exists (state.json may
+//     not have landed yet — startup/rename window) OR archive dir
+//     exists → open peek panel via attachToTaskWorker (which handles
+//     all three via readWorkerDetail's active+archive split).
+//  2. No worker on disk
+//     → flash status-aware guidance (promote / wait-for-coord /
+//     retry) so the operator's next step matches the task's
+//     actual lifecycle position.
+//
+// Codex iter-5 P2 fix: the previous version short-circuited on
+// status BEFORE checking worker existence, hiding existing logs from
+// reset-to-todo recovery flows.
+//
+// Codex iter-3 P2 / iter-4 P3 are preserved here: live status read
+// overrides the snapshot status so a transition between refreshes
+// doesn't dead-end on stale routing.
+//
+// Codex iter-8 P2 #1: when liveTaskStatus returns "" AND no worker
+// exists (active/archive/dir), the task has disappeared between the
+// snapshot and the keypress. Surface a not-found error instead of
+// suggesting promote/retry against a phantom slug.
+//
+// Codex iter-8 P2 #2: when the worker dir exists but state.json
+// hasn't landed yet (startup window), readWorkerDetail's
+// "(no state.json yet)" path is the right peek — route through it
+// instead of the no-worker hint.
+func (m Model) attachToTaskOrHint(project, slug, snapshotStatus string) (Model, tea.Cmd, bool) {
+	if slug == "" {
+		return m, nil, true
+	}
+	// Worker check first. Active state.json:
+	ws, err := readTaskWorker(project, slug)
+	if err == nil && ws != nil {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// Genuine read error (corrupt state.json, permission denied) —
+	// surface verbatim. attachToTaskWorker carries the same error
+	// rendering, so route through it for consistency.
+	if err != nil {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// ws == nil && err == nil → ENOENT on state.json. Worker dir
+	// itself may still exist (startup window before first
+	// UpdateState). readWorkerDetail's "(no state.json yet)" path
+	// is the right surface in that case (codex iter-8 P2).
+	if taskWorkerDirExists(project, slug) {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// Active dir gone. Try the archive.
+	if taskWorkerArchiveExists(project, slug) {
+		return m.attachToTaskWorker(project, slug)
+	}
+	// No worker, active or archived. Codex iter-8 P2 #1 / iter-9 P2:
+	// if the task itself is genuinely missing from tasks.md, surface
+	// not-found. liveTaskStatus's missing=true flag is the
+	// authoritative signal — distinguishes "tasks.md read OK, slug
+	// gone" (deleted) from "tasks.md unreadable" (transient I/O).
+	live, missing := liveTaskStatus(project, slug)
+	if missing {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"task %s/%s no longer exists in tasks.md (archived or deleted) — refresh and pick a current task",
+				project, slug),
+			isErr: true,
+		}
+		m.detail = nil
+		return m, nil, true
+	}
+	status := snapshotStatus
+	if live != "" {
+		status = live
+	}
+	switch status {
+	case "todo":
+		m.flash = &flashMsg{text: noWorkerHintTodo(project, slug), isErr: true}
+	case "ready":
+		m.flash = &flashMsg{text: noWorkerHintReady(project, slug), isErr: true}
+	case "in-review":
+		// Codex iter-6 P2: in-review is the post-completion holding
+		// state — the coord moves finished tasks here AFTER archiving
+		// the worker. Once the archive is pruned (default 7d) the
+		// task naturally has no worker on disk; suggesting status=ready
+		// would re-dispatch already-merged work. Surface the
+		// review-pending state instead.
+		m.flash = &flashMsg{text: noWorkerHintInReview(project, slug), isErr: true}
+	case "done", "abandoned":
+		// Terminal states. The worker is gone by design (worker dir
+		// archived + pruned). Don't suggest a re-dispatch path.
+		m.flash = &flashMsg{text: noWorkerHintTerminal(project, slug, status), isErr: true}
+	default:
+		// blocked / in-progress — the task should have a worker.
+		// Surface the recovery hint so the operator can re-dispatch.
+		m.flash = &flashMsg{text: noWorkerRecoveryHint(project, slug), isErr: true}
+	}
+	// Dismiss any open detail panel so the flash isn't hidden behind
+	// a stale overlay.
+	m.detail = nil
+	return m, nil, true
+}
+
+// taskWorkerDirExists returns true when ~/.fleet/projects/<project>/
+// workers/<slug>/ exists on disk. Codex iter-8 P2: closes the
+// state.json-not-yet-written gap so the [a] flow doesn't dead-end on
+// the no-worker hint during the worker's first-tick startup window.
+// var so tests can stub.
+var taskWorkerDirExists = func(project, slug string) bool {
+	dir, err := state.WorkerDir(project, slug)
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(strings.TrimSuffix(dir, string(filepath.Separator)))
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+// attachToTaskWorker is the [a] handler for both task rows and the
+// task detail panel. Routes to the task's worker peek panel when a
+// worker exists (active OR archived); flashes a context-appropriate
+// hint otherwise.
+//
+// Workers in v0.2 are `claude --print` subprocesses, NOT tmux
+// sessions — so "attach" here means "open the same peek panel that
+// [a] on a worker row opens" (state.json + last 50 lines of
+// output.log via readWorkerDetail). That's the v0.2 surface where
+// the operator sees what the worker wrote when it transitioned to
+// blocked.
+//
+// readTaskWorker is the indirection layer — same stub used by
+// readTaskDetail — so tests can seed a worker without a real
+// state.json file. (nil, nil) means "no worker on disk" (ErrNotFound
+// flattened); (nil, err) means a real read error.
+//
+// Codex iter-1 P2: distinguish "no worker" from "read failed" so the
+// flash points at the right next step. The fleet tasks set syntax is
+// `<slug> status=<value>` (NOT --status); valid statuses are
+// todo|ready|in-progress|in-review|done|blocked|abandoned (no
+// "pending"). Suggesting an invalid command would just fail validation
+// and leave the operator stuck.
+//
+// Codex iter-3 P2: when the active worker dir is gone but an archive
+// dir exists for the slug, route to readWorkerDetail anyway —
+// readWorkerDetail's archive fallback (newestArchiveWorkerDir) will
+// surface the archived state.json + output.log. Without this, [a] on
+// a task whose worker was archived between snapshots would dead-end at
+// the retry hint while the worker's row still has a live peek path.
+func (m Model) attachToTaskWorker(project, slug string) (Model, tea.Cmd, bool) {
+	if slug == "" {
+		return m, nil, true
+	}
+	ws, err := readTaskWorker(project, slug)
+	switch {
+	case err != nil:
+		// Real read error — surface verbatim so the operator can see
+		// the underlying disk/parse failure. "No worker" would mislead.
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("worker state for %s unreadable: %v", slug, err),
+			isErr: true,
+		}
+		m.detail = nil
+		return m, nil, true
+	case ws == nil:
+		// ErrNotFound on state.json. Three reasons to still peek:
+		//   1. worker dir exists but state.json hasn't landed yet
+		//      (startup window — codex iter-8 P2 #2).
+		//   2. archive dir exists (codex iter-3 P2).
+		// Otherwise flash the recovery hint.
+		if !taskWorkerDirExists(project, slug) && !taskWorkerArchiveExists(project, slug) {
+			m.flash = &flashMsg{
+				text:  noWorkerRecoveryHint(project, slug),
+				isErr: true,
+			}
+			// Dismiss the detail panel if it was open: the flash carries
+			// the actionable hint and a stale panel under it would just
+			// confuse the operator.
+			m.detail = nil
+			return m, nil, true
+		}
+		// Fall through to readWorkerDetail — handles the
+		// "(no state.json yet)" case AND the archive fallback.
+	}
+	body, title := readWorkerDetail(project, slug)
+	m.detail = &detailView{title: title, body: body}
+	return m, nil, true
+}
+
+// taskWorkerArchiveExists returns true when ~/.fleet/projects/<project>/
+// workers/archive/ contains at least one entry whose stripped name
+// matches the slug. Wraps newestArchiveWorkerDir's existing detection so
+// attachToTaskWorker can decide whether to peek (active or archived) or
+// flash the no-worker hint. Codex iter-3 P2.
+//
+// var so tests can stub the archive presence without seeding archive
+// dirs. Production calls newestArchiveWorkerDir which is the same
+// helper readWorkerDetail uses, keeping the two paths in sync.
+var taskWorkerArchiveExists = func(project, slug string) bool {
+	return newestArchiveWorkerDir(project, slug) != ""
 }
 
 // actionAttachProject is the project-row branch of [a] (issues #60, #63).
@@ -806,8 +1121,28 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 		if row.task == nil || row.task.Empty || row.task.More > 0 {
 			return m, nil, true
 		}
-		body, title := readTaskDetail(row.parentProject, row.task.Slug)
-		m.detail = &detailView{title: title, body: body}
+		body, title, loaded := readTaskDetail(row.parentProject, row.task.Slug)
+		// Issue #75: carry task identity (project + slug + status) so
+		// [a] inside the panel routes to the matching worker peek for
+		// blocked/in-progress tasks AND to the dispatch hint for
+		// todo/ready tasks. Without status the panel-side [a] would
+		// regress on pre-dispatch tasks (codex iter-2 P2). Non-task
+		// panels leave these empty and the [a] interceptor falls
+		// through to default attach behavior.
+		//
+		// Codex iter-7 P3: only arm task-panel [a] when the task
+		// loaded successfully. If readTaskDetail returned an error
+		// body (slug missing, tasks.md unreadable), the panel still
+		// renders the error text but [a] should fall through to
+		// default dismiss instead of running the stale-row attach
+		// flow against a task that may no longer exist.
+		dv := &detailView{title: title, body: body}
+		if loaded {
+			dv.taskProject = row.parentProject
+			dv.taskSlug = row.task.Slug
+			dv.taskStatus = row.task.Status
+		}
+		m.detail = dv
 	case rowWorker:
 		body, title := readWorkerDetail(row.worker.Project, row.worker.Slug)
 		m.detail = &detailView{title: title, body: body}
