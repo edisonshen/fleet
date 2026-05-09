@@ -38,6 +38,160 @@ This section mirrors the first-turn dispatch prompt (`coordSpawnPrompt` in `inte
 
 If the operator says "implement X" or "fix this bug", the right response is "that's worker work — let me file the task and dispatch", NOT to start editing files. The coord is a manager; a coord that does the work itself burns the operator's main context on what should be a detached session.
 
+## Workflow runbook — the six-step canon
+
+This is the load-bearing description of how a coord runs an end-to-end engagement. Every coord follows these six steps in order. Operator-readable mirror lives at [`docs/COORDINATOR-WORKFLOW.md`](../../docs/COORDINATOR-WORKFLOW.md).
+
+```
+1. DISCUSS           plan + eng detail + testing plan; iterate to operator approval (G2)
+2. SPLIT             approved plan → tasks.md (inline ≤10, planner-subagent >10) (G1)
+3. TASK LIST         one-line goal per task; status lives in structured fields (G5)
+4. IMPLEMENT         dispatch one impl-subagent per task; cap=1 (G7); subagents follow §4
+5. PR-TRACK          poll CI via async-waits (G4); on fail → fix-subagent (cap=3) (G3)
+6. DONE              fleet tasks set status=done pr_url=<url>; advance; raise-hand if empty
+```
+
+### Step 1 — DISCUSS
+
+Operator brings a problem. Coord drives a planning conversation: scope, engineering detail, testing plan, edge cases. Use plan mode + AskUserQuestion when ambiguity is real; resolve in the chat thread when it's not. **No work dispatches until the operator approves the plan.** This is the only approval gate (G2).
+
+Tools allowed: Read / Grep / Bash (non-mutating) on the project tree to ground the discussion. No Edit, no Write on source.
+
+### Step 2 — SPLIT
+
+Once the plan is approved, split it into tasks.
+
+- **Inline split (≤10 tasks):** the coord writes each task via `fleet tasks add --project <p> --spec <body>` then promotes ready ones with `fleet tasks promote <slug>`.
+- **Planner-subagent (>10 tasks):** dispatch a single Agent-tool subagent whose only job is to produce the task list. Its return contract is the list of slugs it created; it exits without dispatching workers.
+
+Threshold = 10 (G1). Above that, splitting inline burns the coord's context for no benefit; below it, the indirection through a planner adds latency without saving anything.
+
+### Step 3 — TASK LIST
+
+Each task line in tasks.md is a **one-line summary** of the goal. Format:
+
+```
+- <slug>: <one-line goal>
+```
+
+Status, branch, pr_url, worker_pid, notes — all live in the structured fields under the task heading; `fleet tasks` already enforces the schema. The one-liner is what humans scan; the fields are what the coord acts on. See `docs/STATE.md` for the full per-task field set.
+
+### Step 4 — IMPLEMENT
+
+The coord dispatches **one** impl-subagent per task. v0.2 cap is 1 in flight per project (G7) — `coordinator.lock` (NB-flock) plus the dispatch-loop active-count guard already enforce this; do not add new locking. Cap > 1 unlocks when worktrees land in v0.2.x via `coord-config.json:parallelism`.
+
+The impl-subagent is bound by the §4 reviewer contract from `/Users/pinkbear/.claude/CLAUDE.md`: codex review + /review skill, multiple rounds, until two consecutive clean passes each. The subagent pushes its branch and opens its PR autonomously when both reviewers are clean — no operator gate at the push step (the gate was step 1).
+
+The coord does NOT foreground-poll the subagent. The harness fires a `<task-notification>` when the Agent-tool subagent finishes; the coord resumes off that notification and reads the subagent's return message (PR URL or BLOCKED).
+
+**Dispatch template (impl-subagent):** prompt must reference the global Subagent Dispatch Contract by name, list the task slug as the WIP tag (`~/.fleet/subagent-wip/<slug>.md`), state the base branch, state explicit non-goals so the subagent doesn't expand scope, and require the §7 return-format contract.
+
+### Step 5 — PR-TRACK
+
+When the impl-subagent returns with a PR URL, the coord:
+
+1. **Notifies the operator** by writing the URL into the chat (push, don't ask). No "should I open the PR?" dialog — that ship sailed at step 1.
+2. **Watches CI** using the standards.md `## Async waits` pattern (G4). Run a single background bash:
+   ```bash
+   # Bash tool, run_in_background: true, timeout proportional to slowest CI step
+   until gh pr view <N> --json state -q '.state' | grep -q MERGED; do sleep 30; done
+   echo "MERGED at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+   ```
+   The harness `<task-notification>` resumes the coord when the loop exits. **No foreground polling, no operator hand-holding, no prompt-cache thrash.**
+3. **On CI fail** (G3): dispatch a **fix-subagent** against the SAME branch with the failure log. Fix-subagent has the same §4 review contract as the impl-subagent. Cap = 3 attempts per task. On the 4th failure, raise-hand to the operator with WIP path + failure log.
+4. **On rebase conflict** (G3): if the conflict is mechanical (e.g., parallel-edited CHANGELOG.md), dispatch a **rebase-subagent** with explicit "rebase only, no scope changes" instructions. If the conflict crosses into business logic, raise-hand — operators decide rebase semantics, not coords.
+5. **On merge** → step 6.
+
+**Fix-subagent dispatch template (skeleton):**
+
+```
+You are a fix-subagent for task <slug>. The PR at <url> failed CI:
+<paste failure log>
+
+Fix the failure. Stay on branch <branch>. Iterate codex + /review until clean.
+Push, do NOT close+reopen the PR. Return the PR URL and a one-line summary
+of the fix. WIP at ~/.fleet/subagent-wip/<slug>.md (resume if present).
+```
+
+**Rebase-subagent dispatch template (skeleton):**
+
+```
+You are a rebase-subagent for task <slug>. PR <url> has rebase conflicts
+against <base>. Rebase ONLY — no scope changes, no opportunistic refactors.
+If a conflict requires business-logic decisions, return BLOCKED with the
+conflict hunks. Otherwise rebase, run the verify suite, push --force-with-
+lease, return the PR URL.
+```
+
+### Step 6 — DONE
+
+CI green + PR merged → coord runs:
+
+```bash
+fleet tasks set <slug> status=done pr_url=<url>
+```
+
+Advance to the next task in priority order. When the task list is empty, the coord raises hand: `"all tasks done; next direction?"` and waits.
+
+### Approval gate (G2)
+
+There is **one** approval gate: step 1. After the operator approves the plan, the coord runs steps 2 → 6 autonomously. The coord raises hand only when:
+
+- An impl- / fix- / rebase-subagent returns BLOCKED (preserve the WIP file path; surface to operator).
+- The CI fix-loop hits cap=3 on a single task.
+- The impl-subagent discovers mid-implementation that the plan is wrong (scope-change discovery — the plan needs revision before more dispatches).
+- A new P0 message lands in `~/.fleet/inbox/<coord-id>.md`.
+
+Anything else — CI pending, rebase trivial, subagent iterating — is normal flow and stays autonomous.
+
+### State documents (G5) — three kinds, three owners
+
+| Doc | Path | Owner | Purpose |
+|-----|------|-------|---------|
+| Subagent doc | `~/.fleet/subagent-wip/<task-tag>.md` | impl- / fix- / rebase-subagent | Phase log per the global CLAUDE.md §2 contract. Coord reads on BLOCKED to recover; otherwise treats as opaque. |
+| **Progress doc** (NEW) | `~/.fleet/projects/<project>/workflow.md` | **coord** | Operator-readable phase log. One row per task with `phase = discussing \| approved \| dispatched \| reviewing \| pr-open \| merged \| blocked`. Atomic publish (`.tmp` + rename + fsync). |
+| Coord doc | `~/.fleet/agents/<coord-id>.json` | fleet-guard heartbeat | Live-state source for the TUI. No coord-side change — documented here for completeness. |
+
+The **progress doc** schema:
+
+```
+---
+schema: v1
+project: <name>
+updated_at: <RFC3339 UTC>
+---
+
+# workflow
+
+## <slug-1>
+- phase: <discussing | approved | dispatched | reviewing | pr-open | merged | blocked>
+- updated_at: <RFC3339 UTC>
+- pr_url: <url or empty>
+- note: <optional one-line context>
+
+## <slug-2>
+...
+```
+
+Atomic publish is mandatory — a partial write that fleet-guard or a TUI render reads is worse than no file. The coord uses the same tmp-fd → fsync → `os.replace` dance as `dispatch.write_worker_inbox` (`dispatch.py:354`). The TUI rendering of `workflow.md` is out of scope for this revision; the file is operator-readable via plain `cat` for now.
+
+### Mid-flight intervention (G6)
+
+The coord polls `~/.fleet/inbox/<coord-id>.md` **each turn** (fleet-guard already routes operator → agent messages to that path). A new P0 message preempts after the current atomic step completes — meaning the coord finishes the in-flight tool call (one CLI mutation, one Agent dispatch) and then handles the message before continuing the loop. **Do not interrupt mid-tool-call**; partial state at a tool boundary is the only invariant.
+
+### Parallelism cap (G7)
+
+v0.2 enforces **one** impl-subagent at a time per project. Two layers of enforcement:
+
+1. `coordinator.lock` (NB-flock) — only one coord process per project (`SKILL.md` two-coord-race section).
+2. The dispatch-loop active-count guard at step 5 of the loop algorithm above (`active >= cap: break`).
+
+**Do not add new locking.** Cap > 1 lifts via `coord-config.json:parallelism > 1` once worktrees ship in v0.2.x; the existing conflict heuristic (`conflict.py` + `loop._has_conflict_with_inflight`) handles the file-overlap concern.
+
+### Async-waits citation (G4)
+
+CI tracking uses `~/.fleet/standards.md` `## Async waits` verbatim — background-bash + `until` loop + `<task-notification>` resume. Do not invent a parallel mechanism. The 30 s poll interval matches PR-merge cadence; tighten only when the operator explicitly asks for faster reaction time on a particular task.
+
 ## Worker dispatch protocol (issue #84 Phase A)
 
 Workers are spawned as **Agent-tool subagents** of this coord agent's Claude session — NOT as detached tmux sessions. They appear in the operator's chat as "N local agents" (Claude-native indicator) and the coord supervisor reads their `state.json` files identically to the v0.2.0 detached-tmux flow.
@@ -337,6 +491,7 @@ Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/
 | `dispatch.py` | Worker prompt assembly + `mint_agent_id` + DISPATCH-block formatter + inbox writer (issue #84 Phase A — no longer shells out to `fleet dispatch`). |
 | `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). Optimistic on no-paths inputs. |
 | `loop._has_conflict_with_inflight` | Conservative loop-side wrapper: a task with no `Files:` line is treated as matching every in-flight task. Operators opt out per task by adding `Files: <real-path>`. |
+| `workflow_state.py` | Atomic-publish writer for `~/.fleet/projects/<p>/workflow.md` — the operator-readable phase log per task (G5). Tmp-fd → fsync → `os.replace`; no daemon, no in-process state. |
 
 ## Tests
 
