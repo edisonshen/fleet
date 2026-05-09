@@ -96,11 +96,12 @@ type rmDoneMsg struct {
 //     first tick can publish coord-state.json + acquire the flock
 //     without racing on a missing parent directory.
 //  2. Shell out to `fleet dispatch coord-<name> --project <name>
-//     --cwd <repo> --prompt "Run the /coordinator skill loop for
-//     project <name>."`. The task_id is STABLE per project (issue
-//     #63): a duplicate [a] press during the skill-boot window
-//     finds the in-flight record via findExistingCoordForProject
-//     and attaches instead of respawning.
+//     --cwd <repo> --prompt <coordSpawnPrompt(name)>`. The prompt
+//     body (issue #80) hard-constrains the coord agent to discuss-
+//     and-dispatch — never inline implementation. The task_id is
+//     STABLE per project (issue #63): a duplicate [a] press during
+//     the skill-boot window finds the in-flight record via
+//     findExistingCoordForProject and attaches instead of respawning.
 //  3. Parse the new agent's ID from dispatch stdout ("agent <id>
 //     spawned" first line). Compute the tmux session name from the
 //     ID (tmux.SessionName).
