@@ -6,6 +6,25 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Project-list cleanup: `[c]` hides a project from the LEFT column
+  and persists the choice in `~/.fleet/hidden-projects.json`
+  (per-machine, atomic publish). Off-row `[c]` toggles show-hidden
+  mode so the operator can re-discover hidden projects without
+  remembering the name. `[enter]` on the new `─── N idle ───` /
+  `─── N hidden ───` separators expands or collapses the group.
+  Activity grouping classifies projects as ACTIVE (fresh coord tick,
+  agent heartbeat, or live worker within `FLEET_ACTIVE_WINDOW_DAYS`,
+  default 7d) or IDLE; idle rows collapse under the separator when
+  any project is active, render inline otherwise. Footer chip
+  surfaces `<N> hidden — [c] view` with `· M with activity` when
+  the hidden list isn't dormant. Hide is HARD: fresh activity does
+  not auto-unhide; only `[c]` on the row itself flips the bit. Workers
+  and agents tagged with a hidden project still appear in the RIGHT
+  column under `v0.1 agents`. Closes
+  [#98](https://github.com/edisonshen/fleet/issues/98).
+
 ### Changed
 
 - Context indicator drops the 5-segment bar glyph (`▰▰▰▱▱`); only the
