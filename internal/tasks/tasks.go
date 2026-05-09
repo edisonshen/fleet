@@ -75,10 +75,23 @@ func validPriority(p Priority) bool {
 // task block must carry. Keep in sync with setKV — these are the keys
 // Write emits, so the parser must refuse to accept anything missing
 // (otherwise the next Write zero-values them).
+//
+// started_at / finished_at are intentionally NOT required: they were
+// added in v0.6.x as additive lifecycle bullets. Old rows (created
+// before the change) lack the lines and must still parse cleanly. The
+// writer ALWAYS emits both bullets — empty string for unset values —
+// so a re-saved old row picks up the new shape without a migration
+// script. See `requiredTaskBullets`'s comment in parse.py for the
+// matching Python contract.
 var requiredTaskBullets = []string{
 	"status", "priority", "worker_pid", "worktree", "pr_url", "branch",
 	"created", "updated", "depends_on", "spawned_by",
 }
+
+// optionalLifecycleBullets are recognized on read but tolerated as
+// missing on existing rows. Listed here for self-documenting reasons
+// only — setKV is the authoritative recognition path.
+var optionalLifecycleBullets = []string{"started_at", "finished_at"}
 
 // Task is one entry in tasks.md. Workers are NOT Fleet agents; they're
 // `claude --print` subprocesses. WorkerPID is the OS PID of that
@@ -95,6 +108,8 @@ type Task struct {
 	Branch     string
 	Created    time.Time
 	Updated    time.Time
+	StartedAt  time.Time // First time status flipped to in-progress; sticky.
+	FinishedAt time.Time // Most recent flip into done/abandoned; cleared on reopen.
 	DependsOn  []string
 	SpawnedBy  string
 	Spec       string
@@ -871,6 +886,21 @@ func setKV(t *Task, k, v string, lineNum int, raw string) error {
 			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid updated: " + err.Error()}
 		}
 		t.Updated = ts
+	case "started_at":
+		// Lifecycle stamp. Empty / "null" → zero time (never started).
+		// Non-required: old rows missing this bullet parse fine.
+		ts, err := parseTime(v)
+		if err != nil {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid started_at: " + err.Error()}
+		}
+		t.StartedAt = ts
+	case "finished_at":
+		// Lifecycle stamp. Empty / "null" → zero time (not finished).
+		ts, err := parseTime(v)
+		if err != nil {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid finished_at: " + err.Error()}
+		}
+		t.FinishedAt = ts
 	case "depends_on":
 		deps, err := parseDeps(v)
 		if err != nil {
@@ -997,6 +1027,12 @@ func renderTask(b *strings.Builder, t *Task) error {
 	writeOptional(b, "branch", t.Branch)
 	writeOptional(b, "created", formatTime(t.Created))
 	writeOptional(b, "updated", formatTime(t.Updated))
+	// Lifecycle timestamps live next to created/updated so the file
+	// stays chronologically grouped. Both are ALWAYS emitted (empty
+	// string for unset values) so re-saved old rows pick up the new
+	// shape — see optionalLifecycleBullets comment.
+	writeOptional(b, "started_at", formatTime(t.StartedAt))
+	writeOptional(b, "finished_at", formatTime(t.FinishedAt))
 	fmt.Fprintf(b, "- depends_on: %s\n", formatDeps(t.DependsOn))
 	writeOptional(b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')

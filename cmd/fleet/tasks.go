@@ -588,6 +588,8 @@ func renderTaskMarkdown(w io.Writer, t *tasks.Task) error {
 	writeOptionalBullet(&b, "branch", t.Branch)
 	writeOptionalBullet(&b, "created", formatTimeRFC3339(t.Created))
 	writeOptionalBullet(&b, "updated", formatTimeRFC3339(t.Updated))
+	writeOptionalBullet(&b, "started_at", formatTimeRFC3339(t.StartedAt))
+	writeOptionalBullet(&b, "finished_at", formatTimeRFC3339(t.FinishedAt))
 	fmt.Fprintf(&b, "- depends_on: %s\n", formatDepsList(t.DependsOn))
 	writeOptionalBullet(&b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')
