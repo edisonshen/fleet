@@ -8,6 +8,8 @@
 //
 // Keyboard:
 //   - j, ↓ / k, ↑: cursor down / up across all rows (wraps)
+//   - ← / →     : jump cursor to first row of left (PROJECTS) /
+//     right (WORKERS) panel
 //   - ⏎ enter   : open detail panel for the row under cursor
 //   - n         : add a new task to the current project (in-process call)
 //   - a         : attach (agents, tmux) or peek (workers, log + state)
