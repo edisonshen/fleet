@@ -42,6 +42,7 @@ import conflict
 import dispatch as dispatch_mod
 import parse
 import remote_control
+import supervisor as supervisor_mod
 import worktree as worktree_mod
 
 
@@ -210,6 +211,15 @@ def _tick_locked(
         return result
     result.parsed_tasks = len(f.tasks)
 
+    # Load coord-state up front — the supervisor mod's slug→agent_id
+    # map and supervisor bookkeeping live in the same file as the
+    # legacy archive-scan watermark, and the reconcile path needs to
+    # forget mappings on worker-clear transitions. Previously this was
+    # loaded between reconcile and drain; the supervisor merge moved
+    # it earlier.
+    state_path = project_dir / "coord-state.json"
+    state = _load_coord_state(state_path)
+
     # 3. Reconcile in-flight workers.
     reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
@@ -225,12 +235,15 @@ def _tick_locked(
             result.reconciled += 1
             if action.raised_to_user:
                 result.raised += 1
+            # Drop slug → agent_id mapping when the worker is gone (any
+            # transition that cleared worker_pid). Keeps the map size
+            # bounded across long-running supervisor sessions.
+            if action.clear_worker:
+                supervisor_mod.forget_agent_id(state, action.slug)
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
     # 4. Drain inbox archive sentinels.
-    state_path = project_dir / "coord-state.json"
-    state = _load_coord_state(state_path)
     tasks_by_slug = {t.slug: t for t in f.tasks}
     drained, last_seen = _drain_archive(
         home / "inbox" / "archive",
@@ -254,6 +267,14 @@ def _tick_locked(
             result.drained += 1
             if action.raised_to_user:
                 result.raised += 1
+            # Worker is leaving the in-flight set on TASK_DONE_PR
+            # (status → in-review with closed worker), WORKER_FAILED
+            # (status → todo, worker cleared), and BLOCKED_QUESTION
+            # (status → blocked). Forget the mapping in all three so
+            # the supervisor doesn't keep nudging an inbox owned by
+            # a defunct agent record.
+            if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
+                supervisor_mod.forget_agent_id(state, action.slug)
         except Exception as exc:
             result.errors.append(f"sentinel {action.slug}: {exc}")
     if last_seen:
@@ -279,6 +300,12 @@ def _tick_locked(
     for action in dispatched:
         try:
             _apply_dispatch(action, project, fleet_bin)
+            # Persist slug → agent_id so the supervisor loop can address
+            # the worker's inbox for nudges without re-parsing tasks.md.
+            # Notes accumulate over re-dispatches; coord-state's mapping
+            # is a single durable lookup.
+            if action.agent_id:
+                supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
             result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
@@ -291,7 +318,224 @@ def _tick_locked(
     # working. tmp+rename is cheap and idempotent on identical state, so
     # the unconditional refresh is correct.
     _save_coord_state(state_path, state)
+
+    # 6. Supervisor loop (issue #79). After the initial reconcile + drain
+    # + dispatch pass we keep the lock and watch in-flight workers. Cheap
+    # mtime polling drives event-based reconciliation; a sparse stuck-
+    # check pass catches workers that died silently. The legacy
+    # single-tick behavior is preserved when poll_interval=0 (or no
+    # in-flight tasks) — the supervisor returns immediately.
+    sup_cfg = supervisor_mod.SupervisorConfig.from_env()
+    if sup_cfg.poll_interval_s > 0:
+        _run_supervisor(
+            cfg=sup_cfg,
+            project=project,
+            project_dir=project_dir,
+            tasks_path=tasks_path,
+            cwd=cwd,
+            cap=cap,
+            home=home,
+            fleet_bin=fleet_bin,
+            state_path=state_path,
+            result=result,
+        )
     return result
+
+
+def _run_supervisor(
+    *,
+    cfg,
+    project: str,
+    project_dir: Path,
+    tasks_path: Path,
+    cwd: str,
+    cap: int,
+    home: Path,
+    fleet_bin: str,
+    state_path: Path,
+    result: TickResult,
+) -> None:
+    """Drive the supervisor loop. Hooks defined here so the supervisor
+    module stays free of loop.py's mutation surface.
+
+    The supervisor reads coord-state.json on every stuck-check pass
+    (its own internal write), so the local `state` dict here is rebuilt
+    on each reconcile-on-mtime-change call from disk. The loop is the
+    only writer of supervisor.* + worker_agent_ids inside this skill
+    (besides the initial dispatch path).
+    """
+    # Build initial probes from tasks.md.
+    try:
+        initial = parse.read(str(tasks_path))
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"supervisor: tasks.md re-read failed: {exc}")
+        return
+
+    # Pull the agent_id map fresh from disk — we just wrote it.
+    coord_state_now = _load_coord_state(state_path)
+    agent_ids = supervisor_mod.load_agent_id_map(coord_state_now)
+
+    if not _supervisor_has_inflight(initial.tasks):
+        # Nothing to watch — the dispatch path scheduled nothing or
+        # everything is already terminal. Skip cleanly.
+        return
+
+    def refresh_probes():
+        try:
+            f2 = parse.read(str(tasks_path))
+        except Exception:
+            return []
+        # Reload agent_id map on every refresh so a fresh dispatch
+        # mid-loop becomes addressable for nudges.
+        cs = _load_coord_state(state_path)
+        amap = supervisor_mod.load_agent_id_map(cs)
+        return supervisor_mod.build_worker_probes(
+            project=project, home=home, tasks=f2.tasks, agent_id_map=amap,
+        )
+
+    def _reconcile_slugs(slugs):
+        """Run reconcile against the given slugs and apply actions.
+
+        Centralizes the read-tasks → reconcile → apply path used by
+        both the mtime-change hook (one slug) and the periodic full
+        sweep (all in-flight). Idempotent — running on slugs whose
+        worker is alive is a no-op.
+
+        Returns True if any slot was freed (action.new_status in the
+        terminal set) so the caller can re-run dispatch to backfill.
+        """
+        try:
+            f3 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor reconcile read: {exc}")
+            return False
+        scoped = [t for t in f3.tasks if t.slug in set(slugs)]
+        if not scoped:
+            return False
+        actions = _reconcile_inflight(
+            scoped, project, fleet_bin, home=home,
+        )
+        cs = _load_coord_state(state_path)
+        slot_freed = False
+        for action in actions:
+            try:
+                _apply_reconcile(
+                    action, project, fleet_bin,
+                    repo=(cwd if cap > 1 else ""),
+                    tasks_by_slug=({t.slug: t for t in f3.tasks} if cap > 1 else None),
+                )
+                if action.clear_worker:
+                    supervisor_mod.forget_agent_id(cs, action.slug)
+                # codex iter-1 [P1]: a worker leaving the in-flight
+                # set frees a dispatch slot. Without re-running
+                # _dispatch_ready, with cap=1 the next ready task
+                # waits hours for the supervisor to exit. Mark the
+                # transition so the outer caller dispatches.
+                if action.new_status in (
+                    "todo", "done", "in-review", "blocked",
+                ):
+                    slot_freed = True
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(
+                    f"supervisor reconcile-apply {action.slug}: {exc}"
+                )
+        _save_coord_state(state_path, cs)
+        return slot_freed
+
+    def _maybe_dispatch_after_reconcile():
+        """Re-run _dispatch_ready under the same lock when a slot freed.
+
+        codex iter-1 [P1] regress: the supervisor's per-worker reconcile
+        flipped a finished worker to in-review/done/todo but the next
+        ready task waited until supervisor exited because dispatch only
+        ran inside the FIRST tick. Re-running here keeps `cap` saturated
+        across the entire supervisor session.
+        """
+        try:
+            f4 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor dispatch read: {exc}")
+            return
+        new_dispatched = _dispatch_ready(
+            tasks=f4.tasks,
+            project=project,
+            cwd=cwd,
+            cap=cap,
+            fleet_bin=fleet_bin,
+            fleet_home=str(home),
+        )
+        cs = _load_coord_state(state_path)
+        for action in new_dispatched:
+            try:
+                _apply_dispatch(action, project, fleet_bin)
+                if action.agent_id:
+                    supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
+        _save_coord_state(state_path, cs)
+
+    def reconcile_one(probe):
+        # Reconcile one slug whose state.json mtime advanced. The full
+        # _reconcile_inflight path is idempotent and matches what the
+        # primary tick does, so we just hand it a one-element scope.
+        if _reconcile_slugs([probe.slug]):
+            _maybe_dispatch_after_reconcile()
+
+    def periodic_full_reconcile():
+        """Re-reconcile EVERY in-flight task (not just mtime-changed ones).
+
+        codex iter-1 [P1] regress: in-review tasks have no live worker,
+        so their state.json mtime never advances and the mtime-driven
+        hook never fires. Without this periodic sweep, the supervisor
+        would sit on the lock for hours while a PR's CI flips green
+        but tasks.md never advances to done. The sweep runs at the
+        same cadence as stuck-check (default every 5 min) and is
+        gated behind the same FLEET_COORD_STUCK_CHECK_EVERY knob;
+        cost is bounded by len(in-flight) gh API calls per cycle.
+        """
+        try:
+            f3 = parse.read(str(tasks_path))
+        except Exception:
+            return
+        slugs = [
+            t.slug for t in f3.tasks
+            if t.status in ("in-progress", "in-review")
+        ]
+        if not slugs:
+            return
+        if _reconcile_slugs(slugs):
+            _maybe_dispatch_after_reconcile()
+
+    def write_state_hook():
+        # Heartbeat publish. Re-load → no-op-write so any concurrent
+        # supervisor stuck-check write isn't clobbered.
+        cs = _load_coord_state(state_path)
+        _save_coord_state(state_path, cs)
+
+    sup_result = supervisor_mod.run_supervisor(
+        cfg=cfg,
+        project=project,
+        home=home,
+        fleet_bin=fleet_bin,
+        refresh_probes=refresh_probes,
+        reconcile_one=reconcile_one,
+        write_state=write_state_hook,
+        periodic_full_reconcile=periodic_full_reconcile,
+    )
+    # Surface supervisor stats as auxiliary tick result fields. We
+    # don't mutate TickResult's primary counters because they describe
+    # the FIRST tick (the reconcile/drain/dispatch pass before the
+    # supervisor entered).
+    if sup_result.errors:
+        result.errors.extend(sup_result.errors)
+
+
+def _supervisor_has_inflight(tasks) -> bool:
+    """True if any task is in-flight (in-progress / in-review)."""
+    for t in tasks:
+        if t.status in ("in-progress", "in-review"):
+            return True
+    return False
 
 
 # ---------- lock helpers ----------

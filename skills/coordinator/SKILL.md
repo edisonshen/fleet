@@ -35,8 +35,8 @@ The skill does NOT need a hook payload — `loop.main` reads `FLEET_PROJECT` (or
 | Path | Content | Atomicity |
 |------|---------|-----------|
 | `~/.fleet/projects/<p>/.locks/coordinator.lock` | flock target (zero-byte) | NB acquired per tick, released on exit |
-| `~/.fleet/projects/<p>/coord-state.json` | `{"last_archive_scan_ts": "<filename>"}` and 24h rolling counters | tmp + rename + fsync |
-| `~/.fleet/inbox/<worker_id>.md` | freshly built worker prompt for one dispatch | tmp + rename + fsync |
+| `~/.fleet/projects/<p>/coord-state.json` | `last_archive_scan_ts`, `worker_agent_ids`, `supervisor.<slug>` (nudged_at, escalated_at, consecutive_stuck_polls, last_phase) | tmp + rename + fsync |
+| `~/.fleet/inbox/<worker_id>.md` | freshly built worker prompt for one dispatch, OR a stuck-idle nudge body (issue #79) | tmp + rename + fsync |
 
 ## Files this skill reads (config)
 
@@ -121,6 +121,26 @@ The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet
      active += 1
 
 6. Return TickResult{skipped, parsed, reconciled, drained, dispatched, raised, errors}
+
+7. Supervisor loop (issue #79). After the initial reconcile/drain/dispatch pass, the coord
+   keeps the lock and watches in-flight workers via cheap state.json mtime polling. When a
+   worker's mtime advances, scoped reconcile fires for that one slug. Every Nth poll a
+   sparse stuck-check pass walks all probes and runs the recovery ladder for any worker that
+   has gone idle (heartbeat stale + counter ≥ threshold + tmux session alive).
+
+   Recovery ladder (per worker, per stuck-check pass):
+     no nudge yet            → write inbox `[OPERATOR] You appear idle. ...`; record nudged_at
+     nudged + cooldown elapsed → `fleet tasks set <slug> status=blocked`; append note
+                                  `STUCK_IDLE_ESCALATED: <reason>`; record escalated_at
+     escalated + cooldown elapsed → `fleet workers update <slug> --phase blocked --reason ...`
+
+   Env-overridable knobs:
+     FLEET_COORD_POLL_INTERVAL_S    default 30 (0 → supervisor disabled, single-tick fallback)
+     FLEET_COORD_STUCK_CHECK_EVERY  default 10 (every 10 polls = 5 min on 30 s base)
+     FLEET_COORD_STUCK_THRESHOLD_S  default 180 (3 min stale heartbeat)
+     FLEET_COORD_STUCK_POLLS        default 3 (consecutive stuck passes before recovery)
+     FLEET_COORD_NUDGE_COOLDOWN_S   default 120
+     FLEET_COORD_POLL_MAX_S         default 14400 (4 h hard cap)
 ```
 
 The fleet CLI commands above came from Phase B (`fleet tasks {add,list,show,set,note,archive,promote}`, `fleet learnings {add,list,prune}`, `fleet standards {show,edit}`, `fleet workers {list,prune}`, `fleet peek <slug>`). Their argv contracts must stay stable for this skill — see `cmd/fleet/tasks.go` etc.
