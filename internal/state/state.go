@@ -496,6 +496,30 @@ func ReadCoordSpawnMarker(projectName string) string {
 	return strings.TrimSpace(first)
 }
 
+// RemoveCoordSpawnMarker deletes the coord-spawn marker for projectName.
+// Returns nil when the marker is already absent (idempotent — the
+// self-heal path in the TUI dashboard renderer is best-effort and must
+// not error out when concurrent dashboard ticks race to clear the same
+// marker).
+//
+// Used by the TUI's self-heal path (issue #96 gap 1): when the spawn
+// marker still exists but the tmux session for the agent_id stored in
+// the marker is gone, the dashboard concludes the spawn died and
+// removes the stale marker so the next render flips Stuck → Idle. Any
+// non-ENOENT removal error is propagated so the caller can surface a
+// flash; ENOENT collapses to nil so a parallel remover doesn't trip
+// the warning.
+func RemoveCoordSpawnMarker(projectName string) error {
+	path, err := CoordSpawnMarkerPath(projectName)
+	if err != nil {
+		return fmt.Errorf("RemoveCoordSpawnMarker: %w", err)
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("RemoveCoordSpawnMarker: %w", err)
+	}
+	return nil
+}
+
 // CoordinatorLockPath returns ~/.fleet/projects/<safe-name>/.locks/coordinator.lock.
 //
 // Held by the running coordinator agent for the lifetime of one tick;

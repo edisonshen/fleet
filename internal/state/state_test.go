@@ -440,6 +440,53 @@ func TestCoordSpawnMarker_TrimsWhitespaceAndCRLF(t *testing.T) {
 	}
 }
 
+// TestRemoveCoordSpawnMarker_RemovesAndIsIdempotent pins issue #96
+// gap 1's clear-on-self-heal contract: the remove path must delete an
+// existing marker AND collapse to nil when the marker is already gone
+// (race: concurrent dashboard render or in-flight dispatch goroutine
+// already cleared it). Non-ENOENT errors propagate so the caller's
+// flash banner can surface real I/O problems.
+func TestRemoveCoordSpawnMarker_RemovesAndIsIdempotent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := EnsureProjectInitialized("demo"); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := WriteCoordSpawnMarker("demo", "abcd1234"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	path, err := CoordSpawnMarkerPath("demo")
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("marker should exist before remove: %v", err)
+	}
+	if err := RemoveCoordSpawnMarker("demo"); err != nil {
+		t.Errorf("first remove: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("marker should be gone after remove; stat err = %v", err)
+	}
+	// Idempotent: a second remove on an absent marker must not error.
+	if err := RemoveCoordSpawnMarker("demo"); err != nil {
+		t.Errorf("second (no-op) remove must be nil; got %v", err)
+	}
+}
+
+// TestRemoveCoordSpawnMarker_RejectsInvalidName mirrors WriteCoordSpawnMarker
+// validation so a hand-mangled project name doesn't accidentally
+// resolve to a path-traversal target. Same rule set as ProjectDir.
+func TestRemoveCoordSpawnMarker_RejectsInvalidName(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, bad := range []string{"owner/repo", "..", ".", "Foo"} {
+		if err := RemoveCoordSpawnMarker(bad); err == nil {
+			t.Errorf("RemoveCoordSpawnMarker(%q) should reject; got nil err", bad)
+		}
+	}
+}
+
 // TestEnsureProjectInitialized_RejectsInvalidName ensures the validator
 // fires (no path-traversal via "../" or absolute-path injection). Same
 // rule as ProjectDir; no silent mapping.

@@ -27,6 +27,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // renderDashboard returns the full Ops Console view (header strip,
@@ -446,20 +447,52 @@ func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) [
 	// fires when scanProject sees no fresh coord-state.json — i.e.
 	// !p.Active (Active is set iff now-stateMtime ≤ coordActiveWindow).
 	// Beyond ctx.spawnTimeout the line flips to a red stuck warning.
+	//
+	// Issue #96 gap 1 self-heal: when derivation lands on Stuck but the
+	// tmux session for the agent_id stored in the marker is gone, the
+	// spawn died silently — clear the stale marker so the next render
+	// flips back to Idle. We probe the tmux session via sessionAliveFn
+	// (existing helper, same one used by the [a] attach branch) so a
+	// live session past timeout still surfaces the warning (real hung
+	// spawn — the operator should attach via tmux).
+	//
+	// Issue #96 gap 2: the stuck hint renders `fleet-<agentID>` from
+	// the marker, not `fleet-<projectName>`. We read the agent_id once
+	// here and thread it through to the renderer; both gaps share the
+	// same marker read so the cost is one os.ReadFile per row per render.
 	markerMtime, markerOK := coordSpawnMarkerMtimeFn(p.Name)
+	markerAgentID := ""
+	if markerOK {
+		markerAgentID = coordSpawnMarkerFn(p.Name)
+	}
 	st := deriveCoordSpawnState(
 		markerOK, markerMtime,
 		!p.LastTick.IsZero(), p.LastTick,
 		ctx.now,
 		coordActiveWindow, ctx.spawnTimeout,
 	)
+	if st == coordSpawnStuck && markerAgentID != "" {
+		sess := tmuxSessionName(markerAgentID)
+		alive := sessionAliveFn(sess)
+		st, _ = applyStuckSelfHeal(st, markerAgentID, alive, func() error {
+			return removeCoordSpawnMarkerFn(p.Name)
+		})
+	}
 	if line, ok := renderCoordSpawnLineForProject(
-		st, prefix, p.Name, ctx.now, markerMtime, ctx.tickFrame,
+		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {
 		return []string{line1, line2, line3, line, ""}
 	}
 
 	return []string{line1, line2, line3, ""}
+}
+
+// tmuxSessionName returns the canonical tmux session name for a fleet
+// agent ID. Thin wrapper around tmux.SessionName so the dashboard
+// renderer's session-naming agrees with the spawn / attach / kill
+// paths in internal/tmux without re-deriving the format here.
+func tmuxSessionName(agentID string) string {
+	return tmux.SessionName(agentID)
 }
 
 // taskBlockLine renders one task row indented under its parent

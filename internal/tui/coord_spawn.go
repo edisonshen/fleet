@@ -222,24 +222,91 @@ func renderCoordSpawnLine(
 // delegates to renderCoordSpawnLine for the spawning case. Split so
 // the stateless renderer can be tested in isolation, then composed
 // with the projectName-bearing branch up here.
+//
+// Stuck hint uses the marker's agent_id (`fleet-<agentID>`) to point at
+// the actual tmux session, not the project name. Issue #96 gap 2: the
+// previous text rendered `fleet-<projectName>` which never matched a
+// real session (tmux convention from internal/tmux is `fleet-<8hex>`),
+// so the hint led the operator nowhere. We accept the agent ID through
+// the call (caller already reads the marker for the self-heal probe),
+// falling back to the project-name framing only when the read returned
+// empty — that "no agent ID found" branch is rare (concurrent marker
+// rewrite during render) and softens the wording so the operator
+// understands why the hint isn't pointing at a specific session.
 func renderCoordSpawnLineForProject(
 	st coordSpawnState,
 	prefix string,
 	projectName string,
+	markerAgentID string,
 	now time.Time,
 	markerMtime time.Time,
 	tickFrame int,
 ) (string, bool) {
 	if st == coordSpawnStuck {
-		// "fleet-<id>" is the tmux session naming convention from
-		// internal/tmux. We don't have the agent ID here (the marker
-		// could have been overwritten); pointing at the project-shaped
-		// session name gives the operator enough to grep their tmux
-		// list. Spec calls out this exact text.
-		body := attentionChipStyle.Render("⚠ coord spawn stuck — check tmux session fleet-" + projectName)
+		var msg string
+		if markerAgentID != "" {
+			msg = "⚠ coord spawn stuck — check tmux session fleet-" + markerAgentID
+		} else {
+			// Marker is on disk (we wouldn't be in Stuck otherwise) but
+			// its body read returned empty — likely a concurrent rewrite
+			// or a hand-edited zero-byte file. Fall back to the project
+			// shape with softer wording so the operator knows the agent
+			// ID couldn't be resolved.
+			msg = "⚠ coord spawn stuck for project " + projectName + " — no agent ID in marker; check `tmux ls`"
+		}
+		body := attentionChipStyle.Render(msg)
 		return prefix + body, true
 	}
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
+}
+
+// applyStuckSelfHeal is the issue #96 gap 1 self-heal gate. When
+// derivation flagged the row as Stuck but the tmux session for the
+// agent ID stored in the marker is definitively gone, the spawn died
+// silently — keeping the warning forever just trains operators to
+// ignore it. Transition Stuck → Idle and remove the stale marker via
+// removeMarker so the next render snaps back to the existing renderer.
+//
+// Inputs are pure: caller supplies the derived state, the agent ID
+// from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
+// the result of the tmux liveness probe (`tmux.HasSession`), and a
+// remover stub. The remover is invoked exactly once per healed row;
+// errors are returned so the caller can surface them in a flash but
+// the healed state is still applied (the warning silently lingering
+// is the worse failure mode).
+//
+// Self-heal does NOT fire when:
+//   - state ≠ Stuck (Idle/Spawning/Active are unaffected),
+//   - markerAgentID is empty (we can't probe a session we don't know
+//     the name of — fall back to the existing Stuck warning so the
+//     operator still sees something is wrong),
+//   - sessionAlive is true (the session exists; the spawn really IS
+//     hung at minute 11+ and the operator should attach via tmux).
+//
+// Returns the (possibly healed) state and any removal error. The error
+// is informational; callers may log via flash but should still render
+// using the returned state.
+func applyStuckSelfHeal(
+	st coordSpawnState,
+	markerAgentID string,
+	sessionAlive bool,
+	removeMarker func() error,
+) (coordSpawnState, error) {
+	if st != coordSpawnStuck {
+		return st, nil
+	}
+	if markerAgentID == "" {
+		return st, nil
+	}
+	if sessionAlive {
+		return st, nil
+	}
+	// Session is gone for the agent the marker names. Heal.
+	var rmErr error
+	if removeMarker != nil {
+		rmErr = removeMarker()
+	}
+	return coordSpawnIdle, rmErr
 }
 
 // resolveCoordSpawnTimeout returns the configured stuck threshold,
