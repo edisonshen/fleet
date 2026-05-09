@@ -889,16 +889,66 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
+		// Capture pre-mutation status so a status= transition can trigger
+		// the lifecycle stamping rules below. Other key= mutations leave
+		// status unchanged and skip the stamping path.
+		oldStatus := t.Status
 		if err := setTaskField(t, key, value); err != nil {
 			return err
 		}
-		t.Updated = time.Now().UTC()
+		now := time.Now().UTC()
+		// Lifecycle transitions stamp started_at / finished_at in the
+		// SAME transaction as the status flip — readers don't see a
+		// half-stamped row. Rules (per task spec):
+		//
+		//   to=in-progress AND started_at zero → stamp started_at = now
+		//   (started_at is sticky: once set, never cleared, even on
+		//   bounce-and-redispatch)
+		//
+		//   to ∈ {done, abandoned} → stamp finished_at = now
+		//   (overwrite on re-finish so reopens reflect the latest)
+		//
+		//   from ∈ {done, abandoned} AND to ∉ {done, abandoned}
+		//     → clear finished_at (reopen / re-dispatch)
+		if key == "status" && t.Status != oldStatus {
+			stampLifecycleTransition(t, oldStatus, t.Status, now)
+		}
+		t.Updated = now
 		if err := tasks.Write(path, f); err != nil {
 			return fmt.Errorf("write: %w", err)
 		}
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
+}
+
+// stampLifecycleTransition applies the lifecycle stamping rules in one
+// place so the state machine is auditable. Called only when status
+// actually changed (no-op transitions skip stamping — re-running
+// `tasks set <slug> status=in-progress` on an already-in-progress task
+// must NOT bump started_at; otherwise sticky-on-first semantics break).
+//
+//	old → new                       effect
+//	-------------------------------- -------------------------------------
+//	* → in-progress (started zero)  started_at = now
+//	* → in-progress (started set)   no-op (sticky)
+//	* → done|abandoned              finished_at = now (overwrite OK)
+//	done|abandoned → !{done,aband}  finished_at = zero (reopen)
+//	other                           no-op
+func stampLifecycleTransition(t *tasks.Task, old, new tasks.Status, now time.Time) {
+	if new == tasks.StatusInProgress && t.StartedAt.IsZero() {
+		t.StartedAt = now
+	}
+	if new == tasks.StatusDone || new == tasks.StatusAbandoned {
+		t.FinishedAt = now
+		return
+	}
+	// Reopen path: leaving the terminal set clears finished_at so the
+	// next finish stamps fresh. started_at stays sticky — the task's
+	// "first start" is still the original.
+	if old == tasks.StatusDone || old == tasks.StatusAbandoned {
+		t.FinishedAt = time.Time{}
+	}
 }
 
 // setTaskField applies key=value to t with the same enum/format

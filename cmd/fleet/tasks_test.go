@@ -971,6 +971,186 @@ func TestTasksList_FinishedAtFallback(t *testing.T) {
 	}
 }
 
+// listTaskRow returns the tasks.Task pointer for slug after re-reading
+// the live file. Lifecycle tests assert StartedAt/FinishedAt directly
+// against the persisted shape (round-trips through the writer).
+func listTaskRow(t *testing.T, project, slug string) *tasks.Task {
+	t.Helper()
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	f, err := tasks.Read(filepath.Join(dir, "tasks.md"))
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	for _, x := range f.Tasks {
+		if x.Slug == slug {
+			return x
+		}
+	}
+	t.Fatalf("task %s not found in tasks.md", slug)
+	return nil
+}
+
+// TestTasksSet_LifecycleStampsStartedAt — todo→in-progress sets
+// started_at on the first transition.
+func TestTasksSet_LifecycleStampsStartedAt(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "lifecycle-1", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	pre := listTaskRow(t, project, slug)
+	if !pre.StartedAt.IsZero() {
+		t.Fatalf("pre-set started_at non-zero: %v", pre.StartedAt)
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if post.StartedAt.IsZero() {
+		t.Errorf("started_at zero after todo→in-progress; want stamped")
+	}
+}
+
+// TestTasksSet_LifecycleStampsFinishedAt — *→done|abandoned stamps
+// finished_at; reopen clears it; re-finish stamps a fresh value.
+func TestTasksSet_LifecycleStampsFinishedAt(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "lifecycle-2", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set in-progress: %v", err)
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set done: %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if post.FinishedAt.IsZero() {
+		t.Errorf("finished_at zero after in-progress→done; want stamped")
+	}
+	firstStart := post.StartedAt
+	firstFinish := post.FinishedAt
+	if firstStart.IsZero() {
+		t.Fatalf("started_at zero; want stamped from prior in-progress")
+	}
+	// Reopen: done → todo. finished_at clears; started_at sticky.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=todo", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set todo: %v", err)
+	}
+	post = listTaskRow(t, project, slug)
+	if !post.FinishedAt.IsZero() {
+		t.Errorf("finished_at not cleared on reopen: %v", post.FinishedAt)
+	}
+	if !post.StartedAt.Equal(firstStart) {
+		t.Errorf("started_at changed on reopen; want sticky %v, got %v", firstStart, post.StartedAt)
+	}
+	// Re-dispatch: todo → in-progress. started_at MUST stay the original
+	// (sticky). finished_at remains zero.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set in-progress (round 2): %v", err)
+	}
+	post = listTaskRow(t, project, slug)
+	if !post.StartedAt.Equal(firstStart) {
+		t.Errorf("started_at not sticky across reopen+redispatch; want %v, got %v", firstStart, post.StartedAt)
+	}
+	// Re-finish: in-progress → done. finished_at gets a NEW timestamp
+	// (>= firstFinish; overwrite is intentional).
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set done (round 2): %v", err)
+	}
+	post = listTaskRow(t, project, slug)
+	if post.FinishedAt.IsZero() {
+		t.Errorf("finished_at zero after re-finish; want stamped")
+	}
+	if post.FinishedAt.Before(firstFinish) {
+		t.Errorf("finished_at went backward on re-finish: first=%v second=%v",
+			firstFinish, post.FinishedAt)
+	}
+}
+
+// TestTasksSet_LifecycleAbandonedStamps — abandoned uses the same path
+// as done.
+func TestTasksSet_LifecycleAbandonedStamps(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "lifecycle-3", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=abandoned", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set abandoned: %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if post.FinishedAt.IsZero() {
+		t.Errorf("finished_at zero after todo→abandoned; want stamped")
+	}
+}
+
+// TestTasksSet_NoOpStatusDoesNotBumpStarted — re-applying the same
+// status MUST NOT update started_at (would break sticky semantics).
+func TestTasksSet_NoOpStatusDoesNotBumpStarted(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "lifecycle-4", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+	first := listTaskRow(t, project, slug).StartedAt
+	// Apply same status again. started_at MUST NOT change.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+		t.Fatalf("second set: %v", err)
+	}
+	second := listTaskRow(t, project, slug).StartedAt
+	if !first.Equal(second) {
+		t.Errorf("started_at changed on no-op status set: first=%v second=%v", first, second)
+	}
+}
+
+// TestTasksSet_NonStatusKeyDoesNotStamp — setting priority/etc. must
+// not touch lifecycle timestamps.
+func TestTasksSet_NonStatusKeyDoesNotStamp(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "lifecycle-5", priority: "P2",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "priority=P0", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set priority: %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if !post.StartedAt.IsZero() {
+		t.Errorf("started_at stamped on priority change: %v", post.StartedAt)
+	}
+	if !post.FinishedAt.IsZero() {
+		t.Errorf("finished_at stamped on priority change: %v", post.FinishedAt)
+	}
+}
+
 // TestTasksList_CollisionPrefersLive — slug existing in BOTH tasks.md
 // and tasks-archive.md (retry-recovery window) shows once, taken from
 // the live tasks.md row.
