@@ -448,6 +448,34 @@ func TestParseActiveSubagents_NilDoc(t *testing.T) {
 	}
 }
 
+// TestParseActiveSubagents_TrailingBackslashSkipped pins iter-1
+// review hardening: a malformed entry with a trailing backslash that
+// would jump past len(s) inside splitKeyValuePairs's escape skip MUST
+// be reported as a malformed-line warning, not panic on out-of-bounds
+// access. strconv.Quote never produces this shape — the test guards
+// against hand-edited / corrupted handoff docs reaching the parser.
+func TestParseActiveSubagents_TrailingBackslashSkipped(t *testing.T) {
+	doc := []byte(
+		"---\nagent_id: \"x\"\n---\n\n" +
+			"## Active Subagents\n" +
+			// Note: trailing backslash inside the quoted value would
+			// have caused +2 to overrun pre-fix.
+			`- task="ok" branch="" phase="" agent_id="11111111" subagent_id="abc\` + "\n" +
+			// Well-formed entry on the next line still parses.
+			`- task="recovers" branch="" phase="" agent_id="22222222" subagent_id=""` + "\n",
+	)
+	subs, warnings, err := ParseActiveSubagents(doc)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(subs) != 1 || subs[0].TaskID != "recovers" {
+		t.Errorf("expected 1 well-formed entry after malformed line, got %+v", subs)
+	}
+	if len(warnings) == 0 {
+		t.Errorf("expected warning for malformed trailing-backslash line, got none")
+	}
+}
+
 func TestResumePrompt(t *testing.T) {
 	t.Run("non-empty path embeds it", func(t *testing.T) {
 		got := ResumePrompt("/Users/x/.fleet/handoffs/a1b2c3d4-20260430-100000.md")
