@@ -94,7 +94,7 @@ func ParseActiveSubagents(doc []byte) (subs []ActiveSubagent, warnings []string,
 // section. The line shape is intentionally rigid to avoid a yaml
 // dependency:
 //
-//	- task="<slug>" branch="<branch>" phase="<phase>" agent_id="<hex>" subagent_id="<id>"
+//   - task="<slug>" branch="<branch>" phase="<phase>" agent_id="<hex>" subagent_id="<id>"
 //
 // Each value MUST be Go-strconv.Quote-formatted. Keys may appear in any
 // order to tolerate future field additions without churning the parser.
