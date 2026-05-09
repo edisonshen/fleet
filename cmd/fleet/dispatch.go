@@ -42,8 +42,8 @@ type dispatchOpts struct {
 	// spawn.SendInitialPrompt(session, prompt) so the agent boots with
 	// the prompt already executed. Used by the v0.2 dashboard's
 	// project-row [a] auto-spawn path (issue #60) where the coord agent
-	// is bootstrapped non-interactively with `Run the /coordinator skill
-	// loop for project <name>.`
+	// is bootstrapped non-interactively with the role-boundary prompt
+	// from internal/tui/keys.go:coordSpawnPrompt (issue #80).
 	prompt string
 	// coordSpawn is the internal flag that whitelists the reserved
 	// "coord-<project>" task_id prefix. The dashboard's task_id
@@ -129,10 +129,11 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		"skip auto-typing the resume prompt on handoff (use for non-claude --command argvs)")
 	// --prompt types `<text>` into the freshly-spawned session after the
 	// pane stabilizes. v0.2 use case: the TUI's project-row [a] auto-
-	// spawn path bootstraps a coord with `Run the /coordinator skill
-	// loop for project <name>.` so the agent is productive without the
-	// operator having to attach + type. Empty → no prompt typed (the
-	// classic interactive dispatch flow).
+	// spawn path bootstraps a coord with the role-boundary prompt
+	// (internal/tui/keys.go:coordSpawnPrompt, issue #80) so the agent
+	// boots with explicit role / delegate / allowed constraints in
+	// place. Empty → no prompt typed (the classic interactive dispatch
+	// flow).
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
 		"first-turn prompt to type into the spawned session (default: none)")
 	// --coord-spawn is the internal escape hatch for the TUI's project-
