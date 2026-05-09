@@ -43,6 +43,8 @@ When the worker pushes a branch and opens a PR, the coordinator transcribes the 
 
 One coordinator per project (NB-flock on `coordinator.lock`); single-worker mode by default in v0.2; cap > 1 with worktrees lands in v0.2.x.
 
+The end-to-end engagement — discuss → split → task list → implement → PR-track → done — is documented in [`docs/COORDINATOR-WORKFLOW.md`](docs/COORDINATOR-WORKFLOW.md). Read it before running your first coord.
+
 ## Why
 
 The bottleneck running multiple Claude Code agents is not Claude. It is the operator. Every context switch costs minutes of re-onboarding. Run four agents naively and you spend more time re-engaging than supervising.
@@ -255,6 +257,7 @@ Two Claude Code skills ship inside the binary and install to `~/.claude/skills/`
 | [`docs/STATE.md`](docs/STATE.md) | Filesystem schema and reliability invariants. |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Committed design decisions with reasoning, indexed by date. |
 | [`docs/SPIKE-context-pct.md`](docs/SPIKE-context-pct.md) | Week 0 feasibility spike — gating questions and findings. |
+| [`docs/COORDINATOR-WORKFLOW.md`](docs/COORDINATOR-WORKFLOW.md) | Operator-facing six-step coord workflow (DISCUSS → SPLIT → TASK LIST → IMPLEMENT → PR-TRACK → DONE). |
 | [`skills/fleet-guard/SKILL.md`](skills/fleet-guard/SKILL.md) | Agent-side Claude Code skill that watches context % and triggers handoffs. |
 | [`skills/coordinator/SKILL.md`](skills/coordinator/SKILL.md) | Per-project autonomous coordinator (v0.2) — task dispatch, reconcile, gh polling. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Per-release additions, changes, fixes. |
