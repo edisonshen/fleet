@@ -182,6 +182,45 @@ type Model struct {
 	// coordSpawnTimeoutDefault (10 minutes). Cached here so the env
 	// isn't re-parsed on every render.
 	coordSpawnTimeout time.Duration
+
+	// activeWindow is the threshold past which an agent/worker signal
+	// no longer counts toward "ACTIVE" classification (issue #98).
+	// Resolved once at New() from FLEET_ACTIVE_WINDOW_DAYS env (default
+	// 7 days). Cached so the env isn't re-parsed on every render.
+	activeWindow time.Duration
+
+	// showHidden, when true, renders the hidden-projects group ("─── N
+	// hidden ───") in the LEFT column with the hidden rows visible
+	// (dim) when expanded (issue #98). Toggled via [c] off-row (cursor
+	// on a separator or no row selected). Default false — operator
+	// never sees the hidden group unless they ask for it.
+	showHidden bool
+
+	// idleExpanded, when true, expands the "─── N idle ───" group so
+	// each idle project's row renders below the separator. Toggled via
+	// [enter] on the idle separator. Default false — idle projects
+	// stay collapsed so the dashboard prioritizes ACTIVE work (issue
+	// #98).
+	//
+	// See dashboardRows for the default-expand fallback when zero
+	// projects are ACTIVE: the spec's "─── N idle ───" wall isn't the
+	// right first impression for an operator with one stale-but-still-
+	// relevant project. idleCollapseExplicit (below) tracks whether
+	// the operator pressed [enter] on the separator, so the auto-
+	// expand only kicks in until the operator chooses.
+	idleExpanded bool
+
+	// idleCollapseExplicit tracks whether the operator has explicitly
+	// pressed [enter] on the idle separator. Once true, the
+	// auto-expand-when-no-active default no longer overrides
+	// idleExpanded. Issue #98 ergonomic refinement.
+	idleCollapseExplicit bool
+
+	// hiddenExpanded, when true, expands the "─── N hidden ───" group
+	// (only visible when showHidden=true) so each hidden project's row
+	// renders below the separator. Toggled via [enter] on the hidden
+	// separator. Default false (issue #98).
+	hiddenExpanded bool
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
@@ -215,6 +254,7 @@ func New(version string) Model {
 		userName:          currentUserName(),
 		startedAt:         time.Now(),
 		coordSpawnTimeout: resolveCoordSpawnTimeout(),
+		activeWindow:      resolveActiveWindow(),
 	}
 }
 

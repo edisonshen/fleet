@@ -30,10 +30,30 @@ const (
 	rowTask
 	rowWorker
 	rowAgent
+	// rowSeparator is the "─── N idle ───" / "─── N hidden ───" group
+	// row in the LEFT column (issue #98). Cursor lands on it; [enter]
+	// expands/collapses the group; [c] off a project row toggles
+	// show-hidden mode. The payload lives in dashRow.separator.
+	rowSeparator
 )
 
+// separatorKind names which group a rowSeparator represents.
+type separatorKind int
+
+const (
+	separatorIdle   separatorKind = iota // "─── N idle ───"
+	separatorHidden                      // "─── N hidden ───" (only when show-hidden mode is on)
+)
+
+// separatorRow carries the per-group state for rowSeparator.
+type separatorRow struct {
+	kind     separatorKind
+	count    int  // number of collapsed projects under this separator
+	expanded bool // when true, the group's projects render after the separator
+}
+
 // dashRow is one navigable row. Exactly one of project / task /
-// worker / agent is non-nil per row (matching kind).
+// worker / agent / separator is non-nil per row (matching kind).
 type dashRow struct {
 	kind rowKind
 
@@ -49,6 +69,8 @@ type dashRow struct {
 	worker *WorkerRow
 	// agent is set for rowAgent.
 	agent *agent.Record
+	// separator is set for rowSeparator (issue #98).
+	separator *separatorRow
 }
 
 // taskRow is the per-task line shown under each project block. Only
@@ -94,11 +116,42 @@ const maxExpandedTasks = 10
 //
 // Output is stable: real (v0.2-init'd) projects retain m.dashboard's
 // original sort order; synthetic rows append after, alpha-sorted.
+//
+// Hidden filter (issue #98): names on the operator's hidden list are
+// stripped from BOTH the v0.2-dirs source AND the synthetic-from-
+// agent-tag source uniformly. Workers/agents tagged with a hidden
+// project still appear in the RIGHT column (workers + "v0.1 agents")
+// — that's the agent listing, not the project listing. This is the
+// single point where the hidden filter applies so the rest of the
+// rendering pipeline doesn't need to know about it.
 func (m Model) unifiedProjects() []*ProjectRow {
+	return m.unifiedProjectsFiltered(hiddenProjectsSet())
+}
+
+// unifiedProjectsAll returns the un-filtered union (no hidden filter
+// applied). Used by the activity-aware footer chip and the hidden-
+// group rendering, both of which need to see hidden projects to count
+// them. Distinct from unifiedProjects so the hot path (rendering the
+// LEFT column) always strips hidden uniformly.
+func (m Model) unifiedProjectsAll() []*ProjectRow {
+	return m.unifiedProjectsFiltered(nil)
+}
+
+// unifiedProjectsFiltered is the worker. hiddenSet, when non-nil,
+// removes any name in the set from both data sources. nil hiddenSet
+// returns the full union.
+func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow {
 	var out []*ProjectRow
 	seen := map[string]bool{}
 	if m.dashboard != nil {
 		for _, p := range m.dashboard.Projects {
+			if p == nil {
+				continue
+			}
+			if hiddenSet[p.Name] {
+				// Drop hidden project from the v0.2-dirs source.
+				continue
+			}
 			out = append(out, p)
 			seen[p.Name] = true
 		}
@@ -110,6 +163,10 @@ func (m Model) unifiedProjects() []*ProjectRow {
 			continue
 		}
 		if seen[r.Project] {
+			continue
+		}
+		if hiddenSet[r.Project] {
+			// Drop hidden project from the synthetic-from-agent source.
 			continue
 		}
 		seen[r.Project] = true
@@ -350,16 +407,170 @@ var sessionProbeOrAliveFn = func(session string) bool {
 // section. The project-side render attaches the coord visually under
 // the project block; double-rendering it on the right would create
 // the appearance of two agents for one underlying record.
+//
+// Activity grouping + hidden list (issue #98): projects are partitioned
+// into ACTIVE / IDLE / HIDDEN buckets BEFORE the per-project task
+// expansion runs. ACTIVE rows render in their natural order at the top.
+// IDLE rows collapse under a "─── N idle ───" separator that the
+// operator can [enter] to expand. HIDDEN rows are filtered out by
+// unifiedProjects() and rejoin the row list under "─── N hidden ───"
+// only when m.showHidden is true. An active search filter overrides
+// the idle separator (matching rows surface inline regardless of
+// activity) so / search keeps working as before.
 func (m Model) dashboardRows() []dashRow {
 	var rows []dashRow
 	projects := m.unifiedProjects()
+	hiddenSet := hiddenProjectsSet()
+
+	// Coord-on-LEFT skip set (issue #55): collect across the visible
+	// projects so the right-column agent block knows which records to
+	// drop. Hidden projects are already absent from `projects`, so
+	// their coord IDs naturally fall through to the agent list — that
+	// matches the spec ("agents tagged with a hidden project still
+	// appear in 'v0.1 agents'").
 	coordIDs := map[string]bool{}
 	for _, p := range projects {
 		if p.CoordID != "" {
 			coordIDs[p.CoordID] = true
 		}
 	}
+
+	// Search-mode override: when an active search filter is set, the
+	// idle separator is suppressed and idle projects merge inline so
+	// matching rows surface. The operator's hunting for a specific
+	// row, not browsing groups.
+	searchActive := m.searchFilter != ""
+
+	// Partition into ACTIVE / IDLE buckets. Activity classification
+	// runs once per render — pure, no I/O.
+	now := nowFn()
+	var workers []*WorkerRow
+	if m.dashboard != nil {
+		workers = m.dashboard.Workers
+	}
+	window := m.activeWindow
+	if window <= 0 {
+		window = activeWindowDefault
+	}
+	var active, idle []*ProjectRow
 	for _, p := range projects {
+		if classifyProjectActivity(p, workers, m.records, now, window) == projectActive {
+			active = append(active, p)
+		} else {
+			idle = append(idle, p)
+		}
+	}
+
+	// ACTIVE bucket — render normally.
+	rows = m.appendProjectRows(rows, active)
+
+	// IDLE bucket — collapse under separator unless search is active.
+	//
+	// Default-expansion rule (issue #98 ergonomic refinement): when no
+	// projects are ACTIVE, treat the idle group as expanded inline and
+	// SUPPRESS the separator. The "─── N idle ───" wall hiding every
+	// project would invert the "see everything that's there" first-
+	// impression for an operator with one stale-but-still-relevant
+	// project. With no active rows above to focus on, the separator's
+	// "you have collapsed stuff" signal is redundant.
+	//
+	// Once any project is ACTIVE, the separator does its job: surface
+	// the count, let [enter] expand. The operator's explicit toggle
+	// via [enter] (idleCollapseExplicit=true) overrides the auto-
+	// suppress so a deliberate "show me everything" stays sticky.
+	switch {
+	case searchActive:
+		rows = m.appendProjectRows(rows, idle)
+	case len(idle) > 0:
+		// Auto-expand-no-separator only fires when:
+		//   - no projects are ACTIVE (no anchor for the operator's eye)
+		//   - operator hasn't pressed [enter] on the separator (no
+		//     explicit choice)
+		//   - operator hasn't toggled idleExpanded via the keybind
+		// Otherwise honor the operator's expansion state with the
+		// separator visible.
+		autoSuppress := !m.idleCollapseExplicit && !m.idleExpanded && len(active) == 0
+		if autoSuppress {
+			rows = m.appendProjectRows(rows, idle)
+		} else {
+			rows = append(rows, dashRow{
+				kind: rowSeparator,
+				separator: &separatorRow{
+					kind:     separatorIdle,
+					count:    len(idle),
+					expanded: m.idleExpanded,
+				},
+			})
+			if m.idleExpanded {
+				rows = m.appendProjectRows(rows, idle)
+			}
+		}
+	}
+
+	// HIDDEN bucket — only when show-hidden mode is on. Reads the
+	// un-filtered list so hidden-but-still-on-disk projects can render
+	// dim under their own separator.
+	if m.showHidden && len(hiddenSet) > 0 {
+		all := m.unifiedProjectsAll()
+		var hidden []*ProjectRow
+		for _, p := range all {
+			if p == nil || !hiddenSet[p.Name] {
+				continue
+			}
+			hidden = append(hidden, p)
+		}
+		if len(hidden) > 0 {
+			rows = append(rows, dashRow{
+				kind: rowSeparator,
+				separator: &separatorRow{
+					kind:     separatorHidden,
+					count:    len(hidden),
+					expanded: m.hiddenExpanded,
+				},
+			})
+			if m.hiddenExpanded {
+				rows = m.appendProjectRows(rows, hidden)
+			}
+		}
+	}
+
+	// RIGHT column — workers, then v0.1 agents.
+	if m.dashboard != nil {
+		for _, w := range m.dashboard.Workers {
+			if !m.matchesFilter(w.Slug) && !m.matchesFilter(w.Project) {
+				continue
+			}
+			rows = append(rows, dashRow{kind: rowWorker, worker: w})
+		}
+	}
+	for _, r := range m.records {
+		if r != nil && coordIDs[r.ID] {
+			// Coord renders on the LEFT under its project row; skip it
+			// here so the right-column doesn't double-count.
+			continue
+		}
+		if !m.matchesFilter(r.ID) && !m.matchesFilter(r.TaskID) && !m.matchesFilter(r.Project) {
+			continue
+		}
+		rows = append(rows, dashRow{kind: rowAgent, agent: r})
+	}
+	return rows
+}
+
+// appendProjectRows adds project + (optionally expanded) task rows for
+// each entry in projects. Encapsulates the per-project filter +
+// expansion logic that dashboardRows runs across both ACTIVE and IDLE
+// buckets (issue #98). Returns the extended row slice.
+//
+// Behavior matches the pre-#98 dashboardRows inner loop verbatim — the
+// only change is that this helper is called per-bucket so an ACTIVE
+// project and an IDLE-but-expanded project render identically once
+// they reach this function.
+func (m Model) appendProjectRows(rows []dashRow, projects []*ProjectRow) []dashRow {
+	for _, p := range projects {
+		if p == nil {
+			continue
+		}
 		projectMatches := m.matchesFilter(p.Name) || m.matchesFilter(p.RepoSlug)
 		// Pre-check: do any tasks match? If yes, render the parent
 		// project header even though its name didn't match.
@@ -434,25 +645,6 @@ func (m Model) dashboardRows() []dashRow {
 			})
 		}
 	}
-	if m.dashboard != nil {
-		for _, w := range m.dashboard.Workers {
-			if !m.matchesFilter(w.Slug) && !m.matchesFilter(w.Project) {
-				continue
-			}
-			rows = append(rows, dashRow{kind: rowWorker, worker: w})
-		}
-	}
-	for _, r := range m.records {
-		if r != nil && coordIDs[r.ID] {
-			// Coord renders on the LEFT under its project row; skip it
-			// here so the right-column doesn't double-count.
-			continue
-		}
-		if !m.matchesFilter(r.ID) && !m.matchesFilter(r.TaskID) && !m.matchesFilter(r.Project) {
-			continue
-		}
-		rows = append(rows, dashRow{kind: rowAgent, agent: r})
-	}
 	return rows
 }
 
@@ -489,6 +681,8 @@ func (m Model) selectedRow() *dashRow {
 //	"T:<project>:<slug>"   task
 //	"W:<project>:<slug>"   worker
 //	"A:<id>"               agent
+//	"S:idle"               idle separator (issue #98)
+//	"S:hidden"             hidden separator (issue #98)
 //
 // Empty string means "no identity available" (defensive — caller
 // falls back to cursor 0).
@@ -521,6 +715,15 @@ func rowIdentity(r dashRow) string {
 	case rowAgent:
 		if r.agent != nil {
 			return "A:" + r.agent.ID
+		}
+	case rowSeparator:
+		if r.separator != nil {
+			switch r.separator.kind {
+			case separatorIdle:
+				return "S:idle"
+			case separatorHidden:
+				return "S:hidden"
+			}
 		}
 	}
 	return ""
