@@ -259,14 +259,14 @@ def test_archive_idempotent_on_second_run(
 def test_archive_finished_at_fallback_to_updated(
     project_dir: Path, fleet_run_recorder, monkeypatch,
 ) -> None:
-    """Old rows missing finished_at fall back to updated for sort.
+    """Old rows missing finished_at use coalesce(updated, created) as rank.
 
     Two rows:
-      old-row  finished_at=None,  updated=10:00  → sort key (None,10:00)
-      new-row  finished_at=11:00, updated=12:00  → sort key (11:00,12:00)
+      old-row  finished_at=None,  updated=10:00  → rank=10:00
+      new-row  finished_at=11:00, updated=12:00  → rank=11:00
 
-    "None" sorts before any real timestamp (it's the oldest), so old-row
-    archives first. Threshold=1 → archive one row total.
+    old-row's effective rank (10:00) is older than new-row's (11:00),
+    so old-row archives first. Threshold=1 → archive one row total.
     """
     monkeypatch.setenv("FLEET_AUTO_ARCHIVE_THRESHOLD", "1")
     t10 = _dt.datetime(2026, 5, 6, 10, 0, 0, tzinfo=_dt.timezone.utc)
@@ -284,6 +284,44 @@ def test_archive_finished_at_fallback_to_updated(
     assert result.archived == 1
     archive_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "archive"]]
     assert archive_calls[0][-1] == "old-row"
+
+
+def test_archive_coalesce_keeps_recent_legacy_row_when_done_is_older(
+    project_dir: Path, fleet_run_recorder, monkeypatch,
+) -> None:
+    """Coalesce semantics regress test: a legacy row (no finished_at)
+    with a RECENT updated outranks a stamped row with an OLDER
+    finished_at — so the stamped row archives first.
+
+    Without coalesce, the legacy row would archive first (None sentinel
+    < any real timestamp), which is WRONG: an old finished_at means
+    the row finished a long time ago and should be archived, not the
+    legacy row that was touched yesterday.
+
+    Layout:
+      legacy-row  finished_at=None,  updated=2030 (recent) → rank=2030
+      stamped-row finished_at=2020 (old)                   → rank=2020
+
+    Threshold=1 → archive ONE row. Coalesce-correct: stamped-row goes.
+    """
+    monkeypatch.setenv("FLEET_AUTO_ARCHIVE_THRESHOLD", "1")
+    old = _dt.datetime(2020, 1, 1, 10, 0, 0, tzinfo=_dt.timezone.utc)
+    recent = _dt.datetime(2030, 1, 1, 10, 0, 0, tzinfo=_dt.timezone.utc)
+    rows = [
+        _mk("legacy-row", finished_at=None, updated=recent, created=old),
+        _mk("stamped-row", finished_at=old, updated=old, created=old),
+    ]
+    _write_tasks(project_dir, rows)
+
+    result = loop._maybe_auto_archive(
+        project_dir / "tasks.md", "fleet", "fleet",
+    )
+    assert result.archived == 1
+    archive_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "archive"]]
+    assert archive_calls[0][-1] == "stamped-row", (
+        f"coalesce regress: expected stamped-row (oldest by rank), got "
+        f"{archive_calls[0][-1]}"
+    )
 
 
 def test_archive_passes_project_flag(

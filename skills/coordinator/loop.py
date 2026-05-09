@@ -1848,22 +1848,26 @@ def _maybe_auto_archive(
         )
         return _AutoArchiveResult(errors=[msg])
 
-    # Sort: finished_at asc, fall back to updated asc, then created
-    # asc. None values (old rows missing finished_at) sort BEFORE any
-    # real timestamp — that's the right behavior here, since rows that
-    # never stamped finished_at are presumed older than ones that did.
+    # Sort: rank = coalesce(finished_at, updated, created), oldest
+    # first. Mirrors the Go-side `finishedAtForSort` coalesce semantics
+    # used in `fleet tasks list`. Old rows that never stamped
+    # finished_at use their updated as the rank — so a task done
+    # yesterday (with finished_at=yesterday) outranks a legacy row
+    # (finished_at=None) whose updated is from a year ago.
+    #
+    # All datetimes are RFC3339 with timezone (parse.py rejects naive
+    # datetimes by going through fromisoformat with the trailing 'Z'
+    # normalized to '+00:00'); _SENTINEL_DT_MIN below stays naive only
+    # to satisfy the rare missing-everything edge case (a row missing
+    # both finished_at AND updated AND created — should not happen
+    # post-parse, but defensive).
     def _sort_key(task) -> tuple:
-        # datetime | None — pick a sentinel below any real timestamp.
-        # Python tuples compare element-wise; the bool-flag-then-value
-        # trick avoids datetime/None comparison errors on 3.x.
-        fa = task.finished_at
-        ua = task.updated
-        ca = task.created
-        return (
-            (0, _dt_min) if fa is None else (1, fa),
-            (0, _dt_min) if ua is None else (1, ua),
-            (0, _dt_min) if ca is None else (1, ca),
-        )
+        rank = task.finished_at or task.updated or task.created
+        if rank is None:
+            rank = _SENTINEL_DT_MIN
+        # Created is the tie-breaker; same coalesce treatment.
+        ca = task.created or _SENTINEL_DT_MIN
+        return (rank, ca)
 
     candidates.sort(key=_sort_key)
 
@@ -1886,10 +1890,16 @@ def _maybe_auto_archive(
 
 
 # Sentinel datetime "before any real timestamp" used by the
-# auto-archive sort. Imported from datetime to avoid a Python-version-
-# specific min datetime constant (3.11 vs 3.12 differ on
-# datetime.MAX/MIN access patterns).
-_dt_min = __import__("datetime").datetime.min
+# auto-archive sort when EVERY ranking key is missing on a task (a
+# row with no finished_at, no updated, AND no created). Should never
+# happen post-parse — required-bullet validation forces created/updated
+# — but kept defensive so a malformed row doesn't crash the sort.
+#
+# datetime.min is naive (no tzinfo); compared against tz-aware values
+# it would TypeError. We never expect to hit this branch in practice
+# because a real row always has at least `created`, but the cheap
+# fallback isolates the edge case from the hot path.
+_SENTINEL_DT_MIN = __import__("datetime").datetime.min
 
 
 def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
