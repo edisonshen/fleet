@@ -207,6 +207,9 @@ EXPECTED_GOLDEN = (
     b"\n"
     b"## Next Steps (prioritized)\n"
     b"_(operator-triggered handoff \xe2\x80\x94 fill in before resuming)_\n"
+    b"\n"
+    b"## Active Subagents\n"
+    b"_(none)_\n"
 )
 
 
@@ -276,6 +279,161 @@ class TestRenderByteGolden:
             recent_activity="x",
         )
         assert want in got
+
+
+class TestActiveSubagentsRender:
+    """Issue #93 Phase B2: the Active Subagents section shape MUST
+    match internal/handoff.renderActiveSubagents byte-for-byte. The
+    Go-side parser (handoff.ParseActiveSubagents) round-trips against
+    this exact format, so any drift breaks coord-handoff continuity."""
+
+    def test_none_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            active_subagents=None,
+        )
+        assert b"## Active Subagents\n_(none)_\n" in got
+
+    def test_empty_list_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            active_subagents=[],
+        )
+        assert b"## Active Subagents\n_(none)_\n" in got
+
+    def test_single_entry(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            active_subagents=[{
+                "task": "fix-foo",
+                "branch": "worker/fix-foo",
+                "phase": "tdd-green",
+                "agent_id": "11112222",
+                "subagent_id": "claude-sub-1",
+            }],
+        )
+        line = (
+            b'- task="fix-foo" branch="worker/fix-foo" phase="tdd-green"'
+            b' agent_id="11112222" subagent_id="claude-sub-1"'
+        )
+        assert line in got
+
+    def test_multiple_entries_input_order_preserved(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            active_subagents=[
+                {"task": "a", "branch": "worker/a", "phase": "push",
+                 "agent_id": "11111111", "subagent_id": ""},
+                {"task": "b", "branch": "worker/b", "phase": "tdd-red",
+                 "agent_id": "22222222", "subagent_id": "claude-sub-2"},
+            ],
+        )
+        idx_a = got.find(b'task="a"')
+        idx_b = got.find(b'task="b"')
+        assert idx_a >= 0 and idx_b >= 0
+        assert idx_a < idx_b
+
+    def test_missing_keys_default_to_empty(self) -> None:
+        """Worker entries with missing optional fields render as empty
+        strings — the field set is uniform across rows."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="abcd1234", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            active_subagents=[{"task": "minimal", "agent_id": "33333333"}],
+        )
+        line = (
+            b'- task="minimal" branch="" phase="" '
+            b'agent_id="33333333" subagent_id=""'
+        )
+        assert line in got
+
+
+class TestCollectActiveSubagents:
+    """Coord identity gate + coord-state.json reading."""
+
+    def test_non_coord_returns_empty(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        got = handoff._collect_active_subagents("auth-fix", "myproj")
+        assert got == []
+
+    def test_empty_project_returns_empty(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        got = handoff._collect_active_subagents("coord-myproj", "")
+        assert got == []
+
+    def test_coord_with_no_state_file_returns_empty(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        (tmp_path / "projects" / "myproj").mkdir(parents=True)
+        got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        assert got == []
+
+    def test_coord_with_workers_emits_entries(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        proj_dir = tmp_path / "projects" / "myproj"
+        (proj_dir / "workers" / "fix-bar").mkdir(parents=True)
+        (proj_dir / "workers" / "fix-foo").mkdir(parents=True)
+        coord_state = {
+            "worker_agent_ids": {
+                "fix-foo": "abcd1234",
+                "fix-bar": "11112222",
+            },
+        }
+        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
+        (proj_dir / "workers" / "fix-foo" / "state.json").write_text(
+            json.dumps({"phase": "tdd-green"})
+        )
+        (proj_dir / "workers" / "fix-bar" / "state.json").write_text(
+            json.dumps({"phase": "push"})
+        )
+        got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        assert got == [
+            {"task": "fix-bar", "branch": "worker/fix-bar",
+             "phase": "push", "agent_id": "11112222",
+             "subagent_id": ""},
+            {"task": "fix-foo", "branch": "worker/fix-foo",
+             "phase": "tdd-green", "agent_id": "abcd1234",
+             "subagent_id": ""},
+        ]
+
+    def test_subagent_ids_threaded_through_when_present(self, tmp_path, monkeypatch) -> None:
+        """worker_subagent_ids (forward-compat parallel map) is read
+        if present — Phase A doesn't capture these IDs yet but the
+        skill must be ready when the upgrade lands."""
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        proj_dir = tmp_path / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        coord_state = {
+            "worker_agent_ids": {"fix-foo": "abcd1234"},
+            "worker_subagent_ids": {"fix-foo": "claude-sub-1"},
+        }
+        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
+        got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        assert len(got) == 1
+        assert got[0]["subagent_id"] == "claude-sub-1"
+
+    def test_legacy_state_no_worker_agent_ids_returns_empty(self, tmp_path, monkeypatch) -> None:
+        """A coord-state.json missing worker_agent_ids (e.g. v0.2.0
+        layout) gracefully renders zero entries instead of crashing."""
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        proj_dir = tmp_path / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "coord-state.json").write_text(json.dumps({"other": 1}))
+        got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        assert got == []
 
 
 def _diff_first_byte(got: bytes, want: bytes) -> str:
