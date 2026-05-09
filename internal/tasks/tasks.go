@@ -88,10 +88,10 @@ var requiredTaskBullets = []string{
 	"created", "updated", "depends_on", "spawned_by",
 }
 
-// optionalLifecycleBullets are recognized on read but tolerated as
-// missing on existing rows. Listed here for self-documenting reasons
-// only — setKV is the authoritative recognition path.
-var optionalLifecycleBullets = []string{"started_at", "finished_at"}
+// Lifecycle bullets started_at + finished_at are recognized on read
+// (see setKV) but tolerated as missing on existing rows. The writer
+// always emits them (empty for unset values) so re-saved rows pick up
+// the new shape.
 
 // Task is one entry in tasks.md. Workers are NOT Fleet agents; they're
 // `claude --print` subprocesses. WorkerPID is the OS PID of that
