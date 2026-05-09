@@ -93,6 +93,14 @@ type WorkerRow struct {
 	Age     string // "2m" / "8m"
 	Blocked bool
 	Reason  string
+	// SubagentID is the Claude Agent-tool subagent token for this
+	// worker, populated from coord-state.json:worker_subagent_ids on
+	// scan. Empty when the coord skill never registered one (offline
+	// dispatches, pre-Phase-C coord, or temporary lock contention).
+	// The TUI renders the first 8 chars as a `· <hash>` chip on the
+	// worker row so the operator can cross-reference with Claude's
+	// chat-side "N local agents" indicator (issue #94 Phase C).
+	SubagentID string
 }
 
 // Snapshot is the dashboard's read-only render input.
@@ -259,8 +267,16 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 		row.CoordID = readCoordHolder(projectsRoot, name)
 	}
 
+	// Issue #94 Phase C: pull the slug → Claude subagent_id map from
+	// coord-state.json. One file read per project per scan — same file
+	// the active/idle gate just stat'd. Stale coords still surface their
+	// last-known map; freshness gating is on the row's Active flag, not
+	// on the chip data itself. An empty / absent / malformed file
+	// returns nil — workers render without the chip.
+	subagentMap := readWorkerSubagentMap(stateJSON)
+
 	// Workers under workers/<slug>/state.json.
-	wrows := scanWorkers(dir, name, now)
+	wrows := scanWorkers(dir, name, now, subagentMap)
 
 	// Attention math: ONLY worker phase=blocked fires the attention chip.
 	//
@@ -320,7 +336,7 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 // orphan dirs (coord crash, manual `fleet workers update`, dirs left
 // behind from before issue #101 landed). Both call the same Delete;
 // idempotent on ENOENT, so a coord-then-TUI race is safe.
-func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
+func scanWorkers(projectDir, project string, now time.Time, subagentMap map[string]string) []*WorkerRow {
 	wDir := filepath.Join(projectDir, "workers")
 	entries, err := os.ReadDir(wDir)
 	if err != nil {
@@ -366,6 +382,9 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		}
 		row := workerRowFor(&s, project, now)
 		if row != nil {
+			if id, ok := subagentMap[s.Slug]; ok {
+				row.SubagentID = id
+			}
 			out = append(out, row)
 		}
 	}
@@ -478,6 +497,30 @@ func workerRowFor(s *workers.State, project string, now time.Time) *WorkerRow {
 	return row
 }
 
+// shortSubagentHash returns the first 8 chars of a Claude Agent-tool
+// subagent_id for the on-row chip (issue #94 Phase C). Inputs:
+//
+//	""        → ""             empty / unregistered → no chip
+//	"   "     → ""             whitespace-only → no chip
+//	"abc12"   → "abc12"        short tokens render in full
+//	"abc1234567" → "abc12345"  long tokens truncate to 8 chars
+//
+// Truncation is on rune boundaries so a multi-byte token doesn't split
+// a code point. The host Claude doesn't pin a strict shape; we tolerate
+// any printable token and let the chip be the visual anchor.
+func shortSubagentHash(s string) string {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return ""
+	}
+	const maxRunes = 8
+	rs := []rune(t)
+	if len(rs) > maxRunes {
+		return string(rs[:maxRunes])
+	}
+	return t
+}
+
 // shortWorkerID returns the purple anchor string per the mockup. We
 // surface the trailing 4-hex suffix that tasks.GenerateSlug appends
 // (e.g. slug "fix-toolbar-1a2b" → "1a2b"). The mockup illustrates
@@ -581,6 +624,54 @@ func readCoordHolder(projectsRoot, projectName string) string {
 	return s
 }
 
+// readWorkerSubagentMap parses coord-state.json's `worker_subagent_ids`
+// dict into a slug → Claude-Agent-tool-subagent-id map. Returns nil
+// (not an empty map) on any read / parse / shape mismatch — callers
+// can range over a nil map cleanly and the row falls back to no chip.
+//
+// The Python coord skill is the single writer (via
+// register_subagent.py + supervisor.remember_subagent_id). The Go side
+// only consumes; we tolerate any shape drift defensively because a
+// hand-edited or pre-Phase-C state file must NEVER crash the TUI.
+//
+// The returned values are the host Claude's opaque subagent tokens
+// (any printable non-whitespace string under 128 chars). Renderer
+// truncates to 8 chars — see workerBlockLines's chip path.
+func readWorkerSubagentMap(stateJSON string) map[string]string {
+	data, err := os.ReadFile(stateJSON)
+	if err != nil {
+		return nil
+	}
+	var raw struct {
+		WorkerSubagentIDs map[string]string `json:"worker_subagent_ids"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	if len(raw.WorkerSubagentIDs) == 0 {
+		return nil
+	}
+	// Filter empty / whitespace-only values defensively. The Python
+	// helper rejects these on write (supervisor._is_subagent_id), but
+	// a hand-edited file could slip them through and we'd otherwise
+	// render an empty `· ` chip.
+	out := make(map[string]string, len(raw.WorkerSubagentIDs))
+	for slug, id := range raw.WorkerSubagentIDs {
+		if slug == "" {
+			continue
+		}
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		out[slug] = trimmed
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // isAgentIDShape returns true when s looks like an 8-char lower-hex
 // agent ID (the shape agent.NewID generates). Anything else — empty
 // string, wrong length, mixed case, non-hex chars — returns false.
@@ -606,6 +697,31 @@ func (s *Snapshot) CIRunning() int {
 	for _, w := range s.Workers {
 		switch w.Phase {
 		case workers.PhaseReviewClaude, workers.PhaseReviewCodex, workers.PhasePush:
+			n++
+		}
+	}
+	return n
+}
+
+// SubagentsRunning counts the total Claude Agent-tool subagents
+// currently registered across all coords on the dashboard. Mirrors
+// CIRunning's pure-derivation shape — the count comes from the same
+// WorkerRow.SubagentID field that drives per-row chip rendering, so
+// the top-status `<N> agents` chip and the row-level chips agree.
+//
+// Workers without a SubagentID (pre-Phase-C dispatch, register_subagent
+// failed, host Claude offline) don't contribute. The count never
+// exceeds len(s.Workers).
+func (s *Snapshot) SubagentsRunning() int {
+	if s == nil {
+		return 0
+	}
+	n := 0
+	for _, w := range s.Workers {
+		if w == nil {
+			continue
+		}
+		if w.SubagentID != "" {
 			n++
 		}
 	}
