@@ -17,6 +17,28 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
+// handoffSessionPrefix is the literal session-name-prefix that
+// internal/handoff.FirstAction's bash bootstrap passes to the
+// `claude remote-control` daemon
+// (`--remote-control-session-name-prefix "fleet-handoff"`). The
+// handoff replacement spawn injects `--remote-control
+// "fleet-handoff-<new-id>"` so the freshly-spawned claude latches
+// onto that daemon at startup, skipping the round-trip through
+// FirstAction's manual `/remote-control` slash command.
+//
+// Why we still keep FirstAction's bash + slash-command instructions
+// in the handoff doc: belt-and-braces. The bash block bootstraps
+// the daemon if it isn't already running (handoff replacement is
+// often the FIRST process on the host to need that daemon) and the
+// slash command is a recovery path if for any reason the spawn-time
+// flag didn't latch. Both paths converge on the same daemon prefix.
+//
+// Keep byte-identical with the literal in
+// internal/handoff/handoff.go FirstAction's bash block — drift would
+// silently regress mobile pairing on handoff. A regression test in
+// the same package pins the equality.
+const handoffSessionPrefix = "fleet-handoff"
+
 // handoffOpts captures cobra-parsed flags + positional arg.
 type handoffOpts struct {
 	oldID                string
@@ -479,11 +501,35 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//    next hop would happily auto-type into the wrapper again
 	//    (codex review iter-13 P2). Operators who want a true
 	//    one-shot must re-pass the flag on the next handoff.
+	//
+	// Remote-control auto-attach for handoff replacements
+	// (fix/remote-control-coord-injection P0): the replacement spawn
+	// gets `--remote-control "fleet-handoff-<new-id>"` injected into
+	// its claude argv, parallel to the coord-spawn path in
+	// dispatch.go. The session prefix is `fleet-handoff` (not
+	// `fleet-coord`) so the replacement attaches to the handoff
+	// daemon that internal/handoff.FirstAction's bash block boots.
+	//
+	// The persisted rec.Command stays the clean `command` (so a
+	// subsequent handoff doesn't inherit a stale --remote-control
+	// "fleet-handoff-<old-id>"); ExecCommand carries the per-spawn
+	// rewrite. injectRemoteControlFlag returns the slice unchanged
+	// for non-default --command shapes so an operator-supplied
+	// scripted pipeline / alt engine isn't silently mutated.
+	rcSessionName := handoffSessionPrefix + "-" + newID
+	rewrittenExecArgv := injectRemoteControlFlag(command, rcSessionName)
+	if sameCommand(rewrittenExecArgv, command) {
+		// No-op rewrite (custom --command): pass nil so the
+		// persisted record and tmux exec are identical (avoids a
+		// confusing Command/ExecCommand divergence in spawn.Options).
+		rewrittenExecArgv = nil
+	}
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
 		Cwd:               cwd,
 		Command:           command,
+		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    newID,
 		DisableAutoResume: thisHandoffDisableAutoResume,
 	})

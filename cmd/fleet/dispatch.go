@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -14,11 +12,6 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
-
-// execCommand is a thin alias for exec.Command so test code can
-// stub remoteControlDaemonRunning's pgrep call without reaching for
-// process-fork primitives.
-var execCommand = exec.Command
 
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
@@ -195,7 +188,8 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			opts.taskID, opts.project)
 	}
 
-	// Issue #73: coord-spawn dispatches inject Claude Code's documented
+	// Issue #73 + dispatch-flag-injection P0 (mobile pairing broken):
+	// coord-spawn dispatches inject Claude Code's documented
 	// `--remote-control "<session>"` flag so the operator's `[a]`
 	// re-attach can reach the coord's tools without manually running
 	// `/remote-control` inside the session.
@@ -220,33 +214,62 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// oldRec.Command doesn't inherit a stale `--remote-control
 	// "fleet-coord-<old-id>"` flag (codex review #73 iter-1 P1).
 	//
-	// Cold-start gate (codex review #73 iter-5 P1): only inject the
-	// flag when a `claude remote-control` daemon is already running.
-	// On a brand-new coord dispatch the daemon isn't up yet
-	// (`bootstrap_remote_control` spawns it on the coord's first
-	// tick), and Claude Code may treat "no daemon listening" as a
-	// startup failure — which the default wrapper script then
-	// propagates as a non-zero exit, killing the tmux session
-	// before the operator even sees the agent. The inbox-relay
-	// path (skills/coordinator/remote_control.py:seed_inbox) still
-	// runs `/remote-control` via the slash command on the next
-	// Stop hook fire, so the cold-start case falls back to the
-	// existing v0.2 flow with no regression.
+	// HISTORY — daemon-presence gate REMOVED (this commit). The
+	// previous code path was:
 	//
-	// Re-attach (`[a]` on an existing coord) — the operator's
-	// reported failure mode in #73 — is the common case where the
-	// daemon IS up (from the coord's prior boot), and there this
-	// flag connects immediately.
+	//     if opts.coordSpawn && remoteControlDaemonRunning() { ... }
 	//
-	// Mixed-daemon caveat: if a `fleet-handoff`-prefix daemon is
-	// running (from a prior handoff flow), the pgrep check below
-	// matches it and we'd inject `fleet-coord-<id>` against a
-	// daemon that filters on `fleet-handoff`. That's a stale-prefix
-	// case the inbox-relay path also doesn't handle perfectly; a
-	// daemon-prefix unification refactor (out-of-scope per dispatch
-	// brief: "Don't touch daemon spawn") would close it. In a
-	// pure-coord environment (the v0.2 dogfood case), this PR works
-	// as designed.
+	// The daemon-presence gate (codex review #73 iter-5 P1) was a
+	// belt-and-braces guard against "claude exits non-zero when the
+	// daemon isn't listening yet". It turned out to be exactly the
+	// wrong half of a chicken-and-egg loop with Bug 1 in
+	// skills/coordinator/remote_control.py:
+	//
+	//   - The Python skill's spawn_daemon_if_needed used a broad
+	//     `pgrep -f "claude remote-control"` guard. When ANY
+	//     remote-control daemon was running (e.g. the operator's
+	//     fleet-handoff daemon from a prior handoff), the coord skill
+	//     silently SKIPPED its own daemon launch.
+	//   - This dispatch path's gate `remoteControlDaemonRunning()`
+	//     correctly narrowed on the fleet-coord prefix. With no
+	//     fleet-coord daemon ever launching, this gate ALWAYS
+	//     returned false on coord spawn → the flag was NEVER
+	//     injected → mobile pairing was broken on every coord across
+	//     the operator's whole fleet.
+	//
+	// Survey at the time of this fix found ALL 7 live agents on the
+	// operator's machine (4 coords + 3 workers, where 2 coords were
+	// the in-flight ones we needed to pair) missing the
+	// --remote-control flag in their persisted command. The Python
+	// pgrep fix (Bug 1) closes one half of the chicken-and-egg, but
+	// keeping the gate here re-creates the same failure on every
+	// fresh coord boot until /tmp gets cleared — because the gate
+	// asks "is the daemon up *right now*", and on a clean dispatch
+	// the answer is always no (the bash bootstrap inside the coord
+	// runs many seconds AFTER tmux.Spawn returns).
+	//
+	// Why dropping the gate is safe:
+	//   - claude --remote-control "<name>" retries on its own
+	//     internal connection loop. The CLI does not exit non-zero
+	//     when the daemon is briefly absent; it waits and connects
+	//     when the daemon comes up. The wrapper's RC=$? branch only
+	//     fires on a real claude process exit (Ctrl-D, /exit, or a
+	//     hard error), not on transient connection retries.
+	//   - The fleet-coord daemon launches on the coord's first tick
+	//     (skills/coordinator/remote_control.py:spawn_daemon_if_needed)
+	//     within seconds of the agent booting. Worst case is a few
+	//     seconds of "daemon not yet up" while claude retries.
+	//   - The inbox-relay path
+	//     (skills/coordinator/remote_control.py:seed_inbox) still
+	//     runs as a belt-and-braces fallback: even if the daemon
+	//     comes up but the spawned claude session doesn't latch
+	//     onto it for some reason, the seeded /remote-control inbox
+	//     message will land on the next Stop hook.
+	//
+	// remoteControlDaemonRunning() and its tests have been removed
+	// (search the git log for the deletion commit). Any new code
+	// that wants to check daemon presence should NOT gate flag
+	// injection on it — the gate is the bug.
 	//
 	// Non-coord dispatches (workers, operator-shelled `fleet dispatch`)
 	// keep the original command unchanged: they don't get auto-attach,
@@ -258,7 +281,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// shape. Custom argvs are out of scope.
 	preAllocatedID := ""
 	var rewrittenExecArgv []string
-	if opts.coordSpawn && remoteControlDaemonRunning() {
+	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
 		// Match the daemon prefix from skills/coordinator/remote_control.py
 		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
@@ -331,148 +354,26 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	return nil
 }
 
-// defaultClaudeInvocation is the literal claude argv inside the shell
-// wrapper that --command defaults to. We rewrite this exact substring
-// when injecting --remote-control so an operator-supplied --command
-// (scripted pipeline, alt engine) is left untouched. See
-// injectRemoteControlFlag.
-const defaultClaudeInvocation = "claude --dangerously-skip-permissions"
+// defaultClaudeWrapperScript re-exposes spawn.DefaultClaudeWrapperScript
+// at the top-level constant name the existing dispatch surface uses.
+// Keeping the alias means the test that pins the byte-equality between
+// `--command`'s default element and the wrapper-script literal stays
+// readable without cross-package qualification.
+const defaultClaudeWrapperScript = spawn.DefaultClaudeWrapperScript
 
-// defaultClaudeWrapperScript is the EXACT literal of the default
-// --command's third element (the shell script body). injectRemoteControlFlag
-// matches on this byte-equal string before rewriting, so a custom
-// `--command sh -c '<arbitrary script that mentions claude>'` is NOT
-// silently mutated (codex review #73 iter-3 P2). Must stay byte-equal
-// with newDispatchCmd's --command default; a regression test pins the
-// equality.
-const defaultClaudeWrapperScript = `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`
-
-// injectRemoteControlFlag rewrites a shell-wrapped claude command to
-// include `--remote-control "<sessionName>"` so the spawned Claude
-// Code session auto-attaches to the remote-control daemon at startup.
-// Returns the slice unchanged if the command does NOT match the
-// documented default shape (custom --command argvs are out of scope —
-// fleet doesn't know their flag conventions).
-//
-// Default shape from newDispatchCmd's --command default:
-//
-//	["sh", "-c", "claude --dangerously-skip-permissions; RC=$?; ..."]
-//
-// We replace the literal "claude --dangerously-skip-permissions" with
-// "claude --dangerously-skip-permissions --remote-control \"<name>\""
-// inside the shell-script element. The trailing arguments (`; RC=$?;
-// ...`) are preserved so the wrapper's clean-exit semantics still
-// apply.
-//
-// Source: Claude Code remote-control CLI flag, documented at
-// https://code.claude.com/docs/en/remote-control.md (issue #73 research
-// finding).
+// injectRemoteControlFlag is a thin local wrapper around
+// spawn.InjectRemoteControlFlag so the dispatch + handoff call sites
+// in this package read with identical signatures. Lifted to
+// internal/spawn so internal/handoffop (the auto-handoff drain) can
+// use the same rewrite without a cross-package import-cycle through
+// cmd/fleet.
 func injectRemoteControlFlag(command []string, sessionName string) []string {
-	// Strict shape match: ONLY rewrite Fleet's documented default
-	// `--command` (the literal shell-wrapped claude invocation
-	// registered by newDispatchCmd). Custom operator-supplied
-	// commands — even shell-wrapped ones that incidentally mention
-	// `claude --dangerously-skip-permissions` — are returned
-	// untouched. A loose `Contains` match risked rewriting arbitrary
-	// shell text inside a custom launcher (codex review #73 iter-3 P2).
-	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
-		return command
-	}
-	script := command[2]
-	if script != defaultClaudeWrapperScript {
-		return command
-	}
-	// Inject the flag IMMEDIATELY after the matched substring so the
-	// rest of the script (`; RC=$?; ...`) keeps its position. Quoting
-	// the session name with double quotes mirrors how the documented
-	// CLI usage is written; sessionName is hex (agent ID) plus the
-	// "fleet-" prefix so quoting is mostly defensive (no spaces, no
-	// shell metas) but cheap to keep.
-	//
-	// ReplaceAll (not Replace n=1) is deliberate: the default wrapper
-	// contains the literal `claude --dangerously-skip-permissions`
-	// TWICE — once as the launch command, once inside the
-	// "[fleet] claude exited cleanly — rerun ..." banner that prints
-	// when claude exits 0. Rewriting only the first occurrence would
-	// leave the banner suggesting a rerun command without remote-
-	// control, so an operator who follows the banner restarts WITHOUT
-	// auto-attach (codex review #73 iter-1 P3). Replacing both keeps
-	// the banner accurate.
-	replaced := strings.ReplaceAll(
-		script,
-		defaultClaudeInvocation,
-		defaultClaudeInvocation+` --remote-control "`+sessionName+`"`,
-	)
-	out := make([]string, len(command))
-	copy(out, command)
-	out[2] = replaced
-	return out
+	return spawn.InjectRemoteControlFlag(command, sessionName)
 }
 
-// sameCommand returns true iff the two argvs are identical
-// element-for-element. Used by the dispatch coord-spawn path to
-// detect when injectRemoteControlFlag returned an unchanged slice
-// (operator-overridden custom --command), so we don't pollute
-// spawn.Options.ExecCommand with a no-op duplicate of Command.
+// sameCommand mirrors the spawn.SameCommand helper. See doc there.
 func sameCommand(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// remoteControlDaemonRunning is the dispatch coord-spawn gate for
-// `--remote-control` injection (codex review #73 iter-5 P1, narrowed
-// in iter-6 P1). Returns true iff `pgrep -f` finds a running daemon
-// whose command-line carries the coord-prefix flag — i.e., a daemon
-// matching `--remote-control-session-name-prefix "fleet-coord"`.
-// Var so tests can stub the production exec.
-//
-// Why match the FULL prefix flag (not just "claude remote-control"):
-// the bootstrap paths in this codebase share the broad pgrep guard
-// — both fleet-coord (skills/coordinator/remote_control.py) and
-// fleet-handoff (internal/handoff/handoff.go) daemons trip the same
-// "is any claude remote-control running" check. A broad probe here
-// would treat a stale fleet-handoff daemon (from a prior handoff
-// flow) as usable; injecting --remote-control "fleet-coord-<id>"
-// against a fleet-handoff-prefix daemon's filter still fails to
-// auto-attach. We narrow on the literal flag value to only match
-// the fleet-coord daemon (codex review #73 iter-6 P1).
-//
-// A pgrep failure (binary missing on the host, kernel hiccup)
-// returns false — best-effort, fall back to the inbox-relay path.
-//
-// The substring keeps the regex inside pgrep's `-f` (basic regex)
-// safe-by-construction: the flag value is a literal string with
-// no metacharacters. If a future change introduces metas, switch
-// to `pgrep -fF` or migrate to /proc scanning.
-var remoteControlDaemonRunning = func() bool {
-	// pgrep -f matches the full argv string. We anchor with `^claude `
-	// to match ONLY the daemon process whose argv[0] is `claude` —
-	// not the transient `bash -c '... claude remote-control ...'`
-	// bootstrap subprocess that spawn_daemon_if_needed runs (codex
-	// review #73 iter-6 P1).
-	//
-	// Pattern: `^claude remote-control --remote-control-session-name-prefix fleet-coord`
-	// — the literal argv shape after the shell strips the quotes.
-	// The bootstrap script writes the flag with double quotes
-	// (`--remote-control-session-name-prefix "fleet-coord"`) so the
-	// shell preserves the literal `fleet-coord` token; by the time
-	// the actual `claude` daemon process exists, its argv carries
-	// the unquoted token (codex review #73 iter-7 P1: shell quotes
-	// don't survive exec, so a pattern with embedded quotes never
-	// matches the live daemon).
-	//
-	// pgrep's `-f` flag treats the pattern as a basic regex over the
-	// full command line; the literal flag value has no metacharacters
-	// so the anchoring is safe by construction.
-	return execCommand("pgrep", "-f",
-		`^claude remote-control --remote-control-session-name-prefix `+remoteControlSessionPrefix+`( |$)`).Run() == nil
+	return spawn.SameCommand(a, b)
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.

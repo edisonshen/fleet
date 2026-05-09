@@ -183,8 +183,24 @@ def _tick_locked(
     # on the per-coord marker file, and any I/O failure is logged + the
     # tick continues. NEVER blocks the coord; matches fleet-guard
     # discipline.
+    #
+    # Returns a status string (see remote_control module docstring).
+    # Non-OK / non-skipped-marker results land in BOOTSTRAP_LOG inside
+    # the function itself. We additionally surface FAILED_* on the
+    # tick's errors list so the operator (via `fleet status` or
+    # equivalent) sees a breadcrumb when bootstrap can't make progress.
     try:
-        remote_control.bootstrap_remote_control(project, coord_id, fleet_home=home)
+        status = remote_control.bootstrap_remote_control(
+            project, coord_id, fleet_home=home,
+        )
+        if status in (
+            remote_control.STATUS_FAILED_SEED,
+            remote_control.STATUS_FAILED_MARKER,
+        ):
+            result.errors.append(
+                f"remote-control bootstrap: {status} "
+                f"(see {remote_control.BOOTSTRAP_LOG} for details)"
+            )
     except Exception as exc:
         # bootstrap_remote_control already wraps each side-effect in
         # try/except, but a programming error in this module shouldn't

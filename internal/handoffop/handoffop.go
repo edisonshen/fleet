@@ -272,11 +272,34 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	if req.SchemaVersion < 2 {
 		thisHandoffDisableAutoResume = true
 	}
+
+	// Auto-handoff replacements get `--remote-control
+	// "fleet-handoff-<new-id>"` injected into the spawned claude argv
+	// so mobile / claude.ai pairing carries through automatically —
+	// matching the operator-triggered cmd/fleet/handoff.go path
+	// (fix/remote-control-coord-injection P0). Without this the
+	// auto-drained replacement only pairs after the agent runs the
+	// `/remote-control` slash command from FirstAction's manual
+	// instructions, which may never happen on a busy session.
+	//
+	// Persisted Command stays the clean `oldRec.Command` so a
+	// subsequent handoff doesn't inherit a stale session name; the
+	// rewrite goes via ExecCommand (per-spawn argv only). For
+	// operator-overridden custom --commands, InjectRemoteControlFlag
+	// returns the slice unchanged — we then pass nil as ExecCommand
+	// so spawn.Spawn doesn't see a no-op divergence.
+	rcSessionName := "fleet-handoff-" + req.NewAgentID
+	rewrittenExecArgv := spawn.InjectRemoteControlFlag(oldRec.Command, rcSessionName)
+	if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
+		rewrittenExecArgv = nil
+	}
+
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:      oldRec,
 		NewDocPath:     req.HandoffDoc,
 		Cwd:            oldRec.Cwd,
 		Command:        oldRec.Command,
+		ExecCommand:    rewrittenExecArgv,
 		PreAllocatedID: req.NewAgentID,
 		// Use disableAutoResume (explicit opt-out only), not
 		// thisHandoffDisableAutoResume (which includes the v1
