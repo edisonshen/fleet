@@ -236,7 +236,7 @@ const ActiveSubagentsNonePlaceholder = "_(none)_"
 //
 // Format per entry:
 //
-//	- task=<slug> branch=<branch> phase=<phase> agent_id=<hex> subagent_id=<id>
+//   - task=<slug> branch=<branch> phase=<phase> agent_id=<hex> subagent_id=<id>
 //
 // Empty fields render as `key=""`. The line is a single physical line
 // (no embedded newlines) so the parser can split on '\n' without
