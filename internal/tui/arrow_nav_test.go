@@ -1,0 +1,122 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+// Issue #90: Up/Down arrows are silent aliases for k/j; footer drops
+// nav + panel chips (intuitive enough to stay implicit). j/k still
+// work; ←/→ panel-switch from PR #85 still works. Help overlay is
+// the canonical surface for arrows + j/k + ←/→ discoverability.
+
+// TestKeyDownArrow_MovesCursorDown pins issue #90: pressing the Down
+// arrow moves the cursor down by one row, identical to pressing j.
+// Down is already wired in model.handleKey ("j", "down" arm) — this
+// test is the regression guard so a future refactor can't quietly
+// drop the alias.
+func TestKeyDownArrow_MovesCursorDown(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "demo", RepoSlug: "demo"},
+			{Name: "other", RepoSlug: "other"},
+		},
+		LoadedAt: time.Now(),
+	}
+	m.dashCursor = 0
+
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	if mm.dashCursor != 1 {
+		t.Errorf("after ↓: dashCursor=%d, want 1 (alias for j)", mm.dashCursor)
+	}
+}
+
+// TestKeyUpArrow_MovesCursorUp pins issue #90: pressing the Up arrow
+// moves the cursor up by one row, identical to pressing k. Wraps at
+// the top boundary the same way k does.
+func TestKeyUpArrow_MovesCursorUp(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "demo", RepoSlug: "demo"},
+			{Name: "other", RepoSlug: "other"},
+		},
+		LoadedAt: time.Now(),
+	}
+	m.dashCursor = 1
+
+	updated, _ := m.Update(keyMsg("up"))
+	mm := updated.(Model)
+	if mm.dashCursor != 0 {
+		t.Errorf("after ↑: dashCursor=%d, want 0 (alias for k)", mm.dashCursor)
+	}
+}
+
+// TestKeyJK_StillWork is the regression test pinning that j/k still
+// move the cursor after issue #90 lands. The arrow aliases are
+// additive; removing j/k would silently break vim-flavored operators.
+func TestKeyJK_StillWork(t *testing.T) {
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "demo", RepoSlug: "demo"},
+			{Name: "other", RepoSlug: "other"},
+		},
+		LoadedAt: time.Now(),
+	}
+	m.dashCursor = 0
+
+	updated, _ := m.Update(keyMsg("j"))
+	mm := updated.(Model)
+	if mm.dashCursor != 1 {
+		t.Errorf("after j: dashCursor=%d, want 1", mm.dashCursor)
+	}
+	updated, _ = mm.Update(keyMsg("k"))
+	mm = updated.(Model)
+	if mm.dashCursor != 0 {
+		t.Errorf("after k: dashCursor=%d, want 0", mm.dashCursor)
+	}
+}
+
+// TestFooter_OmitsNavAndPanelChips pins issue #90: the footer must
+// NOT advertise nav (j/k) or panel (←/→) chips. Both are intuitive
+// enough to stay silent; the [?] help overlay carries the
+// discoverability surface.
+func TestFooter_OmitsNavAndPanelChips(t *testing.T) {
+	out := renderDashboardFooter(0, 200, "")
+	for _, banned := range []string{"j/k", "←/→", "[j", "[k", "] nav", "] panel"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("footer must not contain %q (issue #90), got:\n%s", banned, out)
+		}
+	}
+}
+
+// TestFooter_DocumentsCoreKeysOnly pins the canonical issue #90
+// footer shape: ⏎ open · n task · a attach · h handoff · x archive ·
+// / search · ? help · q quit. All eight chip keys must be present —
+// none of them are intuitive enough to drop.
+func TestFooter_DocumentsCoreKeysOnly(t *testing.T) {
+	out := renderDashboardFooter(0, 200, "")
+	for _, want := range []string{"⏎", "n", "a", "h", "x", "/", "?", "q",
+		"open", "task", "attach", "handoff", "archive", "search", "help", "quit"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("footer missing required chip %q, got:\n%s", want, out)
+		}
+	}
+}
+
+// TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight pins issue #90's
+// discoverability requirement: with the footer silent on nav + panel,
+// the [?] help overlay must document arrows + j/k + ←/→ so an
+// operator who pressed [?] can still find every navigation key.
+func TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight(t *testing.T) {
+	out := renderHelpOverlay(120)
+	for _, want := range []string{"j", "k", "↑", "↓", "←", "→"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help overlay missing nav key %q, got:\n%s", want, out)
+		}
+	}
+}

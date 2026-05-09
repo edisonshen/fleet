@@ -10,7 +10,7 @@
 //	│   <project block>           │   ● <worker row>    │
 //	│   <project block>           │   ● <worker row>    │
 //	├─────────────────────────────┴─────────────────────┤
-//	│ [j/k] nav  [⏎] open  …          uptime HH:MM      │
+//	│ [⏎] open  [n] task  …           uptime HH:MM      │
 //	└───────────────────────────────────────────────────┘
 //
 // Pure formatter — no I/O. Reads m.dashboard (loaded by
@@ -685,19 +685,23 @@ func isHexLower(c rune) bool {
 }
 
 // renderDashboardFooter draws the bottom keybind legend line.
-// Matches the mockup's `[j/k] nav  [←/→] panel  [⏎] open  [n] task
-// [a] attach  [/] search  [?] help`. The right side carries an uptime
-// indicator and (when set) the active search filter. Issue #83 added
-// the [←/→] panel chip — Left jumps the cursor to the first PROJECTS
-// row, Right jumps to the first WORKERS / agents row, so operators
-// don't have to walk j/k across long task expansions to switch panels.
+// Renders only the action chips — navigation (j/k or ↓/↑) and
+// panel-switch (←/→) keys are intuitive enough to stay silent
+// (issue #90). The [?] help overlay still documents every key for
+// discoverability. The right side carries an uptime indicator and
+// (when set) the active search filter.
+//
+// j/k still work; ↓/↑ are silent aliases handled in model.handleKey.
+// ← jumps to the first PROJECTS row, → jumps to the first
+// WORKERS/agents row — both unchanged since PR #85, just no longer
+// advertised in the footer.
 func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string) string {
 	chips := []struct{ key, label string }{
-		{"j/k", "nav"},
-		{"←/→", "panel"},
 		{"⏎", "open"},
 		{"n", "task"},
 		{"a", "attach"},
+		{"h", "handoff"},
+		{"x", "archive"},
 		{"/", "search"},
 		{"?", "help"},
 		{"q", "quit"},

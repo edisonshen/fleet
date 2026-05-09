@@ -189,24 +189,10 @@ func TestKeyLeftArrow_NoProjects_NoOp(t *testing.T) {
 	}
 }
 
-// TestRenderDashboardFooter_AdvertisesPanelChip pins the footer text
-// for the new ←/→ panel chip. The footer is the operator's only
-// surface for "what does this key do" outside the [?] help overlay,
-// so the chip MUST appear in the rendered string.
-func TestRenderDashboardFooter_AdvertisesPanelChip(t *testing.T) {
-	out := renderDashboardFooter(0, 200, "")
-	if !strings.Contains(out, "←/→") {
-		t.Errorf("footer missing ←/→ chip:\n%s", out)
-	}
-	if !strings.Contains(out, "panel") {
-		t.Errorf("footer missing 'panel' label:\n%s", out)
-	}
-}
-
 // TestRenderHelpOverlay_DocsArrowPanelEntry pins the [?] help overlay
-// help line for the panel-switch arrows. Mirrors the footer test but
-// against the modal help so an operator who pressed [?] sees the
-// canonical description.
+// help line for the panel-switch arrows. Issue #90: the footer no
+// longer advertises ←/→ — the help overlay is the canonical surface,
+// so this test guards the discoverability path.
 func TestRenderHelpOverlay_DocsArrowPanelEntry(t *testing.T) {
 	out := renderHelpOverlay(120)
 	if !strings.Contains(out, "←") || !strings.Contains(out, "→") {
