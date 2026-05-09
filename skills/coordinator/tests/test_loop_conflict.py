@@ -169,8 +169,6 @@ def test_dispatch_ready_cap2_skips_overlapping_task(tmp_path) -> None:
             _ok(stdout=wt_a + "\n"),
         ("/usr/local/bin/fleet", "workers", "worktree-path", "--project", "proj", "bravo-1234"):
             _ok(stdout=wt_b + "\n"),
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -191,6 +189,9 @@ def test_dispatch_ready_cap2_skips_overlapping_task(tmp_path) -> None:
     assert len(actions) == 1, f"expected one dispatch, got: {actions}"
     assert actions[0].error == ""
     assert actions[0].slug == "alpha-1234"
+    # Issue #84 Phase A: dispatch instruction emitted for the
+    # dispatched task only.
+    assert actions[0].dispatch_instruction.startswith("DISPATCH: alpha-1234")
     # `git worktree add` ran exactly once — for alpha only. The skipped
     # task must NOT have created its worktree (the conflict gate runs
     # before the worktree-creation block).
@@ -205,9 +206,9 @@ def test_dispatch_ready_cap2_skips_overlapping_task(tmp_path) -> None:
     assert all(wt_b not in c for c in git_add_calls), (
         f"skipped task must not create its worktree: {git_add_calls}"
     )
-    # Only one fleet dispatch invocation.
+    # Issue #84 Phase A: no `fleet dispatch` shell-out anywhere.
     disp_calls = [c for c in calls if len(c) >= 2 and c[1] == "dispatch"]
-    assert len(disp_calls) == 1
+    assert len(disp_calls) == 0, f"unexpected fleet dispatch calls: {disp_calls}"
 
 
 def test_dispatch_ready_cap2_dispatches_disjoint_tasks(tmp_path) -> None:
@@ -218,18 +219,13 @@ def test_dispatch_ready_cap2_dispatches_disjoint_tasks(tmp_path) -> None:
     a = _ready("alpha-1234", spec="Files: internal/tasks/tasks.go")
     b = _ready("bravo-1234", spec="Files: internal/agent/agent.go")
 
-    # Two distinct dispatch outcomes — fleet dispatch is invoked twice
-    # and we hand a fresh agent ID to each call. Use a stateful router
-    # so the second dispatch returns a different agent ID.
-    dispatch_ids = ["aaaa0001", "bbbb0002"]
-
-    def fleet_dispatch_router(cmd, *_args, **_kwargs):
+    # Issue #84 Phase A: no `fleet dispatch` subprocess. The router
+    # only resolves worktree-path + git worktree add; dispatch is
+    # in-process via mint_agent_id + write_inbox + format_instruction.
+    def router(cmd, *_args, **_kwargs):
         if cmd[:3] == ["/usr/local/bin/fleet", "workers", "worktree-path"]:
             slug = cmd[-1]
             return _ok(stdout=(wt_a if slug == "alpha-1234" else wt_b) + "\n")
-        if cmd[:2] == ["/usr/local/bin/fleet", "dispatch"]:
-            agent = dispatch_ids.pop(0) if dispatch_ids else "fffffffa"
-            return _ok(stdout=f"agent {agent} dispatched\n")
         if cmd[:5] == ["git", "-C", repo, "worktree", "add"]:
             return _ok()
         return _ok()
@@ -238,7 +234,7 @@ def test_dispatch_ready_cap2_dispatches_disjoint_tasks(tmp_path) -> None:
 
     def recorder(cmd, *args, **kwargs):
         calls.append(list(cmd))
-        return fleet_dispatch_router(cmd, *args, **kwargs)
+        return router(cmd, *args, **kwargs)
 
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
          patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
@@ -253,8 +249,16 @@ def test_dispatch_ready_cap2_dispatches_disjoint_tasks(tmp_path) -> None:
     assert all(a.error == "" for a in actions), actions
     slugs = sorted(a.slug for a in actions)
     assert slugs == ["alpha-1234", "bravo-1234"]
+    # Issue #84 Phase A: each dispatch yields a fresh DISPATCH block
+    # with a distinct minted agent_id; coord agent invokes Agent
+    # tool once per block.
+    blocks = [a.dispatch_instruction for a in actions]
+    assert all(b.startswith("DISPATCH: ") for b in blocks)
+    agent_ids = sorted(a.agent_id for a in actions)
+    assert len(set(agent_ids)) == 2, f"duplicate agent_ids: {agent_ids}"
+    # No `fleet dispatch` subprocess shell-out — pin the invariant.
     disp_calls = [c for c in calls if len(c) >= 2 and c[1] == "dispatch"]
-    assert len(disp_calls) == 2
+    assert len(disp_calls) == 0, f"unexpected fleet dispatch calls: {disp_calls}"
 
 
 def test_dispatch_ready_cap2_skips_no_files_when_inflight_present(tmp_path) -> None:
@@ -273,8 +277,6 @@ def test_dispatch_ready_cap2_skips_no_files_when_inflight_present(tmp_path) -> N
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_b + "\n"),
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -295,7 +297,8 @@ def test_dispatch_ready_cap2_skips_no_files_when_inflight_present(tmp_path) -> N
     assert actions == [], (
         f"no-files candidate should be conservatively skipped, got: {actions}"
     )
-    # No git worktree add, no fleet dispatch.
+    # No git worktree add. Issue #84 Phase A: no `fleet dispatch`
+    # subprocess (the path was removed entirely).
     assert not any(c[:5] == ["git", "-C", repo, "worktree", "add"] for c in calls), calls
     assert not any(len(c) >= 2 and c[1] == "dispatch" for c in calls), calls
 
@@ -315,10 +318,10 @@ def test_dispatch_ready_cap1_unaffected_by_conflict_logic(tmp_path) -> None:
     candidate = _ready(
         "alpha-1234", spec="Refactor the auth flow.",  # no Files:
     )
-    routes = {
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
-    }
+    # Issue #84 Phase A: no `fleet dispatch` shell-out anymore. The
+    # router has nothing to match for the dispatch path; the in-process
+    # mint+inbox+format flow runs unmocked.
+    routes: dict = {}
     calls: list = []
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
          patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
@@ -334,10 +337,13 @@ def test_dispatch_ready_cap1_unaffected_by_conflict_logic(tmp_path) -> None:
 
     assert len(actions) == 1
     assert actions[0].error == ""
-    # No git invocations in cap=1 mode; the dispatch fired normally.
+    # Issue #84 Phase A: spawn signal is the DISPATCH instruction.
+    assert actions[0].dispatch_instruction.startswith("DISPATCH: alpha-1234")
+    # No git invocations in cap=1 mode.
     assert not any(c[:1] == ["git"] for c in calls), calls
+    # No `fleet dispatch` shell-out either.
     disp_calls = [c for c in calls if len(c) >= 2 and c[1] == "dispatch"]
-    assert len(disp_calls) == 1
+    assert len(disp_calls) == 0
 
 
 def test_dispatch_ready_cap2_overlap_clears_after_first_completes(tmp_path) -> None:
@@ -357,8 +363,6 @@ def test_dispatch_ready_cap2_overlap_clears_after_first_completes(tmp_path) -> N
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_b + "\n"),
-        ("/usr/local/bin/fleet", "dispatch"):
-            _ok(stdout="agent abcdef01 dispatched\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
@@ -383,3 +387,6 @@ def test_dispatch_ready_cap2_overlap_clears_after_first_completes(tmp_path) -> N
         assert len(actions_2) == 1
         assert actions_2[0].slug == "bravo-1234"
         assert actions_2[0].error == ""
+        # Issue #84 Phase A: the across-tick re-consideration emits a
+        # DISPATCH block (the spawn signal) for B.
+        assert actions_2[0].dispatch_instruction.startswith("DISPATCH: bravo-1234")

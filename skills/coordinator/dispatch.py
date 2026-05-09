@@ -1,25 +1,38 @@
-"""Worker prompt assembly + fleet-dispatch caller.
+"""Worker prompt assembly + Agent-tool DISPATCH instruction emitter (issue #84).
 
 The coordinator decides what to dispatch (loop.py); this module owns
 the mechanics of HOW to dispatch:
 
   1. build_worker_prompt(task, standards_md, learnings_md) — assemble
      the self-contained prompt the worker receives on its first turn.
-  2. dispatch_worker(...) — invoke `fleet dispatch <task-id> --project
-     <p> --cwd <wt> --command <claude command>`; capture the new
-     agent ID off stdout.
-  3. write_worker_inbox(agent_id, prompt) — drop the prompt into the
-     worker's inbox so fleet-guard's SessionStart injects it.
+  2. mint_agent_id() — generate an 8-hex token used as the worker's
+     fleet agent_id (matches the token shape `fleet dispatch` used to
+     return).
+  3. format_dispatch_instruction(...) — render a human + machine
+     readable DISPATCH block. The Python skill cannot call Claude's
+     Agent tool directly (it's a Claude tool, not a Python API); the
+     skill prints the DISPATCH block to stdout and the coord agent
+     (Claude session running /coordinator) reads it and invokes the
+     Agent tool with the listed parameters. SKILL.md's "Worker
+     dispatch protocol" section pins this contract for Claude.
+  4. write_worker_inbox(agent_id, prompt) — drop the prompt into the
+     worker's inbox so the coord can pass it via Agent's `prompt`
+     parameter (the coord Reads the file then hands the body to
+     Agent). The file path lives in the DISPATCH block.
 
-Subprocess-only (matches fleet-guard discipline). All paths through
-the fleet binary — Go remains the authoritative writer for tasks.md
-and agent records. parse.py is read-only inside the skill.
+All mutations route through the fleet CLI — Go remains the
+authoritative writer for tasks.md and agent records. parse.py is
+read-only inside the skill.
+
+Phase A scope: dispatch mechanism only. Phase B (deferred) covers
+[a] task-attach replacement, lifecycle/handoff for Agent subagents.
+Phase C (deferred) covers TUI subagent_id surfacing.
 """
 from __future__ import annotations
 
-import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -238,74 +251,87 @@ def _select_learnings(raw: str) -> str:
     return "\n".join(out)
 
 
-def dispatch_worker(
-    task: parse.Task,
-    project: str,
-    cwd: str,
-    *,
-    fleet_bin: str = "fleet",
-    extra_args: list[str] | None = None,
-    timeout_s: float = 30.0,
-) -> DispatchResult:
-    """Invoke `fleet dispatch <task-id> --project <p> --cwd <cwd>`.
+def mint_agent_id() -> str:
+    """Generate a fresh 8-hex token for a worker subagent's agent_id.
 
-    Returns DispatchResult with agent_id parsed off the first 8-hex
-    token in stdout. error is non-empty on failure (subprocess error,
-    non-zero exit, or unparseable stdout). Caller writes nothing if
-    error is set — the dispatch never started, so no inbox stub.
+    Phase A (issue #84) replaced the `fleet dispatch` subprocess —
+    which printed the agent_id on stdout — with the Agent tool path.
+    The skill now mints the agent_id itself before emitting the
+    DISPATCH instruction so:
+
+      1. The token is in tasks.md (`note "dispatched as agent <id>"`)
+         and supervisor's slug→agent_id map BEFORE the coord agent
+         ever calls the Agent tool. If the coord crashes between
+         emit + Agent call, the next tick still has the breadcrumb.
+      2. The inbox file (~/.fleet/inbox/<agent_id>.md) is the
+         worker's first-turn prompt source — without a stable
+         agent_id at emit time we'd have to defer the inbox write
+         to a later coord turn, splitting the dispatch path in two.
+
+    The token is `secrets.token_hex(4)` — 4 random bytes, hex-encoded
+    to 8 chars. Matches Go's agent.NewID alphabet (lowercase hex) and
+    cardinality (32 bits → 4.3B unique workers per coord, which
+    overflows project lifetimes).
     """
-    cmd = [fleet_bin, "dispatch", task.slug, "--project", project, "--cwd", cwd]
-    if extra_args:
-        cmd.extend(extra_args)
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_s,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        return DispatchResult(error=f"fleet binary not found: {exc}")
-    except subprocess.TimeoutExpired as exc:
-        return DispatchResult(error=f"fleet dispatch timed out after {timeout_s}s: {exc}")
-    if proc.returncode != 0:
-        # stderr first, stdout fallback. Trimmed because cobra can
-        # emit a long usage block on a flag error.
-        msg = (proc.stderr or proc.stdout or "").strip().splitlines()
-        return DispatchResult(error="fleet dispatch failed: " + (msg[0] if msg else f"exit {proc.returncode}"))
-    agent_id = _extract_agent_id(proc.stdout)
-    if not agent_id:
-        return DispatchResult(error=f"could not parse agent ID from `fleet dispatch` stdout: {proc.stdout!r}")
-    return DispatchResult(
-        agent_id=agent_id,
-        branch=f"worker/{task.slug}",
-    )
+    return secrets.token_hex(4)
 
 
-# Agent IDs are 8 hex chars (agent.NewID). Two patterns, in order:
-#   1. Strict: `agent <id>` — fleet dispatch's canonical output shape
-#      ("agent <id> dispatched on tmux session ...").
-#   2. Fallback: any standalone 8-hex token, after stripping the bytes
-#      that look like SHAs / tmux paths to reduce false-positive risk.
-# We try strict first; if it doesn't match, fall back to the looser one
-# but only if there's exactly one 8-hex token in the trimmed text.
-_AGENT_ID_STRICT_RE = re.compile(r"\bagent\s+([0-9a-f]{8})\b")
-_AGENT_ID_LOOSE_RE = re.compile(r"\b([0-9a-f]{8})\b")
-# Strictly validate inputs to write_worker_inbox.
+# Strictly validate inputs to write_worker_inbox + format_dispatch_instruction.
 _AGENT_ID_FULL_RE = re.compile(r"^[0-9a-f]{8}$")
 
 
-def _extract_agent_id(text: str) -> str:
-    if not text:
-        return ""
-    # Prefer the keyword-anchored form. Drift-tolerant fallback only
-    # fires when there's exactly one 8-hex match across the whole
-    # string — a path like /tmp/abcdef01/foo would otherwise win.
-    strict = _AGENT_ID_STRICT_RE.search(text)
-    if strict:
-        return strict.group(1)
-    matches = _AGENT_ID_LOOSE_RE.findall(text)
-    if len(matches) == 1:
-        return matches[0]
-    return ""
+def format_dispatch_instruction(
+    *,
+    agent_id: str,
+    slug: str,
+    prompt_file: str,
+    description: str | None = None,
+) -> str:
+    """Render the DISPATCH block the coord agent (Claude) will act on.
+
+    Phase A — the Python skill cannot invoke Claude's Agent tool
+    directly. Instead, /coordinator emits structured DISPATCH blocks
+    on stdout and SKILL.md's "Worker dispatch protocol" section
+    instructs the coord agent to invoke `Agent(...)` for each block
+    on its NEXT assistant turn (one Agent call per block).
+
+    Block format:
+
+        DISPATCH: <slug>
+          agent_id: <8hex>
+          description: <short>
+          prompt_file: <abs path>
+          run_in_background: true
+          subagent_type: general-purpose
+        END_DISPATCH
+
+    description defaults to "fleet worker <slug>". prompt_file is
+    the path the coord must Read; the body is then passed verbatim
+    as Agent's `prompt` parameter. agent_id MUST be 8 hex chars
+    (validated here so a malformed token can't make it into the
+    stream the coord parses).
+
+    Returns the raw block as a string. Caller (loop.py) bundles
+    blocks together — one per dispatched task — and prints them
+    BEFORE the JSON tick summary so the coord sees them as
+    distinct, parseable content.
+    """
+    if not _AGENT_ID_FULL_RE.fullmatch(agent_id):
+        raise ValueError(f"invalid agent_id {agent_id!r}: expected 8 hex chars")
+    if not slug:
+        raise ValueError("slug must be non-empty")
+    if not prompt_file:
+        raise ValueError("prompt_file must be non-empty")
+    desc = (description or f"fleet worker {slug}").strip()
+    return "\n".join([
+        f"DISPATCH: {slug}",
+        f"  agent_id: {agent_id}",
+        f"  description: {desc}",
+        f"  prompt_file: {prompt_file}",
+        "  run_in_background: true",
+        "  subagent_type: general-purpose",
+        "END_DISPATCH",
+    ])
 
 
 def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = None) -> str:

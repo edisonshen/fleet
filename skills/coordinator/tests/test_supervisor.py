@@ -1100,7 +1100,10 @@ def test_loop_dispatch_persists_agent_id_mapping(
     ))
 
     # Stub fleet CLI calls + dispatch subprocess so we run end-to-end
-    # without forking the real `fleet` binary.
+    # without forking the real `fleet` binary. Issue #84 Phase A: the
+    # skill no longer shells out to `fleet dispatch` for workers; it
+    # mints agent_ids in-process via dispatch.mint_agent_id. We pin
+    # the mint to a known token so the assertion is deterministic.
     monkeypatch.setattr(loop, "_run_fleet", lambda *a, **kw: None)
 
     def fake_dispatch_run(cmd, capture_output=True, text=True, timeout=None, check=False):
@@ -1110,15 +1113,11 @@ def test_loop_dispatch_persists_agent_id_mapping(
             )
         if cmd[1:3] == ["learnings", "list"]:
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-        if cmd[1] == "dispatch":
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0,
-                stdout="agent abcdef01 dispatched\n", stderr="",
-            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     import dispatch as dispatch_mod  # noqa: F811
     monkeypatch.setattr(dispatch_mod.subprocess, "run", fake_dispatch_run)
+    monkeypatch.setattr(dispatch_mod, "mint_agent_id", lambda: "abcdef01")
 
     res = loop.tick(
         "fleet", coord_id="cccccc01", cwd=str(tmp_path),

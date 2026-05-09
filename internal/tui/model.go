@@ -8,6 +8,8 @@
 //
 // Keyboard:
 //   - j, ↓ / k, ↑: cursor down / up across all rows (wraps)
+//   - ← / →     : jump cursor to first row of left (PROJECTS) /
+//     right (WORKERS) panel
 //   - ⏎ enter   : open detail panel for the row under cursor
 //   - n         : add a new task to the current project (in-process call)
 //   - a         : attach (agents, tmux) or peek (workers, log + state)
@@ -585,6 +587,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.moveCursor(+1)
 	case "k", "up":
 		m.moveCursor(-1)
+	case "left":
+		m.jumpToLeftPanel()
+	case "right":
+		m.jumpToRightPanel()
 	}
 	return m, nil
 }
@@ -601,6 +607,63 @@ func (m *Model) moveCursor(delta int) {
 	}
 	n := len(rows)
 	m.dashCursor = ((m.dashCursor+delta)%n + n) % n
+}
+
+// jumpToLeftPanel snaps the cursor onto the first PROJECTS-column row
+// (issue #83). Operators with long task expansions can otherwise burn
+// many j/k presses just to walk back across the unified row list. The
+// PROJECTS column always leads dashboardRows() (see rows.go's row
+// ordering contract), so the first row of kind rowProject is the
+// LEFT-panel anchor.
+//
+// No-op when no project row exists (synthetic-only dashboards or
+// empty state) — leaves the cursor where it is rather than hopping to
+// 0, which could be a worker/agent row in pathological layouts.
+//
+// j/k behavior is unchanged: this is an additive shortcut, not a
+// rebinding. Idempotent — pressing ← when already on the first project
+// is a no-op (no flash churn).
+func (m *Model) jumpToLeftPanel() {
+	rows := m.dashboardRows()
+	for i, r := range rows {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			return
+		}
+	}
+}
+
+// jumpToRightPanel snaps the cursor onto the first WORKERS/agents-column
+// row (issue #83). Right-panel ordering in dashboardRows() is workers
+// first then v0.1 agents, so we prefer the first rowWorker and fall back
+// to the first rowAgent — this matches the visual top of the right panel
+// in either populated state.
+//
+// When the right panel is empty (no workers and no agents), set a
+// non-error flash so the operator sees why the keypress did nothing.
+// We don't move the cursor in that case; bouncing to row 0 would just
+// scroll the operator's selection without telling them why.
+func (m *Model) jumpToRightPanel() {
+	rows := m.dashboardRows()
+	// First pass: prefer a worker row (top of WORKERS · N ACTIVE block).
+	for i, r := range rows {
+		if r.kind == rowWorker {
+			m.dashCursor = i
+			return
+		}
+	}
+	// Second pass: fall back to the first agent row when no workers
+	// are loaded (right panel still has agents in the v0.1 sub-block).
+	for i, r := range rows {
+		if r.kind == rowAgent {
+			m.dashCursor = i
+			return
+		}
+	}
+	// Right panel is genuinely empty. Surface a flash; non-error
+	// because pressing → on an empty right panel is a navigation
+	// no-op, not a failure.
+	m.flash = &flashMsg{text: "right panel is empty"}
 }
 
 // View renders the current state. Called by bubbletea on every model
