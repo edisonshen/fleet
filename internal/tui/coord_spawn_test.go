@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // TestCoordSpawnState_NoMarkerNoCoordState_ReturnsIdle pins the
@@ -450,13 +452,16 @@ func stubRemoveMarker(t *testing.T) *[]string {
 }
 
 // TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle pins issue #96
-// gap 1: when derivation flagged the row as Stuck (marker past
+// gap 1 (Path A): when derivation flagged the row as Stuck (marker past
 // spawnTimeout) but the tmux session for the marker's agent_id is
 // gone, the helper transitions the state to Idle and invokes the
 // remove callback exactly once. Pure-input test — no disk, no tmux.
+//
+// agentRecordFresh=false because Path A's defining case is "no record
+// on disk OR record is stale" — silent spawn death.
 func TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle(t *testing.T) {
 	rmCalled := 0
-	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, func() error {
+	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, false, func() error {
 		rmCalled++
 		return nil
 	})
@@ -471,38 +476,87 @@ func TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle(t *testing.T) {
 	}
 }
 
-// TestApplyStuckSelfHeal_LiveSessionPreservesStuck: when the tmux
-// session for the marker's agent_id IS alive, the warning is real
-// (genuinely-hung spawn the operator should attach to via tmux). Heal
-// must NOT fire and the remove callback must NOT be invoked.
-func TestApplyStuckSelfHeal_LiveSessionPreservesStuck(t *testing.T) {
+// TestApplyStuckSelfHeal_LiveSessionStaleRecordPreservesStuck: when the
+// tmux session is alive AND the agent record is NOT fresh (no recent
+// last_activity_ts), the warning is real — a genuinely-hung spawn the
+// operator should attach to via tmux. Heal must NOT fire.
+//
+// This is the regression case for the Path B follow-up: we must not
+// expand healing to "any live session" — only to "live agent record."
+// The original Path A behavior is preserved.
+func TestApplyStuckSelfHeal_LiveSessionStaleRecordPreservesStuck(t *testing.T) {
 	rmCalled := 0
-	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, func() error {
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, false, func() error {
 		rmCalled++
 		return nil
 	})
 	if got != coordSpawnStuck {
-		t.Errorf("got %v; want coordSpawnStuck (live session must keep warning)", got)
+		t.Errorf("got %v; want coordSpawnStuck (live session + stale record must keep warning)", got)
 	}
 	if rmCalled != 0 {
-		t.Errorf("remove invoked %d times for live session; want 0", rmCalled)
+		t.Errorf("remove invoked %d times for live session + stale record; want 0", rmCalled)
+	}
+}
+
+// TestApplyStuckSelfHeal_FreshRecordLiveSessionHealsViaPathB pins the
+// follow-up bug fix: when the marker is past spawnTimeout BUT the agent
+// record at ~/.fleet/agents/<id>.json shows a fresh last_activity_ts
+// AND tmux is alive, the spawn already succeeded and the marker is just
+// stale. Path B heals.
+func TestApplyStuckSelfHeal_FreshRecordLiveSessionHealsViaPathB(t *testing.T) {
+	rmCalled := 0
+	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, true, func() error {
+		rmCalled++
+		return nil
+	})
+	if err != nil {
+		t.Errorf("unexpected err from self-heal: %v", err)
+	}
+	if got != coordSpawnIdle {
+		t.Errorf("got %v; want coordSpawnIdle (fresh record + live session must heal via Path B)", got)
+	}
+	if rmCalled != 1 {
+		t.Errorf("remove invoked %d times; want 1", rmCalled)
+	}
+}
+
+// TestApplyStuckSelfHeal_FreshRecordDeadSessionAlsoHeals: Path B doesn't
+// require live tmux. A fresh record alone is sufficient evidence the
+// spawn succeeded — the tmux session may have been killed independently
+// (operator [x]'d the agent, machine slept, etc). Heal regardless.
+func TestApplyStuckSelfHeal_FreshRecordDeadSessionAlsoHeals(t *testing.T) {
+	rmCalled := 0
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, true, func() error {
+		rmCalled++
+		return nil
+	})
+	if got != coordSpawnIdle {
+		t.Errorf("got %v; want coordSpawnIdle (fresh record alone must heal)", got)
+	}
+	if rmCalled != 1 {
+		t.Errorf("remove invoked %d times; want 1", rmCalled)
 	}
 }
 
 // TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck: when the marker's
 // body read returned empty (concurrent rewrite or hand-edited zero-
-// byte file), we can't probe a session we don't know the name of —
-// keep the Stuck state and let the operator triage via the soft-
-// fallback hint. Remove must NOT fire (no marker we're confident is
-// stale).
+// byte file), we can't probe a session OR a record we don't know the
+// name of — keep the Stuck state and let the operator triage via the
+// soft-fallback hint. Remove must NOT fire (no marker we're confident
+// is stale). This regression test pins the contract under Path B too:
+// even with agentRecordFresh=true, an empty markerAgentID short-circuits.
 func TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck(t *testing.T) {
 	rmCalled := 0
-	got, _ := applyStuckSelfHeal(coordSpawnStuck, "", false, func() error {
-		rmCalled++
-		return nil
-	})
-	if got != coordSpawnStuck {
-		t.Errorf("got %v; want coordSpawnStuck (empty agent ID must keep warning)", got)
+	for _, alive := range []bool{false, true} {
+		for _, fresh := range []bool{false, true} {
+			got, _ := applyStuckSelfHeal(coordSpawnStuck, "", alive, fresh, func() error {
+				rmCalled++
+				return nil
+			})
+			if got != coordSpawnStuck {
+				t.Errorf("alive=%v fresh=%v: got %v; want coordSpawnStuck (empty agent ID must keep warning)", alive, fresh, got)
+			}
+		}
 	}
 	if rmCalled != 0 {
 		t.Errorf("remove invoked %d times with empty agent ID; want 0", rmCalled)
@@ -511,12 +565,12 @@ func TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck(t *testing.T) {
 
 // TestApplyStuckSelfHeal_NonStuckStatesUnaffected: Idle / Spawning /
 // Active are pass-throughs. The helper must never mutate non-Stuck
-// states, even with a known dead session — those rows aren't claiming
-// the row is stuck and the operator is being shown the right thing.
+// states, even when both heal paths would otherwise match — those rows
+// aren't claiming the row is stuck.
 func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	for _, st := range []coordSpawnState{coordSpawnIdle, coordSpawnSpawning, coordSpawnActive} {
 		rmCalled := 0
-		got, _ := applyStuckSelfHeal(st, "abcd1234", false, func() error {
+		got, _ := applyStuckSelfHeal(st, "abcd1234", false, true, func() error {
 			rmCalled++
 			return nil
 		})
@@ -587,5 +641,270 @@ func TestProjectRow_StuckHintFallsBackWhenAgentIDMissing(t *testing.T) {
 	}
 	if !strings.Contains(joined, "no agent ID") {
 		t.Errorf("fallback hint must surface 'no agent ID'; got:\n%s", joined)
+	}
+}
+
+// TestIsAgentRecordFresh covers the helper that drives Path B of
+// applyStuckSelfHeal. Pure-input — feeds a synthetic records slice +
+// fixed now + window so the test is deterministic.
+func TestIsAgentRecordFresh(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	window := 10 * time.Minute
+
+	tests := []struct {
+		name    string
+		records []*agent.Record
+		id      string
+		want    bool
+	}{
+		{
+			name:    "nil records → not fresh",
+			records: nil,
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name:    "empty records → not fresh",
+			records: []*agent.Record{},
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name:    "empty id short-circuits → not fresh",
+			records: []*agent.Record{{ID: "abcd1234", LastActivityTS: now.Add(-1 * time.Minute)}},
+			id:      "",
+			want:    false,
+		},
+		{
+			name:    "id not present → not fresh",
+			records: []*agent.Record{{ID: "deadbeef", LastActivityTS: now.Add(-1 * time.Minute)}},
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name:    "match, fresh tick within window → fresh",
+			records: []*agent.Record{{ID: "abcd1234", LastActivityTS: now.Add(-2 * time.Minute)}},
+			id:      "abcd1234",
+			want:    true,
+		},
+		{
+			name:    "match, exactly at window edge → fresh (≤ window)",
+			records: []*agent.Record{{ID: "abcd1234", LastActivityTS: now.Add(-window)}},
+			id:      "abcd1234",
+			want:    true,
+		},
+		{
+			name:    "match, just past window → not fresh",
+			records: []*agent.Record{{ID: "abcd1234", LastActivityTS: now.Add(-window - time.Second)}},
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name:    "match, zero LastActivityTS (legacy / partial write) → not fresh",
+			records: []*agent.Record{{ID: "abcd1234"}},
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name: "match in middle of slice → fresh",
+			records: []*agent.Record{
+				{ID: "11111111", LastActivityTS: now.Add(-1 * time.Hour)},
+				{ID: "abcd1234", LastActivityTS: now.Add(-30 * time.Second)},
+				{ID: "22222222", LastActivityTS: now.Add(-2 * time.Minute)},
+			},
+			id:   "abcd1234",
+			want: true,
+		},
+		{
+			name: "nil entry tolerated; later match wins",
+			records: []*agent.Record{
+				nil,
+				{ID: "abcd1234", LastActivityTS: now.Add(-30 * time.Second)},
+			},
+			id:   "abcd1234",
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isAgentRecordFresh(tc.records, tc.id, now, window)
+			if got != tc.want {
+				t.Errorf("isAgentRecordFresh(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProjectRow_FreshAgentRecordSelfHealsLiveSession pins the
+// follow-up bug: marker stuck, agent record fresh (last_activity_ts
+// within freshness window), tmux ALIVE → state heals to Idle, removeMarker
+// called once. This is the exact local scenario the operator hit:
+// `~/.fleet/projects/projects-fleet/.locks/coord-spawn-marker` past
+// timeout, but `~/.fleet/agents/<id>.json` shows a fresh tick AND the
+// tmux session is up.
+func TestProjectRow_FreshAgentRecordSelfHealsLiveSession(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	// fleet-abcd1234 IS alive — the bug case. Without Path B this would
+	// have rendered the red "stuck" warning forever.
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+	rmCalls := stubRemoveMarker(t)
+
+	records := []*agent.Record{
+		{ID: "abcd1234", LastActivityTS: now.Add(-30 * time.Second)}, // fresh
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("Path B self-heal must suppress stuck warning when agent record is fresh; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 1 || (*rmCalls)[0] != "demo" {
+		t.Errorf("expected exactly one remove(demo) call; got %v", *rmCalls)
+	}
+}
+
+// TestProjectRow_FreshAgentRecordSelfHealsDeadSession pins Path B
+// independence from tmux state: even if the tmux session is dead, a
+// fresh agent record proves the spawn succeeded at some point and the
+// marker is stale. Heal regardless of session state.
+//
+// (Path A would also fire here — both paths are sufficient. The check is
+// that the heal happens once, which is what removeMarker call count
+// asserts.)
+func TestProjectRow_FreshAgentRecordSelfHealsDeadSession(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{}) // dead
+	rmCalls := stubRemoveMarker(t)
+
+	records := []*agent.Record{
+		{ID: "abcd1234", LastActivityTS: now.Add(-1 * time.Minute)},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("fresh agent record must heal even with dead tmux; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 1 {
+		t.Errorf("expected exactly one remove call; got %d (%v)", len(*rmCalls), *rmCalls)
+	}
+}
+
+// TestProjectRow_NoAgentRecordLiveSessionPreservesStuck pins the
+// regression: marker stuck, NO matching agent record loaded into the
+// model, tmux alive → does NOT heal. The operator should still see the
+// warning so they can investigate (the spawn is genuinely hung — no
+// record was ever written, suggesting fleet-guard never reported in).
+func TestProjectRow_NoAgentRecordLiveSessionPreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+	rmCalls := stubRemoveMarker(t)
+
+	// No matching agent record — m.records is nil / empty.
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      nil,
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("expected stuck warning when no agent record + live session; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 0 {
+		t.Errorf("self-heal must NOT fire without an agent record; got %d remove calls (%v)", len(*rmCalls), *rmCalls)
+	}
+}
+
+// TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA pins
+// regression for Path A: even when a stale agent record exists (old
+// last_activity_ts), the dead-tmux gate must still heal — silent spawn
+// death is the original Path A case and must keep working.
+func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{}) // dead
+	rmCalls := stubRemoveMarker(t)
+
+	records := []*agent.Record{
+		{ID: "abcd1234", LastActivityTS: now.Add(-2 * time.Hour)}, // stale
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("Path A must still heal on dead tmux even with stale record; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 1 {
+		t.Errorf("expected one remove call via Path A; got %d (%v)", len(*rmCalls), *rmCalls)
+	}
+}
+
+// TestProjectRow_StaleAgentRecordLiveSessionPreservesStuck pins the
+// truly-hung case: marker past timeout, agent record exists but
+// last_activity_ts is OLD (beyond the freshness window), tmux ALIVE.
+// Neither heal path matches — the operator IS looking at a real hang
+// and the warning must remain so they triage via tmux.
+func TestProjectRow_StaleAgentRecordLiveSessionPreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+	rmCalls := stubRemoveMarker(t)
+
+	records := []*agent.Record{
+		{ID: "abcd1234", LastActivityTS: now.Add(-1 * time.Hour)}, // stale
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("expected stuck warning when record is stale + session alive; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 0 {
+		t.Errorf("self-heal must NOT fire on truly-hung row; got %d remove calls", len(*rmCalls))
 	}
 }

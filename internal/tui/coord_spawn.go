@@ -30,6 +30,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // coordSpawnCtx bundles the per-render inputs the project block needs
@@ -37,10 +39,18 @@ import (
 // projectBlockLines from buildBodyLines once per dashboard frame so a
 // single now / spinner-frame is consistent across every project row
 // in that frame.
+//
+// records is the model's cached agent.List() slice (m.records). The
+// stuck-marker self-heal path B reads it through isAgentRecordFresh
+// to decide whether the agent named in the marker is still ticking —
+// in which case the marker is stale and should be removed regardless
+// of tmux liveness. Empty / nil is fine: Path B simply won't fire and
+// Path A's dead-tmux gate continues to drive the heal.
 type coordSpawnCtx struct {
 	now          time.Time
 	tickFrame    int
 	spawnTimeout time.Duration
+	records      []*agent.Record
 }
 
 // coordSpawnState enumerates the four indicator states the project row
@@ -260,16 +270,33 @@ func renderCoordSpawnLineForProject(
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
 }
 
-// applyStuckSelfHeal is the issue #96 gap 1 self-heal gate. When
-// derivation flagged the row as Stuck but the tmux session for the
-// agent ID stored in the marker is definitively gone, the spawn died
-// silently — keeping the warning forever just trains operators to
-// ignore it. Transition Stuck → Idle and remove the stale marker via
-// removeMarker so the next render snaps back to the existing renderer.
+// applyStuckSelfHeal is the issue #96 gap 1 + follow-up self-heal gate.
+// When derivation flagged the row as Stuck but evidence on disk says
+// the spawn either died silently OR already succeeded, the warning is a
+// lie — keeping it forever just trains operators to ignore the chip.
+// Transition Stuck → Idle and remove the stale marker via removeMarker
+// so the next render snaps back to the existing renderer.
+//
+// Two heal paths cover the two ways "marker says stuck but the row
+// isn't really stuck" can happen:
+//
+//	Path A (issue #96): tmux session for the marker's agent ID is
+//	  definitively gone → spawn died silently → heal. (sessionAlive=false)
+//
+//	Path B (follow-up): the agent record at ~/.fleet/agents/<id>.json
+//	  has a fresh last_activity_ts → spawn succeeded, the agent is
+//	  ticking, the marker just never got cleared → heal regardless of
+//	  current tmux liveness. (agentRecordFresh=true)
+//
+// Both paths are independently sufficient. Either one being true causes
+// the marker to be removed and the state to flip to Idle. This deliberate
+// OR keeps Path B from regressing on tmux probe failures and keeps Path A
+// working when the agent record was never written (silent spawn death).
 //
 // Inputs are pure: caller supplies the derived state, the agent ID
 // from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
-// the result of the tmux liveness probe (`tmux.HasSession`), and a
+// the tmux liveness probe (`tmux.HasSession`), the agent-record-fresh
+// probe (computed from the loaded record's last_activity_ts), and a
 // remover stub. The remover is invoked exactly once per healed row;
 // errors are returned so the caller can surface them in a flash but
 // the healed state is still applied (the warning silently lingering
@@ -277,11 +304,12 @@ func renderCoordSpawnLineForProject(
 //
 // Self-heal does NOT fire when:
 //   - state ≠ Stuck (Idle/Spawning/Active are unaffected),
-//   - markerAgentID is empty (we can't probe a session we don't know
-//     the name of — fall back to the existing Stuck warning so the
-//     operator still sees something is wrong),
-//   - sessionAlive is true (the session exists; the spawn really IS
-//     hung at minute 11+ and the operator should attach via tmux).
+//   - markerAgentID is empty (we can't probe a session OR a record we
+//     don't know the name of — fall back to the existing Stuck warning
+//     so the operator still sees something is wrong),
+//   - neither heal path matches: sessionAlive=true AND agentRecordFresh=
+//     false. That's the genuinely-hung case (live tmux, no fresh agent
+//     ticks) the original Stuck warning is designed for.
 //
 // Returns the (possibly healed) state and any removal error. The error
 // is informational; callers may log via flash but should still render
@@ -290,6 +318,7 @@ func applyStuckSelfHeal(
 	st coordSpawnState,
 	markerAgentID string,
 	sessionAlive bool,
+	agentRecordFresh bool,
 	removeMarker func() error,
 ) (coordSpawnState, error) {
 	if st != coordSpawnStuck {
@@ -298,15 +327,58 @@ func applyStuckSelfHeal(
 	if markerAgentID == "" {
 		return st, nil
 	}
-	if sessionAlive {
+	// Heal if EITHER path matches. Path A: dead session. Path B: fresh
+	// agent record (spawn succeeded, marker stale). When neither
+	// condition holds, the operator IS looking at a real hang.
+	if sessionAlive && !agentRecordFresh {
 		return st, nil
 	}
-	// Session is gone for the agent the marker names. Heal.
 	var rmErr error
 	if removeMarker != nil {
 		rmErr = removeMarker()
 	}
 	return coordSpawnIdle, rmErr
+}
+
+// agentRecordFreshWindow is the freshness window used by Path B of
+// applyStuckSelfHeal: an agent record's last_activity_ts must be within
+// this window for the marker to be considered stale-but-the-spawn-
+// succeeded. Set to 2× coordActiveWindow so it tolerates one missed
+// fleet-guard heartbeat (the standard "Stop hook fired but the agent's
+// idle between turns" case) without papering over a truly-dead coord
+// whose record file lingers because nothing cleaned it up.
+//
+// Tuning rationale: coordActiveWindow=5m is the existing "● active"
+// gate. Doubling to 10m gives one round-trip of slack — at 11+ minutes
+// of silence we'd rather show the warning than silently swallow it,
+// because the spawn really might be wedged. The constant is exported
+// only via callers; tests pass an explicit window so the value can be
+// pinned without touching production.
+const agentRecordFreshWindow = 2 * coordActiveWindow
+
+// isAgentRecordFresh reports whether the agent-record matching id has a
+// last_activity_ts within window of now. Returns false when records is
+// nil/empty, when no record matches the id, or when the matching record
+// has a zero last_activity_ts (legacy / partial write — degrade safely
+// to "not fresh" so we don't heal off a record we can't trust).
+//
+// records is the same slice the model already loads via loadAgentsCmd
+// (m.records); the caller threads it through coordSpawnCtx so this stays
+// off the os.ReadFile path on every render frame.
+func isAgentRecordFresh(records []*agent.Record, id string, now time.Time, window time.Duration) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.LastActivityTS.IsZero() {
+			return false
+		}
+		return now.Sub(r.LastActivityTS) <= window
+	}
+	return false
 }
 
 // resolveCoordSpawnTimeout returns the configured stuck threshold,
