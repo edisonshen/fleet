@@ -64,3 +64,61 @@ def test_skill_md_role_section_names_dispatch_path():
             f"SKILL.md role section missing CLI delegation path "
             f"({needle!r}) — coords need an explicit how-to (issue #80)."
         )
+
+
+# ---------- Worker dispatch protocol (issue #84 Phase A) ----------
+
+
+def test_skill_md_has_worker_dispatch_protocol_section():
+    """The Worker dispatch protocol section is the contract between
+    the Python skill (which emits DISPATCH blocks) and the coord
+    agent (Claude session, which invokes the Agent tool). If this
+    section is missing, a fresh or handed-off coord doesn't know to
+    act on DISPATCH blocks and workers never spawn — task sits in
+    in-progress with no actual worker, supervisor eventually flips
+    to todo, hours of lost time."""
+    body = _read_skill_md()
+    assert "## Worker dispatch protocol" in body, (
+        "SKILL.md missing '## Worker dispatch protocol' section — "
+        "coord agent has no instructions for handling DISPATCH blocks "
+        "(issue #84 Phase A)."
+    )
+
+
+def test_skill_md_dispatch_protocol_explains_agent_tool_invocation():
+    """The protocol section MUST tell Claude to invoke the Agent tool
+    with run_in_background=true once per DISPATCH block. Drift here
+    silently breaks the worker-spawn path."""
+    body = _read_skill_md()
+    for marker in (
+        "DISPATCH:",
+        "Agent tool",
+        "run_in_background",
+        "subagent_type",
+        "general-purpose",
+        "prompt_file",
+        "agent_id",
+    ):
+        assert marker in body, (
+            f"SKILL.md Worker dispatch protocol missing {marker!r} — "
+            f"coord agent's parser-by-reasoning would miss the field "
+            f"(issue #84 Phase A)."
+        )
+
+
+def test_skill_md_dispatch_protocol_pins_one_call_per_block():
+    """The contract is exactly one Agent call per DISPATCH block — N
+    blocks → N calls. Drift to "one call per tick" would silently
+    drop workers under cap > 1 dispatch."""
+    body = _read_skill_md()
+    # Look for the explicit framing the coord is expected to follow.
+    assert "One Agent call per DISPATCH block" in body or \
+        "one Agent call per DISPATCH block" in body or \
+        "One Agent call per block" in body or \
+        "one Agent call per block" in body or \
+        "one per dispatch block" in body.lower() or \
+        "one Agent call per" in body, (
+            "SKILL.md must pin 'one Agent call per DISPATCH block' so "
+            "the coord agent doesn't collapse multi-block ticks into a "
+            "single Agent call (issue #84 Phase A)."
+        )

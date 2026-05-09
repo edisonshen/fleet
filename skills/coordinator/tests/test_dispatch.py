@@ -157,103 +157,114 @@ def test_build_worker_prompt_default_keeps_branch_create() -> None:
     assert "git rev-parse --abbrev-ref HEAD" not in out
 
 
-# ---------- dispatch_worker subprocess assertions ----------
+# ---------- mint_agent_id (issue #84 Phase A) ----------
 
 
-def test_dispatch_worker_invokes_correct_argv() -> None:
-    t = _make_task()
-    fake = subprocess.CompletedProcess(
-        args=[],
-        returncode=0,
-        stdout="agent abcdef01 dispatched on tmux session fleet-abcdef01\n",
-        stderr="",
+def test_mint_agent_id_returns_8hex() -> None:
+    """mint_agent_id replaces the `fleet dispatch` stdout-parse path.
+
+    Skill mints the token itself before emitting the DISPATCH block so
+    the same id can be recorded in tasks.md (note "dispatched as agent
+    <id>") and in the supervisor slug→agent_id map BEFORE the coord
+    agent invokes the Agent tool. If the coord crashes between emit
+    and Agent call, the next tick still has the breadcrumb."""
+    out = dispatch.mint_agent_id()
+    assert dispatch._AGENT_ID_FULL_RE.fullmatch(out), (
+        f"mint_agent_id must return 8-hex, got {out!r}"
     )
-    with patch.object(dispatch.subprocess, "run", return_value=fake) as m:
-        result = dispatch.dispatch_worker(
-            t, project="fleet", cwd="/repo",
-            fleet_bin="/usr/local/bin/fleet",
-            extra_args=["--mode", "execute"],
-        )
-    assert result.error == ""
-    assert result.agent_id == "abcdef01"
-    assert result.branch == f"worker/{t.slug}"
-    args = m.call_args[0][0]
-    assert args == [
-        "/usr/local/bin/fleet", "dispatch", t.slug,
-        "--project", "fleet", "--cwd", "/repo",
-        "--mode", "execute",
-    ]
 
 
-def test_dispatch_worker_handles_nonzero_exit() -> None:
-    t = _make_task()
-    fake = subprocess.CompletedProcess(
-        args=[], returncode=1, stdout="", stderr="error: project unknown\n",
+def test_mint_agent_id_returns_distinct_tokens() -> None:
+    """Two calls back-to-back must not collide. secrets.token_hex(4)
+    has 32 bits of entropy — birthday collision after ~65k workers,
+    which overflows project lifetimes."""
+    seen = {dispatch.mint_agent_id() for _ in range(100)}
+    assert len(seen) == 100, "mint_agent_id collision in 100 draws"
+
+
+# ---------- format_dispatch_instruction (issue #84 Phase A) ----------
+
+
+def test_format_dispatch_instruction_shape() -> None:
+    """The DISPATCH block is the contract between the Python skill and
+    the coord agent (Claude). SKILL.md's "Worker dispatch protocol"
+    section pins the same format — drift here breaks the coord's
+    parser-by-reasoning."""
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01",
+        slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
     )
-    with patch.object(dispatch.subprocess, "run", return_value=fake):
-        result = dispatch.dispatch_worker(t, project="fleet", cwd="/repo")
-    assert result.agent_id == ""
-    assert "project unknown" in result.error
+    lines = out.splitlines()
+    assert lines[0] == "DISPATCH: ready-aaaa"
+    # Block fields must appear in order with exact spacing.
+    assert lines[1] == "  agent_id: abcdef01"
+    assert lines[2] == "  description: fleet worker ready-aaaa"
+    assert lines[3] == "  prompt_file: /tmp/inbox/abcdef01.md"
+    assert lines[4] == "  run_in_background: true"
+    assert lines[5] == "  subagent_type: general-purpose"
+    assert lines[6] == "END_DISPATCH"
+    assert len(lines) == 7
 
 
-def test_dispatch_worker_handles_unparseable_stdout() -> None:
-    t = _make_task()
-    fake = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout="???\n", stderr="",
+def test_format_dispatch_instruction_custom_description() -> None:
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01",
+        slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        description="custom worker label",
     )
-    with patch.object(dispatch.subprocess, "run", return_value=fake):
-        result = dispatch.dispatch_worker(t, project="fleet", cwd="/repo")
-    assert result.agent_id == ""
-    assert "could not parse agent ID" in result.error
+    assert "  description: custom worker label" in out
+    # Default isn't substituted when an explicit description is set.
+    assert "fleet worker ready-aaaa" not in out
 
 
-def test_extract_agent_id_prefers_strict_form() -> None:
-    """When stdout contains both `agent <id>` and a stray 8-hex token
-    (e.g. embedded in a path), the keyword-anchored form wins.
-
-    Regression: an unanchored fallback alone would pick whichever 8-hex
-    appears first, including SHAs / tmux session paths.
-    """
-    text = "/tmp/cafef00d/setup.log\nagent abcdef01 dispatched\n"
-    assert dispatch._extract_agent_id(text) == "abcdef01"
-
-
-def test_extract_agent_id_loose_fallback_only_when_unique() -> None:
-    """No `agent <id>` keyword + multiple 8-hex tokens → no extraction.
-
-    Otherwise we'd pick the wrong token off ambiguous output.
-    """
-    text = "abcdef01 ... cafef00d ..."
-    assert dispatch._extract_agent_id(text) == ""
-
-
-def test_extract_agent_id_loose_fallback_when_unique() -> None:
-    """No keyword + exactly one 8-hex → use it (drift-tolerant)."""
-    assert dispatch._extract_agent_id("dispatched: abcdef01") == "abcdef01"
-
-
-def test_dispatch_worker_handles_missing_binary() -> None:
-    t = _make_task()
-    with patch.object(
-        dispatch.subprocess, "run",
-        side_effect=FileNotFoundError("no such file"),
-    ):
-        result = dispatch.dispatch_worker(
-            t, project="fleet", cwd="/repo", fleet_bin="/nope/fleet",
+def test_format_dispatch_instruction_rejects_invalid_agent_id() -> None:
+    """A malformed agent_id in the stream the coord parses would let
+    arbitrary content slip into the Agent tool's parameters. Reject
+    at format time so the skill never emits one."""
+    with pytest.raises(ValueError):
+        dispatch.format_dispatch_instruction(
+            agent_id="not-hex",
+            slug="ready-aaaa",
+            prompt_file="/tmp/inbox/x.md",
         )
-    assert "fleet binary not found" in result.error
-
-
-def test_dispatch_worker_handles_timeout() -> None:
-    t = _make_task()
-    with patch.object(
-        dispatch.subprocess, "run",
-        side_effect=subprocess.TimeoutExpired(cmd=["fleet"], timeout=1),
-    ):
-        result = dispatch.dispatch_worker(
-            t, project="fleet", cwd="/repo", timeout_s=1,
+    with pytest.raises(ValueError):
+        dispatch.format_dispatch_instruction(
+            agent_id="abcdef01extra",
+            slug="ready-aaaa",
+            prompt_file="/tmp/inbox/x.md",
         )
-    assert "timed out" in result.error
+
+
+def test_format_dispatch_instruction_rejects_empty_slug_or_path() -> None:
+    with pytest.raises(ValueError):
+        dispatch.format_dispatch_instruction(
+            agent_id="abcdef01", slug="", prompt_file="/x",
+        )
+    with pytest.raises(ValueError):
+        dispatch.format_dispatch_instruction(
+            agent_id="abcdef01", slug="ready-aaaa", prompt_file="",
+        )
+
+
+# ---------- dispatch.py no longer shells out for worker dispatch ----------
+
+
+def test_dispatch_module_no_longer_exposes_dispatch_worker() -> None:
+    """Issue #84 Phase A: dispatch_worker + _extract_agent_id were
+    removed. Anything that imports them must be updated. Pin the
+    surface so a stray re-add doesn't silently regress the
+    no-subprocess invariant."""
+    assert not hasattr(dispatch, "dispatch_worker"), (
+        "dispatch_worker was removed — workers spawn as Agent-tool "
+        "subagents now (issue #84 Phase A); restore would re-introduce "
+        "the `fleet dispatch` subprocess call."
+    )
+    assert not hasattr(dispatch, "_extract_agent_id"), (
+        "_extract_agent_id was removed (was used to parse `fleet "
+        "dispatch` stdout). Skill mints its own agent_ids now."
+    )
 
 
 # ---------- inbox stub ----------

@@ -84,6 +84,12 @@ class TickResult:
 
     skipped=True with reason="lock-busy" means another tick is in
     flight; the coord exits cleanly. Counters are zero when skipped.
+
+    dispatch_instructions carries the rendered DISPATCH blocks (issue
+    #84 Phase A) that the coord agent (Claude) is expected to act on
+    by invoking the Agent tool once per block on its NEXT assistant
+    turn. SKILL.md's "Worker dispatch protocol" section pins the
+    contract.
     """
 
     skipped: bool = False
@@ -94,6 +100,7 @@ class TickResult:
     dispatched: int = 0
     raised: int = 0
     errors: list[str] = field(default_factory=list)
+    dispatch_instructions: list[str] = field(default_factory=list)
 
 
 def tick(
@@ -306,6 +313,14 @@ def _tick_locked(
             # is a single durable lookup.
             if action.agent_id:
                 supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
+            # Issue #84 Phase A: surface the DISPATCH block so the
+            # coord agent (Claude) can invoke the Agent tool. We
+            # collect AFTER _apply_dispatch — the status flip /
+            # state.json bootstrap MUST land on disk before the
+            # coord spawns the subagent, so a worker that races to
+            # `fleet workers update` finds an in-progress task.
+            if action.dispatch_instruction:
+                result.dispatch_instructions.append(action.dispatch_instruction)
             result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
@@ -470,6 +485,15 @@ def _run_supervisor(
                 _apply_dispatch(action, project, fleet_bin)
                 if action.agent_id:
                     supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
+                # Issue #84 Phase A: supervisor-loop dispatches still
+                # need to publish the DISPATCH block so the coord
+                # agent can spawn the Agent subagent. Without this,
+                # the supervisor's mid-tick re-dispatch would write
+                # the inbox file but never surface the spawn
+                # instruction — task would sit in-progress with no
+                # actual worker.
+                if action.dispatch_instruction:
+                    result.dispatch_instructions.append(action.dispatch_instruction)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
         _save_coord_state(state_path, cs)
@@ -1306,6 +1330,10 @@ class _DispatchAction:
     worktree: str = ""  # populated only in cap>1 worktree-mode dispatch;
                         # empty string means "task ran in repo root, no
                         # worktree to clean up on terminal".
+    dispatch_instruction: str = ""  # rendered DISPATCH block (issue #84
+                                    # Phase A) — coord agent reads tick
+                                    # output and invokes Agent tool per
+                                    # block. Empty when error is set.
     error: str = ""
 
 
@@ -1396,25 +1424,39 @@ def _dispatch_ready(
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
             continue
-        result = dispatch_mod.dispatch_worker(
-            t, project=project, cwd=worker_cwd, fleet_bin=fleet_bin,
-        )
-        if result.error:
-            actions.append(_DispatchAction(slug=t.slug, error=result.error))
-            continue
+        # Issue #84 Phase A: skill mints agent_id, writes inbox, emits
+        # a DISPATCH block. Coord agent (Claude session) reads the
+        # block from tick stdout and invokes the Agent tool with
+        # run_in_background=true — workers show up as native subagents
+        # in coord's chat ("N local agents") instead of detached tmux
+        # sessions. The Python skill never calls `fleet dispatch` for
+        # workers anymore (the Go CLI stays for v0.1 manual use).
+        agent_id = dispatch_mod.mint_agent_id()
         try:
-            dispatch_mod.write_worker_inbox(
-                result.agent_id, prompt, fleet_home=fleet_home,
+            inbox_path = dispatch_mod.write_worker_inbox(
+                agent_id, prompt, fleet_home=fleet_home,
             )
         except Exception as exc:
             actions.append(_DispatchAction(
-                slug=t.slug, agent_id=result.agent_id,
+                slug=t.slug, agent_id=agent_id,
                 error=f"inbox write failed: {exc}",
             ))
             continue
+        try:
+            instruction = dispatch_mod.format_dispatch_instruction(
+                agent_id=agent_id, slug=t.slug,
+                prompt_file=inbox_path,
+            )
+        except ValueError as exc:
+            actions.append(_DispatchAction(
+                slug=t.slug, agent_id=agent_id,
+                error=f"dispatch instruction format failed: {exc}",
+            ))
+            continue
         actions.append(_DispatchAction(
-            slug=t.slug, agent_id=result.agent_id, branch=worker_branch,
+            slug=t.slug, agent_id=agent_id, branch=worker_branch,
             worktree=worker_worktree,
+            dispatch_instruction=instruction,
         ))
         active += 1
         in_flight_after_dispatch.append(t)
@@ -1640,6 +1682,16 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("coordinator: no project set (FLEET_PROJECT or argv[0])")
         return 0
     result = tick(project)
+    # Issue #84 Phase A: emit DISPATCH blocks BEFORE the JSON summary
+    # so the coord agent (Claude) sees them as parseable plain text in
+    # the tick output. Each block tells Claude to invoke the Agent
+    # tool with run_in_background=true once per block — see SKILL.md
+    # "Worker dispatch protocol". Blocks are separated by a blank
+    # line so the parser (Claude reasoning over the stdout) can pick
+    # them out of multi-block ticks.
+    for block in result.dispatch_instructions:
+        print(block)
+        print()
     print(json.dumps({
         "skipped": result.skipped,
         "reason": result.reason,
