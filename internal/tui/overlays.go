@@ -26,6 +26,7 @@ var helpEntries = []helpEntry{
 	{"h", "handoff (agents only)"},
 	{"x", "archive (agents) — worker kill ships in v0.2.x"},
 	{"d", "dispatch a new agent (opens repo picker)"},
+	{"+", "register a cloned repo as a fleet project (no dispatch)"},
 	{"/", "filter dashboard rows by substring"},
 	{"?", "this help"},
 	{"q or ctrl+c", "quit fleet"},

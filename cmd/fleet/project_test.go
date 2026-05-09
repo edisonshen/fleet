@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/projects"
 )
@@ -154,7 +155,7 @@ func TestProjectAdd_Idempotent_RefreshesAddedAt(t *testing.T) {
 	// the two writes. Use a no-op time gap by mutating the meta.json
 	// stamp directly to the past, then re-add.
 	pastMeta := first
-	pastMeta.AddedAt = pastMeta.AddedAt.Add(-1 * 60 * 60 * 1_000_000_000) // -1h in ns
+	pastMeta.AddedAt = pastMeta.AddedAt.Add(-time.Hour)
 	if err := projects.Write(tag, pastMeta); err != nil {
 		t.Fatalf("rewrite past meta: %v", err)
 	}
@@ -266,13 +267,9 @@ func TestProjectAdd_RelativePath_IsResolvedToAbsolute(t *testing.T) {
 	}
 }
 
-// projectTagForTest invokes the production tag derivation by shelling
-// out to the binary's internal/tui.ProjectTag (re-exposed via a thin
-// wrapper in cmd/fleet) so the test stays in sync with whatever the
-// CLI actually computes. We avoid depending on the tui package here
-// (would create an import cycle for the cli) and instead mirror the
-// rule. internal/projects exposes ProjectTagForPath as the canonical
-// helper for the CLI; tests call it through that.
+// projectTagForTest delegates to projects.TagForPath — the canonical
+// path → tag rule the CLI uses. Wrapping it in a helper keeps the
+// test calls one-line and self-documenting.
 func projectTagForTest(t *testing.T, p string) string {
 	t.Helper()
 	return projects.TagForPath(p)

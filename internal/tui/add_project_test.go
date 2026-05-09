@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -85,7 +86,7 @@ func TestKey_AddProjectFailureKeepsPickerOpen(t *testing.T) {
 	updated, _ := mm.Update(addProjectDoneMsg{
 		path: "/some/path",
 		out:  "not a git repo: /some/path",
-		err:  errSentinel("not a git repo"),
+		err:  errors.New("not a git repo"),
 	})
 	mmm := updated.(Model)
 	if mmm.mode != modeAddProject {
@@ -124,11 +125,3 @@ func TestKey_AddProjectSuccessClosesPicker(t *testing.T) {
 		t.Error("success path must return a refresh cmd")
 	}
 }
-
-// errSentinel makes a typed error for the test without pulling errors.New
-// into the test imports (the rest of this file is import-light by
-// design — see keys_test.go for the imports it actually needs).
-type errSentinelString string
-
-func (e errSentinelString) Error() string { return string(e) }
-func errSentinel(s string) error          { return errSentinelString(s) }
