@@ -120,6 +120,20 @@ func deriveCoordSpawnState(
 	if coordStateOK && now.Sub(coordStateMtime) <= activeWindow {
 		return coordSpawnActive
 	}
+	// Post-active idle-stop guard: if a coord-state.json exists AND its
+	// mtime is newer than the marker, the coord successfully booted at
+	// some point under this marker (and then stopped ticking — its
+	// state mtime is now stale). That's the existing scanProject
+	// IdleStop branch's territory ("○ idle · auto-stopped" on line 3),
+	// not a fresh cold start. Returning Idle here suppresses our extra
+	// line so the operator doesn't see a contradictory "spawning..."
+	// alongside "auto-stopped" on the same row. The Stuck branch above
+	// still wins past spawnTimeout; this gate only catches the narrow
+	// "marker fresh, state file already published, state file went
+	// stale" window.
+	if coordStateOK && coordStateMtime.After(markerMtime) {
+		return coordSpawnIdle
+	}
 	return coordSpawnSpawning
 }
 

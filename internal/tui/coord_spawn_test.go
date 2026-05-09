@@ -104,6 +104,31 @@ func TestCoordSpawnState_MarkerOlderThanSpawnTimeout_ReturnsStuck(t *testing.T) 
 	}
 }
 
+// TestCoordSpawnState_PostActiveIdleStop_ReturnsIdle pins the
+// /review iter-1 fix: when a coord previously ticked (coord-state.json
+// mtime is newer than the marker) but then stopped (state mtime is
+// now stale), we're in the existing IdleStop branch — NOT a cold
+// start. Returning Idle prevents a contradictory "spawning..." line
+// from rendering alongside the existing "○ idle · auto-stopped"
+// status on the same project row.
+func TestCoordSpawnState_PostActiveIdleStop_ReturnsIdle(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	// Marker was written 7 minutes ago (past activeWindow but inside
+	// spawnTimeout) — the coord tied to this marker booted, ticked at
+	// minute 6 (newer than marker), then died at minute 6 + change.
+	markerMtime := now.Add(-7 * time.Minute)
+	stateMtime := now.Add(-6 * time.Minute) // newer than marker, but stale (>5m)
+	got := deriveCoordSpawnState(
+		true, markerMtime,
+		true, stateMtime,
+		now,
+		5*time.Minute, 10*time.Minute,
+	)
+	if got != coordSpawnIdle {
+		t.Errorf("post-active idle-stop must return Idle (existing renderer wins); got %v", got)
+	}
+}
+
 // TestCoordSpawnState_StuckOverridesActive: a coord-state.json that
 // happens to be fresh when the marker is past timeout doesn't rescue
 // the row from "stuck". The marker is the in-flight signal for the
