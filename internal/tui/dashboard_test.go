@@ -1327,3 +1327,60 @@ func TestScanWorkers_SkipsDeletingStagingDir(t *testing.T) {
 		}
 	}
 }
+
+// TestIsDeletingStagingName — issue #101 regression. Anchor the
+// staging-dir filter on the exact shape `<base>.deleting-<UTCstamp>`
+// so a legitimate slug whose text contains the substring `.deleting-`
+// still renders normally. ValidateSlug allows periods + hyphens, so
+// `phase.deleting-stage-1a2b` is a valid slug today.
+func TestIsDeletingStagingName(t *testing.T) {
+	t.Run("matches canonical", func(t *testing.T) {
+		if !isDeletingStagingName("foo-1a2b.deleting-20260509-100000") {
+			t.Fatal("canonical staging name should match")
+		}
+	})
+	t.Run("matches collision suffix", func(t *testing.T) {
+		if !isDeletingStagingName("foo-1a2b.deleting-20260509-100000-1") {
+			t.Fatal("collision-suffixed staging name should match")
+		}
+	})
+	t.Run("rejects bare substring", func(t *testing.T) {
+		// Legitimate slug; not a staging dir.
+		if isDeletingStagingName("phase.deleting-stage-1a2b") {
+			t.Fatal("legitimate slug containing `.deleting-` should NOT match")
+		}
+	})
+	t.Run("rejects non-stamp tail", func(t *testing.T) {
+		if isDeletingStagingName("foo.deleting-not-a-stamp") {
+			t.Fatal("non-stamp tail should NOT match")
+		}
+	})
+	t.Run("rejects missing marker", func(t *testing.T) {
+		if isDeletingStagingName("foo-1a2b") {
+			t.Fatal("regular slug without marker should NOT match")
+		}
+	})
+}
+
+// TestScanWorkers_DoesNotMisclassifyLegitimateSlug — defense-in-depth
+// regression. A worker slug whose text contains `.deleting-` (allowed
+// by state.ValidateSlug) must still render normally — not be silently
+// dropped by the staging-dir filter.
+func TestScanWorkers_DoesNotMisclassifyLegitimateSlug(t *testing.T) {
+	pdir := withFleetHome(t)
+	// `phase.deleting-stage-1a2b` is a legitimate slug per
+	// state.ValidateSlug (lowercase + digits + . / - / _ allowed).
+	seedWorker(t, pdir, "fleet", "phase.deleting-stage-1a2b", workers.State{
+		Phase: workers.PhaseTDDRed,
+	})
+	rows := scanWorkers(filepath.Join(pdir, "fleet"), "fleet", time.Now())
+	found := false
+	for _, r := range rows {
+		if r.Slug == "phase.deleting-stage-1a2b" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("legitimate slug containing `.deleting-` substring should render normally")
+	}
+}

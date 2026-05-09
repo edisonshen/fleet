@@ -319,10 +319,18 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 		if !e.IsDir() || e.Name() == "archive" {
 			continue
 		}
-		// Skip in-flight delete-staging dirs (workers.Delete renames
-		// to <slug>.deleting-<stamp>/ before RemoveAll). Treating one
-		// as a worker would surface a row for a soon-to-vanish dir.
-		if strings.Contains(e.Name(), ".deleting-") {
+		// Skip in-flight delete-staging dirs. workers.Delete renames
+		// to `<slug>.deleting-YYYYMMDD-HHMMSS[-N]` before RemoveAll;
+		// the dir is short-lived (microseconds on POSIX same-fs)
+		// but a tick that catches one mid-rename would otherwise
+		// surface a row for a soon-to-vanish worker.
+		//
+		// We anchor on the shape `*.deleting-<UTCstamp>` rather than
+		// a bare substring match so an operator-authored slug whose
+		// text happens to contain `.deleting-` (allowed by
+		// state.ValidateSlug — periods + hyphens are valid runes)
+		// still renders normally.
+		if isDeletingStagingName(e.Name()) {
 			continue
 		}
 		path := filepath.Join(wDir, e.Name(), "state.json")
@@ -356,6 +364,47 @@ func scanWorkers(projectDir, project string, now time.Time) []*WorkerRow {
 // var so tests can stub the disk write without seeding a real worker
 // tree. Production calls workers.Delete.
 var workersDeleteFn = workers.Delete
+
+// isDeletingStagingName reports whether name matches the shape
+// workers.Delete renames to before RemoveAll:
+//
+//	<base>.deleting-YYYYMMDD-HHMMSS
+//	<base>.deleting-YYYYMMDD-HHMMSS-<digit>   (collision-retry suffix)
+//
+// We anchor on the trailing 15-char timestamp + optional `-<digit>` so
+// an operator-authored slug whose text legitimately contains the
+// substring `.deleting-` (allowed by state.ValidateSlug) still passes.
+// Returns false on any pattern mismatch.
+func isDeletingStagingName(name string) bool {
+	const marker = ".deleting-"
+	const stampLen = len("YYYYMMDD-HHMMSS") // 15
+	i := strings.LastIndex(name, marker)
+	if i < 0 {
+		return false
+	}
+	rest := name[i+len(marker):]
+	// Strip optional `-<digit>` collision suffix.
+	if len(rest) >= 2 && rest[len(rest)-2] == '-' && rest[len(rest)-1] >= '0' && rest[len(rest)-1] <= '9' {
+		rest = rest[:len(rest)-2]
+	}
+	if len(rest) != stampLen {
+		return false
+	}
+	// Validate stamp shape: 8 digits, hyphen, 6 digits.
+	for k, c := range rest {
+		switch k {
+		case 8:
+			if c != '-' {
+				return false
+			}
+		default:
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 // workerRowFor maps one State into a WorkerRow with display fields.
 // The Color drives the leading dot; the State 2-letter code is the
