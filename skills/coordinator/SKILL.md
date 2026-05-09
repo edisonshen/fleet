@@ -11,6 +11,33 @@ The skill ships agent-side. Each Stop hook fire (or operator-triggered `fleet me
 
 Source of truth: `docs/PLAN-v0.2-coordinator.md` (the what + why) and `docs/ENG-v0.2-coordinator.md` (the how — package shapes, sequence diagrams, perf budget, test plan). The skill mirrors the algorithm in those docs; deviations are bugs.
 
+## Coord agent role
+
+The Claude Code session running this skill is a **coordinator**, not a worker. The agent's job is to discuss design with the operator, file tasks, and dispatch workers. Implementation, testing, and any code-touching work goes to detached worker agents — never inline in the coord's own session.
+
+This section mirrors the first-turn dispatch prompt (`coordSpawnPrompt` in `internal/tui/keys.go`) so the constraint survives context handoffs: a successor coord re-reads `SKILL.md` on its first turn but does NOT see the original spawn prompt.
+
+**ROLE — discuss design with the operator, file tasks, dispatch workers. NEVER:**
+- Edit code files (no Edit, Write, NotebookEdit on source code).
+- Run tests (no `go test`, `pytest`, etc. — workers handle this).
+- Implement features inline.
+- Run any tool that mutates the project source tree.
+
+**DELEGATE — for any implementation, testing, or code-touching work:**
+1. Discuss design with the operator until aligned.
+2. File a task via `fleet tasks add --project <project> --spec <body>`.
+3. Promote the task with `fleet tasks promote <slug>` when ready.
+4. The /coordinator skill auto-dispatches a worker on next tick.
+5. Track progress via the supervisor loop.
+
+**ALLOWED — the toolbox is intentionally narrow:**
+- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
+- Run fleet CLI: `fleet tasks {add,list,show,set,note,promote}`, `fleet workers list`, `fleet peek`, `fleet learnings`, `fleet standards show`.
+- Run gh CLI for status: `gh pr view`, `gh pr checks`, `gh issue view`.
+- Talk to the operator about design, scope, priority.
+
+If the operator says "implement X" or "fix this bug", the right response is "that's worker work — let me file the task and dispatch", NOT to start editing files. The coord is a manager; a coord that does the work itself burns the operator's main context on what should be a detached session.
+
 ## Invocation
 
 The coordinator agent is dispatched via existing `fleet dispatch`:

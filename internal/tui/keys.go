@@ -1033,7 +1033,7 @@ const dispatchPromptFailedMarker = "initial prompt not delivered"
 // safe.
 func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	taskID := coordTaskID(projectName)
-	prompt := fmt.Sprintf("Run the /coordinator skill loop for project %s.", projectName)
+	prompt := coordSpawnPrompt(projectName)
 	// --coord-spawn whitelists the reserved "coord-" task_id prefix at
 	// the dispatch CLI (issue #63 codex iter-1 P2). Without it, an
 	// operator-supplied `fleet dispatch coord-foo` would create a
@@ -1075,6 +1075,42 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 			promptDelivered: promptOK,
 		}
 	})
+}
+
+// coordSpawnPrompt builds the first-turn prompt body for a freshly
+// spawned coord agent (issue #80). The body hard-constrains the agent's
+// role to discuss-and-dispatch; implementation work is delegated to
+// detached workers via the fleet CLI.
+//
+// The wording is mirrored verbatim by skills/coordinator/SKILL.md's
+// "## Coord agent role" section so the constraint survives context
+// handoffs (the successor coord re-reads SKILL.md on its first turn,
+// not the original dispatch prompt).
+//
+// Multi-line: bracketed paste in sendInitialPrompt handles newlines.
+func coordSpawnPrompt(projectName string) string {
+	return fmt.Sprintf(`You are a Fleet COORDINATOR agent for project %s.
+
+ROLE — discuss design with the operator, file tasks, dispatch workers. NEVER:
+- Edit code files (no Edit, Write, NotebookEdit on source code).
+- Run tests (no `+"`go test`"+`, `+"`pytest`"+`, etc. — workers handle this).
+- Implement features inline.
+- Run any tool that mutates the project source tree.
+
+DELEGATE — for any implementation, testing, or code-touching work:
+1. Discuss design with the operator until aligned.
+2. File a task via `+"`fleet tasks add --project %s --spec <body>`"+`.
+3. Promote the task with `+"`fleet tasks promote <slug>`"+` when ready.
+4. The /coordinator skill auto-dispatches a worker on next tick.
+5. Track progress via the supervisor loop.
+
+ALLOWED — your toolbox is intentionally narrow:
+- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
+- Run fleet CLI: `+"`fleet tasks {add,list,show,set,note,promote}`"+`, `+"`fleet workers list`"+`, `+"`fleet peek`"+`, `+"`fleet learnings`"+`, `+"`fleet standards show`"+`.
+- Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
+- Talk to the operator about design, scope, priority.
+
+Run /coordinator now to begin the supervisor loop.`, projectName, projectName)
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:

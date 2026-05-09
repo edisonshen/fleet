@@ -1324,14 +1324,21 @@ func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 	if len(args) < 2 || args[1] != "coord-demo" {
 		t.Errorf("dispatch task_id (args[1]) = %q; want coord-demo (stable per-project)", argString(args, 1))
 	}
-	// Must carry --project demo, --prompt with the coordinator skill loop.
+	// Must carry --project demo and a --prompt body that names the
+	// /coordinator skill (issue #80: the body now leads with the
+	// ROLE/DELEGATE/ALLOWED constraint block and ends with "Run
+	// /coordinator now to begin the supervisor loop."). Substring is
+	// kept loose so prompt wording can iterate without churning this
+	// test; the dedicated TestCoordSpawnPrompt_* covers the role
+	// constraint payload.
 	hasProject, hasPrompt := false, false
 	for i, a := range args {
 		if a == "--project" && i+1 < len(args) && args[i+1] == "demo" {
 			hasProject = true
 		}
 		if a == "--prompt" && i+1 < len(args) &&
-			strings.Contains(args[i+1], "/coordinator skill loop for project demo") {
+			strings.Contains(args[i+1], "/coordinator") &&
+			strings.Contains(args[i+1], "demo") {
 			hasPrompt = true
 		}
 	}
@@ -1339,7 +1346,7 @@ func TestKeyA_ProjectRow_NoCoord_SpawnsAndAttaches(t *testing.T) {
 		t.Errorf("dispatch args missing --project demo: %v", args)
 	}
 	if !hasPrompt {
-		t.Errorf("dispatch args missing --prompt with coord skill loop: %v", args)
+		t.Errorf("dispatch args missing --prompt naming /coordinator + project demo: %v", args)
 	}
 
 	// Now feed the doneMsg back into Update — pendingAttach must be set
@@ -2329,5 +2336,56 @@ func TestKeyA_ProjectRow_DispatchedAgentRecordHasTargetProject(t *testing.T) {
 	if doneMsg.projectName != targetProject {
 		t.Errorf("doneMsg.projectName = %q; want %q (issue #70: must equal the target row's project, not the operator's cwd)",
 			doneMsg.projectName, targetProject)
+	}
+}
+
+// TestCoordSpawnPrompt_IncludesRoleBoundary pins issue #80: the
+// first-turn prompt sent to a freshly spawned coord agent must include
+// the ROLE / DELEGATE / ALLOWED constraint block plus an explicit
+// "NEVER" prohibition. Without these markers, the coord agent has no
+// hard signal that it should not edit code or run tests inline.
+func TestCoordSpawnPrompt_IncludesRoleBoundary(t *testing.T) {
+	prompt := coordSpawnPrompt("demo")
+	for _, marker := range []string{"ROLE", "DELEGATE", "ALLOWED", "NEVER"} {
+		if !strings.Contains(prompt, marker) {
+			t.Errorf("coordSpawnPrompt(%q) missing %q marker:\n%s", "demo", marker, prompt)
+		}
+	}
+	// Sanity: the closing line must point the agent at /coordinator
+	// so the supervisor loop actually starts.
+	if !strings.Contains(prompt, "/coordinator") {
+		t.Errorf("coordSpawnPrompt(%q) missing /coordinator invocation:\n%s", "demo", prompt)
+	}
+}
+
+// TestCoordSpawnPrompt_IncludesProjectName ensures the project name is
+// interpolated in both the opening "for project <p>" and the
+// `fleet tasks add --project <p>` example so the coord knows which
+// project's task list to mutate.
+func TestCoordSpawnPrompt_IncludesProjectName(t *testing.T) {
+	prompt := coordSpawnPrompt("demo-proj")
+	if !strings.Contains(prompt, "for project demo-proj") {
+		t.Errorf("coordSpawnPrompt(%q) missing opening project ref:\n%s", "demo-proj", prompt)
+	}
+	if !strings.Contains(prompt, "--project demo-proj") {
+		t.Errorf("coordSpawnPrompt(%q) missing fleet tasks add --project demo-proj:\n%s", "demo-proj", prompt)
+	}
+}
+
+// TestCoordSpawnPrompt_BoundedSize is a sanity check that the role
+// boundary block stays well below any plausible prompt-buffer cap.
+// Bracketed-paste over tmux send-keys is fine for multi-line strings,
+// but operators occasionally surface "argv too long" issues with
+// extreme prompt bodies; cap at 4 KiB so the prompt cannot quietly
+// drift into territory that breaks the wire.
+func TestCoordSpawnPrompt_BoundedSize(t *testing.T) {
+	prompt := coordSpawnPrompt("demo")
+	const maxBytes = 4096
+	if len(prompt) > maxBytes {
+		t.Errorf("coordSpawnPrompt size = %d bytes; want <= %d (keep prompt body tight)",
+			len(prompt), maxBytes)
+	}
+	if len(prompt) == 0 {
+		t.Error("coordSpawnPrompt returned empty string")
 	}
 }
