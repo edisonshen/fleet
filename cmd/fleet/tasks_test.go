@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
@@ -632,5 +634,365 @@ func TestTasksAdd_NeedsSlugOrSpec(t *testing.T) {
 	}, "", &bytes.Buffer{})
 	if err == nil {
 		t.Error("expected error when slug + spec + positional all empty")
+	}
+}
+
+// listSeedTask writes a task directly through internal/tasks (bypassing
+// runTasksAdd) so the test can pin Status/Created/Updated/StartedAt/
+// FinishedAt deterministically. The CLI add path stamps Created/Updated
+// to time.Now(), which makes recency-sort tests racy.
+func listSeedTask(t *testing.T, project, slug string, status tasks.Status,
+	priority tasks.Priority, created, updated, started, finished time.Time,
+) {
+	t.Helper()
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	path := filepath.Join(dir, "tasks.md")
+	f, err := tasks.Read(path)
+	if err != nil {
+		t.Fatalf("Read tasks.md: %v", err)
+	}
+	tk := &tasks.Task{
+		Slug: slug, Status: status, Priority: priority,
+		Created: created, Updated: updated, StartedAt: started,
+		FinishedAt: finished, SpawnedBy: "user",
+		Spec: "spec", Acceptance: "acc", Notes: "",
+	}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add %s: %v", slug, err)
+	}
+	if err := tasks.Write(path, f); err != nil {
+		t.Fatalf("Write %s: %v", slug, err)
+	}
+}
+
+// listSeedArchiveTask seeds a row directly in tasks-archive.md.
+func listSeedArchiveTask(t *testing.T, project, slug string, status tasks.Status,
+	priority tasks.Priority, created, updated, finished time.Time,
+) {
+	t.Helper()
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	path := filepath.Join(dir, "tasks-archive.md")
+	f, err := tasks.Read(path)
+	if err != nil {
+		t.Fatalf("Read archive: %v", err)
+	}
+	tk := &tasks.Task{
+		Slug: slug, Status: status, Priority: priority,
+		Created: created, Updated: updated, FinishedAt: finished,
+		SpawnedBy: "user", Spec: "s", Acceptance: "a", Notes: "",
+	}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add %s to archive: %v", slug, err)
+	}
+	if err := tasks.Write(path, f); err != nil {
+		t.Fatalf("Write archive: %v", err)
+	}
+}
+
+// listRowSlugs returns the slug column from a `fleet tasks list` output
+// in the order they appeared (skipping the header row). Used to assert
+// recency ordering.
+func listRowSlugs(out string) []string {
+	var slugs []string
+	for i, line := range strings.Split(out, "\n") {
+		if i == 0 || line == "" {
+			continue // header / trailing blank
+		}
+		// Output is tabwriter padded with spaces; first whitespace-
+		// delimited field is the slug.
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		slugs = append(slugs, fields[0])
+	}
+	return slugs
+}
+
+// TestTasksList_DefaultRecencyView — the central acceptance: list shows
+// every active task in priority/created order, then fills the rest of
+// the cap with most-recent done/abandoned. Active is never truncated.
+func TestTasksList_DefaultRecencyView(t *testing.T) {
+	_, project := setupTasksHome(t)
+
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// 3 active rows (P0/P1/P2) and 8 done rows with finished_at spread.
+	listSeedTask(t, project, "active-p0", tasks.StatusInProgress, tasks.PriorityP0,
+		base.Add(1*time.Hour), base.Add(1*time.Hour), base.Add(2*time.Hour), time.Time{})
+	listSeedTask(t, project, "active-p1", tasks.StatusTodo, tasks.PriorityP1,
+		base.Add(2*time.Hour), base.Add(2*time.Hour), time.Time{}, time.Time{})
+	listSeedTask(t, project, "active-p2", tasks.StatusReady, tasks.PriorityP2,
+		base.Add(3*time.Hour), base.Add(3*time.Hour), time.Time{}, time.Time{})
+	for i := 0; i < 8; i++ {
+		slug := fmt.Sprintf("done-%02d", i)
+		fin := base.Add(time.Duration(20+i) * time.Hour) // newer = larger i
+		listSeedTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour),
+			fin, base.Add(time.Duration(i)*time.Hour), fin)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	// Want: 3 active first (P0, P1, P2), then 7 most-recent done (07, 06, 05, 04, 03, 02, 01).
+	want := []string{
+		"active-p0", "active-p1", "active-p2",
+		"done-07", "done-06", "done-05", "done-04", "done-03", "done-02", "done-01",
+	}
+	if len(slugs) != len(want) {
+		t.Fatalf("got %d rows; want %d. got=%v", len(slugs), len(want), slugs)
+	}
+	for i := range want {
+		if slugs[i] != want[i] {
+			t.Errorf("row %d: got %q; want %q (full=%v)", i, slugs[i], want[i], slugs)
+		}
+	}
+}
+
+// TestTasksList_ZeroActiveFillsWithDone — when no active tasks remain,
+// the list cap is filled entirely from done rows.
+func TestTasksList_ZeroActiveFillsWithDone(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 8; i++ {
+		slug := fmt.Sprintf("done-%02d", i)
+		fin := base.Add(time.Duration(20+i) * time.Hour)
+		listSeedTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour),
+			fin, base.Add(time.Duration(i)*time.Hour), fin)
+	}
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	if len(slugs) != 8 {
+		t.Errorf("got %d rows; want 8 (all done rows visible). got=%v", len(slugs), slugs)
+	}
+	if slugs[0] != "done-07" {
+		t.Errorf("most-recent done first: got %q; want done-07", slugs[0])
+	}
+}
+
+// TestTasksList_ManyActiveNeverTruncated — when active count exceeds
+// the cap, total visible = active count (active never truncated).
+func TestTasksList_ManyActiveNeverTruncated(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// 15 active + 5 done. Cap=10 must yield 15 active rows + 0 done.
+	for i := 0; i < 15; i++ {
+		slug := fmt.Sprintf("active-%02d", i)
+		listSeedTask(t, project, slug, tasks.StatusTodo, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour),
+			base.Add(time.Duration(i)*time.Hour),
+			time.Time{}, time.Time{})
+	}
+	for i := 0; i < 5; i++ {
+		slug := fmt.Sprintf("done-%02d", i)
+		fin := base.Add(time.Duration(40+i) * time.Hour)
+		listSeedTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour),
+			fin, base.Add(time.Duration(i)*time.Hour), fin)
+	}
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	if len(slugs) != 15 {
+		t.Errorf("got %d rows; want 15 (all active, never truncated). got=%v", len(slugs), slugs)
+	}
+	for i := 0; i < 15; i++ {
+		if slugs[i] != fmt.Sprintf("active-%02d", i) {
+			t.Errorf("row %d: got %q; want active-%02d", i, slugs[i], i)
+		}
+	}
+}
+
+// TestTasksList_ArchiveMerge — done rows in tasks-archive.md show up
+// in the recency tail alongside live done rows, sorted together.
+func TestTasksList_ArchiveMerge(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// 1 active live; 2 done live; 3 done archive. Active(1) + done-tail(7).
+	listSeedTask(t, project, "live-active", tasks.StatusInProgress, tasks.PriorityP1,
+		base, base, base, time.Time{})
+	listSeedTask(t, project, "live-done-newer", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(50*time.Hour), base, base.Add(50*time.Hour))
+	listSeedTask(t, project, "live-done-older", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(30*time.Hour), base, base.Add(30*time.Hour))
+	listSeedArchiveTask(t, project, "arc-newest", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(70*time.Hour), base.Add(70*time.Hour))
+	listSeedArchiveTask(t, project, "arc-mid", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(40*time.Hour), base.Add(40*time.Hour))
+	listSeedArchiveTask(t, project, "arc-oldest", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(20*time.Hour), base.Add(20*time.Hour))
+
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	want := []string{
+		"live-active",
+		"arc-newest", "live-done-newer", "arc-mid", "live-done-older", "arc-oldest",
+	}
+	if len(slugs) != len(want) {
+		t.Fatalf("got %v; want %v", slugs, want)
+	}
+	for i := range want {
+		if slugs[i] != want[i] {
+			t.Errorf("row %d: got %q; want %q (full=%v)", i, slugs[i], want[i], slugs)
+		}
+	}
+}
+
+// TestTasksList_NoArchiveSkipsArchive — --no-archive must not include
+// archived rows even when they would otherwise fill the cap.
+func TestTasksList_NoArchiveSkipsArchive(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	listSeedTask(t, project, "active-1", tasks.StatusTodo, tasks.PriorityP1,
+		base, base, time.Time{}, time.Time{})
+	listSeedArchiveTask(t, project, "arc-1", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(10*time.Hour), base.Add(10*time.Hour))
+
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{
+		project: project, limit: -1, noArchive: true,
+	}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "arc-1") {
+		t.Errorf("--no-archive leaked archived slug arc-1: %s", got)
+	}
+	if !strings.Contains(got, "active-1") {
+		t.Errorf("--no-archive dropped live row: %s", got)
+	}
+}
+
+// TestTasksList_LimitOverride — --limit N changes the cap; --limit 0 +
+// --all both unbound the cap.
+func TestTasksList_LimitOverride(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 12; i++ {
+		slug := fmt.Sprintf("done-%02d", i)
+		fin := base.Add(time.Duration(20+i) * time.Hour)
+		listSeedTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour),
+			fin, base.Add(time.Duration(i)*time.Hour), fin)
+	}
+
+	cases := []struct {
+		name string
+		opts *tasksListOpts
+		want int
+	}{
+		{"default cap=10", &tasksListOpts{project: project, limit: -1}, 10},
+		{"--limit 3", &tasksListOpts{project: project, limit: 3}, 3},
+		{"--limit 0", &tasksListOpts{project: project, limit: 0}, 12},
+		{"--all", &tasksListOpts{project: project, limit: -1, all: true}, 12},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			if err := runTasksList(tc.opts, out); err != nil {
+				t.Fatalf("list: %v", err)
+			}
+			got := len(listRowSlugs(out.String()))
+			if got != tc.want {
+				t.Errorf("got %d rows; want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTasksList_StatusFilterIgnoresCap — `--status done` returns every
+// done across both files, ignoring the recency cap.
+func TestTasksList_StatusFilterIgnoresCap(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 7; i++ {
+		slug := fmt.Sprintf("live-%02d", i)
+		fin := base.Add(time.Duration(10+i) * time.Hour)
+		listSeedTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour), fin,
+			base.Add(time.Duration(i)*time.Hour), fin)
+	}
+	for i := 0; i < 8; i++ {
+		slug := fmt.Sprintf("arc-%02d", i)
+		fin := base.Add(time.Duration(50+i) * time.Hour)
+		listSeedArchiveTask(t, project, slug, tasks.StatusDone, tasks.PriorityP2,
+			base.Add(time.Duration(i)*time.Hour), fin, fin)
+	}
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, status: "done", limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	if len(slugs) != 15 {
+		t.Errorf("got %d rows; want 15 (7 live + 8 archive). got=%v", len(slugs), slugs)
+	}
+	// First row should be the most-recent finished_at.
+	if slugs[0] != "arc-07" {
+		t.Errorf("first row = %q; want arc-07 (largest finished_at)", slugs[0])
+	}
+}
+
+// TestTasksList_FinishedAtFallback — old rows missing finished_at must
+// fall back to updated for the recency tail sort.
+func TestTasksList_FinishedAtFallback(t *testing.T) {
+	_, project := setupTasksHome(t)
+	base := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	// "old-row" has no finished_at; uses Updated as the rank.
+	// "new-row" has finished_at older than old-row's Updated.
+	listSeedTask(t, project, "old-row", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(50*time.Hour), time.Time{}, time.Time{})
+	listSeedTask(t, project, "new-row", tasks.StatusDone, tasks.PriorityP2,
+		base, base.Add(20*time.Hour), base, base.Add(30*time.Hour))
+
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	if len(slugs) < 2 || slugs[0] != "old-row" {
+		t.Errorf("expected old-row first (Updated 50h > new-row finished_at 30h); got %v", slugs)
+	}
+}
+
+// TestTasksList_CollisionPrefersLive — slug existing in BOTH tasks.md
+// and tasks-archive.md (retry-recovery window) shows once, taken from
+// the live tasks.md row.
+func TestTasksList_CollisionPrefersLive(t *testing.T) {
+	_, project := setupTasksHome(t)
+	created := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	listSeedTask(t, project, "shared-slug", tasks.StatusInProgress, tasks.PriorityP1,
+		created, created.Add(1*time.Hour), created, time.Time{})
+	// Archive with same slug + Created (retry-recovery).
+	listSeedArchiveTask(t, project, "shared-slug", tasks.StatusDone, tasks.PriorityP1,
+		created, created.Add(2*time.Hour), created.Add(2*time.Hour))
+
+	out := &bytes.Buffer{}
+	if err := runTasksList(&tasksListOpts{project: project, limit: -1}, out); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	slugs := listRowSlugs(out.String())
+	if len(slugs) != 1 {
+		t.Errorf("got %d rows; want 1 (deduped). got=%v", len(slugs), slugs)
+	}
+	// Must show the LIVE row's status (in-progress), not archive's done.
+	if !strings.Contains(out.String(), "in-progress") {
+		t.Errorf("dedup picked archive (status=done); expected live (status=in-progress): %s", out.String())
 	}
 }
