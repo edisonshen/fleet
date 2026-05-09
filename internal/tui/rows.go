@@ -356,6 +356,18 @@ var coordSpawnMarkerMtimeFn = func(projectName string) (time.Time, bool) {
 	return info.ModTime(), true
 }
 
+// removeCoordSpawnMarkerFn deletes the coord-spawn marker for project.
+// var so tests can stub the disk write. Production calls
+// state.RemoveCoordSpawnMarker, which is idempotent on ENOENT (the
+// self-heal path can race with a concurrent dispatch goroutine that
+// just rewrote the marker, and "already gone" is the goal here).
+//
+// Used by the dashboard renderer (issue #96 gap 1) to clear stale
+// markers when the tmux session for the agent_id named in the marker
+// is gone — the next render then flips Stuck → Idle naturally because
+// `coordSpawnMarkerMtimeFn` returns ok=false for the deleted file.
+var removeCoordSpawnMarkerFn = state.RemoveCoordSpawnMarker
+
 // nowFn returns the current wall-clock time. var so tests can pin
 // "now" deterministically without touching time.Now globally.
 var nowFn = time.Now

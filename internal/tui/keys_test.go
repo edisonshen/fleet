@@ -938,3 +938,274 @@ func TestKeyX_ArchiveCoord_CleansUpAgentAndSession(t *testing.T) {
 		t.Errorf("expected ['rm', 'c00bf001']; got %v", stub.calls[0])
 	}
 }
+
+// -- [x] dismiss legacy v0.1 project row (issue #96 gap 3) -------------
+
+// projectRowModel builds a Model whose first navigable row is a
+// rowProject for the named project, with the supplied agent records
+// populating the right column. dashboard is left empty so the project
+// only surfaces via the unifiedProjects synthetic path (which is the
+// pure-legacy-v0.1 case the dismiss flow targets).
+//
+// aliveByID is threaded through so deriveStatus produces "dead" when
+// the test wants — the dismiss gate's safety check counts live agents.
+func projectRowModel(t *testing.T, project string, records []*agent.Record, aliveByID map[string]bool) Model {
+	t.Helper()
+	m := New("test")
+	m.records = records
+	m.aliveByID = aliveByID
+	// Locate the rowProject for the target project.
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			return m
+		}
+	}
+	t.Fatalf("no rowProject for %q in dashboardRows; got %+v", project, m.dashboardRows())
+	return m
+}
+
+// TestKeyX_LegacyProjectRow_FullyDeadEntersDismissConfirm pins the
+// happy path of issue #96 gap 3: pressing [x] on a pure-legacy v0.1
+// project row whose tagged agents are all dead enters the dismiss
+// confirmation mode WITHOUT shelling out yet.
+func TestKeyX_LegacyProjectRow_FullyDeadEntersDismissConfirm(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// Project tree absent → pure-legacy classification.
+	(&stubProjectTreeExists{missing: map[string]bool{"pedregal": true}}).install(t)
+
+	// Two dead records tagged with project "pedregal".
+	a1 := agent.New("dead0001")
+	a1.Project = "pedregal"
+	a1.TmuxSession = "fleet-dead0001"
+	a2 := agent.New("dead0002")
+	a2.Project = "pedregal"
+	a2.TmuxSession = "fleet-dead0002"
+	// aliveByID is keyed by record.ID (not session name) and false →
+	// deriveStatus="dead".
+	alive := map[string]bool{"dead0001": false, "dead0002": false}
+
+	m := projectRowModel(t, "pedregal", []*agent.Record{a1, a2}, alive)
+
+	mm, cmd, handled := m.actionArchive()
+	if !handled {
+		t.Fatal("[x] on legacy project row not handled")
+	}
+	if cmd != nil {
+		t.Errorf("[x] press alone must not shell out; got cmd != nil")
+	}
+	if mm.mode != modeConfirmDismissProject {
+		t.Errorf("mode = %v; want modeConfirmDismissProject", mm.mode)
+	}
+	if mm.dismissProjectCandidate != "pedregal" {
+		t.Errorf("dismissProjectCandidate = %q; want pedregal", mm.dismissProjectCandidate)
+	}
+	if len(mm.dismissProjectDeadAgents) != 2 {
+		t.Errorf("dead agent snapshot length = %d; want 2", len(mm.dismissProjectDeadAgents))
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls before confirm; got %v", stub.calls)
+	}
+}
+
+// TestKeyX_LegacyProjectRow_DismissConfirmYFansOutRm: the [y] confirm
+// dispatches one `fleet rm <id>` per dead agent captured at press time.
+func TestKeyX_LegacyProjectRow_DismissConfirmYFansOutRm(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubProjectTreeExists{missing: map[string]bool{"pedregal": true}}).install(t)
+
+	a1 := agent.New("dead0001")
+	a1.Project = "pedregal"
+	a1.TmuxSession = "fleet-dead0001"
+	a2 := agent.New("dead0002")
+	a2.Project = "pedregal"
+	a2.TmuxSession = "fleet-dead0002"
+	// aliveByID keyed by record.ID; explicit false → deriveStatus="dead".
+	alive := map[string]bool{"dead0001": false, "dead0002": false}
+
+	m := projectRowModel(t, "pedregal", []*agent.Record{a1, a2}, alive)
+	mm, _, _ := m.actionArchive()
+	updated, cmd := mm.Update(keyMsg("y"))
+	mmm := updated.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("mode after [y] = %v; want modeNav", mmm.mode)
+	}
+	if mmm.dismissProjectCandidate != "" {
+		t.Errorf("dismissProjectCandidate not cleared; got %q", mmm.dismissProjectCandidate)
+	}
+	if mmm.dismissProjectDeadAgents != nil {
+		t.Errorf("dismissProjectDeadAgents not cleared; got %v", mmm.dismissProjectDeadAgents)
+	}
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from [y] confirm; got nil")
+	}
+	// Drain the cmd. tea.Batch returns a batchMsg containing the wrapped
+	// commands; we drain each one to record the stub calls.
+	msg := cmd()
+	switch v := msg.(type) {
+	case tea.BatchMsg:
+		for _, c := range v {
+			_ = c()
+		}
+	default:
+		// tea.Batch with a single cmd may return that cmd's msg directly;
+		// fall back to running the full slice we know we built.
+		_ = v
+	}
+	if len(stub.calls) != 2 {
+		t.Fatalf("expected 2 rm calls; got %d (%v)", len(stub.calls), stub.calls)
+	}
+	gotIDs := map[string]bool{}
+	for _, c := range stub.calls {
+		if c[0] != "rm" {
+			t.Errorf("expected rm subcommand; got %v", c)
+		}
+		gotIDs[c[1]] = true
+	}
+	if !gotIDs["dead0001"] || !gotIDs["dead0002"] {
+		t.Errorf("expected rm of both dead0001+dead0002; got %v", gotIDs)
+	}
+}
+
+// TestKeyX_LegacyProjectRow_DismissConfirmEscCancels: [esc] cancels
+// the dismiss confirm and clears the candidate state. No fleet calls.
+func TestKeyX_LegacyProjectRow_DismissConfirmEscCancels(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubProjectTreeExists{missing: map[string]bool{"pedregal": true}}).install(t)
+
+	a1 := agent.New("dead0001")
+	a1.Project = "pedregal"
+	a1.TmuxSession = "fleet-dead0001"
+	m := projectRowModel(t, "pedregal", []*agent.Record{a1}, map[string]bool{"dead0001": false})
+
+	mm, _, _ := m.actionArchive()
+	updated, _ := mm.Update(keyMsg("esc"))
+	mmm := updated.(Model)
+	if mmm.mode != modeNav {
+		t.Errorf("esc should return to modeNav; got %v", mmm.mode)
+	}
+	if mmm.dismissProjectCandidate != "" || mmm.dismissProjectDeadAgents != nil {
+		t.Errorf("candidate state not cleared on cancel; got cand=%q dead=%v",
+			mmm.dismissProjectCandidate, mmm.dismissProjectDeadAgents)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls on cancel; got %v", stub.calls)
+	}
+}
+
+// TestKeyX_LegacyProjectRow_LiveAgentRefuses: a project with at least
+// one live agent must NOT enter dismiss mode (operator-safety rule).
+// The flash points the operator at the per-agent [x] flow.
+func TestKeyX_LegacyProjectRow_LiveAgentRefuses(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubProjectTreeExists{missing: map[string]bool{"pedregal": true}}).install(t)
+
+	deadRec := agent.New("dead0001")
+	deadRec.Project = "pedregal"
+	deadRec.TmuxSession = "fleet-dead0001"
+	liveRec := agent.New("live0001")
+	liveRec.Project = "pedregal"
+	liveRec.TmuxSession = "fleet-live0001"
+	// aliveByID keyed by record.ID; deriveStatus reads alive[r.ID].
+	// false → "dead"; true → falls through to "live" (or another non-dead
+	// status). The live record only needs to read != "dead".
+	alive := map[string]bool{"live0001": true, "dead0001": false}
+
+	m := projectRowModel(t, "pedregal", []*agent.Record{deadRec, liveRec}, alive)
+	mm, cmd, handled := m.actionArchive()
+	if !handled {
+		t.Fatal("[x] not handled")
+	}
+	if cmd != nil {
+		t.Errorf("[x] with live agent must not produce a cmd; got cmd != nil")
+	}
+	if mm.mode != modeNav {
+		t.Errorf("must NOT enter dismiss mode when live agent present; got mode=%v", mm.mode)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "live agent") {
+		t.Errorf("flash should mention live agent count; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	}
+}
+
+// TestKeyX_V02ProjectRow_PreservesExistingFlash: regression-pin the
+// pre-#96 [x] semantics on a v0.2-initialized project row. The existing
+// flash text + no-shell-out behavior must NOT change. Worker kill is
+// still deferred to v0.2.x.
+func TestKeyX_V02ProjectRow_PreservesExistingFlash(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// Project tree EXISTS → v0.2 classification — the dismiss path must
+	// NOT trigger.
+	(&stubProjectTreeExists{}).install(t)
+
+	// Build the model via a v0.2 dashboard snapshot (not synthetic).
+	m := New("test")
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "fleet" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	mm, cmd, handled := m.actionArchive()
+	if !handled {
+		t.Fatal("[x] not handled")
+	}
+	if cmd != nil {
+		t.Errorf("[x] on v0.2 project must not produce a cmd; got cmd != nil")
+	}
+	if mm.mode != modeNav {
+		t.Errorf("mode should stay modeNav; got %v", mm.mode)
+	}
+	if mm.dismissProjectCandidate != "" {
+		t.Errorf("v0.2 [x] must not seed dismiss candidate; got %q", mm.dismissProjectCandidate)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "v0.1 agents") {
+		t.Errorf("flash should preserve existing wording; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	}
+}
+
+// TestKeyX_LegacyProjectRow_DismissConfirmJKSwallowed: arrow / nav
+// keystrokes while the dismiss confirm is up must not move the cursor
+// or fall through to nav — same swallow-rest rule as modeConfirmArchive.
+func TestKeyX_LegacyProjectRow_DismissConfirmJKSwallowed(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	(&stubProjectTreeExists{missing: map[string]bool{"pedregal": true}}).install(t)
+
+	a := agent.New("dead0001")
+	a.Project = "pedregal"
+	a.TmuxSession = "fleet-dead0001"
+	m := projectRowModel(t, "pedregal", []*agent.Record{a}, map[string]bool{"dead0001": false})
+
+	mm, _, _ := m.actionArchive()
+	beforeCursor := mm.dashCursor
+	updated, _ := mm.Update(keyMsg("j"))
+	mmm := updated.(Model)
+	if mmm.mode != modeConfirmDismissProject {
+		t.Errorf("j should not exit modeConfirmDismissProject; got %v", mmm.mode)
+	}
+	if mmm.dashCursor != beforeCursor {
+		t.Errorf("dashCursor moved during dismiss confirm: was %d, now %d", beforeCursor, mmm.dashCursor)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls during confirm; got %v", stub.calls)
+	}
+}

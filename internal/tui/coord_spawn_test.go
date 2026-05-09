@@ -282,12 +282,22 @@ func TestProjectRow_HidesSpawningOnceCoordStateActive(t *testing.T) {
 }
 
 // TestProjectRow_RendersStuckWarningAfterTimeout: marker mtime older
-// than spawnTimeout → the spawning line flips to a red warning
-// pointing at the tmux session naming convention.
+// than spawnTimeout AND its named tmux session is alive → the
+// spawning line flips to a red warning pointing at the tmux session
+// naming convention. Issue #96 gap 2 fix: the hint now reads
+// `fleet-<agentID>` (sourced from the marker body) instead of the
+// previous `fleet-<projectName>` text — the project-shaped form never
+// matched a real session, so the operator was led nowhere.
+//
+// Stuck self-heal (gap 1) is gated on the tmux session being DEAD;
+// here we stub it alive so the warning fires (the genuinely-hung-spawn
+// case the operator should triage via tmux).
 func TestProjectRow_RendersStuckWarningAfterTimeout(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
 	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
 
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
 	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
@@ -296,8 +306,11 @@ func TestProjectRow_RendersStuckWarningAfterTimeout(t *testing.T) {
 	if !strings.Contains(joined, "coord spawn stuck") {
 		t.Errorf("expected stuck warning; got:\n%s", joined)
 	}
-	if !strings.Contains(joined, "fleet-demo") {
-		t.Errorf("stuck warning must name the tmux session 'fleet-demo'; got:\n%s", joined)
+	if !strings.Contains(joined, "fleet-abcd1234") {
+		t.Errorf("stuck warning must name the tmux session 'fleet-abcd1234' from marker; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "fleet-demo") {
+		t.Errorf("stuck warning must NOT use project-shaped session name 'fleet-demo'; got:\n%s", joined)
 	}
 	if strings.Contains(joined, "spawning coord...") {
 		t.Errorf("stuck row must not also render spawning line; got:\n%s", joined)
@@ -367,11 +380,12 @@ func TestResolveCoordSpawnTimeout_DefaultAndOverride(t *testing.T) {
 // to return + whether the marker is "present" (ok=true). Restored
 // at test end via t.Cleanup.
 //
-// We don't need to also stub coordSpawnMarkerFn (the agent-ID
-// reader) because projectBlockLines's spawning-indicator branch
-// only consults the mtime — the marker contents are irrelevant for
-// the indicator (the [a] handler / unifiedProjects already consume
-// them for the boot-window task_id fallback).
+// Production projectBlockLines now consults BOTH the mtime AND the
+// agent_id body of the marker (gap 2 hint text + gap 1 self-heal
+// probe). Tests that don't care about those branches can stub mtime
+// alone and the agent-id reader will return its production value (""
+// for a missing marker file in the per-test FLEET_HOME tmpdir, which
+// is the safe default).
 func stubMarkerMtime(t *testing.T, project string, mtime time.Time, ok bool) {
 	t.Helper()
 	prev := coordSpawnMarkerMtimeFn
@@ -382,4 +396,196 @@ func stubMarkerMtime(t *testing.T, project string, mtime time.Time, ok bool) {
 		return mtime, ok
 	}
 	t.Cleanup(func() { coordSpawnMarkerMtimeFn = prev })
+}
+
+// stubMarkerAgentID swaps coordSpawnMarkerFn for a deterministic stub
+// returning agentID for the matching project, "" otherwise. Used by
+// gap-1 self-heal tests + gap-2 hint-text tests so the body and the
+// mtime can be controlled independently. Restored at test end.
+func stubMarkerAgentID(t *testing.T, project, agentID string) {
+	t.Helper()
+	prev := coordSpawnMarkerFn
+	coordSpawnMarkerFn = func(name string) string {
+		if name != project {
+			return ""
+		}
+		return agentID
+	}
+	t.Cleanup(func() { coordSpawnMarkerFn = prev })
+}
+
+// stubAliveSessions swaps sessionAliveFn for a deterministic in-memory
+// map: present-and-true → alive, present-and-false or absent → dead.
+// Restored at test end. Mirrors the existing tmux.HasSession contract
+// (definitive bool — the conflated probe-error case is irrelevant for
+// the self-heal path; we err toward "treat as alive" only when the
+// session was deliberately stubbed dead).
+//
+// Distinct from the keys_test.go helper `stubSessionAlive` (struct,
+// dead-set) — this is the inverse-shape variant for self-heal tests
+// where the alive-set is the natural way to describe the world.
+func stubAliveSessions(t *testing.T, alive map[string]bool) {
+	t.Helper()
+	prev := sessionAliveFn
+	sessionAliveFn = func(session string) bool {
+		return alive[session]
+	}
+	t.Cleanup(func() { sessionAliveFn = prev })
+}
+
+// stubRemoveMarker swaps removeCoordSpawnMarkerFn for a recording stub
+// so tests can assert the self-heal path triggered. Returns a *[]string
+// of the project names the stub was called with so the test can pin
+// expected behavior. Restored at test end.
+func stubRemoveMarker(t *testing.T) *[]string {
+	t.Helper()
+	prev := removeCoordSpawnMarkerFn
+	calls := []string{}
+	removeCoordSpawnMarkerFn = func(name string) error {
+		calls = append(calls, name)
+		return nil
+	}
+	t.Cleanup(func() { removeCoordSpawnMarkerFn = prev })
+	return &calls
+}
+
+// TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle pins issue #96
+// gap 1: when derivation flagged the row as Stuck (marker past
+// spawnTimeout) but the tmux session for the marker's agent_id is
+// gone, the helper transitions the state to Idle and invokes the
+// remove callback exactly once. Pure-input test — no disk, no tmux.
+func TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle(t *testing.T) {
+	rmCalled := 0
+	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, func() error {
+		rmCalled++
+		return nil
+	})
+	if err != nil {
+		t.Errorf("unexpected err from self-heal: %v", err)
+	}
+	if got != coordSpawnIdle {
+		t.Errorf("got %v; want coordSpawnIdle (dead session must heal)", got)
+	}
+	if rmCalled != 1 {
+		t.Errorf("remove invoked %d times; want 1", rmCalled)
+	}
+}
+
+// TestApplyStuckSelfHeal_LiveSessionPreservesStuck: when the tmux
+// session for the marker's agent_id IS alive, the warning is real
+// (genuinely-hung spawn the operator should attach to via tmux). Heal
+// must NOT fire and the remove callback must NOT be invoked.
+func TestApplyStuckSelfHeal_LiveSessionPreservesStuck(t *testing.T) {
+	rmCalled := 0
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, func() error {
+		rmCalled++
+		return nil
+	})
+	if got != coordSpawnStuck {
+		t.Errorf("got %v; want coordSpawnStuck (live session must keep warning)", got)
+	}
+	if rmCalled != 0 {
+		t.Errorf("remove invoked %d times for live session; want 0", rmCalled)
+	}
+}
+
+// TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck: when the marker's
+// body read returned empty (concurrent rewrite or hand-edited zero-
+// byte file), we can't probe a session we don't know the name of —
+// keep the Stuck state and let the operator triage via the soft-
+// fallback hint. Remove must NOT fire (no marker we're confident is
+// stale).
+func TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck(t *testing.T) {
+	rmCalled := 0
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "", false, func() error {
+		rmCalled++
+		return nil
+	})
+	if got != coordSpawnStuck {
+		t.Errorf("got %v; want coordSpawnStuck (empty agent ID must keep warning)", got)
+	}
+	if rmCalled != 0 {
+		t.Errorf("remove invoked %d times with empty agent ID; want 0", rmCalled)
+	}
+}
+
+// TestApplyStuckSelfHeal_NonStuckStatesUnaffected: Idle / Spawning /
+// Active are pass-throughs. The helper must never mutate non-Stuck
+// states, even with a known dead session — those rows aren't claiming
+// the row is stuck and the operator is being shown the right thing.
+func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
+	for _, st := range []coordSpawnState{coordSpawnIdle, coordSpawnSpawning, coordSpawnActive} {
+		rmCalled := 0
+		got, _ := applyStuckSelfHeal(st, "abcd1234", false, func() error {
+			rmCalled++
+			return nil
+		})
+		if got != st {
+			t.Errorf("state %v changed to %v; want unchanged", st, got)
+		}
+		if rmCalled != 0 {
+			t.Errorf("remove invoked for non-Stuck state %v; want 0 calls", st)
+		}
+	}
+}
+
+// TestProjectRow_StaleMarkerSelfHeals: end-to-end render-path
+// integration for issue #96 gap 1. With a marker past spawnTimeout
+// AND the named tmux session dead, the renderer must:
+//  1. NOT emit the red "stuck" warning (the row is stale, not really
+//     hung),
+//  2. invoke removeCoordSpawnMarkerFn for this project so the next
+//     render naturally flips back to the existing Idle path.
+func TestProjectRow_StaleMarkerSelfHeals(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	// Empty alive map → fleet-abcd1234 is dead.
+	stubAliveSessions(t, map[string]bool{})
+	rmCalls := stubRemoveMarker(t)
+
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("stale-marker self-heal must suppress stuck warning; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 1 || (*rmCalls)[0] != "demo" {
+		t.Errorf("expected exactly one remove(demo) call; got %v", *rmCalls)
+	}
+}
+
+// TestProjectRow_StuckHintFallsBackWhenAgentIDMissing pins issue #96
+// gap 2's fallback path: a marker present (mtime past timeout) but with
+// no agent_id body must render a soft-fallback hint that names the
+// project AND tells the operator the agent ID couldn't be resolved.
+// We don't render `fleet-<projectName>` (which never matches a real
+// session under tmux's `fleet-<8hex>` convention).
+//
+// Self-heal does NOT fire when agent_id is empty (we can't probe a
+// session we don't know), so the warning still surfaces.
+func TestProjectRow_StuckHintFallsBackWhenAgentIDMissing(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "") // marker present but body empty
+	stubAliveSessions(t, map[string]bool{})
+
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("expected stuck warning to render with empty agent ID; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "demo") {
+		t.Errorf("fallback hint must mention project 'demo'; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "no agent ID") {
+		t.Errorf("fallback hint must surface 'no agent ID'; got:\n%s", joined)
+	}
 }
