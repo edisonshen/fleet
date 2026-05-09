@@ -350,6 +350,20 @@ def _tick_locked(
     # the unconditional refresh is correct.
     _save_coord_state(state_path, state)
 
+    # Auto-archive when tasks.md grows past the threshold. Runs at end
+    # of every tick, after dispatch + heartbeat, before lock release
+    # (we still hold the coord lock; archive's own state-lock layers
+    # cleanly on top — different paths). Keeps the operator-facing
+    # tasks.md trim without manual `fleet tasks archive` ceremony.
+    try:
+        archived = _maybe_auto_archive(tasks_path, project, fleet_bin)
+        if archived:
+            result.errors.extend(archived.errors)
+    except Exception as exc:  # noqa: BLE001
+        # Archive should never fail a tick — log + continue. Operators
+        # see the breadcrumb via `fleet status`/blocked_reason.
+        result.errors.append(f"auto-archive: {exc}")
+
     # 6. Supervisor loop (issue #79). After the initial reconcile + drain
     # + dispatch pass we keep the lock and watch in-flight workers. Cheap
     # mtime polling drives event-based reconciliation; a sparse stuck-
@@ -1746,6 +1760,136 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
 
 
 # ---------- shared CLI helper ----------
+
+
+# ---------- auto-archive ----------
+
+
+# Default tasks.md size threshold above which we shell `fleet tasks
+# archive` for the oldest done/abandoned rows until count ≤ threshold.
+# Tunable via FLEET_AUTO_ARCHIVE_THRESHOLD; setting 0 disables.
+_AUTO_ARCHIVE_DEFAULT_THRESHOLD = 50
+
+
+@dataclass
+class _AutoArchiveResult:
+    """Captures archive errors for surfacing on the tick result.
+
+    archived: count of slugs successfully shelled to `fleet tasks archive`.
+    errors:   any per-slug shell failure / parse error string.
+    """
+
+    archived: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
+def _auto_archive_threshold() -> int:
+    """Resolve the threshold from env. Returns -1 to mean "disabled".
+
+    FLEET_AUTO_ARCHIVE_THRESHOLD == "0" → disabled.
+    Empty / unset                       → _AUTO_ARCHIVE_DEFAULT_THRESHOLD.
+    Non-integer                         → fall back to default.
+    """
+    raw = os.environ.get("FLEET_AUTO_ARCHIVE_THRESHOLD", "")
+    if raw == "":
+        return _AUTO_ARCHIVE_DEFAULT_THRESHOLD
+    try:
+        n = int(raw)
+    except ValueError:
+        return _AUTO_ARCHIVE_DEFAULT_THRESHOLD
+    if n <= 0:
+        return -1
+    return n
+
+
+def _maybe_auto_archive(
+    tasks_path: Path, project: str, fleet_bin: str,
+) -> _AutoArchiveResult | None:
+    """Trim tasks.md when it grows past FLEET_AUTO_ARCHIVE_THRESHOLD.
+
+    Picks the OLDEST done/abandoned slugs (sort: finished_at asc, fall
+    back to updated asc) and shells them to `fleet tasks archive` one
+    at a time until the row count is at or below the threshold. Active
+    statuses are NEVER archived regardless of count.
+
+    Returns None when the threshold is unmet or disabled. Returns a
+    non-None result with `errors` populated if any per-slug archive
+    shell failed; the tick adds those to result.errors.
+
+    Idempotency: re-entering this function with tasks.md already at /
+    below threshold is a no-op. The threshold check happens on a fresh
+    parse so we react to the current on-disk state, not the stale
+    in-memory snapshot the tick had earlier.
+    """
+    threshold = _auto_archive_threshold()
+    if threshold <= 0:
+        return None
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception as exc:  # noqa: BLE001
+        return _AutoArchiveResult(errors=[f"auto-archive read: {exc}"])
+    if len(f.tasks) <= threshold:
+        return None
+
+    # Build the candidate list: only done/abandoned. Sort oldest-first
+    # so the oldest-done is archived first (matches the operator's
+    # mental model of "trim the tail").
+    candidates = [
+        t for t in f.tasks
+        if t.status in ("done", "abandoned")
+    ]
+    if not candidates:
+        # 51+ active tasks. Surface a breadcrumb so the operator notices
+        # the unbounded growth — but skip silently rather than failing
+        # the tick.
+        msg = (
+            f"auto-archive: tasks.md has {len(f.tasks)} entries "
+            f"(threshold={threshold}) but no done/abandoned candidates"
+        )
+        return _AutoArchiveResult(errors=[msg])
+
+    # Sort: finished_at asc, fall back to updated asc, then created
+    # asc. None values (old rows missing finished_at) sort BEFORE any
+    # real timestamp — that's the right behavior here, since rows that
+    # never stamped finished_at are presumed older than ones that did.
+    def _sort_key(task) -> tuple:
+        # datetime | None — pick a sentinel below any real timestamp.
+        # Python tuples compare element-wise; the bool-flag-then-value
+        # trick avoids datetime/None comparison errors on 3.x.
+        fa = task.finished_at
+        ua = task.updated
+        ca = task.created
+        return (
+            (0, _dt_min) if fa is None else (1, fa),
+            (0, _dt_min) if ua is None else (1, ua),
+            (0, _dt_min) if ca is None else (1, ca),
+        )
+
+    candidates.sort(key=_sort_key)
+
+    # Archive enough rows to fall to or below threshold. Each shell
+    # serializes through tasks.Archive's own state-lock — fine, we're
+    # NOT holding tasks-archive.lock here, just coordinator.lock.
+    surplus = len(f.tasks) - threshold
+    to_archive = candidates[:surplus]
+    out = _AutoArchiveResult()
+    for t in to_archive:
+        try:
+            _run_fleet(
+                [fleet_bin, "tasks", "archive", "--project", project, t.slug],
+                timeout_s=30.0,
+            )
+            out.archived += 1
+        except Exception as exc:  # noqa: BLE001
+            out.errors.append(f"auto-archive {t.slug}: {exc}")
+    return out
+
+
+# Sentinel datetime "before any real timestamp" used by the
+# auto-archive sort. Imported from datetime to avoid a Python-version-
+# specific min datetime constant (3.11 vs 3.12 differ on
+# datetime.MAX/MIN access patterns).
+_dt_min = __import__("datetime").datetime.min
 
 
 def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
