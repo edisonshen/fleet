@@ -118,22 +118,17 @@ func classifyProjectActivity(
 			return projectActive
 		}
 	}
-	// Worker activity: any worker tagged to this project with a fresh
-	// state.json. The dashboard's Workers list already filters to
-	// active (non-archived) workers, so its presence alone is a strong
-	// signal — but we also check UpdatedAt so a worker stuck in the
-	// scan with a stale state.json doesn't keep the project pinned
-	// "active" forever.
+	// Worker activity: any worker tagged to this project. The
+	// dashboard's Workers list already filters to active (non-archived)
+	// workers — scanWorkers reads from workers/<slug>/, and the coord
+	// archives finished workers, so a row in the snapshot means there's
+	// an in-flight worker. WorkerRow doesn't carry UpdatedAt (only the
+	// human-aged string), so we trust the snapshot's existence as the
+	// freshness signal here.
 	for _, w := range workers {
 		if w == nil || w.Project != p.Name {
 			continue
 		}
-		// We don't carry UpdatedAt on WorkerRow (only the human-aged
-		// string). A worker present in the snapshot is always recent
-		// enough to count: scanWorkers reads from workers/<slug>/, and
-		// the coord archives finished workers — so a row in the
-		// snapshot means there's an in-flight worker. That alone is
-		// "active" enough.
 		return projectActive
 	}
 	return projectIdle

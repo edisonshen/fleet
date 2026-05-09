@@ -656,9 +656,16 @@ func (m *Model) moveCursor(delta int) {
 // ordering contract), so the first row of kind rowProject is the
 // LEFT-panel anchor.
 //
-// No-op when no project row exists (synthetic-only dashboards or
-// empty state) — leaves the cursor where it is rather than hopping to
-// 0, which could be a worker/agent row in pathological layouts.
+// Issue #98: when every project is idle AND the operator has explicitly
+// collapsed the idle group, the LEFT column starts with a separator
+// (no project rows visible). Fall back to the first rowSeparator so the
+// operator can still ← into the LEFT panel and press [enter] to expand.
+// Without this fallback, ← would no-op and cursor would stay stuck on
+// the right column, hiding the separator from keyboard access.
+//
+// No-op only when truly no LEFT-column row exists — leaves the cursor
+// where it is rather than hopping to 0, which could be a worker/agent
+// row in pathological layouts.
 //
 // j/k behavior is unchanged: this is an additive shortcut, not a
 // rebinding. Idempotent — pressing ← when already on the first project
@@ -667,6 +674,14 @@ func (m *Model) jumpToLeftPanel() {
 	rows := m.dashboardRows()
 	for i, r := range rows {
 		if r.kind == rowProject {
+			m.dashCursor = i
+			return
+		}
+	}
+	// Fallback: first rowSeparator (issue #98). Reachable when every
+	// project is idle + explicitly collapsed.
+	for i, r := range rows {
+		if r.kind == rowSeparator {
 			m.dashCursor = i
 			return
 		}

@@ -327,6 +327,49 @@ func TestKeyC_OnProjectRow_DiskWriteFails(t *testing.T) {
 	}
 }
 
+func TestJumpToLeftPanel_FallsBackToSeparatorWhenNoProjectsVisible(t *testing.T) {
+	defer resetHiddenStubs()()
+	stubHidden()
+
+	m := New("test")
+	// Two idle projects + operator explicitly collapsed the idle group.
+	// LEFT column has only the separator + right-column rows.
+	m.idleCollapseExplicit = true
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "alpha"},
+			{Name: "beta"},
+		},
+		Workers: []*WorkerRow{
+			{Project: "extra", Slug: "do-1234", State: "ok", Color: "green", Age: "1m"},
+		},
+	}
+	rows := m.dashboardRows()
+	sepIdx := -1
+	for i, r := range rows {
+		if r.kind == rowSeparator {
+			sepIdx = i
+			break
+		}
+	}
+	if sepIdx < 0 {
+		t.Fatalf("expected a separator in the row list: %+v", rows)
+	}
+	// Cursor starts on the right column row (worker).
+	for i, r := range rows {
+		if r.kind == rowWorker {
+			m.dashCursor = i
+			break
+		}
+	}
+	// ← should land cursor on the separator (no project rows exist).
+	m.jumpToLeftPanel()
+	if m.dashCursor != sepIdx {
+		t.Errorf("jumpToLeftPanel should fall back to separator at %d, got cursor at %d (row kind %v)",
+			sepIdx, m.dashCursor, rows[m.dashCursor].kind)
+	}
+}
+
 func TestKeyC_DoesNotCollideWithOtherKeys(t *testing.T) {
 	// Sanity: pressing [d] / [h] / [x] / [a] / [n] does NOT trigger
 	// the hide flow. We don't run them all here (other tests do); just
