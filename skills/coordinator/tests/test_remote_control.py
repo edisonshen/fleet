@@ -563,15 +563,61 @@ class TestBootstrap:
         assert isolated_bootstrap_log.exists()
         assert "status=skipped_invalid" in isolated_bootstrap_log.read_text()
 
+    def test_inbox_busy_returns_skipped_not_failed(
+        self, fleet_home: Path, fake_popen: _FakePopen,
+        isolated_bootstrap_log: Path,
+    ) -> None:
+        """When the operator pre-queued an inbox message via
+        `fleet message <coord_id>` between dispatch and the first
+        tick, bootstrap_remote_control must surface this as
+        STATUS_SKIPPED_INBOX_BUSY (transient, self-healing) — NOT
+        STATUS_FAILED_SEED. The inbox-busy path is normal operation
+        and would otherwise spam the bootstrap log + the tick error
+        feed every time the operator messages a coord during boot.
+
+        Quiet path: no log line, no daemon spawn (we short-circuit
+        before reaching spawn_daemon_if_needed since there's no point
+        re-running the daemon when we know we'll just defer the seed).
+        Marker NOT written → next tick retries; by then fleet-guard
+        will have delivered + archived the operator's message.
+        """
+        inbox_dir = fleet_home / "inbox"
+        inbox_dir.mkdir()
+        # Operator pre-queued a message at the inbox path.
+        (inbox_dir / "abcd1234.md").write_text(
+            "operator note: pause work", encoding="utf-8",
+        )
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_SKIPPED_INBOX_BUSY
+        # Marker NOT written — bootstrap not yet considered done.
+        marker = (
+            fleet_home / "projects" / "myproj"
+            / ".remote-control-bootstrap-abcd1234"
+        )
+        assert not marker.exists()
+        # Operator content untouched.
+        assert (inbox_dir / "abcd1234.md").read_text() == (
+            "operator note: pause work"
+        )
+        # Quiet path: no bootstrap log line written. This is the
+        # critical assertion — without the pre-check, this would have
+        # surfaced as STATUS_FAILED_SEED + a noisy log line every
+        # time the operator messages a coord during boot.
+        assert not isolated_bootstrap_log.exists()
+
     def test_inbox_failure_preserves_no_marker_for_retry(
         self, fleet_home: Path, fake_popen: _FakePopen,
         isolated_bootstrap_log: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """If seed_inbox fails, the marker is NOT written — next tick
-        retries the bootstrap. Daemon spawn is still attempted (pgrep
-        guards re-launch). Returns STATUS_FAILED_SEED + log line so the
-        operator can grep BOOTSTRAP_LOG."""
+        """If seed_inbox fails for a real I/O reason (mkdir/mkstemp
+        errored), the marker is NOT written — next tick retries the
+        bootstrap. Daemon spawn is still attempted (pgrep guards
+        re-launch). Returns STATUS_FAILED_SEED + log line so the
+        operator can grep BOOTSTRAP_LOG. Distinct from the
+        inbox-busy path above (which is self-healing and quiet)."""
         # Force seed_inbox to return False without touching disk.
         monkeypatch.setattr(
             remote_control, "seed_inbox", lambda *_args, **_kwargs: False,
