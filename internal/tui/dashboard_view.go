@@ -294,16 +294,94 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	// hidden separator AND that separator is expanded, render the
 	// project lines dim so the operator's eye reads the rows as
 	// secondary content (issue #98).
+	// Issue #111: render expanded projects as header → tasks → footer
+	// so the count-chip summary sits BELOW the tasks (operator dogfood
+	// feedback: action first, summary second). Collapsed projects keep
+	// the original 3-line block. We "peek ahead" to decide which path
+	// applies, and defer the footer until the project's task group
+	// closes (next top-level row is rowProject / rowSeparator-non-history
+	// / end-of-rows).
+	//
+	//   ASCII shape:
+	//     project A (expanded)
+	//       header (name + repo)
+	//       task 1
+	//       task 2
+	//       ─── 3 done ─── (history separator stays inside the project)
+	//       footer (count chips + status, blank)
+	//     project B (collapsed) — emits full block via projectBlockLines
 	insideHiddenGroup := false
+	type pendingFooter struct {
+		project *ProjectRow
+		prefix  string
+		dim     bool // hidden-group style applied
+	}
+	var pending *pendingFooter
+	flushFooter := func() {
+		if pending == nil {
+			return
+		}
+		footer := projectFooterLines(pending.project, leftW, pending.prefix, spawnCtx)
+		if pending.dim {
+			footer = applyHiddenStyle(footer)
+		}
+		left = append(left, footer...)
+		pending = nil
+	}
+	// projectHasExpandedRowsBelow looks ahead from rowProject at index i
+	// and returns true when the next non-separator-history row belonging
+	// to the SAME project is a rowTask. Used to choose between the
+	// collapsed (full block) and expanded (header / tasks / footer)
+	// rendering paths.
+	projectHasExpandedRowsBelow := func(i int, name string) bool {
+		for j := i + 1; j < len(rows); j++ {
+			r := rows[j]
+			switch r.kind {
+			case rowTask:
+				if r.parentProject == name {
+					return true
+				}
+				return false
+			case rowSeparator:
+				if r.separator != nil && r.separator.kind == separatorHistory && r.parentProject == name {
+					// History separator alone (no expanded children
+					// underneath, no inline active tasks above) still
+					// counts as expansion content — operator sees the
+					// history group below the task list.
+					return true
+				}
+				return false
+			case rowProject, rowAgent, rowWorker:
+				return false
+			}
+		}
+		return false
+	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowProject:
-			lines := projectBlockLines(row.project, leftW, selected, spawnCtx)
-			if insideHiddenGroup {
-				lines = applyHiddenStyle(lines)
+			// A new project row terminates any pending footer for the
+			// previous project — write it before opening this project.
+			flushFooter()
+			if projectHasExpandedRowsBelow(i, row.project.Name) {
+				header, prefix := projectHeaderLines(row.project, leftW, selected)
+				if insideHiddenGroup {
+					header = applyHiddenStyle(header)
+				}
+				left = append(left, header...)
+				pending = &pendingFooter{
+					project: row.project,
+					prefix:  prefix,
+					dim:     insideHiddenGroup,
+				}
+			} else {
+				lines := projectBlockLines(row.project, leftW, selected, spawnCtx)
+				if insideHiddenGroup {
+					lines = applyHiddenStyle(lines)
+				}
+				left = append(left, lines...)
 			}
-			left = append(left, lines...)
 		case rowTask:
 			line := taskBlockLine(row.task, leftW, selected)
 			if insideHiddenGroup {
@@ -311,6 +389,18 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 			}
 			left = append(left, line)
 		case rowSeparator:
+			// History separators belong INSIDE the project block —
+			// the footer fires after the history group closes, not
+			// before. Idle/hidden separators sit between projects, so
+			// they DO close any pending footer.
+			if row.separator != nil && row.separator.kind == separatorHistory {
+				left = append(left, separatorBlockLine(row.separator, leftW, selected))
+				// No trailing blank — history separator is followed by
+				// either the expanded history rows or the project's
+				// footer (which carries its own trailing blank).
+				continue
+			}
+			flushFooter()
 			left = append(left, separatorBlockLine(row.separator, leftW, selected))
 			// Empty trailing line keeps spacing consistent with the
 			// project blocks (which end with "" for visual rhythm).
@@ -322,6 +412,9 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 			}
 		}
 	}
+	// End-of-rows: any project still holding a pending footer (last
+	// project in the list was expanded) gets it appended now.
+	flushFooter()
 
 	// Right column: worker rows, then a sub-header, then agent rows.
 	var right []string
@@ -461,8 +554,8 @@ func rowsHaveLeft(rows []dashRow) bool {
 	return false
 }
 
-// projectBlockLines renders one project's three-line (or four-line)
-// block:
+// projectBlockLines renders one project's collapsed (no expanded
+// task list) block:
 //
 //	<name>                                     [● N attn]
 //	<repo>
@@ -490,7 +583,27 @@ func rowsHaveLeft(rows []dashRow) bool {
 // stuck — check tmux session fleet-<name>" warning. State derivation
 // lives in deriveCoordSpawnState (coord_spawn.go) so it can be tested
 // in isolation; this function just renders the result.
+//
+// Issue #111 split: an expanded project (one whose tasks render below
+// it) renders header + tasks + footer, with the count-chip line moved
+// AFTER the task list so reading order is "tasks first, summary
+// second" (operator dogfood feedback). This function is now the
+// collapsed-only path; buildBodyLines composes projectHeaderLines +
+// projectFooterLines around the task rows for the expanded path.
 func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) []string {
+	header, prefix := projectHeaderLines(p, w, selected)
+	footer := projectFooterLines(p, w, prefix, ctx)
+	return append(header, footer...)
+}
+
+// projectHeaderLines emits the project's identity lines — name (with
+// optional attention chip) + repo slug — without the count-chip
+// summary or trailing blank. Used by buildBodyLines so an expanded
+// project renders header → tasks → footer (issue #111). Also returns
+// the per-row leading prefix so the caller can pass it to
+// projectFooterLines for consistent attention-border + indent across
+// the three-piece composition.
+func projectHeaderLines(p *ProjectRow, w int, selected bool) ([]string, string) {
 	prefix := "  "
 	if p.Attention > 0 {
 		prefix = attentionBorderStyle.Render("▌ ") + " "
@@ -533,35 +646,48 @@ func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) [
 		line2 += projectRepoStyle.Render(p.RepoSlug)
 	}
 
-	// Line 3: counts + status.
+	return []string{line1, line2}, prefix
+}
+
+// projectFooterLines emits the count-chip + coord-status row, the
+// optional coord-id / spawning-coord line, and a trailing blank. This
+// is the bottom of every project block — collapsed projects compose
+// header+footer back-to-back; expanded projects insert their task list
+// between header and footer so the operator reads tasks first
+// (issue #111).
+//
+// prefix is sourced from projectHeaderLines so the attention-border
+// accent stays uniform down the whole block.
+func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) []string {
+	// Line: counts + status.
 	counts := renderCountChips(p.Counts)
 	status := renderCoordStatus(p)
-	line3 := prefix + counts
+	countsLine := prefix + counts
 	if status != "" {
-		gap := w - lipgloss.Width(line3) - lipgloss.Width(status) - 2
+		gap := w - lipgloss.Width(countsLine) - lipgloss.Width(status) - 2
 		if gap < 1 {
 			gap = 1
 		}
-		line3 = line3 + strings.Repeat(" ", gap) + status
+		countsLine = countsLine + strings.Repeat(" ", gap) + status
 	}
 
-	// Optional Line 4: coord identifier (issue #55). Rendered only when
-	// the project's coord is freshly publishing into the lock body —
+	// Optional coord-id line (issue #55). Rendered only when the
+	// project's coord is freshly publishing into the lock body —
 	// operators want to see WHICH agent is coordinating without leaving
 	// the dashboard for `fleet attach`.
 	if p.CoordID != "" {
 		coordLabel := dimStyle.Render("coord ") + workerIDStyle.Render(p.CoordID)
-		line4 := prefix + coordLabel
-		return []string{line1, line2, line3, line4, ""}
+		coordLine := prefix + coordLabel
+		return []string{countsLine, coordLine, ""}
 	}
 
-	// Optional Line 4 alt: coord-spawn indicator (issue #86). When the
-	// coord-spawn marker exists but coord-state.json hasn't published
-	// a fresh tick yet, render "⠋ spawning coord... 1m 23s" so the
-	// 3-5min cold start isn't a silent wait. The stale/missing branch
-	// fires when scanProject sees no fresh coord-state.json — i.e.
-	// !p.Active (Active is set iff now-stateMtime ≤ coordActiveWindow).
-	// Beyond ctx.spawnTimeout the line flips to a red stuck warning.
+	// Optional coord-spawn line (issue #86). When the coord-spawn
+	// marker exists but coord-state.json hasn't published a fresh tick
+	// yet, render "⠋ spawning coord... 1m 23s" so the 3-5min cold start
+	// isn't a silent wait. The stale/missing branch fires when
+	// scanProject sees no fresh coord-state.json — i.e. !p.Active
+	// (Active is set iff now-stateMtime ≤ coordActiveWindow). Beyond
+	// ctx.spawnTimeout the line flips to a red stuck warning.
 	//
 	// Issue #96 gap 1 self-heal: when derivation lands on Stuck but the
 	// tmux session for the agent_id stored in the marker is gone, the
@@ -601,10 +727,10 @@ func projectBlockLines(p *ProjectRow, w int, selected bool, ctx coordSpawnCtx) [
 	if line, ok := renderCoordSpawnLineForProject(
 		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {
-		return []string{line1, line2, line3, line, ""}
+		return []string{countsLine, line, ""}
 	}
 
-	return []string{line1, line2, line3, ""}
+	return []string{countsLine, ""}
 }
 
 // tmuxSessionName returns the canonical tmux session name for a fleet
