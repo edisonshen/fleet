@@ -439,6 +439,15 @@ def _do_handoff(record: dict[str, Any], session: str,
     prev_path: str | None = prev_raw if isinstance(prev_raw, str) and prev_raw else None
 
     recent = capture_recent(session)
+    # Issue #93 Phase B2: when the outgoing agent is a coord, harvest
+    # its in-flight worker subagents so the successor can re-dispatch
+    # them. Coord identity convention is task_id="coord-<project>"
+    # (mirrors internal/tui.coordTaskID). Best-effort: any read failure
+    # falls through to an empty list; the section still renders with
+    # the canonical placeholder body and the successor parser sees
+    # zero entries.
+    active_subagents = _collect_active_subagents(task_id, project)
+
     new_id = ids.new_id()
     ts = datetime.now(timezone.utc)
 
@@ -452,6 +461,7 @@ def _do_handoff(record: dict[str, Any], session: str,
         context_pct=pct,
         ts=ts,
         recent_activity=recent,
+        active_subagents=active_subagents,
     )
     if not doc_path:
         return False
@@ -627,15 +637,29 @@ def _yellow_stuck_too_long(record: dict[str, Any]) -> bool:
 
 # -- doc rendering -----------------------------------------------------------
 
+# Issue #93 Phase B2: Active Subagents section pinned by
+# internal/handoff.ActiveSubagentsNonePlaceholder. Both sides MUST
+# stay byte-identical — the Go byte-golden test (TestRender_SkillByteGolden)
+# and the Python golden (test_render_byte_golden) cross-verify this.
+ACTIVE_SUBAGENTS_NONE_PLACEHOLDER = "_(none)_"
+
+
 def write_doc(*, agent_id: str, task_id: str, project: str,
               handoff_type: str, number: int, prev_path: str | None,
               context_pct: float | None, ts: datetime,
-              recent_activity: str) -> str:
+              recent_activity: str,
+              active_subagents: list[dict] | None = None) -> str:
     """Render and atomically write the handoff doc. Returns the absolute
     path on success, "" on failure. Body has the captured tmux pane in
     `## Completed` (per plan D3 / SKILL.md) and Placeholder in the other
     four sections — the operator or successor agent fills those before
-    resuming."""
+    resuming.
+
+    active_subagents (issue #93 Phase B2): list of in-flight worker
+    subagents the outgoing coord had spawned via the Agent tool. Each
+    entry is a dict with keys task, branch, phase, agent_id,
+    subagent_id (any may be empty string). Defaults to None which
+    renders the `_(none)_` placeholder."""
     path = _handoff_path(agent_id, ts)
     body = _render_doc(
         agent_id=agent_id,
@@ -647,6 +671,7 @@ def write_doc(*, agent_id: str, task_id: str, project: str,
         context_pct=context_pct,
         ts=ts,
         recent_activity=recent_activity,
+        active_subagents=active_subagents,
     )
     if not _atomic_write_bytes(path, body):
         return ""
@@ -663,9 +688,16 @@ def _handoff_path(agent_id: str, ts: datetime) -> Path:
 def _render_doc(*, agent_id: str, task_id: str, project: str,
                 handoff_type: str, number: int, prev_path: str | None,
                 context_pct: float | None, ts: datetime,
-                recent_activity: str) -> bytes:
+                recent_activity: str,
+                active_subagents: list[dict] | None = None) -> bytes:
     """Render the handoff doc bytes. Frontmatter ordering and quoting must
-    match internal/handoff.Render byte-for-byte."""
+    match internal/handoff.Render byte-for-byte.
+
+    active_subagents: optional list of {task, branch, phase, agent_id,
+    subagent_id} dicts; missing keys default to "". None or empty list
+    renders the `_(none)_` placeholder body. See
+    internal/handoff/handoff.go renderActiveSubagents for the matching
+    Go-side shape."""
     out: list[str] = ["---\n"]
     out.append(f"agent_id: {_go_quote(agent_id)}\n")
     out.append(f"task_id: {_go_quote(task_id)}\n")
@@ -691,8 +723,133 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
     out.append(f"## Key Decisions\n{PLACEHOLDER}\n\n")
     out.append(f"## Files Modified\n{PLACEHOLDER}\n\n")
     out.append(f"## Open Questions\n{PLACEHOLDER}\n\n")
-    out.append(f"## Next Steps (prioritized)\n{PLACEHOLDER}\n")
+    out.append(f"## Next Steps (prioritized)\n{PLACEHOLDER}\n\n")
+    out.append(
+        f"## Active Subagents\n{_render_active_subagents(active_subagents)}\n",
+    )
     return "".join(out).encode("utf-8")
+
+
+def _render_active_subagents(subs: list[dict] | None) -> str:
+    """Mirror of internal/handoff.renderActiveSubagents. Empty list
+    renders the canonical placeholder; non-empty renders one
+    `- task=<q> branch=<q> phase=<q> agent_id=<q> subagent_id=<q>`
+    line per entry, deterministic order (input order preserved).
+
+    Each value is Go-quoted via _go_quote so the Go-side parser's
+    strconv.Unquote round-trips unchanged. Missing keys default to
+    empty string — the field set is uniform across rows so the parser
+    can rely on positional layout if needed.
+    """
+    if not subs:
+        return ACTIVE_SUBAGENTS_NONE_PLACEHOLDER
+    lines: list[str] = []
+    for s in subs:
+        task = str(s.get("task", "") or "")
+        branch = str(s.get("branch", "") or "")
+        phase = str(s.get("phase", "") or "")
+        agent_id = str(s.get("agent_id", "") or "")
+        subagent_id = str(s.get("subagent_id", "") or "")
+        lines.append(
+            "- task={t} branch={b} phase={p} agent_id={a} subagent_id={s}".format(
+                t=_go_quote(task), b=_go_quote(branch),
+                p=_go_quote(phase), a=_go_quote(agent_id),
+                s=_go_quote(subagent_id),
+            )
+        )
+    return "\n".join(lines)
+
+
+# Coord identity convention: task_id="coord-<project>" mirrors
+# internal/tui.coordTaskID. fleet-guard never ran on a coord pre-v0.2 so
+# this constant is new — adding it here keeps the lookup contained
+# (no additional cross-module imports).
+_COORD_TASK_ID_PREFIX = "coord-"
+
+
+def _collect_active_subagents(task_id: str, project: str) -> list[dict]:
+    """Read the coord's coord-state.json and return one active-subagent
+    entry per in-flight worker. Returns [] when the agent isn't a coord
+    or any read step fails (best-effort: handoff doc still writes).
+
+    Worker identity comes from coord-state.json's `worker_agent_ids`
+    map (slug → 8-hex Fleet agent_id; written by the coord skill on
+    every dispatch). subagent_id stays empty when the coord skill
+    hasn't captured it (Phase A's DISPATCH-block flow doesn't feed
+    captured Claude IDs back to the skill); in that case the
+    successor re-dispatches via the AgentID's inbox file regardless.
+
+    Phase (last-known) comes from each worker's
+    workers/<slug>/state.json. Missing/unparseable state.json yields
+    phase="" — the entry is still emitted because the agent_id
+    + slug are enough to drive a re-dispatch.
+    """
+    if not task_id or not task_id.startswith(_COORD_TASK_ID_PREFIX):
+        return []
+    if not project:
+        return []
+    try:
+        coord_state_path = (
+            health.fleet_home() / "projects" / project / "coord-state.json"
+        )
+        with open(coord_state_path, "r", encoding="utf-8") as fh:
+            coord_state = json.load(fh)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, json.JSONDecodeError):
+        return []
+    if not isinstance(coord_state, dict):
+        return []
+    worker_map = coord_state.get("worker_agent_ids", {})
+    if not isinstance(worker_map, dict):
+        return []
+    # Future-proof: a Phase B follow-up may add a parallel slug →
+    # claude-subagent-id map. Read it if present so an upgrade adds
+    # data without changing this function's signature.
+    subagent_map = coord_state.get("worker_subagent_ids", {})
+    if not isinstance(subagent_map, dict):
+        subagent_map = {}
+    out: list[dict] = []
+    # Sort by slug for deterministic doc shape — the byte-golden test
+    # cares about ordering, and operators reading the doc benefit from
+    # alphabetic stability across handoffs.
+    for slug in sorted(worker_map.keys()):
+        agent_id = worker_map.get(slug, "")
+        if not isinstance(slug, str) or not isinstance(agent_id, str):
+            continue
+        if not slug or not agent_id:
+            continue
+        phase = _read_worker_phase(project, slug)
+        sub_id = subagent_map.get(slug, "")
+        if not isinstance(sub_id, str):
+            sub_id = ""
+        out.append({
+            "task": slug,
+            "branch": f"worker/{slug}",
+            "phase": phase,
+            "agent_id": agent_id,
+            "subagent_id": sub_id,
+        })
+    return out
+
+
+def _read_worker_phase(project: str, slug: str) -> str:
+    """Read workers/<slug>/state.json and return its `phase` field.
+    Returns "" on any error; the active-subagents entry still renders
+    with empty phase, and the successor coord's re-dispatch logic
+    relies on WIP-file existence + tasks.md status — phase is triage
+    context only."""
+    try:
+        path = (
+            health.fleet_home() / "projects" / project /
+            "workers" / slug / "state.json"
+        )
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, NotADirectoryError, PermissionError, json.JSONDecodeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    phase = data.get("phase", "")
+    return phase if isinstance(phase, str) else ""
 
 
 def _go_quote(s: str) -> str:
