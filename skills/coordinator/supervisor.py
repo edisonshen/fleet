@@ -388,15 +388,32 @@ def _is_subagent_id(s: str) -> bool:
     """Loose validation for an Agent-tool subagent_id token. The host
     Claude doesn't document the exact shape, so we accept any non-empty
     printable string under the length cap. Whitespace is rejected (the
-    coord agent strips before passing the token in)."""
+    coord agent strips before passing the token in).
+
+    Defense-in-depth: shell metacharacters (`;`, `|`, `&`, `$`, backtick,
+    `(`, `)`, `<`, `>`, `\\`, single+double quotes) are rejected. The
+    coord agent passes this id into a Bash tool invocation (per
+    SKILL.md's Worker dispatch protocol step 3); rejecting the
+    metacharacter set blocks shell-injection-via-LLM-output even when
+    the operator's Bash invocation forgets to quote the value. Host
+    Claude's Agent-tool subagent_id format in practice is alphanumeric
+    with hyphens / underscores, so this filter never trips on a
+    legitimate id."""
     if not isinstance(s, str):
         return False
     if not s or len(s) > _SUBAGENT_ID_MAX_LEN:
         return False
+    # Shell-metacharacter blocklist. We use a blocklist (not allowlist)
+    # because the host Claude could in principle return any printable
+    # subagent_id format and we don't want to over-fit. The blocklist
+    # covers the operator-visible shell injection vectors.
+    _SHELL_META = "$`;|&<>()\\\"'"
     for ch in s:
         if ch.isspace():
             return False
         if not ch.isprintable():
+            return False
+        if ch in _SHELL_META:
             return False
     return True
 

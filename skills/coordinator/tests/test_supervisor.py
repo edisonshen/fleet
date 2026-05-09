@@ -848,6 +848,36 @@ def test_remember_subagent_id_repairs_corrupt_top_level() -> None:
     assert state["worker_subagent_ids"] == {"alpha-aaaa": "claude-sub-1"}
 
 
+def test_is_subagent_id_rejects_shell_metacharacters() -> None:
+    """Defense-in-depth: even though host Claude is trusted, an
+    Agent-tool response containing shell metacharacters could survive
+    into a Bash tool invocation (per SKILL.md step 3) before argparse
+    sees it. _is_subagent_id rejects the operator-visible injection
+    vectors so a malicious id never reaches the on-disk map.
+
+    Each metachar is tested independently so a regression on one
+    character is a single-line failure (fix isolated)."""
+    for meta in [";", "|", "&", "$", "`", "(", ")", "<", ">", "\\", "'", '"']:
+        sid = f"claude-sub{meta}1"
+        assert not supervisor._is_subagent_id(sid), (
+            f"shell meta char {meta!r} must be rejected, but {sid!r} accepted"
+        )
+
+
+def test_is_subagent_id_accepts_legitimate_format() -> None:
+    """Legitimate subagent_ids — alphanumeric + hyphen / underscore /
+    period — must pass. Pin the legitimate path so tightening the
+    blocklist doesn't accidentally reject a real Claude token."""
+    for sid in (
+        "claude-sub-1",
+        "claude_sub_xyz",
+        "abc123",
+        "claude-sub-abcdef0123456789",  # 32-char hex-style
+        "x.y.z",  # period is allowed
+    ):
+        assert supervisor._is_subagent_id(sid), f"{sid!r} should pass"
+
+
 # ---------- config from env ----------
 
 
