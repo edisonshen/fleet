@@ -191,6 +191,8 @@ EXPECTED_GOLDEN = (
     b"\n"
     b"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
     b"\n"
+    b"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent \xe2\x80\x94 running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
+    b"\n"
     b"Then continue with the sections below.\n"
     b"\n"
     b"## Completed\n"
@@ -279,6 +281,30 @@ class TestRenderByteGolden:
             recent_activity="x",
         )
         assert want in got
+
+    def test_first_action_instructs_coordinator_run(self) -> None:
+        """handoff-coord-spawn-prompt-fix regression: FIRST_ACTION
+        must include a /coordinator slash command paragraph so
+        replacement coord sessions resume the supervisor tick loop.
+        Without it, ~/.fleet/projects/<p>/.locks/coordinator.lock
+        retains the predecessor's 8-hex agent ID and the TUI
+        dashboard's project row shows the OLD coord's name."""
+        want = b"Then run the slash command `/coordinator`"
+        assert want in handoff.FIRST_ACTION.encode("utf-8")
+        # Idempotency note must accompany the instruction so a
+        # successor agent inspecting the doc understands why running
+        # /coordinator on a non-coord lineage is safe.
+        assert b"idempotent" in handoff.FIRST_ACTION.encode("utf-8")
+        # Order pin: /remote-control attaches the chat session to the
+        # operator's mobile pairing; that must complete BEFORE
+        # /coordinator's supervisor startup output begins streaming.
+        body = handoff.FIRST_ACTION
+        rc_idx = body.find("`/remote-control`")
+        coord_idx = body.find("`/coordinator`")
+        assert rc_idx >= 0 and coord_idx >= 0
+        assert rc_idx < coord_idx, (
+            f"/remote-control must precede /coordinator: rc={rc_idx} coord={coord_idx}"
+        )
 
 
 class TestActiveSubagentsRender:
