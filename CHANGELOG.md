@@ -6,6 +6,127 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-10
+
+Handoff hardening — the v0.6.0 P0 remote-control fix shipped with two
+latent gaps that surface only after a handoff. v0.7.0 closes both, adds
+v0.2 Phase B/C coord-subagent continuity (handoff-survival + TUI
+visibility), lands `fleet project add` for clone-and-register flow,
+upgrades `fleet tasks list` to a recency view with auto-archive, and
+finishes with a small TUI brand polish (FLΞΞT wordmark on the title
+row).
+
+### Added
+
+- v0.2 Phase B coord-handoff continuity for live Agent-tool subagents
+  (#113). When fleet-guard hands off the coord at 50/70% context, any
+  Agent-tool subagent it spawned dies with the parent. The successor
+  coord now reads a new `## Active Subagents` section in the handoff
+  doc (Go-side `internal/handoff` Doc + Python-side `handoff.py` byte-
+  golden cross-verify), and a new `skills/coordinator/handoff_resume.py`
+  helper re-dispatches each worker, gated on WIP-file existence at
+  `~/.fleet/subagent-wip/<task>.md`, with a RESUMING preamble pointing
+  at the WIP. SKILL.md gains a `## Resume after handoff` section so
+  successor coords re-read from disk and run the protocol. Plus B1:
+  `[a]` on a worker row in the TUI now attaches to the project's
+  coord chat (where the worker subagent's output renders as a "local
+  agent" indicator), since worker tmux sessions went away in v0.3
+  Phase A — orphan / dead-coord cases flash a status hint instead of
+  crashing.
+- v0.2 Phase C subagent_id rendering in the TUI (#116). Worker rows
+  now carry a `· <8-char>` chip when the coord registered an
+  Agent-tool subagent_id, plus a top-status `<N> agents` chip
+  paralleling the existing `<N> yellow · <M> red` context-pct chips
+  (hidden at zero, plural-aware). Coord-side `supervisor.py` gains
+  `remember_subagent_id` / `forget_subagent_id` / `load_subagent_id_map`
+  helpers and a `register_subagent.py` CLI the coord agent calls
+  after each Agent-tool dispatch returns. Defense-in-depth shell-
+  metachar blocklist on subagent_id input rejects `;`, `|`, `` ` ``,
+  `$`, etc. with regression coverage.
+- `fleet tasks list` recency view + lifecycle stamps + auto-archive
+  (#114). List now defaults to ACTIVE rows in priority asc + created
+  asc; if active count < 10, fills remaining slots with most-recent
+  done/abandoned (`finished_at` desc, fall back to `updated` desc;
+  tie-break created desc). Total visible = `max(10, active_count)` —
+  active is never truncated. New flags: `--limit N` (`0` = unbounded),
+  `--all`, `--no-archive`, plus `--status S` ignores cap. Lifecycle
+  bullets `started_at` (sticky on first todo→in-progress) and
+  `finished_at` (overwrite on done/abandoned, clear on flip back) land
+  in the same transaction as the status flip — readers never see a
+  half-stamped row. Schema stays v1 (additive optional bullets).
+  Auto-archive at end of every coord tick: when `tasks.md` grows past
+  `FLEET_AUTO_ARCHIVE_THRESHOLD` (default 50, `0` disables), the coord
+  shells `fleet tasks archive` for the OLDEST done/abandoned slugs
+  until count drops to threshold. Active statuses NEVER archived
+  regardless of count.
+- `fleet project add <path>` CLI + `[+]` TUI hotkey (#115). Lightweight
+  way to register a cloned repo as a fleet project without dispatching
+  a task or auto-spawning a coord. Creates
+  `~/.fleet/projects/<tag>/{tasks.md, meta.json}`; idempotent on the
+  same path; refreshes `repo_path` and warns on a tag-collision with a
+  different repo. TUI `[+]` reuses the `[d]` repo picker, shells out
+  to the same CLI, keeps the picker open on failure. New
+  `internal/projects/meta.go` carries the `Meta` struct (schema,
+  repo_path, added_at) with atomic Read/Write helpers; canonical
+  `TagForPath` lives here so future per-project default-cwd consumers
+  can derive the tag without dragging the bubbletea/lipgloss deps
+  (TUI `ProjectTag` is now a re-export).
+- `fleet maintenance bootstrap-remote-control` survey subcommand
+  (#117) walks live agent records and surfaces those whose persisted
+  Command lacks `--remote-control "<session>"`, printing one-line
+  remediation suggestions (`fleet handoff <id>`). Used by operators
+  to catch coords stuck on the pre-v0.6.0 spawn path; flags the
+  candidates without auto-handing off (operator's call).
+
+### Changed
+
+- Dashboard title wordmark now renders as `FLΞΞT` (#119), replacing
+  the prior plain `FLEET` label. The two `Ξ` glyphs (Greek capital
+  Xi, U+039E) render bold + F1 brand red `#E10600`; `F`, `L`, `T`
+  stay bold on the terminal default foreground so the mark adapts
+  to light/dark themes without palette detection. Single-line, no
+  layout shift (cell width preserved at 5). The Greek Xi reads as
+  horizontal speed-lines without needing a tail graphic.
+
+### Fixed
+
+- **P0 follow-up to v0.6.0** — handoff replacement spawn now
+  correctly injects `--remote-control "<session>"` into the standard
+  `["sh", "-c", "claude ..."]` shell-wrapper command shape (#117).
+  The v0.6.0 fix used a strict byte-equality matcher against
+  `DefaultClaudeWrapperScript` that silently skipped any persisted
+  Command body that diverged from the wrapper script bit-for-bit
+  (forensic case: coord ca7eb43e lost remote-control after a manual
+  handoff). Matcher in `internal/spawn.InjectRemoteControlFlag` is
+  now SHAPE-based: any `["sh", "-c", "<body>"]` whose body begins
+  (after optional leading whitespace) with the `claude ` token gets
+  the flag injected immediately after that token. Custom non-claude
+  wrappers, direct argvs, and bash-c shapes still return unchanged.
+  12 new positive/negative shape tests plus an end-to-end integration
+  test (`TestHandoff_ReplacementSpawnedWithRemoteControlFlag`) drive
+  the handoff path against a wrapper-shape command using a shim
+  `claude` in PATH.
+- **P0 follow-up to v0.6.0** — handoff doc First Action now
+  instructs the new coord to run `/coordinator` after `/remote-control`
+  (#118), so the supervisor restarts in the replacement and the
+  dashboard's project-row coord-name column updates to the
+  successor's 8-hex agent ID. Previously the replacement only
+  bootstrapped remote-control; the supervisor loop never restarted,
+  the `coordinator.lock` retained the predecessor's ID, and tasks
+  silently queued. Universal injection (not gated on coord-vs-non-coord
+  task_id) because `/coordinator` is idempotent: NB-flock skips when
+  held, and a non-coord lineage has no project to supervise → exits
+  cleanly. Ordering pinned by test: `/remote-control` first so
+  `/coordinator` startup output streams through the operator's mobile
+  session. Fix lands byte-identically on both the Go-side
+  operator-triggered handoff and the Python-side auto-handoff paths.
+
+### Deferred
+
+- Codex review SKIPPED across this release — rate-limited at
+  2026-05-10; quota resets 2026-05-13 05:31 UTC. `/review` (gstack
+  skill) PASSED on every PR. Codex re-runs queued for post-reset.
+
 ## [0.6.0] - 2026-05-09
 
 Coordinator workflow + active PR shepherding ship as fleet-blessed
@@ -496,7 +617,10 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/edisonshen/fleet/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/edisonshen/fleet/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/edisonshen/fleet/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/edisonshen/fleet/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/edisonshen/fleet/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/edisonshen/fleet/compare/v0.1.3...v0.2.0
