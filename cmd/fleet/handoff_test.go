@@ -807,6 +807,133 @@ func TestHandoff_DeadSession_RecoveryStillWinsWhenPendingExists(t *testing.T) {
 	}
 }
 
+// TestHandoff_ReplacementSpawnedWithRemoteControlFlag pins the
+// handoff-remote-control-shell-wrapper-fix integration contract: when
+// the outgoing record's persisted Command is the standard
+// `["sh", "-c", "claude ..."]` shell wrapper, the replacement spawn's
+// tmux session runs with `--remote-control "fleet-handoff-<new-id>"`
+// injected into the body. This is the bug the fix addresses — the
+// previous strict byte-equality matcher silently skipped injection
+// when the persisted body drifted from the literal wrapper script.
+//
+// We use a wrapper whose body starts with `claude ` (the relaxed
+// matcher's trigger) but substitutes `printf` for the real binary so
+// the test runs even where claude is uninstalled AND the rewritten
+// body is observable. printf prints its own argv to the pane, so
+// capture-pane sees the injected flag verbatim. The trailing `cat`
+// keeps the session alive past the spawn liveness check.
+//
+// The body string is a heredoc-style template: `claude` is the
+// matched token (so the relaxed matcher triggers), but the line is
+// preceded with `set -- ` to capture argv into the shell's positional
+// params, then `printf '%s\n' "$@"` echoes them so the pane shows the
+// effective argv. This sidesteps claude's TUI overwriting the pane.
+func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Wrapper body that (a) starts with `claude ` (matcher trigger),
+	// (b) is observable in the pane regardless of whether claude is
+	// installed. Trick: `claude` is consumed as a no-op via `:` shell
+	// builtin alias — `claude(){ printf '%s\n' "claude" "$@"; }`. The
+	// matcher only inspects the BODY shape (`begins with "claude "`);
+	// what's actually in the function table at runtime is up to us.
+	wrapperCmd := []string{
+		"sh", "-c",
+		// Define a shell function named `claude` that echoes its
+		// rewritten argv (so capture-pane can observe the flag), then
+		// invoke `claude ...`. The relaxed matcher rewrites the
+		// `claude ` token at the START of the body, after function
+		// definition runs — the matcher doesn't introspect shell
+		// semantics, just the literal first non-whitespace token.
+		// To make the matcher fire, the body must START with
+		// `claude `; we put the function definition BEFORE the
+		// invocation, but the matcher only checks the leading token.
+		// Workaround: the entire body must begin with `claude `, so we
+		// invoke `claude` first and have `claude` itself a built-in
+		// alias resolved by the shell. POSIX sh aliases don't carry
+		// across `sh -c`, so use a wrapper script in PATH.
+		//
+		// Simplest robust approach: ship a tiny shim via the env. The
+		// wrapper body is `claude --dangerously-skip-permissions; cat`
+		// and PATH is set so `claude` resolves to a script we drop in
+		// a temp dir.
+		`claude --dangerously-skip-permissions; cat`,
+	}
+	originalCwd := t.TempDir()
+
+	// Drop a fake `claude` shim in a temp dir, prepend to PATH for
+	// this test. The shim echoes its argv (so capture-pane can see
+	// the rewritten flag).
+	shimDir := t.TempDir()
+	shimPath := filepath.Join(shimDir, "claude")
+	if err := os.WriteFile(shimPath, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+	// FLEET_TMUX_SOCKET is per-test, but env vars set via t.Setenv
+	// propagate into spawn.Spawn's tmux command (which inherits the
+	// test process env). The new tmux session inherits PATH; the
+	// `sh -c` body finds our shim before any system claude.
+	t.Setenv("PATH", shimDir+":"+os.Getenv("PATH"))
+
+	first, err := agentSpawnForTest(t, originalCwd, wrapperCmd, "rainier", "auth-fix")
+	if err != nil {
+		t.Fatalf("seed spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
+
+	// Run handoff. Command/cwd inherited from the outgoing record.
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       first.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent post-handoff, got %d", len(live))
+	}
+	rep := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(rep.TmuxSession) })
+
+	// (a) Persisted record carries the CLEAN wrapperCmd (no
+	// --remote-control polluting the next handoff's lineage).
+	if len(rep.Command) != len(wrapperCmd) {
+		t.Fatalf("rep.Command length: got %d want %d", len(rep.Command), len(wrapperCmd))
+	}
+	for i := range wrapperCmd {
+		if rep.Command[i] != wrapperCmd[i] {
+			t.Errorf("rep.Command[%d]: got %q want %q (persisted record must NOT carry --remote-control)",
+				i, rep.Command[i], wrapperCmd[i])
+		}
+	}
+
+	// (b) The pane shows the shim's argv echo, which includes the
+	// `--remote-control "fleet-handoff-<id>"` flag. The shim prints
+	// each arg on its own line, so we grep for the session-name
+	// literal directly.
+	wantFlag := "fleet-handoff-" + rep.ID
+	deadline := time.Now().Add(3 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		raw, capErr := exec.Command(
+			"tmux", "-S", os.Getenv("FLEET_TMUX_SOCKET"),
+			"capture-pane", "-pt", rep.TmuxSession,
+		).Output()
+		if capErr == nil {
+			lastOut = raw
+			if strings.Contains(string(raw), wantFlag) {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected pane to contain %q within deadline; got:\n%s",
+		wantFlag, string(lastOut))
+}
+
 func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

@@ -3,88 +3,114 @@ package spawn
 import "strings"
 
 // DefaultClaudeInvocation is the literal claude argv inside the shell
-// wrapper that --command defaults to. We rewrite this exact substring
-// when injecting --remote-control so an operator-supplied --command
-// (scripted pipeline, alt engine) is left untouched. See
-// InjectRemoteControlFlag.
+// wrapper that --command defaults to. Historical: kept exported because
+// other call sites grep for it. The relaxed matcher in
+// InjectRemoteControlFlag no longer requires byte-equality on the full
+// wrapper, so this constant is now informational rather than load-bearing.
 const DefaultClaudeInvocation = "claude --dangerously-skip-permissions"
 
 // DefaultClaudeWrapperScript is the EXACT literal of the default
-// --command's third element (the shell script body). InjectRemoteControlFlag
-// matches on this byte-equal string before rewriting, so a custom
-// `--command sh -c '<arbitrary script that mentions claude>'` is NOT
-// silently mutated (codex review #73 iter-3 P2). Must stay byte-equal
-// with cmd/fleet/dispatch.go's --command default; a regression test
-// pins the equality.
+// --command's third element (the shell script body). The dispatch
+// surface registers this string as the cobra flag default and the
+// `TestDefaultClaudeWrapperScript_MatchesFlagDefault` test pins drift.
 //
-// Lifted from cmd/fleet during the fix/remote-control-coord-injection
-// work so internal/handoffop (the auto-handoff drain) can rewrite
-// replacement-spawn argvs without an import cycle through cmd/fleet.
+// Lifted from cmd/fleet so internal/handoffop (the auto-handoff drain)
+// could rewrite replacement-spawn argvs without an import cycle through
+// cmd/fleet.
+//
+// Note: as of the wrapper-pattern relaxation
+// (handoff-remote-control-shell-wrapper-fix), InjectRemoteControlFlag
+// no longer requires byte-equality with this constant. Any
+// `["sh", "-c", "claude ..."]` shape is rewritten. The constant is
+// still consumed by the dispatch flag default and by tests that pin the
+// default --command's exact bytes.
 const DefaultClaudeWrapperScript = `claude --dangerously-skip-permissions; RC=$?; if [ "$RC" -ne 0 ]; then echo; echo "[fleet] claude exited code $RC — session terminating"; exit "$RC"; fi; echo; echo "[fleet] claude exited cleanly — rerun claude --dangerously-skip-permissions or Ctrl-b then & to kill this session"; exec ${SHELL:-bash} -i`
+
+// claudeToken is the binary-name-plus-space prefix the relaxed wrapper
+// matcher requires. The trailing space is load-bearing: it prevents
+// false positives like `claudefoo` (a different binary that
+// incidentally starts with the letters c-l-a-u-d-e). See
+// TestInjectRemoteControlFlag_NonClaudeShellWrapper/claude-prefix-but-different-binary.
+const claudeToken = "claude "
 
 // InjectRemoteControlFlag rewrites a shell-wrapped claude command to
 // include `--remote-control "<sessionName>"` so the spawned Claude
 // Code session auto-attaches to the remote-control daemon at startup.
-// Returns the slice unchanged if the command does NOT match the
-// documented default shape (custom --command argvs are out of scope —
-// fleet doesn't know their flag conventions).
 //
-// Default shape from cmd/fleet/dispatch.go's --command default:
+// Wrapper-pattern matcher (handoff-remote-control-shell-wrapper-fix):
+// matches ANY `["sh", "-c", "<body>"]` whose body begins (after
+// optional leading whitespace) with the `claude ` token. Returns the
+// slice unchanged otherwise.
 //
-//	["sh", "-c", "claude --dangerously-skip-permissions; RC=$?; ..."]
+//	["sh", "-c", "claude --dangerously-skip-permissions; ..."]
+//	  ↓ match: argv[0]=="sh" && argv[1]=="-c" && body starts with "claude "
+//	["sh", "-c", "claude --remote-control \"<name>\" --dangerously-skip-permissions; ..."]
 //
-// We replace the literal "claude --dangerously-skip-permissions" with
-// "claude --dangerously-skip-permissions --remote-control \"<name>\""
-// inside the shell-script element. The trailing arguments (`; RC=$?;
-// ...`) are preserved so the wrapper's clean-exit semantics still
-// apply.
+// The flag is positioned IMMEDIATELY after the `claude` token so claude's
+// own flag parser sees it adjacent to the binary (not buried after
+// trailing flags that may consume it as a positional value).
+//
+// Why a relaxed matcher? The previous strict byte-equality on
+// DefaultClaudeWrapperScript silently disabled injection whenever the
+// persisted Command body drifted from the literal default — older
+// fleet release wrapper text, manual operator edits, or future wrapper
+// variants would all skip remote-control injection. The forensic case:
+// coord ca7eb43e lost remote control after a manual handoff because
+// the persisted command body diverged from the literal default by
+// enough characters to break byte-equality. Matching on the
+// `["sh", "-c", "claude ..."]` SHAPE (not the wrapper text) catches
+// every variant that genuinely launches claude.
+//
+// Negative contract (returned unchanged):
+//   - argv[0] != "sh" (e.g. `bash -c`, direct argv).
+//   - argv[1] != "-c".
+//   - len(argv) != 3.
+//   - body doesn't start with `claude ` after optional whitespace
+//     (e.g. `python3 ...`, `echo ...; claude ...`, `claudefoo ...`).
+//   - empty/nil argv.
 //
 // Source: Claude Code remote-control CLI flag, documented at
-// https://code.claude.com/docs/en/remote-control.md (issue #73 research
-// finding).
+// https://code.claude.com/docs/en/remote-control.md (issue #73).
 //
 // Used by THREE call sites — dispatch (coord-spawn), operator-triggered
 // handoff replacement, and internal/handoffop (auto-handoff drain) —
-// each picking its own session-name prefix (`fleet-coord` / `fleet-handoff`).
+// each picking its own session-name prefix (`fleet-coord` /
+// `fleet-handoff`).
 func InjectRemoteControlFlag(command []string, sessionName string) []string {
-	// Strict shape match: ONLY rewrite Fleet's documented default
-	// `--command` (the literal shell-wrapped claude invocation
-	// registered by newDispatchCmd). Custom operator-supplied
-	// commands — even shell-wrapped ones that incidentally mention
-	// `claude --dangerously-skip-permissions` — are returned
-	// untouched. A loose `Contains` match risked rewriting arbitrary
-	// shell text inside a custom launcher (codex review #73 iter-3 P2).
 	if len(command) != 3 || command[0] != "sh" || command[1] != "-c" {
 		return command
 	}
-	script := command[2]
-	if script != DefaultClaudeWrapperScript {
+	body := command[2]
+	// Skip leading whitespace so an indented body still matches. We
+	// keep the original prefix in the rewritten body so the rest of
+	// the script is byte-preserved (whitespace included).
+	idx := 0
+	for idx < len(body) && (body[idx] == ' ' || body[idx] == '\t') {
+		idx++
+	}
+	rest := body[idx:]
+	if !strings.HasPrefix(rest, claudeToken) {
 		return command
 	}
-	// Inject the flag IMMEDIATELY after the matched substring so the
-	// rest of the script (`; RC=$?; ...`) keeps its position. Quoting
-	// the session name with double quotes mirrors how the documented
-	// CLI usage is written; sessionName is hex (agent ID) plus the
-	// "fleet-" prefix so quoting is mostly defensive (no spaces, no
-	// shell metas) but cheap to keep.
+	// Inject `--remote-control "<sessionName>" ` immediately after the
+	// `claude ` token. We slice rather than call strings.Replace so the
+	// rewrite is anchored at this single position — a body that
+	// mentions `claude ` later (e.g. inside a "rerun claude ..." banner)
+	// is preserved verbatim. This differs from the prior implementation
+	// which used ReplaceAll specifically because the legacy wrapper had
+	// the literal twice; with the relaxed matcher we no longer assume
+	// the wrapper shape, so anchored insertion is the correct tool.
 	//
-	// ReplaceAll (not Replace n=1) is deliberate: the default wrapper
-	// contains the literal `claude --dangerously-skip-permissions`
-	// TWICE — once as the launch command, once inside the
-	// "[fleet] claude exited cleanly — rerun ..." banner that prints
-	// when claude exits 0. Rewriting only the first occurrence would
-	// leave the banner suggesting a rerun command without remote-
-	// control, so an operator who follows the banner restarts WITHOUT
-	// auto-attach (codex review #73 iter-1 P3). Replacing both keeps
-	// the banner accurate.
-	replaced := strings.ReplaceAll(
-		script,
-		DefaultClaudeInvocation,
-		DefaultClaudeInvocation+` --remote-control "`+sessionName+`"`,
-	)
+	// sessionName is fleet-controlled (e.g. "fleet-coord-<hex-id>",
+	// "fleet-handoff-<hex-id>"); double-quoting is defensive. Embedded
+	// double-quotes / shell metas in sessionName are not expected, but
+	// shellEscape would be cleaner if that contract ever loosens.
+	prefix := body[:idx+len(claudeToken)] // includes leading WS + "claude "
+	suffix := body[idx+len(claudeToken):] // everything after "claude "
+	rewritten := prefix + `--remote-control "` + sessionName + `" ` + suffix
 	out := make([]string, len(command))
 	copy(out, command)
-	out[2] = replaced
+	out[2] = rewritten
 	return out
 }
 
