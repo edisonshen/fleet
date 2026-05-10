@@ -312,9 +312,17 @@ func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 // TestInjectRemoteControlFlag_RewritesDefaultShellWrapper pins
 // issue #73's core injection logic: the helper must rewrite the
 // documented default shell-wrapped claude command to include
-// `--remote-control "<session>"` immediately after the
-// `--dangerously-skip-permissions` flag, preserving the rest of
-// the wrapper script (RC propagation + interactive shell fallback).
+// `--remote-control "<session>"` immediately after the `claude `
+// token, preserving the rest of the wrapper script (RC propagation +
+// interactive shell fallback).
+//
+// Position note (handoff-remote-control-shell-wrapper-fix): the flag
+// position moved from "after --dangerously-skip-permissions" to
+// "immediately after claude". The earlier position was incidental to
+// strings.ReplaceAll(DefaultClaudeInvocation, ...); the relaxed
+// wrapper-pattern matcher anchors at the `claude ` token instead so
+// claude's own flag parser sees --remote-control adjacent to the
+// binary regardless of which downstream flags appear.
 func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
@@ -332,7 +340,7 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	if got[0] != "sh" || got[1] != "-c" {
 		t.Errorf("rewritten command should keep sh -c prefix; got %v", got[:2])
 	}
-	want := `claude --dangerously-skip-permissions --remote-control "fleet-coord-abcd1234"`
+	want := `claude --remote-control "fleet-coord-abcd1234" --dangerously-skip-permissions`
 	if !strings.Contains(got[2], want) {
 		t.Errorf("script should contain %q; got %q", want, got[2])
 	}
@@ -347,14 +355,25 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 	}
 }
 
-// TestInjectRemoteControlFlag_RewritesRerunBanner pins codex review
-// #73 iter-1 P3: the wrapper script's "claude exited cleanly — rerun
-// claude --dangerously-skip-permissions" banner must also be
-// rewritten to include --remote-control. Otherwise an operator who
-// follows the banner instructions to restart claude after a clean
-// exit gets a session WITHOUT auto-attach. Both the launch command
-// AND the banner must reference the SAME flag-set.
-func TestInjectRemoteControlFlag_RewritesRerunBanner(t *testing.T) {
+// TestInjectRemoteControlFlag_AnchoredInsertion pins the
+// handoff-remote-control-shell-wrapper-fix contract: the relaxed
+// wrapper-pattern matcher inserts the flag at a SINGLE anchored
+// position (immediately after the leading `claude ` token) rather than
+// rewriting every occurrence in the body. The previous ReplaceAll
+// behavior was incidental to the byte-equality matcher — the relaxed
+// matcher targets the launch command, not arbitrary claude mentions
+// elsewhere in the body (e.g. inside a "rerun ..." banner string).
+//
+// Trade-off vs codex review #73 iter-1 P3 (the previous "rewrite the
+// banner too" finding): the default wrapper script's "claude exited
+// cleanly — rerun claude --dangerously-skip-permissions" banner is
+// NOT rewritten under the new contract. The banner is informational
+// (clean coord exits are rare; operators normally `fleet attach <id>`
+// to recover); preserving the original body text is more important
+// than rewriting the banner literal because the relaxed matcher must
+// be safe for any operator-supplied wrapper, not just the default one
+// where we know which substrings to rewrite.
+func TestInjectRemoteControlFlag_AnchoredInsertion(t *testing.T) {
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -371,23 +390,21 @@ func TestInjectRemoteControlFlag_RewritesRerunBanner(t *testing.T) {
 			"`claude --dangerously-skip-permissions`; got %d — test fixture is stale",
 			c)
 	}
-	// Both occurrences should now carry the --remote-control flag.
-	if c := strings.Count(got[2],
-		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`"`); c != 2 {
-		t.Errorf("rewritten wrapper should have 2 occurrences of the "+
-			"rewritten claude invocation (launch + rerun banner); got %d in %q",
-			c, got[2])
+	// EXACTLY ONE occurrence of the rewritten launch command (anchored
+	// insertion at the leading `claude ` token).
+	wantLaunch := `claude --remote-control "` + sessionName + `" --dangerously-skip-permissions`
+	if c := strings.Count(got[2], wantLaunch); c != 1 {
+		t.Errorf("rewritten wrapper should have exactly 1 occurrence of "+
+			"the rewritten launch command; got %d in %q", c, got[2])
 	}
-	// And NO bare claude invocation should remain (regression: a
-	// strings.Replace n=1 leaves the banner stale).
-	bareInvocation := "claude --dangerously-skip-permissions or"
-	if !strings.Contains(got[2],
-		`claude --dangerously-skip-permissions --remote-control "`+sessionName+`" or`) {
-		t.Errorf("rerun banner still suggests bare claude invocation; "+
-			"want banner to reference the rewritten flag-set; got %q",
-			got[2])
+	// The banner literal is preserved verbatim (anchored insertion does
+	// not touch later occurrences of `claude `).
+	bannerLiteral := `rerun claude --dangerously-skip-permissions or`
+	if !strings.Contains(got[2], bannerLiteral) {
+		t.Errorf("rewritten wrapper should preserve the banner literal "+
+			"%q; anchored insertion only rewrites the leading claude token; got %q",
+			bannerLiteral, got[2])
 	}
-	_ = bareInvocation
 }
 
 // TestInjectRemoteControlFlag_NoOpForCustomCommand pins the contract
@@ -422,14 +439,16 @@ func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
 	}
 }
 
-// TestInjectRemoteControlFlag_StrictShapeMatch pins codex review #73
-// iter-3 P2: even a custom `sh -c '<script>'` --command must NOT be
-// rewritten if the script differs in any way from Fleet's documented
-// default — including scripts that incidentally mention
-// `claude --dangerously-skip-permissions` as part of a different
-// wrapper. The strict shape match (byte-equal on the script element)
-// guarantees the documented "custom --command is untouched"
-// contract holds even when the operator writes an unusual launcher.
+// TestInjectRemoteControlFlag_StrictShapeMatch pins the
+// handoff-remote-control-shell-wrapper-fix narrowed contract: the
+// matcher only looks at SHAPE (`["sh", "-c", "claude ..."]`), so a
+// shell wrapper whose body does NOT begin with the `claude ` token is
+// returned unchanged. The earlier byte-equality contract that
+// preserved a body like `claude --dangerously-skip-permissions ; RC=$?`
+// has been deliberately dropped — operator-supplied claude wrappers
+// benefit from auto-injected remote-control just like the default
+// wrapper. See TestInjectRemoteControlFlag_ShellWrapper in
+// internal/spawn/argv_test.go for the positive cases.
 func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
 	cases := []struct {
 		name string
@@ -440,23 +459,15 @@ func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
 			argv: []string{
 				"sh", "-c",
 				// Plausible operator-supplied wrapper that runs claude
-				// but also does additional bookkeeping. Mentions the
-				// literal claude invocation but is NOT byte-equal to
-				// the default.
+				// but also does additional bookkeeping. The body starts
+				// with `echo`, not `claude `, so the relaxed matcher
+				// leaves it alone.
 				`echo "starting"; claude --dangerously-skip-permissions --custom-flag; echo "done"`,
 			},
 		},
 		{
-			name: "custom-script-with-different-shell-quoting",
-			argv: []string{
-				"sh", "-c",
-				// Default-shaped but with one trailing-space difference —
-				// must still not be rewritten.
-				`claude --dangerously-skip-permissions ; RC=$?; exit $RC`,
-			},
-		},
-		{
 			name: "custom-bash-c-not-sh-c",
+			// argv[0] != "sh" → matcher returns unchanged.
 			argv: []string{"bash", "-c", `claude --dangerously-skip-permissions`},
 		},
 	}
