@@ -85,6 +85,56 @@ func TestRender_FirstActionCarriesRemoteControlSlashCommand(t *testing.T) {
 	}
 }
 
+// TestRender_FirstActionInstructsCoordinatorRun pins the regression
+// for the handoff-coord-spawn-prompt-fix bug: a freshly-spawned
+// replacement coord agent must be told to run the `/coordinator` skill
+// so the supervisor loop resumes (NB-flock acquired by the new agent's
+// ID, dashboard "left side" lights up with the new 8-hex). Without
+// this paragraph, the lock body keeps the predecessor's ID and the
+// task queue silently stops draining.
+//
+// The instruction is universal in the FirstAction body (not gated on
+// "is this a coord lineage?") because /coordinator is idempotent — a
+// worker handoff that runs it briefly observes the NB-flock skip on a
+// non-coord cwd and exits cleanly. The cost of an extra slash command
+// in worker handoffs is tiny; the cost of forgetting it on coord
+// handoffs is silent task-queue stalls.
+func TestRender_FirstActionInstructsCoordinatorRun(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
+	got := string(Render(d))
+	want := "Then run the slash command `/coordinator`"
+	if !strings.Contains(got, want) {
+		t.Errorf("First Action body missing /coordinator instruction:\n%s", got)
+	}
+	// The paragraph should also document idempotency so an operator
+	// (or successor agent) inspecting the doc understands why running
+	// it on a non-coord lineage is a safe no-op.
+	if !strings.Contains(got, "idempotent") {
+		t.Errorf("First Action body missing idempotency note for /coordinator:\n%s", got)
+	}
+}
+
+// TestRender_FirstActionCoordinatorAfterRemoteControl pins the
+// ordering invariant: the `/remote-control` slash command must appear
+// BEFORE the `/coordinator` slash command in the rendered doc. Order
+// matters because remote-control attaches the freshly-spawned chat
+// session to the operator's mobile pairing — running /coordinator
+// first means the operator misses the supervisor loop's startup
+// output (which surfaces the "lock acquired" line operators rely on
+// to confirm the handoff replaced the predecessor cleanly).
+func TestRender_FirstActionCoordinatorAfterRemoteControl(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
+	got := string(Render(d))
+	rcIdx := strings.Index(got, "`/remote-control`")
+	coordIdx := strings.Index(got, "`/coordinator`")
+	if rcIdx < 0 || coordIdx < 0 {
+		t.Fatalf("missing one of the slash commands: rc=%d coord=%d", rcIdx, coordIdx)
+	}
+	if rcIdx >= coordIdx {
+		t.Errorf("/remote-control must appear before /coordinator; rc=%d coord=%d", rcIdx, coordIdx)
+	}
+}
+
 func TestRender_StubBodyIsPlaceholder(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
