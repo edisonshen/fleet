@@ -162,8 +162,25 @@ func renderDashboardHeader(m Model, usable int) string {
 	if m.version != "" && m.version != "dev" {
 		suffix = "v" + m.version + " Ops Console"
 	}
-	title := headerLabelStyle.Render("FLEET") + headerSepStyle.Render(" — ") + headerTextStyle.Render(suffix)
+	title := renderFlxxtWordmark() + headerSepStyle.Render(" — ") + headerTextStyle.Render(suffix)
 	return title + "\n" + row
+}
+
+// renderFlxxtWordmark returns the styled "FLΞΞT" brand mark. The mark
+// is composed of three lipgloss-rendered segments concatenated in
+// order: "FL" (bold, default fg), "ΞΞ" (bold, F1 red #E10600), "T"
+// (bold, default fg). Per-segment rendering keeps the SGR envelopes
+// independent so the Xi color doesn't bleed onto F/L/T.
+//
+// The Xis use Greek capital Xi (U+039E), chosen for its triple-stripe
+// glyph that reads as horizontal speed-lines without needing a tail
+// graphic — the wordmark is single-cell-tall and fits the existing
+// title slot.
+func renderFlxxtWordmark() string {
+	return wordmarkOuterStyle.Render("FL") +
+		wordmarkXiStyle.Render("Ξ") +
+		wordmarkXiStyle.Render("Ξ") +
+		wordmarkOuterStyle.Render("T")
 }
 
 // renderColumnHeadings renders the "PROJECTS · 3 ACTIVE" /
