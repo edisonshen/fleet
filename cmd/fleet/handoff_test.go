@@ -974,3 +974,71 @@ func TestHandoff_DocBodyContainsPlaceholders(t *testing.T) {
 		}
 	}
 }
+
+// TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt regresses
+// the handoff-coord-spawn-prompt-fix bug: the predecessor's
+// ~/.fleet/projects/<p>/.locks/coordinator.lock NB-flock body keeps
+// the OLD coord's 8-hex ID after a handoff because the replacement
+// coord session never runs `/coordinator`. The TUI dashboard's
+// project row reads that lock body for the "left-side" coord display,
+// so it shows the predecessor's name (or empty) instead of the new
+// coord's ID. The fix: make handoff replacement docs include a
+// `/coordinator` instruction in the First Action (auto) section,
+// parallel to the `/remote-control` instruction the doc already
+// carries. /coordinator is idempotent — running it on a coord agent
+// that already holds the flock is a no-op (NB-flock skips the
+// already-held case), so universal injection in FirstAction is safe
+// for non-coord handoffs too.
+//
+// End-to-end via runHandoff so we exercise the path the operator
+// hits with `fleet handoff <coord-id>`. seedAgent dispatches with
+// task_id="auth-fix" by default — but the FirstAction body is
+// invariant of task_id (approach (a)), so any seeded agent surfaces
+// the regression. A separate task_id="coord-<project>" lineage test
+// would be necessary only if approach (b) were taken.
+func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v", err)
+	}
+
+	live, _ := agent.List()
+	if len(live) == 0 {
+		t.Fatal("no live agent after handoff")
+	}
+	t.Cleanup(func() { _ = tmux.Kill(live[0].TmuxSession) })
+
+	body, err := os.ReadFile(*live[0].LastHandoffPath)
+	if err != nil {
+		t.Fatalf("read doc: %v", err)
+	}
+	doc := string(body)
+	// Both slash commands must appear. /remote-control bootstraps the
+	// daemon; /coordinator restarts the supervisor loop so the new
+	// agent's ID lands in the project's coordinator.lock body.
+	if !strings.Contains(doc, "`/remote-control`") {
+		t.Errorf("handoff doc missing /remote-control instruction:\n%s", doc)
+	}
+	if !strings.Contains(doc, "`/coordinator`") {
+		t.Errorf("handoff doc missing /coordinator instruction:\n%s", doc)
+	}
+	// Order: remote-control must appear first so the freshly-spawned
+	// chat session attaches to the operator's mobile pairing BEFORE
+	// the supervisor's startup output begins streaming.
+	rcIdx := strings.Index(doc, "`/remote-control`")
+	coordIdx := strings.Index(doc, "`/coordinator`")
+	if rcIdx >= coordIdx {
+		t.Errorf("expected /remote-control before /coordinator; rc=%d coord=%d in:\n%s",
+			rcIdx, coordIdx, doc)
+	}
+}
