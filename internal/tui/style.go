@@ -37,9 +37,32 @@ const (
 	colorBright = "255"
 	colorText   = "250"
 	colorBox    = "240"
+
+	// colorF1Red — exact F1 brand red used on the FLΞΞT wordmark's two
+	// Xis. Hex (truecolor) rather than a palette index because the
+	// Xi-as-speed-stripe motif lives or dies on the specific shade — a
+	// 256-color fallback (e.g. "160" / "203") muddies the brand cue. On
+	// 256-color terminals lipgloss/termenv downsamples cleanly to the
+	// nearest red; on truecolor terminals (Ghostty default) it lands
+	// pixel-perfect.
+	colorF1Red = "#E10600"
 )
 
 var (
+	// FLΞΞT wordmark (issue #112) — F1-style brand mark on the dashboard
+	// title row. Renders as five glyphs: literal `F`, `L`, U+039E Ξ,
+	// U+039E Ξ, `T`. The Xis carry the F1 red (#E10600); FL and T stay
+	// terminal-default-foreground bold so the mark adapts to the user's
+	// theme (light backgrounds get dark FL/T, dark backgrounds get
+	// bright FL/T) without us having to palette-detect.
+	//
+	// Why two styles instead of one with mixed-color spans: lipgloss
+	// styles are flat — color attributes apply to the whole rendered
+	// string. The wordmark is built by concatenating per-glyph renders
+	// in renderDashboardHeader so each Xi gets its own SGR envelope.
+	wordmarkOuterStyle = lipgloss.NewStyle().Bold(true)
+	wordmarkXiStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorF1Red))
+
 	// Header strip styles.
 	headerLabelStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(colorBright))
 	headerTextStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(colorText))

@@ -1,16 +1,25 @@
-// Tests for the dashboard title bar's version-injection behavior.
+// Tests for the dashboard title bar's version-injection behavior +
+// FLΞΞT wordmark rendering (issue #112).
 //
 // The title bar reads m.version (set at New()) and produces:
 //
-//	Released build (Version="0.5.0") → "FLEET — v0.5.0 Ops Console"
-//	Dev build      (Version="dev")   → "FLEET — Ops Console"
-//	Empty version  (m.version="")    → "FLEET — Ops Console"
+//	Released build (Version="0.5.0") → "FLΞΞT — v0.5.0 Ops Console"
+//	Dev build      (Version="dev")   → "FLΞΞT — Ops Console"
+//	Empty version  (m.version="")    → "FLΞΞT — Ops Console"
 //
 // "dev" is the default in cmd/fleet/main.go:20 when goreleaser hasn't
 // injected -X main.Version=<tag> at link time, so on `go run` /
 // `go build` (no ldflags) the title stays clean rather than rendering
 // a meaningless "vdev" chip. Released artifacts get the actual tag
 // injected and the suffix carries it.
+//
+// The wordmark replaced the plain "FLEET" label in PR for #112: the
+// two E's are now Greek capital Xi (U+039E Ξ) styled bold/F1-red so the
+// brand mark reads as horizontal speed-stripes. Version-injection
+// tests below pin the brand presence via the Ξ glyph (assertion
+// tolerates lipgloss ANSI envelopes around the run); the dedicated
+// TestTitle_WordmarkRendersFLXXT and TestTitle_XisRenderedRed cover
+// full glyph order and the red-Xi color treatment respectively.
 package tui
 
 import (
@@ -35,10 +44,11 @@ func withTrueColor(t *testing.T) {
 
 // TestDashboardTitle_InjectsReleasedVersion pins the released-build path:
 // when New is called with a real version string ("0.99.0-test"), the
-// rendered title must contain "FLEET" plus the v-prefixed version inside
-// the "Ops Console" suffix. Substring assertions tolerate lipgloss color
-// escapes around each token (the rendered output may carry ANSI
-// sequences depending on the test runner's TTY profile).
+// rendered title must carry the FLΞΞT brand mark (asserted via the Ξ
+// glyph) plus the v-prefixed version inside the "Ops Console" suffix.
+// Substring assertions tolerate lipgloss color escapes around each
+// token (the rendered output may carry ANSI sequences depending on the
+// test runner's TTY profile).
 func TestDashboardTitle_InjectsReleasedVersion(t *testing.T) {
 	const synthetic = "0.99.0-test"
 	m := New(synthetic)
@@ -46,8 +56,10 @@ func TestDashboardTitle_InjectsReleasedVersion(t *testing.T) {
 	m.height = 30
 
 	out := renderDashboardHeader(m, 120)
-	if !strings.Contains(out, "FLEET") {
-		t.Errorf("title should always carry the FLEET label, got:\n%s", out)
+	// Brand-mark presence: the Ξ glyph (U+039E) is unique to the FLΞΞT
+	// wordmark — anywhere else in the title would be a regression.
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
 	if !strings.Contains(out, "v"+synthetic) {
 		t.Errorf("released-build title should carry v%s, got:\n%s", synthetic, out)
@@ -68,8 +80,8 @@ func TestDashboardTitle_DevVersionRendersBareSuffix(t *testing.T) {
 	m.height = 30
 
 	out := renderDashboardHeader(m, 120)
-	if !strings.Contains(out, "FLEET") {
-		t.Errorf("title should always carry the FLEET label, got:\n%s", out)
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
 	if !strings.Contains(out, "Ops Console") {
 		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
@@ -94,8 +106,8 @@ func TestDashboardTitle_EmptyVersionRendersBareSuffix(t *testing.T) {
 	m.height = 30
 
 	out := renderDashboardHeader(m, 120)
-	if !strings.Contains(out, "FLEET") {
-		t.Errorf("title should always carry the FLEET label, got:\n%s", out)
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
 	if !strings.Contains(out, "Ops Console") {
 		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
