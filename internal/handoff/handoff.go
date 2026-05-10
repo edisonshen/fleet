@@ -145,12 +145,29 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // claude.ai pairing carries through the fleet-guard handoff. Idempotent
 // (pgrep guards re-launch when the daemon is already up).
 //
-// The middle paragraph (issue #56) tells the agent to run the
-// `/remote-control` slash command after the daemon is up. Without that
-// the daemon is listening but the freshly-spawned chat session never
-// attaches to it — the operator's mobile pairing is lost across handoff.
-// Slash command runs in chat (not bash), so it's a separate paragraph
-// after the bash block, not a piped continuation of it.
+// Body order is load-bearing:
+//
+//  1. Bash block: bootstrap the `claude remote-control` daemon (pgrep
+//     guard makes it idempotent).
+//  2. `/remote-control` slash command (issue #56): attach this fresh
+//     chat session to the daemon so the operator's mobile pairing
+//     reconnects. Must run BEFORE /coordinator so any supervisor
+//     startup output streams through the operator's mobile.
+//  3. `/coordinator` slash command (handoff-coord-spawn-prompt-fix):
+//     resume the per-project supervisor loop so the new agent
+//     acquires ~/.fleet/projects/<p>/.locks/coordinator.lock with its
+//     own 8-hex ID. Without this paragraph, replacement coord
+//     sessions never run /coordinator — the predecessor's lock body
+//     persists, the TUI dashboard's coord display shows the OLD ID,
+//     and the task queue stops draining silently. Universal
+//     (non-coord lineages also get the line) because /coordinator is
+//     idempotent: NB-flock skips when held, and a non-coord cwd has
+//     no project to supervise → exit clean. The cost of running it
+//     in worker handoffs is one no-op slash command; the cost of
+//     forgetting it on coord handoffs is silent supervisor death.
+//
+// Slash commands run in chat (not bash), so they're separate
+// paragraphs after the bash block, not piped continuations of it.
 //
 // Issue #31, #56. Must stay byte-identical with
 // skills/fleet-guard/handoff.py FIRST_ACTION constant — the Python skill
@@ -168,6 +185,8 @@ const FirstAction = "**Run this BEFORE anything else** to reconnect the new inst
 	"Use the Bash tool with run_in_background: true.\n" +
 	"\n" +
 	"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n" +
+	"\n" +
+	"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
 	"\n" +
 	"Then continue with the sections below."
 
