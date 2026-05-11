@@ -157,6 +157,32 @@ def test_build_worker_prompt_default_keeps_branch_create() -> None:
     assert "git rev-parse --abbrev-ref HEAD" not in out
 
 
+def test_build_worker_prompt_contains_post_completion_contract() -> None:
+    """Subagent lifecycle hardening: every dispatched prompt carries a
+    'Post-completion contract' section telling the worker that emitting
+    the §7 return block ends the dispatch. Without this language,
+    workers have been observed opening bonus PRs / amending branches /
+    expanding scope (CLAUDE.md §8 violation). The contract pins the
+    boundary explicitly so the regression case can't recur from
+    ambiguous prompt language."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet",
+        standards_md="# Standards",
+        learnings_text="",
+    )
+    # Heading appears so the worker can find the section by scrolling.
+    assert "Post-completion contract" in out
+    # Specific constraints — the wording matters because subagents
+    # parse the prompt for "may NOT" directives.
+    assert "may NOT" in out
+    assert "open additional PRs" in out
+    # Pointer to the right channel for adjacent fixes the worker
+    # noticed but should not act on.
+    assert "fleet tasks add" in out
+    assert "P3" in out
+
+
 # ---------- mint_agent_id (issue #84 Phase A) ----------
 
 

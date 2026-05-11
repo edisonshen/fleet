@@ -1556,3 +1556,213 @@ def test_tick_auto_archives_when_over_threshold(
         assert c[-1] != "active-stay", (
             f"active task should not be archived: {c}"
         )
+
+
+# ---------- subagent lifecycle archive (post-archive audit) ----------
+
+
+def _subagent_record_path(fleet_home: Path, project: str, slug: str) -> Path:
+    """Per-subagent archive record. Mirrors the production layout —
+    ~/.fleet/projects/<project>/subagents/<slug>.json. The record is
+    the audit trail for one Agent-tool dispatch that reached phase=done."""
+    return fleet_home / "projects" / project / "subagents" / f"{slug}.json"
+
+
+def test_tick_archives_worker_on_phase_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """When the reconcile path flips a phase=done worker to in-review,
+    a sibling subagents/<slug>.json record is written with archived_at
+    populated. The record is the durable receipt that this subagent
+    finished its one-shot dispatch — every post-archive `gh pr create`
+    or branch push is now suspect (CLAUDE.md §8 scope violation)."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "shipper-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "shipper-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://github.com/x/y/pull/7",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipper-aaaa", status="in-progress",
+            worker_pid=99999, pr_url="",
+        ),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    rec_path = _subagent_record_path(fleet_home, project, "shipper-aaaa")
+    assert rec_path.exists(), (
+        f"expected subagent archive record at {rec_path}; "
+        f"contents of subagents/: "
+        f"{list(rec_path.parent.iterdir()) if rec_path.parent.exists() else 'missing'}"
+    )
+    data = json.loads(rec_path.read_text(encoding="utf-8"))
+    assert data["slug"] == "shipper-aaaa"
+    archived = data.get("archived_at", "")
+    assert archived, "archived_at must be a non-empty RFC3339 timestamp"
+    # RFC3339 sanity check — fromisoformat parses Zulu offset.
+    _dt.datetime.fromisoformat(archived.replace("Z", "+00:00"))
+    # Expected PR + branch are captured so the post-archive probe knows
+    # what scope the original dispatch claimed.
+    assert data.get("expected_pr_url") == "https://github.com/x/y/pull/7"
+    # post_archive_artifacts starts empty — nothing has fired after
+    # archive yet.
+    assert data.get("post_archive_artifacts", []) == []
+
+
+def test_tick_skips_archive_record_for_blocked_worker(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Lifecycle hardening: only TERMINAL-success transitions (done)
+    write the archive record. A worker at phase=blocked is still in
+    Waiting — the operator may unblock and resume — so we leave no
+    archive receipt. Without this guard, a flapping blocked/unblocked
+    worker would generate a stale post-archive flag the moment it
+    legitimately re-opened or amended its PR."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "stuck-bbbb"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "stuck-bbbb", "project": project,
+        "phase": "blocked", "updated_at": fresh,
+        "blocked_reason": "needs operator input",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("stuck-bbbb", status="in-progress", worker_pid=99998),
+    ])
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    rec_path = _subagent_record_path(fleet_home, project, "stuck-bbbb")
+    assert not rec_path.exists(), (
+        f"blocked worker should NOT have an archive record yet: {rec_path}"
+    )
+
+
+def test_tick_flags_post_archive_artifact(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Post-completion audit: when an archived subagent record exists
+    AND a new PR is found on its branch AFTER archived_at, the tick
+    appends a {pr_number, pr_url, opened_at, action} entry to the
+    record's post_archive_artifacts. That signals 'this Agent-tool
+    subagent kept working after its §7 return' — the operator inspects
+    and decides (close the bonus PR, or accept).
+
+    The gh probe is injected via loop._probe_branch_prs so the test
+    doesn't shell out for real. Production wires it to a `gh api`
+    helper inside the same module."""
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # Pre-seed the subagent archive record from a PRIOR tick. archived_at
+    # is set to 1h ago so the bonus PR's opened_at (now) is strictly
+    # after the archive boundary.
+    sub_dir = fleet_home / "projects" / project / "subagents"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    archived_dt = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(hours=1)
+    rec_path = sub_dir / "shipper-aaaa.json"
+    rec_path.write_text(json.dumps({
+        "slug": "shipper-aaaa",
+        "subagent_id": "abcdef01",
+        "branch": "worker/shipper-aaaa",
+        "archived_at": archived_dt.isoformat().replace("+00:00", "Z"),
+        "expected_pr_url": "https://github.com/x/y/pull/7",
+        "post_archive_artifacts": [],
+    }, indent=2), encoding="utf-8")
+
+    # Task is at status=in-review (post-archive lifecycle). The reconcile
+    # path does NOT need to fire for this audit — the audit is its own
+    # tick step that walks subagents/*.json.
+    _write_tasks(project_dir, [
+        _make_task(
+            "shipper-aaaa", status="in-review",
+            worker_pid=0, pr_url="https://github.com/x/y/pull/7",
+        ),
+    ])
+
+    # The mock returns one bonus PR opened ~5 minutes ago — strictly
+    # after archived_at (1h ago).
+    bonus_opened = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(minutes=5)
+
+    def fake_probe(branch: str):
+        # Production signature: (branch) -> list[dict] with number, url,
+        # createdAt. Empty list means "no PRs on this branch beyond the
+        # expected one".
+        assert branch == "worker/shipper-aaaa", (
+            f"probe must target the archived subagent's branch: {branch}"
+        )
+        return [
+            # The original PR — must be ignored (matches expected_pr_url
+            # OR was opened before archived_at, depending on impl
+            # strategy. We mirror the safer "before-archived_at filter"
+            # branch by setting createdAt to 2h ago).
+            {
+                "number": 7,
+                "url": "https://github.com/x/y/pull/7",
+                "createdAt": (archived_dt - _dt.timedelta(hours=1))
+                .isoformat().replace("+00:00", "Z"),
+            },
+            # Bonus PR opened AFTER archived_at → flagged.
+            {
+                "number": 124,
+                "url": "https://github.com/x/y/pull/124",
+                "createdAt": bonus_opened.isoformat().replace("+00:00", "Z"),
+            },
+        ]
+
+    # Also stub out gh pr checks so the reconcile path doesn't shell.
+    with patch.object(loop, "_probe_branch_prs", side_effect=fake_probe), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    updated = json.loads(rec_path.read_text(encoding="utf-8"))
+    artifacts = updated.get("post_archive_artifacts", [])
+    assert len(artifacts) == 1, (
+        f"expected one flagged bonus PR, got {len(artifacts)}: {artifacts}"
+    )
+    art = artifacts[0]
+    assert art["pr_number"] == 124
+    assert art["pr_url"] == "https://github.com/x/y/pull/124"
+    assert art["action"] == "flag-for-operator"
+    # Same PR observed again on a future tick is NOT re-appended (the
+    # operator already sees ONE flag; duplicating it pollutes the audit
+    # log).
+    with patch.object(loop, "_probe_branch_prs", side_effect=fake_probe), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    updated_again = json.loads(rec_path.read_text(encoding="utf-8"))
+    assert len(updated_again.get("post_archive_artifacts", [])) == 1, (
+        "post-archive flag must be idempotent across ticks: "
+        + repr(updated_again.get("post_archive_artifacts"))
+    )

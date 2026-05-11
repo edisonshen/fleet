@@ -143,3 +143,50 @@ others. A custom multi-PR watcher serializes wake latency and loses the
 harness's per-loop notification primitive.
 
 Applies to every dispatched worker.
+
+## Post-completion discipline
+
+Agent-tool subagents have no kill signal from the parent. A subagent that
+emits its §7 return contract and KEEPS working (opens bonus PRs, amends
+the branch, expands scope) is a CLAUDE.md §8 violation — and the parent
+agent has no way to stop it except after the fact.
+
+PR #124 (closed) was the motivating case: a README-rewrite subagent
+finished an 8-bullet task, returned the §7 contract, then opened a
+separate PR adding bullet #9 it "noticed in the code." The operator
+caught the drift only because the bonus PR appeared in `gh pr list`.
+
+The contract for every dispatched worker:
+
+> After you emit the §7 return contract, your work for this dispatch is
+> COMPLETE. You may NOT:
+>
+>   - open additional PRs
+>   - file additional bugs / tasks unless explicitly invited
+>   - amend, push, or rebase any branch
+>   - take ANY further action on this codebase
+>
+> If during the work you noticed valid follow-up ideas, do NOT do that
+> work yourself. The §7 list is the closed scope. File a P3 ticket via
+> `fleet tasks add --priority P3 --slug <short> "<one-liner>"` so the
+> operator triages it. Bonus content violates CLAUDE.md §8.
+
+Coordinator enforcement (defense in depth):
+
+- Worker prompts (skills/coordinator/dispatch.py) carry this contract
+  verbatim in the "Post-completion contract" section.
+- On phase=done the coord writes a subagent archive receipt at
+  `~/.fleet/projects/<project>/subagents/<slug>.json` with
+  `archived_at` set.
+- Every tick the coord re-probes each archived subagent's worker
+  branch via `gh pr list --head <branch>` and appends any PR opened
+  AFTER `archived_at` to the record's `post_archive_artifacts` list.
+- The TUI dashboard renders "⚠ post-archive activity" on the project
+  row when any archived subagent has non-empty
+  `post_archive_artifacts`. The operator decides per-flag whether to
+  close the bonus PR or accept it.
+
+The receipt + audit is informational; the dispatch-prompt language is
+load-bearing. A subagent that ignores the contract still gets flagged,
+but flagging is a backstop — the contract language is what keeps the
+subagent inside its lane in the first place.
