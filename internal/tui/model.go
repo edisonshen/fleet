@@ -34,6 +34,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/version"
 )
 
@@ -136,6 +137,21 @@ type Model struct {
 	// (presence == in-flight). Cleared when coordSpawnDoneMsg arrives
 	// or when the err branch fires.
 	coordSpawnInFlight map[string]bool
+
+	// projectAddCoordSpawn marks the [+]-hotkey-initiated coord spawns
+	// so the coordSpawnDoneMsg handler can format a recovery-oriented
+	// failure flash. When a project is added via [+] and the follow-on
+	// coord auto-spawn fails (init error, dispatch failure, parse
+	// failure), the operator needs to know that the add itself
+	// succeeded and the new row exists on the dashboard — pressing
+	// [a] on that row retries the spawn. Without this flag the generic
+	// "project <name>: <err>" banner is ambiguous about which path
+	// failed.
+	//
+	// Map key is project name; value is irrelevant (presence == "this
+	// spawn was kicked off from [+]"). Cleared when coordSpawnDoneMsg
+	// arrives regardless of success/error.
+	projectAddCoordSpawn map[string]bool
 
 	// upgradeBanner is the rendered "⬆ vX.Y.Z — brew upgrade fleet"
 	// chip when a newer release is on disk in the version cache.
@@ -551,7 +567,50 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pickerFilter = ""
 		m.repoCandidates = nil
 		m.pickerCursor = 0
-		return m, loadDashboardCmd()
+		// Mirror the [a]-on-project-row coord-spawn path so the freshly
+		// registered project gets a coord auto-spawned without a second
+		// keystroke. Pre-flight failures (project tree init, in-flight
+		// guard) collapse to a flash naming the [a]-row recovery; the
+		// add itself succeeded so the project IS on disk and the
+		// dashboard refresh will surface its row.
+		//
+		// ASCII flow:
+		//
+		//   addProjectDoneMsg(success)
+		//     → projects.TagForPath(path)
+		//     → state.EnsureProjectInitialized(tag)
+		//     → mark coordSpawnInFlight[tag] + projectAddCoordSpawn[tag]
+		//     → tea.Batch(loadDashboardCmd, startCoordSpawn(tag, path))
+		//     → coordSpawnDoneMsg lands → existing handler sets
+		//       pendingAttach + tea.Quit (success) OR flashes the
+		//       "[+]-initiated spawn failed; [a] on the new row to
+		//       retry" hint (err branch, gated on projectAddCoordSpawn).
+		tag := ProjectTag(msg.path)
+		if _, ierr := state.EnsureProjectInitialized(tag); ierr != nil {
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"added project %s but coord auto-spawn init failed: %v — press [a] on the new row to retry",
+					tag, ierr),
+				isErr: true,
+			}
+			return m, loadDashboardCmd()
+		}
+		if m.coordSpawnInFlight != nil && m.coordSpawnInFlight[tag] {
+			// Rare: a coord spawn for the same tag is already in flight
+			// (e.g. operator pressed [a] on a synthetic row before [+]
+			// completed). Skip the second dispatch; the existing spawn
+			// will surface via its own coordSpawnDoneMsg.
+			return m, loadDashboardCmd()
+		}
+		if m.coordSpawnInFlight == nil {
+			m.coordSpawnInFlight = map[string]bool{}
+		}
+		if m.projectAddCoordSpawn == nil {
+			m.projectAddCoordSpawn = map[string]bool{}
+		}
+		m.coordSpawnInFlight[tag] = true
+		m.projectAddCoordSpawn[tag] = true
+		return m, tea.Batch(loadDashboardCmd(), m.startCoordSpawn(tag, msg.path))
 
 	case coordSpawnDoneMsg:
 		// Clear in-flight gate — regardless of success/error, this
@@ -559,6 +618,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the full lookup path again (find existing → spawn).
 		if m.coordSpawnInFlight != nil {
 			delete(m.coordSpawnInFlight, msg.projectName)
+		}
+		// Capture (and clear) the [+]-initiated flag so the err branch
+		// below can format the project-added-but-spawn-failed recovery
+		// hint. Either branch resets the flag — the operator's next
+		// [a] on that row is the normal retry path, not a [+]-initiated
+		// follow-up.
+		wasAddSpawn := m.projectAddCoordSpawn[msg.projectName]
+		if m.projectAddCoordSpawn != nil {
+			delete(m.projectAddCoordSpawn, msg.projectName)
 		}
 		// Issues #60, #63: project-row [a] auto-spawn result. err non-nil
 		// covers init failures, dispatch failures, and agent-ID parse
@@ -582,8 +650,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// attach (the agent is up; worst case the dashboard renders
 		// the coord on RIGHT until the lock body publishes).
 		if msg.err != nil {
+			// Spec: a [+]-initiated spawn failure must surface the
+			// "project is registered — [a] on the new row to retry"
+			// recovery path. The add itself succeeded (we only reach
+			// the spawn after addProjectDoneMsg.err == nil) so the
+			// dashboard already carries the new row; the operator just
+			// needs to know that pressing [a] on it will retry.
+			var text string
+			if wasAddSpawn {
+				text = fmt.Sprintf(
+					"project %s added but coord auto-spawn failed: %v — press [a] on the new row to retry",
+					msg.projectName, msg.err)
+			} else {
+				text = fmt.Sprintf("project %s: %v", msg.projectName, msg.err)
+			}
 			m.flash = &flashMsg{
-				text:  fmt.Sprintf("project %s: %v", msg.projectName, msg.err),
+				text:  text,
 				isErr: true,
 			}
 			return m, loadAgentsCmd()
@@ -950,6 +1032,7 @@ func (m Model) renderFooter() string {
 			hiddenWith = hiddenWithActivity(
 				m.unifiedProjectsAll(),
 				hiddenSet,
+				projectAddedAtFn,
 				workers,
 				m.records,
 				nowFn(),

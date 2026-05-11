@@ -74,7 +74,7 @@ func TestUnifiedProjects_FiltersSyntheticFromAgents(t *testing.T) {
 func TestClassifyProjectActivity_LiveCoord(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha", Active: true}
-	if got := classifyProjectActivity(p, nil, nil, now, 7*24*time.Hour); got != projectActive {
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 7*24*time.Hour); got != projectActive {
 		t.Errorf("Active=true should be projectActive, got %v", got)
 	}
 }
@@ -82,7 +82,7 @@ func TestClassifyProjectActivity_LiveCoord(t *testing.T) {
 func TestClassifyProjectActivity_FreshLastTick(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha", LastTick: now.Add(-1 * time.Hour)}
-	if got := classifyProjectActivity(p, nil, nil, now, 7*24*time.Hour); got != projectActive {
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 7*24*time.Hour); got != projectActive {
 		t.Errorf("recent LastTick should be projectActive, got %v", got)
 	}
 }
@@ -91,7 +91,7 @@ func TestClassifyProjectActivity_StaleLastTick(t *testing.T) {
 	now := time.Now()
 	// 8 days ago > 7d window → idle.
 	p := &ProjectRow{Name: "alpha", LastTick: now.Add(-8 * 24 * time.Hour)}
-	if got := classifyProjectActivity(p, nil, nil, now, 7*24*time.Hour); got != projectIdle {
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 7*24*time.Hour); got != projectIdle {
 		t.Errorf("stale LastTick should be projectIdle, got %v", got)
 	}
 }
@@ -100,7 +100,7 @@ func TestClassifyProjectActivity_FreshAgent(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha"}
 	rec := &agent.Record{ID: "a1", Project: "alpha", LastActivityTS: now.Add(-30 * time.Minute)}
-	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, now, 7*24*time.Hour); got != projectActive {
+	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, time.Time{}, now, 7*24*time.Hour); got != projectActive {
 		t.Errorf("fresh agent heartbeat should be projectActive, got %v", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestClassifyProjectActivity_StaleAgent(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha"}
 	rec := &agent.Record{ID: "a1", Project: "alpha", LastActivityTS: now.Add(-30 * 24 * time.Hour)}
-	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, now, 7*24*time.Hour); got != projectIdle {
+	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, time.Time{}, now, 7*24*time.Hour); got != projectIdle {
 		t.Errorf("stale agent heartbeat should be projectIdle, got %v", got)
 	}
 }
@@ -118,7 +118,7 @@ func TestClassifyProjectActivity_AgentForDifferentProject(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha"}
 	rec := &agent.Record{ID: "a1", Project: "beta", LastActivityTS: now}
-	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, now, 7*24*time.Hour); got != projectIdle {
+	if got := classifyProjectActivity(p, nil, []*agent.Record{rec}, time.Time{}, now, 7*24*time.Hour); got != projectIdle {
 		t.Errorf("agent for different project should not flip alpha to active, got %v", got)
 	}
 }
@@ -127,7 +127,7 @@ func TestClassifyProjectActivity_LiveWorker(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha"}
 	w := &WorkerRow{Project: "alpha", Slug: "task-1234"}
-	if got := classifyProjectActivity(p, []*WorkerRow{w}, nil, now, 7*24*time.Hour); got != projectActive {
+	if got := classifyProjectActivity(p, []*WorkerRow{w}, nil, time.Time{}, now, 7*24*time.Hour); got != projectActive {
 		t.Errorf("live worker should flip project to active, got %v", got)
 	}
 }
@@ -136,12 +136,59 @@ func TestClassifyProjectActivity_RespectsWindow(t *testing.T) {
 	now := time.Now()
 	p := &ProjectRow{Name: "alpha", LastTick: now.Add(-2 * time.Hour)}
 	// Window of 1h → 2h-old tick is idle.
-	if got := classifyProjectActivity(p, nil, nil, now, 1*time.Hour); got != projectIdle {
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 1*time.Hour); got != projectIdle {
 		t.Errorf("with 1h window, 2h-old tick should be idle; got %v", got)
 	}
 	// Window of 24h → 2h-old tick is active.
-	if got := classifyProjectActivity(p, nil, nil, now, 24*time.Hour); got != projectActive {
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 24*time.Hour); got != projectActive {
 		t.Errorf("with 24h window, 2h-old tick should be active; got %v", got)
+	}
+}
+
+// TestClassifyProjectActivity_RecentAddedAt regresses the bug: a freshly
+// registered project (via `fleet project add`) classified IDLE because
+// none of the existing signals (coord-state mtime, agent heartbeats,
+// worker rows) fired. The fix adds projects.Meta.AddedAt as a fifth
+// ACTIVE signal — a project added within the 7d active window is
+// considered live regardless of operator activity. Without this the
+// dashboard's [+] hotkey leaves the new row hidden under the
+// "─── N idle ───" separator until the operator manually toggles
+// show-all.
+func TestClassifyProjectActivity_RecentAddedAt(t *testing.T) {
+	now := time.Now()
+	p := &ProjectRow{Name: "alpha"}
+	// AddedAt = 1h ago, no coord/agents/workers.
+	addedAt := now.Add(-1 * time.Hour)
+	if got := classifyProjectActivity(p, nil, nil, addedAt, now, 7*24*time.Hour); got != projectActive {
+		t.Errorf("recent AddedAt (1h ago, 7d window) should be projectActive, got %v", got)
+	}
+}
+
+// TestClassifyProjectActivity_StaleAddedAt_NoOtherActivity pins the
+// upper bound: an AddedAt outside the active window does NOT keep the
+// project ACTIVE indefinitely. Without this the recency-of-add signal
+// would mask a long-dormant project that should fall to IDLE.
+func TestClassifyProjectActivity_StaleAddedAt_NoOtherActivity(t *testing.T) {
+	now := time.Now()
+	p := &ProjectRow{Name: "alpha"}
+	// AddedAt = 8d ago, beyond the 7d window.
+	addedAt := now.Add(-8 * 24 * time.Hour)
+	if got := classifyProjectActivity(p, nil, nil, addedAt, now, 7*24*time.Hour); got != projectIdle {
+		t.Errorf("stale AddedAt (8d ago, 7d window) should be projectIdle, got %v", got)
+	}
+}
+
+// TestClassifyProjectActivity_ZeroAddedAt_FallsThrough: legacy projects
+// pre-dating meta.json have no AddedAt on disk; the caller passes
+// time.Time{}. The classifier MUST NOT treat the zero value as
+// "infinitely recent" — that would erroneously flip every legacy
+// project to ACTIVE. With no other signals present and a zero AddedAt
+// the result must be IDLE.
+func TestClassifyProjectActivity_ZeroAddedAt_FallsThrough(t *testing.T) {
+	now := time.Now()
+	p := &ProjectRow{Name: "alpha"}
+	if got := classifyProjectActivity(p, nil, nil, time.Time{}, now, 7*24*time.Hour); got != projectIdle {
+		t.Errorf("zero AddedAt with no other signals should be projectIdle, got %v", got)
 	}
 }
 
@@ -428,7 +475,7 @@ func TestHiddenWithActivity_CountsFreshHiddenProjects(t *testing.T) {
 		{Name: "delta"},
 	}
 	hiddenSet := map[string]bool{"beta": true, "delta": true}
-	got := hiddenWithActivity(all, hiddenSet, nil, nil, now, 7*24*time.Hour)
+	got := hiddenWithActivity(all, hiddenSet, nil, nil, nil, now, 7*24*time.Hour)
 	// beta is hidden + active → 1; delta is hidden but idle → 0.
 	if got != 1 {
 		t.Errorf("hiddenWithActivity should count 1 (beta), got %d", got)
