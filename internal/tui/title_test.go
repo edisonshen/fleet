@@ -64,9 +64,6 @@ func TestDashboardTitle_InjectsReleasedVersion(t *testing.T) {
 	if !strings.Contains(out, "v"+synthetic) {
 		t.Errorf("released-build title should carry v%s, got:\n%s", synthetic, out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
 }
 
 // TestDashboardTitle_DevVersionRendersBareSuffix pins the dev-build path:
@@ -83,14 +80,10 @@ func TestDashboardTitle_DevVersionRendersBareSuffix(t *testing.T) {
 	if !strings.Contains(out, "Ξ") {
 		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
-	// "vdev " (with a trailing space) is the failure mode we're guarding
-	// against — the literal "v" + "dev" + " Ops Console" splice that the
-	// pre-polish "v0.2 Ops Console" hard-coded title would have produced
-	// after a naive `m.version` substitution. Pin it absent so a future
-	// refactor that drops the dev-fallback can't regress.
+	// "vdev" is the failure mode we're guarding against — the literal
+	// "v" + "dev" splice from a naive m.version substitution. Pin it
+	// absent so a future refactor that drops the dev-fallback can't
+	// regress.
 	if strings.Contains(out, "vdev") {
 		t.Errorf("dev-build title must NOT carry vdev, got:\n%s", out)
 	}
@@ -109,12 +102,10 @@ func TestDashboardTitle_EmptyVersionRendersBareSuffix(t *testing.T) {
 	if !strings.Contains(out, "Ξ") {
 		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
-	// Guard against the "v Ops Console" naive-splice failure — title
-	// must NOT have a stray "v " prefix on the suffix.
-	if strings.Contains(out, "v Ops Console") {
+	// Guard against a stray "v " prefix when version is empty — the
+	// title's version slot must drop entirely rather than emit a bare
+	// "v".
+	if strings.Contains(out, "v ") {
 		t.Errorf("empty-version title must NOT splice a stray v prefix, got:\n%s", out)
 	}
 }
@@ -236,7 +227,9 @@ func TestTitle_FullContentAtWideWidth(t *testing.T) {
 	if !strings.Contains(out, "v0.7.0") {
 		t.Errorf("wide title missing version, got:\n%q", out)
 	}
-	if !strings.Contains(out, "projects-fleet") {
+	// Project name renders through projectDisplayName (issue #66
+	// invariant): the encoded "projects-fleet" becomes "projects/fleet".
+	if !strings.Contains(out, "projects/fleet") {
 		t.Errorf("wide title missing project name, got:\n%q", out)
 	}
 	if !strings.Contains(out, "4 done") {
@@ -312,7 +305,7 @@ func TestTitle_ProjectDropsAtMidNarrow(t *testing.T) {
 	if !strings.Contains(out, "v0.7.0") {
 		t.Errorf("mid-narrow title (w=40) should keep version, got:\n%q", out)
 	}
-	if strings.Contains(out, "projects-fleet") {
+	if strings.Contains(out, "projects/fleet") {
 		t.Errorf("mid-narrow title (w=40) must drop project name, got:\n%q", out)
 	}
 	if strings.Contains(out, "done") {

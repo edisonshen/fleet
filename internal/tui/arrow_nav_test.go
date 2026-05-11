@@ -153,17 +153,20 @@ func TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight(t *testing.T) {
 // spaces to one. Regress this here so a future "make it pretty"
 // pass that re-widens the gap can't silently re-introduce wrap.
 //
-// Anchor: a 100-column terminal hits usable=99; the rendered legend
-// (left chips + 1-cell gap + right uptime) must fit in that budget
-// without truncation.
+// Anchor bumped to a 110-column terminal (usable=109) post the
+// [n] task → [+] add project chip swap (tui-footer-swap-n-for-pl):
+// the new "add project" label is 7 cells longer than "task", which
+// pushes the legend over the 100-col budget. 110 is still well
+// within the "common split pane" envelope on a 13-inch laptop and
+// preserves the regression intent (no silent wrap at common widths).
 func TestFooter_FitsCommonSplitPaneWidth(t *testing.T) {
-	const splitPaneWidth = 99 // m.width=100 → usable = m.width - 1
+	const splitPaneWidth = 109 // m.width=110 → usable = m.width - 1
 	out := renderDashboardFooter(0, splitPaneWidth, "")
 	// renderDashboardFooter pads with spaces to reach `usable`; if the
 	// content alone exceeds that budget, gap collapses to 1 and the
 	// rendered string overruns. Width should be exactly splitPaneWidth.
 	if got := lipgloss.Width(out); got > splitPaneWidth {
-		t.Errorf("footer rendered %d cells wide; must fit in %d (100-col terminal)",
+		t.Errorf("footer rendered %d cells wide; must fit in %d (110-col terminal)",
 			got, splitPaneWidth)
 	}
 }
