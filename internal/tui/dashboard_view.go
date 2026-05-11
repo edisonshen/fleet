@@ -803,7 +803,12 @@ func projectHeaderLines(p *ProjectRow, w int, selected bool) ([]string, string) 
 	// the warning, drills in via the per-project record.
 	if p.PostArchiveActivity {
 		badge := attentionChipStyle.Render("⚠ post-archive activity")
-		if lipgloss.Width(line2) > len(prefix) {
+		// Compare in CELL width — `prefix` carries ANSI escapes when
+		// attentionBorderStyle is active, so byte length lies. We only
+		// need to know whether line2 has visible content past the
+		// indent so the badge gets a 2-space gap; otherwise it sits
+		// flush with the prefix.
+		if lipgloss.Width(line2) > lipgloss.Width(prefix) {
 			line2 = line2 + "  " + badge
 		} else {
 			line2 = prefix + badge

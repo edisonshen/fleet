@@ -59,6 +59,26 @@ COORD_CONFIG_FILE = "coord-config.json"
 # beyond this just wait for the next tick.
 _ARCHIVE_SCAN_CAP = 200
 
+# How long after a subagent's archived_at the audit keeps probing its
+# branch for bonus PRs. Past this window the audit considers the
+# subagent's lane closed: a PR fired weeks later is operator-cleanup
+# noise, not a live drift signal. Bounds the per-tick gh-shell-out
+# cost (~0.5–1s per record × number of records still inside the
+# window). 14d is generous for a project that ships weekly; tune via
+# FLEET_AUDIT_FRESHNESS_DAYS if needed.
+#
+# Resolved per-call (not module-cached) so a test or operator can
+# `os.environ` it mid-process without re-importing the module.
+def _audit_freshness_seconds() -> int:
+    raw = os.environ.get("FLEET_AUDIT_FRESHNESS_DAYS", "14")
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 14
+    if days < 1:
+        days = 1
+    return days * 86400
+
 
 # Sentinel grammar (ENG §5.3). Worker reports use these to communicate
 # state changes back to the coord through the inbox archive.
@@ -1032,7 +1052,18 @@ def _audit_archived_subagents(
     (matched by pr_number) is NOT re-appended. A subagent record with
     no archived_at is skipped (defensive; shouldn't happen post-write
     but a malformed file shouldn't crash the tick).
+
+    Cost cap: each scanned record costs one `gh pr list` shell-out
+    (~0.5–1s). To prevent the audit from ballooning a tick's runtime
+    once a project has months of archived subagents, we skip records
+    whose archived_at is older than _audit_freshness_seconds(). A
+    bonus PR that fires weeks after the subagent finished is
+    operator-cleanup noise, not a live drift signal — the audit
+    window is closed for those.
     """
+    from datetime import datetime, timezone
+    now_dt = datetime.now(tz=timezone.utc)
+    freshness_s = _audit_freshness_seconds()
     sub_dir = home / "projects" / project / "subagents"
     if not sub_dir.is_dir():
         return 0
@@ -1053,9 +1084,11 @@ def _audit_archived_subagents(
         if not archived_at_s:
             continue
         try:
-            from datetime import datetime
             archived_at = datetime.fromisoformat(archived_at_s.replace("Z", "+00:00"))
         except ValueError:
+            continue
+        # Audit-window guard — see _audit_freshness_seconds() docstring.
+        if (now_dt - archived_at).total_seconds() > freshness_s:
             continue
         branch = str(rec.get("branch", "") or "")
         if not branch:
@@ -1086,7 +1119,6 @@ def _audit_archived_subagents(
             if url and url == expected_url:
                 continue
             try:
-                from datetime import datetime
                 created_at = datetime.fromisoformat(
                     created_s.replace("Z", "+00:00"),
                 )
