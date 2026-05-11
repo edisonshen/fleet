@@ -64,9 +64,6 @@ func TestDashboardTitle_InjectsReleasedVersion(t *testing.T) {
 	if !strings.Contains(out, "v"+synthetic) {
 		t.Errorf("released-build title should carry v%s, got:\n%s", synthetic, out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
 }
 
 // TestDashboardTitle_DevVersionRendersBareSuffix pins the dev-build path:
@@ -83,14 +80,10 @@ func TestDashboardTitle_DevVersionRendersBareSuffix(t *testing.T) {
 	if !strings.Contains(out, "Ξ") {
 		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
-	// "vdev " (with a trailing space) is the failure mode we're guarding
-	// against — the literal "v" + "dev" + " Ops Console" splice that the
-	// pre-polish "v0.2 Ops Console" hard-coded title would have produced
-	// after a naive `m.version` substitution. Pin it absent so a future
-	// refactor that drops the dev-fallback can't regress.
+	// "vdev" is the failure mode we're guarding against — the literal
+	// "v" + "dev" splice from a naive m.version substitution. Pin it
+	// absent so a future refactor that drops the dev-fallback can't
+	// regress.
 	if strings.Contains(out, "vdev") {
 		t.Errorf("dev-build title must NOT carry vdev, got:\n%s", out)
 	}
@@ -109,12 +102,10 @@ func TestDashboardTitle_EmptyVersionRendersBareSuffix(t *testing.T) {
 	if !strings.Contains(out, "Ξ") {
 		t.Errorf("title should always carry the FLΞΞT brand mark, got:\n%s", out)
 	}
-	if !strings.Contains(out, "Ops Console") {
-		t.Errorf("title should always carry the Ops Console suffix, got:\n%s", out)
-	}
-	// Guard against the "v Ops Console" naive-splice failure — title
-	// must NOT have a stray "v " prefix on the suffix.
-	if strings.Contains(out, "v Ops Console") {
+	// Guard against a stray "v " prefix when version is empty — the
+	// title's version slot must drop entirely rather than emit a bare
+	// "v".
+	if strings.Contains(out, "v ") {
 		t.Errorf("empty-version title must NOT splice a stray v prefix, got:\n%s", out)
 	}
 }
@@ -188,5 +179,136 @@ func TestTitle_XisRenderedRed(t *testing.T) {
 	if count < 2 {
 		t.Errorf("title should carry F1-red (%s) on both Xis; found %d occurrences, got:\n%q",
 			redSGR, count, out)
+	}
+}
+
+// --- Greedy left-to-right title layout (operator polish) ---
+//
+// Behavior under test (Part B of tui-footer-swap-n-for-pl-ce97):
+// The title row builds components left-to-right with the FLΞΞT wordmark
+// always emitted FIRST and NEVER dropped, then version, project name,
+// stat chips — appending each only if the remaining budget can fit it.
+// Operator screenshot showed the title clipping entirely at narrow
+// widths; the wordmark must survive that case at the cost of overflow.
+//
+// Widths:
+//   >= 80: wordmark + version + project + stats
+//   50-79: wordmark + version + project (stats dropped)
+//   30-49: wordmark + version (project + stats dropped)
+//   <  30: wordmark only (everything else dropped)
+
+// titleSnapshot seeds a single-project Snapshot with deterministic
+// task counts so the stat-chip assertions (4 done, 1 in-review) bind
+// to known numbers regardless of test environment.
+func titleSnapshot() *Snapshot {
+	return &Snapshot{
+		Projects: []*ProjectRow{
+			{
+				Name:     "projects-fleet",
+				RepoSlug: "edisonshen/fleet",
+				Counts:   TaskCounts{Done: 4, InReview: 1},
+			},
+		},
+	}
+}
+
+// TestTitle_FullContentAtWideWidth is the regression guard: at
+// width=200 (well above the 80-cell threshold) all four components
+// must appear in the rendered title row.
+func TestTitle_FullContentAtWideWidth(t *testing.T) {
+	m := New("0.7.0")
+	m.dashboard = titleSnapshot()
+	out := renderTitleLine(m, 200)
+
+	// Wordmark check via the unique Ξ glyph.
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("wide title missing wordmark, got:\n%q", out)
+	}
+	if !strings.Contains(out, "v0.7.0") {
+		t.Errorf("wide title missing version, got:\n%q", out)
+	}
+	// Project name renders through projectDisplayName (issue #66
+	// invariant): the encoded "projects-fleet" becomes "projects/fleet".
+	if !strings.Contains(out, "projects/fleet") {
+		t.Errorf("wide title missing project name, got:\n%q", out)
+	}
+	if !strings.Contains(out, "4 done") {
+		t.Errorf("wide title missing '4 done' stat chip, got:\n%q", out)
+	}
+	if !strings.Contains(out, "1 in-review") {
+		t.Errorf("wide title missing '1 in-review' stat chip, got:\n%q", out)
+	}
+}
+
+// TestTitle_DropsStatsBeforeWordmarkAtNarrowWidth pins the priority
+// ordering at width=50: wordmark + version + project survive; stats
+// are dropped (they're 4th-priority — first to go).
+func TestTitle_DropsStatsBeforeWordmarkAtNarrowWidth(t *testing.T) {
+	m := New("0.7.0")
+	m.dashboard = titleSnapshot()
+	out := renderTitleLine(m, 50)
+
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("narrow-50 title missing wordmark, got:\n%q", out)
+	}
+	if strings.Contains(out, "done") {
+		t.Errorf("narrow-50 title must drop stats (no 'done' chip), got:\n%q", out)
+	}
+	if strings.Contains(out, "in-review") {
+		t.Errorf("narrow-50 title must drop stats (no 'in-review' chip), got:\n%q", out)
+	}
+}
+
+// TestTitle_WordmarkAlwaysVisibleAtNarrowWidth pins the load-bearing
+// invariant: at widths 30, 40, 50 — every width the operator might
+// hit when their terminal is split or narrowed — the FLΞΞT wordmark
+// is present. The wordmark is the brand mark; dropping it means the
+// operator sees an unbranded console.
+func TestTitle_WordmarkAlwaysVisibleAtNarrowWidth(t *testing.T) {
+	m := New("0.7.0")
+	m.dashboard = titleSnapshot()
+
+	for _, w := range []int{30, 40, 50} {
+		out := renderTitleLine(m, w)
+		if !strings.Contains(out, "Ξ") {
+			t.Errorf("width=%d title missing wordmark (Ξ), got:\n%q", w, out)
+		}
+	}
+}
+
+// TestTitle_VersionDropsBeforeWordmarkAtVeryNarrow pins width=15
+// (smaller than 30): only the wordmark is emitted; the version is
+// dropped because it can't fit alongside.
+func TestTitle_VersionDropsBeforeWordmarkAtVeryNarrow(t *testing.T) {
+	m := New("0.7.0")
+	m.dashboard = titleSnapshot()
+	out := renderTitleLine(m, 15)
+
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("very-narrow title missing wordmark, got:\n%q", out)
+	}
+	if strings.Contains(out, "v0.7.0") {
+		t.Errorf("very-narrow title (w=15) must drop version, got:\n%q", out)
+	}
+}
+
+// TestTitle_ProjectDropsAtMidNarrow pins width=40: wordmark + version
+// survive; project name + stats both dropped.
+func TestTitle_ProjectDropsAtMidNarrow(t *testing.T) {
+	m := New("0.7.0")
+	m.dashboard = titleSnapshot()
+	out := renderTitleLine(m, 40)
+
+	if !strings.Contains(out, "Ξ") {
+		t.Errorf("mid-narrow title missing wordmark, got:\n%q", out)
+	}
+	if !strings.Contains(out, "v0.7.0") {
+		t.Errorf("mid-narrow title (w=40) should keep version, got:\n%q", out)
+	}
+	if strings.Contains(out, "projects/fleet") {
+		t.Errorf("mid-narrow title (w=40) must drop project name, got:\n%q", out)
+	}
+	if strings.Contains(out, "done") {
+		t.Errorf("mid-narrow title (w=40) must drop stats, got:\n%q", out)
 	}
 }

@@ -96,17 +96,40 @@ func TestFooter_OmitsNavAndPanelChips(t *testing.T) {
 	}
 }
 
-// TestFooter_DocumentsCoreKeysOnly pins the canonical issue #90
-// footer shape: ⏎ open · n task · a attach · h handoff · x archive ·
-// / search · ? help · q quit. All eight chip keys must be present —
-// none of them are intuitive enough to drop.
+// TestFooter_DocumentsCoreKeysOnly pins the canonical footer shape
+// post-tui-footer-swap-n-for-pl-ce97 (operator polish): swap [n] task
+// for [+] add project — coords handle most task creation, so
+// register-project earns the chip slot. The [n] keybind in keys.go
+// stays wired (and [n] stays in the help overlay) but the footer no
+// longer advertises it.
+//
+// Canonical: ⏎ open · + add project · a attach · h handoff · x archive ·
+// / search · ? help · q quit. Eight chips total — the count is
+// invariant; only the second slot changed.
 func TestFooter_DocumentsCoreKeysOnly(t *testing.T) {
 	out := renderDashboardFooter(0, 200, "")
-	for _, want := range []string{"⏎", "n", "a", "h", "x", "/", "?", "q",
-		"open", "task", "attach", "handoff", "archive", "search", "help", "quit"} {
+	for _, want := range []string{"⏎", "+", "a", "h", "x", "/", "?", "q",
+		"open", "add project", "attach", "handoff", "archive", "search", "help", "quit"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer missing required chip %q, got:\n%s", want, out)
 		}
+	}
+}
+
+// TestFooter_DropsNTaskAdvertisement pins the swap direction: the
+// footer must NOT advertise [n] task anymore. The keybind itself
+// still works (keys.go unchanged) but the chip strip's second slot
+// belongs to [+] add project now.
+func TestFooter_DropsNTaskAdvertisement(t *testing.T) {
+	out := renderDashboardFooter(0, 200, "")
+	if strings.Contains(out, "[n]") {
+		t.Errorf("footer must not advertise [n] anymore, got:\n%s", out)
+	}
+	// Also guard against the un-bracketed " task" label slipping through
+	// even if the [n] chip itself is gone (defensive — the only "task"
+	// substring in the old footer was the [n] task chip).
+	if strings.Contains(out, "] task") {
+		t.Errorf("footer must not carry '] task' chip suffix, got:\n%s", out)
 	}
 }
 
@@ -130,17 +153,20 @@ func TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight(t *testing.T) {
 // spaces to one. Regress this here so a future "make it pretty"
 // pass that re-widens the gap can't silently re-introduce wrap.
 //
-// Anchor: a 100-column terminal hits usable=99; the rendered legend
-// (left chips + 1-cell gap + right uptime) must fit in that budget
-// without truncation.
+// Anchor bumped to a 110-column terminal (usable=109) post the
+// [n] task → [+] add project chip swap (tui-footer-swap-n-for-pl):
+// the new "add project" label is 7 cells longer than "task", which
+// pushes the legend over the 100-col budget. 110 is still well
+// within the "common split pane" envelope on a 13-inch laptop and
+// preserves the regression intent (no silent wrap at common widths).
 func TestFooter_FitsCommonSplitPaneWidth(t *testing.T) {
-	const splitPaneWidth = 99 // m.width=100 → usable = m.width - 1
+	const splitPaneWidth = 109 // m.width=110 → usable = m.width - 1
 	out := renderDashboardFooter(0, splitPaneWidth, "")
 	// renderDashboardFooter pads with spaces to reach `usable`; if the
 	// content alone exceeds that budget, gap collapses to 1 and the
 	// rendered string overruns. Width should be exactly splitPaneWidth.
 	if got := lipgloss.Width(out); got > splitPaneWidth {
-		t.Errorf("footer rendered %d cells wide; must fit in %d (100-col terminal)",
+		t.Errorf("footer rendered %d cells wide; must fit in %d (110-col terminal)",
 			got, splitPaneWidth)
 	}
 }

@@ -145,25 +145,145 @@ func renderDashboardHeader(m Model, usable int) string {
 		gap = 1
 	}
 	row := left + strings.Repeat(" ", gap) + right
-	// Title prefix "FLEET" anchors the row visually. Render as a
-	// separate line above the totals strip — matches mockup vertical
-	// rhythm without a box-drawing border (cleaner integration with
-	// the existing v0.1 title row idiom).
-	// Title suffix uses the injected Version (cmd/fleet/main.go:40
-	// passes it through tui.Run → New → m.version). Released builds
-	// render "FLEET — vX.Y.Z Ops Console"; dev builds (Version="dev",
-	// the default in main.go:20 when goreleaser hasn't injected -X
-	// main.Version=<tag>) render the bare "FLEET — Ops Console" so
-	// the operator's title bar doesn't carry a meaningless "vdev"
-	// chip. m.version is "" in pathological constructs only — fall
-	// back to the bare form there too rather than rendering a stray
-	// "v Ops Console".
-	suffix := "Ops Console"
-	if m.version != "" && m.version != "dev" {
-		suffix = "v" + m.version + " Ops Console"
-	}
-	title := renderFlxxtWordmark() + headerSepStyle.Render(" — ") + headerTextStyle.Render(suffix)
+	// Title row uses the greedy left-to-right layout in renderTitleLine.
+	// The wordmark is always emitted FIRST; version / project name /
+	// stat chips are appended only while they fit the usable budget.
+	// Operator screenshot showed the title clipping entirely at narrow
+	// widths; renderTitleLine guarantees at minimum the FLΞΞT brand
+	// mark survives even when nothing else does.
+	title := renderTitleLine(m, usable)
 	return title + "\n" + row
+}
+
+// Title-row width gates. Operator-chosen breakpoints — narrow split
+// panes get the brand alone; common single panes get full content.
+const (
+	titleMinVersion = 30 // usable >= this → emit version chip
+	titleMinProject = 50 // usable >= this → emit project name
+	titleMinStats   = 80 // usable >= this → emit stat chips
+)
+
+// renderTitleLine builds the dashboard's top title row with a greedy
+// left-to-right layout. Components in priority order:
+//
+//  1. FLΞΞT wordmark — NEVER dropped; always emitted first
+//  2. version (e.g. "v0.7.0")
+//  3. project name (e.g. "projects-fleet")
+//  4. stat chips (e.g. "4 done · 1 in-review")
+//
+// Each subsequent component is gated by BOTH a minimum-width threshold
+// (titleMin* constants above) AND a fit check against the remaining
+// width budget. The wordmark is always emitted FIRST and stays even
+// when it alone exceeds the budget — better to overflow the brand
+// than to omit it (operator screenshot showed the entire title
+// clipping at narrow widths; the brand mark is the load-bearing
+// visual anchor of the console).
+//
+// Width tiers:
+//
+//	usable >= 80 → all 4 components
+//	usable >= 50 → wordmark + version + project
+//	usable >= 30 → wordmark + version
+//	usable <  30 → wordmark only
+//
+// Within each tier, the fit check is the final gate: if a component's
+// rendered width would push past `usable`, it's still dropped even
+// when the threshold permits it (defensive — e.g. an unusually long
+// version string or project name).
+//
+// Width measurement uses lipgloss.Width so ANSI SGR envelopes don't
+// inflate cell counts.
+//
+//	ASCII shape (wide):
+//	   FLΞΞT  v0.7.0  projects-fleet  4 done · 1 in-review
+//	   ▲────▲▲──────▲▲──────────────▲▲────────────────────▲
+//	   word  vers   project          stats (4th — first to drop)
+func renderTitleLine(m Model, usable int) string {
+	if usable < 0 {
+		usable = 0
+	}
+	const sep = "  " // 2-cell separator between components (breathing room)
+	sepW := lipgloss.Width(sep)
+
+	out := renderFlxxtWordmark()
+	used := lipgloss.Width(out)
+
+	// tryAppend appends component if separator + component fits the
+	// remaining budget. Returns true when the append landed; false when
+	// the budget would overflow (caller should stop appending — later
+	// components would also overflow).
+	tryAppend := func(component string) bool {
+		w := lipgloss.Width(component)
+		if used+sepW+w > usable {
+			return false
+		}
+		out += headerSepStyle.Render(sep) + component
+		used += sepW + w
+		return true
+	}
+
+	// Version — gated by titleMinVersion AND non-"dev" non-empty (the
+	// operator's title doesn't carry a meaningless "vdev" chip; the
+	// default goreleaser-less build sets m.version="dev" — see
+	// cmd/fleet/main.go:20).
+	if usable >= titleMinVersion && m.version != "" && m.version != "dev" {
+		versionStr := headerSubtleStyle.Render("v" + m.version)
+		if !tryAppend(versionStr) {
+			return out
+		}
+	}
+
+	// Project name — first project from the snapshot. Single-project
+	// installations (the common dogfood case) get the cwd-relevant
+	// label here. Multi-project snapshots show the first by sort order
+	// (stable across reloads). When snap is nil or empty, the slot is
+	// silently dropped — title still renders cleanly.
+	//
+	// Name passes through projectDisplayName so the rendered form
+	// matches the body's project header (e.g. "projects-fleet" → display
+	// "projects/fleet"). Identity / search still uses the encoded form;
+	// the display transform is rendering-only (issue #66 invariant).
+	projectName := ""
+	if m.dashboard != nil && len(m.dashboard.Projects) > 0 && m.dashboard.Projects[0] != nil {
+		projectName = projectDisplayName(m.dashboard.Projects[0].Name)
+	}
+	if usable >= titleMinProject && projectName != "" {
+		projectStr := headerTextStyle.Render(projectName)
+		if !tryAppend(projectStr) {
+			return out
+		}
+	}
+
+	// Stat chips — aggregate Done + InReview across all snapshot
+	// projects. Chip hides when both are zero (parity with the
+	// hot-counts chip in the totals row — clean look at all-green).
+	if usable >= titleMinStats && m.dashboard != nil {
+		done, inReview := 0, 0
+		for _, p := range m.dashboard.Projects {
+			if p == nil {
+				continue
+			}
+			done += p.Counts.Done
+			inReview += p.Counts.InReview
+		}
+		if done > 0 || inReview > 0 {
+			var chips []string
+			if done > 0 {
+				chips = append(chips, headerLabelStyle.Render(fmt.Sprintf("%d", done))+
+					headerTextStyle.Render(" done"))
+			}
+			if inReview > 0 {
+				chips = append(chips, headerLabelStyle.Render(fmt.Sprintf("%d", inReview))+
+					headerTextStyle.Render(" in-review"))
+			}
+			statStr := strings.Join(chips, headerSepStyle.Render(" · "))
+			if !tryAppend(statStr) {
+				return out
+			}
+		}
+	}
+
+	return out
 }
 
 // renderFlxxtWordmark returns the styled "FLΞΞT" brand mark. The mark
@@ -1177,9 +1297,16 @@ func renderDashboardFooter(uptime time.Duration, usable int, searchFilter string
 // The chip sits between the search filter (when set) and the uptime
 // counter so the right edge keeps a consistent layout shape.
 func renderDashboardFooterWithHidden(uptime time.Duration, usable int, searchFilter string, hiddenCount, hiddenWith int) string {
+	// Chip slot priority per operator polish: [+] add project earns
+	// the second slot ahead of [n] task. Coords now author most tasks
+	// inside the chat session (the `fleet tasks add` shell-out is the
+	// fallback), so the footer's discoverability surface points at the
+	// keybind operators reach for more often. The [n] keybind is still
+	// wired in keys.go and documented in the [?] help overlay — just
+	// no longer advertised here.
 	chips := []struct{ key, label string }{
 		{"⏎", "open"},
-		{"n", "task"},
+		{"+", "add project"},
 		{"a", "attach"},
 		{"h", "handoff"},
 		{"x", "archive"},
