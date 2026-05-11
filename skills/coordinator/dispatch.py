@@ -202,6 +202,37 @@ def build_worker_prompt(
         f"    fleet workers update {task.slug} {proj_flag} --phase blocked --reason \"<one line>\"",
         "  Then exit 0. Coord raises to operator.",
         "",
+        # Post-completion contract — agent-tool subagents have no kill
+        # signal from the parent; their lifecycle ends only when they
+        # return. A subagent that finishes its §7 contract and KEEPS
+        # working (opening bonus PRs, amending the branch, expanding
+        # scope) is a CLAUDE.md §8 violation. PR #124 (closed) was the
+        # motivating case — a README rewrite subagent added a 9th
+        # feature bullet not in the brief after returning its §7 block.
+        # The post-completion contract makes the boundary explicit so
+        # a worker that "noticed something to fix" routes it through
+        # `fleet tasks add` (P3 backlog) instead of acting on it.
+        "## Post-completion contract",
+        "",
+        "After you emit the §7 return contract, your work for this dispatch",
+        "is COMPLETE. You may NOT:",
+        "  - open additional PRs",
+        "  - file additional bugs / tasks unless explicitly invited",
+        "  - amend, push, or rebase any branch",
+        "  - take ANY further action on this codebase",
+        "",
+        "If during the work you noticed valid follow-up ideas, do NOT do",
+        "that work yourself. The §7 list is the closed scope. File a P3",
+        "ticket via",
+        f"    fleet tasks add --project {project} --spawned-by {task.slug} \\",
+        "      --priority P3 --slug <short> \"<one-liner>\"",
+        "so the operator triages it. Bonus content violates CLAUDE.md §8.",
+        "",
+        "Specific past violation: a subagent dispatched to write a README",
+        "with N feature bullets opened an unauthorized PR adding bullet N+1",
+        "after returning its §7 contract. That PR was closed. Do not repeat",
+        "the pattern.",
+        "",
         "You have: /review, /codex review, gh, git, full repo at <cwd>.",
         "NO interactive chat — operator can't reply mid-flight. Communicate via",
         "`fleet workers update`, which mutates state.json atomically.",

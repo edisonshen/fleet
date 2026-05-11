@@ -254,6 +254,8 @@ def _tick_locked(
                 action, project, fleet_bin,
                 repo=reconcile_repo,
                 tasks_by_slug=reconcile_tasks_by_slug,
+                home=home,
+                full_tasks_by_slug=pre_reconcile_tasks_by_slug,
             )
             result.reconciled += 1
             if action.raised_to_user:
@@ -286,6 +288,8 @@ def _tick_locked(
                 action, project, fleet_bin,
                 repo=sentinel_repo,
                 tasks_by_slug=sentinel_tasks_by_slug,
+                home=home,
+                full_tasks_by_slug=tasks_by_slug,
             )
             result.drained += 1
             if action.raised_to_user:
@@ -340,6 +344,18 @@ def _tick_locked(
             result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
+
+    # Subagent-lifecycle audit (PR #124 motivating case): walk every
+    # subagents/<slug>.json record, probe the worker branch for PRs
+    # opened AFTER archived_at, and append flagged entries to the
+    # record's post_archive_artifacts list. Surfaces in the TUI as a
+    # ⚠ badge on the affected project row. Best-effort — any gh/IO
+    # failure is swallowed inside _audit_archived_subagents so a
+    # tick never fails on the audit.
+    try:
+        _audit_archived_subagents(project, home)
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"subagent audit: {exc}")
 
     # Heartbeat: rewrite coord-state.json on EVERY tick, even when nothing
     # was drained or dispatched. The Variant A dashboard reads this file's
@@ -462,12 +478,15 @@ def _run_supervisor(
         )
         cs = _load_coord_state(state_path)
         slot_freed = False
+        full_map = {t.slug: t for t in f3.tasks}
         for action in actions:
             try:
                 _apply_reconcile(
                     action, project, fleet_bin,
                     repo=(cwd if cap > 1 else ""),
-                    tasks_by_slug=({t.slug: t for t in f3.tasks} if cap > 1 else None),
+                    tasks_by_slug=(full_map if cap > 1 else None),
+                    home=home,
+                    full_tasks_by_slug=full_map,
                 )
                 if action.clear_worker:
                     supervisor_mod.forget_agent_id(cs, action.slug)
@@ -866,6 +885,251 @@ class _ReconcileAction:
                                      # the dir cleanup.
 
 
+# Subagent-lifecycle archive record path. One file per worker that
+# reached phase=done; the post-completion audit re-reads these every
+# tick to detect bonus-PR scope drift (CLAUDE.md §8 violation; see
+# PR #124 as the motivating case).
+#
+# Schema (JSON):
+#   {
+#     "slug": "<task-slug>",
+#     "subagent_id": "<8hex>",          # may be ""
+#     "branch": "worker/<slug>",
+#     "archived_at": "<RFC3339Z>",
+#     "expected_pr_url": "<url>",
+#     "post_archive_artifacts": [
+#       {"pr_number": N, "pr_url": "...", "opened_at": "...",
+#        "action": "flag-for-operator"},
+#       ...
+#     ]
+#   }
+def _subagent_record_path(home: Path, project: str, slug: str) -> Path:
+    return home / "projects" / project / "subagents" / f"{slug}.json"
+
+
+def _write_subagent_archive_record(
+    home: Path,
+    project: str,
+    slug: str,
+    *,
+    expected_pr_url: str,
+    branch: str = "",
+    subagent_id: str = "",
+    now_unix: float | None = None,
+) -> None:
+    """Persist a fresh archive receipt at projects/<p>/subagents/<slug>.json.
+
+    Called from _apply_reconcile when a phase=done worker is being
+    cleared (delete_worker_dir + new_status=in-review). archived_at is
+    "now" in RFC3339Z; the post-archive audit treats any PR with
+    createdAt > archived_at on this worker's branch as scope drift.
+
+    Idempotent: if the record already exists with a populated
+    post_archive_artifacts list, the existing list is preserved so a
+    re-archive (e.g. a re-dispatched worker that lands again) doesn't
+    wipe the audit trail.
+    """
+    import datetime as _dt
+    rec_path = _subagent_record_path(home, project, slug)
+    rec_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if now_unix is None:
+        archived_at = _dt.datetime.now(tz=_dt.timezone.utc)
+    else:
+        archived_at = _dt.datetime.fromtimestamp(now_unix, tz=_dt.timezone.utc)
+    archived_iso = archived_at.isoformat().replace("+00:00", "Z")
+
+    # Preserve any prior artifacts list across a re-archive (e.g. a CI-red
+    # retry that opens a NEW PR and shipping a second time). The operator
+    # may have already inspected a flag; nuking the list would erase the
+    # audit history.
+    prior_artifacts: list = []
+    try:
+        existing = json.loads(rec_path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            raw = existing.get("post_archive_artifacts", [])
+            if isinstance(raw, list):
+                prior_artifacts = raw
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    if not branch:
+        branch = f"worker/{slug}"
+
+    record = {
+        "slug": slug,
+        "subagent_id": subagent_id,
+        "branch": branch,
+        "archived_at": archived_iso,
+        "expected_pr_url": expected_pr_url,
+        "post_archive_artifacts": prior_artifacts,
+    }
+    import tempfile
+    fd, tmp = tempfile.mkstemp(
+        prefix=rec_path.name + ".tmp.", dir=str(rec_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, rec_path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _probe_branch_prs(branch: str) -> list[dict]:
+    """Return PRs whose head ref matches `branch`. Each entry has at
+    least {"number", "url", "createdAt"} keys.
+
+    Production wires this to `gh pr list --head <branch> --state all
+    --json number,url,createdAt`. Empty list on any failure — the audit
+    treats absent-data as "no drift" rather than blocking the tick.
+
+    Override via `monkeypatch.setattr(loop, '_probe_branch_prs', ...)`
+    in tests; same pattern as _gh_pr_checks. Branch matching means we
+    pick up bonus PRs the subagent opened off its OWN worker branch
+    (the most common drift). A subagent that opened a PR off main is
+    out of scope for this probe — the gh repo-level audit would catch
+    those (deferred).
+    """
+    if not branch:
+        return []
+    cmd = [
+        "gh", "pr", "list",
+        "--head", branch,
+        "--state", "all",
+        "--json", "number,url,createdAt",
+    ]
+    data, err = _gh_run_json(cmd, timeout_s=10.0)
+    if err or not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            out.append({
+                "number": entry.get("number"),
+                "url": entry.get("url", ""),
+                "createdAt": entry.get("createdAt", ""),
+            })
+    return out
+
+
+def _audit_archived_subagents(
+    project: str,
+    home: Path,
+) -> int:
+    """Walk projects/<p>/subagents/*.json. For each archived record,
+    probe the worker branch for PRs opened AFTER archived_at and append
+    any to post_archive_artifacts.
+
+    Returns the count of archived records that got a NEW flag this tick
+    (informational; the tick result doesn't propagate this yet — the
+    operator-facing signal is the dashboard badge on the project row).
+
+    Idempotent: a flag already present in post_archive_artifacts
+    (matched by pr_number) is NOT re-appended. A subagent record with
+    no archived_at is skipped (defensive; shouldn't happen post-write
+    but a malformed file shouldn't crash the tick).
+    """
+    sub_dir = home / "projects" / project / "subagents"
+    if not sub_dir.is_dir():
+        return 0
+    flagged_now = 0
+    try:
+        names = sorted(p.name for p in sub_dir.iterdir() if p.name.endswith(".json"))
+    except OSError:
+        return 0
+    for name in names:
+        rec_path = sub_dir / name
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        archived_at_s = str(rec.get("archived_at", "") or "")
+        if not archived_at_s:
+            continue
+        try:
+            from datetime import datetime
+            archived_at = datetime.fromisoformat(archived_at_s.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        branch = str(rec.get("branch", "") or "")
+        if not branch:
+            continue
+        existing = rec.get("post_archive_artifacts", [])
+        if not isinstance(existing, list):
+            existing = []
+        seen_numbers = {
+            a.get("pr_number")
+            for a in existing
+            if isinstance(a, dict) and a.get("pr_number") is not None
+        }
+        # Also exclude the original PR — its createdAt is well before
+        # archived_at and we filter on opened_at > archived_at anyway,
+        # but pinning by pr_url adds a defense against gh API
+        # timezone-tagging quirks at the second boundary.
+        expected_url = str(rec.get("expected_pr_url", "") or "")
+        prs = _probe_branch_prs(branch)
+        new_artifacts: list[dict] = []
+        for pr in prs:
+            num = pr.get("number")
+            url = pr.get("url", "")
+            created_s = str(pr.get("createdAt", "") or "")
+            if num is None or not created_s:
+                continue
+            if num in seen_numbers:
+                continue
+            if url and url == expected_url:
+                continue
+            try:
+                from datetime import datetime
+                created_at = datetime.fromisoformat(
+                    created_s.replace("Z", "+00:00"),
+                )
+            except ValueError:
+                continue
+            if created_at <= archived_at:
+                continue
+            new_artifacts.append({
+                "pr_number": num,
+                "pr_url": url,
+                "opened_at": created_s,
+                "action": "flag-for-operator",
+            })
+        if not new_artifacts:
+            continue
+        existing.extend(new_artifacts)
+        rec["post_archive_artifacts"] = existing
+        # tmp + rename to keep the record durable. The audit can crash
+        # mid-file (gh timeout, etc.) without leaving a half-written
+        # JSON.
+        import tempfile
+        fd, tmp = tempfile.mkstemp(
+            prefix=rec_path.name + ".tmp.", dir=str(rec_path.parent),
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, indent=2, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, rec_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            continue
+        flagged_now += 1
+    return flagged_now
+
+
 def _reconcile_inflight(
     tasks: list[parse.Task],
     project: str,
@@ -1144,6 +1408,8 @@ def _apply_reconcile(
     *,
     repo: str = "",
     tasks_by_slug: dict[str, parse.Task] | None = None,
+    home: Path | None = None,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
 ) -> None:
     """Apply an _ReconcileAction via the fleet CLI.
 
@@ -1190,6 +1456,41 @@ def _apply_reconcile(
     # mutations above, matching the worktree-cleanup discipline.
     if action.delete_worker_dir:
         _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+    # Subagent-lifecycle archive receipt — only on the phase=done +
+    # PR-shipped path. set_pr_url is the signal that this was a
+    # TerminalSuccess (the only branch in _reconcile_inflight that
+    # populates set_pr_url). phase=failed / phase=blocked / rebase /
+    # CI-red paths all skip this — those subagents didn't reach §7
+    # contract emit, so the post-archive audit window doesn't open.
+    #
+    # Best-effort: a write failure is logged to stderr and does NOT
+    # roll back the tasks.md mutations above. The audit signal is a
+    # nice-to-have; correctness lives in tasks.md.
+    if action.set_pr_url and home is not None:
+        try:
+            branch = ""
+            # full_tasks_by_slug is the unfiltered pre-reconcile map
+            # (cap=1 and cap>1 both have it). tasks_by_slug is the
+            # worktree-cleanup-gated variant which is None under cap=1.
+            # The archive write only needs branch lookup; falling back
+            # through both keeps branch-resolution working in either
+            # mode.
+            lookup = full_tasks_by_slug or tasks_by_slug
+            if lookup is not None:
+                tk = lookup.get(action.slug)
+                if tk is not None and tk.branch:
+                    branch = tk.branch
+            _write_subagent_archive_record(
+                home, project, action.slug,
+                expected_pr_url=action.set_pr_url,
+                branch=branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            import sys
+            print(
+                f"coord: subagent archive write failed for {action.slug}: {exc}",
+                file=sys.stderr,
+            )
     # Note: action.raised_to_user is informational; the operator sees
     # the raise via the agent record's needs_input + the appended note.
     # The skill doesn't fan out a separate inbox message — the next
@@ -1319,6 +1620,8 @@ def _apply_sentinel(
     *,
     repo: str = "",
     tasks_by_slug: dict[str, parse.Task] | None = None,
+    home: Path | None = None,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
 ) -> None:
     """Apply a parsed sentinel via the fleet CLI.
 
@@ -1345,6 +1648,29 @@ def _apply_sentinel(
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
         # Worker reached TerminalSuccess — rm-rf workers/<slug>/.
         _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+        # Subagent-lifecycle archive receipt. Same Terminal-success
+        # path as the reconcile branch above — a TASK_DONE_PR sentinel
+        # IS the worker's "I shipped" signal, so we open the
+        # post-archive audit window from this point.
+        if home is not None:
+            try:
+                branch = ""
+                lookup = full_tasks_by_slug or tasks_by_slug
+                if lookup is not None:
+                    tk = lookup.get(action.slug)
+                    if tk is not None and tk.branch:
+                        branch = tk.branch
+                _write_subagent_archive_record(
+                    home, project, action.slug,
+                    expected_pr_url=action.payload,
+                    branch=branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                import sys
+                print(
+                    f"coord: subagent archive write failed for {action.slug}: {exc}",
+                    file=sys.stderr,
+                )
     elif action.kind == "blocked_question":
         # Lifecycle Waiting — operator may un-block the task; KEEP
         # the worker dir (its blocked_reason is still useful context).

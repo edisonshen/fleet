@@ -69,6 +69,22 @@ type ProjectRow struct {
 	// RIGHT column filters that same agent out of its loose-agents
 	// section so a coord doesn't double-render.
 	CoordID string
+
+	// PostArchiveActivity is true when at least one archived subagent
+	// record under projects/<name>/subagents/*.json carries a
+	// non-empty post_archive_artifacts list. The coord skill's
+	// _audit_archived_subagents step (skills/coordinator/loop.py)
+	// populates those entries when it finds a PR opened on a
+	// worker branch AFTER the subagent reached phase=done — i.e.
+	// a CLAUDE.md §8 scope violation by an Agent-tool subagent.
+	//
+	// PR #124 (closed) was the motivating case: a README rewrite
+	// subagent finished its 8-bullet task, returned the §7 contract,
+	// then opened a separate PR adding bullet #9. Without a dashboard
+	// signal the operator had no way to discover the drift short of
+	// grepping `gh pr list`. A "⚠ post-archive activity" indicator
+	// rendered on the project row makes the audit signal visible.
+	PostArchiveActivity bool
 }
 
 // TaskCounts mirrors the columns in the mockup:
@@ -274,6 +290,14 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// on the chip data itself. An empty / absent / malformed file
 	// returns nil — workers render without the chip.
 	subagentMap := readWorkerSubagentMap(stateJSON)
+
+	// Subagent-lifecycle audit signal — scan
+	// projects/<name>/subagents/*.json for any record with non-empty
+	// post_archive_artifacts. One bounded directory listing + one
+	// JSON parse per file; cheap. Failure modes (no subagents dir,
+	// malformed JSON, IO error) all fall through to "false" — the
+	// audit signal is informational, not load-bearing.
+	row.PostArchiveActivity = scanProjectPostArchiveActivity(dir)
 
 	// Workers under workers/<slug>/state.json.
 	wrows := scanWorkers(dir, name, now, subagentMap)
@@ -622,6 +646,63 @@ func readCoordHolder(projectsRoot, projectName string) string {
 		return ""
 	}
 	return s
+}
+
+// scanProjectPostArchiveActivity returns true when any
+// projects/<name>/subagents/*.json record carries a non-empty
+// post_archive_artifacts list. Used by scanProject to populate
+// ProjectRow.PostArchiveActivity — the dashboard's audit signal for
+// subagents that kept working after their §7 return contract
+// (CLAUDE.md §8 violation; PR #124 was the motivating case).
+//
+// Cheap path: one ReadDir, one ReadFile + Unmarshal per record.
+// Bounded by the number of phase=done subagent transitions for the
+// project, which is small in practice (records age out via operator
+// cleanup; even years of dogfood traffic stays under a few hundred).
+// Any IO or parse failure is silently swallowed — the signal is
+// informational, never load-bearing.
+//
+// We only need to know "is the artifacts list non-empty for any
+// record?", so we short-circuit on the first hit. The per-record
+// JSON has the shape:
+//
+//	{
+//	  "slug": "...",
+//	  "archived_at": "...",
+//	  "post_archive_artifacts": [ { "pr_number": N, ... }, ... ]
+//	}
+//
+// Skill writer: skills/coordinator/loop.py:_write_subagent_archive_record
+// + _audit_archived_subagents.
+func scanProjectPostArchiveActivity(projectDir string) bool {
+	subDir := filepath.Join(projectDir, "subagents")
+	entries, err := os.ReadDir(subDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(subDir, name))
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			PostArchiveArtifacts []json.RawMessage `json:"post_archive_artifacts"`
+		}
+		if err := json.Unmarshal(data, &rec); err != nil {
+			continue
+		}
+		if len(rec.PostArchiveArtifacts) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // readWorkerSubagentMap parses coord-state.json's `worker_subagent_ids`
