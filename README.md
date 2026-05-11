@@ -32,6 +32,11 @@ manager. The agents do the work.
 - **Per-task status tracking.** `tasks.md` is the source of truth —
   status, priority, lifecycle timestamps, PR URL, notes. Visible in the
   TUI, mutable via `fleet tasks`.
+- **Workers learn as they work.** Every worker can append to a shared
+  per-project `learnings.md` via `fleet learnings add` from inside its
+  session. The coord injects the top entries into every subsequent
+  dispatch prompt, so the next agent inherits hard-won lessons —
+  gotchas, conventions, pitfalls — without you re-typing them.
 - **PR autopilot.** Each worker watches its own PR. CI fails →
   retry-fix subagent. PR goes BEHIND or DIRTY → rebase subagent on an
   isolated worktree. Trivial review comments addressed inline.
