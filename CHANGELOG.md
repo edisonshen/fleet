@@ -6,6 +6,31 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-11
+
+Quick polish patch — narrow-width title now keeps the brand mark, and
+the footer advertises the more-commonly-needed `[+]` register hotkey.
+
+### Changed
+
+- Dashboard footer chip row now advertises `[+] add project` instead
+  of `[n] task` (#122). The register-project verb is operationally
+  more important than inline task-add — coords handle most task
+  creation, so surfacing the clone-and-register hotkey on the footer
+  reflects actual use. The `[n]` keybind still works as an internal
+  task-add shortcut; it's just no longer the chip the footer markets.
+- Title row uses greedy width-aware layout (#122): at narrow terminal
+  widths, drops stat chips first, then project name, then version —
+  but always preserves the `FLΞΞT` wordmark. The brand mark survives
+  every fallback tier so the dashboard never renders a chip-only
+  header that loses its identity.
+
+### Deferred
+
+- Codex review SKIPPED — rate-limited at 2026-05-11; quota resets
+  2026-05-13 05:31 UTC. `/review` (gstack skill) PASSED. Codex re-run
+  queued for post-reset.
+
 ## [0.7.0] - 2026-05-10
 
 Handoff hardening — the v0.6.0 P0 remote-control fix shipped with two
@@ -617,7 +642,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/edisonshen/fleet/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/edisonshen/fleet/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/edisonshen/fleet/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/edisonshen/fleet/compare/v0.4.0...v0.5.0
