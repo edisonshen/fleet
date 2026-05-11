@@ -719,13 +719,25 @@ def _load_parallelism(project_dir: Path) -> int:
 
 def _save_coord_state(path: Path, state: dict) -> None:
     """Atomic publish of coord-state.json (tmp + rename + fsync)."""
+    _atomic_write_json(path, state)
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """tmp + fsync + rename publish of a JSON file. Caller-owned schema.
+
+    Used by _save_coord_state and the subagent-lifecycle archive paths
+    (_write_subagent_archive_record, _audit_archived_subagents). The
+    invariant: a crash mid-write never leaves a half-finished JSON at
+    `path`. tempfile.mkstemp uses the SAME directory as the target so
+    `os.replace` is atomic on POSIX (cross-filesystem moves would not be).
+    """
     import tempfile
     parent = path.parent
     parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, sort_keys=True)
+            json.dump(data, fh, indent=2, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -964,22 +976,7 @@ def _write_subagent_archive_record(
         "expected_pr_url": expected_pr_url,
         "post_archive_artifacts": prior_artifacts,
     }
-    import tempfile
-    fd, tmp = tempfile.mkstemp(
-        prefix=rec_path.name + ".tmp.", dir=str(rec_path.parent),
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(record, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, rec_path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
+    _atomic_write_json(rec_path, record)
 
 
 def _probe_branch_prs(branch: str) -> list[dict]:
@@ -1107,24 +1104,12 @@ def _audit_archived_subagents(
             continue
         existing.extend(new_artifacts)
         rec["post_archive_artifacts"] = existing
-        # tmp + rename to keep the record durable. The audit can crash
-        # mid-file (gh timeout, etc.) without leaving a half-written
-        # JSON.
-        import tempfile
-        fd, tmp = tempfile.mkstemp(
-            prefix=rec_path.name + ".tmp.", dir=str(rec_path.parent),
-        )
+        # Atomic publish — a crash mid-write (gh timeout, OOM) must NOT
+        # leave a half-written JSON; the audit re-reads the record on
+        # next tick and must always see a parseable file.
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(rec, fh, indent=2, sort_keys=True)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, rec_path)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+            _atomic_write_json(rec_path, rec)
+        except OSError:
             continue
         flagged_now += 1
     return flagged_now
