@@ -155,6 +155,14 @@ func renderDashboardHeader(m Model, usable int) string {
 	return title + "\n" + row
 }
 
+// Title-row width gates. Operator-chosen breakpoints — narrow split
+// panes get the brand alone; common single panes get full content.
+const (
+	titleMinVersion = 30 // usable >= this → emit version chip
+	titleMinProject = 50 // usable >= this → emit project name
+	titleMinStats   = 80 // usable >= this → emit stat chips
+)
+
 // renderTitleLine builds the dashboard's top title row with a greedy
 // left-to-right layout. Components in priority order:
 //
@@ -164,14 +172,14 @@ func renderDashboardHeader(m Model, usable int) string {
 //  4. stat chips (e.g. "4 done · 1 in-review")
 //
 // Each subsequent component is gated by BOTH a minimum-width threshold
-// AND a fit check against the remaining width budget. The wordmark is
-// always emitted FIRST and stays even when it alone exceeds the budget
-// — better to overflow the brand than to omit it (operator screenshot
-// showed the entire title clipping at narrow widths; the brand mark
-// is the load-bearing visual anchor of the console).
+// (titleMin* constants above) AND a fit check against the remaining
+// width budget. The wordmark is always emitted FIRST and stays even
+// when it alone exceeds the budget — better to overflow the brand
+// than to omit it (operator screenshot showed the entire title
+// clipping at narrow widths; the brand mark is the load-bearing
+// visual anchor of the console).
 //
-// Width thresholds (operator-chosen breakpoints — narrow split panes
-// need the brand alone, common single panes get full content):
+// Width tiers:
 //
 //	usable >= 80 → all 4 components
 //	usable >= 50 → wordmark + version + project
@@ -190,12 +198,6 @@ func renderDashboardHeader(m Model, usable int) string {
 //	   FLΞΞT  v0.7.0  projects-fleet  4 done · 1 in-review
 //	   ▲────▲▲──────▲▲──────────────▲▲────────────────────▲
 //	   word  vers   project          stats (4th — first to drop)
-const (
-	titleMinVersion = 30 // usable >= this → emit version chip
-	titleMinProject = 50 // usable >= this → emit project name
-	titleMinStats   = 80 // usable >= this → emit stat chips
-)
-
 func renderTitleLine(m Model, usable int) string {
 	if usable < 0 {
 		usable = 0
