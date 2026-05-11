@@ -58,6 +58,7 @@ its next tick.
 | `enter`   | Expand/collapse row, or open detail               |
 | `a`       | Attach: coord (project), tmux (agent), peek (worker) |
 | `d`       | Dispatch a new agent (opens repo picker)          |
+| `+`       | Register a cloned repo as a fleet project (no dispatch) |
 | `n`       | Add a task to the current project                 |
 | `h`       | Handoff the selected agent to a fresh replacement |
 | `x`       | Archive the selected agent                        |
@@ -84,6 +85,9 @@ PR-TRACK → DONE) is in [docs/COORDINATOR-WORKFLOW.md](docs/COORDINATOR-WORKFLO
 
 - `fleet --help` — full CLI surface (`dispatch`, `attach`, `handoff`,
   `drain`, `tasks`, `workers`, `learnings`, `standards`, `peek`).
+- `fleet maintenance bootstrap-remote-control` — report live agents
+  that pre-date the v0.7.0 remote-control injection fix and need a
+  handoff to regain mobile pairing.
 - [CHANGELOG.md](CHANGELOG.md) — release history.
 - [skills/fleet-guard/SKILL.md](skills/fleet-guard/SKILL.md) — agent-side
   context watcher and handoff trigger.
