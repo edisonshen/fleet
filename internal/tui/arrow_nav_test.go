@@ -96,17 +96,40 @@ func TestFooter_OmitsNavAndPanelChips(t *testing.T) {
 	}
 }
 
-// TestFooter_DocumentsCoreKeysOnly pins the canonical issue #90
-// footer shape: ⏎ open · n task · a attach · h handoff · x archive ·
-// / search · ? help · q quit. All eight chip keys must be present —
-// none of them are intuitive enough to drop.
+// TestFooter_DocumentsCoreKeysOnly pins the canonical footer shape
+// post-tui-footer-swap-n-for-pl-ce97 (operator polish): swap [n] task
+// for [+] add project — coords handle most task creation, so
+// register-project earns the chip slot. The [n] keybind in keys.go
+// stays wired (and [n] stays in the help overlay) but the footer no
+// longer advertises it.
+//
+// Canonical: ⏎ open · + add project · a attach · h handoff · x archive ·
+// / search · ? help · q quit. Eight chips total — the count is
+// invariant; only the second slot changed.
 func TestFooter_DocumentsCoreKeysOnly(t *testing.T) {
 	out := renderDashboardFooter(0, 200, "")
-	for _, want := range []string{"⏎", "n", "a", "h", "x", "/", "?", "q",
-		"open", "task", "attach", "handoff", "archive", "search", "help", "quit"} {
+	for _, want := range []string{"⏎", "+", "a", "h", "x", "/", "?", "q",
+		"open", "add project", "attach", "handoff", "archive", "search", "help", "quit"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer missing required chip %q, got:\n%s", want, out)
 		}
+	}
+}
+
+// TestFooter_DropsNTaskAdvertisement pins the swap direction: the
+// footer must NOT advertise [n] task anymore. The keybind itself
+// still works (keys.go unchanged) but the chip strip's second slot
+// belongs to [+] add project now.
+func TestFooter_DropsNTaskAdvertisement(t *testing.T) {
+	out := renderDashboardFooter(0, 200, "")
+	if strings.Contains(out, "[n]") {
+		t.Errorf("footer must not advertise [n] anymore, got:\n%s", out)
+	}
+	// Also guard against the un-bracketed " task" label slipping through
+	// even if the [n] chip itself is gone (defensive — the only "task"
+	// substring in the old footer was the [n] task chip).
+	if strings.Contains(out, "] task") {
+		t.Errorf("footer must not carry '] task' chip suffix, got:\n%s", out)
 	}
 }
 

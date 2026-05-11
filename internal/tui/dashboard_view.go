@@ -166,6 +166,28 @@ func renderDashboardHeader(m Model, usable int) string {
 	return title + "\n" + row
 }
 
+// renderTitleLine builds the dashboard's top title row with a greedy
+// left-to-right layout. Components in priority order:
+//
+//	1. FLΞΞT wordmark — NEVER dropped; always emitted first
+//	2. version (e.g. "v0.7.0")
+//	3. project name (e.g. "projects-fleet")
+//	4. stat chips (e.g. "4 done · 1 in-review")
+//
+// Each subsequent component is appended only if the remaining width
+// budget can fit it (separator + component). The wordmark is always
+// emitted FIRST and stays even when it alone exceeds the budget —
+// better to overflow the brand than to omit it (operator screenshot
+// showed the entire title clipping at narrow widths; the brand mark
+// is the load-bearing visual anchor of the console).
+//
+// Width measurement uses lipgloss.Width so ANSI SGR envelopes don't
+// inflate cell counts.
+func renderTitleLine(m Model, usable int) string {
+	// stub — TDD red. Replace with real greedy layout in TDD green.
+	return ""
+}
+
 // renderFlxxtWordmark returns the styled "FLΞΞT" brand mark. The mark
 // is composed of three lipgloss-rendered segments concatenated in
 // order: "FL" (bold, default fg), "ΞΞ" (bold, F1 red #E10600), "T"
