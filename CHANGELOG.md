@@ -6,6 +6,45 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-05-12
+
+Coordinator now structurally enforces local `/review` iteration —
+workers write code, mark `phase=review-pending`, exit; coord dispatches
+a fresh reviewer-subagent that iterates `/review` to two-consecutive-
+clean, runs codex once (skip if rate-limited), then a finisher-
+subagent pushes and opens the PR. State-machine gate in `fleet workers
+update` refuses `--phase push` without terminal review status. Fix-
+subagent retry cap removed — coord keeps dispatching until CI green.
+
+### Added
+
+- Three-stage worker dispatch flow: code-writer → reviewer-subagent →
+  push-finisher (#133). Eliminates the §7a exit-before-push pattern by
+  structurally separating concerns — the code-writer never gets to
+  push, so it cannot exit before review; the reviewer-subagent owns
+  the `/review` loop; the finisher owns the push + PR open.
+- Worker state fields `review_claude_status` / `review_codex_status` /
+  `review_*_rounds` (#133). `fleet workers update --review-claude-
+  status passed`, `--review-codex-status skipped --review-codex-skip-
+  reason rate-limited`. Reviewer-subagent writes these as it iterates
+  so the coord can gate `phase=push` on terminal review state.
+- `fleet workers update --phase push` now rejects unless both review
+  statuses are terminal; codex skip allowlist `rate-limited|
+  unavailable` (#133). State-machine gate prevents a worker from ever
+  reaching `phase=push` without going through the reviewer-subagent.
+
+### Changed
+
+- Worker dispatch prompt no longer instructs inline `/review` + push +
+  PR (#133). Worker stops at `phase=review-pending` and exits; coord
+  takes over dispatching the reviewer-subagent. Strips the
+  multi-paragraph review section from the worker prompt — workers are
+  now strictly code-writers.
+- Fix-subagent retry cap removed from `skills/coordinator/SKILL.md`
+  (#133). Coord keeps dispatching fix-subagents on CI fail until
+  success or operator intervention. No code change — the cap was
+  documentation-only.
+
 ## [0.8.0] - 2026-05-12
 
 TUI `[+]` hotkey now auto-spawns the coord and freshly-added projects
@@ -690,7 +729,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/edisonshen/fleet/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/edisonshen/fleet/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/edisonshen/fleet/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/edisonshen/fleet/compare/v0.6.0...v0.7.0
