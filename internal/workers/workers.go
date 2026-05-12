@@ -136,15 +136,64 @@ type State struct {
 
 // Errors.
 var (
-	ErrNotFound          = errors.New("worker state.json not found")
-	ErrInvalidState      = errors.New("invalid worker state")
-	ErrPhaseRequiresPR   = errors.New("phase=done requires pr_url")
-	ErrPhaseRequiresWhy  = errors.New("phase=blocked requires blocked_reason")
-	ErrInvalidPhase      = errors.New("invalid phase")
-	ErrInvalidReviewStat = errors.New("invalid review status")
-	ErrInvalidSlug       = errors.New("invalid worker slug")
-	ErrPreconditionLive  = errors.New("cannot archive live worker")
+	ErrNotFound             = errors.New("worker state.json not found")
+	ErrInvalidState         = errors.New("invalid worker state")
+	ErrPhaseRequiresPR      = errors.New("phase=done requires pr_url")
+	ErrPhaseRequiresWhy     = errors.New("phase=blocked requires blocked_reason")
+	ErrPhaseRequiresReview  = errors.New("phase=push requires review_claude_status=passed and review_codex_status in {passed,skipped}")
+	ErrInvalidPhase         = errors.New("invalid phase")
+	ErrInvalidReviewStat    = errors.New("invalid review status")
+	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable}")
+	ErrInvalidSlug          = errors.New("invalid worker slug")
+	ErrPreconditionLive     = errors.New("cannot archive live worker")
 )
+
+// allowedCodexSkipReasons enumerates the only review_codex_skip_reason
+// values the validator accepts. The CLI flag wrapper rejects anything
+// else upfront, but workers.WriteState is the load-bearing gate that
+// catches direct callers + future skill-side bypasses. Allowed values
+// are intentionally narrow: codex skips are operational concessions
+// (rate-limited at the CLI; binary missing on host) — NOT a way to
+// declare "I didn't feel like running codex". Broadening this set
+// requires explicit operator sign-off (CLAUDE.md §4).
+var allowedCodexSkipReasons = map[string]struct{}{
+	"rate-limited": {},
+	"unavailable":  {},
+}
+
+// validateReviewGate enforces the phase=push precondition. Three-stage
+// flow contract: the worker writes phase=review-pending; the reviewer
+// writes review_claude_status=passed + review_codex_status in
+// {passed, skipped} + phase=review-done; the finisher writes
+// phase=push. Without this gate, a buggy worker that bypassed the
+// reviewer could reach phase=push (and ultimately phase=done with a
+// PR URL) without any /review or codex pass. That is the structural
+// failure mode the three-stage flow exists to prevent.
+//
+// "skipped" is allowed for codex (rate-limit / unavailable) but NEVER
+// for /review — the validator rejects review_claude_status=skipped
+// even if a reviewer subagent were to try it.
+func validateReviewGate(s *State) error {
+	if s.Phase != PhasePush {
+		return nil
+	}
+	if s.ReviewClaudeStatus != ReviewStatusPassed {
+		return fmt.Errorf("%w: review_claude_status=%q", ErrPhaseRequiresReview, s.ReviewClaudeStatus)
+	}
+	switch s.ReviewCodexStatus {
+	case ReviewStatusPassed:
+		// codex clean — no skip-reason required.
+	case ReviewStatusSkipped:
+		// skip must carry an allowed reason.
+		reason := strings.TrimSpace(s.ReviewCodexSkipReason)
+		if _, ok := allowedCodexSkipReasons[reason]; !ok {
+			return fmt.Errorf("%w: got %q", ErrCodexSkipNeedsReason, reason)
+		}
+	default:
+		return fmt.Errorf("%w: review_codex_status=%q", ErrPhaseRequiresReview, s.ReviewCodexStatus)
+	}
+	return nil
+}
 
 // updateMu serializes UpdateState calls within one process per
 // (project, slug) pair. Cross-process serialization is provided by
@@ -217,6 +266,9 @@ func writeStateLocked(project, slug string, s *State) error {
 	}
 	if !validReviewStatus(s.ReviewCodexStatus) {
 		return fmt.Errorf("%w: review_codex_status=%q", ErrInvalidReviewStat, s.ReviewCodexStatus)
+	}
+	if err := validateReviewGate(s); err != nil {
+		return err
 	}
 	if s.Phase == PhaseDone && strings.TrimSpace(s.PRURL) == "" {
 		return ErrPhaseRequiresPR

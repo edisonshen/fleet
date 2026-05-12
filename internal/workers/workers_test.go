@@ -882,6 +882,190 @@ func TestStateRoundTrip_RejectsBogusReviewStatus(t *testing.T) {
 	}
 }
 
+// TestWorkers_PhasePushRejectedWithoutReview: phase=push requires
+// review_claude_status=passed. A worker (or buggy reviewer) that
+// writes phase=push without a terminal /review status must be
+// rejected at WriteState time — this is the structural enforcement
+// that the three-stage flow is built around.
+func TestWorkers_PhasePushRejectedWithoutReview(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:               "push-noreview-aaaa",
+		Project:            "fleet",
+		Phase:              PhasePush,
+		StartedAt:          time.Now().UTC(),
+		PID:                1,
+		ReviewClaudeStatus: ReviewStatusPending, // not terminal
+		ReviewCodexStatus:  ReviewStatusPassed,
+	}
+	err := WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresReview) {
+		t.Errorf("got %v; want ErrPhaseRequiresReview (claude pending)", err)
+	}
+
+	// Empty (= zero value, pre-three-stage worker) also rejected.
+	s.ReviewClaudeStatus = ""
+	err = WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresReview) {
+		t.Errorf("got %v; want ErrPhaseRequiresReview (claude empty)", err)
+	}
+}
+
+// TestWorkers_PhasePushRejectedWithCodexBlockedNotSkipped: codex
+// "blocked" is NOT a valid terminal status for phase=push. Only
+// passed or skipped (with allowed reason) clear the gate.
+func TestWorkers_PhasePushRejectedWithCodexBlockedNotSkipped(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:               "push-codex-blocked-aaaa",
+		Project:            "fleet",
+		Phase:              PhasePush,
+		StartedAt:          time.Now().UTC(),
+		PID:                1,
+		ReviewClaudeStatus: ReviewStatusPassed,
+		ReviewCodexStatus:  ReviewStatusBlocked,
+	}
+	err := WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresReview) {
+		t.Errorf("got %v; want ErrPhaseRequiresReview (codex blocked)", err)
+	}
+}
+
+// TestWorkers_PhasePushRejectedWithoutSkipReason: codex=skipped
+// without a reason in the allowlist is rejected. The reviewer must
+// record WHY codex was skipped (rate-limited|unavailable) — silent
+// skips would let a re-dispatch retry that should have happened slip
+// through.
+func TestWorkers_PhasePushRejectedWithoutSkipReason(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:                  "push-codex-skip-noreason-aaaa",
+		Project:               "fleet",
+		Phase:                 PhasePush,
+		StartedAt:             time.Now().UTC(),
+		PID:                   1,
+		ReviewClaudeStatus:    ReviewStatusPassed,
+		ReviewCodexStatus:     ReviewStatusSkipped,
+		ReviewCodexSkipReason: "", // missing
+	}
+	err := WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrCodexSkipNeedsReason) {
+		t.Errorf("got %v; want ErrCodexSkipNeedsReason (empty reason)", err)
+	}
+
+	// Reason outside the allowlist also rejected.
+	s.ReviewCodexSkipReason = "didn't feel like it"
+	err = WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrCodexSkipNeedsReason) {
+		t.Errorf("got %v; want ErrCodexSkipNeedsReason (bad reason)", err)
+	}
+}
+
+// TestWorkers_PhasePushAcceptedWithReviewPassedAndCodexSkippedRateLimited:
+// the documented happy path for codex rate-limit. Reviewer ran
+// /review clean, attempted codex (got rate-limited), recorded the
+// terminal state and skip reason. Finisher can now reach push.
+func TestWorkers_PhasePushAcceptedWithReviewPassedAndCodexSkippedRateLimited(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, reason := range []string{"rate-limited", "unavailable"} {
+		t.Run(reason, func(t *testing.T) {
+			slug := "push-codex-skip-" + reason + "-aaaa"
+			s := &State{
+				Slug:                  slug,
+				Project:               "fleet",
+				Phase:                 PhasePush,
+				StartedAt:             time.Now().UTC(),
+				PID:                   1,
+				ReviewClaudeStatus:    ReviewStatusPassed,
+				ReviewClaudeRounds:    2,
+				ReviewCodexStatus:     ReviewStatusSkipped,
+				ReviewCodexSkipReason: reason,
+			}
+			if err := WriteState("fleet", slug, s); err != nil {
+				t.Errorf("WriteState: %v; want nil (push with %s skip accepted)", err, reason)
+			}
+		})
+	}
+}
+
+// TestWorkers_PhasePushAcceptedWithBothPassed: the other happy path —
+// both reviewers ran clean.
+func TestWorkers_PhasePushAcceptedWithBothPassed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:               "push-both-passed-aaaa",
+		Project:            "fleet",
+		Phase:              PhasePush,
+		StartedAt:          time.Now().UTC(),
+		PID:                1,
+		ReviewClaudeStatus: ReviewStatusPassed,
+		ReviewClaudeRounds: 2,
+		ReviewCodexStatus:  ReviewStatusPassed,
+		ReviewCodexRounds:  1,
+	}
+	if err := WriteState("fleet", s.Slug, s); err != nil {
+		t.Errorf("WriteState: %v; want nil (both reviewers passed)", err)
+	}
+}
+
+// TestWorkers_PhaseDoneStillRequiresPR: phase=done's pr_url
+// precondition is unchanged. The new review gate fires only on
+// phase=push; phase=done's gate is independent.
+func TestWorkers_PhaseDoneStillRequiresPR(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	s := &State{
+		Slug:               "done-no-pr-aaaa",
+		Project:            "fleet",
+		Phase:              PhaseDone,
+		StartedAt:          time.Now().UTC(),
+		PID:                1,
+		ReviewClaudeStatus: ReviewStatusPassed,
+		ReviewCodexStatus:  ReviewStatusPassed,
+		PRURL:              "", // missing
+	}
+	err := WriteState("fleet", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresPR) {
+		t.Errorf("got %v; want ErrPhaseRequiresPR (done without pr_url, review terminal)", err)
+	}
+}
+
+// TestWorkers_PhaseReviewDoneDoesNotRequireReview: the gate fires on
+// phase=push, NOT phase=review-done. The reviewer subagent writes
+// phase=review-done AFTER its loop completes, so the moment that
+// write happens the review_* fields ARE populated — but the
+// validator should not care, because the reviewer hasn't published
+// review-done yet when it's writing it. Test pins that intermediate
+// phases stay permissive (reviewer iterating with claude=iterating,
+// codex=pending, etc. must round-trip without phase=push gate).
+func TestWorkers_PhaseReviewDoneDoesNotRequireReview(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, phase := range []Phase{
+		PhaseReviewPending, PhaseReviewClaude, PhaseReviewCodex, PhaseReviewDone,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			s := &State{
+				Slug:               "intermediate-" + sanitizeSlug(string(phase)) + "-aaaa",
+				Project:            "fleet",
+				Phase:              phase,
+				StartedAt:          time.Now().UTC(),
+				PID:                1,
+				ReviewClaudeStatus: ReviewStatusIterating,
+				ReviewCodexStatus:  ReviewStatusPending,
+			}
+			if err := WriteState("fleet", s.Slug, s); err != nil {
+				t.Errorf("WriteState phase=%s with iterating reviewers: %v; want nil", phase, err)
+			}
+		})
+	}
+}
+
 func TestPhaseValidation_NewReviewPhasesAccepted(t *testing.T) {
 	// review-pending + review-done must be valid Phase values; the
 	// validPhase check rejects unknowns and would block the three-stage
