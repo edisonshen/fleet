@@ -6,6 +6,24 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-05-12
+
+Coord handoff (auto via fleet-guard or interactive `fleet handoff`)
+now writes enough state for the successor coord to fully reconstruct
+continuity. Previously the `## Active Subagents` section only carried
+`task / branch / phase / agent_id / subagent_id` — missing the PR URL
+and task status. A handoff in the middle of a session left the
+successor reading tasks.md by hand and re-spawning shepherds blind.
+This release enriches the schema and adds an `## Open PRs` snapshot
+so resume is deterministic.
+
+### Fixed
+
+- `## Active Subagents` rows now carry `status` + `pr_url` alongside the existing fields (#138). Legacy 5-field rows still parse with empty defaults — forward-compat with existing on-disk handoff docs.
+- New `## Open PRs` section snapshots `gh pr list --state open --search head:worker/` at handoff time. Empty list renders `(no open PRs)` placeholder.
+- `handoff_resume.py` consumes both: re-spawns a shepherd `until` loop for each open PR, and skips re-dispatch when the in-flight entry's status is already `in-review`, `done`, `abandoned`, or `blocked` (parked, not actively writing).
+- SKILL.md "Resume after handoff" documents the enriched schema + selective re-dispatch behavior.
+
 ## [0.8.2] - 2026-05-12
 
 Fixes a bug where auto-handoff (50%/70% context) lost the project's
@@ -745,7 +763,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/edisonshen/fleet/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/edisonshen/fleet/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/edisonshen/fleet/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/edisonshen/fleet/compare/v0.7.1...v0.8.0
