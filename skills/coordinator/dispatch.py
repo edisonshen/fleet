@@ -355,6 +355,15 @@ class PromptTooLargeError(Exception):
     """Worker prompt exceeded the hard cap. Operator must shrink inputs."""
 
 
+# Canonical engine identifiers used by build_reviewer_prompt /
+# build_finisher_prompt / build_worker_prompt to derive a coord-engine-
+# aware banner. Mirrors internal/enginecfg.EngineClaudeCode /
+# EngineCodex. Kept as plain string literals so the skill has no
+# dependency on the Go side at import time.
+ENGINE_CLAUDE_CODE = "claude-code"
+ENGINE_CODEX = "codex"
+
+
 def build_reviewer_prompt(
     task: parse.Task,
     project: str,
@@ -362,6 +371,7 @@ def build_reviewer_prompt(
     branch: str | None = None,
     workers_dir: str | None = None,
     is_git: bool = True,
+    coord_engine: str | None = None,
 ) -> str:
     """Assemble the reviewer subagent's first-turn prompt.
 
@@ -385,11 +395,27 @@ def build_reviewer_prompt(
         with terminal --review-claude-status and --review-codex-status
         flags. Then exit. The reviewer does NOT push the branch and
         does NOT open the PR — the finisher subagent handles those.
+
+    coord_engine: the engine the coord session was launched with
+                  (claude-code | codex). Defaults to FLEET_ENGINE env or
+                  claude-code. APPROACH A (memory project_codex_multi_
+                  engine.md): regardless of coord_engine, the reviewer
+                  subagent ALWAYS runs claude. When the coord is codex,
+                  the worker + finisher subagents also run codex; the
+                  reviewer pinch-hits as claude for cross-engine
+                  diversity (different model, different blind spots).
+                  The prompt body is identical for both cases — it's
+                  always written for a claude reviewer running
+                  /review + codex against the worker diff — but a
+                  banner up top documents the diversity setup so the
+                  reviewer subagent understands the role split.
     """
     if branch is None:
         branch = f"worker/{task.slug}"
     if workers_dir is None:
         workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
+    if coord_engine is None:
+        coord_engine = os.environ.get("FLEET_ENGINE", "") or ENGINE_CLAUDE_CODE
 
     proj_flag = f"--project {project}"
     base_branch = "main"  # finisher opens the PR against main; reviewer doesn't push.
@@ -418,11 +444,34 @@ def build_reviewer_prompt(
         state_block.append("Project dir: non-git; worker edited files in place. There is no")
         state_block.append("             branch, no `origin/`, no commits — just the working tree.")
 
+    # Engine-diversity banner (Approach A): when coord = codex, the
+    # worker was codex; the reviewer is the cross-engine second opinion
+    # (claude). When coord = claude (the default), worker + reviewer
+    # are both claude; the codex review step inside the loop covers the
+    # cross-engine angle. Either way, the reviewer subagent process
+    # itself is always claude — that's the structural decision Approach
+    # A locks in for the v0.9 MVP. Banner applies to both git and
+    # non-git modes — codex coord can run against either project type.
+    if coord_engine == ENGINE_CODEX:
+        engine_banner = [
+            "Cross-engine review diversity (coord engine = codex):",
+            "  The worker subagent that wrote the diff was running CODEX.",
+            "  You are running CLAUDE as the second-opinion reviewer —",
+            "  same role split the operator gets when coord is claude and",
+            "  the inline `codex review` step provides the cross-engine",
+            "  view, just reversed. Treat the worker's commits as you",
+            "  would any other diff and rely on /review + codex review.",
+            "",
+        ]
+    else:
+        engine_banner = []
+
     lines: list[str] = [
         f"You are a Fleet REVIEWER subagent for task: {task.slug}",
         f"Project: {project}",
         header_branch_line,
         "",
+        *engine_banner,
         "You are running as a Fleet-dispatched Claude session. The previous",
         "subagent (the worker) wrote the implementation + tests and exited at",
         "phase=review-pending. Your job is to run /review and codex review on",

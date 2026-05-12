@@ -469,6 +469,48 @@ def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
     assert "Do NOT `gh pr create`" in out or "Do NOT gh pr create" in out
 
 
+def test_build_reviewer_prompt_codex_coord_adds_diversity_banner() -> None:
+    """When coord_engine = codex, the reviewer prompt must include the
+    cross-engine diversity banner so the (claude) reviewer knows it's
+    pinch-hitting for a codex-written worker diff. The banner labels
+    the role split explicitly — memory project_codex_multi_engine.md
+    Approach A."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", coord_engine="codex",
+    )
+    # Banner present.
+    assert "coord engine = codex" in out.lower()
+    # Worker engine documented.
+    assert "CODEX" in out
+    # Reviewer role still claude.
+    assert "CLAUDE" in out
+    # Existing review-iter contract still in place.
+    assert "/review" in out
+    assert "--phase review-done" in out
+
+
+def test_build_reviewer_prompt_claude_coord_omits_diversity_banner() -> None:
+    """Default coord_engine = claude-code is the v0 path. The diversity
+    banner must NOT appear in this case so the prompt body matches the
+    pre-v0.9 byte shape on the happy path."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", coord_engine="claude-code",
+    )
+    assert "coord engine = codex" not in out.lower()
+
+
+def test_build_reviewer_prompt_reads_engine_from_env(monkeypatch) -> None:
+    """coord_engine defaults to FLEET_ENGINE env when not passed. This
+    is how loop.py picks up the engine without an explicit lookup —
+    spawn propagates FLEET_ENGINE into the coord agent's process."""
+    monkeypatch.setenv("FLEET_ENGINE", "codex")
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet")
+    assert "coord engine = codex" in out.lower()
+
+
 # ---------- build_finisher_prompt (reviewer-subagent-arch) ----------
 
 

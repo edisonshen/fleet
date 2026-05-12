@@ -150,6 +150,13 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_POST_READY_BUFFER_MS",
 	"FLEET_POST_SEND_VERIFY_MS",
 	"FLEET_POST_SEND_RETRY_MS",
+	// FLEET_ENGINE carries the operator-chosen engine across spawn
+	// boundaries so the coordinator skill (Python loop.py + dispatch.py)
+	// can read its own engine from os.environ without having to round-
+	// trip through ~/.fleet/agents/<coord_id>.json. Used by the
+	// reviewer-subagent-arch builders to decide which engine the
+	// reviewer subagent runs (claude pinch-hits when coord=codex).
+	"FLEET_ENGINE",
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
