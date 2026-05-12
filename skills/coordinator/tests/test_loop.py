@@ -2003,6 +2003,82 @@ def test_loop_dispatches_reviewer_on_phase_review_pending(
     assert review_notes, f"expected review-pending note: {note_calls!r}"
 
 
+def test_loop_dispatches_finisher_on_phase_review_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Three-stage flow: reviewer writes phase=review-done → coord
+    dispatches the finisher on the next tick. Counterpart to the
+    review-pending dispatch test."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "review-done-bbbb", status="in-progress", worker_pid=99998,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "review-done-bbbb", "review-done",
+    )
+    dispatch_subprocess.append("ffffbbbb")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert any(
+        block.startswith("DISPATCH: review-done-bbbb")
+        and "agent_id: ffffbbbb" in block
+        for block in result.dispatch_instructions
+    ), f"finisher DISPATCH not emitted: {result.dispatch_instructions!r}"
+    inbox = fleet_home / "inbox" / "ffffbbbb.md"
+    assert inbox.exists()
+    body = inbox.read_text()
+    assert "FINISHER" in body.upper()
+    # The note recorded for this handoff phase is "review-done:".
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    finisher_notes = [c for c in note_calls if "review-done" in (c[-1] if c else "")]
+    assert finisher_notes, f"expected review-done note: {note_calls!r}"
+
+
+def test_loop_does_not_redispatch_finisher_on_consecutive_ticks(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Finisher dedup: same invariant as the reviewer dedup test, but
+    for phase=review-done. Once a finisher is dispatched, a second
+    tick at the same phase MUST NOT spawn a second finisher."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "no-double-finisher-dddd", status="in-progress", worker_pid=99996,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "no-double-finisher-dddd", "review-done",
+    )
+    dispatch_subprocess.append("ffffeeee")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        first = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert any(
+        b.startswith("DISPATCH: no-double-finisher-dddd")
+        for b in first.dispatch_instructions
+    )
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        second = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert not any(
+        b.startswith("DISPATCH: no-double-finisher-dddd")
+        for b in second.dispatch_instructions
+    ), f"finisher redispatched on second tick: {second.dispatch_instructions!r}"
+
+
 def test_loop_does_not_redispatch_reviewer_on_consecutive_ticks(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,

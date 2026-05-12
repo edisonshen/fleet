@@ -1307,7 +1307,9 @@ def _reconcile_inflight(
             # tree entirely so we don't transcribe the worker's
             # mid-pipeline exit as a requeue-to-todo.
             mid_phase = _read_worker_state(project, t.slug, home=home)
-            if mid_phase is not None and mid_phase.get("phase", "") == "review-pending":
+            if mid_phase is not None and mid_phase.get("phase", "") in (
+                "review-pending", "review-done",
+            ):
                 continue
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
@@ -2175,10 +2177,7 @@ def _dispatch_review_handoffs(
         if st is None:
             continue
         phase = st.get("phase", "")
-        # Phase 3 (commit 3): reviewer dispatch on phase=review-pending.
-        # Phase 4 (commit 4) widens this to include review-done →
-        # finisher dispatch.
-        if phase != "review-pending":
+        if phase not in ("review-pending", "review-done"):
             continue
 
         # De-dup: don't re-spawn a reviewer/finisher while it's still
