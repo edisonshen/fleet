@@ -44,12 +44,50 @@ def test_build_worker_prompt_contains_required_sections() -> None:
     assert "TDD only." in out
     assert "## Relevant prior learnings" in out
     assert "use t.TempDir" in out
-    # Workflow tail mentions every required phase.
+    # Three-stage flow: worker writes the code phases ONLY. Review +
+    # push happen in separate subagents (reviewer-subagent-arch).
     for phase in ("branch", "tdd-red", "tdd-green", "tdd-refactor",
-                  "review-claude", "review-codex", "push", "done"):
-        assert f"--phase {phase}" in out
+                  "review-pending"):
+        assert f"--phase {phase}" in out, f"worker prompt missing --phase {phase}"
+    # The old inline phases are GONE from the worker prompt — only the
+    # reviewer subagent runs review-claude/review-codex; only the
+    # finisher subagent runs push/done. Their presence in the worker
+    # prompt would re-introduce the structural failure mode the
+    # three-stage flow exists to prevent.
+    for forbidden in ("--phase review-claude", "--phase review-codex",
+                      "--phase push", "--phase done"):
+        assert forbidden not in out, (
+            f"worker prompt still mentions {forbidden}; three-stage flow "
+            "must hand those phases to the reviewer/finisher subagents"
+        )
+    # Workers no longer invoke /review or codex inline. The prompt may
+    # MENTION them only in prohibition language ("do NOT run /review")
+    # — never as a step. The "On your diff. Fix every P0/P1" wording
+    # from the old prompt is the bright-line check.
+    assert "On your diff" not in out, (
+        "worker prompt still tells worker to run reviewers on its diff"
+    )
+    assert "gh pr create" not in out, (
+        "worker prompt still references gh pr create; that's the finisher's job"
+    )
     # Branch derivation.
     assert f"git checkout -b worker/{t.slug}" in out
+
+
+def test_build_worker_prompt_terminates_at_review_pending() -> None:
+    """Three-stage flow: worker's last phase write is --phase
+    review-pending. No subsequent phase=push or phase=done from this
+    subagent — those belong to the finisher (reviewer-subagent-arch)."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet",
+        standards_md="# Standards",
+        learnings_text="",
+    )
+    # The terminal phase write for this subagent.
+    assert "--phase review-pending" in out
+    # Explicit "exit" instruction at the handoff point.
+    assert "Exit cleanly" in out or "exit cleanly" in out
 
 
 def test_build_worker_prompt_omits_learnings_section_when_empty() -> None:
@@ -176,7 +214,11 @@ def test_build_worker_prompt_contains_post_completion_contract() -> None:
     # Specific constraints — the wording matters because subagents
     # parse the prompt for "may NOT" directives.
     assert "may NOT" in out
-    assert "open additional PRs" in out
+    # Three-stage flow: worker MUST NOT open PRs (the finisher does
+    # that). The prohibition stays — the wording just shifted from
+    # "additional PRs" to "open PRs" since the worker never opens
+    # ANY PR in the new flow.
+    assert "open PRs" in out or "open additional PRs" in out
     # Pointer to the right channel for adjacent fixes the worker
     # noticed but should not act on.
     assert "fleet tasks add" in out
