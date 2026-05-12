@@ -6,6 +6,22 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-05-12
+
+Fixes a bug where auto-handoff (50%/70% context) lost the project's
+coord identity. The replacement coord agent spawned successfully but
+the project's coord-spawn marker still pointed at the dead old agent;
+pressing `[a]` on the project row in the TUI then spawned a third
+coord instead of attaching to the live replacement. The handoff doc
+existed but the lineage was "isolated" — disconnected from the
+project's official coord slot. Fix transfers the marker to the
+replacement's agent ID at the end of both auto-drain and interactive
+`fleet handoff` paths.
+
+### Fixed
+
+- Coord-spawn marker now transfers to the replacement agent on handoff (#136). Auto-handoff and `fleet handoff` both update the marker; worker handoffs leave the marker untouched as before. Six new regression tests pin the behavior across both paths.
+
 ## [0.8.1] - 2026-05-12
 
 Coordinator now structurally enforces local `/review` iteration —
@@ -729,7 +745,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/edisonshen/fleet/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/edisonshen/fleet/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/edisonshen/fleet/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/edisonshen/fleet/compare/v0.7.0...v0.7.1
