@@ -219,6 +219,30 @@ func TestRightColumn_AgentIdleCollapse_ExpandedShowsIdleRows(t *testing.T) {
 	}
 }
 
+// /review iter-1 [P1] regression: the new separatorAgentIdle kind needs
+// a stable rowIdentity string so refreshCursor (called on every
+// dashboardMsg / agentsMsg tick — 1s poll) snaps back onto the
+// separator row across refreshes. Without this, the cursor sitting on
+// the right-column "─── N idle ───" separator silently re-points to
+// whatever row happens to be at the same numeric index after the
+// next poll.
+func TestRowIdentity_AgentIdleSeparatorIsStable(t *testing.T) {
+	r := dashRow{
+		kind: rowSeparator,
+		separator: &separatorRow{
+			kind:  separatorAgentIdle,
+			count: 5,
+		},
+	}
+	id := rowIdentity(r)
+	if id == "" {
+		t.Fatalf("separatorAgentIdle must have a non-empty identity; got %q", id)
+	}
+	if id != "S:agent-idle" {
+		t.Errorf("separatorAgentIdle identity = %q, want %q", id, "S:agent-idle")
+	}
+}
+
 func TestClassifyAgentActivity_HonorsResolveActiveWindow(t *testing.T) {
 	// Direct test of the classifier so the env-driven window is pinned
 	// without going through the full dashboardRows render. Spec: reuse

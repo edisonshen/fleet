@@ -856,6 +856,9 @@ func (m Model) selectedRow() *dashRow {
 //	"A:<id>"               agent
 //	"S:idle"               idle separator (issue #98)
 //	"S:hidden"             hidden separator (issue #98)
+//	"S:history:<project>"  task-history separator inside a project (issue #101)
+//	"S:agent-idle"         right-column v0.1 agent-idle separator
+//	                       (dashboard-accumulation-f-4421)
 //
 // Empty string means "no identity available" (defensive — caller
 // falls back to cursor 0).
@@ -898,6 +901,8 @@ func rowIdentity(r dashRow) string {
 				return "S:hidden"
 			case separatorHistory:
 				return "S:history:" + r.separator.project
+			case separatorAgentIdle:
+				return "S:agent-idle"
 			}
 		}
 	}

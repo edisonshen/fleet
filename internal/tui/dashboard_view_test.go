@@ -3,6 +3,9 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // TestDashboard_RendersPostArchiveBadge pins the visual contract for
@@ -79,5 +82,44 @@ func TestSeparatorBlockLine_AgentIdle_ExpandedLabel(t *testing.T) {
 	}
 	if !strings.Contains(line, "[enter] to collapse") {
 		t.Errorf("expanded agent-idle separator must include the [enter] collapse hint; got: %q", line)
+	}
+}
+
+// /review iter-1 [P0] regression: the right-column separatorAgentIdle
+// row must NEVER bleed into the LEFT column. dashboardRows returns left
+// and right rows in one slice; without an explicit skip in the LEFT-
+// column loop, the agent-idle separator was being appended to BOTH
+// columns (rendering twice).
+func TestBuildBodyLines_AgentIdleSeparatorRendersRightOnly(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	stale := now.Add(-30 * 24 * time.Hour)
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Active: true},
+		},
+		LoadedAt: now,
+	}
+	m.records = []*agent.Record{
+		{
+			ID:             "aaaa0001",
+			Project:        "fleet",
+			TmuxSession:    "fleet-aaaa0001",
+			LastActivityTS: stale, SpawnedAt: stale,
+		},
+	}
+
+	leftLines, rightLines := buildBodyLines(m, 90, 40)
+	leftAll := strings.Join(leftLines, "\n")
+	rightAll := strings.Join(rightLines, "\n")
+
+	if strings.Contains(leftAll, "1 idle") {
+		t.Errorf("agent-idle separator '1 idle' leaked into LEFT column:\n%s", leftAll)
+	}
+	if !strings.Contains(rightAll, "1 idle") {
+		t.Errorf("agent-idle separator '1 idle' missing from RIGHT column:\n%s", rightAll)
 	}
 }

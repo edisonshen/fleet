@@ -536,6 +536,14 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 			}
 			left = append(left, line)
 		case rowSeparator:
+			// /review iter-1 [P0]: skip RIGHT-column separator kinds.
+			// dashboardRows returns left then right rows in one slice;
+			// the right-column loop below handles separatorAgentIdle.
+			// Without this guard, the agent-idle separator double-renders
+			// (once in each column).
+			if row.separator != nil && row.separator.kind == separatorAgentIdle {
+				continue
+			}
 			// History separators belong INSIDE the project block —
 			// the footer fires after the history group closes, not
 			// before. Idle/hidden separators sit between projects, so
