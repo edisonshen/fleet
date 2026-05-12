@@ -302,7 +302,7 @@ const OpenPRsNonePlaceholder = "_(no open PRs)_"
 // renderOpenPRs emits the body of the `## Open PRs` section. Each entry
 // renders as a markdown bullet:
 //
-//	- #<number> <title> — <head> — <url>
+//   - #<number> <title> — <head> — <url>
 //
 // The URL is the load-bearing field — the successor coord re-spawns a
 // shepherd until-loop watching CI/merge state for each URL. Number +
@@ -345,7 +345,7 @@ const ActiveSubagentsNonePlaceholder = "_(none)_"
 //
 // Format per entry (v0.8.3+, 7 fields):
 //
-//	- task=<slug> branch=<branch> phase=<phase> status=<status> pr_url=<url> agent_id=<hex> subagent_id=<id>
+//   - task=<slug> branch=<branch> phase=<phase> status=<status> pr_url=<url> agent_id=<hex> subagent_id=<id>
 //
 // Status + pr_url were added to drive the successor coord's
 // re-dispatch decision (was: always re-dispatch; now: skip Agent
