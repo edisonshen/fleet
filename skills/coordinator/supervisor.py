@@ -893,6 +893,18 @@ def _run_idle_agent_archive_pass(
             continue
         if bool(rec.get("blocked", False)):
             continue
+        # Multi-engine MVP (memory project_codex_multi_engine.md):
+        # non-claude-code engines (currently just "codex") don't run
+        # Claude Code hooks, so fleet-guard never updates their
+        # last_activity_ts. A codex agent that the operator dispatched
+        # an hour ago and is actively running would look "idle since
+        # spawn" to this sweep — and idle-TTL auto-archive would `fleet
+        # rm` it out from under the operator. Skip non-claude-code
+        # engines until a sibling skill writes heartbeats for them.
+        # Empty engine field defaults to claude-code (legacy records).
+        engine = str(rec.get("engine", "") or "claude-code")
+        if engine != "claude-code":
+            continue
         last_ts = _parse_rfc3339(str(rec.get("last_activity_ts", "") or ""))
         if last_ts is None:
             # No parseable heartbeat — skip (defensive: brand-new agent
