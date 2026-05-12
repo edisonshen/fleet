@@ -318,6 +318,31 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			"resume: replacement %s spawned but tmux session %s already exited (command crashed at startup?); old agent untouched, queue file preserved for retry",
 			newRec.ID, newRec.TmuxSession)
 	}
+
+	// Coord-spawn marker transfer. The marker is the dashboard's
+	// gate for "this agent is this project's coord" (see
+	// internal/state/state.go ReadCoordSpawnMarker). When a coord
+	// agent handoffs, the OLD agent ID gets archived but the marker
+	// still points at it — the TUI's [a] keystroke then can't find a
+	// live coord and spawns a duplicate. Re-point the marker at the
+	// replacement here, AFTER spawn confirmed alive and BEFORE
+	// retireOldAgent archives oldRec. Workers and other non-coord
+	// agents leave the marker untouched (the wantID match below
+	// gates this strictly on "old was the project's coord").
+	//
+	// Best-effort: marker errors print a warning but don't fail the
+	// drain — the marker is a UX gate, not a load-bearing security
+	// boundary (per ReadCoordSpawnMarker's doc).
+	if oldRec.Project != "" {
+		if wantID := state.ReadCoordSpawnMarker(oldRec.Project); wantID == oldRec.ID {
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: coord-spawn marker update for project %s failed: %v\n",
+					oldRec.Project, werr)
+			}
+		}
+	}
+
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisableAutoResume, graceMillis, stdout, stderr)
 }

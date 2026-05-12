@@ -1042,3 +1042,118 @@ func TestHandoff_CoordReplacementLineageGetsCoordinatorPrompt(t *testing.T) {
 			rcIdx, coordIdx, doc)
 	}
 }
+
+// -- coord-spawn marker transfer (bug coord-marker-transfer-on-46a3) --------
+//
+// Same intent as the handoffop tests: when the OLD agent IS the
+// project's coord (marker file points at oldRec.ID), the interactive
+// `fleet handoff` path must re-point the marker at the replacement.
+// Non-coord agents leave the marker untouched.
+
+// TestHandoff_TransfersCoordMarkerWhenOldWasCoord — happy path: marker
+// = old.ID before handoff, marker = newRec.ID after.
+func TestHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(old.Project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent after handoff, got %d", len(live))
+	}
+	newRec := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	got := state.ReadCoordSpawnMarker(old.Project)
+	if got != newRec.ID {
+		t.Errorf("coord marker not transferred: got %q want %q (old.ID=%q)",
+			got, newRec.ID, old.ID)
+	}
+}
+
+// TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord — marker points at an
+// unrelated agent ID; handoff of old must NOT mutate it.
+func TestHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	const unrelatedID = "abcdef12"
+	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(old.Project, unrelatedID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live, _ := agent.List()
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	t.Cleanup(func() { _ = tmux.Kill(live[0].TmuxSession) })
+
+	if got := state.ReadCoordSpawnMarker(old.Project); got != unrelatedID {
+		t.Errorf("unrelated coord marker mutated: got %q want %q", got, unrelatedID)
+	}
+}
+
+// TestHandoff_NoMarkerUpdate_WhenNoMarkerExists — no marker file
+// before handoff; no marker file after, no error.
+func TestHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live, _ := agent.List()
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	t.Cleanup(func() { _ = tmux.Kill(live[0].TmuxSession) })
+
+	if got := state.ReadCoordSpawnMarker(old.Project); got != "" {
+		t.Errorf("marker created from nothing: got %q want empty", got)
+	}
+}
