@@ -477,7 +477,8 @@ func (m Model) dashboardRows() []dashRow {
 	}
 	var active, idle []*ProjectRow
 	for _, p := range projects {
-		if classifyProjectActivity(p, workers, m.records, now, window) == projectActive {
+		addedAt := projectAddedAtFn(p.Name)
+		if classifyProjectActivity(p, workers, m.records, addedAt, now, window) == projectActive {
 			active = append(active, p)
 		} else {
 			idle = append(idle, p)
