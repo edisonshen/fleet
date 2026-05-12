@@ -47,7 +47,7 @@ This is the load-bearing description of how a coord runs an end-to-end engagemen
 2. SPLIT             approved plan → tasks.md (inline ≤10, planner-subagent >10) (G1)
 3. TASK LIST         one-line goal per task; status lives in structured fields (G5)
 4. IMPLEMENT         dispatch one impl-subagent per task; cap=1 (G7); subagents follow §4
-5. PR-TRACK          poll CI via async-waits (G4); on fail → fix-subagent (cap=3) (G3)
+5. PR-TRACK          poll CI via async-waits (G4); on fail → fix-subagent (G3)
 6. DONE              fleet tasks set pr_url=<url> + status=done; advance; raise-hand if empty
 ```
 
@@ -146,8 +146,9 @@ there.
    waits.)
 3. **On CI fail** (G3): dispatch a **fix-subagent** against the SAME
    branch with the failure log. Fix-subagent has the same §4 review
-   contract as the impl-subagent. Cap = 3 attempts per task. On the
-   4th failure, raise-hand with WIP path + failure log.
+   contract as the impl-subagent. Iterate until CI is green. No retry
+   cap — fix-subagents keep dispatching until the diff lands or the
+   operator intervenes manually.
 4. **On BEHIND or DIRTY**: dispatch a **rebase-subagent** on an
    isolated git worktree (`git worktree add /tmp/fleet-<task>-<pr>
    <branch>`) with explicit "rebase only, no scope changes"
@@ -198,7 +199,6 @@ Advance to the next task in priority order. When the task list is empty, the coo
 There is **one** approval gate: step 1. After the operator approves the plan, the coord runs steps 2 → 6 autonomously. The coord raises hand only when:
 
 - An impl- / fix- / rebase-subagent returns BLOCKED (preserve the WIP file path; surface to operator).
-- The CI fix-loop hits cap=3 on a single task.
 - The impl-subagent discovers mid-implementation that the plan is wrong (scope-change discovery — the plan needs revision before more dispatches).
 - A new P0 message lands in `~/.fleet/inbox/<coord-id>.md`.
 
