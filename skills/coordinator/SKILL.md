@@ -302,7 +302,21 @@ When fleet-guard hands off the coord at 50/70% context, any in-flight worker sub
 The handoff doc carries enough state for this to be deterministic:
 
 - Frontmatter `previous_handoff: <path>` — the chain pointer. Empty / null on the first handoff for the agent.
-- `## Active Subagents` body section — one machine-readable line per in-flight worker, written by `fleet-guard/handoff.py` from the outgoing coord's `coord-state.json:worker_agent_ids` map.
+- `## Active Subagents` body section — one machine-readable line per in-flight worker, written by `fleet-guard/handoff.py` from the outgoing coord's `coord-state.json:worker_agent_ids` map. v0.8.3+ row shape is 7 fields per entry:
+
+  ```
+  - task="<slug>" branch="worker/<slug>" phase="<phase>" status="<status>" pr_url="<url>" agent_id="<hex>" subagent_id="<id>"
+  ```
+
+  Legacy 5-field rows (pre-v0.8.3, no `status`/`pr_url`) still parse — both default to `""` and the successor falls back to the pre-enrichment "always re-dispatch Agent" behavior.
+
+- `## Open PRs` body section (v0.8.3+) — one markdown bullet per open worker PR captured via `gh pr list --state open --search "head:worker/"` at handoff time:
+
+  ```
+  - #<num> <title> — <head-branch> — <url>
+  ```
+
+  Empty list renders `_(no open PRs)_`. The successor coord re-spawns one shepherd `until`-loop per URL listed, so CI/merge state stays observed across handoff even for PRs whose task already dropped from `coord-state.json:worker_agent_ids` (worker finished, PR not yet merged).
 
 **What you (the coord agent) MUST do on first turn after a handoff:**
 
@@ -314,16 +328,19 @@ The handoff doc carries enough state for this to be deterministic:
    ```
 
    The helper:
-   - Parses the `## Active Subagents` section into a typed list.
-   - For each entry, checks `~/.fleet/subagent-wip/<task-tag>.md` exists.
-   - For each (entry, WIP) pair, rewrites the worker's inbox file (`~/.fleet/inbox/<agent_id>.md`) with a "RESUMING" preamble that points the worker at its WIP, then emits a DISPATCH block on stdout in the same format as `loop.py`'s tick output.
+   - Parses the `## Active Subagents` section into a typed list, surfacing `status` + `pr_url` per entry.
+   - For each entry, branches on the new state:
+     - `status=in-review` (PR open) → SKIP Agent re-dispatch. The shepherd until-loop (one per Open PRs URL) covers it.
+     - `status=done/abandoned/blocked` → terminal. Drop the entry; no resume action.
+     - `status=in-progress` with empty `pr_url` (or legacy empty status) → re-dispatch Agent from WIP. Helper checks `~/.fleet/subagent-wip/<task-tag>.md` exists; rewrites the worker's inbox file (`~/.fleet/inbox/<agent_id>.md`) with a "RESUMING" preamble; emits a DISPATCH block on stdout.
+   - Parses the `## Open PRs` section and emits one `# open-pr-shepherd: <url> — respawn watch loop` line to stderr per URL — these are hints for you (the coord) to re-establish the shepherd `until gh pr view <url> --json mergedAt --jq '.mergedAt != null'; do sleep <interval>; done` watch loops on the next supervisor tick.
 3. For each DISPATCH block in the helper's stdout, follow the exact same protocol as "## Worker dispatch protocol" above — one Agent tool invocation per block, `run_in_background: true`, `prompt` = the body of the inbox file referenced in the block.
 
 The resume preamble explicitly tells the worker subagent to read its WIP first and continue from `next_steps` rather than restart — this is the CLAUDE.md §2 contract (Subagent Dispatch — bake in WIP checkpoints + resumability) operationalized across coord handoff.
 
-If the helper emits zero DISPATCH blocks, the outgoing coord had no in-flight workers (the steady-state case) — proceed with the regular `/coordinator` tick. The helper writes a one-line footer to stderr in this case so the absence is observable.
+If the helper emits zero DISPATCH blocks AND zero open-PR shepherd hints, the outgoing coord had no in-flight workers and no open PRs (the steady-state case) — proceed with the regular `/coordinator` tick. The helper writes a one-line footer to stderr in this case so the absence is observable.
 
-**Skipped entries** (helper writes them to stderr as `# task <slug>: ...`) are not errors — they're entries whose WIP or inbox files have been pruned (worker finished cleanly) or whose `agent_id` was malformed. The successor coord moves on; the supervisor stuck-check will catch any task that stayed in-progress without a worker.
+**Skipped entries** (helper writes them to stderr as `# task <slug>: ...`) are not errors — they're entries whose WIP or inbox files have been pruned (worker finished cleanly), whose `agent_id` was malformed, OR whose `status` indicated the work is in-review / terminal (the Open PRs shepherd hints cover the in-review case). The successor coord moves on; the supervisor stuck-check will catch any task that stayed in-progress without a worker.
 
 ## Invocation
 
