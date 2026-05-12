@@ -56,3 +56,28 @@ func TestDashboard_OmitsPostArchiveBadgeWhenFalse(t *testing.T) {
 		t.Errorf("clean project row must NOT carry post-archive badge, got:\n%s", out)
 	}
 }
+
+// dashboard-accumulation-f-4421 Sub-fix B: pin the rendered chrome for
+// the right-column agent-idle separator. The text must signal the
+// count + the toggle keybind so the operator knows how to expand.
+func TestSeparatorBlockLine_AgentIdle_CollapsedLabel(t *testing.T) {
+	sep := &separatorRow{kind: separatorAgentIdle, count: 12, expanded: false}
+	line := separatorBlockLine(sep, 60, false)
+	if !strings.Contains(line, "12 idle") {
+		t.Errorf("collapsed agent-idle separator must include count '12 idle'; got: %q", line)
+	}
+	if !strings.Contains(line, "[enter] to expand") {
+		t.Errorf("collapsed agent-idle separator must include the [enter] hint; got: %q", line)
+	}
+}
+
+func TestSeparatorBlockLine_AgentIdle_ExpandedLabel(t *testing.T) {
+	sep := &separatorRow{kind: separatorAgentIdle, count: 3, expanded: true}
+	line := separatorBlockLine(sep, 60, false)
+	if !strings.Contains(line, "3 idle") {
+		t.Errorf("expanded agent-idle separator must include count '3 idle'; got: %q", line)
+	}
+	if !strings.Contains(line, "[enter] to collapse") {
+		t.Errorf("expanded agent-idle separator must include the [enter] collapse hint; got: %q", line)
+	}
+}

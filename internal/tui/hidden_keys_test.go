@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -279,8 +280,12 @@ func TestKeyC_OnAgentRow_FlashesDoesNotApply(t *testing.T) {
 
 	m := New("test")
 	m.dashboard = &Snapshot{}
+	// SpawnedAt = time.Now() keeps the record in the Active bucket
+	// post-Sub-fix-B so it renders inline rather than collapsing
+	// under the right-column "─── N idle ───" separator (where the
+	// cursor couldn't land on a rowAgent at all).
 	m.records = []*agent.Record{
-		{ID: "abc12345", Project: "p", TmuxSession: "fleet-abc12345"},
+		{ID: "abc12345", Project: "p", TmuxSession: "fleet-abc12345", SpawnedAt: time.Now()},
 	}
 	m.aliveByID = map[string]bool{"abc12345": true}
 

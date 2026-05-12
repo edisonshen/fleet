@@ -260,6 +260,16 @@ type Model struct {
 	// dashboardMsg ticks so the 1s poll doesn't auto-collapse the
 	// operator's choice (mirrors the `expanded` map's persistence).
 	historyExpanded map[string]bool
+
+	// agentIdleExpanded, when true, expands the right-column
+	// "─── N idle ───" group so each idle v0.1 agent record renders
+	// below the separator. Toggled via [enter] on the agent-idle
+	// separator. Default false — idle agents stay collapsed so the
+	// right column prioritizes asking/blocked agents + fresh records
+	// (dashboard-accumulation-f-4421 Sub-fix B). Mirrors idleExpanded's
+	// shape but is a separate field so toggling the LEFT and RIGHT
+	// idle groups stays independent.
+	agentIdleExpanded bool
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind

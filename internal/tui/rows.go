@@ -41,9 +41,10 @@ const (
 type separatorKind int
 
 const (
-	separatorIdle    separatorKind = iota // "─── N idle ───"
-	separatorHidden                       // "─── N hidden ───" (only when show-hidden mode is on)
-	separatorHistory                      // "─── N done ───" inside an expanded project block (issue #101)
+	separatorIdle      separatorKind = iota // "─── N idle ───"
+	separatorHidden                         // "─── N hidden ───" (only when show-hidden mode is on)
+	separatorHistory                        // "─── N done ───" inside an expanded project block (issue #101)
+	separatorAgentIdle                      // "─── N idle ───" inside the RIGHT-column v0.1 agent list (dashboard-accumulation-f-4421)
 )
 
 // separatorRow carries the per-group state for rowSeparator.
@@ -567,8 +568,21 @@ func (m Model) dashboardRows() []dashRow {
 			rows = append(rows, dashRow{kind: rowWorker, worker: w})
 		}
 	}
+	// Partition v0.1 agent records into Active / Idle buckets:
+	//   - asking (NeedsInput=true) or blocked (Blocked=true) ALWAYS render
+	//     active regardless of staleness — those need operator attention.
+	//   - LastActivityTS within `window` (the same threshold used for
+	//     LEFT-column project activity) → active.
+	//   - everything else → idle (collapses under the agent-idle separator).
+	// Search override: when a filter is set the idle separator is
+	// suppressed and all surviving agents render inline (matches the
+	// LEFT-column projects' search-mode override).
+	var activeAgents, idleAgents []*agent.Record
 	for _, r := range m.records {
-		if r != nil && coordIDs[r.ID] {
+		if r == nil {
+			continue
+		}
+		if coordIDs[r.ID] {
 			// Coord renders on the LEFT under its project row; skip it
 			// here so the right-column doesn't double-count.
 			continue
@@ -576,9 +590,78 @@ func (m Model) dashboardRows() []dashRow {
 		if !m.matchesFilter(r.ID) && !m.matchesFilter(r.TaskID) && !m.matchesFilter(r.Project) {
 			continue
 		}
+		if classifyAgentActivity(r, now, window) == projectActive {
+			activeAgents = append(activeAgents, r)
+		} else {
+			idleAgents = append(idleAgents, r)
+		}
+	}
+	for _, r := range activeAgents {
 		rows = append(rows, dashRow{kind: rowAgent, agent: r})
 	}
+	switch {
+	case len(idleAgents) == 0:
+		// No idle bucket; nothing to collapse, no separator.
+	case searchActive:
+		// Search override — show all surviving agents inline.
+		for _, r := range idleAgents {
+			rows = append(rows, dashRow{kind: rowAgent, agent: r})
+		}
+	default:
+		rows = append(rows, dashRow{
+			kind: rowSeparator,
+			separator: &separatorRow{
+				kind:     separatorAgentIdle,
+				count:    len(idleAgents),
+				expanded: m.agentIdleExpanded,
+			},
+		})
+		if m.agentIdleExpanded {
+			for _, r := range idleAgents {
+				rows = append(rows, dashRow{kind: rowAgent, agent: r})
+			}
+		}
+	}
 	return rows
+}
+
+// classifyAgentActivity returns Active for v0.1 agent records that need
+// operator attention regardless of staleness (asking/blocked flags) OR
+// have heartbeat / spawn freshness inside the configured active window.
+// Idle otherwise. Mirrors classifyProjectActivity's shape so the
+// operator's mental model for "what counts as active" stays one rule
+// across columns.
+//
+// Asking (NeedsInput) and Blocked are sticky-active by design: a record
+// flagged for either has unresolved state the operator must triage
+// before it should disappear from view. Collapsing them under the idle
+// separator would hide the exact rows that motivate keeping the panel
+// open. Both flags survive staleness regardless of LastActivityTS.
+//
+// SpawnedAt is the fallback freshness signal — a brand-new agent whose
+// fleet-guard hook hasn't yet written its first heartbeat (or a record
+// authored in code without LastActivityTS, e.g. test fixtures) still
+// reads as active when spawned within `window`. Without this, freshly
+// dispatched agents would briefly collapse under the idle separator
+// before their first Stop-hook fires.
+func classifyAgentActivity(
+	r *agent.Record,
+	now time.Time,
+	window time.Duration,
+) projectActivity {
+	if r == nil {
+		return projectIdle
+	}
+	if r.NeedsInput || r.Blocked {
+		return projectActive
+	}
+	if !r.LastActivityTS.IsZero() && now.Sub(r.LastActivityTS) <= window {
+		return projectActive
+	}
+	if !r.SpawnedAt.IsZero() && now.Sub(r.SpawnedAt) <= window {
+		return projectActive
+	}
+	return projectIdle
 }
 
 // appendProjectRows adds project + (optionally expanded) task rows for
