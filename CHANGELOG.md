@@ -6,6 +6,54 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-12
+
+TUI `[+]` hotkey now auto-spawns the coord and freshly-added projects
+classify ACTIVE; right-column dashboard accumulation eliminated
+(stuck-worker sweep + idle-agent collapse + 24h auto-archive); Phase
+B/C coord skill files now actually ship in the binary, with a
+drift-prevention test pinning disk against the embed FS.
+
+### Added
+
+- `[+]` TUI hotkey auto-spawns the coordinator after `fleet project
+  add` succeeds (#128), mirroring the `[a]`-on-project-row coord-spawn
+  path. The flash on failure tells the operator the project is
+  registered and to press `[a]` on the new row to retry.
+- Freshly-registered projects classify ACTIVE for the
+  `FLEET_ACTIVE_WINDOW_DAYS` window via `Meta.AddedAt` (#128), so a
+  just-added project appears above the `─── N idle ───` separator
+  instead of getting collapsed on first render. Legacy pre-meta
+  projects fall through to existing rules unchanged.
+- Right-column idle-agent collapse separator (`─── N idle ───`) for
+  v0.1 agent records past the active window (#129), mirroring the
+  left column's worker collapse. `asking` (NeedsInput) and `blocked`
+  records always render active regardless of staleness — they need
+  operator attention. `[enter]` toggles expansion.
+- Coord supervisor auto-archives agents idle >24h (#129); configurable
+  via `FLEET_COORD_IDLE_TTL_H` (range 1..720, zero disables).
+- Drift-prevention test `TestSkillEmbedMatchesDisk` (#131) asserts
+  set-equality between `skills/<name>/` on disk and the corresponding
+  embedded `fs.FS` (`CoordinatorFS()`, `FleetGuardFS()`) so future
+  skill files added on disk but forgotten in the `//go:embed`
+  directive fail CI instead of shipping silently broken.
+
+### Fixed
+
+- Coord reconcile now sweeps `workers/<slug>/` dirs when a task
+  transitions to `status=done` (#129), eliminating stuck worker rows
+  after PR merges. Defense-in-depth tick-time sweep catches the cases
+  the transition-time delete misses: operator-driven `fleet tasks set
+  status=done`, pre-#101 coord versions, and races where status
+  flipped done while a stale dir lingered.
+- Phase B/C coord skill files now bundled in the binary (#130):
+  `register_subagent.py` (Phase C subagent_id register),
+  `handoff_resume.py` (Phase B2 re-dispatch after coord handoff), and
+  `workflow_state.py` (G5 operator-readable workflow.md writer) were
+  in the repo but missing from the `//go:embed` directive, so `brew
+  install + fleet init` deployed a partial coord skill. Per-worker
+  subagent chips on the dashboard now render on fresh installs.
+
 ## [0.7.1] - 2026-05-11
 
 Quick polish patch — narrow-width title now keeps the brand mark, and
@@ -642,7 +690,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/edisonshen/fleet/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/edisonshen/fleet/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/edisonshen/fleet/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/edisonshen/fleet/compare/v0.5.0...v0.6.0
