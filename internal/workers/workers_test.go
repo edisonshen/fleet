@@ -765,6 +765,173 @@ func TestDelete_LeavesProjectDirIntact(t *testing.T) {
 	}
 }
 
+// ---------- three-stage review schema (reviewer-subagent-arch) ----------
+
+// TestStateRoundTrip_ReviewFields confirms the new review_* fields are
+// JSON-round-trippable. Schema-only commit — no enforcement on
+// phase=push yet (that lands in commit 2). Workers pre-dating these
+// fields read back zero values, which is fine.
+func TestStateRoundTrip_ReviewFields(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	in := &State{
+		Slug:                  "review-roundtrip-aaaa",
+		Project:               "fleet",
+		Phase:                 PhaseReviewDone,
+		StartedAt:             time.Date(2026, 5, 11, 14, 0, 0, 0, time.UTC),
+		PID:                   12345,
+		ReviewClaudeStatus:    ReviewStatusPassed,
+		ReviewClaudeRounds:    3,
+		ReviewCodexStatus:     ReviewStatusSkipped,
+		ReviewCodexRounds:     0,
+		ReviewCodexSkipReason: "rate-limited",
+	}
+	if err := WriteState("fleet", in.Slug, in); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	out, err := ReadState("fleet", in.Slug)
+	if err != nil {
+		t.Fatalf("ReadState: %v", err)
+	}
+	if out.ReviewClaudeStatus != ReviewStatusPassed {
+		t.Errorf("ReviewClaudeStatus=%q; want passed", out.ReviewClaudeStatus)
+	}
+	if out.ReviewClaudeRounds != 3 {
+		t.Errorf("ReviewClaudeRounds=%d; want 3", out.ReviewClaudeRounds)
+	}
+	if out.ReviewCodexStatus != ReviewStatusSkipped {
+		t.Errorf("ReviewCodexStatus=%q; want skipped", out.ReviewCodexStatus)
+	}
+	if out.ReviewCodexSkipReason != "rate-limited" {
+		t.Errorf("ReviewCodexSkipReason=%q; want rate-limited", out.ReviewCodexSkipReason)
+	}
+}
+
+// TestStateRoundTrip_ReviewFieldsOmittedWhenEmpty: pre-three-stage
+// workers leave the new fields zero; the on-disk JSON should omit them
+// so the file size doesn't bloat for every worker (omitempty pulls
+// its weight here).
+func TestStateRoundTrip_ReviewFieldsOmittedWhenEmpty(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	in := &State{
+		Slug:      "no-review-aaaa",
+		Project:   "fleet",
+		Phase:     PhaseTDDGreen,
+		StartedAt: time.Now().UTC(),
+		PID:       1,
+	}
+	if err := WriteState("fleet", in.Slug, in); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	path, _ := stateJSONPath("fleet", in.Slug)
+	raw, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatalf("read raw: %v", rerr)
+	}
+	body := string(raw)
+	for _, field := range []string{
+		"review_claude_status", "review_claude_rounds",
+		"review_codex_status", "review_codex_rounds",
+		"review_codex_skip_reason",
+	} {
+		if containsSubstring(body, field) {
+			t.Errorf("raw state.json contains %q; want omitted (omitempty)", field)
+		}
+	}
+}
+
+// TestStateRoundTrip_RejectsBogusReviewStatus: schema validation
+// rejects unknown enum values at WriteState time, the same way it
+// rejects unknown Phase values.
+func TestStateRoundTrip_RejectsBogusReviewStatus(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	cases := []struct {
+		name string
+		mut  func(*State)
+	}{
+		{
+			name: "claude bogus",
+			mut: func(s *State) {
+				s.ReviewClaudeStatus = ReviewStatus("bogus")
+			},
+		},
+		{
+			name: "codex bogus",
+			mut: func(s *State) {
+				s.ReviewCodexStatus = ReviewStatus("nope")
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := &State{
+				Slug:      "bogus-rev-" + sanitizeSlug(c.name),
+				Project:   "fleet",
+				Phase:     PhaseReviewClaude,
+				StartedAt: time.Now().UTC(),
+				PID:       1,
+			}
+			c.mut(s)
+			err := WriteState("fleet", s.Slug, s)
+			if !errors.Is(err, ErrInvalidReviewStat) {
+				t.Errorf("got %v; want ErrInvalidReviewStat", err)
+			}
+		})
+	}
+}
+
+func TestPhaseValidation_NewReviewPhasesAccepted(t *testing.T) {
+	// review-pending + review-done must be valid Phase values; the
+	// validPhase check rejects unknowns and would block the three-stage
+	// flow if we forgot to enumerate them.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	for _, p := range []Phase{PhaseReviewPending, PhaseReviewDone} {
+		s := &State{
+			Slug:      "phase-" + sanitizeSlug(string(p)) + "-aaaa",
+			Project:   "fleet",
+			Phase:     p,
+			StartedAt: time.Now().UTC(),
+			PID:       1,
+		}
+		if err := WriteState("fleet", s.Slug, s); err != nil {
+			t.Errorf("WriteState phase=%s: %v; want nil", p, err)
+		}
+	}
+}
+
+func containsSubstring(haystack, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeSlug(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+			out = append(out, c)
+		case c >= 'A' && c <= 'Z':
+			out = append(out, c+32)
+		case c == '-':
+			out = append(out, c)
+		default:
+			out = append(out, '-')
+		}
+	}
+	return string(out)
+}
+
 func TestDelete_LeavesSiblingsAlone(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)

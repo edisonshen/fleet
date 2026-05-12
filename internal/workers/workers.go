@@ -50,17 +50,60 @@ const (
 	PhaseTDDRefactor  Phase = "tdd-refactor"
 	PhaseReviewClaude Phase = "review-claude"
 	PhaseReviewCodex  Phase = "review-codex"
-	PhasePush         Phase = "push"
-	PhaseDone         Phase = "done"
-	PhaseBlocked      Phase = "blocked"
-	PhaseFailed       Phase = "failed"
+	// PhaseReviewPending and PhaseReviewDone are the three-stage flow
+	// (worker → reviewer → finisher) handoff points (issue
+	// reviewer-subagent-arch). The worker writes phase=review-pending
+	// when its code commits land; the coord dispatches a reviewer
+	// subagent against it. The reviewer writes phase=review-done +
+	// terminal review_*_status when its /review + codex loop returns
+	// clean; the coord dispatches a finisher subagent that pushes +
+	// opens the PR. PhasePush remains the on-the-wire phase the
+	// finisher writes immediately before phase=done.
+	PhaseReviewPending Phase = "review-pending"
+	PhaseReviewDone    Phase = "review-done"
+	PhasePush          Phase = "push"
+	PhaseDone          Phase = "done"
+	PhaseBlocked       Phase = "blocked"
+	PhaseFailed        Phase = "failed"
 )
 
 func validPhase(p Phase) bool {
 	switch p {
 	case PhaseStarting, PhaseBranch, PhaseTDDRed, PhaseTDDGreen,
 		PhaseTDDRefactor, PhaseReviewClaude, PhaseReviewCodex,
+		PhaseReviewPending, PhaseReviewDone,
 		PhasePush, PhaseDone, PhaseBlocked, PhaseFailed:
+		return true
+	}
+	return false
+}
+
+// ReviewStatus is the per-reviewer state on a worker's state.json.
+// The three-stage flow's reviewer subagent writes terminal values
+// (passed | skipped | blocked) before flipping phase to review-done;
+// the workers.go writeStateLocked validator gates phase=push on those
+// terminal values to prevent a worker (or a buggy reviewer) from
+// reaching push without recording review outcome.
+//
+// "skipped" is allowed for codex review when the codex CLI is
+// unreachable (rate-limit, network) — see the CLI-side allowlist on
+// `--review-codex-skip-reason`. "skipped" is NEVER allowed for /review
+// (Claude-side gstack skill); the validator below enforces that.
+type ReviewStatus string
+
+const (
+	ReviewStatusPending   ReviewStatus = "pending"   // not started
+	ReviewStatusIterating ReviewStatus = "iterating" // in /review or codex loop
+	ReviewStatusPassed    ReviewStatus = "passed"    // terminal — clean
+	ReviewStatusSkipped   ReviewStatus = "skipped"   // terminal — codex only
+	ReviewStatusBlocked   ReviewStatus = "blocked"   // terminal — needs operator
+)
+
+func validReviewStatus(s ReviewStatus) bool {
+	switch s {
+	case "", // empty = unset; older workers that pre-date the field
+		ReviewStatusPending, ReviewStatusIterating,
+		ReviewStatusPassed, ReviewStatusSkipped, ReviewStatusBlocked:
 		return true
 	}
 	return false
@@ -78,17 +121,29 @@ type State struct {
 	PRURL           string    `json:"pr_url,omitempty"`
 	BlockedReason   string    `json:"blocked_reason,omitempty"`
 	Exit            *int      `json:"exit,omitempty"`
+
+	// Three-stage flow review fields (reviewer-subagent-arch).
+	// Workers pre-dating the three-stage flow leave these zero;
+	// reviewer subagents populate them via `fleet workers update`
+	// before flipping phase=review-done. The phase=push validator
+	// gates on these (see writeStateLocked).
+	ReviewClaudeStatus    ReviewStatus `json:"review_claude_status,omitempty"`
+	ReviewClaudeRounds    int          `json:"review_claude_rounds,omitempty"`
+	ReviewCodexStatus     ReviewStatus `json:"review_codex_status,omitempty"`
+	ReviewCodexRounds     int          `json:"review_codex_rounds,omitempty"`
+	ReviewCodexSkipReason string       `json:"review_codex_skip_reason,omitempty"`
 }
 
 // Errors.
 var (
-	ErrNotFound         = errors.New("worker state.json not found")
-	ErrInvalidState     = errors.New("invalid worker state")
-	ErrPhaseRequiresPR  = errors.New("phase=done requires pr_url")
-	ErrPhaseRequiresWhy = errors.New("phase=blocked requires blocked_reason")
-	ErrInvalidPhase     = errors.New("invalid phase")
-	ErrInvalidSlug      = errors.New("invalid worker slug")
-	ErrPreconditionLive = errors.New("cannot archive live worker")
+	ErrNotFound          = errors.New("worker state.json not found")
+	ErrInvalidState      = errors.New("invalid worker state")
+	ErrPhaseRequiresPR   = errors.New("phase=done requires pr_url")
+	ErrPhaseRequiresWhy  = errors.New("phase=blocked requires blocked_reason")
+	ErrInvalidPhase      = errors.New("invalid phase")
+	ErrInvalidReviewStat = errors.New("invalid review status")
+	ErrInvalidSlug       = errors.New("invalid worker slug")
+	ErrPreconditionLive  = errors.New("cannot archive live worker")
 )
 
 // updateMu serializes UpdateState calls within one process per
@@ -156,6 +211,12 @@ func writeStateLocked(project, slug string, s *State) error {
 	}
 	if !validPhase(s.Phase) {
 		return fmt.Errorf("%w: %q", ErrInvalidPhase, s.Phase)
+	}
+	if !validReviewStatus(s.ReviewClaudeStatus) {
+		return fmt.Errorf("%w: review_claude_status=%q", ErrInvalidReviewStat, s.ReviewClaudeStatus)
+	}
+	if !validReviewStatus(s.ReviewCodexStatus) {
+		return fmt.Errorf("%w: review_codex_status=%q", ErrInvalidReviewStat, s.ReviewCodexStatus)
 	}
 	if s.Phase == PhaseDone && strings.TrimSpace(s.PRURL) == "" {
 		return ErrPhaseRequiresPR
