@@ -212,6 +212,9 @@ EXPECTED_GOLDEN = (
     b"\n"
     b"## Active Subagents\n"
     b"_(none)_\n"
+    b"\n"
+    b"## Open PRs\n"
+    b"_(no open PRs)_\n"
 )
 
 
@@ -537,6 +540,157 @@ class TestCollectActiveSubagents:
         (proj_dir / "coord-state.json").write_text(json.dumps({"other": 1}))
         got = handoff._collect_active_subagents("coord-myproj", "myproj")
         assert got == []
+
+
+class TestOpenPRsRender:
+    """v0.8.3: the `## Open PRs` section must render byte-identical to
+    internal/handoff.renderOpenPRs. Pinned shape: one
+    `- #<num> <title> — <head> — <url>` bullet per entry; empty list
+    renders the `_(no open PRs)_` placeholder."""
+
+    def test_none_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=None,
+        )
+        assert b"## Open PRs\n_(no open PRs)_\n" in got
+
+    def test_empty_list_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[],
+        )
+        assert b"## Open PRs\n_(no open PRs)_\n" in got
+
+    def test_handoff_doc_includes_open_prs_section(self) -> None:
+        """Spec test: with two open PRs fed in, both must appear as
+        bullets in the rendered `## Open PRs` section."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[
+                {"number": 137, "title": "feat: rich state",
+                 "head": "worker/a",
+                 "url": "https://example/pr/137"},
+                {"number": 138, "title": "fix: next slice",
+                 "head": "worker/b",
+                 "url": "https://example/pr/138"},
+            ],
+        )
+        assert b"- #137 feat: rich state \xe2\x80\x94 worker/a \xe2\x80\x94 https://example/pr/137" in got
+        assert b"- #138 fix: next slice \xe2\x80\x94 worker/b \xe2\x80\x94 https://example/pr/138" in got
+
+    def test_headRefName_alias_supported(self) -> None:
+        """gh pr list --json headRefName returns the field as
+        headRefName; our renderer accepts both `head` and
+        `headRefName` to keep the pipeline tolerant."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[{"number": 1, "title": "x",
+                       "headRefName": "worker/x",
+                       "url": "https://example/pr/1"}],
+        )
+        assert b"worker/x" in got
+
+    def test_newline_in_title_sanitized(self) -> None:
+        """Line-per-entry contract: embedded newlines in titles become
+        spaces so the bullet stays one physical line."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[{"number": 1,
+                       "title": "line one\nline two\rline three",
+                       "head": "worker/x",
+                       "url": "https://example/pr/1"}],
+        )
+        assert b"- #1 line one line two line three \xe2\x80\x94 worker/x \xe2\x80\x94 https://example/pr/1" in got
+
+
+class TestCollectOpenPRs:
+    """`gh pr list` invocation. We monkey-patch subprocess.run + shutil.which
+    so tests don't need a real gh binary."""
+
+    def test_no_gh_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: None)
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = "auth failure"
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_success_parses_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+        payload = json.dumps([
+            {"number": 137, "title": "feat: rich state",
+             "headRefName": "worker/a",
+             "url": "https://example/pr/137"},
+            {"number": 138, "title": "fix: next",
+             "headRefName": "worker/b",
+             "url": "https://example/pr/138"},
+        ])
+
+        class _R:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        got = handoff._collect_open_prs()
+        assert len(got) == 2
+        assert got[0]["number"] == 137
+        assert got[0]["head"] == "worker/a"
+        assert got[1]["url"] == "https://example/pr/138"
+
+    def test_gh_malformed_json_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        class _R:
+            returncode = 0
+            stdout = "not json {"
+            stderr = ""
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_timeout_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        def _raise(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=10)
+
+        monkeypatch.setattr(handoff.subprocess, "run", _raise)
+        assert handoff._collect_open_prs() == []
 
 
 def _diff_first_byte(got: bytes, want: bytes) -> str:

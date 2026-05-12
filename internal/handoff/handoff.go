@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
@@ -86,6 +87,30 @@ type Doc struct {
 	OpenQuestions   string
 	NextSteps       string
 	ActiveSubagents []ActiveSubagent
+	// OpenPRs is the snapshot of open worker PRs at handoff time
+	// (v0.8.3+). Pulled from `gh pr list --state open --search
+	// head:worker/` by the caller. Empty list renders the
+	// _(no open PRs)_ placeholder. The successor coord re-spawns
+	// shepherd until-loops from this list — one per URL — so CI/merge
+	// state stays observed across handoff without depending on the
+	// per-slug pr_url field on ActiveSubagents (covers PRs whose
+	// associated task is already in-review and was dropped from
+	// coord-state.json:worker_agent_ids).
+	OpenPRs []OpenPR
+}
+
+// OpenPR is one open worker PR at handoff time. Captured by the caller
+// invoking `gh pr list --state open --search "head:worker/" --json
+// number,title,headRefName,url`; rendered as a markdown bullet in the
+// `## Open PRs` section. All fields are operator-supplied (PR title)
+// or gh-returned (number, head, url) — render path quotes them as raw
+// markdown text, not Go-strconv format, since this section is for
+// human reading rather than machine round-trip.
+type OpenPR struct {
+	Number      int    // PR number (e.g. 137)
+	Title       string // PR title text
+	HeadRefName string // head branch (worker/<slug>)
+	URL         string // full PR URL
 }
 
 // ActiveSubagent is one in-flight worker the outgoing coord had spawned
@@ -231,6 +256,8 @@ const FirstAction = "**Run this BEFORE anything else** to reconnect the new inst
 //  5. ## Open Questions             — Doc.OpenQuestions
 //  6. ## Next Steps (prioritized)   — Doc.NextSteps
 //  7. ## Active Subagents           — Doc.ActiveSubagents (issue #93 Phase B2)
+//  8. ## Open PRs                   — Doc.OpenPRs (v0.8.3 — successor
+//     re-spawns shepherd until-loops from this snapshot)
 //
 // Pure function — no I/O, no globals. Use Write to persist.
 func Render(d *Doc) []byte {
@@ -261,8 +288,48 @@ func Render(d *Doc) []byte {
 	fmt.Fprintf(&b, "## Files Modified\n%s\n\n", d.FilesModified)
 	fmt.Fprintf(&b, "## Open Questions\n%s\n\n", d.OpenQuestions)
 	fmt.Fprintf(&b, "## Next Steps (prioritized)\n%s\n\n", d.NextSteps)
-	fmt.Fprintf(&b, "## Active Subagents\n%s\n", renderActiveSubagents(d.ActiveSubagents))
+	fmt.Fprintf(&b, "## Active Subagents\n%s\n\n", renderActiveSubagents(d.ActiveSubagents))
+	fmt.Fprintf(&b, "## Open PRs\n%s\n", renderOpenPRs(d.OpenPRs))
 	return b.Bytes()
+}
+
+// OpenPRsNonePlaceholder is the body of the Open PRs section when the
+// outgoing agent had zero open worker PRs (or the caller didn't
+// populate OpenPRs at all). Successor parsers treat this body as "no
+// shepherds to re-spawn".
+const OpenPRsNonePlaceholder = "_(no open PRs)_"
+
+// renderOpenPRs emits the body of the `## Open PRs` section. Each entry
+// renders as a markdown bullet:
+//
+//	- #<number> <title> — <head> — <url>
+//
+// The URL is the load-bearing field — the successor coord re-spawns a
+// shepherd until-loop watching CI/merge state for each URL. Number +
+// title + head are operator readability only.
+//
+// Empty list / nil renders OpenPRsNonePlaceholder. Like the Active
+// Subagents section, every entry is one physical line so a
+// future parser can split on '\n' without re-joining.
+func renderOpenPRs(prs []OpenPR) string {
+	if len(prs) == 0 {
+		return OpenPRsNonePlaceholder
+	}
+	var b bytes.Buffer
+	for i, p := range prs {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		// Sanitize embedded newlines in the title — PR titles are
+		// user-supplied and a literal newline would break the line-
+		// per-entry contract. Single line, no escaping needed beyond
+		// that.
+		title := strings.ReplaceAll(p.Title, "\n", " ")
+		title = strings.ReplaceAll(title, "\r", " ")
+		fmt.Fprintf(&b, "- #%d %s — %s — %s",
+			p.Number, title, p.HeadRefName, p.URL)
+	}
+	return b.String()
 }
 
 // ActiveSubagentsNonePlaceholder is the body of the Active Subagents
