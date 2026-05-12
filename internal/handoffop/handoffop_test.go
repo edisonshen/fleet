@@ -490,3 +490,109 @@ func TestResume_RefusesLegacyRecordMissingCwd(t *testing.T) {
 		t.Errorf("expected legacy-record refusal, got: %v", err)
 	}
 }
+
+// -- coord-spawn marker transfer (bug coord-marker-transfer-on-46a3) --------
+//
+// When an agent that IS the project's coord (marker == oldRec.ID)
+// handoffs through the auto-drain path, the marker must re-point
+// at the replacement so the TUI's [a] keystroke finds the live
+// coord instead of spawning a duplicate. Workers and other non-coord
+// agents leave the marker untouched.
+
+// TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord asserts the
+// happy path: pre-seed marker = oldRec.ID, run Resume, marker should
+// now equal newRec.ID.
+func TestAutoHandoff_TransfersCoordMarkerWhenOldWasCoord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	// Initialize the project dir so WriteCoordSpawnMarker can land
+	// (matches the TUI's pre-dispatch flow).
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	got := state.ReadCoordSpawnMarker(oldRec.Project)
+	if got != newRec.ID {
+		t.Errorf("coord marker not transferred: got %q want %q (oldRec.ID=%q)",
+			got, newRec.ID, oldRec.ID)
+	}
+}
+
+// TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord asserts the
+// guard: marker points at some OTHER agent ID (not oldRec.ID); after
+// a handoff of oldRec, the marker is unchanged.
+func TestAutoHandoff_NoMarkerUpdate_WhenOldWasNotCoord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	const unrelatedID = "abcdef12"
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, unrelatedID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	got := state.ReadCoordSpawnMarker(oldRec.Project)
+	if got != unrelatedID {
+		t.Errorf("unrelated coord marker mutated: got %q want %q", got, unrelatedID)
+	}
+}
+
+// TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists asserts the
+// absent-marker branch: no marker file before Resume → no marker file
+// after Resume (no error, no spurious creation). Most non-coord agents
+// run with no marker at all.
+func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	// Intentionally do NOT seed a marker. Project dir may or may not
+	// exist; ReadCoordSpawnMarker returns "" either way.
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != "" {
+		t.Errorf("marker created from nothing: got %q want empty", got)
+	}
+}

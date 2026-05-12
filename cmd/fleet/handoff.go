@@ -558,6 +558,31 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			newRec.ID, newRec.TmuxSession)
 	}
 
+	// 8a-bis. Coord-spawn marker transfer. The marker is the
+	//     dashboard's gate for "this agent is this project's coord"
+	//     (see internal/state/state.go ReadCoordSpawnMarker). When a
+	//     coord agent handoffs, the OLD agent ID gets archived in
+	//     step 12 but the marker still points at it — the TUI's [a]
+	//     keystroke then can't find a live coord and spawns a
+	//     duplicate. Re-point the marker at the replacement here,
+	//     AFTER spawn confirmed alive (step 8a) and BEFORE retire
+	//     archives oldRec (step 12). Workers and other non-coord
+	//     agents leave the marker untouched (the wantID match below
+	//     gates this strictly on "old was the project's coord").
+	//
+	//     Best-effort: marker errors print a warning but don't fail
+	//     the handoff — the marker is a UX gate, not a load-bearing
+	//     security boundary (per ReadCoordSpawnMarker's doc).
+	if oldRec.Project != "" {
+		if wantID := state.ReadCoordSpawnMarker(oldRec.Project); wantID == oldRec.ID {
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: coord-spawn marker update for project %s failed: %v\n",
+					oldRec.Project, werr)
+			}
+		}
+	}
+
 	// 8b. Auto-resume policy for the rest of this handoff. Uses the
 	//     per-handoff resolved value (not newRec's baseline) so a
 	//     one-shot --no-auto-resume / --auto-resume override only
