@@ -108,6 +108,59 @@ func TestSpawn_FreshDispatch(t *testing.T) {
 	}
 }
 
+// TestSpawn_EngineOverride pins the v0.9 multi-engine MVP: when
+// Options.Engine is set, Spawn stamps that name on the new agent
+// record (instead of agent.DefaultEngine). Empty Engine preserves the
+// pre-v0.9 byte shape (DefaultEngine wins). Round-trips to disk.
+func TestSpawn_EngineOverride(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Command: []string{"sleep", "30"},
+		Engine:  "codex",
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != "codex" {
+		t.Errorf("rec.Engine = %q, want \"codex\"", rec.Engine)
+	}
+	loaded, err := agent.Load(rec.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Engine != "codex" {
+		t.Errorf("loaded.Engine = %q, want \"codex\"", loaded.Engine)
+	}
+}
+
+func TestSpawn_EngineEmptyPreservesDefault(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Command: []string{"sleep", "30"},
+		// Engine intentionally empty: legacy callers shouldn't see a
+		// byte-shape change.
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != agent.DefaultEngine {
+		t.Errorf("rec.Engine = %q, want %q (default preserved)",
+			rec.Engine, agent.DefaultEngine)
+	}
+}
+
 func TestSpawn_CapturesCwdAndCommandOnRecord(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

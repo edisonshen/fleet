@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -27,7 +28,15 @@ type dispatchOpts struct {
 	projectExplicit bool
 	cwd             string
 	command         []string
+	commandExplicit bool
 	noAutoResume    bool
+	// engine is the engine name persisted on agent.Record.Engine and
+	// used to derive the default --command argv (via enginecfg) when
+	// --command is not explicitly set. Empty falls through to the root-
+	// cmd FLEET_ENGINE env var or the codebase default
+	// (enginecfg.DefaultEngine). See resolveEngineFlags at the root cmd
+	// for the precedence model.
+	engine string
 	// prompt is the optional first-turn prompt to type into the
 	// freshly-spawned tmux session AFTER the pane stabilizes. Empty
 	// (default) → no prompt; the operator types one manually after
@@ -87,6 +96,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.taskID = args[0]
 			opts.projectExplicit = cmd.Flags().Changed("project")
+			opts.commandExplicit = cmd.Flags().Changed("command")
 			return runDispatch(opts, cmd.OutOrStdout())
 		},
 	}
@@ -129,6 +139,14 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// flow).
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
 		"first-turn prompt to type into the spawned session (default: none)")
+	// --engine selects the engine for THIS dispatch's agent record. The
+	// dispatch CLI inherits FLEET_ENGINE from the root cmd when unset
+	// (so `fleet -codex dispatch …` does the right thing). Passing an
+	// explicit --engine on the dispatch subcommand overrides the root
+	// flag for this call only — useful for one-off mixed-engine spawns
+	// even when the operator's primary fleet is on a different engine.
+	cmd.Flags().StringVar(&opts.engine, "engine", "",
+		"engine for this dispatch (claude-code | codex; default: inherits FLEET_ENGINE or claude-code)")
 	// --coord-spawn is the internal escape hatch for the TUI's project-
 	// row [a] auto-spawn flow. The "coord-<project>" task_id prefix is
 	// a sentinel the dashboard reads to identify the project's coord
@@ -151,6 +169,44 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 	if err := tmux.Available(); err != nil {
 		return err
+	}
+	// Resolve engine BEFORE the rest of the validation so the agent
+	// record's engine field is settled when spawn runs. Precedence:
+	// explicit --engine > FLEET_ENGINE env (set by root cmd's
+	// PersistentPreRunE) > enginecfg.DefaultEngine.
+	engineName := opts.engine
+	if engineName == "" {
+		engineName = os.Getenv(FleetEngineEnv)
+	}
+	if engineName == "" {
+		engineName = enginecfg.DefaultEngine
+	}
+	if !enginecfg.Known(engineName) {
+		return fmt.Errorf(
+			"--engine %q is unknown (known: claude-code, codex)",
+			engineName)
+	}
+	// When the operator did NOT pass --command, swap the cobra default
+	// (built for claude-code) for the engine-appropriate wrapper. This
+	// is what makes `fleet -codex dispatch <task>` actually launch
+	// codex rather than claude.
+	//
+	// We compare against the claude wrapper bytes-equality the test
+	// `TestDefaultClaudeWrapperScript_MatchesFlagDefault` pins; if the
+	// operator did pass --command (commandExplicit), we leave it alone
+	// regardless of engine. The engine field on the record is still
+	// what it was resolved to — the operator's choice of command and
+	// engine name aren't required to agree (e.g., a custom wrapper
+	// that internally launches claude can still be tagged as engine=
+	// codex if the operator wants to track it that way; we don't
+	// second-guess).
+	if !opts.commandExplicit {
+		argv, err := enginecfg.BuildWrapperCommand(engineName)
+		if err != nil {
+			// Should not happen — Known() above already filtered.
+			return fmt.Errorf("resolve engine %q: %w", engineName, err)
+		}
+		opts.command = argv
 	}
 	// Reject project names with path separators / "..": they'd
 	// silently misbehave at handoff time when they're used as a lock
@@ -305,6 +361,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: opts.noAutoResume,
+		Engine:            engineName,
 	})
 	if err != nil {
 		return err

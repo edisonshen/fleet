@@ -1319,6 +1319,17 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}
+	// Engine propagation: the TUI was launched with `fleet [-codex|-claude
+	// |--engine ...]`; the root cmd stamped FLEET_ENGINE. Forward it as
+	// `--engine <name>` on the dispatch argv so the spawned coord agent
+	// records the right engine + boots the right binary via
+	// internal/enginecfg. The env var ALSO propagates implicitly because
+	// runFleetCmd inherits the parent env, but explicit `--engine` on
+	// the argv makes the contract visible in process listings + audit
+	// logs and avoids relying on the implicit hop.
+	if engine := os.Getenv("FLEET_ENGINE"); engine != "" {
+		args = append(args, "--engine", engine)
+	}
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
 			return coordSpawnDoneMsg{
