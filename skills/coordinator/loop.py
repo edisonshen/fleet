@@ -836,7 +836,7 @@ def _record_review_handoff_dispatched(
     place. Idempotent: a duplicate key is added without dedup (the
     list grows briefly, but _load_review_handoff_state coerces to a
     set on read, and the entries are cleared on terminal phases via
-    _maybe_clear_review_handoff_state below).
+    _clear_review_handoff_state below).
     """
     raw = state.get("review_handoffs_dispatched")
     if not isinstance(raw, list):
