@@ -562,6 +562,14 @@ def _run_supervisor(
                 )
                 if action.clear_worker:
                     supervisor_mod.forget_agent_id(cs, action.slug)
+                    # Three-stage flow (reviewer-subagent-arch): clear
+                    # the review-handoff dispatched markers in sync
+                    # with the agent_id forget, mirroring the same
+                    # cleanup in the primary tick path. Without this,
+                    # supervisor-driven terminal transitions leave
+                    # stale handoff keys that block future re-dispatches
+                    # for the same slug.
+                    _clear_review_handoff_state(cs, action.slug)
                 # codex iter-1 [P1]: a worker leaving the in-flight
                 # set frees a dispatch slot. Without re-running
                 # _dispatch_ready, with cap=1 the next ready task

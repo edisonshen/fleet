@@ -63,6 +63,10 @@ func TestClassifyWorker(t *testing.T) {
 		{"tdd-refactor", workers.PhaseTDDRefactor, lifecycle.StateActive},
 		{"review-claude", workers.PhaseReviewClaude, lifecycle.StateActive},
 		{"review-codex", workers.PhaseReviewCodex, lifecycle.StateActive},
+		// Three-stage flow handoff phases (reviewer-subagent-arch):
+		// task is still in flight, classified Active.
+		{"review-pending", workers.PhaseReviewPending, lifecycle.StateActive},
+		{"review-done", workers.PhaseReviewDone, lifecycle.StateActive},
 		{"push", workers.PhasePush, lifecycle.StateActive},
 		{"done", workers.PhaseDone, lifecycle.StateTerminalSuccess},
 		{"blocked", workers.PhaseBlocked, lifecycle.StateWaiting},

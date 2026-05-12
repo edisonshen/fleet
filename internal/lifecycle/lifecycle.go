@@ -160,7 +160,15 @@ func ClassifyWorker(w *workers.State) State {
 	case workers.PhaseStarting, workers.PhaseBranch:
 		return StatePrerun
 	case workers.PhaseTDDRed, workers.PhaseTDDGreen, workers.PhaseTDDRefactor,
-		workers.PhaseReviewClaude, workers.PhaseReviewCodex, workers.PhasePush:
+		workers.PhaseReviewClaude, workers.PhaseReviewCodex,
+		// PhaseReviewPending and PhaseReviewDone are three-stage flow
+		// handoff phases (reviewer-subagent-arch): the outgoing
+		// subagent has exited and the coord is about to dispatch the
+		// next one. Lifecycle-wise the task is still in flight, so
+		// classify as StateActive — the per-phase delay is bounded
+		// by one coord tick (≤ supervisor poll interval).
+		workers.PhaseReviewPending, workers.PhaseReviewDone,
+		workers.PhasePush:
 		return StateActive
 	case workers.PhaseDone:
 		return StateTerminalSuccess
