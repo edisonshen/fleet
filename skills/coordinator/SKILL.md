@@ -76,15 +76,46 @@ Each task line in tasks.md is a **one-line summary** of the goal. Format:
 
 Status, branch, pr_url, worker_pid, notes — all live in the structured fields under the task heading; `fleet tasks` already enforces the schema. The one-liner is what humans scan; the fields are what the coord acts on. See `docs/STATE.md` for the full per-task field set.
 
-### Step 4 — IMPLEMENT
+### Step 4 — IMPLEMENT (three-stage flow)
 
-The coord dispatches **one** impl-subagent per task. v0.2 cap is 1 in flight per project (G7) — `coordinator.lock` (NB-flock) plus the dispatch-loop active-count guard already enforce this; do not add new locking. Cap > 1 unlocks when worktrees land in v0.2.x via `coord-config.json:parallelism`.
+Starting at the reviewer-subagent-arch landing, every task is implemented by **three** subagents dispatched serially, not one. The split exists because the single-subagent flow let workers bypass /review entirely — observed on the operator's second laptop. Structural enforcement is at the state-layer phase=push validator (see `internal/workers/workers.go:validateReviewGate`); the skill drives the orchestration.
 
-The impl-subagent is bound by the §4 reviewer contract from `/Users/pinkbear/.claude/CLAUDE.md`: codex review + /review skill, multiple rounds, until two consecutive clean passes each. The subagent pushes its branch and opens its PR autonomously when both reviewers are clean — no operator gate at the push step (the gate was step 1).
+```
+   worker             reviewer              finisher
+   ──────             ────────              ────────
+   TDD red/green/  →  /review iter loop  →  git push
+   refactor +         + codex review +      gh pr create
+   local commits      fix commits           fleet workers
+   (no /review,       (no push)             update --phase
+   no push)                                 done --pr-url
+                      flip --phase          flip --phase
+   flip --phase       review-done +         done
+   review-pending     terminal review_*
+   + EXIT             status + EXIT         EXIT
+```
 
-The coord does NOT foreground-poll the subagent. The harness fires a `<task-notification>` when the Agent-tool subagent finishes; the coord resumes off that notification and reads the subagent's return message (PR URL or BLOCKED).
+**State transitions on workers/<slug>/state.json (all single-writer):**
 
-**Dispatch template (impl-subagent):** prompt must reference the global Subagent Dispatch Contract by name, list the task slug as the WIP tag (`~/.fleet/subagent-wip/<slug>.md`), state the base branch, state explicit non-goals so the subagent doesn't expand scope, and require the §7 return-format contract.
+| Subagent | Reads | Writes |
+|----------|-------|--------|
+| worker   | (n/a — fresh state) | `phase` through tdd-red/-green/-refactor → review-pending |
+| reviewer | phase=review-pending | `phase` review-claude/review-codex (in loop) → review-done; `review_claude_status`, `review_claude_rounds`, `review_codex_status`, `review_codex_rounds`, `review_codex_skip_reason` (terminal write at review-done) |
+| finisher | phase=review-done + terminal review_* fields | `phase` push (gated by `validateReviewGate`) → done; `pr_url` |
+
+**Coord dispatch logic (`loop._dispatch_review_handoffs`):**
+
+1. Initial dispatch (status=ready → in-progress): worker subagent. Prompt built by `dispatch.build_worker_prompt`.
+2. On next tick after worker exits at phase=review-pending: reviewer subagent. Prompt built by `dispatch.build_reviewer_prompt`. Worker dir + branch unchanged.
+3. On next tick after reviewer exits at phase=review-done: finisher subagent. Prompt built by `dispatch.build_finisher_prompt`. Worker dir + branch unchanged.
+4. On next tick after finisher writes phase=done: existing reconcile path takes over (status=in-review, then in-review→done on CI green merge).
+
+The coord-state.json field `review_handoffs_dispatched` is the dedup signal: each handoff key is `<slug>:<phase>`, added when the DISPATCH block is emitted, cleared when the slug reaches a terminal task state. Without this, a slow reviewer would be respawned every tick.
+
+**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited` or `unavailable`. The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
+
+**The coord does NOT foreground-poll any of the three subagents.** The harness fires a `<task-notification>` when each subagent returns; the coord runs `/coordinator` on the next assistant turn, the tick reads state.json, and the next handoff fires automatically.
+
+**Dispatch template (any of the three subagents):** prompt must reference the global Subagent Dispatch Contract by name, list the task slug as the WIP tag (`~/.fleet/subagent-wip/<slug>.md`), state explicit non-goals so the subagent doesn't expand scope. v0.2 cap is 1 in flight per project (G7); cap > 1 worktree mode is unchanged by the three-stage flow.
 
 ### Step 5 — PR-TRACK
 
@@ -467,10 +498,15 @@ Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
 <top entries from `fleet learnings list --limit=20`, ≤500 chars × 5>
 (section omitted entirely when no learnings recorded)
 
-## Required workflow
+## Required workflow (three-stage flow — reviewer-subagent-arch)
+
+You write CODE + TESTS, commit them locally, and EXIT at phase=review-pending.
+A separate reviewer subagent runs /review + codex. A separate finisher subagent
+pushes + opens the PR. You do NOT run /review yourself. You do NOT push.
+
   fleet workers update <slug> --project <project> --phase branch
 1. git checkout -b worker/<slug>
-  ... (TDD red/green/refactor → review-claude → review-codex → push → done)
+  ... (TDD red/green/refactor → review-pending → EXIT)
 
 ## Constraints
 - Stay on this task. File incidental bugs (max 3/session, honor system).
@@ -539,6 +575,8 @@ The skill's tick lifecycle is intentionally lean (no in-process state survives a
 | Inbox archive scan finds nothing | Tick proceeds normally. |
 | Slug mismatch in a sentinel | Logged via `errors[]`; no mutation. |
 | Prompt over hard cap | `PromptTooLargeError` — task NOT dispatched; recorded in errors. Operator shrinks standards/learnings/spec. |
+| Reviewer subagent flips phase=push without recording terminal `review_*_status` | `validateReviewGate` in `internal/workers/workers.go` rejects the write with `ErrPhaseRequiresReview`. The reviewer sees the workers CLI error and is expected to retry the update with `--review-claude-status passed` + `--review-codex-status {passed,skipped}`. Structural enforcement — a buggy reviewer can't accidentally let an unreviewed PR reach the finisher. |
+| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited` or `unavailable`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
 
 ## Tools used
 
@@ -557,7 +595,7 @@ Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/
 | `SKILL.md` | This document. Frontmatter + invocation + loop-in-prose + worker prompt template. |
 | `loop.py` | One-tick driver. Public entry: `tick(project, ...)` and `main(argv)`. |
 | `parse.py` | Python mirror of `internal/tasks` — read-only inside the skill, byte-equal with Go. |
-| `dispatch.py` | Worker prompt assembly + `mint_agent_id` + DISPATCH-block formatter + inbox writer (issue #84 Phase A — no longer shells out to `fleet dispatch`). |
+| `dispatch.py` | Worker / reviewer / finisher prompt assembly (`build_worker_prompt`, `build_reviewer_prompt`, `build_finisher_prompt`) + `mint_agent_id` + DISPATCH-block formatter + inbox writer (issue #84 Phase A — no longer shells out to `fleet dispatch`; reviewer-subagent-arch added the reviewer + finisher builders). |
 | `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). Optimistic on no-paths inputs. |
 | `loop._has_conflict_with_inflight` | Conservative loop-side wrapper: a task with no `Files:` line is treated as matching every in-flight task. Operators opt out per task by adding `Files: <real-path>`. |
 | `workflow_state.py` | Atomic-publish writer for `~/.fleet/projects/<p>/workflow.md` — the operator-readable phase log per task (G5). Tmp-fd → fsync → `os.replace`; no daemon, no in-process state. |
