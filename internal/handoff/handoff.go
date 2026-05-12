@@ -107,10 +107,33 @@ type Doc struct {
 // LastPhase mirrors workers/<slug>/state.json's phase field at the
 // time of handoff. Useful as triage context for the successor; the
 // re-dispatch decision is gated on WIP-file existence + status.
+//
+// PRURL is the open PR URL pulled from tasks.md's pr_url field for the
+// worker's slug. Empty when no PR has been opened yet (worker still
+// writing code). The successor coord uses this to (a) re-spawn a
+// shepherd `until`-loop watching CI/merge state without re-dispatching
+// the Agent call, and (b) skip the Agent re-dispatch entirely when a
+// PR exists (work is already on disk + remote).
+//
+// Status mirrors tasks.md's status field per slug (todo / ready /
+// in-progress / in-review / blocked / done / abandoned — the same enum
+// as internal/tasks.Status). The successor branches on this:
+//   - empty pr_url + status=in-progress → re-dispatch Agent (worker
+//     was still writing).
+//   - pr_url set + status=in-review → skip Agent, just re-spawn shepherd.
+//   - status=done/blocked → drop the entry; no resume action needed.
+//
+// Empty strings for either field are legitimate ("no PR yet" / "older
+// handoff doc, status not captured"). Parser tolerates the legacy
+// 5-field row shape that doesn't carry these fields — they default to
+// "" and the successor falls back to the pre-enrichment behavior
+// (always re-dispatch).
 type ActiveSubagent struct {
 	TaskID     string // task slug (the worker's task)
 	Branch     string // worker/<slug>
 	LastPhase  string // tdd-green / push / blocked / etc.
+	Status     string // tasks.md status enum; "" when not captured (legacy doc).
+	PRURL      string // open PR URL from tasks.md; "" when no PR yet.
 	AgentID    string // 8-hex Fleet agent ID (inbox file key)
 	SubagentID string // Claude Agent tool subagent ID; empty when not captured
 }
@@ -253,13 +276,19 @@ const ActiveSubagentsNonePlaceholder = "_(none)_"
 // section. Empty list → ActiveSubagentsNonePlaceholder. Non-empty →
 // one structured line per worker, key=value form, deterministic order.
 //
-// Format per entry:
+// Format per entry (v0.8.3+, 7 fields):
 //
-//   - task=<slug> branch=<branch> phase=<phase> agent_id=<hex> subagent_id=<id>
+//	- task=<slug> branch=<branch> phase=<phase> status=<status> pr_url=<url> agent_id=<hex> subagent_id=<id>
+//
+// Status + pr_url were added to drive the successor coord's
+// re-dispatch decision (was: always re-dispatch; now: skip Agent
+// when a PR is already open + work is in-review, just re-spawn
+// shepherd). Legacy 5-field rows in older handoff docs parse with
+// status="" and pr_url="" — see parseActiveSubagentLine.
 //
 // Empty fields render as `key=""`. The line is a single physical line
 // (no embedded newlines) so the parser can split on '\n' without
-// re-joining. Subagent_id appears even when empty so the parser
+// re-joining. Every field appears even when empty so the parser
 // can rely on the field-set being uniform across rows.
 func renderActiveSubagents(subs []ActiveSubagent) string {
 	if len(subs) == 0 {
@@ -271,8 +300,8 @@ func renderActiveSubagents(subs []ActiveSubagent) string {
 			b.WriteByte('\n')
 		}
 		fmt.Fprintf(&b,
-			"- task=%q branch=%q phase=%q agent_id=%q subagent_id=%q",
-			s.TaskID, s.Branch, s.LastPhase, s.AgentID, s.SubagentID,
+			"- task=%q branch=%q phase=%q status=%q pr_url=%q agent_id=%q subagent_id=%q",
+			s.TaskID, s.Branch, s.LastPhase, s.Status, s.PRURL, s.AgentID, s.SubagentID,
 		)
 	}
 	return b.String()
