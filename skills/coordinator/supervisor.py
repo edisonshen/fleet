@@ -102,6 +102,29 @@ def env_poll_max_s() -> int:
     return _env_int("FLEET_COORD_POLL_MAX_S", 14400)
 
 
+def env_idle_ttl_h() -> int:
+    """Hours of inactivity before an idle agent record is auto-archived
+    via `fleet rm <id>` (dashboard-accumulation-f-4421 Sub-fix C).
+
+    Default 24, range 1..720 (one month). 0 disables the sweep entirely
+    — matches the supervisor's existing zero-disables convention. Out-of-
+    range values (negative, > 720) fall back to the default rather than
+    silently allowing an unbounded TTL that would never archive.
+    """
+    raw = os.environ.get("FLEET_COORD_IDLE_TTL_H", "")
+    if raw == "":
+        return 24
+    try:
+        n = int(raw)
+    except ValueError:
+        return 24
+    if n == 0:
+        return 0
+    if n < 0 or n > 720:
+        return 24
+    return n
+
+
 # Phases we treat as terminal — workers in these phases never get
 # stuck-checked. Mirrors workers.isTerminalPhase + the parse.py task
 # statuses used by the reconcile path. We keep one local constant rather
@@ -546,6 +569,9 @@ class SupervisorResult:
     nudges_sent: int = 0
     escalations: int = 0
     blocks: int = 0
+    # dashboard-accumulation-f-4421 Sub-fix C: count of agent records
+    # auto-archived during this supervisor session via `fleet rm <id>`.
+    idle_archives: int = 0
     exit_reason: str = ""
     errors: list[str] = field(default_factory=list)
 
@@ -767,6 +793,21 @@ def run_supervisor(
                     res.blocks += stuck_summary.blocks
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"stuck-check: {exc}")
+                # dashboard-accumulation-f-4421 Sub-fix C: agent
+                # auto-archive runs alongside the stuck-check pass at the
+                # same cadence. Best-effort; failures log to stderr and
+                # never abort the supervisor.
+                try:
+                    archived = _run_idle_agent_archive_pass(
+                        project=project,
+                        home=home,
+                        fleet_bin=fleet_bin,
+                        now_unix=now_fn(),
+                        log_stream=log_stream,
+                    )
+                    res.idle_archives += archived
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"idle-archive: {exc}")
             try:
                 write_state()
             except Exception as exc:  # noqa: BLE001
@@ -783,6 +824,121 @@ class _StuckPassResult:
     nudges: int = 0
     escalations: int = 0
     blocks: int = 0
+
+
+def _run_idle_agent_archive_pass(
+    *,
+    project: str,
+    home: Path,
+    fleet_bin: str,
+    now_unix: float,
+    log_stream=None,
+) -> int:
+    """Scan ~/.fleet/agents/*.json and `fleet rm <id>` records that have
+    been idle longer than FLEET_COORD_IDLE_TTL_H hours.
+
+    A record is auto-archivable when ALL hold:
+      - r.project == this supervisor's project (scope: own project only;
+        every project's coord runs its own sweep against its own agents).
+      - r.last_activity_ts is older than (now - TTL hours).
+      - r.needs_input == False (asking agents need operator attention).
+      - r.blocked == False (blocked agents need operator triage).
+
+    Returns the count of `fleet rm` shells we invoked. Failures log to
+    stderr but never abort the sweep — the next pass retries. TTL = 0
+    disables the sweep entirely (no scan, returns 0).
+
+    The TTL is read FRESH on every call rather than cached, so an
+    operator toggling FLEET_COORD_IDLE_TTL_H between supervisor sessions
+    doesn't need a coord restart. The supervisor.run_supervisor caller
+    is responsible for guarding the cadence (only invoked on the
+    stuck-check cadence — sub-second cost on a small agent dir but
+    not free).
+    """
+    ttl_h = env_idle_ttl_h()
+    if ttl_h == 0:
+        return 0
+    cutoff_unix = now_unix - (ttl_h * 3600)
+
+    agents_dir = home / "agents"
+    try:
+        entries = list(agents_dir.iterdir())
+    except OSError:
+        # No ~/.fleet/agents/ dir at all (fresh install, test bootstrap
+        # didn't create it). Nothing to sweep.
+        return 0
+
+    archived = 0
+    for entry in entries:
+        if not entry.is_file() or entry.suffix != ".json":
+            continue
+        try:
+            with open(entry, "r", encoding="utf-8") as fp:
+                rec = json.load(fp)
+        except (OSError, json.JSONDecodeError):
+            # Malformed / unreadable record — skip. The TUI tolerates
+            # the same; nothing we should crash on.
+            continue
+        if not isinstance(rec, dict):
+            continue
+        # Scope to this project. Every project's coord runs its own
+        # sweep; a sibling project's stale agent is that coord's
+        # responsibility, not ours.
+        rec_project = str(rec.get("project", "") or "")
+        if rec_project != project:
+            continue
+        # Asking + blocked agents NEVER auto-archive — they need
+        # operator attention.
+        if bool(rec.get("needs_input", False)):
+            continue
+        if bool(rec.get("blocked", False)):
+            continue
+        last_ts = _parse_rfc3339(str(rec.get("last_activity_ts", "") or ""))
+        if last_ts is None:
+            # No parseable heartbeat — skip (defensive: brand-new agent
+            # before its first Stop-hook fires, or a legacy record).
+            continue
+        if last_ts > cutoff_unix:
+            # Fresh enough — keep.
+            continue
+        agent_id = str(rec.get("id", "") or "")
+        if not _is_agent_id(agent_id):
+            # Don't shell out with an invalid id (defensive: a hand-
+            # edited record).
+            continue
+        # Best-effort `fleet rm <id>`. agent.go's archive flow tolerates
+        # tmux session absence and pending-handoff queue absence; if
+        # the agent has a pending handoff, rm refuses and the next
+        # supervisor pass retries.
+        try:
+            proc = subprocess.run(
+                [fleet_bin, "rm", agent_id],
+                capture_output=True, text=True,
+                timeout=30.0, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            emit(
+                f"[coord] idle-archive: fleet rm {agent_id} failed: {exc}",
+                stream=log_stream,
+            )
+            continue
+        if proc.returncode != 0:
+            # Non-zero exit (e.g., pending handoff blocks rm). Log and
+            # move on — next pass retries naturally.
+            err = (proc.stderr or proc.stdout or "").strip()
+            emit(
+                f"[coord] idle-archive: fleet rm {agent_id} "
+                f"exit={proc.returncode}: {err}",
+                stream=log_stream,
+            )
+            continue
+        emit(
+            f"[coord] idle-archive: archived {agent_id} "
+            f"(idle > {ttl_h}h, project={project})",
+            stream=log_stream,
+        )
+        archived += 1
+    return archived
 
 
 def _run_stuck_check_pass(
