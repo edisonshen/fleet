@@ -288,6 +288,27 @@ def _tick_locked(
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
+    # 3.5. Defense-in-depth sweep for done tasks whose worker dir
+    # still exists on disk. The reconcile transitions above already
+    # fire `fleet workers delete` on the in-review→done flip (and the
+    # in-progress→in-review flip when state.json reports phase=done).
+    # This sweep handles the leftover cases:
+    #   - operator-driven `fleet tasks set status=done` (no skill mediation),
+    #   - v0.1-coord-era transitions that pre-date issue #101's
+    #     delete_worker_dir wiring,
+    #   - any path where a task reached status=done while a stale worker
+    #     dir lingered.
+    # Skip on tasks already done from a prior tick: existence-check
+    # the worker dir first; if missing, no CLI invocation. This keeps
+    # the per-tick cost on a clean project at one stat() per done task.
+    try:
+        swept = _sweep_done_worker_dirs(
+            f.tasks, project, fleet_bin, home=home,
+        )
+        result.reconciled += swept
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"sweep done worker dirs: {exc}")
+
     # 4. Drain inbox archive sentinels.
     tasks_by_slug = {t.slug: t for t in f.tasks}
     drained, last_seen = _drain_archive(
@@ -1733,6 +1754,58 @@ def _maybe_delete_worker_dir(slug: str, fleet_bin: str, project: str) -> None:
             f"coord: workers delete failed for {slug}: {exc}",
             file=sys.stderr,
         )
+
+
+def _sweep_done_worker_dirs(
+    tasks: list[parse.Task],
+    project: str,
+    fleet_bin: str,
+    *,
+    home: Path | None = None,
+) -> int:
+    """Defense-in-depth: rm-rf workers/<slug>/ for tasks at status=done
+    whose worker dir still exists.
+
+    Catches three accumulation sources the reconcile-transition path
+    misses:
+      - operator-driven `fleet tasks set status=done` (no skill seam),
+      - v0.1-coord transitions that pre-date issue #101's
+        delete_worker_dir wiring,
+      - any race where the task flipped done elsewhere while a stale
+        worker dir lingered.
+
+    Skip on tasks already done from a prior tick: existence-check the
+    workers/<slug>/ dir up-front. If absent, the sweep is a no-op for
+    that slug (zero CLI invocations). The cost on a clean project is
+    one stat() per done task.
+
+    Failures log to stderr; never abort the tick. Returns the count
+    of dirs we successfully kicked into `fleet workers delete` (used
+    by callers for reporting).
+    """
+    if not project or not tasks:
+        return 0
+    fleet_home = home if home is not None else _resolve_home(None)
+    project_workers = fleet_home / "projects" / project / "workers"
+    swept = 0
+    for t in tasks:
+        if t.status != "done":
+            continue
+        # Stat-first short-circuit: workers.Delete is idempotent on
+        # ENOENT, but firing the CLI every tick on every done task
+        # would emit "already gone" noise to stderr. The on-disk
+        # check is one stat() — cheaper than a subprocess fork.
+        slug_dir = project_workers / t.slug
+        try:
+            if not slug_dir.is_dir():
+                continue
+        except OSError:
+            # Permission / FS error on stat — leave it for a future
+            # tick. Don't crash the sweep.
+            continue
+        _maybe_delete_worker_dir(t.slug, fleet_bin, project)
+        swept += 1
+    return swept
 
 
 def _maybe_remove_worktree(

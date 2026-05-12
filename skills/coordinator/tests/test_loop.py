@@ -1506,6 +1506,170 @@ def test_workers_delete_failure_does_not_abort_tick(
     assert "workers delete failed" in captured.err
 
 
+# ---------- Sub-fix A: defense-in-depth sweep of done-task worker dirs ----------
+
+
+def test_sweep_done_worker_dirs_deletes_orphan_with_status_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """A task at status=done whose worker dir lingers on disk gets
+    rm-rf'd via `fleet workers delete`. Covers the operator-set /
+    pre-#101-coord accumulation path that the reconcile-transition
+    branch never sees (those tasks bypass the in-progress/in-review
+    filter in _reconcile_inflight).
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # Seed an orphan worker dir whose phase is non-terminal — exactly
+    # the screenshot scenario: worker exited early, task got flipped
+    # to done elsewhere.
+    workers_dir = fleet_home / "projects" / project / "workers" / "orphan-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "orphan-aaaa", "project": project,
+        "phase": "tdd-green", "pid": 0,
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("orphan-aaaa", status="done", worker_pid=0),
+    ])
+
+    loop.tick(
+        project, coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    delete_calls = [
+        c for c in fleet_run_recorder
+        if c[1:3] == ["workers", "delete"] and c[-1] == "orphan-aaaa"
+    ]
+    assert delete_calls, (
+        "sweep must fire workers delete for done task with lingering dir; "
+        f"recorded: {fleet_run_recorder}"
+    )
+
+
+def test_sweep_skips_done_task_without_worker_dir(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """"Skip on tasks already done from a prior tick": a done task
+    whose worker dir is absent triggers zero CLI invocations. The
+    stat() short-circuit keeps repeat ticks quiet on a clean tree.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # No workers/<slug>/ dir on disk.
+    _write_tasks(project_dir, [
+        _make_task("ghost-bbbb", status="done", worker_pid=0),
+    ])
+
+    loop.tick(
+        project, coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    delete_calls = [
+        c for c in fleet_run_recorder
+        if c[1:3] == ["workers", "delete"] and c[-1] == "ghost-bbbb"
+    ]
+    assert delete_calls == [], (
+        "sweep must not invoke workers delete when the dir is already "
+        f"gone; recorded: {fleet_run_recorder}"
+    )
+
+
+def test_sweep_does_not_touch_active_task_worker_dirs(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Tasks at non-done statuses (todo / ready / in-progress / in-review /
+    blocked) keep their worker dirs. Only status=done triggers the sweep —
+    the dir is read-only post-shipping state for done tasks but live
+    state for everything else.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # Seed a worker dir for an in-review task. The reconcile path will
+    # query gh on this task because pr_url is set; we stub _gh_pr_checks
+    # to return "pending" so the sweep is the only path that could touch
+    # the dir.
+    workers_dir = fleet_home / "projects" / project / "workers" / "active-cccc"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "active-cccc", "project": project,
+        "phase": "review-claude", "pid": 0,
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task(
+            "active-cccc", status="in-review",
+            worker_pid=99990, pr_url="https://github.com/x/y/pull/9",
+        ),
+    ])
+
+    # Force "pending CI" so the reconcile gh path returns pending and
+    # doesn't transition the task — keeps the sweep as the only
+    # potential delete trigger.
+    pending = loop._CIResult(
+        all_green=False, merged=False, mergeable=True,
+        failed=False, pending=True,
+    )
+    with patch.object(loop, "_pid_alive", return_value=True), \
+         patch.object(loop, "_gh_pr_checks", return_value=pending):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    delete_calls = [
+        c for c in fleet_run_recorder
+        if c[1:3] == ["workers", "delete"] and c[-1] == "active-cccc"
+    ]
+    assert delete_calls == [], (
+        "sweep must not touch worker dirs for non-done tasks; recorded: "
+        + repr(fleet_run_recorder)
+    )
+
+
+def test_sweep_failure_does_not_abort_tick(
+    fleet_home: Path, project_dir: Path,
+    monkeypatch, capsys,
+) -> None:
+    """Sweep is best-effort. A failing `fleet workers delete` logs to
+    stderr but never bubbles into result.errors or rolls back the tick.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    workers_dir = fleet_home / "projects" / project / "workers" / "fragile-dddd"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "fragile-dddd", "project": project,
+        "phase": "tdd-green",
+    }), encoding="utf-8")
+
+    _write_tasks(project_dir, [
+        _make_task("fragile-dddd", status="done", worker_pid=0),
+    ])
+
+    def fake_run(cmd, timeout_s=30.0):
+        if cmd[1:3] == ["workers", "delete"]:
+            raise RuntimeError("simulated delete failure")
+
+    with patch.object(loop, "_run_fleet", side_effect=fake_run):
+        result = loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert result.errors == [], (
+        "sweep failures must be best-effort; got: " + repr(result.errors)
+    )
+    captured = capsys.readouterr()
+    assert "workers delete failed" in captured.err
+
+
 # ---------- auto-archive integration ----------
 
 
