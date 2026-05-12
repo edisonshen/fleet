@@ -175,3 +175,29 @@ def test_skill_md_dispatch_protocol_names_register_subagent():
             f"SKILL.md Worker dispatch protocol missing {marker!r} — "
             f"coord agent skips Phase C subagent_id capture (issue #94)."
         )
+
+
+# ---------- three-stage flow §4 documentation (reviewer-subagent-arch) ----------
+
+
+def test_skill_md_step4_documents_three_stage_flow():
+    """The Step 4 IMPLEMENT section must spell out the worker →
+    reviewer → finisher split. Drift here lets handed-off coords
+    revert to the old single-subagent dispatch pattern, which is the
+    structural failure mode the three-stage flow exists to prevent."""
+    body = _read_skill_md()
+    # Section heading.
+    assert "### Step 4 — IMPLEMENT" in body
+    # The three-stage phrase has to appear in the §4 prose so future
+    # readers grep for it.
+    assert "three-stage flow" in body or "three subagents" in body
+    # Each of the three roles is named.
+    for role in ("worker", "reviewer", "finisher"):
+        assert role in body, f"SKILL.md §4 missing role {role!r}"
+    # The handoff phases.
+    for phase in ("review-pending", "review-done"):
+        assert phase in body, f"SKILL.md §4 missing handoff phase {phase!r}"
+    # The codex skip allowlist is documented (operator-readable guard).
+    assert "rate-limited" in body and "unavailable" in body
+    # /review is never skippable (load-bearing reviewer).
+    assert "NEVER skippable" in body or "never skippable" in body

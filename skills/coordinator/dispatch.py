@@ -162,7 +162,18 @@ def build_worker_prompt(
     else:
         step1 = f"1. git checkout -b {branch}"
     lines.extend([
-        "## Required workflow",
+        "## Required workflow (three-stage flow — reviewer-subagent-arch)",
+        "",
+        "You write CODE + TESTS, commit them locally, and EXIT at",
+        "phase=review-pending. A separate reviewer subagent (dispatched",
+        "by the coord on the next tick) runs /review + codex against your",
+        "branch. A separate finisher subagent pushes + opens the PR.",
+        "",
+        "You do NOT run /review yourself. You do NOT run /codex review",
+        "yourself. You do NOT push the branch. You do NOT open the PR.",
+        "Doing any of those is a contract violation — the reviewer is the",
+        "dedicated reviewer for a reason (structural enforcement that",
+        "/review actually ran).",
         "",
         f"  fleet workers update {task.slug} {proj_flag} --phase branch",
         step1,
@@ -176,20 +187,10 @@ def build_worker_prompt(
         f"  fleet workers update {task.slug} {proj_flag} --phase tdd-refactor",
         "2c. Refactor without changing test behavior. git commit.",
         "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase review-claude",
-        "3a. /review on your diff. Fix every P0/P1.",
-        "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase review-codex",
-        "3b. /codex review on your diff. Fix every P0/P1.",
-        "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase push",
-        "4. gh pr create. Capture the PR URL.",
-        "",
-        f"  fleet workers update {task.slug} {proj_flag} --phase done --pr-url <url>",
-        "5. Done. Coord sees phase=done, archives this dir, transitions task to in-review.",
-        "6. Optional:",
-        f"   fleet learnings add --project {project} --tag <topic> \\",
-        f"     --task {task.slug} \"<one paragraph>\"",
+        f"  fleet workers update {task.slug} {proj_flag} --phase review-pending",
+        "3. Commits are landed locally on the worker branch. Exit cleanly",
+        "   (Ctrl-D / /exit). The coord polls state.json on the next tick,",
+        "   sees phase=review-pending, and dispatches the reviewer subagent.",
         "",
         "## Constraints",
         "",
@@ -214,16 +215,17 @@ def build_worker_prompt(
         # `fleet tasks add` (P3 backlog) instead of acting on it.
         "## Post-completion contract",
         "",
-        "After you emit the §7 return contract, your work for this dispatch",
-        "is COMPLETE. You may NOT:",
-        "  - open additional PRs",
+        "After you flip --phase review-pending and exit, your work for this",
+        "dispatch is COMPLETE. You may NOT:",
+        "  - open PRs (the finisher does that)",
+        "  - run /review or /codex review (the reviewer does that)",
         "  - file additional bugs / tasks unless explicitly invited",
         "  - amend, push, or rebase any branch",
         "  - take ANY further action on this codebase",
         "",
         "If during the work you noticed valid follow-up ideas, do NOT do",
-        "that work yourself. The §7 list is the closed scope. File a P3",
-        "ticket via",
+        "that work yourself. The original task spec is the closed scope.",
+        "File a P3 ticket via",
         f"    fleet tasks add --project {project} --spawned-by {task.slug} \\",
         "      --priority P3 --slug <short> \"<one-liner>\"",
         "so the operator triages it. Bonus content violates CLAUDE.md §8.",
@@ -233,7 +235,8 @@ def build_worker_prompt(
         "after returning its §7 contract. That PR was closed. Do not repeat",
         "the pattern.",
         "",
-        "You have: /review, /codex review, gh, git, full repo at <cwd>.",
+        "You have: gh, git, full repo at <cwd>. /review and /codex review",
+        "are reserved for the reviewer subagent — do NOT invoke them here.",
         "NO interactive chat — operator can't reply mid-flight. Communicate via",
         "`fleet workers update`, which mutates state.json atomically.",
     ])
@@ -253,6 +256,249 @@ def build_worker_prompt(
 
 class PromptTooLargeError(Exception):
     """Worker prompt exceeded the hard cap. Operator must shrink inputs."""
+
+
+def build_reviewer_prompt(
+    task: parse.Task,
+    project: str,
+    *,
+    branch: str | None = None,
+    workers_dir: str | None = None,
+) -> str:
+    """Assemble the reviewer subagent's first-turn prompt.
+
+    Three-stage flow (reviewer-subagent-arch): after the worker writes
+    phase=review-pending and exits, the coord dispatches THIS subagent
+    against the same worker dir + branch. The reviewer iterates /review
+    + codex against the worker's diff and records terminal review
+    status before flipping phase=review-done. The finisher subagent
+    (build_finisher_prompt) picks up from there.
+
+    Contract this prompt enforces (matches CLAUDE.md §4):
+      - /review (gstack skill) is MANDATORY — never skippable. Loop
+        until two consecutive clean passes.
+      - codex review is single-attempt with one 60s retry. On
+        persistent rate-limit, record review_codex_status=skipped
+        with --review-codex-skip-reason rate-limited. ANY other skip
+        reason is rejected by the workers CLI.
+      - Per-iteration fixes are committed (`fix: review iter-N — <line>`)
+        on the worker's branch. No squashing.
+      - Final action: `fleet workers update <slug> --phase review-done`
+        with terminal --review-claude-status and --review-codex-status
+        flags. Then exit. The reviewer does NOT push the branch and
+        does NOT open the PR — the finisher subagent handles those.
+    """
+    if branch is None:
+        branch = f"worker/{task.slug}"
+    if workers_dir is None:
+        workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
+
+    proj_flag = f"--project {project}"
+    base_branch = "main"  # finisher opens the PR against main; reviewer doesn't push.
+
+    lines: list[str] = [
+        f"You are a Fleet REVIEWER subagent for task: {task.slug}",
+        f"Project: {project}",
+        f"Branch to review: {branch}",
+        "",
+        "You are running as a Fleet-dispatched Claude session. The previous",
+        "subagent (the worker) wrote the implementation + tests and exited at",
+        "phase=review-pending. Your job is to run /review and codex review on",
+        "the worker's diff, commit any fixes, and flip the phase to review-done",
+        "so the finisher can push + open the PR.",
+        "",
+        f"State file:  {workers_dir}/state.json",
+        f"Branch:      {branch} (already on disk, already has the worker's commits)",
+        f"Base for review: origin/{base_branch}",
+        "",
+        "## Required workflow",
+        "",
+        f"1. `git checkout {branch}` — make sure you're on the worker's branch.",
+        "   The worker's commits are already there; you append review fixes on",
+        "   top.",
+        "",
+        f"2. /review iteration loop (gstack skill, MANDATORY — never skippable):",
+        "   - Invoke `/review` via the Skill tool (literal name `review`).",
+        "   - On any [P0] or [P1] finding: fix it, write a regression test,",
+        f"     `git commit -m \"fix: review iter-N — <one line>\"`, then re-run",
+        "     `/review`.",
+        "   - Loop until `/review` returns clean in TWO consecutive runs (the",
+        "     second confirms the last fix didn't introduce a regression).",
+        "   - Track the rounds count — you'll pass it as --review-claude-rounds.",
+        f"   - Update phase mid-loop: `fleet workers update {task.slug} {proj_flag} \\",
+        "       --phase review-claude --review-claude-status iterating`",
+        "     (idempotent; helps the operator see live progress).",
+        "",
+        f"3. codex review (single attempt + ONE 60s retry on rate-limit):",
+        "   - Run `codex review --base origin/" + base_branch + " -c 'model_reasoning_effort=\"high\"' --enable web_search_cached < /dev/null 2>/tmp/codex-err.txt`.",
+        "   - On [P0]/[P1] findings: fix, commit `fix: codex iter-N — <line>`,",
+        "     re-run codex until clean in TWO consecutive runs.",
+        "   - On rate-limit (stderr matches `usage limit` / `rate limit` /",
+        "     `too many requests` / `out of token` / `quota`): wait 60s, retry",
+        "     ONCE. If still rate-limited, MARK codex SKIPPED with reason",
+        "     `rate-limited`. If the codex binary is missing or unreachable,",
+        "     MARK SKIPPED with reason `unavailable`. NO other skip reasons are",
+        "     allowed — the workers CLI rejects them at the flag layer.",
+        f"   - Phase nudge: `fleet workers update {task.slug} {proj_flag} \\",
+        "       --phase review-codex --review-codex-status iterating`",
+        "",
+        "4. Final terminal write (the load-bearing call):",
+        "",
+        f"   `fleet workers update {task.slug} {proj_flag} --phase review-done \\",
+        "     --review-claude-status passed --review-claude-rounds <N> \\",
+        "     --review-codex-status {passed|skipped} --review-codex-rounds <M>` \\",
+        "    [`--review-codex-skip-reason rate-limited` only when codex SKIPPED]",
+        "",
+        "   The workers CLI rejects anything except passed/skipped here for",
+        "   codex, and skipped+reason must be in {rate-limited, unavailable}.",
+        "   /review can NEVER be skipped (the CLI rejects --review-claude-",
+        "   status=skipped). If you cannot get /review to pass, do NOT flip",
+        "   phase=review-done — instead:",
+        f"     `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
+        "       --reason \"/review iter-N blocked: <one line>\"`",
+        "   and exit. The coord raises the BLOCKED state to the operator.",
+        "",
+        "5. Exit cleanly (Ctrl-D / /exit) once you wrote --phase review-done.",
+        "   The coord polls state.json on the next tick, sees phase=review-done,",
+        "   and dispatches the finisher subagent. You do NOT push or open the",
+        "   PR — that is the finisher's job.",
+        "",
+        "## Hard prohibitions",
+        "",
+        "- Do NOT push the branch. Do NOT `gh pr create`. Do NOT amend.",
+        "- Do NOT skip /review (mandatory reviewer).",
+        "- Do NOT broaden codex skip reasons beyond {rate-limited, unavailable}",
+        "  — the workers CLI will reject the update and your phase=review-done",
+        "  flip won't land.",
+        "- Do NOT alter the worker's commits except via review-iter fix commits",
+        "  on top.",
+        "",
+        "## §7 return contract (terse)",
+        "",
+        "When done, return a short message: `review iterations: claude=N codex=M;",
+        "final claude=passed; final codex={passed|skipped:rate-limited|skipped:unavailable}`.",
+        "",
+        "You have: /review, /codex review, gh, git, full repo at the worker's cwd.",
+        "NO interactive chat — operator can't reply mid-flight.",
+    ]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
+        raise PromptTooLargeError(
+            f"reviewer prompt for {task.slug} is "
+            f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
+        )
+    return out
+
+
+def build_finisher_prompt(
+    task: parse.Task,
+    project: str,
+    *,
+    branch: str | None = None,
+    workers_dir: str | None = None,
+) -> str:
+    """Assemble the finisher subagent's first-turn prompt.
+
+    Three-stage flow: after the reviewer writes phase=review-done +
+    terminal review_*_status, the coord dispatches THIS subagent. The
+    finisher is purely mechanical:
+
+      1. `git push origin <branch>` (or --force-with-lease if a fix
+         landed on a remote-existing branch from a prior attempt).
+      2. `gh pr create --base main --head <branch> --title ... --body
+         ...` with the standard PR body shape (scope summary +
+         reviewer iteration counts + test plan).
+      3. `fleet workers update <slug> --phase done --pr-url <url>`.
+      4. Exit.
+
+    The finisher does NOT run /review or codex (the reviewer already
+    did). The finisher does NOT amend commits or rebase. Any failure
+    on push or PR creation flips phase=blocked with the failure as
+    --reason. Re-dispatching a failed finisher is the operator's call
+    (or a future autosystem; v0 leaves it manual).
+    """
+    if branch is None:
+        branch = f"worker/{task.slug}"
+    if workers_dir is None:
+        workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
+
+    proj_flag = f"--project {project}"
+
+    lines: list[str] = [
+        f"You are a Fleet FINISHER subagent for task: {task.slug}",
+        f"Project: {project}",
+        f"Branch to push: {branch}",
+        "",
+        "You are running as a Fleet-dispatched Claude session. The reviewer",
+        "subagent ran /review + codex on the worker's diff, recorded terminal",
+        "review_claude_status + review_codex_status, and flipped the phase to",
+        "review-done. Your job is mechanical: push, open the PR, update the",
+        "worker's phase to done. NO code changes. NO review iteration.",
+        "",
+        f"State file:  {workers_dir}/state.json",
+        f"Branch:      {branch} (already has worker + reviewer commits, ready to push)",
+        f"Base for PR: main",
+        "",
+        "## Required workflow",
+        "",
+        f"1. `git push -u origin {branch}` — fresh push. If origin already has",
+        "   a stale prior attempt's tip, use `git push --force-with-lease",
+        f"   origin {branch}` (your branch is the only writer; --force-with-",
+        "   lease is safe). Never plain `--force`.",
+        "",
+        "2. Read state.json to extract reviewer counts for the PR body:",
+        f"   - `cat {workers_dir}/state.json | jq -r '.review_claude_rounds, .review_codex_rounds, .review_codex_status, .review_codex_skip_reason'`",
+        "",
+        f"3. `gh pr create --base main --head {branch} --title '<commit-1 message>' \\",
+        "     --body \"$(cat <<'EOF'",
+        "## Summary",
+        "<1-3 bullets from the worker's commits>",
+        "",
+        "## Review",
+        "- /review: passed (claude rounds: <N>)",
+        "- codex review: <passed (codex rounds: <M>) | SKIPPED: <reason> at <UTC ts>>",
+        "",
+        "## Test plan",
+        "- [ ] CI green",
+        "- [ ] verify locally",
+        "EOF",
+        "     )\"`",
+        "",
+        f"4. Capture the PR URL. Then:",
+        f"   `fleet workers update {task.slug} {proj_flag} --phase done --pr-url <url> --exit 0`",
+        "",
+        "5. Exit cleanly.",
+        "",
+        "## On failure",
+        "",
+        "If `git push` or `gh pr create` errors, do NOT retry blindly. Flip",
+        f"to blocked with the error inlined:",
+        f"   `fleet workers update {task.slug} {proj_flag} --phase blocked \\",
+        "     --reason \"finisher: <one-line error>\"`",
+        "Then exit. The coord raises BLOCKED to the operator.",
+        "",
+        "## Hard prohibitions",
+        "",
+        "- Do NOT run /review or codex. The reviewer already did.",
+        "- Do NOT amend, rebase, or alter commits.",
+        "- Do NOT skip the `fleet workers update --phase done` call. The phase",
+        "  is the canonical completion signal; without it the coord can't",
+        "  transition the task to in-review.",
+        "- Do NOT plain --force-push. --force-with-lease only.",
+        "",
+        "## §7 return contract (terse)",
+        "",
+        "Return: `PR URL: <url>; final phase=done`.",
+        "",
+        "You have: gh, git, full repo at the worker's cwd. NO interactive chat.",
+    ]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
+        raise PromptTooLargeError(
+            f"finisher prompt for {task.slug} is "
+            f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
+        )
+    return out
 
 
 def _select_learnings(raw: str) -> str:

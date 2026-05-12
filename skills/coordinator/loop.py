@@ -285,6 +285,7 @@ def _tick_locked(
             # bounded across long-running supervisor sessions.
             if action.clear_worker:
                 supervisor_mod.forget_agent_id(state, action.slug)
+                _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
@@ -343,6 +344,7 @@ def _tick_locked(
             # a defunct agent record.
             if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
                 supervisor_mod.forget_agent_id(state, action.slug)
+                _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
             result.errors.append(f"sentinel {action.slug}: {exc}")
     if last_seen:
@@ -357,6 +359,35 @@ def _tick_locked(
     except Exception as exc:
         result.errors.append(f"tasks.md re-read failed: {exc}")
         return result
+    # 5a. Review handoffs (reviewer-subagent-arch). Detect in-flight
+    # tasks whose state.json reports phase=review-pending (→ dispatch
+    # reviewer) or phase=review-done (→ dispatch finisher) and emit
+    # the DISPATCH blocks. Each handoff counts toward result.dispatched
+    # so the TUI surfaces an N-agents bump on the next tick.
+    handoffs = _dispatch_review_handoffs(
+        tasks=f.tasks,
+        project=project,
+        fleet_bin=fleet_bin,
+        fleet_home=str(home),
+        home=home,
+        coord_state=state,
+    )
+    for action in handoffs:
+        if action.error:
+            result.errors.append(f"handoff {action.slug}: {action.error}")
+            continue
+        try:
+            _apply_dispatch_handoff(action, project, fleet_bin)
+            if action.agent_id:
+                supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
+                _record_review_handoff_dispatched(
+                    state, action.slug, action.handoff_phase,
+                )
+            if action.dispatch_instruction:
+                result.dispatch_instructions.append(action.dispatch_instruction)
+            result.dispatched += 1
+        except Exception as exc:
+            result.errors.append(f"handoff apply {action.slug}: {exc}")
     dispatched = _dispatch_ready(
         tasks=f.tasks,
         project=project,
@@ -531,6 +562,14 @@ def _run_supervisor(
                 )
                 if action.clear_worker:
                     supervisor_mod.forget_agent_id(cs, action.slug)
+                    # Three-stage flow (reviewer-subagent-arch): clear
+                    # the review-handoff dispatched markers in sync
+                    # with the agent_id forget, mirroring the same
+                    # cleanup in the primary tick path. Without this,
+                    # supervisor-driven terminal transitions leave
+                    # stale handoff keys that block future re-dispatches
+                    # for the same slug.
+                    _clear_review_handoff_state(cs, action.slug)
                 # codex iter-1 [P1]: a worker leaving the in-flight
                 # set frees a dispatch slot. Without re-running
                 # _dispatch_ready, with cap=1 the next ready task
@@ -761,6 +800,69 @@ def _load_parallelism(project_dir: Path) -> int:
 def _save_coord_state(path: Path, state: dict) -> None:
     """Atomic publish of coord-state.json (tmp + rename + fsync)."""
     _atomic_write_json(path, state)
+
+
+def _load_review_handoff_state(home: Path, project: str) -> set[str]:
+    """Read coord-state.json:review_handoffs and return the set of
+    (slug:phase) keys for already-dispatched review handoffs this
+    coord has fired.
+
+    The set is read-only here; mutation routes through
+    _record_review_handoff_dispatched (which is called from
+    _apply_dispatch_handoff). Empty set on missing / malformed file —
+    a coord that lost its state file just re-dispatches at most one
+    duplicate per (slug, phase), which is recoverable: the second
+    reviewer sees the first reviewer's commits and a clean diff to
+    review, runs through the loop quickly (two consecutive clean
+    passes), and writes phase=review-done a second time. The
+    finisher then dispatches as normal.
+    """
+    state_path = home / "projects" / project / "coord-state.json"
+    state = _load_coord_state(state_path)
+    raw = state.get("review_handoffs_dispatched")
+    if not isinstance(raw, list):
+        return set()
+    return {str(x) for x in raw if isinstance(x, str)}
+
+
+def _record_review_handoff_dispatched(
+    state: dict, slug: str, phase: str,
+) -> None:
+    """Append `<slug>:<phase>` to coord-state.review_handoffs_dispatched.
+
+    Called from _apply_dispatch_handoff after the inbox file + DISPATCH
+    block have been emitted. The state dict is the same one tick()
+    will persist at the end via _save_coord_state — we mutate in
+    place. Idempotent: a duplicate key is added without dedup (the
+    list grows briefly, but _load_review_handoff_state coerces to a
+    set on read, and the entries are cleared on terminal phases via
+    _clear_review_handoff_state below).
+    """
+    raw = state.get("review_handoffs_dispatched")
+    if not isinstance(raw, list):
+        raw = []
+    key = f"{slug}:{phase}"
+    if key not in raw:
+        raw.append(key)
+    state["review_handoffs_dispatched"] = raw
+
+
+def _clear_review_handoff_state(state: dict, slug: str) -> None:
+    """Drop ALL review-handoff entries for the given slug.
+
+    Called when a slug reaches a terminal state (done | blocked |
+    failed | todo-after-CI-red etc.) — the worker dir is gone or about
+    to be, and any re-dispatch on the same slug starts fresh. Without
+    this cleanup the dispatched-list would grow unboundedly across a
+    project's lifetime.
+    """
+    raw = state.get("review_handoffs_dispatched")
+    if not isinstance(raw, list):
+        return
+    prefix = slug + ":"
+    state["review_handoffs_dispatched"] = [
+        x for x in raw if isinstance(x, str) and not x.startswith(prefix)
+    ]
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -1204,6 +1306,19 @@ def _reconcile_inflight(
         # to in-review every tick and short-circuited the CI checks
         # that finish the merge → done lifecycle).
         if t.status == "in-progress":
+            # Three-stage flow handoff phases: phase=review-pending
+            # (worker → reviewer) and phase=review-done (reviewer →
+            # finisher). The previous subagent exited cleanly to make
+            # way for the next; this is NOT a "worker died" failure.
+            # The handoff dispatch path (_dispatch_review_handoffs)
+            # spawns the next subagent. Skip the reconcile decision
+            # tree entirely so we don't transcribe the worker's
+            # mid-pipeline exit as a requeue-to-todo.
+            mid_phase = _read_worker_state(project, t.slug, home=home)
+            if mid_phase is not None and mid_phase.get("phase", "") in (
+                "review-pending", "review-done",
+            ):
+                continue
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
                 phase, pr_url, blocked_reason = terminal
@@ -1864,6 +1979,14 @@ class _DispatchAction:
                                     # Phase A) — coord agent reads tick
                                     # output and invokes Agent tool per
                                     # block. Empty when error is set.
+    handoff_phase: str = ""  # three-stage flow: "review-pending"
+                              # (reviewer dispatch) or "review-done"
+                              # (finisher dispatch). Empty for the
+                              # initial worker dispatch — _apply_dispatch
+                              # uses this to decide whether to flip
+                              # task status / bootstrap state.json
+                              # (worker only; reviewer/finisher reuse
+                              # the existing slot).
     error: str = ""
 
 
@@ -1990,6 +2113,136 @@ def _dispatch_ready(
         ))
         active += 1
         in_flight_after_dispatch.append(t)
+    return actions
+
+
+def _dispatch_review_handoffs(
+    *,
+    tasks: list[parse.Task],
+    project: str,
+    fleet_bin: str,
+    fleet_home: str,
+    home: Path,
+    coord_state: dict | None = None,
+) -> list[_DispatchAction]:
+    """Detect in-flight tasks whose worker dir signals a stage handoff
+    and emit DISPATCH blocks for the next stage's subagent.
+
+    Three-stage flow (reviewer-subagent-arch):
+
+        worker (phase=review-pending) → reviewer subagent
+        reviewer (phase=review-done)  → finisher subagent
+
+    Trigger condition is per-task:
+      1. task.status == "in-progress" (the slot is owned).
+      2. workers/<slug>/state.json reports phase=review-pending OR
+         phase=review-done.
+      3. The previous subagent has exited — gated on (worker_pid == 0
+         OR worker_pid not alive). Without this gate we'd race the
+         outgoing worker that's still drawing breath; with it, the
+         handoff fires exactly once on the tick AFTER the worker
+         exited.
+
+    Each handoff dispatches a NEW subagent (its own agent_id, its own
+    inbox file). The worker's state.json stays at the same path —
+    successive subagents own + mutate the same state file, the same
+    way the worker progresses through phases.
+
+    Suppression of double-dispatch: the loop checks the coord-state
+    map's review_handoff_dispatched entry (per slug + phase) to avoid
+    re-spawning a reviewer on every tick while the reviewer is still
+    running. The check is "did we already dispatch a reviewer/finisher
+    for this slug at this phase since the last terminal write?"
+    A finisher's phase=done write resets the per-slug entry.
+
+    BUT: the coord-state map mutation lives in `_apply_dispatch_handoff`
+    (companion to `_apply_dispatch`). This function only PROPOSES.
+    """
+    actions: list[_DispatchAction] = []
+    if coord_state is not None:
+        raw = coord_state.get("review_handoffs_dispatched")
+        seen_handoffs = (
+            {str(x) for x in raw if isinstance(x, str)}
+            if isinstance(raw, list)
+            else set()
+        )
+    else:
+        seen_handoffs = _load_review_handoff_state(home, project)
+    for t in tasks:
+        if t.status != "in-progress":
+            continue
+        # If the previous subagent is still draining, hold off — the
+        # state.json may be in mid-flux. The pid-alive check is the
+        # fast path; the slower state-fresh path can lie when a
+        # worker exits at phase=review-pending (still under the 15-
+        # minute freshness window). We deliberately do NOT consult
+        # `_is_worker_alive` here — that helper considers a fresh
+        # state.json "alive" even when the OS process has exited,
+        # which is exactly the case we want to detect here.
+        if t.worker_pid > 0 and _pid_alive(t.worker_pid):
+            continue
+        st = _read_worker_state(project, t.slug, home=home)
+        if st is None:
+            continue
+        phase = st.get("phase", "")
+        if phase not in ("review-pending", "review-done"):
+            continue
+
+        # De-dup: don't re-spawn a reviewer/finisher while it's still
+        # working. We key on (slug, phase) — once the next subagent
+        # writes phase=review-claude (reviewer iterating) or
+        # phase=push/done (finisher executing), the key changes and
+        # the dispatch is naturally not retriggered.
+        key = f"{t.slug}:{phase}"
+        if key in seen_handoffs:
+            continue
+
+        branch = t.branch or f"worker/{t.slug}"
+        try:
+            if phase == "review-pending":
+                prompt = dispatch_mod.build_reviewer_prompt(
+                    t, project=project, branch=branch,
+                )
+                description = f"fleet reviewer {t.slug}"
+            else:
+                prompt = dispatch_mod.build_finisher_prompt(
+                    t, project=project, branch=branch,
+                )
+                description = f"fleet finisher {t.slug}"
+        except dispatch_mod.PromptTooLargeError as exc:
+            actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
+            continue
+
+        agent_id = dispatch_mod.mint_agent_id()
+        try:
+            inbox_path = dispatch_mod.write_worker_inbox(
+                agent_id, prompt, fleet_home=fleet_home,
+            )
+        except Exception as exc:  # noqa: BLE001
+            actions.append(_DispatchAction(
+                slug=t.slug, agent_id=agent_id,
+                error=f"handoff inbox write failed: {exc}",
+            ))
+            continue
+        try:
+            instruction = dispatch_mod.format_dispatch_instruction(
+                agent_id=agent_id, slug=t.slug,
+                prompt_file=inbox_path, description=description,
+            )
+        except ValueError as exc:
+            actions.append(_DispatchAction(
+                slug=t.slug, agent_id=agent_id,
+                error=f"handoff instruction format failed: {exc}",
+            ))
+            continue
+        # Tag the action so the apply step knows this is a handoff
+        # (which skips status flip + state.json bootstrap — those are
+        # already correct from the prior subagent).
+        actions.append(_DispatchAction(
+            slug=t.slug, agent_id=agent_id, branch=branch,
+            dispatch_instruction=instruction,
+            handoff_phase=phase,
+        ))
     return actions
 
 
@@ -2173,6 +2426,38 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
+
+
+def _apply_dispatch_handoff(
+    action: _DispatchAction, project: str, fleet_bin: str,
+) -> None:
+    """Apply a review-handoff dispatch (reviewer or finisher subagent).
+
+    Mechanically simpler than _apply_dispatch:
+      - Task status stays in-progress (the slot is already owned).
+      - workers/<slug>/state.json stays at its current phase — the
+        reviewer/finisher will flip it themselves.
+      - Branch + worktree are unchanged (same slug, same checkout).
+      - The ONLY persistent mutation is a note recording which
+        subagent_id picked up this stage; the supervisor's agent_id
+        map gets updated separately by the caller.
+
+    Called from tick() after the DISPATCH block has been collected.
+    Coord-state.review_handoffs_dispatched mutation happens in tick()
+    too (it needs the same state dict that tick() persists at the end).
+    """
+    if action.error:
+        return
+    # Single fleet CLI call: record the new subagent_id under the
+    # task's note history. The note's free text is the only persistent
+    # breadcrumb the operator sees in `fleet tasks show` for the
+    # reviewer/finisher slot.
+    label = action.handoff_phase or "handoff"
+    if action.agent_id:
+        _run_fleet([
+            fleet_bin, "tasks", "note", "--project", project, action.slug,
+            f"{label}: dispatched as agent {action.agent_id}",
+        ])
 
 
 # ---------- shared CLI helper ----------

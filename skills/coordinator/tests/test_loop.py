@@ -1930,3 +1930,219 @@ def test_tick_flags_post_archive_artifact(
         "post-archive flag must be idempotent across ticks: "
         + repr(updated_again.get("post_archive_artifacts"))
     )
+
+
+# ---------- three-stage flow: review handoff dispatches (reviewer-subagent-arch) ----------
+
+
+def _write_worker_state(
+    fleet_home: Path, project: str, slug: str, phase: str, *,
+    updated_at: str | None = None,
+) -> None:
+    """Helper: drop a worker state.json with the given phase. Mirrors
+    the on-disk shape Go writes via `fleet workers update`. The new
+    review-* fields can stay empty for these handoff-detection tests."""
+    workers_dir = fleet_home / "projects" / project / "workers" / slug
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    body = {
+        "slug": slug,
+        "project": project,
+        "phase": phase,
+        "started_at": "2026-05-11T10:00:00Z",
+        "updated_at": updated_at or "2026-05-11T11:00:00Z",
+        "pid": 0,
+    }
+    (workers_dir / "state.json").write_text(json.dumps(body))
+
+
+def test_loop_dispatches_reviewer_on_phase_review_pending(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Three-stage flow: worker exits at phase=review-pending → coord
+    dispatches a reviewer subagent on the next tick. The task stays
+    in-progress; a new DISPATCH block is emitted; the reviewer prompt
+    is written to the inbox; result.dispatched is incremented by 1."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "review-pending-aaaa", status="in-progress", worker_pid=99999,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "review-pending-aaaa", "review-pending",
+    )
+    # Reviewer agent_id under test.
+    dispatch_subprocess.append("ffffaaaa")
+    # Worker PID is dead → handoff fires.
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    # The reviewer dispatch is one DISPATCH block; the reconcile path
+    # also sees the dead pid + non-terminal phase (review-pending falls
+    # through to the pr_url branch which has no pr_url → would requeue
+    # to todo). The handoff path runs BEFORE this in tick() — but
+    # _reconcile_inflight's "no terminal state" branch ALSO fires for
+    # review-pending. Test that the dispatch block lands.
+    assert any(
+        block.startswith("DISPATCH: review-pending-aaaa")
+        and "agent_id: ffffaaaa" in block
+        for block in result.dispatch_instructions
+    ), f"reviewer DISPATCH not emitted: {result.dispatch_instructions!r}"
+    # Inbox file written with the reviewer prompt.
+    inbox = fleet_home / "inbox" / "ffffaaaa.md"
+    assert inbox.exists(), "reviewer inbox file not written"
+    body = inbox.read_text()
+    assert "FLEET REVIEWER" in body.upper()
+    # Note recorded under the task: "review-pending: dispatched as agent <id>".
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    review_notes = [c for c in note_calls if "review-pending" in (c[-1] if c else "")]
+    assert review_notes, f"expected review-pending note: {note_calls!r}"
+
+
+def test_loop_dispatches_finisher_on_phase_review_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Three-stage flow: reviewer writes phase=review-done → coord
+    dispatches the finisher on the next tick. Counterpart to the
+    review-pending dispatch test."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "review-done-bbbb", status="in-progress", worker_pid=99998,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "review-done-bbbb", "review-done",
+    )
+    dispatch_subprocess.append("ffffbbbb")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert any(
+        block.startswith("DISPATCH: review-done-bbbb")
+        and "agent_id: ffffbbbb" in block
+        for block in result.dispatch_instructions
+    ), f"finisher DISPATCH not emitted: {result.dispatch_instructions!r}"
+    inbox = fleet_home / "inbox" / "ffffbbbb.md"
+    assert inbox.exists()
+    body = inbox.read_text()
+    assert "FINISHER" in body.upper()
+    # The note recorded for this handoff phase is "review-done:".
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    finisher_notes = [c for c in note_calls if "review-done" in (c[-1] if c else "")]
+    assert finisher_notes, f"expected review-done note: {note_calls!r}"
+
+
+def test_loop_does_not_redispatch_finisher_on_consecutive_ticks(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Finisher dedup: same invariant as the reviewer dedup test, but
+    for phase=review-done. Once a finisher is dispatched, a second
+    tick at the same phase MUST NOT spawn a second finisher."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "no-double-finisher-dddd", status="in-progress", worker_pid=99996,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "no-double-finisher-dddd", "review-done",
+    )
+    dispatch_subprocess.append("ffffeeee")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        first = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert any(
+        b.startswith("DISPATCH: no-double-finisher-dddd")
+        for b in first.dispatch_instructions
+    )
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        second = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert not any(
+        b.startswith("DISPATCH: no-double-finisher-dddd")
+        for b in second.dispatch_instructions
+    ), f"finisher redispatched on second tick: {second.dispatch_instructions!r}"
+
+
+def test_loop_does_not_redispatch_reviewer_on_consecutive_ticks(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Once the reviewer is dispatched at phase=review-pending, a
+    second tick at the SAME phase MUST NOT spawn a second reviewer
+    (the first one is still running). The coord-state.json's
+    review_handoffs_dispatched list is the dedup signal."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "no-double-cccc", status="in-progress", worker_pid=99997,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "no-double-cccc", "review-pending",
+    )
+    dispatch_subprocess.append("ffffcccc")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        first = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    # First tick fires reviewer.
+    assert any(
+        b.startswith("DISPATCH: no-double-cccc")
+        for b in first.dispatch_instructions
+    )
+    # Second tick: state.json still says review-pending (reviewer not
+    # done yet). The coord must skip the handoff dispatch.
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        second = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert not any(
+        b.startswith("DISPATCH: no-double-cccc")
+        for b in second.dispatch_instructions
+    ), f"reviewer redispatched on second tick: {second.dispatch_instructions!r}"
+
+
+def test_loop_skips_handoff_when_worker_pid_alive(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Race condition guard: if the worker process is STILL running
+    (PID alive), don't fire the handoff yet — the state.json may be
+    mid-flux. Handoff fires only after the worker process exits."""
+    _write_tasks(project_dir, [
+        _make_task(
+            "alive-dddd", status="in-progress", worker_pid=12345,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "alive-dddd", "review-pending",
+    )
+    with patch.object(loop, "_pid_alive", return_value=True), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert not any(
+        b.startswith("DISPATCH: alive-dddd")
+        for b in result.dispatch_instructions
+    ), "handoff fired while worker PID still alive"

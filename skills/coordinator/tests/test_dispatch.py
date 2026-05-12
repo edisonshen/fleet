@@ -44,12 +44,50 @@ def test_build_worker_prompt_contains_required_sections() -> None:
     assert "TDD only." in out
     assert "## Relevant prior learnings" in out
     assert "use t.TempDir" in out
-    # Workflow tail mentions every required phase.
+    # Three-stage flow: worker writes the code phases ONLY. Review +
+    # push happen in separate subagents (reviewer-subagent-arch).
     for phase in ("branch", "tdd-red", "tdd-green", "tdd-refactor",
-                  "review-claude", "review-codex", "push", "done"):
-        assert f"--phase {phase}" in out
+                  "review-pending"):
+        assert f"--phase {phase}" in out, f"worker prompt missing --phase {phase}"
+    # The old inline phases are GONE from the worker prompt — only the
+    # reviewer subagent runs review-claude/review-codex; only the
+    # finisher subagent runs push/done. Their presence in the worker
+    # prompt would re-introduce the structural failure mode the
+    # three-stage flow exists to prevent.
+    for forbidden in ("--phase review-claude", "--phase review-codex",
+                      "--phase push", "--phase done"):
+        assert forbidden not in out, (
+            f"worker prompt still mentions {forbidden}; three-stage flow "
+            "must hand those phases to the reviewer/finisher subagents"
+        )
+    # Workers no longer invoke /review or codex inline. The prompt may
+    # MENTION them only in prohibition language ("do NOT run /review")
+    # — never as a step. The "On your diff. Fix every P0/P1" wording
+    # from the old prompt is the bright-line check.
+    assert "On your diff" not in out, (
+        "worker prompt still tells worker to run reviewers on its diff"
+    )
+    assert "gh pr create" not in out, (
+        "worker prompt still references gh pr create; that's the finisher's job"
+    )
     # Branch derivation.
     assert f"git checkout -b worker/{t.slug}" in out
+
+
+def test_build_worker_prompt_terminates_at_review_pending() -> None:
+    """Three-stage flow: worker's last phase write is --phase
+    review-pending. No subsequent phase=push or phase=done from this
+    subagent — those belong to the finisher (reviewer-subagent-arch)."""
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet",
+        standards_md="# Standards",
+        learnings_text="",
+    )
+    # The terminal phase write for this subagent.
+    assert "--phase review-pending" in out
+    # Explicit "exit" instruction at the handoff point.
+    assert "Exit cleanly" in out or "exit cleanly" in out
 
 
 def test_build_worker_prompt_omits_learnings_section_when_empty() -> None:
@@ -176,7 +214,11 @@ def test_build_worker_prompt_contains_post_completion_contract() -> None:
     # Specific constraints — the wording matters because subagents
     # parse the prompt for "may NOT" directives.
     assert "may NOT" in out
-    assert "open additional PRs" in out
+    # Three-stage flow: worker MUST NOT open PRs (the finisher does
+    # that). The prohibition stays — the wording just shifted from
+    # "additional PRs" to "open PRs" since the worker never opens
+    # ANY PR in the new flow.
+    assert "open PRs" in out or "open additional PRs" in out
     # Pointer to the right channel for adjacent fixes the worker
     # noticed but should not act on.
     assert "fleet tasks add" in out
@@ -366,3 +408,98 @@ def test_fetch_learnings_swallows_missing_binary() -> None:
         dispatch.subprocess, "run", side_effect=FileNotFoundError("no fleet"),
     ):
         assert dispatch.fetch_learnings("fleet") == ""
+
+
+# ---------- build_reviewer_prompt (reviewer-subagent-arch) ----------
+
+
+def test_build_reviewer_prompt_contains_review_iter_loop() -> None:
+    """The reviewer subagent's prompt MUST instruct it to iterate
+    /review until two consecutive clean passes. This is the structural
+    invariant — without explicit "loop until clean" wording, a
+    reviewer might run /review once, see [P0] findings, fix one, and
+    declare done."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet")
+    # Section heading + role.
+    assert "FLEET REVIEWER" in out.upper()
+    assert f"task: {t.slug}" in out
+    # /review iteration loop language.
+    assert "/review" in out
+    assert "TWO consecutive" in out or "two consecutive" in out
+    assert "P0" in out and "P1" in out
+    # Fix-commit pattern.
+    assert "fix: review iter-" in out
+    # Final terminal write.
+    assert "--phase review-done" in out
+    assert "--review-claude-status passed" in out
+    assert "--review-claude-rounds" in out
+    # /review is never skippable.
+    assert "MANDATORY" in out or "mandatory" in out
+    # Reviewer does NOT push or open PR.
+    assert "do NOT push" in out.lower() or "Do NOT push" in out
+
+
+def test_build_reviewer_prompt_documents_codex_skip_rate_limit() -> None:
+    """Codex review's rate-limit handling is the documented
+    operational escape hatch. The prompt must spell out: try once,
+    wait 60s, retry, on persistent rate-limit MARK SKIPPED with
+    --review-codex-skip-reason rate-limited. Anything else is rejected
+    by the workers CLI."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet")
+    assert "codex" in out.lower()
+    assert "rate-limit" in out.lower() or "rate limit" in out.lower()
+    assert "60s" in out or "60 s" in out or "60 second" in out.lower()
+    assert "--review-codex-skip-reason" in out
+    assert "rate-limited" in out
+    # Allowlist note: only rate-limited|unavailable are valid.
+    assert "unavailable" in out
+
+
+def test_build_reviewer_prompt_does_not_push_or_open_pr() -> None:
+    """The reviewer hands the PR-opening job to the finisher. Its
+    prompt must NOT mention `gh pr create` as a step it should run —
+    that's a CLAUDE.md §7a "exit-before-push" gotcha if the reviewer
+    thinks it should also push."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet")
+    # Hard prohibition.
+    assert "Do NOT push" in out
+    assert "Do NOT `gh pr create`" in out or "Do NOT gh pr create" in out
+
+
+# ---------- build_finisher_prompt (reviewer-subagent-arch) ----------
+
+
+def test_build_finisher_prompt_documents_push_and_pr() -> None:
+    """The finisher's job is mechanical: push, open PR, mark done.
+    The prompt must instruct exactly those steps with no review loop."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet")
+    assert "FINISHER" in out.upper()
+    assert "git push" in out
+    assert "gh pr create" in out
+    assert "--phase done --pr-url" in out
+    # Hard prohibition: finisher does NOT run /review or codex.
+    assert "Do NOT run /review" in out or "do NOT run /review" in out.lower()
+
+
+def test_build_finisher_prompt_force_with_lease_only() -> None:
+    """A finisher that --force-pushes can blow away co-located changes.
+    The prompt must pin --force-with-lease as the only force variant
+    allowed, and document plain --force as prohibited."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet")
+    assert "--force-with-lease" in out
+    # Explicitly prohibits plain force.
+    assert "plain --force" in out.lower() or "NOT plain --force" in out
+
+
+def test_build_finisher_prompt_blocks_on_push_failure() -> None:
+    """The finisher cannot retry blindly on a push/PR creation
+    failure. It must flip to phase=blocked + raise to operator."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet")
+    assert "--phase blocked" in out
+    assert "--reason" in out
