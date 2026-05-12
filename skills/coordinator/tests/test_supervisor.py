@@ -1250,3 +1250,316 @@ def test_loop_dispatch_persists_agent_id_mapping(
         (project_dir / "coord-state.json").read_text(encoding="utf-8")
     )
     assert coord_state.get("worker_agent_ids", {}) == {"ready-aaaa": "abcdef01"}
+
+
+# ---------- Sub-fix C: agent auto-archive after FLEET_COORD_IDLE_TTL_H ----------
+
+
+def _write_agent_record(
+    fleet_home: Path,
+    agent_id: str,
+    *,
+    project: str,
+    last_activity_ts: str = "",
+    needs_input: bool = False,
+    blocked: bool = False,
+) -> Path:
+    """Seed ~/.fleet/agents/<id>.json with the minimal shape the sweep
+    reads. Mirrors internal/agent.Record's json:"..." tag names verbatim
+    so changing the Go schema here without updating the test is caught
+    by an assertion failure (defensive against schema drift)."""
+    agents_dir = fleet_home / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "schema_version": 1,
+        "id": agent_id,
+        "project": project,
+        "last_activity_ts": last_activity_ts,
+        "needs_input": needs_input,
+        "blocked": blocked,
+    }
+    path = agents_dir / f"{agent_id}.json"
+    path.write_text(json.dumps(rec), encoding="utf-8")
+    return path
+
+
+def test_env_idle_ttl_h_defaults_to_24() -> None:
+    """Default TTL = 24h. Empty env → 24."""
+    with patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("FLEET_COORD_IDLE_TTL_H", None)
+        assert supervisor.env_idle_ttl_h() == 24
+
+
+def test_env_idle_ttl_h_zero_disables() -> None:
+    """Setting the knob to 0 disables the sweep entirely."""
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "0"}):
+        assert supervisor.env_idle_ttl_h() == 0
+
+
+def test_env_idle_ttl_h_clamps_out_of_range() -> None:
+    """Negative and > 720 fall back to the 24h default (defensive
+    against a typo wedging archive at "never")."""
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "-5"}):
+        assert supervisor.env_idle_ttl_h() == 24
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "1000"}):
+        assert supervisor.env_idle_ttl_h() == 24
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "garbage"}):
+        assert supervisor.env_idle_ttl_h() == 24
+
+
+def test_env_idle_ttl_h_accepts_in_range_values() -> None:
+    """1..720 are accepted verbatim."""
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "1"}):
+        assert supervisor.env_idle_ttl_h() == 1
+    with patch.dict(os.environ, {"FLEET_COORD_IDLE_TTL_H": "720"}):
+        assert supervisor.env_idle_ttl_h() == 720
+
+
+def test_idle_agent_archive_pass_archives_stale_record(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Stale-idle agent (no NeedsInput/Blocked flags, LastActivityTS
+    older than TTL) gets `fleet rm <id>` invoked. With TTL=1h and a
+    70-minute-old heartbeat, the sweep fires.
+    """
+    project = "fleet"
+    _write_agent_record(
+        fleet_home, "aaaa0001",
+        project=project,
+        last_activity_ts="2026-05-11T00:00:00Z",
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr="",
+        )
+
+    # 70 minutes after the heartbeat (well past TTL=1h = 3600s).
+    last_heartbeat = supervisor._parse_rfc3339("2026-05-11T00:00:00Z")
+    assert last_heartbeat is not None
+    now_unix = last_heartbeat + 70 * 60
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project=project, home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+
+    assert archived == 1, f"expected 1 archive, recorded calls: {calls}"
+    rm_calls = [c for c in calls if c[1:3] == ["rm", "aaaa0001"]]
+    assert rm_calls, f"expected `fleet rm aaaa0001`, got: {calls}"
+
+
+def test_idle_agent_archive_pass_disabled_by_zero_ttl(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """TTL=0 short-circuits the sweep — no scan, no shell invocations."""
+    _write_agent_record(
+        fleet_home, "aaaa0002",
+        project="fleet",
+        last_activity_ts="2020-01-01T00:00:00Z",  # ancient
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "0")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 0
+    assert calls == [], "TTL=0 must skip every shell invocation"
+
+
+def test_idle_agent_archive_pass_skips_asking(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """NeedsInput=true (asking) records NEVER auto-archive regardless
+    of staleness — they need operator attention."""
+    _write_agent_record(
+        fleet_home, "bbbb0001",
+        project="fleet",
+        last_activity_ts="2020-01-01T00:00:00Z",  # ancient
+        needs_input=True,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 0
+    rm_calls = [c for c in calls if "rm" in c]
+    assert rm_calls == [], (
+        "asking records must never be auto-archived; got: " + repr(calls)
+    )
+
+
+def test_idle_agent_archive_pass_skips_blocked(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Blocked=true records NEVER auto-archive — operator triage path."""
+    _write_agent_record(
+        fleet_home, "cccc0001",
+        project="fleet",
+        last_activity_ts="2020-01-01T00:00:00Z",
+        blocked=True,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 0
+
+
+def test_idle_agent_archive_pass_skips_fresh(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Fresh records (heartbeat younger than TTL) stay live."""
+    # Heartbeat 30 minutes before now; TTL=1h → not yet eligible.
+    _write_agent_record(
+        fleet_home, "dddd0001",
+        project="fleet",
+        last_activity_ts="2026-05-11T00:30:00Z",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    # 30 min after heartbeat — well under the 1h TTL.
+    heartbeat = supervisor._parse_rfc3339("2026-05-11T00:30:00Z")
+    assert heartbeat is not None
+    now_unix = heartbeat + 30 * 60
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=now_unix, log_stream=io.StringIO(),
+    )
+    assert archived == 0
+    assert [c for c in calls if "rm" in c] == []
+
+
+def test_idle_agent_archive_pass_scopes_to_own_project(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Each project's coord only archives its OWN agents — a sibling
+    project's stale agent stays untouched (that project's coord owns
+    it)."""
+    _write_agent_record(
+        fleet_home, "aaaa1111",
+        project="fleet",  # this coord's project
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+    _write_agent_record(
+        fleet_home, "bbbb1111",
+        project="rainier",  # sibling project
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 1
+    rm_calls = [c[2] for c in calls if c[1:2] == ["rm"]]
+    assert rm_calls == ["aaaa1111"], f"expected only our agent rm'd, got: {rm_calls}"
+
+
+def test_idle_agent_archive_pass_tolerates_rm_failure(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """`fleet rm` exit != 0 (e.g., pending handoff blocks) logs to
+    stderr but never crashes the sweep. The next pass retries."""
+    _write_agent_record(
+        fleet_home, "cccc0002",
+        project="fleet",
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="",
+            stderr="agent has pending handoff",
+        )
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    log = io.StringIO()
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=log,
+    )
+    assert archived == 0
+    assert "exit=1" in log.getvalue()
+
+
+def test_idle_agent_archive_pass_tolerates_missing_agents_dir(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """No ~/.fleet/agents/ at all (fresh install) returns 0 cleanly."""
+    # fleet_home fixture creates the dir but no agents subdir — keep it
+    # absent for this test. Verify it doesn't exist.
+    agents_dir = fleet_home / "agents"
+    assert not agents_dir.exists()
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 0
+
+
+def test_idle_agent_archive_pass_skips_malformed_record(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """A hand-edited record with bad JSON is skipped (not crashed)."""
+    agents_dir = fleet_home / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / "eeee0000.json").write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 0

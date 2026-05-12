@@ -3,6 +3,9 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // TestDashboard_RendersPostArchiveBadge pins the visual contract for
@@ -54,5 +57,69 @@ func TestDashboard_OmitsPostArchiveBadgeWhenFalse(t *testing.T) {
 	out := strings.Join(lines, "\n")
 	if strings.Contains(out, "post-archive activity") {
 		t.Errorf("clean project row must NOT carry post-archive badge, got:\n%s", out)
+	}
+}
+
+// dashboard-accumulation-f-4421 Sub-fix B: pin the rendered chrome for
+// the right-column agent-idle separator. The text must signal the
+// count + the toggle keybind so the operator knows how to expand.
+func TestSeparatorBlockLine_AgentIdle_CollapsedLabel(t *testing.T) {
+	sep := &separatorRow{kind: separatorAgentIdle, count: 12, expanded: false}
+	line := separatorBlockLine(sep, 60, false)
+	if !strings.Contains(line, "12 idle") {
+		t.Errorf("collapsed agent-idle separator must include count '12 idle'; got: %q", line)
+	}
+	if !strings.Contains(line, "[enter] to expand") {
+		t.Errorf("collapsed agent-idle separator must include the [enter] hint; got: %q", line)
+	}
+}
+
+func TestSeparatorBlockLine_AgentIdle_ExpandedLabel(t *testing.T) {
+	sep := &separatorRow{kind: separatorAgentIdle, count: 3, expanded: true}
+	line := separatorBlockLine(sep, 60, false)
+	if !strings.Contains(line, "3 idle") {
+		t.Errorf("expanded agent-idle separator must include count '3 idle'; got: %q", line)
+	}
+	if !strings.Contains(line, "[enter] to collapse") {
+		t.Errorf("expanded agent-idle separator must include the [enter] collapse hint; got: %q", line)
+	}
+}
+
+// /review iter-1 [P0] regression: the right-column separatorAgentIdle
+// row must NEVER bleed into the LEFT column. dashboardRows returns left
+// and right rows in one slice; without an explicit skip in the LEFT-
+// column loop, the agent-idle separator was being appended to BOTH
+// columns (rendering twice).
+func TestBuildBodyLines_AgentIdleSeparatorRendersRightOnly(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	stale := now.Add(-30 * 24 * time.Hour)
+	m := New("test")
+	m.width = 140
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Active: true},
+		},
+		LoadedAt: now,
+	}
+	m.records = []*agent.Record{
+		{
+			ID:             "aaaa0001",
+			Project:        "fleet",
+			TmuxSession:    "fleet-aaaa0001",
+			LastActivityTS: stale, SpawnedAt: stale,
+		},
+	}
+
+	leftLines, rightLines := buildBodyLines(m, 90, 40)
+	leftAll := strings.Join(leftLines, "\n")
+	rightAll := strings.Join(rightLines, "\n")
+
+	if strings.Contains(leftAll, "1 idle") {
+		t.Errorf("agent-idle separator '1 idle' leaked into LEFT column:\n%s", leftAll)
+	}
+	if !strings.Contains(rightAll, "1 idle") {
+		t.Errorf("agent-idle separator '1 idle' missing from RIGHT column:\n%s", rightAll)
 	}
 }

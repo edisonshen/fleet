@@ -1492,6 +1492,14 @@ func (m Model) openDetail() (Model, tea.Cmd, bool) {
 			} else {
 				m.historyExpanded[proj] = true
 			}
+		case separatorAgentIdle:
+			// dashboard-accumulation-f-4421 Sub-fix B: [enter] on the
+			// right-column "─── N idle ───" separator toggles the v0.1
+			// agent-idle group. asking/blocked agents are never
+			// inside this bucket — they render above the separator
+			// regardless of staleness — so the toggle only ever
+			// exposes truly-idle records.
+			m.agentIdleExpanded = !m.agentIdleExpanded
 		}
 		m = clampDashCursor(m)
 	}

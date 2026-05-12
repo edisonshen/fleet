@@ -536,6 +536,14 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 			}
 			left = append(left, line)
 		case rowSeparator:
+			// /review iter-1 [P0]: skip RIGHT-column separator kinds.
+			// dashboardRows returns left then right rows in one slice;
+			// the right-column loop below handles separatorAgentIdle.
+			// Without this guard, the agent-idle separator double-renders
+			// (once in each column).
+			if row.separator != nil && row.separator.kind == separatorAgentIdle {
+				continue
+			}
 			// History separators belong INSIDE the project block —
 			// the footer fires after the history group closes, not
 			// before. Idle/hidden separators sit between projects, so
@@ -607,9 +615,18 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
-		if row.kind == rowAgent {
+		switch row.kind {
+		case rowAgent:
 			right = append(right, agentBlockLines(row.agent, m.aliveByID, rightW, selected)...)
 			hasAgents = true
+		case rowSeparator:
+			// dashboard-accumulation-f-4421 Sub-fix B: render the
+			// right-column agent-idle separator. Other separator kinds
+			// belong to the LEFT column and are already painted by the
+			// left-column loop above.
+			if row.separator != nil && row.separator.kind == separatorAgentIdle {
+				right = append(right, separatorBlockLine(row.separator, rightW, selected))
+			}
 		}
 	}
 	_ = hasAgents
@@ -648,6 +665,16 @@ func separatorBlockLine(sep *separatorRow, w int, selected bool) string {
 			label = fmt.Sprintf("%d done (expanded — [enter] to collapse)", sep.count)
 		} else {
 			label = fmt.Sprintf("%d done — [enter] to expand", sep.count)
+		}
+	case separatorAgentIdle:
+		// dashboard-accumulation-f-4421 Sub-fix B: right-column v0.1
+		// agent-idle group. Asking/blocked agents are never folded
+		// into this bucket (they always render above), so the label
+		// doesn't need to mention that gate.
+		if sep.expanded {
+			label = fmt.Sprintf("%d idle (expanded — [enter] to collapse)", sep.count)
+		} else {
+			label = fmt.Sprintf("%d idle — [enter] to expand", sep.count)
 		}
 	default:
 		return ""
