@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"testing"
 
@@ -398,6 +400,136 @@ func TestCoordinatorFS_EmbedsPhaseBCSkillFiles(t *testing.T) {
 			t.Errorf("CoordinatorFS has zero-byte %s", want)
 		}
 	}
+}
+
+// TestSkillEmbedMatchesDisk — set-equality drift gate between the
+// on-disk skills/<name>/ tree and the //go:embed directive in
+// embed.go. The other embed tests in this file (walkExpectedSkillFiles,
+// TestRunInit_InstallsAllBundledSkills) use the embedded FS as the
+// source of truth for "what should be installed" — that's circular: a
+// new file added to skills/<name>/ but forgotten in //go:embed passes
+// those tests silently. That's exactly how Phase B/C's
+// register_subagent.py, handoff_resume.py, and workflow_state.py
+// shipped to the repo + tests + reviewers all green, then the binary
+// went out incomplete.
+//
+// This test walks the *filesystem* (via runtime.Caller so cwd doesn't
+// matter) and asserts disk == embed.FS. A disk-only file fails with
+// "add to embed.go"; an embed-only file fails with "remove or restore"
+// (catches typos in the //go:embed directive too).
+func TestSkillEmbedMatchesDisk(t *testing.T) {
+	// Compute the repo root from this test file's location so the test
+	// is independent of `go test` invocation cwd.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate repo skills/ dir")
+	}
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+
+	type skill struct {
+		name string
+		fsys fs.FS
+	}
+	skills := []skill{
+		{"coordinator", fleet.CoordinatorFS()},
+		{"fleet-guard", fleet.FleetGuardFS()},
+	}
+
+	for _, sk := range skills {
+		diskRoot := filepath.Join(repoRoot, "skills", sk.name)
+		diskFiles := walkSkillDisk(t, diskRoot)
+		embedFiles := walkSkillEmbed(t, sk.fsys)
+
+		// disk - embed → forgot to add to //go:embed
+		var missingFromEmbed []string
+		for f := range diskFiles {
+			if !embedFiles[f] {
+				missingFromEmbed = append(missingFromEmbed, f)
+			}
+		}
+		sort.Strings(missingFromEmbed)
+		if len(missingFromEmbed) > 0 {
+			t.Errorf("skill %q: %d file(s) on disk but NOT in //go:embed (add to embed.go): %v",
+				sk.name, len(missingFromEmbed), missingFromEmbed)
+		}
+
+		// embed - disk → typo in //go:embed (file doesn't exist on disk)
+		var missingFromDisk []string
+		for f := range embedFiles {
+			if !diskFiles[f] {
+				missingFromDisk = append(missingFromDisk, f)
+			}
+		}
+		sort.Strings(missingFromDisk)
+		if len(missingFromDisk) > 0 {
+			t.Errorf("skill %q: %d file(s) in //go:embed but NOT on disk (remove or restore): %v",
+				sk.name, len(missingFromDisk), missingFromDisk)
+		}
+	}
+}
+
+// walkSkillDisk walks the on-disk skills/<name>/ tree and returns the
+// set of runtime files (paths relative to the skill root). Excludes
+// tests/, pytest/python caches, and dotfiles — they're development
+// artifacts that must not ship in the binary.
+func walkSkillDisk(t *testing.T, root string) map[string]bool {
+	t.Helper()
+	files := map[string]bool{}
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		// Exclude development-only subtrees and dotfiles. Anything under
+		// tests/ stays on disk for pytest but never ships; __pycache__
+		// and .pytest_cache are transient build artifacts; dotfiles
+		// (.DS_Store, .gitignore) are environment noise.
+		first := strings.SplitN(rel, string(filepath.Separator), 2)[0]
+		if first == "tests" || first == "__pycache__" || first == ".pytest_cache" || strings.HasPrefix(first, ".") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// Normalize to forward slashes so the disk set matches the
+		// embed.FS set (io/fs always uses '/').
+		files[filepath.ToSlash(rel)] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	return files
+}
+
+// walkSkillEmbed walks an embed.FS-derived fs.Sub and returns the set
+// of file paths (no directories). Paths always use '/' per io/fs.
+func walkSkillEmbed(t *testing.T, fsys fs.FS) map[string]bool {
+	t.Helper()
+	files := map[string]bool{}
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "." || d.IsDir() {
+			return nil
+		}
+		files[path] = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk embed FS: %v", err)
+	}
+	return files
 }
 
 // TestRunInit_InstallsAllBundledSkills — wider contract test: the
