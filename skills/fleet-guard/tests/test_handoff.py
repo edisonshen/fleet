@@ -212,6 +212,9 @@ EXPECTED_GOLDEN = (
     b"\n"
     b"## Active Subagents\n"
     b"_(none)_\n"
+    b"\n"
+    b"## Open PRs\n"
+    b"_(no open PRs)_\n"
 )
 
 
@@ -343,13 +346,16 @@ class TestActiveSubagentsRender:
                 "task": "fix-foo",
                 "branch": "worker/fix-foo",
                 "phase": "tdd-green",
+                "status": "in-progress",
+                "pr_url": "",
                 "agent_id": "11112222",
                 "subagent_id": "claude-sub-1",
             }],
         )
         line = (
             b'- task="fix-foo" branch="worker/fix-foo" phase="tdd-green"'
-            b' agent_id="11112222" subagent_id="claude-sub-1"'
+            b' status="in-progress" pr_url="" '
+            b'agent_id="11112222" subagent_id="claude-sub-1"'
         )
         assert line in got
 
@@ -383,6 +389,7 @@ class TestActiveSubagentsRender:
         )
         line = (
             b'- task="minimal" branch="" phase="" '
+            b'status="" pr_url="" '
             b'agent_id="33333333" subagent_id=""'
         )
         assert line in got
@@ -426,13 +433,15 @@ class TestCollectActiveSubagents:
             json.dumps({"phase": "push"})
         )
         got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        # No tasks.md → status/pr_url default to "" — successor falls
+        # back to "always re-dispatch Agent" (pre-enrichment behavior).
         assert got == [
             {"task": "fix-bar", "branch": "worker/fix-bar",
-             "phase": "push", "agent_id": "11112222",
-             "subagent_id": ""},
+             "phase": "push", "status": "", "pr_url": "",
+             "agent_id": "11112222", "subagent_id": ""},
             {"task": "fix-foo", "branch": "worker/fix-foo",
-             "phase": "tdd-green", "agent_id": "abcd1234",
-             "subagent_id": ""},
+             "phase": "tdd-green", "status": "", "pr_url": "",
+             "agent_id": "abcd1234", "subagent_id": ""},
         ]
 
     def test_subagent_ids_threaded_through_when_present(self, tmp_path, monkeypatch) -> None:
@@ -451,6 +460,77 @@ class TestCollectActiveSubagents:
         assert len(got) == 1
         assert got[0]["subagent_id"] == "claude-sub-1"
 
+    def test_collect_active_subagents_reads_pr_url_and_status(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """v0.8.3: when tasks.md is present, _collect_active_subagents
+        threads status + pr_url through per slug. Successor coord
+        branches its re-dispatch on these (status=in-review with a
+        pr_url means skip Agent + just re-spawn shepherd)."""
+        monkeypatch.setenv("FLEET_HOME", str(tmp_path))
+        proj_dir = tmp_path / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        coord_state = {
+            "worker_agent_ids": {
+                "fix-foo": "abcd1234",
+                "fix-bar": "11112222",
+            },
+        }
+        (proj_dir / "coord-state.json").write_text(json.dumps(coord_state))
+        # Minimal tasks.md with two task blocks: one in-review with a
+        # PR (skip re-dispatch path), one in-progress without (re-
+        # dispatch path).
+        tasks_md = (
+            "---\n"
+            "schema: v1\n"
+            "---\n"
+            "\n"
+            "## task: fix-bar\n"
+            "\n"
+            "- status: in-progress\n"
+            "- priority: P1\n"
+            "- worker_pid: 0\n"
+            "- worktree:\n"
+            "- pr_url:\n"
+            "- branch:\n"
+            "- created: 2026-05-12T00:00:00Z\n"
+            "- updated: 2026-05-12T00:00:00Z\n"
+            "- depends_on: []\n"
+            "- spawned_by: user\n"
+            "\n"
+            "### Spec\n\n"
+            "x\n\n"
+            "### Acceptance\n\n"
+            "### Notes\n\n"
+            "## task: fix-foo\n"
+            "\n"
+            "- status: in-review\n"
+            "- priority: P1\n"
+            "- worker_pid: 0\n"
+            "- worktree:\n"
+            "- pr_url: https://github.com/edisonshen/fleet/pull/999\n"
+            "- branch: worker/fix-foo\n"
+            "- created: 2026-05-12T00:00:00Z\n"
+            "- updated: 2026-05-12T00:00:00Z\n"
+            "- depends_on: []\n"
+            "- spawned_by: user\n"
+            "\n"
+            "### Spec\n\n"
+            "y\n\n"
+            "### Acceptance\n\n"
+            "### Notes\n\n"
+        )
+        (proj_dir / "tasks.md").write_text(tasks_md)
+        got = handoff._collect_active_subagents("coord-myproj", "myproj")
+        # Sorted alphabetically, so fix-bar then fix-foo.
+        assert len(got) == 2
+        assert got[0]["task"] == "fix-bar"
+        assert got[0]["status"] == "in-progress"
+        assert got[0]["pr_url"] == ""
+        assert got[1]["task"] == "fix-foo"
+        assert got[1]["status"] == "in-review"
+        assert got[1]["pr_url"] == "https://github.com/edisonshen/fleet/pull/999"
+
     def test_legacy_state_no_worker_agent_ids_returns_empty(self, tmp_path, monkeypatch) -> None:
         """A coord-state.json missing worker_agent_ids (e.g. v0.2.0
         layout) gracefully renders zero entries instead of crashing."""
@@ -460,6 +540,157 @@ class TestCollectActiveSubagents:
         (proj_dir / "coord-state.json").write_text(json.dumps({"other": 1}))
         got = handoff._collect_active_subagents("coord-myproj", "myproj")
         assert got == []
+
+
+class TestOpenPRsRender:
+    """v0.8.3: the `## Open PRs` section must render byte-identical to
+    internal/handoff.renderOpenPRs. Pinned shape: one
+    `- #<num> <title> — <head> — <url>` bullet per entry; empty list
+    renders the `_(no open PRs)_` placeholder."""
+
+    def test_none_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=None,
+        )
+        assert b"## Open PRs\n_(no open PRs)_\n" in got
+
+    def test_empty_list_renders_placeholder(self) -> None:
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[],
+        )
+        assert b"## Open PRs\n_(no open PRs)_\n" in got
+
+    def test_handoff_doc_includes_open_prs_section(self) -> None:
+        """Spec test: with two open PRs fed in, both must appear as
+        bullets in the rendered `## Open PRs` section."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[
+                {"number": 137, "title": "feat: rich state",
+                 "head": "worker/a",
+                 "url": "https://example/pr/137"},
+                {"number": 138, "title": "fix: next slice",
+                 "head": "worker/b",
+                 "url": "https://example/pr/138"},
+            ],
+        )
+        assert b"- #137 feat: rich state \xe2\x80\x94 worker/a \xe2\x80\x94 https://example/pr/137" in got
+        assert b"- #138 fix: next slice \xe2\x80\x94 worker/b \xe2\x80\x94 https://example/pr/138" in got
+
+    def test_headRefName_alias_supported(self) -> None:
+        """gh pr list --json headRefName returns the field as
+        headRefName; our renderer accepts both `head` and
+        `headRefName` to keep the pipeline tolerant."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[{"number": 1, "title": "x",
+                       "headRefName": "worker/x",
+                       "url": "https://example/pr/1"}],
+        )
+        assert b"worker/x" in got
+
+    def test_newline_in_title_sanitized(self) -> None:
+        """Line-per-entry contract: embedded newlines in titles become
+        spaces so the bullet stays one physical line."""
+        ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
+        got = handoff._render_doc(
+            agent_id="a", task_id="t", project="p",
+            handoff_type="auto-yellow", number=1, prev_path=None,
+            context_pct=None, ts=ts, recent_activity="",
+            open_prs=[{"number": 1,
+                       "title": "line one\nline two\rline three",
+                       "head": "worker/x",
+                       "url": "https://example/pr/1"}],
+        )
+        assert b"- #1 line one line two line three \xe2\x80\x94 worker/x \xe2\x80\x94 https://example/pr/1" in got
+
+
+class TestCollectOpenPRs:
+    """`gh pr list` invocation. We monkey-patch subprocess.run + shutil.which
+    so tests don't need a real gh binary."""
+
+    def test_no_gh_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: None)
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_failure_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = "auth failure"
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_success_parses_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+        payload = json.dumps([
+            {"number": 137, "title": "feat: rich state",
+             "headRefName": "worker/a",
+             "url": "https://example/pr/137"},
+            {"number": 138, "title": "fix: next",
+             "headRefName": "worker/b",
+             "url": "https://example/pr/138"},
+        ])
+
+        class _R:
+            returncode = 0
+            stdout = payload
+            stderr = ""
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        got = handoff._collect_open_prs()
+        assert len(got) == 2
+        assert got[0]["number"] == 137
+        assert got[0]["head"] == "worker/a"
+        assert got[1]["url"] == "https://example/pr/138"
+
+    def test_gh_malformed_json_returns_empty(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        class _R:
+            returncode = 0
+            stdout = "not json {"
+            stderr = ""
+
+        monkeypatch.setattr(
+            handoff.subprocess, "run",
+            lambda *args, **kwargs: _R(),
+        )
+        assert handoff._collect_open_prs() == []
+
+    def test_gh_timeout_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(handoff.shutil, "which", lambda _: "/usr/bin/gh")
+
+        def _raise(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="gh", timeout=10)
+
+        monkeypatch.setattr(handoff.subprocess, "run", _raise)
+        assert handoff._collect_open_prs() == []
 
 
 def _diff_first_byte(got: bytes, want: bytes) -> str:

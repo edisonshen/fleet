@@ -92,13 +92,19 @@ func ParseActiveSubagents(doc []byte) (subs []ActiveSubagent, warnings []string,
 
 // parseActiveSubagentLine parses one body line of the Active Subagents
 // section. The line shape is intentionally rigid to avoid a yaml
-// dependency:
+// dependency. Current (v0.8.3+) shape:
+//
+//   - task="<slug>" branch="<branch>" phase="<phase>" status="<status>" pr_url="<url>" agent_id="<hex>" subagent_id="<id>"
+//
+// Legacy shape (pre-v0.8.3, 5 fields) was:
 //
 //   - task="<slug>" branch="<branch>" phase="<phase>" agent_id="<hex>" subagent_id="<id>"
 //
 // Each value MUST be Go-strconv.Quote-formatted. Keys may appear in any
 // order to tolerate future field additions without churning the parser.
-// Unknown keys are skipped silently (forward-compat).
+// Unknown keys are skipped silently (forward-compat). Legacy 5-field
+// rows parse with status="" and pr_url="" — the successor coord's
+// resume logic treats empty pr_url as "no PR yet, re-dispatch Agent".
 //
 // Returns ok=false on any structural failure (missing leading `- `,
 // unparseable quoted-string, etc.); the caller drops the line and
@@ -123,6 +129,10 @@ func parseActiveSubagentLine(line string) (ActiveSubagent, bool) {
 			entry.Branch = p.value
 		case "phase":
 			entry.LastPhase = p.value
+		case "status":
+			entry.Status = p.value
+		case "pr_url":
+			entry.PRURL = p.value
 		case "agent_id":
 			entry.AgentID = p.value
 		case "subagent_id":

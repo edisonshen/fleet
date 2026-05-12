@@ -463,6 +463,11 @@ def _do_handoff(record: dict[str, Any], session: str,
     # the canonical placeholder body and the successor parser sees
     # zero entries.
     active_subagents = _collect_active_subagents(task_id, project)
+    # v0.8.3: capture open worker PRs via `gh pr list`. The successor
+    # coord re-spawns one shepherd per URL listed. Best-effort: gh
+    # missing / network failure / non-zero exit all produce [] and the
+    # `_(no open PRs)_` placeholder renders.
+    open_prs = _collect_open_prs()
 
     new_id = ids.new_id()
     ts = datetime.now(timezone.utc)
@@ -478,6 +483,7 @@ def _do_handoff(record: dict[str, Any], session: str,
         ts=ts,
         recent_activity=recent,
         active_subagents=active_subagents,
+        open_prs=open_prs,
     )
     if not doc_path:
         return False
@@ -659,12 +665,18 @@ def _yellow_stuck_too_long(record: dict[str, Any]) -> bool:
 # and the Python golden (test_render_byte_golden) cross-verify this.
 ACTIVE_SUBAGENTS_NONE_PLACEHOLDER = "_(none)_"
 
+# v0.8.3: Open PRs snapshot section. Pinned by
+# internal/handoff.OpenPRsNonePlaceholder. Empty list / None renders the
+# placeholder; non-empty renders one bullet per PR.
+OPEN_PRS_NONE_PLACEHOLDER = "_(no open PRs)_"
+
 
 def write_doc(*, agent_id: str, task_id: str, project: str,
               handoff_type: str, number: int, prev_path: str | None,
               context_pct: float | None, ts: datetime,
               recent_activity: str,
-              active_subagents: list[dict] | None = None) -> str:
+              active_subagents: list[dict] | None = None,
+              open_prs: list[dict] | None = None) -> str:
     """Render and atomically write the handoff doc. Returns the absolute
     path on success, "" on failure. Body has the captured tmux pane in
     `## Completed` (per plan D3 / SKILL.md) and Placeholder in the other
@@ -673,9 +685,14 @@ def write_doc(*, agent_id: str, task_id: str, project: str,
 
     active_subagents (issue #93 Phase B2): list of in-flight worker
     subagents the outgoing coord had spawned via the Agent tool. Each
-    entry is a dict with keys task, branch, phase, agent_id,
-    subagent_id (any may be empty string). Defaults to None which
-    renders the `_(none)_` placeholder."""
+    entry is a dict with keys task, branch, phase, status, pr_url,
+    agent_id, subagent_id (any may be empty string). Defaults to None
+    which renders the `_(none)_` placeholder.
+
+    open_prs (v0.8.3): list of open worker PRs at handoff time. Each
+    entry is a dict with keys number, title, head, url. Defaults to
+    None which renders the `_(no open PRs)_` placeholder. The successor
+    coord re-spawns one shepherd until-loop per URL listed."""
     path = _handoff_path(agent_id, ts)
     body = _render_doc(
         agent_id=agent_id,
@@ -688,6 +705,7 @@ def write_doc(*, agent_id: str, task_id: str, project: str,
         ts=ts,
         recent_activity=recent_activity,
         active_subagents=active_subagents,
+        open_prs=open_prs,
     )
     if not _atomic_write_bytes(path, body):
         return ""
@@ -705,15 +723,21 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
                 handoff_type: str, number: int, prev_path: str | None,
                 context_pct: float | None, ts: datetime,
                 recent_activity: str,
-                active_subagents: list[dict] | None = None) -> bytes:
+                active_subagents: list[dict] | None = None,
+                open_prs: list[dict] | None = None) -> bytes:
     """Render the handoff doc bytes. Frontmatter ordering and quoting must
     match internal/handoff.Render byte-for-byte.
 
-    active_subagents: optional list of {task, branch, phase, agent_id,
-    subagent_id} dicts; missing keys default to "". None or empty list
-    renders the `_(none)_` placeholder body. See
+    active_subagents: optional list of {task, branch, phase, status,
+    pr_url, agent_id, subagent_id} dicts; missing keys default to "".
+    None or empty list renders the `_(none)_` placeholder body. See
     internal/handoff/handoff.go renderActiveSubagents for the matching
-    Go-side shape."""
+    Go-side shape.
+
+    open_prs (v0.8.3): optional list of {number, title, head, url}
+    dicts capturing open worker PRs at handoff time. None / empty list
+    renders the `_(no open PRs)_` placeholder. The successor coord
+    re-spawns one shepherd until-loop per URL."""
     out: list[str] = ["---\n"]
     out.append(f"agent_id: {_go_quote(agent_id)}\n")
     out.append(f"task_id: {_go_quote(task_id)}\n")
@@ -741,21 +765,106 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
     out.append(f"## Open Questions\n{PLACEHOLDER}\n\n")
     out.append(f"## Next Steps (prioritized)\n{PLACEHOLDER}\n\n")
     out.append(
-        f"## Active Subagents\n{_render_active_subagents(active_subagents)}\n",
+        f"## Active Subagents\n{_render_active_subagents(active_subagents)}\n\n",
+    )
+    out.append(
+        f"## Open PRs\n{_render_open_prs(open_prs)}\n",
     )
     return "".join(out).encode("utf-8")
+
+
+def _render_open_prs(prs: list[dict] | None) -> str:
+    """Mirror of internal/handoff.renderOpenPRs. Empty list / None
+    renders the canonical `_(no open PRs)_` placeholder; non-empty
+    renders one `- #<num> <title> — <head> — <url>` bullet per entry,
+    input order preserved.
+
+    Embedded newlines / carriage returns in titles are replaced with
+    spaces so each entry stays one physical line — the bullet-per-PR
+    contract must hold even when the upstream `gh pr list` returns a
+    title with embedded whitespace control codes.
+    """
+    if not prs:
+        return OPEN_PRS_NONE_PLACEHOLDER
+    lines: list[str] = []
+    for p in prs:
+        try:
+            num = int(p.get("number", 0) or 0)
+        except (TypeError, ValueError):
+            num = 0
+        title = str(p.get("title", "") or "").replace("\n", " ").replace("\r", " ")
+        head = str(p.get("head", "") or p.get("headRefName", "") or "")
+        url = str(p.get("url", "") or "")
+        lines.append(f"- #{num} {title} — {head} — {url}")
+    return "\n".join(lines)
+
+
+def _collect_open_prs() -> list[dict]:
+    """Run `gh pr list --state open --search "head:worker/" --json
+    number,title,headRefName,url` and return the parsed list. Best-
+    effort: any gh failure, missing binary, json parse error, or
+    timeout returns []. The handoff doc still writes; the
+    `_(no open PRs)_` placeholder body renders.
+
+    Search filter `head:worker/` matches any branch whose name starts
+    with `worker/` — the convention for fleet worker branches. Other
+    in-flight branches (release-prep, hotfix, etc.) are intentionally
+    excluded; the successor coord only re-spawns shepherds for
+    worker-track PRs.
+    """
+    gh = shutil.which("gh")
+    if not gh:
+        return []
+    try:
+        result = subprocess.run(
+            [
+                gh, "pr", "list",
+                "--state", "open",
+                "--search", "head:worker/",
+                "--json", "number,title,headRefName,url",
+            ],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "number": item.get("number", 0),
+            "title": item.get("title", ""),
+            "head": item.get("headRefName", ""),
+            "url": item.get("url", ""),
+        })
+    return out
 
 
 def _render_active_subagents(subs: list[dict] | None) -> str:
     """Mirror of internal/handoff.renderActiveSubagents. Empty list
     renders the canonical placeholder; non-empty renders one
-    `- task=<q> branch=<q> phase=<q> agent_id=<q> subagent_id=<q>`
-    line per entry, deterministic order (input order preserved).
+    `- task=<q> branch=<q> phase=<q> status=<q> pr_url=<q> agent_id=<q>
+    subagent_id=<q>` line per entry (v0.8.3+ 7-field shape),
+    deterministic order (input order preserved).
 
     Each value is Go-quoted via _go_quote so the Go-side parser's
     strconv.Unquote round-trips unchanged. Missing keys default to
     empty string — the field set is uniform across rows so the parser
     can rely on positional layout if needed.
+
+    status + pr_url are sourced from tasks.md per slug
+    (_collect_active_subagents reads them); legacy callers passing
+    dicts without these keys get the empty-string default, which the
+    successor parser treats as "no PR yet, re-dispatch Agent" — the
+    pre-enrichment behavior.
     """
     if not subs:
         return ACTIVE_SUBAGENTS_NONE_PLACEHOLDER
@@ -764,12 +873,16 @@ def _render_active_subagents(subs: list[dict] | None) -> str:
         task = str(s.get("task", "") or "")
         branch = str(s.get("branch", "") or "")
         phase = str(s.get("phase", "") or "")
+        status = str(s.get("status", "") or "")
+        pr_url = str(s.get("pr_url", "") or "")
         agent_id = str(s.get("agent_id", "") or "")
         subagent_id = str(s.get("subagent_id", "") or "")
         lines.append(
-            "- task={t} branch={b} phase={p} agent_id={a} subagent_id={s}".format(
+            "- task={t} branch={b} phase={p} status={st} pr_url={u} "
+            "agent_id={a} subagent_id={s}".format(
                 t=_go_quote(task), b=_go_quote(branch),
-                p=_go_quote(phase), a=_go_quote(agent_id),
+                p=_go_quote(phase), st=_go_quote(status),
+                u=_go_quote(pr_url), a=_go_quote(agent_id),
                 s=_go_quote(subagent_id),
             )
         )
@@ -799,6 +912,12 @@ def _collect_active_subagents(task_id: str, project: str) -> list[dict]:
     workers/<slug>/state.json. Missing/unparseable state.json yields
     phase="" — the entry is still emitted because the agent_id
     + slug are enough to drive a re-dispatch.
+
+    status + pr_url are sourced from tasks.md per slug (v0.8.3+: the
+    successor coord branches its re-dispatch decision on these so we
+    skip Agent re-dispatch when the worker already has an open PR in
+    review). Read failures default both to ""; the successor falls
+    back to "always re-dispatch Agent" — the pre-enrichment behavior.
     """
     if not task_id or not task_id.startswith(_COORD_TASK_ID_PREFIX):
         return []
@@ -823,6 +942,11 @@ def _collect_active_subagents(task_id: str, project: str) -> list[dict]:
     subagent_map = coord_state.get("worker_subagent_ids", {})
     if not isinstance(subagent_map, dict):
         subagent_map = {}
+    # Read tasks.md once per handoff write, not once per slug — 50-task
+    # projects would re-scan the same file 50 times otherwise. The
+    # helper returns {slug: (status, pr_url)} with empty defaults for
+    # any unread slug.
+    task_meta = _read_tasks_meta(project)
     out: list[dict] = []
     # Sort by slug for deterministic doc shape — the byte-golden test
     # cares about ordering, and operators reading the doc benefit from
@@ -837,13 +961,103 @@ def _collect_active_subagents(task_id: str, project: str) -> list[dict]:
         sub_id = subagent_map.get(slug, "")
         if not isinstance(sub_id, str):
             sub_id = ""
+        status, pr_url = task_meta.get(slug, ("", ""))
         out.append({
             "task": slug,
             "branch": f"worker/{slug}",
             "phase": phase,
+            "status": status,
+            "pr_url": pr_url,
             "agent_id": agent_id,
             "subagent_id": sub_id,
         })
+    return out
+
+
+def _read_tasks_meta(project: str) -> dict[str, tuple[str, str]]:
+    """Read ~/.fleet/projects/<project>/tasks.md and return
+    {slug: (status, pr_url)} for every parseable task block.
+
+    Minimal inline reader (no import of the coord skill's parse.py
+    because that lives in a sibling skill directory and fleet-guard
+    runs with sys.path scoped to its own folder). We only need two
+    bullet lines per task block — status + pr_url — and the bullet
+    grammar is simple enough that a hand-rolled scan beats pulling
+    in a yaml/regex dependency.
+
+    Tolerant: any I/O, parse, or schema failure returns {}; the
+    handoff doc renders with empty status/pr_url and the successor
+    falls back to pre-enrichment "always re-dispatch" semantics.
+    """
+    if not project:
+        return {}
+    try:
+        tasks_path = (
+            health.fleet_home() / "projects" / project / "tasks.md"
+        )
+        with open(tasks_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        return {}
+
+    out: dict[str, tuple[str, str]] = {}
+    current_slug: str | None = None
+    status = ""
+    pr_url = ""
+    # Bullet section ends on the first blank line OR the next H2/H3.
+    # Past that, we're in body sections that may contain `- ` markdown
+    # bullets unrelated to task fields. Track in_bullets to avoid
+    # mis-reading a Spec/Acceptance/Notes bullet as a task field.
+    in_bullets = False
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        if raw.startswith("## task: "):
+            # Flush previous block.
+            if current_slug:
+                out[current_slug] = (status, pr_url)
+            current_slug = raw[len("## task: "):].strip() or None
+            status = ""
+            pr_url = ""
+            in_bullets = False
+            continue
+        if raw.startswith("## "):
+            # Non-task H2 (e.g. footer). Flush + stop scanning.
+            if current_slug:
+                out[current_slug] = (status, pr_url)
+                current_slug = None
+            break
+        if current_slug is None:
+            continue
+        stripped = raw.strip()
+        if stripped == "":
+            # First blank line after bullets closes the bullet section.
+            if in_bullets:
+                in_bullets = False
+            continue
+        if raw.startswith("### "):
+            # H3 (Spec/Acceptance/Notes) — no more task bullets.
+            in_bullets = False
+            continue
+        if raw.startswith("- ") and not in_bullets:
+            # First bullet seen for this block opens the bullet section.
+            in_bullets = True
+        if not in_bullets or not raw.startswith("- "):
+            continue
+        # Parse "- key: value" — split on first colon only.
+        body = raw[2:]
+        colon = body.find(":")
+        if colon < 0:
+            continue
+        key = body[:colon].strip()
+        val = body[colon + 1:].strip()
+        if val == "null":
+            val = ""
+        if key == "status":
+            status = val
+        elif key == "pr_url":
+            pr_url = val
+    # EOF flush.
+    if current_slug:
+        out[current_slug] = (status, pr_url)
     return out
 
 

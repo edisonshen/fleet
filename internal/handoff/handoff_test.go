@@ -33,6 +33,7 @@ func TestRender_HasAllSections(t *testing.T) {
 		"## Open Questions",
 		"## Next Steps (prioritized)",
 		"## Active Subagents",
+		"## Open PRs",
 	} {
 		if !strings.Contains(got, h) {
 			t.Errorf("missing section %q in:\n%s", h, got)
@@ -289,7 +290,8 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"## Files Modified\n" + Placeholder + "\n\n" +
 		"## Open Questions\n" + Placeholder + "\n\n" +
 		"## Next Steps (prioritized)\n" + Placeholder + "\n\n" +
-		"## Active Subagents\n" + ActiveSubagentsNonePlaceholder + "\n"
+		"## Active Subagents\n" + ActiveSubagentsNonePlaceholder + "\n\n" +
+		"## Open PRs\n" + OpenPRsNonePlaceholder + "\n"
 	got := string(Render(d))
 	if got != want {
 		t.Errorf("Render byte-shape drifted from skill golden.\nwant:\n%s\n\ngot:\n%s", want, got)
@@ -305,26 +307,126 @@ func TestRender_ActiveSubagents_NoneRendersPlaceholder(t *testing.T) {
 		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
 	got := string(Render(d))
 	want := "## Active Subagents\n" + ActiveSubagentsNonePlaceholder + "\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("expected empty Active Subagents section in:\n%s", got)
+	}
+}
+
+// TestRender_OpenPRs_NoneRendersPlaceholder pins the placeholder body
+// for the Open PRs section when the outgoing agent had zero open
+// worker PRs (or the caller didn't populate OpenPRs).
+func TestRender_OpenPRs_NoneRendersPlaceholder(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil,
+		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
+	got := string(Render(d))
+	want := "## Open PRs\n" + OpenPRsNonePlaceholder + "\n"
 	if !strings.HasSuffix(got, want) {
-		t.Errorf("expected doc to end with empty Active Subagents section:\n%s", got)
+		t.Errorf("expected doc to end with empty Open PRs section:\n%s", got)
+	}
+}
+
+// TestRender_OpenPRs_SingleEntry pins the per-PR bullet shape. The
+// successor coord re-spawns one shepherd until-loop per URL listed,
+// so the URL is the load-bearing field; number + title + head are
+// readability only.
+func TestRender_OpenPRs_SingleEntry(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil,
+		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
+	d.OpenPRs = []OpenPR{
+		{Number: 137, Title: "feat(handoff): rich state",
+			HeadRefName: "worker/handoff-rich-state",
+			URL:         "https://github.com/edisonshen/fleet/pull/137"},
+	}
+	got := string(Render(d))
+	want := "- #137 feat(handoff): rich state — worker/handoff-rich-state — https://github.com/edisonshen/fleet/pull/137"
+	if !strings.Contains(got, want) {
+		t.Errorf("expected PR bullet %q in:\n%s", want, got)
+	}
+}
+
+// TestRender_OpenPRs_MultipleEntries pins multi-PR rendering. Each
+// entry on its own line, input order preserved (gh pr list returns
+// in newest-first order; we don't re-sort).
+func TestRender_OpenPRs_MultipleEntries(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
+	d.OpenPRs = []OpenPR{
+		{Number: 137, Title: "rich state", HeadRefName: "worker/a",
+			URL: "https://example/pr/137"},
+		{Number: 138, Title: "next slice", HeadRefName: "worker/b",
+			URL: "https://example/pr/138"},
+	}
+	got := string(Render(d))
+	if !strings.Contains(got, "- #137 rich state — worker/a — https://example/pr/137") {
+		t.Errorf("missing PR #137 bullet in:\n%s", got)
+	}
+	if !strings.Contains(got, "- #138 next slice — worker/b — https://example/pr/138") {
+		t.Errorf("missing PR #138 bullet in:\n%s", got)
+	}
+	idx137 := strings.Index(got, "#137 rich state")
+	idx138 := strings.Index(got, "#138 next slice")
+	if idx137 < 0 || idx138 < 0 || idx137 >= idx138 {
+		t.Errorf("PR entries lost input order: 137=%d 138=%d", idx137, idx138)
+	}
+}
+
+// TestRender_OpenPRs_NewlineInTitleNeutralized pins the line-per-entry
+// contract: a newline in a PR title must not break the section into
+// multiple bullets. The renderer converts embedded \n and \r to
+// spaces so the bullet stays one physical line.
+func TestRender_OpenPRs_NewlineInTitleNeutralized(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
+	d.OpenPRs = []OpenPR{
+		{Number: 1, Title: "line one\nline two\rline three",
+			HeadRefName: "worker/x", URL: "https://example/pr/1"},
+	}
+	got := string(Render(d))
+	want := "- #1 line one line two line three — worker/x — https://example/pr/1"
+	if !strings.Contains(got, want) {
+		t.Errorf("expected sanitized bullet %q in:\n%s", want, got)
 	}
 }
 
 // TestRender_ActiveSubagents_SingleEntry pins the per-entry line
-// shape. Each line is `- task=<q> branch=<q> phase=<q> agent_id=<q>
-// subagent_id=<q>` — load-bearing for the parser.
+// shape. Each line is `- task=<q> branch=<q> phase=<q> status=<q>
+// pr_url=<q> agent_id=<q> subagent_id=<q>` — load-bearing for the
+// parser. The status + pr_url additions (v0.8.3) drive the successor
+// coord's selective re-dispatch decision.
 func TestRender_ActiveSubagents_SingleEntry(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil,
 		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "fix-foo", Branch: "worker/fix-foo",
-			LastPhase: "tdd-green", AgentID: "abcd1234",
-			SubagentID: "claude-sub-1"},
+			LastPhase: "tdd-green", Status: "in-progress", PRURL: "",
+			AgentID: "abcd1234", SubagentID: "claude-sub-1"},
 	}
 	got := string(Render(d))
-	want := `- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" agent_id="abcd1234" subagent_id="claude-sub-1"`
+	want := `- task="fix-foo" branch="worker/fix-foo" phase="tdd-green" status="in-progress" pr_url="" agent_id="abcd1234" subagent_id="claude-sub-1"`
 	if !strings.Contains(got, want) {
 		t.Errorf("expected entry line %q in:\n%s", want, got)
+	}
+}
+
+// TestRender_ActiveSubagents_NewSchemaShape pins the v0.8.3 7-field
+// row shape for a fully populated entry (status=in-review + pr_url
+// set). Distinct from TestRender_ActiveSubagents_SingleEntry which
+// covers the empty-pr_url path: this one exercises the
+// "skip-Agent-redispatch, re-spawn shepherd only" branch the successor
+// coord uses when the worker already has a PR open.
+func TestRender_ActiveSubagents_NewSchemaShape(t *testing.T) {
+	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil,
+		time.Date(2026, 4, 27, 18, 48, 7, 0, time.UTC))
+	d.ActiveSubagents = []ActiveSubagent{
+		{
+			TaskID: "rich-state", Branch: "worker/rich-state",
+			LastPhase: "review-codex", Status: "in-review",
+			PRURL:   "https://github.com/edisonshen/fleet/pull/137",
+			AgentID: "abcd1234", SubagentID: "claude-sub-1",
+		},
+	}
+	got := string(Render(d))
+	want := `- task="rich-state" branch="worker/rich-state" phase="review-codex" status="in-review" pr_url="https://github.com/edisonshen/fleet/pull/137" agent_id="abcd1234" subagent_id="claude-sub-1"`
+	if !strings.Contains(got, want) {
+		t.Errorf("expected 7-field row %q in:\n%s", want, got)
 	}
 }
 
@@ -334,14 +436,14 @@ func TestRender_ActiveSubagents_SingleEntry(t *testing.T) {
 func TestRender_ActiveSubagents_MultipleEntries(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
-		{TaskID: "a", Branch: "worker/a", LastPhase: "push", AgentID: "11111111", SubagentID: ""},
-		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", AgentID: "22222222", SubagentID: "claude-sub-2"},
+		{TaskID: "a", Branch: "worker/a", LastPhase: "push", Status: "in-progress", PRURL: "", AgentID: "11111111", SubagentID: ""},
+		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", Status: "in-review", PRURL: "https://example/pr/1", AgentID: "22222222", SubagentID: "claude-sub-2"},
 	}
 	got := string(Render(d))
-	if !strings.Contains(got, `- task="a" branch="worker/a" phase="push" agent_id="11111111" subagent_id=""`) {
+	if !strings.Contains(got, `- task="a" branch="worker/a" phase="push" status="in-progress" pr_url="" agent_id="11111111" subagent_id=""`) {
 		t.Errorf("missing entry a in:\n%s", got)
 	}
-	if !strings.Contains(got, `- task="b" branch="worker/b" phase="tdd-red" agent_id="22222222" subagent_id="claude-sub-2"`) {
+	if !strings.Contains(got, `- task="b" branch="worker/b" phase="tdd-red" status="in-review" pr_url="https://example/pr/1" agent_id="22222222" subagent_id="claude-sub-2"`) {
 		t.Errorf("missing entry b in:\n%s", got)
 	}
 	idxA := strings.Index(got, `task="a"`)
@@ -375,8 +477,8 @@ func TestParseActiveSubagents_SingleWorker(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "fix-foo", Branch: "worker/fix-foo",
-			LastPhase: "tdd-green", AgentID: "abcd1234",
-			SubagentID: "claude-sub-1"},
+			LastPhase: "tdd-green", Status: "in-progress", PRURL: "",
+			AgentID: "abcd1234", SubagentID: "claude-sub-1"},
 	}
 	doc := Render(d)
 	subs, warnings, err := ParseActiveSubagents(doc)
@@ -401,9 +503,9 @@ func TestParseActiveSubagents_SingleWorker(t *testing.T) {
 func TestParseActiveSubagents_MultipleWorkers(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
-		{TaskID: "a", Branch: "worker/a", LastPhase: "push", AgentID: "11111111", SubagentID: ""},
-		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", AgentID: "22222222", SubagentID: "claude-sub-2"},
-		{TaskID: "c", Branch: "worker/c", LastPhase: "review-codex", AgentID: "33333333", SubagentID: "claude-sub-3"},
+		{TaskID: "a", Branch: "worker/a", LastPhase: "push", Status: "in-progress", PRURL: "", AgentID: "11111111", SubagentID: ""},
+		{TaskID: "b", Branch: "worker/b", LastPhase: "tdd-red", Status: "in-progress", PRURL: "", AgentID: "22222222", SubagentID: "claude-sub-2"},
+		{TaskID: "c", Branch: "worker/c", LastPhase: "review-codex", Status: "in-review", PRURL: "https://example/pr/3", AgentID: "33333333", SubagentID: "claude-sub-3"},
 	}
 	doc := Render(d)
 	subs, warnings, err := ParseActiveSubagents(doc)
@@ -423,6 +525,38 @@ func TestParseActiveSubagents_MultipleWorkers(t *testing.T) {
 	}
 }
 
+// TestParseActiveSubagents_BackwardsCompat pins the legacy-row-shape
+// tolerance: a 5-field row (no status, no pr_url) written by an older
+// fleet binary MUST still parse, with the new fields defaulting to
+// "". The successor coord falls back to the pre-enrichment "always
+// re-dispatch Agent" behavior on these entries — which is what older
+// docs actually wanted anyway.
+func TestParseActiveSubagents_BackwardsCompat(t *testing.T) {
+	doc := []byte(
+		"---\nagent_id: \"x\"\n---\n\n" +
+			"## Active Subagents\n" +
+			`- task="legacy" branch="worker/legacy" phase="tdd-green" agent_id="abcd1234" subagent_id=""` + "\n",
+	)
+	subs, warnings, err := ParseActiveSubagents(doc)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("expected 1 sub from legacy row, got %d: %+v", len(subs), subs)
+	}
+	got := subs[0]
+	want := ActiveSubagent{
+		TaskID: "legacy", Branch: "worker/legacy", LastPhase: "tdd-green",
+		Status: "", PRURL: "", AgentID: "abcd1234", SubagentID: "",
+	}
+	if got != want {
+		t.Errorf("legacy row parse mismatch:\ngot:  %+v\nwant: %+v", got, want)
+	}
+}
+
 // TestParseActiveSubagents_MalformedLineSkipped pins the resilience
 // contract: a malformed entry mid-section logs a warning and skips
 // the line, but the well-formed entries still parse.
@@ -430,9 +564,9 @@ func TestParseActiveSubagents_MalformedLineSkipped(t *testing.T) {
 	doc := []byte(
 		"---\nagent_id: \"x\"\n---\n\n" +
 			"## Active Subagents\n" +
-			`- task="ok" branch="worker/ok" phase="push" agent_id="11111111" subagent_id=""` + "\n" +
+			`- task="ok" branch="worker/ok" phase="push" status="in-progress" pr_url="" agent_id="11111111" subagent_id=""` + "\n" +
 			"this line is not a valid entry\n" +
-			`- task="also-ok" branch="worker/also-ok" phase="" agent_id="22222222" subagent_id=""` + "\n",
+			`- task="also-ok" branch="worker/also-ok" phase="" status="in-progress" pr_url="" agent_id="22222222" subagent_id=""` + "\n",
 	)
 	subs, warnings, err := ParseActiveSubagents(doc)
 	if err != nil {
@@ -474,8 +608,9 @@ func TestParseActiveSubagents_QuotedFieldsRoundTrip(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "t", "p", 1, nil, time.Now().UTC())
 	d.ActiveSubagents = []ActiveSubagent{
 		{TaskID: "weird slug", Branch: "worker/weird slug",
-			LastPhase: "phase: with colon", AgentID: "abcd1234",
-			SubagentID: `with"quote`},
+			LastPhase: "phase: with colon", Status: "in-review",
+			PRURL:   `https://example/pr/1?token="x"`,
+			AgentID: "abcd1234", SubagentID: `with"quote`},
 	}
 	doc := Render(d)
 	subs, warnings, err := ParseActiveSubagents(doc)
@@ -510,9 +645,9 @@ func TestParseActiveSubagents_TrailingBackslashSkipped(t *testing.T) {
 			"## Active Subagents\n" +
 			// Note: trailing backslash inside the quoted value would
 			// have caused +2 to overrun pre-fix.
-			`- task="ok" branch="" phase="" agent_id="11111111" subagent_id="abc\` + "\n" +
+			`- task="ok" branch="" phase="" status="" pr_url="" agent_id="11111111" subagent_id="abc\` + "\n" +
 			// Well-formed entry on the next line still parses.
-			`- task="recovers" branch="" phase="" agent_id="22222222" subagent_id=""` + "\n",
+			`- task="recovers" branch="" phase="" status="" pr_url="" agent_id="22222222" subagent_id=""` + "\n",
 	)
 	subs, warnings, err := ParseActiveSubagents(doc)
 	if err != nil {

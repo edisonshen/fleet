@@ -1,4 +1,4 @@
-"""Coord handoff resume — Phase B2 (issue #93).
+"""Coord handoff resume — Phase B2 (issue #93) + v0.8.3 rich-state.
 
 When fleet-guard hands off the coord at 50/70% context, any in-flight
 worker subagents the coord had spawned via Claude's Agent tool die with
@@ -6,18 +6,37 @@ the parent process. Phase B2 carries enough state in the handoff doc
 that the successor coord can re-issue the Agent calls on its first
 turn.
 
+v0.8.3 adds two enrichments to the handoff doc the resume helper now
+consumes:
+  - Active Subagents row carries `status` + `pr_url` per slug (pulled
+    from tasks.md at handoff write time). Re-dispatch logic branches:
+      * empty pr_url + status=in-progress → re-dispatch Agent (worker
+        was still writing code; resume from WIP).
+      * pr_url set + status=in-review → SKIP Agent re-dispatch; the
+        successor just re-spawns a shepherd until-loop watching CI/
+        merge state. Work is already on disk + remote.
+      * status=done/abandoned → drop the entry; no resume action.
+  - `## Open PRs` body section — one bullet per open worker PR
+    (`gh pr list --state open --search head:worker/` snapshot). The
+    successor re-spawns one shepherd until-loop per URL listed. This
+    is broader than the per-slug pr_url field on ActiveSubagents: it
+    catches PRs whose task was already dropped from
+    coord-state.json:worker_agent_ids (worker finished, but the PR
+    isn't merged yet).
+
 This module is the successor's helper:
 
   1. parse_handoff_doc(path) — read the handoff doc and extract the
      `## Active Subagents` section as a typed list. Mirrors the Go
      side's handoff.ParseActiveSubagents — both sides round-trip the
      same byte shape (golden tests pin this).
-  2. build_resume_dispatches(subs, wip_dir, fleet_home) — for each
-     active subagent whose WIP file exists, render a DISPATCH block
-     the coord agent (Claude) can act on by invoking the Agent tool.
-     The prompt body is the worker's existing inbox file (the original
-     prompt) PLUS a "RESUMING" preamble pointing at the WIP path so
-     the worker reads its checkpoint before doing any new work.
+  2. parse_open_prs(path) — read the `## Open PRs` section and return
+     a list of URLs the successor will re-spawn shepherds for.
+  3. build_resume_dispatches(subs, wip_dir, fleet_home) — for each
+     active subagent whose WIP file exists AND whose status/pr_url
+     indicates the worker still needs to be re-issued, render a
+     DISPATCH block. Subagents in-review with a PR are NOT re-
+     dispatched (shepherd path covers them).
 
 The contract: the coord agent's SKILL.md "Resume after handoff"
 section instructs Claude to call:
@@ -27,14 +46,16 @@ section instructs Claude to call:
 on its first turn. The script emits zero or more DISPATCH blocks on
 stdout — same format as loop.py's tick output — so the existing
 "Worker dispatch protocol" reading the coord agent already does covers
-re-dispatch identically to first-spawn.
+re-dispatch identically to first-spawn. Open PR shepherd hints are
+written to stderr so the operator can re-establish them manually if
+the coord agent doesn't pick up the wakeup-loop conventions.
 """
 from __future__ import annotations
 
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Local sibling module — keep imports stable when running as a script
@@ -69,8 +90,20 @@ class ResumeEntry:
     task_id: str           # task slug
     branch: str            # worker/<slug>
     phase: str             # last-known phase (triage context only)
-    agent_id: str          # 8-hex Fleet agent ID; inbox file key
-    subagent_id: str       # Claude Agent tool subagent ID; may be empty
+    status: str = ""       # tasks.md status enum; "" for legacy 5-field rows
+    pr_url: str = ""       # open PR URL from tasks.md; "" when no PR yet
+    agent_id: str = ""     # 8-hex Fleet agent ID; inbox file key
+    subagent_id: str = ""  # Claude Agent tool subagent ID; may be empty
+
+
+# v0.8.3: statuses where Agent re-dispatch is NOT needed — the worker
+# is past the writing phase and either (a) a shepherd is watching a PR
+# or (b) the task is already terminal. The successor coord either re-
+# spawns a shepherd (in-review) or drops the entry (done/abandoned/
+# blocked). The pre-enrichment behavior treated every active entry as
+# "re-dispatch"; this set lets us be precise.
+_TERMINAL_STATUSES = frozenset({"done", "abandoned"})
+_NON_REDISPATCH_STATUSES = frozenset({"in-review", "done", "abandoned", "blocked"})
 
 
 def parse_handoff_doc(path: str | os.PathLike) -> list[ResumeEntry]:
@@ -123,7 +156,11 @@ _KV_RE = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
 
 def _parse_entry_line(line: str) -> ResumeEntry | None:
     """Parse one `- task=... branch=... ...` body line. Returns None on
-    structural failure; the caller drops the line and continues."""
+    structural failure; the caller drops the line and continues.
+
+    v0.8.3: status + pr_url are recognized fields. Legacy 5-field rows
+    (no status/pr_url) parse with the new fields defaulting to "" —
+    the successor falls back to "always re-dispatch Agent" behavior."""
     if not line.startswith("- "):
         return None
     rest = line[2:]
@@ -139,9 +176,57 @@ def _parse_entry_line(line: str) -> ResumeEntry | None:
         task_id=task,
         branch=fields.get("branch", ""),
         phase=fields.get("phase", ""),
+        status=fields.get("status", ""),
+        pr_url=fields.get("pr_url", ""),
         agent_id=fields.get("agent_id", ""),
         subagent_id=fields.get("subagent_id", ""),
     )
+
+
+# v0.8.3: Open PRs section header constants.
+_OPEN_PRS_HEADER = "## Open PRs"
+_OPEN_PRS_NONE_PLACEHOLDER = "_(no open PRs)_"
+# `- #<num> <title> — <head> — <url>` — the URL is what matters for
+# shepherd respawn. The em dash separator is U+2014. Regex captures the
+# URL as the last em-dash-delimited segment so titles containing em
+# dashes don't break the parse.
+_OPEN_PR_URL_RE = re.compile(r"\s—\s(https?://\S+)\s*$")
+
+
+def parse_open_prs(path: str | os.PathLike) -> list[str]:
+    """Read the handoff doc at `path` and return the list of open PR
+    URLs from the `## Open PRs` section. Returns [] when the section
+    is missing, empty, or only contains the placeholder.
+
+    Lines that don't match the expected bullet shape are dropped
+    silently (older docs predating the section, hand-edited docs).
+    The shepherd respawn is best-effort: each URL the successor sees
+    becomes one watch loop; missing URLs just mean no watcher for
+    that PR (operator's `gh pr list` already covers manual oversight).
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    return _parse_open_prs_body(text)
+
+
+def _parse_open_prs_body(doc: str) -> list[str]:
+    in_section = False
+    urls: list[str] = []
+    for raw in doc.splitlines():
+        if not in_section:
+            if raw.strip() == _OPEN_PRS_HEADER:
+                in_section = True
+            continue
+        if raw.startswith("## "):
+            break
+        line = raw.strip()
+        if not line or line == _OPEN_PRS_NONE_PLACEHOLDER:
+            continue
+        m = _OPEN_PR_URL_RE.search(line)
+        if not m:
+            continue
+        urls.append(m.group(1))
+    return urls
 
 
 def _unquote_go(s: str) -> str:
@@ -196,12 +281,25 @@ def build_resume_dispatches(
     fleet_home: str | os.PathLike,
 ) -> tuple[list[str], list[str]]:
     """Build DISPATCH blocks the coord agent can act on to re-spawn
-    each Active Subagent whose WIP file exists.
+    each Active Subagent whose WIP file exists AND whose status/pr_url
+    indicates the worker still needs to be re-issued.
 
     Returns (blocks, skipped). `blocks` is the list of rendered
     DISPATCH strings (one per resume target); `skipped` is a list of
     one-line human-readable reasons for entries that were NOT
-    re-dispatched (missing WIP, missing inbox, malformed agent_id).
+    re-dispatched (missing WIP, missing inbox, malformed agent_id,
+    pr already open and in review, or terminal status).
+
+    v0.8.3 decision branches:
+      - status in {in-review, done, abandoned, blocked} → SKIP Agent
+        re-dispatch. in-review entries have an open PR — the shepherd
+        respawn loop (parse_open_prs path) covers them. done/
+        abandoned/blocked are terminal; no resume action needed.
+      - empty status (legacy 5-field row) → fall back to pre-
+        enrichment behavior: re-dispatch if WIP + inbox present.
+      - empty pr_url + status in flight (todo/ready/in-progress) →
+        re-dispatch Agent (worker was still writing code; resume
+        from WIP).
 
     Resume protocol:
       - WIP at <wip_dir>/<task_id>.md — required. Without a checkpoint,
@@ -226,6 +324,21 @@ def build_resume_dispatches(
             continue
         if not e.agent_id:
             skipped.append(f"task {e.task_id}: missing agent_id; skip")
+            continue
+        # v0.8.3: skip Agent re-dispatch for in-review / terminal
+        # entries. Empty status (legacy row) falls through to the
+        # pre-enrichment "always re-dispatch" path below.
+        if e.status and e.status in _NON_REDISPATCH_STATUSES:
+            if e.status == "in-review":
+                skipped.append(
+                    f"task {e.task_id}: status=in-review pr_url={e.pr_url!r}; "
+                    "skip Agent (shepherd-only path)",
+                )
+            else:
+                skipped.append(
+                    f"task {e.task_id}: status={e.status}; "
+                    "skip (terminal or blocked)",
+                )
             continue
         wip_path = wip_dir_p / f"{e.task_id}.md"
         if not wip_path.exists():
@@ -279,9 +392,9 @@ def main(argv: list[str] | None = None) -> int:
 
     Emits zero or more DISPATCH blocks on stdout — same shape the coord
     agent already acts on for first-spawn dispatches. Skipped entries
-    write to stderr (operator visibility). Always exits 0 unless the
-    handoff doc itself is unreadable (exit 1) — partial resumes are
-    better than aborting the whole successor.
+    + open-PR shepherd hints write to stderr (operator visibility).
+    Always exits 0 unless the handoff doc itself is unreadable (exit
+    1) — partial resumes are better than aborting the whole successor.
     """
     args = list(argv) if argv is not None else sys.argv[1:]
     if not args:
@@ -293,6 +406,17 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(f"handoff_resume: doc not found: {doc_path}", file=sys.stderr)
         return 1
+    # v0.8.3: parse the Open PRs section too. Shepherd respawn is a
+    # coord-level concern (the wakeup loop watching each URL), so we
+    # surface the URLs to stderr as hints; the coord agent's
+    # /coordinator skill (called from First Action) re-establishes
+    # them on its next tick via the standard `gh pr status` path.
+    open_pr_urls: list[str] = []
+    try:
+        open_pr_urls = parse_open_prs(doc_path)
+    except FileNotFoundError:
+        # Already handled above by parse_handoff_doc; defensive.
+        pass
     fleet_home = os.environ.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
     wip_dir = os.environ.get(
         "FLEET_SUBAGENT_WIP_DIR",
@@ -302,13 +426,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     for line in skipped:
         print(f"# {line}", file=sys.stderr)
+    for url in open_pr_urls:
+        print(
+            f"# open-pr-shepherd: {url} — respawn `gh pr view` watch loop",
+            file=sys.stderr,
+        )
     for b in blocks:
         print(b)
         print()
     if not blocks:
         print(
             "# handoff_resume: no resumable subagents "
-            f"(parsed={len(entries)} skipped={len(skipped)})",
+            f"(parsed={len(entries)} skipped={len(skipped)} "
+            f"open_prs={len(open_pr_urls)})",
             file=sys.stderr,
         )
     return 0
