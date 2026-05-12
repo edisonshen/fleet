@@ -337,7 +337,7 @@ func TestRunInit_InstallsCoordinatorSkill(t *testing.T) {
 	}
 
 	coordRoot := filepath.Join(claudeHome, "skills", "coordinator")
-	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py", "worktree.py", "remote_control.py", "supervisor.py"} {
+	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py", "worktree.py", "remote_control.py", "supervisor.py", "register_subagent.py", "handoff_resume.py", "workflow_state.py"} {
 		got := filepath.Join(coordRoot, want)
 		info, err := os.Stat(got)
 		if err != nil {
@@ -369,6 +369,34 @@ func TestRunInit_InstallsCoordinatorSkill(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCoordinatorFS_EmbedsPhaseBCSkillFiles — regression guard for a
+// silent partial-embed bug: register_subagent.py, handoff_resume.py,
+// and workflow_state.py existed in skills/coordinator/ but were never
+// added to embed.go's explicit //go:embed file list, so `brew install
+// fleet && fleet init` shipped a coord skill missing those three. The
+// runtime coord couldn't register subagent_ids (no register_subagent.py
+// to invoke) → TUI had no worker_subagent_ids to render → no per-worker
+// subagent chips. Pin all three by name here so a future skill addition
+// that forgets to extend the embed directive fails this test loudly
+// instead of degrading silently in operator installs.
+func TestCoordinatorFS_EmbedsPhaseBCSkillFiles(t *testing.T) {
+	fsys := fleet.CoordinatorFS()
+	for _, want := range []string{
+		"register_subagent.py", // Phase C — records subagent_id in coord-state.json
+		"handoff_resume.py",    // Phase B2 — re-issues Agent calls after coord handoff
+		"workflow_state.py",    // G5 — operator-readable workflow.md writer
+	} {
+		data, err := fs.ReadFile(fsys, want)
+		if err != nil {
+			t.Errorf("CoordinatorFS missing %s: %v (embed.go //go:embed directive likely needs %s appended)", want, err, want)
+			continue
+		}
+		if len(data) == 0 {
+			t.Errorf("CoordinatorFS has zero-byte %s", want)
+		}
 	}
 }
 
