@@ -628,10 +628,23 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// any code inside that replacement keying off FLEET_ENGINE — the
 	// reviewer-prompt builder, `fleet dispatch` subprocesses — would
 	// pick the wrong engine.
+	//
+	// Legacy records (codex review iter-3 P2): pre-v0.9 agent records
+	// predate the engine field, so opts.OldRecord.Engine is "" even
+	// though agent.New defaults the new record to claude-code. Without
+	// normalization the handoff env would inherit the caller's
+	// FLEET_ENGINE while the new record silently sat at claude-code,
+	// re-introducing the env/record mismatch on the upgrade path.
+	// agent.DefaultEngine = "claude-code" matches what agent.New
+	// stamps onto a fresh record, so we substitute it here.
 	for _, key := range propagatedRuntimeEnv {
 		v := os.Getenv(key)
-		if key == "FLEET_ENGINE" && opts.OldRecord != nil && opts.OldRecord.Engine != "" {
-			v = opts.OldRecord.Engine
+		if key == "FLEET_ENGINE" && opts.OldRecord != nil {
+			eng := opts.OldRecord.Engine
+			if eng == "" {
+				eng = agent.DefaultEngine
+			}
+			v = eng
 		}
 		if v != "" {
 			extraEnv = append(extraEnv, key+"="+v)
