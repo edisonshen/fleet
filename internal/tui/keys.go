@@ -619,6 +619,23 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// sessions" and the operator drops back to their shell with
 		// no idea why. Surface the diagnosis in-TUI.
 		if !sessionAliveFn(cur.TmuxSession) {
+			// Resume-suggestion gate (resume-dead-coord-ab65): a dead
+			// COORD agent (TaskID == "coord-<project>") has a working
+			// resume path via [a] on the project row, which goes through
+			// the dispatch CLI's synth-handoff recovery flow. Suggest
+			// that instead of archive so the operator doesn't throw
+			// state away. Non-coord dead agents (workers, manual
+			// dispatches) keep the archive suggestion — there's no
+			// resume path to point at.
+			if cur.Project != "" && cur.TaskID == coordTaskID(cur.Project) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",
+						cur.ID, cur.Project),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
@@ -1023,13 +1040,36 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p.CoordID != "" {
 		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
 			if !sessionAliveFn(rec.TmuxSession) {
+				// Dead tmux session: re-dispatch the coord under the
+				// same stable task_id ("coord-<project>"). The dispatch
+				// CLI's dead-pid+dead-tmux detection (see
+				// cmd/fleet/dispatch.go) writes a synth-handoff doc
+				// from on-disk state and points the successor at it,
+				// so the resume picks up where the dead coord left
+				// off without throwing state away. Previously this
+				// case flashed "press [x] to archive, then [a] to
+				// respawn" — which threw state away by archiving the
+				// only link the dispatch path has back to the dead
+				// coord's worker state. Flash the resume so the
+				// operator knows we're not silently respawning.
+				if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
+					m.flash = &flashMsg{
+						text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
+						isErr: true,
+					}
+					return m, nil, true
+				}
+				if m.coordSpawnInFlight == nil {
+					m.coordSpawnInFlight = map[string]bool{}
+				}
+				m.coordSpawnInFlight[p.Name] = true
+				cwd := coordCwdForProject(m.records, p.Name)
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"coord %s for project %s has a dead tmux session — press [x] on its agent row to archive, then [a] here to respawn",
+						"resuming coord %s for project %s from last checkpoint (dead tmux session — synth handoff)",
 						rec.ID, p.Name),
-					isErr: true,
 				}
-				return m, nil, true
+				return m, m.startCoordSpawn(p.Name, cwd), true
 			}
 			m.pendingAttach = rec.TmuxSession
 			return m, tea.Quit, true

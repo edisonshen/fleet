@@ -6,6 +6,7 @@ package main
 // state and points the successor at it.
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // fakeAgentRecord builds a minimal agent.Record for the recovery-detection
@@ -55,7 +58,7 @@ func TestFindRecoveryCandidate_AlivePidIsNotCandidate(t *testing.T) {
 	records := []*agent.Record{
 		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
 	}
-	pidAlive := func(int) bool { return true }      // still ticking
+	pidAlive := func(int) bool { return true }         // still ticking
 	sessionAlive := func(string) bool { return false } // tmux gone
 
 	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
@@ -132,6 +135,9 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
 
 	// Seed the dead coord's agent record so writeRecoveryHandoffDoc has
 	// something to update.
@@ -201,5 +207,133 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 	}
 	if *reread.LastHandoffPath != docPath {
 		t.Errorf("last_handoff_path = %q; want %q", *reread.LastHandoffPath, docPath)
+	}
+}
+
+// TestRunDispatch_DeadCoord_Recovers exercises runDispatch end-to-end:
+// a stale coord record on disk with a dead pid AND no live tmux
+// session must (a) trigger the synth-handoff write, (b) archive the
+// dead record, (c) spawn a fresh successor whose last_handoff_path
+// points at the synth doc. Pre-fix, this case would have ignored the
+// dead record (and the dashboard's existing dispatch path would have
+// over-counted live coords).
+//
+// Requires real tmux (we actually spawn the successor); skips on CI
+// hosts that lack it. The sleep/60 command keeps the successor alive
+// long enough to assert its record fields without racing teardown.
+func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Seed the dead coord record. pid 99999 is overwhelmingly likely
+	// not running on the test host; the kill(0) probe returns ESRCH.
+	// TmuxSession points at a name no one will create — we never
+	// spawn it, so tmux.HasSession returns false.
+	deadRec := agent.New("deadc0de")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-deadc0de"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	// Seed minimal project state so synth has something to describe.
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{
+		"worker_agent_ids": map[string]string{
+			"fix-foo-1234": "cafef00d",
+		},
+	}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	wDir := filepath.Join(pdir, "workers", "fix-foo-1234")
+	if err := os.MkdirAll(wDir, 0o755); err != nil {
+		t.Fatalf("mkdir worker dir: %v", err)
+	}
+	wState := map[string]any{
+		"slug":    "fix-foo-1234",
+		"project": "myproj",
+		"phase":   "tdd-green",
+		"pid":     0,
+	}
+	wData, _ := json.Marshal(wState)
+	if err := os.WriteFile(filepath.Join(wDir, "state.json"), wData, 0o644); err != nil {
+		t.Fatalf("write worker state: %v", err)
+	}
+
+	// Run dispatch with --coord-spawn pointing at the same task_id.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	stdout := out.String()
+	if !strings.Contains(stdout, "recovering dead coord deadc0de") {
+		t.Errorf("dispatch stdout must announce recovery; got:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "synth handoff written to") {
+		t.Errorf("dispatch stdout must mention synth handoff path; got:\n%s", stdout)
+	}
+
+	// The dead record must be archived (no longer in agent.List).
+	live, lerr := agent.List()
+	if lerr != nil {
+		t.Fatalf("agent.List: %v", lerr)
+	}
+	for _, r := range live {
+		if r.ID == "deadc0de" {
+			t.Errorf("dead record %s must be archived; still in live list", r.ID)
+		}
+	}
+
+	// The successor must exist and carry a LastHandoffPath that points
+	// at a recovery-synth doc.
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected a successor coord on disk; got %d live records (%+v)", len(live), live)
+	}
+	t.Cleanup(func() {
+		// Best-effort cleanup of the successor's tmux session — the
+		// test launched a real sleep/60 inside it via spawn.Spawn.
+		_ = tmux.Kill(successor.TmuxSession)
+	})
+	if successor.LastHandoffPath == nil {
+		t.Fatalf("successor LastHandoffPath must point at synth doc; got nil")
+	}
+	body, rerr := os.ReadFile(*successor.LastHandoffPath)
+	if rerr != nil {
+		t.Fatalf("read successor handoff doc: %v", rerr)
+	}
+	if !strings.Contains(string(body), `handoff_type: "`+handoff.TypeRecoverySynth+`"`) {
+		t.Errorf("successor handoff doc must be recovery-synth; got:\n%s", body)
+	}
+	if !strings.Contains(string(body), "fix-foo-1234") {
+		t.Errorf("successor handoff doc must list the in-flight worker slug; got:\n%s", body)
+	}
+	// handoff_number on the successor should be > 1 (incremented from
+	// the dead's HandoffNumber). New() defaults to 1; spawn.Spawn's
+	// OldRecord branch bumps to old+1.
+	if successor.HandoffNumber <= 1 {
+		t.Errorf("successor HandoffNumber = %d; want >= 2 (incremented from dead's 1)",
+			successor.HandoffNumber)
 	}
 }

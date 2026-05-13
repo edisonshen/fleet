@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -13,6 +14,12 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// tmuxHasSession is the production sessionAliveProbe for
+// findRecoveryCandidate. Wraps tmux.HasSession; the indirection keeps
+// the recovery helper testable without a live tmux server (tests
+// pass closures instead).
+var tmuxHasSession = tmux.HasSession
 
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
@@ -389,7 +396,53 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
+	// hits a project whose previous coord left a stale record on disk
+	// (pid dead AND tmux session gone), build a synth handoff doc from
+	// on-disk state and route the spawn through the
+	// OldRecord+NewDocPath branch of spawn.Spawn. The successor's first
+	// turn runs handoff_resume.py and picks up the dead coord's
+	// in-flight work without throwing state away.
+	//
+	// Guarded on opts.coordSpawn: an operator-supplied `fleet dispatch
+	// <task>` with no --coord-spawn flag must NEVER substitute a
+	// recovery synth — that would steal another lineage's identity if
+	// the operator's task_id happened to collide.
+	//
+	// Failure mode: a synth-doc write failure DOES NOT block the
+	// dispatch. We log a warning and fall through to a fresh spawn so
+	// the project isn't stuck unable to recover. The dead record's
+	// state.json + workers/<slug>/ trees stay on disk; a later
+	// dispatch attempt can retry the synth write. Choosing
+	// "available coord without resume context" over "no coord at all"
+	// preserves the operator's ability to manually inspect the workers
+	// dir if they need to.
+	var oldRecord *agent.Record
+	var newDocPath string
+	if opts.coordSpawn {
+		records, lerr := agent.List()
+		if lerr != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"warning: dead-coord recovery probe skipped (agent.List: %v) — proceeding with fresh spawn\n", lerr)
+		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession); dead != nil {
+			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
+			if derr != nil {
+				_, _ = fmt.Fprintf(stdout,
+					"warning: synth handoff doc write failed (%v) — proceeding with fresh spawn (workers state preserved on disk)\n",
+					derr)
+			} else {
+				oldRecord = dead
+				newDocPath = docPath
+				_, _ = fmt.Fprintf(stdout,
+					"recovering dead coord %s for project %s: synth handoff written to %s\n",
+					dead.ID, dead.Project, docPath)
+			}
+		}
+	}
+
 	rec, err := spawn.Spawn(spawn.Options{
+		OldRecord:         oldRecord,
+		NewDocPath:        newDocPath,
 		TaskID:            opts.taskID,
 		Project:           opts.project,
 		Cwd:               opts.cwd,
@@ -401,6 +454,22 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Recovery-path bookkeeping: archive the dead record so the next
+	// dispatch's findRecoveryCandidate doesn't keep returning the same
+	// stale entry. spawn.Spawn already wrote the successor record;
+	// the dead record's role is purely "chain-link source for the
+	// synth doc's previous_handoff field" — that's already captured in
+	// the successor's record fields. Archive errors are logged but
+	// non-fatal: an unarchived dead record is benign (re-detected next
+	// dispatch and re-handled idempotently).
+	if oldRecord != nil {
+		if aerr := oldRecord.Archive(); aerr != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"warning: archive of dead coord record %s failed (%v) — next dispatch will re-detect\n",
+				oldRecord.ID, aerr)
+		}
 	}
 
 	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
