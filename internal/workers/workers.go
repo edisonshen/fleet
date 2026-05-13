@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -143,9 +144,15 @@ var (
 	ErrPhaseRequiresReview  = errors.New("phase=push requires review_claude_status=passed and review_codex_status in {passed,skipped}")
 	ErrInvalidPhase         = errors.New("invalid phase")
 	ErrInvalidReviewStat    = errors.New("invalid review status")
-	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable}")
+	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable, no-git}")
 	ErrInvalidSlug          = errors.New("invalid worker slug")
 	ErrPreconditionLive     = errors.New("cannot archive live worker")
+	// ErrPhasePushNonGit fires when a worker on a non-git project tries
+	// to transition through phase=push. Non-git projects skip push
+	// entirely (review-done → done); a phase=push write is a contract
+	// violation by the finisher dispatch path. Clear error message so
+	// the caller knows to transition phase=done directly.
+	ErrPhasePushNonGit = errors.New("non-git project: phase=push is not valid; transition phase=done directly")
 )
 
 // allowedCodexSkipReasons enumerates the only review_codex_skip_reason
@@ -153,12 +160,35 @@ var (
 // else upfront, but workers.WriteState is the load-bearing gate that
 // catches direct callers + future skill-side bypasses. Allowed values
 // are intentionally narrow: codex skips are operational concessions
-// (rate-limited at the CLI; binary missing on host) — NOT a way to
-// declare "I didn't feel like running codex". Broadening this set
-// requires explicit operator sign-off (CLAUDE.md §4).
+// (rate-limited at the CLI; binary missing on host; no-git project)
+// — NOT a way to declare "I didn't feel like running codex".
+// Broadening this set requires explicit operator sign-off (CLAUDE.md §4).
+//
+// "no-git" was added for non-git projects (operator clarification
+// 2026-05-12): `codex review --base main` needs a git diff to operate;
+// for non-git projects the reviewer records skip-reason=no-git and the
+// /review (Claude) reviewer remains mandatory.
 var allowedCodexSkipReasons = map[string]struct{}{
 	"rate-limited": {},
 	"unavailable":  {},
+	"no-git":       {},
+}
+
+// projectIsGit returns true if the project's meta.json declares git
+// mode (or is missing — legacy projects pre-date the IsGit field and
+// must default to git). The lookup is cheap (one file read) and
+// happens at WriteState time so the validator can branch on it.
+//
+// On any read error other than ErrNotFound, defaults to git mode —
+// the assumption is "treat unknown as git so we don't accidentally
+// relax the validator for a malformed meta.json". The git-mode
+// behavior is strictly more conservative.
+func projectIsGit(project string) bool {
+	m, err := projects.Read(project)
+	if err != nil {
+		return true
+	}
+	return m.GitMode()
 }
 
 // validateReviewGate enforces the phase=push precondition. Three-stage
@@ -267,10 +297,23 @@ func writeStateLocked(project, slug string, s *State) error {
 	if !validReviewStatus(s.ReviewCodexStatus) {
 		return fmt.Errorf("%w: review_codex_status=%q", ErrInvalidReviewStat, s.ReviewCodexStatus)
 	}
+	// Non-git projects skip the push step entirely. Reject phase=push
+	// upfront with a clear error so the dispatch code knows to write
+	// phase=done directly. Git projects fall through to the normal
+	// review-gate validator below. The project lookup is best-effort;
+	// missing meta.json defaults to git-mode (see projectIsGit).
+	gitMode := projectIsGit(project)
+	if !gitMode && s.Phase == PhasePush {
+		return ErrPhasePushNonGit
+	}
 	if err := validateReviewGate(s); err != nil {
 		return err
 	}
-	if s.Phase == PhaseDone && strings.TrimSpace(s.PRURL) == "" {
+	// phase=done's pr_url precondition applies only to git projects.
+	// For non-git, the worker shipped a local diff — there is no PR
+	// to point at. The finisher records the diff summary in the
+	// task note, not on state.json.
+	if s.Phase == PhaseDone && gitMode && strings.TrimSpace(s.PRURL) == "" {
 		return ErrPhaseRequiresPR
 	}
 	if s.Phase == PhaseBlocked && strings.TrimSpace(s.BlockedReason) == "" {
