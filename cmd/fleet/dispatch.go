@@ -467,9 +467,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		if coordRecordExistsForProject(opts.taskID, opts.project) {
 			return fmt.Errorf(
 				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
-					"likely cause: a live coord is on a different tmux socket. "+
-					"if you intentionally stopped the coord, run `fleet rm <coord-id>` (or press [x] on the dashboard) "+
-					"to clear the record before retrying", opts.project)
+					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
+					"in case (2), wait %s for the freshness signal to age out, then retry — recovery will pick up in-flight worker state. "+
+					"do NOT `fleet rm` the dead record first; that disables the recovery path",
+				opts.project, coordFreshnessWindow)
 		}
 	}
 
@@ -580,18 +581,24 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				// non-default engine can pass --command + --engine
 				// together; commandExplicit then takes the explicit
 				// path and skips this inheritance.
-				// Legacy-record normalization (codex review iter-12
-				// P2): pre-v0.9 records legitimately have engine="",
-				// which is treated as claude-code everywhere else.
-				// Without this normalization, recovering a legacy
-				// record under --engine claude-code would fall through
-				// to the default wrapper instead of inheriting the
-				// custom command — a regression on the upgrade path.
-				preClampEngineNormalized := preClampEngine
-				if preClampEngineNormalized == "" {
-					preClampEngineNormalized = enginecfg.DefaultEngine
-				}
-				if !opts.commandExplicit && preClampEngineNormalized == engineName && len(oldRecord.Command) > 0 {
+				// Legacy-record safety (codex review iter-14 P1):
+				// pre-v0.9 records have engine="" because the field
+				// didn't exist. iter-13 tried to make these inherit
+				// by treating "" as claude-code, but that bypasses
+				// the claude-only guard above (which short-circuits
+				// on engine=="") for legacy records whose custom
+				// Command might launch a non-claude engine. We can't
+				// introspect an arbitrary argv to know what it
+				// spawns, so the safe default is: skip inheritance
+				// for legacy records. The wrapper-swap block earlier
+				// already populated opts.command with the engine-
+				// default wrapper, so the successor runs claude-code
+				// as the --coord-spawn contract requires. Operators
+				// who want their legacy custom wrapper back can re-
+				// add it post-recovery via `fleet handoff <id>
+				// --command <wrapper>`.
+				legacyRecord := preClampEngine == ""
+				if !opts.commandExplicit && !legacyRecord && preClampEngine == engineName && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
 					if opts.coordSpawn && preAllocatedID != "" {
 						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
