@@ -1318,3 +1318,46 @@ func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
 		t.Errorf("legacy-record bypass: successor inherited untrusted legacy command %v; expected claude-code default wrapper", successor.Command)
 	}
 }
+
+// TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError pins codex
+// review round-3 P1: when agent.List() errors during --coord-spawn
+// (corrupt/unreadable agents dir), the live-coord veto and dead-coord
+// recovery probe used to both fall open — letting dispatch spawn a
+// fresh coord even though a live coord could exist on a different
+// tmux socket whose record we couldn't read. The fix lifts agent.List
+// above both checks and aborts the dispatch with a clear error.
+func TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 000 doesn't deny root reads")
+	}
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	// Make the agents directory unreadable so agent.List's ReadDir
+	// errors. chmod 100 (execute-only) lets runDispatch's internal
+	// state.Bootstrap re-run safely (MkdirAll on the already-existing
+	// agents/.locks subdir only needs execute on the parent) while
+	// still blocking the directory-listing read that agent.List does.
+	agentsDir := filepath.Join(root, "agents")
+	if err := os.Chmod(agentsDir, 0o100); err != nil {
+		t.Skipf("chmod agents dir: %v (likely sandbox restriction)", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(agentsDir, 0o755) })
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected runDispatch to fail closed on agent.List error; got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot list agent records") {
+		t.Errorf("error message should mention agent.List failure for split-brain safety; got: %v", err)
+	}
+}

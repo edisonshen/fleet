@@ -205,27 +205,19 @@ func coordStateFresh(project string) bool {
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
 
-// coordRecordExistsForProject reports whether ~/.fleet/agents/
-// contains any LIVE (non-archived) record matching the given task_id
+// coordRecordExistsInList reports whether the given pre-fetched
+// records slice contains an unarchived agent record for this task_id
 // + project. The dispatch-side live-coord veto pairs this with
 // coordStateFresh to detect "something is supervising this project"
 // without false-positives from stale leftover files.
 //
-// Codex review iter-12 P1: pre-iter-11 versions of this function
-// tried to ALSO check pid/tmux liveness to filter out dead records
-// — but the cross-socket case (live coord on a different tmux server)
-// can't be detected locally, and a stricter check would falsely
-// allow the dispatch through. The current shape — any record exists —
-// vetoes the cross-socket case correctly and leaves the post-shutdown
-// case to operator cleanup via `fleet rm` / [x].
-//
-// Returns false on agent.List errors (defensive: prefer false-negative
-// "let dispatch proceed" over false-positive "block forever").
-func coordRecordExistsForProject(taskID, project string) bool {
-	records, err := agent.List()
-	if err != nil {
-		return false
-	}
+// Takes a slice rather than calling agent.List internally (codex
+// review iter-15 P1): the caller fetches the list ONCE early in
+// runDispatch and fail-closes on errors, so a corrupt agents
+// directory aborts the spawn instead of silently disabling the
+// live-coord veto and risking split-brain on a different tmux socket.
+// The slice is also reused by findRecoveryCandidate below.
+func coordRecordExistsInList(taskID, project string, records []*agent.Record) bool {
 	for _, r := range records {
 		if r == nil {
 			continue

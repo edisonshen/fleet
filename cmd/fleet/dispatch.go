@@ -438,6 +438,30 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Pre-fetch the agent record list ONCE so the live-coord veto AND
+	// the dead-coord recovery probe below share the same view (codex
+	// review iter-15 P1). Failing closed here is critical: without a
+	// readable record list we can't detect a live coord on a different
+	// tmux socket, and falling through would spawn a fresh coord that
+	// races the live one — the split-brain case the veto exists to
+	// prevent. Errors from agent.List are rare in practice (corrupt
+	// individual records get silently skipped; only directory-level
+	// failures bubble up — permission denied, unreadable mount), so
+	// blocking on them surfaces a real environment problem instead of
+	// silently breaking the cross-socket safety guarantee.
+	var coordRecords []*agent.Record
+	if opts.coordSpawn {
+		recs, lerr := agent.List()
+		if lerr != nil {
+			return fmt.Errorf(
+				"--coord-spawn refusing to spawn for project %q: cannot list agent records (%v). "+
+					"split-brain risk: a live coord on a different tmux socket might exist whose record we can't read. "+
+					"fix the agents directory (likely permission/mount issue under ~/.fleet/agents) and retry",
+				opts.project, lerr)
+		}
+		coordRecords = recs
+	}
+
 	// Live-coord veto (codex review iter-12 P1 — reinstated after
 	// iter-11 briefly removed it). The Python /coordinator skill only
 	// holds coordinator.lock for a single tick before releasing it in
@@ -464,7 +488,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
 	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if coordRecordExistsForProject(opts.taskID, opts.project) {
+		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
 			return fmt.Errorf(
 				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
 					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
@@ -498,11 +522,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	var oldRecord *agent.Record
 	var newDocPath string
 	if opts.coordSpawn {
-		records, lerr := agent.List()
-		if lerr != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: dead-coord recovery probe skipped (agent.List: %v) — proceeding with fresh spawn\n", lerr)
-		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession, coordStateFresh); dead != nil {
+		if dead := findRecoveryCandidate(opts.taskID, opts.project, coordRecords, pidAlive, tmuxHasSession, coordStateFresh); dead != nil {
 			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
 			if derr != nil {
 				_, _ = fmt.Fprintf(stdout,
