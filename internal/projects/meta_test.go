@@ -123,3 +123,113 @@ func TestMeta_RejectsInvalidProjectName(t *testing.T) {
 		t.Fatal("expected validation error on bad project name, got nil")
 	}
 }
+
+// TestMeta_LegacyFileWithoutIsGit_ParsesAsTrue: a meta.json written by
+// v0.8.x and earlier (no is_git field) must continue to behave as a
+// git-backed project. GitMode() returns true; the on-disk file is
+// untouched on subsequent Reads.
+func TestMeta_LegacyFileWithoutIsGit_ParsesAsTrue(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	// Hand-craft a legacy meta.json with no is_git field. Reproduces
+	// the on-disk shape of every project registered before this PR.
+	dir := filepath.Join(root, "projects", "legacy-demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	legacy := `{"schema":"v1","repo_path":"/abs/old","added_at":"2026-04-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(dir, "meta.json"), []byte(legacy), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := Read("legacy-demo")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.IsGit != nil {
+		t.Errorf("IsGit should remain nil for legacy file, got %v", *got.IsGit)
+	}
+	if !got.GitMode() {
+		t.Errorf("GitMode() should default to true for legacy file")
+	}
+}
+
+// TestMeta_IsGitFalseRoundTrip: when the operator registers a non-git
+// directory, IsGit=false must round-trip through disk verbatim. The
+// JSON encoder MUST emit the field (so a re-read sees false rather
+// than the legacy-default true).
+func TestMeta_IsGitFalseRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+
+	m := Meta{
+		Schema:   "v1",
+		RepoPath: "/abs/non-git/dir",
+		AddedAt:  time.Date(2026, 5, 12, 0, 0, 0, 0, time.UTC),
+		IsGit:    BoolPtr(false),
+	}
+	if err := Write("non-git-demo", m); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Inspect raw on-disk shape: is_git must be present and false.
+	data, err := os.ReadFile(filepath.Join(root, "projects", "non-git-demo", "meta.json"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("Unmarshal raw: %v", err)
+	}
+	v, ok := raw["is_git"]
+	if !ok {
+		t.Fatalf("is_git missing on disk for explicit-false; raw=%v", raw)
+	}
+	if b, _ := v.(bool); b {
+		t.Errorf("is_git on disk = %v, want false", v)
+	}
+
+	got, err := Read("non-git-demo")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.IsGit == nil {
+		t.Fatal("IsGit nil after read; want explicit false")
+	}
+	if *got.IsGit {
+		t.Errorf("IsGit=%v, want false", *got.IsGit)
+	}
+	if got.GitMode() {
+		t.Errorf("GitMode()=true, want false")
+	}
+}
+
+// TestMeta_IsGitTrueRoundTrip: when IsGit is set explicitly to true,
+// Read also reflects that. (The legacy default-true path is tested
+// separately above.) The on-disk file omits the field (matches the
+// omitempty json tag) only when the pointer is nil — an explicit
+// pointer-to-true keeps the field present.
+func TestMeta_IsGitTrueRoundTrip(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+
+	m := Meta{
+		Schema:   "v1",
+		RepoPath: "/abs/git/dir",
+		AddedAt:  time.Date(2026, 5, 12, 0, 0, 0, 0, time.UTC),
+		IsGit:    BoolPtr(true),
+	}
+	if err := Write("git-demo", m); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read("git-demo")
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.IsGit == nil || !*got.IsGit {
+		t.Errorf("IsGit=%v, want pointer to true", got.IsGit)
+	}
+	if !got.GitMode() {
+		t.Errorf("GitMode()=false, want true")
+	}
+}

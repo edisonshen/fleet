@@ -27,11 +27,37 @@ import (
 // Meta is the parsed shape of meta.json. Only the three fields the
 // spec requires; future fields land here as omitempty so older readers
 // continue to round-trip them through Write.
+//
+// IsGit is a pointer so the JSON layer can distinguish "field absent on
+// disk" (legacy meta.json predating non-git support) from "field present,
+// value false" (operator added a non-git directory). After unmarshal, an
+// absent IsGit collapses to true via Read's normalization — legacy
+// projects keep behaving as git projects unchanged.
 type Meta struct {
 	Schema   string    `json:"schema"`
 	RepoPath string    `json:"repo_path"`
 	AddedAt  time.Time `json:"added_at"`
+	IsGit    *bool     `json:"is_git,omitempty"`
 }
+
+// GitMode returns true when the project is git-backed. Defaults to true
+// when IsGit is nil — legacy meta.json files pre-date the field and the
+// invariant "v0.8.x and earlier only registered git projects" makes the
+// default safe.
+func (m Meta) GitMode() bool {
+	if m.IsGit == nil {
+		return true
+	}
+	return *m.IsGit
+}
+
+// boolPtr is a tiny constructor for the *bool fields above. Local to
+// the package because every caller is in projects/ or its tests.
+func boolPtr(b bool) *bool { return &b }
+
+// BoolPtr re-exports boolPtr for callers outside the package (cmd/fleet,
+// tests) that need to set IsGit explicitly. Kept tiny on purpose.
+func BoolPtr(b bool) *bool { return boolPtr(b) }
 
 // SchemaVersion is the value Write emits in Schema for newly minted
 // meta.json files. Existing files keep whatever schema they had on
