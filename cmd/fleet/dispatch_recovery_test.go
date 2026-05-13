@@ -1239,3 +1239,82 @@ func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
 		t.Errorf("engine clamp + command inherit interaction: successor still carries codex sentinel command %v; expected claude-code default wrapper", successor.Command)
 	}
 }
+
+// TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit pins codex
+// review iter-14 P1: pre-v0.9 records have engine="" because the field
+// didn't exist. iter-13 added a "" → claude-code normalization in the
+// command-inheritance branch, which bypassed the claude-only guard
+// (that guard short-circuits on engine=="") and silently installed
+// the legacy record's custom Command on the successor — even though
+// the argv could be launching codex or anything else. The fix: refuse
+// inheritance for legacy records; let the engine-default wrapper from
+// the wrapper-swap block win. Operators can re-add a custom wrapper
+// post-recovery via `fleet handoff <id> --command <wrapper>`.
+func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Pre-v0.9 dead record: Engine field empty, custom Command that
+	// could be running anything. The codex-sentinel is the smoking
+	// gun — if iter-13's normalization were still live, this argv
+	// would get inherited despite the claude-only contract.
+	deadRec := agent.New("legacyc0")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-legacyc0"
+	deadRec.Engine = "" // pre-v0.9 record: field didn't exist
+	deadRec.Command = []string{"sleep", "300"}
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	// Plain `fleet dispatch <task> --coord-spawn`: no explicit engine,
+	// no --command. Default engine is claude-code so the wrapper-swap
+	// block populates opts.command with the claude-code default. The
+	// inheritance branch must NOT overwrite that with the legacy
+	// custom command.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		// engine intentionally empty → resolves to enginecfg.DefaultEngine (claude-code)
+		// commandExplicit=false, command empty
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "legacyc0" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	// The successor's record must NOT carry the legacy custom command.
+	if len(successor.Command) == 2 && successor.Command[0] == "sleep" && successor.Command[1] == "300" {
+		t.Errorf("legacy-record bypass: successor inherited untrusted legacy command %v; expected claude-code default wrapper", successor.Command)
+	}
+}
