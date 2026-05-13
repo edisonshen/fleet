@@ -1263,6 +1263,7 @@ def _write_agent_record(
     last_activity_ts: str = "",
     needs_input: bool = False,
     blocked: bool = False,
+    engine: str = "claude-code",
 ) -> Path:
     """Seed ~/.fleet/agents/<id>.json with the minimal shape the sweep
     reads. Mirrors internal/agent.Record's json:"..." tag names verbatim
@@ -1274,6 +1275,7 @@ def _write_agent_record(
         "schema_version": 1,
         "id": agent_id,
         "project": project,
+        "engine": engine,
         "last_activity_ts": last_activity_ts,
         "needs_input": needs_input,
         "blocked": blocked,
@@ -1467,6 +1469,98 @@ def test_idle_agent_archive_pass_skips_fresh(
     )
     assert archived == 0
     assert [c for c in calls if "rm" in c] == []
+
+
+def test_idle_agent_archive_pass_skips_non_claude_engine(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Multi-engine MVP (memory project_codex_multi_engine.md): codex
+    agents never run Claude Code's Stop hook, so fleet-guard never
+    updates their last_activity_ts. An actively-running codex agent
+    would look "stale-since-spawn" to the idle-archive sweep, and
+    without an engine gate the sweep would `fleet rm` it out from
+    under the operator. Engine-gate: skip records where
+    engine != "claude-code" until a sibling skill writes heartbeats
+    for them.
+    """
+    # Codex agent with ancient last_activity_ts (would normally be
+    # eligible for archive based on staleness alone).
+    _write_agent_record(
+        fleet_home, "cccc1234",
+        project="fleet",
+        engine="codex",
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+    # And a claude-code control: same staleness, but engine=claude-code
+    # so it SHOULD be archived. This pins the engine-gate as the only
+    # axis the new branch toggles on.
+    _write_agent_record(
+        fleet_home, "ccaa1234",
+        project="fleet",
+        engine="claude-code",
+        last_activity_ts="2020-01-01T00:00:00Z",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr="",
+        )
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    # Only the claude-code agent was archived; codex was skipped.
+    assert archived == 1
+    rm_ids = [c[2] for c in calls if c[1:2] == ["rm"]]
+    assert rm_ids == ["ccaa1234"], (
+        f"only claude-code agent should be archived; got: {rm_ids}"
+    )
+
+
+def test_idle_agent_archive_pass_legacy_record_treated_as_claude(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Legacy agent records (written before v0.9 multi-engine) lack
+    the `engine` field. The sweep treats missing/empty engine as
+    `claude-code` so the v0 idle-archive behavior is preserved
+    byte-for-byte on legacy installs."""
+    agents_dir = fleet_home / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    # Legacy record: NO engine field.
+    rec = {
+        "schema_version": 1,
+        "id": "aaaa9999",
+        "project": "fleet",
+        "last_activity_ts": "2020-01-01T00:00:00Z",
+        "needs_input": False,
+        "blocked": False,
+    }
+    (agents_dir / "aaaa9999.json").write_text(json.dumps(rec), encoding="utf-8")
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="", stderr="",
+        )
+
+    monkeypatch.setenv("FLEET_COORD_IDLE_TTL_H", "1")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    archived = supervisor._run_idle_agent_archive_pass(
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        now_unix=2000000000.0, log_stream=io.StringIO(),
+    )
+    assert archived == 1
+    rm_ids = [c[2] for c in calls if c[1:2] == ["rm"]]
+    assert rm_ids == ["aaaa9999"]
 
 
 def test_idle_agent_archive_pass_scopes_to_own_project(

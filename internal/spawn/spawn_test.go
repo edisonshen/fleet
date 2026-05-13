@@ -108,6 +108,59 @@ func TestSpawn_FreshDispatch(t *testing.T) {
 	}
 }
 
+// TestSpawn_EngineOverride pins the v0.9 multi-engine MVP: when
+// Options.Engine is set, Spawn stamps that name on the new agent
+// record (instead of agent.DefaultEngine). Empty Engine preserves the
+// pre-v0.9 byte shape (DefaultEngine wins). Round-trips to disk.
+func TestSpawn_EngineOverride(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Command: []string{"sleep", "30"},
+		Engine:  "codex",
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != "codex" {
+		t.Errorf("rec.Engine = %q, want \"codex\"", rec.Engine)
+	}
+	loaded, err := agent.Load(rec.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.Engine != "codex" {
+		t.Errorf("loaded.Engine = %q, want \"codex\"", loaded.Engine)
+	}
+}
+
+func TestSpawn_EngineEmptyPreservesDefault(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "p",
+		Command: []string{"sleep", "30"},
+		// Engine intentionally empty: legacy callers shouldn't see a
+		// byte-shape change.
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != agent.DefaultEngine {
+		t.Errorf("rec.Engine = %q, want %q (default preserved)",
+			rec.Engine, agent.DefaultEngine)
+	}
+}
+
 func TestSpawn_CapturesCwdAndCommandOnRecord(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -646,6 +699,135 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("expected all of %v in pane within deadline:\n%s", wants, string(lastOut))
+}
+
+// TestSpawn_HandoffOverridesFleetEngineEnv regresses codex review
+// iter-2 [P1]: on the handoff branch the replacement agent inherits
+// OldRecord.Engine (e.g. claude-code), so the FLEET_ENGINE env var
+// stamped into the spawned tmux session MUST match the record, not
+// the caller's session env. Without the guard a caller running
+// `fleet --engine codex handoff <claude-agent>` propagates
+// FLEET_ENGINE=codex into a replacement that's actually running
+// claude-code; any downstream code keying off FLEET_ENGINE (the
+// reviewer-prompt builder + `fleet dispatch` subprocesses) then
+// picks the wrong engine.
+func TestSpawn_HandoffOverridesFleetEngineEnv(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Caller's env claims codex. The OldRecord is claude-code. The
+	// replacement's env must reflect the record (claude-code), not the
+	// caller (codex).
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	old := agent.New("aaaa2222")
+	old.TaskID = "engine-leak"
+	old.Project = "rainier"
+	old.Engine = "claude-code"
+	old.Role = "executor"
+	old.Mode = "execute"
+
+	// Echo FLEET_ENGINE then idle so the pane stays alive while we
+	// capture it.
+	cmd := []string{"sh", "-c", "echo ENGINE_SEEN=$FLEET_ENGINE; cat"}
+	rec, err := Spawn(Options{
+		OldRecord: old,
+		Command:   cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != "claude-code" {
+		t.Fatalf("rec.Engine = %q, want claude-code (OldRecord inheritance)",
+			rec.Engine)
+	}
+
+	// Poll the pane for ENGINE_SEEN=claude-code. The negative assertion
+	// (must NOT contain codex) is the regression bite.
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			s := string(out)
+			if strings.Contains(s, "ENGINE_SEEN=claude-code") {
+				// Belt + suspenders: confirm we didn't ALSO leak codex.
+				if strings.Contains(s, "ENGINE_SEEN=codex") {
+					t.Fatalf("env leaked caller's FLEET_ENGINE=codex into "+
+						"claude-code handoff replacement:\n%s", s)
+				}
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected ENGINE_SEEN=claude-code in pane within deadline:\n%s",
+		string(lastOut))
+}
+
+// TestSpawn_HandoffLegacyRecordNormalizesFleetEngine regresses codex
+// review iter-3 [P2]: when handing off a pre-v0.9 agent record that
+// predates the engine field, OldRecord.Engine is empty but agent.New
+// stamps DefaultEngine (claude-code) on the new record. Without
+// normalizing the env to DefaultEngine, the caller's FLEET_ENGINE
+// (e.g. codex from `fleet --engine codex handoff ...`) would leak
+// into a replacement whose record actually says claude-code, re-
+// introducing the env/record mismatch the iter-2 fix removed.
+func TestSpawn_HandoffLegacyRecordNormalizesFleetEngine(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Caller's session is codex; OldRecord predates the engine field.
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	old := agent.New("aaaa3333")
+	old.TaskID = "legacy-handoff"
+	old.Project = "rainier"
+	old.Engine = "" // pre-v0.9 legacy: engine field absent
+	old.Role = "executor"
+	old.Mode = "execute"
+
+	cmd := []string{"sh", "-c", "echo ENGINE_SEEN=$FLEET_ENGINE; cat"}
+	rec, err := Spawn(Options{
+		OldRecord: old,
+		Command:   cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// agent.New defaults Engine to claude-code on the new record;
+	// inheritance branch leaves it (OldRecord.Engine == "" so the
+	// "if old.Engine != '' { rec.Engine = old.Engine }" guard
+	// preserves the default).
+	if rec.Engine != agent.DefaultEngine {
+		t.Fatalf("rec.Engine = %q, want %q (legacy handoff default)",
+			rec.Engine, agent.DefaultEngine)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			s := string(out)
+			if strings.Contains(s, "ENGINE_SEEN=claude-code") {
+				if strings.Contains(s, "ENGINE_SEEN=codex") {
+					t.Fatalf("env leaked caller's FLEET_ENGINE=codex into "+
+						"legacy-record handoff replacement:\n%s", s)
+				}
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected ENGINE_SEEN=claude-code in pane (legacy normalization):\n%s",
+		string(lastOut))
 }
 
 // TestWaitForReadyToPrompt_AppliesPostReadyBuffer pins issue #65

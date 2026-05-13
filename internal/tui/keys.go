@@ -619,6 +619,23 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// sessions" and the operator drops back to their shell with
 		// no idea why. Surface the diagnosis in-TUI.
 		if !sessionAliveFn(cur.TmuxSession) {
+			// Resume-suggestion gate (resume-dead-coord-ab65): a dead
+			// COORD agent (TaskID == "coord-<project>") has a working
+			// resume path via [a] on the project row, which goes through
+			// the dispatch CLI's synth-handoff recovery flow. Suggest
+			// that instead of archive so the operator doesn't throw
+			// state away. Non-coord dead agents (workers, manual
+			// dispatches) keep the archive suggestion — there's no
+			// resume path to point at.
+			if cur.Project != "" && cur.TaskID == coordTaskID(cur.Project) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",
+						cur.ID, cur.Project),
+					isErr: true,
+				}
+				return m, nil, true
+			}
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"agent %s session is dead — claude likely exited inside it. Press [x] to archive the orphan record.",
@@ -1022,14 +1039,73 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	// — same UX bug as the agent-row branch's "no sessions" failure mode.
 	if p.CoordID != "" {
 		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
-			if !sessionAliveFn(rec.TmuxSession) {
+			// Probe with sessionProbeOrAliveFn (codex review iter-6 P1):
+			// the bare sessionAliveFn returns false on transport errors
+			// (bad FLEET_TMUX_SOCKET, restarting tmux server, etc.),
+			// which would falsely trigger the recovery spawn against a
+			// still-live coord on a different socket. The
+			// sessionProbeOrAliveFn helper distinguishes definitive
+			// "no such session" from probe-error: the latter is treated
+			// as alive (conservative) so we don't dispatch a duplicate
+			// over a transport hiccup.
+			if !sessionProbeOrAliveFn(rec.TmuxSession) {
+				// Dead tmux session: re-dispatch the coord under the
+				// same stable task_id ("coord-<project>"). The dispatch
+				// CLI's dead-coord detection (see
+				// cmd/fleet/dispatch_recovery.go) writes a synth-handoff
+				// doc from on-disk state and points the successor at it,
+				// so the resume picks up where the dead coord left
+				// off without throwing state away. Previously this
+				// case flashed "press [x] to archive, then [a] to
+				// respawn" — which threw state away by archiving the
+				// only link the dispatch path has back to the dead
+				// coord's worker state. Flash the resume so the
+				// operator knows we're not silently respawning.
+				if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
+					m.flash = &flashMsg{
+						text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
+						isErr: true,
+					}
+					return m, nil, true
+				}
+				// In-flight guard (codex review iter-6 P2): the lower
+				// fresh-spawn path 2.6 below has the same check; we
+				// honor it here too so an operator's double-tap on
+				// [a] before the first coordSpawnDoneMsg arrives
+				// doesn't fire a second recovery dispatch against the
+				// same project state.
+				if m.coordSpawnInFlight[p.Name] {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"coord resume for project %s already in flight — wait for it to finish",
+							p.Name),
+						isErr: true,
+					}
+					return m, nil, true
+				}
+				if m.coordSpawnInFlight == nil {
+					m.coordSpawnInFlight = map[string]bool{}
+				}
+				m.coordSpawnInFlight[p.Name] = true
+				// Pass the DEAD COORD's own cwd, not the project's
+				// first-record cwd (codex review iter-11 P2). The
+				// dispatch CLI's recovery path falls back to the dead
+				// coord's Cwd when --cwd is empty (codex iter-9 P2),
+				// but if we pass any --cwd here it wins. Sending
+				// rec.Cwd specifically keeps the resumed coord in the
+				// SAME checkout the dead coord ran in, even when
+				// other workers/reviewers for the same project live
+				// in different worktrees.
+				//
+				// Empty rec.Cwd legitimately falls through to
+				// startCoordSpawn → omits --cwd → dispatch CLI's
+				// OldRecord.Cwd fallback fires.
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
-						"coord %s for project %s has a dead tmux session — press [x] on its agent row to archive, then [a] here to respawn",
+						"resuming coord %s for project %s from last checkpoint (dead tmux session — synth handoff)",
 						rec.ID, p.Name),
-					isErr: true,
 				}
-				return m, nil, true
+				return m, m.startCoordSpawn(p.Name, rec.Cwd), true
 			}
 			m.pendingAttach = rec.TmuxSession
 			return m, tea.Quit, true
@@ -1319,6 +1395,30 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}
+	// Engine propagation gated to claude-code (codex review iter-2 P1):
+	// the TUI's `[a]` auto-spawn path bootstraps a project's coordinator,
+	// and the coordinator skill (skills/coordinator/loop.py +
+	// dispatch.py:format_dispatch_instruction) emits Claude-Agent-tool
+	// DISPATCH blocks that ONLY a claude-code session can consume. If we
+	// forwarded FLEET_ENGINE=codex unfiltered, an operator running `fleet
+	// -codex` who clicks `[a]` would silently spawn a codex coord that
+	// can't fan out workers/reviewers/finishers — the project row would
+	// stall the first time it needed a subagent.
+	//
+	// MVP scope (memory project_codex_multi_engine.md): `fleet --engine
+	// codex dispatch ...` works for explicit worker dispatches today;
+	// codex-aware coord skill is a follow-up. Until then the TUI's auto-
+	// spawn always launches a claude-code coord regardless of the
+	// operator's session engine. Operators who want a codex coord
+	// explicitly can `fleet --engine codex dispatch coord-<project>
+	// --coord-spawn --project <project>` from the shell once the skill
+	// supports it.
+	//
+	// We keep the explicit --engine claude-code stamp (rather than
+	// letting it default) so the audit trail / process listing makes the
+	// gating decision obvious and a future regression that drops this
+	// guard is caught by reviewer eyeballs.
+	args = append(args, "--engine", "claude-code")
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
 			return coordSpawnDoneMsg{

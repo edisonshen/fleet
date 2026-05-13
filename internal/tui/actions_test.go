@@ -1327,16 +1327,35 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 	}
 }
 
-// TestKeyA_ProjectRow_DeadCoordSessionFlashes regresses the case where
-// project.CoordID is set but the tmux session has died. We must not
-// silently exec tmux on a dead session; flash a clear hint instead.
-func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
+// TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch pins
+// resume-dead-coord-ab65: when project.CoordID is set but its tmux
+// session is dead, [a] re-dispatches the coord (reusing the stable
+// "coord-<project>" task_id so the new agent picks up where the
+// dead one left off via the synth-handoff path in dispatch). Previously
+// this case flashed "press [x] on its agent row to archive, then [a]
+// here to respawn" — which threw state away. The new flash names the
+// resume and the spawn is dispatched in the same tea.Cmd.
+func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
+	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
-	stub := &stubFleetCmd{}
+	// sessionProbeFn defaults to tmux.SessionAlive; in tests with no
+	// tmux server, it returns alive=false err=nil (definitive dead),
+	// matching the stub above. Pin that explicitly via stubSessionProbe
+	// so this test stays deterministic on hosts that have a tmux
+	// daemon ambient-running.
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
 	stub.install(t)
 
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
 	m := New("test")
 	m.records = []*agent.Record{coord}
 	m.dashboard = &Snapshot{
@@ -1353,16 +1372,271 @@ func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
 	mm := updated.(Model)
 
 	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach must NOT be set for dead session; got %q", mm.pendingAttach)
+		t.Errorf("pendingAttach must NOT be set on a dead session (resume goes through dispatch); got %q", mm.pendingAttach)
 	}
-	if cmd != nil {
-		t.Errorf("[a] on dead coord should not produce cmd; got non-nil")
+	if cmd == nil {
+		t.Fatalf("[a] on dead coord should produce a resume-dispatch cmd; got nil")
 	}
+	// Drain the cmd to fire the dispatch.
+	msg := cmd()
+	doneMsg, ok := msg.(coordSpawnDoneMsg)
+	if !ok {
+		t.Fatalf("expected coordSpawnDoneMsg; got %T (%+v)", msg, msg)
+	}
+	if doneMsg.err != nil {
+		t.Fatalf("resume-dispatch returned err: %v", doneMsg.err)
+	}
+	if doneMsg.projectName != "demo" {
+		t.Errorf("projectName = %q; want demo", doneMsg.projectName)
+	}
+	// Flash must point at the resume, not at archive — the operator
+	// should know we're picking up where the dead coord left off.
+	if mm.flash == nil {
+		t.Fatalf("expected resume flash; got nil")
+	}
+	if !strings.Contains(mm.flash.text, "resuming coord") ||
+		!strings.Contains(mm.flash.text, "coord001") {
+		t.Errorf("flash should mention resume + the dead coord id; got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "archive") {
+		t.Errorf("flash must NOT suggest archive on the resume path; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one dispatch call; got %d (%v)", len(stub.calls), stub.calls)
+	}
+	args := stub.calls[0]
+	if args[0] != "dispatch" {
+		t.Errorf("first arg = %q; want dispatch", args[0])
+	}
+	if len(args) < 2 || args[1] != "coord-demo" {
+		t.Errorf("dispatch task_id (args[1]) = %q; want coord-demo (stable per-project)", argString(args, 1))
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd pins codex
+// review iter-11 P2: the resume-dispatch's --cwd arg comes from the
+// DEAD COORD's recorded Cwd, not from coordCwdForProject (which
+// returns the first same-project record's Cwd — could be a worker
+// in a different worktree). The dead coord's Cwd is the
+// authoritative starting checkout for the recovery.
+func TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	// Dead coord with a specific Cwd.
+	const deadCoordCwd = "/Users/op/projects/demo-main"
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.Cwd = deadCoordCwd
+
+	// Decoy: another agent for the same project in a DIFFERENT
+	// worktree. coordCwdForProject would return this one's Cwd
+	// (first match) — but the resume MUST use the dead coord's Cwd.
+	decoy := sampleAgent("decoy001")
+	decoy.Project = "demo"
+	decoy.TaskID = "worker-some-other"
+	decoy.Cwd = "/Users/op/projects/demo-worker-worktree"
+
+	m := New("test")
+	m.records = []*agent.Record{decoy, coord} // decoy first → coordCwdForProject would return its Cwd
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected resume-dispatch cmd")
+	}
+	cmd() // fire
+	_ = mm
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one dispatch call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+	// Find --cwd in args.
+	var cwdArg string
+	for i, a := range args {
+		if a == "--cwd" && i+1 < len(args) {
+			cwdArg = args[i+1]
+			break
+		}
+	}
+	if cwdArg != deadCoordCwd {
+		t.Errorf("--cwd should be dead coord's Cwd (%q), not the decoy's; got %q (args=%v)",
+			deadCoordCwd, cwdArg, args)
+	}
+}
+
+// TestKeyA_AgentRow_DeadCoordSession_SuggestsResume pins behavior 3:
+// when [a] lands on a dead-session AGENT row that's tagged as a coord
+// (TaskID == "coord-<project>"), the flash suggests [r]esume by going
+// to the project row, not [x] archive. Archive remains valid as an
+// explicit operator action, but it's no longer the default suggestion.
+func TestKeyA_AgentRow_DeadCoordSession_SuggestsResume(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := makeModelWithAgents(coord)
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "coord001" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
 	if mm.flash == nil || !mm.flash.isErr {
-		t.Errorf("[a] on dead coord should flash an error; got %+v", mm.flash)
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "resume") {
+		t.Errorf("dead-coord flash should suggest resume; got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "[x] to archive") {
+		t.Errorf("dead-coord flash should NOT lead with archive; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive pins
+// that the resume-suggestion is gated on the agent being a coord —
+// non-coord dead agents (workers, manual dispatches) continue to
+// suggest [x] archive because there's no resume path for them.
+func TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-agent01": true}}).install(t)
+
+	worker := sampleAgent("agent01")
+	worker.Project = "demo"
+	worker.TaskID = "some-task" // NOT coord-<project>
+	m := makeModelWithAgents(worker)
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "agent01" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "[x]") || !strings.Contains(mm.flash.text, "archive") {
+		t.Errorf("dead non-coord flash should suggest [x] archive; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive pins codex
+// review iter-6 P1: when HasSession returns false BUT the tristate
+// SessionAlive probe errors out (transport hiccup: bad
+// FLEET_TMUX_SOCKET, restarting tmux server), the TUI must NOT
+// trigger the recovery spawn. The conservative path is to treat the
+// probe error as alive — the alternative is dispatching a duplicate
+// over a live coord on a different socket.
+func TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	// HasSession=false (the bare probe), but the tristate probe
+	// reports a transport error — sessionProbeOrAliveFn must keep
+	// the session classed alive and NOT trigger the recovery flow.
+	(&stubSessionProbe{errSessions: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	// With probe-error treated as alive, [a] takes the live-coord
+	// attach branch — pendingAttach is set and tea.Quit fires. No
+	// dispatch shells out.
+	if mm.pendingAttach == "" {
+		t.Errorf("transport-error probe must NOT trigger recovery; pendingAttach should be set for alive path")
+	}
+	if cmd == nil {
+		t.Fatal("expected tea.Quit cmd on alive-attach path")
 	}
 	if len(stub.calls) != 0 {
-		t.Errorf("[a] on dead coord should NOT shell out; got %v", stub.calls)
+		t.Errorf("transport-error must NOT dispatch a recovery spawn; got %d calls (%v)", len(stub.calls), stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn pins
+// codex review iter-6 P2: when a recovery dispatch is already in
+// flight for this project (coordSpawnInFlight[name]=true), a second
+// [a] press on the project row must NOT fire another dispatch.
+// Without the guard, an operator double-tap would race two recovery
+// dispatches against the same coord-state.json.
+func TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	// Simulate a prior [a] press that already triggered a recovery
+	// dispatch (in-flight; coordSpawnDoneMsg hasn't arrived yet).
+	m.coordSpawnInFlight = map[string]bool{"demo": true}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if len(stub.calls) != 0 {
+		t.Errorf("in-flight guard must block duplicate dispatch; got %d calls (%v)", len(stub.calls), stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash explaining the in-flight guard; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "in flight") {
+		t.Errorf("flash should explain the in-flight guard; got %q", mm.flash.text)
 	}
 }
 
@@ -1479,6 +1753,60 @@ func argString(args []string, i int) string {
 		return ""
 	}
 	return args[i]
+}
+
+// TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine regresses codex review
+// iter-2 [P1]: an operator running `fleet -codex` who clicks [a] on
+// a project row must NOT spawn a codex coordinator, because the
+// coordinator skill emits Claude-Agent-tool DISPATCH blocks that
+// only a claude-code session can consume. The auto-spawn argv must
+// always carry `--engine claude-code` regardless of FLEET_ENGINE.
+//
+// Operators who want a codex coord explicitly invoke `fleet
+// --engine codex dispatch coord-<project> --coord-spawn --project
+// <project>` from the shell once the coord skill grows codex
+// support (MVP scope, memory project_codex_multi_engine.md).
+func TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	// Operator launched fleet with -codex.
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] on project with no coord should produce a spawn cmd")
+	}
+	_ = cmd() // drain to fire the stub
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+	engine := argValue(args, "--engine")
+	if engine != "claude-code" {
+		t.Errorf("auto-spawn --engine = %q; want claude-code "+
+			"(coord skill is claude-only in v0.9 MVP; codex would stall)",
+			engine)
+	}
 }
 
 // coordSpawnDoneMsgFromArgs mimics the real startCoordSpawn closure

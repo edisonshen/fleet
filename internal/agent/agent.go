@@ -247,32 +247,53 @@ func (r *Record) Archive() error {
 
 // List returns every live agent record under ~/.fleet/agents/.
 // Archived records (under agents/archive/) are not included.
+// Records that fail to parse are silently skipped — partial results
+// beat zero results when the operator is trying to triage. Callers
+// that need a strict "everything parses or we abort" guarantee
+// (split-brain veto in dispatch) should use ListStrict.
 func List() ([]*Record, error) {
+	good, _, err := listInternal()
+	return good, err
+}
+
+// ListStrict is List that also returns the IDs of records that
+// failed to parse. Used by the dispatch --coord-spawn split-brain
+// veto (codex review iter-17 P1): the silent-skip behavior is unsafe
+// when we're deciding whether a live coord exists, because the
+// unparseable record might be the live coord's. The caller must fail
+// closed when len(badIDs) > 0.
+//
+// Other callers (fleet status, TUI dashboard) keep using List() to
+// preserve the triage UX.
+func ListStrict() (good []*Record, badIDs []string, err error) {
+	return listInternal()
+}
+
+// listInternal does the actual directory walk. Shared between List
+// and ListStrict so the silent-skip behavior is in one place.
+func listInternal() (good []*Record, badIDs []string, err error) {
 	dir, err := state.AgentDir()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("readdir agents: %w", err)
+		return nil, nil, fmt.Errorf("readdir agents: %w", err)
 	}
-	var out []*Record
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
 		id := e.Name()[:len(e.Name())-len(".json")]
-		r, err := Load(id)
-		if err != nil {
-			// Skip records we can't parse rather than failing the
-			// whole list — partial results beat zero results when
-			// the operator is trying to triage.
+		r, lerr := Load(id)
+		if lerr != nil {
+			badIDs = append(badIDs, id)
 			continue
 		}
-		out = append(out, r)
+		good = append(good, r)
 	}
-	return out, nil
+	return good, badIDs, nil
 }

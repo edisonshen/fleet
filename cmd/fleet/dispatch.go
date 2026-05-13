@@ -4,14 +4,23 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// tmuxHasSession is the production sessionAliveProbe for
+// findRecoveryCandidate. Wraps tmux.HasSession; the indirection keeps
+// the recovery helper testable without a live tmux server (tests
+// pass closures instead).
+var tmuxHasSession = tmux.HasSession
 
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
@@ -27,7 +36,32 @@ type dispatchOpts struct {
 	projectExplicit bool
 	cwd             string
 	command         []string
+	commandExplicit bool
 	noAutoResume    bool
+	// noAutoResumeExplicit tracks whether --no-auto-resume was set on
+	// the CLI. False means the flag was left at its cobra default
+	// (false), and the dead-coord recovery path should inherit from
+	// oldRecord.DisableAutoResume rather than reset to false (codex
+	// review iter-19 P2). Inheritance ensures a coord launched with a
+	// custom shell/REPL wrapper + --no-auto-resume doesn't have
+	// natural-language ResumePrompt typed into it on recovery.
+	noAutoResumeExplicit bool
+	// engine is the engine name persisted on agent.Record.Engine and
+	// used to derive the default --command argv (via enginecfg) when
+	// --command is not explicitly set. Empty falls through to the root-
+	// cmd FLEET_ENGINE env var or the codebase default
+	// (enginecfg.DefaultEngine). See resolveEngineFlags at the root cmd
+	// for the precedence model.
+	engine string
+	// engineExplicit reports whether the operator explicitly chose the
+	// engine on this dispatch (via --engine / -codex / -claude on root,
+	// OR programmatically via opts.engine in tests). False means the
+	// engine name was inherited from FLEET_ENGINE env or the codebase
+	// default. The dead-coord recovery path uses this gate to decide
+	// whether to clamp OldRecord.Engine; without the gate, default-
+	// resolved values would silently rewrite a recovered non-default
+	// engine back to claude-code (codex review iter-7 P1).
+	engineExplicit bool
 	// prompt is the optional first-turn prompt to type into the
 	// freshly-spawned tmux session AFTER the pane stabilizes. Empty
 	// (default) → no prompt; the operator types one manually after
@@ -87,6 +121,20 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.taskID = args[0]
 			opts.projectExplicit = cmd.Flags().Changed("project")
+			opts.commandExplicit = cmd.Flags().Changed("command")
+			opts.noAutoResumeExplicit = cmd.Flags().Changed("no-auto-resume")
+			// engineExplicit tracks whether the operator (or a TUI
+			// shell-out) chose the engine via a root flag. Codex review
+			// iter-7 P1: distinguishing operator-chosen from
+			// default-resolved is necessary so dead-coord recovery
+			// only clamps the inherited Engine when the new dispatch
+			// actually requested a different engine. Without this gate,
+			// every plain `fleet dispatch --coord-spawn` would silently
+			// rewrite a recovered codex coord back to claude-code.
+			root := cmd.Root()
+			opts.engineExplicit = root.PersistentFlags().Changed("engine") ||
+				root.PersistentFlags().Changed("codex") ||
+				root.PersistentFlags().Changed("claude")
 			return runDispatch(opts, cmd.OutOrStdout())
 		},
 	}
@@ -111,7 +159,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// operator to babysit it. Override with `--command` for scripted
 	// pipelines or alternate engines.
 	cmd.Flags().StringSliceVar(&opts.command, "command",
-		[]string{"sh", "-c", defaultClaudeWrapperScript},
+		defaultClaudeCommand,
 		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
 	// Auto-resume types "Read your handoff doc at <path> and continue"
 	// into the replacement on handoff. Disable for custom --command
@@ -129,6 +177,16 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// flow).
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
 		"first-turn prompt to type into the spawned session (default: none)")
+	// NOTE: --engine is NOT registered on dispatch as a local flag.
+	// Registering it locally would shadow the root persistent flag
+	// (cobra binds same-name local flags first), so root's
+	// PersistentPreRunE would never see the operator's choice and
+	// conflict-detection between --engine and -codex/-claude would
+	// silently no-op. The dispatch path reads the resolved engine via
+	// FLEET_ENGINE (which root's PersistentPreRunE always populates).
+	// The opts.engine field survives only for programmatic test access
+	// (engine_flag_test.go's TestDispatch_UnknownEngineRejected sets it
+	// directly to exercise the validation gate).
 	// --coord-spawn is the internal escape hatch for the TUI's project-
 	// row [a] auto-spawn flow. The "coord-<project>" task_id prefix is
 	// a sentinel the dashboard reads to identify the project's coord
@@ -151,6 +209,98 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 	if err := tmux.Available(); err != nil {
 		return err
+	}
+	// Resolve engine BEFORE the rest of the validation so the agent
+	// record's engine field is settled when spawn runs. Precedence:
+	//   1. opts.engine (programmatic only — tests + Options struct;
+	//      NOT a CLI flag, see newDispatchCmd for why)
+	//   2. FLEET_ENGINE env (root's PersistentPreRunE always sets this
+	//      after running resolveEngineFlags, which conflict-checks the
+	//      --engine / -codex / -claude root flags)
+	//   3. enginecfg.DefaultEngine
+	//
+	// Once resolved we also stamp FLEET_ENGINE so the spawned tmux
+	// session (and any subprocess spawn calls out to, e.g. the workers
+	// CLI shell-out) sees a consistent env value matching the agent
+	// record's Engine field. Without this re-stamp, a future code path
+	// that sets opts.engine directly (the TUI's startCoordSpawn does
+	// this through --engine on the inherited root flag, but tests and
+	// programmatic callers can bypass it) would leave the env stale.
+	engineName := opts.engine
+	// Programmatic opts.engine counts as an explicit choice (tests +
+	// Options struct callers). engineExplicit may also already be true
+	// if the CLI RunE detected a root --engine / -codex / -claude flag.
+	if opts.engine != "" {
+		opts.engineExplicit = true
+	}
+	if engineName == "" {
+		engineName = os.Getenv(FleetEngineEnv)
+	}
+	if engineName == "" {
+		engineName = enginecfg.DefaultEngine
+	}
+	if !enginecfg.Known(engineName) {
+		return fmt.Errorf(
+			"--engine %q is unknown (known: claude-code, codex)",
+			engineName)
+	}
+	// Coord-spawn engine guard (codex review iter-9 P2): the Python
+	// /coordinator skill emits Claude-Agent-tool DISPATCH blocks that
+	// ONLY claude-code sessions can consume. The TUI's startCoordSpawn
+	// hardcodes --engine claude-code as a self-protective measure, but
+	// the direct CLI path (`fleet --engine codex dispatch coord-X
+	// --coord-spawn --project X`) would otherwise spawn a codex
+	// session that can't fan out workers / reviewers / finishers —
+	// the project row would stall the first time it needed a subagent.
+	// Fail loud at the CLI to match the TUI's safety guarantee.
+	if opts.coordSpawn && engineName != enginecfg.EngineClaudeCode {
+		return fmt.Errorf(
+			"--coord-spawn requires --engine %s (got %q); the coordinator skill needs Claude's Agent tool to fan out workers/reviewers/finishers",
+			enginecfg.EngineClaudeCode, engineName)
+	}
+	if err := os.Setenv(FleetEngineEnv, engineName); err != nil {
+		return fmt.Errorf("set %s=%s: %w", FleetEngineEnv, engineName, err)
+	}
+	// When the operator did NOT pass --command, swap the cobra default
+	// (built for claude-code) for the engine-appropriate wrapper. This
+	// is what makes `fleet -codex dispatch <task>` actually launch
+	// codex rather than claude.
+	//
+	// We compare against the claude wrapper bytes-equality the test
+	// `TestDefaultClaudeWrapperScript_MatchesFlagDefault` pins; if the
+	// operator did pass --command (commandExplicit), we leave it alone
+	// regardless of engine. The engine field on the record is still
+	// what it was resolved to — the operator's choice of command and
+	// engine name aren't required to agree (e.g., a custom wrapper
+	// that internally launches claude can still be tagged as engine=
+	// codex if the operator wants to track it that way; we don't
+	// second-guess).
+	// Two signals tell us the caller did NOT pick a command and we
+	// should swap in the engine wrapper:
+	//   1. CLI path: cobra's RunE sets `commandExplicit` from
+	//      Flags().Changed("command"). False ⇒ operator didn't pass
+	//      --command, so cobra's claude-shaped default is leaking
+	//      through (`[]string{"sh","-c",defaultClaudeWrapperScript}`)
+	//      and we should overwrite it for non-claude engines.
+	//   2. Programmatic path: in-process callers (tests, future
+	//      cross-package wiring) bypass cobra entirely; `commandExplicit`
+	//      stays false but `opts.command` is whatever the caller
+	//      passed — empty if they didn't care, populated if they did.
+	//
+	// Distinguish the two: when commandExplicit=false AND opts.command
+	// is empty (or equals the cobra default), the caller had no
+	// preference → swap. Otherwise the caller picked a command → leave
+	// it alone. Pre-fix the guard only checked commandExplicit, which
+	// stomped programmatically-injected commands on CI (see
+	// TestDispatch_ProgrammaticCommandNotOverriddenByEngine).
+	if !opts.commandExplicit &&
+		(len(opts.command) == 0 || sameCommand(opts.command, defaultClaudeCommand)) {
+		argv, err := enginecfg.BuildWrapperCommand(engineName)
+		if err != nil {
+			// Should not happen — Known() above already filtered.
+			return fmt.Errorf("resolve engine %q: %w", engineName, err)
+		}
+		opts.command = argv
 	}
 	// Reject project names with path separators / "..": they'd
 	// silently misbehave at handoff time when they're used as a lock
@@ -297,23 +447,321 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Pre-fetch the agent record list ONCE so the live-coord veto AND
+	// the dead-coord recovery probe below share the same view (codex
+	// review iter-15 P1). Use ListStrict so unparseable records also
+	// fail the dispatch (codex iter-17 P1): agent.List silently skips
+	// corrupt JSON, but an unparseable record might be the live coord's.
+	// Skipping it would let the veto fall open and a duplicate coord
+	// spawn against the same project on a different tmux socket. Two
+	// fail-closed gates here:
+	//
+	//   - lerr != nil: directory-level read failure (permission, mount).
+	//     We can't enumerate records at all → abort.
+	//   - len(badIDs) > 0: at least one record file exists but won't
+	//     parse → abort, surface the IDs so the operator can fix or
+	//     archive them.
+	//
+	// Other --coord-spawn safety checks (coordStateFresh, recovery
+	// probe) fail closed too: stat errors on coord-state.json are
+	// treated as "fresh" (live), and the recovery probe shares the
+	// same records slice.
+	var coordRecords []*agent.Record
+	if opts.coordSpawn {
+		recs, badIDs, lerr := agent.ListStrict()
+		if lerr != nil {
+			return fmt.Errorf(
+				"--coord-spawn refusing to spawn for project %q: cannot list agent records (%v). "+
+					"split-brain risk: a live coord on a different tmux socket might exist whose record we can't read. "+
+					"fix the agents directory (likely permission/mount issue under ~/.fleet/agents) and retry",
+				opts.project, lerr)
+		}
+		if len(badIDs) > 0 {
+			return fmt.Errorf(
+				"--coord-spawn refusing to spawn for project %q: %d unparseable record(s) under ~/.fleet/agents (%v). "+
+					"split-brain risk: an unparseable record could belong to a live coord on this or another tmux socket. "+
+					"inspect the file(s), then fix the JSON or move them to ~/.fleet/agents/archive/ and retry",
+				opts.project, len(badIDs), badIDs)
+		}
+		coordRecords = recs
+	}
+
+	// Live-coord veto (codex review iter-12 P1 — reinstated after
+	// iter-11 briefly removed it). The Python /coordinator skill only
+	// holds coordinator.lock for a single tick before releasing it in
+	// `finally`, so the lock CANNOT serve as a racing-coords safety
+	// net at the dispatch boundary (two coords would alternate ticks,
+	// both mutating tasks/worker state — split-brain coordination).
+	//
+	// Veto when BOTH:
+	//   (a) coord-state.json mtime is fresh (something is ticking), AND
+	//   (b) an agent record exists for this project+task_id (the
+	//       record claiming to BE that something).
+	//
+	// Both signals required to keep the dispatch-after-clean-archive
+	// case unblocked (codex iter-8 P2): after an operator hits [x] to
+	// archive the dead record, (b) fails → dispatch proceeds.
+	//
+	// Limitations we accept:
+	//   - Recently-crashed coords whose record hasn't been archived
+	//     will be vetoed for the freshness window. Operator workaround:
+	//     `fleet rm <coord-id>` first.
+	//   - Live coord on a different tmux socket: (a) and (b) both hold
+	//     correctly, veto fires, split-brain avoided. This is the
+	//     load-bearing case the veto exists for.
+	//
+	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
+	if opts.coordSpawn && coordStateFresh(opts.project) {
+		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
+			return fmt.Errorf(
+				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
+					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
+					"in case (2), wait %s for the freshness signal to age out, then retry — recovery will pick up in-flight worker state. "+
+					"do NOT `fleet rm` the dead record first; that disables the recovery path",
+				opts.project, coordFreshnessWindow)
+		}
+	}
+
+	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
+	// hits a project whose previous coord left a stale record on disk
+	// (pid dead AND tmux session gone), build a synth handoff doc from
+	// on-disk state and route the spawn through the
+	// OldRecord+NewDocPath branch of spawn.Spawn. The successor's first
+	// turn runs handoff_resume.py and picks up the dead coord's
+	// in-flight work without throwing state away.
+	//
+	// Guarded on opts.coordSpawn: an operator-supplied `fleet dispatch
+	// <task>` with no --coord-spawn flag must NEVER substitute a
+	// recovery synth — that would steal another lineage's identity if
+	// the operator's task_id happened to collide.
+	//
+	// Failure mode: a synth-doc write failure DOES NOT block the
+	// dispatch. We log a warning and fall through to a fresh spawn so
+	// the project isn't stuck unable to recover. The dead record's
+	// state.json + workers/<slug>/ trees stay on disk; a later
+	// dispatch attempt can retry the synth write. Choosing
+	// "available coord without resume context" over "no coord at all"
+	// preserves the operator's ability to manually inspect the workers
+	// dir if they need to.
+	var oldRecord *agent.Record
+	var newDocPath string
+	if opts.coordSpawn {
+		if dead := findRecoveryCandidate(opts.taskID, opts.project, coordRecords, pidAlive, tmuxHasSession, coordStateFresh); dead != nil {
+			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
+			if derr != nil {
+				_, _ = fmt.Fprintf(stdout,
+					"warning: synth handoff doc write failed (%v) — proceeding with fresh spawn (workers state preserved on disk)\n",
+					derr)
+			} else {
+				oldRecord = dead
+				newDocPath = docPath
+				// Snapshot the dead record's original engine BEFORE
+				// the clamp mutates it (codex review iter-12 P2). The
+				// command-inheritance check below needs to know
+				// whether the engine ACTUALLY changed (pre-clamp
+				// vs post-clamp), not just whether it ended up
+				// matching engineName.
+				preClampEngine := oldRecord.Engine
+				// Engine override clamp (codex review iter-4 P2,
+				// refined iter-7 P1): only clamp when the caller
+				// EXPLICITLY chose the engine on this dispatch (via
+				// root --engine / -codex / -claude / programmatic
+				// opts.engine). Without this gate, a plain `fleet
+				// dispatch <task> --coord-spawn` against a dead codex
+				// coord would silently inherit claude-code from the
+				// FLEET_ENGINE default and rewrite the recovered
+				// lineage's engine — breaking dead-coord recovery for
+				// non-default engines. The TUI's auto-spawn path
+				// always passes --engine claude-code on the shell-out,
+				// so engineExplicit is true there and the clamp still
+				// fires as intended.
+				if opts.engineExplicit && oldRecord.Engine != engineName {
+					oldRecord.Engine = engineName
+				}
+				// Coord-spawn back-door guard (codex review iter-9 P2):
+				// the front-door check above rejects an operator
+				// running `fleet --engine codex dispatch coord-X
+				// --coord-spawn`, but the recovery path can still
+				// inherit a dead codex coord's Engine when the caller
+				// didn't set engineExplicit. Block that here so the
+				// CLI's coord-spawn contract holds end-to-end: every
+				// successful --coord-spawn produces a claude-code
+				// successor that can fan out workers.
+				if oldRecord.Engine != "" && oldRecord.Engine != enginecfg.EngineClaudeCode {
+					return fmt.Errorf(
+						"--coord-spawn recovery refused: dead coord %s ran engine %q but the coordinator skill only works under claude-code. "+
+							"either pass --engine claude-code to force-migrate the recovery, or archive the dead record (`fleet rm %s`) and start fresh",
+						oldRecord.ID, oldRecord.Engine, oldRecord.ID)
+				}
+				// Command inheritance (codex review iter-7 P2,
+				// refined iter-8 P1 + iter-12 P2): when the operator
+				// did NOT pass --command, inherit the dead coord's
+				// recorded Command so a custom wrapper / non-default
+				// argv survives the recovery. Without this the
+				// resumed coord restarts under the current default
+				// wrapper — wrong binary even though task identity
+				// was preserved.
+				//
+				// The engine-clamp interaction: inheritance MUST be
+				// skipped when the engine was clamped to a different
+				// value (e.g., explicit --engine claude-code over a
+				// dead codex coord). Inheriting the OLD engine's
+				// argv under the NEW engine record defeats the clamp.
+				// The gate `oldRecord.Engine == engineName` after the
+				// clamp block above captures both cases: if no clamp
+				// fired (engineExplicit=false), oldRecord.Engine is
+				// unchanged and equals itself; if clamp fired,
+				// oldRecord.Engine was set to engineName.
+				//
+				// Codex iter-12 P2: when engineExplicit=true AND the
+				// requested engine matches the dead's (e.g., TUI
+				// auto-spawn forcing claude-code over a dead claude-
+				// code coord that had a custom wrapper), inheritance
+				// SHOULD still fire — same engine, same wrapper
+				// expectation. The old gate of `!engineExplicit`
+				// blocked this case unnecessarily.
+				//
+				// Operators who DO want a non-default command under a
+				// non-default engine can pass --command + --engine
+				// together; commandExplicit then takes the explicit
+				// path and skips this inheritance.
+				// Legacy-record safety (codex review iter-14 P1):
+				// pre-v0.9 records have engine="" because the field
+				// didn't exist. iter-13 tried to make these inherit
+				// by treating "" as claude-code, but that bypasses
+				// the claude-only guard above (which short-circuits
+				// on engine=="") for legacy records whose custom
+				// Command might launch a non-claude engine. We can't
+				// introspect an arbitrary argv to know what it
+				// spawns, so the safe default is: skip inheritance
+				// for legacy records. The wrapper-swap block earlier
+				// already populated opts.command with the engine-
+				// default wrapper, so the successor runs claude-code
+				// as the --coord-spawn contract requires. Operators
+				// who want their legacy custom wrapper back can re-
+				// add it post-recovery via `fleet handoff <id>
+				// --command <wrapper>`.
+				legacyRecord := preClampEngine == ""
+				if !opts.commandExplicit && !legacyRecord && preClampEngine == engineName && len(oldRecord.Command) > 0 {
+					opts.command = append([]string(nil), oldRecord.Command...)
+					if opts.coordSpawn && preAllocatedID != "" {
+						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
+						rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
+						if !sameCommand(rewritten, opts.command) {
+							rewrittenExecArgv = rewritten
+						} else {
+							// Custom command (non-default shape) — pass
+							// nil so the tmux exec uses opts.command
+							// untouched and the persisted Command on
+							// the record stays clean.
+							rewrittenExecArgv = nil
+						}
+					}
+				}
+				_, _ = fmt.Fprintf(stdout,
+					"recovering dead coord %s for project %s: synth handoff written to %s\n",
+					dead.ID, dead.Project, docPath)
+			}
+		}
+	}
+
+	// Cwd inheritance on recovery (codex review iter-9 P2): spawn.Spawn
+	// resolves an empty Cwd to the caller's cwd (os.Getwd). When the
+	// dispatch is a dead-coord recovery and the operator didn't pass
+	// --cwd, fall back to the dead coord's recorded cwd so the resumed
+	// coord runs against the same checkout. Without this, running
+	// `fleet dispatch coord-X --coord-spawn` from a different shell
+	// would restart the coord in the WRONG checkout, leaving any
+	// relative git/test commands acting on the wrong tree. Mirrors
+	// cmd/fleet/handoff.go's pattern (`if cwd == "" { cwd = oldRec.Cwd }`).
+	spawnCwd := opts.cwd
+	if spawnCwd == "" && oldRecord != nil && oldRecord.Cwd != "" {
+		spawnCwd = oldRecord.Cwd
+	}
+	// DisableAutoResume inheritance on recovery (codex review iter-19
+	// P2): when the operator did NOT explicitly pass --no-auto-resume
+	// AND the dead coord had it set, inherit. Otherwise a coord
+	// launched with a custom shell/REPL wrapper + --no-auto-resume
+	// would get natural-language ResumePrompt typed into it on
+	// recovery, breaking the very case --no-auto-resume exists for.
+	// The explicit-flag gate lets operators override on the recovery
+	// dispatch if they want to change the policy.
+	disableAutoResume := opts.noAutoResume
+	if !opts.noAutoResumeExplicit && oldRecord != nil && oldRecord.DisableAutoResume {
+		disableAutoResume = true
+	}
 	rec, err := spawn.Spawn(spawn.Options{
+		OldRecord:         oldRecord,
+		NewDocPath:        newDocPath,
 		TaskID:            opts.taskID,
 		Project:           opts.project,
-		Cwd:               opts.cwd,
+		Cwd:               spawnCwd,
 		Command:           opts.command,
 		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
-		DisableAutoResume: opts.noAutoResume,
+		DisableAutoResume: disableAutoResume,
+		Engine:            engineName,
 	})
 	if err != nil {
 		return err
 	}
 
+	// Recovery-path bookkeeping (codex review iter-11 P1): we
+	// deliberately DO NOT archive the dead record here. Local tmux
+	// probes cannot rule out a live coord on a different tmux
+	// socket — if findRecoveryCandidate misclassified a still-live
+	// coord as dead, archiving its record pre-emptively would
+	// disappear the live coord from `fleet status` and the TUI even
+	// though the duplicate-recovery's coord skill will lose the
+	// coordinator.lock race and exit. Leaving the dead record on
+	// disk is the safe default:
+	//
+	//   - if the recovery was correct (dead coord truly gone): the
+	//     successor is now live; the dead record sits unarchived on
+	//     the dashboard until the operator hits [x] (matches the v0.1
+	//     cleanup UX for crashed agents).
+	//   - if the recovery misclassified (live coord on different
+	//     socket): the duplicate successor's coord skill loses the
+	//     NB-flock race and exits cleanly; both records remain;
+	//     dashboard truthfully shows both; operator decides what's
+	//     stale.
+	//
+	// Idempotency: a subsequent dispatch sees the same dead record
+	// and re-runs recovery. spawn.Spawn's OldRecord-branch fields
+	// (handoff_number++, last_handoff_path=NewDocPath) are derived
+	// per-call from oldRecord state, so the chain stays coherent.
+	// findRecoveryCandidate's newest-wins tiebreaker (codex iter-7
+	// P2) picks the most-recent dead record if multiple recoveries
+	// accumulate, so successive recoveries don't fork lineages.
+	_ = oldRecord // archive intentionally skipped; see comment block.
+
 	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)
 	_, _ = fmt.Fprintf(stdout, "  project: %s\n", rec.Project)
 	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", rec.TmuxSession)
+	// Recovery-path prompt swap (codex review iter-2 P1): when the
+	// dead-coord recovery branch wrote a synth handoff doc, the
+	// successor MUST receive `handoff.ResumePrompt(newDocPath)` so its
+	// first action runs handoff_resume.py and picks up in-flight
+	// workers. Without this, the synth doc sits on disk and the new
+	// /coordinator session boots fresh, orphaning worker state.
+	//
+	// Replaces (rather than appends to) opts.prompt because the coord-
+	// spawn role briefing ends with "Run /coordinator now" — same
+	// terminal action the resume doc's ## First Action body already
+	// instructs (see handoff.FirstAction). Two directives competing in
+	// one prompt would race over which one the agent acts on first.
+	// The resume doc IS the source of truth post-recovery; the role
+	// briefing's content is for fresh coord boots only.
+	//
+	// Gated on !opts.noAutoResume (codex review iter-4 P2):
+	// --no-auto-resume is the documented escape hatch for shells/REPLs/
+	// alternate engines that can't consume natural-language prompts.
+	// Honoring it here too keeps the recovery path consistent with the
+	// regular handoff path's contract.
+	if newDocPath != "" && !disableAutoResume {
+		opts.prompt = handoff.ResumePrompt(newDocPath)
+	}
 	if opts.prompt != "" {
 		// Best-effort: a SendInitialPrompt failure here logs a warning
 		// to stderr but does NOT fail the dispatch — the session is up,
@@ -344,8 +792,17 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
 				perr)
 		case !submitted:
+			// Codex review iter-6 P2: include the same sigil
+			// ("initial prompt not delivered") the TUI's
+			// dispatchPromptFailedMarker matches on. Without this,
+			// the TUI's startCoordSpawn parses stdout for the marker
+			// and finds it missing — even though the prompt sits
+			// unsubmitted in Claude's input box — so it writes the
+			// coord-spawn marker and treats the session as a live
+			// coord. The literal "initial prompt not delivered"
+			// substring is the wire contract.
 			_, _ = fmt.Fprintf(stdout,
-				"warning: initial prompt typed but Enter did not submit (still in Claude's input box after retry) — attach and press Enter manually\n")
+				"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
 		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}
@@ -360,6 +817,14 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 // `--command`'s default element and the wrapper-script literal stays
 // readable without cross-package qualification.
 const defaultClaudeWrapperScript = spawn.DefaultClaudeWrapperScript
+
+// defaultClaudeCommand is the canonical argv cobra leaves in
+// opts.command when the operator did NOT pass --command. Mirrors the
+// StringSliceVar default at flag registration (newDispatchCmd).
+// runDispatch compares against this to detect "cobra-default-pass-
+// through" so the engine→wrapper swap can fire for non-claude engines
+// without stomping a caller-supplied command.
+var defaultClaudeCommand = []string{"sh", "-c", defaultClaudeWrapperScript}
 
 // injectRemoteControlFlag is a thin local wrapper around
 // spawn.InjectRemoteControlFlag so the dispatch + handoff call sites

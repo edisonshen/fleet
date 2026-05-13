@@ -150,6 +150,13 @@ var propagatedRuntimeEnv = []string{
 	"FLEET_POST_READY_BUFFER_MS",
 	"FLEET_POST_SEND_VERIFY_MS",
 	"FLEET_POST_SEND_RETRY_MS",
+	// FLEET_ENGINE carries the operator-chosen engine across spawn
+	// boundaries so the coordinator skill (Python loop.py + dispatch.py)
+	// can read its own engine from os.environ without having to round-
+	// trip through ~/.fleet/agents/<coord_id>.json. Used by the
+	// reviewer-subagent-arch builders to decide which engine the
+	// reviewer subagent runs (claude pinch-hits when coord=codex).
+	"FLEET_ENGINE",
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
@@ -474,6 +481,13 @@ type Options struct {
 	TaskID  string
 	Project string
 
+	// Engine is the engine identifier persisted on agent.Record.Engine
+	// (e.g. "claude-code", "codex"). Empty means "leave agent.New's
+	// DefaultEngine in place" — preserves the v0 byte-shape on the
+	// happy path. Ignored when OldRecord is non-nil; the handoff
+	// already inherits oldRec.Engine on the existing override path.
+	Engine string
+
 	// Cwd is the working directory for the spawned tmux session.
 	// Empty inherits the caller's cwd.
 	Cwd string
@@ -604,8 +618,35 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if exe, err := os.Executable(); err == nil {
 		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
 	}
+	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
+	// case on the handoff branch: the replacement agent inherits
+	// OldRecord.Engine (set below), so its env must match the record
+	// rather than the caller's session env. Without this guard a
+	// caller running `fleet --engine codex handoff <claude-agent>`
+	// would propagate FLEET_ENGINE=codex into a replacement that's
+	// actually running claude-code (codex review iter-2 P1), and
+	// any code inside that replacement keying off FLEET_ENGINE — the
+	// reviewer-prompt builder, `fleet dispatch` subprocesses — would
+	// pick the wrong engine.
+	//
+	// Legacy records (codex review iter-3 P2): pre-v0.9 agent records
+	// predate the engine field, so opts.OldRecord.Engine is "" even
+	// though agent.New defaults the new record to claude-code. Without
+	// normalization the handoff env would inherit the caller's
+	// FLEET_ENGINE while the new record silently sat at claude-code,
+	// re-introducing the env/record mismatch on the upgrade path.
+	// agent.DefaultEngine = "claude-code" matches what agent.New
+	// stamps onto a fresh record, so we substitute it here.
 	for _, key := range propagatedRuntimeEnv {
-		if v := os.Getenv(key); v != "" {
+		v := os.Getenv(key)
+		if key == "FLEET_ENGINE" && opts.OldRecord != nil {
+			eng := opts.OldRecord.Engine
+			if eng == "" {
+				eng = agent.DefaultEngine
+			}
+			v = eng
+		}
+		if v != "" {
 			extraEnv = append(extraEnv, key+"="+v)
 		}
 	}
@@ -645,6 +686,15 @@ func Spawn(opts Options) (*agent.Record, error) {
 		rec.TaskID = opts.TaskID
 		rec.Project = opts.Project
 		rec.DisableAutoResume = opts.DisableAutoResume
+		// Engine override (v0.9 multi-engine MVP). Empty leaves the
+		// agent.New default ("claude-code") in place so existing call
+		// sites keep their byte shape; non-empty stamps the operator's
+		// `fleet -codex` / `fleet --engine <name>` choice. The handoff
+		// branch above already inherits oldRec.Engine; we mirror that
+		// here for the fresh-dispatch path.
+		if opts.Engine != "" {
+			rec.Engine = opts.Engine
+		}
 	}
 
 	// Pass the canonicalized cwd (not opts.Cwd) so the tmux session
