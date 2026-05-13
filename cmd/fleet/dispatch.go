@@ -397,6 +397,27 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Live-coord veto (codex review iter-4 P1): under --coord-spawn,
+	// refuse to spawn at ALL when coordinator.lock is held by another
+	// process. The dashboard's tmux.HasSession can return false even
+	// for a live coord (operator dashboard on a different tmux server),
+	// and the TUI's [a] flow would fall through to fresh-spawn here if
+	// we only vetoed inside findRecoveryCandidate. That fresh spawn
+	// races the live coord on the same task_id + project, leaving two
+	// supervisors fighting for `coord-state.json` writes. Refusing
+	// makes the failure mode loud: the operator sees an explicit
+	// "live coord holds the lock" error and knows the existing coord
+	// is fine.
+	//
+	// Only fires on --coord-spawn (the auto-coord-bootstrap path). A
+	// manual `fleet dispatch <task>` against a worker task is unaffected.
+	if opts.coordSpawn && coordLockHeld(opts.project) {
+		return fmt.Errorf(
+			"refusing to spawn coord for project %q: coordinator.lock is held by a live coord. "+
+				"the existing coord is alive (likely on a different tmux server); "+
+				"don't dispatch a duplicate", opts.project)
+	}
+
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
 	// hits a project whose previous coord left a stale record on disk
 	// (pid dead AND tmux session gone), build a synth handoff doc from
@@ -434,6 +455,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			} else {
 				oldRecord = dead
 				newDocPath = docPath
+				// Engine override clamp (codex review iter-4 P2): when the
+				// caller passed an explicit --engine (e.g., TUI auto-spawn
+				// pinning claude-code), don't let spawn.Spawn's OldRecord
+				// branch silently inherit the dead coord's Engine. The
+				// TUI's gating comment claims --engine claude-code always
+				// wins; without this, OldRecord.Engine="codex" would beat
+				// it and the recovered coord would boot codex (which the
+				// coord skill doesn't support yet, per the TUI's safety
+				// guard).
+				if engineName != "" && oldRecord.Engine != engineName {
+					oldRecord.Engine = engineName
+				}
 				_, _ = fmt.Fprintf(stdout,
 					"recovering dead coord %s for project %s: synth handoff written to %s\n",
 					dead.ID, dead.Project, docPath)
@@ -491,7 +524,13 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// one prompt would race over which one the agent acts on first.
 	// The resume doc IS the source of truth post-recovery; the role
 	// briefing's content is for fresh coord boots only.
-	if newDocPath != "" {
+	//
+	// Gated on !opts.noAutoResume (codex review iter-4 P2):
+	// --no-auto-resume is the documented escape hatch for shells/REPLs/
+	// alternate engines that can't consume natural-language prompts.
+	// Honoring it here too keeps the recovery path consistent with the
+	// regular handoff path's contract.
+	if newDocPath != "" && !opts.noAutoResume {
 		opts.prompt = handoff.ResumePrompt(newDocPath)
 	}
 	if opts.prompt != "" {

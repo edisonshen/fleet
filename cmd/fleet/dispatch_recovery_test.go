@@ -531,3 +531,188 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 		t.Errorf("captured prompt must reference a .md handoff doc; got: %q", capturedPrompt)
 	}
 }
+
+// TestRunDispatch_LiveCoordLockRefusesSpawn pins codex review iter-4
+// P1: when --coord-spawn lands on a project whose coordinator.lock is
+// held by a live coord (operator dashboard on a different tmux server
+// → tmux.HasSession returns false), runDispatch must refuse to spawn a
+// duplicate. Without this veto, the TUI's [a]-on-dead-tmux flow would
+// dispatch a fresh spawn that races the live coord on the same
+// task_id, leaving two supervisors fighting for coord-state.json writes.
+func TestRunDispatch_LiveCoordLockRefusesSpawn(t *testing.T) {
+	setupFleetHome(t)
+
+	// Hold LOCK_EX on coordinator.lock from this goroutine — simulates
+	// the live Python /coordinator skill holding the lock.
+	lockPath, err := state.CoordinatorLockPath("myproj")
+	if err != nil {
+		t.Fatalf("CoordinatorLockPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("mkdir locks dir: %v", err)
+	}
+	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("flock LOCK_EX: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	err = runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected runDispatch to refuse spawn under held lock; got nil error\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "coordinator.lock is held") {
+		t.Errorf("error must mention held lock; got: %v", err)
+	}
+	// No successor record should be on disk.
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			t.Errorf("no successor must be spawned under held lock; got %s on tmux %s", r.ID, r.TmuxSession)
+		}
+	}
+}
+
+// TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap pins codex
+// review iter-4 P2: --no-auto-resume is the documented escape hatch
+// for shells/REPLs/alternate engines that can't consume natural-
+// language prompts. The recovery path must honor it — opts.prompt
+// stays whatever the caller passed (empty in TUI case, or operator-
+// supplied) rather than being replaced by ResumePrompt.
+func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	var capturedPrompt string
+	prev := sendInitialPrompt
+	sendInitialPrompt = func(session, prompt string) (bool, error) {
+		capturedPrompt = prompt
+		return true, nil
+	}
+	t.Cleanup(func() { sendInitialPrompt = prev })
+
+	deadRec := agent.New("deadbabe")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-deadbabe"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+
+	origPrompt := "shell-friendly-no-auto-resume-prompt"
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		prompt:          origPrompt,
+		noAutoResume:    true, // operator explicitly opted out
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+
+	if capturedPrompt != origPrompt {
+		t.Errorf("noAutoResume must skip the ResumePrompt swap; got: %q want: %q",
+			capturedPrompt, origPrompt)
+	}
+	if strings.Contains(capturedPrompt, "Read your handoff doc at ") {
+		t.Errorf("noAutoResume must NOT inject ResumePrompt natural-language; got: %q", capturedPrompt)
+	}
+}
+
+// TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex pins
+// codex review iter-4 P2: when the caller passes an explicit --engine
+// (e.g., TUI auto-spawn pinning claude-code), the recovery path must
+// NOT silently inherit OldRecord.Engine="codex". Without the clamp,
+// spawn.Spawn's OldRecord branch would set rec.Engine = "codex"
+// regardless of opts.Engine, defeating the TUI's safety guard against
+// auto-spawning codex coords (which the coord skill doesn't yet support).
+func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	deadRec := agent.New("c0dexc0d")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0dexc0d"
+	deadRec.Engine = "codex" // dead coord ran codex
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		engine:          "claude-code", // explicit TUI-style override
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	if successor.Engine != "claude-code" {
+		t.Errorf("engine clamp: successor.Engine = %q; want claude-code (explicit --engine must beat inherited codex)",
+			successor.Engine)
+	}
+}
