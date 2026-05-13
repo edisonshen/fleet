@@ -1240,6 +1240,71 @@ func TestWorkers_NonGit_PhasePushRejected(t *testing.T) {
 	}
 }
 
+// TestWorkers_NonGit_PhaseDoneRejectedWithoutReview: codex iter-1 [P2]
+// regression. The review-gate validator must fire on the terminal
+// phase for non-git projects (phase=done), not just on phase=push.
+// Without this gate, a buggy worker on a non-git project could jump
+// straight from starting → done with empty review_* fields, bypassing
+// the load-bearing /review enforcement.
+func TestWorkers_NonGit_PhaseDoneRejectedWithoutReview(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	writeNonGitProject(t, "ng-noreview")
+
+	// phase=done attempt with no review status recorded. Empty
+	// review_claude_status must be rejected — same invariant the
+	// phase=push gate enforces for git projects.
+	s := &State{
+		Slug:               "ng-noreview-aaaa",
+		Project:            "ng-noreview",
+		Phase:              PhaseDone,
+		StartedAt:          time.Now().UTC(),
+		PID:                1,
+		ReviewClaudeStatus: "",                  // missing — must be rejected
+		ReviewCodexStatus:  ReviewStatusSkipped, // present but claude empty
+		// pr_url intentionally empty (non-git mode allows that;
+		// the review gate is the relevant check here).
+	}
+	err := WriteState("ng-noreview", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresReview) {
+		t.Errorf("non-git phase=done with empty review_claude_status: got %v, want ErrPhaseRequiresReview", err)
+	}
+
+	// Even with claude=passed, codex must be in {passed, skipped} —
+	// blocked is not a terminal pass.
+	s.ReviewClaudeStatus = ReviewStatusPassed
+	s.ReviewCodexStatus = ReviewStatusBlocked
+	err = WriteState("ng-noreview", s.Slug, s)
+	if !errors.Is(err, ErrPhaseRequiresReview) {
+		t.Errorf("non-git phase=done with codex=blocked: got %v, want ErrPhaseRequiresReview", err)
+	}
+}
+
+// TestWorkers_Git_PhaseDoneNotGatedByReview: the non-git gate change
+// MUST NOT affect git projects. Git's phase=done has no review-gate
+// (the gate fires on phase=push for git). A git worker that wrote
+// phase=done with pr_url and empty review_* fields must still write
+// successfully — the gate would have fired earlier on phase=push.
+func TestWorkers_Git_PhaseDoneNotGatedByReview(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	// No meta.json → git mode (default-true).
+	s := &State{
+		Slug:      "git-done-noreview-aaaa",
+		Project:   "git-proj",
+		Phase:     PhaseDone,
+		StartedAt: time.Now().UTC(),
+		PID:       1,
+		// review_* deliberately empty — git's review gate fires on
+		// phase=push only. phase=done's only precondition for git is
+		// pr_url, which we set here.
+		PRURL: "https://github.com/example/repo/pull/123",
+	}
+	if err := WriteState("git-proj", s.Slug, s); err != nil {
+		t.Errorf("git phase=done with empty review_* + pr_url should succeed (gate is on phase=push): %v", err)
+	}
+}
+
 // TestWorkers_CodexSkipReasonNoGitAccepted: the new "no-git" entry in
 // allowedCodexSkipReasons is what the reviewer writes when
 // `codex review --base main` can't operate without a git diff. The

@@ -2262,3 +2262,43 @@ def test_loop_non_git_cap_above_one_skips_worktree_create(
         )
 
     assert result.dispatched == 1
+
+
+def test_loop_non_git_phase_done_reconciles_to_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Codex iter-1 [P1] regression: a non-git worker that wrote
+    phase=done (no pr_url) must be reconciled to status=done — NOT
+    requeued to todo as 'worker died without PR'. The legacy reconcile
+    path required pr_url to recognize success; for non-git projects
+    that's wrong.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [
+        _make_task(
+            "ng-done-aaaa", status="in-progress", worker_pid=99997, pr_url="",
+        ),
+    ])
+    # Worker wrote phase=done (no pr_url — non-git mode).
+    _write_worker_state(
+        fleet_home, "fleet", "ng-done-aaaa", "done",
+    )
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # Task lands at status=done — NOT in-review, NOT todo.
+    assert any("status=done" in c for c in set_calls), (
+        f"non-git phase=done should reconcile to status=done; "
+        f"got set calls: {set_calls!r}"
+    )
+    # No "died without PR" note — that path is the failure case.
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    assert not any("died without PR" in (c[-1] if c else "") for c in note_calls)
+    # The success note mentions non-git so the operator sees the mode.
+    success_notes = [c for c in note_calls if "non-git" in (c[-1] if c else "")]
+    assert success_notes, f"expected non-git success note: {note_calls!r}"

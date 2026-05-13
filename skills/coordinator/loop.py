@@ -1284,6 +1284,12 @@ def _reconcile_inflight(
     Returns a list of _ReconcileAction; caller applies via the fleet CLI.
     """
     actions: list[_ReconcileAction] = []
+    # One project-mode lookup per reconcile pass. Non-git projects'
+    # finishers write phase=done WITHOUT a pr_url; the reconcile path
+    # needs to recognize that as success rather than the legacy
+    # "worker died without PR" failure (codex iter-1 [P1]).
+    fleet_home_str = str(home) if home is not None else None
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home_str)
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
             continue
@@ -1322,6 +1328,23 @@ def _reconcile_inflight(
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
                 phase, pr_url, blocked_reason = terminal
+                # Non-git: finisher's terminal write is phase=done WITHOUT
+                # a pr_url. Treat that as TerminalSuccess and flip the
+                # task to status=done directly (skip the in-review →
+                # CI-poll dance — there is no PR to poll). Codex iter-1
+                # [P1] regression — the legacy `phase == "done" and pr_url`
+                # branch fell through to "worker died without PR" and
+                # requeued every successful non-git task to todo.
+                if not is_git and phase == "done":
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="done",
+                        clear_worker=True,
+                        note="non-git worker phase=done (no PR)",
+                        raised_to_user=True,
+                        raise_text=f"non-git worker shipped {t.slug}",
+                        delete_worker_dir=True,
+                    ))
+                    continue
                 if phase == "done" and pr_url:
                     # Worker shipped — flip to in-review with the PR
                     # URL so the next tick's pr_url branch runs gh
