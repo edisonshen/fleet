@@ -135,31 +135,29 @@ func TestFindRecoveryCandidate_MultipleDeadPicksNewest(t *testing.T) {
 	}
 }
 
-// TestFindRecoveryCandidate_FreshCoordStateVetoes pins the load-bearing
-// safety gate (codex review iter-3 P1 fix, iter-5 follow-up): when pid
-// + tmux both LOOK dead (operator on a different tmux server, dispatch
-// CLI pid long-since reaped) but coord-state.json's mtime is fresh,
-// findRecovery MUST refuse to recover. The live coord ticks
-// coord-state.json on every supervisor pass; fresh mtime means
-// SOMETHING is actively supervising. We must NOT synth-recover over
-// a live coord and race two coord supervisors on the same project.
-//
-// Why mtime instead of coordinator.lock: the Python /coordinator skill
-// holds coordinator.lock only for the duration of each tick (LOCK_NB|
-// LOCK_EX with finally-release). Between ticks it's acquirable, so
-// a lock-based probe would falsely classify the coord as dead during
-// every inter-tick gap (codex review iter-3 P1).
-func TestFindRecoveryCandidate_FreshCoordStateVetoes(t *testing.T) {
+// TestFindRecoveryCandidate_FreshCoordStateStillCandidate pins codex
+// review iter-9 P1: a dead record with fresh coord-state.json mtime
+// MUST still be a recovery candidate. The fresh-mtime case is
+// ambiguous (live-on-different-socket OR recently-crashed); the
+// dispatch-side veto (runDispatch + liveCoordRecordExists) handles
+// the live case via the dual-signal check. findRecoveryCandidate's
+// job is narrower — identify dead records to recover, regardless of
+// mtime. Without this, recently-crashed coords would be denied
+// synth-handoff recovery (the exact feature we're shipping).
+func TestFindRecoveryCandidate_FreshCoordStateStillCandidate(t *testing.T) {
 	records := []*agent.Record{
 		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
 	}
 	pidAlive := func(int) bool { return false }        // dispatch CLI pid reaped
-	sessionAlive := func(string) bool { return false } // operator on diff tmux server
-	coordFresh := func(string) bool { return true }    // BUT coord recently ticked
+	sessionAlive := func(string) bool { return false } // tmux session gone
+	coordFresh := func(string) bool { return true }    // mtime is fresh — but irrelevant here
 
 	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
-	if got != nil {
-		t.Errorf("fresh-mtime coord must NOT be a recovery candidate; got %+v", got)
+	if got == nil {
+		t.Fatalf("dead record with fresh mtime must still be a recovery candidate (recent crash); got nil")
+	}
+	if got.ID != "aaaaaaaa" {
+		t.Errorf("candidate ID = %q; want aaaaaaaa", got.ID)
 	}
 }
 
@@ -590,14 +588,20 @@ func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
 	setupFleetHome(t)
 
 	// Seed a live coord record alongside the fresh coord-state.json —
-	// the BOTH-signal case from iter-8 P2. PID=os.Getpid() so the
-	// liveCoordRecordExists probe (codex iter-9 P1) treats this
-	// record as alive rather than as a recovery candidate.
+	// the BOTH-signal case from iter-8 P2. We need a REAL live tmux
+	// session because liveCoordRecordExists (codex iter-9 P2) only
+	// trusts tmux as a positive liveness signal; PID alone is
+	// vulnerable to PID reuse.
+	liveSessionName := tmux.SessionName("liverec0")
+	if err := tmux.Spawn(liveSessionName, t.TempDir(), []string{"sleep", "60"}, nil); err != nil {
+		t.Fatalf("spawn live tmux: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(liveSessionName) })
+
 	liveRec := agent.New("liverec0")
 	liveRec.TaskID = "coord-myproj"
 	liveRec.Project = "myproj"
-	liveRec.TmuxSession = "fleet-liverec0"
-	liveRec.PID = os.Getpid()
+	liveRec.TmuxSession = liveSessionName
 	if err := liveRec.Write(); err != nil {
 		t.Fatalf("seed live record: %v", err)
 	}
@@ -943,6 +947,139 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			t.Errorf("no successor must be spawned when codex recovery is rejected; got %s", r.ID)
 		}
+	}
+}
+
+// TestRunDispatch_DeadCoord_FreshMtimeStillRecovers pins codex review
+// iter-9 P1 end-to-end: when a coord just crashed (its dead record
+// is on disk AND coord-state.json's mtime is still fresh from the
+// last tick), runDispatch must still take the synth-handoff recovery
+// path. Otherwise the resumed coord would boot fresh and orphan the
+// in-flight worker state.
+func TestRunDispatch_DeadCoord_FreshMtimeStillRecovers(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Dead record: pid is 99999 (host doesn't have it; treats as dead),
+	// tmux session is a name that doesn't exist (tmux.HasSession returns
+	// false). No live tmux session on this socket.
+	deadRec := agent.New("recentdc")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-recentdc"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	// DO NOT backdate the mtime — leave it fresh. Recovery must still
+	// fire because liveCoordRecordExists sees no live tmux session
+	// (the dead record's tmux is gone).
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch should recover the dead coord despite fresh coord-state.json: %v\n%s",
+			err, out.String())
+	}
+	stdout := out.String()
+	if !strings.Contains(stdout, "recovering dead coord recentdc") {
+		t.Errorf("recovery must fire on fresh-mtime dead coord; got:\n%s", stdout)
+	}
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+}
+
+// TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord pins codex review
+// iter-9 P2: when the operator runs a recovery dispatch from a
+// different shell/repo than where the dead coord ran, the successor
+// must restart in the dead coord's recorded cwd. Without this, a
+// recovery launched from /tmp would put the coord in /tmp instead of
+// the project checkout, breaking relative git/test commands.
+func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Real directory the dead coord supposedly ran from. We use a
+	// t.TempDir to avoid touching shared filesystem state.
+	deadCoordCwd := t.TempDir()
+	deadRec := agent.New("cwd1cwd1")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-cwd1cwd1"
+	deadRec.Cwd = deadCoordCwd
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// No --cwd on this dispatch — the runtime cwd is whatever the test
+	// runner picked. The recovery path must fall back to oldRecord.Cwd.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		// cwd intentionally empty
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	if successor.Cwd != deadCoordCwd {
+		t.Errorf("cwd inheritance: successor.Cwd = %q; want %q (dead coord's recorded cwd)",
+			successor.Cwd, deadCoordCwd)
 	}
 }
 

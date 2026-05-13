@@ -464,7 +464,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// manual `fleet dispatch <task>` against a worker task is
 	// unaffected.
 	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if liveCoordRecordExists(opts.taskID, opts.project, pidAlive, tmuxHasSession) {
+		if liveCoordRecordExists(opts.taskID, opts.project, tmuxHasSession) {
 			return fmt.Errorf(
 				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a live record exists. "+
 					"likely cause: a coord is still alive on a different tmux server. "+
@@ -587,12 +587,25 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Cwd inheritance on recovery (codex review iter-9 P2): spawn.Spawn
+	// resolves an empty Cwd to the caller's cwd (os.Getwd). When the
+	// dispatch is a dead-coord recovery and the operator didn't pass
+	// --cwd, fall back to the dead coord's recorded cwd so the resumed
+	// coord runs against the same checkout. Without this, running
+	// `fleet dispatch coord-X --coord-spawn` from a different shell
+	// would restart the coord in the WRONG checkout, leaving any
+	// relative git/test commands acting on the wrong tree. Mirrors
+	// cmd/fleet/handoff.go's pattern (`if cwd == "" { cwd = oldRec.Cwd }`).
+	spawnCwd := opts.cwd
+	if spawnCwd == "" && oldRecord != nil && oldRecord.Cwd != "" {
+		spawnCwd = oldRecord.Cwd
+	}
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,
 		TaskID:            opts.taskID,
 		Project:           opts.project,
-		Cwd:               opts.cwd,
+		Cwd:               spawnCwd,
 		Command:           opts.command,
 		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
