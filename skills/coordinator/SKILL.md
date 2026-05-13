@@ -111,7 +111,7 @@ Starting at the reviewer-subagent-arch landing, every task is implemented by **t
 
 The coord-state.json field `review_handoffs_dispatched` is the dedup signal: each handoff key is `<slug>:<phase>`, added when the DISPATCH block is emitted, cleared when the slug reaches a terminal task state. Without this, a slow reviewer would be respawned every tick.
 
-**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited` or `unavailable`. The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
+**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited`, `unavailable`, or `no-git` (non-git projects — see "## Non-git projects" below). The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
 
 **The coord does NOT foreground-poll any of the three subagents.** The harness fires a `<task-notification>` when each subagent returns; the coord runs `/coordinator` on the next assistant turn, the tick reads state.json, and the next handoff fires automatically.
 
@@ -622,7 +622,7 @@ The skill's tick lifecycle is intentionally lean (no in-process state survives a
 | Slug mismatch in a sentinel | Logged via `errors[]`; no mutation. |
 | Prompt over hard cap | `PromptTooLargeError` — task NOT dispatched; recorded in errors. Operator shrinks standards/learnings/spec. |
 | Reviewer subagent flips phase=push without recording terminal `review_*_status` | `validateReviewGate` in `internal/workers/workers.go` rejects the write with `ErrPhaseRequiresReview`. The reviewer sees the workers CLI error and is expected to retry the update with `--review-claude-status passed` + `--review-codex-status {passed,skipped}`. Structural enforcement — a buggy reviewer can't accidentally let an unreviewed PR reach the finisher. |
-| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited` or `unavailable`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
+| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited`, `unavailable`, or `no-git`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
 
 ## Tools used
 
