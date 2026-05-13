@@ -1319,17 +1319,30 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 	if cwd != "" {
 		args = append(args, "--cwd", cwd)
 	}
-	// Engine propagation: the TUI was launched with `fleet [-codex|-claude
-	// |--engine ...]`; the root cmd stamped FLEET_ENGINE. Forward it as
-	// `--engine <name>` on the dispatch argv so the spawned coord agent
-	// records the right engine + boots the right binary via
-	// internal/enginecfg. The env var ALSO propagates implicitly because
-	// runFleetCmd inherits the parent env, but explicit `--engine` on
-	// the argv makes the contract visible in process listings + audit
-	// logs and avoids relying on the implicit hop.
-	if engine := os.Getenv("FLEET_ENGINE"); engine != "" {
-		args = append(args, "--engine", engine)
-	}
+	// Engine propagation gated to claude-code (codex review iter-2 P1):
+	// the TUI's `[a]` auto-spawn path bootstraps a project's coordinator,
+	// and the coordinator skill (skills/coordinator/loop.py +
+	// dispatch.py:format_dispatch_instruction) emits Claude-Agent-tool
+	// DISPATCH blocks that ONLY a claude-code session can consume. If we
+	// forwarded FLEET_ENGINE=codex unfiltered, an operator running `fleet
+	// -codex` who clicks `[a]` would silently spawn a codex coord that
+	// can't fan out workers/reviewers/finishers — the project row would
+	// stall the first time it needed a subagent.
+	//
+	// MVP scope (memory project_codex_multi_engine.md): `fleet --engine
+	// codex dispatch ...` works for explicit worker dispatches today;
+	// codex-aware coord skill is a follow-up. Until then the TUI's auto-
+	// spawn always launches a claude-code coord regardless of the
+	// operator's session engine. Operators who want a codex coord
+	// explicitly can `fleet --engine codex dispatch coord-<project>
+	// --coord-spawn --project <project>` from the shell once the skill
+	// supports it.
+	//
+	// We keep the explicit --engine claude-code stamp (rather than
+	// letting it default) so the audit trail / process listing makes the
+	// gating decision obvious and a future regression that drops this
+	// guard is caught by reviewer eyeballs.
+	args = append(args, "--engine", "claude-code")
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		if err != nil {
 			return coordSpawnDoneMsg{

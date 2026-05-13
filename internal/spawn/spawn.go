@@ -618,8 +618,22 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if exe, err := os.Executable(); err == nil {
 		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
 	}
+	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
+	// case on the handoff branch: the replacement agent inherits
+	// OldRecord.Engine (set below), so its env must match the record
+	// rather than the caller's session env. Without this guard a
+	// caller running `fleet --engine codex handoff <claude-agent>`
+	// would propagate FLEET_ENGINE=codex into a replacement that's
+	// actually running claude-code (codex review iter-2 P1), and
+	// any code inside that replacement keying off FLEET_ENGINE — the
+	// reviewer-prompt builder, `fleet dispatch` subprocesses — would
+	// pick the wrong engine.
 	for _, key := range propagatedRuntimeEnv {
-		if v := os.Getenv(key); v != "" {
+		v := os.Getenv(key)
+		if key == "FLEET_ENGINE" && opts.OldRecord != nil && opts.OldRecord.Engine != "" {
+			v = opts.OldRecord.Engine
+		}
+		if v != "" {
 			extraEnv = append(extraEnv, key+"="+v)
 		}
 	}

@@ -1481,6 +1481,60 @@ func argString(args []string, i int) string {
 	return args[i]
 }
 
+// TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine regresses codex review
+// iter-2 [P1]: an operator running `fleet -codex` who clicks [a] on
+// a project row must NOT spawn a codex coordinator, because the
+// coordinator skill emits Claude-Agent-tool DISPATCH blocks that
+// only a claude-code session can consume. The auto-spawn argv must
+// always carry `--engine claude-code` regardless of FLEET_ENGINE.
+//
+// Operators who want a codex coord explicitly invoke `fleet
+// --engine codex dispatch coord-<project> --coord-spawn --project
+// <project>` from the shell once the coord skill grows codex
+// support (MVP scope, memory project_codex_multi_engine.md).
+func TestKeyA_CoordSpawn_AlwaysClaudeCodeEngine(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t)
+	// Operator launched fleet with -codex.
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	m := New("test")
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	_, cmd := m.Update(keyMsg("a"))
+	if cmd == nil {
+		t.Fatal("[a] on project with no coord should produce a spawn cmd")
+	}
+	_ = cmd() // drain to fire the stub
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected 1 fleet call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+	engine := argValue(args, "--engine")
+	if engine != "claude-code" {
+		t.Errorf("auto-spawn --engine = %q; want claude-code "+
+			"(coord skill is claude-only in v0.9 MVP; codex would stall)",
+			engine)
+	}
+}
+
 // coordSpawnDoneMsgFromArgs mimics the real startCoordSpawn closure
 // post-issue-#63: parse the agent ID and return the coordSpawnDoneMsg
 // shape. No lock-poll branch — if dispatch printed the agent line,

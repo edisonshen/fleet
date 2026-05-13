@@ -701,6 +701,73 @@ func TestSpawn_RuntimeEnvPropagated(t *testing.T) {
 	t.Errorf("expected all of %v in pane within deadline:\n%s", wants, string(lastOut))
 }
 
+// TestSpawn_HandoffOverridesFleetEngineEnv regresses codex review
+// iter-2 [P1]: on the handoff branch the replacement agent inherits
+// OldRecord.Engine (e.g. claude-code), so the FLEET_ENGINE env var
+// stamped into the spawned tmux session MUST match the record, not
+// the caller's session env. Without the guard a caller running
+// `fleet --engine codex handoff <claude-agent>` propagates
+// FLEET_ENGINE=codex into a replacement that's actually running
+// claude-code; any downstream code keying off FLEET_ENGINE (the
+// reviewer-prompt builder + `fleet dispatch` subprocesses) then
+// picks the wrong engine.
+func TestSpawn_HandoffOverridesFleetEngineEnv(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Caller's env claims codex. The OldRecord is claude-code. The
+	// replacement's env must reflect the record (claude-code), not the
+	// caller (codex).
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	old := agent.New("aaaa2222")
+	old.TaskID = "engine-leak"
+	old.Project = "rainier"
+	old.Engine = "claude-code"
+	old.Role = "executor"
+	old.Mode = "execute"
+
+	// Echo FLEET_ENGINE then idle so the pane stays alive while we
+	// capture it.
+	cmd := []string{"sh", "-c", "echo ENGINE_SEEN=$FLEET_ENGINE; cat"}
+	rec, err := Spawn(Options{
+		OldRecord: old,
+		Command:   cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Engine != "claude-code" {
+		t.Fatalf("rec.Engine = %q, want claude-code (OldRecord inheritance)",
+			rec.Engine)
+	}
+
+	// Poll the pane for ENGINE_SEEN=claude-code. The negative assertion
+	// (must NOT contain codex) is the regression bite.
+	deadline := time.Now().Add(2 * time.Second)
+	var lastOut []byte
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("tmux", capturePaneArgs(rec.TmuxSession)...).Output()
+		if err == nil {
+			lastOut = out
+			s := string(out)
+			if strings.Contains(s, "ENGINE_SEEN=claude-code") {
+				// Belt + suspenders: confirm we didn't ALSO leak codex.
+				if strings.Contains(s, "ENGINE_SEEN=codex") {
+					t.Fatalf("env leaked caller's FLEET_ENGINE=codex into "+
+						"claude-code handoff replacement:\n%s", s)
+				}
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("expected ENGINE_SEEN=claude-code in pane within deadline:\n%s",
+		string(lastOut))
+}
+
 // TestWaitForReadyToPrompt_AppliesPostReadyBuffer pins issue #65
 // Fix B: after waitForPaneStable converges, WaitForReadyToPrompt
 // MUST sleep an additional FLEET_POST_READY_BUFFER_MS (default 1500
