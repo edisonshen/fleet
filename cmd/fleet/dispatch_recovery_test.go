@@ -570,18 +570,35 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 }
 
 // TestRunDispatch_FreshCoordStateRefusesSpawn pins codex review
-// iter-4/iter-5 P1: when --coord-spawn lands on a project whose
-// coord-state.json was mtime-updated within coordFreshnessWindow,
-// runDispatch must refuse to spawn a duplicate. The TUI's [a]-on-
-// dead-tmux flow lands here when the operator dashboard sits on a
-// different tmux server than the live coord — tmux.HasSession reports
-// false, but the coord is actively ticking and updating coord-state.json.
-// Without this veto, we'd race two supervisors on the same project.
+// iter-4/iter-5/iter-8 P1+P2: when --coord-spawn lands on a project
+// whose coord-state.json was mtime-updated within coordFreshnessWindow
+// AND a live agent record exists, runDispatch must refuse to spawn a
+// duplicate. The TUI's [a]-on-dead-tmux flow lands here when the
+// operator dashboard sits on a different tmux server than the live
+// coord — tmux.HasSession reports false, but the coord is actively
+// ticking and updating coord-state.json. Without this veto, we'd
+// race two supervisors on the same project.
+//
+// iter-8 P2: this MUST also require an alive agent record. After a
+// clean coord shutdown, coord-state.json persists with fresh mtime
+// past the archive — the veto would falsely block legitimate respawns
+// for the full freshness window. See the
+// TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn test
+// below for the negative path.
 func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
+	requireTmux(t)
 	setupFleetHome(t)
 
-	// Seed a just-touched coord-state.json — simulates the live coord
-	// having ticked very recently.
+	// Seed a live coord record alongside the fresh coord-state.json —
+	// the BOTH-signal case from iter-8 P2.
+	liveRec := agent.New("liverec0")
+	liveRec.TaskID = "coord-myproj"
+	liveRec.Project = "myproj"
+	liveRec.TmuxSession = "fleet-liverec0"
+	if err := liveRec.Write(); err != nil {
+		t.Fatalf("seed live record: %v", err)
+	}
+
 	pdir, err := state.ProjectDir("myproj")
 	if err != nil {
 		t.Fatalf("ProjectDir: %v", err)
@@ -613,9 +630,56 @@ func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
 	// No successor record should be on disk.
 	live, _ := agent.List()
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "liverec0" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			t.Errorf("no successor must be spawned under fresh coord-state.json; got %s on tmux %s", r.ID, r.TmuxSession)
+		}
+	}
+}
+
+// TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn pins codex
+// review iter-8 P2: when coord-state.json is fresh but NO live agent
+// record exists for the project+task (the legitimate post-clean-
+// shutdown / post-archive scenario), runDispatch must NOT veto. The
+// stale file alone is misleading after an archive; without this
+// allowance, [a] / `fleet dispatch --coord-spawn` would fail for
+// the full freshness window after a clean coord shutdown.
+func TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Fresh coord-state.json (post-shutdown leftover) but NO live
+	// agent record.
+	pdir, err := state.ProjectDir("myproj")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch must NOT veto when coord-state.json is fresh but no live record exists: %v\n%s",
+			err, out.String())
+	}
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
 		}
 	}
 }
@@ -955,5 +1019,83 @@ func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
 	if len(successor.Command) != 2 || successor.Command[0] != "sleep" || successor.Command[1] != "120" {
 		t.Errorf("command inheritance: successor.Command = %v; want [sleep 120] (inherited from dead coord)",
 			successor.Command)
+	}
+}
+
+// TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit pins codex
+// review iter-8 P1: when the engine clamp fires (operator explicitly
+// chose --engine claude-code over a dead codex coord), the recovery
+// path must NOT inherit the dead coord's Command — that argv was
+// built for the OLD engine's wrapper and would spawn codex even
+// though the record advertises claude-code, defeating the clamp.
+// The fresh-engine wrapper (already in opts.command after the wrapper-
+// swap block) is the correct argv.
+func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Dead coord ran codex with a sentinel codex-wrapper command.
+	deadRec := agent.New("c0dexsen")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0dexsen"
+	deadRec.Engine = "codex"
+	deadRec.Command = []string{"sleep", "300"} // codex-era sentinel
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	// Operator forces claude-code (TUI auto-spawn pattern). No
+	// --command on the dispatch — without the iter-8 gate, the
+	// inheritance branch would silently install the codex Command.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		engine:          "claude-code", // explicit + non-matching → clamp fires
+		// command intentionally empty; commandExplicit=false
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	// Successor.Engine must be claude-code (clamp).
+	if successor.Engine != "claude-code" {
+		t.Errorf("engine: got %q; want claude-code", successor.Engine)
+	}
+	// Successor.Command must NOT be the codex sentinel — it should
+	// be the claude-code default wrapper (engine-derived argv from
+	// the wrapper-swap block in runDispatch).
+	if len(successor.Command) == 2 && successor.Command[0] == "sleep" && successor.Command[1] == "300" {
+		t.Errorf("engine clamp + command inherit interaction: successor still carries codex sentinel command %v; expected claude-code default wrapper", successor.Command)
 	}
 }

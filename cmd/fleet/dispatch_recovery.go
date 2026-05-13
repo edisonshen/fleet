@@ -194,6 +194,34 @@ func coordStateFresh(project string) bool {
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
 
+// liveCoordRecordExists reports whether ~/.fleet/agents/ contains a
+// LIVE record matching the given task_id + project. Used by the
+// dispatch live-coord veto to distinguish "coord-state.json is fresh
+// because a live coord is ticking" from "coord-state.json is fresh
+// because the file persisted past a clean coord shutdown."
+//
+// Returns false on agent.List errors (defensive: prefer false-negative
+// "let dispatch proceed" over false-positive "block forever"). The
+// freshness signal alone would have been enough in the
+// dashboard-on-different-tmux-socket scenario codex iter-4 P1
+// originally caught, but it's not enough on its own — the freshness
+// signal persists past the live coord that wrote it (codex iter-8 P2).
+func liveCoordRecordExists(taskID, project string) bool {
+	records, err := agent.List()
+	if err != nil {
+		return false
+	}
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID == taskID && r.Project == project {
+			return true
+		}
+	}
+	return false
+}
+
 // pidAlive is the production pidAliveFn. Mirrors workers.IsAlive (the
 // existing kill(pid, 0) probe) — duplicated here rather than imported
 // to avoid the workers → handoff dep cycle (workers already depends

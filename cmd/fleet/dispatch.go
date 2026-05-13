@@ -424,25 +424,39 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	// Live-coord veto (codex review iter-4 P1): under --coord-spawn,
-	// refuse to spawn at ALL when the project's coord-state.json mtime
-	// is within coordFreshnessWindow. The dashboard's tmux.HasSession
-	// can return false even for a live coord (operator dashboard on a
-	// different tmux server), and the TUI's [a] flow would fall
-	// through to fresh-spawn here if we only vetoed inside
-	// findRecoveryCandidate. That fresh spawn races the live coord on
-	// the same task_id + project, leaving two supervisors fighting for
-	// `coord-state.json` writes. Refusing makes the failure mode loud:
-	// the operator sees an explicit "live coord recently ticked" error
-	// and knows the existing coord is fine.
+	// Live-coord veto (codex review iter-4 P1, refined iter-8 P2):
+	// under --coord-spawn, refuse to spawn at ALL when BOTH:
+	//   (a) coord-state.json mtime is within coordFreshnessWindow, AND
+	//   (b) a live agent record exists for this project+task_id.
+	//
+	// Both signals are required because:
+	//   - mtime alone (codex iter-4): false-positives after a clean
+	//     coord shutdown — the file persists with fresh mtime, but
+	//     no record + no tmux means there's nothing live to race.
+	//   - record alone: false-positives on dead-pid+dead-tmux records
+	//     that haven't been archived yet (the whole point of the
+	//     recovery flow).
+	//
+	// The combined check fires only when there's both "something
+	// recently ticked" AND "a record on disk claiming to BE that
+	// something." After a clean shutdown that archived the record,
+	// (b) fails and the dispatch proceeds normally. The TUI's [a]
+	// flow on a dead-tmux coord still vetoes because (a)+(b) both
+	// hold during a live coord-on-different-tmux-server scenario:
+	// the record is live (TUI hasn't archived it) and coord-state.json
+	// is being ticked by the unseen coord.
 	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path). A
-	// manual `fleet dispatch <task>` against a worker task is unaffected.
+	// manual `fleet dispatch <task>` against a worker task is
+	// unaffected.
 	if opts.coordSpawn && coordStateFresh(opts.project) {
-		return fmt.Errorf(
-			"refusing to spawn coord for project %q: coord-state.json mtime is recent. "+
-				"the existing coord is alive (likely on a different tmux server); "+
-				"don't dispatch a duplicate", opts.project)
+		if liveCoordRecordExists(opts.taskID, opts.project) {
+			return fmt.Errorf(
+				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a live record exists. "+
+					"likely cause: a coord is still alive on a different tmux server. "+
+					"if you intentionally stopped the coord, run `fleet rm <coord-id>` (or press [x] on the dashboard) "+
+					"to clear the record before retrying", opts.project)
+		}
 	}
 
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
@@ -498,31 +512,30 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				if opts.engineExplicit && oldRecord.Engine != engineName {
 					oldRecord.Engine = engineName
 				}
-				// Command inheritance (codex review iter-7 P2): when
-				// the operator did NOT pass --command, inherit the
-				// dead coord's recorded Command so a custom wrapper /
-				// non-default argv survives the recovery. Without this
-				// the resumed coord restarts under the current default
-				// wrapper — wrong binary/config even though engine and
-				// task identity were preserved. Mirrors the regular
-				// `fleet handoff` path's pattern (cmd/fleet/handoff.go
-				// `if len(command) == 0 { command = oldRec.Command }`).
-				// Gated on !commandExplicit so an operator who DID
-				// pass --command on the recovery dispatch overrides
-				// the inherited value, matching the handoff CLI's
-				// contract.
+				// Command inheritance (codex review iter-7 P2,
+				// refined iter-8 P1): when the operator did NOT pass
+				// --command AND did NOT explicitly choose an engine,
+				// inherit the dead coord's recorded Command so a
+				// custom wrapper / non-default argv survives the
+				// recovery. Without this the resumed coord restarts
+				// under the current default wrapper — wrong binary
+				// even though task identity was preserved.
 				//
-				// IMPORTANT: this overwrites opts.command AFTER the
-				// rewrittenExecArgv computation above (line ~411-425),
-				// which built ExecCommand from the pre-recovery
-				// opts.command. Re-derive rewrittenExecArgv here so
-				// the tmux exec uses the inherited Command with the
-				// per-spawn --remote-control flag injection. Skip the
-				// reset when commandExplicit (operator's command wins
-				// untouched) or oldRecord.Command is empty (legacy
-				// record predating Command persistence — fall through
-				// to the dispatch-default).
-				if !opts.commandExplicit && len(oldRecord.Command) > 0 {
+				// !engineExplicit is critical: when the operator (or
+				// TUI auto-spawn) forces a specific engine via
+				// --engine / -codex / -claude, the dead coord's
+				// Command argv was built for the OLD engine. Inheriting
+				// it would spawn the old engine's wrapper while the
+				// record advertises the new engine — defeating the
+				// engine clamp above (iter-7 P1). The fresh-engine
+				// default wrapper (already applied to opts.command in
+				// the wrapper-swap block earlier) is the right argv.
+				//
+				// Operators who DO want a non-default command under a
+				// non-default engine can pass --command + --engine
+				// together; commandExplicit then takes the explicit
+				// path and skips this inheritance.
+				if !opts.commandExplicit && !opts.engineExplicit && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
 					if opts.coordSpawn && preAllocatedID != "" {
 						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
