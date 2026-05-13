@@ -321,17 +321,20 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 	if !strings.Contains(string(body), "fix-foo-1234") {
 		t.Errorf("synth doc must list the in-flight worker slug; got body:\n%s", body)
 	}
-	// The dead agent's last_handoff_path must now point at the synth
-	// doc so a future read sees the recovery doc as its predecessor.
+	// Codex iter-12 P1: the dead record's last_handoff_path must NOT
+	// be mutated by the recovery write — if findRecoveryCandidate
+	// misclassified a live coord (cross-tmux-socket case) and the
+	// duplicate recovery loses the lock race, mutating the live
+	// coord's record would corrupt its chain. The chain link lives
+	// on the SUCCESSOR's record (spawn.Spawn's OldRecord branch sets
+	// it), not the predecessor's.
 	reread, lerr := agent.Load(deadRec.ID)
 	if lerr != nil {
 		t.Fatalf("reload dead record: %v", lerr)
 	}
-	if reread.LastHandoffPath == nil {
-		t.Fatalf("dead agent's last_handoff_path must be set to the synth doc; got nil")
-	}
-	if *reread.LastHandoffPath != docPath {
-		t.Errorf("last_handoff_path = %q; want %q", *reread.LastHandoffPath, docPath)
+	if reread.LastHandoffPath != nil {
+		t.Errorf("dead record's last_handoff_path must remain nil after recovery write; got %q",
+			*reread.LastHandoffPath)
 	}
 }
 
@@ -984,6 +987,76 @@ func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
 	if successor.Cwd != deadCoordCwd {
 		t.Errorf("cwd inheritance: successor.Cwd = %q; want %q (dead coord's recorded cwd)",
 			successor.Cwd, deadCoordCwd)
+	}
+}
+
+// TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit
+// pins codex review iter-12 P2: when the operator (or TUI auto-spawn)
+// passes --engine but the requested engine MATCHES the dead coord's
+// engine, custom command inheritance must still fire. The TUI always
+// shells recovery with --engine claude-code; a dead claude-code coord
+// running a custom wrapper should restart under that wrapper, not
+// under the default. The earlier iter-7 gate of !engineExplicit
+// blocked this case unnecessarily.
+func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Dead claude-code coord with a custom wrapper command.
+	deadRec := agent.New("matchcmd")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-matchcmd"
+	deadRec.Engine = "claude-code"
+	deadRec.Command = []string{"sleep", "240"} // custom wrapper sentinel
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	// engineExplicit=true (programmatic) AND engine matches dead's.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		engine:          "claude-code", // explicit + matches dead
+		// commandExplicit=false; opts.command empty
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "matchcmd" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	if len(successor.Command) != 2 || successor.Command[0] != "sleep" || successor.Command[1] != "240" {
+		t.Errorf("custom command must be inherited when engine matches dead's: got %v; want [sleep 240]",
+			successor.Command)
 	}
 }
 

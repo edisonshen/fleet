@@ -498,6 +498,13 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			} else {
 				oldRecord = dead
 				newDocPath = docPath
+				// Snapshot the dead record's original engine BEFORE
+				// the clamp mutates it (codex review iter-12 P2). The
+				// command-inheritance check below needs to know
+				// whether the engine ACTUALLY changed (pre-clamp
+				// vs post-clamp), not just whether it ended up
+				// matching engineName.
+				preClampEngine := oldRecord.Engine
 				// Engine override clamp (codex review iter-4 P2,
 				// refined iter-7 P1): only clamp when the caller
 				// EXPLICITLY chose the engine on this dispatch (via
@@ -530,29 +537,38 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 						oldRecord.ID, oldRecord.Engine, oldRecord.ID)
 				}
 				// Command inheritance (codex review iter-7 P2,
-				// refined iter-8 P1): when the operator did NOT pass
-				// --command AND did NOT explicitly choose an engine,
-				// inherit the dead coord's recorded Command so a
-				// custom wrapper / non-default argv survives the
-				// recovery. Without this the resumed coord restarts
-				// under the current default wrapper — wrong binary
-				// even though task identity was preserved.
+				// refined iter-8 P1 + iter-12 P2): when the operator
+				// did NOT pass --command, inherit the dead coord's
+				// recorded Command so a custom wrapper / non-default
+				// argv survives the recovery. Without this the
+				// resumed coord restarts under the current default
+				// wrapper — wrong binary even though task identity
+				// was preserved.
 				//
-				// !engineExplicit is critical: when the operator (or
-				// TUI auto-spawn) forces a specific engine via
-				// --engine / -codex / -claude, the dead coord's
-				// Command argv was built for the OLD engine. Inheriting
-				// it would spawn the old engine's wrapper while the
-				// record advertises the new engine — defeating the
-				// engine clamp above (iter-7 P1). The fresh-engine
-				// default wrapper (already applied to opts.command in
-				// the wrapper-swap block earlier) is the right argv.
+				// The engine-clamp interaction: inheritance MUST be
+				// skipped when the engine was clamped to a different
+				// value (e.g., explicit --engine claude-code over a
+				// dead codex coord). Inheriting the OLD engine's
+				// argv under the NEW engine record defeats the clamp.
+				// The gate `oldRecord.Engine == engineName` after the
+				// clamp block above captures both cases: if no clamp
+				// fired (engineExplicit=false), oldRecord.Engine is
+				// unchanged and equals itself; if clamp fired,
+				// oldRecord.Engine was set to engineName.
+				//
+				// Codex iter-12 P2: when engineExplicit=true AND the
+				// requested engine matches the dead's (e.g., TUI
+				// auto-spawn forcing claude-code over a dead claude-
+				// code coord that had a custom wrapper), inheritance
+				// SHOULD still fire — same engine, same wrapper
+				// expectation. The old gate of `!engineExplicit`
+				// blocked this case unnecessarily.
 				//
 				// Operators who DO want a non-default command under a
 				// non-default engine can pass --command + --engine
 				// together; commandExplicit then takes the explicit
 				// path and skips this inheritance.
-				if !opts.commandExplicit && !opts.engineExplicit && len(oldRecord.Command) > 0 {
+				if !opts.commandExplicit && preClampEngine == engineName && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
 					if opts.coordSpawn && preAllocatedID != "" {
 						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID

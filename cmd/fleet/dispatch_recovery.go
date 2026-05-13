@@ -266,18 +266,17 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	if err := handoff.Write(doc, docPath); err != nil {
 		return "", fmt.Errorf("write handoff doc: %w", err)
 	}
-	// Update the dead record's last_handoff_path so the chain stays
-	// intact across the archive that follows. We rewrite the file
-	// atomically via agent.Record.Write — state.WriteAtomic handles
-	// the tmp+rename. A crash between Write and the caller's archive
-	// is benign: the record file is consistent, and the next dispatch
-	// will re-detect dead-pid+dead-tmux and re-run this path
-	// (idempotent — the synth doc filename uses a per-run random
-	// suffix so we don't overwrite, but the orphan is small and the
-	// successor only cares about the last_handoff_path pointer).
-	deadRec.LastHandoffPath = &docPath
-	if err := deadRec.Write(); err != nil {
-		return "", fmt.Errorf("update dead record last_handoff_path: %w", err)
-	}
+	// We deliberately DO NOT mutate deadRec.LastHandoffPath here
+	// (codex review iter-12 P1). When findRecoveryCandidate misclassifies
+	// a live coord on another tmux socket as dead, rewriting its
+	// record's last_handoff_path would corrupt the live coord's chain
+	// — its next real handoff would build from this synthetic doc it
+	// never inherited. The chain link instead lives on the SUCCESSOR's
+	// record: spawn.Spawn's OldRecord branch sets the new record's
+	// LastHandoffPath = NewDocPath, so the recovery doc IS the
+	// successor's predecessor link. If the recovery loses the
+	// coordinator.lock race, the successor exits cleanly and its
+	// (unused) record can be archived manually; the live coord's
+	// chain is untouched.
 	return docPath, nil
 }
