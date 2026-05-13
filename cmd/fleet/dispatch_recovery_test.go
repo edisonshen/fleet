@@ -694,6 +694,51 @@ func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
 	}
 }
 
+// TestRunDispatch_UnsubmittedPromptEmitsFailureMarker pins codex
+// review iter-6 P2: when sendInitialPrompt returns submitted=false,
+// runDispatch's stdout MUST contain the "initial prompt not delivered"
+// substring that the TUI's dispatchPromptFailedMarker matches on.
+// Without this, the TUI parses the lack of marker as "prompt delivered
+// successfully" and writes the coord-spawn marker — even though the
+// prompt is still in Claude's input box and no /coordinator skill is
+// running, leaving a phantom coord on the dashboard.
+func TestRunDispatch_UnsubmittedPromptEmitsFailureMarker(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	prev := sendInitialPrompt
+	sendInitialPrompt = func(session, prompt string) (bool, error) {
+		return false, nil // typed but Enter did not submit
+	}
+	t.Cleanup(func() { sendInitialPrompt = prev })
+
+	opts := &dispatchOpts{
+		taskID:          "some-task",
+		project:         "myproj",
+		projectExplicit: true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		prompt:          "trigger the unsubmitted-warning branch",
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	// Cleanup the successor's tmux session.
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "some-task" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+
+	if !strings.Contains(out.String(), "initial prompt not delivered") {
+		t.Errorf("unsubmitted-prompt warning must include dispatchPromptFailedMarker sigil; got:\n%s",
+			out.String())
+	}
+}
+
 // TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex pins
 // codex review iter-4 P2: when the caller passes an explicit --engine
 // (e.g., TUI auto-spawn pinning claude-code), the recovery path must

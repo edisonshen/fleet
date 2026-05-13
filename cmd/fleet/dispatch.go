@@ -563,8 +563,17 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
 				perr)
 		case !submitted:
+			// Codex review iter-6 P2: include the same sigil
+			// ("initial prompt not delivered") the TUI's
+			// dispatchPromptFailedMarker matches on. Without this,
+			// the TUI's startCoordSpawn parses stdout for the marker
+			// and finds it missing — even though the prompt sits
+			// unsubmitted in Claude's input box — so it writes the
+			// coord-spawn marker and treats the session as a live
+			// coord. The literal "initial prompt not delivered"
+			// substring is the wire contract.
 			_, _ = fmt.Fprintf(stdout,
-				"warning: initial prompt typed but Enter did not submit (still in Claude's input box after retry) — attach and press Enter manually\n")
+				"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
 		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}

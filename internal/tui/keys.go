@@ -1039,12 +1039,21 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	// — same UX bug as the agent-row branch's "no sessions" failure mode.
 	if p.CoordID != "" {
 		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
-			if !sessionAliveFn(rec.TmuxSession) {
+			// Probe with sessionProbeOrAliveFn (codex review iter-6 P1):
+			// the bare sessionAliveFn returns false on transport errors
+			// (bad FLEET_TMUX_SOCKET, restarting tmux server, etc.),
+			// which would falsely trigger the recovery spawn against a
+			// still-live coord on a different socket. The
+			// sessionProbeOrAliveFn helper distinguishes definitive
+			// "no such session" from probe-error: the latter is treated
+			// as alive (conservative) so we don't dispatch a duplicate
+			// over a transport hiccup.
+			if !sessionProbeOrAliveFn(rec.TmuxSession) {
 				// Dead tmux session: re-dispatch the coord under the
 				// same stable task_id ("coord-<project>"). The dispatch
-				// CLI's dead-pid+dead-tmux detection (see
-				// cmd/fleet/dispatch.go) writes a synth-handoff doc
-				// from on-disk state and points the successor at it,
+				// CLI's dead-coord detection (see
+				// cmd/fleet/dispatch_recovery.go) writes a synth-handoff
+				// doc from on-disk state and points the successor at it,
 				// so the resume picks up where the dead coord left
 				// off without throwing state away. Previously this
 				// case flashed "press [x] to archive, then [a] to
@@ -1055,6 +1064,21 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 				if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
 					m.flash = &flashMsg{
 						text:  fmt.Sprintf("project %s: init failed: %v", p.Name, err),
+						isErr: true,
+					}
+					return m, nil, true
+				}
+				// In-flight guard (codex review iter-6 P2): the lower
+				// fresh-spawn path 2.6 below has the same check; we
+				// honor it here too so an operator's double-tap on
+				// [a] before the first coordSpawnDoneMsg arrives
+				// doesn't fire a second recovery dispatch against the
+				// same project state.
+				if m.coordSpawnInFlight[p.Name] {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"coord resume for project %s already in flight — wait for it to finish",
+							p.Name),
 						isErr: true,
 					}
 					return m, nil, true

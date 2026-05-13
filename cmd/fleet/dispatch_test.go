@@ -224,7 +224,7 @@ func TestDispatch_PromptUnsubmittedWarningShape(t *testing.T) {
 	// Reproduce inline so we lock the warning shape without needing
 	// to fork a real spawn.
 	_, _ = out.WriteString(
-		"warning: initial prompt typed but Enter did not submit (still in Claude's input box after retry) — attach and press Enter manually\n")
+		"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
 	if !strings.Contains(out.String(), "Enter did not submit") {
 		t.Errorf("warning message lost the operator-grep marker for the unsubmitted-after-retry path; got %q",
 			out.String())
@@ -235,6 +235,17 @@ func TestDispatch_PromptUnsubmittedWarningShape(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "press Enter manually") {
 		t.Errorf("warning message lost the recovery hint; got %q", out.String())
+	}
+	// Codex review iter-6 P2: the unsubmitted warning MUST embed the
+	// "initial prompt not delivered" sigil that the TUI's
+	// dispatchPromptFailedMarker matches on. Without this, an
+	// unsubmitted prompt looks like a successful delivery to the TUI,
+	// which then writes the coord-spawn marker as if /coordinator had
+	// started — even though the prompt is still sitting in Claude's
+	// input box and no supervisor is running.
+	if !strings.Contains(out.String(), "initial prompt not delivered") {
+		t.Errorf("warning must include dispatchPromptFailedMarker (\"initial prompt not delivered\") so the TUI can detect it; got %q",
+			out.String())
 	}
 }
 

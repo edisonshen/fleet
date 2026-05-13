@@ -1338,6 +1338,12 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	// sessionProbeFn defaults to tmux.SessionAlive; in tests with no
+	// tmux server, it returns alive=false err=nil (definitive dead),
+	// matching the stub above. Pin that explicitly via stubSessionProbe
+	// so this test stays deterministic on hosts that have a tmux
+	// daemon ambient-running.
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
 
 	stub := &stubFleetCmd{
 		stubbed: func(args []string) tea.Msg {
@@ -1464,6 +1470,101 @@ func TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive(t *testing.T) {
 	}
 	if !strings.Contains(mm.flash.text, "[x]") || !strings.Contains(mm.flash.text, "archive") {
 		t.Errorf("dead non-coord flash should suggest [x] archive; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive pins codex
+// review iter-6 P1: when HasSession returns false BUT the tristate
+// SessionAlive probe errors out (transport hiccup: bad
+// FLEET_TMUX_SOCKET, restarting tmux server), the TUI must NOT
+// trigger the recovery spawn. The conservative path is to treat the
+// probe error as alive — the alternative is dispatching a duplicate
+// over a live coord on a different socket.
+func TestKeyA_ProjectRow_DeadCoord_TmuxProbeErrorStaysLive(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	// HasSession=false (the bare probe), but the tristate probe
+	// reports a transport error — sessionProbeOrAliveFn must keep
+	// the session classed alive and NOT trigger the recovery flow.
+	(&stubSessionProbe{errSessions: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	// With probe-error treated as alive, [a] takes the live-coord
+	// attach branch — pendingAttach is set and tea.Quit fires. No
+	// dispatch shells out.
+	if mm.pendingAttach == "" {
+		t.Errorf("transport-error probe must NOT trigger recovery; pendingAttach should be set for alive path")
+	}
+	if cmd == nil {
+		t.Fatal("expected tea.Quit cmd on alive-attach path")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("transport-error must NOT dispatch a recovery spawn; got %d calls (%v)", len(stub.calls), stub.calls)
+	}
+}
+
+// TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn pins
+// codex review iter-6 P2: when a recovery dispatch is already in
+// flight for this project (coordSpawnInFlight[name]=true), a second
+// [a] press on the project row must NOT fire another dispatch.
+// Without the guard, an operator double-tap would race two recovery
+// dispatches against the same coord-state.json.
+func TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	// Simulate a prior [a] press that already triggered a recovery
+	// dispatch (in-flight; coordSpawnDoneMsg hasn't arrived yet).
+	m.coordSpawnInFlight = map[string]bool{"demo": true}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+
+	if len(stub.calls) != 0 {
+		t.Errorf("in-flight guard must block duplicate dispatch; got %d calls (%v)", len(stub.calls), stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash explaining the in-flight guard; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "in flight") {
+		t.Errorf("flash should explain the in-flight guard; got %q", mm.flash.text)
 	}
 }
 
