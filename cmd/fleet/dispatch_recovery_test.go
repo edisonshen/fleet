@@ -437,3 +437,97 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 			successor.HandoffNumber)
 	}
 }
+
+// TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor pins codex
+// iter-2 P1: when the recovery path fires AND opts.prompt is non-empty,
+// the successor receives `handoff.ResumePrompt(newDocPath)` — NOT the
+// original opts.prompt. Without this, the synth doc sits on disk and
+// the new /coordinator session boots fresh, throwing in-flight worker
+// state away (defeating the entire purpose of recovery).
+func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	// Capture the prompt that gets sent so we can assert ResumePrompt.
+	var capturedPrompt string
+	prev := sendInitialPrompt
+	sendInitialPrompt = func(session, prompt string) (bool, error) {
+		capturedPrompt = prompt
+		return true, nil
+	}
+	t.Cleanup(func() { sendInitialPrompt = prev })
+
+	// Seed dead coord record + minimal project state.
+	deadRec := agent.New("c0ded00d")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0ded00d"
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{
+		"worker_agent_ids": map[string]string{
+			"fix-foo-1234": "cafef00d",
+		},
+	}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	wDir := filepath.Join(pdir, "workers", "fix-foo-1234")
+	if err := os.MkdirAll(wDir, 0o755); err != nil {
+		t.Fatalf("mkdir worker dir: %v", err)
+	}
+	wState := map[string]any{
+		"slug":    "fix-foo-1234",
+		"project": "myproj",
+		"phase":   "tdd-green",
+		"pid":     0,
+	}
+	wData, _ := json.Marshal(wState)
+	if err := os.WriteFile(filepath.Join(wDir, "state.json"), wData, 0o644); err != nil {
+		t.Fatalf("write worker state: %v", err)
+	}
+
+	// The TUI passes a freshCoord-style prompt; we send a sentinel here
+	// so we can verify the recovery branch SWAPPED it for ResumePrompt
+	// (rather than appending or leaving the sentinel intact).
+	origPrompt := "FRESH-COORD-PROMPT-SENTINEL — should be replaced on recovery"
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		prompt:          origPrompt,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	// Cleanup the successor's tmux session — runDispatch spawned a real one.
+	live, _ := agent.List()
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+
+	if capturedPrompt == origPrompt {
+		t.Fatalf("recovery path must REPLACE opts.prompt with ResumePrompt; got original sentinel: %q", capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, "Read your handoff doc at ") {
+		t.Errorf("captured prompt must be handoff.ResumePrompt shape; got: %q", capturedPrompt)
+	}
+	if !strings.Contains(capturedPrompt, ".md") {
+		t.Errorf("captured prompt must reference a .md handoff doc; got: %q", capturedPrompt)
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -476,6 +477,23 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)
 	_, _ = fmt.Fprintf(stdout, "  project: %s\n", rec.Project)
 	_, _ = fmt.Fprintf(stdout, "  tmux:    %s\n", rec.TmuxSession)
+	// Recovery-path prompt swap (codex review iter-2 P1): when the
+	// dead-coord recovery branch wrote a synth handoff doc, the
+	// successor MUST receive `handoff.ResumePrompt(newDocPath)` so its
+	// first action runs handoff_resume.py and picks up in-flight
+	// workers. Without this, the synth doc sits on disk and the new
+	// /coordinator session boots fresh, orphaning worker state.
+	//
+	// Replaces (rather than appends to) opts.prompt because the coord-
+	// spawn role briefing ends with "Run /coordinator now" — same
+	// terminal action the resume doc's ## First Action body already
+	// instructs (see handoff.FirstAction). Two directives competing in
+	// one prompt would race over which one the agent acts on first.
+	// The resume doc IS the source of truth post-recovery; the role
+	// briefing's content is for fresh coord boots only.
+	if newDocPath != "" {
+		opts.prompt = handoff.ResumePrompt(newDocPath)
+	}
 	if opts.prompt != "" {
 		// Best-effort: a SendInitialPrompt failure here logs a warning
 		// to stderr but does NOT fail the dispatch — the session is up,
