@@ -371,6 +371,15 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 //
 // var so tests can stub. Production wraps the gh shell-out.
 var collectOpenPRs = func(cwd string) []handoff.OpenPR {
+	// Skip when cwd is unknown (codex review iter-19 P2): legacy
+	// records may not carry Cwd, and gh would then resolve PR list
+	// against the process cwd — possibly an unrelated repo. The
+	// tasks.md fallback in writeRecoveryHandoffDoc covers this case
+	// authoritatively, so a nil return here just hands off to that
+	// path rather than risking wrong-repo PR URLs in the synth doc.
+	if cwd == "" {
+		return nil
+	}
 	ghBin, err := exec.LookPath("gh")
 	if err != nil {
 		return nil
@@ -383,9 +392,7 @@ var collectOpenPRs = func(cwd string) []handoff.OpenPR {
 		"--search", "head:worker/",
 		"--json", "number,title,headRefName,url",
 	)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
+	cmd.Dir = cwd
 	stdout, err := cmd.Output()
 	if err != nil {
 		return nil

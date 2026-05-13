@@ -38,6 +38,14 @@ type dispatchOpts struct {
 	command         []string
 	commandExplicit bool
 	noAutoResume    bool
+	// noAutoResumeExplicit tracks whether --no-auto-resume was set on
+	// the CLI. False means the flag was left at its cobra default
+	// (false), and the dead-coord recovery path should inherit from
+	// oldRecord.DisableAutoResume rather than reset to false (codex
+	// review iter-19 P2). Inheritance ensures a coord launched with a
+	// custom shell/REPL wrapper + --no-auto-resume doesn't have
+	// natural-language ResumePrompt typed into it on recovery.
+	noAutoResumeExplicit bool
 	// engine is the engine name persisted on agent.Record.Engine and
 	// used to derive the default --command argv (via enginecfg) when
 	// --command is not explicitly set. Empty falls through to the root-
@@ -114,6 +122,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 			opts.taskID = args[0]
 			opts.projectExplicit = cmd.Flags().Changed("project")
 			opts.commandExplicit = cmd.Flags().Changed("command")
+			opts.noAutoResumeExplicit = cmd.Flags().Changed("no-auto-resume")
 			// engineExplicit tracks whether the operator (or a TUI
 			// shell-out) chose the engine via a root flag. Codex review
 			// iter-7 P1: distinguishing operator-chosen from
@@ -669,6 +678,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if spawnCwd == "" && oldRecord != nil && oldRecord.Cwd != "" {
 		spawnCwd = oldRecord.Cwd
 	}
+	// DisableAutoResume inheritance on recovery (codex review iter-19
+	// P2): when the operator did NOT explicitly pass --no-auto-resume
+	// AND the dead coord had it set, inherit. Otherwise a coord
+	// launched with a custom shell/REPL wrapper + --no-auto-resume
+	// would get natural-language ResumePrompt typed into it on
+	// recovery, breaking the very case --no-auto-resume exists for.
+	// The explicit-flag gate lets operators override on the recovery
+	// dispatch if they want to change the policy.
+	disableAutoResume := opts.noAutoResume
+	if !opts.noAutoResumeExplicit && oldRecord != nil && oldRecord.DisableAutoResume {
+		disableAutoResume = true
+	}
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,
@@ -678,7 +699,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Command:           opts.command,
 		ExecCommand:       rewrittenExecArgv,
 		PreAllocatedID:    preAllocatedID,
-		DisableAutoResume: opts.noAutoResume,
+		DisableAutoResume: disableAutoResume,
 		Engine:            engineName,
 	})
 	if err != nil {
@@ -738,7 +759,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// alternate engines that can't consume natural-language prompts.
 	// Honoring it here too keeps the recovery path consistent with the
 	// regular handoff path's contract.
-	if newDocPath != "" && !opts.noAutoResume {
+	if newDocPath != "" && !disableAutoResume {
 		opts.prompt = handoff.ResumePrompt(newDocPath)
 	}
 	if opts.prompt != "" {

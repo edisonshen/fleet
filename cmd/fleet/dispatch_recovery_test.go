@@ -1120,6 +1120,102 @@ func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testi
 	}
 }
 
+// TestRunDispatch_DeadCoord_InheritsDisableAutoResume pins codex
+// review iter-19 P2: when the dead coord had DisableAutoResume=true
+// (custom shell/REPL wrapper) and the operator did NOT explicitly
+// pass --no-auto-resume on the recovery dispatch, the successor must
+// inherit the setting. Without inheritance, ResumePrompt's natural-
+// language text would get typed into a session that explicitly
+// opted out — defeating the whole point of --no-auto-resume.
+func TestRunDispatch_DeadCoord_InheritsDisableAutoResume(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	var capturedPrompt string
+	prev := sendInitialPrompt
+	sendInitialPrompt = func(session, prompt string) (bool, error) {
+		capturedPrompt = prompt
+		return true, nil
+	}
+	t.Cleanup(func() { sendInitialPrompt = prev })
+
+	deadRec := agent.New("dis4uto1")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-dis4uto1"
+	deadRec.Engine = "claude-code"
+	deadRec.DisableAutoResume = true // dead coord explicitly opted out
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	// Operator did NOT pass --no-auto-resume → inherit from dead.
+	origPrompt := "operator-supplied-prompt-that-must-survive"
+	opts := &dispatchOpts{
+		taskID:               "coord-myproj",
+		project:              "myproj",
+		projectExplicit:      true,
+		coordSpawn:           true,
+		command:              []string{"sleep", "60"},
+		commandExplicit:      true,
+		prompt:               origPrompt,
+		noAutoResumeExplicit: false,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "dis4uto1" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	if !successor.DisableAutoResume {
+		t.Errorf("successor must inherit DisableAutoResume=true from dead coord; got false")
+	}
+	if capturedPrompt != origPrompt {
+		t.Errorf("with inherited DisableAutoResume, ResumePrompt swap must be skipped; got %q want %q",
+			capturedPrompt, origPrompt)
+	}
+}
+
+// TestCollectOpenPRs_EmptyCwdReturnsNil pins codex review iter-19 P2:
+// when the dead coord's Cwd is empty (legacy record without cwd
+// stored), collectOpenPRs must NOT shell out to gh — that would
+// resolve PR list against the process cwd (an unrelated repo) and
+// synth wrong-repo PR URLs into the recovery doc. The tasks.md
+// fallback in writeRecoveryHandoffDoc handles this case
+// authoritatively.
+func TestCollectOpenPRs_EmptyCwdReturnsNil(t *testing.T) {
+	prs := collectOpenPRs("")
+	if prs != nil {
+		t.Errorf("collectOpenPRs(\"\") must return nil to avoid wrong-repo PR enrichment; got %v", prs)
+	}
+}
+
 // TestRunDispatch_CoordSpawnRejectsCodexEngine pins codex review
 // iter-9 P2 front-door: the CLI must reject
 // `fleet --engine codex dispatch coord-X --coord-spawn` outright
