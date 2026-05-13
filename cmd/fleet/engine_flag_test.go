@@ -200,9 +200,8 @@ func TestDispatch_FleetEngineEnvStamped(t *testing.T) {
 // claude wrapper, `exec codex` in the codex wrapper). On CI the
 // resolved wrapper exec'd a binary not on PATH and the tmux session
 // crashed at startup, manifesting as "expected 1 live agent, got 0"
-// in 9+ handoff/drain/rm tests. The fix: also honor `len(opts.command)
-// > 0` as caller intent — both signals mean "the caller picked a
-// command, don't stomp it."
+// in 9+ handoff/drain/rm tests. The fix: also treat a non-default
+// `opts.command` as caller intent.
 //
 // This test asserts the persisted agent.Record.Command equals the
 // programmatic argv even when FLEET_ENGINE=codex would otherwise
@@ -255,6 +254,82 @@ func TestDispatch_ProgrammaticCommandNotOverriddenByEngine(t *testing.T) {
 		}
 	}
 	// Clean up the live tmux session so the test doesn't leak.
+	_ = tmux.Kill(live[0].TmuxSession)
+}
+
+// TestDispatch_CobraDefaultCommandSwappedForEngine regresses the codex
+// [P1] surfaced in the iter-4 review: on the normal CLI path,
+// `cmd.Flags().StringSliceVar(&opts.command, ...)` pre-fills
+// opts.command with the claude wrapper default whether or not the
+// operator passed --command. The first attempt at the
+// programmatic-override fix used `len(opts.command) == 0` as the
+// secondary guard, which is NEVER true on the CLI path → the engine
+// wrapper swap silently never fired for `fleet -codex dispatch <task>`
+// and the agent record ran the claude wrapper despite engine=codex.
+//
+// Correct discriminator: compare against the cobra default
+// (defaultClaudeCommand). When commandExplicit=false AND opts.command
+// equals the cobra default, treat as "operator didn't pick a command"
+// and route through BuildWrapperCommand for the resolved engine.
+//
+// This test simulates the CLI path: commandExplicit=false (no
+// --command), opts.command = defaultClaudeCommand (cobra pre-fill),
+// FLEET_ENGINE=codex (root persistent flag resolved). The persisted
+// Record.Command MUST be the codex wrapper, not the claude wrapper.
+func TestDispatch_CobraDefaultCommandSwappedForEngine(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed; skipping integration test")
+	}
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	var b [3]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	// Mirror what cobra leaves on the dispatch RunE path when the
+	// operator did NOT pass --command. A copy of defaultClaudeCommand
+	// guards against accidental in-place mutation by sameCommand /
+	// future BuildWrapperCommand behavior.
+	cmd := make([]string, len(defaultClaudeCommand))
+	copy(cmd, defaultClaudeCommand)
+	opts := &dispatchOpts{
+		taskID:          "t1",
+		project:         "p1",
+		commandExplicit: false,
+		command:         cmd,
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("agent.List: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	got := live[0].Command
+	wantArgv, err := enginecfg.BuildWrapperCommand(enginecfg.EngineCodex)
+	if err != nil {
+		t.Fatalf("BuildWrapperCommand(codex): %v", err)
+	}
+	if len(got) != len(wantArgv) {
+		t.Fatalf("record.Command = %v, want %v (codex wrapper — engine swap missed CLI path)",
+			got, wantArgv)
+	}
+	for i := range got {
+		if got[i] != wantArgv[i] {
+			t.Fatalf("record.Command[%d] = %q, want %q (codex wrapper — engine swap missed CLI path: full=%v)",
+				i, got[i], wantArgv[i], got)
+		}
+	}
 	_ = tmux.Kill(live[0].TmuxSession)
 }
 

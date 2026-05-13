@@ -121,7 +121,7 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// operator to babysit it. Override with `--command` for scripted
 	// pipelines or alternate engines.
 	cmd.Flags().StringSliceVar(&opts.command, "command",
-		[]string{"sh", "-c", defaultClaudeWrapperScript},
+		defaultClaudeCommand,
 		"command to run inside the tmux session (default: shell-wrapped claude --dangerously-skip-permissions)")
 	// Auto-resume types "Read your handoff doc at <path> and continue"
 	// into the replacement on handoff. Disable for custom --command
@@ -217,12 +217,26 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// that internally launches claude can still be tagged as engine=
 	// codex if the operator wants to track it that way; we don't
 	// second-guess).
-	// Belt-and-suspenders: `commandExplicit` is only set inside RunE
-	// (cobra Changed() check), so callers that bypass cobra and call
-	// runDispatch programmatically (e.g. tests) never flip it true.
-	// Also honor a non-empty opts.command as caller intent — both
-	// signals mean "the caller picked a command, don't stomp it."
-	if !opts.commandExplicit && len(opts.command) == 0 {
+	// Two signals tell us the caller did NOT pick a command and we
+	// should swap in the engine wrapper:
+	//   1. CLI path: cobra's RunE sets `commandExplicit` from
+	//      Flags().Changed("command"). False ⇒ operator didn't pass
+	//      --command, so cobra's claude-shaped default is leaking
+	//      through (`[]string{"sh","-c",defaultClaudeWrapperScript}`)
+	//      and we should overwrite it for non-claude engines.
+	//   2. Programmatic path: in-process callers (tests, future
+	//      cross-package wiring) bypass cobra entirely; `commandExplicit`
+	//      stays false but `opts.command` is whatever the caller
+	//      passed — empty if they didn't care, populated if they did.
+	//
+	// Distinguish the two: when commandExplicit=false AND opts.command
+	// is empty (or equals the cobra default), the caller had no
+	// preference → swap. Otherwise the caller picked a command → leave
+	// it alone. Pre-fix the guard only checked commandExplicit, which
+	// stomped programmatically-injected commands on CI (see
+	// TestDispatch_ProgrammaticCommandNotOverriddenByEngine).
+	if !opts.commandExplicit &&
+		(len(opts.command) == 0 || sameCommand(opts.command, defaultClaudeCommand)) {
 		argv, err := enginecfg.BuildWrapperCommand(engineName)
 		if err != nil {
 			// Should not happen — Known() above already filtered.
@@ -439,6 +453,14 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 // `--command`'s default element and the wrapper-script literal stays
 // readable without cross-package qualification.
 const defaultClaudeWrapperScript = spawn.DefaultClaudeWrapperScript
+
+// defaultClaudeCommand is the canonical argv cobra leaves in
+// opts.command when the operator did NOT pass --command. Mirrors the
+// StringSliceVar default at flag registration (newDispatchCmd).
+// runDispatch compares against this to detect "cobra-default-pass-
+// through" so the engine→wrapper swap can fire for non-claude engines
+// without stomping a caller-supplied command.
+var defaultClaudeCommand = []string{"sh", "-c", defaultClaudeWrapperScript}
 
 // injectRemoteControlFlag is a thin local wrapper around
 // spawn.InjectRemoteControlFlag so the dispatch + handoff call sites
