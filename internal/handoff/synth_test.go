@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // withFleetHomeSynth installs a tmp ~/.fleet root for the test and
@@ -216,5 +218,146 @@ func TestSynthesizeRecovery_SkipsMissingWorkerState(t *testing.T) {
 	}
 	if doc.ActiveSubagents[0].TaskID != "fix-foo-1234" {
 		t.Errorf("task: got %q want fix-foo-1234", doc.ActiveSubagents[0].TaskID)
+	}
+}
+
+// seedTasksMD writes a minimal tasks.md with one task per (slug, status)
+// entry. Used by status-overlay tests to seed the per-slug status enum
+// the synth pass must pick up.
+func seedTasksMD(t *testing.T, projectsRoot, project string, statusBySlug map[string]tasks.Status) {
+	t.Helper()
+	dir := filepath.Join(projectsRoot, project)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	f := &tasks.File{Schema: 1}
+	// Deterministic iteration order: sort slugs.
+	slugs := make([]string, 0, len(statusBySlug))
+	for s := range statusBySlug {
+		slugs = append(slugs, s)
+	}
+	// Stable insertion order (sort).
+	for i := 0; i < len(slugs); i++ {
+		for j := i + 1; j < len(slugs); j++ {
+			if slugs[j] < slugs[i] {
+				slugs[i], slugs[j] = slugs[j], slugs[i]
+			}
+		}
+	}
+	for _, s := range slugs {
+		f.Tasks = append(f.Tasks, &tasks.Task{
+			Slug:     s,
+			Status:   statusBySlug[s],
+			Priority: tasks.Priority("P1"),
+			Created:  now,
+			Updated:  now,
+			Spec:     "synth-test task " + s,
+		})
+	}
+	if err := tasks.Write(filepath.Join(dir, "tasks.md"), f); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+}
+
+// TestSynthesizeRecovery_OverlaysStatusFromTasksMD pins codex review
+// iter-3 P2: the synth doc must carry the per-slug Status from tasks.md
+// so handoff_resume.py's re-dispatch logic can short-circuit
+// in-review / blocked / done workers. Without this overlay every row
+// would have Status="", treated as "always re-dispatch" by the
+// successor — wasting work on already-finished tasks.
+func TestSynthesizeRecovery_OverlaysStatusFromTasksMD(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"fix-foo-1234": "deadbeef",
+		"fix-bar-5678": "cafef00d",
+		"fix-baz-9abc": "feedface",
+	})
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "push", "https://github.com/owner/repo/pull/42")
+	seedWorkerState(t, pdir, "myproj", "fix-baz-9abc", "done", "https://github.com/owner/repo/pull/43")
+	// tasks.md says: foo is in-progress (re-dispatch), bar is in-review
+	// (shepherd only — no re-dispatch), baz is done (drop).
+	seedTasksMD(t, pdir, "myproj", map[string]tasks.Status{
+		"fix-foo-1234": tasks.Status("in-progress"),
+		"fix-bar-5678": tasks.Status("in-review"),
+		"fix-baz-9abc": tasks.Status("done"),
+	})
+
+	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("SynthesizeRecovery: %v", err)
+	}
+	byTask := map[string]ActiveSubagent{}
+	for _, s := range doc.ActiveSubagents {
+		byTask[s.TaskID] = s
+	}
+	if foo := byTask["fix-foo-1234"]; foo.Status != "in-progress" {
+		t.Errorf("fix-foo status: got %q want in-progress", foo.Status)
+	}
+	if bar := byTask["fix-bar-5678"]; bar.Status != "in-review" {
+		t.Errorf("fix-bar status: got %q want in-review", bar.Status)
+	}
+	if baz := byTask["fix-baz-9abc"]; baz.Status != "done" {
+		t.Errorf("fix-baz status: got %q want done", baz.Status)
+	}
+}
+
+// TestSynthesizeRecovery_MissingTasksMDLeavesStatusEmpty covers the
+// fresh-project edge case: coord crashed before tasks.md was ever
+// written (or it was hand-deleted). Synth must NOT fail — status is
+// just empty, handoff_resume.py falls back to "re-dispatch all" which
+// is the safe default. We're proving the recovery path stays resilient
+// when tasks.md is absent.
+func TestSynthesizeRecovery_MissingTasksMDLeavesStatusEmpty(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"fix-foo-1234": "deadbeef",
+	})
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	// No tasks.md.
+
+	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("SynthesizeRecovery without tasks.md: %v", err)
+	}
+	if len(doc.ActiveSubagents) != 1 {
+		t.Fatalf("ActiveSubagents: got %d want 1", len(doc.ActiveSubagents))
+	}
+	if doc.ActiveSubagents[0].Status != "" {
+		t.Errorf("status without tasks.md: got %q want \"\" (legacy fallback)", doc.ActiveSubagents[0].Status)
+	}
+}
+
+// TestSynthesizeRecovery_SlugMissingFromTasksMDStaysEmpty covers the
+// mid-write crash: coord registered the slug in coord-state.json but
+// crashed before adding it to tasks.md. Synth must not synthesize a
+// status; empty triggers the safe re-dispatch fallback.
+func TestSynthesizeRecovery_SlugMissingFromTasksMDStaysEmpty(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"fix-foo-1234": "deadbeef",
+		"fix-bar-5678": "cafef00d", // in coord-state but NOT tasks.md
+	})
+	seedWorkerState(t, pdir, "myproj", "fix-foo-1234", "tdd-green", "")
+	seedWorkerState(t, pdir, "myproj", "fix-bar-5678", "tdd-green", "")
+	seedTasksMD(t, pdir, "myproj", map[string]tasks.Status{
+		"fix-foo-1234": tasks.Status("in-progress"),
+		// fix-bar-5678 absent.
+	})
+
+	doc, err := SynthesizeRecovery("a1b2c3d4", "myproj", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("SynthesizeRecovery: %v", err)
+	}
+	byTask := map[string]ActiveSubagent{}
+	for _, s := range doc.ActiveSubagents {
+		byTask[s.TaskID] = s
+	}
+	if byTask["fix-foo-1234"].Status != "in-progress" {
+		t.Errorf("fix-foo status: got %q want in-progress", byTask["fix-foo-1234"].Status)
+	}
+	if byTask["fix-bar-5678"].Status != "" {
+		t.Errorf("fix-bar status (slug missing from tasks.md): got %q want \"\"", byTask["fix-bar-5678"].Status)
 	}
 }

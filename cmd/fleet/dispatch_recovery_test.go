@@ -143,7 +143,7 @@ func TestFindRecoveryCandidate_CoordLockHeldVetoes(t *testing.T) {
 	records := []*agent.Record{
 		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
 	}
-	pidAlive := func(int) bool { return false }       // dispatch CLI pid reaped
+	pidAlive := func(int) bool { return false }        // dispatch CLI pid reaped
 	sessionAlive := func(string) bool { return false } // operator on diff tmux server
 	lockHeld := func(string) bool { return true }      // BUT coord still alive
 

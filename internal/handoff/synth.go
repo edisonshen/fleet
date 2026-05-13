@@ -35,6 +35,7 @@ package handoff
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,6 +43,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // TypeRecoverySynth marks a handoff doc that was synthesized from
@@ -98,6 +100,15 @@ func SynthesizeRecovery(agentID, project string, ts time.Time) (*Doc, error) {
 		return doc, nil
 	}
 
+	// Pull per-slug status from tasks.md (codex review iter-3 P2). The
+	// worker state.json doesn't carry tasks.md's status enum — that's
+	// authoritative only in tasks.md. Without this lookup, every synth
+	// row carries Status="", which handoff_resume.py treats as the
+	// legacy "always re-dispatch" case. Recovering a coord with tasks
+	// already in-review / done / blocked would then reissue workers
+	// that should have been skipped.
+	statusBySlug := readStatusBySlug(pdir, project)
+
 	// Sort slugs for deterministic ordering — without this, the synth
 	// doc body would shuffle on each run and a hand-diff between two
 	// recovery attempts on the same state would lie. Tests rely on
@@ -119,10 +130,52 @@ func SynthesizeRecovery(agentID, project string, ts time.Time) (*Doc, error) {
 		sub.TaskID = slug
 		sub.Branch = "worker/" + slug
 		sub.AgentID = agentIDsBySlug[slug]
+		// Overlay tasks.md status when present. Empty when (a) tasks.md
+		// doesn't exist (fresh project before any /tasks add), (b) the
+		// slug isn't in tasks.md (e.g., the coord registered the slug
+		// in coord-state.json but crashed before adding to tasks.md),
+		// or (c) tasks.md couldn't be parsed. In all three cases, the
+		// successor coord's handoff_resume.py falls back to the legacy
+		// "re-dispatch" path, which is the safe default — we'd rather
+		// re-issue a worker than silently skip one.
+		if st, ok := statusBySlug[slug]; ok {
+			sub.Status = st
+		}
 		doc.ActiveSubagents = append(doc.ActiveSubagents, sub)
 	}
 
 	return doc, nil
+}
+
+// readStatusBySlug reads tasks.md and returns slug→status as a map.
+// Returns an empty map on any error (missing file, parse failure) —
+// the caller treats absent entries as "unknown status" and falls back
+// to the safe default of re-dispatch. We deliberately swallow errors
+// here rather than fail the whole recovery: tasks.md may legitimately
+// be missing (fresh project), partially written (coord crashed
+// mid-write), or schema-incompatible (binary downgrade).
+func readStatusBySlug(projectDir, project string) map[string]string {
+	out := map[string]string{}
+	path := filepath.Join(projectDir, "tasks.md")
+	if _, err := os.Stat(path); err != nil {
+		// Missing file → empty map. Not an error: legitimate when no
+		// tasks were ever added.
+		if errors.Is(err, os.ErrNotExist) {
+			return out
+		}
+		return out
+	}
+	f, err := tasks.Read(path)
+	if err != nil {
+		// Parse error → empty map. Successor coord re-dispatches all
+		// workers (legacy fallback), which is safer than refusing to
+		// build the recovery doc.
+		return out
+	}
+	for _, t := range f.Tasks {
+		out[t.Slug] = string(t.Status)
+	}
+	return out
 }
 
 // readWorkerAgentIDs parses coord-state.json's worker_agent_ids map.
