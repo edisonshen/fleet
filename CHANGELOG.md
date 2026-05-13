@@ -6,6 +6,26 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-13
+
+`fleet project add <path>` now accepts non-git directories. Operators
+can dispatch fleet workers against debug / polish / scratch projects
+without first running `git init`. The worker SOP is identical to git
+projects (TDD → phase=review-pending → reviewer-subagent runs /review
+iterations → done) — only the finisher's `git push` + `gh pr create`
+step is skipped. Deliverable is the file diff in place. Codex review
+auto-skips with reason `no-git` since `codex review --base main`
+needs a git diff.
+
+### Added
+
+- `fleet project add <path>` accepts directories without a `.git` entry; meta.json records `is_git=false` and stderr emits a warning. Existing git projects continue to require + assert the `.git` entry (#140).
+- `Meta.IsGit` (pointer field for forward-compat) + `GitMode()` helper. Legacy meta.json files without the field default to `GitMode()=true` (treated as git-backed, byte-equal behavior to pre-v0.9.0).
+- `internal/workers/workers.go` phase-machine accepts codex skip reason `no-git` (alongside `rate-limited` and `unavailable`) and allows `phase=done` directly for non-git projects without requiring the `push` transition (#140).
+- `skills/coordinator/dispatch.py` worker / reviewer / finisher prompt builders branch on the project's `GitMode()`. Non-git workers edit files in place; non-git finishers mark `phase=done` and exit without pushing.
+- `skills/coordinator/loop.py` reconcile accepts `phase=done` without `pr_url` for non-git projects and transitions the task to `status=done` directly (no PR-track / CI-poll).
+- `skills/coordinator/SKILL.md` documents the non-git mode in a dedicated section.
+
 ## [0.8.3] - 2026-05-12
 
 Coord handoff (auto via fleet-guard or interactive `fleet handoff`)
@@ -763,7 +783,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/edisonshen/fleet/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/edisonshen/fleet/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/edisonshen/fleet/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/edisonshen/fleet/compare/v0.8.0...v0.8.1
