@@ -857,19 +857,22 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_DeadCoord_FreshMtimeStillRecovers pins codex review
-// iter-9 P1 end-to-end: when a coord just crashed (its dead record
-// is on disk AND coord-state.json's mtime is still fresh from the
-// last tick), runDispatch must still take the synth-handoff recovery
-// path. Otherwise the resumed coord would boot fresh and orphan the
-// in-flight worker state.
-func TestRunDispatch_DeadCoord_FreshMtimeStillRecovers(t *testing.T) {
-	requireTmux(t)
+// TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch pins codex review
+// iter-12 P1: when coord-state.json is fresh AND a record exists for
+// the project, dispatch must refuse. The split-brain risk in the
+// cross-tmux-socket case (live coord on another socket → fresh mtime
+// + record present) outweighs the UX cost of refusing a recently-
+// crashed coord's same-window restart. Operator workaround:
+// `fleet rm <coord-id>` to clear the stale record, then retry.
+//
+// (Earlier iter-9/iter-10 versions of this test pinned the inverse:
+// "recovery fires on fresh-mtime crashes." Codex iter-12 P1 reverted
+// that decision because the cross-socket scenario can't be
+// distinguished locally, and split-brain coordination is worse than
+// blocked recovery.)
+func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 	setupFleetHome(t)
 
-	// Dead record: pid is 99999 (host doesn't have it; treats as dead),
-	// tmux session is a name that doesn't exist (tmux.HasSession returns
-	// false). No live tmux session on this socket.
 	deadRec := agent.New("recentdc")
 	deadRec.TaskID = "coord-myproj"
 	deadRec.Project = "myproj"
@@ -889,9 +892,7 @@ func TestRunDispatch_DeadCoord_FreshMtimeStillRecovers(t *testing.T) {
 	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
 	}
-	// DO NOT backdate the mtime — leave it fresh. Recovery must still
-	// fire because liveCoordRecordExists sees no live tmux session
-	// (the dead record's tmux is gone).
+	// Fresh mtime + record present → veto must fire.
 
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
@@ -902,19 +903,19 @@ func TestRunDispatch_DeadCoord_FreshMtimeStillRecovers(t *testing.T) {
 		commandExplicit: true,
 	}
 	var out bytes.Buffer
-	if err := runDispatch(opts, &out); err != nil {
-		t.Fatalf("runDispatch should recover the dead coord despite fresh coord-state.json: %v\n%s",
-			err, out.String())
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected runDispatch to refuse spawn under fresh mtime + record present; got nil\n%s", out.String())
 	}
-	stdout := out.String()
-	if !strings.Contains(stdout, "recovering dead coord recentdc") {
-		t.Errorf("recovery must fire on fresh-mtime dead coord; got:\n%s", stdout)
+	if !strings.Contains(err.Error(), "mtime is recent") {
+		t.Errorf("error must mention recent mtime; got: %v", err)
 	}
+	// No successor should be on disk.
 	live, _ := agent.List()
 	for _, r := range live {
 		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "recentdc" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			break
+			t.Errorf("no successor should spawn under fresh-mtime veto; got %s", r.ID)
 		}
 	}
 }

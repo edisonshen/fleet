@@ -438,28 +438,40 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	// Live-coord veto removed (codex review iter-11): we cannot
-	// reliably detect a live coord on a different tmux socket from
-	// local probes — tmux.HasSession only sees the current socket;
-	// agent.Record.PID is the short-lived dispatch CLI's pid and is
-	// subject to OS PID reuse; coord-state.json mtime alone (codex
-	// iter-4 had it; iter-8 paired with record existence; iter-10
-	// dropped record-PID) gave false positives after clean shutdowns
-	// AND false negatives during cross-socket scenarios. Every
-	// combination we tried left at least one real failure mode open.
+	// Live-coord veto (codex review iter-12 P1 — reinstated after
+	// iter-11 briefly removed it). The Python /coordinator skill only
+	// holds coordinator.lock for a single tick before releasing it in
+	// `finally`, so the lock CANNOT serve as a racing-coords safety
+	// net at the dispatch boundary (two coords would alternate ticks,
+	// both mutating tasks/worker state — split-brain coordination).
 	//
-	// The coord skill's own NB-flock on coordinator.lock IS the
-	// authoritative single-supervisor guarantee. A duplicate spawn
-	// (either from a cross-socket race or a recently-archived restart)
-	// is loser-exits-cleanly via that flock — brief tmux orphan,
-	// but no correctness violation. We trade the brief UX issue for
-	// reliability on the actually-load-bearing recovery flows.
+	// Veto when BOTH:
+	//   (a) coord-state.json mtime is fresh (something is ticking), AND
+	//   (b) an agent record exists for this project+task_id (the
+	//       record claiming to BE that something).
 	//
-	// findRecoveryCandidate's pid/tmux-dead gates remain as the
-	// gate against synth-recovering OVER a live coord (which would
-	// create a more dangerous handoff-chain corruption than a simple
-	// duplicate spawn). Even those are best-effort given the same
-	// detection limits.
+	// Both signals required to keep the dispatch-after-clean-archive
+	// case unblocked (codex iter-8 P2): after an operator hits [x] to
+	// archive the dead record, (b) fails → dispatch proceeds.
+	//
+	// Limitations we accept:
+	//   - Recently-crashed coords whose record hasn't been archived
+	//     will be vetoed for the freshness window. Operator workaround:
+	//     `fleet rm <coord-id>` first.
+	//   - Live coord on a different tmux socket: (a) and (b) both hold
+	//     correctly, veto fires, split-brain avoided. This is the
+	//     load-bearing case the veto exists for.
+	//
+	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
+	if opts.coordSpawn && coordStateFresh(opts.project) {
+		if coordRecordExistsForProject(opts.taskID, opts.project) {
+			return fmt.Errorf(
+				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
+					"likely cause: a live coord is on a different tmux socket. "+
+					"if you intentionally stopped the coord, run `fleet rm <coord-id>` (or press [x] on the dashboard) "+
+					"to clear the record before retrying", opts.project)
+		}
+	}
 
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
 	// hits a project whose previous coord left a stale record on disk
@@ -568,7 +580,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				// non-default engine can pass --command + --engine
 				// together; commandExplicit then takes the explicit
 				// path and skips this inheritance.
-				if !opts.commandExplicit && preClampEngine == engineName && len(oldRecord.Command) > 0 {
+				// Legacy-record normalization (codex review iter-12
+				// P2): pre-v0.9 records legitimately have engine="",
+				// which is treated as claude-code everywhere else.
+				// Without this normalization, recovering a legacy
+				// record under --engine claude-code would fall through
+				// to the default wrapper instead of inheriting the
+				// custom command — a regression on the upgrade path.
+				preClampEngineNormalized := preClampEngine
+				if preClampEngineNormalized == "" {
+					preClampEngineNormalized = enginecfg.DefaultEngine
+				}
+				if !opts.commandExplicit && preClampEngineNormalized == engineName && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
 					if opts.coordSpawn && preAllocatedID != "" {
 						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
