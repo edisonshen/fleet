@@ -1319,6 +1319,82 @@ func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
 	}
 }
 
+// TestRunDispatch_CoordSpawn_FailsClosedOnUnparseableRecord pins
+// codex review iter-17 P1: agent.List silently skips records that
+// fail to parse, so an unparseable record (corrupt JSON, partial
+// write) could mask a live coord and let --coord-spawn fall through
+// to a fresh spawn — split-brain. The dispatch path now uses
+// agent.ListStrict and aborts when any record won't parse.
+func TestRunDispatch_CoordSpawn_FailsClosedOnUnparseableRecord(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	// Drop a malformed .json into the agents dir. agent.List would
+	// silently skip it; ListStrict reports it via badIDs.
+	badPath := filepath.Join(root, "agents", "corruptr.json")
+	if err := os.WriteFile(badPath, []byte("{ not valid json"), 0o644); err != nil {
+		t.Fatalf("write corrupt record: %v", err)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected runDispatch to fail closed on unparseable record; got nil")
+	}
+	if !strings.Contains(err.Error(), "unparseable record") {
+		t.Errorf("error message should mention unparseable record for split-brain safety; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "corruptr") {
+		t.Errorf("error message should surface the corrupt record's ID; got: %v", err)
+	}
+}
+
+// TestCoordStateFresh_FailsClosedOnTransientStatError pins codex
+// review iter-17 P1: when stat on coord-state.json fails for a
+// transient reason (permission, I/O), coordStateFresh used to return
+// false ("not fresh"), which bypassed the live-coord veto. A live
+// coord on another socket whose state.json was briefly unreadable
+// would be misclassified as dead. The fix: IsNotExist still returns
+// false, but other errors return true (fail closed → veto fires).
+func TestCoordStateFresh_FailsClosedOnTransientStatError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — chmod 600 doesn't deny root execute")
+	}
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	// Seed coord-state.json so the path resolves to something stat
+	// could read under normal perms.
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	// chmod 600 on the project dir removes execute → stat of any
+	// child fails with EACCES (POSIX requires execute on each path
+	// component to stat through it).
+	if err := os.Chmod(pdir, 0o600); err != nil {
+		t.Skipf("chmod project dir: %v (likely sandbox restriction)", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(pdir, 0o755) })
+
+	if !coordStateFresh("myproj") {
+		t.Errorf("coordStateFresh must fail closed (return true) on transient stat error; got false → live-coord veto would be bypassed")
+	}
+}
+
 // TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError pins codex
 // review round-3 P1: when agent.List() errors during --coord-spawn
 // (corrupt/unreadable agents dir), the live-coord veto and dead-coord

@@ -440,24 +440,39 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 
 	// Pre-fetch the agent record list ONCE so the live-coord veto AND
 	// the dead-coord recovery probe below share the same view (codex
-	// review iter-15 P1). Failing closed here is critical: without a
-	// readable record list we can't detect a live coord on a different
-	// tmux socket, and falling through would spawn a fresh coord that
-	// races the live one — the split-brain case the veto exists to
-	// prevent. Errors from agent.List are rare in practice (corrupt
-	// individual records get silently skipped; only directory-level
-	// failures bubble up — permission denied, unreadable mount), so
-	// blocking on them surfaces a real environment problem instead of
-	// silently breaking the cross-socket safety guarantee.
+	// review iter-15 P1). Use ListStrict so unparseable records also
+	// fail the dispatch (codex iter-17 P1): agent.List silently skips
+	// corrupt JSON, but an unparseable record might be the live coord's.
+	// Skipping it would let the veto fall open and a duplicate coord
+	// spawn against the same project on a different tmux socket. Two
+	// fail-closed gates here:
+	//
+	//   - lerr != nil: directory-level read failure (permission, mount).
+	//     We can't enumerate records at all → abort.
+	//   - len(badIDs) > 0: at least one record file exists but won't
+	//     parse → abort, surface the IDs so the operator can fix or
+	//     archive them.
+	//
+	// Other --coord-spawn safety checks (coordStateFresh, recovery
+	// probe) fail closed too: stat errors on coord-state.json are
+	// treated as "fresh" (live), and the recovery probe shares the
+	// same records slice.
 	var coordRecords []*agent.Record
 	if opts.coordSpawn {
-		recs, lerr := agent.List()
+		recs, badIDs, lerr := agent.ListStrict()
 		if lerr != nil {
 			return fmt.Errorf(
 				"--coord-spawn refusing to spawn for project %q: cannot list agent records (%v). "+
 					"split-brain risk: a live coord on a different tmux socket might exist whose record we can't read. "+
 					"fix the agents directory (likely permission/mount issue under ~/.fleet/agents) and retry",
 				opts.project, lerr)
+		}
+		if len(badIDs) > 0 {
+			return fmt.Errorf(
+				"--coord-spawn refusing to spawn for project %q: %d unparseable record(s) under ~/.fleet/agents (%v). "+
+					"split-brain risk: an unparseable record could belong to a live coord on this or another tmux socket. "+
+					"inspect the file(s), then fix the JSON or move them to ~/.fleet/agents/archive/ and retry",
+				opts.project, len(badIDs), badIDs)
 		}
 		coordRecords = recs
 	}

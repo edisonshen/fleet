@@ -179,12 +179,15 @@ func findRecoveryCandidate(
 // ~/.fleet/projects/<project>/coord-state.json was mtime-updated
 // within coordFreshnessWindow. Returns true (= live coord) when:
 //   - the file exists AND its mtime is within the window
+//   - stat fails with a transient error (codex review iter-17 P1):
+//     we can't tell live-vs-dead, so fail closed on the safety
+//     side — the live-coord veto fires and the dispatch refuses
+//     rather than risk spawning a duplicate against an
+//     unverified-but-possibly-live coord.
 //
 // Returns false (= dead or never-ran) when:
 //   - the file doesn't exist (no coord ever ran for this project)
 //   - the file mtime is older than the window
-//   - any error stat-ing the file (defensive: prefer false-negative
-//     "let recovery proceed" over false-positive "live coord")
 //
 // Production probe for findRecoveryCandidate. The Python /coordinator
 // skill writes coord-state.json through state.WriteAtomic on every
@@ -195,12 +198,22 @@ func findRecoveryCandidate(
 func coordStateFresh(project string) bool {
 	pdir, err := state.ProjectDir(project)
 	if err != nil {
-		return false
+		// Path resolution failed — we can't even locate the file,
+		// so we can't make a safety call. Return true so the
+		// --coord-spawn veto fires (fail closed). The error would
+		// be surfaced to the operator on the next path-using call.
+		return true
 	}
 	fi, err := os.Stat(filepath.Join(pdir, "coord-state.json"))
 	if err != nil {
-		// Missing / unstattable → no fresh coord. Recovery proceeds.
-		return false
+		if os.IsNotExist(err) {
+			// No coord has ever run for this project.
+			return false
+		}
+		// Transient stat error (permission, I/O, broken mount).
+		// Fail closed: treat as fresh so the live-coord veto
+		// fires and we don't accidentally spawn a duplicate.
+		return true
 	}
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
