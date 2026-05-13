@@ -235,6 +235,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			"--engine %q is unknown (known: claude-code, codex)",
 			engineName)
 	}
+	// Coord-spawn engine guard (codex review iter-9 P2): the Python
+	// /coordinator skill emits Claude-Agent-tool DISPATCH blocks that
+	// ONLY claude-code sessions can consume. The TUI's startCoordSpawn
+	// hardcodes --engine claude-code as a self-protective measure, but
+	// the direct CLI path (`fleet --engine codex dispatch coord-X
+	// --coord-spawn --project X`) would otherwise spawn a codex
+	// session that can't fan out workers / reviewers / finishers —
+	// the project row would stall the first time it needed a subagent.
+	// Fail loud at the CLI to match the TUI's safety guarantee.
+	if opts.coordSpawn && engineName != enginecfg.EngineClaudeCode {
+		return fmt.Errorf(
+			"--coord-spawn requires --engine %s (got %q); the coordinator skill needs Claude's Agent tool to fan out workers/reviewers/finishers",
+			enginecfg.EngineClaudeCode, engineName)
+	}
 	if err := os.Setenv(FleetEngineEnv, engineName); err != nil {
 		return fmt.Errorf("set %s=%s: %w", FleetEngineEnv, engineName, err)
 	}
@@ -450,7 +464,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// manual `fleet dispatch <task>` against a worker task is
 	// unaffected.
 	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if liveCoordRecordExists(opts.taskID, opts.project) {
+		if liveCoordRecordExists(opts.taskID, opts.project, pidAlive, tmuxHasSession) {
 			return fmt.Errorf(
 				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a live record exists. "+
 					"likely cause: a coord is still alive on a different tmux server. "+
@@ -511,6 +525,21 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				// fires as intended.
 				if opts.engineExplicit && oldRecord.Engine != engineName {
 					oldRecord.Engine = engineName
+				}
+				// Coord-spawn back-door guard (codex review iter-9 P2):
+				// the front-door check above rejects an operator
+				// running `fleet --engine codex dispatch coord-X
+				// --coord-spawn`, but the recovery path can still
+				// inherit a dead codex coord's Engine when the caller
+				// didn't set engineExplicit. Block that here so the
+				// CLI's coord-spawn contract holds end-to-end: every
+				// successful --coord-spawn produces a claude-code
+				// successor that can fan out workers.
+				if oldRecord.Engine != "" && oldRecord.Engine != enginecfg.EngineClaudeCode {
+					return fmt.Errorf(
+						"--coord-spawn recovery refused: dead coord %s ran engine %q but the coordinator skill only works under claude-code. "+
+							"either pass --engine claude-code to force-migrate the recovery, or archive the dead record (`fleet rm %s`) and start fresh",
+						oldRecord.ID, oldRecord.Engine, oldRecord.ID)
 				}
 				// Command inheritance (codex review iter-7 P2,
 				// refined iter-8 P1): when the operator did NOT pass

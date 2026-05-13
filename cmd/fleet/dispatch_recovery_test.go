@@ -590,11 +590,14 @@ func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
 	setupFleetHome(t)
 
 	// Seed a live coord record alongside the fresh coord-state.json —
-	// the BOTH-signal case from iter-8 P2.
+	// the BOTH-signal case from iter-8 P2. PID=os.Getpid() so the
+	// liveCoordRecordExists probe (codex iter-9 P1) treats this
+	// record as alive rather than as a recovery candidate.
 	liveRec := agent.New("liverec0")
 	liveRec.TaskID = "coord-myproj"
 	liveRec.Project = "myproj"
 	liveRec.TmuxSession = "fleet-liverec0"
+	liveRec.PID = os.Getpid()
 	if err := liveRec.Write(); err != nil {
 		t.Fatalf("seed live record: %v", err)
 	}
@@ -878,15 +881,17 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 	}
 }
 
-// TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit pins codex
-// review iter-7 P1: when the operator did NOT pass --engine on the
-// recovery dispatch (engineExplicit=false), the inherited
-// OldRecord.Engine survives intact. Without this gate, every plain
-// `fleet dispatch <task> --coord-spawn` would silently rewrite a
-// recovered codex coord back to claude-code (the resolved-default
-// engine name when no flag is set).
-func TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit(t *testing.T) {
-	requireTmux(t)
+// TestRunDispatch_DeadCoord_CodexRecoveryRejected pins codex review
+// iter-9 P2 back-door: recovery of a dead codex coord without
+// engine-clamp would inherit engine=codex into the successor, but the
+// Python /coordinator skill needs Claude's Agent tool — a codex
+// successor is non-functional. The dispatch path must reject this
+// instead of silently spawning a broken coord.
+//
+// Operator escape: pass --engine claude-code to force-migrate the
+// recovery (engineExplicit=true → clamp fires → successor is
+// claude-code, command is reset to claude wrapper).
+func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	setupFleetHome(t)
 
 	deadRec := agent.New("c0dexc0de")
@@ -914,8 +919,6 @@ func TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit(t *testing.T) {
 		t.Fatalf("chtimes coord-state: %v", err)
 	}
 
-	// No engine flag set — simulates plain `fleet dispatch <task>
-	// --coord-spawn` (engineName resolves to default via env/codebase).
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -923,28 +926,50 @@ func TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit(t *testing.T) {
 		coordSpawn:      true,
 		command:         []string{"sleep", "60"},
 		commandExplicit: true,
-		// engine:          "" — NOT explicit
-		// engineExplicit: false (default)
+		// No engine flag — would inherit codex without the guard.
 	}
 	var out bytes.Buffer
-	if err := runDispatch(opts, &out); err != nil {
-		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected codex recovery to be rejected; got nil error\n%s", out.String())
 	}
+	if !strings.Contains(err.Error(), "coordinator skill only works under claude-code") {
+		t.Errorf("error must explain the codex-coord limitation; got: %v", err)
+	}
+	// No successor should be on disk.
 	live, _ := agent.List()
-	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
-			successor = r
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dexc0de" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			break
+			t.Errorf("no successor must be spawned when codex recovery is rejected; got %s", r.ID)
 		}
 	}
-	if successor == nil {
-		t.Fatalf("expected successor record; got none")
+}
+
+// TestRunDispatch_CoordSpawnRejectsCodexEngine pins codex review
+// iter-9 P2 front-door: the CLI must reject
+// `fleet --engine codex dispatch coord-X --coord-spawn` outright
+// (not just for recovery). The Python /coordinator skill emits
+// Claude-Agent-tool DISPATCH blocks that only claude-code can run.
+func TestRunDispatch_CoordSpawnRejectsCodexEngine(t *testing.T) {
+	setupFleetHome(t)
+
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		engine:          "codex", // explicit codex on coord-spawn — must fail
 	}
-	if successor.Engine != "codex" {
-		t.Errorf("engine clamp must be gated on engineExplicit: got Engine=%q; want codex (inherited from dead coord, no --engine override)",
-			successor.Engine)
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected --coord-spawn + --engine codex to be rejected; got nil\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "--coord-spawn requires --engine claude-code") {
+		t.Errorf("error must mention coord-spawn engine constraint; got: %v", err)
 	}
 }
 

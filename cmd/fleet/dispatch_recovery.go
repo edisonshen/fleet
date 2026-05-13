@@ -195,18 +195,23 @@ func coordStateFresh(project string) bool {
 }
 
 // liveCoordRecordExists reports whether ~/.fleet/agents/ contains a
-// LIVE record matching the given task_id + project. Used by the
+// record matching the given task_id + project whose pid OR tmux
+// session is alive (i.e., NOT a recovery candidate). Used by the
 // dispatch live-coord veto to distinguish "coord-state.json is fresh
 // because a live coord is ticking" from "coord-state.json is fresh
-// because the file persisted past a clean coord shutdown."
+// because the file persisted past a clean coord shutdown" — AND, per
+// codex review iter-9 P1, from "coord-state.json is fresh because the
+// dead coord just ticked before crashing." The latter case is the
+// load-bearing recovery target; vetoing it would strand recently-
+// crashed coords for the full freshness window.
 //
 // Returns false on agent.List errors (defensive: prefer false-negative
 // "let dispatch proceed" over false-positive "block forever"). The
-// freshness signal alone would have been enough in the
-// dashboard-on-different-tmux-socket scenario codex iter-4 P1
-// originally caught, but it's not enough on its own — the freshness
-// signal persists past the live coord that wrote it (codex iter-8 P2).
-func liveCoordRecordExists(taskID, project string) bool {
+// pidAlive + sessionAlive probes match findRecoveryCandidate's
+// definition of "dead" exactly so the two checks stay in lockstep —
+// any record findRecoveryCandidate would treat as a recovery target
+// MUST NOT make this function return true.
+func liveCoordRecordExists(taskID, project string, pidAlive pidAliveFn, sessionAlive sessionAliveProbe) bool {
 	records, err := agent.List()
 	if err != nil {
 		return false
@@ -215,7 +220,17 @@ func liveCoordRecordExists(taskID, project string) bool {
 		if r == nil {
 			continue
 		}
-		if r.TaskID == taskID && r.Project == project {
+		if r.TaskID != taskID || r.Project != project {
+			continue
+		}
+		// Mirror findRecoveryCandidate's "dead" definition: record is
+		// dead when both pid is gone AND tmux session is gone. Any
+		// record that fails BOTH probes is a recovery candidate, not
+		// a live coord. Returning true only on records that LOOK
+		// alive prevents the veto from misclassifying recent crashes.
+		pidOK := r.PID > 0 && pidAlive(r.PID)
+		tmuxOK := r.TmuxSession != "" && sessionAlive(r.TmuxSession)
+		if pidOK || tmuxOK {
 			return true
 		}
 	}
