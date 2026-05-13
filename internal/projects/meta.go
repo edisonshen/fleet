@@ -30,9 +30,11 @@ import (
 //
 // IsGit is a pointer so the JSON layer can distinguish "field absent on
 // disk" (legacy meta.json predating non-git support) from "field present,
-// value false" (operator added a non-git directory). After unmarshal, an
-// absent IsGit collapses to true via Read's normalization — legacy
-// projects keep behaving as git projects unchanged.
+// value false" (operator added a non-git directory). Callers should
+// route the git-vs-non-git decision through GitMode(); it treats nil
+// (absent field) as true so legacy projects keep behaving as git
+// projects unchanged. Read() returns the field verbatim — it does NOT
+// normalize.
 type Meta struct {
 	Schema   string    `json:"schema"`
 	RepoPath string    `json:"repo_path"`
