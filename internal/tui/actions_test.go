@@ -1327,16 +1327,29 @@ func TestKeyA_ProjectRow_CoordIDSetButRecordNotLoaded_FlashesRetry(t *testing.T)
 	}
 }
 
-// TestKeyA_ProjectRow_DeadCoordSessionFlashes regresses the case where
-// project.CoordID is set but the tmux session has died. We must not
-// silently exec tmux on a dead session; flash a clear hint instead.
-func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
+// TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch pins
+// resume-dead-coord-ab65: when project.CoordID is set but its tmux
+// session is dead, [a] re-dispatches the coord (reusing the stable
+// "coord-<project>" task_id so the new agent picks up where the
+// dead one left off via the synth-handoff path in dispatch). Previously
+// this case flashed "press [x] on its agent row to archive, then [a]
+// here to respawn" — which threw state away. The new flash names the
+// resume and the spawn is dispatched in the same tea.Cmd.
+func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
+	withFleetHome(t)
 	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
-	stub := &stubFleetCmd{}
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
 	stub.install(t)
 
 	coord := sampleAgent("coord001")
 	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
 	m := New("test")
 	m.records = []*agent.Record{coord}
 	m.dashboard = &Snapshot{
@@ -1353,16 +1366,104 @@ func TestKeyA_ProjectRow_DeadCoordSessionFlashes(t *testing.T) {
 	mm := updated.(Model)
 
 	if mm.pendingAttach != "" {
-		t.Errorf("pendingAttach must NOT be set for dead session; got %q", mm.pendingAttach)
+		t.Errorf("pendingAttach must NOT be set on a dead session (resume goes through dispatch); got %q", mm.pendingAttach)
 	}
-	if cmd != nil {
-		t.Errorf("[a] on dead coord should not produce cmd; got non-nil")
+	if cmd == nil {
+		t.Fatalf("[a] on dead coord should produce a resume-dispatch cmd; got nil")
 	}
+	// Drain the cmd to fire the dispatch.
+	msg := cmd()
+	doneMsg, ok := msg.(coordSpawnDoneMsg)
+	if !ok {
+		t.Fatalf("expected coordSpawnDoneMsg; got %T (%+v)", msg, msg)
+	}
+	if doneMsg.err != nil {
+		t.Fatalf("resume-dispatch returned err: %v", doneMsg.err)
+	}
+	if doneMsg.projectName != "demo" {
+		t.Errorf("projectName = %q; want demo", doneMsg.projectName)
+	}
+	// Flash must point at the resume, not at archive — the operator
+	// should know we're picking up where the dead coord left off.
+	if mm.flash == nil {
+		t.Fatalf("expected resume flash; got nil")
+	}
+	if !strings.Contains(mm.flash.text, "resuming coord") ||
+		!strings.Contains(mm.flash.text, "coord001") {
+		t.Errorf("flash should mention resume + the dead coord id; got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "archive") {
+		t.Errorf("flash must NOT suggest archive on the resume path; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one dispatch call; got %d (%v)", len(stub.calls), stub.calls)
+	}
+	args := stub.calls[0]
+	if args[0] != "dispatch" {
+		t.Errorf("first arg = %q; want dispatch", args[0])
+	}
+	if len(args) < 2 || args[1] != "coord-demo" {
+		t.Errorf("dispatch task_id (args[1]) = %q; want coord-demo (stable per-project)", argString(args, 1))
+	}
+}
+
+// TestKeyA_AgentRow_DeadCoordSession_SuggestsResume pins behavior 3:
+// when [a] lands on a dead-session AGENT row that's tagged as a coord
+// (TaskID == "coord-<project>"), the flash suggests [r]esume by going
+// to the project row, not [x] archive. Archive remains valid as an
+// explicit operator action, but it's no longer the default suggestion.
+func TestKeyA_AgentRow_DeadCoordSession_SuggestsResume(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	m := makeModelWithAgents(coord)
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "coord001" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
 	if mm.flash == nil || !mm.flash.isErr {
-		t.Errorf("[a] on dead coord should flash an error; got %+v", mm.flash)
+		t.Fatalf("expected error flash; got %+v", mm.flash)
 	}
-	if len(stub.calls) != 0 {
-		t.Errorf("[a] on dead coord should NOT shell out; got %v", stub.calls)
+	if !strings.Contains(mm.flash.text, "resume") {
+		t.Errorf("dead-coord flash should suggest resume; got %q", mm.flash.text)
+	}
+	if strings.Contains(mm.flash.text, "[x] to archive") {
+		t.Errorf("dead-coord flash should NOT lead with archive; got %q", mm.flash.text)
+	}
+}
+
+// TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive pins
+// that the resume-suggestion is gated on the agent being a coord —
+// non-coord dead agents (workers, manual dispatches) continue to
+// suggest [x] archive because there's no resume path for them.
+func TestKeyA_AgentRow_DeadNonCoordSession_StillSuggestsArchive(t *testing.T) {
+	(&stubSessionAlive{dead: map[string]bool{"fleet-agent01": true}}).install(t)
+
+	worker := sampleAgent("agent01")
+	worker.Project = "demo"
+	worker.TaskID = "some-task" // NOT coord-<project>
+	m := makeModelWithAgents(worker)
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "agent01" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, _ := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "[x]") || !strings.Contains(mm.flash.text, "archive") {
+		t.Errorf("dead non-coord flash should suggest [x] archive; got %q", mm.flash.text)
 	}
 }
 
