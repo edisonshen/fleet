@@ -139,14 +139,16 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 	// flow).
 	cmd.Flags().StringVar(&opts.prompt, "prompt", "",
 		"first-turn prompt to type into the spawned session (default: none)")
-	// --engine selects the engine for THIS dispatch's agent record. The
-	// dispatch CLI inherits FLEET_ENGINE from the root cmd when unset
-	// (so `fleet -codex dispatch …` does the right thing). Passing an
-	// explicit --engine on the dispatch subcommand overrides the root
-	// flag for this call only — useful for one-off mixed-engine spawns
-	// even when the operator's primary fleet is on a different engine.
-	cmd.Flags().StringVar(&opts.engine, "engine", "",
-		"engine for this dispatch (claude-code | codex; default: inherits FLEET_ENGINE or claude-code)")
+	// NOTE: --engine is NOT registered on dispatch as a local flag.
+	// Registering it locally would shadow the root persistent flag
+	// (cobra binds same-name local flags first), so root's
+	// PersistentPreRunE would never see the operator's choice and
+	// conflict-detection between --engine and -codex/-claude would
+	// silently no-op. The dispatch path reads the resolved engine via
+	// FLEET_ENGINE (which root's PersistentPreRunE always populates).
+	// The opts.engine field survives only for programmatic test access
+	// (engine_flag_test.go's TestDispatch_UnknownEngineRejected sets it
+	// directly to exercise the validation gate).
 	// --coord-spawn is the internal escape hatch for the TUI's project-
 	// row [a] auto-spawn flow. The "coord-<project>" task_id prefix is
 	// a sentinel the dashboard reads to identify the project's coord
@@ -172,8 +174,20 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 	// Resolve engine BEFORE the rest of the validation so the agent
 	// record's engine field is settled when spawn runs. Precedence:
-	// explicit --engine > FLEET_ENGINE env (set by root cmd's
-	// PersistentPreRunE) > enginecfg.DefaultEngine.
+	//   1. opts.engine (programmatic only — tests + Options struct;
+	//      NOT a CLI flag, see newDispatchCmd for why)
+	//   2. FLEET_ENGINE env (root's PersistentPreRunE always sets this
+	//      after running resolveEngineFlags, which conflict-checks the
+	//      --engine / -codex / -claude root flags)
+	//   3. enginecfg.DefaultEngine
+	//
+	// Once resolved we also stamp FLEET_ENGINE so the spawned tmux
+	// session (and any subprocess spawn calls out to, e.g. the workers
+	// CLI shell-out) sees a consistent env value matching the agent
+	// record's Engine field. Without this re-stamp, a future code path
+	// that sets opts.engine directly (the TUI's startCoordSpawn does
+	// this through --engine on the inherited root flag, but tests and
+	// programmatic callers can bypass it) would leave the env stale.
 	engineName := opts.engine
 	if engineName == "" {
 		engineName = os.Getenv(FleetEngineEnv)
@@ -185,6 +199,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		return fmt.Errorf(
 			"--engine %q is unknown (known: claude-code, codex)",
 			engineName)
+	}
+	if err := os.Setenv(FleetEngineEnv, engineName); err != nil {
+		return fmt.Errorf("set %s=%s: %w", FleetEngineEnv, engineName, err)
 	}
 	// When the operator did NOT pass --command, swap the cobra default
 	// (built for claude-code) for the engine-appropriate wrapper. This

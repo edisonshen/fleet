@@ -2,21 +2,42 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/enginecfg"
 )
 
-// TestDispatch_EngineFlag_Exposed pins the --engine flag on the
-// dispatch subcommand so a future refactor doesn't drop it. The TUI
-// (internal/tui/keys.go:startCoordSpawn) and the operator both rely
-// on this flag.
+// TestDispatch_EngineFlag_Exposed pins that `fleet dispatch --engine ...`
+// is a valid invocation — the flag must be visible on the assembled
+// dispatch subcommand WHEN reached through the root cmd (cobra walks
+// parent persistent flags). The TUI (internal/tui/keys.go:startCoordSpawn)
+// and the operator both rely on this surface.
+//
+// Why root assembly (not bare newDispatchCmd): the --engine flag is
+// registered ONLY on the root command's PersistentFlags(). Registering
+// it locally on dispatch would shadow the root version (codex review
+// iter-1 P1) and silently bypass root's resolveEngineFlags conflict
+// detection (--engine vs -codex/-claude). The pin therefore goes
+// through the assembled root.
 func TestDispatch_EngineFlag_Exposed(t *testing.T) {
-	cmd := newDispatchCmd()
-	flag := cmd.Flag("engine")
+	root := newRootCmd()
+	var dispatchCmd *cobra.Command
+	for _, c := range root.Commands() {
+		if c.Name() == "dispatch" {
+			dispatchCmd = c
+			break
+		}
+	}
+	if dispatchCmd == nil {
+		t.Fatal("root must expose the dispatch subcommand")
+	}
+	flag := dispatchCmd.Flag("engine")
 	if flag == nil {
-		t.Fatal("dispatch must expose --engine for the multi-engine wiring")
+		t.Fatal("dispatch must inherit --engine from root for the multi-engine wiring")
 	}
 	if flag.DefValue != "" {
 		t.Errorf("--engine default = %q; want empty (inherits FLEET_ENGINE)",
@@ -71,6 +92,96 @@ func TestDispatch_EngineFromEnv(t *testing.T) {
 	// runDispatch will fail at tmux.Available() or spawn.Spawn in CI
 	// without a real tmux server — that's fine; we only assert the
 	// engine-validation branch didn't fire.
+}
+
+// TestDispatch_NoLocalEngineFlagShadow regresses codex review iter-1
+// [P1]: a `--engine` flag registered locally on the dispatch
+// subcommand shadowed root's persistent flag and silently bypassed
+// resolveEngineFlags' conflict detection (--engine vs -codex/-claude).
+// After the fix the dispatch subcommand exposes --engine ONLY via
+// inheritance from root, so a value passed on dispatch is funneled
+// through root's PersistentPreRunE → FLEET_ENGINE → runDispatch.
+//
+// We exercise the assembled root cmd with a real argv and assert:
+//  1. Conflicting --engine codex --claude returns a "conflicting flags"
+//     error from resolveEngineFlags (would silently no-op before).
+//  2. The local dispatch flag set contains NO `engine` flag entry —
+//     only the inherited persistent one. Cobra's PersistentFlags() on
+//     the assembled subcommand surfaces the inherited flag, while
+//     LocalFlags() does NOT.
+func TestDispatch_NoLocalEngineFlagShadow(t *testing.T) {
+	root := newRootCmd()
+	var dispatchCmd *cobra.Command
+	for _, c := range root.Commands() {
+		if c.Name() == "dispatch" {
+			dispatchCmd = c
+			break
+		}
+	}
+	if dispatchCmd == nil {
+		t.Fatal("root must expose dispatch")
+	}
+	// Local flag set must NOT have --engine; only inheritance from root.
+	local := dispatchCmd.LocalFlags().Lookup("engine")
+	if local != nil {
+		t.Errorf(
+			"dispatch must NOT register a local --engine flag (would shadow root); got DefValue=%q",
+			local.DefValue,
+		)
+	}
+	inherited := dispatchCmd.InheritedFlags().Lookup("engine")
+	if inherited == nil {
+		t.Error("dispatch must inherit --engine from root's PersistentFlags")
+	}
+}
+
+// TestRootEngineConflict_PassesThroughDispatch regresses codex review
+// iter-1 [P1]: `fleet --engine codex --claude dispatch t` must error
+// at root's PersistentPreRunE (resolveEngineFlags conflict). Before
+// the fix the local --engine flag captured codex and the root saw
+// "" for rootEngine, so resolveEngineFlags("", false, true, "")
+// returned claude-code without complaint — the disagreement landed
+// silently in env vs record.
+func TestRootEngineConflict_PassesThroughDispatch(t *testing.T) {
+	root := newRootCmd()
+	root.SetArgs([]string{"--engine", "codex", "--claude", "dispatch", "t1", "--project", "p1"})
+	// Suppress output to keep test logs clean; we only care about err.
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+	err := root.Execute()
+	if err == nil {
+		t.Fatal("expected conflict error for --engine codex --claude")
+	}
+	if !strings.Contains(err.Error(), "conflicting flags") {
+		t.Errorf("err = %v, want 'conflicting flags' phrase", err)
+	}
+}
+
+// TestDispatch_FleetEngineEnvStamped regresses the second half of
+// codex review iter-1 [P1]: runDispatch must re-stamp FLEET_ENGINE
+// with the resolved engine BEFORE spawn so the spawned tmux process
+// inherits a consistent value matching the agent record. Previous
+// code wrote opts.engine into the record but left FLEET_ENGINE stale,
+// so the spawned coord could read the wrong engine from env.
+func TestDispatch_FleetEngineEnvStamped(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	// Start with env unset; opts.engine carries the intent.
+	t.Setenv("FLEET_ENGINE", "")
+	opts := &dispatchOpts{
+		taskID:  "t1",
+		project: "p1",
+		engine:  "codex",
+	}
+	var out bytes.Buffer
+	// runDispatch will fail later (no tmux in CI), but only AFTER it
+	// re-stamps FLEET_ENGINE. We re-read the env after the call.
+	_ = runDispatch(opts, &out)
+	if got := os.Getenv("FLEET_ENGINE"); got != "codex" {
+		t.Errorf("FLEET_ENGINE = %q after dispatch; want %q (re-stamp regression)",
+			got, "codex")
+	}
 }
 
 func TestResolveEngineFlags_DefaultWhenAllBlank(t *testing.T) {
@@ -183,6 +294,26 @@ func TestRewriteEngineShorthand(t *testing.T) {
 		{[]string{"--codex-other"}, []string{"--codex-other"}},
 		// empty argv.
 		{[]string{}, []string{}},
+		// codex review iter-1 P2: `-codex` is data for --command, must
+		// pass through unchanged so a custom wrapper sees the same
+		// argument the operator typed. Multiple --command pairs each
+		// guard their own immediate next-token.
+		{
+			in:   []string{"dispatch", "t", "--command", "sh", "--command", "-c", "--command", "-codex"},
+			want: []string{"dispatch", "t", "--command", "sh", "--command", "-c", "--command", "-codex"},
+		},
+		// codex review iter-1 P2: POSIX `--` end-of-options marker
+		// halts the rewrite for everything after it.
+		{
+			in:   []string{"dispatch", "t", "--", "-codex", "-claude"},
+			want: []string{"dispatch", "t", "--", "-codex", "-claude"},
+		},
+		// Fleet-level -codex before `--` still rewrites; child data
+		// after `--` does not.
+		{
+			in:   []string{"-codex", "dispatch", "t", "--", "-claude"},
+			want: []string{"--codex", "dispatch", "t", "--", "-claude"},
+		},
 	}
 	for _, tc := range tests {
 		got := rewriteEngineShorthand(tc.in)

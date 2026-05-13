@@ -173,14 +173,47 @@ func resolveEngineFlags(
 // shorthand flags (`-c -o -d -e -x`), which the operator definitely
 // didn't mean. The pre-processing happens at main() so every code
 // path (`fleet -codex`, `fleet -codex dispatch ...`, `fleet -codex
-// tasks list`) parses the long-form flag identically. The argv rewrite
-// is bounded: only the exact tokens `-codex` and `-claude` are
-// transformed, anywhere on the command line. Other tokens (including
-// `--codex` / `--claude` already in long form, and unrelated flags
-// like `-c`) pass through unchanged.
+// tasks list`) parses the long-form flag identically.
+//
+// Scope of the rewrite (codex review iter-1 P2 — don't mangle child
+// argv):
+//   - Only the exact tokens `-codex` and `-claude` are transformed.
+//   - Stops rewriting after the POSIX end-of-options marker `--`. Anything
+//     past `--` is positional data for the subcommand, not Fleet flags.
+//   - Stops rewriting the IMMEDIATE next token after `--command`. The
+//     `--command` flag's documented use is "pass arbitrary argv to the
+//     spawned engine wrapper" (e.g. `--command sh --command -c
+//     --command -codex` where `-codex` is a child-script argument, not
+//     a Fleet engine selector). Without this gate, an operator's
+//     custom wrapper that happens to use a `-codex` argument gets
+//     silently mangled into `--codex`. The gate is per-token, not
+//     "everything after the first --command", because StringSliceVar
+//     accepts multiple `--command <value>` pairs and each value is a
+//     single child-argv element.
+//   - Other tokens (including `--codex` / `--claude` already in long
+//     form, unrelated short flags like `-c`, `--codex-other`) pass
+//     through unchanged.
 func rewriteEngineShorthand(argv []string) []string {
 	out := make([]string, len(argv))
+	endOfOpts := false
+	skipNext := false
 	for i, a := range argv {
+		if endOfOpts || skipNext {
+			out[i] = a
+			skipNext = false
+			continue
+		}
+		if a == "--" {
+			out[i] = a
+			endOfOpts = true
+			continue
+		}
+		if a == "--command" {
+			// The next token is user data — don't rewrite it.
+			out[i] = a
+			skipNext = true
+			continue
+		}
 		switch a {
 		case "-codex":
 			out[i] = "--codex"
