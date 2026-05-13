@@ -438,40 +438,28 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	// Live-coord veto (codex review iter-4 P1, refined iter-8 P2):
-	// under --coord-spawn, refuse to spawn at ALL when BOTH:
-	//   (a) coord-state.json mtime is within coordFreshnessWindow, AND
-	//   (b) a live agent record exists for this project+task_id.
+	// Live-coord veto removed (codex review iter-11): we cannot
+	// reliably detect a live coord on a different tmux socket from
+	// local probes — tmux.HasSession only sees the current socket;
+	// agent.Record.PID is the short-lived dispatch CLI's pid and is
+	// subject to OS PID reuse; coord-state.json mtime alone (codex
+	// iter-4 had it; iter-8 paired with record existence; iter-10
+	// dropped record-PID) gave false positives after clean shutdowns
+	// AND false negatives during cross-socket scenarios. Every
+	// combination we tried left at least one real failure mode open.
 	//
-	// Both signals are required because:
-	//   - mtime alone (codex iter-4): false-positives after a clean
-	//     coord shutdown — the file persists with fresh mtime, but
-	//     no record + no tmux means there's nothing live to race.
-	//   - record alone: false-positives on dead-pid+dead-tmux records
-	//     that haven't been archived yet (the whole point of the
-	//     recovery flow).
+	// The coord skill's own NB-flock on coordinator.lock IS the
+	// authoritative single-supervisor guarantee. A duplicate spawn
+	// (either from a cross-socket race or a recently-archived restart)
+	// is loser-exits-cleanly via that flock — brief tmux orphan,
+	// but no correctness violation. We trade the brief UX issue for
+	// reliability on the actually-load-bearing recovery flows.
 	//
-	// The combined check fires only when there's both "something
-	// recently ticked" AND "a record on disk claiming to BE that
-	// something." After a clean shutdown that archived the record,
-	// (b) fails and the dispatch proceeds normally. The TUI's [a]
-	// flow on a dead-tmux coord still vetoes because (a)+(b) both
-	// hold during a live coord-on-different-tmux-server scenario:
-	// the record is live (TUI hasn't archived it) and coord-state.json
-	// is being ticked by the unseen coord.
-	//
-	// Only fires on --coord-spawn (the auto-coord-bootstrap path). A
-	// manual `fleet dispatch <task>` against a worker task is
-	// unaffected.
-	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if liveCoordRecordExists(opts.taskID, opts.project, tmuxHasSession) {
-			return fmt.Errorf(
-				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a live record exists. "+
-					"likely cause: a coord is still alive on a different tmux server. "+
-					"if you intentionally stopped the coord, run `fleet rm <coord-id>` (or press [x] on the dashboard) "+
-					"to clear the record before retrying", opts.project)
-		}
-	}
+	// findRecoveryCandidate's pid/tmux-dead gates remain as the
+	// gate against synth-recovering OVER a live coord (which would
+	// create a more dangerous handoff-chain corruption than a simple
+	// duplicate spawn). Even those are best-effort given the same
+	// detection limits.
 
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
 	// hits a project whose previous coord left a stale record on disk

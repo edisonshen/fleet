@@ -1087,13 +1087,25 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 					m.coordSpawnInFlight = map[string]bool{}
 				}
 				m.coordSpawnInFlight[p.Name] = true
-				cwd := coordCwdForProject(m.records, p.Name)
+				// Pass the DEAD COORD's own cwd, not the project's
+				// first-record cwd (codex review iter-11 P2). The
+				// dispatch CLI's recovery path falls back to the dead
+				// coord's Cwd when --cwd is empty (codex iter-9 P2),
+				// but if we pass any --cwd here it wins. Sending
+				// rec.Cwd specifically keeps the resumed coord in the
+				// SAME checkout the dead coord ran in, even when
+				// other workers/reviewers for the same project live
+				// in different worktrees.
+				//
+				// Empty rec.Cwd legitimately falls through to
+				// startCoordSpawn → omits --cwd → dispatch CLI's
+				// OldRecord.Cwd fallback fires.
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
 						"resuming coord %s for project %s from last checkpoint (dead tmux session — synth handoff)",
 						rec.ID, p.Name),
 				}
-				return m, m.startCoordSpawn(p.Name, cwd), true
+				return m, m.startCoordSpawn(p.Name, rec.Cwd), true
 			}
 			m.pendingAttach = rec.TmuxSession
 			return m, tea.Quit, true

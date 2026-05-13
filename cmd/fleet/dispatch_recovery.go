@@ -133,6 +133,17 @@ func findRecoveryCandidate(
 	// can pass coordStateFresh and tests can pass a stub matching the
 	// production probe shape, even though the body doesn't read it.
 	_ = coordFresh
+	// pidAlive is retained in the signature for backwards-compat with
+	// tests but the body no longer consults it (codex review iter-11
+	// P2). agent.Record.PID is the SHORT-LIVED dispatch CLI's pid set
+	// in spawn.Spawn via os.Getpid; after dispatch exits, that pid is
+	// reused by an unrelated host process within minutes. Using it as
+	// a "live" signal would suppress legitimate recoveries whenever
+	// the host happened to recycle the old dispatch CLI's pid. tmux
+	// session aliveness on the local socket is the only reliable
+	// negative signal we have, and even that misses cross-socket
+	// scenarios (see the dispatch-side comment in runDispatch).
+	_ = pidAlive
 	var best *agent.Record
 	for _, r := range records {
 		if r == nil {
@@ -141,22 +152,11 @@ func findRecoveryCandidate(
 		if r.TaskID != taskID || r.Project != project {
 			continue
 		}
-		// Alive pid → secondary veto. Note: this signal is weaker than
-		// the mtime check above because agent.Record.PID is the
-		// dispatch CLI's PID, which is reaped when `fleet dispatch`
-		// exits and may be reused by an unrelated process (codex iter-3
-		// P2). When the dispatch CLI's old pid is reused by some other
-		// process running on the host, this returns true even though
-		// the coord is gone. mtime above handles that case; this gate
-		// only fires when both signals agree the coord is alive.
-		if r.PID > 0 && pidAlive(r.PID) {
-			continue
-		}
-		// Alive tmux + dead pid is the zombie-shell case (issue #65
-		// territory). It's NOT a recovery candidate: a fresh spawn
-		// would race a live shell on the same session name. The
-		// existing fail-loud handling in the dispatch path handles it
-		// via attach failure rather than synth-handoff recovery.
+		// Alive tmux on this socket → NOT a recovery candidate. A
+		// synth-recovery here would race a live shell on the same
+		// session name. Cross-socket coords are invisible to this
+		// probe, but the coord skill's NB-flock catches those
+		// downstream — the loser exits cleanly.
 		if r.TmuxSession != "" && sessionAlive(r.TmuxSession) {
 			continue
 		}
@@ -203,48 +203,6 @@ func coordStateFresh(project string) bool {
 		return false
 	}
 	return time.Since(fi.ModTime()) <= coordFreshnessWindow
-}
-
-// liveCoordRecordExists reports whether ~/.fleet/agents/ contains a
-// record matching the given task_id + project whose tmux session is
-// alive (i.e., NOT a recovery candidate). Used by the dispatch
-// live-coord veto to distinguish "coord-state.json is fresh because a
-// live coord is ticking" from "coord-state.json is fresh because the
-// file persisted past a clean coord shutdown" — AND, per codex review
-// iter-9 P1, from "coord-state.json is fresh because the dead coord
-// just ticked before crashing." The latter case is the load-bearing
-// recovery target; vetoing it would strand recently-crashed coords
-// for the full freshness window.
-//
-// Codex iter-9 P2: agent.Record.PID is the SHORT-LIVED dispatch CLI
-// process's pid (set in spawn.Spawn via os.Getpid), not the coord
-// inside tmux. After dispatch exits, that pid is reused by an
-// unrelated host process — false-positives "alive" for any record
-// whose old dispatch pid was recycled. tmux session aliveness is the
-// only reliable positive signal: a record with a live tmux session
-// genuinely has a process running in it.
-//
-// Returns false on agent.List errors (defensive: prefer false-negative
-// "let dispatch proceed" over false-positive "block forever").
-func liveCoordRecordExists(taskID, project string, sessionAlive sessionAliveProbe) bool {
-	records, err := agent.List()
-	if err != nil {
-		return false
-	}
-	for _, r := range records {
-		if r == nil {
-			continue
-		}
-		if r.TaskID != taskID || r.Project != project {
-			continue
-		}
-		// Only tmux is a reliable positive liveness signal here. PID
-		// would false-positive on PID reuse (codex iter-9 P2).
-		if r.TmuxSession != "" && sessionAlive(r.TmuxSession) {
-			return true
-		}
-	}
-	return false
 }
 
 // pidAlive is the production pidAliveFn. Mirrors workers.IsAlive (the

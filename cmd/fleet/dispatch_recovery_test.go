@@ -51,21 +51,29 @@ func TestFindRecoveryCandidate_DeadPidAndDeadTmuxIsCandidate(t *testing.T) {
 	}
 }
 
-// TestFindRecoveryCandidate_AlivePidIsNotCandidate pins the safety
-// gate: a running coord (pid alive) is NEVER a recovery candidate,
-// even if tmux is unhappy — the operator might just be on a different
-// tmux server. Don't kidnap a live process.
-func TestFindRecoveryCandidate_AlivePidIsNotCandidate(t *testing.T) {
+// TestFindRecoveryCandidate_PidNoLongerVetoes pins codex review iter-11
+// P2: agent.Record.PID is the short-lived dispatch CLI's pid (set in
+// spawn.Spawn via os.Getpid), so after that pid is reused by an
+// unrelated host process pidAlive(r.PID) would return true and
+// suppress recovery — losing the dead coord's resume context. The
+// pidAlive gate is therefore dropped from findRecoveryCandidate's
+// body; tmux-aliveness on the local socket is the only signal.
+// pidAlive remains in the signature for backwards-compat with tests
+// that pre-date this iteration.
+func TestFindRecoveryCandidate_PidNoLongerVetoes(t *testing.T) {
 	records := []*agent.Record{
 		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
 	}
-	pidAlive := func(int) bool { return true }         // still ticking
+	pidAlive := func(int) bool { return true }         // pretend pid alive (e.g. recycled)
 	sessionAlive := func(string) bool { return false } // tmux gone
 
-	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	coordFresh := func(string) bool { return false }
 	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
-	if got != nil {
-		t.Errorf("alive-pid candidate must NOT be returned; got %+v", got)
+	if got == nil {
+		t.Fatalf("PID alive must no longer veto recovery (recycled pid case); got nil candidate")
+	}
+	if got.ID != "aaaaaaaa" {
+		t.Errorf("candidate ID = %q; want aaaaaaaa", got.ID)
 	}
 }
 
@@ -567,129 +575,14 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_FreshCoordStateRefusesSpawn pins codex review
-// iter-4/iter-5/iter-8 P1+P2: when --coord-spawn lands on a project
-// whose coord-state.json was mtime-updated within coordFreshnessWindow
-// AND a live agent record exists, runDispatch must refuse to spawn a
-// duplicate. The TUI's [a]-on-dead-tmux flow lands here when the
-// operator dashboard sits on a different tmux server than the live
-// coord — tmux.HasSession reports false, but the coord is actively
-// ticking and updating coord-state.json. Without this veto, we'd
-// race two supervisors on the same project.
-//
-// iter-8 P2: this MUST also require an alive agent record. After a
-// clean coord shutdown, coord-state.json persists with fresh mtime
-// past the archive — the veto would falsely block legitimate respawns
-// for the full freshness window. See the
-// TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn test
-// below for the negative path.
-func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	// Seed a live coord record alongside the fresh coord-state.json —
-	// the BOTH-signal case from iter-8 P2. We need a REAL live tmux
-	// session because liveCoordRecordExists (codex iter-9 P2) only
-	// trusts tmux as a positive liveness signal; PID alone is
-	// vulnerable to PID reuse.
-	liveSessionName := tmux.SessionName("liverec0")
-	if err := tmux.Spawn(liveSessionName, t.TempDir(), []string{"sleep", "60"}, nil); err != nil {
-		t.Fatalf("spawn live tmux: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(liveSessionName) })
-
-	liveRec := agent.New("liverec0")
-	liveRec.TaskID = "coord-myproj"
-	liveRec.Project = "myproj"
-	liveRec.TmuxSession = liveSessionName
-	if err := liveRec.Write(); err != nil {
-		t.Fatalf("seed live record: %v", err)
-	}
-
-	pdir, err := state.ProjectDir("myproj")
-	if err != nil {
-		t.Fatalf("ProjectDir: %v", err)
-	}
-	if err := os.MkdirAll(pdir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
-	}
-	csPath := filepath.Join(pdir, "coord-state.json")
-	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
-		t.Fatalf("write coord-state: %v", err)
-	}
-
-	opts := &dispatchOpts{
-		taskID:          "coord-myproj",
-		project:         "myproj",
-		projectExplicit: true,
-		coordSpawn:      true,
-		command:         []string{"sleep", "60"},
-		commandExplicit: true,
-	}
-	var out bytes.Buffer
-	err = runDispatch(opts, &out)
-	if err == nil {
-		t.Fatalf("expected runDispatch to refuse spawn for a fresh coord; got nil error\n%s", out.String())
-	}
-	if !strings.Contains(err.Error(), "mtime is recent") {
-		t.Errorf("error must mention recent mtime; got: %v", err)
-	}
-	// No successor record should be on disk.
-	live, _ := agent.List()
-	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "liverec0" {
-			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			t.Errorf("no successor must be spawned under fresh coord-state.json; got %s on tmux %s", r.ID, r.TmuxSession)
-		}
-	}
-}
-
-// TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn pins codex
-// review iter-8 P2: when coord-state.json is fresh but NO live agent
-// record exists for the project+task (the legitimate post-clean-
-// shutdown / post-archive scenario), runDispatch must NOT veto. The
-// stale file alone is misleading after an archive; without this
-// allowance, [a] / `fleet dispatch --coord-spawn` would fail for
-// the full freshness window after a clean coord shutdown.
-func TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	// Fresh coord-state.json (post-shutdown leftover) but NO live
-	// agent record.
-	pdir, err := state.ProjectDir("myproj")
-	if err != nil {
-		t.Fatalf("ProjectDir: %v", err)
-	}
-	if err := os.MkdirAll(pdir, 0o755); err != nil {
-		t.Fatalf("mkdir project dir: %v", err)
-	}
-	csPath := filepath.Join(pdir, "coord-state.json")
-	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
-		t.Fatalf("write coord-state: %v", err)
-	}
-
-	opts := &dispatchOpts{
-		taskID:          "coord-myproj",
-		project:         "myproj",
-		projectExplicit: true,
-		coordSpawn:      true,
-		command:         []string{"sleep", "60"},
-		commandExplicit: true,
-	}
-	var out bytes.Buffer
-	if err := runDispatch(opts, &out); err != nil {
-		t.Fatalf("runDispatch must NOT veto when coord-state.json is fresh but no live record exists: %v\n%s",
-			err, out.String())
-	}
-	live, _ := agent.List()
-	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
-			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			break
-		}
-	}
-}
+// Note (codex review iter-11): the dispatch-side fresh-mtime veto was
+// removed because no local probe combination reliably detects a live
+// coord on a different tmux socket without also blocking legitimate
+// recoveries. The coord skill's NB-flock on coordinator.lock is the
+// authoritative single-supervisor guarantee. Tests that previously
+// pinned the veto (TestRunDispatch_FreshCoordStateRefusesSpawn,
+// TestRunDispatch_FreshCoordState_NoLiveRecord_AllowsSpawn) were
+// deleted alongside the dispatch-side check.
 
 // TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap pins codex
 // review iter-4 P2: --no-auto-resume is the documented escape hatch

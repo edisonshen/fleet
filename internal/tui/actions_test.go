@@ -1413,6 +1413,78 @@ func TestKeyA_ProjectRow_DeadCoordSession_ResumesViaDispatch(t *testing.T) {
 	}
 }
 
+// TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd pins codex
+// review iter-11 P2: the resume-dispatch's --cwd arg comes from the
+// DEAD COORD's recorded Cwd, not from coordCwdForProject (which
+// returns the first same-project record's Cwd — could be a worker
+// in a different worktree). The dead coord's Cwd is the
+// authoritative starting checkout for the recovery.
+func TestKeyA_ProjectRow_DeadCoordSession_PassesDeadCoordCwd(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	stub := &stubFleetCmd{
+		stubbed: func(args []string) tea.Msg {
+			out := "agent abcd1234 spawned\n  task: coord-demo\n  project: demo\n  tmux: fleet-abcd1234\n"
+			return coordSpawnDoneMsgFromArgs(args, out, nil)
+		},
+	}
+	stub.install(t)
+
+	// Dead coord with a specific Cwd.
+	const deadCoordCwd = "/Users/op/projects/demo-main"
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.Cwd = deadCoordCwd
+
+	// Decoy: another agent for the same project in a DIFFERENT
+	// worktree. coordCwdForProject would return this one's Cwd
+	// (first match) — but the resume MUST use the dead coord's Cwd.
+	decoy := sampleAgent("decoy001")
+	decoy.Project = "demo"
+	decoy.TaskID = "worker-some-other"
+	decoy.Cwd = "/Users/op/projects/demo-worker-worktree"
+
+	m := New("test")
+	m.records = []*agent.Record{decoy, coord} // decoy first → coordCwdForProject would return its Cwd
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "demo", CoordID: "coord001"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd == nil {
+		t.Fatalf("expected resume-dispatch cmd")
+	}
+	cmd() // fire
+	_ = mm
+
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected one dispatch call; got %d", len(stub.calls))
+	}
+	args := stub.calls[0]
+	// Find --cwd in args.
+	var cwdArg string
+	for i, a := range args {
+		if a == "--cwd" && i+1 < len(args) {
+			cwdArg = args[i+1]
+			break
+		}
+	}
+	if cwdArg != deadCoordCwd {
+		t.Errorf("--cwd should be dead coord's Cwd (%q), not the decoy's; got %q (args=%v)",
+			deadCoordCwd, cwdArg, args)
+	}
+}
+
 // TestKeyA_AgentRow_DeadCoordSession_SuggestsResume pins behavior 3:
 // when [a] lands on a dead-session AGENT row that's tagged as a coord
 // (TaskID == "coord-<project>"), the flash suggests [r]esume by going
