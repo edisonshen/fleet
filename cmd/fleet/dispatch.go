@@ -604,21 +604,34 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		return err
 	}
 
-	// Recovery-path bookkeeping: archive the dead record so the next
-	// dispatch's findRecoveryCandidate doesn't keep returning the same
-	// stale entry. spawn.Spawn already wrote the successor record;
-	// the dead record's role is purely "chain-link source for the
-	// synth doc's previous_handoff field" — that's already captured in
-	// the successor's record fields. Archive errors are logged but
-	// non-fatal: an unarchived dead record is benign (re-detected next
-	// dispatch and re-handled idempotently).
-	if oldRecord != nil {
-		if aerr := oldRecord.Archive(); aerr != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"warning: archive of dead coord record %s failed (%v) — next dispatch will re-detect\n",
-				oldRecord.ID, aerr)
-		}
-	}
+	// Recovery-path bookkeeping (codex review iter-11 P1): we
+	// deliberately DO NOT archive the dead record here. Local tmux
+	// probes cannot rule out a live coord on a different tmux
+	// socket — if findRecoveryCandidate misclassified a still-live
+	// coord as dead, archiving its record pre-emptively would
+	// disappear the live coord from `fleet status` and the TUI even
+	// though the duplicate-recovery's coord skill will lose the
+	// coordinator.lock race and exit. Leaving the dead record on
+	// disk is the safe default:
+	//
+	//   - if the recovery was correct (dead coord truly gone): the
+	//     successor is now live; the dead record sits unarchived on
+	//     the dashboard until the operator hits [x] (matches the v0.1
+	//     cleanup UX for crashed agents).
+	//   - if the recovery misclassified (live coord on different
+	//     socket): the duplicate successor's coord skill loses the
+	//     NB-flock race and exits cleanly; both records remain;
+	//     dashboard truthfully shows both; operator decides what's
+	//     stale.
+	//
+	// Idempotency: a subsequent dispatch sees the same dead record
+	// and re-runs recovery. spawn.Spawn's OldRecord-branch fields
+	// (handoff_number++, last_handoff_path=NewDocPath) are derived
+	// per-call from oldRecord state, so the chain stays coherent.
+	// findRecoveryCandidate's newest-wins tiebreaker (codex iter-7
+	// P2) picks the most-recent dead record if multiple recoveries
+	// accumulate, so successive recoveries don't fork lineages.
+	_ = oldRecord // archive intentionally skipped; see comment block.
 
 	_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", rec.ID)
 	_, _ = fmt.Fprintf(stdout, "  task:    %s\n", rec.TaskID)

@@ -422,22 +422,32 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 		t.Errorf("dispatch stdout must mention synth handoff path; got:\n%s", stdout)
 	}
 
-	// The dead record must be archived (no longer in agent.List).
+	// The dead record is intentionally LEFT on disk (codex review
+	// iter-11 P1): archiving it pre-emptively would disappear a
+	// still-live coord on a different tmux socket if
+	// findRecoveryCandidate misclassified the cross-socket case.
+	// The dashboard's [x] flow cleans up the dead record manually.
 	live, lerr := agent.List()
 	if lerr != nil {
 		t.Fatalf("agent.List: %v", lerr)
 	}
+	var deadFound bool
 	for _, r := range live {
 		if r.ID == "deadc0de" {
-			t.Errorf("dead record %s must be archived; still in live list", r.ID)
+			deadFound = true
+			break
 		}
+	}
+	if !deadFound {
+		t.Errorf("dead record must stay on disk after recovery (iter-11 P1 archive deferral); got it missing from agent.List")
 	}
 
 	// The successor must exist and carry a LastHandoffPath that points
-	// at a recovery-synth doc.
+	// at a recovery-synth doc. Skip the dead record itself (codex
+	// iter-11 P1 leaves it on disk).
 	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "deadc0de" {
 			successor = r
 			break
 		}
@@ -556,9 +566,10 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 		t.Fatalf("runDispatch: %v\n%s", err, out.String())
 	}
 	// Cleanup the successor's tmux session — runDispatch spawned a real one.
+	// Skip the dead record (iter-11 P1: stays on disk).
 	live, _ := agent.List()
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0ded00d" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
 		}
@@ -647,7 +658,7 @@ func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
 	}
 	live, _ := agent.List()
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "deadbabe" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
 		}
@@ -763,7 +774,7 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 	live, _ := agent.List()
 	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dexc0d" {
 			successor = r
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
@@ -898,7 +909,7 @@ func TestRunDispatch_DeadCoord_FreshMtimeStillRecovers(t *testing.T) {
 	}
 	live, _ := agent.List()
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "recentdc" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
 		}
@@ -961,7 +972,7 @@ func TestRunDispatch_DeadCoord_InheritsCwdFromOldRecord(t *testing.T) {
 	live, _ := agent.List()
 	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "cwd1cwd1" {
 			successor = r
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
@@ -1060,7 +1071,7 @@ func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
 	live, _ := agent.List()
 	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dec0de" {
 			successor = r
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
@@ -1134,7 +1145,7 @@ func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
 	live, _ := agent.List()
 	var successor *agent.Record
 	for _, r := range live {
-		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" && r.ID != "c0dexsen" {
 			successor = r
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
 			break
