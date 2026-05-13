@@ -2046,10 +2046,16 @@ def _dispatch_ready(
         # then `git worktree add`. On any failure we record the error
         # and skip this task — leaving stale state would corrupt the
         # next tick's view of in-flight tasks.
+        #
+        # Non-git projects skip worktree creation entirely — there is
+        # no git to branch from. The dispatch falls through to single-
+        # worker behavior (worker_cwd=cwd, no worktree) regardless of
+        # cap. Operators who run cap>1 on a non-git project would
+        # otherwise hit `git worktree add` failing on every tick.
         worker_cwd = cwd
         worker_branch = f"worker/{t.slug}"
         worker_worktree = ""
-        if cap > 1:
+        if cap > 1 and is_git:
             wt_path = worktree_mod.compute_worktree_path(
                 project, t.slug, fleet_bin=fleet_bin,
             )

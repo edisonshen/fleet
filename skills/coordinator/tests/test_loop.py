@@ -2235,3 +2235,30 @@ def test_loop_dispatches_non_git_finisher_without_push_or_pr(
     # phase=done is written without --pr-url.
     assert "--phase done --exit 0" in body
     assert "--phase done --pr-url" not in body
+
+
+def test_loop_non_git_cap_above_one_skips_worktree_create(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A non-git project dispatched with cap>1 must skip worktree
+    creation entirely (no `git worktree add` — there's no git). The
+    dispatch falls through to single-worker behavior: worker_cwd is
+    the project's cwd, no worktree path is recorded.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [_make_task("ng-cap2-cccc", status="ready")])
+    dispatch_subprocess.append("cccc0001")
+
+    # Patch worktree.create_worktree to FAIL loudly — the guard means
+    # it must never be called for a non-git project.
+    def _fail_create(*a, **kw):
+        raise AssertionError("worktree.create_worktree must not run for non-git")
+
+    with patch.object(loop.worktree_mod, "create_worktree", side_effect=_fail_create):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            cap=2, fleet_home=str(fleet_home),
+        )
+
+    assert result.dispatched == 1
