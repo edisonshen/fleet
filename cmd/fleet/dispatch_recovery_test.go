@@ -106,16 +106,22 @@ func TestFindRecoveryCandidate_NameMustMatch(t *testing.T) {
 	}
 }
 
-// TestFindRecoveryCandidate_MultipleDeadPicksFirst pins behavior on
-// the unlikely-but-possible case where multiple stale records share
-// the same task_id (e.g., a recovery itself crashed before archiving
-// its predecessor). We pick the first match — the caller is expected
-// to archive after spawning so the next dispatch finds at most one.
-func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
-	records := []*agent.Record{
-		fakeAgentRecord("oldest01", "coord-myproj", "myproj", 11111, "fleet-oldest01"),
-		fakeAgentRecord("newest02", "coord-myproj", "myproj", 22222, "fleet-newest02"),
-	}
+// TestFindRecoveryCandidate_MultipleDeadPicksNewest pins codex review
+// iter-7 P2: when multiple stale records share the same task_id (e.g.,
+// a prior recovery itself crashed before archiving its predecessor),
+// findRecoveryCandidate picks the most-recently-spawned record. An
+// arbitrary first-match would inherit cwd / engine / handoff-chain
+// from an older lineage and restart in the wrong checkout. The caller
+// archives the picked record post-spawn so the next dispatch finds
+// at most one — but until that archive lands, we pick the newest.
+func TestFindRecoveryCandidate_MultipleDeadPicksNewest(t *testing.T) {
+	oldest := fakeAgentRecord("oldest01", "coord-myproj", "myproj", 11111, "fleet-oldest01")
+	oldest.SpawnedAt = time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	newest := fakeAgentRecord("newest02", "coord-myproj", "myproj", 22222, "fleet-newest02")
+	newest.SpawnedAt = time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	// Deliberately place "oldest" first in slice order so the test
+	// pins SpawnedAt-based picking, not slice-position.
+	records := []*agent.Record{oldest, newest}
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
@@ -124,10 +130,8 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 	if got == nil {
 		t.Fatalf("expected one candidate; got nil")
 	}
-	// Either is acceptable behavior; we just lock determinism by
-	// requiring the first match (slice order is the agent.List order).
-	if got.ID != "oldest01" {
-		t.Errorf("candidate ID = %q; want oldest01 (first match wins)", got.ID)
+	if got.ID != "newest02" {
+		t.Errorf("candidate ID = %q; want newest02 (highest SpawnedAt wins)", got.ID)
 	}
 }
 
@@ -807,5 +811,149 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 	if successor.Engine != "claude-code" {
 		t.Errorf("engine clamp: successor.Engine = %q; want claude-code (explicit --engine must beat inherited codex)",
 			successor.Engine)
+	}
+}
+
+// TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit pins codex
+// review iter-7 P1: when the operator did NOT pass --engine on the
+// recovery dispatch (engineExplicit=false), the inherited
+// OldRecord.Engine survives intact. Without this gate, every plain
+// `fleet dispatch <task> --coord-spawn` would silently rewrite a
+// recovered codex coord back to claude-code (the resolved-default
+// engine name when no flag is set).
+func TestRunDispatch_DeadCoord_EngineClampGatedOnExplicit(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	deadRec := agent.New("c0dexc0de")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0dexc0de"
+	deadRec.Engine = "codex" // dead coord ran codex
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	// No engine flag set — simulates plain `fleet dispatch <task>
+	// --coord-spawn` (engineName resolves to default via env/codebase).
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "60"},
+		commandExplicit: true,
+		// engine:          "" — NOT explicit
+		// engineExplicit: false (default)
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	if successor.Engine != "codex" {
+		t.Errorf("engine clamp must be gated on engineExplicit: got Engine=%q; want codex (inherited from dead coord, no --engine override)",
+			successor.Engine)
+	}
+}
+
+// TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord pins codex
+// review iter-7 P2: when the operator did NOT pass --command on the
+// recovery dispatch, the successor inherits the dead coord's recorded
+// Command so custom wrappers / non-default argvs survive recovery.
+// Without this, a coord launched with `--command custom-wrapper` would
+// restart under the default wrapper on recovery — wrong binary even
+// though task identity was preserved.
+func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	deadRec := agent.New("c0dec0de")
+	deadRec.TaskID = "coord-myproj"
+	deadRec.Project = "myproj"
+	deadRec.PID = 99999
+	deadRec.TmuxSession = "fleet-c0dec0de"
+	deadRec.Engine = "claude-code"
+	// Custom command — the operator dispatched the dead coord with
+	// `--command /usr/local/bin/custom-wrapper`. Recovery must inherit
+	// this rather than fall back to the engine-default wrapper.
+	deadRec.Command = []string{"sleep", "120"} // sentinel non-default
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("seed dead record: %v", err)
+	}
+	root := os.Getenv("FLEET_HOME")
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
+	}
+
+	// No --command on the recovery dispatch — simulates plain
+	// `fleet dispatch <task> --coord-spawn`. commandExplicit=false
+	// triggers the inheritance branch.
+	opts := &dispatchOpts{
+		taskID:          "coord-myproj",
+		project:         "myproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		// command intentionally empty; commandExplicit=false
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, _ := agent.List()
+	var successor *agent.Record
+	for _, r := range live {
+		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
+			successor = r
+			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
+			break
+		}
+	}
+	if successor == nil {
+		t.Fatalf("expected successor record; got none")
+	}
+	// The successor's persisted Command must be the dead coord's
+	// sentinel value, NOT the engine-default wrapper.
+	if len(successor.Command) != 2 || successor.Command[0] != "sleep" || successor.Command[1] != "120" {
+		t.Errorf("command inheritance: successor.Command = %v; want [sleep 120] (inherited from dead coord)",
+			successor.Command)
 	}
 }

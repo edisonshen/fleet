@@ -117,21 +117,17 @@ func findRecoveryCandidate(
 	sessionAlive sessionAliveProbe,
 	coordFresh coordFreshProbe,
 ) *agent.Record {
+	// Fresh-coord veto fires once (it's a per-project predicate, not
+	// per-record), saving N-1 calls when the records slice is long.
+	if coordFresh(project) {
+		return nil
+	}
+	var best *agent.Record
 	for _, r := range records {
 		if r == nil {
 			continue
 		}
 		if r.TaskID != taskID || r.Project != project {
-			continue
-		}
-		// Fresh coord-state.json → coord ticked recently → live.
-		// Even if pid + tmux both look dead (operator on a different
-		// tmux server, dispatch CLI pid long since reaped + possibly
-		// reused by an unrelated process), a recent mtime means
-		// SOMETHING is supervising. Don't synth-recover over a live
-		// coord — that would race two coords on the same project
-		// (codex review iter-3 P1).
-		if coordFresh(project) {
 			continue
 		}
 		// Alive pid → secondary veto. Note: this signal is weaker than
@@ -153,9 +149,19 @@ func findRecoveryCandidate(
 		if r.TmuxSession != "" && sessionAlive(r.TmuxSession) {
 			continue
 		}
-		return r
+		// Pick the most-recently-spawned dead record (codex review
+		// iter-7 P2). agent.List returns filesystem-iteration order
+		// which is NOT timestamp-sorted; with multiple stale records
+		// (e.g., a prior recovery itself crashed before archiving its
+		// predecessor), an arbitrary first-match would inherit cwd /
+		// engine / handoff-chain from an older lineage and restart in
+		// the wrong checkout. SpawnedAt is the canonical "this agent
+		// was minted" timestamp on agent.Record.
+		if best == nil || r.SpawnedAt.After(best.SpawnedAt) {
+			best = r
+		}
 	}
-	return nil
+	return best
 }
 
 // coordStateFresh reports whether

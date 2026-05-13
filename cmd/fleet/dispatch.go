@@ -45,6 +45,15 @@ type dispatchOpts struct {
 	// (enginecfg.DefaultEngine). See resolveEngineFlags at the root cmd
 	// for the precedence model.
 	engine string
+	// engineExplicit reports whether the operator explicitly chose the
+	// engine on this dispatch (via --engine / -codex / -claude on root,
+	// OR programmatically via opts.engine in tests). False means the
+	// engine name was inherited from FLEET_ENGINE env or the codebase
+	// default. The dead-coord recovery path uses this gate to decide
+	// whether to clamp OldRecord.Engine; without the gate, default-
+	// resolved values would silently rewrite a recovered non-default
+	// engine back to claude-code (codex review iter-7 P1).
+	engineExplicit bool
 	// prompt is the optional first-turn prompt to type into the
 	// freshly-spawned tmux session AFTER the pane stabilizes. Empty
 	// (default) → no prompt; the operator types one manually after
@@ -105,6 +114,18 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 			opts.taskID = args[0]
 			opts.projectExplicit = cmd.Flags().Changed("project")
 			opts.commandExplicit = cmd.Flags().Changed("command")
+			// engineExplicit tracks whether the operator (or a TUI
+			// shell-out) chose the engine via a root flag. Codex review
+			// iter-7 P1: distinguishing operator-chosen from
+			// default-resolved is necessary so dead-coord recovery
+			// only clamps the inherited Engine when the new dispatch
+			// actually requested a different engine. Without this gate,
+			// every plain `fleet dispatch --coord-spawn` would silently
+			// rewrite a recovered codex coord back to claude-code.
+			root := cmd.Root()
+			opts.engineExplicit = root.PersistentFlags().Changed("engine") ||
+				root.PersistentFlags().Changed("codex") ||
+				root.PersistentFlags().Changed("claude")
 			return runDispatch(opts, cmd.OutOrStdout())
 		},
 	}
@@ -197,6 +218,12 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// this through --engine on the inherited root flag, but tests and
 	// programmatic callers can bypass it) would leave the env stale.
 	engineName := opts.engine
+	// Programmatic opts.engine counts as an explicit choice (tests +
+	// Options struct callers). engineExplicit may also already be true
+	// if the CLI RunE detected a root --engine / -codex / -claude flag.
+	if opts.engine != "" {
+		opts.engineExplicit = true
+	}
 	if engineName == "" {
 		engineName = os.Getenv(FleetEngineEnv)
 	}
@@ -455,17 +482,61 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			} else {
 				oldRecord = dead
 				newDocPath = docPath
-				// Engine override clamp (codex review iter-4 P2): when the
-				// caller passed an explicit --engine (e.g., TUI auto-spawn
-				// pinning claude-code), don't let spawn.Spawn's OldRecord
-				// branch silently inherit the dead coord's Engine. The
-				// TUI's gating comment claims --engine claude-code always
-				// wins; without this, OldRecord.Engine="codex" would beat
-				// it and the recovered coord would boot codex (which the
-				// coord skill doesn't support yet, per the TUI's safety
-				// guard).
-				if engineName != "" && oldRecord.Engine != engineName {
+				// Engine override clamp (codex review iter-4 P2,
+				// refined iter-7 P1): only clamp when the caller
+				// EXPLICITLY chose the engine on this dispatch (via
+				// root --engine / -codex / -claude / programmatic
+				// opts.engine). Without this gate, a plain `fleet
+				// dispatch <task> --coord-spawn` against a dead codex
+				// coord would silently inherit claude-code from the
+				// FLEET_ENGINE default and rewrite the recovered
+				// lineage's engine — breaking dead-coord recovery for
+				// non-default engines. The TUI's auto-spawn path
+				// always passes --engine claude-code on the shell-out,
+				// so engineExplicit is true there and the clamp still
+				// fires as intended.
+				if opts.engineExplicit && oldRecord.Engine != engineName {
 					oldRecord.Engine = engineName
+				}
+				// Command inheritance (codex review iter-7 P2): when
+				// the operator did NOT pass --command, inherit the
+				// dead coord's recorded Command so a custom wrapper /
+				// non-default argv survives the recovery. Without this
+				// the resumed coord restarts under the current default
+				// wrapper — wrong binary/config even though engine and
+				// task identity were preserved. Mirrors the regular
+				// `fleet handoff` path's pattern (cmd/fleet/handoff.go
+				// `if len(command) == 0 { command = oldRec.Command }`).
+				// Gated on !commandExplicit so an operator who DID
+				// pass --command on the recovery dispatch overrides
+				// the inherited value, matching the handoff CLI's
+				// contract.
+				//
+				// IMPORTANT: this overwrites opts.command AFTER the
+				// rewrittenExecArgv computation above (line ~411-425),
+				// which built ExecCommand from the pre-recovery
+				// opts.command. Re-derive rewrittenExecArgv here so
+				// the tmux exec uses the inherited Command with the
+				// per-spawn --remote-control flag injection. Skip the
+				// reset when commandExplicit (operator's command wins
+				// untouched) or oldRecord.Command is empty (legacy
+				// record predating Command persistence — fall through
+				// to the dispatch-default).
+				if !opts.commandExplicit && len(oldRecord.Command) > 0 {
+					opts.command = append([]string(nil), oldRecord.Command...)
+					if opts.coordSpawn && preAllocatedID != "" {
+						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
+						rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
+						if !sameCommand(rewritten, opts.command) {
+							rewrittenExecArgv = rewritten
+						} else {
+							// Custom command (non-default shape) — pass
+							// nil so the tmux exec uses opts.command
+							// untouched and the persisted Command on
+							// the record stays clean.
+							rewrittenExecArgv = nil
+						}
+					}
 				}
 				_, _ = fmt.Fprintf(stdout,
 					"recovering dead coord %s for project %s: synth handoff written to %s\n",
