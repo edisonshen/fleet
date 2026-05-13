@@ -29,12 +29,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 )
 
 // pidAliveFn lets tests stub the kill(0) probe used by
@@ -313,6 +316,18 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	// placeholder. The successor coord can re-derive from `gh pr
 	// list` on its first tick if it cares.
 	doc.OpenPRs = collectOpenPRs(deadRec.Cwd)
+	// Fallback (codex review round-6 P1): if `gh pr list` returned
+	// empty — gh missing, auth issue, network blip, or no PRs match
+	// the head:worker/ search — supplement from tasks.md. Any task
+	// with status=in-review and a non-empty pr_url is a PR the
+	// successor must respawn a shepherd for; the gh enrichment alone
+	// is best-effort and can silently drop these in a degraded
+	// environment. tasks.md is the on-disk source of truth maintained
+	// by the coord skill on every PR transition, so it survives gh
+	// outages by definition.
+	if len(doc.OpenPRs) == 0 {
+		doc.OpenPRs = openPRsFromTasks(deadRec.Project)
+	}
 
 	docPath, err := state.HandoffPath(deadRec.ID, ts)
 	if err != nil {
@@ -394,4 +409,66 @@ var collectOpenPRs = func(cwd string) []handoff.OpenPR {
 		})
 	}
 	return out
+}
+
+// openPRsFromTasks reads ~/.fleet/projects/<project>/tasks.md and
+// returns one handoff.OpenPR per task that is in-review and carries a
+// non-empty pr_url. Fallback for the recovery synth doc when
+// collectOpenPRs returned empty (codex review round-6 P1) — gh
+// availability isn't required for the successor coord to respawn
+// shepherds for in-review PRs.
+//
+// Title falls back to the task slug (tasks.md doesn't carry a separate
+// PR title field; the coord skill's shepherd until-loop only needs URL
+// + Number to track CI/merge state). HeadRefName mirrors the coord
+// skill's branch convention (`worker/<slug>`). Number is parsed from
+// the URL's trailing path segment; if parse fails, the entry is still
+// emitted with Number=0 so the URL is at least surfaced to the
+// successor — the shepherd can re-derive the number from `gh pr view`.
+//
+// Returns nil on tasks.md missing / parse failure: degraded-but-not-
+// catastrophic — the doc will render the `_(no open PRs)_` placeholder
+// and the successor coord's first tick will re-scan tasks.md anyway.
+func openPRsFromTasks(project string) []handoff.OpenPR {
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil
+	}
+	path := filepath.Join(pdir, "tasks.md")
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	f, err := tasks.Read(path)
+	if err != nil {
+		return nil
+	}
+	var out []handoff.OpenPR
+	for _, t := range f.Tasks {
+		if t.Status != tasks.StatusInReview || t.PRURL == "" {
+			continue
+		}
+		out = append(out, handoff.OpenPR{
+			Number:      prNumberFromURL(t.PRURL),
+			Title:       t.Slug,
+			HeadRefName: "worker/" + t.Slug,
+			URL:         t.PRURL,
+		})
+	}
+	return out
+}
+
+// prNumberFromURL extracts the trailing PR number from a GitHub PR URL
+// like https://github.com/owner/repo/pull/42. Returns 0 on parse
+// failure — the caller emits the OpenPR anyway so the URL still
+// reaches the successor.
+func prNumberFromURL(url string) int {
+	idx := strings.LastIndex(url, "/")
+	if idx < 0 || idx == len(url)-1 {
+		return 0
+	}
+	n, err := strconv.Atoi(url[idx+1:])
+	if err != nil {
+		return 0
+	}
+	return n
 }

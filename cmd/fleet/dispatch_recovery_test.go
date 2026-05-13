@@ -17,6 +17,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -1412,6 +1413,79 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnUnparseableRecord(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "corruptr") {
 		t.Errorf("error message should surface the corrupt record's ID; got: %v", err)
+	}
+}
+
+// TestWriteRecoveryHandoffDoc_FallsBackToTasksMdWhenGHEmpty pins
+// codex review round-6 P1: when collectOpenPRs returns empty (gh
+// missing, auth issue, network blip, or no head:worker/ matches),
+// the recovery synth doc must still surface in-review PRs from
+// tasks.md so the successor coord respawns shepherds. Without this,
+// a gh outage during recovery silently drops in-review PR
+// supervision — the worker has already exited, the task is in-review,
+// and no shepherd until-loop watches the PR.
+func TestWriteRecoveryHandoffDoc_FallsBackToTasksMdWhenGHEmpty(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+
+	// gh returns nothing — simulates the degraded case.
+	prev := collectOpenPRs
+	collectOpenPRs = func(string) []handoff.OpenPR { return nil }
+	t.Cleanup(func() { collectOpenPRs = prev })
+
+	deadRec := fakeAgentRecord("ghoutage", "coord-myproj", "myproj", 11111, "fleet-ghoutage")
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("write dead record: %v", err)
+	}
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	// coord-state.json with empty worker_agent_ids — simulates the
+	// case codex flagged: workers exited, tasks in-review, no
+	// active subagents to walk.
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+	// tasks.md with two in-review tasks carrying PR URLs, plus one
+	// done task that must NOT appear in OpenPRs. Built via the
+	// tasks package's writer to keep the test resilient to format
+	// changes in the on-disk markdown grammar.
+	tfile := &tasks.File{
+		Schema: 1,
+		Tasks: []*tasks.Task{
+			{Slug: "fix-foo-1234", Status: tasks.StatusInReview, Priority: tasks.PriorityP1, PRURL: "https://github.com/owner/repo/pull/42"},
+			{Slug: "feat-bar-5678", Status: tasks.StatusInReview, Priority: tasks.PriorityP1, PRURL: "https://github.com/owner/repo/pull/43"},
+			{Slug: "done-baz-9999", Status: tasks.StatusDone, Priority: tasks.PriorityP2, PRURL: "https://github.com/owner/repo/pull/40"},
+		},
+	}
+	if err := tasks.Write(filepath.Join(pdir, "tasks.md"), tfile); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+
+	docPath, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("writeRecoveryHandoffDoc: %v", err)
+	}
+	body, rerr := os.ReadFile(docPath)
+	if rerr != nil {
+		t.Fatalf("read synth doc: %v", rerr)
+	}
+	bodyStr := string(body)
+	if !strings.Contains(bodyStr, "https://github.com/owner/repo/pull/42") {
+		t.Errorf("synth doc must include in-review PR URL #42 from tasks.md fallback; got body:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "https://github.com/owner/repo/pull/43") {
+		t.Errorf("synth doc must include in-review PR URL #43 from tasks.md fallback; got body:\n%s", bodyStr)
+	}
+	// Done task's PR must NOT appear — only in-review needs respawn.
+	if strings.Contains(bodyStr, "https://github.com/owner/repo/pull/40") {
+		t.Errorf("synth doc must NOT include done-task PR #40; got body:\n%s", bodyStr)
 	}
 }
 
