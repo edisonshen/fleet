@@ -398,22 +398,22 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 
 	// Live-coord veto (codex review iter-4 P1): under --coord-spawn,
-	// refuse to spawn at ALL when coordinator.lock is held by another
-	// process. The dashboard's tmux.HasSession can return false even
-	// for a live coord (operator dashboard on a different tmux server),
-	// and the TUI's [a] flow would fall through to fresh-spawn here if
-	// we only vetoed inside findRecoveryCandidate. That fresh spawn
-	// races the live coord on the same task_id + project, leaving two
-	// supervisors fighting for `coord-state.json` writes. Refusing
-	// makes the failure mode loud: the operator sees an explicit
-	// "live coord holds the lock" error and knows the existing coord
-	// is fine.
+	// refuse to spawn at ALL when the project's coord-state.json mtime
+	// is within coordFreshnessWindow. The dashboard's tmux.HasSession
+	// can return false even for a live coord (operator dashboard on a
+	// different tmux server), and the TUI's [a] flow would fall
+	// through to fresh-spawn here if we only vetoed inside
+	// findRecoveryCandidate. That fresh spawn races the live coord on
+	// the same task_id + project, leaving two supervisors fighting for
+	// `coord-state.json` writes. Refusing makes the failure mode loud:
+	// the operator sees an explicit "live coord recently ticked" error
+	// and knows the existing coord is fine.
 	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path). A
 	// manual `fleet dispatch <task>` against a worker task is unaffected.
-	if opts.coordSpawn && coordLockHeld(opts.project) {
+	if opts.coordSpawn && coordStateFresh(opts.project) {
 		return fmt.Errorf(
-			"refusing to spawn coord for project %q: coordinator.lock is held by a live coord. "+
+			"refusing to spawn coord for project %q: coord-state.json mtime is recent. "+
 				"the existing coord is alive (likely on a different tmux server); "+
 				"don't dispatch a duplicate", opts.project)
 	}
@@ -446,7 +446,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		if lerr != nil {
 			_, _ = fmt.Fprintf(stdout,
 				"warning: dead-coord recovery probe skipped (agent.List: %v) — proceeding with fresh spawn\n", lerr)
-		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession, coordLockHeld); dead != nil {
+		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession, coordStateFresh); dead != nil {
 			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
 			if derr != nil {
 				_, _ = fmt.Fprintf(stdout,

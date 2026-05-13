@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -42,8 +41,8 @@ func TestFindRecoveryCandidate_DeadPidAndDeadTmuxIsCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	lockHeld := func(string) bool { return false } // no live coord
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got == nil {
 		t.Fatalf("expected recovery candidate; got nil")
 	}
@@ -63,8 +62,8 @@ func TestFindRecoveryCandidate_AlivePidIsNotCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return true }         // still ticking
 	sessionAlive := func(string) bool { return false } // tmux gone
 
-	lockHeld := func(string) bool { return false } // no live coord
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got != nil {
 		t.Errorf("alive-pid candidate must NOT be returned; got %+v", got)
 	}
@@ -82,8 +81,8 @@ func TestFindRecoveryCandidate_AliveTmuxIsNotCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return true } // tmux still up
 
-	lockHeld := func(string) bool { return false } // no live coord
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got != nil {
 		t.Errorf("alive-tmux candidate must NOT be returned; got %+v", got)
 	}
@@ -100,8 +99,8 @@ func TestFindRecoveryCandidate_NameMustMatch(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	lockHeld := func(string) bool { return false } // no live coord
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got != nil {
 		t.Errorf("cross-project candidate must NOT be returned; got %+v", got)
 	}
@@ -120,8 +119,8 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	lockHeld := func(string) bool { return false } // no live coord
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	coordFresh := func(string) bool { return false } // coord-state.json stale → dead
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got == nil {
 		t.Fatalf("expected one candidate; got nil")
 	}
@@ -132,97 +131,104 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 	}
 }
 
-// TestFindRecoveryCandidate_CoordLockHeldVetoes pins the load-bearing
-// safety gate: when pid + tmux both LOOK dead (operator on a different
-// tmux server, dispatch CLI pid long-since reaped) but coordinator.lock
-// is still held by the live Python /coordinator skill, findRecovery
-// MUST refuse to recover. Otherwise --coord-spawn would synth-recover
-// over a live coord and race two coord supervisors on the same project
-// (codex review iter-1 P1).
-func TestFindRecoveryCandidate_CoordLockHeldVetoes(t *testing.T) {
+// TestFindRecoveryCandidate_FreshCoordStateVetoes pins the load-bearing
+// safety gate (codex review iter-3 P1 fix, iter-5 follow-up): when pid
+// + tmux both LOOK dead (operator on a different tmux server, dispatch
+// CLI pid long-since reaped) but coord-state.json's mtime is fresh,
+// findRecovery MUST refuse to recover. The live coord ticks
+// coord-state.json on every supervisor pass; fresh mtime means
+// SOMETHING is actively supervising. We must NOT synth-recover over
+// a live coord and race two coord supervisors on the same project.
+//
+// Why mtime instead of coordinator.lock: the Python /coordinator skill
+// holds coordinator.lock only for the duration of each tick (LOCK_NB|
+// LOCK_EX with finally-release). Between ticks it's acquirable, so
+// a lock-based probe would falsely classify the coord as dead during
+// every inter-tick gap (codex review iter-3 P1).
+func TestFindRecoveryCandidate_FreshCoordStateVetoes(t *testing.T) {
 	records := []*agent.Record{
 		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
 	}
 	pidAlive := func(int) bool { return false }        // dispatch CLI pid reaped
 	sessionAlive := func(string) bool { return false } // operator on diff tmux server
-	lockHeld := func(string) bool { return true }      // BUT coord still alive
+	coordFresh := func(string) bool { return true }    // BUT coord recently ticked
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, coordFresh)
 	if got != nil {
-		t.Errorf("lock-held coord must NOT be a recovery candidate; got %+v", got)
+		t.Errorf("fresh-mtime coord must NOT be a recovery candidate; got %+v", got)
 	}
 }
 
-// TestCoordLockHeld_AcquirableLockReturnsFalse pins the production lock
-// probe: when the project's coordinator.lock file exists but nobody
-// holds it (acquirable with LOCK_NB|LOCK_EX), coordLockHeld returns
-// false so findRecoveryCandidate proceeds with the recovery.
-func TestCoordLockHeld_AcquirableLockReturnsFalse(t *testing.T) {
+// TestCoordStateFresh_RecentMtimeReturnsTrue pins the production probe:
+// when coord-state.json exists AND its mtime is within
+// coordFreshnessWindow, coordStateFresh returns true so the live coord
+// is protected from recovery.
+func TestCoordStateFresh_RecentMtimeReturnsTrue(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("state.Bootstrap: %v", err)
 	}
-	// Create the lock file (zero-byte sentinel) without holding it.
-	lockPath, err := state.CoordinatorLockPath("myproj")
+	pdir, err := state.ProjectDir("myproj")
 	if err != nil {
-		t.Fatalf("CoordinatorLockPath: %v", err)
+		t.Fatalf("ProjectDir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		t.Fatalf("mkdir locks dir: %v", err)
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
 	}
-	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
-		t.Fatalf("write lock file: %v", err)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
 	}
-
-	if coordLockHeld("myproj") {
-		t.Errorf("coordLockHeld must return false for an acquirable lock")
+	// Just-now mtime is within the window by definition.
+	if !coordStateFresh("myproj") {
+		t.Errorf("coordStateFresh must return true for a just-written coord-state.json")
 	}
 }
 
-// TestCoordLockHeld_HeldLockReturnsTrue pins the inverse: when another
-// process holds LOCK_EX on coordinator.lock, our probe must return
-// true (the live coord must NOT be recovery-targeted).
-func TestCoordLockHeld_HeldLockReturnsTrue(t *testing.T) {
+// TestCoordStateFresh_StaleMtimeReturnsFalse pins the inverse: when
+// coord-state.json's mtime is older than coordFreshnessWindow, the
+// coord is treated as dead and recovery proceeds.
+func TestCoordStateFresh_StaleMtimeReturnsFalse(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("state.Bootstrap: %v", err)
 	}
-	lockPath, err := state.CoordinatorLockPath("myproj")
+	pdir, err := state.ProjectDir("myproj")
 	if err != nil {
-		t.Fatalf("CoordinatorLockPath: %v", err)
+		t.Fatalf("ProjectDir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		t.Fatalf("mkdir locks dir: %v", err)
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
 	}
-	// Hold LOCK_EX from the test goroutine, simulating a live coord.
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatalf("open holder: %v", err)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
 	}
-	defer func() { _ = holder.Close() }()
-	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
-		t.Fatalf("flock LOCK_EX: %v", err)
+	// Backdate mtime well past coordFreshnessWindow (5m).
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes: %v", err)
 	}
 
-	if !coordLockHeld("myproj") {
-		t.Errorf("coordLockHeld must return true while LOCK_EX is held by another fd")
+	if coordStateFresh("myproj") {
+		t.Errorf("coordStateFresh must return false for a stale-mtime coord-state.json")
 	}
 }
 
-// TestCoordLockHeld_MissingFileReturnsFalse covers the fresh-project
-// case: the lock file doesn't exist (no coord ever ran), so coordLockHeld
-// reports "not held" and the caller proceeds.
-func TestCoordLockHeld_MissingFileReturnsFalse(t *testing.T) {
+// TestCoordStateFresh_MissingFileReturnsFalse covers the fresh-project
+// case: coord-state.json doesn't exist (no coord ever ran), so
+// coordStateFresh reports "not live" and the caller proceeds.
+func TestCoordStateFresh_MissingFileReturnsFalse(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("state.Bootstrap: %v", err)
 	}
 
-	if coordLockHeld("freshproj") {
-		t.Errorf("coordLockHeld on a missing lock file must return false")
+	if coordStateFresh("freshproj") {
+		t.Errorf("coordStateFresh on a missing coord-state.json must return false")
 	}
 }
 
@@ -257,8 +263,17 @@ func TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk(t *testing.T) {
 		},
 	}
 	csData, _ := json.Marshal(cs)
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
+	}
+	// Backdate mtime past coordFreshnessWindow so the dead-coord
+	// recovery probe sees this as a stopped coord. A just-written
+	// coord-state.json looks like a live coord that JUST ticked — the
+	// veto path would refuse to spawn.
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
 	}
 	wDir := filepath.Join(pdir, "workers", "fix-foo-1234")
 	if err := os.MkdirAll(wDir, 0o755); err != nil {
@@ -349,8 +364,17 @@ func TestRunDispatch_DeadCoord_Recovers(t *testing.T) {
 		},
 	}
 	csData, _ := json.Marshal(cs)
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
+	}
+	// Backdate mtime past coordFreshnessWindow so the dead-coord
+	// recovery probe sees this as a stopped coord. A just-written
+	// coord-state.json looks like a live coord that JUST ticked — the
+	// veto path would refuse to spawn.
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
 	}
 	wDir := filepath.Join(pdir, "workers", "fix-foo-1234")
 	if err := os.MkdirAll(wDir, 0o755); err != nil {
@@ -477,8 +501,17 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 		},
 	}
 	csData, _ := json.Marshal(cs)
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
+	}
+	// Backdate mtime past coordFreshnessWindow so the dead-coord
+	// recovery probe sees this as a stopped coord. A just-written
+	// coord-state.json looks like a live coord that JUST ticked — the
+	// veto path would refuse to spawn.
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
 	}
 	wDir := filepath.Join(pdir, "workers", "fix-foo-1234")
 	if err := os.MkdirAll(wDir, 0o755); err != nil {
@@ -532,32 +565,29 @@ func TestRunDispatch_DeadCoord_SendsResumePromptToSuccessor(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_LiveCoordLockRefusesSpawn pins codex review iter-4
-// P1: when --coord-spawn lands on a project whose coordinator.lock is
-// held by a live coord (operator dashboard on a different tmux server
-// → tmux.HasSession returns false), runDispatch must refuse to spawn a
-// duplicate. Without this veto, the TUI's [a]-on-dead-tmux flow would
-// dispatch a fresh spawn that races the live coord on the same
-// task_id, leaving two supervisors fighting for coord-state.json writes.
-func TestRunDispatch_LiveCoordLockRefusesSpawn(t *testing.T) {
+// TestRunDispatch_FreshCoordStateRefusesSpawn pins codex review
+// iter-4/iter-5 P1: when --coord-spawn lands on a project whose
+// coord-state.json was mtime-updated within coordFreshnessWindow,
+// runDispatch must refuse to spawn a duplicate. The TUI's [a]-on-
+// dead-tmux flow lands here when the operator dashboard sits on a
+// different tmux server than the live coord — tmux.HasSession reports
+// false, but the coord is actively ticking and updating coord-state.json.
+// Without this veto, we'd race two supervisors on the same project.
+func TestRunDispatch_FreshCoordStateRefusesSpawn(t *testing.T) {
 	setupFleetHome(t)
 
-	// Hold LOCK_EX on coordinator.lock from this goroutine — simulates
-	// the live Python /coordinator skill holding the lock.
-	lockPath, err := state.CoordinatorLockPath("myproj")
+	// Seed a just-touched coord-state.json — simulates the live coord
+	// having ticked very recently.
+	pdir, err := state.ProjectDir("myproj")
 	if err != nil {
-		t.Fatalf("CoordinatorLockPath: %v", err)
+		t.Fatalf("ProjectDir: %v", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		t.Fatalf("mkdir locks dir: %v", err)
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
 	}
-	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		t.Fatalf("open holder: %v", err)
-	}
-	defer func() { _ = holder.Close() }()
-	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
-		t.Fatalf("flock LOCK_EX: %v", err)
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
 	}
 
 	opts := &dispatchOpts{
@@ -571,17 +601,17 @@ func TestRunDispatch_LiveCoordLockRefusesSpawn(t *testing.T) {
 	var out bytes.Buffer
 	err = runDispatch(opts, &out)
 	if err == nil {
-		t.Fatalf("expected runDispatch to refuse spawn under held lock; got nil error\n%s", out.String())
+		t.Fatalf("expected runDispatch to refuse spawn for a fresh coord; got nil error\n%s", out.String())
 	}
-	if !strings.Contains(err.Error(), "coordinator.lock is held") {
-		t.Errorf("error must mention held lock; got: %v", err)
+	if !strings.Contains(err.Error(), "mtime is recent") {
+		t.Errorf("error must mention recent mtime; got: %v", err)
 	}
 	// No successor record should be on disk.
 	live, _ := agent.List()
 	for _, r := range live {
 		if r.TaskID == "coord-myproj" && r.Project == "myproj" {
 			t.Cleanup(func() { _ = tmux.Kill(r.TmuxSession) })
-			t.Errorf("no successor must be spawned under held lock; got %s on tmux %s", r.ID, r.TmuxSession)
+			t.Errorf("no successor must be spawned under fresh coord-state.json; got %s on tmux %s", r.ID, r.TmuxSession)
 		}
 	}
 }
@@ -619,8 +649,17 @@ func TestRunDispatch_DeadCoord_NoAutoResumeSkipsPromptSwap(t *testing.T) {
 	}
 	cs := map[string]any{"worker_agent_ids": map[string]string{}}
 	csData, _ := json.Marshal(cs)
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
+	}
+	// Backdate mtime past coordFreshnessWindow so the dead-coord
+	// recovery probe sees this as a stopped coord. A just-written
+	// coord-state.json looks like a live coord that JUST ticked — the
+	// veto path would refuse to spawn.
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
 	}
 
 	origPrompt := "shell-friendly-no-auto-resume-prompt"
@@ -682,8 +721,17 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 	}
 	cs := map[string]any{"worker_agent_ids": map[string]string{}}
 	csData, _ := json.Marshal(cs)
-	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+	csPath := filepath.Join(pdir, "coord-state.json")
+	if err := os.WriteFile(csPath, csData, 0o644); err != nil {
 		t.Fatalf("write coord-state: %v", err)
+	}
+	// Backdate mtime past coordFreshnessWindow so the dead-coord
+	// recovery probe sees this as a stopped coord. A just-written
+	// coord-state.json looks like a live coord that JUST ticked — the
+	// veto path would refuse to spawn.
+	stale := time.Now().Add(-2 * coordFreshnessWindow)
+	if err := os.Chtimes(csPath, stale, stale); err != nil {
+		t.Fatalf("chtimes coord-state: %v", err)
 	}
 
 	opts := &dispatchOpts{

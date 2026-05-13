@@ -25,6 +25,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -45,34 +46,55 @@ type pidAliveFn func(pid int) bool
 // with a closure over a fixed name set.
 type sessionAliveProbe func(session string) bool
 
-// coordLockHeldProbe is the per-project coordinator.lock liveness
-// probe used by findRecoveryCandidate. Production tries to acquire the
-// project's coordinator.lock with LOCK_NB|LOCK_EX; an EWOULDBLOCK means
-// a live coord holds it (the Python /coordinator skill takes LOCK_EX
-// and never releases for the agent's lifetime). Tests stub with a
-// closure over a fixed map.
+// coordFreshProbe reports whether the project's coord-state.json
+// mtime is within the freshness window — i.e., a coord ticked recently
+// and is therefore alive. Production stats
+// ~/.fleet/projects/<project>/coord-state.json and compares against
+// coordFreshnessWindow (5m, mirroring the dashboard's active-coord
+// rendering threshold). Tests stub with a closure.
 //
 // This is the load-bearing safety gate that the pidAlive/sessionAlive
-// pair cannot provide. agent.Record.PID is the SHORT-LIVED dispatch
-// CLI process's pid (set in spawn.Spawn via os.Getpid), not the coord
-// inside tmux. After `fleet dispatch` exits, that pid is dead even
-// for a healthy coord. When the operator is on a different tmux
-// socket/server, tmux.HasSession ALSO returns false (the live session
-// lives on the other server). Both signals say "dead" while the coord
-// is fine — without this third gate, --coord-spawn would synth a
-// recovery and spawn a duplicate coord (codex review iter-1 P1).
-type coordLockHeldProbe func(project string) bool
+// pair cannot provide:
+//   - agent.Record.PID is the SHORT-LIVED dispatch CLI's pid (set in
+//     spawn.Spawn via os.Getpid), not the coord inside tmux. After
+//     `fleet dispatch` exits, that pid is dead even for a healthy
+//     coord — and the OS may have reused it for an unrelated process
+//     (codex iter-3 P2).
+//   - tmux.HasSession returns false when the operator's dashboard sits
+//     on a different tmux server/socket than the live coord's session.
+//
+// coord-state.json mtime, by contrast, is updated by the Python
+// /coordinator skill on every tick (the skill writes ack timestamps +
+// supervisor sub-state through state.WriteAtomic on each successful
+// tick). A coord whose mtime is fresh has ticked within the window
+// and is alive on SOME tmux server. A coord with stale mtime hasn't
+// ticked recently and IS the safe recovery target.
+//
+// Note: the coord skill takes LOCK_NB|LOCK_EX on coordinator.lock per
+// tick and releases it in finally. The lock is therefore NOT held
+// between ticks — using it as a liveness signal would falsely classify
+// healthy idle coords as dead (codex iter-3 P1). mtime is the right
+// signal because it advances with each tick and persists between them.
+type coordFreshProbe func(project string) bool
+
+// coordFreshnessWindow is how recently coord-state.json must have been
+// mtime-updated for the coord to be considered alive. Mirrors the TUI
+// dashboard's coordActiveWindow (internal/tui/dashboard.go) so the
+// recovery probe and the dashboard agree on what "live" means — an
+// operator who sees "● active" on the dashboard cannot also trigger
+// a recovery flow against the same project.
+const coordFreshnessWindow = 5 * time.Minute
 
 // findRecoveryCandidate walks the live agent records (output of
 // agent.List) looking for a dead coord matching the given task_id +
-// project. "Dead" = coordinator.lock IS acquirable AND pid is NOT alive
-// AND tmux session is NOT alive.
+// project. "Dead" = coord-state.json is STALE (mtime older than
+// coordFreshnessWindow) AND pid is NOT alive AND tmux session is NOT
+// alive.
 //
-// The coordinator.lock check is the load-bearing signal — pid + tmux
-// can both look dead even for a healthy coord (operator on different
-// tmux server + dispatch CLI pid is short-lived). The pidAlive +
-// sessionAlive gates remain as belt-and-suspenders so an alive-anywhere
-// signal still vetoes recovery.
+// The mtime check is the load-bearing signal. pid + tmux probes can
+// both look dead even for a healthy coord (operator on different tmux
+// server + dispatch CLI pid is short-lived). They remain as belt-and-
+// suspenders so an alive-anywhere signal still vetoes recovery.
 //
 // Returns the first match (the slice order is agent.List order, which
 // is filesystem-iteration order — not stable across runs but stable
@@ -87,13 +109,13 @@ type coordLockHeldProbe func(project string) bool
 //
 // The probe-fn arguments exist to keep this pure-function — no syscall,
 // no exec — so tests can run without touching tmux or the kernel.
-// Production passes pidAlive + tmux.HasSession + coordLockHeld.
+// Production passes pidAlive + tmux.HasSession + coordStateFresh.
 func findRecoveryCandidate(
 	taskID, project string,
 	records []*agent.Record,
 	pidAlive pidAliveFn,
 	sessionAlive sessionAliveProbe,
-	coordLockHeld coordLockHeldProbe,
+	coordFresh coordFreshProbe,
 ) *agent.Record {
 	for _, r := range records {
 		if r == nil {
@@ -102,25 +124,24 @@ func findRecoveryCandidate(
 		if r.TaskID != taskID || r.Project != project {
 			continue
 		}
-		// Lock-held → live coord. Even if pid + tmux both look dead
-		// (operator on a different tmux server, dispatch CLI pid long
-		// since reaped), an unreleased LOCK_EX on coordinator.lock means
-		// SOMETHING is holding the supervisor seat. Don't synth-recover
-		// over a live coord — that would race two coords on the same
-		// project (codex review iter-1 P1).
-		if coordLockHeld(project) {
+		// Fresh coord-state.json → coord ticked recently → live.
+		// Even if pid + tmux both look dead (operator on a different
+		// tmux server, dispatch CLI pid long since reaped + possibly
+		// reused by an unrelated process), a recent mtime means
+		// SOMETHING is supervising. Don't synth-recover over a live
+		// coord — that would race two coords on the same project
+		// (codex review iter-3 P1).
+		if coordFresh(project) {
 			continue
 		}
-		// Alive pid → bail. We won't replace a live coord even if its
-		// tmux session looks unhappy — the operator might be on a
-		// different tmux server, and a duplicate dispatch would split
-		// the coord's lock body across two agents.
-		//
-		// Note: this gate is weaker than the lock check above because
-		// agent.Record.PID is the dispatch CLI's PID, which is reaped
-		// when `fleet dispatch` exits. Most healthy coords will fail
-		// this probe (pid points at nothing). The lock probe above is
-		// the load-bearing veto.
+		// Alive pid → secondary veto. Note: this signal is weaker than
+		// the mtime check above because agent.Record.PID is the
+		// dispatch CLI's PID, which is reaped when `fleet dispatch`
+		// exits and may be reused by an unrelated process (codex iter-3
+		// P2). When the dispatch CLI's old pid is reused by some other
+		// process running on the host, this returns true even though
+		// the coord is gone. mtime above handles that case; this gate
+		// only fires when both signals agree the coord is alive.
 		if r.PID > 0 && pidAlive(r.PID) {
 			continue
 		}
@@ -137,44 +158,34 @@ func findRecoveryCandidate(
 	return nil
 }
 
-// coordLockHeld tries to acquire LOCK_EX|LOCK_NB on the project's
-// coordinator.lock. Returns true when the lock IS held by someone
-// (EWOULDBLOCK = a live coord owns it), false when it's acquirable
-// (no live coord) or the lock file/dir doesn't exist (no coord ever
-// ran for this project).
+// coordStateFresh reports whether
+// ~/.fleet/projects/<project>/coord-state.json was mtime-updated
+// within coordFreshnessWindow. Returns true (= live coord) when:
+//   - the file exists AND its mtime is within the window
 //
-// Production probe for findRecoveryCandidate. Best-effort — any I/O
-// error other than EWOULDBLOCK returns false ("not held by anyone we
-// can detect"), favoring "proceed with recovery" over "block
-// indefinitely." A false negative here is worse than a false positive:
-// the coord skill itself NB-flocks coordinator.lock as its first act,
-// so a synth-recovered duplicate exits cleanly on the lock contention.
+// Returns false (= dead or never-ran) when:
+//   - the file doesn't exist (no coord ever ran for this project)
+//   - the file mtime is older than the window
+//   - any error stat-ing the file (defensive: prefer false-negative
+//     "let recovery proceed" over false-positive "live coord")
 //
-// IMPORTANT: this MUST close the fd before returning so we don't hold
-// the lock ourselves. The defer takes care of that on every path.
-func coordLockHeld(project string) bool {
-	path, err := state.CoordinatorLockPath(project)
+// Production probe for findRecoveryCandidate. The Python /coordinator
+// skill writes coord-state.json through state.WriteAtomic on every
+// tick — both for ack timestamps and for supervisor sub-state. mtime
+// therefore advances with every tick that runs to completion, even
+// if no fields actually changed. A stale mtime means the coord
+// stopped ticking, which is the recovery trigger.
+func coordStateFresh(project string) bool {
+	pdir, err := state.ProjectDir(project)
 	if err != nil {
 		return false
 	}
-	if _, err := os.Stat(path); err != nil {
-		// File missing — no coord ever held it. Not held.
-		return false
-	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	fi, err := os.Stat(filepath.Join(pdir, "coord-state.json"))
 	if err != nil {
-		// Can't open (perm, etc.) — fail open so recovery can proceed.
-		// The coord skill's own NB-flock will catch any double-spawn.
+		// Missing / unstattable → no fresh coord. Recovery proceeds.
 		return false
 	}
-	defer func() { _ = f.Close() }()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		// EWOULDBLOCK = held by another process. Treat any flock error
-		// here as "held" — safer to skip recovery than race a live coord.
-		return true
-	}
-	// Acquired — nobody else holds it. Release via deferred Close.
-	return false
+	return time.Since(fi.ModTime()) <= coordFreshnessWindow
 }
 
 // pidAlive is the production pidAliveFn. Mirrors workers.IsAlive (the
