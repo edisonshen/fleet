@@ -34,6 +34,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -140,12 +141,18 @@ var (
 	ErrInvalidState         = errors.New("invalid worker state")
 	ErrPhaseRequiresPR      = errors.New("phase=done requires pr_url")
 	ErrPhaseRequiresWhy     = errors.New("phase=blocked requires blocked_reason")
-	ErrPhaseRequiresReview  = errors.New("phase=push requires review_claude_status=passed and review_codex_status in {passed,skipped}")
+	ErrPhaseRequiresReview  = errors.New("terminal phase requires review_claude_status=passed and review_codex_status in {passed,skipped}")
 	ErrInvalidPhase         = errors.New("invalid phase")
 	ErrInvalidReviewStat    = errors.New("invalid review status")
-	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable}")
+	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable, no-git}")
 	ErrInvalidSlug          = errors.New("invalid worker slug")
 	ErrPreconditionLive     = errors.New("cannot archive live worker")
+	// ErrPhasePushNonGit fires when a worker on a non-git project tries
+	// to transition through phase=push. Non-git projects skip push
+	// entirely (review-done → done); a phase=push write is a contract
+	// violation by the finisher dispatch path. Clear error message so
+	// the caller knows to transition phase=done directly.
+	ErrPhasePushNonGit = errors.New("non-git project: phase=push is not valid; transition phase=done directly")
 )
 
 // allowedCodexSkipReasons enumerates the only review_codex_skip_reason
@@ -153,28 +160,68 @@ var (
 // else upfront, but workers.WriteState is the load-bearing gate that
 // catches direct callers + future skill-side bypasses. Allowed values
 // are intentionally narrow: codex skips are operational concessions
-// (rate-limited at the CLI; binary missing on host) — NOT a way to
-// declare "I didn't feel like running codex". Broadening this set
-// requires explicit operator sign-off (CLAUDE.md §4).
+// (rate-limited at the CLI; binary missing on host; no-git project)
+// — NOT a way to declare "I didn't feel like running codex".
+// Broadening this set requires explicit operator sign-off (CLAUDE.md §4).
+//
+// "no-git" was added for non-git projects (operator clarification
+// 2026-05-12): `codex review --base main` needs a git diff to operate;
+// for non-git projects the reviewer records skip-reason=no-git and the
+// /review (Claude) reviewer remains mandatory.
 var allowedCodexSkipReasons = map[string]struct{}{
 	"rate-limited": {},
 	"unavailable":  {},
+	"no-git":       {},
 }
 
-// validateReviewGate enforces the phase=push precondition. Three-stage
-// flow contract: the worker writes phase=review-pending; the reviewer
-// writes review_claude_status=passed + review_codex_status in
-// {passed, skipped} + phase=review-done; the finisher writes
-// phase=push. Without this gate, a buggy worker that bypassed the
-// reviewer could reach phase=push (and ultimately phase=done with a
-// PR URL) without any /review or codex pass. That is the structural
-// failure mode the three-stage flow exists to prevent.
+// projectIsGit returns true if the project's meta.json declares git
+// mode (or is missing — legacy projects pre-date the IsGit field and
+// must default to git). The lookup is cheap (one file read) and
+// happens at WriteState time so the validator can branch on it.
 //
-// "skipped" is allowed for codex (rate-limit / unavailable) but NEVER
-// for /review — the validator rejects review_claude_status=skipped
-// even if a reviewer subagent were to try it.
-func validateReviewGate(s *State) error {
-	if s.Phase != PhasePush {
+// On any read error other than ErrNotFound, defaults to git mode —
+// the assumption is "treat unknown as git so we don't accidentally
+// relax the validator for a malformed meta.json". The git-mode
+// behavior is strictly more conservative.
+func projectIsGit(project string) bool {
+	m, err := projects.Read(project)
+	if err != nil {
+		return true
+	}
+	return m.GitMode()
+}
+
+// validateReviewGate enforces the review-terminal precondition.
+// Three-stage flow contract:
+//   - git project: worker→reviewer→finisher. Worker writes
+//     review-pending; reviewer writes review-done + terminal
+//     review_*_status; finisher writes phase=push, then phase=done
+//     with pr_url. The gate fires on phase=push.
+//   - non-git project: worker→reviewer→finisher (no push step).
+//     Worker writes review-pending; reviewer writes review-done +
+//     terminal review_*_status; finisher writes phase=done directly
+//     (no pr_url). The gate fires on phase=done because that is the
+//     terminal write the finisher makes.
+//
+// Without this gate, a buggy worker that bypassed the reviewer could
+// reach phase=push (git) or phase=done (non-git) without any /review
+// or codex pass. That is the structural failure mode the three-stage
+// flow exists to prevent. Codex iter-1 [P2]: the original gate fired
+// only on phase=push, leaving non-git projects without any review
+// enforcement at all.
+//
+// "skipped" is allowed for codex (rate-limit / unavailable / no-git)
+// but NEVER for /review — the validator rejects
+// review_claude_status=skipped even if a reviewer subagent were to
+// try it.
+func validateReviewGate(s *State, gitMode bool) error {
+	// Git: gate fires on phase=push. Non-git: gate fires on phase=done
+	// (the finisher's terminal write — there is no push step).
+	gate := PhasePush
+	if !gitMode {
+		gate = PhaseDone
+	}
+	if s.Phase != gate {
 		return nil
 	}
 	if s.ReviewClaudeStatus != ReviewStatusPassed {
@@ -267,10 +314,23 @@ func writeStateLocked(project, slug string, s *State) error {
 	if !validReviewStatus(s.ReviewCodexStatus) {
 		return fmt.Errorf("%w: review_codex_status=%q", ErrInvalidReviewStat, s.ReviewCodexStatus)
 	}
-	if err := validateReviewGate(s); err != nil {
+	// Non-git projects skip the push step entirely. Reject phase=push
+	// upfront with a clear error so the dispatch code knows to write
+	// phase=done directly. Git projects fall through to the normal
+	// review-gate validator below. The project lookup is best-effort;
+	// missing meta.json defaults to git-mode (see projectIsGit).
+	gitMode := projectIsGit(project)
+	if !gitMode && s.Phase == PhasePush {
+		return ErrPhasePushNonGit
+	}
+	if err := validateReviewGate(s, gitMode); err != nil {
 		return err
 	}
-	if s.Phase == PhaseDone && strings.TrimSpace(s.PRURL) == "" {
+	// phase=done's pr_url precondition applies only to git projects.
+	// For non-git, the worker shipped a local diff — there is no PR
+	// to point at. The finisher records the diff summary in the
+	// task note, not on state.json.
+	if s.Phase == PhaseDone && gitMode && strings.TrimSpace(s.PRURL) == "" {
 		return ErrPhaseRequiresPR
 	}
 	if s.Phase == PhaseBlocked && strings.TrimSpace(s.BlockedReason) == "" {

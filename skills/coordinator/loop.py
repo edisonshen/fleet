@@ -1284,6 +1284,12 @@ def _reconcile_inflight(
     Returns a list of _ReconcileAction; caller applies via the fleet CLI.
     """
     actions: list[_ReconcileAction] = []
+    # One project-mode lookup per reconcile pass. Non-git projects'
+    # finishers write phase=done WITHOUT a pr_url; the reconcile path
+    # needs to recognize that as success rather than the legacy
+    # "worker died without PR" failure (codex iter-1 [P1]).
+    fleet_home_str = str(home) if home is not None else None
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home_str)
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
             continue
@@ -1322,6 +1328,23 @@ def _reconcile_inflight(
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
                 phase, pr_url, blocked_reason = terminal
+                # Non-git: finisher's terminal write is phase=done WITHOUT
+                # a pr_url. Treat that as TerminalSuccess and flip the
+                # task to status=done directly (skip the in-review →
+                # CI-poll dance — there is no PR to poll). Codex iter-1
+                # [P1] regression — the legacy `phase == "done" and pr_url`
+                # branch fell through to "worker died without PR" and
+                # requeued every successful non-git task to todo.
+                if not is_git and phase == "done":
+                    actions.append(_ReconcileAction(
+                        slug=t.slug, new_status="done",
+                        clear_worker=True,
+                        note="non-git worker phase=done (no PR)",
+                        raised_to_user=True,
+                        raise_text=f"non-git worker shipped {t.slug}",
+                        delete_worker_dir=True,
+                    ))
+                    continue
                 if phase == "done" and pr_url:
                     # Worker shipped — flip to in-review with the PR
                     # URL so the next tick's pr_url branch runs gh
@@ -2026,6 +2049,10 @@ def _dispatch_ready(
     actions: list[_DispatchAction] = []
     standards_md = dispatch_mod.fetch_standards(project, fleet_bin=fleet_bin)
     learnings_text = dispatch_mod.fetch_learnings(project, fleet_bin=fleet_bin)
+    # Per-dispatch git-mode lookup: read meta.json's is_git field. Legacy
+    # projects (no is_git) and read errors default to True (git mode) —
+    # the conservative branch keeps existing behavior intact.
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
     in_flight_after_dispatch: list[parse.Task] = list(in_progress)
 
     for t in candidates:
@@ -2042,10 +2069,16 @@ def _dispatch_ready(
         # then `git worktree add`. On any failure we record the error
         # and skip this task — leaving stale state would corrupt the
         # next tick's view of in-flight tasks.
+        #
+        # Non-git projects skip worktree creation entirely — there is
+        # no git to branch from. The dispatch falls through to single-
+        # worker behavior (worker_cwd=cwd, no worktree) regardless of
+        # cap. Operators who run cap>1 on a non-git project would
+        # otherwise hit `git worktree add` failing on every tick.
         worker_cwd = cwd
         worker_branch = f"worker/{t.slug}"
         worker_worktree = ""
-        if cap > 1:
+        if cap > 1 and is_git:
             wt_path = worktree_mod.compute_worktree_path(
                 project, t.slug, fleet_bin=fleet_bin,
             )
@@ -2073,6 +2106,7 @@ def _dispatch_ready(
                 learnings_text=learnings_text,
                 branch=worker_branch,
                 worktree_pre_created=bool(worker_worktree),
+                is_git=is_git,
             )
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
@@ -2168,6 +2202,9 @@ def _dispatch_review_handoffs(
         )
     else:
         seen_handoffs = _load_review_handoff_state(home, project)
+    # Git mode is the same per-tick decision as in _dispatch_ready —
+    # the reviewer + finisher prompts branch on this.
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -2201,12 +2238,12 @@ def _dispatch_review_handoffs(
         try:
             if phase == "review-pending":
                 prompt = dispatch_mod.build_reviewer_prompt(
-                    t, project=project, branch=branch,
+                    t, project=project, branch=branch, is_git=is_git,
                 )
                 description = f"fleet reviewer {t.slug}"
             else:
                 prompt = dispatch_mod.build_finisher_prompt(
-                    t, project=project, branch=branch,
+                    t, project=project, branch=branch, is_git=is_git,
                 )
                 description = f"fleet finisher {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:

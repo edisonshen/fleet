@@ -111,7 +111,7 @@ Starting at the reviewer-subagent-arch landing, every task is implemented by **t
 
 The coord-state.json field `review_handoffs_dispatched` is the dedup signal: each handoff key is `<slug>:<phase>`, added when the DISPATCH block is emitted, cleared when the slug reaches a terminal task state. Without this, a slow reviewer would be respawned every tick.
 
-**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited` or `unavailable`. The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
+**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited`, `unavailable`, or `no-git` (non-git projects — see "## Non-git projects" below). The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
 
 **The coord does NOT foreground-poll any of the three subagents.** The harness fires a `<task-notification>` when each subagent returns; the coord runs `/coordinator` on the next assistant turn, the tick reads state.json, and the next handoff fires automatically.
 
@@ -484,7 +484,7 @@ The fleet CLI commands above came from Phase B (`fleet tasks {add,list,show,set,
 
 ## Worker prompt template
 
-Built fresh per dispatch by `dispatch.build_worker_prompt(task, project, standards_md, learnings_text)`. ENG §6.5 specifies the layout. Hard cap 16KB rendered; oversized prompts raise `PromptTooLargeError` and the loop records the failure rather than dispatch.
+Built fresh per dispatch by `dispatch.build_worker_prompt(task, project, standards_md, learnings_text, *, is_git=True)`. ENG §6.5 specifies the layout. Hard cap 16KB rendered; oversized prompts raise `PromptTooLargeError` and the loop records the failure rather than dispatch. `is_git=False` is set by `loop.py` for projects whose `meta.json` declares `is_git: false` (see "## Non-git projects" below); the rendered prompt swaps branch + commit steps for in-place edits but keeps the same phase machine.
 
 The rendered prompt is:
 
@@ -536,6 +536,35 @@ Every `fleet workers update` invocation in the rendered prompt includes `--proje
 The `## Standards (the bar — non-negotiable)` block in the rendered prompt inlines whatever `fleet standards show --merged` emits. The fleet-shipped baseline (seeded by `fleet init`) carries Testing, Code review, and Async waits sections — see [`docs/STANDARDS-BASELINE.md`](../../docs/STANDARDS-BASELINE.md). The Async waits section is the canonical recipe workers should reach for when reconcile or post-push paths need to wait on PR-merge / CI-green / deploy-finish state changes (issue [#105](https://github.com/edisonshen/fleet/issues/105)): a `Bash(run_in_background=true)` call running an `until <check>; do sleep 30; done` loop fires a `<task-notification>` on exit so the worker resumes without foreground sleep chains, operator pings, or prompt-cache thrash.
 
 `dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. The coord agent (Claude session) reads that file and passes the body verbatim as the Agent tool's `prompt` parameter (issue #84 Phase A). fleet-guard's SessionStart hook injection from the v0.1/v0.2.0 era still works for any tmux-spawned worker (e.g., a manual `fleet dispatch` invocation), but the coord skill itself no longer takes that path — workers are Agent subagents now.
+
+## Non-git projects
+
+`fleet project add <path>` accepts directories without a `.git` entry. The project's `meta.json` records `is_git: false` and the coordinator's dispatch path adapts as follows. Operator clarification 2026-05-12: **"same SOP, just no push pr step"** — the three-stage flow (worker → reviewer → finisher) is preserved; only the finisher's mechanical actions change.
+
+What's the same as a git project:
+- **Phase machine** — workers progress through `starting → branch → tdd-red → tdd-green → tdd-refactor → review-pending` and exit. Reviewer flips `review-claude → review-codex → review-done`. Finisher writes `done`.
+- **Three subagents** — one worker, one reviewer, one finisher. Each is a separate Agent-tool dispatch with its own agent_id.
+- **/review is MANDATORY** — `/review` (gstack skill) runs in the reviewer subagent and is never skippable. Same loop, same iter-on-P0/P1 contract.
+- **Phase=blocked + raise-to-operator** — failure modes route through the same reconcile path.
+
+What's different:
+- **No branch creation.** Workers edit files in the project directory in place. `worker/<slug>` branch instructions are omitted from the worker prompt.
+- **No commits.** Each TDD phase (`tdd-red`, `tdd-green`, `tdd-refactor`) updates files in place; the worker prompt says "no commit" explicitly.
+- **codex review SKIPPED with reason `no-git`.** `codex review --base origin/main` needs a git diff to operate; for non-git the reviewer's terminal write is `--review-codex-status skipped --review-codex-skip-reason no-git`. The workers CLI allowlists `no-git` alongside `rate-limited` and `unavailable`.
+- **Finisher does NOT push, does NOT open a PR.** The terminal call is `fleet workers update <slug> --phase done --exit 0` (no `--pr-url`). The workers package's `phase=done` precondition is relaxed for non-git projects (the gate that requires `pr_url` fires only when `meta.GitMode() == true`). The finisher appends a one-line diff summary via `fleet tasks note <slug> "finisher: <summary>"` so the operator sees the deliverable in `fleet tasks show`.
+- **phase=push is REJECTED** for non-git projects (`ErrPhasePushNonGit`). The dispatch path skips push entirely; a buggy finisher that tries to write `phase=push` gets a clear error pointing it at `phase=done` directly.
+
+Use cases for non-git mode:
+- Debug / polish sessions on a scratch directory.
+- One-off file generation (docs, configs, fixtures) outside a repo.
+- Working directories the operator deliberately keeps off git.
+
+Not in scope for the non-git mode (per the launch spec — file follow-ups if needed):
+- No TUI badge differentiating git vs. non-git projects in the dashboard.
+- No auto-`git init` — operator's explicit choice to register without git.
+- No per-task git override — the per-project `is_git` flag is the only switch.
+
+The `project_is_git` lookup is one cheap file read per tick (`~/.fleet/projects/<p>/meta.json`). Missing file, missing `is_git` field, or malformed JSON all default to `true` (git-mode) — the conservative branch keeps legacy projects (pre-v0.9) behaving exactly as before.
 
 ## Sentinel grammar (worker → coord)
 
@@ -593,7 +622,7 @@ The skill's tick lifecycle is intentionally lean (no in-process state survives a
 | Slug mismatch in a sentinel | Logged via `errors[]`; no mutation. |
 | Prompt over hard cap | `PromptTooLargeError` — task NOT dispatched; recorded in errors. Operator shrinks standards/learnings/spec. |
 | Reviewer subagent flips phase=push without recording terminal `review_*_status` | `validateReviewGate` in `internal/workers/workers.go` rejects the write with `ErrPhaseRequiresReview`. The reviewer sees the workers CLI error and is expected to retry the update with `--review-claude-status passed` + `--review-codex-status {passed,skipped}`. Structural enforcement — a buggy reviewer can't accidentally let an unreviewed PR reach the finisher. |
-| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited` or `unavailable`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
+| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited`, `unavailable`, or `no-git`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
 
 ## Tools used
 

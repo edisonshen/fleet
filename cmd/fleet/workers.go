@@ -378,6 +378,12 @@ type workersUpdateOpts struct {
 var allowedCodexSkipReasonsCLI = map[string]struct{}{
 	"rate-limited": {},
 	"unavailable":  {},
+	// "no-git" mirrors the workers package allowlist for non-git
+	// projects (operator clarification 2026-05-12). The reviewer
+	// subagent records this when `codex review --base main` cannot
+	// operate without a git diff. /review (Claude-side) remains
+	// mandatory regardless.
+	"no-git": {},
 }
 
 // workersReviewStatusValid returns true when s is one of the
@@ -453,7 +459,7 @@ explicitly when the caller is a wrapper script.`,
 	cmd.Flags().IntVar(&opts.reviewCodexRounds, "review-codex-rounds", 0,
 		"reviewer subagent: rounds of codex review run before terminal status (0..N)")
 	cmd.Flags().StringVar(&opts.reviewCodexSkipReason, "review-codex-skip-reason", "",
-		"reviewer subagent: skip reason — required when --review-codex-status=skipped (allowlist: rate-limited, unavailable)")
+		"reviewer subagent: skip reason — required when --review-codex-status=skipped (allowlist: rate-limited, unavailable, no-git)")
 	_ = cmd.MarkFlagRequired("phase")
 	return cmd
 }
@@ -499,7 +505,7 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		if codexStatus == workers.ReviewStatusSkipped {
 			if _, ok := allowedCodexSkipReasonsCLI[codexSkipReason]; !ok {
 				return fmt.Errorf(
-					"--review-codex-status=skipped requires --review-codex-skip-reason in {rate-limited, unavailable}; got %q",
+					"--review-codex-status=skipped requires --review-codex-skip-reason in {rate-limited, unavailable, no-git}; got %q",
 					codexSkipReason,
 				)
 			}

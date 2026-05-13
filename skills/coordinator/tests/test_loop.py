@@ -2146,3 +2146,159 @@ def test_loop_skips_handoff_when_worker_pid_alive(
         b.startswith("DISPATCH: alive-dddd")
         for b in result.dispatch_instructions
     ), "handoff fired while worker PID still alive"
+
+
+# ---------- non-git project support ----------
+
+
+def _write_non_git_meta(fleet_home: Path, project: str) -> None:
+    """Seed a meta.json with is_git=false at the project root. Loop's
+    project_is_git lookup reads this file at dispatch time."""
+    proj_dir = fleet_home / "projects" / project
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    (proj_dir / "meta.json").write_text(
+        json.dumps({
+            "schema": "v1",
+            "repo_path": "/tmp/non-git-fake",
+            "added_at": "2026-05-12T00:00:00Z",
+            "is_git": False,
+        }),
+        encoding="utf-8",
+    )
+
+
+def test_loop_dispatches_non_git_worker_with_no_branch_or_commit(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A ready task on a non-git project receives the non-git worker
+    prompt: no 'git checkout -b', no 'git commit' instructions. The
+    three-stage handoff (exit at phase=review-pending) is preserved.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [_make_task("ng-ready-aaaa", status="ready")])
+    dispatch_subprocess.append("aaaaaa01")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert result.dispatched == 1
+    inbox = fleet_home / "inbox" / "aaaaaa01.md"
+    assert inbox.exists()
+    body = inbox.read_text()
+    assert "non-git project" in body.lower()
+    assert "git checkout -b" not in body
+    assert "git commit" not in body
+    # Same SOP — exit at phase=review-pending still drives the handoff.
+    assert "--phase review-pending" in body
+
+
+def test_loop_dispatches_non_git_finisher_without_push_or_pr(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Reviewer wrote phase=review-done on a non-git project → coord
+    dispatches the non-git finisher. The finisher prompt MUST NOT
+    contain 'git push' or 'gh pr create' command lines, and the
+    final terminal write does NOT carry --pr-url.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [
+        _make_task(
+            "ng-finish-bbbb", status="in-progress", worker_pid=88888,
+        ),
+    ])
+    _write_worker_state(
+        fleet_home, "fleet", "ng-finish-bbbb", "review-done",
+    )
+    dispatch_subprocess.append("bbbbbb01")
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_checks", return_value=loop._CIResult(pending=True)):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    blocks = [
+        b for b in result.dispatch_instructions
+        if b.startswith("DISPATCH: ng-finish-bbbb") and "agent_id: bbbbbb01" in b
+    ]
+    assert blocks, f"non-git finisher not dispatched: {result.dispatch_instructions!r}"
+    inbox = fleet_home / "inbox" / "bbbbbb01.md"
+    assert inbox.exists()
+    body = inbox.read_text()
+    assert "FLEET FINISHER" in body.upper()
+    # No push, no PR command lines.
+    assert "git push -u" not in body
+    assert "gh pr create" not in body
+    # phase=done is written without --pr-url.
+    assert "--phase done --exit 0" in body
+    assert "--phase done --pr-url" not in body
+
+
+def test_loop_non_git_cap_above_one_skips_worktree_create(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """A non-git project dispatched with cap>1 must skip worktree
+    creation entirely (no `git worktree add` — there's no git). The
+    dispatch falls through to single-worker behavior: worker_cwd is
+    the project's cwd, no worktree path is recorded.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [_make_task("ng-cap2-cccc", status="ready")])
+    dispatch_subprocess.append("cccc0001")
+
+    # Patch worktree.create_worktree to FAIL loudly — the guard means
+    # it must never be called for a non-git project.
+    def _fail_create(*a, **kw):
+        raise AssertionError("worktree.create_worktree must not run for non-git")
+
+    with patch.object(loop.worktree_mod, "create_worktree", side_effect=_fail_create):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            cap=2, fleet_home=str(fleet_home),
+        )
+
+    assert result.dispatched == 1
+
+
+def test_loop_non_git_phase_done_reconciles_to_done(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Codex iter-1 [P1] regression: a non-git worker that wrote
+    phase=done (no pr_url) must be reconciled to status=done — NOT
+    requeued to todo as 'worker died without PR'. The legacy reconcile
+    path required pr_url to recognize success; for non-git projects
+    that's wrong.
+    """
+    _write_non_git_meta(fleet_home, "fleet")
+    _write_tasks(project_dir, [
+        _make_task(
+            "ng-done-aaaa", status="in-progress", worker_pid=99997, pr_url="",
+        ),
+    ])
+    # Worker wrote phase=done (no pr_url — non-git mode).
+    _write_worker_state(
+        fleet_home, "fleet", "ng-done-aaaa", "done",
+    )
+    with patch.object(loop, "_pid_alive", return_value=False):
+        result = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert result.reconciled == 1
+    set_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "set"]]
+    # Task lands at status=done — NOT in-review, NOT todo.
+    assert any("status=done" in c for c in set_calls), (
+        f"non-git phase=done should reconcile to status=done; "
+        f"got set calls: {set_calls!r}"
+    )
+    # No "died without PR" note — that path is the failure case.
+    note_calls = [c for c in fleet_run_recorder if c[1:3] == ["tasks", "note"]]
+    assert not any("died without PR" in (c[-1] if c else "") for c in note_calls)
+    # The success note mentions non-git so the operator sees the mode.
+    success_notes = [c for c in note_calls if "non-git" in (c[-1] if c else "")]
+    assert success_notes, f"expected non-git success note: {note_calls!r}"

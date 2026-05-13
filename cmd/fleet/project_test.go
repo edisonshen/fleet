@@ -120,17 +120,89 @@ func TestProjectAdd_MissingPath_Errors(t *testing.T) {
 	}
 }
 
-func TestProjectAdd_NotAGitRepo_Errors(t *testing.T) {
-	setupFleetHome(t)
+// TestProjectAdd_NonGitDirectory_AcceptedWithWarning replaces the
+// previous "must be a git repo" guard. Operator clarification
+// 2026-05-12: non-git directories register as IsGit=false with a
+// stderr warning. The worker dispatch then skips push + PR.
+func TestProjectAdd_NonGitDirectory_AcceptedWithWarning(t *testing.T) {
+	root := setupFleetHome(t)
 	dir := t.TempDir() // no .git inside
 
-	out := &bytes.Buffer{}
-	err := runProjectAdd(dir, out, out)
-	if err == nil {
-		t.Fatal("expected error on non-git path, got nil")
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := runProjectAdd(dir, stdout, stderr); err != nil {
+		t.Fatalf("non-git add must succeed, got: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not a git repo") {
-		t.Errorf("error should mention 'not a git repo', got: %v", err)
+
+	// stderr carries the warning. Body text is informational; check
+	// for the noun-marker "non-git" so the operator sees what mode
+	// they're in.
+	if !strings.Contains(stderr.String(), "non-git") {
+		t.Errorf("expected 'non-git' warning on stderr, got:\n%s", stderr.String())
+	}
+
+	// meta.json on disk records is_git=false. Use the raw map to
+	// confirm the field is present (not just default-true).
+	tag := projectTagForTest(t, dir)
+	metaPath := filepath.Join(root, "projects", tag, "meta.json")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(metaData, &raw); err != nil {
+		t.Fatalf("unmarshal meta.json: %v", err)
+	}
+	v, ok := raw["is_git"]
+	if !ok {
+		t.Fatalf("is_git missing on disk for non-git add; raw=%v", raw)
+	}
+	if b, _ := v.(bool); b {
+		t.Errorf("is_git=%v on disk for non-git add, want false", v)
+	}
+	got, err := projects.Read(tag)
+	if err != nil {
+		t.Fatalf("projects.Read: %v", err)
+	}
+	if got.GitMode() {
+		t.Errorf("GitMode() = true for non-git project; want false")
+	}
+}
+
+// TestProjectAdd_GitDirectoryHasIsGitTrue: happy path stays unchanged —
+// a directory with .git registers as IsGit=true (explicit pointer).
+func TestProjectAdd_GitDirectoryHasIsGitTrue(t *testing.T) {
+	root := setupFleetHome(t)
+	repo := makeRepo(t, "dir")
+
+	out := &bytes.Buffer{}
+	if err := runProjectAdd(repo, out, out); err != nil {
+		t.Fatalf("git add: %v", err)
+	}
+
+	tag := projectTagForTest(t, repo)
+	metaPath := filepath.Join(root, "projects", tag, "meta.json")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal meta.json: %v", err)
+	}
+	v, ok := raw["is_git"]
+	if !ok {
+		t.Fatalf("is_git missing for git add; raw=%v", raw)
+	}
+	if b, _ := v.(bool); !b {
+		t.Errorf("is_git=%v for git add, want true", v)
+	}
+	got, err := projects.Read(tag)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if !got.GitMode() {
+		t.Errorf("GitMode()=false for git project; want true")
 	}
 }
 

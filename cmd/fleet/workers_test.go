@@ -472,6 +472,10 @@ func TestWorkersUpdateCLI_ReviewCodexSkipReasonAllowlist(t *testing.T) {
 	}{
 		{name: "rate-limited accepted", reason: "rate-limited", wantError: false},
 		{name: "unavailable accepted", reason: "unavailable", wantError: false},
+		// "no-git" is the documented skip reason for non-git projects
+		// (operator clarification 2026-05-12). Codex review needs a git
+		// diff; non-git workers record this and continue.
+		{name: "no-git accepted", reason: "no-git", wantError: false},
 		{name: "empty rejected", reason: "", wantError: true},
 		{name: "didn't feel like it rejected", reason: "lazy", wantError: true},
 		{name: "uppercase rejected", reason: "RATE-LIMITED", wantError: true},
