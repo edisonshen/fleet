@@ -23,8 +23,11 @@ package main
 // and project carried forward. No new spawn options required.
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -296,6 +299,21 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	doc.PreviousPath = deadRec.LastHandoffPath
 	doc.Number = deadRec.HandoffNumber
 
+	// Populate OpenPRs by shelling out to `gh pr list` (codex review
+	// iter-18 P1). When the dead coord had tasks in-review status,
+	// handoff_resume.py deliberately skips re-dispatching those
+	// workers and relies on the ## Open PRs section to re-spawn the
+	// PR shepherd until-loops. Without this enrichment, every
+	// recovery-synth doc renders _(no open PRs)_ and the successor
+	// drops in-review PRs on the floor — no worker re-dispatch, no
+	// shepherd. Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+	//
+	// Failures are silent (best-effort): gh missing, auth issue, or
+	// timeout returns an empty slice and the doc renders the
+	// placeholder. The successor coord can re-derive from `gh pr
+	// list` on its first tick if it cares.
+	doc.OpenPRs = collectOpenPRs(deadRec.Cwd)
+
 	docPath, err := state.HandoffPath(deadRec.ID, ts)
 	if err != nil {
 		return "", fmt.Errorf("resolve handoff doc path: %w", err)
@@ -316,4 +334,64 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	// (unused) record can be archived manually; the live coord's
 	// chain is untouched.
 	return docPath, nil
+}
+
+// collectOpenPRs shells out to `gh pr list --state open --search
+// head:worker/ --json number,title,headRefName,url` and returns the
+// parsed list as handoff.OpenPR entries. Used by the recovery path
+// to pre-populate the synth doc's ## Open PRs section so the
+// successor coord re-spawns shepherd until-loops for in-review
+// workers. Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+//
+// cwd: optional directory to run gh in. The gh CLI needs a git
+// repo to discover the upstream — passing the dead coord's recorded
+// cwd makes the command resolve to the right repo even when fleet
+// is invoked from another directory. Empty falls back to gh's
+// default (process cwd).
+//
+// Best-effort: missing gh binary, auth failure, JSON parse error,
+// or 10s timeout returns an empty slice. The doc still renders with
+// the _(no open PRs)_ placeholder; the successor can re-derive from
+// gh on its first tick if it needs to.
+//
+// var so tests can stub. Production wraps the gh shell-out.
+var collectOpenPRs = func(cwd string) []handoff.OpenPR {
+	ghBin, err := exec.LookPath("gh")
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ghBin,
+		"pr", "list",
+		"--state", "open",
+		"--search", "head:worker/",
+		"--json", "number,title,headRefName,url",
+	)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	stdout, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	var raw []struct {
+		Number      int    `json:"number"`
+		Title       string `json:"title"`
+		HeadRefName string `json:"headRefName"`
+		URL         string `json:"url"`
+	}
+	if err := json.Unmarshal(stdout, &raw); err != nil {
+		return nil
+	}
+	out := make([]handoff.OpenPR, 0, len(raw))
+	for _, p := range raw {
+		out = append(out, handoff.OpenPR{
+			Number:      p.Number,
+			Title:       p.Title,
+			HeadRefName: p.HeadRefName,
+			URL:         p.URL,
+		})
+	}
+	return out
 }

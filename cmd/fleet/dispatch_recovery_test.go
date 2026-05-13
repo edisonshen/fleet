@@ -242,6 +242,64 @@ func TestCoordStateFresh_MissingFileReturnsFalse(t *testing.T) {
 	}
 }
 
+// TestWriteRecoveryHandoffDoc_PopulatesOpenPRsFromGH pins codex review
+// iter-18 P1: the synth handoff doc must carry an Open PRs section
+// pulled from `gh pr list` so the successor coord re-spawns shepherd
+// until-loops for in-review workers. Without this, handoff_resume.py
+// skips re-dispatching in-review workers (their status says skip)
+// AND there's no shepherd hint either — the PR is dropped on the floor.
+// Mirrors skills/fleet-guard/handoff.py:_collect_open_prs.
+func TestWriteRecoveryHandoffDoc_PopulatesOpenPRsFromGH(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+
+	// Stub gh's PR list output so the test doesn't depend on a real
+	// gh CLI or GitHub auth.
+	prev := collectOpenPRs
+	collectOpenPRs = func(string) []handoff.OpenPR {
+		return []handoff.OpenPR{
+			{Number: 42, Title: "fix: foo", HeadRefName: "worker/fix-foo-1234", URL: "https://github.com/owner/repo/pull/42"},
+			{Number: 43, Title: "feat: bar", HeadRefName: "worker/feat-bar-5678", URL: "https://github.com/owner/repo/pull/43"},
+		}
+	}
+	t.Cleanup(func() { collectOpenPRs = prev })
+
+	deadRec := fakeAgentRecord("ghprtest", "coord-myproj", "myproj", 11111, "fleet-ghprtest")
+	if err := deadRec.Write(); err != nil {
+		t.Fatalf("write dead record: %v", err)
+	}
+	pdir := filepath.Join(root, "projects", "myproj")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cs := map[string]any{"worker_agent_ids": map[string]string{}}
+	csData, _ := json.Marshal(cs)
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), csData, 0o644); err != nil {
+		t.Fatalf("write coord-state: %v", err)
+	}
+
+	docPath, err := writeRecoveryHandoffDoc(deadRec, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("writeRecoveryHandoffDoc: %v", err)
+	}
+	body, rerr := os.ReadFile(docPath)
+	if rerr != nil {
+		t.Fatalf("read synth doc: %v", rerr)
+	}
+	if !strings.Contains(string(body), "#42 fix: foo") {
+		t.Errorf("synth doc must include PR #42 from gh output; got body:\n%s", body)
+	}
+	if !strings.Contains(string(body), "#43 feat: bar") {
+		t.Errorf("synth doc must include PR #43 from gh output; got body:\n%s", body)
+	}
+	if !strings.Contains(string(body), "https://github.com/owner/repo/pull/42") {
+		t.Errorf("synth doc must include PR URL for shepherd respawn; got body:\n%s", body)
+	}
+}
+
 // TestWriteRecoveryHandoffDoc_WritesSynthDocToDisk pins the wiring
 // between SynthesizeRecovery and the on-disk handoff doc file. The
 // dispatch path produces a doc at ~/.fleet/handoffs/<id>-<stamp>.md
