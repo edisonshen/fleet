@@ -217,7 +217,12 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// that internally launches claude can still be tagged as engine=
 	// codex if the operator wants to track it that way; we don't
 	// second-guess).
-	if !opts.commandExplicit {
+	// Belt-and-suspenders: `commandExplicit` is only set inside RunE
+	// (cobra Changed() check), so callers that bypass cobra and call
+	// runDispatch programmatically (e.g. tests) never flip it true.
+	// Also honor a non-empty opts.command as caller intent — both
+	// signals mean "the caller picked a command, don't stomp it."
+	if !opts.commandExplicit && len(opts.command) == 0 {
 		argv, err := enginecfg.BuildWrapperCommand(engineName)
 		if err != nil {
 			// Should not happen — Known() above already filtered.

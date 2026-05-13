@@ -2,13 +2,19 @@ package main
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // TestDispatch_EngineFlag_Exposed pins that `fleet dispatch --engine ...`
@@ -182,6 +188,74 @@ func TestDispatch_FleetEngineEnvStamped(t *testing.T) {
 		t.Errorf("FLEET_ENGINE = %q after dispatch; want %q (re-stamp regression)",
 			got, "codex")
 	}
+}
+
+// TestDispatch_ProgrammaticCommandNotOverriddenByEngine regresses a CI
+// bug where the engine-wrapper override in runDispatch stomped a
+// programmatically-injected `opts.command`. The original guard checked
+// only `opts.commandExplicit` — a flag set ONLY inside RunE via cobra
+// Changed(). Tests (and any other in-process caller) that bypass cobra
+// to call runDispatch directly with a populated `command` had it
+// silently replaced with the engine wrapper argv (`exec claude` in the
+// claude wrapper, `exec codex` in the codex wrapper). On CI the
+// resolved wrapper exec'd a binary not on PATH and the tmux session
+// crashed at startup, manifesting as "expected 1 live agent, got 0"
+// in 9+ handoff/drain/rm tests. The fix: also honor `len(opts.command)
+// > 0` as caller intent — both signals mean "the caller picked a
+// command, don't stomp it."
+//
+// This test asserts the persisted agent.Record.Command equals the
+// programmatic argv even when FLEET_ENGINE=codex would otherwise
+// route through BuildWrapperCommand("codex").
+func TestDispatch_ProgrammaticCommandNotOverriddenByEngine(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not installed; skipping integration test")
+	}
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	// Isolate the tmux socket so concurrent test runs don't collide.
+	var b [3]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	t.Setenv("FLEET_ENGINE", "codex")
+
+	opts := &dispatchOpts{
+		taskID:  "t1",
+		project: "p1",
+		// commandExplicit deliberately left false (bypasses cobra,
+		// matches the seedAgent test helper pattern).
+		command: []string{"sleep", "60"},
+	}
+	var out bytes.Buffer
+	if err := runDispatch(opts, &out); err != nil {
+		t.Fatalf("runDispatch: %v\n%s", err, out.String())
+	}
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("agent.List: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent, got %d", len(live))
+	}
+	got := live[0].Command
+	want := []string{"sleep", "60"}
+	if len(got) != len(want) {
+		t.Fatalf("record.Command = %v, want %v (engine wrapper stomped programmatic command)",
+			got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("record.Command[%d] = %q, want %q (engine wrapper stomped programmatic command: full=%v)",
+				i, got[i], want[i], got)
+		}
+	}
+	// Clean up the live tmux session so the test doesn't leak.
+	_ = tmux.Kill(live[0].TmuxSession)
 }
 
 func TestResolveEngineFlags_DefaultWhenAllBlank(t *testing.T) {
