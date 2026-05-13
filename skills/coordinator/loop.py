@@ -2026,6 +2026,10 @@ def _dispatch_ready(
     actions: list[_DispatchAction] = []
     standards_md = dispatch_mod.fetch_standards(project, fleet_bin=fleet_bin)
     learnings_text = dispatch_mod.fetch_learnings(project, fleet_bin=fleet_bin)
+    # Per-dispatch git-mode lookup: read meta.json's is_git field. Legacy
+    # projects (no is_git) and read errors default to True (git mode) —
+    # the conservative branch keeps existing behavior intact.
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
     in_flight_after_dispatch: list[parse.Task] = list(in_progress)
 
     for t in candidates:
@@ -2073,6 +2077,7 @@ def _dispatch_ready(
                 learnings_text=learnings_text,
                 branch=worker_branch,
                 worktree_pre_created=bool(worker_worktree),
+                is_git=is_git,
             )
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
@@ -2168,6 +2173,9 @@ def _dispatch_review_handoffs(
         )
     else:
         seen_handoffs = _load_review_handoff_state(home, project)
+    # Git mode is the same per-tick decision as in _dispatch_ready —
+    # the reviewer + finisher prompts branch on this.
+    is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home)
     for t in tasks:
         if t.status != "in-progress":
             continue
@@ -2201,12 +2209,12 @@ def _dispatch_review_handoffs(
         try:
             if phase == "review-pending":
                 prompt = dispatch_mod.build_reviewer_prompt(
-                    t, project=project, branch=branch,
+                    t, project=project, branch=branch, is_git=is_git,
                 )
                 description = f"fleet reviewer {t.slug}"
             else:
                 prompt = dispatch_mod.build_finisher_prompt(
-                    t, project=project, branch=branch,
+                    t, project=project, branch=branch, is_git=is_git,
                 )
                 description = f"fleet finisher {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:

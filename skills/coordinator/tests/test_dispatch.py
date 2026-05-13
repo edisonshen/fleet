@@ -503,3 +503,152 @@ def test_build_finisher_prompt_blocks_on_push_failure() -> None:
     out = dispatch.build_finisher_prompt(t, project="fleet")
     assert "--phase blocked" in out
     assert "--reason" in out
+
+
+# ---------- non-git project support (operator clarification 2026-05-12) ----------
+
+
+def test_project_is_git_missing_meta_defaults_true(tmp_path) -> None:
+    """A project without a meta.json on disk defaults to git-mode —
+    legacy projects pre-date the field and must keep behaving as
+    git-backed.
+    """
+    out = dispatch.project_is_git("ghost", fleet_home=str(tmp_path))
+    assert out is True
+
+
+def test_project_is_git_field_absent_defaults_true(tmp_path) -> None:
+    """meta.json with no is_git key (legacy file) also defaults to git-mode."""
+    proj_dir = tmp_path / "projects" / "legacy"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "meta.json").write_text(
+        '{"schema":"v1","repo_path":"/x","added_at":"2026-01-01T00:00:00Z"}',
+        encoding="utf-8",
+    )
+    assert dispatch.project_is_git("legacy", fleet_home=str(tmp_path)) is True
+
+
+def test_project_is_git_false_returns_false(tmp_path) -> None:
+    """is_git=false on disk surfaces as False — this drives the
+    non-git prompt branches downstream.
+    """
+    proj_dir = tmp_path / "projects" / "scratch"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "meta.json").write_text(
+        '{"schema":"v1","repo_path":"/x","added_at":"2026-01-01T00:00:00Z","is_git":false}',
+        encoding="utf-8",
+    )
+    assert dispatch.project_is_git("scratch", fleet_home=str(tmp_path)) is False
+
+
+def test_project_is_git_malformed_json_defaults_true(tmp_path) -> None:
+    """Conservative default: malformed meta.json falls back to git-mode
+    so a corrupted file doesn't accidentally relax the validator.
+    """
+    proj_dir = tmp_path / "projects" / "broken"
+    proj_dir.mkdir(parents=True)
+    (proj_dir / "meta.json").write_text("this is { not json", encoding="utf-8")
+    assert dispatch.project_is_git("broken", fleet_home=str(tmp_path)) is True
+
+
+def test_build_worker_prompt_git_project_uses_three_stage_flow() -> None:
+    """is_git=True (default) pins the existing three-stage worker
+    contract: branch creation, git commits, exit at review-pending.
+    Regression guard against the non-git branch accidentally taking
+    over for the common case.
+    """
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="fleet", standards_md="", learnings_text="", is_git=True,
+    )
+    # Git-mode signals.
+    assert "git checkout -b worker/" in out
+    assert "git commit" in out
+    # The handoff exit remains phase=review-pending.
+    assert "--phase review-pending" in out
+    # Not the non-git intro.
+    assert "non-git project" not in out
+
+
+def test_build_worker_prompt_non_git_project_skips_branch_push_pr() -> None:
+    """is_git=False emits the non-git worker contract: no branch
+    creation, no commits, but the same TDD/phase progression and
+    exit-at-review-pending handoff.
+    """
+    t = _make_task()
+    out = dispatch.build_worker_prompt(
+        t, project="scratch", standards_md="", learnings_text="", is_git=False,
+    )
+    # Non-git mode signals.
+    assert "non-git project" in out.lower()
+    # No branch creation step.
+    assert "git checkout -b" not in out
+    # The contract still routes through review-pending — same SOP.
+    assert "--phase review-pending" in out
+    # Worker still hands off to reviewer (the three-stage flow is
+    # preserved; only the finisher's actions differ).
+    assert "reviewer" in out.lower()
+
+
+def test_build_reviewer_prompt_non_git_uses_no_git_skip_reason() -> None:
+    """Non-git reviewer cannot run `codex review --base main` (no diff)
+    so it MUST record skip-reason=no-git. The prompt names that exact
+    reason so the reviewer doesn't invent an alternative.
+    """
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="scratch", is_git=False)
+    assert "no-git" in out
+    # /review is still mandatory.
+    assert "/review" in out
+    # The non-git reviewer does NOT attempt the `codex review --base
+    # origin/main` invocation — that's the git path. The terminal
+    # update line pins skip-reason=no-git.
+    assert "codex review --base origin/main" not in out
+    assert "--review-codex-skip-reason no-git" in out
+
+
+def test_build_reviewer_prompt_git_keeps_codex_loop() -> None:
+    """Regression: is_git=True (default) keeps the existing reviewer
+    workflow with the codex iteration loop intact.
+    """
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(t, project="fleet", is_git=True)
+    assert "codex review --base origin/main" in out
+    # Three documented skip reasons (the workers CLI allowlist).
+    assert "rate-limited" in out
+    assert "unavailable" in out
+    # no-git is documented in the allowlist mention but is NOT this
+    # reviewer's intended reason — that's the non-git path.
+
+
+def test_build_finisher_prompt_non_git_skips_push_and_pr() -> None:
+    """Non-git finisher: no git push, no gh pr create. Writes
+    phase=done WITHOUT a pr_url (workers CLI relaxes the pr_url gate
+    for non-git projects).
+    """
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="scratch", is_git=False)
+    # Hard prohibitions. We assert the imperative-command form is
+    # absent ("git push -u" / "gh pr create" the verb) rather than
+    # the literal substring — the body explains that there is no PR
+    # and no push, which incidentally contains the substring "PR" in
+    # informational prose.
+    assert "git push -u" not in out
+    assert "gh pr create" not in out
+    # Phase done is the terminal write — the command line itself must
+    # NOT carry --pr-url.
+    assert "--phase done --exit 0" in out
+    assert "--phase done --pr-url" not in out
+    # Diff summary is the operator-visible deliverable.
+    assert "diff" in out.lower()
+
+
+def test_build_finisher_prompt_git_keeps_push_and_pr() -> None:
+    """Regression: is_git=True (default) keeps the existing finisher
+    push + PR workflow.
+    """
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(t, project="fleet", is_git=True)
+    assert "git push" in out
+    assert "gh pr create" in out
+    assert "--phase done --pr-url" in out
