@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -41,7 +42,8 @@ func TestFindRecoveryCandidate_DeadPidAndDeadTmuxIsCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
+	lockHeld := func(string) bool { return false } // no live coord
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
 	if got == nil {
 		t.Fatalf("expected recovery candidate; got nil")
 	}
@@ -61,7 +63,8 @@ func TestFindRecoveryCandidate_AlivePidIsNotCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return true }         // still ticking
 	sessionAlive := func(string) bool { return false } // tmux gone
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
+	lockHeld := func(string) bool { return false } // no live coord
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
 	if got != nil {
 		t.Errorf("alive-pid candidate must NOT be returned; got %+v", got)
 	}
@@ -79,7 +82,8 @@ func TestFindRecoveryCandidate_AliveTmuxIsNotCandidate(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return true } // tmux still up
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
+	lockHeld := func(string) bool { return false } // no live coord
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
 	if got != nil {
 		t.Errorf("alive-tmux candidate must NOT be returned; got %+v", got)
 	}
@@ -96,7 +100,8 @@ func TestFindRecoveryCandidate_NameMustMatch(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
+	lockHeld := func(string) bool { return false } // no live coord
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
 	if got != nil {
 		t.Errorf("cross-project candidate must NOT be returned; got %+v", got)
 	}
@@ -115,7 +120,8 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 	pidAlive := func(int) bool { return false }
 	sessionAlive := func(string) bool { return false }
 
-	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive)
+	lockHeld := func(string) bool { return false } // no live coord
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
 	if got == nil {
 		t.Fatalf("expected one candidate; got nil")
 	}
@@ -123,6 +129,100 @@ func TestFindRecoveryCandidate_MultipleDeadPicksFirst(t *testing.T) {
 	// requiring the first match (slice order is the agent.List order).
 	if got.ID != "oldest01" {
 		t.Errorf("candidate ID = %q; want oldest01 (first match wins)", got.ID)
+	}
+}
+
+// TestFindRecoveryCandidate_CoordLockHeldVetoes pins the load-bearing
+// safety gate: when pid + tmux both LOOK dead (operator on a different
+// tmux server, dispatch CLI pid long-since reaped) but coordinator.lock
+// is still held by the live Python /coordinator skill, findRecovery
+// MUST refuse to recover. Otherwise --coord-spawn would synth-recover
+// over a live coord and race two coord supervisors on the same project
+// (codex review iter-1 P1).
+func TestFindRecoveryCandidate_CoordLockHeldVetoes(t *testing.T) {
+	records := []*agent.Record{
+		fakeAgentRecord("aaaaaaaa", "coord-myproj", "myproj", 99999, "fleet-aaaaaaaa"),
+	}
+	pidAlive := func(int) bool { return false }       // dispatch CLI pid reaped
+	sessionAlive := func(string) bool { return false } // operator on diff tmux server
+	lockHeld := func(string) bool { return true }      // BUT coord still alive
+
+	got := findRecoveryCandidate("coord-myproj", "myproj", records, pidAlive, sessionAlive, lockHeld)
+	if got != nil {
+		t.Errorf("lock-held coord must NOT be a recovery candidate; got %+v", got)
+	}
+}
+
+// TestCoordLockHeld_AcquirableLockReturnsFalse pins the production lock
+// probe: when the project's coordinator.lock file exists but nobody
+// holds it (acquirable with LOCK_NB|LOCK_EX), coordLockHeld returns
+// false so findRecoveryCandidate proceeds with the recovery.
+func TestCoordLockHeld_AcquirableLockReturnsFalse(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	// Create the lock file (zero-byte sentinel) without holding it.
+	lockPath, err := state.CoordinatorLockPath("myproj")
+	if err != nil {
+		t.Fatalf("CoordinatorLockPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("mkdir locks dir: %v", err)
+	}
+	if err := os.WriteFile(lockPath, nil, 0o644); err != nil {
+		t.Fatalf("write lock file: %v", err)
+	}
+
+	if coordLockHeld("myproj") {
+		t.Errorf("coordLockHeld must return false for an acquirable lock")
+	}
+}
+
+// TestCoordLockHeld_HeldLockReturnsTrue pins the inverse: when another
+// process holds LOCK_EX on coordinator.lock, our probe must return
+// true (the live coord must NOT be recovery-targeted).
+func TestCoordLockHeld_HeldLockReturnsTrue(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	lockPath, err := state.CoordinatorLockPath("myproj")
+	if err != nil {
+		t.Fatalf("CoordinatorLockPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		t.Fatalf("mkdir locks dir: %v", err)
+	}
+	// Hold LOCK_EX from the test goroutine, simulating a live coord.
+	holder, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatalf("flock LOCK_EX: %v", err)
+	}
+
+	if !coordLockHeld("myproj") {
+		t.Errorf("coordLockHeld must return true while LOCK_EX is held by another fd")
+	}
+}
+
+// TestCoordLockHeld_MissingFileReturnsFalse covers the fresh-project
+// case: the lock file doesn't exist (no coord ever ran), so coordLockHeld
+// reports "not held" and the caller proceeds.
+func TestCoordLockHeld_MissingFileReturnsFalse(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+
+	if coordLockHeld("freshproj") {
+		t.Errorf("coordLockHeld on a missing lock file must return false")
 	}
 }
 

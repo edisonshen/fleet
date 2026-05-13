@@ -424,7 +424,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		if lerr != nil {
 			_, _ = fmt.Fprintf(stdout,
 				"warning: dead-coord recovery probe skipped (agent.List: %v) — proceeding with fresh spawn\n", lerr)
-		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession); dead != nil {
+		} else if dead := findRecoveryCandidate(opts.taskID, opts.project, records, pidAlive, tmuxHasSession, coordLockHeld); dead != nil {
 			docPath, derr := writeRecoveryHandoffDoc(dead, time.Now().UTC())
 			if derr != nil {
 				_, _ = fmt.Fprintf(stdout,
