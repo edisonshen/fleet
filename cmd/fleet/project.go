@@ -47,8 +47,11 @@ func newProjectAddCmd() *cobra.Command {
 		Use:   "add <path>",
 		Short: "Register a cloned repo as a fleet project (no dispatch, no coord)",
 		Long: `add registers <path> as a fleet project without dispatching a task
-or auto-spawning a coordinator. The path must exist and contain a .git
-entry (file or directory — covers worktrees).
+or auto-spawning a coordinator. The path must exist. A .git entry
+(file or directory — covers worktrees) makes it a "git" project; a
+directory without .git is registered as a non-git project (no commits,
+no branches, no PRs — workers edit files in place and the finisher
+marks the task done with a local-diff summary).
 
 Creates ~/.fleet/projects/<tag>/{tasks.md, meta.json}. The tag is
 derived via the standard parent-basename + sanitization rule (same as
@@ -114,11 +117,23 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 	// (3) .git entry — file OR directory. A real clone has a .git
 	// directory; a `git worktree add`'d checkout has a .git file with
 	// a "gitdir: ..." pointer. Both are valid project roots.
+	//
+	// Non-git mode (operator clarification 2026-05-12): a directory
+	// without .git is accepted with a stderr warning. The project is
+	// registered with IsGit=false; downstream dispatch swaps the
+	// finisher (push + PR) for a "mark done with local-diff summary"
+	// path. Worker still runs TDD + /review + (where possible) codex
+	// review.
+	isGit := true
 	if _, gerr := os.Stat(filepath.Join(abs, ".git")); gerr != nil {
 		if errors.Is(gerr, os.ErrNotExist) {
-			return fmt.Errorf("project add: not a git repo: %s (no .git entry)", abs)
+			isGit = false
+			_, _ = fmt.Fprintf(stderr,
+				"warning: %s has no .git entry; registering as non-git project (no commits, no PRs, edits in place)\n",
+				abs)
+		} else {
+			return fmt.Errorf("project add: stat %s/.git: %w", abs, gerr)
 		}
-		return fmt.Errorf("project add: stat %s/.git: %w", abs, gerr)
 	}
 
 	// (4) tag.
@@ -195,11 +210,18 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 
 	// (9) write meta.json. Use UTC so timestamps are stable across
 	// machines / timezones (matches state.HandoffPath's UTC choice).
+	//
+	// IsGit is always persisted explicitly (pointer to true OR false).
+	// Without an explicit value, a re-add of a non-git project that
+	// happens to gain a .git entry between adds would silently flip
+	// to git-mode but leave is_git absent on disk — leaving downstream
+	// readers ambiguous. Explicit is cheap.
 	now := nowFn().UTC()
 	m := projects.Meta{
 		Schema:   projects.SchemaVersion,
 		RepoPath: abs,
 		AddedAt:  now,
+		IsGit:    projects.BoolPtr(isGit),
 	}
 	if err := projects.Write(tag, m); err != nil {
 		return fmt.Errorf("project add: write meta.json: %w", err)
