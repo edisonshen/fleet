@@ -333,6 +333,38 @@ func TestStatus_SessionCapBanner_SmallCapThresholdFaithful(t *testing.T) {
 	})
 }
 
+// TestStatus_SessionCapBanner_OnJSONPath regresses codex iter-3 P2:
+// the banner used to be skipped on `fleet status --json` because the
+// JSON branch returned from enc.Encode before reaching the banner
+// call. Scripted/monitoring callers piping stdout through jq still
+// need the cap warning on stderr.
+func TestStatus_SessionCapBanner_OnJSONPath(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "5")
+
+	// 5/5 = 100% — banner must fire.
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d", "fleet-e"}
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(string) bool { return false },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "WARNING") {
+		t.Errorf("--json path must still emit cap banner on stderr; stderr:\n%s",
+			stderr.String())
+	}
+	// stdout must remain valid JSON — banner went to stderr.
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "[") {
+		t.Errorf("--json stdout should be a JSON array, got: %s", stdout.String())
+	}
+}
+
 // TestStatus_SessionCapBanner_AbsentOnProbeFailure regresses the
 // "transient tmux unreachable" case. The status command must not
 // spam the operator on every run when tmux is briefly missing.

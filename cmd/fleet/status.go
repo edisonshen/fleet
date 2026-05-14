@@ -79,6 +79,12 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
+		// Session-cap banner runs on the JSON path too (codex iter-3
+		// P2). It writes to stderr — `fleet status --json | jq`
+		// reads only stdout, so the banner doesn't corrupt the
+		// JSON stream while still surfacing the cap warning to
+		// monitoring jobs and scripted callers watching stderr.
+		emitSessionCapBanner(stderr)
 		// JSON path stays a single record array — appending the
 		// nudge would break jq pipelines and `fleet status --json |
 		// fleet ...` chains. Operators piping through jq see only
