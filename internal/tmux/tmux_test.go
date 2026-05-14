@@ -121,6 +121,47 @@ func TestKill_IdempotentOnMissing(t *testing.T) {
 	}
 }
 
+// TestListSessions_NoServerReturnsEmpty covers the
+// no-server-running case: ListSessions must collapse it into
+// "no sessions, no error" instead of surfacing it as a probe failure.
+// `fleet maintenance prune-orphan-tmux` should print a clean empty
+// report when there's no tmux server, not fail.
+func TestListSessions_NoServerReturnsEmpty(t *testing.T) {
+	requireTmux(t)
+	// requireTmux gave us a fresh, isolated socket; no sessions yet.
+	got, err := ListSessions()
+	if err != nil {
+		t.Errorf("ListSessions on fresh socket: got err %v; want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListSessions on fresh socket: got %v; want empty slice", got)
+	}
+}
+
+// TestListSessions_RoundTripWithSpawnedSession is the happy path:
+// spawn a session, ListSessions sees it. Cleanup kills it.
+func TestListSessions_RoundTripWithSpawnedSession(t *testing.T) {
+	requireTmux(t)
+	session := "fleet-test-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+	if err := Spawn(session, "", []string{"sleep", "30"}, nil); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	got, err := ListSessions()
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	found := false
+	for _, s := range got {
+		if s == session {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListSessions did not include spawned %q; got %v", session, got)
+	}
+}
+
 func TestSpawn_EmptyCommand(t *testing.T) {
 	if err := Spawn("any", "", nil, nil); err == nil {
 		t.Error("expected error for empty command")

@@ -385,3 +385,50 @@ func Kill(session string) error {
 func SessionName(agentID string) string {
 	return "fleet-" + agentID
 }
+
+// ListSessions returns the names of every tmux session on the active
+// server (FLEET_TMUX_SOCKET when set, else the default server).
+//
+// Equivalent shell:
+//
+//	tmux ls -F '#{session_name}'
+//
+// Returns an empty slice with no error when the server has no live
+// sessions (tmux prints "no server running" / "no current client"
+// to stderr; both collapse here into "no sessions"). Genuine probe
+// failures (tmux binary missing, broken socket permissions) surface
+// as errors so the operator-facing `fleet maintenance prune-orphan-tmux`
+// can distinguish "no orphans" from "couldn't even check".
+//
+// Trailing newline stripped; per-line names trimmed. Empty lines
+// (defensive — tmux shouldn't emit them) skipped.
+func ListSessions() ([]string, error) {
+	cmd := exec.Command("tmux", tmuxArgs("ls", "-F", "#{session_name}")...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			msg := strings.ToLower(stderr.String())
+			switch {
+			case strings.Contains(msg, "no server running"),
+				strings.Contains(msg, "no sessions"),
+				strings.Contains(msg, "no current client"),
+				strings.Contains(msg, "no such file or directory"),
+				strings.Contains(msg, "connection refused"),
+				strings.Contains(msg, "lost server"):
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("tmux ls: %w (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	var names []string
+	for _, line := range strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		names = append(names, line)
+	}
+	return names, nil
+}

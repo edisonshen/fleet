@@ -92,9 +92,18 @@ func Resume(req queue.SpawnFresh, queuePath string,
 	// If the session is dead, the spawn started but the command crashed
 	// at startup (a wrapped engine binary, perhaps); wipe the stale
 	// record and spawn fresh.
+	//
+	// HasSession-then-Remove was the leak (fix/orphan-tmux-sweeper-and-leak-plug):
+	// HasSession returns false for both "session gone" AND "probe failed",
+	// so a transient probe failure could delete the record while the tmux
+	// session was still alive — orphaning it. DropReplacementRecord pairs
+	// the os.Remove with tmux.Kill (idempotent + SessionAlive-backed) so
+	// the record is only removed after the session is confirmed gone.
 	if !tmux.HasSession(newRec.TmuxSession) {
-		if path, perr := state.AgentPath(newRec.ID); perr == nil {
-			_ = os.Remove(path)
+		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+			return fmt.Errorf(
+				"resume: stale replacement %s session %s appeared dead but cleanup failed (%w); spawn fresh aborted",
+				newRec.ID, newRec.TmuxSession, dropErr)
 		}
 		_, _ = fmt.Fprintf(stderr,
 			"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
@@ -311,8 +320,13 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 		return fmt.Errorf("resume: spawn replacement: %w", err)
 	}
 	if !tmux.HasSession(newRec.TmuxSession) {
-		if path, perr := state.AgentPath(newRec.ID); perr == nil {
-			_ = os.Remove(path)
+		// fix/orphan-tmux-sweeper-and-leak-plug: use DropReplacementRecord
+		// so a probe-failure window doesn't delete the record while the
+		// tmux session is still alive.
+		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+			return fmt.Errorf(
+				"resume: replacement %s tmux session %s appeared dead but cleanup failed (%w); old agent untouched, queue file preserved for retry",
+				newRec.ID, newRec.TmuxSession, dropErr)
 		}
 		return fmt.Errorf(
 			"resume: replacement %s spawned but tmux session %s already exited (command crashed at startup?); old agent untouched, queue file preserved for retry",
@@ -439,20 +453,21 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 		if tmux.HasSession(oldRec.TmuxSession) {
 			// Old still alive after Kill — roll back the new agent ONLY
 			// if the new session is also gone (don't strand a live tmux
-			// session with no fleet record).
-			_ = tmux.Kill(newRec.TmuxSession)
-			if !tmux.HasSession(newRec.TmuxSession) {
-				if path, perr := state.AgentPath(newRec.ID); perr == nil {
-					_ = os.Remove(path)
-				}
-				_ = queue.Delete(queuePath)
+			// session with no fleet record). DropReplacementRecord pairs
+			// the kill + remove so a probe-failure window can't drop the
+			// record while the new session is still alive
+			// (fix/orphan-tmux-sweeper-and-leak-plug). On cleanup error
+			// we surface the both-alive variant of the message so the
+			// operator triages both stuck sessions manually.
+			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 				return fmt.Errorf(
-					"resume: old session %s still alive after kill failure: %w (replacement %s rolled back; investigate)",
-					oldRec.TmuxSession, err, newRec.ID)
+					"resume: old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved; cleanup attempt also failed: %v; clean up both manually)",
+					oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID, dropErr)
 			}
+			_ = queue.Delete(queuePath)
 			return fmt.Errorf(
-				"resume: old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved; clean up both manually)",
-				oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID)
+				"resume: old session %s still alive after kill failure: %w (replacement %s rolled back; investigate)",
+				oldRec.TmuxSession, err, newRec.ID)
 		}
 		_, _ = fmt.Fprintf(stderr,
 			"note: kill %s reported error but session is gone: %v\n",

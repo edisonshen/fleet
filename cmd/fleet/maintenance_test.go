@@ -2,12 +2,20 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 )
+
+// stateBootstrapForTest is a thin wrapper for tests that need a
+// bootstrapped FLEET_HOME but don't want to import state's full
+// surface. Keeps the import block of individual tests narrow.
+func stateBootstrapForTest() (string, error) { return state.Bootstrap() }
 
 // TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC pins the
 // reporter contract: only LIVE agents (HasSession true) whose
@@ -208,5 +216,220 @@ func TestCommandHasRemoteControl(t *testing.T) {
 				t.Errorf("commandHasRemoteControl(%v) = %v; want %v", tc.cmd, got, tc.want)
 			}
 		})
+	}
+}
+
+// --- prune-orphan-tmux tests
+// (fix/orphan-tmux-sweeper-and-leak-plug)
+
+// TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive verifies the
+// default-dry-run contract: orphans (no live record) and non-orphans
+// (live record) both appear on stdout with the correct flags, killFn
+// is NEVER called (dry-run gate), and exit is nil.
+func TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive(t *testing.T) {
+	live := map[string]bool{
+		"alive1":  true,
+		"alive2":  true,
+		"orphan1": false,
+		"orphan2": false,
+	}
+	listFn := func() ([]string, error) {
+		return []string{
+			"fleet-alive1",
+			"fleet-orphan2", // intentionally out of alpha order to test sort
+			"fleet-orphan1",
+			"fleet-alive2",
+			"some-other-session", // unrelated, must be ignored
+		}, nil
+	}
+	existsFn := func(id string) bool { return live[id] }
+	killCalls := 0
+	killFn := func(string) error { killCalls++; return nil }
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		false /* dry-run */, listFn, existsFn, killFn); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+	if killCalls != 0 {
+		t.Errorf("dry-run must NOT call killFn; got %d calls", killCalls)
+	}
+	got := stdout.String()
+	// Alphabetical order: alive1, alive2, orphan1, orphan2.
+	expected := []string{
+		"fleet-alive1  orphan=false  state=live  killed=false\n",
+		"fleet-alive2  orphan=false  state=live  killed=false\n",
+		"fleet-orphan1  orphan=true  state=missing  killed=false\n",
+		"fleet-orphan2  orphan=true  state=missing  killed=false\n",
+	}
+	if got != strings.Join(expected, "") {
+		t.Errorf("stdout mismatch:\nGOT:\n%s\nWANT:\n%s", got, strings.Join(expected, ""))
+	}
+	if strings.Contains(got, "some-other-session") {
+		t.Errorf("non-fleet sessions should not appear in output; got:\n%s", got)
+	}
+}
+
+// TestPruneOrphanTmux_KillModeKillsOnlyOrphans verifies --kill: killFn
+// is called for every orphan (and only orphans), output reflects
+// killed=true on those rows, and live sessions are untouched. This is
+// the operator's safety contract for the sweeper.
+func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
+	live := map[string]bool{
+		"alivex":  true,
+		"orphana": false,
+		"orphanb": false,
+	}
+	listFn := func() ([]string, error) {
+		return []string{"fleet-alivex", "fleet-orphana", "fleet-orphanb"}, nil
+	}
+	existsFn := func(id string) bool { return live[id] }
+	var killed []string
+	killFn := func(s string) error { killed = append(killed, s); return nil }
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		true /* --kill */, listFn, existsFn, killFn); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+	// Sort because killFn invocation order depends on listFn order,
+	// which is the input order (not alphabetical — alpha order is for
+	// stdout). Either way, the SET of killed sessions must be exactly
+	// the orphans.
+	wantKilled := []string{"fleet-orphana", "fleet-orphanb"}
+	sort.Strings(killed)
+	sort.Strings(wantKilled)
+	if len(killed) != len(wantKilled) {
+		t.Fatalf("killed sessions: got %v; want %v", killed, wantKilled)
+	}
+	for i := range killed {
+		if killed[i] != wantKilled[i] {
+			t.Errorf("killed[%d]: got %q; want %q", i, killed[i], wantKilled[i])
+		}
+	}
+	got := stdout.String()
+	if !strings.Contains(got, "fleet-orphana  orphan=true  state=missing  killed=true\n") {
+		t.Errorf("expected orphana row with killed=true; got:\n%s", got)
+	}
+	if !strings.Contains(got, "fleet-orphanb  orphan=true  state=missing  killed=true\n") {
+		t.Errorf("expected orphanb row with killed=true; got:\n%s", got)
+	}
+	if !strings.Contains(got, "fleet-alivex  orphan=false  state=live  killed=false\n") {
+		t.Errorf("expected alivex row with killed=false; got:\n%s", got)
+	}
+}
+
+// TestPruneOrphanTmux_KillFailureSurfacedAsWarning verifies that a
+// killFn error does NOT abort the sweep: the operator can chain this
+// into a cron job and trust that one stuck session doesn't block the
+// rest. The error message goes to stderr, exit is nil, and the row
+// shows killed=false for the failed session.
+func TestPruneOrphanTmux_KillFailureSurfacedAsWarning(t *testing.T) {
+	listFn := func() ([]string, error) {
+		return []string{"fleet-failkill", "fleet-okkill"}, nil
+	}
+	existsFn := func(string) bool { return false } // both orphans
+	killFn := func(s string) error {
+		if s == "fleet-failkill" {
+			return errors.New("simulated tmux failure")
+		}
+		return nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		true, listFn, existsFn, killFn); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "warning: kill fleet-failkill") {
+		t.Errorf("stderr should contain kill-failure warning; got: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "fleet-failkill  orphan=true  state=missing  killed=false\n") {
+		t.Errorf("stdout should show killed=false for the failed session; got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "fleet-okkill  orphan=true  state=missing  killed=true\n") {
+		t.Errorf("stdout should show killed=true for the successful session; got:\n%s", stdout.String())
+	}
+}
+
+// TestPruneOrphanTmux_ListErrorSurfacedAsError ensures we don't
+// silently swallow a tmux probe failure — if we can't list sessions,
+// we exit non-zero so cron / scripts notice instead of treating
+// "couldn't even check" as "no orphans".
+func TestPruneOrphanTmux_ListErrorSurfacedAsError(t *testing.T) {
+	listFn := func() ([]string, error) { return nil, errors.New("simulated tmux ls failure") }
+	existsFn := func(string) bool { return true }
+	killFn := func(string) error { return nil }
+
+	var stdout, stderr bytes.Buffer
+	err := runMaintenancePruneOrphanTmux(&stdout, &stderr, false,
+		listFn, existsFn, killFn)
+	if err == nil {
+		t.Fatalf("expected error when listFn fails; got nil")
+	}
+	if !strings.Contains(err.Error(), "list tmux sessions") {
+		t.Errorf("error should describe the operation; got: %v", err)
+	}
+}
+
+// TestPruneOrphanTmux_IgnoresNonFleetAndDegeneratePrefixes pins the
+// scope guard: sessions named "fleet-" with no ID, or sessions not
+// prefixed with "fleet-", are silently dropped. Operator's "other"
+// tmux work is left alone.
+func TestPruneOrphanTmux_IgnoresNonFleetAndDegeneratePrefixes(t *testing.T) {
+	listFn := func() ([]string, error) {
+		return []string{
+			"fleet-",        // degenerate — no ID
+			"unrelated",     // non-fleet
+			"work",          // non-fleet
+			"fleet-real-id", // genuine orphan
+		}, nil
+	}
+	existsFn := func(string) bool { return false }
+	killCalls := []string{}
+	killFn := func(s string) error { killCalls = append(killCalls, s); return nil }
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr, true,
+		listFn, existsFn, killFn); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+	// Only the genuine fleet-<id> orphan should be reported / killed.
+	got := stdout.String()
+	if got != "fleet-real-id  orphan=true  state=missing  killed=true\n" {
+		t.Errorf("expected only fleet-real-id row; got:\n%s", got)
+	}
+	if len(killCalls) != 1 || killCalls[0] != "fleet-real-id" {
+		t.Errorf("expected exactly one kill of fleet-real-id; got %v", killCalls)
+	}
+}
+
+// TestAgentRecordExists_LiveRecordPresent is the happy path: a freshly
+// written agent record is visible to the orphan check.
+func TestAgentRecordExists_LiveRecordPresent(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := stateBootstrapForTest(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	rec := agent.New("hasone")
+	if err := rec.Write(); err != nil {
+		t.Fatalf("rec.Write: %v", err)
+	}
+	if !agentRecordExists("hasone") {
+		t.Errorf("agentRecordExists(\"hasone\") = false; want true (record was written)")
+	}
+}
+
+// TestAgentRecordExists_MissingReturnsFalse is the orphan-detection
+// bar: a record that was never written (or was deleted) reports false.
+func TestAgentRecordExists_MissingReturnsFalse(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := stateBootstrapForTest(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if agentRecordExists("nonexistent") {
+		t.Errorf("agentRecordExists(\"nonexistent\") = true; want false (no record on disk)")
 	}
 }
