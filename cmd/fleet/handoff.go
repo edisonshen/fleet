@@ -996,32 +996,59 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
-	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
-		!errors.Is(err, tmux.ErrNoSession) {
-		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
-	}
-	if opts.graceMillis > 0 {
-		time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
-	}
-	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
-		if tmux.HasSession(oldRec.TmuxSession) {
-			return fmt.Errorf(
-				"resume handoff: old session %s still alive after kill: %w (replacement %s exists; investigate)",
-				oldRec.TmuxSession, err, newRec.ID)
+	// Coord swap fast path on the crash-recovery flow too. If the
+	// previous run crashed after spawn but before the marker write,
+	// the marker is still at oldRec.ID and a coord swap is still
+	// pending — route through AtomicCoordSwap (codex review iter-5
+	// [P1]). If the previous run got past marker commit before
+	// crashing, marker is already at newRec.ID and isCoordSwap is
+	// false — fall through to inline kill+archive (the marker is
+	// already where it needs to be).
+	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	if isCoordSwap {
+		_, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
+			Project:              oldRec.Project,
+			OldRec:               oldRec,
+			AlreadySpawnedNewRec: newRec,
+			GraceWindow:          time.Duration(opts.graceMillis) * time.Millisecond,
+		}, stderr)
+		if swapErr != nil {
+			switch {
+			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel),
+				errors.Is(swapErr, handoffop.ErrOldKillProbeAmbiguousSentinel):
+				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
+			default:
+				return swapErr
+			}
 		}
-		_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
-			oldRec.TmuxSession, err)
-	}
+	} else {
+		if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
+			!errors.Is(err, tmux.ErrNoSession) {
+			_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n", oldRec.TmuxSession, err)
+		}
+		if opts.graceMillis > 0 {
+			time.Sleep(time.Duration(opts.graceMillis) * time.Millisecond)
+		}
+		if err := tmux.Kill(oldRec.TmuxSession); err != nil {
+			if tmux.HasSession(oldRec.TmuxSession) {
+				return fmt.Errorf(
+					"resume handoff: old session %s still alive after kill: %w (replacement %s exists; investigate)",
+					oldRec.TmuxSession, err, newRec.ID)
+			}
+			_, _ = fmt.Fprintf(stderr, "note: kill %s reported error but session is gone: %v\n",
+				oldRec.TmuxSession, err)
+		}
 
-	if err := oldRec.Archive(); err != nil {
-		path, perr := state.AgentPath(oldRec.ID)
-		if perr == nil {
-			if rmErr := os.Remove(path); rmErr == nil {
-				_, _ = fmt.Fprintf(stderr, "warning: archive %s: %v (live record removed instead)\n",
-					oldRec.ID, err)
-			} else {
-				return fmt.Errorf("resume handoff: archive %s failed (%w) AND remove failed (%w)",
-					oldRec.ID, err, rmErr)
+		if err := oldRec.Archive(); err != nil {
+			path, perr := state.AgentPath(oldRec.ID)
+			if perr == nil {
+				if rmErr := os.Remove(path); rmErr == nil {
+					_, _ = fmt.Fprintf(stderr, "warning: archive %s: %v (live record removed instead)\n",
+						oldRec.ID, err)
+				} else {
+					return fmt.Errorf("resume handoff: archive %s failed (%w) AND remove failed (%w)",
+						oldRec.ID, err, rmErr)
+				}
 			}
 		}
 	}

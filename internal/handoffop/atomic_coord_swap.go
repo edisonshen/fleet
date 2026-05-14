@@ -132,15 +132,21 @@ var ErrOrphanSurvivedSentinel = errors.New("atomic coord swap: orphan survived")
 // archiving on ambiguous probe strands the project with no live coord.
 type ErrOldKillProbeAmbiguous struct {
 	OldSession string
+	OldAgentID string
 	NewAgentID string
 	Project    string
 	ProbeErr   error
 }
 
 func (e *ErrOldKillProbeAmbiguous) Error() string {
+	// Use OldAgentID (not OldSession) in the suggested fleet rm
+	// command — `fleet rm` takes an agent ID, not a tmux session
+	// name. Codex review iter-5 [P3]: following the prior message
+	// with the session name verbatim would fail and leave the stale
+	// record in place.
 	return fmt.Sprintf(
 		"atomic coord swap: marker committed to %s but post-kill probe of OLD session %s for project %q was ambiguous: %v (OLD record preserved; operator: confirm OLD dead, then `fleet rm %s`)",
-		e.NewAgentID, e.OldSession, e.Project, e.ProbeErr, e.OldSession)
+		e.NewAgentID, e.OldSession, e.Project, e.ProbeErr, e.OldAgentID)
 }
 
 func (e *ErrOldKillProbeAmbiguous) Is(target error) bool {
@@ -419,6 +425,7 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			}
 			return res, &ErrOldKillProbeAmbiguous{
 				OldSession: in.OldRec.TmuxSession,
+				OldAgentID: in.OldRec.ID,
 				NewAgentID: newRec.ID,
 				Project:    in.Project,
 				ProbeErr:   perr,
