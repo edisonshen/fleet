@@ -213,6 +213,13 @@ func TestMaybeAutoInit_DispatchHooked(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("HOME", tmp)
 	t.Setenv("FLEET_HOME", filepath.Join(tmp, ".fleet"))
+	// Postmortem 2026-05-14 (orphan tmux leak): on a host with tmux
+	// installed, runDispatch reaches spawn.Spawn and creates a real
+	// tmux session even though the test only cares about the
+	// maybeAutoInit branch firing earlier in the call. Isolate +
+	// kill-server on cleanup so the spawn never targets the operator's
+	// default tmux server.
+	isolateTmuxSocket(t)
 
 	claudeMain := filepath.Join(tmp, ".claude", "skills", "fleet-guard", "main.py")
 	if _, err := os.Stat(claudeMain); err == nil {

@@ -139,6 +139,12 @@ func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
 func TestDispatch_AllowsBenignCoordPrefix(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Postmortem 2026-05-14 (orphan tmux leak): without socket
+	// isolation, runDispatch reaches spawn.Spawn on a host with tmux
+	// installed and leaks a real session onto the operator's default
+	// tmux server. The test wasn't designed to spawn but does so as a
+	// side-effect; isolate + clean up unconditionally.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "coord-cache-warm",
 		project: "ops",
@@ -152,6 +158,9 @@ func TestDispatch_AllowsBenignCoordPrefix(t *testing.T) {
 	if err != nil && strings.Contains(err.Error(), "reserved coord sentinel") {
 		t.Errorf("benign coord-* task must not trigger reservation gate; got %q", err.Error())
 	}
+	// If spawn DID succeed (host has tmux), the per-test tmux server
+	// owns the session — isolateTmuxSocket's kill-server cleanup
+	// reaps it on test exit.
 }
 
 // TestDispatch_CoordSpawnFlag_Exposed pins the hidden flag's
@@ -304,6 +313,10 @@ func TestDispatch_CoordSpawnRequiresExplicitProject(t *testing.T) {
 func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Postmortem 2026-05-14 (orphan tmux leak): isolate so a host with
+	// tmux installed doesn't leak a session via runDispatch → spawn.Spawn
+	// onto the operator's default tmux server.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:          "coord-tatoosh",
 		project:         "tatoosh",
@@ -318,6 +331,8 @@ func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 	if err != nil && strings.Contains(err.Error(), "--coord-spawn requires --project") {
 		t.Errorf("issue #70 gate fired with --project explicitly set; got %q", err.Error())
 	}
+	// isolateTmuxSocket's kill-server cleanup reaps any session
+	// spawn.Spawn may have created on the per-test server.
 }
 
 // TestInjectRemoteControlFlag_RewritesDefaultShellWrapper pins
