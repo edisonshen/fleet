@@ -46,6 +46,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 const (
@@ -304,6 +306,76 @@ func firstToken(s string) string {
 		}
 	}
 	return s
+}
+
+// pidResolveTimeout returns the configured pid-resolution budget,
+// honoring FLEET_PID_RESOLVE_S for tests / operators on slow-spawn
+// engines. Falls back to defaultPidResolveTimeout when unset / invalid.
+func pidResolveTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("FLEET_PID_RESOLVE_S"))
+	if raw == "" {
+		return defaultPidResolveTimeout
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return defaultPidResolveTimeout
+	}
+	return time.Duration(n) * time.Second
+}
+
+// pidResolveDisambiguator picks the unique argv substring that
+// identifies THIS spawn's engine among potentially many sibling engines
+// on the host.
+//
+// For coord-spawn dispatches, dispatch.go injects `--remote-control
+// "fleet-coord-<id>"` into the wrapper script. We extract that exact
+// string from execArgv when present — matching against execArgv (not
+// opts.Command) catches the injection even though the persisted
+// rec.Command stays the clean form. Returns empty when no
+// disambiguator is found; the resolver then falls back to the engine
+// hint priority.
+//
+// Match strategy: scan execArgv for any token containing "fleet-coord-"
+// + the agent id. We accept the substring rather than equality because
+// the dispatch-side injector wraps the name in quotes inside the shell
+// wrapper string, so the argv token in the persisted execArgv is
+// `"fleet-coord-<id>"` (literal quotes) but the running claude's argv
+// in ps has it bare as `fleet-coord-<id>`. We strip quotes when
+// extracting.
+func pidResolveDisambiguator(agentID string, execArgv []string) string {
+	if agentID == "" {
+		return ""
+	}
+	needle := "fleet-coord-" + agentID
+	for _, a := range execArgv {
+		if strings.Contains(a, needle) {
+			return needle
+		}
+	}
+	return ""
+}
+
+// pidResolveEngineHint picks the engine binary's command name for the
+// engine-match priority. Falls back to oldRec.Engine on handoff so the
+// successor inherits the same hint.
+//
+// Returns empty for unknown engines — the resolver then falls back to
+// the deepest-non-shell-descendant heuristic, which handles custom
+// wrappers cleanly. "claude-code" maps to "claude" (the binary name);
+// "codex" maps to "codex". Future engines add a row to the map.
+func pidResolveEngineHint(engine string, oldRec *agent.Record) string {
+	eng := engine
+	if eng == "" && oldRec != nil {
+		eng = oldRec.Engine
+	}
+	switch eng {
+	case "claude-code", "":
+		return "claude"
+	case "codex":
+		return "codex"
+	default:
+		return ""
+	}
 }
 
 // productionResolveDeps returns the wired deps for the resolver. ps and

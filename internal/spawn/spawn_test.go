@@ -43,6 +43,12 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// Speed up the pid-resolver poll budget in tests. Production uses
+	// 10s; tests with synthetic commands ("sleep 30", "sh -c sleep 60")
+	// will never find a "claude" descendant, so the resolver will run
+	// to timeout. 1s keeps the test wall time bounded while still
+	// exercising the polling loop.
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
 }
 
 // capturePaneArgs builds tmux args for capture-pane against the
