@@ -166,15 +166,17 @@ func resolveEnginePid(
 	//    is pure stall.
 	var tentativePid int
 	var tentativeArgs string
+	// rawShellLeafObservations tracks consecutive polls where the
+	// pane has been a shell with no children. We require N
+	// consecutive observations (~rawShellLeafConfirmPolls × 50ms =
+	// ~250ms) before fast-returning the pane pid, so a normal
+	// `sh -c "claude ..."` spawn sampled BEFORE claude exec'd
+	// doesn't trip the fast-path and record the wrapper shell.
+	// Codex iter-7 regression fix (2026-05-14).
+	rawShellLeafObservations := 0
 	for {
 		procs, err := deps.listProcs()
 		if err == nil {
-			// Fast-path: pane is a raw shell with no children. The
-			// operator dispatched a shell directly; pane pid is the
-			// right answer; no point polling for descendants.
-			if paneIsRawShellLeaf(procs, panePid) {
-				return panePid, "", nil
-			}
 			pid, args, stable := findEngineDescendant(procs, panePid, disambiguator, engineHint)
 			if pid > 0 {
 				if stable {
@@ -185,6 +187,22 @@ func resolveEnginePid(
 				// have died by the deadline).
 				tentativePid = pid
 				tentativeArgs = args
+			}
+			// Fast-path: pane has been a raw shell with no children
+			// for N consecutive polls. Initial poll alone is NOT
+			// enough — `sh -c "claude ..."` can momentarily show
+			// the shell without its claude child while the fork is
+			// in flight. After N stable observations the wrapper
+			// has clearly NOT exec'd a real child, so the pane IS
+			// the correct recorded pid (operator dispatched a
+			// bare shell with no command).
+			if paneIsRawShellLeaf(procs, panePid) {
+				rawShellLeafObservations++
+				if rawShellLeafObservations >= rawShellLeafConfirmPolls {
+					return panePid, "", nil
+				}
+			} else {
+				rawShellLeafObservations = 0
 			}
 		}
 		if !deps.now().Before(deadline) {
@@ -203,6 +221,16 @@ func resolveEnginePid(
 		deps.sleep(defaultPidResolvePollInterval)
 	}
 }
+
+// rawShellLeafConfirmPolls is how many CONSECUTIVE polls the pane
+// must be observed as a raw shell with no children before the
+// resolver fast-returns the pane pid. ~250ms total (5 polls × 50ms)
+// is well above the typical shell-fork-to-exec window (~10-100ms)
+// for normal `sh -c "..."` spawns, and far below the 10s default
+// timeout. Smaller values risk recording the wrapper shell on a
+// slow fork (codex iter-7); larger values delay raw-shell-only
+// dispatch unnecessarily.
+const rawShellLeafConfirmPolls = 5
 
 // findEngineDescendant walks the process tree rooted at panePID and
 // returns (pid, argv) of the first descendant whose argv satisfies the

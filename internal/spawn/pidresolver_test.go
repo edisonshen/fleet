@@ -360,11 +360,60 @@ func TestResolveEnginePid_TentativeMatchWaitsForStability(t *testing.T) {
 	// long-lived either). 201 is the bug.
 }
 
+// TestResolveEnginePid_WrapperShellWithLateChildDoesNotFastPath
+// pins codex iter-7's P1 regression: a normal `sh -c "claude ..."`
+// spawn sampled BEFORE claude exec'd as a child must NOT fast-path
+// return the wrapper shell. The shell has no children for the
+// first ~100ms while the fork-exec is in flight; if the resolver
+// fast-returned on that snapshot, we'd record the wrapper pid and
+// reintroduce the dead-PID bug.
+//
+// Test shape: first poll shows wrapper shell only. Second poll
+// shows claude as a child. Resolver must return claude pid, not
+// the shell.
+func TestResolveEnginePid_WrapperShellWithLateChildDoesNotFastPath(t *testing.T) {
+	listCalls := 0
+	deps := resolveEnginePidDeps{
+		panePID: func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) {
+			listCalls++
+			if listCalls == 1 {
+				// First poll: wrapper shell only, no claude yet.
+				return []procEntry{
+					{PID: 200, PPID: 1, Args: "sh -c claude --remote-control fleet-coord-X1"},
+				}, nil
+			}
+			// Subsequent polls: claude exists as child.
+			return []procEntry{
+				{PID: 200, PPID: 1, Args: "sh -c claude --remote-control fleet-coord-X1"},
+				{PID: 201, PPID: 200, Args: "claude --remote-control fleet-coord-X1"},
+			}, nil
+		},
+		now: func() time.Time {
+			// Advance slowly so we don't hit deadline before the
+			// child appears in poll 2.
+			return time.Unix(0, 0).Add(time.Duration(listCalls) * 50 * time.Millisecond)
+		},
+		sleep: func(time.Duration) {},
+	}
+	pid, _, err := resolveEnginePid("fleet-x", "fleet-coord-X1", "claude", 5*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid == 200 {
+		t.Errorf("resolver fast-returned wrapper shell pid 200 on first poll; the child claude should win on poll 2")
+	}
+	if pid != 201 {
+		t.Errorf("pid = %d, want 201 (the claude child)", pid)
+	}
+}
+
 // TestResolveEnginePid_RawShellLeafFastReturns pins codex iter-5's
 // P2: when the dispatched command is a raw shell (`fleet dispatch
 // --command sh`), the pane process is the shell with no children.
-// The resolver must fast-return the pane pid instead of stalling
-// for the full timeout (the pane IS the correct recorded pid).
+// The resolver must eventually fast-return the pane pid (after N
+// consecutive raw-shell-leaf observations to differentiate from
+// the codex iter-7 wrapper-with-late-child race).
 func TestResolveEnginePid_RawShellLeafFastReturns(t *testing.T) {
 	procs := []procEntry{
 		{PID: 200, PPID: 1, Args: "sh"}, // pane is bare shell, no children
