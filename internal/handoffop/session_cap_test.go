@@ -2,6 +2,7 @@ package handoffop
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -127,13 +128,7 @@ func TestSpawnAndRetire_SessionCapProbeFailureProceeds(t *testing.T) {
 }
 
 // errProbeFail is a sentinel for the probe-failure test.
-var errProbeFail = mkErr("tmux: command not found")
-
-func mkErr(s string) error { return &simpleErr{s} }
-
-type simpleErr struct{ s string }
-
-func (e *simpleErr) Error() string { return e.s }
+var errProbeFail = errors.New("tmux: command not found")
 
 // seedAgentRecord writes a minimal live state.json so
 // state.LiveAgentRecordExists returns true for the id. Uses

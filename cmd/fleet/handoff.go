@@ -156,18 +156,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if err := tmux.Available(); err != nil {
 		return err
 	}
-	// FLEET_MAX_SESSIONS backstop. Refuse to spawn the replacement
-	// when the total count of fleet-* tmux sessions is at-or-above
-	// the cap. --force-replacement bypasses for operator cleanups
-	// that NEED the successor up first. Runs BEFORE the per-agent
-	// flock so a refusal exits cleanly without taking the lock.
-	bypass := SessionCapBypassReason("")
-	if opts.forceReplacement {
-		bypass = SessionCapBypassForceReplacement
-	}
-	if err := enforceSessionCap(stderr, bypass); err != nil {
-		return err
-	}
 
 	// 1. Per-agent flock — acquired BEFORE any side effects so
 	//    concurrent `fleet handoff X` invocations serialize from the
@@ -571,6 +559,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// confusing Command/ExecCommand divergence in spawn.Options).
 		rewrittenExecArgv = nil
 	}
+
+	// FLEET_MAX_SESSIONS backstop. Runs HERE (not at the top of
+	// runHandoff) so the recovery and dead-session branches above
+	// — which complete an in-flight handoff WITHOUT spawning a new
+	// session — aren't blocked by the cap (codex review iter-1 P1).
+	// A retry of `fleet handoff <id>` after a crash that already
+	// produced its replacement would otherwise fail closed at-cap
+	// even though no spawn is needed, stranding the queue file.
+	// --force-replacement bypasses the cap for operator cleanups
+	// that need the successor up first.
+	bypass := SessionCapBypassReason("")
+	if opts.forceReplacement {
+		bypass = SessionCapBypassForceReplacement
+	}
+	if err := enforceSessionCap(stderr, bypass); err != nil {
+		return err
+	}
+
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,

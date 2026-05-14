@@ -266,6 +266,73 @@ func TestStatus_SessionCapBanner_AtCap(t *testing.T) {
 	}
 }
 
+// TestStatus_SessionCapBanner_SmallCapThresholdFaithful regresses
+// codex iter-1 P2: with `(max * 80) / 100` integer-division, the
+// banner fired too early for small caps (max=1 → threshold=0 →
+// always warn; max=4 → threshold=3 → warn at 75%, not 80%).
+// The fix cross-multiplies (`total*100 >= max*80`) so the
+// advertised 80% holds for every cap.
+func TestStatus_SessionCapBanner_SmallCapThresholdFaithful(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	t.Run("max=1, zero sessions: silent", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "1")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) { return nil, nil },
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		if strings.Contains(stderr.String(), "WARNING") {
+			t.Errorf("max=1, 0 sessions should be silent; stderr:\n%s",
+				stderr.String())
+		}
+	})
+
+	t.Run("max=4, three sessions (75%): silent", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "4")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) {
+				return []string{"fleet-a", "fleet-b", "fleet-c"}, nil
+			},
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		if strings.Contains(stderr.String(), "WARNING") {
+			t.Errorf("max=4, 3 sessions (75%%) should be silent; stderr:\n%s",
+				stderr.String())
+		}
+	})
+
+	t.Run("max=4, four sessions (100%): banner with red", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "4")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) {
+				return []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d"}, nil
+			},
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		body := stderr.String()
+		if !strings.Contains(body, "WARNING") {
+			t.Errorf("max=4, 4 sessions (100%%) should warn; stderr:\n%s", body)
+		}
+		if !strings.Contains(body, "\x1b[1;31m") {
+			t.Errorf("100%% should use red ANSI; stderr:\n%s", body)
+		}
+	})
+}
+
 // TestStatus_SessionCapBanner_AbsentOnProbeFailure regresses the
 // "transient tmux unreachable" case. The status command must not
 // spam the operator on every run when tmux is briefly missing.

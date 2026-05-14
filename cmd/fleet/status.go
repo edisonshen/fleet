@@ -165,9 +165,18 @@ func emitSessionCapBanner(stderr io.Writer) {
 		return
 	}
 	max := state.MaxSessions(stderr)
-	threshold := (max * sessionCapWarnThresholdPct) / 100
 	total := counts.Total()
-	if total < threshold {
+	// Compare `total*100 >= max*pct` instead of `total >= (max*pct)/100`
+	// to keep the threshold faithful for small caps (codex review
+	// iter-1 P2). Integer division floors: with max=1 and pct=80,
+	// `(max*pct)/100` rounds to 0 and the banner would fire at zero
+	// sessions; with max=4 it'd fire at 50% (2/4) instead of the
+	// advertised 80%. The cross-multiplied form preserves the
+	// percentage exactly without floats.
+	//
+	// Also skip emit when total is zero — nothing useful to warn
+	// about, even when the rounded threshold lands at 0.
+	if total == 0 || total*100 < max*sessionCapWarnThresholdPct {
 		return
 	}
 	bannerStyle := bannerStyleWarning

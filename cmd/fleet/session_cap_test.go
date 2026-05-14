@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -159,6 +162,53 @@ func TestEnforceSessionCap_ListErrorProceedsWithoutBlocking(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "could not enumerate") {
 		t.Errorf("expected probe-fail warning, got %q", stderr.String())
+	}
+}
+
+// TestHandoff_CapDoesNotBlockDeadSessionShortCircuit regresses
+// codex iter-1 P1: the FLEET_MAX_SESSIONS cap originally ran at the
+// top of runHandoff, before the dead-session short-circuit. That
+// stranded operators who needed to archive a dead agent's record
+// at-cap. The fix moved the cap check to right before spawn.Spawn,
+// so dead-session archiving proceeds regardless of count.
+//
+// Test setup: at-cap (injected), no live session for the old agent
+// → runHandoff should archive the record without invoking the cap.
+func TestHandoff_CapDoesNotBlockDeadSessionShortCircuit(t *testing.T) {
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+	t.Setenv("FLEET_MAX_SESSIONS", "1")
+	// Inject at-cap so any precheck would refuse.
+	withInjectedSessionFns(t,
+		func() ([]string, error) {
+			return []string{"fleet-other1", "fleet-other2"}, nil
+		},
+		func(string) bool { return true },
+	)
+
+	// Build a record whose tmux session DOESN'T exist (dead-session
+	// short-circuit path).
+	rec := agent.New("deadbeef")
+	rec.TaskID = "stub"
+	rec.Project = "stub"
+	rec.TmuxSession = "fleet-deadbeef-nonexistent"
+	rec.Cwd = tmp
+	rec.Command = []string{"sleep", "60"}
+	if err := rec.Write(); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := runHandoff(&handoffOpts{
+		oldID:       rec.ID,
+		graceMillis: 0,
+	}, &stdout, &stderr); err != nil {
+		t.Fatalf("dead-session handoff should succeed (cap must not block recovery paths); err=%v", err)
+	}
+	// Record archived.
+	livePath := filepath.Join(tmp, "agents", rec.ID+".json")
+	if _, statErr := os.Stat(livePath); !os.IsNotExist(statErr) {
+		t.Errorf("live record should be archived; stat=%v", statErr)
 	}
 }
 
