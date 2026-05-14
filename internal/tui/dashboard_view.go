@@ -920,6 +920,13 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 			return removeCoordSpawnMarkerFn(p.Name)
 		})
 	}
+	// PART 2b downgrade: stuck → waiting when the agent record has
+	// needs_input=true. Runs after applyStuckSelfHeal so a record that
+	// has BOTH a fresh last_activity_ts AND needs_input=true falls
+	// through the heal path (becomes Idle); ones that need-input but
+	// don't have fresh activity (typical case: claude paused awaiting
+	// operator answer for many minutes) downgrade here.
+	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID)
 	if line, ok := renderCoordSpawnLineForProject(
 		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {

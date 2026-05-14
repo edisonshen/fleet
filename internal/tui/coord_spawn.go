@@ -76,6 +76,22 @@ const (
 	// lost confidence the coord skill will ever publish; surface a red
 	// warning prompting the operator to attach via tmux.
 	coordSpawnStuck
+
+	// coordSpawnWaiting: marker mtime is older than spawnTimeout BUT the
+	// agent record has needs_input=true — the coord is alive and waiting
+	// on operator input. fleet-guard sets needs_input from INSIDE claude
+	// on each Stop hook fire, which is impossible if claude were dead.
+	// Render informational ("◌ coord waiting on input — fleet attach
+	// <agent_id>"), not the attention-chip stuck warning.
+	//
+	// Reserved for the narrow case where stuck WOULD have fired but
+	// needs_input rescues. The derivation function does NOT return this
+	// state directly — the render-side wrapper downgrades stuck → waiting
+	// after checking the agent record. Keeping the gate at the render
+	// layer means the derivation stays pure (marker mtime + state mtime
+	// only) and the needs_input lookup is local to the project block
+	// that already reads ctx.records.
+	coordSpawnWaiting
 )
 
 // coordSpawnTimeoutDefault is the default age past which a spawn is
@@ -263,7 +279,8 @@ func renderCoordSpawnLineForProject(
 	markerMtime time.Time,
 	tickFrame int,
 ) (string, bool) {
-	if st == coordSpawnStuck {
+	switch st {
+	case coordSpawnStuck:
 		var msg string
 		if markerAgentID != "" {
 			msg = "▲ coord spawn stuck — check tmux session fleet-" + markerAgentID
@@ -277,8 +294,51 @@ func renderCoordSpawnLineForProject(
 		}
 		body := attentionChipStyle.Render(msg)
 		return prefix + body, true
+	case coordSpawnWaiting:
+		// Informational: the coord is alive, just waiting on operator
+		// input. Use dim styling (matches the spawning line treatment)
+		// rather than the attention-chip red so the operator's eye
+		// isn't pulled to it — they already know they need to answer.
+		var msg string
+		if markerAgentID != "" {
+			msg = "◌ coord waiting on input — fleet attach " + markerAgentID
+		} else {
+			msg = "◌ coord waiting on input for project " + projectName + " — check `tmux ls`"
+		}
+		body := dimStyle.Render(msg)
+		return prefix + body, true
 	}
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
+}
+
+// downgradeStuckOnNeedsInput converts coordSpawnStuck → coordSpawnWaiting
+// when the agent record matching markerAgentID has needs_input=true.
+// PART 2b of the bundled liveness-correctness fix (2026-05-13): an
+// agent with needs_input=true is alive — fleet-guard sets that flag
+// from INSIDE claude on every Stop hook fire. The stuck-attention-chip
+// path is reserved for the "spawn never converged" failure mode where
+// no needs_input signal exists.
+//
+// Returns the (possibly downgraded) state. No effect on non-stuck
+// states or when no matching record is found.
+func downgradeStuckOnNeedsInput(
+	st coordSpawnState,
+	records []*agent.Record,
+	markerAgentID string,
+) coordSpawnState {
+	if st != coordSpawnStuck || markerAgentID == "" {
+		return st
+	}
+	for _, r := range records {
+		if r == nil || r.ID != markerAgentID {
+			continue
+		}
+		if r.NeedsInput {
+			return coordSpawnWaiting
+		}
+		return st
+	}
+	return st
 }
 
 // applyStuckSelfHeal is the issue #96 gap 1 + follow-up self-heal gate.
