@@ -32,6 +32,18 @@ package main
 // check and push the total to max+1 in a race. Acceptable for v1 —
 // the cap's job is to stop runaway accumulation (60+ sessions), not
 // to enforce an exact ceiling. Documented in the helper.
+//
+// Single-socket scope (codex iter-11 P2): the count comes from
+// `tmux ls` on the ACTIVE tmux socket (FLEET_TMUX_SOCKET when set,
+// the default server otherwise). Fleet sessions spread across
+// multiple tmux sockets (e.g., a stray FLEET_TMUX_SOCKET escape
+// in a worker shell-out, or the operator manually picking a
+// different socket) won't be counted toward the cap. This is a
+// known limitation — implementing cross-socket enumeration would
+// require scanning the filesystem for tmux sockets, which is
+// fragile and out of scope for the postmortem's safety-net goal.
+// In practice the operator's normal fleet runs on one socket and
+// the cap correctly reflects total RAM-consuming sessions there.
 
 import (
 	"fmt"
