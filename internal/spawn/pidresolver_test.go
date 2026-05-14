@@ -177,6 +177,46 @@ func TestFindEngineDescendant_NoDescendantsReturnsZero(t *testing.T) {
 	}
 }
 
+// TestFindEngineDescendant_PaneLeaderIsEngine pins the codex-iter-1
+// fix (2026-05-14): when tmux launches the engine directly (no shell
+// wrapper — e.g. `fleet dispatch --command claude` or a custom
+// non-shell argv), the pane pid IS the engine pid. The walk must
+// include the pane process itself, not just its children. Without
+// this, direct-command spawns burn the full 10s resolver timeout
+// before falling back to the same pane pid.
+//
+// Two sub-cases:
+//   - Disambiguator match on the pane process directly
+//   - Engine-name match on the pane process directly
+func TestFindEngineDescendant_PaneLeaderIsEngine(t *testing.T) {
+	t.Run("disambiguator on pane leader", func(t *testing.T) {
+		// Pane pid 200 IS the claude with the disambiguator. No children.
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "claude --remote-control fleet-coord-X1"},
+		}
+		pid, args := findEngineDescendant(procs, 200, "fleet-coord-X1", "claude")
+		if pid != 200 {
+			t.Errorf("pid = %d, want 200 (pane leader)", pid)
+		}
+		if !strings.Contains(args, "fleet-coord-X1") {
+			t.Errorf("args = %q, want argv containing disambiguator", args)
+		}
+	})
+	t.Run("engine name on pane leader", func(t *testing.T) {
+		// Pane pid 300 IS claude. No disambiguator (plain worker spawn).
+		procs := []procEntry{
+			{PID: 300, PPID: 1, Args: "claude --dangerously-skip-permissions"},
+		}
+		pid, args := findEngineDescendant(procs, 300, "", "claude")
+		if pid != 300 {
+			t.Errorf("pid = %d, want 300 (pane leader as engine)", pid)
+		}
+		if args == "" {
+			t.Errorf("args empty; want claude argv")
+		}
+	})
+}
+
 // TestFindEngineDescendant_DisambiguatorBeatsEngineMatch verifies the
 // match priority — a disambiguator hit anywhere in the tree wins over
 // a deeper engine-only match.

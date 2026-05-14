@@ -200,10 +200,13 @@ func findEngineDescendant(
 	if panePID <= 0 || len(procs) == 0 {
 		return 0, ""
 	}
-	// Build parent → children index for O(N) walk.
+	// Build parent → children index for O(N) walk, plus pid → entry
+	// index so we can seed the queue with the pane process itself.
 	children := make(map[int][]procEntry, len(procs))
+	byPID := make(map[int]procEntry, len(procs))
 	for _, p := range procs {
 		children[p.PPID] = append(children[p.PPID], p)
+		byPID[p.PID] = p
 	}
 	// BFS with depth tracking so we can prefer deeper matches in the
 	// fallback path (a deeper claude beats a shell wrapper at the
@@ -213,20 +216,46 @@ func findEngineDescendant(
 		depth int
 	}
 	queue := make([]frame, 0, 8)
+	// Seed with the pane process itself at depth 0. For direct-command
+	// spawns (no shell wrapper — `fleet dispatch --command claude` or
+	// any non-shell argv tmux runs directly), the pane pid IS the
+	// engine pid and never appears in children[panePID]. Without this
+	// the resolver burns the full 10s timeout before falling back to
+	// the same pane pid (codex review iter-1 finding, 2026-05-14).
+	// Depth 0 keeps wrapper-shell spawns picking their deeper claude
+	// child via the depth-bias path; the pane process is still in the
+	// running for engine-match / disambiguator-match when it qualifies.
+	if entry, ok := byPID[panePID]; ok {
+		queue = append(queue, frame{entry: entry, depth: 0})
+	}
 	for _, c := range children[panePID] {
 		queue = append(queue, frame{entry: c, depth: 1})
 	}
+	// Sentinel -1 so depth=0 matches still update best* trackers. A
+	// direct-command pane is at depth 0 and must be eligible to win.
 	var bestEngine procEntry
-	var bestEngineDepth int
+	bestEngineDepth := -1
 	var bestFallback procEntry
-	var bestFallbackDepth int
+	bestFallbackDepth := -1
 	for len(queue) > 0 {
 		f := queue[0]
 		queue = queue[1:]
 		p := f.entry
-		// Priority 1: exact disambiguator hit — return immediately.
+		// Priority 1: exact disambiguator hit — return immediately
+		// UNLESS the match is on a shell wrapper. A shell argv that
+		// carries the disambiguator (via `sh -c "claude ... <disam>"`)
+		// is just transport — we want the real engine underneath. If
+		// the matched entry is a shell, defer to depth-2+ children;
+		// the production poll loop will re-walk once claude exec's.
 		if disambiguator != "" && strings.Contains(p.Args, disambiguator) {
-			return p.PID, p.Args
+			if !isShellArgv(p.Args) {
+				return p.PID, p.Args
+			}
+			// Shell carrying the disambiguator — still keep it as a
+			// fallback signal so a pane-only walk (no claude yet)
+			// doesn't return 0 and burn the timeout for nothing. We
+			// don't slot it into bestFallback because the shell filter
+			// below excludes shells; instead, we just keep walking.
 		}
 		// Priority 2: engine command match. Keep the deepest one in
 		// case multiple processes share the engine name in the tree.
@@ -248,10 +277,10 @@ func findEngineDescendant(
 			queue = append(queue, frame{entry: g, depth: f.depth + 1})
 		}
 	}
-	if bestEngineDepth > 0 {
+	if bestEngineDepth >= 0 {
 		return bestEngine.PID, bestEngine.Args
 	}
-	if bestFallbackDepth > 0 {
+	if bestFallbackDepth >= 0 {
 		return bestFallback.PID, bestFallback.Args
 	}
 	return 0, ""
