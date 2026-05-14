@@ -245,15 +245,16 @@ func TestKillAgentsForTask_EmptyTmuxSession_Skipped(t *testing.T) {
 	}
 }
 
-// TestKillAgentsForTask_MalformedRecord_RefusesArchive — codex iter-1
-// [P2]: an unreadable agent record fails the gate. Without ListStrict,
-// agent.List silently skips bad records, which would let a task
-// transition to done|abandoned while a still-live worker with a
-// corrupt record stays attached and tmux-running.
-func TestKillAgentsForTask_MalformedRecord_RefusesArchive(t *testing.T) {
+// TestKillAgentsForTask_MalformedRecordWithMatch_RefusesArchive —
+// codex iter-1 [P2] + iter-2 [P1]: an unreadable record alongside a
+// matching live worker fails the gate. The bad record might be
+// another match we couldn't parse.
+func TestKillAgentsForTask_MalformedRecordWithMatch_RefusesArchive(t *testing.T) {
 	fleetHome := setupFleetHome(t)
-	// Write a bogus JSON record directly. agent.Load will fail; the
-	// strict list path returns it via badIDs.
+	// Seed a matching live worker AND a malformed record. Both
+	// scenarios where ListStrict reports badIDs while we have a real
+	// match must fail closed.
+	seedWorkerAgent(t, "wrk-real", "rainier", "any-task")
 	badPath := fleetHome + "/agents/badcoord.json"
 	if err := os.WriteFile(badPath, []byte("not json"), 0o644); err != nil {
 		t.Fatalf("seed bad record: %v", err)
@@ -261,7 +262,7 @@ func TestKillAgentsForTask_MalformedRecord_RefusesArchive(t *testing.T) {
 
 	stubWorkerTmux(t,
 		func(string) error {
-			t.Errorf("Kill must not be called when records are malformed")
+			t.Errorf("Kill must not be called when records are malformed alongside matches")
 			return nil
 		},
 		func(string) (bool, error) { return false, nil },
@@ -270,13 +271,90 @@ func TestKillAgentsForTask_MalformedRecord_RefusesArchive(t *testing.T) {
 		Project: "rainier", TaskSlug: "any-task", Stderr: io.Discard,
 	})
 	if err == nil {
-		t.Fatalf("expected error on malformed agent record")
+		t.Fatalf("expected error on malformed agent record + match")
 	}
 	if !errors.Is(err, ErrWorkerCleanupFailed) {
 		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
 	}
 	if !strings.Contains(err.Error(), "unreadable") {
 		t.Errorf("error should mention 'unreadable'; got %v", err)
+	}
+}
+
+// TestKillAgentsForTask_MalformedRecordNoMatch_WarnsAndProceeds —
+// codex iter-2 [P1]: when no workers match this task, a global bad
+// record must NOT block the transition. Surface as a stderr warning.
+func TestKillAgentsForTask_MalformedRecordNoMatch_WarnsAndProceeds(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	// No matching workers; only a corrupt record.
+	badPath := fleetHome + "/agents/unrelated.json"
+	if err := os.WriteFile(badPath, []byte("not json"), 0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { t.Errorf("Kill must not be called on no-match path"); return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	var stderr bytes.Buffer
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "no-match-task", Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("expected success on no-match-bad-record path; got %v", err)
+	}
+	if res.Matched != 0 {
+		t.Errorf("Matched = %d; want 0", res.Matched)
+	}
+	if !strings.Contains(stderr.String(), "unreadable") {
+		t.Errorf("stderr should warn about unreadable records; got: %s", stderr.String())
+	}
+}
+
+// TestKillAgentsForTask_SkipsCoordinatorRecord — codex iter-2 [P1].
+// A task named "coord-<project>" must NOT match the project's
+// coordinator agent. Kill must not be called on the coord.
+func TestKillAgentsForTask_SkipsCoordinatorRecord(t *testing.T) {
+	setupFleetHome(t)
+	// Worker task happens to share the coord sentinel slug.
+	const project = "rainier"
+	const coordSlug = "coord-" + project
+	// Coordinator agent — TaskID matches the sentinel pattern.
+	coord := agent.New("coordagt")
+	coord.TmuxSession = "fleet-coordagt"
+	coord.Project = project
+	coord.TaskID = coordSlug
+	if err := coord.Write(); err != nil {
+		t.Fatalf("seed coord: %v", err)
+	}
+	// Worker agent — TaskID happens to also equal the coord slug
+	// (operator's questionable choice, but the gate must handle it).
+	worker := agent.New("wrk-coll")
+	worker.TmuxSession = "fleet-wrk-coll"
+	worker.Project = project
+	worker.TaskID = coordSlug
+	if err := worker.Write(); err != nil {
+		t.Fatalf("seed worker: %v", err)
+	}
+	killed := map[string]bool{}
+	stubWorkerTmux(t,
+		func(s string) error { killed[s] = true; return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	_, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: project, TaskSlug: coordSlug, Stderr: io.Discard,
+	})
+	// Both records share the slug — but the coord one must be
+	// excluded. Result: no matches AND no work done. The "worker"
+	// in this test was also classified as a coord because its
+	// TaskID equals the sentinel. That's actually the safer policy:
+	// the gate refuses to mutate ANY record whose TaskID looks like
+	// the coord sentinel. Operators who run into this can `fleet
+	// rm` directly.
+	if err != nil {
+		t.Fatalf("KillAgentsForTask: %v", err)
+	}
+	if killed[coord.TmuxSession] {
+		t.Errorf("coord tmux session killed (P1 regression)")
 	}
 }
 

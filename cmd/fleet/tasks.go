@@ -29,6 +29,7 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tui"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // newTasksCmd wires the umbrella `fleet tasks` command and its
@@ -969,6 +970,28 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 				}
 				_, _ = fmt.Fprintf(stdout, "%s %d worker agent(s) for %s: %v\n",
 					what, cleanupRes.Matched, slug, cleanupRes.IDs)
+			}
+
+			// codex iter-2 [P2]: also clean up the workers/<slug>/ dir
+			// for coord-dispatched workers (the claude --print
+			// subprocess shape, NOT tmux-backed). Without this, a
+			// terminal task transition leaves the worker dir in place
+			// and `fleet workers list` keeps reporting the worker as
+			// live under a done|abandoned task.
+			//
+			// Best-effort: workers.Delete is idempotent on ENOENT;
+			// other errors are surfaced as a warning, NOT a hard
+			// failure. Reason: the tmux-agent half of cleanup
+			// (KillAgentsForTask above) is the load-bearing leak
+			// surface (per the operator's brief — the orphan-tmux
+			// leak is what crashed the Mac). A workers/<slug>/ dir
+			// hang-around is a UX nit, not a resource leak.
+			if err := workers.Delete(project, slug); err != nil {
+				if !errors.Is(err, workers.ErrInvalidSlug) {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: cleanup workers/%s/: %v (task still marked %s; run `fleet workers list` to triage)\n",
+						slug, err, t.Status)
+				}
 			}
 		}
 

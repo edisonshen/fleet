@@ -70,23 +70,36 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 	if opts.TaskSlug == "" {
 		return res, fmt.Errorf("%w: empty task slug", ErrWorkerCleanupFailed)
 	}
-	// codex iter-1 [P2]: use ListStrict so a malformed agent record
-	// fails the cleanup gate instead of silently slipping through.
+	// codex iter-1 [P2] + iter-2 [P1]: use ListStrict so unparseable
+	// agent records can't silently slip past the cleanup gate.
 	// agent.List drops unparseable records (the documented triage
 	// behavior at internal/agent/agent.go:List), which would let a
 	// task transition to done|abandoned while a still-live worker
 	// with a corrupt record stays attached and tmux-running.
+	//
+	// codex iter-2 [P1]: a global fail-closed on any bad record turns
+	// localized record damage into a fleet-wide block on every task
+	// transition. The safe-but-narrow policy: collect bad IDs, run
+	// the loop against parsed records, and fail closed at the END
+	// only if we matched real workers (in which case a bad record
+	// COULD be another match we missed). On a no-op transition
+	// (zero matched workers) we surface bad records as a warning
+	// via stderr and proceed — the operator's `tasks set` for an
+	// unrelated project shouldn't be wedged by a hand-edited record
+	// elsewhere.
 	all, badIDs, err := agent.ListStrict()
 	if err != nil {
 		return res, fmt.Errorf("%w: list agents: %w", ErrWorkerCleanupFailed, err)
 	}
-	if len(badIDs) > 0 {
-		return res, fmt.Errorf(
-			"%w: %d agent record(s) unreadable (%v); refusing to mark task %s terminal — fix or remove the records and retry",
-			ErrWorkerCleanupFailed, len(badIDs), badIDs, opts.TaskSlug)
-	}
+	// Pass 1: filter to matching records WITHOUT mutating any. Coord
+	// records are excluded (iter-2 [P1]); empty-session records are
+	// skipped; only TaskID + Project matches contribute.
+	var matches []*agent.Record
 	for _, rec := range all {
 		if rec == nil {
+			continue
+		}
+		if isCoordinatorTaskID(rec.TaskID, rec.Project) {
 			continue
 		}
 		if rec.TaskID != opts.TaskSlug || rec.Project != opts.Project {
@@ -95,6 +108,27 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		if rec.TmuxSession == "" {
 			continue
 		}
+		matches = append(matches, rec)
+	}
+	// codex iter-2 [P1]: bad records gate. If we have real matches
+	// AND there are unparseable records, refuse — a bad record could
+	// be another worker we missed. If there are no matches, warn and
+	// proceed — a corrupt record elsewhere in fleet shouldn't wedge
+	// every task transition.
+	if len(badIDs) > 0 {
+		if len(matches) > 0 {
+			return res, fmt.Errorf(
+				"%w: %d agent record(s) unreadable (%v) while %d worker(s) match task %s; refusing to mark terminal — fix or remove the unreadable records and retry",
+				ErrWorkerCleanupFailed, len(badIDs), badIDs, len(matches), opts.TaskSlug)
+		}
+		if opts.Stderr != nil {
+			_, _ = fmt.Fprintf(opts.Stderr,
+				"warning: %d agent record(s) unreadable (%v); no workers matched task %s so the cleanup gate proceeds, but operator should triage the corrupt records\n",
+				len(badIDs), badIDs, opts.TaskSlug)
+		}
+	}
+	// Pass 2: kill + archive each matched record.
+	for _, rec := range matches {
 		res.Matched++
 		res.IDs = append(res.IDs, rec.ID)
 
@@ -156,6 +190,23 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// isCoordinatorTaskID reports whether a record's TaskID is the
+// coordinator sentinel for its project. Per skills/coordinator/SKILL.md
+// the coord agent carries TaskID = "coord-<project>". A worker task
+// happening to share that slug must not let `tasks set` kill the
+// project's coord (codex iter-2 [P1]).
+//
+// The check is permissive on legacy records: TaskID="" or
+// Project="" returns false (not a coord). Operators who don't follow
+// the sentinel convention won't trip this; they also accept the
+// previously-documented behavior.
+func isCoordinatorTaskID(taskID, project string) bool {
+	if taskID == "" || project == "" {
+		return false
+	}
+	return taskID == "coord-"+project
 }
 
 // tmuxKillForCleanup / tmuxSessionAliveForCleanup are package vars so
