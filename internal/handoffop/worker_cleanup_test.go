@@ -145,6 +145,42 @@ func TestKillAgentsForTask_KillFailsProbeAmbiguous_RefusesArchive(t *testing.T) 
 	}
 }
 
+// TestKillAgentsForTask_KeepSessionEmptySessionStillArchives — codex
+// iter-11 [P2]. --keep-session preserves the record only when there's
+// a tmux session to preserve. Records with empty TmuxSession get
+// archived even under --keep-session.
+func TestKillAgentsForTask_KeepSessionEmptySessionStillArchives(t *testing.T) {
+	setupFleetHome(t)
+	legacy := agent.New("legacy-keep")
+	legacy.TmuxSession = ""
+	legacy.TaskID = "keep-empty"
+	legacy.Project = "rainier"
+	if err := legacy.Write(); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { t.Errorf("Kill should not be called"); return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "keep-empty", KeepSession: true,
+		Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("KillAgentsForTask: %v", err)
+	}
+	if res.Matched != 1 {
+		t.Errorf("Matched = %d; want 1", res.Matched)
+	}
+	if res.Archived != 1 {
+		t.Errorf("Archived = %d; want 1 (empty session has nothing to keep)", res.Archived)
+	}
+	livePath, _ := state.AgentPath(legacy.ID)
+	if workerFileExists(livePath) {
+		t.Errorf("legacy empty-session record still live under --keep-session (iter-11 P2 regression)")
+	}
+}
+
 // TestKillAgentsForTask_KeepSessionSkipsKillAndArchive.
 // codex iter-1 [P1]: --keep-session preserves BOTH the tmux session
 // AND the live agent record — operators use `fleet attach <id>` to
@@ -361,6 +397,41 @@ func TestKillAgentsForTask_MalformedRecordNoMatchUnrelated_WarnsAndProceeds(t *t
 	})
 	if err != nil {
 		t.Fatalf("expected success on no-match-unrelated-bad-record path; got %v", err)
+	}
+	if res.Matched != 0 {
+		t.Errorf("Matched = %d; want 0", res.Matched)
+	}
+	if !strings.Contains(stderr.String(), "unreadable") {
+		t.Errorf("stderr should warn about unreadable records; got: %s", stderr.String())
+	}
+}
+
+// TestKillAgentsForTask_MalformedRecordProjectOnly_Proceeds — codex
+// iter-11 [P1]. A bad record containing only the project field (no
+// task_id reference) must NOT block transitions for other tasks in
+// the same project. Every record in a project carries the project
+// substring, so the relevance check requires task_id+slug as the
+// discriminator.
+func TestKillAgentsForTask_MalformedRecordProjectOnly_Proceeds(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	// Bad record from another task in the same project. Has the
+	// project literal but the task_id field is corrupted away.
+	badPath := fleetHome + "/agents/projonly.json"
+	raw := `{"id": "projonly", "project": "rainier", "tmux_session": "fleet-projonly"`
+	if err := os.WriteFile(badPath, []byte(raw), 0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	var stderr bytes.Buffer
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "completely-different-task",
+		Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("expected success on project-only bad record + unrelated task; got %v", err)
 	}
 	if res.Matched != 0 {
 		t.Errorf("Matched = %d; want 0", res.Matched)

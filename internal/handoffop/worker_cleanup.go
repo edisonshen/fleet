@@ -190,19 +190,18 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 			res.Killed++
 		}
 
-		// Archive the record — only when we killed the session. With
-		// --keep-session the tmux session stays alive, so we LEAVE the
-		// record live too: that's the only path operators have to
-		// `fleet attach` the preserved session for debugging (codex
-		// iter-1 [P1]). Archive in --keep-session would hide the
-		// session from the very lookup the operator runs to inspect
-		// it.
-		//
-		// In the strict cleanup path (KeepSession=false), the tmux
-		// session is dead by here, so archiving cannot hide a live
-		// agent. Fall back to direct os.Remove on archive failure to
-		// match the pattern in runHandoff step 12 / retireOldAgent.
-		if !opts.KeepSession {
+		// Archive the record — only when there's something worth
+		// preserving:
+		//   - KeepSession=false: always archive (session is dead).
+		//   - KeepSession=true AND non-empty TmuxSession: skip
+		//     archive (the operator wants `fleet attach <id>` to
+		//     reach the preserved tmux session — codex iter-1 P1).
+		//   - KeepSession=true AND empty TmuxSession: archive
+		//     anyway. There's no tmux to preserve, so leaving the
+		//     record live just stale-displays in fleet status
+		//     (codex iter-11 P2).
+		archiveThis := !opts.KeepSession || rec.TmuxSession == ""
+		if archiveThis {
 			if err := rec.Archive(); err != nil {
 				path, perr := state.AgentPath(rec.ID)
 				if perr != nil {
@@ -279,35 +278,33 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 
 // badRecordsPlausiblyRelated reads each unparseable agent record's
 // raw bytes and reports those whose contents could plausibly belong
-// to the named task. Safety net for the codex iter-4 [P2] +
-// iter-7 [P1] case: when agent.ListStrict surfaces unparseable
-// records, we can't Load them, but their raw JSON usually still has
-// identifiable key/value pairs. Grepping is cheaper than re-
-// implementing a tolerant parser.
+// to the named task. Safety net for the codex iter-4 [P2] /
+// iter-7 [P1] / iter-11 [P1] case: when agent.ListStrict surfaces
+// unparseable records, we can't Load them, but their raw JSON
+// usually still has identifiable key/value pairs.
 //
-// Relation rule (iter-7 P1: relaxed from iter-4's "both required"):
-// a bad record is treated as related when its raw bytes contain
-// EITHER
+// Relation rule (iter-11 P1: tightened from iter-7's OR-either):
+// require the task_id substring + slug literal. The project field
+// alone is too broad — every agent record in a project carries
+// "project": "<project>", so a single corrupt record for an
+// unrelated task in the same project would otherwise block every
+// task transition in that project. task_id is the per-task
+// discriminator.
 //
-//	"task_id"  ... "<slug>"      (task_id substring + slug literal), OR
-//	"project"  ... "<project>"   (project substring + project literal).
-//
-// Either alone is enough — requiring BOTH (iter-4) missed truncated
-// records where corruption ate one of the fields. False positives
-// (an unrelated record happens to contain a literal that matches
-// the slug or project string) are tolerable: refuse the transition;
-// operator triages. False negatives only happen when corruption ate
-// EVERY reference to slug/project, at which point the record cannot
-// meaningfully belong to this task.
+// We grep for BOTH `"task_id"` AND the slug literal `"<slug>"` so
+// a record that mentions the slug substring elsewhere (e.g., inside
+// a quoted path) doesn't trigger a false positive. Records whose
+// corruption ate the task_id field entirely fall through as
+// "not related" — that's symmetric with iter-2's policy of not
+// wedging fleet-wide on unrelated corrupt records.
 //
 // Read errors treat the record as "could match" — we already know
 // it's unreadable; surfacing it as related lets the gate refuse.
-func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string {
+// ENOENT (concurrently removed) is NOT related (iter-9 P2).
+func badRecordsPlausiblyRelated(badIDs []string, _ /*project*/, slug string) []string {
 	var related []string
 	taskMarker := `"task_id"`
 	slugMarker := `"` + slug + `"`
-	projMarker := `"project"`
-	projValueMarker := `"` + project + `"`
 	for _, id := range badIDs {
 		path, perr := state.AgentPath(id)
 		if perr != nil {
@@ -316,24 +313,17 @@ func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string 
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
-			// codex iter-9 [P2]: a record that vanished between
-			// ListStrict's readdir and our follow-up read (concurrent
-			// `fleet rm` / handoff that archived it) is NOT related —
-			// it's already gone. Distinguish ENOENT from other read
-			// failures.
 			if errors.Is(rerr, os.ErrNotExist) {
 				continue
 			}
-			// Other read failures (permission, I/O) — be conservative.
 			related = append(related, id)
 			continue
 		}
 		s := string(data)
-		hasTask := strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker)
-		hasProj := strings.Contains(s, projMarker) && strings.Contains(s, projValueMarker)
-		// Iter-7 P1: EITHER signal is enough (relaxed from iter-4's
-		// "both required"). Truncated JSON might have lost one field.
-		if hasTask || hasProj {
+		// iter-11 P1: BOTH task_id key AND slug literal required.
+		// project alone matches every record in the project — too
+		// broad.
+		if strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker) {
 			related = append(related, id)
 		}
 	}
