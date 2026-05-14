@@ -621,6 +621,56 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 	}
 }
 
+// TestAtomicCoordSwap_OldKill_ProbeAmbiguous covers the codex iter-4 [P1]
+// fix: post-kill probe returns (alive=false, err!=nil). The marker is
+// committed; we MUST NOT archive OLD (cross-socket case could hide a
+// live coord). Helper returns *ErrOldKillProbeAmbiguous; OLD record
+// stays on disk; inbox alert dropped.
+func TestAtomicCoordSwap_OldKill_ProbeAmbiguous(t *testing.T) {
+	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
+	fake := &fakeSwap{
+		postReadyAlive: true,
+		killErr:        nil,
+		postKillAlive:  false,
+		postKillErr:    errors.New("simulated transport blip on post-kill probe"),
+	}
+	restore := fake.install(t, newRec)
+	defer restore()
+
+	var stderr bytes.Buffer
+	_, err := AtomicCoordSwap(in, &stderr)
+	if err == nil {
+		t.Fatalf("expected ErrOldKillProbeAmbiguous")
+	}
+	if !errors.Is(err, ErrOldKillProbeAmbiguousSentinel) {
+		t.Errorf("expected ErrOldKillProbeAmbiguous; got: %v", err)
+	}
+	// Marker committed.
+	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
+		t.Errorf("marker = %q; want newcoord (invariant: NEW owns post-commit)", got)
+	}
+	// OLD record MUST stay on disk (operator triage).
+	livePath, _ := state.AgentPath("oldcoord")
+	if _, statErr := os.Stat(livePath); statErr != nil {
+		t.Errorf("OLD record should be preserved on ambiguous probe; statErr=%v", statErr)
+	}
+	// OLD record NOT archived.
+	archivePath, _ := state.AgentArchivePath("oldcoord")
+	if _, statErr := os.Stat(archivePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("OLD record should NOT be archived on ambiguous probe; statErr=%v", statErr)
+	}
+	// Inbox alert dropped.
+	root, _ := state.Root()
+	inboxPath := filepath.Join(root, "inbox", "newcoord.md")
+	if _, statErr := os.Stat(inboxPath); statErr != nil {
+		t.Errorf("inbox alert should be present: %v", statErr)
+	}
+	// [P1] log to stderr.
+	if !strings.Contains(stderr.String(), "[P1]") {
+		t.Errorf("stderr should contain [P1] log; got: %s", stderr.String())
+	}
+}
+
 // TestAtomicCoordSwap_OldKill_Fails_ButGone: step 5.b returns err but
 // step 5.c reports session is gone (race with operator manual kill).
 // Marker committed; OLD archived; success.

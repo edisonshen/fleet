@@ -747,19 +747,26 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			GraceWindow:          time.Duration(opts.graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
-			// FAILURE MODE 5: marker IS at NEW (committed); OLD's
-			// tmux session is an orphan; OLD record archived; inbox
-			// alert dropped; [P0] logged. The helper already did the
-			// retire bookkeeping. Surface the wrapped error to stderr
-			// so the operator's CLI output shows the orphan banner;
-			// the handoff is functionally committed so we fall
-			// through to queue delete + prompt send like happy path.
-			if errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel) {
+			// Three error classes from the helper:
+			//
+			//   - ErrOrphanSurvived (FAILURE MODE 5): marker
+			//     committed; OLD's tmux is an orphan; OLD record
+			//     archived; inbox alert + [P0] dropped. Surface
+			//     warning, proceed to queue delete + prompt send.
+			//
+			//   - ErrOldKillProbeAmbiguous: marker committed; OLD's
+			//     record PRESERVED (cross-socket ambiguity); inbox
+			//     alert + [P1] dropped. Surface warning, proceed —
+			//     operator triages OLD via TUI.
+			//
+			//   - Any other error: true rollback (marker still at
+			//     OLD; NEW cleaned up). Return error so the queue
+			//     file stays for retry.
+			switch {
+			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel),
+				errors.Is(swapErr, handoffop.ErrOldKillProbeAmbiguousSentinel):
 				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
-			} else {
-				// True rollback (marker still at OLD; NEW cleaned up
-				// by the helper). Surface error; queue file stays in
-				// place so retry can pick up.
+			default:
 				return swapErr
 			}
 		}

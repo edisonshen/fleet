@@ -111,6 +111,46 @@ func (e *ErrOrphanSurvived) Is(target error) bool {
 // against any *ErrOrphanSurvived value.
 var ErrOrphanSurvivedSentinel = errors.New("atomic coord swap: orphan survived")
 
+// ErrOldKillProbeAmbiguous is returned when step 5.c's tmux.SessionAlive
+// probe of OLD comes back (alive=false, err!=nil) — i.e., the kill may
+// have succeeded but the probe couldn't confirm. The marker has already
+// committed to NEW (step 4). We DO NOT archive OLD's record on this
+// path because OLD might still be alive on a different tmux socket
+// holding coordinator.lock — archiving would hide the live coord from
+// `fleet status` and the dashboard, while the new coord (which can't
+// take coordinator.lock) exits.
+//
+// On this error: marker is at NEW; OLD's record stays on disk;
+// operator triages via TUI. If OLD is genuinely dead, prune-orphan-tmux
+// won't see it (no orphan because the record points at a non-existent
+// session — sweeper keys on the inverse: orphan session, no live
+// record). The expected operator action is `fleet rm <OLD>` once they
+// confirm OLD is gone.
+//
+// Codex review iter-4 [P1]: the plan's "going forward is safer than
+// backward" bias didn't account for the cross-socket case where
+// archiving on ambiguous probe strands the project with no live coord.
+type ErrOldKillProbeAmbiguous struct {
+	OldSession string
+	NewAgentID string
+	Project    string
+	ProbeErr   error
+}
+
+func (e *ErrOldKillProbeAmbiguous) Error() string {
+	return fmt.Sprintf(
+		"atomic coord swap: marker committed to %s but post-kill probe of OLD session %s for project %q was ambiguous: %v (OLD record preserved; operator: confirm OLD dead, then `fleet rm %s`)",
+		e.NewAgentID, e.OldSession, e.Project, e.ProbeErr, e.OldSession)
+}
+
+func (e *ErrOldKillProbeAmbiguous) Is(target error) bool {
+	return target == ErrOldKillProbeAmbiguousSentinel
+}
+
+// ErrOldKillProbeAmbiguousSentinel is the sentinel for errors.Is
+// matching against any *ErrOldKillProbeAmbiguous value.
+var ErrOldKillProbeAmbiguousSentinel = errors.New("atomic coord swap: old-kill probe ambiguous")
+
 // AtomicCoordSwapInputs collects the parameters for one swap. Mirrors
 // the plan's INPUTS block.
 type AtomicCoordSwapInputs struct {
@@ -352,14 +392,36 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 		alive, perr := sessionAliveFn(in.OldRec.TmuxSession)
 		switch {
 		case perr != nil:
-			// Probe ambiguous. Marker is already committed; going
-			// forward is safer than backward. Log a warning and
-			// proceed to archive (step 6). The plan calls this "[P1]
-			// warning; treat as probably dead but uncertain."
+			// Probe ambiguous. Marker is already committed to NEW
+			// (step 4). We CANNOT proceed to archive OLD because the
+			// cross-socket case (OLD alive on a different tmux socket
+			// holding coordinator.lock) would hide a live coord from
+			// `fleet status` while NEW exits losing the lock race —
+			// project would have no visible coord (codex review
+			// iter-4 [P1]).
+			//
+			// Instead: preserve OLD's record, drop an inbox alert,
+			// log [P1] to stderr, return ErrOldKillProbeAmbiguous.
+			// Operator action: confirm OLD dead (e.g., via
+			// `fleet maintenance prune-orphan-tmux` or inspecting
+			// other sockets), then `fleet rm <OLD>`.
 			if stderr != nil {
 				_, _ = fmt.Fprintf(stderr,
-					"[P1] atomic coord swap: post-kill probe for OLD %s ambiguous: %v (marker already committed to %s; proceeding with archive)\n",
+					"[P1] atomic coord swap: post-kill probe for OLD %s ambiguous: %v (marker committed to %s; OLD record preserved for operator triage)\n",
 					in.OldRec.TmuxSession, perr, newRec.ID)
+			}
+			if alertErr := dropOrphanInboxAlert(newRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
+				if stderr != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: atomic coord swap: drop ambiguous-probe inbox alert at %s: %v\n",
+						newRec.ID, alertErr)
+				}
+			}
+			return res, &ErrOldKillProbeAmbiguous{
+				OldSession: in.OldRec.TmuxSession,
+				NewAgentID: newRec.ID,
+				Project:    in.Project,
+				ProbeErr:   perr,
 			}
 		case alive:
 			// FAILURE MODE 5. Marker is at NEW (committed in step 4).

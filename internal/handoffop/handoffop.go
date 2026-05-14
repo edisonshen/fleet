@@ -564,16 +564,17 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			GraceWindow:          time.Duration(graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
-			// FAILURE MODE 5: marker committed; OLD is now an orphan
-			// tmux session; OLD record archived by helper; inbox alert
-			// dropped; [P0] logged. Surface to stderr and proceed to
-			// queue delete + prompt send so the new coord can start.
-			if errors.Is(swapErr, ErrOrphanSurvivedSentinel) {
+			// FAILURE MODE 5 and ambiguous-OLD-probe both committed
+			// the marker; both surface as warnings rather than
+			// errors so the queue delete + prompt send still runs.
+			// Any other error is a true rollback (marker still at
+			// OLD; helper cleaned up NEW); queue file is preserved
+			// so retry can pick up.
+			switch {
+			case errors.Is(swapErr, ErrOrphanSurvivedSentinel),
+				errors.Is(swapErr, ErrOldKillProbeAmbiguousSentinel):
 				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
-			} else {
-				// True rollback (e.g., marker raced, marker write
-				// failed). Queue file is preserved so retry can pick
-				// up. NEW was cleaned up by the helper.
+			default:
 				return swapErr
 			}
 		}
