@@ -297,17 +297,17 @@ func TestKillAgentsForTask_EmptyTmuxSession_ArchivesWithoutKill(t *testing.T) {
 }
 
 // TestKillAgentsForTask_MalformedRecordRelevantText_RefusesArchive —
-// codex iter-1 [P2] + iter-2 [P1] + iter-7 [P1]: an unreadable
-// record whose raw bytes mention this task's slug OR project name
-// fails the gate. Whether or not there's also a parseable match
-// for this task doesn't matter — the bad record's text content is
-// the relevance signal.
+// codex iter-1 [P2] + iter-2 [P1] + iter-13 [P2]: an unreadable
+// record whose raw bytes mention BOTH this task's slug AND project
+// fails the gate. Slug + project together avoid cross-project false
+// positives.
 func TestKillAgentsForTask_MalformedRecordRelevantText_RefusesArchive(t *testing.T) {
 	fleetHome := setupFleetHome(t)
-	// Bad record whose raw bytes contain this task's slug.
+	// Bad record whose raw bytes contain BOTH task_id+slug AND
+	// project+project. Truncated mid-record so parser fails.
 	badPath := fleetHome + "/agents/badcoord.json"
 	if err := os.WriteFile(badPath,
-		[]byte(`{"task_id": "any-task", "tmux_session": "fleet-leak",`),
+		[]byte(`{"task_id": "any-task", "project": "rainier", "tmux_session": "fleet-leak",`),
 		0o644); err != nil {
 		t.Fatalf("seed bad record: %v", err)
 	}
@@ -441,14 +441,19 @@ func TestKillAgentsForTask_MalformedRecordProjectOnly_Proceeds(t *testing.T) {
 	}
 }
 
-// TestKillAgentsForTask_MalformedRecordTaskIDOnly_Refuses — codex
-// iter-7 [P1]: a record corrupted past the project field still
-// usually carries the task_id substring. The relevance check must
-// fail closed on EITHER signal (task_id OR project), not require
-// both.
-func TestKillAgentsForTask_MalformedRecordTaskIDOnly_Refuses(t *testing.T) {
+// TestKillAgentsForTask_MalformedRecordTaskIDOnly_Proceeds — codex
+// iter-13 [P2] reversal of iter-7. Task slugs are only unique within
+// a project, so the relevance check requires BOTH task_id+slug AND
+// project+project to avoid cross-project false positives. A record
+// truncated past the project field is treated as "not related" — the
+// false-negative tradeoff is acceptable; the operator can re-run
+// `tasks set` and triage the corrupt record separately. Without this
+// pivot, `tasks set X status=done` in project A would block on a
+// corrupt record carrying "task_id": "X" from project B.
+func TestKillAgentsForTask_MalformedRecordTaskIDOnly_Proceeds(t *testing.T) {
 	fleetHome := setupFleetHome(t)
-	// Record truncated AFTER task_id but BEFORE project.
+	// Record truncated AFTER task_id but BEFORE project — only
+	// task_id+slug survives, project literal is missing.
 	badPath := fleetHome + "/agents/truncwrk.json"
 	raw := `{"id": "truncwrk", "task_id": "stuck-task"` // truncated
 	if err := os.WriteFile(badPath, []byte(raw), 0o644); err != nil {
@@ -458,14 +463,46 @@ func TestKillAgentsForTask_MalformedRecordTaskIDOnly_Refuses(t *testing.T) {
 		func(string) error { t.Errorf("Kill must not be called"); return nil },
 		func(string) (bool, error) { return false, nil },
 	)
+	var stderr bytes.Buffer
 	_, err := KillAgentsForTask(WorkerCleanupOpts{
-		Project: "rainier", TaskSlug: "stuck-task", Stderr: io.Discard,
+		Project: "rainier", TaskSlug: "stuck-task", Stderr: &stderr,
 	})
-	if err == nil {
-		t.Fatalf("expected error when bad record carries only task_id (iter-7 P1)")
+	// iter-13: BOTH signals required. project missing → not related.
+	if err != nil {
+		t.Fatalf("expected success when bad record is missing project field; got %v", err)
 	}
-	if !errors.Is(err, ErrWorkerCleanupFailed) {
-		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
+	if !strings.Contains(stderr.String(), "unreadable") {
+		t.Errorf("stderr should warn; got %s", stderr.String())
+	}
+}
+
+// TestKillAgentsForTask_MalformedRecordCrossProjectSameSlug_Proceeds —
+// codex iter-13 [P2]. Task slugs are only unique within a project, so
+// a corrupt record from project B carrying the same task slug must
+// NOT block `tasks set` in project A. Verified by including the
+// project literal in the bad record but with a DIFFERENT value.
+func TestKillAgentsForTask_MalformedRecordCrossProjectSameSlug_Proceeds(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	// Bad record has task_id+slug AND project literal — but the
+	// project value is different.
+	badPath := fleetHome + "/agents/projbcoll.json"
+	raw := `{"task_id": "shared-slug", "project": "projectB", "tmux_session": "fleet-projbcoll"`
+	if err := os.WriteFile(badPath, []byte(raw), 0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	var stderr bytes.Buffer
+	_, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "projectA", TaskSlug: "shared-slug", Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("expected success — bad record is in project B, not project A: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "unreadable") {
+		t.Errorf("stderr should warn about unreadable records; got %s", stderr.String())
 	}
 }
 

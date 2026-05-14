@@ -283,28 +283,27 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 // unparseable records, we can't Load them, but their raw JSON
 // usually still has identifiable key/value pairs.
 //
-// Relation rule (iter-11 P1: tightened from iter-7's OR-either):
-// require the task_id substring + slug literal. The project field
-// alone is too broad — every agent record in a project carries
-// "project": "<project>", so a single corrupt record for an
-// unrelated task in the same project would otherwise block every
-// task transition in that project. task_id is the per-task
-// discriminator.
+// Relation rule (iter-11 P1 + iter-13 P2): require task_id + slug
+// match AND project match. Task slugs are only unique within a
+// project — project A and B could both have "fix-login-1234", so
+// matching on slug alone would block cross-project transitions
+// (iter-13). Project alone is too broad (iter-11). Both together
+// give the same selector the parsed loop uses.
 //
-// We grep for BOTH `"task_id"` AND the slug literal `"<slug>"` so
-// a record that mentions the slug substring elsewhere (e.g., inside
-// a quoted path) doesn't trigger a false positive. Records whose
-// corruption ate the task_id field entirely fall through as
-// "not related" — that's symmetric with iter-2's policy of not
-// wedging fleet-wide on unrelated corrupt records.
+// We grep for BOTH `"task_id"` AND `"<slug>"` AND `"project"` AND
+// `"<project>"`. Records whose corruption ate any of these fields
+// fall through as "not related" — symmetric with iter-2's policy
+// of not wedging fleet-wide on unrelated corrupt records.
 //
 // Read errors treat the record as "could match" — we already know
 // it's unreadable; surfacing it as related lets the gate refuse.
 // ENOENT (concurrently removed) is NOT related (iter-9 P2).
-func badRecordsPlausiblyRelated(badIDs []string, _ /*project*/, slug string) []string {
+func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string {
 	var related []string
 	taskMarker := `"task_id"`
 	slugMarker := `"` + slug + `"`
+	projMarker := `"project"`
+	projValueMarker := `"` + project + `"`
 	for _, id := range badIDs {
 		path, perr := state.AgentPath(id)
 		if perr != nil {
@@ -320,10 +319,10 @@ func badRecordsPlausiblyRelated(badIDs []string, _ /*project*/, slug string) []s
 			continue
 		}
 		s := string(data)
-		// iter-11 P1: BOTH task_id key AND slug literal required.
-		// project alone matches every record in the project — too
-		// broad.
-		if strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker) {
+		hasTask := strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker)
+		hasProj := strings.Contains(s, projMarker) && strings.Contains(s, projValueMarker)
+		// iter-13 P2: BOTH required — task_id+slug AND project+project.
+		if hasTask && hasProj {
 			related = append(related, id)
 		}
 	}
