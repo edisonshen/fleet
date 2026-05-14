@@ -109,6 +109,7 @@ without worrying about ordering edge cases.`,
 				cmd.OutOrStdout(),
 				cmd.ErrOrStderr(),
 				kill,
+				agentDirSane,
 				tmux.ListSessionsWithCreated,
 				agentRecordExists,
 				tmux.Kill,
@@ -120,6 +121,35 @@ without worrying about ordering edge cases.`,
 	cmd.Flags().BoolVar(&kill, "kill", false,
 		"actually kill the orphan tmux sessions (default: dry-run, list only)")
 	return cmd
+}
+
+// agentDirSane verifies that the live-agent state root (~/.fleet/agents)
+// exists AND is a directory before the orphan-tmux sweeper iterates
+// sessions.
+//
+// Codex iter-1 [P2]: without this precondition, a mispointed FLEET_HOME
+// or a wiped ~/.fleet/agents (e.g., dotfile rebuild, `rm -rf ~/.fleet`
+// during operator triage, transient mount issue) makes every os.Stat in
+// agentRecordExists return ErrNotExist → every live fleet-* tmux session
+// is misclassified as orphan. With `--kill`, the sweeper then mass-
+// terminates healthy agents. agentDirSane fails closed: if the dir is
+// missing or not a directory, return an error and the sweeper aborts
+// before iterating.
+func agentDirSane() error {
+	dir, err := state.AgentDir()
+	if err != nil {
+		return fmt.Errorf("resolve agent dir: %w", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat agent dir %s: %w (live-agent state root unavailable — refusing to sweep, every session would misclassify as orphan)",
+			dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("agent dir %s exists but is not a directory (live-agent state root corrupted — refusing to sweep)",
+			dir)
+	}
+	return nil
 }
 
 // agentRecordExists reports whether ~/.fleet/agents/<id>.json exists
@@ -153,11 +183,20 @@ func agentRecordExists(id string) bool {
 	}
 }
 
-// runMaintenancePruneOrphanTmux is the testable core. listInfoFn yields
-// the tmux session names + creation times on the active server;
-// existsFn reports whether an agent record is live; killFn kills a
-// session (only called when performKill is true AND the session is an
-// orphan AND the session is older than freshness).
+// runMaintenancePruneOrphanTmux is the testable core. dirSaneFn verifies
+// the live-agent state root before iterating; listInfoFn yields the tmux
+// session names + creation times on the active server; existsFn reports
+// whether an agent record is live; killFn kills a session (only called
+// when performKill is true AND the session is an orphan AND the session
+// is older than freshness).
+//
+// dirSaneFn precondition (codex iter-1 [P2]): if ~/.fleet/agents is
+// missing or not a directory, every existsFn call would return false,
+// every session would misclassify as orphan, and --kill would mass-
+// terminate live agents. Fail closed: return the dirSaneFn error before
+// iterating sessions. Tests pass dirSaneFn = `func() error { return nil }`
+// for the "agents dir present" path and `func() error { return errors.New(...) }`
+// for the "dir missing" abort path.
 //
 // Freshness gate: a tmux session newer than `freshness` is reported as
 // state=fresh and is NEVER killed even when --kill is set. This guards
@@ -178,12 +217,16 @@ func agentRecordExists(id string) bool {
 func runMaintenancePruneOrphanTmux(
 	stdout, stderr io.Writer,
 	performKill bool,
+	dirSaneFn func() error,
 	listInfoFn func() ([]tmux.SessionInfo, error),
 	existsFn func(id string) bool,
 	killFn func(session string) error,
 	nowFn func() time.Time,
 	freshness time.Duration,
 ) error {
+	if err := dirSaneFn(); err != nil {
+		return fmt.Errorf("agent dir sanity check: %w", err)
+	}
 	infos, err := listInfoFn()
 	if err != nil {
 		return fmt.Errorf("list tmux sessions: %w", err)
