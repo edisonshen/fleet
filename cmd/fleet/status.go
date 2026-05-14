@@ -191,8 +191,11 @@ func emitSessionCapBanner(stderr io.Writer) {
 	if total >= max {
 		bannerStyle = bannerStyleCritical
 	}
+	// prune-orphan-tmux is dry-run by default; banner explicitly
+	// names --kill so following the printed remediation actually
+	// reaps the orphan sessions (codex iter-8 P3).
 	line := fmt.Sprintf(
-		"WARNING: %d/%d fleet tmux sessions in use (%d live, %d orphan).\nApproaching FLEET_MAX_SESSIONS cap. Run `fleet maintenance prune-orphan-tmux` to reap orphans.\n",
+		"WARNING: %d/%d fleet tmux sessions in use (%d live, %d orphan).\nApproaching FLEET_MAX_SESSIONS cap. Run `fleet maintenance prune-orphan-tmux --kill` to reap orphans (omit --kill for a dry-run inspection).\n",
 		total, max, counts.Live, counts.Orphan)
 	// ANSI coloring only when stderr is a real terminal (codex
 	// iter-6 P2). When stderr is redirected to a file / piped to a

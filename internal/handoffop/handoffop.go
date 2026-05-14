@@ -266,18 +266,20 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// the queue file is the only producer. Probe failures don't
 	// block (best-effort, same as the CLI gate).
 	//
-	// CapApproved skip (codex iter-7 P1): when the producer of this
-	// queue file already passed the cap (operator-triggered
-	// `fleet handoff` set req.CapApproved=true at step 4a, or this
-	// drain pass already passed and re-enqueued), the cap was
-	// already approved for this logical handoff. Skip the re-check
-	// so a tightened cap after the crash can't strand an authorized
-	// queue file. Auto-handoff producers (fleet-guard skill) leave
-	// CapApproved=false, so they still get gated here.
-	if req.CapApproved {
-		// Already approved upstream — skip the cap check.
-	} else if counts, cerr := state.CountFleetSessions(
-		sessionListProbe, state.LiveAgentRecordExists); cerr != nil {
+	// Cap is re-checked on EVERY consumer pass (codex iter-8 P1):
+	// the producer-side approval in cmd/fleet/handoff.go is not
+	// load-bearing for crash recovery — between original handoff
+	// and retry the cap state can shift (operator lowered
+	// FLEET_MAX_SESSIONS; other paths spawned sessions; the old
+	// session died, turning a net-zero swap into a +1 spawn). Only
+	// the swap-aware accounting below is correct for arbitrary
+	// post-crash state. The producer-side CapApproved field
+	// remains in the queue schema as a forward-compatibility hook
+	// and a tracking signal for diagnostics, but is intentionally
+	// NOT used to bypass this check.
+	counts, cerr := state.CountFleetSessions(
+		sessionListProbe, state.LiveAgentRecordExists)
+	if cerr != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: FLEET_MAX_SESSIONS precheck could not enumerate tmux sessions (%v); proceeding without cap enforcement\n",
 			cerr)

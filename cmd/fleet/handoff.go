@@ -330,19 +330,14 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				opts.autoResume = !*pending.DisableAutoResume
 				opts.autoResumeFlagWasSet = true
 			}
-			// Cap-bypass preservation across recovery (codex iter-6
-			// P2 / iter-7 P2): if the queue's producer was an
-			// already-authorized handoff (CapApproved=true), the
-			// orphan-recovery fall-through is the same logical
-			// handoff retried — must NOT be re-blocked by a cap that
-			// may have tightened since. fleet-guard auto-handoff
-			// queues leave CapApproved=false; rerunning
-			// `fleet handoff <id>` on those must still go through
-			// the cap gate (otherwise auto-handoff would gain an
-			// unintended cap bypass via the CLI retry path).
-			if pending.CapApproved {
-				opts.forceReplacement = true
-			}
+			// Cap re-checked on retry (codex iter-8 P1): we do NOT
+			// auto-bypass the cap here even when pending.CapApproved
+			// is true. The cap math is state-dependent (post-crash
+			// the session list and the old-alive bit may differ
+			// from the original handoff's view), so the swap-aware
+			// gate at step 4a must re-run. If the cap legitimately
+			// refuses, the operator can re-issue with
+			// `--force-replacement` knowing the current state.
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -384,13 +379,10 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					opts.autoResume = !*pending.DisableAutoResume
 					opts.autoResumeFlagWasSet = true
 				}
-				// Preserve cap-bypass across recovery for handoff-
-				// authored queues only (codex iter-6 P2 / iter-7
-				// P2). Auto-handoff queues must still go through
-				// the cap gate on CLI retry.
-				if pending.CapApproved {
-					opts.forceReplacement = true
-				}
+				// Cap re-checked on retry (codex iter-8 P1): we do
+				// not auto-bypass the cap here even when the
+				// queue's CapApproved=true; post-crash state can
+				// differ. Step 4a's swap-aware gate must run.
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
 					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
