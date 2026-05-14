@@ -458,6 +458,26 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("agent %s is a legacy record with no stored command; pass --command <argv> explicitly", opts.oldID)
 	}
 
+	// 4a. FLEET_MAX_SESSIONS backstop. Runs HERE (after recovery
+	// branches in steps 2-3a, before the doc/queue/spawn side
+	// effects in steps 5-8) so:
+	//   - recovery completion paths above (no spawn) aren't blocked;
+	//   - a refusal exits BEFORE writing the queue file, which would
+	//     otherwise leave a `spawn-fresh-<id>.json` that blocks
+	//     `fleet rm <id>` and traps the operator at-cap with no
+	//     escape valve (codex iter-4 P1).
+	// --force-replacement bypasses the cap for operator cleanups
+	// that need the successor up first. swapsInFlight=1: the
+	// about-to-be-killed old session is in the current count, so
+	// the post-swap total is unchanged.
+	bypass := SessionCapBypassReason("")
+	if opts.forceReplacement {
+		bypass = SessionCapBypassForceReplacement
+	}
+	if err := enforceSessionCap(stderr, bypass, 1); err != nil {
+		return err
+	}
+
 	// 5. Write the handoff doc. The doc represents "agent oldID
 	//    handed off"; its handoff_number is the OLD agent's number,
 	//    its previous_handoff chains back to whatever the old agent
@@ -558,27 +578,6 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// persisted record and tmux exec are identical (avoids a
 		// confusing Command/ExecCommand divergence in spawn.Options).
 		rewrittenExecArgv = nil
-	}
-
-	// FLEET_MAX_SESSIONS backstop. Runs HERE (not at the top of
-	// runHandoff) so the recovery and dead-session branches above
-	// — which complete an in-flight handoff WITHOUT spawning a new
-	// session — aren't blocked by the cap (codex review iter-1 P1).
-	// A retry of `fleet handoff <id>` after a crash that already
-	// produced its replacement would otherwise fail closed at-cap
-	// even though no spawn is needed, stranding the queue file.
-	// --force-replacement bypasses the cap for operator cleanups
-	// that need the successor up first.
-	bypass := SessionCapBypassReason("")
-	if opts.forceReplacement {
-		bypass = SessionCapBypassForceReplacement
-	}
-	// swapsInFlight=1: the about-to-be-killed old session is in the
-	// current count, so the post-swap total is unchanged. Refusing
-	// at-cap on a net-zero swap would deadlock a queued/manual handoff
-	// where the old agent IS the Nth session (codex iter-2 P1).
-	if err := enforceSessionCap(stderr, bypass, 1); err != nil {
-		return err
 	}
 
 	newRec, err := spawn.Spawn(spawn.Options{

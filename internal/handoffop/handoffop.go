@@ -40,6 +40,12 @@ const DefaultGraceMillis = 3000
 // level var so tests inject a fake without touching tmux.
 var sessionListProbe = tmux.ListSessions
 
+// sessionAliveProbe is the tmux session-liveness probe the cap path
+// uses to decide swap-vs-+1 accounting. Tristate: (alive, err) per
+// tmux.SessionAlive's contract. Indirected via a package-level var
+// so tests inject deterministic fakes.
+var sessionAliveProbe = tmux.SessionAlive
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -260,12 +266,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// the queue file is the only producer. Probe failures don't
 	// block (best-effort, same as the CLI gate).
 	//
-	// Net-zero swap accounting (codex iter-2 P1): this is a HANDOFF —
-	// the new spawn is followed by a kill of oldRec.TmuxSession, so
-	// total session count stays flat at completion. Compare
-	// `projected = current_total + 1 - 1` (spawn minus retire) to the
-	// cap. Without this, a queued handoff for the Nth session would
-	// deadlock at exactly N=max since the old session is in the count.
+	// Net-zero swap accounting (codex iter-2 P1 / iter-4 P2): if the
+	// old session is currently alive in the tmux list, it's IN
+	// counts.Total() — the new spawn followed by oldRec.TmuxSession
+	// kill is net zero, so projected = total. If the old session has
+	// already exited (Resume can reach spawnAndRetire when both the
+	// replacement record AND its session are missing while old's
+	// session may also be gone), it's NOT in counts.Total() — the
+	// new spawn is then net +1 and we must use projected = total + 1
+	// to avoid letting the count tip past max on this drain.
 	counts, cerr := state.CountFleetSessions(
 		sessionListProbe, state.LiveAgentRecordExists)
 	if cerr != nil {
@@ -274,7 +283,20 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			cerr)
 	} else {
 		max := state.MaxSessions(stderr)
-		projected := counts.Total() // +1 spawn, -1 retire = net 0
+		// If the old session is alive (its name appears in the list),
+		// the swap is net-zero. Otherwise the spawn is net +1.
+		// SessionAlive (tristate): probe-error treated as alive for
+		// this accounting so a transient tmux flake doesn't push us
+		// into the over-refusal branch. Best-effort semantics —
+		// matches the upstream "don't block on probe failures" rule
+		// applied to listFn above.
+		alive, probeErr := sessionAliveProbe(oldRec.TmuxSession)
+		oldInCount := alive || probeErr != nil
+		projected := counts.Total()
+		if !oldInCount {
+			// Old session definitively gone — spawn is net +1.
+			projected = counts.Total() + 1
+		}
 		if projected > max {
 			// Queue file is preserved so the operator can drain manually
 			// after pruning. The error message mirrors the CLI gate's
