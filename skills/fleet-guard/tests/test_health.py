@@ -352,3 +352,101 @@ class TestPaths:
     ) -> None:
         monkeypatch.delenv("FLEET_HOME", raising=False)
         assert health.fleet_home() == Path.home() / ".fleet"
+
+
+# -- reconcile_pid ----------------------------------------------------------
+
+class TestReconcilePid:
+    """Drift recovery for the P0 spawn-pid bug (2026-05-13).
+
+    Spawn writes the real claude pid into agent.Record.PID via
+    resolveEnginePid (internal/spawn/pidresolver.go). But the pid can
+    drift if claude internally execs — e.g. on /remote-control reconnect,
+    or on Claude Code's auto-update path. The fleet-guard Stop hook fires
+    on every assistant turn from inside the claude process itself, so its
+    os.getpid() ancestor chain ALWAYS contains the live claude pid.
+
+    reconcile_pid checks if the recorded pid is still alive; on miss, it
+    re-resolves from the running process ancestry and rewrites the
+    record. Live pid = no-op."""
+
+    def test_returns_false_when_record_missing(
+        self, fleet_home_tmp: Path,
+    ) -> None:
+        """No record on disk → no reconciliation possible. Mirrors
+        update_record's missing-record contract."""
+        ok = health.reconcile_pid("missing01")
+        assert ok is False
+
+    def test_no_op_when_recorded_pid_alive(
+        self, fleet_home_tmp: Path,
+    ) -> None:
+        """Happy path: recorded pid matches a live process → return True
+        without touching the record. We use our own pid (the test process)
+        which is guaranteed alive."""
+        path = _seed_record(fleet_home_tmp, "agent_live", pid=os.getpid())
+        before = path.read_text(encoding="utf-8")
+        ok = health.reconcile_pid("agent_live")
+        assert ok is True
+        # Record bytes unchanged — no write happened.
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_rewrites_pid_when_recorded_pid_dead(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Drift case: recorded pid is dead, but our ancestor chain has a
+        live process → write the live pid into the record.
+
+        We seed a record with pid=1 (init, always alive but NOT our
+        ancestor) — wait, init IS alive, so we need a definitely-dead pid.
+        Use a very high pid that can't exist. Then stub _resolve_self_pid
+        to return our own pid as the resolved successor."""
+        # Pick a pid guaranteed dead (max pid on macOS is 99999, on Linux
+        # 4194304; 9_999_999 is safely beyond both).
+        dead_pid = 9_999_999
+        path = _seed_record(fleet_home_tmp, "agent_drift", pid=dead_pid)
+
+        # Stub the self-pid resolver to return our process pid, which
+        # the live check will succeed on.
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: os.getpid())
+
+        ok = health.reconcile_pid("agent_drift")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == os.getpid()
+
+    def test_no_rewrite_when_recorded_dead_and_resolver_returns_none(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If we can't find a live successor in our ancestor chain (the
+        fleet-guard skill is somehow running outside a claude session),
+        leave the record alone — better stale data than guessed data.
+        Returns False to signal "no reconciliation happened"."""
+        dead_pid = 9_999_999
+        path = _seed_record(fleet_home_tmp, "agent_orphan", pid=dead_pid)
+        before = path.read_text(encoding="utf-8")
+
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: None)
+
+        ok = health.reconcile_pid("agent_orphan")
+        assert ok is False
+        # Record bytes unchanged — no write happened.
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_pid_zero_in_record_triggers_resolve(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """pid=0 in the record (legacy or partial write) is treated as
+        dead — kick the resolver."""
+        path = _seed_record(fleet_home_tmp, "agent_zero", pid=0)
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: os.getpid())
+        ok = health.reconcile_pid("agent_zero")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == os.getpid()
