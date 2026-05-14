@@ -416,11 +416,11 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 					"[P1] atomic coord swap: post-kill probe for OLD %s ambiguous: %v (marker committed to %s; OLD record preserved for operator triage)\n",
 					in.OldRec.TmuxSession, perr, newRec.ID)
 			}
-			if alertErr := dropOrphanInboxAlert(newRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
+			if alertErr := dropOrphanIncidentAlert(newRec.ID, in.OldRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
 				if stderr != nil {
 					_, _ = fmt.Fprintf(stderr,
-						"warning: atomic coord swap: drop ambiguous-probe inbox alert at %s: %v\n",
-						newRec.ID, alertErr)
+						"warning: atomic coord swap: drop ambiguous-probe incident alert: %v\n",
+						alertErr)
 				}
 			}
 			return res, &ErrOldKillProbeAmbiguous{
@@ -451,11 +451,11 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 					}
 				}
 			}
-			if alertErr := dropOrphanInboxAlert(newRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
+			if alertErr := dropOrphanIncidentAlert(newRec.ID, in.OldRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
 				if stderr != nil {
 					_, _ = fmt.Fprintf(stderr,
-						"warning: atomic coord swap: drop orphan inbox alert at %s: %v\n",
-						newRec.ID, alertErr)
+						"warning: atomic coord swap: drop orphan incident alert: %v\n",
+						alertErr)
 				}
 			}
 			if stderr != nil {
@@ -567,23 +567,46 @@ func swapLockPath(project string) (string, error) {
 	return filepath.Join(filepath.Clean(dir), ".locks", "swap.lock"), nil
 }
 
-// dropOrphanInboxAlert writes a structured alert at ~/.fleet/inbox/<newID>.md
-// so the operator's fleet-guard inbox-relay path surfaces the orphan
-// banner. Best-effort — the FAILURE MODE 5 stderr log is the load-bearing
-// alert channel; this is for the TUI side.
-func dropOrphanInboxAlert(newID, oldSession, project string) error {
-	root, err := state.Root()
+// dropOrphanIncidentAlert writes an operator-facing incident JSON file
+// at ~/.fleet/incidents/coord-swap-<utcStamp>-<oldSession>.json. The
+// TUI dashboard scans this directory and renders a per-project banner;
+// the file is structured (mirroring the macOS jetsam observer's shape)
+// so future tooling can grep / aggregate.
+//
+// Codex review iter-6 [P2]: previously this dropped a markdown alert
+// at ~/.fleet/inbox/<newID>.md, but that path is the agent's command
+// channel — fleet-guard's inbox.py relays the file content into the
+// agent's NEXT TURN. Sending a swap-failure alert there means the
+// replacement agent reads "you left an orphan tmux session" as input,
+// which corrupts the agent's task focus and can overwrite legitimate
+// operator messages queued in the same inbox file. ~/.fleet/incidents/
+// is the right channel: not parsed by any agent, scanned by the TUI
+// dashboard for operator-visible badges.
+//
+// Best-effort — the [P0]/[P1] stderr logs are the load-bearing alert
+// channel; this is supplementary for the TUI side.
+func dropOrphanIncidentAlert(newAgentID, oldAgentID, oldSession, project string) error {
+	dir, err := state.IncidentsDir()
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(root, "inbox", newID+".md")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir incidents dir: %w", err)
+	}
+	now := time.Now().UTC()
+	// Path: incidents/coord-swap-<utc-iso>-<old-session>.json. Stable,
+	// sortable, unique enough that two ambiguous-probe events on the
+	// same project don't collide.
+	filename := fmt.Sprintf("coord-swap-%s-%s.json",
+		now.Format("20060102T150405Z"), oldSession)
+	path := filepath.Join(dir, filename)
+	// Body is JSON-ish so future TUI badge code can parse fields
+	// rather than scraping markdown. Manual JSON to avoid pulling
+	// encoding/json into a hot path the helper barely uses.
 	body := fmt.Sprintf(
-		"# coord-swap orphan tmux alert\n\n"+
-			"coord-swap left orphan tmux session `%s` for project `%s`.\n"+
-			"`fleet maintenance prune-orphan-tmux` will reap on its next sweep.\n"+
-			"You can also reap manually via `tmux kill-session -t %s` if you have access to the right socket.\n",
-		oldSession, project, oldSession)
-	return state.WriteAtomic(path, []byte(body))
+		`{"kind":"coord-swap-orphan","timestamp_utc":%q,"project":%q,"new_agent_id":%q,"old_agent_id":%q,"old_session":%q,"summary":"coord-swap left orphan tmux session; investigate via fleet maintenance prune-orphan-tmux"}`,
+		now.Format(time.RFC3339), project, newAgentID, oldAgentID, oldSession)
+	return state.WriteAtomic(path, []byte(body+"\n"))
 }
 
 // Package-level seams for unit-testable dependency injection. Production

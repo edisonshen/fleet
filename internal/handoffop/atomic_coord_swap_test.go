@@ -603,11 +603,20 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 	if _, statErr := os.Stat(archivePath); statErr != nil {
 		t.Errorf("OLD record should be at archive path; stat err=%v", statErr)
 	}
-	// Inbox alert must exist.
+	// Incident alert must exist (codex iter-6 [P2] — moved off the
+	// agent inbox channel to operator-facing incidents/ dir).
 	root, _ := state.Root()
-	inboxPath := filepath.Join(root, "inbox", "newcoord.md")
-	if _, statErr := os.Stat(inboxPath); statErr != nil {
-		t.Errorf("inbox alert at %s missing: %v", inboxPath, statErr)
+	incidentsDir := filepath.Join(root, "incidents")
+	entries, _ := os.ReadDir(incidentsDir)
+	hasIncident := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "coord-swap-") {
+			hasIncident = true
+			break
+		}
+	}
+	if !hasIncident {
+		t.Errorf("incidents/coord-swap-* alert missing under %s; entries=%v", incidentsDir, entries)
 	}
 	// [P0] log to stderr.
 	if !strings.Contains(stderr.String(), "[P0]") {
@@ -659,11 +668,20 @@ func TestAtomicCoordSwap_OldKill_ProbeAmbiguous(t *testing.T) {
 	if _, statErr := os.Stat(archivePath); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("OLD record should NOT be archived on ambiguous probe; statErr=%v", statErr)
 	}
-	// Inbox alert dropped.
+	// Incident alert dropped (codex iter-6 [P2] — operator-facing
+	// incidents dir, not the agent inbox channel).
 	root, _ := state.Root()
-	inboxPath := filepath.Join(root, "inbox", "newcoord.md")
-	if _, statErr := os.Stat(inboxPath); statErr != nil {
-		t.Errorf("inbox alert should be present: %v", statErr)
+	incidentsDir := filepath.Join(root, "incidents")
+	entries, _ := os.ReadDir(incidentsDir)
+	hasIncident := false
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "coord-swap-") {
+			hasIncident = true
+			break
+		}
+	}
+	if !hasIncident {
+		t.Errorf("incidents/coord-swap-* alert missing under %s; entries=%v", incidentsDir, entries)
 	}
 	// [P1] log to stderr.
 	if !strings.Contains(stderr.String(), "[P1]") {

@@ -747,24 +747,25 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			GraceWindow:          time.Duration(opts.graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
-			// Three error classes from the helper:
+			// Three error classes:
 			//
-			//   - ErrOrphanSurvived (FAILURE MODE 5): marker
-			//     committed; OLD's tmux is an orphan; OLD record
-			//     archived; inbox alert + [P0] dropped. Surface
-			//     warning, proceed to queue delete + prompt send.
+			//   - ErrOrphanSurvived (FAILURE MODE 5): marker committed,
+			//     OLD's tmux orphan but archived from records side,
+			//     ready for prune-orphan-tmux. Safe to proceed with
+			//     queue delete + prompt send.
 			//
-			//   - ErrOldKillProbeAmbiguous: marker committed; OLD's
-			//     record PRESERVED (cross-socket ambiguity); inbox
-			//     alert + [P1] dropped. Surface warning, proceed —
-			//     operator triages OLD via TUI.
+			//   - ErrOldKillProbeAmbiguous: marker committed BUT OLD
+			//     may still be alive on a different tmux socket
+			//     holding coordinator.lock. NEW may lose the race and
+			//     exit. Preserve the queue journal so a retry after
+			//     operator cleans up OLD can resume (codex review
+			//     iter-6 [P1]). Return the error so the queue file
+			//     stays.
 			//
-			//   - Any other error: true rollback (marker still at
-			//     OLD; NEW cleaned up). Return error so the queue
-			//     file stays for retry.
+			//   - Any other error: true rollback (marker still at OLD,
+			//     NEW cleaned up). Queue file stays for retry.
 			switch {
-			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel),
-				errors.Is(swapErr, handoffop.ErrOldKillProbeAmbiguousSentinel):
+			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel):
 				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
 			default:
 				return swapErr
@@ -1013,9 +1014,11 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			GraceWindow:          time.Duration(opts.graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
+			// See iter-6 [P1] commentary in runHandoff: ambiguous-probe
+			// preserves the queue journal so retry can resume after
+			// operator confirms OLD dead.
 			switch {
-			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel),
-				errors.Is(swapErr, handoffop.ErrOldKillProbeAmbiguousSentinel):
+			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel):
 				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
 			default:
 				return swapErr

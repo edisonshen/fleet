@@ -564,15 +564,26 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			GraceWindow:          time.Duration(graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
-			// FAILURE MODE 5 and ambiguous-OLD-probe both committed
-			// the marker; both surface as warnings rather than
-			// errors so the queue delete + prompt send still runs.
-			// Any other error is a true rollback (marker still at
-			// OLD; helper cleaned up NEW); queue file is preserved
-			// so retry can pick up.
+			// Three error classes:
+			//
+			//   - ErrOrphanSurvived (FAILURE MODE 5): marker committed,
+			//     OLD's tmux orphan but archived from records side,
+			//     ready for prune-orphan-tmux. Safe to proceed with
+			//     queue delete + prompt send — helper handled retire
+			//     bookkeeping.
+			//
+			//   - ErrOldKillProbeAmbiguous: marker committed BUT
+			//     OLD may still be alive on a different tmux socket
+			//     holding coordinator.lock. NEW may lose the race and
+			//     exit. Preserve the queue journal so a retry after
+			//     operator cleans up OLD can resume (codex review
+			//     iter-6 [P1]). Return the error so the surrounding
+			//     drain path leaves the queue file alone.
+			//
+			//   - Any other error: true rollback (marker still at OLD,
+			//     NEW cleaned up). Return so queue file stays.
 			switch {
-			case errors.Is(swapErr, ErrOrphanSurvivedSentinel),
-				errors.Is(swapErr, ErrOldKillProbeAmbiguousSentinel):
+			case errors.Is(swapErr, ErrOrphanSurvivedSentinel):
 				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
 			default:
 				return swapErr
