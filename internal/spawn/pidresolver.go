@@ -456,6 +456,16 @@ func pidResolveTimeout() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// PidResolveTimeout exposes pidResolveTimeout to callers outside the
+// spawn package. Used by `fleet maintenance prune-orphan-tmux` to
+// compute a freshness window that's never shorter than the spawn
+// path's record-write delay — otherwise the sweeper could kill a
+// healthy replacement that's still inside the pid-resolution wait
+// (codex review iter-3 [P1]).
+func PidResolveTimeout() time.Duration {
+	return pidResolveTimeout()
+}
+
 // pidResolveDisambiguator picks the unique argv substring that
 // identifies THIS spawn's engine among potentially many sibling engines
 // on the host.

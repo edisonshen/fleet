@@ -28,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -46,24 +47,44 @@ import (
 // only.
 var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7})$`)
 
-// pruneOrphanTmuxFreshness is the minimum age a tmux session must
-// reach before prune-orphan-tmux considers it an orphan candidate.
+// pruneOrphanTmuxMinFreshness is the floor for the freshness window:
+// even when FLEET_PID_RESOLVE_S is unset or tiny, the sweeper waits at
+// least this long before classifying a record-absent session as orphan.
 //
 // Rationale: spawn.Spawn creates the tmux session first (tmux.Spawn),
-// then resolves the engine pid (up to pidResolveTimeout, ~5s typical),
-// then writes the agent record (rec.Write). Between tmux create and
-// rec.Write the on-disk state matches the orphan shape exactly:
-// session exists, record absent. A sweeper that runs in that window
-// (especially via cron / startup hook) would kill a brand-new healthy
-// replacement.
+// then resolves the engine pid (up to spawn.PidResolveTimeout()), then
+// writes the agent record (rec.Write). Between tmux create and rec.Write
+// the on-disk state matches the orphan shape exactly: session exists,
+// record absent. A sweeper that runs in that window (especially via
+// cron / startup hook) would kill a brand-new healthy replacement.
 //
-// 90s is well above the typical 1-5s spawn cost AND covers the
-// resolveEnginePid worst-case timeout with margin. Operators who want
-// to reap genuine 12-hour-old orphans never notice this delay.
+// 90s is well above the typical 1-5s spawn cost when the operator
+// hasn't tuned FLEET_PID_RESOLVE_S — it covers slow Macs, slow disks,
+// and ZFS-style snapshot pauses. The dynamic ceiling below adds 2x
+// the configured pid-resolve timeout when the operator raised it
+// (codex review iter-3 [P1]).
+const pruneOrphanTmuxMinFreshness = 90 * time.Second
+
+// pruneOrphanTmuxFreshness computes the actual freshness window to use,
+// scaling with FLEET_PID_RESOLVE_S so that operators who raise the
+// pid-resolve budget for slow-spawning wrapper engines don't get their
+// in-flight replacements terminated by --kill.
 //
-// Codex review iter-2 [P1]: avoid killing sessions in the spawn→
-// record-write window.
-const pruneOrphanTmuxFreshness = 90 * time.Second
+// Returns max(pruneOrphanTmuxMinFreshness, 2 * spawn.PidResolveTimeout()).
+// The 2x multiplier covers the gap between when the pid-resolve clock
+// starts (just after tmux.Spawn) and when the record actually lands on
+// disk (after pid resolution succeeds OR times out — both go through
+// rec.Write), plus a margin for slow filesystems.
+//
+// Codex review iter-2 [P1] established the lower bound; codex review
+// iter-3 [P1] established the dynamic ceiling.
+func pruneOrphanTmuxFreshness() time.Duration {
+	dynamicCeiling := 2 * spawn.PidResolveTimeout()
+	if dynamicCeiling > pruneOrphanTmuxMinFreshness {
+		return dynamicCeiling
+	}
+	return pruneOrphanTmuxMinFreshness
+}
 
 func newMaintenanceCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -129,7 +150,7 @@ without worrying about ordering edge cases.`,
 				agentRecordExists,
 				tmux.Kill,
 				time.Now,
-				pruneOrphanTmuxFreshness,
+				pruneOrphanTmuxFreshness(),
 			)
 		},
 	}
