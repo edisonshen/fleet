@@ -35,6 +35,17 @@ import (
 // handoff path may override.
 const DefaultGraceMillis = 3000
 
+// sessionListProbe is the tmux-session enumerator the auto-drain path
+// uses for the FLEET_MAX_SESSIONS precheck. Indirected via a package-
+// level var so tests inject a fake without touching tmux.
+var sessionListProbe = tmux.ListSessions
+
+// sessionAliveProbe is the tmux session-liveness probe the cap path
+// uses to decide swap-vs-+1 accounting. Tristate: (alive, err) per
+// tmux.SessionAlive's contract. Indirected via a package-level var
+// so tests inject deterministic fakes.
+var sessionAliveProbe = tmux.SessionAlive
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -245,6 +256,64 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 // the session, then retires the old agent.
 func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	oldRec *agent.Record, graceMillis int, stdout, stderr io.Writer) error {
+
+	// FLEET_MAX_SESSIONS backstop on the auto-drain path. The
+	// fleet-guard skill writes queue files on auto-handoff; this
+	// helper is the consumer. Without the cap here, a runaway
+	// auto-handoff loop (e.g. a future bug that retries forever)
+	// could blow past the operator's limit. No --force-replacement
+	// escape on this path because there's no operator to flag it —
+	// the queue file is the only producer. Probe failures don't
+	// block (best-effort, same as the CLI gate).
+	//
+	// Cap is re-checked on EVERY consumer pass (codex iter-8 P1):
+	// the producer-side approval in cmd/fleet/handoff.go is not
+	// load-bearing for crash recovery — between original handoff
+	// and retry the cap state can shift (operator lowered
+	// FLEET_MAX_SESSIONS; other paths spawned sessions; the old
+	// session died, turning a net-zero swap into a +1 spawn). Only
+	// the swap-aware accounting below is correct for arbitrary
+	// post-crash state. The producer-side CapApproved field
+	// remains in the queue schema as a forward-compatibility hook
+	// and a tracking signal for diagnostics, but is intentionally
+	// NOT used to bypass this check.
+	counts, cerr := state.CountFleetSessions(
+		sessionListProbe, state.LiveAgentRecordExists)
+	if cerr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: FLEET_MAX_SESSIONS precheck could not enumerate tmux sessions (%v); proceeding without cap enforcement\n",
+			cerr)
+	} else {
+		max := state.MaxSessions(stderr)
+		// If the old session is alive (its name appears in the list),
+		// the swap is net-zero. Otherwise the spawn is net +1.
+		// SessionAlive (tristate): probe-error treated as alive for
+		// this accounting so a transient tmux flake doesn't push us
+		// into the over-refusal branch. Best-effort semantics —
+		// matches the upstream "don't block on probe failures" rule
+		// applied to listFn above.
+		alive, probeErr := sessionAliveProbe(oldRec.TmuxSession)
+		oldInCount := alive || probeErr != nil
+		projected := counts.Total()
+		if !oldInCount {
+			// Old session definitively gone — spawn is net +1.
+			projected = counts.Total() + 1
+		}
+		if projected > max {
+			// Queue file is preserved so the operator can drain
+			// manually after pruning. We intentionally DON'T suggest
+			// `fleet rm <id>` here (codex iter-10 P1): rm refuses
+			// any agent that has a pending spawn-fresh queue file,
+			// so on this drain path the operator must either prune
+			// ORPHANS (the only sessions rm-able right now) or
+			// raise FLEET_MAX_SESSIONS. The CLI handoff gate
+			// retains `fleet rm <id>` since it fires BEFORE the
+			// queue write.
+			return fmt.Errorf(
+				"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` to reap orphans (or raise FLEET_MAX_SESSIONS), then rerun `fleet drain` (queue file %s preserved)",
+				max, counts.Live, counts.Orphan, queuePath)
+		}
+	}
 
 	if oldRec.Cwd == "" {
 		return fmt.Errorf(
@@ -560,6 +629,10 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				NewAgentID:        newRec.ID,
 				NewSession:        newRec.TmuxSession,
 				DisableAutoResume: override,
+				// Spawn already happened on this drain pass, so the
+				// cap was effectively approved — mark so future
+				// retries don't re-check (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				// Send failed AND re-enqueue failed → replacement
 				// is alive but un-prompted, no journal entry to

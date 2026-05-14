@@ -522,6 +522,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// FLEET_MAX_SESSIONS backstop. Runs HERE — after engine /
+	// project / coord-spawn validation, BEFORE the dead-coord
+	// recovery branch's synth handoff doc write — so a cap refusal
+	// doesn't leave a synthetic doc on disk for a replacement that
+	// never spawned (codex iter-9 P2). swapsInFlight=0: dispatch
+	// is net +1.
+	if err := enforceSessionCap(os.Stderr, "", 0); err != nil {
+		return err
+	}
+
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
 	// hits a project whose previous coord left a stale record on disk
 	// (pid dead AND tmux session gone), build a synth handoff doc from
