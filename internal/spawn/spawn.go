@@ -555,6 +555,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 	session := tmux.SessionName(id)
 	rec := agent.New(id)
 	rec.TmuxSession = session
+	// Provisional pid: the fleet binary's own pid. Overwritten after
+	// tmux.Spawn with the resolved real engine pid (resolveEnginePid
+	// walks the pane's child process tree). Without this overwrite,
+	// every downstream liveness probe (TUI dead-coord sweep, coord
+	// reconcile) would classify the agent as DEAD by construction —
+	// the fleet binary exits immediately after dispatch returns.
 	rec.PID = os.Getpid()
 
 	// Capture the resolved cwd so `fleet handoff` can place the
@@ -722,6 +728,37 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// Failure is silent — TUI keybind hints + the wrapped command's
 	// in-session banner are fallback discovery paths.
 	_ = tmux.SetStatusHint(session, "[Ctrl-b d to detach]")
+
+	// Resolve the real engine pid via the tmux pane child tree (P0
+	// bug fix 2026-05-13). For coord-spawn dispatches, the
+	// disambiguator is the per-agent --remote-control session name
+	// injected by cmd/fleet/dispatch.go (fleet-coord-<id>). For
+	// other dispatches we fall back to engineHint matching ("claude"
+	// for the default engine; empty for custom-command spawns).
+	// resolveEnginePid blocks up to pidResolveTimeout; on timeout it
+	// returns the pane pid as a best-effort fallback (wrong-but-live
+	// beats os.Getpid which is dead by construction).
+	disambiguator := pidResolveDisambiguator(id, execArgv)
+	engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
+	resolvedPid, _, resolveErr := resolveEnginePid(
+		session, disambiguator, engineHint,
+		pidResolveTimeout(),
+		productionResolveDeps(),
+	)
+	if resolveErr != nil {
+		// Pane pid unreachable — log a warning to stderr but DO NOT
+		// fail the spawn. The agent record will still go to disk with
+		// PID=os.Getpid (the pre-fix shape); operators can re-resolve
+		// via fleet-guard heartbeat once the agent boots and the
+		// Stop hook fires. Aborting here would orphan a live tmux
+		// session for a transient tmux probe blip.
+		_, _ = fmt.Fprintf(os.Stderr,
+			"warning: resolve engine pid for %s failed: %v (recording fleet binary pid as fallback)\n",
+			session, resolveErr)
+	} else if resolvedPid > 0 {
+		rec.PID = resolvedPid
+	}
+
 	if err := rec.Write(); err != nil {
 		// Orphan rollback: tmux session up, record missing → operator
 		// would see a ghost session in `tmux ls` with no `fleet status`

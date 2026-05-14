@@ -842,6 +842,25 @@ func projectHeaderLines(p *ProjectRow, w int, selected bool) ([]string, string) 
 		}
 	}
 
+	// PART 3 jetsam observer — render a "killed by memorystatus" badge
+	// when fleet-guard has written one or more incident JSON files for
+	// this project under ~/.fleet/incidents/. Uses attentionChipStyle
+	// for the same red/bold visual weight as the post-archive badge;
+	// the ✗ glyph signals "kill" (vs ⚠ "subagent drift"). When count
+	// is 1 we omit the number to keep the badge compact.
+	if p.IncidentCount > 0 {
+		text := "✗ killed by memorystatus"
+		if p.IncidentCount > 1 {
+			text = fmt.Sprintf("✗ %d killed by memorystatus", p.IncidentCount)
+		}
+		badge := attentionChipStyle.Render(text)
+		if lipgloss.Width(line2) > lipgloss.Width(prefix) {
+			line2 = line2 + "  " + badge
+		} else {
+			line2 = prefix + badge
+		}
+	}
+
 	return []string{line1, line2}, prefix
 }
 
@@ -920,6 +939,13 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 			return removeCoordSpawnMarkerFn(p.Name)
 		})
 	}
+	// PART 2b downgrade: stuck → waiting when the agent record has
+	// needs_input=true AND last_activity_ts is within
+	// agentRecordFreshWindow. Codex iter-4 (2026-05-14) added the
+	// freshness gate so a stale needs_input=true flag (set before
+	// claude died while the wrapper-shell survived) doesn't mask a
+	// dead coord — the original stuck warning surfaces in that case.
+	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
 	if line, ok := renderCoordSpawnLineForProject(
 		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {

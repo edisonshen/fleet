@@ -112,6 +112,17 @@ def _on_stop(payload: dict, agent_id: str, session: str,
         context_pct=pct,
         context_source="hook",
     )
+    # Drift recovery for the P0 spawn-pid bug (2026-05-13). The Go-side
+    # spawn resolver writes the real engine pid at dispatch, but claude
+    # can internally exec (e.g. on /remote-control reconnect, on
+    # auto-update). Each Stop hook fires inside the live claude
+    # process, so this is the right place to detect+repair drift. Cost:
+    # one kill(pid, 0) probe in the happy path, one ps invocation on
+    # the rare drift path. Failure is silent — best effort.
+    try:
+        health.reconcile_pid(agent_id)
+    except Exception as exc:
+        print(f"fleet-guard: pid reconcile error: {exc}", file=sys.stderr)
 
     inbox_body = inbox.read_pending(agent_id)
     if inbox_body is not None:

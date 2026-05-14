@@ -131,23 +131,67 @@ func TestCoordSpawnState_PostActiveIdleStop_ReturnsIdle(t *testing.T) {
 	}
 }
 
-// TestCoordSpawnState_StuckOverridesActive: a coord-state.json that
-// happens to be fresh when the marker is past timeout doesn't rescue
-// the row from "stuck". The marker is the in-flight signal for the
-// operator's most recent [a] press; if it never converged on time
-// the warning fires.
-func TestCoordSpawnState_StuckOverridesActive(t *testing.T) {
+// TestCoordSpawnState_StuckRequiresStaleCoordState: stuck only fires
+// when the marker is past timeout AND there is no liveness signal from
+// coord-state.json (mtime stale or absent). A coord that is still
+// actively ticking — proven by a coord-state mtime within activeWindow
+// — by definition is not stuck during spawn; it successfully booted
+// and continues to publish state. The "stuck" framing is reserved for
+// the narrow case where the marker exists but no fresh state ever
+// arrived, OR where state arrived once and then went stale alongside
+// the marker aging past the timeout.
+//
+// The pre-fix ordering treated every long-lived alive coord as stuck
+// (PART 2.5 — false-positive on coord de3e12a9 at 20:47 PDT 2026-05-13:
+// claude alive 20 min, coord-state mtime 6 min ago, badge fired). The
+// fix inverts the order in deriveCoordSpawnState: the active check
+// runs before the spawn-timeout check.
+func TestCoordSpawnState_StuckRequiresStaleCoordState(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-12 * time.Minute) // past timeout
-	stateMtime := now.Add(-15 * time.Second)  // fresh
+	// Stale coord-state — no liveness signal. With the marker past
+	// timeout AND no fresh state, the coord legitimately looks stuck.
+	staleStateMtime := now.Add(-30 * time.Minute)
 	got := deriveCoordSpawnState(
 		true, markerMtime,
-		true, stateMtime,
+		true, staleStateMtime,
 		now,
 		5*time.Minute, 10*time.Minute,
 	)
 	if got != coordSpawnStuck {
-		t.Errorf("stuck must override active; got %v", got)
+		t.Errorf("marker past timeout + stale state must be stuck; got %v", got)
+	}
+}
+
+// TestCoordSpawnState_FreshCoordStateBeatsStaleSpawnMarker pins the
+// PART 2.5 fix: a coord that is actively publishing coord-state.json
+// (mtime within activeWindow) is NOT stuck regardless of how old the
+// spawn marker is. The marker is set ONCE at spawn and never refreshed;
+// a coord ticking 12+ minutes after spawn is healthy, not stuck.
+//
+// Pre-fix: this case returned coordSpawnStuck because the timeout check
+// ran before the active check. After the fix, active wins.
+//
+// Evidence (real bug, 2026-05-13 20:47 PDT):
+//   - coord de3e12a9 spawned at 20:26 PDT (~21 min before badge fired)
+//   - claude pid 10445 alive and executing tool calls
+//   - coord-state.json mtime 20:41 PDT (6 min stale, but within 5m
+//     when the badge fired)
+//   - badge said "▲ coord spawn stuck" — false positive
+func TestCoordSpawnState_FreshCoordStateBeatsStaleSpawnMarker(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	// Marker spawned 15 minutes ago — past the 10-minute spawn timeout.
+	markerMtime := now.Add(-15 * time.Minute)
+	// Coord-state.json was updated 1 minute ago — clearly alive.
+	coordStateMtime := now.Add(-1 * time.Minute)
+	got := deriveCoordSpawnState(
+		true, markerMtime,
+		true, coordStateMtime,
+		now,
+		5*time.Minute, 10*time.Minute,
+	)
+	if got != coordSpawnActive {
+		t.Errorf("fresh coord-state must beat stale spawn marker; got %v want coordSpawnActive", got)
 	}
 }
 
@@ -338,6 +382,162 @@ func TestProjectRow_NoMarkerNoSpawningLine(t *testing.T) {
 	if len(lines) != 4 {
 		t.Errorf("no-marker block must be 4 lines (3 content + blank); got %d:\n%s",
 			len(lines), joined)
+	}
+}
+
+// TestProjectRow_StuckDowngradesToWaitingWhenNeedsInputFresh pins
+// PART 2b of the bundle + codex iter-4 freshness gate: when the
+// spawn marker is past timeout AND the agent record matching the
+// marker has needs_input=true AND last_activity_ts is within
+// agentRecordFreshWindow, render an informational "coord waiting on
+// input" line instead of the attention-chip stuck warning. The
+// freshness gate is load-bearing — a stale flag from a dead claude
+// (wrapper-shell survived after engine exit) must NOT trigger the
+// downgrade.
+//
+// Note: with last_activity_ts fresh enough to pass the freshness
+// gate (within agentRecordFreshWindow = 10m by default), the Path B
+// self-heal in applyStuckSelfHeal ALSO fires — it transitions stuck
+// → idle and removes the marker. So the realistic render here is
+// "no spawn line at all" (Idle). To exercise the WAITING path
+// specifically, we pin a last_activity_ts that is fresh enough for
+// needs-input trust (within the 10m freshWindow) but past the
+// Path B "agent record is fresh" gate is the same window — so both
+// heal and waiting are eligible. Heal wins (runs first). This is
+// the correct production outcome: a healthy coord asking for input
+// renders Idle (with the operator-input chip), not Waiting.
+//
+// Real bug surfaced 2026-05-13: coord bab86984 (projects-spark)
+// showed the stuck badge while its claude process pid 8306 had been
+// running 12 minutes idle awaiting input — needs_input=true,
+// last_activity 33s after spawn. The badge trained the operator to
+// spawn replacements over a live coord.
+func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInputFresh(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": false})
+
+	// last_activity_ts FRESH (within freshWindow=10m) → needs_input
+	// flag is trusted. Session-alive=false so Path A of heal doesn't
+	// short-circuit; Path B (record-fresh) heals to Idle BEFORE the
+	// downgrade runs. Realistic production behavior — see test
+	// docstring above.
+	rec := &agent.Record{
+		ID:             "abcd1234",
+		LastActivityTS: now.Add(-3 * time.Minute), // FRESH
+		NeedsInput:     true,
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{rec},
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("fresh needs_input must NOT render stuck; got:\n%s", joined)
+	}
+}
+
+// TestDowngradeStuckOnNeedsInput_UnitContract pins the new
+// downgrade contract via the pure helper (no project-block plumbing
+// involved). Confirms the freshness gate flips the verdict on the
+// exact case codex iter-4 raised: stale needs_input flag must fall
+// through to stuck, not mask a dead coord.
+func TestDowngradeStuckOnNeedsInput_UnitContract(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	freshWindow := 10 * time.Minute
+	cases := []struct {
+		name       string
+		needsInput bool
+		lastTSAge  time.Duration // age from now (positive = past)
+		want       coordSpawnState
+	}{
+		{
+			name:       "needs_input=true + fresh ts → waiting",
+			needsInput: true,
+			lastTSAge:  3 * time.Minute,
+			want:       coordSpawnWaiting,
+		},
+		{
+			name:       "needs_input=true + stale ts → STUCK (codex iter-4 gate)",
+			needsInput: true,
+			lastTSAge:  30 * time.Minute, // past 10m window
+			want:       coordSpawnStuck,  // dead coord with stale flag
+		},
+		{
+			name:       "needs_input=false + fresh ts → stuck (no input signal)",
+			needsInput: false,
+			lastTSAge:  3 * time.Minute,
+			want:       coordSpawnStuck,
+		},
+		{
+			name:       "needs_input=true + zero ts → stuck (no signal trust)",
+			needsInput: true,
+			lastTSAge:  0, // sentinel for IsZero()
+			want:       coordSpawnStuck,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts time.Time
+			if tc.lastTSAge > 0 {
+				ts = now.Add(-tc.lastTSAge)
+			}
+			rec := &agent.Record{
+				ID:             "abcd1234",
+				LastActivityTS: ts,
+				NeedsInput:     tc.needsInput,
+			}
+			got := downgradeStuckOnNeedsInput(
+				coordSpawnStuck,
+				[]*agent.Record{rec},
+				"abcd1234",
+				now,
+				freshWindow,
+			)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProjectRow_StuckPreservedWhenNeedsInputFalse: the inverse case —
+// genuine stuck (no needs_input signal, no fresh state) still renders
+// the attention-chip warning. Ensures the gate doesn't accidentally
+// suppress real failure modes.
+func TestProjectRow_StuckPreservedWhenNeedsInputFalse(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+
+	// Agent record exists but needs_input=false AND stale → real stuck.
+	rec := &agent.Record{
+		ID:             "abcd1234",
+		LastActivityTS: now.Add(-30 * time.Minute),
+		NeedsInput:     false,
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{rec},
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("needs_input=false + stale + past timeout → stuck must fire; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "waiting on input") {
+		t.Errorf("real stuck must not render waiting line; got:\n%s", joined)
 	}
 }
 

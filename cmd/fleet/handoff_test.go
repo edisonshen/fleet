@@ -56,6 +56,13 @@ func requireTmux(t *testing.T) {
 	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
 	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
 	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
+	// Speed up the pid-resolver fallback budget — production polls
+	// up to 10s waiting for claude to exec inside the wrapper shell.
+	// Integration tests use synthetic commands ("sleep 30", shells)
+	// where no claude descendant ever appears, so we'd otherwise
+	// pay the full 10s timeout per test. 1s keeps the polling loop
+	// exercised while bounding wall time.
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
 }
 
 // seedAgent dispatches a long-lived agent for handoff to operate on.

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,6 +43,12 @@ func requireTmux(t *testing.T) {
 		t.Fatalf("rand.Read: %v", err)
 	}
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// Speed up the pid-resolver poll budget in tests. Production uses
+	// 10s; tests with synthetic commands ("sleep 30", "sh -c sleep 60")
+	// will never find a "claude" descendant, so the resolver will run
+	// to timeout. 1s keeps the test wall time bounded while still
+	// exercising the polling loop.
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
 }
 
 // capturePaneArgs builds tmux args for capture-pane against the
@@ -105,6 +112,59 @@ func TestSpawn_FreshDispatch(t *testing.T) {
 	}
 	if loaded.TaskID != "auth-fix" {
 		t.Errorf("loaded.TaskID=%q", loaded.TaskID)
+	}
+}
+
+// TestSpawn_RecordsRealEnginePidNotFleetBinaryPid is the regression
+// test for the P0 bug surfaced 2026-05-13: spawn used to write
+// os.Getpid() (the fleet binary's own pid) into agent.Record.PID. That
+// pid dies as soon as `fleet dispatch` exits, so every downstream
+// liveness probe (TUI dead-coord sweep, coord reconcile) classified
+// every coord as DEAD by construction.
+//
+// After the fix, rec.PID must be the pid of the engine running inside
+// the tmux pane — not the test binary's pid. We verify by spawning a
+// long-lived `sleep` and checking the recorded pid:
+//   - is not the test process's pid (the bug's signature)
+//   - corresponds to a live process (kill -0 succeeds)
+//   - matches a child of the tmux pane pid
+func TestSpawn_RecordsRealEnginePidNotFleetBinaryPid(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	rec, err := Spawn(Options{
+		TaskID:  "pid-resolution",
+		Project: "rainier",
+		// Long-lived child so the pid is still alive when we probe.
+		Command: []string{"sh", "-c", "sleep 60"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// Bug signature: recorded pid == os.Getpid().
+	if rec.PID == os.Getpid() {
+		t.Fatalf("recorded pid = test-process pid (%d) — spawn-pid bug regressed", rec.PID)
+	}
+	if rec.PID <= 0 {
+		t.Fatalf("recorded pid invalid: %d", rec.PID)
+	}
+
+	// Live process check via kill(0). EPERM also means alive; we don't
+	// expect EPERM here since the spawned tmux session runs as the
+	// same user as the test.
+	if err := syscall.Kill(rec.PID, 0); err != nil {
+		t.Errorf("recorded pid %d is not alive: %v", rec.PID, err)
+	}
+
+	// Round-trips to disk with the real pid.
+	loaded, err := agent.Load(rec.ID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.PID != rec.PID {
+		t.Errorf("loaded.PID = %d, want %d", loaded.PID, rec.PID)
 	}
 }
 

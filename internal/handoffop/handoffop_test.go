@@ -52,6 +52,11 @@ func requireTmux(t *testing.T) {
 	t.Setenv("FLEET_POST_SEND_VERIFY_MS", "0")
 	t.Setenv("FLEET_POST_SEND_RETRY_MS", "0")
 	t.Setenv("FLEET_PROMPT_ENTER_DELAY_MS", "50")
+	// pid-resolver fallback budget — production polls up to 10s for
+	// claude to exec inside the wrapper shell; tests use synthetic
+	// commands where no claude descendant exists, so we'd pay the
+	// full timeout per test without this pin.
+	t.Setenv("FLEET_PID_RESOLVE_S", "1")
 }
 
 // spawnSeedAgent stands in for `fleet dispatch`: seeds an agent record

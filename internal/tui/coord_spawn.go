@@ -76,6 +76,22 @@ const (
 	// lost confidence the coord skill will ever publish; surface a red
 	// warning prompting the operator to attach via tmux.
 	coordSpawnStuck
+
+	// coordSpawnWaiting: marker mtime is older than spawnTimeout BUT the
+	// agent record has needs_input=true — the coord is alive and waiting
+	// on operator input. fleet-guard sets needs_input from INSIDE claude
+	// on each Stop hook fire, which is impossible if claude were dead.
+	// Render informational ("◌ coord waiting on input — fleet attach
+	// <agent_id>"), not the attention-chip stuck warning.
+	//
+	// Reserved for the narrow case where stuck WOULD have fired but
+	// needs_input rescues. The derivation function does NOT return this
+	// state directly — the render-side wrapper downgrades stuck → waiting
+	// after checking the agent record. Keeping the gate at the render
+	// layer means the derivation stays pure (marker mtime + state mtime
+	// only) and the needs_input lookup is local to the project block
+	// that already reads ctx.records.
+	coordSpawnWaiting
 )
 
 // coordSpawnTimeoutDefault is the default age past which a spawn is
@@ -116,19 +132,30 @@ func deriveCoordSpawnState(
 	if !markerOK {
 		return coordSpawnIdle
 	}
-	// Stuck check fires regardless of coord-state freshness — once the
-	// marker is older than the timeout, even a "fresh" coord-state
-	// could be a different agent (the spec's "stuck" framing assumes
-	// the operator's [a] launch never succeeded, and resuming it at
-	// minute 11 isn't useful — they should attach via tmux). Spec
-	// section: "Marker AND elapsed > FLEET_COORD_SPAWN_TIMEOUT_S".
-	if now.Sub(markerMtime) > spawnTimeout {
-		return coordSpawnStuck
-	}
-	// Coord-state fresh → existing PR #57 active rendering wins. The
-	// caller suppresses our extra line in this case.
+	// Liveness wins over spawn-timeout (PART 2.5 fix). A coord whose
+	// coord-state.json mtime is within activeWindow is actively ticking
+	// — by definition, NOT stuck. The marker is set ONCE at spawn and
+	// never refreshed, so without this ordering EVERY long-lived alive
+	// coord would eventually trip the timeout and render as stuck (real
+	// bug surfaced 2026-05-13: coord de3e12a9 spawned 20:26 PDT, claude
+	// alive 20+ min, badge fired at 20:47 PDT despite a 6-min-stale
+	// coord-state mtime within the 5m activeWindow window when checked).
+	//
+	// Reserve "stuck" for the narrow case the spec actually targets:
+	// marker exists but no fresh state ever arrived (cold-start wedge),
+	// OR marker is past timeout AND state went stale alongside it
+	// (genuinely dead). Both of those are caught by the timeout branch
+	// below, which only runs when the active gate did NOT match.
 	if coordStateOK && now.Sub(coordStateMtime) <= activeWindow {
 		return coordSpawnActive
+	}
+	// Stuck: marker is older than the timeout AND we have no liveness
+	// signal from coord-state.json. The operator's [a] launch never
+	// converged (or converged and then went silent past the window);
+	// resuming it at minute 11+ isn't useful — they should attach via
+	// tmux. Spec section: "Marker AND elapsed > FLEET_COORD_SPAWN_TIMEOUT_S".
+	if now.Sub(markerMtime) > spawnTimeout {
+		return coordSpawnStuck
 	}
 	// Post-active idle-stop guard: if a coord-state.json exists AND its
 	// mtime is newer than the marker, the coord successfully booted at
@@ -252,7 +279,8 @@ func renderCoordSpawnLineForProject(
 	markerMtime time.Time,
 	tickFrame int,
 ) (string, bool) {
-	if st == coordSpawnStuck {
+	switch st {
+	case coordSpawnStuck:
 		var msg string
 		if markerAgentID != "" {
 			msg = "▲ coord spawn stuck — check tmux session fleet-" + markerAgentID
@@ -266,8 +294,74 @@ func renderCoordSpawnLineForProject(
 		}
 		body := attentionChipStyle.Render(msg)
 		return prefix + body, true
+	case coordSpawnWaiting:
+		// Informational: the coord is alive, just waiting on operator
+		// input. Use dim styling (matches the spawning line treatment)
+		// rather than the attention-chip red so the operator's eye
+		// isn't pulled to it — they already know they need to answer.
+		var msg string
+		if markerAgentID != "" {
+			msg = "◌ coord waiting on input — fleet attach " + markerAgentID
+		} else {
+			msg = "◌ coord waiting on input for project " + projectName + " — check `tmux ls`"
+		}
+		body := dimStyle.Render(msg)
+		return prefix + body, true
 	}
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
+}
+
+// downgradeStuckOnNeedsInput converts coordSpawnStuck → coordSpawnWaiting
+// when the agent record matching markerAgentID has needs_input=true AND
+// the record is fresh (last_activity_ts within agentRecordFreshWindow).
+//
+// PART 2b of the bundled liveness-correctness fix (2026-05-13): an
+// agent with needs_input=true is alive — fleet-guard sets that flag
+// from INSIDE claude on every Stop hook fire. The stuck-attention-chip
+// path is reserved for the "spawn never converged" failure mode where
+// no needs_input signal exists.
+//
+// Codex iter-4 hardening (2026-05-14): the needs_input flag is only
+// as fresh as the last Stop hook write. If claude asked a question
+// then died while the tmux wrapper survived, the stale flag would
+// mask a dead coord. Gate the downgrade on last_activity_ts being
+// within agentRecordFreshWindow (same window applyStuckSelfHeal uses
+// for Path B). A stale-flag-from-dead-claude case falls through to
+// the original stuck warning, surfacing recovery to the operator.
+//
+// Returns the (possibly downgraded) state. No effect on non-stuck
+// states, when no matching record is found, or when the record's
+// last_activity_ts is older than the freshness window.
+func downgradeStuckOnNeedsInput(
+	st coordSpawnState,
+	records []*agent.Record,
+	markerAgentID string,
+	now time.Time,
+	freshWindow time.Duration,
+) coordSpawnState {
+	if st != coordSpawnStuck || markerAgentID == "" {
+		return st
+	}
+	for _, r := range records {
+		if r == nil || r.ID != markerAgentID {
+			continue
+		}
+		if !r.NeedsInput {
+			return st
+		}
+		// needs_input=true AND last_activity_ts fresh → trust the flag.
+		// last_activity_ts is stamped on every Stop hook fire; a stale
+		// timestamp means fleet-guard hasn't run recently — the agent
+		// may have died with the flag set.
+		if r.LastActivityTS.IsZero() {
+			return st
+		}
+		if now.Sub(r.LastActivityTS) > freshWindow {
+			return st
+		}
+		return coordSpawnWaiting
+	}
+	return st
 }
 
 // applyStuckSelfHeal is the issue #96 gap 1 + follow-up self-heal gate.

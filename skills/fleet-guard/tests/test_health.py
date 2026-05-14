@@ -352,3 +352,339 @@ class TestPaths:
     ) -> None:
         monkeypatch.delenv("FLEET_HOME", raising=False)
         assert health.fleet_home() == Path.home() / ".fleet"
+
+
+# -- reconcile_pid ----------------------------------------------------------
+
+class TestReconcilePid:
+    """Drift recovery for the P0 spawn-pid bug (2026-05-13).
+
+    Spawn writes the real claude pid into agent.Record.PID via
+    resolveEnginePid (internal/spawn/pidresolver.go). But the pid can
+    drift if claude internally execs — e.g. on /remote-control reconnect,
+    or on Claude Code's auto-update path. The fleet-guard Stop hook fires
+    on every assistant turn from inside the claude process itself, so its
+    os.getpid() ancestor chain ALWAYS contains the live claude pid.
+
+    reconcile_pid checks if the recorded pid is still alive; on miss, it
+    re-resolves from the running process ancestry and rewrites the
+    record. Live pid = no-op."""
+
+    def test_returns_false_when_record_missing(
+        self, fleet_home_tmp: Path,
+    ) -> None:
+        """No record on disk → no reconciliation possible. Mirrors
+        update_record's missing-record contract."""
+        ok = health.reconcile_pid("missing01")
+        assert ok is False
+
+    def test_no_op_when_recorded_pid_alive(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Happy path: recorded pid matches a live process → return True
+        without touching the record. We use our own pid (the test process)
+        which is guaranteed alive.
+
+        Codex iter-3 hardening: reconcile_pid also checks whether the
+        recorded pid LOOKS like the right process via
+        _recorded_pid_looks_like_wrapper. For this test we stub the
+        wrapper check to False so a live python pid is treated as the
+        engine — the test isolates the live-pid path, not the
+        wrapper-detection path (that has its own coverage)."""
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id, check_disambiguator=True: False)
+        path = _seed_record(fleet_home_tmp, "agent_live", pid=os.getpid())
+        before = path.read_text(encoding="utf-8")
+        ok = health.reconcile_pid("agent_live")
+        assert ok is True
+        # Record bytes unchanged — no write happened.
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_rewrites_pid_when_recorded_pid_dead(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Drift case: recorded pid is dead, but our ancestor chain has a
+        live process → write the live pid into the record.
+
+        We seed a record with pid=1 (init, always alive but NOT our
+        ancestor) — wait, init IS alive, so we need a definitely-dead pid.
+        Use a very high pid that can't exist. Then stub _resolve_self_pid
+        to return our own pid as the resolved successor."""
+        # Pick a pid guaranteed dead (max pid on macOS is 99999, on Linux
+        # 4194304; 9_999_999 is safely beyond both).
+        dead_pid = 9_999_999
+        path = _seed_record(fleet_home_tmp, "agent_drift", pid=dead_pid)
+
+        # Stub the self-pid resolver to return our process pid, which
+        # the live check will succeed on.
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: os.getpid())
+
+        ok = health.reconcile_pid("agent_drift")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == os.getpid()
+
+    def test_no_rewrite_when_recorded_dead_and_resolver_returns_none(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If we can't find a live successor in our ancestor chain (the
+        fleet-guard skill is somehow running outside a claude session),
+        leave the record alone — better stale data than guessed data.
+        Returns False to signal "no reconciliation happened"."""
+        dead_pid = 9_999_999
+        path = _seed_record(fleet_home_tmp, "agent_orphan", pid=dead_pid)
+        before = path.read_text(encoding="utf-8")
+
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: None)
+
+        ok = health.reconcile_pid("agent_orphan")
+        assert ok is False
+        # Record bytes unchanged — no write happened.
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_pid_zero_in_record_triggers_resolve(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """pid=0 in the record (legacy or partial write) is treated as
+        dead — kick the resolver."""
+        path = _seed_record(fleet_home_tmp, "agent_zero", pid=0)
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: os.getpid())
+        ok = health.reconcile_pid("agent_zero")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == os.getpid()
+
+
+class TestReconcileLiveWrapperShellTriggersResolve:
+    """Codex iter-3 hardening (2026-05-14): a live recorded pid is
+    not sufficient to skip reconciliation when that pid is the
+    wrapper shell. The Go-side resolver falls back to the pane pid
+    (the shell) on timeout; the shell outlives the engine, so the
+    Stop hook must re-resolve to the real claude pid instead of
+    short-circuiting on _pid_alive."""
+
+    def test_live_wrapper_pid_triggers_reresolve(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recorded pid is the live wrapper shell. _pid_alive returns
+        True, but _recorded_pid_looks_like_wrapper detects it as a
+        shell → re-resolve via _resolve_self_pid → write the real
+        claude pid."""
+        path = _seed_record(fleet_home_tmp, "agent_wrap", pid=os.getpid())
+        # Stub the wrapper-detector to return True (simulates a live
+        # shell ancestor recorded earlier as the timeout fallback).
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id, check_disambiguator=True: True)
+        # Resolver returns a different (real claude) pid.
+        real_claude_pid = 99887766
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: real_claude_pid)
+        ok = health.reconcile_pid("agent_wrap")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == real_claude_pid, (
+            f"recorded pid should have been re-resolved from wrapper "
+            f"to real claude pid {real_claude_pid}; got {record['pid']}"
+        )
+
+    def test_live_wrapper_pid_noop_when_resolver_returns_same_pid(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When _resolve_self_pid returns the same pid we already
+        have (resolver couldn't do better), reconcile must return
+        True without rewriting the record. Avoids a churn-write that
+        produces no change."""
+        my_pid = os.getpid()
+        path = _seed_record(fleet_home_tmp, "agent_same", pid=my_pid)
+        before = path.read_text(encoding="utf-8")
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id, check_disambiguator=True: True)
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: my_pid)
+        ok = health.reconcile_pid("agent_same")
+        assert ok is True
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_recorded_pid_looks_like_wrapper_returns_false_for_dead_pid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sanity: probing argv for a non-existent pid returns False
+        (ps yields empty stdout) so we don't return True spuriously.
+
+        Patch subprocess.run to return empty stdout (mirrors what
+        `ps -p <dead-pid>` does in production); conftest.py's autouse
+        no-op fixture patches Popen which the real subprocess.run
+        would otherwise hit and crash on under test."""
+        import subprocess as _sp
+
+        class _FakeCompleted:
+            stdout = ""
+
+        monkeypatch.setattr(_sp, "run", lambda *a, **k: _FakeCompleted())
+        assert health._recorded_pid_looks_like_wrapper(9999999, "x") is False
+
+    def test_non_coord_worker_skips_disambiguator_check(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-6 (2026-05-14): plain workers (task_id NOT
+        starting with 'coord-') don't carry the fleet-coord-<id>
+        disambiguator. reconcile_pid must NOT force a re-resolve on
+        every Stop hook just because the worker's argv lacks the
+        needle. Stays on the fast _pid_alive path."""
+        # Seed a worker record (task_id='demo-task' is non-coord).
+        path = _seed_record(fleet_home_tmp, "worker01",
+                            pid=os.getpid(), task_id="demo-task")
+        before = path.read_text(encoding="utf-8")
+        # Stub _recorded_pid_looks_like_wrapper to assert it was
+        # called with check_disambiguator=False.
+        calls = []
+        original = health._recorded_pid_looks_like_wrapper
+
+        def _wrap(pid, agent_id, check_disambiguator=True):
+            calls.append((pid, agent_id, check_disambiguator))
+            # For the test process pid (our pid, python3), shell
+            # detection returns False; with disambiguator disabled
+            # we expect False overall.
+            return False  # no wrapper detected → fast-path
+
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper", _wrap)
+        ok = health.reconcile_pid("worker01")
+        assert ok is True
+        # Record unchanged (fast-path).
+        assert path.read_text(encoding="utf-8") == before
+        # The wrapper-detector WAS called, but with disambiguator
+        # disabled.
+        assert calls, "wrapper-detector was not invoked"
+        pid_arg, agent_arg, check_arg = calls[0]
+        assert check_arg is False, (
+            f"non-coord worker should call wrapper-detector with "
+            f"check_disambiguator=False; got True"
+        )
+
+    def test_coord_spawn_agent_uses_disambiguator_check(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Coord-spawn agents (task_id starts with 'coord-') get the
+        full disambiguator check because their engine argv carries
+        `fleet-coord-<id>`."""
+        path = _seed_record(fleet_home_tmp, "coord01",
+                            pid=os.getpid(), task_id="coord-demo")
+        calls = []
+
+        def _wrap(pid, agent_id, check_disambiguator=True):
+            calls.append((pid, agent_id, check_disambiguator))
+            return False
+
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper", _wrap)
+        ok = health.reconcile_pid("coord01")
+        assert ok is True
+        assert calls, "wrapper-detector was not invoked"
+        _, _, check_arg = calls[0]
+        assert check_arg is True, (
+            f"coord-spawn agent should call wrapper-detector with "
+            f"check_disambiguator=True; got False"
+        )
+
+
+class TestResolveSelfPidShellSkip:
+    """Codex iter-3 hardening (2026-05-14): the disambiguator match
+    in _resolve_self_pid must skip shell wrappers. Otherwise a `sh -c
+    "claude --remote-control fleet-coord-X ..."` ancestor — which
+    carries the disambiguator transitively — would be returned as the
+    resolved pid, and the wrapper can outlive the engine, leaving dead
+    coords misclassified as alive.
+
+    The unit tests below pin the helper directly, bypassing the
+    ps shell-out, by patching subprocess.run output."""
+
+    def _set_ps_output(
+        self, monkeypatch: pytest.MonkeyPatch, lines: list[str],
+    ) -> None:
+        """Patch subprocess.run inside health._resolve_self_pid to
+        return a synthetic `ps -o pid,ppid,args -ax` output."""
+        import subprocess as _sp
+        header = "  PID  PPID ARGS\n"
+        body = "\n".join(lines) + "\n"
+        out = header + body
+
+        class _FakeCompleted:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        def _fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+            return _FakeCompleted(out)
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+
+    def test_is_shell_argv_pins_shell_token(self) -> None:
+        """Sanity: the helper recognizes the common shell command
+        names with optional leading path."""
+        assert health._is_shell_argv("sh -c foo")
+        assert health._is_shell_argv("/bin/bash -c foo")
+        assert health._is_shell_argv("zsh -i")
+        assert not health._is_shell_argv("claude --foo")
+        assert not health._is_shell_argv("codex review")
+        assert not health._is_shell_argv("")
+
+    def test_disambiguator_match_skips_shell_wrapper(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Coord-spawn shape: bash hook is our pid (Z); ancestor is
+        claude (X) which has the disambiguator; ancestor's ancestor is
+        `sh -c "claude ... fleet-coord-X"` (X') which ALSO has the
+        disambiguator transitively. The resolver must return X (the
+        claude), NOT X' (the wrapper shell)."""
+        agent_id = "abcd1234"
+        needle = f"fleet-coord-{agent_id}"
+        # Simulate ancestry: our_pid (bash) → claude → sh wrapper → tmux server.
+        # os.getpid() returns this test's pid; we register that in procs as
+        # the bash hook process.
+        our_pid = os.getpid()
+        claude_pid = 90001
+        wrapper_pid = 90002
+        self._set_ps_output(monkeypatch, [
+            f"{our_pid} {claude_pid} bash /tmp/hook.sh",
+            f"{claude_pid} {wrapper_pid} claude --remote-control {needle} --dangerously-skip-permissions",
+            f"{wrapper_pid} 1 sh -c claude --remote-control {needle} --dangerously-skip-permissions",
+        ])
+        got = health._resolve_self_pid(agent_id)
+        assert got == claude_pid, (
+            f"resolver returned {got}; want {claude_pid} (the claude, "
+            f"NOT the wrapper shell {wrapper_pid})"
+        )
+
+    def test_disambiguator_only_on_shell_returns_none_via_engine_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When claude is already dead and only the wrapper shell with
+        the disambiguator remains in our ancestry, the resolver must
+        NOT return the shell pid. It returns None (or whatever the
+        engine-match path produces), letting reconcile_pid bail
+        rather than rewrite the record to point at a wrapper that can
+        outlive the engine."""
+        agent_id = "abcd1234"
+        needle = f"fleet-coord-{agent_id}"
+        our_pid = os.getpid()
+        wrapper_pid = 90002
+        # Our parent is the wrapper shell — no claude in the chain
+        # anymore (drift case).
+        self._set_ps_output(monkeypatch, [
+            f"{our_pid} {wrapper_pid} bash /tmp/hook.sh",
+            f"{wrapper_pid} 1 sh -c claude --remote-control {needle}",
+        ])
+        got = health._resolve_self_pid(agent_id)
+        assert got != wrapper_pid, (
+            f"resolver returned wrapper pid {wrapper_pid}; must skip "
+            "shell ancestors carrying the disambiguator transitively"
+        )
