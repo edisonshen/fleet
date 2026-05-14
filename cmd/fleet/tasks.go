@@ -996,9 +996,19 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 			if werr := workers.Archive(project, slug); werr != nil {
 				switch {
 				case errors.Is(werr, workers.ErrPreconditionLive):
-					_, _ = fmt.Fprintf(stderr,
-						"warning: workers/%s/ archive skipped — worker still running (%v); operator should run `fleet workers list` after the worker exits, or stop it manually\n",
-						slug, werr)
+					// codex iter-4 [P1]: workers.Archive's precondition
+					// has proven the coord-dispatched worker is still
+					// running or its phase is non-terminal. Refuse the
+					// task transition — the same blocker invariant the
+					// operator's brief mandates for tmux-backed workers
+					// applies here. Without this, an operator could
+					// `tasks set status=done` while a live
+					// `claude --print` subprocess keeps running, exactly
+					// the orphaned-worker state this gate exists to
+					// prevent.
+					return fmt.Errorf(
+						"worker cleanup gate blocked status=%s for %s: coord-worker still live (%w) — stop the worker or wait for its phase=done|blocked|failed",
+						t.Status, slug, werr)
 				case errors.Is(werr, workers.ErrInvalidSlug):
 					// Slug failed validation — ignore silently; this
 					// is a fleet bug, not operator-actionable.

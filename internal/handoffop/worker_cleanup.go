@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
@@ -110,16 +111,36 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		}
 		matches = append(matches, rec)
 	}
-	// codex iter-2 [P1]: bad records gate. If we have real matches
-	// AND there are unparseable records, refuse — a bad record could
-	// be another worker we missed. If there are no matches, warn and
-	// proceed — a corrupt record elsewhere in fleet shouldn't wedge
-	// every task transition.
+	// codex iter-2 [P1] + iter-4 [P2]: bad-records gate. Three cases:
+	//
+	//   - matched records > 0 AND bad records exist: refuse. A bad
+	//     record could be another match we missed.
+	//
+	//   - no matches AND bad records contain raw-text evidence they
+	//     could belong to this task (task_id or project substring
+	//     match): refuse. The only worker may BE the corrupt one;
+	//     proceeding would mark the task terminal while a live tmux
+	//     session lingers.
+	//
+	//   - no matches AND no plausibly-related bad records: warn and
+	//     proceed. A corrupt record in an unrelated project shouldn't
+	//     wedge every task transition (the iter-2 fix).
+	//
+	// The raw-text check is a safety net, not a parser: it grep-
+	// matches `"task_id": "<slug>"` / `"project": "<project>"` literals
+	// against the file bytes. False positives are tolerable (refuse
+	// the transition; operator triages). False negatives mean a
+	// genuinely unrelated corrupt record won't block — same as before.
 	if len(badIDs) > 0 {
 		if len(matches) > 0 {
 			return res, fmt.Errorf(
 				"%w: %d agent record(s) unreadable (%v) while %d worker(s) match task %s; refusing to mark terminal — fix or remove the unreadable records and retry",
 				ErrWorkerCleanupFailed, len(badIDs), badIDs, len(matches), opts.TaskSlug)
+		}
+		if relevant := badRecordsPlausiblyRelated(badIDs, opts.Project, opts.TaskSlug); len(relevant) > 0 {
+			return res, fmt.Errorf(
+				"%w: %d agent record(s) unreadable AND raw-text match THIS task (%v); refusing to mark %s terminal — fix or remove the unreadable records and retry",
+				ErrWorkerCleanupFailed, len(relevant), relevant, opts.TaskSlug)
 		}
 		if opts.Stderr != nil {
 			_, _ = fmt.Fprintf(opts.Stderr,
@@ -190,6 +211,56 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// badRecordsPlausiblyRelated reads each unparseable agent record's
+// raw bytes and reports the subset whose contents contain literal
+// "task_id" + slug AND "project" + project matches. This is the
+// codex iter-4 [P2] safety net: when agent.ListStrict surfaces
+// unparseable records, we can't tell from Load alone whether they
+// belong to the current task — but their raw JSON usually still
+// has identifiable key/value pairs, even if some other field broke
+// parsing. Grepping is cheaper than re-implementing a tolerant
+// parser and stays robust to schema drift.
+//
+// Returns IDs of bad records whose raw bytes contain BOTH
+//
+//	"task_id"  ... "<slug>"
+//	"project"  ... "<project>"
+//
+// (substring match — JSON whitespace tolerant). False positives are
+// safe (refuse the task transition; operator triages). False negatives
+// only happen for records corrupted past those substrings, which would
+// not have matched the project anyway.
+//
+// Read errors on a bad path treat the record as "could match" — the
+// safe default; we already know it's unreadable.
+func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string {
+	var related []string
+	taskMarker := `"task_id"`
+	slugMarker := `"` + slug + `"`
+	projMarker := `"project"`
+	projValueMarker := `"` + project + `"`
+	for _, id := range badIDs {
+		path, perr := state.AgentPath(id)
+		if perr != nil {
+			related = append(related, id)
+			continue
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			related = append(related, id)
+			continue
+		}
+		s := string(data)
+		// Must contain BOTH task_id+slug AND project+project.
+		hasTask := strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker)
+		hasProj := strings.Contains(s, projMarker) && strings.Contains(s, projValueMarker)
+		if hasTask && hasProj {
+			related = append(related, id)
+		}
+	}
+	return related
 }
 
 // isCoordinatorTaskID reports whether a record's TaskID is the
