@@ -239,14 +239,72 @@ def reconcile_pid(agent_id: str) -> bool:
         recorded_int = int(recorded)
     except (TypeError, ValueError):
         recorded_int = 0
+    # Codex iter-3 hardening (2026-05-14): a live recorded pid is not
+    # sufficient to skip reconciliation. The Go-side spawn resolver
+    # falls back to the pane pid (the wrapper shell `sh -c "claude
+    # ..."`) on timeout. The shell stays alive for the whole session,
+    # so a naive _pid_alive check would let the wrong-but-live pid
+    # persist forever. Re-resolve when the recorded pid points at a
+    # shell argv OR (defense-in-depth) when its argv does NOT contain
+    # this agent's disambiguator. The resolver itself is idempotent —
+    # if no better pid is found we keep the recorded pid via the
+    # _resolve_self_pid returning None branch.
     if recorded_int > 0 and _pid_alive(recorded_int):
-        return True
+        if not _recorded_pid_looks_like_wrapper(recorded_int, agent_id):
+            return True
     new_pid = _resolve_self_pid(agent_id)
     if new_pid is None or new_pid <= 0:
         return False
+    # If resolver returned the same pid we already have, no-op write.
+    if new_pid == recorded_int:
+        return True
     record["pid"] = new_pid
     record["last_activity_ts"] = now_rfc3339()
     return _atomic_write_json(agent_record_path(agent_id), record)
+
+
+def _recorded_pid_looks_like_wrapper(pid: int, agent_id: str) -> bool:
+    """Return True when the recorded pid's argv suggests the resolver
+    earlier latched onto a wrapper shell rather than the real engine.
+    Triggers reconciliation re-resolution.
+
+    Heuristics (best-effort — return False on any probe failure so we
+    don't churn the record on a transient ps blip):
+      - argv first token is a known POSIX shell command name
+      - agent_id is non-empty AND the disambiguator
+        `fleet-coord-<agent_id>` is NOT in the argv (we expected to
+        find it on the real engine row)
+
+    Both heuristics must agree on "looks like a wrapper" — if argv
+    is unreadable we return False (skip reconcile, keep status quo).
+    """
+    if pid <= 0:
+        return False
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True, text=True, check=False, timeout=5,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    argv = out.strip()
+    if not argv:
+        # ps returned nothing — the process died between _pid_alive
+        # and now, or argv is unreadable. Either way, return False so
+        # the caller takes the no-op branch (will probably re-fire on
+        # the next Stop hook with a different verdict).
+        return False
+    if _is_shell_argv(argv):
+        return True
+    if agent_id:
+        needle = f"fleet-coord-{agent_id}"
+        if needle not in argv:
+            # Recorded pid is non-shell but doesn't carry our
+            # disambiguator either. Could be pid recycle into an
+            # unrelated process. Reconcile.
+            return True
+    return False
 
 
 def _pid_alive(pid: int) -> bool:

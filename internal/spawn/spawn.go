@@ -739,7 +739,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// returns the pane pid as a best-effort fallback (wrong-but-live
 	// beats os.Getpid which is dead by construction).
 	disambiguator := pidResolveDisambiguator(id, execArgv)
-	engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord)
+	engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
 	resolvedPid, _, resolveErr := resolveEnginePid(
 		session, disambiguator, engineHint,
 		pidResolveTimeout(),

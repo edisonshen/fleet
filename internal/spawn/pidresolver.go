@@ -388,23 +388,54 @@ func pidResolveDisambiguator(agentID string, execArgv []string) string {
 // engine-match priority. Falls back to oldRec.Engine on handoff so the
 // successor inherits the same hint.
 //
-// Returns empty for unknown engines — the resolver then falls back to
-// the deepest-non-shell-descendant heuristic, which handles custom
-// wrappers cleanly. "claude-code" maps to "claude" (the binary name);
-// "codex" maps to "codex". Future engines add a row to the map.
-func pidResolveEngineHint(engine string, oldRec *agent.Record) string {
+// command is opts.Command — the spawn's argv before any shell-wrapping.
+// When command[0] doesn't match the engine binary name (a custom
+// `--command` spawn like `sh -c 'claude --version; sleep 60'`), we
+// return EMPTY hint so the resolver falls back to the deepest-non-
+// shell-descendant heuristic. Without this guard the engine-match
+// would prefer a short-lived `claude --version` helper over the
+// actual long-lived process the operator cares about (codex iter-3
+// finding, 2026-05-14).
+//
+// Returns empty for unknown engines or custom commands. "claude-code"
+// maps to "claude" (the binary name); "codex" maps to "codex". Future
+// engines add a row to the map.
+func pidResolveEngineHint(engine string, oldRec *agent.Record, command []string) string {
 	eng := engine
 	if eng == "" && oldRec != nil {
 		eng = oldRec.Engine
 	}
+	var hint string
 	switch eng {
 	case "claude-code", "":
-		return "claude"
+		hint = "claude"
 	case "codex":
-		return "codex"
+		hint = "codex"
 	default:
 		return ""
 	}
+	// Custom-command detection: when command[0] is not the engine
+	// binary, drop the hint so we don't latch onto incidental helper
+	// processes (e.g. `claude --version` in `sh -c 'claude --version;
+	// sleep 60'`). argv[0] being a shell is the canonical custom
+	// shape; an empty command list means no spawn (caller error).
+	if len(command) == 0 {
+		return hint
+	}
+	if isShellArgv(command[0]) {
+		return ""
+	}
+	// Strip leading path so "/usr/local/bin/claude" matches "claude".
+	first := command[0]
+	if idx := strings.LastIndexByte(first, '/'); idx >= 0 {
+		first = first[idx+1:]
+	}
+	if first != hint {
+		// Custom binary that isn't the engine — empty hint, fall back
+		// to the deepest-non-shell heuristic.
+		return ""
+	}
+	return hint
 }
 
 // productionResolveDeps returns the wired deps for the resolver. ps and

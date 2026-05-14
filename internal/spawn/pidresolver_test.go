@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // TestResolveEnginePid_PrefersDisambiguatorMatch pins the strongest
@@ -289,6 +291,100 @@ func TestIsShellArgv(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("isShellArgv(%q) = %v, want %v", tc.argv, got, tc.want)
 		}
+	}
+}
+
+// TestPidResolveEngineHint pins the codex iter-3 fix (2026-05-14):
+// the engine hint must drop to empty for custom-command spawns so
+// the resolver falls back to the deepest-non-shell-descendant
+// heuristic. Without this, `sh -c 'claude --version; sleep 60'`
+// would prefer the short-lived `claude --version` over the
+// actual long-lived `sleep` child.
+func TestPidResolveEngineHint(t *testing.T) {
+	cases := []struct {
+		name    string
+		engine  string
+		oldRec  *agent.Record
+		command []string
+		want    string
+	}{
+		{
+			name:    "default engine + claude argv → claude hint",
+			engine:  "claude-code",
+			command: []string{"claude", "--dangerously-skip-permissions"},
+			want:    "claude",
+		},
+		{
+			name:    "empty engine + claude argv → claude hint (handoff fallback)",
+			engine:  "",
+			command: []string{"claude"},
+			want:    "claude",
+		},
+		{
+			name:    "codex engine + codex argv → codex hint",
+			engine:  "codex",
+			command: []string{"codex", "review"},
+			want:    "codex",
+		},
+		{
+			name:    "claude-code + sh wrapper argv → EMPTY hint (custom command)",
+			engine:  "claude-code",
+			command: []string{"sh", "-c", "claude --version; sleep 60"},
+			want:    "",
+		},
+		{
+			name:    "claude-code + /bin/bash argv → EMPTY hint",
+			engine:  "claude-code",
+			command: []string{"/bin/bash", "-c", "echo hi"},
+			want:    "",
+		},
+		{
+			name:    "claude-code + custom binary argv → EMPTY hint",
+			engine:  "claude-code",
+			command: []string{"/usr/local/bin/my-wrapper", "--foo"},
+			want:    "",
+		},
+		{
+			name:    "claude-code + /usr/local/bin/claude → claude hint (path-stripped)",
+			engine:  "claude-code",
+			command: []string{"/usr/local/bin/claude"},
+			want:    "claude",
+		},
+		{
+			name:    "unknown engine + any argv → EMPTY hint",
+			engine:  "future-engine",
+			command: []string{"claude"},
+			want:    "",
+		},
+		{
+			name:    "empty engine + empty oldRec + claude argv → claude hint (default)",
+			engine:  "",
+			oldRec:  nil,
+			command: []string{"claude"},
+			want:    "claude",
+		},
+		{
+			name:    "handoff: empty engine, oldRec.Engine=codex, codex argv → codex hint",
+			engine:  "",
+			oldRec:  &agent.Record{Engine: "codex"},
+			command: []string{"codex"},
+			want:    "codex",
+		},
+		{
+			name:    "empty command list → fallback to engine hint",
+			engine:  "claude-code",
+			command: nil,
+			want:    "claude",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pidResolveEngineHint(tc.engine, tc.oldRec, tc.command)
+			if got != tc.want {
+				t.Errorf("pidResolveEngineHint(%q, %+v, %v) = %q, want %q",
+					tc.engine, tc.oldRec, tc.command, got, tc.want)
+			}
+		})
 	}
 }
 

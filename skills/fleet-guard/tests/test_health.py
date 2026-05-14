@@ -380,10 +380,20 @@ class TestReconcilePid:
 
     def test_no_op_when_recorded_pid_alive(
         self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Happy path: recorded pid matches a live process → return True
         without touching the record. We use our own pid (the test process)
-        which is guaranteed alive."""
+        which is guaranteed alive.
+
+        Codex iter-3 hardening: reconcile_pid also checks whether the
+        recorded pid LOOKS like the right process via
+        _recorded_pid_looks_like_wrapper. For this test we stub the
+        wrapper check to False so a live python pid is treated as the
+        engine — the test isolates the live-pid path, not the
+        wrapper-detection path (that has its own coverage)."""
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id: False)
         path = _seed_record(fleet_home_tmp, "agent_live", pid=os.getpid())
         before = path.read_text(encoding="utf-8")
         ok = health.reconcile_pid("agent_live")
@@ -450,6 +460,77 @@ class TestReconcilePid:
         assert ok is True
         record = json.loads(path.read_text(encoding="utf-8"))
         assert record["pid"] == os.getpid()
+
+
+class TestReconcileLiveWrapperShellTriggersResolve:
+    """Codex iter-3 hardening (2026-05-14): a live recorded pid is
+    not sufficient to skip reconciliation when that pid is the
+    wrapper shell. The Go-side resolver falls back to the pane pid
+    (the shell) on timeout; the shell outlives the engine, so the
+    Stop hook must re-resolve to the real claude pid instead of
+    short-circuiting on _pid_alive."""
+
+    def test_live_wrapper_pid_triggers_reresolve(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recorded pid is the live wrapper shell. _pid_alive returns
+        True, but _recorded_pid_looks_like_wrapper detects it as a
+        shell → re-resolve via _resolve_self_pid → write the real
+        claude pid."""
+        path = _seed_record(fleet_home_tmp, "agent_wrap", pid=os.getpid())
+        # Stub the wrapper-detector to return True (simulates a live
+        # shell ancestor recorded earlier as the timeout fallback).
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id: True)
+        # Resolver returns a different (real claude) pid.
+        real_claude_pid = 99887766
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: real_claude_pid)
+        ok = health.reconcile_pid("agent_wrap")
+        assert ok is True
+        record = json.loads(path.read_text(encoding="utf-8"))
+        assert record["pid"] == real_claude_pid, (
+            f"recorded pid should have been re-resolved from wrapper "
+            f"to real claude pid {real_claude_pid}; got {record['pid']}"
+        )
+
+    def test_live_wrapper_pid_noop_when_resolver_returns_same_pid(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When _resolve_self_pid returns the same pid we already
+        have (resolver couldn't do better), reconcile must return
+        True without rewriting the record. Avoids a churn-write that
+        produces no change."""
+        my_pid = os.getpid()
+        path = _seed_record(fleet_home_tmp, "agent_same", pid=my_pid)
+        before = path.read_text(encoding="utf-8")
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
+                            lambda pid, agent_id: True)
+        monkeypatch.setattr(health, "_resolve_self_pid",
+                            lambda agent_id: my_pid)
+        ok = health.reconcile_pid("agent_same")
+        assert ok is True
+        assert path.read_text(encoding="utf-8") == before
+
+    def test_recorded_pid_looks_like_wrapper_returns_false_for_dead_pid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sanity: probing argv for a non-existent pid returns False
+        (ps yields empty stdout) so we don't return True spuriously.
+
+        Patch subprocess.run to return empty stdout (mirrors what
+        `ps -p <dead-pid>` does in production); conftest.py's autouse
+        no-op fixture patches Popen which the real subprocess.run
+        would otherwise hit and crash on under test."""
+        import subprocess as _sp
+
+        class _FakeCompleted:
+            stdout = ""
+
+        monkeypatch.setattr(_sp, "run", lambda *a, **k: _FakeCompleted())
+        assert health._recorded_pid_looks_like_wrapper(9999999, "x") is False
 
 
 class TestResolveSelfPidShellSkip:
