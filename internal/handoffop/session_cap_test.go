@@ -193,6 +193,42 @@ func TestSpawnAndRetire_DeadOldSessionAtCapRefused(t *testing.T) {
 	}
 }
 
+// TestSpawnAndRetire_CapApprovedSkipsCheck regresses codex iter-7
+// P1: when the queue file's CapApproved flag is true (set by
+// `fleet handoff` at step 4a, or by a prior drain pass after the
+// initial check passed), spawnAndRetire must NOT re-check the cap.
+// Otherwise an authorized in-flight handoff gets stranded if the
+// cap state tightened between crash and retry. Auto-handoff queues
+// (CapApproved=false) still gate normally.
+func TestSpawnAndRetire_CapApprovedSkipsCheck(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_MAX_SESSIONS", "1")
+	// Way over cap — 5 sessions, max=1. Without CapApproved this
+	// would refuse.
+	withInjectedSessionListProbe(t, func() ([]string, error) {
+		return []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d", "fleet-e"}, nil
+	})
+	for _, id := range []string{"a", "b", "c", "d", "e"} {
+		seedAgentRecord(t, id)
+	}
+
+	oldRec := &agent.Record{ID: "olda", TmuxSession: "fleet-olda", Command: []string{"x"}}
+	// CapApproved=true → skip cap, fall through to next rejection
+	// (oldRec.Cwd == "" — legacy record).
+	req := queue.SpawnFresh{OldAgentID: "olda", NewAgentID: "newa", CapApproved: true}
+	var stdout, stderr bytes.Buffer
+	err := spawnAndRetire(req, "/tmp/q.json", oldRec, 0, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected legacy-record rejection, got nil")
+	}
+	if strings.Contains(err.Error(), "refusing to spawn") {
+		t.Fatalf("CapApproved=true should bypass cap; err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "no stored cwd") {
+		t.Fatalf("expected legacy-record rejection downstream; got: %v", err)
+	}
+}
+
 // TestSpawnAndRetire_SessionCapProbeFailureProceeds confirms the
 // best-effort semantic: when the tmux list probe itself fails, the
 // cap check logs to stderr and falls through (rather than blocking

@@ -266,18 +266,18 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// the queue file is the only producer. Probe failures don't
 	// block (best-effort, same as the CLI gate).
 	//
-	// Net-zero swap accounting (codex iter-2 P1 / iter-4 P2): if the
-	// old session is currently alive in the tmux list, it's IN
-	// counts.Total() — the new spawn followed by oldRec.TmuxSession
-	// kill is net zero, so projected = total. If the old session has
-	// already exited (Resume can reach spawnAndRetire when both the
-	// replacement record AND its session are missing while old's
-	// session may also be gone), it's NOT in counts.Total() — the
-	// new spawn is then net +1 and we must use projected = total + 1
-	// to avoid letting the count tip past max on this drain.
-	counts, cerr := state.CountFleetSessions(
-		sessionListProbe, state.LiveAgentRecordExists)
-	if cerr != nil {
+	// CapApproved skip (codex iter-7 P1): when the producer of this
+	// queue file already passed the cap (operator-triggered
+	// `fleet handoff` set req.CapApproved=true at step 4a, or this
+	// drain pass already passed and re-enqueued), the cap was
+	// already approved for this logical handoff. Skip the re-check
+	// so a tightened cap after the crash can't strand an authorized
+	// queue file. Auto-handoff producers (fleet-guard skill) leave
+	// CapApproved=false, so they still get gated here.
+	if req.CapApproved {
+		// Already approved upstream — skip the cap check.
+	} else if counts, cerr := state.CountFleetSessions(
+		sessionListProbe, state.LiveAgentRecordExists); cerr != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: FLEET_MAX_SESSIONS precheck could not enumerate tmux sessions (%v); proceeding without cap enforcement\n",
 			cerr)
@@ -621,6 +621,10 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				NewAgentID:        newRec.ID,
 				NewSession:        newRec.TmuxSession,
 				DisableAutoResume: override,
+				// Spawn already happened on this drain pass, so the
+				// cap was effectively approved — mark so future
+				// retries don't re-check (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				// Send failed AND re-enqueue failed → replacement
 				// is alive but un-prompted, no journal entry to

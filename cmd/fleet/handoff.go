@@ -330,18 +330,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				opts.autoResume = !*pending.DisableAutoResume
 				opts.autoResumeFlagWasSet = true
 			}
-			// Force-replacement preservation across recovery (codex
-			// iter-6 P2): the original handoff that wrote this queue
-			// file already passed the FLEET_MAX_SESSIONS gate at step
-			// 4a. The orphan-recovery fall-through is a retry of the
-			// same logical handoff, so it must NOT be re-blocked by a
-			// cap that may have tightened since (operator lowered
-			// FLEET_MAX_SESSIONS, leak accumulated, etc.). Treat the
-			// retry as already-authorized and apply the same bypass
-			// the operator used originally. Without this, the queue
-			// file's "durable journal" guarantee for post-step-7
-			// crashes is silently lost when the cap state changed.
-			opts.forceReplacement = true
+			// Cap-bypass preservation across recovery (codex iter-6
+			// P2 / iter-7 P2): if the queue's producer was an
+			// already-authorized handoff (CapApproved=true), the
+			// orphan-recovery fall-through is the same logical
+			// handoff retried — must NOT be re-blocked by a cap that
+			// may have tightened since. fleet-guard auto-handoff
+			// queues leave CapApproved=false; rerunning
+			// `fleet handoff <id>` on those must still go through
+			// the cap gate (otherwise auto-handoff would gain an
+			// unintended cap bypass via the CLI retry path).
+			if pending.CapApproved {
+				opts.forceReplacement = true
+			}
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -383,10 +384,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					opts.autoResume = !*pending.DisableAutoResume
 					opts.autoResumeFlagWasSet = true
 				}
-				// Preserve cap-bypass across recovery (codex iter-6
-				// P2): the original handoff already passed the cap
-				// gate; the retry must not be re-blocked.
-				opts.forceReplacement = true
+				// Preserve cap-bypass across recovery for handoff-
+				// authored queues only (codex iter-6 P2 / iter-7
+				// P2). Auto-handoff queues must still go through
+				// the cap gate on CLI retry.
+				if pending.CapApproved {
+					opts.forceReplacement = true
+				}
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
 					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
@@ -560,6 +564,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		NewAgentID:        newID,
 		NewSession:        newSession,
 		DisableAutoResume: override,
+		// CapApproved (codex iter-7 P1): step 4a already passed
+		// the FLEET_MAX_SESSIONS gate. Persist so recovery via
+		// handoffop.Resume / fleet drain doesn't re-block this
+		// authorized handoff if the cap tightened between crash
+		// and retry.
+		CapApproved: true,
 	})
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
@@ -834,6 +844,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				NewAgentID:        newID,
 				NewSession:        newSession,
 				DisableAutoResume: override,
+				// Already passed cap; preserve so retries don't
+				// re-block on a tightened cap (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
@@ -988,6 +1001,10 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 				NewAgentID:        newRec.ID,
 				NewSession:        newRec.TmuxSession,
 				DisableAutoResume: pendingDisableAutoResume,
+				// Resume path; the original handoff already passed
+				// the cap. Preserve so further retries don't
+				// re-block on a tightened cap (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",

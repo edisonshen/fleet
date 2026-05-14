@@ -77,8 +77,26 @@ type SpawnFresh struct {
 	// Persisting it here ensures that a crashed handoff resumed by
 	// `fleet drain` / TUI watcher honors the same policy
 	// (codex review iter-10 / iter-11 P2).
-	DisableAutoResume *bool     `json:"disable_auto_resume,omitempty"`
-	EnqueuedAt        time.Time `json:"enqueued_at"`
+	DisableAutoResume *bool `json:"disable_auto_resume,omitempty"`
+	// CapApproved is true when the queue file's producer already
+	// passed the FLEET_MAX_SESSIONS gate before writing this file.
+	// `fleet handoff` sets it to true (the operator-triggered path
+	// checks the cap at step 4a before writing the queue).
+	// fleet-guard auto-handoff leaves it false (the producer is the
+	// queue file itself; the consumer in handoffop.spawnAndRetire
+	// must check the cap before spawning).
+	//
+	// Recovery semantic: when `fleet drain` / TUI watcher / `fleet
+	// handoff` retries a stale queue file, CapApproved=true bypasses
+	// the consumer's cap check — the handoff was already authorized.
+	// Without this, a tightened cap (operator lowered
+	// FLEET_MAX_SESSIONS after a crash, leak accumulated) could
+	// permanently strand authorized queue files. Conversely,
+	// CapApproved=false on an auto-handoff queue keeps the
+	// spawnAndRetire cap firing so the auto-drainer can't blow
+	// past the ceiling.
+	CapApproved bool      `json:"cap_approved,omitempty"`
+	EnqueuedAt  time.Time `json:"enqueued_at"`
 }
 
 // SpawnFreshName returns the queue filename (without .json) for
