@@ -17,7 +17,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrNoSession is returned when an operation references a session that
@@ -431,4 +433,75 @@ func ListSessions() ([]string, error) {
 		names = append(names, line)
 	}
 	return names, nil
+}
+
+// SessionInfo pairs a tmux session name with the wall-clock instant
+// tmux created it. Used by the prune-orphan-tmux sweeper to skip
+// freshly-spawned sessions whose agent record is still being written.
+type SessionInfo struct {
+	Name    string
+	Created time.Time
+}
+
+// ListSessionsWithCreated returns every tmux session on the active
+// server paired with its creation time. Equivalent shell:
+//
+//	tmux ls -F '#{session_name} #{session_created}'
+//
+// `session_created` is a Unix epoch (seconds). Lines that fail to parse
+// (defensive — tmux shouldn't emit malformed output) are skipped with a
+// zero Created so the caller falls back to "treat as fresh-unknown".
+//
+// Returns an empty slice with no error when the server has no live
+// sessions. Genuine probe failures surface as errors.
+//
+// Used by `fleet maintenance prune-orphan-tmux` to gate destructive
+// cleanup on session age — a freshly-spawned tmux session can exist
+// before its agent record finishes writing (see spawn.Spawn:
+// tmux.Spawn → resolveEnginePid → rec.Write), and the sweeper must
+// not kill that legitimate window.
+func ListSessionsWithCreated() ([]SessionInfo, error) {
+	cmd := exec.Command("tmux", tmuxArgs("ls", "-F", "#{session_name} #{session_created}")...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			msg := strings.ToLower(stderr.String())
+			switch {
+			case strings.Contains(msg, "no server running"),
+				strings.Contains(msg, "no sessions"),
+				strings.Contains(msg, "no current client"),
+				strings.Contains(msg, "no such file or directory"),
+				strings.Contains(msg, "connection refused"),
+				strings.Contains(msg, "lost server"):
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("tmux ls (with created): %w (%s)", err, strings.TrimSpace(stderr.String()))
+	}
+	var infos []SessionInfo
+	for _, line := range strings.Split(strings.TrimRight(stdout.String(), "\n"), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: "<name> <unix-seconds>". Split on the LAST space so
+		// session names with spaces (rare but legal in tmux) survive.
+		idx := strings.LastIndex(line, " ")
+		if idx <= 0 || idx == len(line)-1 {
+			// Malformed — record name with zero Created so caller treats
+			// it as freshness-unknown (safer than dropping silently).
+			infos = append(infos, SessionInfo{Name: line})
+			continue
+		}
+		name := line[:idx]
+		secs, err := strconv.ParseInt(line[idx+1:], 10, 64)
+		if err != nil {
+			infos = append(infos, SessionInfo{Name: name})
+			continue
+		}
+		infos = append(infos, SessionInfo{Name: name, Created: time.Unix(secs, 0)})
+	}
+	return infos, nil
 }

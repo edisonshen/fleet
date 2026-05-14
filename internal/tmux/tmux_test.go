@@ -162,6 +162,63 @@ func TestListSessions_RoundTripWithSpawnedSession(t *testing.T) {
 	}
 }
 
+// TestListSessionsWithCreated_NoServerReturnsEmpty mirrors
+// TestListSessions_NoServerReturnsEmpty for the timestamped variant.
+// `fleet maintenance prune-orphan-tmux` relies on this collapsing
+// no-server into "no orphans" rather than surfacing a probe error.
+func TestListSessionsWithCreated_NoServerReturnsEmpty(t *testing.T) {
+	requireTmux(t)
+	got, err := ListSessionsWithCreated()
+	if err != nil {
+		t.Errorf("ListSessionsWithCreated on fresh socket: got err %v; want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ListSessionsWithCreated on fresh socket: got %v; want empty slice", got)
+	}
+}
+
+// TestListSessionsWithCreated_RoundTripRecordsCreation spawns a session
+// and verifies ListSessionsWithCreated returns it WITH a non-zero
+// Created timestamp roughly matching wall-clock — the prune-orphan-tmux
+// freshness gate (codex iter-2 [P1]) depends on this metadata.
+func TestListSessionsWithCreated_RoundTripRecordsCreation(t *testing.T) {
+	requireTmux(t)
+	session := "fleet-test-" + randHex(t)
+	t.Cleanup(func() { _ = Kill(session) })
+
+	before := time.Now()
+	if err := Spawn(session, "", []string{"sleep", "30"}, nil); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	after := time.Now()
+
+	got, err := ListSessionsWithCreated()
+	if err != nil {
+		t.Fatalf("ListSessionsWithCreated: %v", err)
+	}
+	var found *SessionInfo
+	for i := range got {
+		if got[i].Name == session {
+			found = &got[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("ListSessionsWithCreated did not include spawned %q; got %v", session, got)
+	}
+	if found.Created.IsZero() {
+		t.Errorf("expected non-zero Created for %q; got zero (parse failure?)", session)
+	}
+	// Allow a 5s slack on either side — tmux session_created is a
+	// Unix second so it rounds; wall-clock skew on a busy test runner
+	// is small but real.
+	lo := before.Add(-5 * time.Second)
+	hi := after.Add(5 * time.Second)
+	if found.Created.Before(lo) || found.Created.After(hi) {
+		t.Errorf("Created %v outside expected window [%v, %v]", found.Created, lo, hi)
+	}
+}
+
 func TestSpawn_EmptyCommand(t *testing.T) {
 	if err := Spawn("any", "", nil, nil); err == nil {
 		t.Error("expected error for empty command")
