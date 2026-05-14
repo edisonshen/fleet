@@ -2,16 +2,33 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 )
+
+// stubHandoffOpTmux wires the package-level test seam in
+// internal/handoffop so the worker-cleanup gate fires with controlled
+// behavior. Used by the three TestTasksSet_TerminalStatus* integration
+// tests at the bottom of this file.
+func stubHandoffOpTmux(t *testing.T,
+	kill func(string) error,
+	alive func(string) (bool, error),
+) {
+	t.Helper()
+	restore := handoffop.SetTmuxForCleanupForTest(kill, alive)
+	t.Cleanup(restore)
+}
 
 // setupTasksHome bootstraps FLEET_HOME and chdir to a tmpdir so
 // resolveProject's cwd-derived default produces a stable name. Returns
@@ -197,7 +214,7 @@ func TestTasksList_Filters(t *testing.T) {
 	// mixed status set, --status=todo trims to two rows, and
 	// --status=ready trims to one. Without the flip both branches
 	// would pass even if the filter did nothing.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slugs[1], "status=ready", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slugs[1], "status=ready", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set ready: %v", err)
 	}
 
@@ -300,12 +317,12 @@ func TestTasksSet_StatusValidation(t *testing.T) {
 	slug := parts[1]
 
 	// Bad status.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=bogus", &bytes.Buffer{}); err == nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=bogus", &bytes.Buffer{}, io.Discard); err == nil {
 		t.Error("expected error on invalid status, got nil")
 	}
 	// Good status.
 	out := &bytes.Buffer{}
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=ready", out); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=ready", out, io.Discard); err != nil {
 		t.Errorf("valid status rejected: %v", err)
 	}
 }
@@ -324,7 +341,7 @@ func TestTasksSet_RejectsCreatedUpdated(t *testing.T) {
 	}
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "created=2030-01-01T00:00:00Z", &bytes.Buffer{}); err == nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "created=2030-01-01T00:00:00Z", &bytes.Buffer{}, io.Discard); err == nil {
 		t.Error("expected error on created= mutation")
 	}
 }
@@ -343,10 +360,10 @@ func TestTasksNote_AppendsToSection(t *testing.T) {
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
 
-	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "first", &bytes.Buffer{}); err != nil {
+	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "first", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("first note: %v", err)
 	}
-	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "second", &bytes.Buffer{}); err != nil {
+	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "second", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("second note: %v", err)
 	}
 
@@ -382,7 +399,7 @@ func TestTasksPromote_TodoToReady(t *testing.T) {
 	}
 
 	// Now status=in-progress; promote should refuse.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set status: %v", err)
 	}
 	if err := runTasksPromote(&tasksPromoteOpts{project: project}, slug, &bytes.Buffer{}); err == nil {
@@ -531,7 +548,7 @@ func TestTasksSet_RejectsQuotedDeps(t *testing.T) {
 	}
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
-	err := runTasksSet(&tasksSetOpts{project: project}, slug, `depends_on=["foo"]`, &bytes.Buffer{})
+	err := runTasksSet(&tasksSetOpts{project: project}, slug, `depends_on=["foo"]`, &bytes.Buffer{}, io.Discard)
 	if err == nil {
 		t.Error("expected error on quoted depends_on via set")
 	}
@@ -551,10 +568,10 @@ func TestTasksSet_RejectsNonNumericPID(t *testing.T) {
 	}
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=123abc", &bytes.Buffer{}); err == nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=123abc", &bytes.Buffer{}, io.Discard); err == nil {
 		t.Error("expected error on worker_pid with trailing garbage")
 	}
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=-5", &bytes.Buffer{}); err == nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "worker_pid=-5", &bytes.Buffer{}, io.Discard); err == nil {
 		t.Error("expected error on negative worker_pid")
 	}
 }
@@ -619,7 +636,7 @@ func TestTasksSet_RejectsMultilineScalars(t *testing.T) {
 		"worktree=/tmp/a\n/tmp/b",
 		"spawned_by=alice\neve",
 	} {
-		if err := runTasksSet(&tasksSetOpts{project: project}, slug, kv, &bytes.Buffer{}); err == nil {
+		if err := runTasksSet(&tasksSetOpts{project: project}, slug, kv, &bytes.Buffer{}, io.Discard); err == nil {
 			t.Errorf("expected error on multiline value %q", kv)
 		}
 	}
@@ -1009,7 +1026,7 @@ func TestTasksSet_LifecycleStampsStartedAt(t *testing.T) {
 	if !pre.StartedAt.IsZero() {
 		t.Fatalf("pre-set started_at non-zero: %v", pre.StartedAt)
 	}
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 	post := listTaskRow(t, project, slug)
@@ -1030,10 +1047,10 @@ func TestTasksSet_LifecycleStampsFinishedAt(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	slug := strings.Fields(addOut.String())[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set in-progress: %v", err)
 	}
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set done: %v", err)
 	}
 	post := listTaskRow(t, project, slug)
@@ -1046,7 +1063,7 @@ func TestTasksSet_LifecycleStampsFinishedAt(t *testing.T) {
 		t.Fatalf("started_at zero; want stamped from prior in-progress")
 	}
 	// Reopen: done → todo. finished_at clears; started_at sticky.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=todo", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=todo", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set todo: %v", err)
 	}
 	post = listTaskRow(t, project, slug)
@@ -1058,7 +1075,7 @@ func TestTasksSet_LifecycleStampsFinishedAt(t *testing.T) {
 	}
 	// Re-dispatch: todo → in-progress. started_at MUST stay the original
 	// (sticky). finished_at remains zero.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set in-progress (round 2): %v", err)
 	}
 	post = listTaskRow(t, project, slug)
@@ -1067,7 +1084,7 @@ func TestTasksSet_LifecycleStampsFinishedAt(t *testing.T) {
 	}
 	// Re-finish: in-progress → done. finished_at gets a NEW timestamp
 	// (>= firstFinish; overwrite is intentional).
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=done", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set done (round 2): %v", err)
 	}
 	post = listTaskRow(t, project, slug)
@@ -1092,7 +1109,7 @@ func TestTasksSet_LifecycleAbandonedStamps(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	slug := strings.Fields(addOut.String())[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=abandoned", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=abandoned", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set abandoned: %v", err)
 	}
 	post := listTaskRow(t, project, slug)
@@ -1113,12 +1130,12 @@ func TestTasksSet_NoOpStatusDoesNotBumpStarted(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	slug := strings.Fields(addOut.String())[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("first set: %v", err)
 	}
 	first := listTaskRow(t, project, slug).StartedAt
 	// Apply same status again. started_at MUST NOT change.
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "status=in-progress", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("second set: %v", err)
 	}
 	second := listTaskRow(t, project, slug).StartedAt
@@ -1139,7 +1156,7 @@ func TestTasksSet_NonStatusKeyDoesNotStamp(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 	slug := strings.Fields(addOut.String())[1]
-	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "priority=P0", &bytes.Buffer{}); err != nil {
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "priority=P0", &bytes.Buffer{}, io.Discard); err != nil {
 		t.Fatalf("set priority: %v", err)
 	}
 	post := listTaskRow(t, project, slug)
@@ -1174,5 +1191,129 @@ func TestTasksList_CollisionPrefersLive(t *testing.T) {
 	// Must show the LIVE row's status (in-progress), not archive's done.
 	if !strings.Contains(out.String(), "in-progress") {
 		t.Errorf("dedup picked archive (status=done); expected live (status=in-progress): %s", out.String())
+	}
+}
+
+// TestTasksSet_TerminalStatusKillsWorker — Piece B integration test.
+// status=done MUST trigger the worker-cleanup gate.
+func TestTasksSet_TerminalStatusKillsWorker(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "worker-cleanup-1", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "ready",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+
+	rec := agent.New("workr001")
+	rec.TmuxSession = "fleet-workr001"
+	rec.TaskID = slug
+	rec.Project = project
+	if err := rec.Write(); err != nil {
+		t.Fatalf("agent.Write: %v", err)
+	}
+	stubHandoffOpTmux(t,
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	if err := runTasksSet(&tasksSetOpts{project: project},
+		slug, "status=done", &bytes.Buffer{}, io.Discard); err != nil {
+		t.Fatalf("set status=done: %v", err)
+	}
+	livePath, _ := state.AgentPath(rec.ID)
+	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("agent live record present after status=done (cleanup gate failed)")
+	}
+	archPath, _ := state.AgentArchivePath(rec.ID)
+	if _, err := os.Stat(archPath); err != nil {
+		t.Errorf("agent archive missing after status=done: %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if post.Status != tasks.StatusDone {
+		t.Errorf("status = %s; want done", post.Status)
+	}
+}
+
+// TestTasksSet_TerminalStatusKillFailsRefusesWrite — BLOCKER semantic.
+// Kill fails AND session still alive → status flip REFUSED.
+func TestTasksSet_TerminalStatusKillFailsRefusesWrite(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "worker-cleanup-2", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "in-progress",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	rec := agent.New("stuckwrk")
+	rec.TmuxSession = "fleet-stuckwrk"
+	rec.TaskID = slug
+	rec.Project = project
+	if err := rec.Write(); err != nil {
+		t.Fatalf("agent.Write: %v", err)
+	}
+	stubHandoffOpTmux(t,
+		func(string) error { return errors.New("simulated tmux kill failure") },
+		func(string) (bool, error) { return true, nil },
+	)
+	err := runTasksSet(&tasksSetOpts{project: project},
+		slug, "status=done", &bytes.Buffer{}, io.Discard)
+	if err == nil {
+		t.Fatalf("expected runTasksSet to fail when worker tmux can't be killed")
+	}
+	if !strings.Contains(err.Error(), "worker cleanup gate") {
+		t.Errorf("error should mention cleanup gate; got %v", err)
+	}
+	post := listTaskRow(t, project, slug)
+	if post.Status == tasks.StatusDone {
+		t.Errorf("task flipped to done despite cleanup gate failure (invariant violation)")
+	}
+	livePath, _ := state.AgentPath(rec.ID)
+	if _, statErr := os.Stat(livePath); statErr != nil {
+		t.Errorf("agent record removed despite live tmux: %v", statErr)
+	}
+}
+
+// TestTasksSet_KeepSessionFlagSkipsKill — --keep-session means agent
+// record archived but Kill not called.
+func TestTasksSet_KeepSessionFlagSkipsKill(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "keep-session-1", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "in-progress",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	rec := agent.New("keepwrk1")
+	rec.TmuxSession = "fleet-keepwrk1"
+	rec.TaskID = slug
+	rec.Project = project
+	if err := rec.Write(); err != nil {
+		t.Fatalf("agent.Write: %v", err)
+	}
+	killCalled := false
+	stubHandoffOpTmux(t,
+		func(string) error { killCalled = true; return nil },
+		func(string) (bool, error) { return true, nil },
+	)
+	if err := runTasksSet(&tasksSetOpts{project: project, keepSession: true},
+		slug, "status=done", &bytes.Buffer{}, io.Discard); err != nil {
+		t.Fatalf("set status=done --keep-session: %v", err)
+	}
+	if killCalled {
+		t.Errorf("tmux.Kill called despite --keep-session")
+	}
+	livePath, _ := state.AgentPath(rec.ID)
+	if _, statErr := os.Stat(livePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("agent record still live after --keep-session archive")
+	}
+	post := listTaskRow(t, project, slug)
+	if post.Status != tasks.StatusDone {
+		t.Errorf("status = %s; want done", post.Status)
 	}
 }

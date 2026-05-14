@@ -25,6 +25,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/tui"
@@ -834,6 +835,18 @@ func formatDepsList(deps []string) string {
 
 type tasksSetOpts struct {
 	project string
+	// keepSession opts out of the tmux.Kill step that fires on a
+	// status flip into done|abandoned. Default false: every fleet
+	// agent whose TaskID matches this task is killed AND archived
+	// before the status flip is persisted. With --keep-session the
+	// kill is skipped but the agent record is still archived; this
+	// is the operator's escape hatch for debugging a worker post-
+	// completion (attach to the lingering tmux session for log
+	// inspection).
+	//
+	// Per fix/atomic-coord-swap-and-worker-cleanup the operator's
+	// brief makes worker cleanup a BLOCKING gate for task completion.
+	keepSession bool
 }
 
 func newTasksSetCmd() *cobra.Command {
@@ -855,17 +868,26 @@ Validation matches the parser: invalid status/priority/depends_on
 syntax returns an error.
 
 created/updated are NOT settable here — the parser owns created and
-the writer auto-bumps updated on every mutation.`,
+the writer auto-bumps updated on every mutation.
+
+When status transitions to done or abandoned, every fleet agent
+attached to the task (TaskID match + project match) is killed and
+archived BEFORE the status flip is persisted. If any worker can't be
+cleanly killed (tmux probe failure / still alive after kill), the
+status flip is REFUSED so the orphan is operator-visible. Pass
+--keep-session to skip the kill step (record still archived).`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTasksSet(opts, args[0], args[1], cmd.OutOrStdout())
+			return runTasksSet(opts, args[0], args[1], cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
 	}
 	cmd.Flags().StringVar(&opts.project, "project", "", "project name (default: cwd basename)")
+	cmd.Flags().BoolVar(&opts.keepSession, "keep-session", false,
+		"on terminal status flip, archive worker record but do NOT kill its tmux session (debug escape hatch)")
 	return cmd
 }
 
-func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
+func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap: %w", err)
 	}
@@ -914,12 +936,54 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout io.Writer) error {
 			stampLifecycleTransition(t, oldStatus, t.Status, now)
 		}
 		t.Updated = now
+
+		// fix/atomic-coord-swap-and-worker-cleanup: worker cleanup is
+		// a BLOCKING gate for terminal-status transitions. Before
+		// status=done/abandoned is persisted, every fleet agent
+		// attached to this task is killed (unless --keep-session) and
+		// archived. If any kill or probe fails, the status flip is
+		// REFUSED — orphan-tmux visible state beats silently-stranded
+		// workers.
+		//
+		// Runs only on a NEW terminal transition. Runs BEFORE
+		// tasks.Write so we don't ship a "done" row that references
+		// workers we couldn't kill — the write is the commit point.
+		if key == "status" && t.Status != oldStatus && isTerminalStatus(t.Status) {
+			cleanupRes, cerr := handoffop.KillAgentsForTask(handoffop.WorkerCleanupOpts{
+				Project:     project,
+				TaskSlug:    slug,
+				KeepSession: opts.keepSession,
+				Stderr:      stderr,
+			})
+			if cerr != nil {
+				return fmt.Errorf("worker cleanup gate blocked status=%s for %s: %w (matched=%d killed=%d archived=%d)",
+					t.Status, slug, cerr,
+					cleanupRes.Matched, cleanupRes.Killed, cleanupRes.Archived)
+			}
+			if cleanupRes.Matched > 0 {
+				what := "killed+archived"
+				if opts.keepSession {
+					what = "archived (session preserved)"
+				}
+				_, _ = fmt.Fprintf(stdout, "%s %d worker agent(s) for %s: %v\n",
+					what, cleanupRes.Matched, slug, cleanupRes.IDs)
+			}
+		}
+
 		if err := tasks.Write(path, f); err != nil {
 			return fmt.Errorf("write: %w", err)
 		}
 		_, _ = fmt.Fprintf(stdout, "set %s.%s = %s\n", slug, key, value)
 		return nil
 	})
+}
+
+// isTerminalStatus reports whether s is a terminal task status (done
+// | abandoned). Used by runTasksSet to gate the worker-cleanup pass.
+// blocked is intentionally NOT terminal — operators may unblock and
+// the worker resumes.
+func isTerminalStatus(s tasks.Status) bool {
+	return s == tasks.StatusDone || s == tasks.StatusAbandoned
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
