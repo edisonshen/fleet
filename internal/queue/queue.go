@@ -77,8 +77,28 @@ type SpawnFresh struct {
 	// Persisting it here ensures that a crashed handoff resumed by
 	// `fleet drain` / TUI watcher honors the same policy
 	// (codex review iter-10 / iter-11 P2).
-	DisableAutoResume *bool     `json:"disable_auto_resume,omitempty"`
-	EnqueuedAt        time.Time `json:"enqueued_at"`
+	DisableAutoResume *bool `json:"disable_auto_resume,omitempty"`
+	// CapApproved is true when the queue file's producer already
+	// passed the FLEET_MAX_SESSIONS gate before writing this file.
+	// `fleet handoff` sets it to true (the operator-triggered path
+	// checks the cap at step 4a before writing the queue).
+	// fleet-guard auto-handoff leaves it false.
+	//
+	// This is a DIAGNOSTIC / forensic field — it is NOT used to
+	// bypass the consumer-side cap re-check (codex iter-8 P1).
+	// Between original handoff and retry the cap state can shift
+	// (operator lowered FLEET_MAX_SESSIONS; the old session died,
+	// turning a net-zero swap into a +1 spawn; other paths created
+	// sessions). Skipping the cap on CapApproved=true would let a
+	// recovered handoff push the host past max — defeating the
+	// backstop in the exact failure mode it must cover.
+	//
+	// Consumers (handoffop.spawnAndRetire) MUST re-check the cap
+	// with current state and swap-aware accounting regardless of
+	// this field's value. Operators who legitimately need to spawn
+	// over-cap on retry use `fleet handoff --force-replacement`.
+	CapApproved bool      `json:"cap_approved,omitempty"`
+	EnqueuedAt  time.Time `json:"enqueued_at"`
 }
 
 // SpawnFreshName returns the queue filename (without .json) for

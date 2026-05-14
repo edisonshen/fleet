@@ -3,12 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// errProbeFail is a sentinel returned by the injected listFn in
+// TestStatus_SessionCapBanner_AbsentOnProbeFailure.
+var errProbeFail = errors.New("tmux: command not found")
 
 // stubEnsureFresh swaps statusEnsureFreshFn for a no-op so tests
 // don't fan out HTTP calls. Restored when the test ends.
@@ -36,8 +41,8 @@ func TestStatus_TriggersEnsureFresh(t *testing.T) {
 	}
 	t.Cleanup(func() { statusEnsureFreshFn = prev })
 
-	var buf bytes.Buffer
-	if err := runStatus(&statusOpts{}, &buf, "0.1.2"); err != nil {
+	var buf, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &buf, &stderr, "0.1.2"); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
 	if !called {
@@ -71,8 +76,8 @@ func TestStatus_PrintsUpgradeFooter(t *testing.T) {
 		t.Fatalf("seed cache: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if err := runStatus(&statusOpts{}, &buf, "0.1.2"); err != nil {
+	var buf, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &buf, &stderr, "0.1.2"); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := buf.String()
@@ -98,8 +103,8 @@ func TestStatus_NoUpgradeFooter_WhenUpToDate(t *testing.T) {
 		t.Fatalf("seed cache: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if err := runStatus(&statusOpts{}, &buf, "0.1.2"); err != nil {
+	var buf, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &buf, &stderr, "0.1.2"); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := buf.String()
@@ -126,12 +131,300 @@ func TestStatus_NoUpgradeFooter_OnJSON(t *testing.T) {
 		t.Fatalf("seed cache: %v", err)
 	}
 
-	var buf bytes.Buffer
-	if err := runStatus(&statusOpts{jsonOut: true}, &buf, "0.1.2"); err != nil {
+	var buf, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &buf, &stderr, "0.1.2"); err != nil {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := buf.String()
 	if strings.Contains(out, "brew upgrade fleet") {
 		t.Errorf("json output should not append nudge; got:\n%s", out)
+	}
+}
+
+// withInjectedStatusSessionFns swaps the package-level
+// statusSessionListFn / statusSessionExistsFn for the test's duration.
+// Mirrors withInjectedSessionFns in session_cap_test.go.
+func withInjectedStatusSessionFns(t *testing.T,
+	listFn func() ([]string, error),
+	existsFn func(id string) bool,
+) {
+	t.Helper()
+	prevList := statusSessionListFn
+	prevExists := statusSessionExistsFn
+	statusSessionListFn = listFn
+	statusSessionExistsFn = existsFn
+	t.Cleanup(func() {
+		statusSessionListFn = prevList
+		statusSessionExistsFn = prevExists
+	})
+}
+
+// TestStatus_SessionCapBanner_BelowThreshold pins the no-banner case
+// (count < 80% of cap) so noise stays absent during normal operation.
+func TestStatus_SessionCapBanner_BelowThreshold(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "10")
+
+	// 7/10 = 70% — below 80% threshold, silent.
+	sessions := []string{
+		"fleet-a", "fleet-b", "fleet-c", "fleet-d",
+		"fleet-e", "fleet-f", "fleet-g",
+	}
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(string) bool { return true },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if strings.Contains(stderr.String(), "WARNING") {
+		t.Errorf("70%% should be silent; stderr:\n%s", stderr.String())
+	}
+}
+
+// TestStatus_SessionCapBanner_AtWarnThreshold pins the warning-tier
+// case (count == 80% of cap) — banner present with the yellow style.
+func TestStatus_SessionCapBanner_AtWarnThreshold(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "10")
+
+	// 8/10 = 80% — at threshold, warning emitted. 5 live + 3 orphan.
+	sessions := []string{
+		"fleet-a", "fleet-b", "fleet-c", "fleet-d",
+		"fleet-e", "fleet-f", "fleet-g", "fleet-h",
+	}
+	live := map[string]bool{"a": true, "b": true, "c": true, "d": true, "e": true}
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return live[id] },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	body := stderr.String()
+	if !strings.Contains(body, "WARNING") {
+		t.Errorf("80%% should emit banner; stderr:\n%s", body)
+	}
+	if !strings.Contains(body, "8/10") {
+		t.Errorf("banner should show count/max; stderr:\n%s", body)
+	}
+	if !strings.Contains(body, "5 live") || !strings.Contains(body, "3 orphan") {
+		t.Errorf("banner should show live/orphan breakdown; stderr:\n%s", body)
+	}
+	if !strings.Contains(body, "prune-orphan-tmux") {
+		t.Errorf("banner should point at prune command; stderr:\n%s", body)
+	}
+	// ANSI styling verified separately in TestPaintBanner — the
+	// runStatus integration here uses bytes.Buffer (non-TTY) so the
+	// emitter intentionally omits color codes (codex iter-6 P2).
+}
+
+// TestStatus_SessionCapBanner_AtCap pins the critical-tier case
+// (count >= cap) — banner uses red ANSI.
+func TestStatus_SessionCapBanner_AtCap(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "5")
+
+	// 5/5 = 100%, all orphan.
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d", "fleet-e"}
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(string) bool { return false },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	body := stderr.String()
+	if !strings.Contains(body, "WARNING") {
+		t.Errorf("100%% should emit banner; stderr:\n%s", body)
+	}
+	if !strings.Contains(body, "5/5") {
+		t.Errorf("banner should show 5/5; stderr:\n%s", body)
+	}
+	if !strings.Contains(body, "0 live") || !strings.Contains(body, "5 orphan") {
+		t.Errorf("banner should show all-orphan breakdown; stderr:\n%s", body)
+	}
+	// ANSI styling verified in TestPaintBanner — non-TTY stderr
+	// here doesn't include color codes (codex iter-6 P2).
+}
+
+// TestStatus_SessionCapBanner_SmallCapThresholdFaithful regresses
+// codex iter-1 P2: with `(max * 80) / 100` integer-division, the
+// banner fired too early for small caps (max=1 → threshold=0 →
+// always warn; max=4 → threshold=3 → warn at 75%, not 80%).
+// The fix cross-multiplies (`total*100 >= max*80`) so the
+// advertised 80% holds for every cap.
+func TestStatus_SessionCapBanner_SmallCapThresholdFaithful(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	t.Run("max=1, zero sessions: silent", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "1")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) { return nil, nil },
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		if strings.Contains(stderr.String(), "WARNING") {
+			t.Errorf("max=1, 0 sessions should be silent; stderr:\n%s",
+				stderr.String())
+		}
+	})
+
+	t.Run("max=4, three sessions (75%): silent", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "4")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) {
+				return []string{"fleet-a", "fleet-b", "fleet-c"}, nil
+			},
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		if strings.Contains(stderr.String(), "WARNING") {
+			t.Errorf("max=4, 3 sessions (75%%) should be silent; stderr:\n%s",
+				stderr.String())
+		}
+	})
+
+	t.Run("max=4, four sessions (100%): banner present", func(t *testing.T) {
+		t.Setenv("FLEET_MAX_SESSIONS", "4")
+		withInjectedStatusSessionFns(t,
+			func() ([]string, error) {
+				return []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d"}, nil
+			},
+			func(string) bool { return true },
+		)
+		var stdout, stderr bytes.Buffer
+		if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+			t.Fatalf("runStatus: %v", err)
+		}
+		body := stderr.String()
+		if !strings.Contains(body, "WARNING") {
+			t.Errorf("max=4, 4 sessions (100%%) should warn; stderr:\n%s", body)
+		}
+		// ANSI styling verified in TestPaintBanner.
+	})
+}
+
+// TestStatus_SessionCapBanner_OnJSONPath regresses codex iter-3 P2:
+// the banner used to be skipped on `fleet status --json` because the
+// JSON branch returned from enc.Encode before reaching the banner
+// call. Scripted/monitoring callers piping stdout through jq still
+// need the cap warning on stderr.
+func TestStatus_SessionCapBanner_OnJSONPath(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "5")
+
+	// 5/5 = 100% — banner must fire.
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d", "fleet-e"}
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(string) bool { return false },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "WARNING") {
+		t.Errorf("--json path must still emit cap banner on stderr; stderr:\n%s",
+			stderr.String())
+	}
+	// stdout must remain valid JSON — banner went to stderr.
+	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "[") {
+		t.Errorf("--json stdout should be a JSON array, got: %s", stdout.String())
+	}
+}
+
+// TestPaintBanner pins the ANSI escape codes for the warning and
+// critical tiers. The actual emit path in runStatus gates this on
+// TTY detection (codex iter-6 P2) so non-terminal stderr stays
+// plain — this test exercises the pure styling function directly.
+func TestPaintBanner(t *testing.T) {
+	line := "x\n"
+	t.Run("warning style: bold yellow", func(t *testing.T) {
+		got := paintBanner(line, bannerStyleWarning)
+		if !strings.Contains(got, "\x1b[1;33m") {
+			t.Errorf("warning should use bold yellow; got %q", got)
+		}
+		if !strings.HasSuffix(got, "\x1b[0m") {
+			t.Errorf("output should end with reset; got %q", got)
+		}
+	})
+	t.Run("critical style: bold red", func(t *testing.T) {
+		got := paintBanner(line, bannerStyleCritical)
+		if !strings.Contains(got, "\x1b[1;31m") {
+			t.Errorf("critical should use bold red; got %q", got)
+		}
+		if !strings.HasSuffix(got, "\x1b[0m") {
+			t.Errorf("output should end with reset; got %q", got)
+		}
+	})
+}
+
+// TestStderrIsTerminal pins the TTY-detection helper used to gate
+// ANSI emission. bytes.Buffer is not a *os.File, so it always
+// returns false — which is what tests rely on to assert
+// uncolored banner output.
+func TestStderrIsTerminal(t *testing.T) {
+	if stderrIsTerminal(&bytes.Buffer{}) {
+		t.Errorf("bytes.Buffer must not register as a terminal")
+	}
+	// os.DevNull is a real *os.File but is NOT a terminal — must
+	// also return false so redirected runs stay plain.
+	dn, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer func() { _ = dn.Close() }()
+	if stderrIsTerminal(dn) {
+		t.Errorf("/dev/null must not register as a terminal")
+	}
+}
+
+// TestStatus_SessionCapBanner_AbsentOnProbeFailure regresses the
+// "transient tmux unreachable" case. The status command must not
+// spam the operator on every run when tmux is briefly missing.
+func TestStatus_SessionCapBanner_AbsentOnProbeFailure(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_MAX_SESSIONS", "5")
+
+	withInjectedStatusSessionFns(t,
+		func() ([]string, error) {
+			return nil, errProbeFail
+		},
+		func(string) bool { return true },
+	)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if strings.Contains(stderr.String(), "WARNING") {
+		t.Errorf("probe failure should not emit banner; stderr:\n%s",
+			stderr.String())
 	}
 }

@@ -49,6 +49,13 @@ type handoffOpts struct {
 	noAutoResume         bool
 	autoResume           bool
 	autoResumeFlagWasSet bool // true when operator explicitly passed --no-auto-resume OR --auto-resume
+	// forceReplacement bypasses the FLEET_MAX_SESSIONS spawn-time cap
+	// (see cmd/fleet/session_cap.go). Operator escape hatch: when
+	// they're already doing the cleanup and need the successor up
+	// first, the cap would otherwise block the very command meant to
+	// make room. The bypass is logged to stderr so it shows in the
+	// session transcript.
+	forceReplacement bool
 }
 
 func newHandoffCmd() *cobra.Command {
@@ -112,6 +119,15 @@ outgoing record and increments handoff_number by 1.`,
 		"skip auto-typing the resume prompt; persists on the replacement record so future handoffs inherit OFF")
 	cmd.Flags().BoolVar(&opts.autoResume, "auto-resume", false,
 		"force auto-typing the resume prompt; persists on the replacement record so future handoffs inherit ON")
+	// --force-replacement bypasses the FLEET_MAX_SESSIONS spawn-time
+	// cap (see cmd/fleet/session_cap.go). The cap exists to refuse
+	// runaway accumulation, but when the operator is ALREADY doing
+	// the cleanup (e.g., handing off a stuck coord to free up room),
+	// blocking the very command meant to make room would be the
+	// wrong call. The bypass is logged to stderr so it appears in
+	// transcripts.
+	cmd.Flags().BoolVar(&opts.forceReplacement, "force-replacement", false,
+		"bypass the FLEET_MAX_SESSIONS spawn-time cap (use when handing off as part of an operator cleanup)")
 	return cmd
 }
 
@@ -314,6 +330,27 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				opts.autoResume = !*pending.DisableAutoResume
 				opts.autoResumeFlagWasSet = true
 			}
+			// Cap re-checked on retry (codex iter-8 P1): we do NOT
+			// auto-bypass the cap here even when pending.CapApproved
+			// is true. The cap math is state-dependent (post-crash
+			// the session list and the old-alive bit may differ
+			// from the original handoff's view), so the swap-aware
+			// gate at step 4a must re-run. If the cap legitimately
+			// refuses, the operator can re-issue with
+			// `--force-replacement` knowing the current state.
+			//
+			// Cap check runs INSIDE this recovery branch BEFORE
+			// queue.Delete (codex iter-10 P2) so a cap refusal
+			// preserves the per-handoff overrides on disk for the
+			// next retry. Without this, a refused recovery would
+			// have already destroyed pending.DisableAutoResume.
+			capBypass := SessionCapBypassReason("")
+			if opts.forceReplacement {
+				capBypass = SessionCapBypassForceReplacement
+			}
+			if capErr := enforceSessionCap(stderr, capBypass, 1); capErr != nil {
+				return capErr
+			}
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -354,6 +391,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					opts.noAutoResume = *pending.DisableAutoResume
 					opts.autoResume = !*pending.DisableAutoResume
 					opts.autoResumeFlagWasSet = true
+				}
+				// Cap re-checked on retry (codex iter-8 P1 / iter-10
+				// P2): the swap-aware gate must run with current
+				// state, and the queue file must persist if the cap
+				// refuses so a future retry can still find the
+				// per-handoff overrides.
+				capBypass := SessionCapBypassReason("")
+				if opts.forceReplacement {
+					capBypass = SessionCapBypassForceReplacement
+				}
+				if capErr := enforceSessionCap(stderr, capBypass, 1); capErr != nil {
+					return capErr
 				}
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
@@ -442,6 +491,26 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("agent %s is a legacy record with no stored command; pass --command <argv> explicitly", opts.oldID)
 	}
 
+	// 4a. FLEET_MAX_SESSIONS backstop. Runs HERE (after recovery
+	// branches in steps 2-3a, before the doc/queue/spawn side
+	// effects in steps 5-8) so:
+	//   - recovery completion paths above (no spawn) aren't blocked;
+	//   - a refusal exits BEFORE writing the queue file, which would
+	//     otherwise leave a `spawn-fresh-<id>.json` that blocks
+	//     `fleet rm <id>` and traps the operator at-cap with no
+	//     escape valve (codex iter-4 P1).
+	// --force-replacement bypasses the cap for operator cleanups
+	// that need the successor up first. swapsInFlight=1: the
+	// about-to-be-killed old session is in the current count, so
+	// the post-swap total is unchanged.
+	bypass := SessionCapBypassReason("")
+	if opts.forceReplacement {
+		bypass = SessionCapBypassForceReplacement
+	}
+	if err := enforceSessionCap(stderr, bypass, 1); err != nil {
+		return err
+	}
+
 	// 5. Write the handoff doc. The doc represents "agent oldID
 	//    handed off"; its handoff_number is the OLD agent's number,
 	//    its previous_handoff chains back to whatever the old agent
@@ -508,6 +577,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		NewAgentID:        newID,
 		NewSession:        newSession,
 		DisableAutoResume: override,
+		// CapApproved (codex iter-7 P1): step 4a already passed
+		// the FLEET_MAX_SESSIONS gate. Persist so recovery via
+		// handoffop.Resume / fleet drain doesn't re-block this
+		// authorized handoff if the cap tightened between crash
+		// and retry.
+		CapApproved: true,
 	})
 	if err != nil {
 		return fmt.Errorf("enqueue spawn-fresh: %w", err)
@@ -543,6 +618,7 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// confusing Command/ExecCommand divergence in spawn.Options).
 		rewrittenExecArgv = nil
 	}
+
 	newRec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRec,
 		NewDocPath:        docPath,
@@ -781,6 +857,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				NewAgentID:        newID,
 				NewSession:        newSession,
 				DisableAutoResume: override,
+				// Already passed cap; preserve so retries don't
+				// re-block on a tightened cap (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
@@ -935,6 +1014,10 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 				NewAgentID:        newRec.ID,
 				NewSession:        newRec.TmuxSession,
 				DisableAutoResume: pendingDisableAutoResume,
+				// Resume path; the original handoff already passed
+				// the cap. Preserve so further retries don't
+				// re-block on a tightened cap (codex iter-7 P1).
+				CapApproved: true,
 			}); werr != nil {
 				_, _ = fmt.Fprintf(stderr,
 					"warning: re-enqueue after send failure: %v (replacement may need manual prompt on attach)\n",
