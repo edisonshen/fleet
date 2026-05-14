@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,97 @@ func TestWriteAtomic_OverwritesExisting(t *testing.T) {
 	}
 	if string(got) != "v2" {
 		t.Errorf("got %q want v2", got)
+	}
+}
+
+// TestWriteAtomic_FsyncsParentDir verifies the parent-dir fsync runs
+// AFTER the rename — durability gate for AtomicCoordSwap's marker
+// commit point. Without the parent-dir fsync, a crash between rename(2)
+// returning and the directory entry hitting disk can leave the renamed
+// file invisible after reboot (data on disk, but no dentry pointing at
+// it). The hook records (dir, error) pairs so the assertion is
+// deterministic without needing syscall tracing.
+func TestWriteAtomic_FsyncsParentDir(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	var calls []string
+	old := fsyncParent
+	fsyncParent = func(dir string) error {
+		calls = append(calls, dir)
+		return old(dir)
+	}
+	t.Cleanup(func() { fsyncParent = old })
+
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("fsyncParent calls = %d; want 1", len(calls))
+	}
+	if calls[0] != tmp {
+		t.Errorf("fsyncParent dir = %q; want %q", calls[0], tmp)
+	}
+}
+
+// TestWriteAtomic_FsyncParentDir_OrderingAfterRename pins the ordering
+// contract: parent-dir fsync runs ONLY after rename completes. If a
+// future refactor moves the fsync earlier (e.g., before close or
+// before rename), the test surfaces the regression.
+func TestWriteAtomic_FsyncParentDir_OrderingAfterRename(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	old := fsyncParent
+	var observed bool
+	fsyncParent = func(dir string) error {
+		// At the moment the parent-dir fsync runs, the renamed file
+		// MUST already exist (rename is the step before this hook).
+		// Probe via os.Lstat which doesn't follow symlinks.
+		if _, err := os.Lstat(dest); err == nil {
+			observed = true
+		}
+		return nil
+	}
+	t.Cleanup(func() { fsyncParent = old })
+
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	if !observed {
+		t.Errorf("parent-dir fsync ran before rename committed; ordering broken")
+	}
+}
+
+// TestWriteAtomic_FsyncParentDir_ErrorPropagates exercises the
+// error-return path so a flaky filesystem returning EIO on the parent
+// fsync surfaces to the caller (AtomicCoordSwap will then refuse to
+// declare the swap committed). Without propagation, a parent-fsync
+// failure would silently lose durability — the very failure mode the
+// fsync exists to prevent.
+func TestWriteAtomic_FsyncParentDir_ErrorPropagates(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	old := fsyncParent
+	sentinel := errors.New("simulated parent fsync EIO")
+	fsyncParent = func(dir string) error { return sentinel }
+	t.Cleanup(func() { fsyncParent = old })
+
+	err := WriteAtomic(dest, []byte("ok"))
+	if err == nil {
+		t.Fatalf("WriteAtomic should have errored on parent fsync failure")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("WriteAtomic error = %v; want wraps %v", err, sentinel)
+	}
+	// File should still exist on disk (rename succeeded before fsync
+	// failed) — the error contract is "we couldn't prove durability,"
+	// not "we rolled back the rename." Callers treat this as a hard
+	// fail (AtomicCoordSwap aborts the swap), but the on-disk state
+	// is still the post-rename shape.
+	if _, statErr := os.Stat(dest); statErr != nil {
+		t.Errorf("destination file disappeared after fsync error: %v", statErr)
 	}
 }
 
