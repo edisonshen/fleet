@@ -940,12 +940,12 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		})
 	}
 	// PART 2b downgrade: stuck → waiting when the agent record has
-	// needs_input=true. Runs after applyStuckSelfHeal so a record that
-	// has BOTH a fresh last_activity_ts AND needs_input=true falls
-	// through the heal path (becomes Idle); ones that need-input but
-	// don't have fresh activity (typical case: claude paused awaiting
-	// operator answer for many minutes) downgrade here.
-	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID)
+	// needs_input=true AND last_activity_ts is within
+	// agentRecordFreshWindow. Codex iter-4 (2026-05-14) added the
+	// freshness gate so a stale needs_input=true flag (set before
+	// claude died while the wrapper-shell survived) doesn't mask a
+	// dead coord — the original stuck warning surfaces in that case.
+	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
 	if line, ok := renderCoordSpawnLineForProject(
 		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {

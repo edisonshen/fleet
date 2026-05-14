@@ -312,19 +312,32 @@ func renderCoordSpawnLineForProject(
 }
 
 // downgradeStuckOnNeedsInput converts coordSpawnStuck → coordSpawnWaiting
-// when the agent record matching markerAgentID has needs_input=true.
+// when the agent record matching markerAgentID has needs_input=true AND
+// the record is fresh (last_activity_ts within agentRecordFreshWindow).
+//
 // PART 2b of the bundled liveness-correctness fix (2026-05-13): an
 // agent with needs_input=true is alive — fleet-guard sets that flag
 // from INSIDE claude on every Stop hook fire. The stuck-attention-chip
 // path is reserved for the "spawn never converged" failure mode where
 // no needs_input signal exists.
 //
+// Codex iter-4 hardening (2026-05-14): the needs_input flag is only
+// as fresh as the last Stop hook write. If claude asked a question
+// then died while the tmux wrapper survived, the stale flag would
+// mask a dead coord. Gate the downgrade on last_activity_ts being
+// within agentRecordFreshWindow (same window applyStuckSelfHeal uses
+// for Path B). A stale-flag-from-dead-claude case falls through to
+// the original stuck warning, surfacing recovery to the operator.
+//
 // Returns the (possibly downgraded) state. No effect on non-stuck
-// states or when no matching record is found.
+// states, when no matching record is found, or when the record's
+// last_activity_ts is older than the freshness window.
 func downgradeStuckOnNeedsInput(
 	st coordSpawnState,
 	records []*agent.Record,
 	markerAgentID string,
+	now time.Time,
+	freshWindow time.Duration,
 ) coordSpawnState {
 	if st != coordSpawnStuck || markerAgentID == "" {
 		return st
@@ -333,10 +346,20 @@ func downgradeStuckOnNeedsInput(
 		if r == nil || r.ID != markerAgentID {
 			continue
 		}
-		if r.NeedsInput {
-			return coordSpawnWaiting
+		if !r.NeedsInput {
+			return st
 		}
-		return st
+		// needs_input=true AND last_activity_ts fresh → trust the flag.
+		// last_activity_ts is stamped on every Stop hook fire; a stale
+		// timestamp means fleet-guard hasn't run recently — the agent
+		// may have died with the flag set.
+		if r.LastActivityTS.IsZero() {
+			return st
+		}
+		if now.Sub(r.LastActivityTS) > freshWindow {
+			return st
+		}
+		return coordSpawnWaiting
 	}
 	return st
 }

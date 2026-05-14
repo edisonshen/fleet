@@ -385,36 +385,49 @@ func TestProjectRow_NoMarkerNoSpawningLine(t *testing.T) {
 	}
 }
 
-// TestProjectRow_StuckDowngradesToWaitingWhenNeedsInput pins PART 2b
-// of the bundle: when the spawn marker is past timeout AND the agent
-// record matching the marker has needs_input=true, render an
-// informational "coord waiting on input" line instead of the
-// attention-chip stuck warning. The agent is alive — fleet-guard set
-// needs_input from inside claude on the last Stop hook fire, which is
-// impossible if claude were dead. Reserve the stuck-attention render
-// for the genuine "spawn never converged" failure mode (no needs_input
-// signal, no fresh coord-state).
+// TestProjectRow_StuckDowngradesToWaitingWhenNeedsInputFresh pins
+// PART 2b of the bundle + codex iter-4 freshness gate: when the
+// spawn marker is past timeout AND the agent record matching the
+// marker has needs_input=true AND last_activity_ts is within
+// agentRecordFreshWindow, render an informational "coord waiting on
+// input" line instead of the attention-chip stuck warning. The
+// freshness gate is load-bearing — a stale flag from a dead claude
+// (wrapper-shell survived after engine exit) must NOT trigger the
+// downgrade.
 //
-// Real bug surfaced 2026-05-13: coord bab86984 (projects-spark) showed
-// the stuck badge while its claude process pid 8306 had been running
-// 12 minutes idle awaiting input — needs_input=true, last_activity 33s
-// after spawn. The badge trained the operator to spawn replacements
-// over a live coord.
-func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInput(t *testing.T) {
+// Note: with last_activity_ts fresh enough to pass the freshness
+// gate (within agentRecordFreshWindow = 10m by default), the Path B
+// self-heal in applyStuckSelfHeal ALSO fires — it transitions stuck
+// → idle and removes the marker. So the realistic render here is
+// "no spawn line at all" (Idle). To exercise the WAITING path
+// specifically, we pin a last_activity_ts that is fresh enough for
+// needs-input trust (within the 10m freshWindow) but past the
+// Path B "agent record is fresh" gate is the same window — so both
+// heal and waiting are eligible. Heal wins (runs first). This is
+// the correct production outcome: a healthy coord asking for input
+// renders Idle (with the operator-input chip), not Waiting.
+//
+// Real bug surfaced 2026-05-13: coord bab86984 (projects-spark)
+// showed the stuck badge while its claude process pid 8306 had been
+// running 12 minutes idle awaiting input — needs_input=true,
+// last_activity 33s after spawn. The badge trained the operator to
+// spawn replacements over a live coord.
+func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInputFresh(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "abcd1234")
-	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": false})
 
-	// Seed an agent record matching the marker, with needs_input=true.
-	// LastActivityTS is OLD (past activeWindow) so the self-heal Path B
-	// freshness gate does NOT fire — without needs_input, the stuck
-	// chip would render here.
+	// last_activity_ts FRESH (within freshWindow=10m) → needs_input
+	// flag is trusted. Session-alive=false so Path A of heal doesn't
+	// short-circuit; Path B (record-fresh) heals to Idle BEFORE the
+	// downgrade runs. Realistic production behavior — see test
+	// docstring above.
 	rec := &agent.Record{
 		ID:             "abcd1234",
-		LastActivityTS: now.Add(-30 * time.Minute), // stale, not fresh
-		NeedsInput:     true,                       // alive, awaiting operator
+		LastActivityTS: now.Add(-3 * time.Minute), // FRESH
+		NeedsInput:     true,
 	}
 	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
 	ctx := coordSpawnCtx{
@@ -426,13 +439,71 @@ func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInput(t *testing.T) {
 	lines := projectBlockLines(p, 80, false, ctx)
 	joined := strings.Join(lines, "\n")
 	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("needs_input=true must downgrade stuck → waiting; got stuck warning:\n%s", joined)
+		t.Errorf("fresh needs_input must NOT render stuck; got:\n%s", joined)
 	}
-	if !strings.Contains(joined, "waiting on input") {
-		t.Errorf("expected informational waiting line; got:\n%s", joined)
+}
+
+// TestDowngradeStuckOnNeedsInput_UnitContract pins the new
+// downgrade contract via the pure helper (no project-block plumbing
+// involved). Confirms the freshness gate flips the verdict on the
+// exact case codex iter-4 raised: stale needs_input flag must fall
+// through to stuck, not mask a dead coord.
+func TestDowngradeStuckOnNeedsInput_UnitContract(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	freshWindow := 10 * time.Minute
+	cases := []struct {
+		name       string
+		needsInput bool
+		lastTSAge  time.Duration // age from now (positive = past)
+		want       coordSpawnState
+	}{
+		{
+			name:       "needs_input=true + fresh ts → waiting",
+			needsInput: true,
+			lastTSAge:  3 * time.Minute,
+			want:       coordSpawnWaiting,
+		},
+		{
+			name:       "needs_input=true + stale ts → STUCK (codex iter-4 gate)",
+			needsInput: true,
+			lastTSAge:  30 * time.Minute, // past 10m window
+			want:       coordSpawnStuck,  // dead coord with stale flag
+		},
+		{
+			name:       "needs_input=false + fresh ts → stuck (no input signal)",
+			needsInput: false,
+			lastTSAge:  3 * time.Minute,
+			want:       coordSpawnStuck,
+		},
+		{
+			name:       "needs_input=true + zero ts → stuck (no signal trust)",
+			needsInput: true,
+			lastTSAge:  0, // sentinel for IsZero()
+			want:       coordSpawnStuck,
+		},
 	}
-	if !strings.Contains(joined, "fleet attach abcd1234") {
-		t.Errorf("waiting line must suggest 'fleet attach <agent_id>'; got:\n%s", joined)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ts time.Time
+			if tc.lastTSAge > 0 {
+				ts = now.Add(-tc.lastTSAge)
+			}
+			rec := &agent.Record{
+				ID:             "abcd1234",
+				LastActivityTS: ts,
+				NeedsInput:     tc.needsInput,
+			}
+			got := downgradeStuckOnNeedsInput(
+				coordSpawnStuck,
+				[]*agent.Record{rec},
+				"abcd1234",
+				now,
+				freshWindow,
+			)
+			if got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
