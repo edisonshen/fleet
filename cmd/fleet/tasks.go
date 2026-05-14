@@ -1051,6 +1051,7 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 			// races and now fails, surface as a warning — the
 			// tmux-agent leak (the load-bearing failure mode) is
 			// already closed.
+			workerArchived := true
 			if werr := workers.Archive(project, slug); werr != nil {
 				switch {
 				case errors.Is(werr, workers.ErrPreconditionLive):
@@ -1061,11 +1062,23 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 						t.Status, slug, werr)
 				case errors.Is(werr, workers.ErrInvalidSlug):
 					// Slug failed validation — ignore silently.
+					workerArchived = false
 				default:
 					_, _ = fmt.Fprintf(stderr,
 						"warning: workers/%s/ archive failed: %v (task will be marked %s; triage with `fleet workers list`)\n",
 						slug, werr, t.Status)
+					workerArchived = false
 				}
+			}
+			// codex iter-15 [P2]: clear the task row's worker_pid
+			// after we've archived the worker dir. Without this, a
+			// later no-op `tasks set X status=done` re-run finds
+			// the stale PID in t.WorkerPID, the kernel may have
+			// recycled that PID for an unrelated process, and the
+			// gate refuses spuriously. Clearing keeps the re-run
+			// idempotent.
+			if workerArchived {
+				t.WorkerPID = 0
 			}
 		}
 

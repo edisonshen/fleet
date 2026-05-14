@@ -541,6 +541,38 @@ func TestKillAgentsForTask_MalformedRecordNoMatchButRawTextMatches_Refuses(t *te
 	}
 }
 
+// TestKillAgentsForTask_CoordMarkerMissingProtectsCoord — codex
+// iter-15 [P2]. When the coord-spawn marker is missing/unreadable,
+// every record with TaskID="coord-<project>" is treated as the coord
+// (conservative fallback). Without this, `tasks set coord-<project>
+// status=done` would kill the real coord.
+func TestKillAgentsForTask_CoordMarkerMissingProtectsCoord(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	const coordSlug = "coord-" + project
+	// Coord agent — TaskID = sentinel. NO marker file written.
+	coord := agent.New("coordagt")
+	coord.TmuxSession = "fleet-coordagt"
+	coord.Project = project
+	coord.TaskID = coordSlug
+	if err := coord.Write(); err != nil {
+		t.Fatalf("seed coord: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { t.Errorf("Kill must not be called on coord-protected record"); return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: project, TaskSlug: coordSlug, Stderr: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("KillAgentsForTask: %v", err)
+	}
+	if res.Matched != 0 {
+		t.Errorf("Matched = %d; want 0 (coord protected when marker missing)", res.Matched)
+	}
+}
+
 // TestKillAgentsForTask_SkipsRealCoordRecord — codex iter-2 [P1] +
 // iter-6 [P2]. The real coord agent (whose ID matches the coord-spawn
 // marker) is exempted from cleanup, but a non-coord worker that

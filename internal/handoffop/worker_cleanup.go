@@ -330,18 +330,26 @@ func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string 
 }
 
 // isProjectCoordRecord reports whether a record IS its project's
-// coordinator agent. Two-signal check (codex iter-2 P1 + iter-6 P2):
+// coordinator agent. Conservative check (codex iter-2 P1 + iter-6 P2
+// + iter-15 P2):
 //
 //  1. TaskID matches the "coord-<project>" sentinel, AND
-//  2. The project's coord-spawn marker points at this exact agent ID.
+//  2. EITHER the project's coord-spawn marker points at this exact
+//     agent ID, OR the marker is missing/unreadable (returns "" —
+//     ReadCoordSpawnMarker collapses errors to empty string).
 //
-// Both signals together rule out the false-positive case where an
-// operator names a real task "coord-<project>" — that task's worker
-// agent won't have the coord-spawn marker pointing at it. Only the
-// actual coord-spawn flow writes the marker.
+// The marker-missing branch is the iter-15 P2 fix: when the marker
+// file is gone (operator hand-deleted, fresh project bootstrap, FS
+// issue), we can't disambiguate which "coord-<project>" record is
+// the real coord. Falling closed (treat all matches as coord)
+// preserves the coord's survival at the cost of leaking the worker
+// case ("operator named a real task coord-<project>" — already
+// rejected at `tasks add` for safety, see operator's brief).
+// Operators who run into this can `fleet rm` the actual stale
+// record directly.
 //
 // Empty TaskID / Project / agent ID all return false (definitely
-// not a coord — bail out cheap).
+// not a coord).
 func isProjectCoordRecord(agentID, taskID, project string) bool {
 	if agentID == "" || taskID == "" || project == "" {
 		return false
@@ -349,7 +357,11 @@ func isProjectCoordRecord(agentID, taskID, project string) bool {
 	if taskID != "coord-"+project {
 		return false
 	}
-	return state.ReadCoordSpawnMarker(project) == agentID
+	markerID := state.ReadCoordSpawnMarker(project)
+	// Marker matches OR marker is unreadable — both treat as coord
+	// (iter-15 P2: marker-missing must not allow `tasks set
+	// coord-<project> status=done` to kill the coord).
+	return markerID == agentID || markerID == ""
 }
 
 // tmuxKillForCleanup / tmuxSessionAliveForCleanup are package vars so
