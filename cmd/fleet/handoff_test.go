@@ -22,6 +22,14 @@ func setupFleetHome(t *testing.T) string {
 	t.Helper()
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	// Make the FLEET_MAX_SESSIONS cap effectively unbounded by
+	// default. Tests that exercise the cap explicitly set their own
+	// value (e.g. FLEET_MAX_SESSIONS=3). Without this, the new
+	// spawn-time precheck would see the operator's REAL tmux
+	// session count when tests don't isolate via FLEET_TMUX_SOCKET,
+	// and unrelated tests would fire cap-refusal errors instead of
+	// reaching the validation paths they're testing.
+	t.Setenv("FLEET_MAX_SESSIONS", "100000")
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}

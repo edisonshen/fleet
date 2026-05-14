@@ -522,6 +522,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// FLEET_MAX_SESSIONS backstop. Runs HERE — after engine /
+	// project / coord-spawn validation, BEFORE the dead-coord
+	// recovery branch's synth handoff doc write — so a cap refusal
+	// doesn't leave a synthetic doc on disk for a replacement that
+	// never spawned (codex iter-9 P2). swapsInFlight=0: dispatch
+	// is net +1.
+	if err := enforceSessionCap(os.Stderr, "", 0); err != nil {
+		return err
+	}
+
 	// Dead-coord recovery (resume-dead-coord-ab65): when --coord-spawn
 	// hits a project whose previous coord left a stale record on disk
 	// (pid dead AND tmux session gone), build a synth handoff doc from
@@ -689,18 +699,6 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	disableAutoResume := opts.noAutoResume
 	if !opts.noAutoResumeExplicit && oldRecord != nil && oldRecord.DisableAutoResume {
 		disableAutoResume = true
-	}
-	// FLEET_MAX_SESSIONS backstop. Refuse to spawn when the total
-	// count of fleet-* tmux sessions is already at-or-above the cap,
-	// pointing the operator at the prune + rm escape valves. Best-
-	// effort: probe failures don't block the spawn (see
-	// enforceSessionCap doc). Placed AFTER cheaper validations
-	// (engine, project, coord-spawn, recovery) so a bad task ID or
-	// unknown engine still fails fast without paying the cap probe.
-	// swapsInFlight=0: dispatch is a NET +1 spawn (no old session to
-	// retire). Cap refuses iff `current_total + 1 > max`.
-	if err := enforceSessionCap(os.Stderr, "", 0); err != nil {
-		return err
 	}
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
