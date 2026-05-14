@@ -145,14 +145,18 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 				len(badIDs), badIDs, opts.TaskSlug, opts.Project)
 		}
 	}
-	// codex iter-9 [P1]: snapshot the IDs we intend to act on. After
-	// the kill+archive loop we'll re-list and refuse if a new
-	// replacement appeared for this task between the snapshot and now
-	// (concurrent `fleet handoff` / auto-handoff race).
-	snapshotIDs := make(map[string]struct{}, len(matches))
-	for _, rec := range matches {
-		snapshotIDs[rec.ID] = struct{}{}
-	}
+	// codex iter-9 [P1] + iter-10 [P1]: after the kill+archive loop
+	// we'll re-list and refuse the transition if ANY live record
+	// matches this task. Two cases this catches:
+	//   (a) Concurrent fleet handoff / auto-handoff wrote a fresh
+	//       replacement after our snapshot (iter-9).
+	//   (b) A late fleet-guard health tick or other writer
+	//       resurrected an agents/<id>.json we just archived
+	//       (iter-10) — Archive moves the file, a subsequent
+	//       UpdateState recreates it.
+	// In both cases the post-cleanup check sees the live record and
+	// refuses. The operator's recovery is to re-run `fleet tasks set`,
+	// which will pick up the live record on its own snapshot.
 
 	// Pass 2: kill + archive each matched record.
 	for _, rec := range matches {
@@ -227,13 +231,21 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 	// this task. If so, our cleanup is incomplete — the new record
 	// is live and untouched. Re-list and refuse the transition so
 	// the operator (or the next `tasks set`) catches the new record.
+	//
+	// Skip the re-check in KeepSession mode: the operator INTENTIONALLY
+	// preserved the live records, so they'll be there. The cleanup
+	// gate's invariant ("no live record for this task after cleanup")
+	// doesn't apply when the operator opted out of the cleanup.
+	if opts.KeepSession {
+		return res, nil
+	}
 	postAll, postBadIDs, perr := agent.ListStrict()
 	if perr != nil {
 		return res, fmt.Errorf(
 			"%w: post-cleanup re-list failed: %w (workers killed but cannot confirm none appeared concurrently; task %s NOT marked terminal — retry)",
 			ErrWorkerCleanupFailed, perr, opts.TaskSlug)
 	}
-	var newcomers []string
+	var stillLive []string
 	for _, rec := range postAll {
 		if rec == nil {
 			continue
@@ -244,15 +256,16 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		if rec.TaskID != opts.TaskSlug || rec.Project != opts.Project {
 			continue
 		}
-		if _, ok := snapshotIDs[rec.ID]; ok {
-			continue // already handled this pass
-		}
-		newcomers = append(newcomers, rec.ID)
+		// iter-10 P1: ANY live record matching this task means
+		// invariant violation. Don't filter by snapshot — a record
+		// with an ID we already archived could have been resurrected
+		// by a late writer.
+		stillLive = append(stillLive, rec.ID)
 	}
-	if len(newcomers) > 0 {
+	if len(stillLive) > 0 {
 		return res, fmt.Errorf(
-			"%w: %d replacement agent(s) appeared during cleanup (%v); task %s NOT marked terminal — re-run `fleet tasks set` to clean up the newcomers",
-			ErrWorkerCleanupFailed, len(newcomers), newcomers, opts.TaskSlug)
+			"%w: %d agent record(s) live for task %s after cleanup (%v) — concurrent handoff or late writer resurrected a record; task NOT marked terminal — re-run `fleet tasks set` to clean them up",
+			ErrWorkerCleanupFailed, len(stillLive), opts.TaskSlug, stillLive)
 	}
 	if len(postBadIDs) > 0 {
 		if relevant := badRecordsPlausiblyRelated(postBadIDs, opts.Project, opts.TaskSlug); len(relevant) > 0 {
