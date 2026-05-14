@@ -35,6 +35,11 @@ import (
 // handoff path may override.
 const DefaultGraceMillis = 3000
 
+// sessionListProbe is the tmux-session enumerator the auto-drain path
+// uses for the FLEET_MAX_SESSIONS precheck. Indirected via a package-
+// level var so tests inject a fake without touching tmux.
+var sessionListProbe = tmux.ListSessions
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -245,6 +250,29 @@ func cleanUpStaleQueue(req queue.SpawnFresh, queuePath string,
 // the session, then retires the old agent.
 func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	oldRec *agent.Record, graceMillis int, stdout, stderr io.Writer) error {
+
+	// FLEET_MAX_SESSIONS backstop on the auto-drain path. The
+	// fleet-guard skill writes queue files on auto-handoff; this
+	// helper is the consumer. Without the cap here, a runaway
+	// auto-handoff loop (e.g. a future bug that retries forever)
+	// could blow past the operator's limit. No --force-replacement
+	// escape on this path because there's no operator to flag it —
+	// the queue file is the only producer. Probe failures don't
+	// block (best-effort, same as the CLI gate).
+	counts, cerr := state.CountFleetSessions(
+		sessionListProbe, state.LiveAgentRecordExists)
+	if cerr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: FLEET_MAX_SESSIONS precheck could not enumerate tmux sessions (%v); proceeding without cap enforcement\n",
+			cerr)
+	} else if max := state.MaxSessions(stderr); counts.Total() >= max {
+		// Queue file is preserved so the operator can drain manually
+		// after pruning. The error message mirrors the CLI gate's
+		// language for consistency.
+		return fmt.Errorf(
+			"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` or `fleet rm <id>`, then rerun `fleet drain` (queue file %s preserved)",
+			max, counts.Live, counts.Orphan, queuePath)
+	}
 
 	if oldRec.Cwd == "" {
 		return fmt.Errorf(

@@ -1,0 +1,196 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/edisonshen/fleet/internal/state"
+)
+
+// withInjectedSessionFns replaces the package-level sessionListFn /
+// sessionExistsFn for the duration of the test. Restoration runs via
+// t.Cleanup so a panicking test still resets.
+func withInjectedSessionFns(t *testing.T,
+	listFn func() ([]string, error),
+	existsFn func(id string) bool,
+) {
+	t.Helper()
+	prevList := sessionListFn
+	prevExists := sessionExistsFn
+	sessionListFn = listFn
+	sessionExistsFn = existsFn
+	t.Cleanup(func() {
+		sessionListFn = prevList
+		sessionExistsFn = prevExists
+	})
+}
+
+func TestEnforceSessionCap_BelowCap(t *testing.T) {
+	t.Setenv(state.FleetMaxSessionsEnv, "30")
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c"}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return true },
+	)
+	var stderr bytes.Buffer
+	if err := enforceSessionCap(&stderr, ""); err != nil {
+		t.Fatalf("unexpected error at 3/30: %v", err)
+	}
+}
+
+func TestEnforceSessionCap_AtCap(t *testing.T) {
+	t.Setenv(state.FleetMaxSessionsEnv, "3")
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c"}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return true },
+	)
+	var stderr bytes.Buffer
+	err := enforceSessionCap(&stderr, "")
+	if err == nil {
+		t.Fatalf("expected refusal at 3/3, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		"refusing to spawn",
+		"FLEET_MAX_SESSIONS=3",
+		"3 live",
+		"0 orphan",
+		"prune-orphan-tmux",
+		"fleet rm",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("err missing %q\nfull: %s", want, msg)
+		}
+	}
+}
+
+func TestEnforceSessionCap_OverCap(t *testing.T) {
+	// Document that the gate refuses even when count > max (e.g. a
+	// race let through extra sessions). Recovery path: prune orphans.
+	t.Setenv(state.FleetMaxSessionsEnv, "2")
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c", "fleet-d"}
+	live := map[string]bool{"fleet-a": true, "fleet-b": true}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return live["fleet-"+id] },
+	)
+	var stderr bytes.Buffer
+	err := enforceSessionCap(&stderr, "")
+	if err == nil {
+		t.Fatalf("expected refusal at 4/2, got nil")
+	}
+	if !strings.Contains(err.Error(), "2 live") {
+		t.Errorf("expected live=2 in err: %s", err.Error())
+	}
+	if !strings.Contains(err.Error(), "2 orphan") {
+		t.Errorf("expected orphan=2 in err: %s", err.Error())
+	}
+}
+
+func TestEnforceSessionCap_NonFleetSessionsExcluded(t *testing.T) {
+	// Tmux sessions that don't start with "fleet-" must not count
+	// toward the cap. Operators may have unrelated tmux sessions on
+	// the same server; fleet does not own those.
+	t.Setenv(state.FleetMaxSessionsEnv, "3")
+	sessions := []string{
+		"fleet-a", "fleet-b",
+		"work", "scratch", "vim-session", "fleet-",
+	}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return true },
+	)
+	var stderr bytes.Buffer
+	if err := enforceSessionCap(&stderr, ""); err != nil {
+		t.Fatalf("unexpected error at 2 fleet / 3 cap (4 non-fleet): %v", err)
+	}
+}
+
+func TestEnforceSessionCap_ForceReplacementBypass(t *testing.T) {
+	// --force-replacement skips the precheck entirely. Even at-cap,
+	// the spawn proceeds and the bypass reason is logged.
+	t.Setenv(state.FleetMaxSessionsEnv, "1")
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c"}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(id string) bool { return true },
+	)
+	var stderr bytes.Buffer
+	if err := enforceSessionCap(&stderr, SessionCapBypassForceReplacement); err != nil {
+		t.Fatalf("force-replacement bypass should not error: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "force-replacement") {
+		t.Errorf("expected bypass note in stderr: %s", stderr.String())
+	}
+}
+
+func TestEnforceSessionCap_NilStderrTolerated(t *testing.T) {
+	// Spawn paths may pass nil stderr. The cap must not panic.
+	t.Setenv(state.FleetMaxSessionsEnv, "30")
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return []string{"fleet-a"}, nil },
+		func(id string) bool { return true },
+	)
+	if err := enforceSessionCap(nil, ""); err != nil {
+		t.Fatalf("nil-stderr below-cap: %v", err)
+	}
+	// And on bypass with nil stderr (no log target).
+	if err := enforceSessionCap(nil, SessionCapBypassForceReplacement); err != nil {
+		t.Fatalf("nil-stderr bypass: %v", err)
+	}
+}
+
+func TestEnforceSessionCap_ListErrorProceedsWithoutBlocking(t *testing.T) {
+	// Probe failure (tmux unreachable) — best-effort cap means we
+	// log to stderr and return nil so the operator isn't locked out
+	// of dispatch by a transient tmux server hiccup.
+	t.Setenv(state.FleetMaxSessionsEnv, "30")
+	boom := errors.New("tmux not on PATH")
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return nil, boom },
+		func(id string) bool { return true },
+	)
+	var stderr bytes.Buffer
+	if err := enforceSessionCap(&stderr, ""); err != nil {
+		t.Fatalf("list error should not block spawn: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "could not enumerate") {
+		t.Errorf("expected probe-fail warning, got %q", stderr.String())
+	}
+}
+
+func TestEnforceSessionCap_DefaultCap30(t *testing.T) {
+	// With FLEET_MAX_SESSIONS unset, default is 30. Verify 30 sessions
+	// is at-cap (refuse) and 29 is under-cap (allow).
+	t.Setenv(state.FleetMaxSessionsEnv, "")
+	make30 := func(n int) []string {
+		out := make([]string, n)
+		for i := 0; i < n; i++ {
+			out[i] = "fleet-" + string(rune('a'+i%26)) + string(rune('a'+(i/26)%26))
+		}
+		return out
+	}
+	t.Run("29 allowed", func(t *testing.T) {
+		s := make30(29)
+		withInjectedSessionFns(t,
+			func() ([]string, error) { return s, nil },
+			func(string) bool { return true },
+		)
+		if err := enforceSessionCap(nil, ""); err != nil {
+			t.Fatalf("29/30 should allow: %v", err)
+		}
+	})
+	t.Run("30 refused", func(t *testing.T) {
+		s := make30(30)
+		withInjectedSessionFns(t,
+			func() ([]string, error) { return s, nil },
+			func(string) bool { return true },
+		)
+		if err := enforceSessionCap(nil, ""); err == nil {
+			t.Fatalf("30/30 should refuse")
+		}
+	})
+}

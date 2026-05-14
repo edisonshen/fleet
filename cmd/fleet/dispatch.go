@@ -690,6 +690,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if !opts.noAutoResumeExplicit && oldRecord != nil && oldRecord.DisableAutoResume {
 		disableAutoResume = true
 	}
+	// FLEET_MAX_SESSIONS backstop. Refuse to spawn when the total
+	// count of fleet-* tmux sessions is already at-or-above the cap,
+	// pointing the operator at the prune + rm escape valves. Best-
+	// effort: probe failures don't block the spawn (see
+	// enforceSessionCap doc). Placed AFTER cheaper validations
+	// (engine, project, coord-spawn, recovery) so a bad task ID or
+	// unknown engine still fails fast without paying the cap probe.
+	if err := enforceSessionCap(os.Stderr, ""); err != nil {
+		return err
+	}
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,

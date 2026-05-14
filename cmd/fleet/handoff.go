@@ -49,6 +49,13 @@ type handoffOpts struct {
 	noAutoResume         bool
 	autoResume           bool
 	autoResumeFlagWasSet bool // true when operator explicitly passed --no-auto-resume OR --auto-resume
+	// forceReplacement bypasses the FLEET_MAX_SESSIONS spawn-time cap
+	// (see cmd/fleet/session_cap.go). Operator escape hatch: when
+	// they're already doing the cleanup and need the successor up
+	// first, the cap would otherwise block the very command meant to
+	// make room. The bypass is logged to stderr so it shows in the
+	// session transcript.
+	forceReplacement bool
 }
 
 func newHandoffCmd() *cobra.Command {
@@ -112,6 +119,15 @@ outgoing record and increments handoff_number by 1.`,
 		"skip auto-typing the resume prompt; persists on the replacement record so future handoffs inherit OFF")
 	cmd.Flags().BoolVar(&opts.autoResume, "auto-resume", false,
 		"force auto-typing the resume prompt; persists on the replacement record so future handoffs inherit ON")
+	// --force-replacement bypasses the FLEET_MAX_SESSIONS spawn-time
+	// cap (see cmd/fleet/session_cap.go). The cap exists to refuse
+	// runaway accumulation, but when the operator is ALREADY doing
+	// the cleanup (e.g., handing off a stuck coord to free up room),
+	// blocking the very command meant to make room would be the
+	// wrong call. The bypass is logged to stderr so it appears in
+	// transcripts.
+	cmd.Flags().BoolVar(&opts.forceReplacement, "force-replacement", false,
+		"bypass the FLEET_MAX_SESSIONS spawn-time cap (use when handing off as part of an operator cleanup)")
 	return cmd
 }
 
@@ -138,6 +154,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
 	if err := tmux.Available(); err != nil {
+		return err
+	}
+	// FLEET_MAX_SESSIONS backstop. Refuse to spawn the replacement
+	// when the total count of fleet-* tmux sessions is at-or-above
+	// the cap. --force-replacement bypasses for operator cleanups
+	// that NEED the successor up first. Runs BEFORE the per-agent
+	// flock so a refusal exits cleanly without taking the lock.
+	bypass := SessionCapBypassReason("")
+	if opts.forceReplacement {
+		bypass = SessionCapBypassForceReplacement
+	}
+	if err := enforceSessionCap(stderr, bypass); err != nil {
 		return err
 	}
 
