@@ -972,25 +972,40 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 					what, cleanupRes.Matched, slug, cleanupRes.IDs)
 			}
 
-			// codex iter-2 [P2]: also clean up the workers/<slug>/ dir
-			// for coord-dispatched workers (the claude --print
-			// subprocess shape, NOT tmux-backed). Without this, a
-			// terminal task transition leaves the worker dir in place
-			// and `fleet workers list` keeps reporting the worker as
-			// live under a done|abandoned task.
+			// codex iter-2 [P2] + iter-3 [P1]: also archive the
+			// workers/<slug>/ dir for coord-dispatched workers (the
+			// `claude --print` subprocess shape, NOT tmux-backed).
+			// Without this, a terminal task transition leaves the
+			// worker dir in place and `fleet workers list` keeps
+			// reporting the worker as live under a done|abandoned task.
 			//
-			// Best-effort: workers.Delete is idempotent on ENOENT;
-			// other errors are surfaced as a warning, NOT a hard
-			// failure. Reason: the tmux-agent half of cleanup
-			// (KillAgentsForTask above) is the load-bearing leak
-			// surface (per the operator's brief — the orphan-tmux
-			// leak is what crashed the Mac). A workers/<slug>/ dir
-			// hang-around is a UX nit, not a resource leak.
-			if err := workers.Delete(project, slug); err != nil {
-				if !errors.Is(err, workers.ErrInvalidSlug) {
+			// Use workers.Archive (not workers.Delete) so the
+			// precondition gate fires: Archive refuses if the
+			// worker's state.json is non-terminal phase or its PID
+			// is alive. This prevents a `tasks set status=done` from
+			// blowing away a live coord-worker's state mid-flight
+			// (codex iter-3 P1: workers.Delete is unconditional and
+			// doesn't take the worker lock).
+			//
+			// Best-effort: Archive errors are surfaced as a warning,
+			// NOT a hard failure. Reason: the tmux-agent half of
+			// cleanup (KillAgentsForTask above) is the load-bearing
+			// leak surface; a workers/<slug>/ dir hanging around is
+			// a UX nit, not a resource leak. ENOENT (no state.json)
+			// is a no-op success.
+			if werr := workers.Archive(project, slug); werr != nil {
+				switch {
+				case errors.Is(werr, workers.ErrPreconditionLive):
 					_, _ = fmt.Fprintf(stderr,
-						"warning: cleanup workers/%s/: %v (task still marked %s; run `fleet workers list` to triage)\n",
-						slug, err, t.Status)
+						"warning: workers/%s/ archive skipped — worker still running (%v); operator should run `fleet workers list` after the worker exits, or stop it manually\n",
+						slug, werr)
+				case errors.Is(werr, workers.ErrInvalidSlug):
+					// Slug failed validation — ignore silently; this
+					// is a fleet bug, not operator-actionable.
+				default:
+					_, _ = fmt.Fprintf(stderr,
+						"warning: workers/%s/ archive failed: %v (task marked %s; triage with `fleet workers list`)\n",
+						slug, werr, t.Status)
 				}
 			}
 		}
