@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -27,28 +28,65 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// pruneOrphanTmuxFreshness is the minimum age a tmux session must
-// reach before prune-orphan-tmux considers it an orphan candidate.
+// fleetAgentIDPattern matches the agent ID format produced by
+// agent.NewID(): 8 lowercase hex characters (happy path), OR the
+// crypto/rand fallback shape "t%07x" with the value masked to 32 bits.
+// %07x is a MINIMUM width (not maximum), so the fallback can produce
+// either t+7hex (value <= 0x0fffffff, the smaller half) or t+8hex
+// (value > 0x0fffffff, the larger 15/16ths). The regex must accept
+// both to avoid missing real fleet sessions on the fallback path
+// (codex iter-5 [P3]).
+//
+// Codex iter-2 [P1]: without this gate, any tmux session starting with
+// `fleet-` would be classified as orphan once older than 90s and killed
+// in --kill mode. Operators routinely name unrelated sessions with the
+// `fleet-` prefix; the sweeper must scope to the agent.NewID() shape
+// only.
+var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7,8})$`)
+
+// pruneOrphanTmuxMinFreshness is the floor for the freshness window:
+// even when FLEET_PID_RESOLVE_S is unset or tiny, the sweeper waits at
+// least this long before classifying a record-absent session as orphan.
 //
 // Rationale: spawn.Spawn creates the tmux session first (tmux.Spawn),
-// then resolves the engine pid (up to pidResolveTimeout, ~5s typical),
-// then writes the agent record (rec.Write). Between tmux create and
-// rec.Write the on-disk state matches the orphan shape exactly:
-// session exists, record absent. A sweeper that runs in that window
-// (especially via cron / startup hook) would kill a brand-new healthy
-// replacement.
+// then resolves the engine pid (up to spawn.PidResolveTimeout()), then
+// writes the agent record (rec.Write). Between tmux create and rec.Write
+// the on-disk state matches the orphan shape exactly: session exists,
+// record absent. A sweeper that runs in that window (especially via
+// cron / startup hook) would kill a brand-new healthy replacement.
 //
-// 90s is well above the typical 1-5s spawn cost AND covers the
-// resolveEnginePid worst-case timeout with margin. Operators who want
-// to reap genuine 12-hour-old orphans never notice this delay.
+// 90s is well above the typical 1-5s spawn cost when the operator
+// hasn't tuned FLEET_PID_RESOLVE_S — it covers slow Macs, slow disks,
+// and ZFS-style snapshot pauses. The dynamic ceiling below adds 2x
+// the configured pid-resolve timeout when the operator raised it
+// (codex review iter-3 [P1]).
+const pruneOrphanTmuxMinFreshness = 90 * time.Second
+
+// pruneOrphanTmuxFreshness computes the actual freshness window to use,
+// scaling with FLEET_PID_RESOLVE_S so that operators who raise the
+// pid-resolve budget for slow-spawning wrapper engines don't get their
+// in-flight replacements terminated by --kill.
 //
-// Codex review iter-2 [P1]: avoid killing sessions in the spawn→
-// record-write window.
-const pruneOrphanTmuxFreshness = 90 * time.Second
+// Returns max(pruneOrphanTmuxMinFreshness, 2 * spawn.PidResolveTimeout()).
+// The 2x multiplier covers the gap between when the pid-resolve clock
+// starts (just after tmux.Spawn) and when the record actually lands on
+// disk (after pid resolution succeeds OR times out — both go through
+// rec.Write), plus a margin for slow filesystems.
+//
+// Codex review iter-2 [P1] established the lower bound; codex review
+// iter-3 [P1] established the dynamic ceiling.
+func pruneOrphanTmuxFreshness() time.Duration {
+	dynamicCeiling := 2 * spawn.PidResolveTimeout()
+	if dynamicCeiling > pruneOrphanTmuxMinFreshness {
+		return dynamicCeiling
+	}
+	return pruneOrphanTmuxMinFreshness
+}
 
 func newMaintenanceCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -109,17 +147,47 @@ without worrying about ordering edge cases.`,
 				cmd.OutOrStdout(),
 				cmd.ErrOrStderr(),
 				kill,
+				agentDirSane,
 				tmux.ListSessionsWithCreated,
 				agentRecordExists,
 				tmux.Kill,
 				time.Now,
-				pruneOrphanTmuxFreshness,
+				pruneOrphanTmuxFreshness(),
 			)
 		},
 	}
 	cmd.Flags().BoolVar(&kill, "kill", false,
 		"actually kill the orphan tmux sessions (default: dry-run, list only)")
 	return cmd
+}
+
+// agentDirSane verifies that the live-agent state root (~/.fleet/agents)
+// exists AND is a directory before the orphan-tmux sweeper iterates
+// sessions.
+//
+// Codex iter-1 [P2]: without this precondition, a mispointed FLEET_HOME
+// or a wiped ~/.fleet/agents (e.g., dotfile rebuild, `rm -rf ~/.fleet`
+// during operator triage, transient mount issue) makes every os.Stat in
+// agentRecordExists return ErrNotExist → every live fleet-* tmux session
+// is misclassified as orphan. With `--kill`, the sweeper then mass-
+// terminates healthy agents. agentDirSane fails closed: if the dir is
+// missing or not a directory, return an error and the sweeper aborts
+// before iterating.
+func agentDirSane() error {
+	dir, err := state.AgentDir()
+	if err != nil {
+		return fmt.Errorf("resolve agent dir: %w", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat agent dir %s: %w (live-agent state root unavailable — refusing to sweep, every session would misclassify as orphan)",
+			dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("agent dir %s exists but is not a directory (live-agent state root corrupted — refusing to sweep)",
+			dir)
+	}
+	return nil
 }
 
 // agentRecordExists reports whether ~/.fleet/agents/<id>.json exists
@@ -153,11 +221,20 @@ func agentRecordExists(id string) bool {
 	}
 }
 
-// runMaintenancePruneOrphanTmux is the testable core. listInfoFn yields
-// the tmux session names + creation times on the active server;
-// existsFn reports whether an agent record is live; killFn kills a
-// session (only called when performKill is true AND the session is an
-// orphan AND the session is older than freshness).
+// runMaintenancePruneOrphanTmux is the testable core. dirSaneFn verifies
+// the live-agent state root before iterating; listInfoFn yields the tmux
+// session names + creation times on the active server; existsFn reports
+// whether an agent record is live; killFn kills a session (only called
+// when performKill is true AND the session is an orphan AND the session
+// is older than freshness).
+//
+// dirSaneFn precondition (codex iter-1 [P2]): if ~/.fleet/agents is
+// missing or not a directory, every existsFn call would return false,
+// every session would misclassify as orphan, and --kill would mass-
+// terminate live agents. Fail closed: return the dirSaneFn error before
+// iterating sessions. Tests pass dirSaneFn = `func() error { return nil }`
+// for the "agents dir present" path and `func() error { return errors.New(...) }`
+// for the "dir missing" abort path.
 //
 // Freshness gate: a tmux session newer than `freshness` is reported as
 // state=fresh and is NEVER killed even when --kill is set. This guards
@@ -178,12 +255,16 @@ func agentRecordExists(id string) bool {
 func runMaintenancePruneOrphanTmux(
 	stdout, stderr io.Writer,
 	performKill bool,
+	dirSaneFn func() error,
 	listInfoFn func() ([]tmux.SessionInfo, error),
 	existsFn func(id string) bool,
 	killFn func(session string) error,
 	nowFn func() time.Time,
 	freshness time.Duration,
 ) error {
+	if err := dirSaneFn(); err != nil {
+		return fmt.Errorf("agent dir sanity check: %w", err)
+	}
 	infos, err := listInfoFn()
 	if err != nil {
 		return fmt.Errorf("list tmux sessions: %w", err)
@@ -208,6 +289,17 @@ func runMaintenancePruneOrphanTmux(
 			// Session name was literally "fleet-" — odd but treat as
 			// non-fleet so we don't accidentally kill something we
 			// can't identify.
+			continue
+		}
+		if !fleetAgentIDPattern.MatchString(id) {
+			// Suffix doesn't match agent.NewID()'s shape (8 lowercase
+			// hex chars, or "t" + 7 hex chars in the crypto/rand
+			// fallback shape). The operator likely named an unrelated
+			// session with the `fleet-` prefix (e.g., `fleet-debug`,
+			// `fleet-prod-shell`). Skipping out of caution — the
+			// sweeper's contract is "agent sessions only", and tmux
+			// session names from spawn always come from
+			// tmux.SessionName(agent.NewID()) (codex iter-2 [P1]).
 			continue
 		}
 		live := existsFn(id)

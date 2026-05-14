@@ -326,11 +326,23 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// up the stale replacement and fall through to normal
 			// spawn — the old agent is still alive, so a fresh
 			// replacement is the correct recovery action.
-			if !tmux.HasSession(newRec.TmuxSession) {
+			//
+			// Codex iter-1 [P1]: use SessionAlive tristate so a
+			// transient probe-failure doesn't masquerade as "session
+			// dead" and trigger cleanup on a healthy replacement. Only
+			// definitive (alive=false, err=nil) enters the cleanup +
+			// fall-through-to-spawn branch.
+			alive, perr := tmux.SessionAlive(newRec.TmuxSession)
+			switch {
+			case perr != nil:
+				return fmt.Errorf(
+					"recovery probe: probe replacement %s session %s failed: %w (queue file preserved for operator inspection)",
+					newRec.ID, newRec.TmuxSession, perr)
+			case !alive:
 				// fix/orphan-tmux-sweeper-and-leak-plug: pair the record
 				// removal with tmux.Kill (idempotent + SessionAlive-backed)
-				// so a transient probe failure can't delete the record
-				// while leaving the tmux session alive.
+				// so a transient probe failure inside Kill can't delete the
+				// record while leaving the tmux session alive.
 				if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 					return fmt.Errorf(
 						"recovery probe: stale replacement %s session %s appeared dead but cleanup failed: %w (queue file preserved; investigate manually)",
@@ -348,11 +360,11 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
 					newRec.ID, newRec.TmuxSession)
 				// Fall through to normal spawn flow.
-				break
+			default:
+				return resumeHandoff(opts, stdout, stderr, oldRec, newRec,
+					pending.HandoffDoc, pendingPath, pending.DisableAutoResume,
+					pending.SchemaVersion)
 			}
-			return resumeHandoff(opts, stdout, stderr, oldRec, newRec,
-				pending.HandoffDoc, pendingPath, pending.DisableAutoResume,
-				pending.SchemaVersion)
 		}
 	}
 
@@ -555,9 +567,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//     long-lived agent. If `--command` was a wrapper that crashed
 	//     at startup, killing the old session would leave the task
 	//     with no live successor. Roll back instead.
-	if !tmux.HasSession(newRec.TmuxSession) {
+	//
+	//     Codex iter-1 [P1]: SessionAlive tristate at the outer gate so a
+	//     transient probe-failure doesn't roll back a healthy spawn. Only
+	//     definitive (alive=false, err=nil) enters the rollback branch.
+	switch alive, perr := tmux.SessionAlive(newRec.TmuxSession); {
+	case perr != nil:
+		return fmt.Errorf(
+			"probe replacement %s session %s failed: %w (record preserved; old agent untouched, queue file preserved for retry)",
+			newRec.ID, newRec.TmuxSession, perr)
+	case !alive:
 		// fix/orphan-tmux-sweeper-and-leak-plug: pair record removal with
-		// tmux.Kill so a probe-failure window can't leak the session.
+		// tmux.Kill so a probe-failure window inside Kill can't leak the
+		// session.
 		if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 			return fmt.Errorf(
 				"replacement %s tmux session %s appeared dead but cleanup failed: %w (old agent untouched, queue file preserved; investigate manually)",
@@ -810,7 +832,18 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	// died after the original spawn (operator manually killed it,
 	// crashed, etc.), retiring the old agent now would leave the task
 	// with nothing running. Bail without touching the old agent.
-	if !tmux.HasSession(newRec.TmuxSession) {
+	//
+	// Codex iter-1 [P1]: SessionAlive tristate so a transient probe-fail
+	// doesn't fabricate "session gone" and force a rollback when the
+	// replacement is actually alive. Probe errors surface as explicit
+	// errors with the record preserved; only definitive (alive=false,
+	// err=nil) trips the gone-session bail-out.
+	switch alive, perr := tmux.SessionAlive(newRec.TmuxSession); {
+	case perr != nil:
+		return fmt.Errorf(
+			"resume handoff: probe replacement %s session %s failed: %w; old agent %s untouched (retry after the probe is reliable)",
+			newRec.ID, newRec.TmuxSession, perr, oldRec.ID)
+	case !alive:
 		return fmt.Errorf(
 			"resume handoff: replacement %s tmux session %s is gone; old agent %s untouched (clean up agents/%s.json + queue file or restart handoff)",
 			newRec.ID, newRec.TmuxSession, oldRec.ID, newRec.ID)
