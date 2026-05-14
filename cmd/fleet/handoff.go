@@ -764,12 +764,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			//
 			//   - Any other error: true rollback (marker still at OLD,
 			//     NEW cleaned up). Queue file stays for retry.
-			switch {
-			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel):
-				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
-			default:
-				return swapErr
-			}
+			// Codex iter-7 [P1]: ErrOrphanSurvived no longer auto-archives
+			// OLD; the orphan is live and operator must triage. Preserve
+			// the queue journal so retry after operator cleans up OLD
+			// can resume. Treat both orphan classes identically — return
+			// the error so the surrounding handoff path does NOT delete
+			// the queue.
+			return swapErr
 		}
 	} else {
 		// 9. Send "/exit" to the old session. ErrNoSession means it
@@ -1017,12 +1018,13 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			// See iter-6 [P1] commentary in runHandoff: ambiguous-probe
 			// preserves the queue journal so retry can resume after
 			// operator confirms OLD dead.
-			switch {
-			case errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel):
-				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
-			default:
-				return swapErr
-			}
+			// Codex iter-7 [P1]: ErrOrphanSurvived no longer auto-archives
+			// OLD; the orphan is live and operator must triage. Preserve
+			// the queue journal so retry after operator cleans up OLD
+			// can resume. Treat both orphan classes identically — return
+			// the error so the surrounding handoff path does NOT delete
+			// the queue.
+			return swapErr
 		}
 	} else {
 		if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&

@@ -89,15 +89,20 @@ var ErrSwapInProgress = errors.New("atomic coord swap: another swap holds the lo
 // same way they grep for "still alive" in the pre-AtomicCoordSwap world.
 type ErrOrphanSurvived struct {
 	OldSession string
+	OldAgentID string
 	NewAgentID string
 	Project    string
 	Inner      error
 }
 
 func (e *ErrOrphanSurvived) Error() string {
+	// Codex review iter-7 [P1]: helper no longer archives OLD on
+	// this path; operator action is `fleet rm <oldAgentID>` after
+	// confirming OLD dead (not the prior "prune-orphan-tmux will
+	// reap" wording, which was true when we archived).
 	return fmt.Sprintf(
-		"atomic coord swap: marker committed to %s but OLD tmux session %s for project %q survived kill (orphan tmux session; prune-orphan-tmux will reap on next sweep): %v",
-		e.NewAgentID, e.OldSession, e.Project, e.Inner)
+		"atomic coord swap: marker committed to %s but OLD tmux session %s for project %q survived kill (OLD record preserved; operator: confirm OLD dead then `fleet rm %s`): %v",
+		e.NewAgentID, e.OldSession, e.Project, e.OldAgentID, e.Inner)
 }
 
 // Is allows errors.Is(err, ErrOrphanSurvivedSentinel) without callers
@@ -285,13 +290,39 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			ErrConcurrentSwap, in.Project, in.OldRec.ID, cur)
 	}
 
-	// Steps 2-3 — spawn the replacement + readiness probe. Skipped
-	// when the caller pre-spawned (AlreadySpawnedNewRec set), in which
-	// case the caller is responsible for asserting the same liveness
-	// invariant before invoking the helper.
+	// Steps 2-3 — spawn the replacement + readiness probe. When the
+	// caller pre-spawned (AlreadySpawnedNewRec set), we skip the
+	// spawn + readiness wait (caller already did those) but STILL
+	// run step 3.b's NEW probe under the lock. This is the codex
+	// iter-7 [P2] fix: callers' inline probe code (e.g.,
+	// handoffop.retireOldAgent) only logs probe errors and proceeds,
+	// so without this gate a transient probe-failure could mask a
+	// NEW that died between the caller's wait and our marker commit.
+	// Step 4 would then write the marker pointing at a dead NEW.
 	var newRec *agent.Record
 	if in.AlreadySpawnedNewRec != nil {
 		newRec = in.AlreadySpawnedNewRec
+		// Step 3.b re-probe NEW alive — same contract as the
+		// internal-spawn path. Probe error preserves NEW for
+		// operator inspection; definitive dead surfaces clearly.
+		switch alive, perr := sessionAliveFn(newRec.TmuxSession); {
+		case perr != nil:
+			return res, fmt.Errorf(
+				"atomic coord swap: probe pre-spawned replacement %s session %s failed: %w (caller's spawn handling preserves the record for operator inspection; marker unchanged at %s)",
+				newRec.ID, newRec.TmuxSession, perr, in.OldRec.ID)
+		case !alive:
+			// Pre-spawned NEW is dead. Clean it up via the helper's
+			// shared DropReplacementRecord so the caller's record +
+			// session both go away cleanly. Marker unchanged.
+			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+				return res, fmt.Errorf(
+					"atomic coord swap: pre-spawned replacement %s tmux session %s already exited AND cleanup failed: %w (marker unchanged at %s)",
+					newRec.ID, newRec.TmuxSession, dropErr, in.OldRec.ID)
+			}
+			return res, fmt.Errorf(
+				"atomic coord swap: pre-spawned replacement %s tmux session %s already exited before swap committed; marker unchanged at %s",
+				newRec.ID, newRec.TmuxSession, in.OldRec.ID)
+		}
 	} else {
 		// Step 2 — spawn. spawn.Spawn rolls back its own state.json
 		// write failure (kills the orphan tmux session before
@@ -432,25 +463,28 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			}
 		case alive:
 			// FAILURE MODE 5. Marker is at NEW (committed in step 4).
-			// OLD's tmux session is an orphan. Archive OLD's record so
-			// prune-orphan-tmux can reap; drop inbox alert; log [P0];
-			// return ErrOrphanSurvived. Invariant still holds.
-			if arcErr := in.OldRec.Archive(); arcErr != nil {
-				// Archive failed too. Fall back to deleting the live
-				// record so prune-orphan-tmux's "session exists, no
-				// live record" check can still find the orphan. If
-				// even Remove fails, log it — operator triage from here.
-				path, perr := state.AgentPath(in.OldRec.ID)
-				if perr == nil {
-					if rmErr := os.Remove(path); rmErr != nil {
-						if stderr != nil {
-							_, _ = fmt.Fprintf(stderr,
-								"[P0] atomic coord swap: FAILURE MODE 5 cleanup: archive %s failed (%v) AND remove failed (%v); orphan tmux %s for project %s — operator: manual cleanup required\n",
-								in.OldRec.ID, arcErr, rmErr, in.OldRec.TmuxSession, in.Project)
-						}
-					}
-				}
-			}
+			// OLD's tmux session survived our kill — provably still
+			// running. We PRESERVE OLD's record (do NOT archive) so:
+			//
+			//   - `fleet status` still shows OLD; operator sees the
+			//     live coord they need to triage.
+			//   - The cross-socket case (OLD truly holds
+			//     coordinator.lock and NEW will lose the race +
+			//     exit) is recoverable: OLD record + tmux + marker
+			//     pointing at potentially-dead-NEW give the operator
+			//     enough state to reason about what happened.
+			//
+			// Previously we archived OLD here so `fleet maintenance
+			// prune-orphan-tmux` could reap the tmux session
+			// automatically. Codex review iter-7 [P1]: that tradeoff
+			// was wrong — auto-reaping lost the operator-visible
+			// "live OLD record" signal, and on the cross-socket case
+			// the project ended up with marker at NEW (which may
+			// exit losing the lock race) and OLD archived — no
+			// visible live coord.
+			//
+			// Operator action: confirm OLD truly dead (kill manually
+			// via tmux if needed), then `fleet rm <OLD_ID>`.
 			if alertErr := dropOrphanIncidentAlert(newRec.ID, in.OldRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
 				if stderr != nil {
 					_, _ = fmt.Fprintf(stderr,
@@ -460,12 +494,13 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			}
 			if stderr != nil {
 				_, _ = fmt.Fprintf(stderr,
-					"[P0] atomic coord swap: FAILURE MODE 5: marker committed to %s for project %s but OLD tmux session %s survived kill (kill_err=%v); OLD record archived; orphan reapable by `fleet maintenance prune-orphan-tmux`\n",
-					newRec.ID, in.Project, in.OldRec.TmuxSession, killErr)
+					"[P0] atomic coord swap: FAILURE MODE 5: marker committed to %s for project %s but OLD tmux session %s survived kill (kill_err=%v); OLD record PRESERVED for operator triage — `fleet rm %s` after confirming OLD dead\n",
+					newRec.ID, in.Project, in.OldRec.TmuxSession, killErr, in.OldRec.ID)
 			}
 			res.OrphanedKill = true
 			return res, &ErrOrphanSurvived{
 				OldSession: in.OldRec.TmuxSession,
+				OldAgentID: in.OldRec.ID,
 				NewAgentID: newRec.ID,
 				Project:    in.Project,
 				Inner:      killErr,

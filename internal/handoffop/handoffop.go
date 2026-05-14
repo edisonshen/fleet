@@ -564,30 +564,16 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			GraceWindow:          time.Duration(graceMillis) * time.Millisecond,
 		}, stderr)
 		if swapErr != nil {
-			// Three error classes:
-			//
-			//   - ErrOrphanSurvived (FAILURE MODE 5): marker committed,
-			//     OLD's tmux orphan but archived from records side,
-			//     ready for prune-orphan-tmux. Safe to proceed with
-			//     queue delete + prompt send — helper handled retire
-			//     bookkeeping.
-			//
-			//   - ErrOldKillProbeAmbiguous: marker committed BUT
-			//     OLD may still be alive on a different tmux socket
-			//     holding coordinator.lock. NEW may lose the race and
-			//     exit. Preserve the queue journal so a retry after
-			//     operator cleans up OLD can resume (codex review
-			//     iter-6 [P1]). Return the error so the surrounding
-			//     drain path leaves the queue file alone.
-			//
-			//   - Any other error: true rollback (marker still at OLD,
-			//     NEW cleaned up). Return so queue file stays.
-			switch {
-			case errors.Is(swapErr, ErrOrphanSurvivedSentinel):
-				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
-			default:
-				return swapErr
-			}
+			// Codex iter-6/7: both ErrOldKillProbeAmbiguous AND
+			// ErrOrphanSurvived (iter-7 stopped auto-archiving OLD
+			// on FAILURE MODE 5) mean the swap is not in a clean
+			// final state — OLD may still be alive on another socket
+			// holding the coordinator.lock; NEW may lose the lock
+			// race + exit. Preserve the queue journal so retry can
+			// resume after operator confirms OLD dead. Pass the
+			// error up unchanged — surrounding drain leaves the
+			// queue alone, surfaces the error to log analysis.
+			return swapErr
 		}
 	} else {
 		// Worker (or non-coord) handoff: inline retire — same flow

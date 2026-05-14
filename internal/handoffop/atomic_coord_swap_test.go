@@ -559,9 +559,12 @@ func TestAtomicCoordSwap_MarkerWrite_Fails(t *testing.T) {
 }
 
 // TestAtomicCoordSwap_OldKill_Fails_StillAlive — FAILURE MODE 5.
-// Marker committed; OLD's tmux session refuses to die. Helper archives
-// OLD's record, drops inbox alert, logs [P0], returns ErrOrphanSurvived.
-// Invariant still holds.
+// Marker committed; OLD's tmux session refuses to die. Helper PRESERVES
+// OLD's record (codex iter-7 [P1] — was previously archived; reverted
+// to preserve so cross-socket case keeps operator-visible signal),
+// drops incident alert, logs [P0], returns ErrOrphanSurvived.
+// Invariant still holds (marker at NEW; OLD is now a live tmux session
+// that operator must clean up manually).
 func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
 	fake := &fakeSwap{
@@ -587,6 +590,9 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 	if orphan.OldSession != in.OldRec.TmuxSession {
 		t.Errorf("orphan.OldSession = %q; want %q", orphan.OldSession, in.OldRec.TmuxSession)
 	}
+	if orphan.OldAgentID != "oldcoord" {
+		t.Errorf("orphan.OldAgentID = %q; want oldcoord", orphan.OldAgentID)
+	}
 	if orphan.NewAgentID != "newcoord" {
 		t.Errorf("orphan.NewAgentID = %q; want newcoord", orphan.NewAgentID)
 	}
@@ -594,14 +600,16 @@ func TestAtomicCoordSwap_OldKill_Fails_StillAlive(t *testing.T) {
 	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
 		t.Errorf("marker = %q; want newcoord (invariant: NEW owns post-commit)", got)
 	}
-	// OLD record MUST be archived (so prune-orphan-tmux reaps the session).
+	// OLD record MUST be PRESERVED on disk (codex iter-7 [P1]).
+	// Operator can see the live OLD via `fleet status` and decide
+	// whether the cross-socket case obtains.
 	livePath, _ := state.AgentPath("oldcoord")
-	if _, statErr := os.Stat(livePath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("OLD live record should be archived; stat err=%v", statErr)
+	if _, statErr := os.Stat(livePath); statErr != nil {
+		t.Errorf("OLD live record should be PRESERVED for operator triage; stat err=%v", statErr)
 	}
 	archivePath, _ := state.AgentArchivePath("oldcoord")
-	if _, statErr := os.Stat(archivePath); statErr != nil {
-		t.Errorf("OLD record should be at archive path; stat err=%v", statErr)
+	if _, statErr := os.Stat(archivePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("OLD record should NOT be archived (codex iter-7); statErr=%v", statErr)
 	}
 	// Incident alert must exist (codex iter-6 [P2] — moved off the
 	// agent inbox channel to operator-facing incidents/ dir).
