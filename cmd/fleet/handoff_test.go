@@ -39,7 +39,17 @@ func requireTmux(t *testing.T) {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
+	t.Setenv("FLEET_TMUX_SOCKET", sock)
+	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
+	// server AND remove the socket file on exit. Without this, every
+	// integration test leaks one server + one .sock file forever.
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			t.Logf("cleanup: remove %s: %v", sock, err)
+		}
+	})
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on

@@ -42,7 +42,18 @@ func requireTmux(t *testing.T) {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
+	t.Setenv("FLEET_TMUX_SOCKET", sock)
+	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
+	// server AND remove the socket file on exit so /tmp doesn't fill
+	// up with stale fleet-test-*.sock files and the default tmux server
+	// doesn't accumulate fleet-* sessions.
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			t.Logf("cleanup: remove %s: %v", sock, err)
+		}
+	})
 	// Speed up the pid-resolver poll budget in tests. Production uses
 	// 10s; tests with synthetic commands ("sleep 30", "sh -c sleep 60")
 	// will never find a "claude" descendant, so the resolver will run
