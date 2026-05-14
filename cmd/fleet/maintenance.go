@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -30,6 +31,20 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// fleetAgentIDPattern matches the agent ID format produced by
+// agent.NewID(): 8 lowercase hex characters, OR the t+7hex fallback
+// shape used when crypto/rand fails (e.g., "t1a2b3c4"). The sweeper
+// uses this to refuse killing tmux sessions whose suffix doesn't match
+// — so operator's unrelated `fleet-debug` / `fleet-prod-shell` sessions
+// stay untouched even when older than the freshness window.
+//
+// Codex iter-2 [P1]: without this gate, any tmux session starting with
+// `fleet-` would be classified as orphan once older than 90s and killed
+// in --kill mode. Operators routinely name unrelated sessions with the
+// `fleet-` prefix; the sweeper must scope to the agent.NewID() shape
+// only.
+var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7})$`)
 
 // pruneOrphanTmuxFreshness is the minimum age a tmux session must
 // reach before prune-orphan-tmux considers it an orphan candidate.
@@ -251,6 +266,17 @@ func runMaintenancePruneOrphanTmux(
 			// Session name was literally "fleet-" — odd but treat as
 			// non-fleet so we don't accidentally kill something we
 			// can't identify.
+			continue
+		}
+		if !fleetAgentIDPattern.MatchString(id) {
+			// Suffix doesn't match agent.NewID()'s shape (8 lowercase
+			// hex chars, or "t" + 7 hex chars in the crypto/rand
+			// fallback shape). The operator likely named an unrelated
+			// session with the `fleet-` prefix (e.g., `fleet-debug`,
+			// `fleet-prod-shell`). Skipping out of caution — the
+			// sweeper's contract is "agent sessions only", and tmux
+			// session names from spawn always come from
+			// tmux.SessionName(agent.NewID()) (codex iter-2 [P1]).
 			continue
 		}
 		live := existsFn(id)
