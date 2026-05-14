@@ -256,18 +256,20 @@ func TestCommandHasRemoteControl(t *testing.T) {
 // (live record) both appear on stdout with the correct flags, killFn
 // is NEVER called (dry-run gate), and exit is nil.
 func TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive(t *testing.T) {
+	// Use agent.NewID()-shaped IDs (8 lowercase hex) so the codex
+	// iter-2 [P1] scope guard treats them as agent sessions.
 	live := map[string]bool{
-		"alive1":  true,
-		"alive2":  true,
-		"orphan1": false,
-		"orphan2": false,
+		"a11e0001": true,  // "alive1"
+		"a11e0002": true,  // "alive2"
+		"01fa0001": false, // "orphan1"
+		"01fa0002": false, // "orphan2"
 	}
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
 		return staleInfos(
-			"fleet-alive1",
-			"fleet-orphan2", // intentionally out of alpha order to test sort
-			"fleet-orphan1",
-			"fleet-alive2",
+			"fleet-a11e0001",
+			"fleet-01fa0002", // intentionally out of alpha order to test sort
+			"fleet-01fa0001",
+			"fleet-a11e0002",
 			"some-other-session", // unrelated, must be ignored
 		), nil
 	}
@@ -285,12 +287,12 @@ func TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive(t *testing.T) {
 		t.Errorf("dry-run must NOT call killFn; got %d calls", killCalls)
 	}
 	got := stdout.String()
-	// Alphabetical order: alive1, alive2, orphan1, orphan2.
+	// Alphabetical order: 01fa0001, 01fa0002, a11e0001, a11e0002.
 	expected := []string{
-		"fleet-alive1  orphan=false  state=live  killed=false\n",
-		"fleet-alive2  orphan=false  state=live  killed=false\n",
-		"fleet-orphan1  orphan=true  state=missing  killed=false\n",
-		"fleet-orphan2  orphan=true  state=missing  killed=false\n",
+		"fleet-01fa0001  orphan=true  state=missing  killed=false\n",
+		"fleet-01fa0002  orphan=true  state=missing  killed=false\n",
+		"fleet-a11e0001  orphan=false  state=live  killed=false\n",
+		"fleet-a11e0002  orphan=false  state=live  killed=false\n",
 	}
 	if got != strings.Join(expected, "") {
 		t.Errorf("stdout mismatch:\nGOT:\n%s\nWANT:\n%s", got, strings.Join(expected, ""))
@@ -306,12 +308,12 @@ func TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive(t *testing.T) {
 // the operator's safety contract for the sweeper.
 func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
 	live := map[string]bool{
-		"alivex":  true,
-		"orphana": false,
-		"orphanb": false,
+		"a11e000a": true,  // "alivex"
+		"01fa000a": false, // "orphana"
+		"01fa000b": false, // "orphanb"
 	}
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
-		return staleInfos("fleet-alivex", "fleet-orphana", "fleet-orphanb"), nil
+		return staleInfos("fleet-a11e000a", "fleet-01fa000a", "fleet-01fa000b"), nil
 	}
 	existsFn := func(id string) bool { return live[id] }
 	var killed []string
@@ -327,7 +329,7 @@ func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
 	// which is the input order (not alphabetical — alpha order is for
 	// stdout). Either way, the SET of killed sessions must be exactly
 	// the orphans.
-	wantKilled := []string{"fleet-orphana", "fleet-orphanb"}
+	wantKilled := []string{"fleet-01fa000a", "fleet-01fa000b"}
 	sort.Strings(killed)
 	sort.Strings(wantKilled)
 	if len(killed) != len(wantKilled) {
@@ -339,14 +341,14 @@ func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
 		}
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "fleet-orphana  orphan=true  state=missing  killed=true\n") {
-		t.Errorf("expected orphana row with killed=true; got:\n%s", got)
+	if !strings.Contains(got, "fleet-01fa000a  orphan=true  state=missing  killed=true\n") {
+		t.Errorf("expected 01fa000a row with killed=true; got:\n%s", got)
 	}
-	if !strings.Contains(got, "fleet-orphanb  orphan=true  state=missing  killed=true\n") {
-		t.Errorf("expected orphanb row with killed=true; got:\n%s", got)
+	if !strings.Contains(got, "fleet-01fa000b  orphan=true  state=missing  killed=true\n") {
+		t.Errorf("expected 01fa000b row with killed=true; got:\n%s", got)
 	}
-	if !strings.Contains(got, "fleet-alivex  orphan=false  state=live  killed=false\n") {
-		t.Errorf("expected alivex row with killed=false; got:\n%s", got)
+	if !strings.Contains(got, "fleet-a11e000a  orphan=false  state=live  killed=false\n") {
+		t.Errorf("expected a11e000a row with killed=false; got:\n%s", got)
 	}
 }
 
@@ -357,11 +359,12 @@ func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
 // shows killed=false for the failed session.
 func TestPruneOrphanTmux_KillFailureSurfacedAsWarning(t *testing.T) {
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
-		return staleInfos("fleet-failkill", "fleet-okkill"), nil
+		// 8-hex-char IDs for the codex iter-2 [P1] scope guard.
+		return staleInfos("fleet-fa11aaaa", "fleet-0ffaa111"), nil
 	}
 	existsFn := func(string) bool { return false } // both orphans
 	killFn := func(s string) error {
-		if s == "fleet-failkill" {
+		if s == "fleet-fa11aaaa" {
 			return errors.New("simulated tmux failure")
 		}
 		return nil
@@ -373,13 +376,13 @@ func TestPruneOrphanTmux_KillFailureSurfacedAsWarning(t *testing.T) {
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
-	if !strings.Contains(stderr.String(), "warning: kill fleet-failkill") {
+	if !strings.Contains(stderr.String(), "warning: kill fleet-fa11aaaa") {
 		t.Errorf("stderr should contain kill-failure warning; got: %s", stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "fleet-failkill  orphan=true  state=missing  killed=false\n") {
+	if !strings.Contains(stdout.String(), "fleet-fa11aaaa  orphan=true  state=missing  killed=false\n") {
 		t.Errorf("stdout should show killed=false for the failed session; got:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "fleet-okkill  orphan=true  state=missing  killed=true\n") {
+	if !strings.Contains(stdout.String(), "fleet-0ffaa111  orphan=true  state=missing  killed=true\n") {
 		t.Errorf("stdout should show killed=true for the successful session; got:\n%s", stdout.String())
 	}
 }
@@ -414,10 +417,10 @@ func TestPruneOrphanTmux_ListErrorSurfacedAsError(t *testing.T) {
 func TestPruneOrphanTmux_IgnoresNonFleetAndDegeneratePrefixes(t *testing.T) {
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
 		return staleInfos(
-			"fleet-",        // degenerate — no ID
-			"unrelated",     // non-fleet
-			"work",          // non-fleet
-			"fleet-real-id", // genuine orphan
+			"fleet-",         // degenerate — no ID
+			"unrelated",      // non-fleet
+			"work",           // non-fleet
+			"fleet-1ea11d00", // genuine orphan (8 hex chars)
 		), nil
 	}
 	existsFn := func(string) bool { return false }
@@ -432,11 +435,11 @@ func TestPruneOrphanTmux_IgnoresNonFleetAndDegeneratePrefixes(t *testing.T) {
 	}
 	// Only the genuine fleet-<id> orphan should be reported / killed.
 	got := stdout.String()
-	if got != "fleet-real-id  orphan=true  state=missing  killed=true\n" {
-		t.Errorf("expected only fleet-real-id row; got:\n%s", got)
+	if got != "fleet-1ea11d00  orphan=true  state=missing  killed=true\n" {
+		t.Errorf("expected only fleet-1ea11d00 row; got:\n%s", got)
 	}
-	if len(killCalls) != 1 || killCalls[0] != "fleet-real-id" {
-		t.Errorf("expected exactly one kill of fleet-real-id; got %v", killCalls)
+	if len(killCalls) != 1 || killCalls[0] != "fleet-1ea11d00" {
+		t.Errorf("expected exactly one kill of fleet-1ea11d00; got %v", killCalls)
 	}
 }
 
@@ -450,11 +453,11 @@ func TestPruneOrphanTmux_FreshSessionSpared(t *testing.T) {
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
 		return []tmux.SessionInfo{
 			// Fresh: created 5s ago, well inside the 90s window.
-			{Name: "fleet-fresh01", Created: pruneTestNow.Add(-5 * time.Second)},
+			{Name: "fleet-f1e50001", Created: pruneTestNow.Add(-5 * time.Second)},
 			// Stale: created 2 hours ago, comfortably past the window.
-			{Name: "fleet-stale02", Created: pruneTestNow.Add(-2 * time.Hour)},
+			{Name: "fleet-5fa10002", Created: pruneTestNow.Add(-2 * time.Hour)},
 			// Edge case: zero Created (parse failure) — treat as fresh.
-			{Name: "fleet-unknown03"},
+			{Name: "fleet-01dd0003"},
 		}, nil
 	}
 	existsFn := func(string) bool { return false } // all three records missing
@@ -469,23 +472,23 @@ func TestPruneOrphanTmux_FreshSessionSpared(t *testing.T) {
 	}
 
 	// Only the stale session should be killed.
-	if len(killed) != 1 || killed[0] != "fleet-stale02" {
-		t.Fatalf("expected exactly one kill of fleet-stale02; got %v", killed)
+	if len(killed) != 1 || killed[0] != "fleet-5fa10002" {
+		t.Fatalf("expected exactly one kill of fleet-5fa10002; got %v", killed)
 	}
 
 	got := stdout.String()
 	// Fresh sessions: state=fresh, orphan=false, killed=false.
-	wantFresh := "fleet-fresh01  orphan=false  state=fresh  killed=false\n"
+	wantFresh := "fleet-f1e50001  orphan=false  state=fresh  killed=false\n"
 	if !strings.Contains(got, wantFresh) {
 		t.Errorf("expected fresh row %q; got:\n%s", wantFresh, got)
 	}
 	// Zero-Created session also treated as fresh (safer than orphan).
-	wantUnknown := "fleet-unknown03  orphan=false  state=fresh  killed=false\n"
+	wantUnknown := "fleet-01dd0003  orphan=false  state=fresh  killed=false\n"
 	if !strings.Contains(got, wantUnknown) {
 		t.Errorf("expected zero-created row classified as fresh %q; got:\n%s", wantUnknown, got)
 	}
 	// Stale session: state=missing, orphan=true, killed=true.
-	wantStale := "fleet-stale02  orphan=true  state=missing  killed=true\n"
+	wantStale := "fleet-5fa10002  orphan=true  state=missing  killed=true\n"
 	if !strings.Contains(got, wantStale) {
 		t.Errorf("expected stale row %q; got:\n%s", wantStale, got)
 	}
@@ -495,14 +498,17 @@ func TestPruneOrphanTmux_FreshSessionSpared(t *testing.T) {
 // behavior at the threshold: a session exactly at freshness counts as
 // stale (now.Sub(created) < freshness is FALSE at exactly == freshness).
 func TestPruneOrphanTmux_BoundaryAtFreshness(t *testing.T) {
+	// Use agent.NewID()-shaped IDs for the codex iter-2 [P1] scope guard.
+	// (The "89", "90", "91" suffixes from the previous test names doubled
+	// as timing labels — keep that as a comment for readers.)
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
 		return []tmux.SessionInfo{
 			// 89s old: still fresh.
-			{Name: "fleet-89s", Created: pruneTestNow.Add(-89 * time.Second)},
+			{Name: "fleet-89000089", Created: pruneTestNow.Add(-89 * time.Second)},
 			// 90s old: at boundary → stale.
-			{Name: "fleet-90s", Created: pruneTestNow.Add(-90 * time.Second)},
+			{Name: "fleet-90000090", Created: pruneTestNow.Add(-90 * time.Second)},
 			// 91s old: stale.
-			{Name: "fleet-91s", Created: pruneTestNow.Add(-91 * time.Second)},
+			{Name: "fleet-91000091", Created: pruneTestNow.Add(-91 * time.Second)},
 		}, nil
 	}
 	existsFn := func(string) bool { return false }
@@ -517,7 +523,7 @@ func TestPruneOrphanTmux_BoundaryAtFreshness(t *testing.T) {
 	}
 
 	sort.Strings(killed)
-	want := []string{"fleet-90s", "fleet-91s"}
+	want := []string{"fleet-90000090", "fleet-91000091"}
 	if len(killed) != len(want) {
 		t.Fatalf("killed: got %v; want %v", killed, want)
 	}
@@ -527,10 +533,10 @@ func TestPruneOrphanTmux_BoundaryAtFreshness(t *testing.T) {
 		}
 	}
 	got := stdout.String()
-	if !strings.Contains(got, "fleet-89s  orphan=false  state=fresh") {
+	if !strings.Contains(got, "fleet-89000089  orphan=false  state=fresh") {
 		t.Errorf("89s row should be fresh; got:\n%s", got)
 	}
-	if !strings.Contains(got, "fleet-90s  orphan=true  state=missing") {
+	if !strings.Contains(got, "fleet-90000090  orphan=true  state=missing") {
 		t.Errorf("90s row should be missing/orphan; got:\n%s", got)
 	}
 }
@@ -639,6 +645,128 @@ func TestAgentDirSane_DirIsFile_Errors(t *testing.T) {
 	}
 }
 
+// -- codex iter-2 [P1]: fleet-prefix scope guard --------------------------
+//
+// Before the regex gate, any tmux session whose name started with
+// "fleet-" was a candidate for orphan classification — including
+// operator-named sessions like `fleet-debug` or `fleet-prod-shell`
+// that aren't actually fleet agents. With `--kill`, those got
+// mass-terminated. The fix restricts the sweeper to sessions whose
+// suffix matches agent.NewID()'s shape (8 hex chars, or t+7 hex
+// fallback).
+
+// TestPruneOrphanTmux_IgnoresNonAgentSuffixes is the load-bearing
+// regression test for codex iter-2 [P1]. Operators routinely name
+// unrelated sessions with the "fleet-" prefix. The sweeper must
+// recognize that "fleet-debug", "fleet-prod-shell", "fleet-Notes",
+// and other non-agent suffixes are NOT agent sessions, even when
+// older than the freshness window and "record absent" via existsFn.
+// No killFn calls allowed for those rows.
+func TestPruneOrphanTmux_IgnoresNonAgentSuffixes(t *testing.T) {
+	listInfoFn := func() ([]tmux.SessionInfo, error) {
+		return staleInfos(
+			// Real agent ID shape — must be killed when classified as orphan.
+			"fleet-a1b2c3d4",
+			// Fallback ID shape (crypto/rand failure path) — also killable.
+			"fleet-t1a2b3c4",
+			// Operator's unrelated sessions — must be SKIPPED, even old.
+			"fleet-debug",
+			"fleet-prod-shell",
+			"fleet-Notes",             // uppercase, never an agent ID
+			"fleet-a1b2c3d",           // 7 hex chars (short by one)
+			"fleet-a1b2c3d4e",         // 9 hex chars (long by one)
+			"fleet-A1B2C3D4",          // uppercase hex — agent.NewID is lowercase
+			"fleet-coord-handoff-foo", // structured non-agent name
+			"fleet-zxyq3210",          // contains non-hex digits
+		), nil
+	}
+	existsFn := func(string) bool { return false } // every record "missing"
+	var killed []string
+	killFn := func(s string) error { killed = append(killed, s); return nil }
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		true /* --kill */, pruneDirSaneOK, listInfoFn, existsFn, killFn,
+		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+
+	// Only the two real agent-ID-shaped sessions should be killed.
+	sort.Strings(killed)
+	want := []string{"fleet-a1b2c3d4", "fleet-t1a2b3c4"}
+	if len(killed) != len(want) {
+		t.Fatalf("killed: got %v; want %v (non-agent suffixes must be skipped)", killed, want)
+	}
+	for i := range killed {
+		if killed[i] != want[i] {
+			t.Errorf("killed[%d] = %q; want %q", i, killed[i], want[i])
+		}
+	}
+
+	// None of the operator's unrelated sessions should appear in stdout
+	// either — they're skipped entirely (matching the existing
+	// "ignored non-fleet-prefix" behavior).
+	got := stdout.String()
+	forbidden := []string{
+		"fleet-debug",
+		"fleet-prod-shell",
+		"fleet-Notes",
+		"fleet-coord-handoff-foo",
+		"fleet-A1B2C3D4",
+	}
+	for _, name := range forbidden {
+		if strings.Contains(got, name) {
+			t.Errorf("operator's unrelated session %q appeared in output (must be silently skipped); got:\n%s",
+				name, got)
+		}
+	}
+}
+
+// TestFleetAgentIDPattern pins the regex behavior directly so future
+// edits to the pattern can't accidentally widen or narrow the scope
+// without explicit test updates.
+func TestFleetAgentIDPattern(t *testing.T) {
+	tests := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		// Real agent.NewID() outputs — must match.
+		{"happy 8 hex", "a1b2c3d4", true},
+		{"happy 8 hex zeros", "00000000", true},
+		{"happy 8 hex max", "ffffffff", true},
+		// Crypto/rand fallback shape — must match.
+		{"fallback t+7hex", "t1a2b3c4", true},
+		{"fallback t+7hex zeros", "t0000000", true},
+		// Wrong length — must NOT match.
+		{"7 hex short", "a1b2c3d", false},
+		{"9 hex long", "a1b2c3d4e", false},
+		{"empty", "", false},
+		// Wrong case — agent IDs are lowercase hex only.
+		{"uppercase hex", "A1B2C3D4", false},
+		{"mixed case hex", "a1B2c3D4", false},
+		// Wrong characters — must NOT match.
+		{"contains g (not hex)", "g1b2c3d4", false},
+		{"contains z (not hex)", "z1234567", false},
+		// Operator's unrelated session suffixes — must NOT match.
+		{"plain word", "debug", false},
+		{"hyphenated", "prod-shell", false},
+		{"with dot", "foo.bar01", false},
+		// Fallback shape variants that should NOT match.
+		{"t+8hex (too long)", "t1a2b3c4d", false},
+		{"t+7nonhex", "tzzzzzzz", false},
+		{"T uppercase prefix", "T1234567", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fleetAgentIDPattern.MatchString(tc.id)
+			if got != tc.want {
+				t.Errorf("fleetAgentIDPattern.MatchString(%q) = %t; want %t", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPruneOrphanTmux_AbortsWhenAgentsDirMissing is the load-bearing
 // regression test for codex iter-1 [P2]: when the precondition fails,
 // runMaintenancePruneOrphanTmux must error out IMMEDIATELY without
@@ -656,7 +784,7 @@ func TestPruneOrphanTmux_AbortsWhenAgentsDirMissing(t *testing.T) {
 	var listCalls, existsCalls, killCalls int
 	listInfoFn := func() ([]tmux.SessionInfo, error) {
 		listCalls++
-		return staleInfos("fleet-victim"), nil
+		return staleInfos("fleet-1c1ca110"), nil
 	}
 	existsFn := func(string) bool { existsCalls++; return false }
 	killFn := func(string) error { killCalls++; return nil }
