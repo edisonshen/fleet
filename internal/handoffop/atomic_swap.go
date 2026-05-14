@@ -95,30 +95,30 @@ var (
 // the invariant outlined at the top of this file. Caller has already
 // done:
 //
-//   1. agent.Load both records (OldRec live, NewRec just-spawned).
-//   2. spawn.Spawn the replacement (NewRec carries the result).
-//   3. Any pre-swap readiness wait the caller's policy requires.
+//  1. agent.Load both records (OldRec live, NewRec just-spawned).
+//  2. spawn.Spawn the replacement (NewRec carries the result).
+//  3. Any pre-swap readiness wait the caller's policy requires.
 //
 // AtomicSwap then:
 //
-//   A. Re-verifies NewRec's tmux session is alive via SessionAlive
-//      (NOT HasSession — tristate distinguishes "vanished" from
-//      "probe failed"). Confirmed-dead rolls back NewRec via
-//      DropReplacementRecord and returns. Probe ambiguous refuses
-//      to proceed and returns — operator triages.
+//	A. Re-verifies NewRec's tmux session is alive via SessionAlive
+//	   (NOT HasSession — tristate distinguishes "vanished" from
+//	   "probe failed"). Confirmed-dead rolls back NewRec via
+//	   DropReplacementRecord and returns. Probe ambiguous refuses
+//	   to proceed and returns — operator triages.
 //
-//   B. Kills OldRec.TmuxSession via tmux.Kill (idempotent +
-//      SessionAlive-backed). On kill error, re-probes via
-//      SessionAlive:
-//        - still alive → roll back NewRec; OLD stays live; return.
-//        - probe ambiguous → roll back NewRec; OLD untouched; return.
-//        - confirmed dead → race; log note; proceed to archive.
+//	B. Kills OldRec.TmuxSession via tmux.Kill (idempotent +
+//	   SessionAlive-backed). On kill error, re-probes via
+//	   SessionAlive:
+//	     - still alive → roll back NewRec; OLD stays live; return.
+//	     - probe ambiguous → roll back NewRec; OLD untouched; return.
+//	     - confirmed dead → race; log note; proceed to archive.
 //
-//   C. Optionally re-points the coord-spawn marker from
-//      OldRec.Project at NewRec. Best-effort.
+//	C. Optionally re-points the coord-spawn marker from
+//	   OldRec.Project at NewRec. Best-effort.
 //
-//   D. Archives OldRec via oldRec.Archive() with fallback to direct
-//      os.Remove of the live record.
+//	D. Archives OldRec via oldRec.Archive() with fallback to direct
+//	   os.Remove of the live record.
 //
 // Returns SwapResult on success; (zero, error) on any failure.
 // Callers MUST treat AtomicSwap's error as "do not delete the queue
