@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
 	"sort"
 	"strings"
 	"testing"
@@ -38,6 +39,12 @@ func staleInfos(names ...string) []tmux.SessionInfo {
 // bootstrapped FLEET_HOME but don't want to import state's full
 // surface. Keeps the import block of individual tests narrow.
 func stateBootstrapForTest() (string, error) { return state.Bootstrap() }
+
+// pruneDirSaneOK is the no-op dirSaneFn used by every prune test that
+// doesn't specifically exercise the agentDirSane precondition (codex
+// iter-1 [P2]). Returning nil keeps the sweeper iterating sessions as
+// it did before the precondition was wired in.
+func pruneDirSaneOK() error { return nil }
 
 // TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC pins the
 // reporter contract: only LIVE agents (HasSession true) whose
@@ -270,7 +277,7 @@ func TestPruneOrphanTmux_DryRunListsOrphansLeavesAlive(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
-		false /* dry-run */, listInfoFn, existsFn, killFn,
+		false /* dry-run */, pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -312,7 +319,7 @@ func TestPruneOrphanTmux_KillModeKillsOnlyOrphans(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
-		true /* --kill */, listInfoFn, existsFn, killFn,
+		true /* --kill */, pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -362,7 +369,7 @@ func TestPruneOrphanTmux_KillFailureSurfacedAsWarning(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
-		true, listInfoFn, existsFn, killFn,
+		true, pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -390,7 +397,7 @@ func TestPruneOrphanTmux_ListErrorSurfacedAsError(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	err := runMaintenancePruneOrphanTmux(&stdout, &stderr, false,
-		listInfoFn, existsFn, killFn,
+		pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second)
 	if err == nil {
 		t.Fatalf("expected error when listFn fails; got nil")
@@ -419,7 +426,7 @@ func TestPruneOrphanTmux_IgnoresNonFleetAndDegeneratePrefixes(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr, true,
-		listInfoFn, existsFn, killFn,
+		pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -456,7 +463,7 @@ func TestPruneOrphanTmux_FreshSessionSpared(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
-		true /* --kill */, listInfoFn, existsFn, killFn,
+		true /* --kill */, pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -504,7 +511,7 @@ func TestPruneOrphanTmux_BoundaryAtFreshness(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
-		true, listInfoFn, existsFn, killFn,
+		true, pruneDirSaneOK, listInfoFn, existsFn, killFn,
 		func() time.Time { return pruneTestNow }, 90*time.Second); err != nil {
 		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
 	}
@@ -555,5 +562,130 @@ func TestAgentRecordExists_MissingReturnsFalse(t *testing.T) {
 	}
 	if agentRecordExists("nonexistent") {
 		t.Errorf("agentRecordExists(\"nonexistent\") = true; want false (no record on disk)")
+	}
+}
+
+// -- codex iter-1 [P2]: agentDirSane precondition --------------------------
+//
+// Without this precondition, if ~/.fleet/agents is missing or not a
+// directory (mispointed FLEET_HOME, dotfile rebuild, transient mount
+// issue), every agentRecordExists call returns false → every fleet-<id>
+// tmux session is classified as orphan → `--kill` mass-terminates
+// healthy agents. The precondition fails closed: error out before
+// iterating sessions, so nothing gets killed.
+
+// TestAgentDirSane_DirExists_NoError verifies the happy path: after
+// Bootstrap creates ~/.fleet/agents/, agentDirSane returns nil. This is
+// the precondition that allows the sweeper to iterate sessions.
+func TestAgentDirSane_DirExists_NoError(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := stateBootstrapForTest(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	if err := agentDirSane(); err != nil {
+		t.Errorf("agentDirSane() returned error despite bootstrapped agent dir: %v", err)
+	}
+}
+
+// TestAgentDirSane_DirMissing_Errors verifies the failure path: with
+// FLEET_HOME pointed at a temp dir but NO bootstrap call (so
+// ~/.fleet/agents doesn't exist), agentDirSane must return a non-nil
+// error mentioning the missing dir. This is the regression bar — the
+// pre-fix code had no such precondition, so the sweeper would proceed
+// and misclassify every session.
+func TestAgentDirSane_DirMissing_Errors(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	// Do NOT call Bootstrap — agents/ subdir never created.
+
+	err := agentDirSane()
+	if err == nil {
+		t.Fatalf("agentDirSane() returned nil despite missing agent dir")
+	}
+	// Error message must be unambiguous so the operator can grep for it
+	// in their cron logs.
+	if !strings.Contains(err.Error(), "stat agent dir") {
+		t.Errorf("error should describe the operation; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refusing to sweep") {
+		t.Errorf("error should explain why sweep aborted; got: %v", err)
+	}
+}
+
+// TestAgentDirSane_DirIsFile_Errors verifies the not-a-directory failure:
+// if something stomped on ~/.fleet/agents and left a regular file in
+// its place, agentDirSane must refuse rather than mass-classify
+// sessions as orphan.
+func TestAgentDirSane_DirIsFile_Errors(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	// Create ~/.fleet (root) but plant a regular file at ~/.fleet/agents
+	// instead of a directory.
+	if err := os.MkdirAll(tmp, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	fakeAgentsFile := tmp + "/agents"
+	if err := os.WriteFile(fakeAgentsFile, []byte("not a dir"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	err := agentDirSane()
+	if err == nil {
+		t.Fatalf("agentDirSane() returned nil despite agents/ being a regular file")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("error should mention 'not a directory'; got: %v", err)
+	}
+}
+
+// TestPruneOrphanTmux_AbortsWhenAgentsDirMissing is the load-bearing
+// regression test for codex iter-1 [P2]: when the precondition fails,
+// runMaintenancePruneOrphanTmux must error out IMMEDIATELY without
+// iterating sessions, without calling listInfoFn, without calling
+// existsFn, and (critically) without calling killFn. This protects
+// healthy live agents from being mass-killed by a sweeper that doesn't
+// know its state root went missing.
+func TestPruneOrphanTmux_AbortsWhenAgentsDirMissing(t *testing.T) {
+	// Failing dirSaneFn simulates the post-`rm -rf ~/.fleet/agents`
+	// state (or any other reason the state root went missing).
+	wantDirErr := errors.New("simulated: ~/.fleet/agents went missing")
+	dirSaneFn := func() error { return wantDirErr }
+
+	// These must NOT be called when the precondition fails.
+	var listCalls, existsCalls, killCalls int
+	listInfoFn := func() ([]tmux.SessionInfo, error) {
+		listCalls++
+		return staleInfos("fleet-victim"), nil
+	}
+	existsFn := func(string) bool { existsCalls++; return false }
+	killFn := func(string) error { killCalls++; return nil }
+
+	var stdout, stderr bytes.Buffer
+	err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		true /* --kill */, dirSaneFn, listInfoFn, existsFn, killFn,
+		func() time.Time { return pruneTestNow }, 90*time.Second)
+	if err == nil {
+		t.Fatalf("expected error when agent dir is missing; got nil")
+	}
+	if !strings.Contains(err.Error(), "agent dir sanity check") {
+		t.Errorf("error should describe the operation; got: %v", err)
+	}
+	if !errors.Is(err, wantDirErr) {
+		t.Errorf("error should wrap the underlying sanity-check error; got: %v", err)
+	}
+	// Regression bar: NOTHING after the precondition runs.
+	if listCalls != 0 {
+		t.Errorf("listInfoFn called %d times after sanity-check failure; want 0", listCalls)
+	}
+	if existsCalls != 0 {
+		t.Errorf("existsFn called %d times after sanity-check failure; want 0", existsCalls)
+	}
+	if killCalls != 0 {
+		t.Errorf("killFn called %d times after sanity-check failure; want 0 (this is the mass-kill regression bar)", killCalls)
+	}
+	// No output rows either.
+	if stdout.Len() != 0 {
+		t.Errorf("stdout should be empty after sanity-check failure; got: %q", stdout.String())
 	}
 }
