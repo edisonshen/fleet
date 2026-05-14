@@ -16,16 +16,39 @@ package main
 // hand off when convenient).
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// pruneOrphanTmuxFreshness is the minimum age a tmux session must
+// reach before prune-orphan-tmux considers it an orphan candidate.
+//
+// Rationale: spawn.Spawn creates the tmux session first (tmux.Spawn),
+// then resolves the engine pid (up to pidResolveTimeout, ~5s typical),
+// then writes the agent record (rec.Write). Between tmux create and
+// rec.Write the on-disk state matches the orphan shape exactly:
+// session exists, record absent. A sweeper that runs in that window
+// (especially via cron / startup hook) would kill a brand-new healthy
+// replacement.
+//
+// 90s is well above the typical 1-5s spawn cost AND covers the
+// resolveEnginePid worst-case timeout with margin. Operators who want
+// to reap genuine 12-hour-old orphans never notice this delay.
+//
+// Codex review iter-2 [P1]: avoid killing sessions in the spawn→
+// record-write window.
+const pruneOrphanTmuxFreshness = 90 * time.Second
 
 func newMaintenanceCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -36,10 +59,196 @@ on any other subcommand.
 
 Subcommands:
   bootstrap-remote-control  — list live agents missing --remote-control
-                              in their persisted Command (report only).`,
+                              in their persisted Command (report only).
+  prune-orphan-tmux         — find tmux sessions named fleet-<id> that
+                              have no matching live agent record. Dry-run
+                              by default; pass --kill to actually kill.`,
 	}
 	cmd.AddCommand(newMaintenanceBootstrapRemoteControlCmd())
+	cmd.AddCommand(newMaintenancePruneOrphanTmuxCmd())
 	return cmd
+}
+
+// newMaintenancePruneOrphanTmuxCmd wires `fleet maintenance
+// prune-orphan-tmux`. Defensive sweeper for the orphan tmux session
+// leak that crashed the operator's Mac twice (PR
+// fix/orphan-tmux-sweeper-and-leak-plug). The same PR plugs the root
+// cause in handoff.go / handoffop.go — this command is the safety net
+// for orphans left over from buggy builds AND a periodic operator
+// hygiene tool going forward.
+func newMaintenancePruneOrphanTmuxCmd() *cobra.Command {
+	var kill bool
+	cmd := &cobra.Command{
+		Use:   "prune-orphan-tmux",
+		Short: "Find tmux sessions named fleet-<id> with no live agent record",
+		Long: `prune-orphan-tmux enumerates tmux sessions whose name starts with
+"fleet-" via ` + "`tmux ls -F '#{session_name}'`" + `, derives the agent ID
+from the suffix, and checks whether a live agent record exists at
+~/.fleet/agents/<id>.json. Sessions whose ID has NO live record are
+orphans — most likely the residue of a previous build's leak.
+
+Default behavior is DRY-RUN: prints the orphan list and exits 0 WITHOUT
+killing. Pass --kill to actually run ` + "`tmux kill-session`" + ` on
+each orphan.
+
+Output format (one line per session):
+  <session>  orphan=<true|false>  state=<missing|live|fresh>  killed=<true|false>
+
+Idempotent. Safe to run while live fleet agents are working — only
+sessions whose state.json is absent AND are older than the freshness
+threshold are candidates, so live agents (and brand-new spawns in the
+tmux-up-but-record-write-pending window) are never touched. Sessions
+whose name doesn't match the fleet-<id> pattern are also left alone.
+
+Exit code is always 0 (even if some kills failed; warnings go to
+stderr) so the operator can chain this into cron / a startup script
+without worrying about ordering edge cases.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runMaintenancePruneOrphanTmux(
+				cmd.OutOrStdout(),
+				cmd.ErrOrStderr(),
+				kill,
+				tmux.ListSessionsWithCreated,
+				agentRecordExists,
+				tmux.Kill,
+				time.Now,
+				pruneOrphanTmuxFreshness,
+			)
+		},
+	}
+	cmd.Flags().BoolVar(&kill, "kill", false,
+		"actually kill the orphan tmux sessions (default: dry-run, list only)")
+	return cmd
+}
+
+// agentRecordExists reports whether ~/.fleet/agents/<id>.json exists
+// AS A LIVE record (archive copies don't count — the operator's brief
+// is explicit that "live state.json" is the gate).
+//
+// Returns false on both "file does not exist" AND "Stat error" (e.g.,
+// FLEET_HOME unresolvable). The fallback is conservative for safety:
+// if we can't be sure the record is live, we still treat the session
+// as "has record" so we don't accidentally kill a session for which we
+// just lost read access to its record. The orphan-detection bar is
+// "missing record", not "ambiguous record" — operator can retry after
+// fixing perms.
+func agentRecordExists(id string) bool {
+	path, err := state.AgentPath(id)
+	if err != nil {
+		// Path resolution failure → can't even probe. Conservative:
+		// treat as "live" so we don't kill on ambiguity.
+		return true
+	}
+	_, statErr := os.Stat(path)
+	switch {
+	case statErr == nil:
+		return true
+	case errors.Is(statErr, os.ErrNotExist):
+		return false
+	default:
+		// Other stat error (permission denied, I/O failure). Be
+		// conservative — don't classify as orphan.
+		return true
+	}
+}
+
+// runMaintenancePruneOrphanTmux is the testable core. listInfoFn yields
+// the tmux session names + creation times on the active server;
+// existsFn reports whether an agent record is live; killFn kills a
+// session (only called when performKill is true AND the session is an
+// orphan AND the session is older than freshness).
+//
+// Freshness gate: a tmux session newer than `freshness` is reported as
+// state=fresh and is NEVER killed even when --kill is set. This guards
+// the spawn.Spawn race where tmux.Spawn precedes rec.Write by up to a
+// few seconds (codex review iter-2 [P1]).
+//
+// Output contract (pinned by tests):
+//   - One line per session whose name starts with "fleet-".
+//   - Lines start with the session name, followed by three key=value
+//     pairs separated by two spaces: orphan=, state=, killed=.
+//   - state= is "live" (record present), "missing" (record absent and
+//     session older than freshness — orphan), or "fresh" (record absent
+//     but session younger than freshness — likely a spawn in flight).
+//   - orphan=true only for state=missing rows.
+//   - Sessions whose name doesn't start with "fleet-" are not listed
+//     (out of scope for this command).
+//   - Stable ordering: alphabetical by session name.
+func runMaintenancePruneOrphanTmux(
+	stdout, stderr io.Writer,
+	performKill bool,
+	listInfoFn func() ([]tmux.SessionInfo, error),
+	existsFn func(id string) bool,
+	killFn func(session string) error,
+	nowFn func() time.Time,
+	freshness time.Duration,
+) error {
+	infos, err := listInfoFn()
+	if err != nil {
+		return fmt.Errorf("list tmux sessions: %w", err)
+	}
+	type row struct {
+		session string
+		id      string
+		orphan  bool
+		fresh   bool
+		killed  bool
+	}
+	var rows []row
+	now := nowFn()
+	for _, info := range infos {
+		s := info.Name
+		if !strings.HasPrefix(s, "fleet-") {
+			// Not a fleet-managed session; out of scope.
+			continue
+		}
+		id := strings.TrimPrefix(s, "fleet-")
+		if id == "" {
+			// Session name was literally "fleet-" — odd but treat as
+			// non-fleet so we don't accidentally kill something we
+			// can't identify.
+			continue
+		}
+		live := existsFn(id)
+		// Freshness gate: record-absent sessions younger than the
+		// threshold are NOT orphans yet — they're likely spawn.Spawn
+		// in the tmux-up / record-not-yet-written window. A zero
+		// Created (parse failure) is treated as fresh-unknown so we
+		// don't kill on ambiguous metadata.
+		isFresh := !live && (info.Created.IsZero() || now.Sub(info.Created) < freshness)
+		r := row{
+			session: s,
+			id:      id,
+			orphan:  !live && !isFresh,
+			fresh:   isFresh,
+		}
+		if performKill && r.orphan {
+			if kerr := killFn(s); kerr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: kill %s: %v (continuing)\n", s, kerr)
+			} else {
+				r.killed = true
+			}
+		}
+		rows = append(rows, r)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		return rows[i].session < rows[j].session
+	})
+	for _, r := range rows {
+		stateLabel := "live"
+		switch {
+		case r.fresh:
+			stateLabel = "fresh"
+		case r.orphan:
+			stateLabel = "missing"
+		}
+		_, _ = fmt.Fprintf(stdout,
+			"%s  orphan=%t  state=%s  killed=%t\n",
+			r.session, r.orphan, stateLabel, r.killed)
+	}
+	return nil
 }
 
 func newMaintenanceBootstrapRemoteControlCmd() *cobra.Command {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
@@ -326,8 +327,14 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// spawn — the old agent is still alive, so a fresh
 			// replacement is the correct recovery action.
 			if !tmux.HasSession(newRec.TmuxSession) {
-				if path, perr := state.AgentPath(newRec.ID); perr == nil {
-					_ = os.Remove(path)
+				// fix/orphan-tmux-sweeper-and-leak-plug: pair the record
+				// removal with tmux.Kill (idempotent + SessionAlive-backed)
+				// so a transient probe failure can't delete the record
+				// while leaving the tmux session alive.
+				if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+					return fmt.Errorf(
+						"recovery probe: stale replacement %s session %s appeared dead but cleanup failed: %w (queue file preserved; investigate manually)",
+						newRec.ID, newRec.TmuxSession, dropErr)
 				}
 				// Preserve auto-resume override into opts before
 				// fall-through (codex iter-17 P1).
@@ -549,8 +556,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	//     at startup, killing the old session would leave the task
 	//     with no live successor. Roll back instead.
 	if !tmux.HasSession(newRec.TmuxSession) {
-		if path, perr := state.AgentPath(newRec.ID); perr == nil {
-			_ = os.Remove(path)
+		// fix/orphan-tmux-sweeper-and-leak-plug: pair record removal with
+		// tmux.Kill so a probe-failure window can't leak the session.
+		if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+			return fmt.Errorf(
+				"replacement %s tmux session %s appeared dead but cleanup failed: %w (old agent untouched, queue file preserved; investigate manually)",
+				newRec.ID, newRec.TmuxSession, dropErr)
 		}
 		_ = queue.Delete(queuePath)
 		return fmt.Errorf(
@@ -663,22 +674,20 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// otherwise we'd leave a live tmux session with no
 			// fleet record (untracked successor that a later retry
 			// would not see, leading to multiple replacements).
-			_ = tmux.Kill(newRec.TmuxSession)
-			if !tmux.HasSession(newRec.TmuxSession) {
-				if path, perr := state.AgentPath(newRec.ID); perr == nil {
-					_ = os.Remove(path)
-				}
-				_ = queue.Delete(queuePath)
+			// DropReplacementRecord pairs the kill + remove so a
+			// probe-failure window can't leak the new session
+			// (fix/orphan-tmux-sweeper-and-leak-plug). On cleanup
+			// error we surface the both-alive variant so the
+			// operator triages both stuck sessions manually.
+			if dropErr := handoffop.DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 				return fmt.Errorf(
-					"old session %s still alive after kill failure: %w (replacement %s rolled back; investigate before retrying)",
-					oldRec.TmuxSession, err, newRec.ID)
+					"old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved; cleanup attempt also failed: %v; clean up both manually)",
+					oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID, dropErr)
 			}
-			// Both kills failed. Don't touch the new record — it
-			// still points at a live tmux session. Operator must
-			// investigate both stuck sessions.
+			_ = queue.Delete(queuePath)
 			return fmt.Errorf(
-				"old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved to track the live session; clean up both manually)",
-				oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID)
+				"old session %s still alive after kill failure: %w (replacement %s rolled back; investigate before retrying)",
+				oldRec.TmuxSession, err, newRec.ID)
 		}
 		// Session vanished concurrently with our Kill attempt
 		// (race with operator's manual kill, OS shutdown, etc.).
