@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -718,6 +717,50 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		return err
 	}
 
+	// Dead-coord recovery — atomic marker flip (case 4 in the v5
+	// plan). When we recovered a dead coord (oldRecord != nil) AND
+	// the marker still resolves to the dead coord's ID, route the
+	// marker transition through AtomicCoordSwap with OldIsDead=true.
+	// The helper:
+	//   - acquires the per-project swap.lock,
+	//   - re-verifies the marker == oldRecord.ID (catches a TUI
+	//     marker write that raced this dispatch),
+	//   - writes the marker → rec.ID via WriteAtomic + parent-dir
+	//     fsync (commit 1),
+	//   - SKIPS kill + archive of oldRecord (OldIsDead=true matches
+	//     this path's existing "_ = oldRecord; archive intentionally
+	//     skipped" semantics — operator clears via TUI [x]).
+	//
+	// We do NOT call the helper when:
+	//   - oldRecord == nil (fresh coord spawn, no swap)
+	//   - marker doesn't match oldRecord.ID (e.g., never written
+	//     because TUI flow short-circuited, or operator manually
+	//     deleted). The existing post-dispatch TUI marker write
+	//     remains the marker-flip mechanism in that case.
+	//
+	// The TUI's post-dispatch state.WriteCoordSpawnMarker call still
+	// runs (it's idempotent for the same agent ID) — leaving the
+	// belt-and-suspenders intact while the helper provides the
+	// atomic, lock-serialized commit point for crash safety.
+	if oldRecord != nil && state.ReadCoordSpawnMarker(opts.project) == oldRecord.ID {
+		if _, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
+			Project:              opts.project,
+			OldRec:               oldRecord,
+			AlreadySpawnedNewRec: rec,
+			OldIsDead:            true,
+		}, os.Stderr); swapErr != nil {
+			// Best-effort: a swap-helper error here doesn't abort
+			// dispatch — the spawn already succeeded, the record is
+			// on disk, the TUI's post-dispatch marker write will
+			// take care of the marker flip. Surface the warning so
+			// log analysis can correlate dispatch outcomes with
+			// swap-helper errors.
+			_, _ = fmt.Fprintf(stdout,
+				"warning: atomic coord-swap (dead-coord recovery) returned: %v (dispatch still succeeded; TUI fallback marker write will run)\n",
+				swapErr)
+		}
+	}
+
 	// Recovery-path bookkeeping (codex review iter-11 P1): we
 	// deliberately DO NOT archive the dead record here. Local tmux
 	// probes cannot rule out a live coord on a different tmux
@@ -774,14 +817,6 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if newDocPath != "" && !disableAutoResume {
 		opts.prompt = handoff.ResumePrompt(newDocPath)
 	}
-	// promptOK tracks whether the boot prompt was successfully
-	// delivered (or was empty / opted out). Only when promptOK is
-	// true do we run the dead-coord-recovery AtomicCoordSwap below —
-	// otherwise the marker would point at a session that's idle
-	// (prompt in input box) or dying (send-keys errored mid-boot),
-	// and the dashboard's `[a]` recovery path would stop offering
-	// recovery for the dead session (codex review iter-2 [P1]).
-	promptOK := opts.prompt == ""
 	if opts.prompt != "" {
 		// Best-effort: a SendInitialPrompt failure here logs a warning
 		// to stderr but does NOT fail the dispatch — the session is up,
@@ -825,64 +860,8 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
 		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
-			promptOK = true
 		}
 	}
-
-	// Dead-coord recovery — atomic marker flip (case 4 in the v5
-	// plan). Runs AFTER the boot prompt was confirmed delivered so
-	// we don't move the marker onto a session that crashed during
-	// boot or got stuck with an unsubmitted prompt (codex review
-	// iter-2 [P1]). The helper:
-	//   - acquires the per-project swap.lock,
-	//   - re-verifies the marker == oldRecord.ID (catches a TUI or
-	//     concurrent dispatch that raced this one),
-	//   - writes the marker → rec.ID via WriteAtomic + parent-dir
-	//     fsync (commit 1),
-	//   - SKIPS kill + archive of oldRecord (OldIsDead=true matches
-	//     this path's existing "_ = oldRecord; archive intentionally
-	//     skipped" semantics — operator clears via TUI [x]).
-	//
-	// We skip the helper when:
-	//   - oldRecord == nil (fresh coord spawn, no swap to perform)
-	//   - !promptOK (boot prompt failed to deliver — don't lock in a
-	//     dead session as the project coord)
-	//   - marker doesn't match oldRecord.ID (e.g., never written
-	//     because TUI flow short-circuited, or operator manually
-	//     deleted). The existing post-dispatch TUI marker write
-	//     remains the marker-flip mechanism in that case.
-	//
-	// On non-orphan helper errors (concurrent-swap race, marker-write
-	// failure): the helper has already killed the pre-spawned NEW
-	// (DropReplacementRecord). We MUST abort the dispatch rather than
-	// fall through to "agent spawned" stdout — the TUI parses success
-	// from exit code 0 and would try to attach to a session that no
-	// longer exists (codex review iter-2 [P2]).
-	if oldRecord != nil && promptOK && state.ReadCoordSpawnMarker(opts.project) == oldRecord.ID {
-		if _, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
-			Project:              opts.project,
-			OldRec:               oldRecord,
-			AlreadySpawnedNewRec: rec,
-			OldIsDead:            true,
-		}, os.Stderr); swapErr != nil {
-			// FAILURE MODE 5: marker IS at NEW (committed); OLD is
-			// the orphan (which on this dead-coord recovery path was
-			// supposed to be dead anyway, so the "orphan" is the
-			// expected outcome). Surface the warning + proceed to
-			// success — the dispatch DID deliver a live coord.
-			if errors.Is(swapErr, handoffop.ErrOrphanSurvivedSentinel) {
-				_, _ = fmt.Fprintf(stdout, "warning: %v\n", swapErr)
-			} else {
-				// Non-orphan error: helper killed NEW + removed
-				// record. Don't print "agent spawned" — return error
-				// so the TUI knows the recovery failed.
-				return fmt.Errorf(
-					"dead-coord recovery: atomic coord-swap failed (replacement %s cleaned up by helper): %w",
-					rec.ID, swapErr)
-			}
-		}
-	}
-
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
 	return nil
 }
