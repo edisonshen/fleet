@@ -834,9 +834,13 @@ func TestFleetAgentIDPattern(t *testing.T) {
 		{"happy 8 hex", "a1b2c3d4", true},
 		{"happy 8 hex zeros", "00000000", true},
 		{"happy 8 hex max", "ffffffff", true},
-		// Crypto/rand fallback shape — must match.
+		// Crypto/rand fallback shape — must match BOTH t+7hex
+		// (value <= 0x0fffffff) and t+8hex (value > 0x0fffffff,
+		// the more common case — %07x is min-width, not max).
 		{"fallback t+7hex", "t1a2b3c4", true},
 		{"fallback t+7hex zeros", "t0000000", true},
+		{"fallback t+8hex", "tffffffff", true}, // codex iter-5 [P3]
+		{"fallback t+8hex typical", "t89abcdef", true},
 		// Wrong length — must NOT match.
 		{"7 hex short", "a1b2c3d", false},
 		{"9 hex long", "a1b2c3d4e", false},
@@ -852,7 +856,7 @@ func TestFleetAgentIDPattern(t *testing.T) {
 		{"hyphenated", "prod-shell", false},
 		{"with dot", "foo.bar01", false},
 		// Fallback shape variants that should NOT match.
-		{"t+8hex (too long)", "t1a2b3c4d", false},
+		{"t+9hex (too long)", "t1a2b3c4de", false},
 		{"t+7nonhex", "tzzzzzzz", false},
 		{"T uppercase prefix", "T1234567", false},
 	}
