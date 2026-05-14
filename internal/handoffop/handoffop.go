@@ -533,55 +533,86 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
-	if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
-		!errors.Is(err, tmux.ErrNoSession) {
-		_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n",
-			oldRec.TmuxSession, err)
-	}
-	if graceMillis > 0 {
-		time.Sleep(time.Duration(graceMillis) * time.Millisecond)
-	}
-	if err := tmux.Kill(oldRec.TmuxSession); err != nil {
-		if tmux.HasSession(oldRec.TmuxSession) {
-			// Old still alive after Kill — roll back the new agent ONLY
-			// if the new session is also gone (don't strand a live tmux
-			// session with no fleet record). DropReplacementRecord pairs
-			// the kill + remove so a probe-failure window can't drop the
-			// record while the new session is still alive
-			// (fix/orphan-tmux-sweeper-and-leak-plug). On cleanup error
-			// we surface the both-alive variant of the message so the
-			// operator triages both stuck sessions manually.
-			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
-				return fmt.Errorf(
-					"resume: old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved; cleanup attempt also failed: %v; clean up both manually)",
-					oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID, dropErr)
+	// Coord swap fast path. When OLD is the project's coordinator
+	// (marker matches OLD.ID), the retire sequence runs through the
+	// transactional AtomicCoordSwap helper instead of the inline
+	// marker-flip + /exit + grace + Kill + Archive sequence. This
+	// collapses the four observable writes into one atomic commit
+	// point at the marker rename (the v5 plan's load-bearing
+	// invariant). Worker handoffs fall through to the inline path.
+	//
+	// IMPORTANT: the spawnAndRetire caller has already (a) written
+	// the NEW agent record and (b) probed NEW alive. AtomicCoordSwap's
+	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
+	// steps and proceeds straight to the marker commit.
+	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	if isCoordSwap {
+		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
+			Project:              oldRec.Project,
+			OldRec:               oldRec,
+			AlreadySpawnedNewRec: newRec,
+			GraceWindow:          time.Duration(graceMillis) * time.Millisecond,
+		}, stderr)
+		if swapErr != nil {
+			// FAILURE MODE 5: marker committed; OLD is now an orphan
+			// tmux session; OLD record archived by helper; inbox alert
+			// dropped; [P0] logged. Surface to stderr and proceed to
+			// queue delete + prompt send so the new coord can start.
+			if errors.Is(swapErr, ErrOrphanSurvivedSentinel) {
+				_, _ = fmt.Fprintf(stderr, "warning: %v\n", swapErr)
+			} else {
+				// True rollback (e.g., marker raced, marker write
+				// failed). Queue file is preserved so retry can pick
+				// up. NEW was cleaned up by the helper.
+				return swapErr
 			}
-			_ = queue.Delete(queuePath)
-			return fmt.Errorf(
-				"resume: old session %s still alive after kill failure: %w (replacement %s rolled back; investigate)",
-				oldRec.TmuxSession, err, newRec.ID)
 		}
-		_, _ = fmt.Fprintf(stderr,
-			"note: kill %s reported error but session is gone: %v\n",
-			oldRec.TmuxSession, err)
-	}
+	} else {
+		// Worker (or non-coord) handoff: inline retire — same flow
+		// the codex iter-1..20 series hardened. Deferred for a later
+		// PR that adds task-row CAS semantics.
+		if err := tmux.SendKeys(oldRec.TmuxSession, "/exit", "Enter"); err != nil &&
+			!errors.Is(err, tmux.ErrNoSession) {
+			_, _ = fmt.Fprintf(stderr, "warning: send-keys to %s: %v\n",
+				oldRec.TmuxSession, err)
+		}
+		if graceMillis > 0 {
+			time.Sleep(time.Duration(graceMillis) * time.Millisecond)
+		}
+		if err := tmux.Kill(oldRec.TmuxSession); err != nil {
+			if tmux.HasSession(oldRec.TmuxSession) {
+				if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+					return fmt.Errorf(
+						"resume: old session %s AND new session %s both alive after kill failure: %w (replacement %s record preserved; cleanup attempt also failed: %v; clean up both manually)",
+						oldRec.TmuxSession, newRec.TmuxSession, err, newRec.ID, dropErr)
+				}
+				_ = queue.Delete(queuePath)
+				return fmt.Errorf(
+					"resume: old session %s still alive after kill failure: %w (replacement %s rolled back; investigate)",
+					oldRec.TmuxSession, err, newRec.ID)
+			}
+			_, _ = fmt.Fprintf(stderr,
+				"note: kill %s reported error but session is gone: %v\n",
+				oldRec.TmuxSession, err)
+		}
 
-	if err := oldRec.Archive(); err != nil {
-		path, perr := state.AgentPath(oldRec.ID)
-		if perr == nil {
-			if rmErr := os.Remove(path); rmErr == nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: archive %s: %v (live record removed instead)\n",
-					oldRec.ID, err)
+		if err := oldRec.Archive(); err != nil {
+			path, perr := state.AgentPath(oldRec.ID)
+			if perr == nil {
+				if rmErr := os.Remove(path); rmErr == nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: archive %s: %v (live record removed instead)\n",
+						oldRec.ID, err)
+				} else {
+					return fmt.Errorf(
+						"resume: archive %s failed (%w) AND remove failed (%w); replacement %s spawned but old record stuck",
+						oldRec.ID, err, rmErr, newRec.ID)
+				}
 			} else {
 				return fmt.Errorf(
-					"resume: archive %s failed (%w) AND remove failed (%w); replacement %s spawned but old record stuck",
-					oldRec.ID, err, rmErr, newRec.ID)
+					"resume: archive %s failed (%w) AND could not resolve live path (%w); replacement %s spawned",
+					oldRec.ID, err, perr, newRec.ID)
 			}
-		} else {
-			return fmt.Errorf(
-				"resume: archive %s failed (%w) AND could not resolve live path (%w); replacement %s spawned",
-				oldRec.ID, err, perr, newRec.ID)
 		}
 	}
 	queueDeleted := true

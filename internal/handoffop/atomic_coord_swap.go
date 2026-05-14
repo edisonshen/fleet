@@ -123,7 +123,25 @@ type AtomicCoordSwapInputs struct {
 	// NewRecSpec — spawn.Options for the replacement. The helper does
 	// not mutate this; PreAllocatedID, OldRecord, NewDocPath, etc. are
 	// the caller's responsibility.
+	//
+	// Ignored when AlreadySpawnedNewRec is non-nil.
 	NewRecSpec spawn.Options
+
+	// AlreadySpawnedNewRec, when non-nil, instructs the helper to
+	// SKIP steps 2-3 (spawn + readiness probe) and proceed directly
+	// to step 4 (marker commit) using this record. This is the entry
+	// point for callers that already wrote a crash-recovery queue
+	// journal and ran their own spawn before invoking the helper
+	// (e.g. `fleet handoff` and the auto-drain path, which pre-allocate
+	// IDs and journal them BEFORE spawning).
+	//
+	// When set, the caller is responsible for having already:
+	//   - verified the NEW tmux session is alive (step 3.b equivalent),
+	//   - written the NEW agent record to disk,
+	//   - waited for the pane to stabilize if applicable.
+	// The helper still runs step 1 (precondition + flock) before the
+	// commit so the marker invariant is preserved.
+	AlreadySpawnedNewRec *agent.Record
 
 	// OldIsDead — caller asserts oldRec.session is gone (case 4 only).
 	// When true, steps 5 + 6 are SKIPPED entirely — no kill, no
@@ -205,57 +223,62 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			ErrConcurrentSwap, in.Project, in.OldRec.ID, cur)
 	}
 
-	// Step 2 — spawn the replacement. spawn.Spawn rolls back its own
-	// state.json write failure (kills the orphan tmux session before
-	// returning). On error here the marker is still at OLD and no
-	// observable change has happened.
-	newRec, serr := spawnFn(in.NewRecSpec)
-	if serr != nil {
-		return res, fmt.Errorf("atomic coord swap: spawn replacement: %w", serr)
+	// Steps 2-3 — spawn the replacement + readiness probe. Skipped
+	// when the caller pre-spawned (AlreadySpawnedNewRec set), in which
+	// case the caller is responsible for asserting the same liveness
+	// invariant before invoking the helper.
+	var newRec *agent.Record
+	if in.AlreadySpawnedNewRec != nil {
+		newRec = in.AlreadySpawnedNewRec
+	} else {
+		// Step 2 — spawn. spawn.Spawn rolls back its own state.json
+		// write failure (kills the orphan tmux session before
+		// returning). On error here the marker is still at OLD and no
+		// observable change has happened.
+		spawned, serr := spawnFn(in.NewRecSpec)
+		if serr != nil {
+			return res, fmt.Errorf("atomic coord swap: spawn replacement: %w", serr)
+		}
+		newRec = spawned
+
+		// Step 3.a — wait for NEW's pane to stabilize.
+		// spawn.WaitForReadyToPrompt is best-effort: convergence
+		// failure (didn't stabilize in MaxWait) returns an error but
+		// the pane may still be usable. We don't fail the swap on
+		// convergence failure alone — Step 3.b's tristate
+		// SessionAlive probe is the authoritative liveness gate.
+		if werr := waitForReadyToPromptFn(newRec.TmuxSession); werr != nil {
+			if stderr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: atomic coord swap: readiness poll for %s did not converge: %v (probe-checking liveness)\n",
+					newRec.TmuxSession, werr)
+			}
+		}
+
+		// Step 3.b — re-probe NEW after the readiness wait. Catches
+		// the "NEW dies during boot" window. The tristate is critical:
+		//
+		//   - alive=true,  err=nil → continue.
+		//   - alive=false, err=nil → definitively dead → roll back NEW.
+		//   - alive=false, err!=nil → probe ambiguous → preserve NEW
+		//     record + tmux for operator inspection (no rollback).
+		switch alive, perr := sessionAliveFn(newRec.TmuxSession); {
+		case perr != nil:
+			return res, fmt.Errorf(
+				"atomic coord swap: probe replacement %s session %s failed: %w (NEW record preserved for operator inspection; marker unchanged at %s)",
+				newRec.ID, newRec.TmuxSession, perr, in.OldRec.ID)
+		case !alive:
+			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+				return res, fmt.Errorf(
+					"atomic coord swap: replacement %s tmux session %s exited during readiness wait AND cleanup failed: %w (marker unchanged at %s; investigate)",
+					newRec.ID, newRec.TmuxSession, dropErr, in.OldRec.ID)
+			}
+			return res, fmt.Errorf(
+				"atomic coord swap: replacement %s tmux session %s exited during readiness wait; marker unchanged at %s",
+				newRec.ID, newRec.TmuxSession, in.OldRec.ID)
+		}
 	}
 	res.NewRec = newRec
-
-	// Step 3.a — wait for NEW's pane to stabilize. spawn.WaitForReadyToPrompt
-	// is best-effort: convergence failure (didn't stabilize in MaxWait)
-	// returns an error but the pane may still be usable. We don't fail
-	// the swap on convergence failure alone — Step 3.b's tristate
-	// SessionAlive probe is the authoritative liveness gate.
-	if werr := waitForReadyToPromptFn(newRec.TmuxSession); werr != nil {
-		// Convergence failure isn't fatal — the probe in 3.b is the
-		// source of truth. Surface to caller's stderr so log analysis
-		// can correlate slow-boot wrappers with swap latency.
-		if stderr != nil {
-			_, _ = fmt.Fprintf(stderr,
-				"warning: atomic coord swap: readiness poll for %s did not converge: %v (probe-checking liveness)\n",
-				newRec.TmuxSession, werr)
-		}
-	}
-
-	// Step 3.b — re-probe NEW after the readiness wait. Catches the
-	// "NEW dies during boot" window. The tristate is critical:
-	//
-	//   - alive=true,  err=nil → continue.
-	//   - alive=false, err=nil → definitively dead → roll back NEW.
-	//   - alive=false, err!=nil → probe ambiguous → preserve NEW record
-	//     + tmux for operator inspection (no rollback).
-	switch alive, perr := sessionAliveFn(newRec.TmuxSession); {
-	case perr != nil:
-		// Probe error: preserve NEW for operator inspection. Marker
-		// unchanged.
-		return res, fmt.Errorf(
-			"atomic coord swap: probe replacement %s session %s failed: %w (NEW record preserved for operator inspection; marker unchanged at %s)",
-			newRec.ID, newRec.TmuxSession, perr, in.OldRec.ID)
-	case !alive:
-		// Definitively dead. Roll back NEW.
-		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
-			return res, fmt.Errorf(
-				"atomic coord swap: replacement %s tmux session %s exited during readiness wait AND cleanup failed: %w (marker unchanged at %s; investigate)",
-				newRec.ID, newRec.TmuxSession, dropErr, in.OldRec.ID)
-		}
-		return res, fmt.Errorf(
-			"atomic coord swap: replacement %s tmux session %s exited during readiness wait; marker unchanged at %s",
-			newRec.ID, newRec.TmuxSession, in.OldRec.ID)
-	}
 
 	// Step 4 — *** ATOMIC COMMIT POINT ***
 	// WriteCoordSpawnMarker uses WriteAtomic, which (after commit 1)
