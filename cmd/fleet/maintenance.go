@@ -34,18 +34,20 @@ import (
 )
 
 // fleetAgentIDPattern matches the agent ID format produced by
-// agent.NewID(): 8 lowercase hex characters, OR the t+7hex fallback
-// shape used when crypto/rand fails (e.g., "t1a2b3c4"). The sweeper
-// uses this to refuse killing tmux sessions whose suffix doesn't match
-// — so operator's unrelated `fleet-debug` / `fleet-prod-shell` sessions
-// stay untouched even when older than the freshness window.
+// agent.NewID(): 8 lowercase hex characters (happy path), OR the
+// crypto/rand fallback shape "t%07x" with the value masked to 32 bits.
+// %07x is a MINIMUM width (not maximum), so the fallback can produce
+// either t+7hex (value <= 0x0fffffff, the smaller half) or t+8hex
+// (value > 0x0fffffff, the larger 15/16ths). The regex must accept
+// both to avoid missing real fleet sessions on the fallback path
+// (codex iter-5 [P3]).
 //
 // Codex iter-2 [P1]: without this gate, any tmux session starting with
 // `fleet-` would be classified as orphan once older than 90s and killed
 // in --kill mode. Operators routinely name unrelated sessions with the
 // `fleet-` prefix; the sweeper must scope to the agent.NewID() shape
 // only.
-var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7})$`)
+var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7,8})$`)
 
 // pruneOrphanTmuxMinFreshness is the floor for the freshness window:
 // even when FLEET_PID_RESOLVE_S is unset or tiny, the sweeper waits at
