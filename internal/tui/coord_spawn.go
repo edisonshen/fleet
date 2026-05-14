@@ -116,19 +116,30 @@ func deriveCoordSpawnState(
 	if !markerOK {
 		return coordSpawnIdle
 	}
-	// Stuck check fires regardless of coord-state freshness — once the
-	// marker is older than the timeout, even a "fresh" coord-state
-	// could be a different agent (the spec's "stuck" framing assumes
-	// the operator's [a] launch never succeeded, and resuming it at
-	// minute 11 isn't useful — they should attach via tmux). Spec
-	// section: "Marker AND elapsed > FLEET_COORD_SPAWN_TIMEOUT_S".
-	if now.Sub(markerMtime) > spawnTimeout {
-		return coordSpawnStuck
-	}
-	// Coord-state fresh → existing PR #57 active rendering wins. The
-	// caller suppresses our extra line in this case.
+	// Liveness wins over spawn-timeout (PART 2.5 fix). A coord whose
+	// coord-state.json mtime is within activeWindow is actively ticking
+	// — by definition, NOT stuck. The marker is set ONCE at spawn and
+	// never refreshed, so without this ordering EVERY long-lived alive
+	// coord would eventually trip the timeout and render as stuck (real
+	// bug surfaced 2026-05-13: coord de3e12a9 spawned 20:26 PDT, claude
+	// alive 20+ min, badge fired at 20:47 PDT despite a 6-min-stale
+	// coord-state mtime within the 5m activeWindow window when checked).
+	//
+	// Reserve "stuck" for the narrow case the spec actually targets:
+	// marker exists but no fresh state ever arrived (cold-start wedge),
+	// OR marker is past timeout AND state went stale alongside it
+	// (genuinely dead). Both of those are caught by the timeout branch
+	// below, which only runs when the active gate did NOT match.
 	if coordStateOK && now.Sub(coordStateMtime) <= activeWindow {
 		return coordSpawnActive
+	}
+	// Stuck: marker is older than the timeout AND we have no liveness
+	// signal from coord-state.json. The operator's [a] launch never
+	// converged (or converged and then went silent past the window);
+	// resuming it at minute 11+ isn't useful — they should attach via
+	// tmux. Spec section: "Marker AND elapsed > FLEET_COORD_SPAWN_TIMEOUT_S".
+	if now.Sub(markerMtime) > spawnTimeout {
+		return coordSpawnStuck
 	}
 	// Post-active idle-stop guard: if a coord-state.json exists AND its
 	// mtime is newer than the marker, the coord successfully booted at
