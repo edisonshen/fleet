@@ -201,6 +201,174 @@ def update_record(agent_id: str, **fields: Any) -> bool:
     return _atomic_write_json(path, record)
 
 
+def reconcile_pid(agent_id: str) -> bool:
+    """Drift recovery for the P0 spawn-pid bug (2026-05-13).
+
+    spawn.Spawn (Go side) records the real engine pid via the resolver
+    that walks the tmux pane child tree. But the pid can drift if claude
+    internally execs — e.g. on /remote-control reconnect, on auto-update
+    paths — leaving agent.Record.PID pointing at a process that no
+    longer exists.
+
+    The fleet-guard Stop hook fires INSIDE the claude process on every
+    assistant turn, so its own ancestor chain is guaranteed to contain
+    the live claude pid (it's our parent's parent's parent... up the
+    fork chain to the tmux-wrapper shell). When the recorded pid is
+    dead, we walk our own ancestry until we find a process whose argv
+    matches the agent's tmux session marker (fleet-coord-<id>) OR the
+    engine binary name, and write that pid back.
+
+    Returns True when no action was needed (recorded pid is alive) OR
+    when reconciliation succeeded. False when the record is missing,
+    the resolver found no live successor, or the rewrite failed.
+
+    This widens OWNED_FIELDS to include "pid" specifically for this
+    self-heal path. The skill-vs-dispatch ownership partition in
+    SKILL.md still holds: dispatch is authoritative for the INITIAL
+    pid (set in internal/spawn/spawn.go after the pane-tree resolver
+    converges). The skill only writes pid as a corrective when the
+    recorded pid is observably dead while the host claude is observably
+    alive (we wouldn't be running this hook otherwise). Without this
+    widening, the bug fix in Go doesn't survive a single claude exec.
+    """
+    record = read_record(agent_id)
+    if record is None:
+        return False
+    recorded = record.get("pid", 0)
+    try:
+        recorded_int = int(recorded)
+    except (TypeError, ValueError):
+        recorded_int = 0
+    if recorded_int > 0 and _pid_alive(recorded_int):
+        return True
+    new_pid = _resolve_self_pid(agent_id)
+    if new_pid is None or new_pid <= 0:
+        return False
+    record["pid"] = new_pid
+    record["last_activity_ts"] = now_rfc3339()
+    return _atomic_write_json(agent_record_path(agent_id), record)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Liveness probe via kill(pid, 0). True when the pid exists (errno
+    EPERM also counts as alive — the process is there, we just can't
+    signal it). False on ESRCH (no such process) or any other error.
+
+    Mirrors internal/spawn/dispatch_recovery.go:pidAlive on the Go side
+    so the two-language pair agree on what 'alive' means."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # EPERM: process exists, we don't have signal permission. Alive.
+        return True
+    except (OSError, ProcessLookupError):
+        # ESRCH or other transport error. Treat as dead — the worst
+        # case is we trigger reconciliation when we didn't need to.
+        return False
+
+
+def _resolve_self_pid(agent_id: str) -> int | None:
+    """Walk this process's ancestor chain looking for a claude (or wrapped
+    engine) process whose argv matches the agent's tmux session marker.
+
+    Returns the pid of the matching ancestor, or None if no match.
+
+    Match strategy:
+      1. Argv contains 'fleet-coord-<agent_id>' — the strongest signal
+         (coord-spawn dispatches inject this via --remote-control).
+      2. Argv command is 'claude' (or codex etc.) — the engine binary.
+      3. Fallback to None — we can't safely guess.
+
+    The fleet-guard hook runs inside the claude process. claude → tmux
+    pane shell → tmux server is the typical ancestry; we want the
+    deepest 'claude' ancestor. We walk up via ppid until we hit pid 1
+    or a process whose argv we can't read.
+
+    Failure modes (returns None):
+      - ps not on PATH (vanishingly rare; the skill needs ps for
+        liveness probes anyway).
+      - No ancestor matches (the hook is somehow running outside a
+        claude session — drift not recoverable).
+      - ps output unparseable.
+    """
+    needle = f"fleet-coord-{agent_id}" if agent_id else ""
+    # Build pid → (ppid, args) map via one ps call.
+    procs: dict[int, tuple[int, str]] = {}
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["ps", "-o", "pid,ppid,args", "-ax"],
+            capture_output=True, text=True, check=False, timeout=5,
+        ).stdout
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    for line in out.splitlines()[1:]:
+        line = line.lstrip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, parts[2])
+
+    # Walk ancestry from our own pid upward. Bounded by max depth so a
+    # corrupt ps output (cycle) can't loop forever.
+    cur = os.getpid()
+    for _ in range(256):
+        info = procs.get(cur)
+        if info is None:
+            break
+        _, args = info
+        if needle and needle in args:
+            return cur
+        if _argv_command_is(args, "claude") or _argv_command_is(args, "codex"):
+            # Engine match — return ONLY if we haven't been able to
+            # match the disambiguator yet. Walk one more step in case
+            # a deeper engine ancestor carries the disambiguator.
+            best = cur
+            # Continue walking to look for a disambiguator match.
+            cur = info[0]
+            while True:
+                info2 = procs.get(cur)
+                if info2 is None:
+                    break
+                _, args2 = info2
+                if needle and needle in args2:
+                    return cur
+                cur = info2[0]
+                if cur <= 1:
+                    break
+            return best
+        cur = info[0]
+        if cur <= 1:
+            break
+    return None
+
+
+def _argv_command_is(argv: str, name: str) -> bool:
+    """Match the first whitespace-separated token of argv against name,
+    stripping a leading path. Mirrors argvCommandIs in Go-side
+    pidresolver.go."""
+    s = argv.lstrip()
+    space = s.find(" ")
+    if space < 0:
+        first = s
+    else:
+        first = s[:space]
+    slash = first.rfind("/")
+    if slash >= 0:
+        first = first[slash + 1:]
+    return first == name
+
+
 def _atomic_write_json(path: Path, record: dict[str, Any]) -> bool:
     """Write record to path via tempfile + os.replace. Returns False on any
     I/O failure (caller logs). The temp file lives in the same directory as
