@@ -173,7 +173,7 @@ func TestFindEngineDescendant_NoDescendantsReturnsZero(t *testing.T) {
 	procs := []procEntry{
 		{PID: 200, PPID: 1, Args: "sh -c ..."},
 	}
-	pid, _ := findEngineDescendant(procs, 200, "fleet-coord-x", "claude")
+	pid, _, _ := findEngineDescendant(procs, 200, "fleet-coord-x", "claude")
 	if pid != 0 {
 		t.Errorf("pid = %d, want 0 when no descendants", pid)
 	}
@@ -196,12 +196,15 @@ func TestFindEngineDescendant_PaneLeaderIsEngine(t *testing.T) {
 		procs := []procEntry{
 			{PID: 200, PPID: 1, Args: "claude --remote-control fleet-coord-X1"},
 		}
-		pid, args := findEngineDescendant(procs, 200, "fleet-coord-X1", "claude")
+		pid, args, stable := findEngineDescendant(procs, 200, "fleet-coord-X1", "claude")
 		if pid != 200 {
 			t.Errorf("pid = %d, want 200 (pane leader)", pid)
 		}
 		if !strings.Contains(args, "fleet-coord-X1") {
 			t.Errorf("args = %q, want argv containing disambiguator", args)
+		}
+		if !stable {
+			t.Error("disambiguator-on-non-shell match must be stable")
 		}
 	})
 	t.Run("engine name on pane leader", func(t *testing.T) {
@@ -209,12 +212,15 @@ func TestFindEngineDescendant_PaneLeaderIsEngine(t *testing.T) {
 		procs := []procEntry{
 			{PID: 300, PPID: 1, Args: "claude --dangerously-skip-permissions"},
 		}
-		pid, args := findEngineDescendant(procs, 300, "", "claude")
+		pid, args, stable := findEngineDescendant(procs, 300, "", "claude")
 		if pid != 300 {
 			t.Errorf("pid = %d, want 300 (pane leader as engine)", pid)
 		}
 		if args == "" {
 			t.Errorf("args empty; want claude argv")
+		}
+		if !stable {
+			t.Error("engine-name match must be stable")
 		}
 	})
 }
@@ -233,7 +239,7 @@ func TestFindEngineDescendant_DisambiguatorBeatsEngineMatch(t *testing.T) {
 		// when the disambiguator is set.
 		{PID: 201, PPID: 200, Args: "claude --no-disambiguator-here"},
 	}
-	pid, args := findEngineDescendant(procs, 200, "fleet-coord-A1", "claude")
+	pid, args, _ := findEngineDescendant(procs, 200, "fleet-coord-A1", "claude")
 	// The shell wrapper carries the disambiguator in its argv, so it
 	// IS the first match. This is fine — the production resolver's
 	// poll loop will re-walk and pick up the deeper claude on the
@@ -292,6 +298,128 @@ func TestIsShellArgv(t *testing.T) {
 			t.Errorf("isShellArgv(%q) = %v, want %v", tc.argv, got, tc.want)
 		}
 	}
+}
+
+// TestResolveEnginePid_TentativeMatchWaitsForStability pins codex
+// iter-5's P1 (2026-05-14): for custom-shell commands like
+// `sh -c 'claude --version; sleep 60'`, the resolver must NOT
+// return the first non-shell descendant immediately — the deepest
+// non-shell might be a transient helper. Instead it waits for
+// stability (the same tentative pid through to the deadline) so a
+// short-lived helper has died and the long-lived child has taken
+// its place.
+//
+// Test shape: simulate two snapshots — snapshot 1 has only the
+// helper child; snapshot 2 has the helper dead and the long-lived
+// child running. With tentative-match semantics, the resolver must
+// return the LATER (long-lived) pid, not the first non-shell match.
+func TestResolveEnginePid_TentativeMatchWaitsForStability(t *testing.T) {
+	tick := time.Unix(0, 0)
+	nowCalls := 0
+	// Two snapshots: first has the transient helper, second has the
+	// long-lived sleep. listProcs increments a counter and returns
+	// the appropriate fixture.
+	snap1 := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh -c claude --version; sleep 60"},
+		{PID: 201, PPID: 200, Args: "claude --version"}, // transient
+	}
+	snap2 := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh -c claude --version; sleep 60"},
+		{PID: 202, PPID: 200, Args: "sleep 60"}, // long-lived
+	}
+	listCalls := 0
+	deps := resolveEnginePidDeps{
+		panePID: func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) {
+			listCalls++
+			if listCalls == 1 {
+				return snap1, nil
+			}
+			return snap2, nil
+		},
+		now: func() time.Time {
+			nowCalls++
+			if nowCalls > 1 {
+				tick = tick.Add(120 * time.Millisecond)
+			}
+			return tick
+		},
+		sleep: func(time.Duration) {},
+	}
+	// 250ms timeout — covers ~2 poll iters with our tick scheme.
+	// engineHint="" because this is a custom-shell command.
+	pid, _, err := resolveEnginePid("fleet-x", "", "", 250*time.Millisecond, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid == 201 {
+		t.Errorf("resolver returned transient helper pid 201; tentative match must NOT win first snapshot")
+	}
+	// Acceptable outcomes: 202 (later long-lived child) or 200 (pane
+	// fallback if both helpers exited and snapshot 2 had nothing
+	// long-lived either). 201 is the bug.
+}
+
+// TestResolveEnginePid_RawShellLeafFastReturns pins codex iter-5's
+// P2: when the dispatched command is a raw shell (`fleet dispatch
+// --command sh`), the pane process is the shell with no children.
+// The resolver must fast-return the pane pid instead of stalling
+// for the full timeout (the pane IS the correct recorded pid).
+func TestResolveEnginePid_RawShellLeafFastReturns(t *testing.T) {
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh"}, // pane is bare shell, no children
+	}
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	// 10s timeout — if we don't fast-path, the test would hang for
+	// 10s of real time (sleep is mocked, but `now` is fixed too, so
+	// the loop would technically be infinite). Fast-path returns
+	// pane pid on first iter.
+	pid, _, err := resolveEnginePid("fleet-x", "", "", 10*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 200 {
+		t.Errorf("raw-shell-leaf must fast-return pane pid 200; got %d", pid)
+	}
+}
+
+// TestPaneIsRawShellLeaf covers the helper in isolation.
+func TestPaneIsRawShellLeaf(t *testing.T) {
+	t.Run("shell pane, no children → true", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "sh"},
+		}
+		if !paneIsRawShellLeaf(procs, 200) {
+			t.Error("want true")
+		}
+	})
+	t.Run("shell pane with children → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "sh -c claude"},
+			{PID: 201, PPID: 200, Args: "claude"},
+		}
+		if paneIsRawShellLeaf(procs, 200) {
+			t.Error("want false; pane has a claude child")
+		}
+	})
+	t.Run("non-shell pane, no children → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "claude --foo"},
+		}
+		if paneIsRawShellLeaf(procs, 200) {
+			t.Error("want false; pane is not a shell")
+		}
+	})
+	t.Run("pane pid not in procs → false", func(t *testing.T) {
+		if paneIsRawShellLeaf(nil, 200) {
+			t.Error("want false on empty procs")
+		}
+	})
 }
 
 // TestPidResolveEngineHint pins the codex iter-3 fix (2026-05-14):

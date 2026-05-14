@@ -153,17 +153,51 @@ func resolveEnginePid(
 	// Walk descendants looking for an engine match. Repeat with a short
 	// sleep so claude's brief exec window after the wrapper shell starts
 	// has time to land in `ps` output.
+	//
+	// Stability ladder (codex iter-5):
+	//  - stable match (disambiguator on non-shell, OR engine-name hit):
+	//    return immediately.
+	//  - tentative match (deepest non-shell, custom-shell case): keep
+	//    polling; return only when the same pid persists to the LAST
+	//    poll before deadline (transient helpers will have exited).
+	//  - raw-shell-leaf pane (no children, pane argv is a shell): fast-
+	//    return the pane pid — for `fleet dispatch --command sh`, the
+	//    pane IS the correct recorded pid and waiting for the timeout
+	//    is pure stall.
+	var tentativePid int
+	var tentativeArgs string
 	for {
 		procs, err := deps.listProcs()
 		if err == nil {
-			pid, args := findEngineDescendant(procs, panePid, disambiguator, engineHint)
+			// Fast-path: pane is a raw shell with no children. The
+			// operator dispatched a shell directly; pane pid is the
+			// right answer; no point polling for descendants.
+			if paneIsRawShellLeaf(procs, panePid) {
+				return panePid, "", nil
+			}
+			pid, args, stable := findEngineDescendant(procs, panePid, disambiguator, engineHint)
 			if pid > 0 {
-				return pid, args, nil
+				if stable {
+					return pid, args, nil
+				}
+				// Tentative — remember it; only return if the same pid
+				// persists in subsequent polls (transient helpers will
+				// have died by the deadline).
+				tentativePid = pid
+				tentativeArgs = args
 			}
 		}
 		if !deps.now().Before(deadline) {
-			// Best-effort fallback: return pane pid (wrong but live)
-			// + empty argv so the caller signals "couldn't disambiguate".
+			// Deadline reached. Prefer a tentative match (best-effort
+			// non-shell descendant we observed during the window) over
+			// the pane pid: even a tentative match is more informative
+			// than the wrapper shell.
+			if tentativePid > 0 {
+				return tentativePid, tentativeArgs, nil
+			}
+			// No tentative observation either. Return pane pid as the
+			// wrong-but-live fallback (callers signal "couldn't
+			// disambiguate" via empty argv).
 			return panePid, "", nil
 		}
 		deps.sleep(defaultPidResolvePollInterval)
@@ -193,12 +227,22 @@ func resolveEnginePid(
 // The walk is BFS via a pid-to-descendants map so we don't recurse on
 // pathological trees. Cycle detection is implicit — a process can have
 // at most one ppid, so the tree is a tree.
+// findEngineDescendant returns the resolved pid + argv + a
+// "stable" flag. stable=true means the match is a strong signal
+// (disambiguator on a non-shell, or engine-name match) and the
+// resolver should return immediately. stable=false means we have a
+// best-effort fallback (deepest non-shell descendant) which can be
+// a transient helper for custom-shell commands like
+// `sh -c 'claude --version; sleep 60'`. The resolver should keep
+// polling for stable matches and only accept a tentative match on
+// the LAST poll before the deadline. Codex iter-5 hardening
+// (2026-05-14).
 func findEngineDescendant(
 	procs []procEntry, panePID int,
 	disambiguator, engineHint string,
-) (int, string) {
+) (int, string, bool) {
 	if panePID <= 0 || len(procs) == 0 {
-		return 0, ""
+		return 0, "", false
 	}
 	// Build parent → children index for O(N) walk, plus pid → entry
 	// index so we can seed the queue with the pane process itself.
@@ -249,7 +293,7 @@ func findEngineDescendant(
 		// the production poll loop will re-walk once claude exec's.
 		if disambiguator != "" && strings.Contains(p.Args, disambiguator) {
 			if !isShellArgv(p.Args) {
-				return p.PID, p.Args
+				return p.PID, p.Args, true // strong match
 			}
 			// Shell carrying the disambiguator — still keep it as a
 			// fallback signal so a pane-only walk (no claude yet)
@@ -278,12 +322,44 @@ func findEngineDescendant(
 		}
 	}
 	if bestEngineDepth >= 0 {
-		return bestEngine.PID, bestEngine.Args
+		// Engine-name match is a strong signal — the operator named
+		// this engine, and a process matching the engine binary's
+		// command is unlikely to be transient.
+		return bestEngine.PID, bestEngine.Args, true
 	}
 	if bestFallbackDepth >= 0 {
-		return bestFallback.PID, bestFallback.Args
+		// Tentative match: deepest non-shell descendant. For custom
+		// shell commands (`sh -c 'claude --version; sleep 60'`) this
+		// can be a short-lived helper. Caller polls for stability.
+		return bestFallback.PID, bestFallback.Args, false
 	}
-	return 0, ""
+	return 0, "", false
+}
+
+// paneIsRawShellLeaf reports whether the pane process is itself a
+// shell argv AND has no children in procs. Used by resolveEnginePid
+// to fast-return on raw-shell sessions (`fleet dispatch --command
+// sh`) where the correct pid IS the pane and waiting for the
+// timeout would gratuitously stall the spawn. Codex iter-5
+// hardening (2026-05-14).
+func paneIsRawShellLeaf(procs []procEntry, panePID int) bool {
+	if panePID <= 0 || len(procs) == 0 {
+		return false
+	}
+	var paneArgs string
+	hasChildren := false
+	for _, p := range procs {
+		if p.PID == panePID {
+			paneArgs = p.Args
+		}
+		if p.PPID == panePID {
+			hasChildren = true
+		}
+	}
+	if paneArgs == "" {
+		return false
+	}
+	return isShellArgv(paneArgs) && !hasChildren
 }
 
 // argvCommandIs reports whether the first token of argv (the command
