@@ -645,6 +645,105 @@ func TestAgentDirSane_DirIsFile_Errors(t *testing.T) {
 	}
 }
 
+// -- codex iter-3 [P1]: freshness scales with FLEET_PID_RESOLVE_S ----------
+//
+// The original constant pruneOrphanTmuxFreshness = 90s assumed every
+// healthy spawn writes its agent record within 90 seconds. But
+// spawn.Spawn blocks record creation on resolveEnginePid, whose budget
+// is operator-configurable via FLEET_PID_RESOLVE_S (default 10s).
+// Operators on slow-spawning wrapper engines who raise that env var
+// above 45s would hit the regression: a legitimate replacement sits in
+// the `session exists + record missing` state for >90s before its
+// record lands, and --kill mass-terminates it.
+//
+// Fix: pruneOrphanTmuxFreshness() returns
+// max(pruneOrphanTmuxMinFreshness, 2 * spawn.PidResolveTimeout()) so
+// the window scales with the configured pid-resolve budget.
+
+// TestPruneOrphanTmuxFreshness_DefaultUsesMinFloor: without the env var,
+// the freshness window equals the static floor. This is the most
+// common case — operators don't tune FLEET_PID_RESOLVE_S.
+func TestPruneOrphanTmuxFreshness_DefaultUsesMinFloor(t *testing.T) {
+	t.Setenv("FLEET_PID_RESOLVE_S", "")
+	got := pruneOrphanTmuxFreshness()
+	if got != pruneOrphanTmuxMinFreshness {
+		t.Errorf("default freshness = %v; want %v (the static floor)",
+			got, pruneOrphanTmuxMinFreshness)
+	}
+}
+
+// TestPruneOrphanTmuxFreshness_ShortTimeoutKeepsFloor: even if the
+// operator sets FLEET_PID_RESOLVE_S to a small value (say 5s), the
+// floor still applies — we never go BELOW 90s.
+func TestPruneOrphanTmuxFreshness_ShortTimeoutKeepsFloor(t *testing.T) {
+	t.Setenv("FLEET_PID_RESOLVE_S", "5")
+	got := pruneOrphanTmuxFreshness()
+	if got != pruneOrphanTmuxMinFreshness {
+		t.Errorf("freshness with FLEET_PID_RESOLVE_S=5 = %v; want %v (floor wins)",
+			got, pruneOrphanTmuxMinFreshness)
+	}
+}
+
+// TestPruneOrphanTmuxFreshness_LargeTimeoutScales: this is the load-
+// bearing regression for codex iter-3 [P1]. With FLEET_PID_RESOLVE_S=120,
+// the operator has explicitly said "this engine takes up to 120s to
+// start." The freshness window MUST be at least 240s (2x) so a healthy
+// replacement booting in 120s doesn't get killed.
+func TestPruneOrphanTmuxFreshness_LargeTimeoutScales(t *testing.T) {
+	t.Setenv("FLEET_PID_RESOLVE_S", "120")
+	got := pruneOrphanTmuxFreshness()
+	want := 240 * time.Second
+	if got != want {
+		t.Errorf("freshness with FLEET_PID_RESOLVE_S=120 = %v; want %v (2x scaling)",
+			got, want)
+	}
+	if got <= pruneOrphanTmuxMinFreshness {
+		t.Errorf("freshness should EXCEED floor %v when pid-resolve raised; got %v",
+			pruneOrphanTmuxMinFreshness, got)
+	}
+}
+
+// TestPruneOrphanTmux_FreshnessHonorsPidResolveEnv is the end-to-end
+// behavior: when FLEET_PID_RESOLVE_S=120 and a session has been alive
+// for 100s (record missing), the sweeper must NOT classify it as orphan
+// — the operator's wrapper engine could legitimately still be inside the
+// pid-resolve wait.
+func TestPruneOrphanTmux_FreshnessHonorsPidResolveEnv(t *testing.T) {
+	t.Setenv("FLEET_PID_RESOLVE_S", "120") // → freshness window = 240s
+	listInfoFn := func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{
+			// 100s old. Below the static 90s floor would have killed
+			// it, but with FLEET_PID_RESOLVE_S=120 the floor becomes
+			// 240s — this is still inside the spawn window.
+			{Name: "fleet-aaaaaaaa", Created: pruneTestNow.Add(-100 * time.Second)},
+			// 300s old: definitely past the dynamic 240s window.
+			{Name: "fleet-bbbbbbbb", Created: pruneTestNow.Add(-300 * time.Second)},
+		}, nil
+	}
+	existsFn := func(string) bool { return false }
+	var killed []string
+	killFn := func(s string) error { killed = append(killed, s); return nil }
+
+	var stdout, stderr bytes.Buffer
+	if err := runMaintenancePruneOrphanTmux(&stdout, &stderr,
+		true /* --kill */, pruneDirSaneOK, listInfoFn, existsFn, killFn,
+		func() time.Time { return pruneTestNow },
+		pruneOrphanTmuxFreshness()); err != nil {
+		t.Fatalf("runMaintenancePruneOrphanTmux: %v", err)
+	}
+
+	// Only the 300s-old session is past the dynamic window.
+	if len(killed) != 1 || killed[0] != "fleet-bbbbbbbb" {
+		t.Fatalf("expected exactly one kill of fleet-bbbbbbbb (the past-240s session); got %v",
+			killed)
+	}
+	// 100s-old session must be classified as fresh, not orphan.
+	got := stdout.String()
+	if !strings.Contains(got, "fleet-aaaaaaaa  orphan=false  state=fresh") {
+		t.Errorf("100s-old session should be fresh (FLEET_PID_RESOLVE_S=120 → window=240s); got:\n%s", got)
+	}
+}
+
 // -- codex iter-2 [P1]: fleet-prefix scope guard --------------------------
 //
 // Before the regex gate, any tmux session whose name started with
