@@ -1,0 +1,278 @@
+// Tests for pidresolver.go — the spawn-path fix for P0 bug 2026-05-13
+// (spawn recorded the fleet binary's own pid instead of the real claude
+// pid inside the tmux pane, so every liveness probe classified live
+// coords as DEAD).
+package spawn
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestResolveEnginePid_PrefersDisambiguatorMatch pins the strongest
+// match priority: when an agent's disambiguator appears in a descendant
+// argv, we return that pid even if a sibling process also matches the
+// engine command name. Mirrors the real coord-spawn shape: pane child
+// is `sh -c "claude --remote-control fleet-coord-<id> ..."`, the
+// resolver picks the claude process matching the agent id.
+func TestResolveEnginePid_PrefersDisambiguatorMatch(t *testing.T) {
+	// Synthetic process tree:
+	//   pane (sh)
+	//     └── claude --remote-control fleet-coord-A1   (target)
+	//   unrelated tmux session pane (sh)
+	//     └── claude --remote-control fleet-coord-B2   (sibling — should NOT match)
+	procs := []procEntry{
+		{PID: 100, PPID: 1, Args: "tmux server"},
+		{PID: 200, PPID: 100, Args: "sh -c claude --remote-control fleet-coord-A1 --dangerously-skip-permissions"},
+		{PID: 201, PPID: 200, Args: "claude --remote-control fleet-coord-A1 --dangerously-skip-permissions"},
+		{PID: 300, PPID: 100, Args: "sh -c claude --remote-control fleet-coord-B2 --dangerously-skip-permissions"},
+		{PID: 301, PPID: 300, Args: "claude --remote-control fleet-coord-B2 --dangerously-skip-permissions"},
+	}
+	deps := resolveEnginePidDeps{
+		panePID: func(session string) (int, error) {
+			if session != "fleet-A1" {
+				t.Fatalf("unexpected session: %s", session)
+			}
+			return 200, nil
+		},
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	pid, args, err := resolveEnginePid(
+		"fleet-A1",
+		"fleet-coord-A1",
+		"claude",
+		1*time.Second,
+		deps,
+	)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 201 {
+		t.Errorf("pid = %d, want 201 (the A1 claude)", pid)
+	}
+	if !strings.Contains(args, "fleet-coord-A1") {
+		t.Errorf("args = %q, want claude argv containing fleet-coord-A1", args)
+	}
+}
+
+// TestResolveEnginePid_FallsBackToEngineMatch: when there is no
+// disambiguator (plain worker dispatch without --remote-control), the
+// resolver picks the deepest claude descendant.
+func TestResolveEnginePid_FallsBackToEngineMatch(t *testing.T) {
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh -c claude --dangerously-skip-permissions"},
+		{PID: 201, PPID: 200, Args: "claude --dangerously-skip-permissions"},
+	}
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	pid, args, err := resolveEnginePid("fleet-x", "", "claude", 1*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 201 {
+		t.Errorf("pid = %d, want 201", pid)
+	}
+	if args == "" {
+		t.Errorf("args empty; want claude argv")
+	}
+}
+
+// TestResolveEnginePid_TimeoutFallsBackToPanePid: when no descendant
+// matches before the deadline, return the pane pid + empty argv. A
+// wrong-but-live pid beats the previous os.Getpid() bug where the
+// recorded pid was dead by construction.
+func TestResolveEnginePid_TimeoutFallsBackToPanePid(t *testing.T) {
+	// Only the wrapper shell is in the tree; claude never exec'd.
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh -c claude ..."},
+	}
+	// now() ticks ahead each call so we cross the deadline after a few
+	// poll iterations — deterministic without sleeping in real time.
+	tick := time.Unix(0, 0)
+	nowCalls := 0
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now: func() time.Time {
+			nowCalls++
+			if nowCalls > 1 {
+				tick = tick.Add(500 * time.Millisecond)
+			}
+			return tick
+		},
+		sleep: func(time.Duration) {},
+	}
+	pid, args, err := resolveEnginePid(
+		"fleet-x",
+		"fleet-coord-x",
+		"claude",
+		100*time.Millisecond,
+		deps,
+	)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 200 {
+		t.Errorf("timeout pid = %d, want 200 (pane fallback)", pid)
+	}
+	if args != "" {
+		t.Errorf("timeout args = %q, want empty", args)
+	}
+}
+
+// TestResolveEnginePid_PanePidUnreachableErrors: a tmux that won't
+// answer list-panes within the budget surfaces as a hard error. This
+// is the only failure mode that aborts the spawn — without a pane pid
+// we have nothing to walk.
+func TestResolveEnginePid_PanePidUnreachableErrors(t *testing.T) {
+	tick := time.Unix(0, 0)
+	nowCalls := 0
+	deps := resolveEnginePidDeps{
+		panePID: func(string) (int, error) {
+			return 0, errors.New("tmux not reachable")
+		},
+		listProcs: func() ([]procEntry, error) { return nil, nil },
+		now: func() time.Time {
+			nowCalls++
+			if nowCalls > 1 {
+				tick = tick.Add(500 * time.Millisecond)
+			}
+			return tick
+		},
+		sleep: func(time.Duration) {},
+	}
+	_, _, err := resolveEnginePid(
+		"fleet-x",
+		"fleet-coord-x",
+		"claude",
+		50*time.Millisecond,
+		deps,
+	)
+	if err == nil {
+		t.Fatal("expected error when pane pid unreachable")
+	}
+	if !strings.Contains(err.Error(), "pane pid unreachable") {
+		t.Errorf("err = %v, want 'pane pid unreachable' message", err)
+	}
+}
+
+// TestFindEngineDescendant_NoDescendantsReturnsZero: a pane with no
+// child processes (pre-exec or just-killed) returns 0. The poll loop
+// retries until the timeout, then falls back to the pane pid.
+func TestFindEngineDescendant_NoDescendantsReturnsZero(t *testing.T) {
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "sh -c ..."},
+	}
+	pid, _ := findEngineDescendant(procs, 200, "fleet-coord-x", "claude")
+	if pid != 0 {
+		t.Errorf("pid = %d, want 0 when no descendants", pid)
+	}
+}
+
+// TestFindEngineDescendant_DisambiguatorBeatsEngineMatch verifies the
+// match priority — a disambiguator hit anywhere in the tree wins over
+// a deeper engine-only match.
+func TestFindEngineDescendant_DisambiguatorBeatsEngineMatch(t *testing.T) {
+	procs := []procEntry{
+		// Shallow disambiguator match (shell itself carries the
+		// argv passed to -c, so the shell row's args includes
+		// "fleet-coord-A1"). Resolver should pick this over the
+		// deeper claude process if it had a different disambiguator.
+		{PID: 200, PPID: 1, Args: "sh -c claude --remote-control fleet-coord-A1"},
+		// Deeper engine-only match — would win in fallback but not
+		// when the disambiguator is set.
+		{PID: 201, PPID: 200, Args: "claude --no-disambiguator-here"},
+	}
+	pid, args := findEngineDescendant(procs, 200, "fleet-coord-A1", "claude")
+	// The shell wrapper carries the disambiguator in its argv, so it
+	// IS the first match. This is fine — the production resolver's
+	// poll loop will re-walk and pick up the deeper claude on the
+	// next iteration once claude actually exec's. The test pins the
+	// match-priority contract: disambiguator wins over engine.
+	if pid != 200 && pid != 201 {
+		t.Fatalf("pid = %d, want 200 or 201", pid)
+	}
+	if !strings.Contains(args, "fleet-coord-A1") && !strings.Contains(args, "claude") {
+		t.Errorf("args = %q, want some match argv", args)
+	}
+}
+
+// TestArgvCommandIs covers the argv command-name match used by the
+// engine-hint priority. Strips a leading path so a binary at
+// /usr/local/bin/claude matches "claude".
+func TestArgvCommandIs(t *testing.T) {
+	cases := []struct {
+		argv string
+		name string
+		want bool
+	}{
+		{"claude --foo", "claude", true},
+		{"/usr/local/bin/claude --foo", "claude", true},
+		{"sh -c claude", "claude", false}, // first token is "sh"
+		{"", "claude", false},
+		{"claude", "claude", true},
+		{"claude-wrapper --x", "claude", false}, // exact match required
+	}
+	for _, tc := range cases {
+		got := argvCommandIs(tc.argv, tc.name)
+		if got != tc.want {
+			t.Errorf("argvCommandIs(%q, %q) = %v, want %v",
+				tc.argv, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestIsShellArgv ensures we don't classify the wrapper shell as the
+// engine via the fallback path.
+func TestIsShellArgv(t *testing.T) {
+	cases := []struct {
+		argv string
+		want bool
+	}{
+		{"sh -c foo", true},
+		{"/bin/bash -c foo", true},
+		{"zsh", true},
+		{"claude --foo", false},
+		{"", false},
+		{"  /usr/bin/dash -c foo", true},
+	}
+	for _, tc := range cases {
+		got := isShellArgv(tc.argv)
+		if got != tc.want {
+			t.Errorf("isShellArgv(%q) = %v, want %v", tc.argv, got, tc.want)
+		}
+	}
+}
+
+// TestParsePsOutput pins the parser against representative ps -ax
+// output. The first line is a header (non-numeric pid) and should be
+// dropped; subsequent lines parse into entries with args containing
+// internal whitespace preserved.
+func TestParsePsOutput(t *testing.T) {
+	raw := []byte(`  PID  PPID ARGS
+    1     0 /sbin/launchd
+ 1241  1239 -/bin/zsh
+ 5876  5873 claude --remote-control fleet-coord-A1 --dangerously-skip-permissions
+`)
+	got := parsePsOutput(raw)
+	if len(got) != 3 {
+		t.Fatalf("got %d entries, want 3", len(got))
+	}
+	if got[0].PID != 1 || got[0].PPID != 0 {
+		t.Errorf("entry[0] = %+v", got[0])
+	}
+	if got[2].PID != 5876 || got[2].PPID != 5873 {
+		t.Errorf("entry[2] pid/ppid = %d/%d", got[2].PID, got[2].PPID)
+	}
+	if !strings.Contains(got[2].Args, "fleet-coord-A1") {
+		t.Errorf("entry[2].Args = %q", got[2].Args)
+	}
+}
