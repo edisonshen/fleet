@@ -6,6 +6,60 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-14
+
+Coord liveness gets a correctness pass and dead coordinators become
+resumable instead of dead-ends. Operators can `[a]` a dead coord in
+the TUI dispatch flow and a successor takes over via a synthetic
+handoff document — in-flight workers and open PRs survive intact.
+Spawn now records the real engine pid (not the wrapper-shell pid),
+fleet-guard re-resolves on every Stop hook, the TUI distinguishes
+stuck / idle / waiting / dead, and a new jetsam observer surfaces
+macOS memory-pressure kills as an OOM badge on the project row.
+
+### Added
+
+- Dead-coord resume via synthetic handoff (#142). The TUI's dispatch
+  flow detects dead coordinators (stale `coord-state.json` + no live
+  lock) and offers `[a]` to attach a successor. The successor inherits
+  cwd, engine, and command from the dead record; tasks.md status is
+  overlaid onto recovery-synth `## Active Subagents` rows; the
+  `## Open PRs` section is enriched via `gh pr list` with a tasks.md
+  fallback when gh is unavailable. Fails closed on agent.List/stat
+  errors, dual-signal live-coord veto, defers dead-record archive,
+  gates engine clamp on explicit operator choice, inherits
+  `DisableAutoResume`.
+- `pidresolver` package — walks the tmux pane child tree to identify
+  the real engine pid, tests the pane leader (not just children),
+  skips wrapper shells carrying the disambiguator, and stabilizes
+  tentative matches with N=5 consecutive observations (#144).
+- Jetsam observer (#144). `skills/fleet-guard/jetsam.py` parses
+  macOS jetsam log output and writes incident JSON; the TUI project
+  row gains an OOM badge when an incident is present. jetsam.py is
+  wired into the fleet-guard `go:embed` directive.
+
+### Changed
+
+- Spawn path records the real engine pid by walking the tmux pane
+  child tree rather than recording the wrapper-shell pid (#144).
+  fleet-guard re-resolves the pid on every Stop hook so heartbeats
+  survive engine restarts.
+- TUI coord-state derivation now lets fresh `coord-state.json`
+  freshness beat stale spawn-timeout markers (#144). Liveness wins
+  over the spawn-timeout fallback when both signals disagree.
+
+### Fixed
+
+- Alive-but-idle coords no longer render as DEAD/STUCK in the TUI
+  (#144). `stuck` downgrades to `waiting` when the agent reports
+  `needs_input=true`, gated on `last_activity_ts` freshness so a
+  long-dead coord with a stale `needs_input` flag still surfaces as
+  dead.
+- `[a]` on a project row no longer spawns a phantom coord when the
+  recorded coord agent is dead but its record still claims the slot
+  (#142). The dead record is detected and the dispatch flow offers
+  attachment instead of unconditional spawn.
+
 ## [0.9.0] - 2026-05-13
 
 `fleet project add <path>` now accepts non-git directories. Operators
