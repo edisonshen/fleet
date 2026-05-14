@@ -11,6 +11,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -714,6 +715,50 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Dead-coord recovery — atomic marker flip (case 4 in the v5
+	// plan). When we recovered a dead coord (oldRecord != nil) AND
+	// the marker still resolves to the dead coord's ID, route the
+	// marker transition through AtomicCoordSwap with OldIsDead=true.
+	// The helper:
+	//   - acquires the per-project swap.lock,
+	//   - re-verifies the marker == oldRecord.ID (catches a TUI
+	//     marker write that raced this dispatch),
+	//   - writes the marker → rec.ID via WriteAtomic + parent-dir
+	//     fsync (commit 1),
+	//   - SKIPS kill + archive of oldRecord (OldIsDead=true matches
+	//     this path's existing "_ = oldRecord; archive intentionally
+	//     skipped" semantics — operator clears via TUI [x]).
+	//
+	// We do NOT call the helper when:
+	//   - oldRecord == nil (fresh coord spawn, no swap)
+	//   - marker doesn't match oldRecord.ID (e.g., never written
+	//     because TUI flow short-circuited, or operator manually
+	//     deleted). The existing post-dispatch TUI marker write
+	//     remains the marker-flip mechanism in that case.
+	//
+	// The TUI's post-dispatch state.WriteCoordSpawnMarker call still
+	// runs (it's idempotent for the same agent ID) — leaving the
+	// belt-and-suspenders intact while the helper provides the
+	// atomic, lock-serialized commit point for crash safety.
+	if oldRecord != nil && state.ReadCoordSpawnMarker(opts.project) == oldRecord.ID {
+		if _, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
+			Project:              opts.project,
+			OldRec:               oldRecord,
+			AlreadySpawnedNewRec: rec,
+			OldIsDead:            true,
+		}, os.Stderr); swapErr != nil {
+			// Best-effort: a swap-helper error here doesn't abort
+			// dispatch — the spawn already succeeded, the record is
+			// on disk, the TUI's post-dispatch marker write will
+			// take care of the marker flip. Surface the warning so
+			// log analysis can correlate dispatch outcomes with
+			// swap-helper errors.
+			_, _ = fmt.Fprintf(stdout,
+				"warning: atomic coord-swap (dead-coord recovery) returned: %v (dispatch still succeeded; TUI fallback marker write will run)\n",
+				swapErr)
+		}
 	}
 
 	// Recovery-path bookkeeping (codex review iter-11 P1): we
