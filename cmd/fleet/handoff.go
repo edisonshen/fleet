@@ -667,23 +667,41 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// 8a-bis. Detect coord swap vs worker handoff. The coord-spawn
-	//     marker is the dashboard's gate for "this agent is this
-	//     project's coord". When the OLD agent IS the project's coord
-	//     (marker matches OLD.ID), the retire path runs through the
-	//     transactional AtomicCoordSwap helper instead of the inline
-	//     marker-write + Kill + Archive sequence below. This collapses
-	//     the four discrete writes (marker rename, /exit, kill, archive)
-	//     into one atomic commit point at the marker rename — the v5
-	//     guarantee that no observable instant sees the marker pointing
-	//     at a dead OLD or NEW. See the plan at
-	//     /Users/pinkbear/.claude/plans/synthetic-kindling-shell.md.
+	// 8a-bis. Detect coord swap vs worker handoff + eager marker
+	//     write. The coord-spawn marker is the dashboard's gate for
+	//     "this agent is this project's coord". When the OLD agent
+	//     IS the project's coord (marker matches OLD.ID), the retire
+	//     path runs through the transactional AtomicCoordSwap helper
+	//     instead of the inline marker-write + Kill + Archive
+	//     sequence below.
+	//
+	//     We ALSO eagerly write the marker → newRec.ID here, BEFORE
+	//     the readiness wait at step 8c (codex review iter-9 [P1]).
+	//     Without this eager write, the marker stays at oldRec.ID
+	//     during NEW's up-to-30s boot — and if OLD exits during that
+	//     window, the TUI's [a] path can't find NEW (record.ID !=
+	//     marker) and spawns a duplicate coord. The eager write
+	//     closes that duplicate-coord window. AtomicCoordSwap's
+	//     step 1.b accepts the marker at either oldRec.ID (no eager
+	//     write yet) or newRec.ID (eager write landed) and skips a
+	//     redundant rename when markerAtNew is already true.
 	//
 	//     Worker handoffs (marker is unset OR marker != OLD.ID) keep
 	//     the inline path unchanged — worker swap has different
 	//     transactional semantics (task-row CompareAndSwap, deferred
 	//     to a separate PR).
-	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	isCoordSwap := false
+	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
+		isCoordSwap = true
+		// Eager marker write — best-effort. AtomicCoordSwap will
+		// re-commit (idempotent) inside its step 4 if this failed,
+		// or skip step 4 if it succeeded.
+		if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: eager coord-spawn marker update for project %s failed: %v (AtomicCoordSwap will retry)\n",
+				oldRec.Project, werr)
+		}
+	}
 
 	// 8b. Auto-resume policy for the rest of this handoff. Uses the
 	//     per-handoff resolved value (not newRec's baseline) so a
@@ -998,15 +1016,33 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 
-	// Coord swap fast path on the crash-recovery flow too. If the
-	// previous run crashed after spawn but before the marker write,
-	// the marker is still at oldRec.ID and a coord swap is still
-	// pending — route through AtomicCoordSwap (codex review iter-5
-	// [P1]). If the previous run got past marker commit before
-	// crashing, marker is already at newRec.ID and isCoordSwap is
-	// false — fall through to inline kill+archive (the marker is
-	// already where it needs to be).
-	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	// Coord swap fast path on the crash-recovery flow too. The
+	// previous run may have:
+	//   - crashed AFTER spawn but BEFORE marker write: marker still
+	//     at oldRec.ID, swap still pending → AtomicCoordSwap commits.
+	//   - crashed AFTER marker commit during retire: marker at
+	//     newRec.ID, retire bookkeeping still pending → helper's
+	//     step 1.b accepts markerAtNew, step 4 skips the redundant
+	//     rename, retire (kill+archive OLD) proceeds.
+	// (Codex iter-5 [P1], iter-9 [P1].)
+	//
+	// Eager marker write when marker is still at oldRec.ID, same as
+	// runHandoff — closes the duplicate-coord window during the
+	// resumeHandoff readiness wait.
+	isCoordSwap := false
+	if oldRec.Project != "" {
+		switch state.ReadCoordSpawnMarker(oldRec.Project) {
+		case oldRec.ID:
+			isCoordSwap = true
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: eager coord-spawn marker update for project %s failed: %v (AtomicCoordSwap will retry)\n",
+					oldRec.Project, werr)
+			}
+		case newRec.ID:
+			isCoordSwap = true
+		}
+	}
 	if isCoordSwap {
 		_, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{
 			Project:              oldRec.Project,

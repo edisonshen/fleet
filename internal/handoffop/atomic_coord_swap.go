@@ -272,21 +272,30 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	}
 	defer release()
 
-	// Step 1.b — verify the marker still points at OLD. If something
-	// else moved it (concurrent swap, manual operator override), abort
-	// without spawning. The lock makes this race the narrow window
-	// between OUR acquire and OUR read; in practice another swap that
-	// completed before us will have re-pointed the marker.
+	// Step 1.b — verify the marker resolves to either oldRec.ID
+	// (fresh swap; we'll commit the rename in step 4) or — when the
+	// caller pre-spawned and pre-committed the marker for the duplicate-
+	// coord-window fix — to AlreadySpawnedNewRec.ID (re-commit
+	// idempotent; we skip step 4 and proceed with retire bookkeeping).
+	// Any other value means another swap raced us and committed to a
+	// third party.
+	//
+	// Codex review iter-9 [P1]: the pre-commit-marker case is necessary
+	// because removing the eager marker write left a window where the
+	// marker pointed at OLD while NEW was booting. If OLD exited during
+	// that window, the TUI's [a] path couldn't find NEW (record.ID !=
+	// marker) and spawned a duplicate. Callers (spawnAndRetire,
+	// runHandoff) now write the marker eagerly under their own
+	// best-effort path and the helper accepts either marker state.
 	//
 	// Codex review iter-1 [P2]: when the caller pre-spawned
 	// (AlreadySpawnedNewRec set), an ErrConcurrentSwap here MUST also
 	// clean up the pre-spawned NEW — otherwise the marker-race detection
-	// turns INTO the duplicate-agent state it was supposed to prevent
-	// (NEW record on disk + NEW tmux session live but no commitment to
-	// it as coord). DropReplacementRecord is idempotent and pairs kill +
-	// remove safely.
+	// turns INTO the duplicate-agent state it was supposed to prevent.
 	cur := state.ReadCoordSpawnMarker(in.Project)
-	if cur != in.OldRec.ID {
+	markerAtOld := cur == in.OldRec.ID
+	markerAtNew := in.AlreadySpawnedNewRec != nil && cur == in.AlreadySpawnedNewRec.ID
+	if !markerAtOld && !markerAtNew {
 		if in.AlreadySpawnedNewRec != nil {
 			rec := in.AlreadySpawnedNewRec
 			if dropErr := DropReplacementRecord(rec.TmuxSession, rec.ID, stderr); dropErr != nil {
@@ -389,17 +398,27 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	// not durable yet — operator's `fleet rm <NEW>` resolves) or at
 	// NEW (rename durable — crash window B/C, queued-vs-not split per
 	// the plan).
-	if werr := writeCoordSpawnMarkerFn(in.Project, newRec.ID); werr != nil {
-		// Marker write failed. NEW is alive but not declared as coord.
-		// Roll back NEW — kill + remove record — and surface error.
-		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+	//
+	// SKIPPED when the marker is already at NEW (markerAtNew = true from
+	// step 1.b). That happens when the caller pre-committed the marker
+	// (codex iter-9 [P1] fix: spawnAndRetire writes the marker eagerly
+	// to close the duplicate-coord window during NEW's readiness wait).
+	// Re-writing is idempotent — same value to same path — but skipping
+	// avoids the extra rename when it's a no-op.
+	if !markerAtNew {
+		if werr := writeCoordSpawnMarkerFn(in.Project, newRec.ID); werr != nil {
+			// Marker write failed. NEW is alive but not declared as
+			// coord. Roll back NEW — kill + remove record — and
+			// surface error.
+			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
+				return res, fmt.Errorf(
+					"atomic coord swap: marker write failed (%w) AND replacement cleanup failed (%w); marker unchanged at %s but NEW session %s may be live — investigate",
+					werr, dropErr, in.OldRec.ID, newRec.TmuxSession)
+			}
 			return res, fmt.Errorf(
-				"atomic coord swap: marker write failed (%w) AND replacement cleanup failed (%w); marker unchanged at %s but NEW session %s may be live — investigate",
-				werr, dropErr, in.OldRec.ID, newRec.TmuxSession)
+				"atomic coord swap: marker write failed: %w (replacement rolled back; marker unchanged at %s)",
+				werr, in.OldRec.ID)
 		}
-		return res, fmt.Errorf(
-			"atomic coord swap: marker write failed: %w (replacement rolled back; marker unchanged at %s)",
-			werr, in.OldRec.ID)
 	}
 
 	// Step 5 — retire OLD. Asymmetric on OldIsDead.
@@ -647,9 +666,15 @@ func dropOrphanIncidentAlert(newAgentID, oldAgentID, oldSession, project string)
 	// Body is JSON-ish so future TUI badge code can parse fields
 	// rather than scraping markdown. Manual JSON to avoid pulling
 	// encoding/json into a hot path the helper barely uses.
+	//
+	// Codex review iter-9 [P2]: the "investigate via prune-orphan-tmux"
+	// hint was wrong post-iter-7 (the helper now preserves OLD's
+	// record, so prune-orphan-tmux's "session exists, no live record"
+	// rule doesn't match). Updated to point operators at `fleet rm`
+	// after they manually confirm OLD dead.
 	body := fmt.Sprintf(
-		`{"kind":"coord-swap-orphan","timestamp_utc":%q,"project":%q,"new_agent_id":%q,"old_agent_id":%q,"old_session":%q,"summary":"coord-swap left orphan tmux session; investigate via fleet maintenance prune-orphan-tmux"}`,
-		now.Format(time.RFC3339), project, newAgentID, oldAgentID, oldSession)
+		`{"kind":"coord-swap-orphan","timestamp_utc":%q,"project":%q,"new_agent_id":%q,"old_agent_id":%q,"old_session":%q,"summary":"coord-swap left OLD tmux session alive (or probe ambiguous); confirm OLD dead manually (e.g. inspect other tmux sockets / tmux kill-session) then `+"`fleet rm %s`"+`"}`,
+		now.Format(time.RFC3339), project, newAgentID, oldAgentID, oldSession, oldAgentID)
 	return state.WriteAtomic(path, []byte(body+"\n"))
 }
 

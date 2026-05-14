@@ -149,16 +149,29 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		thisHandoffDisable = true
 	}
 	// Coord-swap detection for the case-3 resume path (replacement
-	// already spawned + alive). marker == oldRec.ID means the
-	// previous run crashed BEFORE writing the marker — this resume
-	// needs the atomic commit. marker == newRec.ID means the previous
-	// run got past step 4 (marker committed) and crashed during
-	// retire — this resume just finishes kill+archive without routing
-	// through AtomicCoordSwap (its step 1.b precondition would fail
-	// because marker is already at NEW). Anything else (oldRec.Project
-	// empty, marker pointing somewhere unrelated) is a worker handoff
-	// or non-coord agent — inline path.
-	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	// already spawned + alive). isCoordSwap fires when the marker
+	// resolves to either oldRec.ID (previous run crashed BEFORE
+	// commit) or newRec.ID (previous run committed but crashed during
+	// retire — still need atomic kill+archive bookkeeping). The
+	// helper's step 1.b accepts both states (codex iter-9 [P1]).
+	//
+	// On marker==oldRec.ID, eager-write the marker → newRec.ID before
+	// retireOldAgent so the readiness wait doesn't open a duplicate-
+	// coord window.
+	isCoordSwap := false
+	if oldRec.Project != "" {
+		switch state.ReadCoordSpawnMarker(oldRec.Project) {
+		case oldRec.ID:
+			isCoordSwap = true
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: eager coord-spawn marker update for project %s failed: %v (retireOldAgent will retry inside AtomicCoordSwap)\n",
+					oldRec.Project, werr)
+			}
+		case newRec.ID:
+			isCoordSwap = true
+		}
+	}
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisable, graceMillis, isCoordSwap, stdout, stderr)
 }
@@ -436,25 +449,42 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// Coord-spawn marker transfer. Detect whether this is a coord
-	// swap (marker == oldRec.ID) BEFORE retireOldAgent runs so the
-	// retire path's isCoordSwap branch fires. Previously the marker
-	// was written here, which made retireOldAgent's
-	// ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID predicate
-	// FALSE — the marker had already moved to newRec.ID, so
-	// retireOldAgent took the worker path and the helper's
-	// transactional commit point was bypassed (codex review iter-1
-	// [P1]).
+	// Coord-spawn marker transfer in two passes (codex iter-1 [P1] +
+	// iter-9 [P1]):
 	//
-	// Fix: hoist the detection here, drop the early marker write —
-	// the helper writes the marker atomically inside retireOldAgent's
-	// coord branch (under the swap.lock). The TUI's post-dispatch
-	// marker-write is still the redundant belt for dashboard freshness.
+	//   1. DETECT isCoordSwap by reading the marker BEFORE we change
+	//      it. Pass through to retireOldAgent so its isCoordSwap branch
+	//      fires regardless of subsequent marker reads.
+	//
+	//   2. EAGERLY write marker → newRec.ID BEFORE retireOldAgent's
+	//      readiness wait. Without this the marker stays at oldRec.ID
+	//      during NEW's boot. If OLD exits during that window, the
+	//      TUI's [a] path can't find NEW (record.ID != marker) and
+	//      spawns a duplicate coord.
+	//
+	// AtomicCoordSwap's step 1.b accepts EITHER marker==oldRec.ID OR
+	// marker==newRec.ID (when AlreadySpawnedNewRec is set), so the
+	// eager write is idempotent w.r.t. the helper's commit contract.
+	// The helper's step 4 also skips a redundant rename when
+	// markerAtNew is already true.
 	//
 	// Workers and other non-coord agents go through retireOldAgent's
 	// inline path unchanged — the v0.2 worker-swap transactional
 	// refactor is deferred per the v5 plan's Non-goals.
-	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
+	isCoordSwap := false
+	if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID {
+		isCoordSwap = true
+		// Eager marker write — closes the duplicate-coord window
+		// during NEW's readiness wait. Best-effort; marker errors
+		// print a warning but don't fail the drain. retireOldAgent's
+		// AtomicCoordSwap call will re-commit (idempotent) or
+		// commit fresh, whichever applies.
+		if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: eager coord-spawn marker update for project %s failed: %v (retireOldAgent will retry inside AtomicCoordSwap)\n",
+				oldRec.Project, werr)
+		}
+	}
 
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
 		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, stdout, stderr)
