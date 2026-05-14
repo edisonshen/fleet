@@ -111,41 +111,41 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		}
 		matches = append(matches, rec)
 	}
-	// codex iter-2 [P1] + iter-4 [P2]: bad-records gate. Three cases:
+	// codex iter-2 [P1] + iter-4 [P2] + iter-7 [P1]: bad-records gate.
+	// Apply the raw-text relevance filter UNIFORMLY: a bad record only
+	// counts against this task if its raw bytes mention this task's
+	// slug OR project name. Two outcomes:
 	//
-	//   - matched records > 0 AND bad records exist: refuse. A bad
-	//     record could be another match we missed.
+	//   - any plausibly-related bad record: refuse the transition.
+	//     The "ALL agents for this task are corrupt" failure mode
+	//     and the "matches exist + some unrelated bad record" failure
+	//     mode have the same fix: hide the bad record's contents
+	//     might still be a worker we missed, but only if those
+	//     contents reference this task at all.
 	//
-	//   - no matches AND bad records contain raw-text evidence they
-	//     could belong to this task (task_id or project substring
-	//     match): refuse. The only worker may BE the corrupt one;
-	//     proceeding would mark the task terminal while a live tmux
-	//     session lingers.
-	//
-	//   - no matches AND no plausibly-related bad records: warn and
-	//     proceed. A corrupt record in an unrelated project shouldn't
-	//     wedge every task transition (the iter-2 fix).
+	//   - no plausibly-related bad records: warn (if any bad records
+	//     exist) and proceed. A corrupt record in an unrelated
+	//     project shouldn't wedge every task transition.
 	//
 	// The raw-text check is a safety net, not a parser: it grep-
-	// matches `"task_id": "<slug>"` / `"project": "<project>"` literals
-	// against the file bytes. False positives are tolerable (refuse
-	// the transition; operator triages). False negatives mean a
-	// genuinely unrelated corrupt record won't block — same as before.
+	// matches `"task_id": "<slug>"` OR `"project": "<project>"`
+	// literals against the file bytes. Either substring is enough —
+	// requiring BOTH (iter-4) missed truncated records where one
+	// field is lost (iter-7 P1). False positives are tolerable
+	// (refuse; operator triages). False negatives only happen when
+	// the record is corrupted past every reference to slug/project,
+	// at which point the record cannot meaningfully belong to this
+	// task anyway.
 	if len(badIDs) > 0 {
-		if len(matches) > 0 {
-			return res, fmt.Errorf(
-				"%w: %d agent record(s) unreadable (%v) while %d worker(s) match task %s; refusing to mark terminal — fix or remove the unreadable records and retry",
-				ErrWorkerCleanupFailed, len(badIDs), badIDs, len(matches), opts.TaskSlug)
-		}
 		if relevant := badRecordsPlausiblyRelated(badIDs, opts.Project, opts.TaskSlug); len(relevant) > 0 {
 			return res, fmt.Errorf(
-				"%w: %d agent record(s) unreadable AND raw-text match THIS task (%v); refusing to mark %s terminal — fix or remove the unreadable records and retry",
-				ErrWorkerCleanupFailed, len(relevant), relevant, opts.TaskSlug)
+				"%w: %d agent record(s) unreadable AND raw-text match task %s or project %s (%v); refusing to mark terminal — fix or remove the unreadable records and retry",
+				ErrWorkerCleanupFailed, len(relevant), opts.TaskSlug, opts.Project, relevant)
 		}
 		if opts.Stderr != nil {
 			_, _ = fmt.Fprintf(opts.Stderr,
-				"warning: %d agent record(s) unreadable (%v); no workers matched task %s so the cleanup gate proceeds, but operator should triage the corrupt records\n",
-				len(badIDs), badIDs, opts.TaskSlug)
+				"warning: %d agent record(s) unreadable (%v); none match task %s or project %s, cleanup gate proceeds — operator should triage the corrupt records\n",
+				len(badIDs), badIDs, opts.TaskSlug, opts.Project)
 		}
 	}
 	// Pass 2: kill + archive each matched record.
@@ -214,27 +214,30 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 }
 
 // badRecordsPlausiblyRelated reads each unparseable agent record's
-// raw bytes and reports the subset whose contents contain literal
-// "task_id" + slug AND "project" + project matches. This is the
-// codex iter-4 [P2] safety net: when agent.ListStrict surfaces
-// unparseable records, we can't tell from Load alone whether they
-// belong to the current task — but their raw JSON usually still
-// has identifiable key/value pairs, even if some other field broke
-// parsing. Grepping is cheaper than re-implementing a tolerant
-// parser and stays robust to schema drift.
+// raw bytes and reports those whose contents could plausibly belong
+// to the named task. Safety net for the codex iter-4 [P2] +
+// iter-7 [P1] case: when agent.ListStrict surfaces unparseable
+// records, we can't Load them, but their raw JSON usually still has
+// identifiable key/value pairs. Grepping is cheaper than re-
+// implementing a tolerant parser.
 //
-// Returns IDs of bad records whose raw bytes contain BOTH
+// Relation rule (iter-7 P1: relaxed from iter-4's "both required"):
+// a bad record is treated as related when its raw bytes contain
+// EITHER
 //
-//	"task_id"  ... "<slug>"
-//	"project"  ... "<project>"
+//	"task_id"  ... "<slug>"      (task_id substring + slug literal), OR
+//	"project"  ... "<project>"   (project substring + project literal).
 //
-// (substring match — JSON whitespace tolerant). False positives are
-// safe (refuse the task transition; operator triages). False negatives
-// only happen for records corrupted past those substrings, which would
-// not have matched the project anyway.
+// Either alone is enough — requiring BOTH (iter-4) missed truncated
+// records where corruption ate one of the fields. False positives
+// (an unrelated record happens to contain a literal that matches
+// the slug or project string) are tolerable: refuse the transition;
+// operator triages. False negatives only happen when corruption ate
+// EVERY reference to slug/project, at which point the record cannot
+// meaningfully belong to this task.
 //
-// Read errors on a bad path treat the record as "could match" — the
-// safe default; we already know it's unreadable.
+// Read errors treat the record as "could match" — we already know
+// it's unreadable; surfacing it as related lets the gate refuse.
 func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string {
 	var related []string
 	taskMarker := `"task_id"`
@@ -253,10 +256,11 @@ func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string 
 			continue
 		}
 		s := string(data)
-		// Must contain BOTH task_id+slug AND project+project.
 		hasTask := strings.Contains(s, taskMarker) && strings.Contains(s, slugMarker)
 		hasProj := strings.Contains(s, projMarker) && strings.Contains(s, projValueMarker)
-		if hasTask && hasProj {
+		// Iter-7 P1: EITHER signal is enough (relaxed from iter-4's
+		// "both required"). Truncated JSON might have lost one field.
+		if hasTask || hasProj {
 			related = append(related, id)
 		}
 	}

@@ -245,24 +245,25 @@ func TestKillAgentsForTask_EmptyTmuxSession_Skipped(t *testing.T) {
 	}
 }
 
-// TestKillAgentsForTask_MalformedRecordWithMatch_RefusesArchive —
-// codex iter-1 [P2] + iter-2 [P1]: an unreadable record alongside a
-// matching live worker fails the gate. The bad record might be
-// another match we couldn't parse.
-func TestKillAgentsForTask_MalformedRecordWithMatch_RefusesArchive(t *testing.T) {
+// TestKillAgentsForTask_MalformedRecordRelevantText_RefusesArchive —
+// codex iter-1 [P2] + iter-2 [P1] + iter-7 [P1]: an unreadable
+// record whose raw bytes mention this task's slug OR project name
+// fails the gate. Whether or not there's also a parseable match
+// for this task doesn't matter — the bad record's text content is
+// the relevance signal.
+func TestKillAgentsForTask_MalformedRecordRelevantText_RefusesArchive(t *testing.T) {
 	fleetHome := setupFleetHome(t)
-	// Seed a matching live worker AND a malformed record. Both
-	// scenarios where ListStrict reports badIDs while we have a real
-	// match must fail closed.
-	seedWorkerAgent(t, "wrk-real", "rainier", "any-task")
+	// Bad record whose raw bytes contain this task's slug.
 	badPath := fleetHome + "/agents/badcoord.json"
-	if err := os.WriteFile(badPath, []byte("not json"), 0o644); err != nil {
+	if err := os.WriteFile(badPath,
+		[]byte(`{"task_id": "any-task", "tmux_session": "fleet-leak",`),
+		0o644); err != nil {
 		t.Fatalf("seed bad record: %v", err)
 	}
 
 	stubWorkerTmux(t,
 		func(string) error {
-			t.Errorf("Kill must not be called when records are malformed alongside matches")
+			t.Errorf("Kill must not be called when bad record matches task slug")
 			return nil
 		},
 		func(string) (bool, error) { return false, nil },
@@ -271,13 +272,54 @@ func TestKillAgentsForTask_MalformedRecordWithMatch_RefusesArchive(t *testing.T)
 		Project: "rainier", TaskSlug: "any-task", Stderr: io.Discard,
 	})
 	if err == nil {
-		t.Fatalf("expected error on malformed agent record + match")
+		t.Fatalf("expected error on malformed agent record whose text matches task")
 	}
 	if !errors.Is(err, ErrWorkerCleanupFailed) {
 		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
 	}
 	if !strings.Contains(err.Error(), "unreadable") {
 		t.Errorf("error should mention 'unreadable'; got %v", err)
+	}
+}
+
+// TestKillAgentsForTask_MalformedRecordMatchWithUnrelatedBad_Proceeds —
+// codex iter-7 [P1]: when matches exist AND there's a bad record but
+// the bad record's text doesn't mention this task or project, the
+// gate proceeds (clean up the matched workers). Previously: any bad
+// record blocked even unrelated task transitions when matches existed.
+func TestKillAgentsForTask_MalformedRecordMatchWithUnrelatedBad_Proceeds(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	worker := seedWorkerAgent(t, "wrk-clean", "rainier", "clean-task")
+	// Bad record from an unrelated project — mentions different slug
+	// and different project.
+	badPath := fleetHome + "/agents/badunrelated.json"
+	if err := os.WriteFile(badPath,
+		[]byte(`{"task_id": "different-task", "project": "different-proj"`),
+		0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	var stderr bytes.Buffer
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "clean-task", Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("expected success when bad record is unrelated; got %v", err)
+	}
+	if res.Matched != 1 || res.Killed != 1 || res.Archived != 1 {
+		t.Errorf("counts: matched=%d killed=%d archived=%d; want 1/1/1",
+			res.Matched, res.Killed, res.Archived)
+	}
+	if !strings.Contains(stderr.String(), "unreadable") {
+		t.Errorf("stderr should warn about unreadable records; got: %s", stderr.String())
+	}
+	// Verify worker WAS cleaned up.
+	livePath, _ := state.AgentPath(worker.ID)
+	if workerFileExists(livePath) {
+		t.Errorf("worker record still live; iter-7 P1 regression (bad record blocked transition)")
 	}
 }
 
@@ -313,6 +355,34 @@ func TestKillAgentsForTask_MalformedRecordNoMatchUnrelated_WarnsAndProceeds(t *t
 	}
 }
 
+// TestKillAgentsForTask_MalformedRecordTaskIDOnly_Refuses — codex
+// iter-7 [P1]: a record corrupted past the project field still
+// usually carries the task_id substring. The relevance check must
+// fail closed on EITHER signal (task_id OR project), not require
+// both.
+func TestKillAgentsForTask_MalformedRecordTaskIDOnly_Refuses(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	// Record truncated AFTER task_id but BEFORE project.
+	badPath := fleetHome + "/agents/truncwrk.json"
+	raw := `{"id": "truncwrk", "task_id": "stuck-task"` // truncated
+	if err := os.WriteFile(badPath, []byte(raw), 0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+	stubWorkerTmux(t,
+		func(string) error { t.Errorf("Kill must not be called"); return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+	_, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "stuck-task", Stderr: io.Discard,
+	})
+	if err == nil {
+		t.Fatalf("expected error when bad record carries only task_id (iter-7 P1)")
+	}
+	if !errors.Is(err, ErrWorkerCleanupFailed) {
+		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
+	}
+}
+
 // TestKillAgentsForTask_MalformedRecordNoMatchButRawTextMatches_Refuses —
 // codex iter-4 [P2]: when the ONLY agent attached to this task has a
 // corrupt record, the parsed loop finds zero matches but the raw bytes
@@ -343,7 +413,7 @@ func TestKillAgentsForTask_MalformedRecordNoMatchButRawTextMatches_Refuses(t *te
 	if !errors.Is(err, ErrWorkerCleanupFailed) {
 		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
 	}
-	if !strings.Contains(err.Error(), "raw-text match THIS task") {
+	if !strings.Contains(err.Error(), "raw-text match") {
 		t.Errorf("error should mention raw-text match; got %v", err)
 	}
 }
