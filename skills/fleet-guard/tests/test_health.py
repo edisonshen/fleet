@@ -393,7 +393,7 @@ class TestReconcilePid:
         engine — the test isolates the live-pid path, not the
         wrapper-detection path (that has its own coverage)."""
         monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
-                            lambda pid, agent_id: False)
+                            lambda pid, agent_id, check_disambiguator=True: False)
         path = _seed_record(fleet_home_tmp, "agent_live", pid=os.getpid())
         before = path.read_text(encoding="utf-8")
         ok = health.reconcile_pid("agent_live")
@@ -482,7 +482,7 @@ class TestReconcileLiveWrapperShellTriggersResolve:
         # Stub the wrapper-detector to return True (simulates a live
         # shell ancestor recorded earlier as the timeout fallback).
         monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
-                            lambda pid, agent_id: True)
+                            lambda pid, agent_id, check_disambiguator=True: True)
         # Resolver returns a different (real claude) pid.
         real_claude_pid = 99887766
         monkeypatch.setattr(health, "_resolve_self_pid",
@@ -507,7 +507,7 @@ class TestReconcileLiveWrapperShellTriggersResolve:
         path = _seed_record(fleet_home_tmp, "agent_same", pid=my_pid)
         before = path.read_text(encoding="utf-8")
         monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper",
-                            lambda pid, agent_id: True)
+                            lambda pid, agent_id, check_disambiguator=True: True)
         monkeypatch.setattr(health, "_resolve_self_pid",
                             lambda agent_id: my_pid)
         ok = health.reconcile_pid("agent_same")
@@ -531,6 +531,70 @@ class TestReconcileLiveWrapperShellTriggersResolve:
 
         monkeypatch.setattr(_sp, "run", lambda *a, **k: _FakeCompleted())
         assert health._recorded_pid_looks_like_wrapper(9999999, "x") is False
+
+    def test_non_coord_worker_skips_disambiguator_check(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex iter-6 (2026-05-14): plain workers (task_id NOT
+        starting with 'coord-') don't carry the fleet-coord-<id>
+        disambiguator. reconcile_pid must NOT force a re-resolve on
+        every Stop hook just because the worker's argv lacks the
+        needle. Stays on the fast _pid_alive path."""
+        # Seed a worker record (task_id='demo-task' is non-coord).
+        path = _seed_record(fleet_home_tmp, "worker01",
+                            pid=os.getpid(), task_id="demo-task")
+        before = path.read_text(encoding="utf-8")
+        # Stub _recorded_pid_looks_like_wrapper to assert it was
+        # called with check_disambiguator=False.
+        calls = []
+        original = health._recorded_pid_looks_like_wrapper
+
+        def _wrap(pid, agent_id, check_disambiguator=True):
+            calls.append((pid, agent_id, check_disambiguator))
+            # For the test process pid (our pid, python3), shell
+            # detection returns False; with disambiguator disabled
+            # we expect False overall.
+            return False  # no wrapper detected → fast-path
+
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper", _wrap)
+        ok = health.reconcile_pid("worker01")
+        assert ok is True
+        # Record unchanged (fast-path).
+        assert path.read_text(encoding="utf-8") == before
+        # The wrapper-detector WAS called, but with disambiguator
+        # disabled.
+        assert calls, "wrapper-detector was not invoked"
+        pid_arg, agent_arg, check_arg = calls[0]
+        assert check_arg is False, (
+            f"non-coord worker should call wrapper-detector with "
+            f"check_disambiguator=False; got True"
+        )
+
+    def test_coord_spawn_agent_uses_disambiguator_check(
+        self, fleet_home_tmp: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Coord-spawn agents (task_id starts with 'coord-') get the
+        full disambiguator check because their engine argv carries
+        `fleet-coord-<id>`."""
+        path = _seed_record(fleet_home_tmp, "coord01",
+                            pid=os.getpid(), task_id="coord-demo")
+        calls = []
+
+        def _wrap(pid, agent_id, check_disambiguator=True):
+            calls.append((pid, agent_id, check_disambiguator))
+            return False
+
+        monkeypatch.setattr(health, "_recorded_pid_looks_like_wrapper", _wrap)
+        ok = health.reconcile_pid("coord01")
+        assert ok is True
+        assert calls, "wrapper-detector was not invoked"
+        _, _, check_arg = calls[0]
+        assert check_arg is True, (
+            f"coord-spawn agent should call wrapper-detector with "
+            f"check_disambiguator=True; got False"
+        )
 
 
 class TestResolveSelfPidShellSkip:

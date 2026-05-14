@@ -245,12 +245,22 @@ def reconcile_pid(agent_id: str) -> bool:
     # ..."`) on timeout. The shell stays alive for the whole session,
     # so a naive _pid_alive check would let the wrong-but-live pid
     # persist forever. Re-resolve when the recorded pid points at a
-    # shell argv OR (defense-in-depth) when its argv does NOT contain
-    # this agent's disambiguator. The resolver itself is idempotent —
+    # shell argv OR (for coord-spawn agents only) its argv does NOT
+    # contain the disambiguator. The resolver itself is idempotent —
     # if no better pid is found we keep the recorded pid via the
     # _resolve_self_pid returning None branch.
+    #
+    # Codex iter-6 (2026-05-14): the disambiguator probe is scoped
+    # to coord-spawn agents (task_id starts with "coord-"). Plain
+    # workers and handoff replacements don't get the
+    # `fleet-coord-<id>` injection, so checking for the needle on
+    # every Stop hook would force a ps -ax scan on every turn AND
+    # could reconcile a healthy worker pid to nothing.
+    is_coord_spawn = str(record.get("task_id", "")).startswith("coord-")
     if recorded_int > 0 and _pid_alive(recorded_int):
-        if not _recorded_pid_looks_like_wrapper(recorded_int, agent_id):
+        if not _recorded_pid_looks_like_wrapper(
+            recorded_int, agent_id, check_disambiguator=is_coord_spawn,
+        ):
             return True
     new_pid = _resolve_self_pid(agent_id)
     if new_pid is None or new_pid <= 0:
@@ -263,20 +273,26 @@ def reconcile_pid(agent_id: str) -> bool:
     return _atomic_write_json(agent_record_path(agent_id), record)
 
 
-def _recorded_pid_looks_like_wrapper(pid: int, agent_id: str) -> bool:
+def _recorded_pid_looks_like_wrapper(
+    pid: int, agent_id: str, check_disambiguator: bool = True,
+) -> bool:
     """Return True when the recorded pid's argv suggests the resolver
     earlier latched onto a wrapper shell rather than the real engine.
     Triggers reconciliation re-resolution.
 
     Heuristics (best-effort — return False on any probe failure so we
     don't churn the record on a transient ps blip):
-      - argv first token is a known POSIX shell command name
-      - agent_id is non-empty AND the disambiguator
-        `fleet-coord-<agent_id>` is NOT in the argv (we expected to
-        find it on the real engine row)
+      - argv first token is a known POSIX shell command name → wrapper
+      - check_disambiguator=True AND agent_id non-empty AND
+        `fleet-coord-<agent_id>` is NOT in the argv → wrapper /
+        pid-recycled-into-something-else
 
-    Both heuristics must agree on "looks like a wrapper" — if argv
-    is unreadable we return False (skip reconcile, keep status quo).
+    check_disambiguator MUST be False for non-coord-spawn agents
+    (plain workers, handoff replacements). Only coord-spawn dispatches
+    inject `fleet-coord-<id>` into the engine's argv, so checking the
+    needle on a worker would force every Stop hook through the slow
+    ps -ax resolve path AND could repeatedly try to reconcile a
+    healthy worker pid that simply doesn't carry the token.
     """
     if pid <= 0:
         return False
@@ -297,10 +313,10 @@ def _recorded_pid_looks_like_wrapper(pid: int, agent_id: str) -> bool:
         return False
     if _is_shell_argv(argv):
         return True
-    if agent_id:
+    if check_disambiguator and agent_id:
         needle = f"fleet-coord-{agent_id}"
         if needle not in argv:
-            # Recorded pid is non-shell but doesn't carry our
+            # Recorded pid is non-shell but doesn't carry our coord
             # disambiguator either. Could be pid recycle into an
             # unrelated process. Reconcile.
             return True
