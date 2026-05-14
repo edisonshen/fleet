@@ -963,7 +963,9 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 			if cleanupRes.Matched > 0 {
 				what := "killed+archived"
 				if opts.keepSession {
-					what = "archived (session preserved)"
+					// codex iter-1 [P1]: --keep-session preserves the
+					// live record so operators can `fleet attach <id>`.
+					what = "session+record preserved (--keep-session)"
 				}
 				_, _ = fmt.Fprintf(stdout, "%s %d worker agent(s) for %s: %v\n",
 					what, cleanupRes.Matched, slug, cleanupRes.IDs)

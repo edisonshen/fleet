@@ -145,8 +145,11 @@ func TestKillAgentsForTask_KillFailsProbeAmbiguous_RefusesArchive(t *testing.T) 
 	}
 }
 
-// TestKillAgentsForTask_KeepSessionSkipsKill.
-func TestKillAgentsForTask_KeepSessionSkipsKill(t *testing.T) {
+// TestKillAgentsForTask_KeepSessionSkipsKillAndArchive.
+// codex iter-1 [P1]: --keep-session preserves BOTH the tmux session
+// AND the live agent record — operators use `fleet attach <id>` to
+// reach the preserved session, so archiving the record would hide it.
+func TestKillAgentsForTask_KeepSessionSkipsKillAndArchive(t *testing.T) {
 	setupFleetHome(t)
 	worker := seedWorkerAgent(t, "wrk-keep", "rainier", "keep-task")
 
@@ -165,19 +168,24 @@ func TestKillAgentsForTask_KeepSessionSkipsKill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KillAgentsForTask: %v", err)
 	}
+	if res.Matched != 1 {
+		t.Errorf("Matched = %d; want 1", res.Matched)
+	}
 	if res.Killed != 0 {
 		t.Errorf("Killed = %d; want 0", res.Killed)
 	}
-	if res.Archived != 1 {
-		t.Errorf("Archived = %d; want 1", res.Archived)
+	if res.Archived != 0 {
+		t.Errorf("Archived = %d; want 0 with KeepSession (preserve record for fleet attach)", res.Archived)
 	}
+	// Record stays live so `fleet attach <id>` can find the preserved
+	// tmux session.
 	livePath, _ := state.AgentPath(worker.ID)
-	if workerFileExists(livePath) {
-		t.Errorf("worker record still live")
+	if !workerFileExists(livePath) {
+		t.Errorf("worker record archived with KeepSession=true (codex iter-1 P1 regression)")
 	}
 	archPath, _ := state.AgentArchivePath(worker.ID)
-	if !workerFileExists(archPath) {
-		t.Errorf("worker archive missing")
+	if workerFileExists(archPath) {
+		t.Errorf("worker archive present with KeepSession=true")
 	}
 }
 
@@ -234,6 +242,41 @@ func TestKillAgentsForTask_EmptyTmuxSession_Skipped(t *testing.T) {
 	livePath, _ := state.AgentPath(legacy.ID)
 	if !workerFileExists(livePath) {
 		t.Errorf("legacy record removed unexpectedly")
+	}
+}
+
+// TestKillAgentsForTask_MalformedRecord_RefusesArchive — codex iter-1
+// [P2]: an unreadable agent record fails the gate. Without ListStrict,
+// agent.List silently skips bad records, which would let a task
+// transition to done|abandoned while a still-live worker with a
+// corrupt record stays attached and tmux-running.
+func TestKillAgentsForTask_MalformedRecord_RefusesArchive(t *testing.T) {
+	fleetHome := setupFleetHome(t)
+	// Write a bogus JSON record directly. agent.Load will fail; the
+	// strict list path returns it via badIDs.
+	badPath := fleetHome + "/agents/badcoord.json"
+	if err := os.WriteFile(badPath, []byte("not json"), 0o644); err != nil {
+		t.Fatalf("seed bad record: %v", err)
+	}
+
+	stubWorkerTmux(t,
+		func(string) error {
+			t.Errorf("Kill must not be called when records are malformed")
+			return nil
+		},
+		func(string) (bool, error) { return false, nil },
+	)
+	_, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "any-task", Stderr: io.Discard,
+	})
+	if err == nil {
+		t.Fatalf("expected error on malformed agent record")
+	}
+	if !errors.Is(err, ErrWorkerCleanupFailed) {
+		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("error should mention 'unreadable'; got %v", err)
 	}
 }
 

@@ -70,9 +70,20 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 	if opts.TaskSlug == "" {
 		return res, fmt.Errorf("%w: empty task slug", ErrWorkerCleanupFailed)
 	}
-	all, err := agent.List()
+	// codex iter-1 [P2]: use ListStrict so a malformed agent record
+	// fails the cleanup gate instead of silently slipping through.
+	// agent.List drops unparseable records (the documented triage
+	// behavior at internal/agent/agent.go:List), which would let a
+	// task transition to done|abandoned while a still-live worker
+	// with a corrupt record stays attached and tmux-running.
+	all, badIDs, err := agent.ListStrict()
 	if err != nil {
 		return res, fmt.Errorf("%w: list agents: %w", ErrWorkerCleanupFailed, err)
+	}
+	if len(badIDs) > 0 {
+		return res, fmt.Errorf(
+			"%w: %d agent record(s) unreadable (%v); refusing to mark task %s terminal — fix or remove the records and retry",
+			ErrWorkerCleanupFailed, len(badIDs), badIDs, opts.TaskSlug)
 	}
 	for _, rec := range all {
 		if rec == nil {
@@ -110,28 +121,39 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 			res.Killed++
 		}
 
-		// Archive the record. On archive failure, fall back to
-		// removing the live record (same pattern as runHandoff step
-		// 12 / retireOldAgent).
-		if err := rec.Archive(); err != nil {
-			path, perr := state.AgentPath(rec.ID)
-			if perr != nil {
-				return res, fmt.Errorf(
-					"%w: archive worker %s failed (%w) AND could not resolve path (%w); task %s NOT marked terminal",
-					ErrWorkerCleanupFailed, rec.ID, err, perr, opts.TaskSlug)
+		// Archive the record — only when we killed the session. With
+		// --keep-session the tmux session stays alive, so we LEAVE the
+		// record live too: that's the only path operators have to
+		// `fleet attach` the preserved session for debugging (codex
+		// iter-1 [P1]). Archive in --keep-session would hide the
+		// session from the very lookup the operator runs to inspect
+		// it.
+		//
+		// In the strict cleanup path (KeepSession=false), the tmux
+		// session is dead by here, so archiving cannot hide a live
+		// agent. Fall back to direct os.Remove on archive failure to
+		// match the pattern in runHandoff step 12 / retireOldAgent.
+		if !opts.KeepSession {
+			if err := rec.Archive(); err != nil {
+				path, perr := state.AgentPath(rec.ID)
+				if perr != nil {
+					return res, fmt.Errorf(
+						"%w: archive worker %s failed (%w) AND could not resolve path (%w); task %s NOT marked terminal",
+						ErrWorkerCleanupFailed, rec.ID, err, perr, opts.TaskSlug)
+				}
+				if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+					return res, fmt.Errorf(
+						"%w: archive worker %s failed (%w) AND fallback remove failed (%w); task %s NOT marked terminal",
+						ErrWorkerCleanupFailed, rec.ID, err, rmErr, opts.TaskSlug)
+				}
+				if opts.Stderr != nil {
+					_, _ = fmt.Fprintf(opts.Stderr,
+						"warning: archive worker %s: %v (live record removed instead, archive copy lost)\n",
+						rec.ID, err)
+				}
 			}
-			if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-				return res, fmt.Errorf(
-					"%w: archive worker %s failed (%w) AND fallback remove failed (%w); task %s NOT marked terminal",
-					ErrWorkerCleanupFailed, rec.ID, err, rmErr, opts.TaskSlug)
-			}
-			if opts.Stderr != nil {
-				_, _ = fmt.Fprintf(opts.Stderr,
-					"warning: archive worker %s: %v (live record removed instead, archive copy lost)\n",
-					rec.ID, err)
-			}
+			res.Archived++
 		}
-		res.Archived++
 	}
 	return res, nil
 }

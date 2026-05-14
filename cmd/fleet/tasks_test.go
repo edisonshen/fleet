@@ -1277,9 +1277,10 @@ func TestTasksSet_TerminalStatusKillFailsRefusesWrite(t *testing.T) {
 	}
 }
 
-// TestTasksSet_KeepSessionFlagSkipsKill — --keep-session means agent
-// record archived but Kill not called.
-func TestTasksSet_KeepSessionFlagSkipsKill(t *testing.T) {
+// TestTasksSet_KeepSessionFlagSkipsKillAndArchive — codex iter-1 P1.
+// --keep-session preserves the tmux session AND the live agent record
+// so the operator can `fleet attach <id>` to inspect.
+func TestTasksSet_KeepSessionFlagSkipsKillAndArchive(t *testing.T) {
 	_, project := setupTasksHome(t)
 	addOut := &bytes.Buffer{}
 	if err := runTasksAdd(&tasksAddOpts{
@@ -1308,9 +1309,10 @@ func TestTasksSet_KeepSessionFlagSkipsKill(t *testing.T) {
 	if killCalled {
 		t.Errorf("tmux.Kill called despite --keep-session")
 	}
+	// Record STAYS live — fleet attach <id> must continue to work.
 	livePath, _ := state.AgentPath(rec.ID)
-	if _, statErr := os.Stat(livePath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Errorf("agent record still live after --keep-session archive")
+	if _, statErr := os.Stat(livePath); statErr != nil {
+		t.Errorf("agent record archived with --keep-session (codex iter-1 P1 regression): %v", statErr)
 	}
 	post := listTaskRow(t, project, slug)
 	if post.Status != tasks.StatusDone {
