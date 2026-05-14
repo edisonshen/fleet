@@ -1002,7 +1002,18 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 						"worker cleanup gate blocked status=%s for %s: coord-worker has phase=%q but no exit recorded — fleet bug; record exit via `fleet workers update` before retrying",
 						t.Status, slug, wstate.Phase)
 				}
-			} else if !errors.Is(rerr, workers.ErrNotFound) {
+			} else if errors.Is(rerr, workers.ErrNotFound) {
+				// codex iter-14 [P1]: state.json missing falls back to
+				// the task row's worker_pid. If the row claims a PID
+				// and that PID is alive, refuse the transition — the
+				// `claude --print` subprocess survives whether or not
+				// its state.json exists.
+				if t.WorkerPID > 0 && workers.IsAlive(t.WorkerPID) {
+					return fmt.Errorf(
+						"worker cleanup gate blocked status=%s for %s: task row worker_pid=%d still alive (workers/<slug>/state.json missing) — stop the worker",
+						t.Status, slug, t.WorkerPID)
+				}
+			} else {
 				// Read failure that isn't ENOENT — can't prove
 				// coord-worker is gone; refuse.
 				return fmt.Errorf(
