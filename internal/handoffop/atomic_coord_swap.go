@@ -4,24 +4,33 @@ package handoffop
 // a project's coordinator. It enforces one invariant: at any observable
 // moment, state.ReadCoordSpawnMarker(project) resolves to exactly one
 // agent ID, AND that agent's tmux session is alive. OLD tmux sessions
-// that survive past the marker rename are *orphan processes*, not
-// coords; they are reapable by `fleet maintenance prune-orphan-tmux`.
+// that survive past the marker rename are operator-triaged orphans, not
+// coords.
 //
 // The marker rename in step 4 is the atomic commit point. Steps 1–3
 // (preconditions + spawn + readiness probe) run BEFORE the commit and
 // leave no observable change on rollback. Steps 5–6 (kill OLD + archive
 // OLD record) run AFTER the commit and are best-effort retire mechanics:
 // on failure the marker is still at NEW, the invariant holds, and the
-// helper degrades into FAILURE MODE 5 (archive OLD record + inbox alert
-// + ErrOrphanSurvived) so the existing prune-orphan-tmux sweeper can
-// reap the leaked session on its next pass.
+// helper degrades into FAILURE MODE 5 (preserve OLD record + incident
+// alert + ErrOrphanSurvived) for operator triage.
 //
-// The four covered cases:
-//   1. Auto-handoff 50% (Yellow) — fleet-guard MILESTONE.
-//   2. Auto-handoff 70% (Red) — fleet-guard hard threshold.
-//   3. Manual `fleet handoff <id>` — operator CLI.
-//   4. Dead-coord resume via TUI [a] — oldIsDead=true.
-//   5. Engine swap — implicit, identical to case 3 plus new Engine.
+// Cases currently wired in production callers:
+//   1. Auto-handoff 50% (Yellow) — fleet-guard MILESTONE drain via
+//      internal/handoffop.retireOldAgent.
+//   2. Auto-handoff 70% (Red) — same drain path.
+//   3. Manual `fleet handoff <id>` — cmd/fleet/handoff.go runHandoff
+//      + resumeHandoff (crash-recovery).
+//   5. Engine swap — implicit, same path as case 3 plus new Engine.
+//
+// Case 4 (dead-coord resume via TUI [a] — OldIsDead=true) is in the
+// helper's contract but NOT wired in this PR's dispatch.go integration:
+// the dispatch flow currently has structural ordering constraints
+// (sendInitialPrompt before/after commit, cross-socket probe ambiguity
+// vs OldIsDead=true assertion) that warrant a separate follow-up
+// (see WIP notes for atomic-coord-swap-v5 Phase 6). External callers
+// (e.g., a future TUI-side integration) can still invoke the helper
+// with OldIsDead=true; it's exercised by unit tests.
 //
 // Worker swap is OUT OF SCOPE for this helper. Worker swap needs task-row
 // CompareAndSwap under LockProjectState, not a marker-file rename.
