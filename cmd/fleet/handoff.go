@@ -744,6 +744,21 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			_ = os.Remove(path)
 		}
 		_ = queue.Delete(queuePath)
+		// Codex iter-10 [P1]: if we eagerly moved the coord marker
+		// to newRec.ID (8a-bis) and NEW then died during the
+		// readiness wait, the marker is pointing at a dead agent
+		// while OLD is still the live coord. Restore the marker to
+		// oldRec.ID so the dashboard's [a] discovery + a retry's
+		// isCoordSwap detection both keep working. Best-effort —
+		// the operator can also re-write via the TUI flow if this
+		// fails.
+		if isCoordSwap {
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: rollback coord-spawn marker for project %s failed: %v (operator may need to re-write manually)\n",
+					oldRec.Project, werr)
+			}
+		}
 		return fmt.Errorf(
 			"replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)

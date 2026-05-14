@@ -331,14 +331,28 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 		case !alive:
 			// Pre-spawned NEW is dead. Clean it up via the helper's
 			// shared DropReplacementRecord so the caller's record +
-			// session both go away cleanly. Marker unchanged.
+			// session both go away cleanly.
+			//
+			// Codex iter-10 [P2]: if the caller eagerly wrote the
+			// marker to newRec.ID (markerAtNew == true) before
+			// calling us, the marker now points at a dead agent
+			// while OLD is still the only live coord. Restore the
+			// marker to oldRec.ID so dashboard discovery + a retry's
+			// isCoordSwap detection both keep working.
 			if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 				return res, fmt.Errorf(
-					"atomic coord swap: pre-spawned replacement %s tmux session %s already exited AND cleanup failed: %w (marker unchanged at %s)",
-					newRec.ID, newRec.TmuxSession, dropErr, in.OldRec.ID)
+					"atomic coord swap: pre-spawned replacement %s tmux session %s already exited AND cleanup failed: %w (marker may still point at %s — operator: re-write coord-spawn-marker manually)",
+					newRec.ID, newRec.TmuxSession, dropErr, newRec.ID)
+			}
+			if markerAtNew {
+				if werr := writeCoordSpawnMarkerFn(in.Project, in.OldRec.ID); werr != nil && stderr != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: atomic coord swap: rollback coord-spawn marker for project %s to %s failed: %v (operator: re-write manually if dashboard misses OLD)\n",
+						in.Project, in.OldRec.ID, werr)
+				}
 			}
 			return res, fmt.Errorf(
-				"atomic coord swap: pre-spawned replacement %s tmux session %s already exited before swap committed; marker unchanged at %s",
+				"atomic coord swap: pre-spawned replacement %s tmux session %s already exited before swap committed; marker rolled back to %s",
 				newRec.ID, newRec.TmuxSession, in.OldRec.ID)
 		}
 	} else {
