@@ -101,6 +101,22 @@ func HandoffDir() (string, error) {
 	return filepath.Join(root, "handoffs"), nil
 }
 
+// IncidentsDir returns ~/.fleet/incidents/.
+//
+// The macOS memorystatus / jetsam observer in skills/fleet-guard
+// writes structured incident JSON files here when the kernel kills a
+// claude process under memory pressure. The TUI dashboard scans this
+// directory to render a per-project "killed by memorystatus" badge.
+// Same shape as HandoffDir / AgentDir — one writer (the skill), many
+// readers (Go-side TUI scan + Python-side debug helpers).
+func IncidentsDir() (string, error) {
+	root, err := Root()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "incidents"), nil
+}
+
 // HandoffPath returns ~/.fleet/handoffs/<id>-<YYYYMMDD-HHMMSS>-<rnd>.md.
 //
 // ts is normalized to UTC so the filename is stable regardless of

@@ -831,6 +831,117 @@ func TestReadCoordHolder_MissingFile(t *testing.T) {
 	}
 }
 
+// TestScanProject_CountsJetsamIncidentsForProject pins PART 3 of the
+// bundled liveness-correctness fix (2026-05-13): when the kernel
+// kills a claude process under memory pressure (macOS
+// memorystatus / jetsam), fleet-guard writes a structured incident
+// JSON to ~/.fleet/incidents/. The dashboard scan counts these per
+// project so the row can render a "killed by memorystatus" badge.
+//
+// Incident JSON shape (per skills/fleet-guard/jetsam.py):
+//
+//	{
+//	  "schema_version": 1,
+//	  "agent_id": "...",
+//	  "pid": N,
+//	  "reason": "highwater" | "vm-thrashing" | "fork-fail" | ...,
+//	  "killed_at": "<RFC3339>",
+//	  "project": "<project-name>",
+//	  ...
+//	}
+//
+// scanProject reads the incidents dir once and increments
+// row.IncidentCount for each record whose `project` field matches.
+func TestScanProject_CountsJetsamIncidentsForProject(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	root := filepath.Dir(pdir) // ~/.fleet
+	incidentsDir := filepath.Join(root, "incidents")
+	if err := os.MkdirAll(incidentsDir, 0o755); err != nil {
+		t.Fatalf("mkdir incidents: %v", err)
+	}
+	writeIncident := func(name, project string) {
+		body := map[string]interface{}{
+			"schema_version": 1,
+			"agent_id":       name,
+			"pid":            12345,
+			"reason":         "highwater",
+			"killed_at":      "2026-05-13T17:20:01Z",
+			"project":        project,
+		}
+		data, err := json.MarshalIndent(body, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(incidentsDir, name+".json")
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeIncident("agent1", "demo")
+	writeIncident("agent2", "demo")
+	writeIncident("agent3", "other-project")
+
+	snap := scanDashboard(time.Now())
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	p := snap.Projects[0]
+	if p.IncidentCount != 2 {
+		t.Errorf("IncidentCount = %d, want 2 (only demo-tagged incidents)", p.IncidentCount)
+	}
+}
+
+// TestScanProject_NoIncidentsLeavesCountZero pins the no-op path:
+// when the incidents dir is missing or contains no matching records,
+// IncidentCount stays 0 and no badge renders.
+func TestScanProject_NoIncidentsLeavesCountZero(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	snap := scanDashboard(time.Now())
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	if snap.Projects[0].IncidentCount != 0 {
+		t.Errorf("IncidentCount = %d, want 0", snap.Projects[0].IncidentCount)
+	}
+}
+
+// TestScanProject_SkipsMalformedIncidentJSON ensures one bad incident
+// file doesn't poison the whole scan. The bad file is skipped; valid
+// matching incidents still count.
+func TestScanProject_SkipsMalformedIncidentJSON(t *testing.T) {
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+	root := filepath.Dir(pdir)
+	incidentsDir := filepath.Join(root, "incidents")
+	if err := os.MkdirAll(incidentsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Garbage file — scanner must skip silently.
+	if err := os.WriteFile(filepath.Join(incidentsDir, "bad.json"),
+		[]byte("{ this is not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// One good incident.
+	body, _ := json.Marshal(map[string]interface{}{
+		"schema_version": 1, "agent_id": "g", "pid": 1,
+		"reason": "highwater", "project": "demo",
+	})
+	if err := os.WriteFile(filepath.Join(incidentsDir, "good.json"),
+		body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snap := scanDashboard(time.Now())
+	if len(snap.Projects) != 1 {
+		t.Fatalf("expected 1 project, got %d", len(snap.Projects))
+	}
+	if snap.Projects[0].IncidentCount != 1 {
+		t.Errorf("IncidentCount = %d, want 1 (good incident only)",
+			snap.Projects[0].IncidentCount)
+	}
+}
+
 // TestScanProject_AttachesCoordIDWhenFresh pins that scanProject
 // populates row.CoordID when the lock body has a valid 8-hex ID AND
 // coord-state.json is fresh enough to mark the project Active.
