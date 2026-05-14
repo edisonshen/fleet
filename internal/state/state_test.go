@@ -162,35 +162,49 @@ func TestWriteAtomic_FsyncParentDir_OrderingAfterRename(t *testing.T) {
 	}
 }
 
-// TestWriteAtomic_FsyncParentDir_ErrorPropagates exercises the
-// error-return path so a flaky filesystem returning EIO on the parent
-// fsync surfaces to the caller (AtomicCoordSwap will then refuse to
-// declare the swap committed). Without propagation, a parent-fsync
-// failure would silently lose durability — the very failure mode the
-// fsync exists to prevent.
-func TestWriteAtomic_FsyncParentDir_ErrorPropagates(t *testing.T) {
+// TestWriteAtomic_FsyncParentDir_FailureLogsButDoesNotError exercises
+// the codex-iter-1 [P1] fix: a post-rename parent-dir fsync failure
+// must NOT propagate as a WriteAtomic error, because the rename ALREADY
+// committed observable state at that point. Existing callers (spawn,
+// AtomicCoordSwap rollback, agent.Write) treat ANY WriteAtomic error
+// as "nothing changed; roll back" — but if the rename succeeded and
+// only the parent-fsync failed, those rollbacks would tear down state
+// that the operator + concurrent processes can already see (committed
+// marker, written agent record, etc.). Best-effort log preserves the
+// durability gap visibility without breaking caller rollback contracts.
+func TestWriteAtomic_FsyncParentDir_FailureLogsButDoesNotError(t *testing.T) {
 	tmp := t.TempDir()
 	dest := filepath.Join(tmp, "out.json")
 
-	old := fsyncParent
+	oldFsync := fsyncParent
+	oldLog := fsyncFailureLog
 	sentinel := errors.New("simulated parent fsync EIO")
 	fsyncParent = func(dir string) error { return sentinel }
-	t.Cleanup(func() { fsyncParent = old })
+	var loggedPath string
+	var loggedErr error
+	fsyncFailureLog = func(p string, e error) {
+		loggedPath = p
+		loggedErr = e
+	}
+	t.Cleanup(func() {
+		fsyncParent = oldFsync
+		fsyncFailureLog = oldLog
+	})
 
-	err := WriteAtomic(dest, []byte("ok"))
-	if err == nil {
-		t.Fatalf("WriteAtomic should have errored on parent fsync failure")
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic should NOT error on parent-fsync failure (rename already committed): %v", err)
 	}
-	if !errors.Is(err, sentinel) {
-		t.Errorf("WriteAtomic error = %v; want wraps %v", err, sentinel)
-	}
-	// File should still exist on disk (rename succeeded before fsync
-	// failed) — the error contract is "we couldn't prove durability,"
-	// not "we rolled back the rename." Callers treat this as a hard
-	// fail (AtomicCoordSwap aborts the swap), but the on-disk state
-	// is still the post-rename shape.
+	// File MUST exist on disk (rename committed).
 	if _, statErr := os.Stat(dest); statErr != nil {
-		t.Errorf("destination file disappeared after fsync error: %v", statErr)
+		t.Errorf("destination file missing after fsync failure: %v", statErr)
+	}
+	// Log hook must have been called with the destination path + the
+	// underlying error so log analysis can correlate durability gaps.
+	if loggedPath != dest {
+		t.Errorf("fsyncFailureLog path = %q; want %q", loggedPath, dest)
+	}
+	if !errors.Is(loggedErr, sentinel) {
+		t.Errorf("fsyncFailureLog err = %v; want wraps %v", loggedErr, sentinel)
 	}
 }
 

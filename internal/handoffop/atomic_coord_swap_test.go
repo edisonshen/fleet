@@ -258,6 +258,45 @@ func TestAtomicCoordSwap_Preconditions_MarkerNotOld(t *testing.T) {
 	}
 }
 
+// TestAtomicCoordSwap_Preconditions_MarkerNotOld_AlreadySpawned_CleansUpNEW
+// is the codex iter-1 [P2] regression: when the caller pre-spawned NEW
+// (AlreadySpawnedNewRec set) AND the marker races to a different ID
+// before we acquire the lock, the helper MUST clean up the pre-spawned
+// NEW. Otherwise the detection of the race produces the duplicate-agent
+// state the check was meant to prevent.
+func TestAtomicCoordSwap_Preconditions_MarkerNotOld_AlreadySpawned_CleansUpNEW(t *testing.T) {
+	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
+	// Caller pre-spawned NEW and wrote its record.
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("newRec.Write seed: %v", err)
+	}
+	in.AlreadySpawnedNewRec = newRec
+	// Race: marker moved to someone else.
+	if err := state.WriteCoordSpawnMarker("rainier", "racedcoord"); err != nil {
+		t.Fatalf("seed race marker: %v", err)
+	}
+	fake := &fakeSwap{}
+	restore := fake.install(t, newRec)
+	defer restore()
+
+	_, err := AtomicCoordSwap(in, nil)
+	if err == nil {
+		t.Fatalf("expected ErrConcurrentSwap")
+	}
+	if !errors.Is(err, ErrConcurrentSwap) {
+		t.Errorf("expected ErrConcurrentSwap; got: %v", err)
+	}
+	// Pre-spawned NEW record MUST be cleaned up (DropReplacementRecord).
+	newPath, _ := state.AgentPath("newcoord")
+	if _, statErr := os.Stat(newPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("pre-spawned NEW record should be cleaned up on concurrent-swap detection; statErr=%v", statErr)
+	}
+	// Marker untouched.
+	if got := state.ReadCoordSpawnMarker("rainier"); got != "racedcoord" {
+		t.Errorf("marker = %q; want racedcoord (unchanged)", got)
+	}
+}
+
 // TestAtomicCoordSwap_Preconditions_LockHeld verifies that two
 // concurrent AtomicCoordSwap calls on the same project serialize at the
 // flock — the second call blocks until the first releases. We exercise

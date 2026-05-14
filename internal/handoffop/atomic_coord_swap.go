@@ -217,8 +217,24 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	// without spawning. The lock makes this race the narrow window
 	// between OUR acquire and OUR read; in practice another swap that
 	// completed before us will have re-pointed the marker.
+	//
+	// Codex review iter-1 [P2]: when the caller pre-spawned
+	// (AlreadySpawnedNewRec set), an ErrConcurrentSwap here MUST also
+	// clean up the pre-spawned NEW — otherwise the marker-race detection
+	// turns INTO the duplicate-agent state it was supposed to prevent
+	// (NEW record on disk + NEW tmux session live but no commitment to
+	// it as coord). DropReplacementRecord is idempotent and pairs kill +
+	// remove safely.
 	cur := state.ReadCoordSpawnMarker(in.Project)
 	if cur != in.OldRec.ID {
+		if in.AlreadySpawnedNewRec != nil {
+			rec := in.AlreadySpawnedNewRec
+			if dropErr := DropReplacementRecord(rec.TmuxSession, rec.ID, stderr); dropErr != nil {
+				return res, fmt.Errorf(
+					"%w (project=%q expected=%s observed=%s) AND pre-spawned NEW cleanup failed: %v (record preserved for operator inspection)",
+					ErrConcurrentSwap, in.Project, in.OldRec.ID, cur, dropErr)
+			}
+		}
 		return res, fmt.Errorf("%w (project=%q expected=%s observed=%s)",
 			ErrConcurrentSwap, in.Project, in.OldRec.ID, cur)
 	}

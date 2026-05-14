@@ -148,8 +148,19 @@ func Resume(req queue.SpawnFresh, queuePath string,
 	if req.SchemaVersion < 2 {
 		thisHandoffDisable = true
 	}
+	// Coord-swap detection for the case-3 resume path (replacement
+	// already spawned + alive). marker == oldRec.ID means the
+	// previous run crashed BEFORE writing the marker — this resume
+	// needs the atomic commit. marker == newRec.ID means the previous
+	// run got past step 4 (marker committed) and crashed during
+	// retire — this resume just finishes kill+archive without routing
+	// through AtomicCoordSwap (its step 1.b precondition would fail
+	// because marker is already at NEW). Anything else (oldRec.Project
+	// empty, marker pointing somewhere unrelated) is a worker handoff
+	// or non-coord agent — inline path.
+	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisable, graceMillis, stdout, stderr)
+		thisHandoffDisable, graceMillis, isCoordSwap, stdout, stderr)
 }
 
 // cleanUpStaleQueue handles the "old record already archived" branch.
@@ -425,32 +436,28 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			newRec.ID, newRec.TmuxSession)
 	}
 
-	// Coord-spawn marker transfer. The marker is the dashboard's
-	// gate for "this agent is this project's coord" (see
-	// internal/state/state.go ReadCoordSpawnMarker). When a coord
-	// agent handoffs, the OLD agent ID gets archived but the marker
-	// still points at it — the TUI's [a] keystroke then can't find a
-	// live coord and spawns a duplicate. Re-point the marker at the
-	// replacement here, AFTER spawn confirmed alive and BEFORE
-	// retireOldAgent archives oldRec. Workers and other non-coord
-	// agents leave the marker untouched (the wantID match below
-	// gates this strictly on "old was the project's coord").
+	// Coord-spawn marker transfer. Detect whether this is a coord
+	// swap (marker == oldRec.ID) BEFORE retireOldAgent runs so the
+	// retire path's isCoordSwap branch fires. Previously the marker
+	// was written here, which made retireOldAgent's
+	// ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID predicate
+	// FALSE — the marker had already moved to newRec.ID, so
+	// retireOldAgent took the worker path and the helper's
+	// transactional commit point was bypassed (codex review iter-1
+	// [P1]).
 	//
-	// Best-effort: marker errors print a warning but don't fail the
-	// drain — the marker is a UX gate, not a load-bearing security
-	// boundary (per ReadCoordSpawnMarker's doc).
-	if oldRec.Project != "" {
-		if wantID := state.ReadCoordSpawnMarker(oldRec.Project); wantID == oldRec.ID {
-			if werr := state.WriteCoordSpawnMarker(oldRec.Project, newRec.ID); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: coord-spawn marker update for project %s failed: %v\n",
-					oldRec.Project, werr)
-			}
-		}
-	}
+	// Fix: hoist the detection here, drop the early marker write —
+	// the helper writes the marker atomically inside retireOldAgent's
+	// coord branch (under the swap.lock). The TUI's post-dispatch
+	// marker-write is still the redundant belt for dashboard freshness.
+	//
+	// Workers and other non-coord agents go through retireOldAgent's
+	// inline path unchanged — the v0.2 worker-swap transactional
+	// refactor is deferred per the v5 plan's Non-goals.
+	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
 
 	return retireOldAgent(oldRec, newRec, req.HandoffDoc, queuePath,
-		thisHandoffDisableAutoResume, graceMillis, stdout, stderr)
+		thisHandoffDisableAutoResume, graceMillis, isCoordSwap, stdout, stderr)
 }
 
 // retireOldAgent runs the post-spawn tail in this order: wait for
@@ -494,7 +501,7 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 // triage.
 func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	disableAutoResume bool,
-	graceMillis int, stdout, stderr io.Writer) error {
+	graceMillis int, isCoordSwap bool, stdout, stderr io.Writer) error {
 
 	// disableAutoResume comes from the caller so per-handoff
 	// overrides (queue's *bool) win over newRec's baseline policy
@@ -534,18 +541,21 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 	}
 
 	// Coord swap fast path. When OLD is the project's coordinator
-	// (marker matches OLD.ID), the retire sequence runs through the
-	// transactional AtomicCoordSwap helper instead of the inline
-	// marker-flip + /exit + grace + Kill + Archive sequence. This
-	// collapses the four observable writes into one atomic commit
-	// point at the marker rename (the v5 plan's load-bearing
-	// invariant). Worker handoffs fall through to the inline path.
+	// (caller-supplied isCoordSwap from spawnAndRetire's pre-flight
+	// marker check — codex iter-1 [P1] fix: doing the check HERE
+	// would always see the marker already at newRec.ID because the
+	// pre-helper marker write moved it before this function ran),
+	// the retire sequence runs through the transactional
+	// AtomicCoordSwap helper instead of the inline marker-flip +
+	// /exit + grace + Kill + Archive sequence. This collapses the
+	// four observable writes into one atomic commit point at the
+	// marker rename (the v5 plan's load-bearing invariant). Worker
+	// handoffs fall through to the inline path.
 	//
 	// IMPORTANT: the spawnAndRetire caller has already (a) written
 	// the NEW agent record and (b) probed NEW alive. AtomicCoordSwap's
 	// AlreadySpawnedNewRec entrypoint skips its own spawn + probe
 	// steps and proceeds straight to the marker commit.
-	isCoordSwap := oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == oldRec.ID
 	if isCoordSwap {
 		_, swapErr := AtomicCoordSwap(AtomicCoordSwapInputs{
 			Project:              oldRec.Project,
