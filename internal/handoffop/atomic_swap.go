@@ -32,6 +32,20 @@
 //   return, EITHER the OLD agent OR the NEW agent is the live coord for
 //   the task — never both, never neither. Failure paths must preserve
 //   that invariant before returning the error.
+//
+// Wiring status (fix/atomic-coord-swap-and-worker-cleanup):
+//
+//   AtomicSwap is the canonical helper for NEW replacement paths, but
+//   the two existing live paths (runHandoff in cmd/fleet/handoff.go
+//   and retireOldAgent in this package) still drive their hand-rolled
+//   13-step sequences. Those sequences enforce the same SessionAlive
+//   + DropReplacementRecord invariant the helper centralizes — they
+//   were brought up to spec by the leak-plug PR's codex iter-1 P1
+//   fixes. Refactoring them to call AtomicSwap is a follow-up: the
+//   existing flows are CORRECT, just verbose; landing the refactor in
+//   the same PR as the helper would conflate two changes to the most
+//   fragile sequencer in fleet. New code that needs to retire an old
+//   agent + promote a new one SHOULD call AtomicSwap.
 
 package handoffop
 

@@ -106,9 +106,6 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		if rec.TaskID != opts.TaskSlug || rec.Project != opts.Project {
 			continue
 		}
-		if rec.TmuxSession == "" {
-			continue
-		}
 		matches = append(matches, rec)
 	}
 	// codex iter-2 [P1] + iter-4 [P2] + iter-7 [P1]: bad-records gate.
@@ -153,7 +150,11 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		res.Matched++
 		res.IDs = append(res.IDs, rec.ID)
 
-		if !opts.KeepSession {
+		// Only kill when there's a real tmux session to kill. Records
+		// with empty TmuxSession (legacy / no-tmux) still get
+		// archived below — they were dropped on the floor previously
+		// (codex iter-8 P2 regression).
+		if !opts.KeepSession && rec.TmuxSession != "" {
 			if err := tmuxKillForCleanup(rec.TmuxSession); err != nil {
 				alive, probeErr := tmuxSessionAliveForCleanup(rec.TmuxSession)
 				switch {

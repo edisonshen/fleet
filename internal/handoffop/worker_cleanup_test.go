@@ -213,8 +213,13 @@ func TestKillAgentsForTask_NoMatchingWorkers_NoOp(t *testing.T) {
 	}
 }
 
-// TestKillAgentsForTask_EmptyTmuxSession_Skipped.
-func TestKillAgentsForTask_EmptyTmuxSession_Skipped(t *testing.T) {
+// TestKillAgentsForTask_EmptyTmuxSession_ArchivesWithoutKill — codex
+// iter-8 [P2]. A matching record with empty TmuxSession (legacy /
+// no-tmux) used to be dropped on the floor entirely, leaving the
+// record live attached to a terminal task. Now: still no Kill
+// (nothing to kill) but the record IS archived alongside parsed
+// matches so the operator-visible state matches reality.
+func TestKillAgentsForTask_EmptyTmuxSession_ArchivesWithoutKill(t *testing.T) {
 	setupFleetHome(t)
 	legacy := agent.New("legacy01")
 	legacy.TaskID = "legacy-task"
@@ -236,12 +241,22 @@ func TestKillAgentsForTask_EmptyTmuxSession_Skipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("KillAgentsForTask: %v", err)
 	}
-	if res.Matched != 0 {
-		t.Errorf("legacy empty-session record should not match (Matched=%d)", res.Matched)
+	if res.Matched != 1 {
+		t.Errorf("legacy empty-session record should match (Matched=%d, want 1)", res.Matched)
+	}
+	if res.Killed != 0 {
+		t.Errorf("Killed = %d; want 0 (empty session)", res.Killed)
+	}
+	if res.Archived != 1 {
+		t.Errorf("Archived = %d; want 1 (record should be archived even without tmux)", res.Archived)
 	}
 	livePath, _ := state.AgentPath(legacy.ID)
-	if !workerFileExists(livePath) {
-		t.Errorf("legacy record removed unexpectedly")
+	if workerFileExists(livePath) {
+		t.Errorf("legacy record still live after archive (iter-8 P2 regression)")
+	}
+	archPath, _ := state.AgentArchivePath(legacy.ID)
+	if !workerFileExists(archPath) {
+		t.Errorf("legacy record archive missing")
 	}
 }
 
