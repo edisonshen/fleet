@@ -131,23 +131,67 @@ func TestCoordSpawnState_PostActiveIdleStop_ReturnsIdle(t *testing.T) {
 	}
 }
 
-// TestCoordSpawnState_StuckOverridesActive: a coord-state.json that
-// happens to be fresh when the marker is past timeout doesn't rescue
-// the row from "stuck". The marker is the in-flight signal for the
-// operator's most recent [a] press; if it never converged on time
-// the warning fires.
-func TestCoordSpawnState_StuckOverridesActive(t *testing.T) {
+// TestCoordSpawnState_StuckRequiresStaleCoordState: stuck only fires
+// when the marker is past timeout AND there is no liveness signal from
+// coord-state.json (mtime stale or absent). A coord that is still
+// actively ticking — proven by a coord-state mtime within activeWindow
+// — by definition is not stuck during spawn; it successfully booted
+// and continues to publish state. The "stuck" framing is reserved for
+// the narrow case where the marker exists but no fresh state ever
+// arrived, OR where state arrived once and then went stale alongside
+// the marker aging past the timeout.
+//
+// The pre-fix ordering treated every long-lived alive coord as stuck
+// (PART 2.5 — false-positive on coord de3e12a9 at 20:47 PDT 2026-05-13:
+// claude alive 20 min, coord-state mtime 6 min ago, badge fired). The
+// fix inverts the order in deriveCoordSpawnState: the active check
+// runs before the spawn-timeout check.
+func TestCoordSpawnState_StuckRequiresStaleCoordState(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-12 * time.Minute) // past timeout
-	stateMtime := now.Add(-15 * time.Second)  // fresh
+	// Stale coord-state — no liveness signal. With the marker past
+	// timeout AND no fresh state, the coord legitimately looks stuck.
+	staleStateMtime := now.Add(-30 * time.Minute)
 	got := deriveCoordSpawnState(
 		true, markerMtime,
-		true, stateMtime,
+		true, staleStateMtime,
 		now,
 		5*time.Minute, 10*time.Minute,
 	)
 	if got != coordSpawnStuck {
-		t.Errorf("stuck must override active; got %v", got)
+		t.Errorf("marker past timeout + stale state must be stuck; got %v", got)
+	}
+}
+
+// TestCoordSpawnState_FreshCoordStateBeatsStaleSpawnMarker pins the
+// PART 2.5 fix: a coord that is actively publishing coord-state.json
+// (mtime within activeWindow) is NOT stuck regardless of how old the
+// spawn marker is. The marker is set ONCE at spawn and never refreshed;
+// a coord ticking 12+ minutes after spawn is healthy, not stuck.
+//
+// Pre-fix: this case returned coordSpawnStuck because the timeout check
+// ran before the active check. After the fix, active wins.
+//
+// Evidence (real bug, 2026-05-13 20:47 PDT):
+//   - coord de3e12a9 spawned at 20:26 PDT (~21 min before badge fired)
+//   - claude pid 10445 alive and executing tool calls
+//   - coord-state.json mtime 20:41 PDT (6 min stale, but within 5m
+//     when the badge fired)
+//   - badge said "▲ coord spawn stuck" — false positive
+func TestCoordSpawnState_FreshCoordStateBeatsStaleSpawnMarker(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	// Marker spawned 15 minutes ago — past the 10-minute spawn timeout.
+	markerMtime := now.Add(-15 * time.Minute)
+	// Coord-state.json was updated 1 minute ago — clearly alive.
+	coordStateMtime := now.Add(-1 * time.Minute)
+	got := deriveCoordSpawnState(
+		true, markerMtime,
+		true, coordStateMtime,
+		now,
+		5*time.Minute, 10*time.Minute,
+	)
+	if got != coordSpawnActive {
+		t.Errorf("fresh coord-state must beat stale spawn marker; got %v want coordSpawnActive", got)
 	}
 }
 
