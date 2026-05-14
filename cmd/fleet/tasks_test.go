@@ -360,10 +360,10 @@ func TestTasksNote_AppendsToSection(t *testing.T) {
 	parts := strings.Fields(addOut.String())
 	slug := parts[1]
 
-	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "first", &bytes.Buffer{}, io.Discard); err != nil {
+	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "first", &bytes.Buffer{}); err != nil {
 		t.Fatalf("first note: %v", err)
 	}
-	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "second", &bytes.Buffer{}, io.Discard); err != nil {
+	if err := runTasksNote(&tasksNoteOpts{project: project, section: "notes"}, slug, "second", &bytes.Buffer{}); err != nil {
 		t.Fatalf("second note: %v", err)
 	}
 
