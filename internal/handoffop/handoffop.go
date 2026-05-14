@@ -96,10 +96,22 @@ func Resume(req queue.SpawnFresh, queuePath string,
 	// HasSession-then-Remove was the leak (fix/orphan-tmux-sweeper-and-leak-plug):
 	// HasSession returns false for both "session gone" AND "probe failed",
 	// so a transient probe failure could delete the record while the tmux
-	// session was still alive — orphaning it. DropReplacementRecord pairs
-	// the os.Remove with tmux.Kill (idempotent + SessionAlive-backed) so
-	// the record is only removed after the session is confirmed gone.
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// session was still alive — orphaning it.
+	//
+	// Codex iter-1 [P1]: HasSession is also ambiguous at the OUTER gate.
+	// A transient probe-fail used to enter the cleanup branch where the
+	// helper's own SessionAlive probe could disagree on a retry and kill
+	// a healthy replacement. Use SessionAlive tristate directly (via the
+	// package-level seam tests can swap) so the branch fires only on
+	// definitive (alive=false, err=nil); on probe errors, surface the
+	// ambiguity and preserve the record for operator inspection — the
+	// surrounding handoff stays untouched.
+	switch alive, perr := tmuxSessionAliveFn(newRec.TmuxSession); {
+	case perr != nil:
+		return fmt.Errorf(
+			"resume: probe replacement %s session %s failed: %w (record preserved for operator inspection)",
+			newRec.ID, newRec.TmuxSession, perr)
+	case !alive:
 		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 			return fmt.Errorf(
 				"resume: stale replacement %s session %s appeared dead but cleanup failed (%w); spawn fresh aborted",
@@ -319,10 +331,21 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	if err != nil {
 		return fmt.Errorf("resume: spawn replacement: %w", err)
 	}
-	if !tmux.HasSession(newRec.TmuxSession) {
+	// Codex iter-1 [P1]: use SessionAlive tristate at the outer gate (via
+	// the package-level seam tests can swap) so a transient probe-failure
+	// doesn't masquerade as "session dead" and roll back a healthy spawn.
+	// Probe errors surface as explicit errors with the new record
+	// preserved; only definitive (alive=false, err=nil) enters the
+	// rollback branch.
+	switch alive, perr := tmuxSessionAliveFn(newRec.TmuxSession); {
+	case perr != nil:
+		return fmt.Errorf(
+			"resume: probe replacement %s session %s failed: %w (record preserved; old agent untouched, queue file preserved for retry)",
+			newRec.ID, newRec.TmuxSession, perr)
+	case !alive:
 		// fix/orphan-tmux-sweeper-and-leak-plug: use DropReplacementRecord
-		// so a probe-failure window doesn't delete the record while the
-		// tmux session is still alive.
+		// so a probe-failure window inside Kill doesn't delete the record
+		// while the tmux session is still alive.
 		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 			return fmt.Errorf(
 				"resume: replacement %s tmux session %s appeared dead but cleanup failed (%w); old agent untouched, queue file preserved for retry",

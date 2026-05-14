@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -600,4 +601,157 @@ func TestAutoHandoff_NoMarkerUpdate_WhenNoMarkerExists(t *testing.T) {
 	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != "" {
 		t.Errorf("marker created from nothing: got %q want empty", got)
 	}
+}
+
+// -- codex iter-1 P1: SessionAlive tristate gate at outer cleanup sites -----
+//
+// HasSession used to gate the cleanup branches in Resume's case-3
+// (record-exists path) and spawnAndRetire's post-spawn check. HasSession
+// returns false for BOTH "session genuinely dead" AND "probe failed"
+// (transport error / lost server). On a flaky probe window:
+//
+//   1. Resume's outer gate saw HasSession==false and entered the
+//      cleanup branch on a live replacement.
+//   2. DropReplacementRecord re-probed via SessionAlive (tristate),
+//      which on the retry sometimes succeeded — disagreement with the
+//      first probe. If Kill then ran, a healthy replacement got killed
+//      and the handoff respawned needlessly (or failed mid-way).
+//
+// The fix at each outer gate switches to SessionAlive tristate
+// (via the package-level tmuxSessionAliveFn seam). Cleanup runs only
+// on definitive (alive=false, err=nil). Probe errors surface as
+// explicit errors with the record preserved for operator inspection.
+
+// TestResume_Case3_ProbeErrorPreservesRecordAndDropsNoSession is the
+// regression test for the case-3 outer gate (replacement record exists,
+// session probe returns an error). Pre-fix HasSession-based gate would
+// enter cleanup, possibly killing a healthy replacement. Post-fix
+// SessionAlive tristate must surface the probe error without invoking
+// DropReplacementRecord (no kill, record file intact, queue preserved).
+func TestResume_Case3_ProbeErrorPreservesRecordAndDropsNoSession(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, docPath := writeSkillQueue(t, oldRec)
+
+	// Plant a replacement record (so Resume reaches case-3) but DO NOT
+	// spawn a tmux session for it — only the record is on disk. The fake
+	// SessionAlive below will say "probe failed", and the outer gate
+	// must NOT call DropReplacementRecord (which would invoke Kill).
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = req.NewSession
+	newRec.SpawnedAt = time.Now().UTC()
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("plant new rec: %v", err)
+	}
+	newRecPath, err := state.AgentPath(newRec.ID)
+	if err != nil {
+		t.Fatalf("state.AgentPath: %v", err)
+	}
+
+	probeErr := errors.New("simulated tmux probe failure (transport error)")
+	origAlive := tmuxSessionAliveFn
+	origKill := tmuxKillFn
+	var killCalls int
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		if s == newRec.TmuxSession {
+			return false, probeErr
+		}
+		return origAlive(s)
+	}
+	tmuxKillFn = func(s string) error {
+		killCalls++
+		return origKill(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive; tmuxKillFn = origKill })
+
+	out := &bytes.Buffer{}
+	resumeErr := Resume(req, qp, 0, out, out)
+	_ = docPath
+
+	if resumeErr == nil {
+		t.Fatalf("Resume: expected probe-failure error; got nil")
+	}
+	if !strings.Contains(resumeErr.Error(), "probe replacement") &&
+		!strings.Contains(resumeErr.Error(), "probe") {
+		t.Errorf("Resume error should mention probe failure; got: %v", resumeErr)
+	}
+	if !strings.Contains(resumeErr.Error(), probeErr.Error()) {
+		t.Errorf("Resume error should wrap the underlying probe error %q; got: %v", probeErr, resumeErr)
+	}
+	// Critical regression bar: record preserved AND no Kill invoked.
+	if _, statErr := os.Stat(newRecPath); statErr != nil {
+		t.Errorf("replacement record removed on probe error (this is the leak shape): %v", statErr)
+	}
+	if killCalls != 0 {
+		t.Errorf("tmuxKillFn called %d times on probe error; expected 0 (outer gate must not enter cleanup branch on ambiguous probe)",
+			killCalls)
+	}
+	// Queue file must also stay so the operator can retry once the
+	// probe is reliable again.
+	if _, err := os.Stat(qp); err != nil {
+		t.Errorf("queue file %s removed on probe error; want preserved: %v", qp, err)
+	}
+}
+
+// TestResume_Case3_DefinitiveDeadStillEntersCleanup pins the happy-path
+// cleanup branch: when the probe is unambiguous (alive=false, err=nil),
+// the outer gate must call DropReplacementRecord and fall through to a
+// fresh spawn. Without this test, a regression that erroneously routed
+// definitive-dead through the new probe-error branch would silently
+// strand the operator (no fresh spawn).
+//
+// Uses the existing fakeable seam so we don't need to race a real tmux
+// session into the "definitely-dead but record-exists" shape.
+func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Plant a replacement record but no tmux session (so cleanup +
+	// fresh-spawn is the correct branch).
+	newRec := agent.New(req.NewAgentID)
+	newRec.TaskID = oldRec.TaskID
+	newRec.Project = oldRec.Project
+	newRec.Cwd = oldRec.Cwd
+	newRec.Command = oldRec.Command
+	newRec.TmuxSession = req.NewSession
+	newRec.SpawnedAt = time.Now().UTC()
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("plant new rec: %v", err)
+	}
+
+	origAlive := tmuxSessionAliveFn
+	// First probe (outer gate): definitively dead. Subsequent probes
+	// fall through to the real tmux.SessionAlive (used by the spawned-
+	// fresh path's own post-spawn liveness check).
+	var probedSessions []string
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		probedSessions = append(probedSessions, s)
+		if s == req.NewSession && len(probedSessions) == 1 {
+			return false, nil // definitively dead
+		}
+		return origAlive(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Fresh replacement must be spawned + alive at the same PreAllocatedID.
+	freshRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load fresh record: %v", err)
+	}
+	if !tmux.HasSession(freshRec.TmuxSession) {
+		t.Errorf("fresh replacement session %s not alive after cleanup+respawn", freshRec.TmuxSession)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
