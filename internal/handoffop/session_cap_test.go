@@ -101,12 +101,17 @@ func TestSpawnAndRetire_SessionCapRefusal(t *testing.T) {
 		"refusing to spawn",
 		"FLEET_MAX_SESSIONS=2",
 		"prune-orphan-tmux",
-		"fleet rm",
 		queuePath,
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err missing %q\nfull: %s", want, err.Error())
 		}
+	}
+	// `fleet rm` MUST NOT appear in this error (codex iter-10 P1) —
+	// rm refuses any agent with a pending spawn-fresh queue file, so
+	// suggesting it on this drain path would point at a no-op.
+	if strings.Contains(err.Error(), "fleet rm") {
+		t.Errorf("err should not suggest `fleet rm`: %s", err.Error())
 	}
 }
 

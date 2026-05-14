@@ -300,11 +300,17 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 			projected = counts.Total() + 1
 		}
 		if projected > max {
-			// Queue file is preserved so the operator can drain manually
-			// after pruning. The error message mirrors the CLI gate's
-			// language for consistency.
+			// Queue file is preserved so the operator can drain
+			// manually after pruning. We intentionally DON'T suggest
+			// `fleet rm <id>` here (codex iter-10 P1): rm refuses
+			// any agent that has a pending spawn-fresh queue file,
+			// so on this drain path the operator must either prune
+			// ORPHANS (the only sessions rm-able right now) or
+			// raise FLEET_MAX_SESSIONS. The CLI handoff gate
+			// retains `fleet rm <id>` since it fires BEFORE the
+			// queue write.
 			return fmt.Errorf(
-				"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` or `fleet rm <id>`, then rerun `fleet drain` (queue file %s preserved)",
+				"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` to reap orphans (or raise FLEET_MAX_SESSIONS), then rerun `fleet drain` (queue file %s preserved)",
 				max, counts.Live, counts.Orphan, queuePath)
 		}
 	}

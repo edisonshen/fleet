@@ -338,6 +338,19 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 			// gate at step 4a must re-run. If the cap legitimately
 			// refuses, the operator can re-issue with
 			// `--force-replacement` knowing the current state.
+			//
+			// Cap check runs INSIDE this recovery branch BEFORE
+			// queue.Delete (codex iter-10 P2) so a cap refusal
+			// preserves the per-handoff overrides on disk for the
+			// next retry. Without this, a refused recovery would
+			// have already destroyed pending.DisableAutoResume.
+			capBypass := SessionCapBypassReason("")
+			if opts.forceReplacement {
+				capBypass = SessionCapBypassForceReplacement
+			}
+			if capErr := enforceSessionCap(stderr, capBypass, 1); capErr != nil {
+				return capErr
+			}
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -379,10 +392,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					opts.autoResume = !*pending.DisableAutoResume
 					opts.autoResumeFlagWasSet = true
 				}
-				// Cap re-checked on retry (codex iter-8 P1): we do
-				// not auto-bypass the cap here even when the
-				// queue's CapApproved=true; post-crash state can
-				// differ. Step 4a's swap-aware gate must run.
+				// Cap re-checked on retry (codex iter-8 P1 / iter-10
+				// P2): the swap-aware gate must run with current
+				// state, and the queue file must persist if the cap
+				// refuses so a future retry can still find the
+				// per-handoff overrides.
+				capBypass := SessionCapBypassReason("")
+				if opts.forceReplacement {
+					capBypass = SessionCapBypassForceReplacement
+				}
+				if capErr := enforceSessionCap(stderr, capBypass, 1); capErr != nil {
+					return capErr
+				}
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
 					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
