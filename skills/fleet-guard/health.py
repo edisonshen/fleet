@@ -321,27 +321,39 @@ def _resolve_self_pid(agent_id: str) -> int | None:
 
     # Walk ancestry from our own pid upward. Bounded by max depth so a
     # corrupt ps output (cycle) can't loop forever.
+    #
+    # Match rules (codex iter-3 hardening, 2026-05-14):
+    #   - Disambiguator match short-circuits ONLY when the matched
+    #     entry is NOT a shell argv. A `sh -c "claude --remote-control
+    #     fleet-coord-X ..."` wrapper carries the disambiguator
+    #     transitively; matching on that shell would return the
+    #     wrapper pid and let dead claudes show up as alive (the
+    #     wrapper outlives the engine). Mirrors Go-side resolver
+    #     pidresolver.go:findEngineDescendant.
+    #   - Engine-name match still uses the "walk further if there is
+    #     a deeper disambiguator hit" heuristic, with the same shell
+    #     skip applied.
     cur = os.getpid()
     for _ in range(256):
         info = procs.get(cur)
         if info is None:
             break
         _, args = info
-        if needle and needle in args:
+        if needle and needle in args and not _is_shell_argv(args):
             return cur
         if _argv_command_is(args, "claude") or _argv_command_is(args, "codex"):
             # Engine match — return ONLY if we haven't been able to
-            # match the disambiguator yet. Walk one more step in case
-            # a deeper engine ancestor carries the disambiguator.
+            # match the disambiguator on a non-shell ancestor yet.
+            # Walk one more step in case a deeper engine ancestor
+            # carries the disambiguator (and is not a shell).
             best = cur
-            # Continue walking to look for a disambiguator match.
             cur = info[0]
             while True:
                 info2 = procs.get(cur)
                 if info2 is None:
                     break
                 _, args2 = info2
-                if needle and needle in args2:
+                if needle and needle in args2 and not _is_shell_argv(args2):
                     return cur
                 cur = info2[0]
                 if cur <= 1:
@@ -367,6 +379,26 @@ def _argv_command_is(argv: str, name: str) -> bool:
     if slash >= 0:
         first = first[slash + 1:]
     return first == name
+
+
+def _is_shell_argv(argv: str) -> bool:
+    """Report whether argv looks like a POSIX shell wrapper (`sh`,
+    `bash`, `zsh`, etc.). Mirrors Go-side isShellArgv in
+    pidresolver.go. Used to skip wrapper-shell ancestors that carry
+    the disambiguator transitively (e.g. `sh -c "claude --remote-
+    control fleet-coord-X ..."`) so reconcile_pid doesn't rewrite the
+    record to point at a wrapper shell that can outlive the engine.
+    """
+    s = argv.lstrip()
+    space = s.find(" ")
+    if space < 0:
+        first = s
+    else:
+        first = s[:space]
+    slash = first.rfind("/")
+    if slash >= 0:
+        first = first[slash + 1:]
+    return first in {"sh", "bash", "zsh", "dash", "ksh", "fish"}
 
 
 def _atomic_write_json(path: Path, record: dict[str, Any]) -> bool:

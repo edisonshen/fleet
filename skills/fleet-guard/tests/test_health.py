@@ -450,3 +450,96 @@ class TestReconcilePid:
         assert ok is True
         record = json.loads(path.read_text(encoding="utf-8"))
         assert record["pid"] == os.getpid()
+
+
+class TestResolveSelfPidShellSkip:
+    """Codex iter-3 hardening (2026-05-14): the disambiguator match
+    in _resolve_self_pid must skip shell wrappers. Otherwise a `sh -c
+    "claude --remote-control fleet-coord-X ..."` ancestor — which
+    carries the disambiguator transitively — would be returned as the
+    resolved pid, and the wrapper can outlive the engine, leaving dead
+    coords misclassified as alive.
+
+    The unit tests below pin the helper directly, bypassing the
+    ps shell-out, by patching subprocess.run output."""
+
+    def _set_ps_output(
+        self, monkeypatch: pytest.MonkeyPatch, lines: list[str],
+    ) -> None:
+        """Patch subprocess.run inside health._resolve_self_pid to
+        return a synthetic `ps -o pid,ppid,args -ax` output."""
+        import subprocess as _sp
+        header = "  PID  PPID ARGS\n"
+        body = "\n".join(lines) + "\n"
+        out = header + body
+
+        class _FakeCompleted:
+            def __init__(self, stdout: str) -> None:
+                self.stdout = stdout
+
+        def _fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+            return _FakeCompleted(out)
+
+        monkeypatch.setattr(_sp, "run", _fake_run)
+
+    def test_is_shell_argv_pins_shell_token(self) -> None:
+        """Sanity: the helper recognizes the common shell command
+        names with optional leading path."""
+        assert health._is_shell_argv("sh -c foo")
+        assert health._is_shell_argv("/bin/bash -c foo")
+        assert health._is_shell_argv("zsh -i")
+        assert not health._is_shell_argv("claude --foo")
+        assert not health._is_shell_argv("codex review")
+        assert not health._is_shell_argv("")
+
+    def test_disambiguator_match_skips_shell_wrapper(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Coord-spawn shape: bash hook is our pid (Z); ancestor is
+        claude (X) which has the disambiguator; ancestor's ancestor is
+        `sh -c "claude ... fleet-coord-X"` (X') which ALSO has the
+        disambiguator transitively. The resolver must return X (the
+        claude), NOT X' (the wrapper shell)."""
+        agent_id = "abcd1234"
+        needle = f"fleet-coord-{agent_id}"
+        # Simulate ancestry: our_pid (bash) → claude → sh wrapper → tmux server.
+        # os.getpid() returns this test's pid; we register that in procs as
+        # the bash hook process.
+        our_pid = os.getpid()
+        claude_pid = 90001
+        wrapper_pid = 90002
+        self._set_ps_output(monkeypatch, [
+            f"{our_pid} {claude_pid} bash /tmp/hook.sh",
+            f"{claude_pid} {wrapper_pid} claude --remote-control {needle} --dangerously-skip-permissions",
+            f"{wrapper_pid} 1 sh -c claude --remote-control {needle} --dangerously-skip-permissions",
+        ])
+        got = health._resolve_self_pid(agent_id)
+        assert got == claude_pid, (
+            f"resolver returned {got}; want {claude_pid} (the claude, "
+            f"NOT the wrapper shell {wrapper_pid})"
+        )
+
+    def test_disambiguator_only_on_shell_returns_none_via_engine_path(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When claude is already dead and only the wrapper shell with
+        the disambiguator remains in our ancestry, the resolver must
+        NOT return the shell pid. It returns None (or whatever the
+        engine-match path produces), letting reconcile_pid bail
+        rather than rewrite the record to point at a wrapper that can
+        outlive the engine."""
+        agent_id = "abcd1234"
+        needle = f"fleet-coord-{agent_id}"
+        our_pid = os.getpid()
+        wrapper_pid = 90002
+        # Our parent is the wrapper shell — no claude in the chain
+        # anymore (drift case).
+        self._set_ps_output(monkeypatch, [
+            f"{our_pid} {wrapper_pid} bash /tmp/hook.sh",
+            f"{wrapper_pid} 1 sh -c claude --remote-control {needle}",
+        ])
+        got = health._resolve_self_pid(agent_id)
+        assert got != wrapper_pid, (
+            f"resolver returned wrapper pid {wrapper_pid}; must skip "
+            "shell ancestors carrying the disambiguator transitively"
+        )
