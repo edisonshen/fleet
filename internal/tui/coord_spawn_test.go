@@ -385,6 +385,91 @@ func TestProjectRow_NoMarkerNoSpawningLine(t *testing.T) {
 	}
 }
 
+// TestProjectRow_StuckDowngradesToWaitingWhenNeedsInput pins PART 2b
+// of the bundle: when the spawn marker is past timeout AND the agent
+// record matching the marker has needs_input=true, render an
+// informational "coord waiting on input" line instead of the
+// attention-chip stuck warning. The agent is alive — fleet-guard set
+// needs_input from inside claude on the last Stop hook fire, which is
+// impossible if claude were dead. Reserve the stuck-attention render
+// for the genuine "spawn never converged" failure mode (no needs_input
+// signal, no fresh coord-state).
+//
+// Real bug surfaced 2026-05-13: coord bab86984 (projects-spark) showed
+// the stuck badge while its claude process pid 8306 had been running
+// 12 minutes idle awaiting input — needs_input=true, last_activity 33s
+// after spawn. The badge trained the operator to spawn replacements
+// over a live coord.
+func TestProjectRow_StuckDowngradesToWaitingWhenNeedsInput(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+
+	// Seed an agent record matching the marker, with needs_input=true.
+	// LastActivityTS is OLD (past activeWindow) so the self-heal Path B
+	// freshness gate does NOT fire — without needs_input, the stuck
+	// chip would render here.
+	rec := &agent.Record{
+		ID:             "abcd1234",
+		LastActivityTS: now.Add(-30 * time.Minute), // stale, not fresh
+		NeedsInput:     true,                       // alive, awaiting operator
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{rec},
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("needs_input=true must downgrade stuck → waiting; got stuck warning:\n%s", joined)
+	}
+	if !strings.Contains(joined, "waiting on input") {
+		t.Errorf("expected informational waiting line; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "fleet attach abcd1234") {
+		t.Errorf("waiting line must suggest 'fleet attach <agent_id>'; got:\n%s", joined)
+	}
+}
+
+// TestProjectRow_StuckPreservedWhenNeedsInputFalse: the inverse case —
+// genuine stuck (no needs_input signal, no fresh state) still renders
+// the attention-chip warning. Ensures the gate doesn't accidentally
+// suppress real failure modes.
+func TestProjectRow_StuckPreservedWhenNeedsInputFalse(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "abcd1234")
+	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+
+	// Agent record exists but needs_input=false AND stale → real stuck.
+	rec := &agent.Record{
+		ID:             "abcd1234",
+		LastActivityTS: now.Add(-30 * time.Minute),
+		NeedsInput:     false,
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      []*agent.Record{rec},
+	}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("needs_input=false + stale + past timeout → stuck must fire; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "waiting on input") {
+		t.Errorf("real stuck must not render waiting line; got:\n%s", joined)
+	}
+}
+
 // TestResolveCoordSpawnTimeout_DefaultAndOverride pins env-var
 // parsing for FLEET_COORD_SPAWN_TIMEOUT_S. Default fires when unset
 // or unparseable; valid integers convert to seconds.
