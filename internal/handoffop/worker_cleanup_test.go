@@ -513,6 +513,68 @@ func TestKillAgentsForTask_InvalidInputs(t *testing.T) {
 	}
 }
 
+// TestKillAgentsForTask_RaceNewReplacement_Refuses — codex iter-9
+// [P1]. After the snapshot, a concurrent handoff/dispatch writes a
+// fresh replacement record for the same task. The post-cleanup
+// re-list must detect the newcomer and refuse the transition.
+func TestKillAgentsForTask_RaceNewReplacement_Refuses(t *testing.T) {
+	setupFleetHome(t)
+	worker := seedWorkerAgent(t, "wrk-pre", "rainier", "race-task")
+
+	stubWorkerTmux(t,
+		func(string) error { return nil },
+		func(string) (bool, error) { return false, nil },
+	)
+
+	// Hook agent.Archive to write a brand-new replacement record
+	// AFTER the original is archived but before the post-cleanup
+	// re-list runs. We do this by writing the replacement during
+	// Archive via t.Cleanup ordering — simpler: write it BEFORE
+	// calling KillAgentsForTask but use a tmux session the stub
+	// reports dead. Actually simplest: write a second record AFTER
+	// KillAgentsForTask snapshot but BEFORE the re-list. Since our
+	// stub is synchronous, we wrap it.
+	racedRec := agent.New("wrk-new")
+	racedRec.TmuxSession = "fleet-wrk-new"
+	racedRec.TaskID = "race-task"
+	racedRec.Project = "rainier"
+
+	// Inject the new record during the Kill stub call (simulates
+	// concurrent handoff that lands while we're killing the old).
+	origKill := tmuxKillForCleanup
+	tmuxKillForCleanup = func(s string) error {
+		if err := racedRec.Write(); err != nil {
+			t.Fatalf("seed raced rec: %v", err)
+		}
+		return origKill(s)
+	}
+	t.Cleanup(func() { tmuxKillForCleanup = origKill })
+
+	_, err := KillAgentsForTask(WorkerCleanupOpts{
+		Project: "rainier", TaskSlug: "race-task", Stderr: io.Discard,
+	})
+	if err == nil {
+		t.Fatalf("expected error when racer wrote new replacement during cleanup")
+	}
+	if !errors.Is(err, ErrWorkerCleanupFailed) {
+		t.Errorf("not wrapping ErrWorkerCleanupFailed: %v", err)
+	}
+	if !strings.Contains(err.Error(), "replacement agent") {
+		t.Errorf("error should mention replacement agent; got %v", err)
+	}
+	// Original worker was archived (we got past the kill loop).
+	livePath, _ := state.AgentPath(worker.ID)
+	if workerFileExists(livePath) {
+		t.Errorf("original worker not archived")
+	}
+	// Raced replacement is still live (the re-list spotted it but
+	// did not act on it).
+	racedPath, _ := state.AgentPath(racedRec.ID)
+	if !workerFileExists(racedPath) {
+		t.Errorf("raced replacement not preserved")
+	}
+}
+
 // TestKillAgentsForTask_KillRaceSessionGone_LogsAndArchives.
 func TestKillAgentsForTask_KillRaceSessionGone_LogsAndArchives(t *testing.T) {
 	setupFleetHome(t)

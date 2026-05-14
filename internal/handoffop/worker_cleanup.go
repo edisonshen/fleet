@@ -145,6 +145,15 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 				len(badIDs), badIDs, opts.TaskSlug, opts.Project)
 		}
 	}
+	// codex iter-9 [P1]: snapshot the IDs we intend to act on. After
+	// the kill+archive loop we'll re-list and refuse if a new
+	// replacement appeared for this task between the snapshot and now
+	// (concurrent `fleet handoff` / auto-handoff race).
+	snapshotIDs := make(map[string]struct{}, len(matches))
+	for _, rec := range matches {
+		snapshotIDs[rec.ID] = struct{}{}
+	}
+
 	// Pass 2: kill + archive each matched record.
 	for _, rec := range matches {
 		res.Matched++
@@ -211,6 +220,47 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 			res.Archived++
 		}
 	}
+
+	// codex iter-9 [P1]: race re-check. Between our snapshot at the
+	// top of this function and now, a concurrent `fleet handoff` /
+	// auto-handoff may have written a fresh replacement record for
+	// this task. If so, our cleanup is incomplete — the new record
+	// is live and untouched. Re-list and refuse the transition so
+	// the operator (or the next `tasks set`) catches the new record.
+	postAll, postBadIDs, perr := agent.ListStrict()
+	if perr != nil {
+		return res, fmt.Errorf(
+			"%w: post-cleanup re-list failed: %w (workers killed but cannot confirm none appeared concurrently; task %s NOT marked terminal — retry)",
+			ErrWorkerCleanupFailed, perr, opts.TaskSlug)
+	}
+	var newcomers []string
+	for _, rec := range postAll {
+		if rec == nil {
+			continue
+		}
+		if isProjectCoordRecord(rec.ID, rec.TaskID, rec.Project) {
+			continue
+		}
+		if rec.TaskID != opts.TaskSlug || rec.Project != opts.Project {
+			continue
+		}
+		if _, ok := snapshotIDs[rec.ID]; ok {
+			continue // already handled this pass
+		}
+		newcomers = append(newcomers, rec.ID)
+	}
+	if len(newcomers) > 0 {
+		return res, fmt.Errorf(
+			"%w: %d replacement agent(s) appeared during cleanup (%v); task %s NOT marked terminal — re-run `fleet tasks set` to clean up the newcomers",
+			ErrWorkerCleanupFailed, len(newcomers), newcomers, opts.TaskSlug)
+	}
+	if len(postBadIDs) > 0 {
+		if relevant := badRecordsPlausiblyRelated(postBadIDs, opts.Project, opts.TaskSlug); len(relevant) > 0 {
+			return res, fmt.Errorf(
+				"%w: %d unreadable record(s) appeared during cleanup AND raw-text match task %s (%v); task NOT marked terminal — fix the records and retry",
+				ErrWorkerCleanupFailed, len(relevant), opts.TaskSlug, relevant)
+		}
+	}
 	return res, nil
 }
 
@@ -253,6 +303,15 @@ func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string 
 		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil {
+			// codex iter-9 [P2]: a record that vanished between
+			// ListStrict's readdir and our follow-up read (concurrent
+			// `fleet rm` / handoff that archived it) is NOT related —
+			// it's already gone. Distinguish ENOENT from other read
+			// failures.
+			if errors.Is(rerr, os.ErrNotExist) {
+				continue
+			}
+			// Other read failures (permission, I/O) — be conservative.
 			related = append(related, id)
 			continue
 		}
