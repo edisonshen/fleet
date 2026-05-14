@@ -11,18 +11,21 @@ package main
 // them loud — operator gets a clear error pointing at the prune
 // command and the rm command, instead of a slow-motion OOM.
 //
-// Wired into two CLI entry points that spawn fleet-<id> sessions:
+// Wired into the three entry points that spawn fleet-<id> sessions.
+// Each passes a `swapsInFlight` accounting for the about-to-be-killed
+// old session(s) — without that offset, a queued handoff at exactly
+// N=max would deadlock (codex iter-2 P1):
 //
 //   - cmd/fleet/dispatch.go (runDispatch) — `fleet dispatch <task>`
 //     and `fleet dispatch coord-<project> --coord-spawn`.
+//     swapsInFlight=0 (net +1).
 //   - cmd/fleet/handoff.go (runHandoff) — `fleet handoff <id>`. The
 //     `--force-replacement` flag bypasses the precheck for operators
 //     who are mid-cleanup and need the successor up first.
-//
-// internal/handoffop's Resume entrypoint (auto-drain from fleet-guard)
-// is also wired through enforceSessionCap so background auto-handoffs
-// can't push the count past the cap. That call sits in
-// internal/handoffop/Resume; this file owns the cmd/fleet layer.
+//     swapsInFlight=1 (net 0).
+//   - internal/handoffop/handoffop.go (spawnAndRetire) — auto-drain
+//     from fleet-guard's queue files. Compares net-zero against the
+//     cap; no --force-replacement (no operator on the path).
 //
 // Best-effort, not a strict mutex (codex iter expectation): two
 // concurrent `fleet dispatch` invocations can both pass the count
@@ -75,11 +78,21 @@ func productionSessionExistsFn() func(id string) bool {
 }
 
 // enforceSessionCap is the spawn-time guardrail. Returns a non-nil
-// error when the current count of fleet-<id> tmux sessions is at or
-// above FLEET_MAX_SESSIONS. The error message lists the live + orphan
-// breakdown and points at the maintenance prune-orphan-tmux command
-// (Subagent #1) plus `fleet rm <id>` as the two operator-facing
-// escape valves.
+// error when the projected count of fleet-<id> tmux sessions AFTER
+// the upcoming spawn would exceed FLEET_MAX_SESSIONS. The error
+// message lists the live + orphan breakdown and points at the
+// maintenance prune-orphan-tmux command (Subagent #1) plus
+// `fleet rm <id>` as the two operator-facing escape valves.
+//
+// `swapsInFlight` is the number of OLD sessions that the caller is
+// about to kill as part of this operation. Used by handoff paths
+// (operator-triggered and auto-drain) to encode "this spawn will be
+// followed by a kill, so net session count stays flat." Pass 0 for
+// fleet dispatch (net +1); pass 1 for fleet handoff and handoffop
+// spawnAndRetire (net 0). Without this offset, at exactly N=max a
+// queue-driven handoff would deadlock — its own OLD agent is counted
+// in `total`, the new spawn would tip over the cap, and the queue
+// file would fail forever (codex iter-2 P1).
 //
 // When `bypass` is non-empty, the precheck is skipped and the bypass
 // reason is logged to stderr. Used by handoff's --force-replacement
@@ -93,7 +106,7 @@ func productionSessionExistsFn() func(id string) bool {
 // explicitly.
 //
 // stderr may be nil — tests pass nil to assert pure return value.
-func enforceSessionCap(stderr io.Writer, bypass SessionCapBypassReason) error {
+func enforceSessionCap(stderr io.Writer, bypass SessionCapBypassReason, swapsInFlight int) error {
 	if bypass != "" {
 		if stderr != nil {
 			_, _ = fmt.Fprintf(stderr,
@@ -124,7 +137,13 @@ func enforceSessionCap(stderr io.Writer, bypass SessionCapBypassReason) error {
 		return nil
 	}
 	max := state.MaxSessions(stderr)
-	if counts.Total() < max {
+	// Projected post-swap count = current_total + 1 (spawn) - swaps.
+	// For dispatch (swaps=0): projected = total + 1.
+	// For handoff (swaps=1): projected = total (net-zero).
+	// Refuse iff projected > max, i.e. when even after accounting for
+	// the about-to-be-killed sessions we'd be over the ceiling.
+	projected := counts.Total() + 1 - swapsInFlight
+	if projected <= max {
 		return nil
 	}
 	// Multiline message renders cleanly under cobra's `error: <err>`

@@ -573,7 +573,11 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	if opts.forceReplacement {
 		bypass = SessionCapBypassForceReplacement
 	}
-	if err := enforceSessionCap(stderr, bypass); err != nil {
+	// swapsInFlight=1: the about-to-be-killed old session is in the
+	// current count, so the post-swap total is unchanged. Refusing
+	// at-cap on a net-zero swap would deadlock a queued/manual handoff
+	// where the old agent IS the Nth session (codex iter-2 P1).
+	if err := enforceSessionCap(stderr, bypass, 1); err != nil {
 		return err
 	}
 

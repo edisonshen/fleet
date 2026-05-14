@@ -697,7 +697,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// enforceSessionCap doc). Placed AFTER cheaper validations
 	// (engine, project, coord-spawn, recovery) so a bad task ID or
 	// unknown engine still fails fast without paying the cap probe.
-	if err := enforceSessionCap(os.Stderr, ""); err != nil {
+	// swapsInFlight=0: dispatch is a NET +1 spawn (no old session to
+	// retire). Cap refuses iff `current_total + 1 > max`.
+	if err := enforceSessionCap(os.Stderr, "", 0); err != nil {
 		return err
 	}
 	rec, err := spawn.Spawn(spawn.Options{

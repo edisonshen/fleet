@@ -38,7 +38,7 @@ func TestEnforceSessionCap_BelowCap(t *testing.T) {
 		func(id string) bool { return true },
 	)
 	var stderr bytes.Buffer
-	if err := enforceSessionCap(&stderr, ""); err != nil {
+	if err := enforceSessionCap(&stderr, "", 0); err != nil {
 		t.Fatalf("unexpected error at 3/30: %v", err)
 	}
 }
@@ -51,7 +51,7 @@ func TestEnforceSessionCap_AtCap(t *testing.T) {
 		func(id string) bool { return true },
 	)
 	var stderr bytes.Buffer
-	err := enforceSessionCap(&stderr, "")
+	err := enforceSessionCap(&stderr, "", 0)
 	if err == nil {
 		t.Fatalf("expected refusal at 3/3, got nil")
 	}
@@ -81,7 +81,7 @@ func TestEnforceSessionCap_OverCap(t *testing.T) {
 		func(id string) bool { return live["fleet-"+id] },
 	)
 	var stderr bytes.Buffer
-	err := enforceSessionCap(&stderr, "")
+	err := enforceSessionCap(&stderr, "", 0)
 	if err == nil {
 		t.Fatalf("expected refusal at 4/2, got nil")
 	}
@@ -107,7 +107,7 @@ func TestEnforceSessionCap_NonFleetSessionsExcluded(t *testing.T) {
 		func(id string) bool { return true },
 	)
 	var stderr bytes.Buffer
-	if err := enforceSessionCap(&stderr, ""); err != nil {
+	if err := enforceSessionCap(&stderr, "", 0); err != nil {
 		t.Fatalf("unexpected error at 2 fleet / 3 cap (4 non-fleet): %v", err)
 	}
 }
@@ -122,7 +122,7 @@ func TestEnforceSessionCap_ForceReplacementBypass(t *testing.T) {
 		func(id string) bool { return true },
 	)
 	var stderr bytes.Buffer
-	if err := enforceSessionCap(&stderr, SessionCapBypassForceReplacement); err != nil {
+	if err := enforceSessionCap(&stderr, SessionCapBypassForceReplacement, 0); err != nil {
 		t.Fatalf("force-replacement bypass should not error: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "force-replacement") {
@@ -137,11 +137,11 @@ func TestEnforceSessionCap_NilStderrTolerated(t *testing.T) {
 		func() ([]string, error) { return []string{"fleet-a"}, nil },
 		func(id string) bool { return true },
 	)
-	if err := enforceSessionCap(nil, ""); err != nil {
+	if err := enforceSessionCap(nil, "", 0); err != nil {
 		t.Fatalf("nil-stderr below-cap: %v", err)
 	}
 	// And on bypass with nil stderr (no log target).
-	if err := enforceSessionCap(nil, SessionCapBypassForceReplacement); err != nil {
+	if err := enforceSessionCap(nil, SessionCapBypassForceReplacement, 0); err != nil {
 		t.Fatalf("nil-stderr bypass: %v", err)
 	}
 }
@@ -157,11 +157,37 @@ func TestEnforceSessionCap_ListErrorProceedsWithoutBlocking(t *testing.T) {
 		func(id string) bool { return true },
 	)
 	var stderr bytes.Buffer
-	if err := enforceSessionCap(&stderr, ""); err != nil {
+	if err := enforceSessionCap(&stderr, "", 0); err != nil {
 		t.Fatalf("list error should not block spawn: %v", err)
 	}
 	if !strings.Contains(stderr.String(), "could not enumerate") {
 		t.Errorf("expected probe-fail warning, got %q", stderr.String())
+	}
+}
+
+// TestEnforceSessionCap_SwapsInFlightOffsetsCount regresses codex
+// iter-2 P1: when the caller is about to retire an OLD session as
+// part of the spawn (handoff semantics), the cap must use the
+// PROJECTED post-swap count, not the current count. At exactly
+// N=max with all live sessions, a net-zero handoff would otherwise
+// deadlock — the queue file fails forever because the old session
+// is counted, the new spawn tips over, and nothing kills the old
+// without the spawn succeeding.
+func TestEnforceSessionCap_SwapsInFlightOffsetsCount(t *testing.T) {
+	t.Setenv(state.FleetMaxSessionsEnv, "3")
+	// Exactly at cap: 3 live fleet-* sessions.
+	sessions := []string{"fleet-a", "fleet-b", "fleet-c"}
+	withInjectedSessionFns(t,
+		func() ([]string, error) { return sessions, nil },
+		func(string) bool { return true },
+	)
+	// swapsInFlight=0 (dispatch): projected = 3 + 1 - 0 = 4 > 3, refuse.
+	if err := enforceSessionCap(nil, "", 0); err == nil {
+		t.Errorf("swaps=0 at-cap: expected refusal")
+	}
+	// swapsInFlight=1 (handoff): projected = 3 + 1 - 1 = 3 ≤ 3, allowed.
+	if err := enforceSessionCap(nil, "", 1); err != nil {
+		t.Errorf("swaps=1 at-cap (net-zero swap): unexpected refusal: %v", err)
 	}
 }
 
@@ -229,7 +255,7 @@ func TestEnforceSessionCap_DefaultCap30(t *testing.T) {
 			func() ([]string, error) { return s, nil },
 			func(string) bool { return true },
 		)
-		if err := enforceSessionCap(nil, ""); err != nil {
+		if err := enforceSessionCap(nil, "", 0); err != nil {
 			t.Fatalf("29/30 should allow: %v", err)
 		}
 	})
@@ -239,7 +265,7 @@ func TestEnforceSessionCap_DefaultCap30(t *testing.T) {
 			func() ([]string, error) { return s, nil },
 			func(string) bool { return true },
 		)
-		if err := enforceSessionCap(nil, ""); err == nil {
+		if err := enforceSessionCap(nil, "", 0); err == nil {
 			t.Fatalf("30/30 should refuse")
 		}
 	})

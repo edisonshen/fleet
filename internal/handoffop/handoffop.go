@@ -259,19 +259,30 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// escape on this path because there's no operator to flag it —
 	// the queue file is the only producer. Probe failures don't
 	// block (best-effort, same as the CLI gate).
+	//
+	// Net-zero swap accounting (codex iter-2 P1): this is a HANDOFF —
+	// the new spawn is followed by a kill of oldRec.TmuxSession, so
+	// total session count stays flat at completion. Compare
+	// `projected = current_total + 1 - 1` (spawn minus retire) to the
+	// cap. Without this, a queued handoff for the Nth session would
+	// deadlock at exactly N=max since the old session is in the count.
 	counts, cerr := state.CountFleetSessions(
 		sessionListProbe, state.LiveAgentRecordExists)
 	if cerr != nil {
 		_, _ = fmt.Fprintf(stderr,
 			"warning: FLEET_MAX_SESSIONS precheck could not enumerate tmux sessions (%v); proceeding without cap enforcement\n",
 			cerr)
-	} else if max := state.MaxSessions(stderr); counts.Total() >= max {
-		// Queue file is preserved so the operator can drain manually
-		// after pruning. The error message mirrors the CLI gate's
-		// language for consistency.
-		return fmt.Errorf(
-			"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` or `fleet rm <id>`, then rerun `fleet drain` (queue file %s preserved)",
-			max, counts.Live, counts.Orphan, queuePath)
+	} else {
+		max := state.MaxSessions(stderr)
+		projected := counts.Total() // +1 spawn, -1 retire = net 0
+		if projected > max {
+			// Queue file is preserved so the operator can drain manually
+			// after pruning. The error message mirrors the CLI gate's
+			// language for consistency.
+			return fmt.Errorf(
+				"resume: refusing to spawn — already at FLEET_MAX_SESSIONS=%d tmux sessions (%d live, %d orphan); run `fleet maintenance prune-orphan-tmux --kill` or `fleet rm <id>`, then rerun `fleet drain` (queue file %s preserved)",
+				max, counts.Live, counts.Orphan, queuePath)
+		}
 	}
 
 	if oldRec.Cwd == "" {

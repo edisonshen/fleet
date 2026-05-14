@@ -22,10 +22,12 @@ func withInjectedSessionListProbe(t *testing.T, fn func() ([]string, error)) {
 }
 
 // TestSpawnAndRetire_SessionCapRefusal pins the auto-drain path's
-// FLEET_MAX_SESSIONS gate. When the count of fleet-* tmux sessions is
-// already at or above the cap, spawnAndRetire must refuse, preserve
-// the queue file, and surface a message pointing at the prune + rm
-// escape valves.
+// FLEET_MAX_SESSIONS gate. spawnAndRetire is net-zero by intent
+// (spawn new + retire old), so the cap compares the CURRENT total
+// against max (not total+1). When the current total already EXCEEDS
+// the cap (e.g. orphan leak built up past the ceiling), the cap
+// refuses, preserves the queue file, and surfaces a message
+// pointing at the prune + rm escape valves.
 //
 // Builds the smallest record/queue state needed to drive spawnAndRetire
 // into the cap-check path BEFORE it tries to call spawn.Spawn. The
@@ -34,11 +36,10 @@ func withInjectedSessionListProbe(t *testing.T, fn func() ([]string, error)) {
 func TestSpawnAndRetire_SessionCapRefusal(t *testing.T) {
 	tmp := setupFleetHome(t)
 	_ = tmp
-	t.Setenv("FLEET_MAX_SESSIONS", "3")
+	t.Setenv("FLEET_MAX_SESSIONS", "2")
 
-	// Inject a fake list that returns 3 fleet-* sessions — at-cap
-	// regardless of orphan/live split (we mark them all live so the
-	// total is 3 but orphan=0).
+	// Inject a fake list that returns 3 fleet-* sessions — over-cap
+	// (count=3, max=2). Net-zero projected = 3 > 2 → refuse.
 	withInjectedSessionListProbe(t, func() ([]string, error) {
 		return []string{"fleet-aaa", "fleet-bbb", "fleet-ccc"}, nil
 	})
@@ -78,7 +79,7 @@ func TestSpawnAndRetire_SessionCapRefusal(t *testing.T) {
 	}
 	for _, want := range []string{
 		"refusing to spawn",
-		"FLEET_MAX_SESSIONS=3",
+		"FLEET_MAX_SESSIONS=2",
 		"prune-orphan-tmux",
 		"fleet rm",
 		queuePath,
@@ -86,6 +87,42 @@ func TestSpawnAndRetire_SessionCapRefusal(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err missing %q\nfull: %s", want, err.Error())
 		}
+	}
+}
+
+// TestSpawnAndRetire_NetZeroAtCapAllowed regresses codex iter-2 P1:
+// the auto-drain handoff is net-zero by intent (spawn new + retire
+// old), so at exactly N=max the queue-driven handoff must proceed —
+// without this fix the queue file would deadlock at the ceiling. We
+// confirm spawnAndRetire moves past the cap check by observing the
+// legacy-record-rejection error from the NEXT step (oldRec.Cwd ==
+// "" is rejected explicitly). If the cap had blocked, we'd see its
+// message instead.
+func TestSpawnAndRetire_NetZeroAtCapAllowed(t *testing.T) {
+	setupFleetHome(t)
+	t.Setenv("FLEET_MAX_SESSIONS", "3")
+	// Exactly at cap — 3 live fleet-* sessions.
+	withInjectedSessionListProbe(t, func() ([]string, error) {
+		return []string{"fleet-aaa", "fleet-bbb", "fleet-ccc"}, nil
+	})
+	for _, id := range []string{"aaa", "bbb", "ccc"} {
+		seedAgentRecord(t, id)
+	}
+
+	// Cwd intentionally empty so spawnAndRetire reaches the next
+	// rejection AFTER passing the cap check.
+	oldRec := &agent.Record{ID: "olda", Command: []string{"x"}}
+	req := queue.SpawnFresh{OldAgentID: "olda", NewAgentID: "newa"}
+	var stdout, stderr bytes.Buffer
+	err := spawnAndRetire(req, "/tmp/q.json", oldRec, 0, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("expected legacy-record rejection, got nil")
+	}
+	if strings.Contains(err.Error(), "refusing to spawn") {
+		t.Fatalf("cap should NOT have blocked net-zero handoff at-cap; err=%v", err)
+	}
+	if !strings.Contains(err.Error(), "no stored cwd") {
+		t.Fatalf("expected legacy-record rejection downstream; got: %v", err)
 	}
 }
 
