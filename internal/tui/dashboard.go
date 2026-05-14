@@ -85,6 +85,20 @@ type ProjectRow struct {
 	// grepping `gh pr list`. A "⚠ post-archive activity" indicator
 	// rendered on the project row makes the audit signal visible.
 	PostArchiveActivity bool
+
+	// IncidentCount is the number of incident JSON files under
+	// ~/.fleet/incidents/ whose `project` field matches this row's
+	// Name. The macOS memorystatus / jetsam observer in
+	// skills/fleet-guard/jetsam.py writes one file per kernel kill so
+	// fleet has a structured diagnostic record. A non-zero count
+	// renders a "✗ killed by memorystatus" badge on the row so the
+	// operator sees OOM kills they'd otherwise notice only as a
+	// silently-dead tmux session.
+	//
+	// Cheap path: one ReadDir on the incidents dir per scan. Bounded
+	// by the number of cumulative kills the operator hasn't cleared
+	// yet — small in practice (a few per outage; zero in steady state).
+	IncidentCount int
 }
 
 // TaskCounts mirrors the columns in the mockup:
@@ -298,6 +312,12 @@ func scanProject(projectsRoot, name string, now time.Time) (*ProjectRow, []*Work
 	// malformed JSON, IO error) all fall through to "false" — the
 	// audit signal is informational, not load-bearing.
 	row.PostArchiveActivity = scanProjectPostArchiveActivity(dir)
+	// PART 3 jetsam observer wire-up — count incidents whose project
+	// field matches this row. The fleet-guard skill writes one JSON
+	// per memorystatus / jetsam kill to ~/.fleet/incidents/; the badge
+	// renders when count > 0. One ReadDir per project per scan; the
+	// directory is empty in steady state.
+	row.IncidentCount = scanProjectIncidentCount(name)
 
 	// Workers under workers/<slug>/state.json.
 	wrows := scanWorkers(dir, name, now, subagentMap)
@@ -703,6 +723,58 @@ func scanProjectPostArchiveActivity(projectDir string) bool {
 		}
 	}
 	return false
+}
+
+// scanProjectIncidentCount returns the number of incident JSON files
+// under ~/.fleet/incidents/ whose top-level `project` field equals
+// projectName. The macOS memorystatus / jetsam observer in
+// skills/fleet-guard/jetsam.py writes these files; the schema is
+//
+//	{
+//	  "schema_version": 1,
+//	  "agent_id": "...",
+//	  "pid": N,
+//	  "reason": "highwater" | "vm-thrashing" | "fork-fail" | ...,
+//	  "killed_at": "<RFC3339>",
+//	  "project": "<project-name>",
+//	  ...
+//	}
+//
+// Returns 0 when the dir is missing, when no files match, or on read
+// errors. Malformed JSON entries are skipped silently (mirrors
+// scanProjectPostArchiveActivity's tolerance for partial writes /
+// hand-edits). Best-effort: a directory-listing race during a
+// concurrent incident write doesn't crash the TUI scan; worst case
+// the count is one off for one frame.
+func scanProjectIncidentCount(projectName string) int {
+	dir, err := state.IncidentsDir()
+	if err != nil {
+		return 0
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	count := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var rec struct {
+			Project string `json:"project"`
+		}
+		if err := json.Unmarshal(data, &rec); err != nil {
+			continue
+		}
+		if rec.Project == projectName {
+			count++
+		}
+	}
+	return count
 }
 
 // readWorkerSubagentMap parses coord-state.json's `worker_subagent_ids`

@@ -3,6 +3,7 @@ package tui
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -939,6 +940,58 @@ func TestScanProject_SkipsMalformedIncidentJSON(t *testing.T) {
 	if snap.Projects[0].IncidentCount != 1 {
 		t.Errorf("IncidentCount = %d, want 1 (good incident only)",
 			snap.Projects[0].IncidentCount)
+	}
+}
+
+// TestProjectBlock_RendersMemorystatusBadgeOnIncident pins PART 3
+// of the bundled liveness-correctness fix: when ProjectRow.IncidentCount
+// > 0, the project block header renders an attention-chip badge
+// reading "✗ killed by memorystatus" (or "✗ N killed by memorystatus"
+// for N > 1). Pluralization mirrors the post-archive badge's compact
+// shape (no number when count == 1).
+func TestProjectBlock_RendersMemorystatusBadgeOnIncident(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	stubMarkerMtime(t, "demo", time.Time{}, false) // no spawn marker
+	cases := []struct {
+		count     int
+		wantBadge string
+	}{
+		{1, "✗ killed by memorystatus"},
+		{2, "✗ 2 killed by memorystatus"},
+		{5, "✗ 5 killed by memorystatus"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("count_%d", tc.count), func(t *testing.T) {
+			p := &ProjectRow{
+				Name:          "demo",
+				RepoSlug:      "demo",
+				IncidentCount: tc.count,
+			}
+			ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+			lines := projectBlockLines(p, 80, false, ctx)
+			joined := strings.Join(lines, "\n")
+			if !strings.Contains(joined, tc.wantBadge) {
+				t.Errorf("incident count %d → badge %q not found; got:\n%s",
+					tc.count, tc.wantBadge, joined)
+			}
+		})
+	}
+}
+
+// TestProjectBlock_NoBadgeWhenIncidentCountZero ensures the badge
+// path is only entered when there's evidence — the badge is too
+// visually loud to render unconditionally.
+func TestProjectBlock_NoBadgeWhenIncidentCountZero(t *testing.T) {
+	withFleetHome(t)
+	now := time.Now()
+	stubMarkerMtime(t, "demo", time.Time{}, false)
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo", IncidentCount: 0}
+	ctx := coordSpawnCtx{now: now, tickFrame: 0, spawnTimeout: 10 * time.Minute}
+	lines := projectBlockLines(p, 80, false, ctx)
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "killed by memorystatus") {
+		t.Errorf("count=0 must not render badge; got:\n%s", joined)
 	}
 }
 

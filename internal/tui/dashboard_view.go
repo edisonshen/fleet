@@ -842,6 +842,25 @@ func projectHeaderLines(p *ProjectRow, w int, selected bool) ([]string, string) 
 		}
 	}
 
+	// PART 3 jetsam observer — render a "killed by memorystatus" badge
+	// when fleet-guard has written one or more incident JSON files for
+	// this project under ~/.fleet/incidents/. Uses attentionChipStyle
+	// for the same red/bold visual weight as the post-archive badge;
+	// the ✗ glyph signals "kill" (vs ⚠ "subagent drift"). When count
+	// is 1 we omit the number to keep the badge compact.
+	if p.IncidentCount > 0 {
+		text := "✗ killed by memorystatus"
+		if p.IncidentCount > 1 {
+			text = fmt.Sprintf("✗ %d killed by memorystatus", p.IncidentCount)
+		}
+		badge := attentionChipStyle.Render(text)
+		if lipgloss.Width(line2) > lipgloss.Width(prefix) {
+			line2 = line2 + "  " + badge
+		} else {
+			line2 = prefix + badge
+		}
+	}
+
 	return []string{line1, line2}, prefix
 }
 
