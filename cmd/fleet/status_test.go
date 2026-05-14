@@ -222,13 +222,9 @@ func TestStatus_SessionCapBanner_AtWarnThreshold(t *testing.T) {
 	if !strings.Contains(body, "prune-orphan-tmux") {
 		t.Errorf("banner should point at prune command; stderr:\n%s", body)
 	}
-	// Yellow/warning style (not red).
-	if !strings.Contains(body, "\x1b[1;33m") {
-		t.Errorf("at-threshold should use yellow ANSI; stderr:\n%s", body)
-	}
-	if strings.Contains(body, "\x1b[1;31m") {
-		t.Errorf("at-threshold should NOT use red ANSI; stderr:\n%s", body)
-	}
+	// ANSI styling verified separately in TestPaintBanner — the
+	// runStatus integration here uses bytes.Buffer (non-TTY) so the
+	// emitter intentionally omits color codes (codex iter-6 P2).
 }
 
 // TestStatus_SessionCapBanner_AtCap pins the critical-tier case
@@ -260,10 +256,8 @@ func TestStatus_SessionCapBanner_AtCap(t *testing.T) {
 	if !strings.Contains(body, "0 live") || !strings.Contains(body, "5 orphan") {
 		t.Errorf("banner should show all-orphan breakdown; stderr:\n%s", body)
 	}
-	// Red/critical style.
-	if !strings.Contains(body, "\x1b[1;31m") {
-		t.Errorf("at-cap should use red ANSI; stderr:\n%s", body)
-	}
+	// ANSI styling verified in TestPaintBanner — non-TTY stderr
+	// here doesn't include color codes (codex iter-6 P2).
 }
 
 // TestStatus_SessionCapBanner_SmallCapThresholdFaithful regresses
@@ -311,7 +305,7 @@ func TestStatus_SessionCapBanner_SmallCapThresholdFaithful(t *testing.T) {
 		}
 	})
 
-	t.Run("max=4, four sessions (100%): banner with red", func(t *testing.T) {
+	t.Run("max=4, four sessions (100%): banner present", func(t *testing.T) {
 		t.Setenv("FLEET_MAX_SESSIONS", "4")
 		withInjectedStatusSessionFns(t,
 			func() ([]string, error) {
@@ -327,9 +321,7 @@ func TestStatus_SessionCapBanner_SmallCapThresholdFaithful(t *testing.T) {
 		if !strings.Contains(body, "WARNING") {
 			t.Errorf("max=4, 4 sessions (100%%) should warn; stderr:\n%s", body)
 		}
-		if !strings.Contains(body, "\x1b[1;31m") {
-			t.Errorf("100%% should use red ANSI; stderr:\n%s", body)
-		}
+		// ANSI styling verified in TestPaintBanner.
 	})
 }
 
@@ -362,6 +354,52 @@ func TestStatus_SessionCapBanner_OnJSONPath(t *testing.T) {
 	// stdout must remain valid JSON — banner went to stderr.
 	if !strings.HasPrefix(strings.TrimSpace(stdout.String()), "[") {
 		t.Errorf("--json stdout should be a JSON array, got: %s", stdout.String())
+	}
+}
+
+// TestPaintBanner pins the ANSI escape codes for the warning and
+// critical tiers. The actual emit path in runStatus gates this on
+// TTY detection (codex iter-6 P2) so non-terminal stderr stays
+// plain — this test exercises the pure styling function directly.
+func TestPaintBanner(t *testing.T) {
+	line := "x\n"
+	t.Run("warning style: bold yellow", func(t *testing.T) {
+		got := paintBanner(line, bannerStyleWarning)
+		if !strings.Contains(got, "\x1b[1;33m") {
+			t.Errorf("warning should use bold yellow; got %q", got)
+		}
+		if !strings.HasSuffix(got, "\x1b[0m") {
+			t.Errorf("output should end with reset; got %q", got)
+		}
+	})
+	t.Run("critical style: bold red", func(t *testing.T) {
+		got := paintBanner(line, bannerStyleCritical)
+		if !strings.Contains(got, "\x1b[1;31m") {
+			t.Errorf("critical should use bold red; got %q", got)
+		}
+		if !strings.HasSuffix(got, "\x1b[0m") {
+			t.Errorf("output should end with reset; got %q", got)
+		}
+	})
+}
+
+// TestStderrIsTerminal pins the TTY-detection helper used to gate
+// ANSI emission. bytes.Buffer is not a *os.File, so it always
+// returns false — which is what tests rely on to assert
+// uncolored banner output.
+func TestStderrIsTerminal(t *testing.T) {
+	if stderrIsTerminal(&bytes.Buffer{}) {
+		t.Errorf("bytes.Buffer must not register as a terminal")
+	}
+	// os.DevNull is a real *os.File but is NOT a terminal — must
+	// also return false so redirected runs stay plain.
+	dn, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	defer func() { _ = dn.Close() }()
+	if stderrIsTerminal(dn) {
+		t.Errorf("/dev/null must not register as a terminal")
 	}
 }
 

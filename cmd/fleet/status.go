@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"text/tabwriter"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
@@ -192,7 +194,28 @@ func emitSessionCapBanner(stderr io.Writer) {
 	line := fmt.Sprintf(
 		"WARNING: %d/%d fleet tmux sessions in use (%d live, %d orphan).\nApproaching FLEET_MAX_SESSIONS cap. Run `fleet maintenance prune-orphan-tmux` to reap orphans.\n",
 		total, max, counts.Live, counts.Orphan)
-	_, _ = fmt.Fprint(stderr, paintBanner(line, bannerStyle))
+	// ANSI coloring only when stderr is a real terminal (codex
+	// iter-6 P2). When stderr is redirected to a file / piped to a
+	// log aggregator / running under CI, the escape codes turn
+	// plain warning text into control-coded junk that downstream
+	// alerting has to strip. Plain text suffices in those cases.
+	if stderrIsTerminal(stderr) {
+		_, _ = fmt.Fprint(stderr, paintBanner(line, bannerStyle))
+	} else {
+		_, _ = fmt.Fprint(stderr, line)
+	}
+}
+
+// stderrIsTerminal reports whether the given writer is an actual
+// terminal (vs a redirected file / pipe). Only *os.File backed by a
+// tty fd qualifies; anything else (bytes.Buffer in tests, log
+// pipelines, redirected runs) returns false.
+func stderrIsTerminal(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok {
+		return false
+	}
+	return isatty.IsTerminal(f.Fd()) || isatty.IsCygwinTerminal(f.Fd())
 }
 
 // bannerStyle is the visual tier for the session-cap banner. Two

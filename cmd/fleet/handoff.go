@@ -330,6 +330,18 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				opts.autoResume = !*pending.DisableAutoResume
 				opts.autoResumeFlagWasSet = true
 			}
+			// Force-replacement preservation across recovery (codex
+			// iter-6 P2): the original handoff that wrote this queue
+			// file already passed the FLEET_MAX_SESSIONS gate at step
+			// 4a. The orphan-recovery fall-through is a retry of the
+			// same logical handoff, so it must NOT be re-blocked by a
+			// cap that may have tightened since (operator lowered
+			// FLEET_MAX_SESSIONS, leak accumulated, etc.). Treat the
+			// retry as already-authorized and apply the same bypass
+			// the operator used originally. Without this, the queue
+			// file's "durable journal" guarantee for post-step-7
+			// crashes is silently lost when the cap state changed.
+			opts.forceReplacement = true
 			_ = queue.Delete(pendingPath)
 		case nerr != nil:
 			return fmt.Errorf("recovery probe: load replacement %s failed: %w", pending.NewAgentID, nerr)
@@ -371,6 +383,10 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					opts.autoResume = !*pending.DisableAutoResume
 					opts.autoResumeFlagWasSet = true
 				}
+				// Preserve cap-bypass across recovery (codex iter-6
+				// P2): the original handoff already passed the cap
+				// gate; the retry must not be re-blocked.
+				opts.forceReplacement = true
 				_ = queue.Delete(pendingPath)
 				_, _ = fmt.Fprintf(stderr,
 					"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
