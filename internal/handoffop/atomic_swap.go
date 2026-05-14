@@ -199,6 +199,34 @@ func AtomicSwap(opts AtomicSwapOpts) (SwapResult, error) {
 		}
 	}
 
+	// codex iter-12 [P2]: re-probe NEW after retiring OLD. If NEW
+	// died during the kill-old window (rare but possible — wrapper
+	// crash, OS kill, etc.), promoting it via marker + archive
+	// would leave the project with zero live coords. Confirm NEW
+	// is still alive before any "promote" side effect.
+	postAlive, postProbeErr := tmuxSessionAliveForSwap(opts.NewRec.TmuxSession)
+	switch {
+	case postProbeErr != nil:
+		return SwapResult{}, fmt.Errorf(
+			"swap %s→%s: NEW session %s post-retire probe failed: %w (OLD killed but NOT archived; investigate)",
+			opts.OldRec.ID, opts.NewRec.ID, opts.NewRec.TmuxSession, postProbeErr)
+	case !postAlive:
+		// NEW died mid-swap. OLD's session is already dead (we just
+		// killed it). The project has zero live coords. Roll back
+		// NEW's record so the operator sees the orphan record gone,
+		// preserve OLD's record so they can see what happened (we
+		// haven't archived OLD yet at this point — guaranteed by
+		// the "archive last" ordering of Step D).
+		if dropErr := DropReplacementRecord(opts.NewRec.TmuxSession, opts.NewRec.ID, opts.Stderr); dropErr != nil {
+			return SwapResult{}, fmt.Errorf(
+				"swap %s→%s: NEW died after OLD kill AND NEW rollback failed (%w); OLD record preserved, NEW record may be stuck",
+				opts.OldRec.ID, opts.NewRec.ID, dropErr)
+		}
+		return SwapResult{}, fmt.Errorf(
+			"swap %s→%s: NEW session %s died after OLD was killed; project has zero live coords — operator must spawn a fresh coord",
+			opts.OldRec.ID, opts.NewRec.ID, opts.NewRec.TmuxSession)
+	}
+
 	res := SwapResult{}
 
 	// Step C: re-point coord-spawn marker if asked.

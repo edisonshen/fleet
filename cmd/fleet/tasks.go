@@ -963,64 +963,58 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 		// WorkerCleanupOpts.KeepSession; the side-effect-free
 		// transition still goes through.
 		if key == "status" && isTerminalStatus(t.Status) {
-			// codex iter-5 [P2]: PRE-FLIGHT GATE — gather all the
-			// "could this task transition succeed?" signals BEFORE
-			// any destructive cleanup runs. Each pre-flight check
-			// either passes silently or returns an error. We then
-			// run the destructive cleanup (kill tmux + archive
-			// records + archive workers/) only after all pre-flights
-			// pass, in an order chosen so the cheapest reversible
-			// step happens last (tasks.Write below).
+			// codex iter-5 [P2] + iter-12 [P2]: PRE-FLIGHT, then
+			// DESTRUCTIVE. Sequence:
 			//
-			// codex iter-3 [P1]: workers.Archive's precondition is
-			// READ-ONLY: it reads state.json + checks PID liveness,
-			// then refuses with ErrPreconditionLive if non-terminal.
-			// Calling it FIRST means we surface "coord-worker still
-			// running" BEFORE killing any tmux sessions — operator
-			// can fix the actual condition without losing the tmux
-			// worker.
+			//   1. Pre-flight: probe workers/<slug>/state.json
+			//      WITHOUT mutating it. If the worker is non-
+			//      terminal phase or its PID is alive, REFUSE the
+			//      transition — same semantic as iter-3/4 but
+			//      doesn't archive the worker dir if subsequent
+			//      tmux cleanup fails (iter-12 P2).
 			//
-			// Pre-flight 1: probe whether workers.Archive would refuse
-			// (worker still live). We can't easily "preview" Archive
-			// without doing it, but the gate semantics mean a single
-			// call IS the preflight: success = archived, error =
-			// state preserved. We accept that the archive happens
-			// here (committed before tasks.Write); the design tradeoff
-			// is: workers/<slug>/ archive is recoverable from disk
-			// (the dir is moved, not deleted) AND it's gated on
-			// terminal phase so we're only archiving genuinely-dead
-			// state. If tasks.Write fails afterward, the operator
-			// re-runs `tasks set` and the worker archive is a no-op
-			// (ENOENT-tolerant). The tmux-agent kill below is the
-			// truly irreversible step; gating that AFTER the worker
-			// archive succeeds means we don't kill tmux for a task
-			// the workers/Archive precondition would have refused.
-			if werr := workers.Archive(project, slug); werr != nil {
+			//   2. Destructive: KillAgentsForTask (tmux kill +
+			//      record archive).
+			//
+			//   3. Destructive: workers.Archive moves the worker
+			//      dir to archive/. Runs AFTER tmux cleanup succeeds
+			//      so a tmux-kill failure doesn't strand the worker
+			//      dir in archive while the task is still in-progress.
+			//
+			//   4. tasks.Write commits the terminal status.
+			//
+			// Pre-flight step: probe via workers.ReadState +
+			// IsAlive. Mirrors the precondition check inside
+			// workers.Archive but doesn't perform the rename.
+			if wstate, rerr := workers.ReadState(project, slug); rerr == nil {
+				// State exists. Check terminal phase + dead PID.
 				switch {
-				case errors.Is(werr, workers.ErrPreconditionLive):
+				case !isWorkerPhaseTerminal(wstate.Phase):
 					return fmt.Errorf(
-						"worker cleanup gate blocked status=%s for %s: coord-worker still live (%w) — stop the worker or wait for its phase=done|blocked|failed",
-						t.Status, slug, werr)
-				case errors.Is(werr, workers.ErrInvalidSlug):
-					// Slug failed validation — ignore silently;
-					// fleet bug, not operator-actionable.
-				default:
-					// codex iter-5 [P1]: any other error means we
-					// cannot prove the coord-worker is gone. Refuse
-					// the transition (matches the tmux-backed half's
-					// fail-closed semantic). Includes lock-acquisition
-					// errors, unreadable state.json, I/O failures.
+						"worker cleanup gate blocked status=%s for %s: coord-worker phase=%q (must be done|blocked|failed) — stop the worker or wait",
+						t.Status, slug, wstate.Phase)
+				case wstate.Exit == nil && wstate.PID > 0 && workers.IsAlive(wstate.PID):
 					return fmt.Errorf(
-						"worker cleanup gate blocked status=%s for %s: workers/<slug>/ archive failed (%w) — cannot prove coord-worker is gone; triage with `fleet workers list`",
-						t.Status, slug, werr)
+						"worker cleanup gate blocked status=%s for %s: coord-worker pid=%d still alive — stop the worker",
+						t.Status, slug, wstate.PID)
+				case wstate.Exit == nil && wstate.PID == 0:
+					return fmt.Errorf(
+						"worker cleanup gate blocked status=%s for %s: coord-worker has phase=%q but no exit recorded — fleet bug; record exit via `fleet workers update` before retrying",
+						t.Status, slug, wstate.Phase)
 				}
+			} else if !errors.Is(rerr, workers.ErrNotFound) {
+				// Read failure that isn't ENOENT — can't prove
+				// coord-worker is gone; refuse.
+				return fmt.Errorf(
+					"worker cleanup gate blocked status=%s for %s: workers/<slug>/state.json read failed (%w); triage with `fleet workers list`",
+					t.Status, slug, rerr)
 			}
 
-			// tmux-agent kill + archive happens AFTER the coord-worker
-			// archive succeeded. If KillAgentsForTask fails partway
-			// through (it kills as it goes), some tmux sessions may
-			// be dead but their records re-added; recovery is to
-			// re-run `tasks set`.
+			// Pre-flight passed. Now the destructive steps.
+			//
+			// tmux-agent kill + record archive (KillAgentsForTask).
+			// Run this FIRST: if it fails, the workers/<slug>/ dir
+			// stays intact for operator triage (iter-12 P2 fix).
 			cleanupRes, cerr := handoffop.KillAgentsForTask(handoffop.WorkerCleanupOpts{
 				Project:     project,
 				TaskSlug:    slug,
@@ -1035,12 +1029,32 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 			if cleanupRes.Matched > 0 {
 				what := "killed+archived"
 				if opts.keepSession {
-					// codex iter-1 [P1]: --keep-session preserves the
-					// live record so operators can `fleet attach <id>`.
 					what = "session+record preserved (--keep-session)"
 				}
 				_, _ = fmt.Fprintf(stdout, "%s %d worker agent(s) for %s: %v\n",
 					what, cleanupRes.Matched, slug, cleanupRes.IDs)
+			}
+
+			// Worker dir archive. Best-effort: pre-flight already
+			// proved terminal phase, so this should succeed. If it
+			// races and now fails, surface as a warning — the
+			// tmux-agent leak (the load-bearing failure mode) is
+			// already closed.
+			if werr := workers.Archive(project, slug); werr != nil {
+				switch {
+				case errors.Is(werr, workers.ErrPreconditionLive):
+					// Concurrent UpdateState landed between our
+					// pre-flight and now. Refuse — operator triages.
+					return fmt.Errorf(
+						"worker cleanup gate blocked status=%s for %s: coord-worker became live during cleanup (%w) — re-run `fleet tasks set` after the worker exits",
+						t.Status, slug, werr)
+				case errors.Is(werr, workers.ErrInvalidSlug):
+					// Slug failed validation — ignore silently.
+				default:
+					_, _ = fmt.Fprintf(stderr,
+						"warning: workers/%s/ archive failed: %v (task will be marked %s; triage with `fleet workers list`)\n",
+						slug, werr, t.Status)
+				}
 			}
 		}
 
@@ -1058,6 +1072,18 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 // the worker resumes.
 func isTerminalStatus(s tasks.Status) bool {
 	return s == tasks.StatusDone || s == tasks.StatusAbandoned
+}
+
+// isWorkerPhaseTerminal mirrors internal/workers.isTerminalPhase
+// (unexported there). Used by runTasksSet's pre-flight check to
+// preview whether workers.Archive would refuse with ErrPreconditionLive
+// — without actually mutating workers/<slug>/.
+func isWorkerPhaseTerminal(p workers.Phase) bool {
+	switch p {
+	case workers.PhaseDone, workers.PhaseBlocked, workers.PhaseFailed:
+		return true
+	}
+	return false
 }
 
 // stampLifecycleTransition applies the lifecycle stamping rules in one
