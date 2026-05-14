@@ -348,15 +348,20 @@ func TestKillAgentsForTask_MalformedRecordNoMatchButRawTextMatches_Refuses(t *te
 	}
 }
 
-// TestKillAgentsForTask_SkipsCoordinatorRecord — codex iter-2 [P1].
-// A task named "coord-<project>" must NOT match the project's
-// coordinator agent. Kill must not be called on the coord.
-func TestKillAgentsForTask_SkipsCoordinatorRecord(t *testing.T) {
+// TestKillAgentsForTask_SkipsRealCoordRecord — codex iter-2 [P1] +
+// iter-6 [P2]. The real coord agent (whose ID matches the coord-spawn
+// marker) is exempted from cleanup, but a non-coord worker that
+// happens to share the "coord-<project>" TaskID is still cleaned up.
+// Two-signal check (TaskID + marker) prevents false positives.
+func TestKillAgentsForTask_SkipsRealCoordRecord(t *testing.T) {
 	setupFleetHome(t)
-	// Worker task happens to share the coord sentinel slug.
 	const project = "rainier"
 	const coordSlug = "coord-" + project
-	// Coordinator agent — TaskID matches the sentinel pattern.
+	// Initialize project dir for coord-spawn marker writes.
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	// REAL coord agent: TaskID = sentinel AND marker points at it.
 	coord := agent.New("coordagt")
 	coord.TmuxSession = "fleet-coordagt"
 	coord.Project = project
@@ -364,8 +369,12 @@ func TestKillAgentsForTask_SkipsCoordinatorRecord(t *testing.T) {
 	if err := coord.Write(); err != nil {
 		t.Fatalf("seed coord: %v", err)
 	}
-	// Worker agent — TaskID happens to also equal the coord slug
-	// (operator's questionable choice, but the gate must handle it).
+	if err := state.WriteCoordSpawnMarker(project, coord.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+	// Non-coord worker that ALSO happens to share the sentinel slug.
+	// The marker doesn't point at this one — so iter-6 P2 says clean
+	// it up like any other worker.
 	worker := agent.New("wrk-coll")
 	worker.TmuxSession = "fleet-wrk-coll"
 	worker.Project = project
@@ -378,21 +387,21 @@ func TestKillAgentsForTask_SkipsCoordinatorRecord(t *testing.T) {
 		func(s string) error { killed[s] = true; return nil },
 		func(string) (bool, error) { return false, nil },
 	)
-	_, err := KillAgentsForTask(WorkerCleanupOpts{
+	res, err := KillAgentsForTask(WorkerCleanupOpts{
 		Project: project, TaskSlug: coordSlug, Stderr: io.Discard,
 	})
-	// Both records share the slug — but the coord one must be
-	// excluded. Result: no matches AND no work done. The "worker"
-	// in this test was also classified as a coord because its
-	// TaskID equals the sentinel. That's actually the safer policy:
-	// the gate refuses to mutate ANY record whose TaskID looks like
-	// the coord sentinel. Operators who run into this can `fleet
-	// rm` directly.
 	if err != nil {
 		t.Fatalf("KillAgentsForTask: %v", err)
 	}
 	if killed[coord.TmuxSession] {
-		t.Errorf("coord tmux session killed (P1 regression)")
+		t.Errorf("coord tmux session killed despite marker pointing at it (P1 regression)")
+	}
+	// Worker should have been cleaned up (Matched=1, killed=1).
+	if res.Matched != 1 {
+		t.Errorf("Matched = %d; want 1 (worker not exempted)", res.Matched)
+	}
+	if !killed[worker.TmuxSession] {
+		t.Errorf("worker tmux session NOT killed (iter-6 P2 regression: false-positive coord exemption)")
 	}
 }
 

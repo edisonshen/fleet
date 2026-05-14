@@ -100,7 +100,7 @@ func KillAgentsForTask(opts WorkerCleanupOpts) (WorkerCleanupResult, error) {
 		if rec == nil {
 			continue
 		}
-		if isCoordinatorTaskID(rec.TaskID, rec.Project) {
+		if isProjectCoordRecord(rec.ID, rec.TaskID, rec.Project) {
 			continue
 		}
 		if rec.TaskID != opts.TaskSlug || rec.Project != opts.Project {
@@ -263,21 +263,27 @@ func badRecordsPlausiblyRelated(badIDs []string, project, slug string) []string 
 	return related
 }
 
-// isCoordinatorTaskID reports whether a record's TaskID is the
-// coordinator sentinel for its project. Per skills/coordinator/SKILL.md
-// the coord agent carries TaskID = "coord-<project>". A worker task
-// happening to share that slug must not let `tasks set` kill the
-// project's coord (codex iter-2 [P1]).
+// isProjectCoordRecord reports whether a record IS its project's
+// coordinator agent. Two-signal check (codex iter-2 P1 + iter-6 P2):
 //
-// The check is permissive on legacy records: TaskID="" or
-// Project="" returns false (not a coord). Operators who don't follow
-// the sentinel convention won't trip this; they also accept the
-// previously-documented behavior.
-func isCoordinatorTaskID(taskID, project string) bool {
-	if taskID == "" || project == "" {
+//  1. TaskID matches the "coord-<project>" sentinel, AND
+//  2. The project's coord-spawn marker points at this exact agent ID.
+//
+// Both signals together rule out the false-positive case where an
+// operator names a real task "coord-<project>" — that task's worker
+// agent won't have the coord-spawn marker pointing at it. Only the
+// actual coord-spawn flow writes the marker.
+//
+// Empty TaskID / Project / agent ID all return false (definitely
+// not a coord — bail out cheap).
+func isProjectCoordRecord(agentID, taskID, project string) bool {
+	if agentID == "" || taskID == "" || project == "" {
 		return false
 	}
-	return taskID == "coord-"+project
+	if taskID != "coord-"+project {
+		return false
+	}
+	return state.ReadCoordSpawnMarker(project) == agentID
 }
 
 // tmuxKillForCleanup / tmuxSessionAliveForCleanup are package vars so

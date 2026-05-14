@@ -949,7 +949,20 @@ func runTasksSet(opts *tasksSetOpts, slug, kv string, stdout, stderr io.Writer) 
 		// Runs only on a NEW terminal transition. Runs BEFORE
 		// tasks.Write so we don't ship a "done" row that references
 		// workers we couldn't kill — the write is the commit point.
-		if key == "status" && t.Status != oldStatus && isTerminalStatus(t.Status) {
+		// codex iter-6 [P2]: fire the cleanup gate whenever the
+		// target status is terminal (done | abandoned), even on a
+		// no-op transition where current == target. This is the
+		// recovery path after --keep-session: operator ran
+		// `tasks set X status=done --keep-session` earlier to
+		// preserve a session for debugging, and now wants to
+		// actually clean up. Re-running `tasks set X status=done`
+		// (no flag) MUST run the gate, not no-op.
+		//
+		// When --keep-session is passed (this run or any), the gate
+		// still runs but the kill+archive is skipped per
+		// WorkerCleanupOpts.KeepSession; the side-effect-free
+		// transition still goes through.
+		if key == "status" && isTerminalStatus(t.Status) {
 			// codex iter-5 [P2]: PRE-FLIGHT GATE — gather all the
 			// "could this task transition succeed?" signals BEFORE
 			// any destructive cleanup runs. Each pre-flight check
