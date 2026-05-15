@@ -144,13 +144,31 @@ scan_file() {
 }
 
 # Pass 1: discover helper functions (any non-Test function in *_test.go
-# OR a Method declaration) whose body calls one of the seed markers.
-# Their names become additional markers so test functions that delegate
-# isolation through a helper (e.g., env := setupCoordIntegration(t, ...))
-# don't trip the lint. Method receivers are stripped so the lookup
-# substring is `.plantCoord(` or just the bare name.
+# OR a Method declaration) whose body calls one of the seed markers OR
+# triggers. Helper names get appended to the appropriate list:
+#
+#   - Marker-bearing helpers (call requireTmux / tmuxtest.RequireTmux /
+#     FLEET_TMUX_SOCKET / etc.) get added to `markers`, so a test
+#     calling e.g. setupCoordIntegration(t) inherits the isolation
+#     attestation.
+#
+#   - Trigger-bearing helpers (call tmux.Spawn / spawn.Spawn / etc.,
+#     and do NOT themselves contain a marker) get added to `triggers`,
+#     so a test calling seedAgent(t) / plantCoord(t) is required to
+#     ALSO call an isolation marker. Codex review iter-2 [P3]
+#     (2026-05-15): without this, a test that only calls a helper-
+#     wrapped Spawn passes the lint and the runtime guard becomes
+#     the sole safety net.
+#
+# Both passes use the same awk scanner, parameterized on which list to
+# match against. Method receivers like "(env *integrationEnv) plantCoord(...)"
+# are stripped — emit the bare method name so the lookup substring is
+# ".plantCoord(" or just "plantCoord(".
 discover_helpers() {
-  awk -v marks="$markers" '
+  local file="$1"
+  local needles="$2"
+  local exclude="$3" # don't emit a helper whose name appears here (avoids self-loop)
+  awk -v needles="$needles" -v exclude="$exclude" '
     function any_substr(haystack, needles_str,    n, arr, i) {
       n = split(needles_str, arr, " ")
       for (i = 1; i <= n; i++) {
@@ -162,72 +180,112 @@ discover_helpers() {
     function reset() {
       in_func = 0
       func_name = ""
-      saw_iso = 0
+      saw = 0
     }
     BEGIN { reset() }
-    # Non-Test function or method declaration at column 0. Method
-    # receivers like "(env *integrationEnv) plantCoord(...)" are
-    # captured — we grab the bare method name as the helper marker.
     /^func / {
       reset()
       in_func = 1
       n = $0
       sub(/^func[ \t]+/, "", n)
-      # Strip method receiver if present: "(recv *T) Name(...)" → "Name(...)"
       if (substr(n, 1, 1) == "(") {
         idx = index(n, ") ")
         if (idx > 0) n = substr(n, idx + 2)
       }
       sub(/\(.*/, "", n)
       func_name = n
-      # Skip Test funcs — they are checked, not used as markers.
+      # Skip Test funcs — they are checked, not used as helpers.
       if (substr(func_name, 1, 4) == "Test") in_func = 0
       next
     }
     in_func {
-      if (any_substr($0, marks)) saw_iso = 1
+      if (any_substr($0, needles)) saw = 1
       if ($0 ~ /^}/) {
-        if (saw_iso && func_name != "") {
-          # Emit "<funcName>(" — the call-site substring the test
-          # function body would contain.
-          printf "%s(\n", func_name
+        if (saw && func_name != "") {
+          # Suppress helpers whose name is in the exclude list — this
+          # prevents trigger-bearing helpers that ALSO call markers from
+          # being emitted as triggers (e.g. setupCoordIntegration calls
+          # requireTmux and seeds tmux; we want it as a marker, not a
+          # trigger).
+          emit = 1
+          if (exclude != "") {
+            en = split(exclude, ea, " ")
+            for (i = 1; i <= en; i++) {
+              if (ea[i] == "") continue
+              if (index(ea[i], func_name "(") > 0) { emit = 0; break }
+            }
+          }
+          if (emit) printf "%s(\n", func_name
         }
         reset()
       }
     }
-  ' "$1"
+  ' "$file"
 }
 
-# Walk every test file twice. First gather helpers; merge their names
-# into the marker list so the second pass treats helper-delegated tests
-# as isolated.
-helper_markers=""
-while IFS= read -r f; do
-  if skip_file "$f"; then continue; fi
-  while IFS= read -r h; do
-    [ -n "$h" ] || continue
-    helper_markers="$helper_markers $h"
-  done < <(discover_helpers "$f")
-done < <(file_lister)
+# Multi-pass helper discovery. We need to fixed-point both:
+#   1. Helpers that call any marker → become markers themselves.
+#   2. Helpers that call any trigger AND no marker → become triggers
+#      themselves (so a test calling only a Spawn-wrapping helper
+#      without an isolation marker gets flagged).
+#
+# Pass M (marker chain): a helper that calls a marker is an isolating
+# delegate. setupCoordIntegration → requireTmux → tmuxtest.RequireTmux
+# is the classic chain.
+#
+# Pass T (trigger chain): a helper that calls tmux.Spawn / spawn.Spawn /
+# runDispatch / etc. (without itself isolating) becomes a trigger. A
+# test calling seedAgent(t) without requireTmux(t) is then flagged.
+# Codex review iter-2 [P3] (2026-05-15): the "Spawn-wrapping helpers
+# bypass the lint" hole closes here.
+#
+# Iteration cap = 3 passes per chain. Deeper helper graphs would need
+# a real call-graph parser; today's tree has at most 2 levels.
+discover_markers_in_file() { discover_helpers "$1" "$markers" ""; }
+discover_triggers_in_file() {
+  # Exclude helpers that ALSO match the marker list — those are
+  # isolation delegates, not trigger sinks. The exclude check uses
+  # the current markers list (which includes discovered marker
+  # helpers from earlier passes).
+  discover_helpers "$1" "$triggers" "$markers"
+}
 
-# Iterate twice more: the new helpers themselves may delegate (e.g.,
-# plantCoord calls setupCoordIntegration). Three passes is enough for
-# Fleet's current depth; deeper chains would need a real call graph.
-for pass in 1 2; do
-  markers="$markers $helper_markers"
-  new_helpers=""
+# --- Marker chain ---
+for pass in 1 2 3; do
+  new_markers=""
   while IFS= read -r f; do
     if skip_file "$f"; then continue; fi
     while IFS= read -r h; do
       [ -n "$h" ] || continue
-      case " $helper_markers " in
-        *" $h "*) ;; # already known
-        *) new_helpers="$new_helpers $h";;
+      case " $markers " in
+        *" $h "*) ;; # already a marker
+        *) new_markers="$new_markers $h";;
       esac
-    done < <(discover_helpers "$f")
+    done < <(discover_markers_in_file "$f")
   done < <(file_lister)
-  if [ -z "$new_helpers" ]; then break; fi
-  helper_markers="$helper_markers $new_helpers"
+  if [ -z "$new_markers" ]; then break; fi
+  markers="$markers $new_markers"
+done
+
+# --- Trigger chain ---
+# Run AFTER the marker chain so the exclude-list (markers) is final;
+# a Spawn-wrapping helper that ALSO calls an isolation marker (e.g.,
+# a helper that pre-spawns under an already-isolated socket) won't be
+# misclassified as a trigger sink.
+for pass in 1 2 3; do
+  new_triggers=""
+  while IFS= read -r f; do
+    if skip_file "$f"; then continue; fi
+    while IFS= read -r h; do
+      [ -n "$h" ] || continue
+      case " $triggers " in
+        *" $h "*) ;; # already a trigger
+        *) new_triggers="$new_triggers $h";;
+      esac
+    done < <(discover_triggers_in_file "$f")
+  done < <(file_lister)
+  if [ -z "$new_triggers" ]; then break; fi
+  triggers="$triggers $new_triggers"
 done
 
 violations=()
