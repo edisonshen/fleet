@@ -591,7 +591,54 @@ def reap_one(
         return decision
 
     # 6. Hard-kill via SIGKILL. Last resort.
-    if inp.pid > 0:
+    # Codex iter-16 [P1]: validate the recorded pid is still the
+    # worker's BEFORE signaling. Two safety checks:
+    #   - The pid recorded on `inp` must match the pid currently in
+    #     worker_state. A worker that recovered and exited would have
+    #     blanked or rotated this field — signaling the recorded value
+    #     in that case risks targeting a recycled host pid.
+    #   - The worker_state heartbeat must be STALE (older than
+    #     the_grace window × 2). A worker still actively heartbeating
+    #     is not a kill target — its session is alive AND making
+    #     progress; we'd be killing healthy work. (This rare case
+    #     would also imply `fleet rm` failed but the worker is alive,
+    #     which is a real degenerate state — operator must triage.)
+    # Both checks have an obvious bypass via state.json being missing/
+    # stale itself; the conservative answer there is also "don't
+    # signal" — let operator intervene.
+    pid_safe = False
+    if inp.pid > 0 and inp.worker_state is not None:
+        recorded_pid = inp.worker_state.get("pid", 0) or inp.worker_state.get(
+            "worker_pid", 0,
+        )
+        try:
+            recorded_pid_int = int(recorded_pid)
+        except (TypeError, ValueError):
+            recorded_pid_int = 0
+        if recorded_pid_int == inp.pid:
+            # Heartbeat freshness: state.json.updated_at parsed
+            # against grace_window_s × 2 — if the worker has written
+            # within that window, it's actively running and we should
+            # NOT kill.
+            updated_at = str(
+                inp.worker_state.get("updated_at", "") or "",
+            )
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromisoformat(
+                    updated_at.replace("Z", "+00:00"),
+                )
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                age_s = (
+                    datetime.fromtimestamp(now_unix, tz=timezone.utc) - ts
+                ).total_seconds()
+                if age_s > (grace_window_s * 2):
+                    pid_safe = True
+            except (ValueError, OSError, OverflowError):
+                # Unparseable timestamp → conservative no.
+                pid_safe = False
+    if pid_safe:
         hk_ok = hard_kill_fn(inp.pid)
         if hk_ok:
             # Codex iter-6 [P1]: re-probe tmux AFTER the SIGKILL. The
@@ -655,12 +702,23 @@ def reap_one(
             decision.state = "error"
             return decision
     decision.state = "error"
-    decision.detail = (
-        f"fleet rm failed ({err}); no pid available for SIGKILL"
-    )
+    if inp.pid > 0 and not pid_safe:
+        # Codex iter-16 [P1]: pid present but failed the
+        # ownership/heartbeat validity check. We refuse to signal an
+        # unverified pid to avoid killing a recycled-host process.
+        decision.detail = (
+            f"fleet rm failed ({err}); refusing SIGKILL: pid {inp.pid} "
+            "failed ownership/heartbeat validity (mismatch or fresh "
+            "heartbeat suggests pid recycled or worker still alive)"
+        )
+    else:
+        decision.detail = (
+            f"fleet rm failed ({err}); no pid available for SIGKILL"
+        )
     _stderr_log(
         f"[P0] reaper: kill failure for worker {inp.slug} "
-        f"(agent={inp.agent_id}) — manual intervention required: {err}",
+        f"(agent={inp.agent_id}) — manual intervention required: "
+        f"{decision.detail}",
         stream=log_stream,
     )
     return decision

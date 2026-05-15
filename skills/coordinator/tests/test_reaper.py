@@ -272,12 +272,18 @@ def test_reaper_within_grace_does_not_fleet_rm() -> None:
 
 
 def test_reaper_kill_fails_session_alive_hard_kills_via_pid() -> None:
-    """fleet rm fails, session STILL alive on re-probe → SIGKILL pid."""
+    """fleet rm fails, session STILL alive on re-probe → SIGKILL pid.
+    worker_state matches inp.pid and has a stale heartbeat so the
+    codex iter-16 pid-validity gate allows SIGKILL.
+    """
     entry = reaper.ReaperEntry(
         slug="alpha-aaaa", kill_directive_ts=1000.0,
     )
     inp = _inp(worker_state={
         "phase": "done", "pr_url": "https://x/y/pull/1",
+        "pid": 99999,
+        # Stale heartbeat (epoch 1970) → > grace_window × 2 from now_unix=1015.
+        "updated_at": "1970-01-01T00:00:00Z",
     }, pid=99999)
     # session_alive_fn called twice: once for the grace-expired probe
     # (alive=True), once for the post-rm re-probe (still alive=True →
@@ -548,6 +554,63 @@ def test_reap_probes_pending_judgment_no_entry_kept() -> None:
     )
 
 
+def test_hard_kill_refused_when_pid_does_not_match_state() -> None:
+    """Codex iter-16 [P1] regress: refuse SIGKILL when the input pid
+    doesn't match the worker_state.pid. Otherwise a recycled host pid
+    could become a kill target."""
+    entry = reaper.ReaperEntry(
+        slug="alpha-aaaa", kill_directive_ts=1000.0,
+    )
+    # worker_state.pid != inp.pid → validity check fails.
+    inp = _inp(worker_state={
+        "phase": "done", "pr_url": "https://x/y/pull/1",
+        "pid": 55555,
+        "updated_at": "1970-01-01T00:00:00Z",
+    }, pid=99999)
+    stubs = _stubs(alive=[True, True], rm=[(False, "queue file")])
+    d = reaper.reap_one(
+        inp, entry=entry, fleet_bin="fleet",
+        now_unix=1015.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    # State=error (refused to SIGKILL) — stubs.hard_calls stays empty.
+    assert d.state == "error"
+    assert "ownership/heartbeat validity" in d.detail
+    assert stubs.hard_calls == []
+
+
+def test_hard_kill_refused_when_heartbeat_fresh() -> None:
+    """Codex iter-16 [P1] regress: refuse SIGKILL when the worker is
+    actively heartbeating — that's healthy work, not a dead pid we
+    need to SIGKILL."""
+    from datetime import datetime, timezone
+    entry = reaper.ReaperEntry(
+        slug="alpha-aaaa", kill_directive_ts=1000.0,
+    )
+    # Fresh heartbeat: now-2s, within grace_window × 2.
+    fresh_ts = datetime.fromtimestamp(1013.0, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    inp = _inp(worker_state={
+        "phase": "done", "pr_url": "https://x/y/pull/1",
+        "pid": 99999, "updated_at": fresh_ts,
+    }, pid=99999)
+    stubs = _stubs(alive=[True, True], rm=[(False, "queue file")])
+    d = reaper.reap_one(
+        inp, entry=entry, fleet_bin="fleet",
+        now_unix=1015.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    assert d.state == "error"
+    assert stubs.hard_calls == []
+
+
 def test_hard_kill_retries_fleet_rm_to_archive_record() -> None:
     """Codex iter-7 [P2] regress: after a successful SIGKILL, the
     reaper retries `fleet rm` so the agent record is archived (the
@@ -560,6 +623,9 @@ def test_hard_kill_retries_fleet_rm_to_archive_record() -> None:
     )
     inp = _inp(worker_state={
         "phase": "done", "pr_url": "https://x/y/pull/1",
+        "pid": 99999,
+        # Stale heartbeat to satisfy the codex iter-16 pid-validity gate.
+        "updated_at": "1970-01-01T00:00:00Z",
     }, pid=99999)
     # session_alive sequence:
     #  1. post-grace probe: alive (force kill path)

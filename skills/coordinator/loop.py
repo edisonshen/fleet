@@ -1353,10 +1353,18 @@ def _consume_reaper_redispatch(
     # is typically still at status=in-progress (the lane is being
     # cleared; reconcile flips it to todo on a subsequent tick).
     # Treating in-progress as "stale" was wrong — drop only the
-    # definitively-terminal statuses; leave in-progress/in-review
-    # markers untouched so the next reconcile pass can flip them and
-    # the consume runs against the new state.
-    _DROP_STATUSES = {"done", "blocked", "abandoned", "ready"}
+    # definitively-terminal statuses; leave in-progress untouched so
+    # the next reconcile pass can flip it and the consume runs against
+    # the new state.
+    #
+    # Codex iter-16 [P2]: include `in-review` in the drop set. A
+    # deferred TASK_DONE_PR replay can move an error-aborted slug
+    # from todo BACK to in-review (recovery: the worker that failed
+    # actually did ship a PR before the failure write). The marker
+    # is then stale; if the PR later hits CI red and reconcile flips
+    # back to todo, the stale marker would re-promote to ready and
+    # spawn an unwanted replacement worker.
+    _DROP_STATUSES = {"done", "blocked", "abandoned", "ready", "in-review"}
     for slug in list(pending):
         t = by_slug.get(slug)
         if t is None:
