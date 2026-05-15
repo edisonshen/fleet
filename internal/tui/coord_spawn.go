@@ -699,32 +699,35 @@ func agentNeedsInput(records []*agent.Record, id string) bool {
 }
 
 // agentClaudeAlive reports whether the Claude process recorded in the
-// agent record matching id is still alive AND not just a wrapper
-// shell. Returns false when:
+// agent record matching id is still alive, is not just a wrapper
+// shell, AND its argv still carries the agent-specific disambiguator
+// (`fleet-coord-<id>`) for coord agents. Returns false when:
 //   - id is empty, records is nil/empty, or no record matches,
 //   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
 //   - the PID's process is dead (kill(0) returns ESRCH),
 //   - the PID's argv first-token is a POSIX shell binary, indicating
 //     spawn.Spawn's resolveEnginePid fell back to the tmux pane's
-//     wrapper shell instead of the real Claude process. Codex iter-16
-//     P1: kill(0) alone can't distinguish "Claude alive idle" from
-//     "wrapper survived Claude exit" because both keep the same shell
-//     PID alive. argv inspection identifies the wrapper case so the
-//     red stuck chip stays visible for real spawn failures.
+//     wrapper shell instead of the real Claude process,
+//   - the record is a coord-spawn agent (task_id starts with "coord-")
+//     AND the PID's argv does NOT contain `fleet-coord-<id>`, meaning
+//     the kernel recycled the PID into an unrelated process OR the
+//     resolver latched onto a non-coord process. Codex iter-20 P1
+//     drove this: kill(0) + non-shell argv is insufficient evidence
+//     when PIDs can recycle and resolveEnginePid can mis-attribute.
 //
-// Path C uses this to distinguish:
-//   - Claude alive, idle between Stop-hook fires (HANDOFF state) →
-//     argv contains "claude", kill(0) true → suppress red chip
-//   - Wrapper survived after Claude exited at startup → argv is
-//     "sh -c ..." or similar, kill(0) true on shell → keep red chip
+// Mirror of skills/fleet-guard/health.py:_recorded_pid_looks_like_wrapper
+// (Python side runs the same disambiguator check in reconcile_pid).
 //
-// Cost: one kill(0) (~1μs) + one `ps -o args= -p <pid>` (~10ms on
-// macOS) per render per project. Probe failures (transient ps blip,
-// EPERM, kernel hiccup) return "" from agentProcessArgvFn, which
-// argvLooksLikeShellWrapper treats as "not a wrapper" — so we
-// default to "alive" on probe failure rather than flipping a healthy
-// row to stuck. Stub-overridable via agentProcessAliveFn AND
-// agentProcessArgvFn for tests.
+// Probe failures (transient ps blip, EPERM, kernel hiccup) return ""
+// from agentProcessArgvFn, which argvLooksLikeShellWrapper treats as
+// "not a wrapper." The disambiguator check ALSO falls back to "trust
+// kill(0)" on empty argv — we cannot prove PID drift without an argv
+// readout, and the alternative (treating every probe failure as
+// "dead") would flip working coords to stuck on a flaky ps.
+//
+// Cost: one kill(0) (~1μs) + one `ps -o args= -p <pid>` (~10ms macOS)
+// per render per project. Stub-overridable via agentProcessAliveFn
+// AND agentProcessArgvFn for tests.
 func agentClaudeAlive(records []*agent.Record, id string) bool {
 	if id == "" || len(records) == 0 {
 		return false
@@ -736,11 +739,36 @@ func agentClaudeAlive(records []*agent.Record, id string) bool {
 		if !agentProcessAliveFn(r.PID) {
 			return false
 		}
-		// PID is alive — verify it's not the wrapper shell. argv
-		// probe failures are conservative ("" → not-wrapper → trust
-		// kill(0)) so a flaky ps doesn't flip working coords to stuck.
-		if argvLooksLikeShellWrapper(agentProcessArgvFn(r.PID)) {
+		argv := agentProcessArgvFn(r.PID)
+		// argv probe failures (empty string) conservatively trust
+		// kill(0) — flaky ps does not flip working coords to stuck.
+		if argv == "" {
+			return true
+		}
+		if argvLooksLikeShellWrapper(argv) {
 			return false
+		}
+		// Disambiguator check (codex iter-20 P1): coord-spawn agents
+		// inject `fleet-coord-<agent_id>` into the spawned engine's
+		// argv (internal/spawn injects this for the resolver to find
+		// the right pane child). If the recorded PID's argv lacks the
+		// needle, the kernel either recycled the PID into an
+		// unrelated process OR resolveEnginePid latched onto a
+		// non-coord helper at dispatch time.
+		//
+		// Restricted to coord-spawn agents to match fleet-guard's
+		// Python health.py check: only coord task_ids ("coord-<...>")
+		// carry the injected disambiguator. Plain workers / handoff
+		// replacements don't get it, so checking would force a false
+		// negative on healthy non-coord agents (Path C suppression
+		// doesn't apply to those rows anyway — they don't have a
+		// coord-spawn marker — but the helper stays correct in
+		// isolation for future callers).
+		if strings.HasPrefix(r.TaskID, "coord-") {
+			needle := "fleet-coord-" + id
+			if !strings.Contains(argv, needle) {
+				return false
+			}
 		}
 		return true
 	}
@@ -909,11 +937,16 @@ func agentNeverTickedSinceSpawn(
 			continue
 		}
 		if r.SpawnedAt.IsZero() {
-			// Legacy record: marker mtime past spawnTimeout AND no
-			// state file = operator has waited long enough; surface
-			// the diagnostic. Codex iter-10 P2 — without this fallback
-			// legacy records render silent after Path C suppression.
-			return true
+			// Legacy record: codex iter-20 P2 — fire the diagnostic
+			// ONLY when no state file has ever existed under this
+			// project. If lastTick is non-zero, a previous coord (or
+			// this one) published state at some point; without
+			// SpawnedAt we can't tell which, but defaulting to "not
+			// never-ticked" (false) preserves the existing
+			// idle-stop/post-active render rather than overlaying a
+			// contradictory "never ticked" message on a legacy row
+			// whose state file proves a tick happened.
+			return lastTick.IsZero()
 		}
 		if now.Sub(r.SpawnedAt) <= graceWindow {
 			return false
