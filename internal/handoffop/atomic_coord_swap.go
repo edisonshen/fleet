@@ -591,6 +591,24 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 			//     this is ambiguous — OLD may be alive on a different
 			//     socket. Return ErrOldKillProbeAmbiguous, preserve
 			//     OLD record, surface to operator.
+			//
+			// Codex iter-17 [P1] (deferred — known scope limitation):
+			// The killErr==nil branch still has a residual cross-socket
+			// blind spot. `tmux.Kill` returns nil when its pre-probe
+			// SessionAlive (current socket) says "not alive" — including
+			// the case where OLD has ALWAYS been on a different socket.
+			// In that case Kill is a no-op on the current socket, returns
+			// nil, post-probe also says "not alive" here, and step 6
+			// archives OLD while it is still globally live on the other
+			// socket. Distinguishing that case requires recording
+			// OLD's originating FLEET_TMUX_SOCKET on agent.Record at
+			// spawn time and checking it here — a schema change that
+			// cross-cuts spawn + state + every probe site (out of scope
+			// for this PR; matches the PR #149 cross-socket cap
+			// precedent of documenting the limitation rather than
+			// re-architecting). Multi-socket deployment is rare in
+			// practice; on a single-socket fleet (the default), this
+			// branch is correct. Tracked for a follow-up PR.
 			if killErr != nil {
 				if stderr != nil {
 					_, _ = fmt.Fprintf(stderr,

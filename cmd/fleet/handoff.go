@@ -394,6 +394,20 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					coordSwapPostCommit = true
 				}
 				if coordSwapPostCommit && !opts.forceReplacement {
+					// Codex iter-17 [P1] (deferred — known scope limitation):
+					// tmux.SessionAlive only probes the CURRENT
+					// FLEET_TMUX_SOCKET. (alive=false, err=nil) here
+					// means "not on our socket," not "globally dead."
+					// If OLD's coord was always on a different tmux
+					// socket, we fall through and respawn — creating a
+					// duplicate coord. Distinguishing requires
+					// persisting OLD's originating socket on
+					// agent.Record (schema change cross-cutting spawn +
+					// state + every probe site); deferred to a follow-up
+					// PR per the PR #149 cross-socket cap precedent.
+					// `--force-replacement` still works for operator
+					// cleanup once OLD is manually confirmed dead.
+					// Single-socket fleet (the default) is correct here.
 					oldAlive, probeErr := tmux.SessionAlive(oldRec.TmuxSession)
 					switch {
 					case probeErr != nil:
