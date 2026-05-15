@@ -1057,16 +1057,27 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// Gated on a live tmux session so a Path A heal (silent spawn
 	// death) doesn't trigger this hint, and on markerAgentID being
 	// non-empty so we have an ID to render.
-	// Grace window is the FIXED cold-start budget (10m), not the
-	// operator-configurable FLEET_COORD_SPAWN_TIMEOUT_S
-	// (ctx.spawnTimeout) — that env var only governs the RED stuck
-	// threshold. Reusing it here would surface "spawned but never
-	// ticked" during normal 3-5min cold starts if the operator lowered
-	// the timeout to 60-120s. The never-ticked diagnostic is a
-	// post-cold-start signal; its window should be fixed regardless
-	// of when the operator wants the red chip to fire.
+	// Grace window for the never-ticked hint tracks the same threshold
+	// that caused Stuck → Idle via Path C: ctx.spawnTimeout (which is
+	// FLEET_COORD_SPAWN_TIMEOUT_S or coordSpawnTimeoutDefault). Codex
+	// iter-12 P2: using a fixed 10m budget would silence the row for
+	// up to 9 minutes after a shorter operator-configured timeout
+	// expired — exactly the period where the operator wants to see
+	// the diagnostic. With the same threshold, the soft hint surfaces
+	// in the same render that Path C clears the red chip, so there's
+	// no silent gap.
+	//
+	// Caps at coordSpawnTimeoutDefault (10m) for very LARGE custom
+	// timeouts: a 30m FLEET_COORD_SPAWN_TIMEOUT_S would otherwise
+	// suppress the hint for 30m past the cold-start budget. Take the
+	// min so the hint never fires later than 10min past spawn even
+	// when the operator wants the red chip pushed out further.
+	grace := ctx.spawnTimeout
+	if grace > coordSpawnTimeoutDefault {
+		grace = coordSpawnTimeoutDefault
+	}
 	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
-		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, coordSpawnTimeoutDefault) {
+		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, grace) {
 		st = coordSpawnNeverTicked
 	}
 
