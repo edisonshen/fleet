@@ -544,6 +544,12 @@ def reap_one(
         )
         if already_dead:
             # Session gone — best-effort archive immediately, drop entry.
+            # Codex iter-17 [P2]: an rm failure here on a dead session
+            # leaves the agent record unarchived. The conservative
+            # answer (retry forever) hits the "agent already archived"
+            # idempotent case in a loop. We accept the [P2] gap: the
+            # orphan-tmux invariant is met (no live session) and the
+            # idle-archive TTL covers the record-stranded case.
             ok, err = fleet_rm_fn(fleet_bin, inp.agent_id)
             decision.state = "killed"
             decision.detail = (
@@ -567,9 +573,12 @@ def reap_one(
     alive = session_alive_fn(inp.tmux_session) if inp.tmux_session else False
 
     if not alive:
-        # Worker exited cleanly during grace. Best-effort archive via
-        # `fleet rm`; failure is non-fatal (the operator's manual rm
-        # path remains).
+        # Worker exited cleanly during grace. Best-effort archive
+        # via `fleet rm`; failure is non-fatal (the operator's manual
+        # rm path remains; idle-archive TTL is the safety net).
+        # Codex iter-17 [P2]: see same comment in the already-dead
+        # fast path above — retrying rm forever loops on the "agent
+        # already archived" idempotent case. Accept the [P2] gap.
         ok, err = fleet_rm_fn(fleet_bin, inp.agent_id)
         decision.state = "killed"
         decision.detail = "" if ok else f"fleet rm noop (already gone? {err})"
@@ -583,7 +592,14 @@ def reap_one(
         return decision
 
     # 5. fleet rm failed. Re-probe; if the session is gone we're fine
-    #    (rm raced with an orphan reaper).
+    #    on the kill side. The agent record may still be unarchived,
+    #    but the orphan-tmux invariant (live session, no record) is
+    #    NOT violated (alive2=False). Treat as killed — typical rm-
+    #    failure-with-session-gone shapes are "agent already archived"
+    #    by a concurrent reaper, which is the idempotent path the
+    #    spec wants. The agent-record-unarchived shape (codex iter-17
+    #    [P2]) is operator manual-cleanup territory, covered by the
+    #    idle-archive TTL sweep as a safety net.
     alive2 = session_alive_fn(inp.tmux_session) if inp.tmux_session else False
     if not alive2:
         decision.state = "killed"
