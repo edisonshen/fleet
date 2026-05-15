@@ -992,8 +992,16 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// Gated on a live tmux session so a Path A heal (silent spawn
 	// death) doesn't trigger this hint, and on markerAgentID being
 	// non-empty so we have an ID to render.
+	// Grace window is the FIXED cold-start budget (10m), not the
+	// operator-configurable FLEET_COORD_SPAWN_TIMEOUT_S
+	// (ctx.spawnTimeout) — that env var only governs the RED stuck
+	// threshold. Reusing it here would surface "spawned but never
+	// ticked" during normal 3-5min cold starts if the operator lowered
+	// the timeout to 60-120s. The never-ticked diagnostic is a
+	// post-cold-start signal; its window should be fixed regardless
+	// of when the operator wants the red chip to fire.
 	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
-		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, ctx.spawnTimeout) {
+		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, coordSpawnTimeoutDefault) {
 		st = coordSpawnNeverTicked
 	}
 
