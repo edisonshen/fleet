@@ -492,6 +492,14 @@ def reap_one(
                 "reaper disabled, but session is gone "
                 "(operator manual cleanup detected)"
             )
+            # Codex iter-21 [P2]: carry the prior judgment forward so
+            # the manual-cleanup path still flags error-abort slugs
+            # for redispatch. Without this, reap_probes' redispatch_
+            # pending gate (which keys on JUDGE_ERROR_ABORT) sees the
+            # default JUDGE_PENDING here and skips the redispatch
+            # flag — leaving a failed worker sitting in todo with no
+            # replacement.
+            decision.judgment = entry.judgment or JUDGE_PENDING
             return decision
         decision.state = "no-op"
         decision.detail = "reaper disabled (FLEET_COORD_REAPER_DISABLED=1)"

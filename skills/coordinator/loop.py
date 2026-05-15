@@ -1151,6 +1151,13 @@ def _run_supervisor(
         force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
         coord_id=coord_id,
+        # Codex iter-21 [P3]: share the single mtime baseline that
+        # force_tick_check_hook closed over (force_tick_baseline["mtime"])
+        # so the operator-message-exit gate and the force-tick check
+        # both use the same starting point. Eliminates the two-read
+        # race where an operator write between the two snapshots
+        # could be silenced.
+        direct_inbox_session_baseline=force_tick_baseline["mtime"],
     )
     # Surface supervisor stats as auxiliary tick result fields. We
     # don't mutate TickResult's primary counters because they describe

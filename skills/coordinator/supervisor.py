@@ -871,6 +871,7 @@ def run_supervisor(
     force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
     coord_id: str = "",
+    direct_inbox_session_baseline: float | None = None,
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -901,19 +902,22 @@ def run_supervisor(
         return res
 
     started_at = now_fn()
-    # Codex iter-11 [P1]: snapshot the direct-inbox mtime at session
-    # start so the "operator wrote to inbox → exit" gate fires only
-    # when the file actually changes during supervision. A pre-
-    # existing file (stale operator message, prior [STUCK] alert)
-    # otherwise would exit on every forced wake regardless of cause.
-    direct_inbox_session_baseline = 0.0
-    if coord_id:
-        try:
-            direct_inbox_session_baseline = (
-                (home / "inbox" / f"{coord_id}.md").stat().st_mtime
-            )
-        except OSError:
-            direct_inbox_session_baseline = 0.0
+    # Codex iter-11 [P1] + iter-21 [P3]: snapshot the direct-inbox
+    # mtime at session start so the "operator wrote to inbox → exit"
+    # gate fires only when the file actually changes during
+    # supervision. The caller (loop._run_supervisor) may pass an
+    # already-captured baseline — that's the SAME snapshot the
+    # force_tick_check_hook uses, eliminating the two-read race
+    # codex iter-21 [P3] flagged.
+    if direct_inbox_session_baseline is None:
+        direct_inbox_session_baseline = 0.0
+        if coord_id:
+            try:
+                direct_inbox_session_baseline = (
+                    (home / "inbox" / f"{coord_id}.md").stat().st_mtime
+                )
+            except OSError:
+                direct_inbox_session_baseline = 0.0
     last_mtimes: dict[str, float] = {}
     # Per-slug "last observed state change" timestamp. Drives the
     # invariant-4 adaptive cadence: probes stable for >

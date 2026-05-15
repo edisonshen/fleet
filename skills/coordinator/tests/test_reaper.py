@@ -416,6 +416,45 @@ def test_reaper_disabled_preserves_open_lane_when_session_alive(monkeypatch) -> 
     assert coord_state["reaper"]["alpha-aaaa"]["kill_directive_ts"] == 1000.0
 
 
+def test_reaper_disabled_manual_cleanup_preserves_error_abort_redispatch(
+    monkeypatch,
+) -> None:
+    """Codex iter-21 [P2] regress: when reaper is disabled AND operator
+    manually killed the session, the lane closes BUT the prior judgment
+    (e.g., JUDGE_ERROR_ABORT for a failed worker) must propagate so the
+    redispatch_pending flag still fires. Without it, a failed worker
+    cleaned up manually under disabled-reaper would land in todo with
+    no replacement scheduled."""
+    monkeypatch.setenv("FLEET_COORD_REAPER_DISABLED", "1")
+    coord_state = {
+        "reaper": {
+            "broken-aaaa": {
+                "kill_directive_ts": 1000.0,
+                "hard_killed": False,
+                # Prior judgment: error-abort (worker had phase=failed).
+                "judgment": reaper.JUDGE_ERROR_ABORT,
+            }
+        }
+    }
+    inputs = [_inp(slug="broken-aaaa", worker_state={
+        "phase": "failed",
+    })]
+    # session dead — operator manually ran fleet rm.
+    stubs = _stubs(alive=[False])
+    decisions = reaper.reap_probes(
+        probes_inputs=inputs, coord_state=coord_state,
+        fleet_bin="fleet", now_unix=1100.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    assert decisions[0].state == "killed"
+    # Judgment carried forward → redispatch_pending flagged.
+    pending = reaper.load_redispatch_pending(coord_state)
+    assert "broken-aaaa" in pending
+
+
 def test_reaper_disabled_clears_lane_when_operator_killed_session(monkeypatch) -> None:
     """Codex iter-20 [P2] regress: when reaper is disabled AND the
     operator manually ran `fleet rm` (so the tmux session is gone),
