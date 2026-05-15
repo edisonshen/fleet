@@ -1410,13 +1410,15 @@ def _run_stuck_check_pass(
                     f"[coord] worker {p.slug} stuck since {_fmt_ts(now_unix)}; nudging",
                     stream=log_stream,
                 )
-            else:
-                # No agent_id (or nudge_worker failed). Still record
-                # that we detected stuck this pass so the cooldown
-                # gates work on the next pass — otherwise we'd loop
-                # back into "stuck alert + no progress" on every
-                # stuck-check tick.
-                sup.nudged_at = now_unix
+            # Codex iter-7 [P2]: if the nudge was NOT actually delivered
+            # (no agent_id, or nudge_worker returned ""), do NOT advance
+            # nudged_at — otherwise the next pass cooldown would mature
+            # and escalate the worker to operator-blocked without any
+            # recovery message having reached it. Leave nudged_at=0 so
+            # the loop retries on the next stuck-check pass; the
+            # stuck-alert above keeps surfacing the situation. The
+            # cooldown-of-cooldowns concern (alert spam) is bounded by
+            # FLEET_COORD_STUCK_CHECK_EVERY (default 5 min cadence).
         elif sup.escalated_at <= 0.0:
             # Need at least one full cooldown after the nudge before
             # escalating, so the worker has a chance to respond.

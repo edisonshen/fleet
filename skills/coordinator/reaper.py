@@ -494,13 +494,35 @@ def reap_one(
     # judgment ∈ {complete, error-abort} → reap.
 
     if not inp.agent_id and not inp.tmux_session:
-        # No tmux address (legacy/test-fixture/operator-driven worker).
-        # The reaper has nothing to kill: treat as already-reaped so the
-        # reconcile path can flip status without blocking. Probing
-        # tmux for a `fleet-` session keyed on an empty id would just
-        # answer "not alive" anyway, so the kill primitive is a no-op.
+        # No tmux address. Two real-world causes:
+        #  (a) Legacy/test-fixture/operator-driven worker that never
+        #      registered an agent_id; the original session (if any)
+        #      is almost certainly already dead — the worker exited
+        #      cleanly via the worker.py code path that doesn't touch
+        #      worker_agent_ids. fleet maintenance prune-orphan-tmux is
+        #      the operator-facing cleanup primitive for any leftover
+        #      tmux session.
+        #  (b) Codex iter-7 [P1]: coord-restart that lost worker_agent_
+        #      ids while the original fleet-<id> tmux session is STILL
+        #      up. Same operator cleanup primitive applies.
+        #
+        # The reaper cannot probe what it can't address. Returning
+        # killed here lets reconcile finish the lifecycle (status flip,
+        # worker dir cleanup) so the operator's task tracker reflects
+        # reality; the lurking orphan tmux session (if any) is covered
+        # by prune-orphan-tmux. We log a warning so the operator sees
+        # the gap in the lifecycle.
         decision.state = "killed"
-        decision.detail = "no agent_id/tmux_session (nothing to kill)"
+        decision.detail = (
+            "no agent_id/tmux_session (nothing reaper can address); "
+            "if a tmux session leaked, fleet maintenance prune-orphan-tmux "
+            "will reap it"
+        )
+        _stderr_log(
+            f"[WARN] reaper: no agent_id/tmux_session for {inp.slug}; "
+            "lifecycle proceeds (any leftover tmux is prune-orphan-tmux's job).",
+            stream=log_stream,
+        )
         return decision
 
     # 1. Send /exit if we haven't yet. The send is best-effort: a failed
@@ -580,15 +602,36 @@ def reap_one(
                 if inp.tmux_session else False
             )
             if not alive_post_sigkill:
+                # Codex iter-7 [P2]: retry `fleet rm` to archive the
+                # agent record. The first rm failed before we killed
+                # the session; with the session now dead, the second
+                # rm typically succeeds (it's idempotent on tmux-
+                # session-missing). If it still fails, log so the
+                # operator can prune the agent record manually — but
+                # close the lane: SIGKILL succeeded, the session is
+                # gone, the orphan-leak shape is averted.
+                ok2, err2 = fleet_rm_fn(fleet_bin, inp.agent_id)
                 entry.hard_killed = True
                 decision.hard_killed = True
                 decision.state = "hard-killed"
-                decision.detail = (
-                    f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid}"
-                )
+                if ok2:
+                    decision.detail = (
+                        f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid}; "
+                        "agent record archived on retry"
+                    )
+                else:
+                    decision.detail = (
+                        f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid}; "
+                        f"retry rm err: {err2}"
+                    )
                 _stderr_log(
                     f"[P0] reaper: hard-killed worker {inp.slug} "
-                    f"(agent={inp.agent_id} pid={inp.pid}) — fleet rm failed: {err}",
+                    f"(agent={inp.agent_id} pid={inp.pid}) — fleet rm failed: {err}"
+                    + (
+                        "" if ok2
+                        else f"; record archive retry also failed: {err2}"
+                          " — manual `fleet rm` may be needed"
+                    ),
                     stream=log_stream,
                 )
                 return decision

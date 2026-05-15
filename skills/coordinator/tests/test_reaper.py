@@ -491,6 +491,42 @@ def test_reap_probes_pending_judgment_no_entry_kept() -> None:
     )
 
 
+def test_hard_kill_retries_fleet_rm_to_archive_record() -> None:
+    """Codex iter-7 [P2] regress: after a successful SIGKILL, the
+    reaper retries `fleet rm` so the agent record is archived (the
+    first rm failed BEFORE the session was dead; the second normally
+    succeeds with the session gone). Without the retry, the dead
+    worker stays in ~/.fleet/agents as a phantom live agent until
+    the unrelated idle-archive TTL eventually cleans it up."""
+    entry = reaper.ReaperEntry(
+        slug="alpha-aaaa", kill_directive_ts=1000.0,
+    )
+    inp = _inp(worker_state={
+        "phase": "done", "pr_url": "https://x/y/pull/1",
+    }, pid=99999)
+    # session_alive sequence:
+    #  1. post-grace probe: alive (force kill path)
+    #  2. post-fleet-rm probe: alive (rm didn't kill)
+    #  3. post-SIGKILL probe: dead (SIGKILL worked)
+    # fleet_rm sequence: first call fails, second call (retry) succeeds.
+    stubs = _stubs(
+        alive=[True, True, False],
+        rm=[(False, "queue file"), (True, "")],
+    )
+    d = reaper.reap_one(
+        inp, entry=entry, fleet_bin="fleet",
+        now_unix=1015.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    assert d.state == "hard-killed"
+    # fleet_rm was invoked TWICE — once pre-SIGKILL, once post-SIGKILL.
+    assert len(stubs.rm_calls) == 2
+    assert "archived on retry" in d.detail
+
+
 # ---------- hard_kill_pid primitive ----------
 
 
