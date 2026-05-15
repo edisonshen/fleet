@@ -207,18 +207,35 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 		return errors.New("tmux.Spawn: empty command")
 	}
 	// Sink guard (postmortem 2026-05-14, follow-up to PR #150): inside
-	// `go test`, refuse to create a session on the operator's default
-	// tmux socket. Tests MUST set FLEET_TMUX_SOCKET via the shared
-	// `tmuxtest.RequireTmux(t)` helper so per-test sessions live on an
-	// isolated server that's torn down in t.Cleanup. Without this guard
-	// a transitive caller (runDispatch → spawn.Spawn → tmux.Spawn) can
-	// leak fleet-* sessions onto the host server. testing.Testing()
-	// (Go 1.21+) is true iff the binary was built by `go test`, so
-	// production paths are untouched. The lint at
-	// scripts/lint-test-isolation.sh is a static backup; this runtime
-	// guard is the load-bearing safety boundary.
-	if testing.Testing() && os.Getenv("FLEET_TMUX_SOCKET") == "" {
-		return fmt.Errorf("tmux.Spawn: refusing to use default tmux socket under go test (session %q); call tmuxtest.RequireTmux(t) to isolate FLEET_TMUX_SOCKET", session)
+	// `go test`, refuse to create a session unless FLEET_TMUX_SOCKET
+	// points at a per-test socket path. Tests MUST call the shared
+	// `tmuxtest.RequireTmux(t)` (or `IsolateSocket(t)`) helper so the
+	// per-test tmux server is torn down in t.Cleanup. Without this
+	// guard a transitive caller (runDispatch → spawn.Spawn → tmux.Spawn)
+	// can leak fleet-* sessions onto the host server.
+	//
+	// testing.Testing() (Go 1.21+) is true iff the binary was built by
+	// `go test`, so production paths are untouched.
+	//
+	// Codex review iter-12 [P2] (2026-05-15): the earlier guard only
+	// rejected an empty FLEET_TMUX_SOCKET, so a `go test` run that
+	// INHERITED a shared socket from the operator's environment (e.g.,
+	// the caller exported FLEET_TMUX_SOCKET to point at a long-lived
+	// server) would silently bypass the guard. Tighten to require the
+	// path follow the `/tmp/fleet-test-*.sock` shape that the canonical
+	// helper produces. An inherited operator socket like
+	// `/tmp/tmux-501/default` no longer slips through.
+	//
+	// The lint at scripts/lint-test-isolation.sh is a static backup;
+	// this runtime guard is the load-bearing safety boundary.
+	if testing.Testing() {
+		sock := os.Getenv("FLEET_TMUX_SOCKET")
+		if sock == "" {
+			return fmt.Errorf("tmux.Spawn: refusing to use default tmux socket under go test (session %q); call tmuxtest.RequireTmux(t) to isolate FLEET_TMUX_SOCKET", session)
+		}
+		if !strings.HasPrefix(sock, "/tmp/fleet-test-") || !strings.HasSuffix(sock, ".sock") {
+			return fmt.Errorf("tmux.Spawn: refusing inherited FLEET_TMUX_SOCKET=%q under go test (session %q); only /tmp/fleet-test-*.sock paths (from tmuxtest.RequireTmux / IsolateSocket) are accepted", sock, session)
+		}
 	}
 	args := []string{"new-session", "-d", "-s", session}
 	if cwd != "" {

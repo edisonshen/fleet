@@ -264,6 +264,24 @@ func TestSpawn_EmptyCommand(t *testing.T) {
 	}
 }
 
+// TestSpawn_RefusesInheritedNonTestSocketUnderGoTest pins codex review
+// iter-12 [P2]: under `go test`, Spawn must refuse FLEET_TMUX_SOCKET
+// values that don't follow the canonical `/tmp/fleet-test-*.sock`
+// pattern. Without this check, a wrapping shell that exports
+// FLEET_TMUX_SOCKET (e.g., pointed at a long-lived operator-owned
+// server) would silently bypass the sink guard.
+func TestSpawn_RefusesInheritedNonTestSocketUnderGoTest(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/tmux-501/default") // not a /tmp/fleet-test-* path
+
+	err := Spawn("fleet-test-inherited-guard", "", []string{"sleep", "1"}, nil)
+	if err == nil {
+		t.Fatal("Spawn must refuse a non-fleet-test FLEET_TMUX_SOCKET under go test")
+	}
+	if !strings.Contains(err.Error(), "inherited FLEET_TMUX_SOCKET") {
+		t.Errorf("error must mention inherited FLEET_TMUX_SOCKET; got %q", err.Error())
+	}
+}
+
 // TestSpawn_RefusesDefaultSocketUnderGoTest is the regression for the
 // sink guard added 2026-05-14 (follow-up to PR #150). Tests that
 // transitively reach tmux.Spawn through runDispatch/runHandoff without
@@ -277,6 +295,11 @@ func TestSpawn_EmptyCommand(t *testing.T) {
 // restores the prior value on test exit, so we don't have to manage
 // the inherited socket from a wrapping test harness.
 func TestSpawn_RefusesDefaultSocketUnderGoTest(t *testing.T) {
+	// lint-test-isolation:exempt — this test specifically exercises the
+	// sink guard's empty-socket rejection path. It MUST call Spawn
+	// without an isolated socket; the lint would otherwise flag it.
+	// The test itself proves the runtime guard is the safety boundary.
+	//
 	// Force-clear FLEET_TMUX_SOCKET for this test only. t.Setenv with
 	// empty value sets the env var to ""; we use os.Unsetenv to
 	// truly remove it, then register a cleanup that restores it.
