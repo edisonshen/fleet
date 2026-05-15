@@ -759,10 +759,13 @@ func coordNeverTickedThisSpawn(
 
 // agentNeverTickedSinceSpawn reports whether a softer "spawned but never
 // ticked" hint should render after Path C self-heal. Returns true when
-// the agent record for id exists AND has a non-zero spawned_at older
-// than graceWindow AND the last coord-state.json tick (lastTick) either
-// is zero (no state file ever) or predates spawned_at (a stale state
-// from a previous coord under this project).
+// the agent record for id exists AND either (a) spawned_at is zero
+// (legacy record — we can't measure grace, but the marker has aged
+// past spawnTimeout so the operator has waited long enough; codex
+// iter-10 P2) or (b) spawned_at is non-zero, older than graceWindow,
+// AND the last coord-state.json tick (lastTick) either is zero (no
+// state file ever) or predates spawned_at (a stale state from a
+// previous coord under this project).
 //
 // graceWindow is the cold-start budget: cold starts on a fresh laptop
 // top out around 3-5min, so the caller passes coordSpawnTimeoutDefault
@@ -770,12 +773,12 @@ func coordNeverTickedThisSpawn(
 // under this spawn" is informational rather than alarming, and points
 // the operator at /coordinator skill registration or Stop hook config.
 //
-// Returns false on the obvious non-applicable cases:
+// Returns false on the non-applicable cases:
 //   - empty id, nil/empty records, no matching record,
-//   - spawned_at is zero (legacy record, can't infer "since spawn"),
-//   - spawn is within the grace window (cold start may still complete),
-//   - lastTick is non-zero AND ≥ spawned_at (a tick already arrived
-//     under this agent — no longer "never ticked").
+//   - non-zero spawned_at within the grace window (cold start may still complete),
+//   - non-zero spawned_at AND lastTick within mtime tolerance of (or
+//     after) spawned_at (a tick already arrived under this agent —
+//     no longer "never ticked").
 func agentNeverTickedSinceSpawn(
 	records []*agent.Record,
 	id string,
@@ -791,7 +794,11 @@ func agentNeverTickedSinceSpawn(
 			continue
 		}
 		if r.SpawnedAt.IsZero() {
-			return false
+			// Legacy record: marker mtime past spawnTimeout AND no
+			// state file = operator has waited long enough; surface
+			// the diagnostic. Codex iter-10 P2 — without this fallback
+			// legacy records render silent after Path C suppression.
+			return true
 		}
 		if now.Sub(r.SpawnedAt) <= graceWindow {
 			return false

@@ -986,29 +986,36 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// Second-chance downgrade for stale-needs_input + live-Claude
 	// (codex iter-8 P2): the freshness gate above leaves a long-lived
 	// waiting-on-input row as Stuck if the operator has been idle for
-	// > agentRecordFreshWindow (10m). Once we have the
-	// agentClaudeAlive process probe, we can trust the needs_input
-	// flag regardless of last_activity_ts staleness — fleet-guard only
-	// clears needs_input on UserPromptSubmit, and the kill(0) check
-	// independently confirms Claude is still running. Promote Stuck →
-	// Waiting so the operator sees the actionable "fleet attach <id>"
-	// cue instead of "never ticked / Stop hook may be broken."
+	// > agentRecordFreshWindow (10m). Promote Stuck → Waiting so the
+	// operator sees the actionable "fleet attach <id>" cue instead of
+	// "never ticked / Stop hook may be broken."
+	//
+	// Requires the same agentEverActivated + agentClaudeAlive double
+	// gate as Path C (codex iter-10 P1): needs_input is set from
+	// inside Claude on each Stop hook fire, so the flag's presence
+	// already implies fleet-guard ran; but we also require the PID to
+	// be reconciled (fleet-guard's reconcile_pid runs in the same hook
+	// that sets needs_input) and currently alive. Without both gates,
+	// a wrapper-only crash before any Stop hook can't reach this
+	// branch anyway (needs_input would be false), but a coord that
+	// set needs_input once then died would falsely downgrade — the
+	// kill(0) probe filters that.
 	if st == coordSpawnStuck && markerAgentID != "" &&
 		agentNeedsInput(ctx.records, markerAgentID) &&
+		agentEverActivated(ctx.records, markerAgentID) &&
 		agentClaudeAlive(ctx.records, markerAgentID) {
 		st = coordSpawnWaiting
 	}
 
 	// Path C suppression (2026-05-14 false-positive fix): if heal /
 	// downgrade did not fire and the agent record exists for an alive
-	// tmux session AND Claude is currently alive (kill(record.PID, 0)
-	// succeeds) AND the coord has never published a tick under this
-	// spawn, the spawn pipeline completed AND Claude is still running
-	// (not just a wrapper-shell that survived a Claude crash).
-	// Suppress the red attention chip at the render layer WITHOUT
-	// removing the marker — the marker is the only proof of which
-	// agent is coord for the project in this state (no
-	// coordinator.lock body has been published yet), so the [a]
+	// tmux session AND Claude is currently alive AND fleet-guard has
+	// reconciled record.PID at least once AND the coord has never
+	// published a tick under this spawn → the spawn pipeline completed
+	// AND Claude is still running. Suppress the red attention chip at
+	// the render layer WITHOUT removing the marker — the marker is the
+	// only proof of which agent is coord for the project in this state
+	// (no coordinator.lock body has been published yet), so the [a]
 	// re-attach path in findExistingCoordForProject still needs it.
 	// The softer coordSpawnNeverTicked hint below surfaces the
 	// underlying problem informationally when the agent has aged past
@@ -1021,19 +1028,32 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// published, and then wedged. The operator needs the attention
 	// chip to surface that as a real hang.
 	//
-	// Process-liveness gate (codex iter-6 / iter-8 P1):
-	// agentClaudeAlive performs a kill(record.PID, 0) probe to
-	// distinguish "Claude alive but idle between Stop-hook fires"
-	// (suppress) from "tmux wrapper survived after Claude exited"
-	// (keep stuck warning). Tmux session liveness alone cannot
-	// disambiguate — the wrapper shell that exec'd Claude keeps the
-	// tmux pane open after Claude exits. Inequality-based
-	// agentEverActivated (an earlier iteration) was insufficient
-	// because Claude could fire one hook then die while the wrapper
-	// stayed alive.
+	// Process-liveness gate (codex iter-6 / iter-8 / iter-10 P1): two
+	// independent signals required to trust the kill(0) result.
+	//
+	//	(a) agentEverActivated: last_activity_ts != spawned_at proves
+	//	    fleet-guard's Stop hook fired ≥1 time since spawn. That hook
+	//	    invokes reconcile_pid which repairs record.PID to the live
+	//	    Claude pid (skills/fleet-guard/health.py:reconcile_pid).
+	//	    Without this gate, record.PID could still be the fleet
+	//	    binary's os.Getpid() (the spawn-time provisional value that
+	//	    becomes dead-by-construction the moment fleet dispatch
+	//	    returns) — making kill(0) meaningless. Codex iter-10 P1
+	//	    drove this addition.
+	//
+	//	(b) agentClaudeAlive: kill(record.PID, 0) succeeds. Confirms
+	//	    Claude is CURRENTLY alive (post-iter-8 P1 — Claude could
+	//	    fire one Stop hook then die while the tmux wrapper survived;
+	//	    only the live PID check tracks the current state).
+	//
+	// Both required. agentEverActivated alone leaves wrapper-survived-
+	// Claude-exited-mid-session uncaught; agentClaudeAlive alone
+	// trusts an unreconciled provisional PID (or a fallback pane-shell
+	// PID that survives even after Claude crashed early).
 	if st == coordSpawnStuck && sessAlive && markerAgentID != "" &&
 		agentRecordExists(ctx.records, markerAgentID) &&
 		neverTicked &&
+		agentEverActivated(ctx.records, markerAgentID) &&
 		agentClaudeAlive(ctx.records, markerAgentID) {
 		st = coordSpawnIdle
 	}
