@@ -798,11 +798,15 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 }
 
 // TestAgentEverActivated_EdgeCases pins the activation-detection
-// helper: equality (agent.New()-shape record before any Stop hook
-// fires) returns false; LastActivityTS within mtime tolerance is
-// still false; strictly after by more than tolerance returns true.
+// helper. agentEverActivated uses INEQUALITY (not "strictly after")
+// because fleet-guard writes last_activity_ts with whole-second
+// precision while agent.New() preserves nanoseconds — a fast first
+// Stop hook may write last_activity_ts < spawned_at by sub-second
+// truncation while still proving Claude is alive (codex iter-7 P1).
+// The only false case is exact-equal (agent.New() shape before any
+// hook fires).
 func TestAgentEverActivated_EdgeCases(t *testing.T) {
-	spawnedAt := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	spawnedAt := time.Date(2026, 5, 9, 12, 0, 0, 123456789, time.UTC)
 	cases := []struct {
 		name    string
 		records []*agent.Record
@@ -848,25 +852,24 @@ func TestAgentEverActivated_EdgeCases(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "within mtime tolerance → false",
+			name: "fast Stop hook in same second (sub-second-less by truncation) → true",
+			// fleet-guard writes whole seconds: spawnedAt's nanoseconds
+			// drop, leaving last_activity_ts ~123ms LESS than spawnedAt.
+			// Activation must be detected (codex iter-7 P1).
 			records: []*agent.Record{
-				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(1 * time.Second)},
+				{
+					ID:             "x",
+					SpawnedAt:      spawnedAt,
+					LastActivityTS: spawnedAt.Truncate(time.Second),
+				},
 			},
 			id:   "x",
-			want: false,
+			want: true,
 		},
 		{
-			name: "exactly at mtime tolerance boundary → false",
+			name: "Stop hook in next second → true",
 			records: []*agent.Record{
-				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(coordTickMtimeTolerance)},
-			},
-			id:   "x",
-			want: false,
-		},
-		{
-			name: "strictly past tolerance → true (activated)",
-			records: []*agent.Record{
-				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(coordTickMtimeTolerance + time.Second)},
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Truncate(time.Second).Add(1 * time.Second)},
 			},
 			id:   "x",
 			want: true,
