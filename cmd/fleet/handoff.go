@@ -385,6 +385,17 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 						"recovery probe: stale replacement %s session %s appeared dead but cleanup failed: %w (queue file preserved; investigate manually)",
 						newRec.ID, newRec.TmuxSession, dropErr)
 				}
+				// Codex iter-12 [P1]: a prior swap may have committed
+				// marker → newRec.ID before returning ErrOrphanSurvived
+				// / ErrOldKillProbeAmbiguous / similar. With newRec
+				// just dropped, the marker still points at the deleted
+				// ID. The fall-through to normal spawn re-detects
+				// isCoordSwap with `marker == oldRec.ID` (line 693-694);
+				// without restoring the marker the check returns false,
+				// the inline retire path runs (no AtomicCoordSwap), and
+				// `[a]` can spawn a duplicate coord pointing at the
+				// dead ID. Idempotent if marker already at oldRec.ID.
+				handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
 				// Preserve auto-resume override into opts before
 				// fall-through (codex iter-17 P1).
 				if pending.DisableAutoResume != nil {

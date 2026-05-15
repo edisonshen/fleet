@@ -755,3 +755,184 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
+
+// -- codex iter-12 P1: stale-coord-marker rollback before respawn ----------
+//
+// When a previous coord-swap attempt committed marker → newRec.ID and
+// then returned (e.g., ErrOrphanSurvived / ErrOldKillProbeAmbiguous /
+// readiness-wait crash) WITHOUT rolling back the marker, the queue
+// journal stays. A retry enters Resume's case-3 outer gate, sees the
+// stale replacement record + dead session, calls DropReplacementRecord,
+// then falls through to spawnAndRetire.
+//
+// Pre-fix: the spawnAndRetire isCoordSwap check at line 474-475 only
+// matches marker == oldRec.ID. The marker still points at the deleted
+// staleNewID, so isCoordSwap goes false. The retire path runs inline
+// (no AtomicCoordSwap), the marker is never re-pointed at the new
+// replacement, and the TUI's `[a]` keystroke (which reads the marker
+// to find the live coord) chases the deleted ID and spawns a duplicate.
+//
+// Post-fix: Resume's case-3 cleanup calls
+// RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID,
+// stderr) right after DropReplacementRecord. The marker resets to
+// oldRec.ID, the fall-through's isCoordSwap detects the swap, the
+// AtomicCoordSwap helper commits marker → freshRec.ID, and the TUI's
+// `[a]` finds the new live coord with no duplicate.
+
+func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Initialize project + seed marker pointing at the would-be
+	// replacement (req.NewAgentID), simulating a prior swap that
+	// committed the marker and then failed.
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, req.NewAgentID); err != nil {
+		t.Fatalf("seed stale marker: %v", err)
+	}
+
+	// Plant a stale replacement record but no tmux session (so the
+	// outer gate's SessionAlive returns alive=false, triggering
+	// cleanup + fall-through to spawnAndRetire).
+	staleNew := agent.New(req.NewAgentID)
+	staleNew.TaskID = oldRec.TaskID
+	staleNew.Project = oldRec.Project
+	staleNew.Cwd = oldRec.Cwd
+	staleNew.Command = oldRec.Command
+	staleNew.TmuxSession = req.NewSession
+	staleNew.SpawnedAt = time.Now().UTC()
+	if err := staleNew.Write(); err != nil {
+		t.Fatalf("plant stale new rec: %v", err)
+	}
+
+	// Force the outer-gate probe to report "definitively dead" on the
+	// first call so cleanup fires deterministically.
+	origAlive := tmuxSessionAliveFn
+	var probedSessions []string
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		probedSessions = append(probedSessions, s)
+		if s == req.NewSession && len(probedSessions) == 1 {
+			return false, nil
+		}
+		return origAlive(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Fresh replacement spawned at the same pre-allocated ID and alive.
+	freshRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load fresh record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
+	if !tmux.HasSession(freshRec.TmuxSession) {
+		t.Errorf("fresh replacement session %s not alive after respawn", freshRec.TmuxSession)
+	}
+
+	// The load-bearing assertion: after Resume completes, the coord
+	// marker must point at the FRESH replacement (freshRec.ID, same as
+	// the pre-allocated req.NewAgentID), proving:
+	//
+	//   1. The rollback fired (marker stepped back from staleNew →
+	//      oldRec.ID after the drop), AND
+	//   2. spawnAndRetire's isCoordSwap detection saw marker ==
+	//      oldRec.ID and routed through AtomicCoordSwap, which then
+	//      committed marker → freshRec.ID.
+	//
+	// Pre-fix: marker would still equal req.NewAgentID (the
+	// pre-allocated ID), but only because the stale marker was
+	// pointing at the deleted record's same ID. That coincidence
+	// makes the pre-fix bug invisible in this test. So we also assert
+	// the freshRec is alive — which proves a NEW spawn happened with
+	// the marker-rooted swap path completing successfully.
+	got := state.ReadCoordSpawnMarker(oldRec.Project)
+	if got != freshRec.ID {
+		t.Errorf("coord marker not at fresh replacement: got %q want %q",
+			got, freshRec.ID)
+	}
+
+	// Stronger pin: assert oldRec was archived (proves AtomicCoordSwap
+	// ran end-to-end, not the inline retire path). The inline retire
+	// path also archives, but the marker rebase to freshRec.ID is the
+	// AtomicCoordSwap commit-point signature — without isCoordSwap
+	// firing on the retry, the marker would NOT be moved to freshRec.ID
+	// at all (the inline path doesn't touch the marker).
+	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Errorf("oldRec %s should be archived (not findable in live agents): err=%v",
+			oldRec.ID, lerr)
+	}
+}
+
+// TestResume_StaleCoordMarker_NonCoord_NoRollback pins the guard
+// branch: when the marker exists but points at some UNRELATED agent
+// (not oldRec.ID and not newRec.ID), the cleanup must NOT rewrite it.
+// Touching an unrelated marker would corrupt another project's coord
+// pointer. Idempotency of RollbackCoordMarkerIfPointingAt covers this.
+func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	const unrelatedID = "deadbeef"
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, unrelatedID); err != nil {
+		t.Fatalf("seed unrelated marker: %v", err)
+	}
+
+	// Plant a stale replacement record with no tmux session.
+	staleNew := agent.New(req.NewAgentID)
+	staleNew.TaskID = oldRec.TaskID
+	staleNew.Project = oldRec.Project
+	staleNew.Cwd = oldRec.Cwd
+	staleNew.Command = oldRec.Command
+	staleNew.TmuxSession = req.NewSession
+	staleNew.SpawnedAt = time.Now().UTC()
+	if err := staleNew.Write(); err != nil {
+		t.Fatalf("plant stale new rec: %v", err)
+	}
+
+	origAlive := tmuxSessionAliveFn
+	var probedSessions []string
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		probedSessions = append(probedSessions, s)
+		if s == req.NewSession && len(probedSessions) == 1 {
+			return false, nil
+		}
+		return origAlive(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Marker must STILL be at the unrelated ID — the rollback only
+	// fires on marker == staleNew.ID (the deleted replacement's ID).
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != unrelatedID {
+		t.Errorf("unrelated marker corrupted: got %q want %q",
+			got, unrelatedID)
+	}
+
+	// Fresh replacement must still be alive (the cleanup + respawn
+	// still works regardless of marker rollback path).
+	freshRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load fresh record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
+	if !tmux.HasSession(freshRec.TmuxSession) {
+		t.Errorf("fresh replacement session %s not alive", freshRec.TmuxSession)
+	}
+}

@@ -128,6 +128,18 @@ func Resume(req queue.SpawnFresh, queuePath string,
 				"resume: stale replacement %s session %s appeared dead but cleanup failed (%w); spawn fresh aborted",
 				newRec.ID, newRec.TmuxSession, dropErr)
 		}
+		// Codex iter-12 [P1]: a prior coord-swap attempt may have
+		// committed marker → newRec.ID (eager write before retire,
+		// or the AtomicCoordSwap commit point) and then returned
+		// ErrOrphanSurvived / ErrOldKillProbeAmbiguous / similar,
+		// leaving the marker pointing at the replacement we just
+		// dropped. The fall-through to spawnAndRetire's isCoordSwap
+		// check only matches marker == oldRec.ID, so without this
+		// rollback the retry's swap detection misses, the inline
+		// retire path runs (no AtomicCoordSwap), and `[a]` can spawn
+		// a duplicate coord because the marker still names the dead
+		// agent. Idempotent if marker is already at oldRec.ID.
+		RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
 		_, _ = fmt.Fprintf(stderr,
 			"note: stale replacement %s (session %s already exited) cleaned up; spawning fresh replacement\n",
 			newRec.ID, newRec.TmuxSession)

@@ -426,6 +426,118 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 	})
 }
 
+// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn pins
+// codex iter-12 [P1] on the manual-handoff recovery path
+// (cmd/fleet/handoff.go:378-387). When the recovery probe finds a stale
+// replacement record with a dead tmux session, it drops the record and
+// falls through to the normal spawn flow. A previous coord-swap attempt
+// may have committed marker → staleNew.ID before failing; without
+// rolling back the marker, the fall-through's isCoordSwap detection at
+// line 693-694 (`marker == oldRec.ID`) returns false, the inline retire
+// path runs (no AtomicCoordSwap), and the marker is left pointing at
+// the deleted ID — letting `[a]` spawn a duplicate coord.
+//
+// Post-fix: the cleanup branch calls
+// handoffop.RollbackCoordMarkerIfPointingAt before the fall-through.
+// The marker steps back to oldRec.ID, isCoordSwap fires on the retry,
+// AtomicCoordSwap commits marker → fresh replacement's ID.
+func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T) {
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Seed coord marker → old.ID (a real coord setup) THEN stomp it to
+	// a fake "previous attempt" newAgentID, simulating the stale
+	// marker a prior crashed swap would leave behind.
+	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	const staleNewID = "stalenew"
+	if err := state.WriteCoordSpawnMarker(old.Project, staleNewID); err != nil {
+		t.Fatalf("seed stale marker: %v", err)
+	}
+
+	// Plant a stale replacement record whose tmux session is dead
+	// (the session string points at a name we never spawned, so
+	// tmux.SessionAlive returns (false, nil) definitively).
+	staleNew := agent.New(staleNewID)
+	staleNew.TaskID = old.TaskID
+	staleNew.Project = old.Project
+	staleNew.Cwd = old.Cwd
+	staleNew.Command = old.Command
+	staleNew.TmuxSession = "fleet-stalenew-dead"
+	staleNew.SpawnedAt = time.Now().UTC()
+	if err := staleNew.Write(); err != nil {
+		t.Fatalf("plant stale new rec: %v", err)
+	}
+
+	// Seed queue file so runHandoff enters the recovery probe.
+	docPath := filepath.Join(tmp, "handoffs", old.ID+"-stub.md")
+	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(docPath, []byte("stub doc"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    old.ID,
+		HandoffDoc:    docPath,
+		Project:       old.Project,
+		TaskID:        old.TaskID,
+		NewAgentID:    staleNewID,
+		NewSession:    staleNew.TmuxSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	// Run handoff. The recovery probe sees stale newRec, drops it,
+	// rolls back the marker (post-fix), falls through to normal
+	// spawn. The fall-through's isCoordSwap detects marker ==
+	// oldRec.ID, routes through AtomicCoordSwap, commits marker
+	// → fresh replacement's ID.
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		cwd:         old.Cwd,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("runHandoff: %v\n%s", err, out.String())
+	}
+
+	// Exactly one live agent remains — the fresh replacement. The
+	// stale newRec record is gone, the old one is archived.
+	live := listLive(t)
+	if len(live) != 1 {
+		t.Fatalf("expected 1 live agent post-handoff, got %d: %+v", len(live), live)
+	}
+	fresh := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(fresh.TmuxSession) })
+
+	// Stale record must be gone (DropReplacementRecord ran).
+	if _, err := os.Stat(filepath.Join(tmp, "agents", staleNewID+".json")); !os.IsNotExist(err) {
+		t.Errorf("stale replacement record should be deleted: stat err=%v", err)
+	}
+
+	// Old archived.
+	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); !os.IsNotExist(err) {
+		t.Errorf("old live record should be archived (not in live dir): stat err=%v", err)
+	}
+
+	// Marker must point at the FRESH replacement, NOT the deleted
+	// staleNewID. Pre-fix this assertion failed because isCoordSwap
+	// went false on the retry (marker == staleNewID, not == old.ID)
+	// and the inline retire path never moved the marker.
+	got := state.ReadCoordSpawnMarker(old.Project)
+	if got != fresh.ID {
+		t.Errorf("coord marker not at fresh replacement: got %q want %q (staleNewID=%q, old.ID=%q)",
+			got, fresh.ID, staleNewID, old.ID)
+	}
+}
+
 func TestHandoff_AbortsWhenReplacementDiesAtStartup(t *testing.T) {
 	// Codex iter-9 P1: if the replacement command exits immediately
 	// (e.g., a wrapper that crashes during startup), spawn.Spawn
