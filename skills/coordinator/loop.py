@@ -322,10 +322,12 @@ def _tick_locked(
             if action.clear_worker:
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
-                # The reaper entry for this slug was already deleted by
-                # reap_probes when the kill succeeded; clear redispatch
-                # marker too so a re-dispatch tick doesn't loop forever.
-                reaper_mod.clear_redispatch_pending(state, action.slug)
+                # Codex iter-2 [P1]: do NOT clear reaper_redispatch_pending
+                # here. The marker is the explicit signal to dispatch a
+                # replacement on the NEXT pass (consumed by the
+                # _promote_redispatch_pending hook below). Clearing it
+                # before dispatch sees it means a failed worker just
+                # lands in `todo` and never gets the promised replacement.
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
@@ -389,6 +391,22 @@ def _tick_locked(
             result.errors.append(f"sentinel {action.slug}: {exc}")
     if last_seen:
         state["last_archive_scan_ts"] = last_seen
+
+    # 4.5. Consume reaper_redispatch_pending markers (codex iter-2 [P1]).
+    # The reaper flagged slugs whose worker hit phase=failed (judgment=
+    # error-abort) for re-dispatch. Reconcile flipped those slugs to
+    # `todo`; _filter_ready only picks `ready`. Promote pending slugs
+    # from todo → ready so the next _dispatch_ready call sees them.
+    # The marker is consumed (cleared) on a successful promote; a slug
+    # that's already not in todo state (operator intervened, status
+    # diverged) gets its marker dropped without action.
+    try:
+        _consume_reaper_redispatch(
+            project=project, fleet_bin=fleet_bin, home=home,
+            coord_state=state, tasks_path=tasks_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"redispatch promote: {exc}")
 
     # 5. Dispatch ready tasks under cap.
     # Re-read tasks.md after reconcile/drain so the dispatch-side filter
@@ -625,10 +643,8 @@ def _run_supervisor(
                     # stale handoff keys that block future re-dispatches
                     # for the same slug.
                     _clear_review_handoff_state(cs, action.slug)
-                    # Clear redispatch marker on the same beat as the
-                    # primary tick path does — keeps the ledger clean
-                    # across supervisor + tick transitions.
-                    reaper_mod.clear_redispatch_pending(cs, action.slug)
+                    # Codex iter-2 [P1]: do NOT clear reaper_redispatch_
+                    # pending here — the dispatch hook is the consumer.
                 # codex iter-1 [P1]: a worker leaving the in-flight
                 # set frees a dispatch slot. Without re-running
                 # _dispatch_ready, with cap=1 the next ready task
@@ -653,7 +669,23 @@ def _run_supervisor(
         ready task waited until supervisor exited because dispatch only
         ran inside the FIRST tick. Re-running here keeps `cap` saturated
         across the entire supervisor session.
+
+        Codex iter-2 [P1]: also consumes reaper_redispatch_pending
+        markers — a slug flagged by the error-abort path needs its
+        status promoted from todo → ready before _dispatch_ready can
+        pick it up.
         """
+        # Consume the redispatch marker BEFORE re-reading tasks.md so
+        # promoted slugs appear as `ready` to _dispatch_ready.
+        cs0 = _load_coord_state(state_path)
+        try:
+            _consume_reaper_redispatch(
+                project=project, fleet_bin=fleet_bin, home=home,
+                coord_state=cs0, tasks_path=tasks_path,
+            )
+            _save_coord_state(state_path, cs0)
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor redispatch: {exc}")
         try:
             f4 = parse.read(str(tasks_path))
         except Exception as exc:  # noqa: BLE001
@@ -734,24 +766,74 @@ def _run_supervisor(
     # this check into "always True" and spin the supervisor at 0-second
     # sleeps. Baseline the mtime at supervisor entry so only an mtime
     # ADVANCE post-entry counts as an event.
+    #
+    # Codex iter-2 [P1]: after the FIRST force-tick fires, advance the
+    # baseline + archive watermark to the current values so the same
+    # event doesn't re-fire on the next iteration (which would spin
+    # the supervisor at 0-second sleeps). We mutate the closed-over
+    # baseline + last_seen_archive on every True return.
     coord_id_for_force = os.environ.get("FLEET_AGENT_ID", "") or ""
-    direct_inbox_baseline = 0.0
+    # Use a mutable singleton dict so the inner hook can update the
+    # baseline without `nonlocal`. The hook reads the current value
+    # before each check and bumps it after a hit.
+    force_tick_baseline = {"mtime": 0.0, "archive": ""}
     if coord_id_for_force:
         baseline_path = home / "inbox" / f"{coord_id_for_force}.md"
         try:
-            direct_inbox_baseline = baseline_path.stat().st_mtime
+            force_tick_baseline["mtime"] = baseline_path.stat().st_mtime
         except OSError:
-            direct_inbox_baseline = 0.0
+            force_tick_baseline["mtime"] = 0.0
+        # Seed the archive watermark from coord-state's last_archive_scan_ts.
+        cs0 = _load_coord_state(state_path)
+        force_tick_baseline["archive"] = str(
+            cs0.get("last_archive_scan_ts", "") or ""
+        )
 
     def force_tick_check_hook() -> bool:
+        # Read latest archive watermark from disk so a primary-tick
+        # archive scan that updated coord-state is honored — keeps the
+        # supervisor's view in sync with the tick-side drain.
         cs = _load_coord_state(state_path)
-        watermark = str(cs.get("last_archive_scan_ts", "") or "")
-        return supervisor_mod.has_pending_inbox_events(
+        disk_archive = str(cs.get("last_archive_scan_ts", "") or "")
+        if disk_archive > force_tick_baseline["archive"]:
+            force_tick_baseline["archive"] = disk_archive
+        triggered = supervisor_mod.has_pending_inbox_events(
             coord_id=coord_id_for_force,
             fleet_home=home,
-            last_seen_archive=watermark,
-            direct_inbox_mtime_baseline=direct_inbox_baseline,
+            last_seen_archive=force_tick_baseline["archive"],
+            direct_inbox_mtime_baseline=force_tick_baseline["mtime"],
         )
+        if triggered:
+            # Advance baseline + archive watermark so the next iteration
+            # doesn't re-fire on the same event (codex iter-2 [P1]).
+            # Direct inbox: bump baseline to the current mtime so any
+            # further write is required to retrigger.
+            if coord_id_for_force:
+                direct = home / "inbox" / f"{coord_id_for_force}.md"
+                try:
+                    new_mtime = direct.stat().st_mtime
+                    if new_mtime > force_tick_baseline["mtime"]:
+                        force_tick_baseline["mtime"] = new_mtime
+                except OSError:
+                    pass
+                # Archive: walk the dir once to find the newest
+                # post-watermark filename and bump the watermark to
+                # match. This is the same shape _drain_archive uses.
+                archive = home / "inbox" / "archive"
+                try:
+                    if archive.is_dir():
+                        prefix = coord_id_for_force + "-"
+                        names = sorted(
+                            p.name for p in archive.iterdir()
+                            if p.name.startswith(prefix)
+                        )
+                        if names:
+                            newest = names[-1]
+                            if newest > force_tick_baseline["archive"]:
+                                force_tick_baseline["archive"] = newest
+                except OSError:
+                    pass
+        return triggered
 
     # Invariant 5 reaper hook. Runs every iteration so a worker that
     # writes phase=done mid-supervisor session is reaped within the
@@ -914,6 +996,70 @@ def _reaper_lane_clear_for(coord_state: dict, slug: str) -> bool:
     only this gate is needed. Returns True iff the reaper has no open
     kill cycle for `slug`."""
     return reaper_mod.reaper_lane_clear(coord_state, slug)
+
+
+def _consume_reaper_redispatch(
+    *,
+    project: str,
+    fleet_bin: str,
+    home: Path,
+    coord_state: dict,
+    tasks_path: Path,
+) -> None:
+    """Promote `reaper_redispatch_pending` slugs from todo → ready.
+
+    Codex iter-2 [P1]: the reaper sets the redispatch marker for slugs
+    that hit phase=failed (error-abort judgment). Reconcile flips those
+    slugs to `todo`. `_filter_ready` only dispatches status=ready
+    tasks, so without an explicit promotion step a failed worker just
+    sits idle until the operator manually re-runs it.
+
+    Algorithm:
+      - For each slug in the pending set:
+          * Re-read tasks.md (cheap; microseconds).
+          * If the task is at status=todo, shell `fleet tasks set
+            status=ready` so the next _dispatch_ready picks it up.
+          * Drop the marker either way: status=todo+promoted → marker
+            consumed; status=anything-else → marker no longer relevant.
+
+    Best-effort: a shell failure logs but doesn't block other slugs;
+    the next tick retries (the marker stays set on failure).
+    """
+    pending = reaper_mod.load_redispatch_pending(coord_state)
+    if not pending:
+        return
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:
+        return
+    by_slug = {t.slug: t for t in f.tasks}
+    for slug in list(pending):
+        t = by_slug.get(slug)
+        if t is None:
+            # Task disappeared (archived?) — drop the stale marker.
+            reaper_mod.clear_redispatch_pending(coord_state, slug)
+            continue
+        if t.status != "todo":
+            # Operator intervened or reconcile took a different path
+            # (e.g., blocked) — the marker is no longer actionable.
+            reaper_mod.clear_redispatch_pending(coord_state, slug)
+            continue
+        # Promote todo → ready. _run_fleet raises on failure → the
+        # marker stays set and the next tick retries.
+        try:
+            _run_fleet([
+                fleet_bin, "tasks", "set", "--project", project,
+                slug, "status=ready",
+            ])
+            _run_fleet([
+                fleet_bin, "tasks", "note", "--project", project,
+                slug,
+                "reaper: error-abort → re-dispatch (replacement worker)",
+            ])
+            reaper_mod.clear_redispatch_pending(coord_state, slug)
+        except Exception:
+            # Leave the marker; next tick retries.
+            continue
 
 
 # ---------- lock helpers ----------

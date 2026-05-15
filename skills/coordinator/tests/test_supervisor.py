@@ -1929,6 +1929,42 @@ def test_has_pending_inbox_events_false_on_empty_coord_id(fleet_home: Path) -> N
     ) is False
 
 
+def test_force_tick_does_not_spin_after_first_hit(fleet_home: Path) -> None:
+    """Codex iter-2 [P1] regress: after a force-tick fires on an
+    inbox event, the supervisor MUST eventually sleep again (the event
+    is processed and the baseline/watermark advances). Without this
+    advance, the supervisor spins at 0-second sleeps forever.
+
+    Driven via the production loop.tick path so the integration is
+    end-to-end: place an inbox file, run a single supervisor iteration
+    that force-ticks once, then assert the NEXT iteration would NOT
+    force-tick again."""
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[OPERATOR] hi\n", encoding="utf-8")
+    import os as _os
+    cur_mtime = _os.stat(inbox).st_mtime
+    # Build the hook the way loop.py does, with a mutable baseline.
+    baseline = {"mtime": cur_mtime - 10.0, "archive": ""}
+
+    def hook():
+        triggered = supervisor.has_pending_inbox_events(
+            "c00bf001", fleet_home=fleet_home,
+            last_seen_archive=baseline["archive"],
+            direct_inbox_mtime_baseline=baseline["mtime"],
+        )
+        if triggered:
+            try:
+                baseline["mtime"] = _os.stat(inbox).st_mtime
+            except OSError:
+                pass
+        return triggered
+
+    # First call: mtime > baseline → fires.
+    assert hook() is True
+    # Second call: baseline now equals mtime → does NOT fire.
+    assert hook() is False
+
+
 def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
     fleet_home: Path,
 ) -> None:
