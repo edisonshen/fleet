@@ -27,6 +27,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -577,6 +578,70 @@ var agentProcessAliveFn = func(pid int) bool {
 	return workersIsAlive(pid)
 }
 
+// agentProcessArgvFn returns the argv of the process with the given
+// PID, or empty string when the lookup fails or the process is dead.
+// Production runs `ps -p <pid> -o args=` (~10ms per call on macOS);
+// tests swap it to a deterministic map.
+//
+// Path C uses this to detect the wrapper-pane-shell case: when
+// spawn.Spawn's resolveEnginePid fell back to recording the tmux
+// pane's wrapper shell PID (typically `sh -c "...claude..."`), the
+// shell stays alive after Claude exits — kill(0) cannot tell us
+// Claude died. argv inspection identifies the shell-wrapper case
+// directly and keeps the stuck warning visible (codex iter-16 P1).
+//
+// Mirror of skills/fleet-guard/health.py:_recorded_pid_looks_like_wrapper
+// but lives in Go for the dashboard's single-process render path.
+var agentProcessArgvFn = func(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	// ps is POSIX-portable; -o args= prints only the argv without a
+	// header. Five-second timeout matches the Python helper. Errors
+	// (transient ps blip, EPERM) return "" → treat as "can't tell"
+	// at the caller; the caller defaults to "alive" so a probe blip
+	// does not flip a healthy row to stuck.
+	cmd := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid))
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// shellArgvPrefixes lists the POSIX shell binary names that indicate
+// a wrapper shell rather than an engine process. Mirror of
+// skills/fleet-guard/health.py:_is_shell_argv. The check is
+// argv[0]-only (whitespace-split first token), so a process whose
+// first argv component matches one of these is treated as a wrapper.
+var shellArgvPrefixes = []string{
+	"sh", "bash", "dash", "zsh", "ksh", "fish",
+	"/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh", "/bin/ksh",
+	"/usr/bin/sh", "/usr/bin/bash", "/usr/bin/dash",
+	"/usr/bin/zsh", "/usr/bin/ksh", "/usr/bin/fish",
+	"/usr/local/bin/bash", "/usr/local/bin/zsh", "/usr/local/bin/fish",
+}
+
+// argvLooksLikeShellWrapper reports whether argv's first token is a
+// known POSIX shell binary. Empty argv returns false — the caller's
+// "can't tell" default is "treat as alive" which means we do NOT
+// flip a real coord to stuck on a transient ps probe failure.
+func argvLooksLikeShellWrapper(argv string) bool {
+	if argv == "" {
+		return false
+	}
+	first := argv
+	if idx := strings.IndexAny(argv, " \t"); idx > 0 {
+		first = argv[:idx]
+	}
+	for _, prefix := range shellArgvPrefixes {
+		if first == prefix {
+			return true
+		}
+	}
+	return false
+}
+
 // workersIsAlive is a thin indirection over workers.IsAlive so the
 // tui package can test agentProcessAliveFn's behavior without taking
 // a direct dependency on the workers package's exported helper. The
@@ -607,20 +672,32 @@ func agentNeedsInput(records []*agent.Record, id string) bool {
 }
 
 // agentClaudeAlive reports whether the Claude process recorded in the
-// agent record matching id is still alive. Returns false when:
+// agent record matching id is still alive AND not just a wrapper
+// shell. Returns false when:
 //   - id is empty, records is nil/empty, or no record matches,
 //   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
-//   - the PID's process is dead (kill(0) returns ESRCH).
+//   - the PID's process is dead (kill(0) returns ESRCH),
+//   - the PID's argv first-token is a POSIX shell binary, indicating
+//     spawn.Spawn's resolveEnginePid fell back to the tmux pane's
+//     wrapper shell instead of the real Claude process. Codex iter-16
+//     P1: kill(0) alone can't distinguish "Claude alive idle" from
+//     "wrapper survived Claude exit" because both keep the same shell
+//     PID alive. argv inspection identifies the wrapper case so the
+//     red stuck chip stays visible for real spawn failures.
 //
-// Path C uses this to distinguish "Claude alive but idle" from "tmux
-// wrapper survived after Claude exited" (codex iter-8 P1). The session
-// liveness probe (tmux.HasSession) cannot distinguish those cases —
-// the wrapper shell that exec'd Claude keeps the tmux pane open even
-// after Claude exits, so sessionAliveFn stays true. PID liveness is
-// the only signal that disambiguates.
+// Path C uses this to distinguish:
+//   - Claude alive, idle between Stop-hook fires (HANDOFF state) →
+//     argv contains "claude", kill(0) true → suppress red chip
+//   - Wrapper survived after Claude exited at startup → argv is
+//     "sh -c ..." or similar, kill(0) true on shell → keep red chip
 //
-// Single kill(0) per render per project — cheap (Linux: < 1μs; macOS:
-// similar). Stub-overridable via agentProcessAliveFn for tests.
+// Cost: one kill(0) (~1μs) + one `ps -o args= -p <pid>` (~10ms on
+// macOS) per render per project. Probe failures (transient ps blip,
+// EPERM, kernel hiccup) return "" from agentProcessArgvFn, which
+// argvLooksLikeShellWrapper treats as "not a wrapper" — so we
+// default to "alive" on probe failure rather than flipping a healthy
+// row to stuck. Stub-overridable via agentProcessAliveFn AND
+// agentProcessArgvFn for tests.
 func agentClaudeAlive(records []*agent.Record, id string) bool {
 	if id == "" || len(records) == 0 {
 		return false
@@ -629,7 +706,16 @@ func agentClaudeAlive(records []*agent.Record, id string) bool {
 		if r == nil || r.ID != id {
 			continue
 		}
-		return agentProcessAliveFn(r.PID)
+		if !agentProcessAliveFn(r.PID) {
+			return false
+		}
+		// PID is alive — verify it's not the wrapper shell. argv
+		// probe failures are conservative ("" → not-wrapper → trust
+		// kill(0)) so a flaky ps doesn't flip working coords to stuck.
+		if argvLooksLikeShellWrapper(agentProcessArgvFn(r.PID)) {
+			return false
+		}
+		return true
 	}
 	return false
 }

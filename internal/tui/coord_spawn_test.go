@@ -644,13 +644,43 @@ func stubAliveSessions(t *testing.T, alive map[string]bool) {
 // false) are treated as dead. Restored at test end. Used by Path C
 // tests that need to distinguish "Claude alive" from "wrapper-only"
 // without taking a real OS-process dependency.
+//
+// Also stubs agentProcessArgvFn to return "claude" by default for
+// alive PIDs (i.e. NOT a shell wrapper). Use stubProcessArgv to
+// override the argv per-PID when exercising the wrapper-shell
+// detection path.
 func stubProcessAlive(t *testing.T, alive map[int]bool) {
 	t.Helper()
-	prev := agentProcessAliveFn
+	prevAlive := agentProcessAliveFn
+	prevArgv := agentProcessArgvFn
 	agentProcessAliveFn = func(pid int) bool {
 		return alive[pid]
 	}
-	t.Cleanup(func() { agentProcessAliveFn = prev })
+	agentProcessArgvFn = func(pid int) string {
+		if alive[pid] {
+			// Default: looks like Claude (NOT a shell wrapper).
+			return "claude --remote-control"
+		}
+		return ""
+	}
+	t.Cleanup(func() {
+		agentProcessAliveFn = prevAlive
+		agentProcessArgvFn = prevArgv
+	})
+}
+
+// stubProcessArgv swaps agentProcessArgvFn with a deterministic map
+// keyed by PID. Used by tests that need to inject a specific argv
+// (e.g. a shell-wrapper argv to exercise the wrapper-pane-shell
+// detection path). Must be called AFTER stubProcessAlive to override
+// its default argv. Restored at test end.
+func stubProcessArgv(t *testing.T, argv map[int]string) {
+	t.Helper()
+	prev := agentProcessArgvFn
+	agentProcessArgvFn = func(pid int) string {
+		return argv[pid]
+	}
+	t.Cleanup(func() { agentProcessArgvFn = prev })
 }
 
 // stubRemoveMarker swaps removeCoordSpawnMarkerFn for a recording stub
@@ -1104,12 +1134,94 @@ func TestRender_LiveClaudeStopHookNeverFired_SuppressesStuck(t *testing.T) {
 	}
 }
 
+// TestRender_WrapperShellPid_PreservesStuck pins the codex iter-16
+// [P1] fix: when spawn.Spawn's resolveEnginePid fell back to recording
+// the tmux pane's wrapper shell PID (e.g. `sh -c "...claude..."`),
+// kill(0) on that shell PID returns true even after Claude exited.
+// agentClaudeAlive now checks argv via `ps -o args=`; if the first
+// token is a POSIX shell binary, treat as "not Claude alive" so the
+// red stuck chip stays visible for the operator to triage.
+func TestRender_WrapperShellPid_PreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{12121: true})
+	// Override argv: this PID is the wrapper shell, not Claude.
+	stubProcessArgv(t, map[int]string{
+		12121: "sh -c claude --dangerously-skip-permissions",
+	})
+	stubRemoveMarker(t)
+
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			PID:            12121,
+			LastActivityTS: spawnedAt, // same as SpawnedAt
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("wrapper-shell PID: red stuck chip MUST surface (argv probe); got:\n%s", joined)
+	}
+}
+
+// TestArgvLooksLikeShellWrapper_EdgeCases pins the argv classifier
+// contract. The first-token-only check matches fleet-guard's Python
+// implementation; argv with claude in argv[2] (after `sh -c`) still
+// counts as a wrapper because argv[0] is the shell.
+func TestArgvLooksLikeShellWrapper_EdgeCases(t *testing.T) {
+	cases := []struct {
+		name string
+		argv string
+		want bool
+	}{
+		{"empty → false (probe failure → not-wrapper)", "", false},
+		{"sh -c claude → true", "sh -c claude --dangerously-skip-permissions", true},
+		{"/bin/sh -c claude → true", "/bin/sh -c claude", true},
+		{"bash -c → true", "bash -c claude", true},
+		{"/usr/bin/zsh → true", "/usr/bin/zsh", true},
+		{"/usr/local/bin/fish -c → true", "/usr/local/bin/fish -c claude", true},
+		{"claude --remote-control → false (real Claude)", "claude --remote-control", false},
+		{"/usr/local/bin/claude → false", "/usr/local/bin/claude", false},
+		{"node --version → false (non-shell binary)", "node --version", false},
+		{"single-token shell name → true", "sh", true},
+		{"shellish prefix but different binary → false", "shfoo --bar", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := argvLooksLikeShellWrapper(tc.argv)
+			if got != tc.want {
+				t.Errorf("argvLooksLikeShellWrapper(%q) = %v, want %v", tc.argv, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAgentClaudeAlive_EdgeCases pins the process-liveness helper:
 // empty id, no matching record, PID 0, nil-record entries all return
-// false; matching record with alive PID returns true; matching record
-// with dead PID returns false.
+// false; matching record with alive Claude PID returns true; matching
+// record with dead PID returns false; matching record with alive but
+// wrapper-shell PID returns false (codex iter-16 P1 — argv check).
 func TestAgentClaudeAlive_EdgeCases(t *testing.T) {
-	stubProcessAlive(t, map[int]bool{1000: true, 2000: false})
+	stubProcessAlive(t, map[int]bool{1000: true, 2000: false, 3000: true})
+	// Override 3000's argv: it's a wrapper shell.
+	stubProcessArgv(t, map[int]string{
+		1000: "claude --remote-control",
+		3000: "sh -c claude --dangerously-skip-permissions",
+	})
 
 	cases := []struct {
 		name    string
@@ -1121,8 +1233,9 @@ func TestAgentClaudeAlive_EdgeCases(t *testing.T) {
 		{"nil records → false", nil, "x", false},
 		{"no matching id → false", []*agent.Record{{ID: "y", PID: 1000}}, "x", false},
 		{"PID 0 → false (legacy / partial write)", []*agent.Record{{ID: "x", PID: 0}}, "x", false},
-		{"PID alive → true", []*agent.Record{{ID: "x", PID: 1000}}, "x", true},
+		{"PID alive + claude argv → true", []*agent.Record{{ID: "x", PID: 1000}}, "x", true},
 		{"PID stubbed dead → false", []*agent.Record{{ID: "x", PID: 2000}}, "x", false},
+		{"PID alive but shell wrapper argv → false (iter-16)", []*agent.Record{{ID: "x", PID: 3000}}, "x", false},
 		{
 			name: "nil entry tolerated, later match wins",
 			records: []*agent.Record{
