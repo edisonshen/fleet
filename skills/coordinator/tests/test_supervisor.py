@@ -2155,8 +2155,10 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
     SessionStart hook on the NEXT Claude-agent turn, not by the coord
     skill itself. While the supervisor is running, an operator message
     sent via `fleet message <coord>` would otherwise stay invisible
-    until the supervisor exits (could be 4 h). Fix: when a direct-
-    inbox file is present on a forced wake, exit the supervisor so
+    until the supervisor exits (could be 4 h).
+
+    Fix: when a direct-inbox file's mtime ADVANCES past the start-of-
+    session baseline (codex iter-11 [P1]), exit the supervisor so
     the next turn fires fleet-guard.
     """
     a_path = (
@@ -2167,9 +2169,76 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
         slug="alpha-aaaa", state_path=a_path,
         agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
     )
-    # Operator writes to the direct inbox BEFORE the supervisor starts.
+    # Pre-existing inbox file (e.g., a [STUCK] alert from a previous
+    # supervisor session); baseline must capture this so it doesn't
+    # cause a premature exit. Set mtime to a known-old value so the
+    # supervisor records that as the baseline.
     inbox = fleet_home / "inbox" / "c00bf001.md"
-    inbox.write_text("[OPERATOR] hi\n", encoding="utf-8")
+    inbox.write_text("[STUCK] stale alpha-aaaa phase=tdd-red\n", encoding="utf-8")
+    import os as _os
+    pre_mtime = 1000.0
+    _os.utime(inbox, (pre_mtime, pre_mtime))
+
+    # force_tick will fire each iteration; on the second call, we
+    # bump the inbox mtime past the baseline to simulate an operator
+    # writing a new message mid-supervision.
+    check_count = {"n": 0}
+
+    def fake_force():
+        check_count["n"] += 1
+        if check_count["n"] == 2:
+            _os.utime(inbox, (pre_mtime + 100, pre_mtime + 100))
+        return True
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=fake_force,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor exited because the operator wrote to the direct inbox
+    # (mtime advanced past the start-of-session baseline).
+    assert res.exit_reason == "operator-inbox-message"
+
+
+def test_supervisor_does_not_exit_on_stale_inbox_file(fleet_home: Path) -> None:
+    """Codex iter-11 [P1] regress: a pre-existing inbox file (e.g., a
+    [STUCK] alert dropped by emit_stuck_alert itself in a prior tick)
+    must NOT trigger the operator-message-exit on every forced wake.
+    The exit only fires when mtime advances past the start-of-session
+    baseline."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # Pre-existing inbox file — should NOT trigger exit because the
+    # mtime baseline captures its initial state.
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[STUCK] stale\n", encoding="utf-8")
 
     sleep_calls: list[float] = []
     fake_now = {"t": 0.0}
@@ -2197,8 +2266,9 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
         coord_id="c00bf001",
         log_stream=io.StringIO(),
     )
-    # Supervisor exited because the operator wrote to the direct inbox.
-    assert res.exit_reason == "operator-inbox-message"
+    # Supervisor reached "all-terminal" — the stale inbox did NOT
+    # trigger a premature operator-message exit.
+    assert res.exit_reason == "all-terminal"
 
 
 def test_reaper_hook_runs_before_reconcile_on_mtime_change(

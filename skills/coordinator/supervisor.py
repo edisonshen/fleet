@@ -888,6 +888,19 @@ def run_supervisor(
         return res
 
     started_at = now_fn()
+    # Codex iter-11 [P1]: snapshot the direct-inbox mtime at session
+    # start so the "operator wrote to inbox → exit" gate fires only
+    # when the file actually changes during supervision. A pre-
+    # existing file (stale operator message, prior [STUCK] alert)
+    # otherwise would exit on every forced wake regardless of cause.
+    direct_inbox_session_baseline = 0.0
+    if coord_id:
+        try:
+            direct_inbox_session_baseline = (
+                (home / "inbox" / f"{coord_id}.md").stat().st_mtime
+            )
+        except OSError:
+            direct_inbox_session_baseline = 0.0
     last_mtimes: dict[str, float] = {}
     # Per-slug "last observed state change" timestamp. Drives the
     # invariant-4 adaptive cadence: probes stable for >
@@ -962,14 +975,20 @@ def run_supervisor(
         # SessionStart hook and surfaces the message. The coord skill
         # itself doesn't consume that inbox surface (fleet-guard
         # does), so staying in the supervisor would silence operator
-        # messages indefinitely. We detect this via direct-inbox mtime
-        # advance: the force_tick_check already tracks it. Archive-
-        # only force-ticks (worker → coord events) do NOT trigger the
-        # exit because force_tick_dispatch handles those internally.
+        # messages indefinitely.
+        #
+        # Codex iter-11 [P1]: gate on mtime ADVANCE relative to the
+        # supervisor's start-of-session snapshot, not just file
+        # existence. A pre-existing inbox file (stale operator message,
+        # or a [STUCK] line dropped by emit_stuck_alert itself) would
+        # otherwise terminate the supervisor on every forced wake —
+        # including archive-driven NEW_TASK / TASK_DONE_PR wakes that
+        # have nothing to do with operator messages.
         if forced and coord_id:
             direct = home / "inbox" / f"{coord_id}.md"
             try:
-                if direct.is_file():
+                cur_mtime = direct.stat().st_mtime
+                if cur_mtime > direct_inbox_session_baseline:
                     res.exit_reason = "operator-inbox-message"
                     emit(
                         f"[coord] supervisor loop exiting: operator wrote "
