@@ -556,6 +556,57 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 	return false
 }
 
+// coordNeverTickedThisSpawn reports whether the coord-state.json
+// publication has NOT yet caught up to the agent's spawned_at. Returns
+// true when:
+//   - the agent record exists for id (Path C only makes sense with a
+//     record on disk), AND
+//   - spawned_at is non-zero (legacy records with zero spawned_at fall
+//     through to "we can't tell" — return false, default to NOT
+//     suppressing the stuck warning since the operator's signal is
+//     load-bearing), AND
+//   - lastTick is zero (no coord-state.json ever) OR predates
+//     spawned_at (a leftover state file from a previous coord under
+//     this project).
+//
+// Used by the render-layer Path C suppression to distinguish "alive
+// coord that has never ticked under this spawn" (false-positive
+// stuck) from "alive coord that ticked successfully then wedged"
+// (genuine stuck — keep the warning so the operator triages via
+// tmux). The narrower check is the codex iter-2 [P1] fix: without
+// it Path C demotes every live tmux session to Idle even when
+// LastTick proves the coord successfully booted, hiding real hangs.
+//
+// Distinct from agentNeverTickedSinceSpawn, which adds a grace
+// window before promoting Idle → NeverTicked for the informational
+// hint. Path C suppression has no grace window (a stuck-derivation
+// row that's never ticked under this spawn is always a false
+// positive regardless of age — the grace window only matters for
+// "should we tell the operator there's a problem with the Stop
+// hook?", not for "should we hide the red warning?").
+func coordNeverTickedThisSpawn(
+	records []*agent.Record,
+	id string,
+	lastTick time.Time,
+) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() {
+			return false
+		}
+		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
 // agentNeverTickedSinceSpawn reports whether a softer "spawned but never
 // ticked" hint should render after Path C self-heal. Returns true when
 // the agent record for id exists AND has a non-zero spawned_at older

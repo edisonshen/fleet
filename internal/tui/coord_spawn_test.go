@@ -797,6 +797,131 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	}
 }
 
+// TestRender_PreviouslyTickedAlreadyWedged_PreservesStuck pins the
+// codex iter-2 [P1] gate on Path C: when an alive coord already
+// published a coord-state.json tick under THIS spawn (LastTick ≥
+// SpawnedAt) and then wedged (LastTick stale + marker past timeout),
+// the stuck attention chip MUST surface — it's a real hang. Path C
+// suppression is for "never ticked", not "ticked once and then died".
+//
+// Without this gate, the codex review iter-2 finding would land: every
+// live tmux session with any matching agent record would demote to
+// Idle, hiding real wedge cases the operator needs to triage.
+func TestRender_PreviouslyTickedAlreadyWedged_PreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubRemoveMarker(t)
+
+	// SpawnedAt 20m ago; LastActivityTS stale; coord ticked at minute
+	// 12 (after SpawnedAt) then went silent. Classic "booted, ticked
+	// once, then wedged" — real hang.
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			LastActivityTS: now.Add(-30 * time.Minute), // stale
+			SpawnedAt:      now.Add(-20 * time.Minute),
+		},
+	}
+	p := &ProjectRow{
+		Name:     "demo",
+		RepoSlug: "demo",
+		LastTick: now.Add(-8 * time.Minute), // after SpawnedAt, but stale
+	}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("previously-ticked + wedged → stuck must surface; Path C must NOT suppress; got:\n%s", joined)
+	}
+}
+
+// TestCoordNeverTickedThisSpawn_EdgeCases pins the Path C narrow gate
+// helper. The "previously ticked then wedged" case (LastTick after
+// SpawnedAt) returns false — keep the stuck warning. "Never ticked"
+// (zero LastTick OR LastTick before SpawnedAt) returns true — Path C
+// can suppress.
+func TestCoordNeverTickedThisSpawn_EdgeCases(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	spawnedAt := now.Add(-15 * time.Minute)
+
+	cases := []struct {
+		name     string
+		records  []*agent.Record
+		id       string
+		lastTick time.Time
+		want     bool
+	}{
+		{
+			name:    "empty id → false",
+			records: []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:      "",
+			want:    false,
+		},
+		{
+			name:    "nil records → false",
+			records: nil,
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "no matching record → false",
+			records: []*agent.Record{{ID: "y", SpawnedAt: spawnedAt}},
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "zero SpawnedAt → false (legacy, can't tell)",
+			records: []*agent.Record{{ID: "x"}},
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "zero LastTick, valid SpawnedAt → true (never ticked)",
+			records: []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:      "x",
+			want:    true,
+		},
+		{
+			name:     "LastTick before SpawnedAt → true (leftover tick from previous coord)",
+			records:  []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:       "x",
+			lastTick: now.Add(-1 * time.Hour),
+			want:     true,
+		},
+		{
+			name:     "LastTick equals SpawnedAt → false (boundary: tick at exact spawn moment counts as ticked)",
+			records:  []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:       "x",
+			lastTick: spawnedAt,
+			want:     false,
+		},
+		{
+			name:     "LastTick after SpawnedAt → false (already ticked, even if now stale)",
+			records:  []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:       "x",
+			lastTick: now.Add(-2 * time.Minute),
+			want:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coordNeverTickedThisSpawn(tc.records, tc.id, tc.lastTick)
+			if got != tc.want {
+				t.Errorf("coordNeverTickedThisSpawn(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck pins the
 // brief-required Path C contract at the render layer (not in
 // applyStuckSelfHeal — see that helper's docstring for why Path C is

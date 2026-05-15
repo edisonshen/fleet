@@ -947,18 +947,30 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		})
 
 		// Path C suppression (2026-05-14 false-positive fix): if Path
-		// A/B did not heal and the agent record exists for an alive
-		// tmux session, the spawn pipeline completed but no Stop-hook
-		// tick has fired yet (HANDOFF state, freshly-booted, Stop hook
-		// misconfig). Suppress the red attention chip at the render
-		// layer WITHOUT removing the marker — the marker is the only
-		// proof of which agent is coord for the project in this state
-		// (no coordinator.lock body has been published yet), so the
-		// [a] re-attach path in findExistingCoordForProject still needs
-		// it. The softer coordSpawnNeverTicked hint below surfaces the
-		// underlying problem informationally when the agent has aged
-		// past the cold-start grace window.
-		if st == coordSpawnStuck && sessAlive && agentRecordExists(ctx.records, markerAgentID) {
+		// A/B did not heal, the agent record exists for an alive tmux
+		// session, AND the coord has never published a tick under this
+		// spawn (no coord-state.json yet, or its mtime predates the
+		// agent's spawned_at), the spawn pipeline completed but no
+		// Stop-hook tick has fired yet (HANDOFF state, freshly-booted,
+		// Stop hook misconfig). Suppress the red attention chip at the
+		// render layer WITHOUT removing the marker — the marker is the
+		// only proof of which agent is coord for the project in this
+		// state (no coordinator.lock body has been published yet), so
+		// the [a] re-attach path in findExistingCoordForProject still
+		// needs it. The softer coordSpawnNeverTicked hint below
+		// surfaces the underlying problem informationally when the
+		// agent has aged past the cold-start grace window.
+		//
+		// Narrow gate (codex iter-2 P1): Path C only suppresses when
+		// LastTick is zero OR predates SpawnedAt. If the coord
+		// previously ticked under this spawn (LastTick >= SpawnedAt)
+		// and is NOW stale + past spawnTimeout, the derivation's
+		// stuck verdict is RIGHT — the coord booted, published, and
+		// then wedged. The operator needs the attention chip to
+		// surface that as a real hang, not a false positive.
+		if st == coordSpawnStuck && sessAlive &&
+			agentRecordExists(ctx.records, markerAgentID) &&
+			coordNeverTickedThisSpawn(ctx.records, markerAgentID, p.LastTick) {
 			st = coordSpawnIdle
 		}
 	}
