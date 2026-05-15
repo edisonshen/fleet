@@ -73,6 +73,29 @@ def env_poll_interval_s() -> int:
     return _env_int("FLEET_COORD_POLL_INTERVAL_S", 30)
 
 
+def env_poll_base_interval_s() -> int:
+    """Default poll cadence per subagent (invariant 4, "5 seconds per
+    subagent" target). Used by the adaptive driver when the loop is
+    spending time on a single probe; the legacy single-rate driver
+    keeps `env_poll_interval_s()` for back-compat.
+
+    Default 5 s; tests pin smaller values. 0 falls back to the legacy
+    single-rate cadence (no adaptive backoff)."""
+    return _env_int("FLEET_COORD_POLL_BASE_INTERVAL_S", 5)
+
+
+def env_poll_backoff_interval_s() -> int:
+    """Dilated poll cadence per subagent after stability window (spec:
+    30 s). Tests pin smaller values."""
+    return _env_int("FLEET_COORD_POLL_BACKOFF_INTERVAL_S", 30)
+
+
+def env_poll_stability_window_s() -> int:
+    """Time a subagent's state must be stable before the per-probe
+    cadence dilates from base to backoff. Spec default 5 min = 300 s."""
+    return _env_int("FLEET_COORD_POLL_STABILITY_WINDOW_S", 300)
+
+
 def env_stuck_check_every() -> int:
     """Run stuck-check every Nth poll. 10 default = 5 min on 30 s polls.
     0 disables stuck-checking entirely (cheap mtime polling continues)."""
@@ -188,6 +211,16 @@ class SupervisorConfig:
     stuck_polls: int = 3                # 0 → fire recovery on first stuck pass
     nudge_cooldown_s: int = 120
     poll_max_s: int = 14400             # hard wall-clock cap
+    # Invariant-4 adaptive cadence (DESIGN-subagent-lifecycle.md §4).
+    #   poll_base_interval_s     — per-probe poll cadence default (5 s).
+    #   poll_backoff_interval_s  — dilated cadence after stability (30 s).
+    #   poll_stability_window_s  — seconds of no state-change before dilation.
+    # poll_base_interval_s=0 falls back to the legacy single-rate driver
+    # (poll_interval_s above) so legacy tests + operators stay byte-
+    # identical to v0.2.x supervisor behavior.
+    poll_base_interval_s: int = 5
+    poll_backoff_interval_s: int = 30
+    poll_stability_window_s: int = 300
 
     @classmethod
     def from_env(cls) -> "SupervisorConfig":
@@ -198,6 +231,9 @@ class SupervisorConfig:
             stuck_polls=env_stuck_polls(),
             nudge_cooldown_s=env_nudge_cooldown_s(),
             poll_max_s=env_poll_max_s(),
+            poll_base_interval_s=env_poll_base_interval_s(),
+            poll_backoff_interval_s=env_poll_backoff_interval_s(),
+            poll_stability_window_s=env_poll_stability_window_s(),
         )
 
 
@@ -634,6 +670,146 @@ def has_active_workers(probes: list[WorkerProbe]) -> bool:
     return len(probes) > 0
 
 
+# ---------- adaptive cadence ----------
+
+
+def compute_next_sleep_s(
+    *,
+    cfg: SupervisorConfig,
+    probes: list[WorkerProbe],
+    last_change_ts: dict[str, float],
+    now_unix: float,
+) -> float:
+    """Return the sleep interval for the next supervisor iteration.
+
+    Each probe has a per-slug "stable since" timestamp tracked in
+    `last_change_ts`. A probe stable for > poll_stability_window_s
+    dilates to poll_backoff_interval_s; otherwise it polls at
+    poll_base_interval_s.
+
+    The loop sleeps for `min(per_probe_cadence)`, so a single newly-
+    active subagent reverts the loop to base cadence (the responsiveness
+    requirement: the spec says "default 5 s per subagent" — the loop
+    must visit each probe within that window).
+
+    poll_base_interval_s <= 0 disables adaptive cadence; we fall back to
+    cfg.poll_interval_s (legacy single-rate). This keeps existing tests
+    that pin poll_base_interval_s=0 byte-identical to the v0.2.x driver.
+    """
+    if cfg.poll_base_interval_s <= 0:
+        return float(cfg.poll_interval_s)
+    if not probes:
+        # Nothing to poll — fall back to base cadence so the outer loop
+        # can re-evaluate has_active_workers in bounded time.
+        return float(cfg.poll_base_interval_s)
+    base = float(cfg.poll_base_interval_s)
+    backoff = float(max(cfg.poll_backoff_interval_s, cfg.poll_base_interval_s))
+    window = float(cfg.poll_stability_window_s)
+    min_interval = backoff
+    for p in probes:
+        last_change = last_change_ts.get(p.slug, now_unix)
+        age = now_unix - last_change
+        if age <= window:
+            return base  # at least one probe is hot — full speed
+        min_interval = min(min_interval, backoff)
+    return min_interval
+
+
+# ---------- force-tick (inbox / queue event) ----------
+
+
+def has_pending_inbox_events(
+    coord_id: str,
+    *,
+    fleet_home: Path,
+    last_seen_archive: str,
+) -> bool:
+    """Return True iff there's at least one inbox or queue event the
+    coord hasn't processed yet.
+
+    Two surfaces, both cheap fs scans (no parse, no shell):
+      1. ~/.fleet/inbox/<coord_id>.md — operator → coord message.
+      2. ~/.fleet/inbox/archive/<coord_id>-*.md — worker → coord archive
+         (the supervisor's force-tick wakes the loop when a worker's
+         response lands during a long backoff sleep). We compare archive
+         filenames against `last_seen_archive` (the watermark loop.py
+         persists). Any name > watermark counts.
+
+    The check is intentionally narrow: a true event triggers a forced
+    immediate poll on the next iteration; false positives just shorten
+    one sleep, so we err toward "skip force-tick" on any I/O hiccup.
+    """
+    if not coord_id:
+        return False
+    # Direct inbox file for operator messages.
+    direct = fleet_home / "inbox" / f"{coord_id}.md"
+    try:
+        if direct.exists():
+            return True
+    except OSError:
+        pass
+    # Archive sweep for worker responses.
+    archive = fleet_home / "inbox" / "archive"
+    try:
+        entries = archive.iterdir() if archive.is_dir() else iter(())
+    except OSError:
+        return False
+    prefix = coord_id + "-"
+    for entry in entries:
+        try:
+            name = entry.name
+        except OSError:
+            continue
+        if not name.startswith(prefix):
+            continue
+        if last_seen_archive and name <= last_seen_archive:
+            continue
+        return True
+    return False
+
+
+def emit_stuck_alert(
+    coord_id: str,
+    slug: str,
+    *,
+    fleet_home: Path,
+    detail: str,
+) -> str:
+    """Drop a [STUCK] inbox alert at ~/.fleet/inbox/<coord_id>.md.
+
+    Invariant 4 explicitly says "surface to operator (TUI badge, optional
+    inbox alert), NOT auto-killed". This is the inbox-alert surface.
+    The supervisor's existing recovery ladder (nudge → escalate → block)
+    is a SEPARATE behavior that legacy operators rely on; toggling it
+    off would regress recovery. The two surfaces coexist:
+      - stuck-alert (this fn): inbox drop so TUI/operator sees the flag.
+      - recovery ladder: actions that touch worker inboxes / tasks.md.
+
+    Returns the path written on success, "" on any error.
+
+    The write is append-only via O_APPEND so we don't clobber a coord
+    inbox that's already populated with an operator message — fleet-
+    guard's coord-side hook reads the file end-to-end.
+    """
+    if not coord_id or not slug:
+        return ""
+    inbox_dir = fleet_home / "inbox"
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return ""
+    target = inbox_dir / f"{coord_id}.md"
+    line = f"[STUCK] worker {slug}: {detail}\n"
+    try:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        return ""
+    return str(target)
+
+
 def run_supervisor(
     *,
     cfg: SupervisorConfig,
@@ -646,6 +822,8 @@ def run_supervisor(
     reconcile_one: Callable[[WorkerProbe], None],
     write_state: Callable[[], None],
     periodic_full_reconcile: Callable[[], None] | None = None,
+    force_tick_check: Callable[[], bool] | None = None,
+    reaper_hook: Callable[[list[WorkerProbe]], None] | None = None,
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -677,11 +855,18 @@ def run_supervisor(
 
     started_at = now_fn()
     last_mtimes: dict[str, float] = {}
+    # Per-slug "last observed state change" timestamp. Drives the
+    # invariant-4 adaptive cadence: probes stable for >
+    # poll_stability_window_s dilate from base to backoff cadence.
+    # Seeded to `started_at` so the loop polls at base cadence until
+    # each probe has accumulated stability_window worth of silence.
+    last_change_ts: dict[str, float] = {}
     poll_count = 0
 
     probes = refresh_probes()
     for p in probes:
         last_mtimes[p.slug] = safe_mtime(p.state_path)
+        last_change_ts[p.slug] = started_at
 
     if not has_active_workers(probes):
         res.exit_reason = "no-active-workers"
@@ -690,7 +875,9 @@ def run_supervisor(
 
     emit(
         f"[coord] supervisor loop starting: {len(probes)} active workers, "
-        f"poll={cfg.poll_interval_s}s stuck_every={cfg.stuck_check_every} "
+        f"poll={cfg.poll_interval_s}s base={cfg.poll_base_interval_s}s "
+        f"backoff={cfg.poll_backoff_interval_s}s "
+        f"stuck_every={cfg.stuck_check_every} "
         f"threshold={cfg.stuck_threshold_s}s",
         stream=log_stream,
     )
@@ -701,7 +888,28 @@ def run_supervisor(
             emit("[coord] supervisor loop exiting: max duration reached", stream=log_stream)
             break
 
-        sleep_fn(float(cfg.poll_interval_s))
+        # Invariant 4: compute the next sleep adaptively. Probes still
+        # in their stability window force base cadence; otherwise back
+        # off. force_tick_check is the inbox/queue event surface — if
+        # an event is queued we sleep 0 (effectively "skip the wait").
+        forced = False
+        if force_tick_check is not None:
+            try:
+                forced = bool(force_tick_check())
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"force_tick_check: {exc}")
+                forced = False
+        if forced:
+            sleep_s = 0.0
+        else:
+            sleep_s = compute_next_sleep_s(
+                cfg=cfg,
+                probes=probes,
+                last_change_ts=last_change_ts,
+                now_unix=now_fn(),
+            )
+        if sleep_s > 0:
+            sleep_fn(sleep_s)
         poll_count += 1
         res.iterations += 1
 
@@ -720,8 +928,12 @@ def run_supervisor(
         for slug in list(last_mtimes.keys()):
             if slug not in cur_slugs:
                 del last_mtimes[slug]
+        for slug in list(last_change_ts.keys()):
+            if slug not in cur_slugs:
+                del last_change_ts[slug]
         for p in probes:
             last_mtimes.setdefault(p.slug, safe_mtime(p.state_path))
+            last_change_ts.setdefault(p.slug, now_fn())
 
         # Mtime change detection — cheap stat, no API calls.
         changed: list[WorkerProbe] = []
@@ -731,6 +943,7 @@ def run_supervisor(
             if cur > prev:
                 changed.append(p)
                 last_mtimes[p.slug] = cur
+                last_change_ts[p.slug] = now_fn()
 
         if changed:
             for p in changed:
@@ -743,6 +956,16 @@ def run_supervisor(
                 write_state()
             except Exception as exc:  # noqa: BLE001
                 res.errors.append(f"write_state after reconcile: {exc}")
+
+        # Invariant 5 (reaper). The hook runs every iteration so
+        # complete/error-abort judgments are acted on within one poll
+        # cadence (5 s default). Hook owns its own state persistence
+        # via the coord-state.json layer; failures are non-fatal.
+        if reaper_hook is not None:
+            try:
+                reaper_hook(probes)
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"reaper_hook: {exc}")
 
         # Periodic full reconcile + sparse stuck-check. Decoupled
         # cadences: periodic_full_reconcile runs at every
@@ -1048,6 +1271,21 @@ def _run_stuck_check_pass(
                     f"[coord] worker {p.slug} stuck since {_fmt_ts(now_unix)}; nudging",
                     stream=log_stream,
                 )
+                # DESIGN invariant 4: surface stuck workers to the
+                # operator via the coord's own inbox so the TUI shows
+                # the alert separately from the per-worker nudge.
+                # Skipped silently when FLEET_AGENT_ID isn't set (test
+                # path or v0.1 manual-coord usage). Failures here are
+                # non-fatal — the nudge already fired.
+                coord_id = os.environ.get("FLEET_AGENT_ID", "") or ""
+                if coord_id:
+                    emit_stuck_alert(
+                        coord_id, p.slug, fleet_home=home,
+                        detail=(
+                            f"phase={cur_phase or '?'} idle since "
+                            f"{_fmt_ts(now_unix)}; nudged"
+                        ),
+                    )
         elif sup.escalated_at <= 0.0:
             # Need at least one full cooldown after the nudge before
             # escalating, so the worker has a chance to respond.

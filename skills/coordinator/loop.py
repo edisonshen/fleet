@@ -41,6 +41,7 @@ from typing import Iterable
 import conflict
 import dispatch as dispatch_mod
 import parse
+import reaper as reaper_mod
 import remote_control
 import supervisor as supervisor_mod
 import worktree as worktree_mod
@@ -263,12 +264,47 @@ def _tick_locked(
     state_path = project_dir / "coord-state.json"
     state = _load_coord_state(state_path)
 
-    # 3. Reconcile in-flight workers.
+    # 2.5. Reaper pass (DESIGN invariant 5). Runs BEFORE reconcile so a
+    # worker whose state.json reports phase=done has its tmux session
+    # killed + record archived BEFORE _apply_reconcile flips status to
+    # in-review/done. Reaper mutates `state` in place (kill_directive_ts
+    # tracking + redispatch_pending flagging). Decisions are surfaced
+    # as raises/errors so the operator sees the hard-kill events.
+    try:
+        reap_decisions = _reap_inflight(
+            f.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=state, now_unix=now_unix,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"reaper: {exc}")
+        reap_decisions = []
+    for dec in reap_decisions:
+        if dec.state == "hard-killed":
+            result.errors.append(
+                f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+            )
+            result.raised += 1
+        elif dec.state == "error":
+            result.errors.append(
+                f"reaper error {dec.slug}: {dec.detail}"
+            )
+
+    # 3. Reconcile in-flight workers. Reaper-gated: a worker whose
+    # reaper lane is still open (kill_directive sent, grace not yet
+    # expired) defers its status flip — _apply_reconcile is suppressed
+    # for that action this tick.
     reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
     reconcile_repo = cwd if cap > 1 else ""
     reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
     for action in reconciled:
+        # Invariant 5 gate: if this action would clear the worker
+        # (terminal-ish transition) but the reaper hasn't completed
+        # its kill cycle yet, defer the apply. The next tick re-runs
+        # reconcile and re-evaluates — once the reaper finishes the
+        # archive, this action proceeds.
+        if action.clear_worker and not _reaper_lane_clear_for(state, action.slug):
+            continue
         try:
             _apply_reconcile(
                 action, project, fleet_bin,
@@ -286,6 +322,10 @@ def _tick_locked(
             if action.clear_worker:
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
+                # The reaper entry for this slug was already deleted by
+                # reap_probes when the kill succeeded; clear redispatch
+                # marker too so a re-dispatch tick doesn't loop forever.
+                reaper_mod.clear_redispatch_pending(state, action.slug)
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
@@ -665,6 +705,45 @@ def _run_supervisor(
         cs = _load_coord_state(state_path)
         _save_coord_state(state_path, cs)
 
+    # Invariant 4 force-tick: short-circuit the next sleep when there's
+    # a pending inbox event for this coord. Cheap fs scan; the supervisor
+    # consults this on every iteration before computing the sleep budget.
+    def force_tick_check_hook() -> bool:
+        cs = _load_coord_state(state_path)
+        watermark = str(cs.get("last_archive_scan_ts", "") or "")
+        return supervisor_mod.has_pending_inbox_events(
+            coord_id=os.environ.get("FLEET_AGENT_ID", "") or "",
+            fleet_home=home,
+            last_seen_archive=watermark,
+        )
+
+    # Invariant 5 reaper hook. Runs every iteration so a worker that
+    # writes phase=done mid-supervisor session is reaped within the
+    # base poll cadence (5 s default) rather than waiting for the
+    # next stuck-check pass (5 min default).
+    def reaper_hook_supervisor(probes):
+        try:
+            f5 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"reaper hook tasks-read: {exc}")
+            return
+        cs = _load_coord_state(state_path)
+        decisions = _reap_inflight(
+            f5.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=cs, now_unix=time.time(),
+        )
+        for dec in decisions:
+            if dec.state == "hard-killed":
+                result.errors.append(
+                    f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+                )
+                result.raised += 1
+            elif dec.state == "error":
+                result.errors.append(
+                    f"reaper error {dec.slug}: {dec.detail}"
+                )
+        _save_coord_state(state_path, cs)
+
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
         project=project,
@@ -674,6 +753,8 @@ def _run_supervisor(
         reconcile_one=reconcile_one,
         write_state=write_state_hook,
         periodic_full_reconcile=periodic_full_reconcile,
+        force_tick_check=force_tick_check_hook,
+        reaper_hook=reaper_hook_supervisor,
     )
     # Surface supervisor stats as auxiliary tick result fields. We
     # don't mutate TickResult's primary counters because they describe
@@ -689,6 +770,114 @@ def _supervisor_has_inflight(tasks) -> bool:
         if t.status in ("in-progress", "in-review"):
             return True
     return False
+
+
+# ---------- reaper integration (invariant 5) ----------
+#
+# The reaper judges each in-flight worker on every supervisor poll and on
+# the primary tick path. When the judgment is `complete` or `error-abort`
+# it sends /exit, waits the grace window, falls through to `fleet rm`,
+# and last-resort `kill -9`s the pid.
+#
+# Status-flip ordering: the existing _reconcile_inflight path computes
+# `new_status` and `clear_worker` from state.json. We layer the reaper
+# under it: the reaper runs first to make sure the tmux session is gone
+# (or recorded as in-progress kill); then _apply_reconcile's status flip
+# is the operator-visible commit point. If the reaper still has an open
+# entry for a slug, _apply_reconcile defers the status flip — matches the
+# DESIGN doc: "Before the reaper succeeds, status stays in its prior
+# non-terminal state — so the operator never sees 'task done' with a
+# still-live worker."
+
+
+def _build_reap_inputs(
+    tasks: list[parse.Task],
+    *,
+    project: str,
+    home: Path,
+    agent_id_map: dict[str, str],
+    is_git: bool,
+) -> list[reaper_mod.ReapInputs]:
+    """Build ReapInputs from the in-flight task list.
+
+    Probes every task at status=in-progress or in-review. In-review
+    workers have already exited (the PR is open and we're polling CI);
+    the reaper just confirms the tmux session is gone — the judgment
+    will normally be `complete` (phase=done with pr_url) so we run the
+    archive path even when the subprocess exited cleanly without
+    a `/exit`.
+    """
+    out: list[reaper_mod.ReapInputs] = []
+    for t in tasks:
+        if t.status not in ("in-progress", "in-review"):
+            continue
+        agent_id = agent_id_map.get(t.slug, "")
+        tmux_session = (
+            supervisor_mod.session_name_for_agent(agent_id) if agent_id else ""
+        )
+        worker_state = _read_worker_state(project, t.slug, home=home)
+        pid = 0
+        if worker_state is not None:
+            raw_pid = worker_state.get("pid", 0) or worker_state.get("worker_pid", 0)
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                pid = 0
+        out.append(reaper_mod.ReapInputs(
+            slug=t.slug,
+            agent_id=agent_id,
+            tmux_session=tmux_session,
+            worker_state=worker_state,
+            task_status=t.status,
+            pid=pid,
+            is_git=is_git,
+        ))
+    return out
+
+
+def _reap_inflight(
+    tasks: list[parse.Task],
+    *,
+    project: str,
+    home: Path,
+    fleet_bin: str,
+    coord_state: dict,
+    now_unix: float,
+) -> list[reaper_mod.ReapDecision]:
+    """Run the reaper against every in-flight task. Mutates coord_state
+    in place; caller persists via _save_coord_state.
+
+    Returns the decisions list (one per probe). The caller is expected
+    to surface stderr-grade [P0] events and translate decisions into
+    tick-result error / raise text where relevant.
+    """
+    if not tasks:
+        return []
+    agent_id_map = supervisor_mod.load_agent_id_map(coord_state)
+    is_git = dispatch_mod.project_is_git(project, fleet_home=str(home))
+    inputs = _build_reap_inputs(
+        tasks, project=project, home=home,
+        agent_id_map=agent_id_map, is_git=is_git,
+    )
+    if not inputs:
+        return []
+    grace = reaper_mod.env_grace_window_s()
+    decisions = reaper_mod.reap_probes(
+        probes_inputs=inputs,
+        coord_state=coord_state,
+        fleet_bin=fleet_bin,
+        now_unix=now_unix,
+        grace_window_s=grace,
+        session_alive_fn=supervisor_mod.tmux_session_alive,
+    )
+    return decisions
+
+
+def _reaper_lane_clear_for(coord_state: dict, slug: str) -> bool:
+    """Wrapper so loop.py callers don't import reaper_mod directly when
+    only this gate is needed. Returns True iff the reaper has no open
+    kill cycle for `slug`."""
+    return reaper_mod.reaper_lane_clear(coord_state, slug)
 
 
 # ---------- lock helpers ----------
