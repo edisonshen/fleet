@@ -28,5 +28,13 @@ if _SKILL_DIR not in sys.path:
 @pytest.fixture(autouse=True)
 def _disable_supervisor_by_default(monkeypatch):
     """Default: supervisor disabled. Tests that need it set their own
-    FLEET_COORD_POLL_INTERVAL_S inside the test body via monkeypatch."""
+    FLEET_COORD_POLL_INTERVAL_S inside the test body via monkeypatch.
+
+    FLEET_COORD_POLL_BASE_INTERVAL_S=0 pins the legacy single-rate
+    driver (poll_interval_s) so existing tests stay byte-identical to
+    the v0.2.x supervisor behavior. The new invariant-4 adaptive
+    cadence is exercised by tests that override this explicitly via
+    monkeypatch + SupervisorConfig() args.
+    """
     monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "0")
+    monkeypatch.setenv("FLEET_COORD_POLL_BASE_INTERVAL_S", "0")

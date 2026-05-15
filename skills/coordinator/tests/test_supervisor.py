@@ -115,6 +115,10 @@ def _cfg(**overrides) -> supervisor.SupervisorConfig:
         poll_interval_s=30, stuck_check_every=10,
         stuck_threshold_s=180, stuck_polls=3, nudge_cooldown_s=120,
         poll_max_s=14400,
+        # Legacy single-rate driver. Tests that exercise the invariant-4
+        # adaptive cadence override these explicitly.
+        poll_base_interval_s=0, poll_backoff_interval_s=0,
+        poll_stability_window_s=0,
     )
     base.update(overrides)
     return supervisor.SupervisorConfig(**base)
@@ -684,7 +688,7 @@ def test_stuck_check_runs_only_every_n_polls(
     # Stub out actual stuck-check pass to count invocations.
     pass_count = {"n": 0}
 
-    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream):
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
         pass_count["n"] += 1
         return supervisor._StuckPassResult()
 
@@ -1657,3 +1661,799 @@ def test_idle_agent_archive_pass_skips_malformed_record(
         now_unix=2000000000.0, log_stream=io.StringIO(),
     )
     assert archived == 0
+
+
+# ---------- Invariant 4: adaptive cadence (base 5s → backoff 30s) ----------
+
+
+def _adaptive_cfg(**overrides) -> supervisor.SupervisorConfig:
+    """Cfg with adaptive cadence ENABLED. Differs from _cfg by setting
+    poll_base_interval_s > 0; the legacy _cfg pins it to 0 so existing
+    tests stay on the single-rate driver."""
+    base = dict(
+        poll_interval_s=5, stuck_check_every=0,
+        stuck_threshold_s=180, stuck_polls=3, nudge_cooldown_s=120,
+        poll_max_s=14400,
+        poll_base_interval_s=5,
+        poll_backoff_interval_s=30,
+        poll_stability_window_s=300,
+    )
+    base.update(overrides)
+    return supervisor.SupervisorConfig(**base)
+
+
+def test_legacy_mode_stuck_check_cadence_uses_wall_clock(fleet_home: Path) -> None:
+    """Codex iter-8 [P2] regress: forced-wake zero-sleep iterations
+    used to inflate poll_count and could trigger the periodic / stuck
+    check ladders prematurely in legacy mode. Wall-clock cadence
+    means a burst of zero-sleep iterations does NOT advance the
+    cadence — only elapsed seconds do."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    stuck_count = {"n": 0}
+
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
+        stuck_count["n"] += 1
+        return supervisor._StuckPassResult()
+    import unittest.mock as mock
+    fake_now_state = {"t": 0.0}
+
+    def fake_sleep(s):
+        fake_now_state["t"] += s if s > 0 else 0.0
+
+    seq = iter([[probe]] * 20 + [[]])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _cfg(
+        poll_interval_s=30, stuck_check_every=10,
+    )
+    # All iterations force-tick → zero sleep. With legacy poll-count
+    # cadence, 20 zero-sleep iterations × stuck_check_every=10 would
+    # trigger stuck-check twice. With wall-clock cadence, no time
+    # passes (fake_sleep recorded 0 every iter), so cadence target
+    # (30 × 10 = 300 s) is never reached → zero stuck-checks.
+    with mock.patch.object(supervisor, "_run_stuck_check_pass", fake_pass):
+        supervisor.run_supervisor(
+            cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+            sleep_fn=fake_sleep, now_fn=lambda: fake_now_state["t"],
+            refresh_probes=fake_refresh,
+            reconcile_one=lambda p: None,
+            write_state=lambda: None,
+            force_tick_check=lambda: True,
+            log_stream=io.StringIO(),
+        )
+    assert stuck_count["n"] == 0, (
+        f"forced-wake bursts triggered premature stuck-check: {stuck_count['n']}"
+    )
+
+
+def test_env_legacy_poll_interval_does_not_force_adaptive_cadence(
+    monkeypatch,
+) -> None:
+    """Codex iter-5 [P2]: an operator who only sets
+    FLEET_COORD_POLL_INTERVAL_S=60 must keep getting 60 s polls.
+    Without an explicit FLEET_COORD_POLL_BASE_INTERVAL_S, the adaptive
+    cadence stays off (poll_base_interval_s=0)."""
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "60")
+    monkeypatch.delenv("FLEET_COORD_POLL_BASE_INTERVAL_S", raising=False)
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.poll_interval_s == 60
+    # Adaptive cadence disabled — falls through to poll_interval_s.
+    assert cfg.poll_base_interval_s == 0
+
+
+def test_env_explicit_base_interval_enables_adaptive_cadence(
+    monkeypatch,
+) -> None:
+    """Operator who explicitly sets FLEET_COORD_POLL_BASE_INTERVAL_S
+    (even to the default 5) gets the adaptive driver."""
+    monkeypatch.setenv("FLEET_COORD_POLL_BASE_INTERVAL_S", "5")
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.poll_base_interval_s == 5
+
+
+def test_poll_cadence_default_5s() -> None:
+    """When no probe has been stable for stability_window, the next
+    sleep is poll_base_interval_s (default 5)."""
+    cfg = _adaptive_cfg()
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=Path("/tmp/nope"),
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # Fresh start: last_change_ts == now → age 0 < stability window.
+    s = supervisor.compute_next_sleep_s(
+        cfg=cfg, probes=[probe],
+        last_change_ts={"alpha-aaaa": 1000.0},
+        now_unix=1000.0,
+    )
+    assert s == 5.0
+
+
+def test_poll_cadence_adaptive_backoff_after_5min_stable() -> None:
+    """When EVERY probe has been stable for > stability_window, the
+    sleep dilates to poll_backoff_interval_s."""
+    cfg = _adaptive_cfg()
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=Path("/tmp/nope"),
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # last_change 600s ago > stability_window=300 → backoff.
+    s = supervisor.compute_next_sleep_s(
+        cfg=cfg, probes=[probe],
+        last_change_ts={"alpha-aaaa": 1000.0},
+        now_unix=1600.0,
+    )
+    assert s == 30.0
+
+
+def test_poll_cadence_one_active_probe_keeps_loop_at_base() -> None:
+    """A single hot probe pulls the whole loop back to base cadence —
+    matches the spec: 'default 5 s PER subagent'."""
+    cfg = _adaptive_cfg()
+    hot = supervisor.WorkerProbe(
+        slug="hot-aaaa", state_path=Path("/tmp/nope"),
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    cold = supervisor.WorkerProbe(
+        slug="cold-bbbb", state_path=Path("/tmp/nope2"),
+        agent_id="bbbbbbbb", tmux_session="fleet-bbbbbbbb",
+    )
+    s = supervisor.compute_next_sleep_s(
+        cfg=cfg, probes=[hot, cold],
+        # hot probe just changed; cold has been stable for hours.
+        last_change_ts={"hot-aaaa": 1500.0, "cold-bbbb": 0.0},
+        now_unix=1500.0,
+    )
+    assert s == 5.0
+
+
+def test_poll_cadence_legacy_single_rate_when_base_zero() -> None:
+    """poll_base_interval_s=0 disables adaptive cadence — fall back to
+    poll_interval_s. This preserves v0.2.x byte-identical behavior for
+    legacy tests + operators."""
+    cfg = _cfg(poll_interval_s=30)
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=Path("/tmp/nope"),
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    s = supervisor.compute_next_sleep_s(
+        cfg=cfg, probes=[probe],
+        last_change_ts={"alpha-aaaa": 0.0},
+        now_unix=100000.0,
+    )
+    assert s == 30.0
+
+
+def test_poll_cadence_force_tick_on_inbox_event(fleet_home: Path) -> None:
+    """force_tick_check returning True → sleep_fn invoked with 0
+    (no actual wait). Verified by capturing sleep_fn args."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    # First refresh returns the probe; second returns [] to exit loop.
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    # First iteration: force-tick returns True → sleep_s=0.
+    # Second iteration: returns False → sleep_s>0.
+    force_calls = {"n": 0}
+
+    def fake_force():
+        force_calls["n"] += 1
+        return force_calls["n"] == 1
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=fake_force,
+        log_stream=io.StringIO(),
+    )
+    # Iter 1: force-tick fired → 0.1s throttle sleep (codex iter-19
+    # [P2]: floor on forced wakes to prevent spin on parse-error
+    # spin scenarios).
+    # Iter 2: force-tick False → full base/backoff cadence (5 or 30 s).
+    assert force_calls["n"] >= 2
+    assert any(s >= 5.0 for s in sleep_calls), sleep_calls
+    # The first sleep is the throttle for the forced wake; the second
+    # is the genuine cadence sleep after force-tick returned False.
+    assert sleep_calls[0] == 0.1
+    assert res.exit_reason == "all-terminal"
+
+
+def test_poll_detects_stuck_via_last_activity_ts_plus_session_alive(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Invariant 4 stuck condition: last_activity_ts stale AND tmux
+    alive AND status=running → mark stuck. Verify is_stuck_idle
+    captures all four conditions."""
+    state = {
+        "phase": "tdd-red",
+        "updated_at": "1970-01-01T00:00:00Z",  # very stale
+    }
+    sup = supervisor.WorkerSupervisorState(
+        slug="alpha-aaaa", consecutive_stuck_polls=5,
+    )
+    cfg = _cfg(stuck_polls=3, stuck_threshold_s=10)
+    assert supervisor.is_stuck_idle(
+        state, sup, cfg=cfg, session_alive=True, now_unix=10_000.0,
+    ) is True
+    # Tmux dead breaks the contract — not stuck (nothing to nudge).
+    assert supervisor.is_stuck_idle(
+        state, sup, cfg=cfg, session_alive=False, now_unix=10_000.0,
+    ) is False
+    # Terminal phase breaks it too.
+    state2 = {"phase": "done", "updated_at": "1970-01-01T00:00:00Z"}
+    assert supervisor.is_stuck_idle(
+        state2, sup, cfg=cfg, session_alive=True, now_unix=10_000.0,
+    ) is False
+
+
+def test_stuck_alert_drops_inbox_line(fleet_home: Path) -> None:
+    """emit_stuck_alert writes [STUCK] line into ~/.fleet/inbox/<coord>.md.
+    The TUI/operator surface is this file."""
+    target = supervisor.emit_stuck_alert(
+        "c00bf001", "alpha-aaaa", fleet_home=fleet_home,
+        detail="phase=tdd-red idle since X",
+    )
+    assert target
+    body = (fleet_home / "inbox" / "c00bf001.md").read_text()
+    assert "[STUCK]" in body
+    assert "alpha-aaaa" in body
+    assert "phase=tdd-red" in body
+
+
+def test_stuck_alert_appends_does_not_clobber(fleet_home: Path) -> None:
+    """Append-only: an existing inbox file is preserved."""
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[OPERATOR] previous message\n", encoding="utf-8")
+    supervisor.emit_stuck_alert(
+        "c00bf001", "alpha-aaaa", fleet_home=fleet_home, detail="d",
+    )
+    body = inbox.read_text()
+    assert "[OPERATOR] previous message" in body
+    assert "[STUCK]" in body
+
+
+def test_has_pending_inbox_events_true_on_direct_inbox(fleet_home: Path) -> None:
+    """Direct inbox file present with mtime > baseline → True."""
+    (fleet_home / "inbox" / "c00bf001.md").write_text("hi", encoding="utf-8")
+    # Default baseline=0.0 → any mtime triggers event.
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+    ) is True
+
+
+def test_has_pending_inbox_events_false_when_baseline_matches_mtime(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-1 [P1] regress: a coord inbox file that persists
+    across the supervisor session must NOT keep force-ticking. With
+    baseline = current mtime, only an mtime advance counts."""
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("hi", encoding="utf-8")
+    import os as _os
+    cur_mtime = _os.stat(inbox).st_mtime
+    # Pretend the supervisor recorded this mtime at session start.
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+        direct_inbox_mtime_baseline=cur_mtime,
+    ) is False
+    # Touch the file (advance mtime) — event fires.
+    _os.utime(inbox, (cur_mtime + 10, cur_mtime + 10))
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+        direct_inbox_mtime_baseline=cur_mtime,
+    ) is True
+
+
+def test_has_pending_inbox_events_true_on_archive_post_watermark(
+    fleet_home: Path,
+) -> None:
+    """Archive file > watermark → force-tick returns True."""
+    archive = fleet_home / "inbox" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "c00bf001-20260101-000000Z-msg.md").write_text("hi", encoding="utf-8")
+    # Watermark below the file: should detect it.
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home,
+        last_seen_archive="c00bf001-20250101-000000Z-old.md",
+    ) is True
+    # Watermark at-or-above the file: no event.
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home,
+        last_seen_archive="c00bf001-20270101-000000Z-old.md",
+    ) is False
+
+
+def test_has_pending_inbox_events_false_on_empty(fleet_home: Path) -> None:
+    """No inbox files at all → False (no event)."""
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+    ) is False
+
+
+def test_has_pending_inbox_events_false_on_empty_coord_id(fleet_home: Path) -> None:
+    """Empty coord_id is a no-op (we don't know whose inbox to check)."""
+    assert supervisor.has_pending_inbox_events(
+        "", fleet_home=fleet_home, last_seen_archive="",
+    ) is False
+
+
+def test_force_tick_does_not_spin_after_first_hit(fleet_home: Path) -> None:
+    """Codex iter-2 [P1] regress: after a force-tick fires on an
+    inbox event, the supervisor MUST eventually sleep again (the event
+    is processed and the baseline/watermark advances). Without this
+    advance, the supervisor spins at 0-second sleeps forever.
+
+    Driven via the production loop.tick path so the integration is
+    end-to-end: place an inbox file, run a single supervisor iteration
+    that force-ticks once, then assert the NEXT iteration would NOT
+    force-tick again."""
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[OPERATOR] hi\n", encoding="utf-8")
+    import os as _os
+    cur_mtime = _os.stat(inbox).st_mtime
+    # Build the hook the way loop.py does, with a mutable baseline.
+    baseline = {"mtime": cur_mtime - 10.0, "archive": ""}
+
+    def hook():
+        triggered = supervisor.has_pending_inbox_events(
+            "c00bf001", fleet_home=fleet_home,
+            last_seen_archive=baseline["archive"],
+            direct_inbox_mtime_baseline=baseline["mtime"],
+        )
+        if triggered:
+            try:
+                baseline["mtime"] = _os.stat(inbox).st_mtime
+            except OSError:
+                pass
+        return triggered
+
+    # First call: mtime > baseline → fires.
+    assert hook() is True
+    # Second call: baseline now equals mtime → does NOT fire.
+    assert hook() is False
+
+
+def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
+    fleet_home: Path,
+) -> None:
+    """Wire test: force_tick_check returning True causes the next
+    iteration to NOT sleep (sleep_fn invoked with 0 → loop skips).
+    Verify with sleep_calls capture."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    # ALWAYS force-tick → 0.1s throttle on each iteration (codex
+    # iter-19 [P2]: floor on forced wakes to prevent spin on
+    # parse-error scenarios).
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        log_stream=io.StringIO(),
+    )
+    # Every forced iteration applied the 0.1s throttle.
+    assert all(s == 0.1 for s in sleep_calls), sleep_calls
+    assert res.iterations >= 1
+
+
+def test_reaper_hook_return_triggers_reconcile_for_just_reaped_slugs(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-3 [P2]: when the reaper hook returns a list of slugs
+    whose kill cycle completed THIS iteration, those slugs get added
+    to `changed` so reconcile re-runs against them — closing the
+    "deferred status flip waits for periodic full reconcile" gap that
+    blocks cap=1 dispatch for ~5 min."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="done", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    reconcile_calls: list[str] = []
+
+    def fake_reconcile(p):
+        reconcile_calls.append(p.slug)
+
+    # Reaper hook reports alpha-aaaa just got reaped (returned the slug).
+    def fake_reap(probes):
+        return ["alpha-aaaa"]
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=fake_reconcile,
+        write_state=lambda: None,
+        reaper_hook=fake_reap,
+        log_stream=io.StringIO(),
+    )
+    # Even though state.json mtime didn't advance, reconcile fired
+    # because the reaper hook returned alpha-aaaa as just-reaped.
+    assert "alpha-aaaa" in reconcile_calls, f"reconcile_calls={reconcile_calls}"
+
+
+def test_supervisor_exits_when_operator_writes_direct_inbox(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-10 [P2] regress: the coord inbox at
+    ~/.fleet/inbox/<coord>.md is consumed by fleet-guard's
+    SessionStart hook on the NEXT Claude-agent turn, not by the coord
+    skill itself. While the supervisor is running, an operator message
+    sent via `fleet message <coord>` would otherwise stay invisible
+    until the supervisor exits (could be 4 h).
+
+    Fix: when a direct-inbox file's mtime ADVANCES past the start-of-
+    session baseline (codex iter-11 [P1]), exit the supervisor so
+    the next turn fires fleet-guard.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # Pre-existing inbox file (e.g., a [STUCK] alert from a previous
+    # supervisor session); baseline must capture this so it doesn't
+    # cause a premature exit. Set mtime to a known-old value so the
+    # supervisor records that as the baseline.
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[STUCK] stale alpha-aaaa phase=tdd-red\n", encoding="utf-8")
+    import os as _os
+    pre_mtime = 1000.0
+    _os.utime(inbox, (pre_mtime, pre_mtime))
+
+    # force_tick will fire each iteration; on the second call, we
+    # bump the inbox mtime past the baseline to simulate an operator
+    # writing a new message mid-supervision.
+    check_count = {"n": 0}
+
+    def fake_force():
+        check_count["n"] += 1
+        if check_count["n"] == 2:
+            _os.utime(inbox, (pre_mtime + 100, pre_mtime + 100))
+        return True
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=fake_force,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor exited because the operator wrote to the direct inbox
+    # (mtime advanced past the start-of-session baseline).
+    assert res.exit_reason == "operator-inbox-message"
+
+
+def test_supervisor_own_stuck_alert_does_not_trigger_inbox_exit(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex iter-12 [P1] regress: when _run_stuck_check_pass emits a
+    [STUCK] alert into the coord's own inbox, the supervisor MUST NOT
+    treat that as an operator message and exit. The session baseline
+    is bumped to swallow the supervisor's own write.
+
+    Driven by stubbing the stuck-check pass to write to the inbox
+    directly + asserting the supervisor reaches all-terminal rather
+    than operator-inbox-message exit.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # No pre-existing inbox file — baseline=0; the stub will create it.
+    import os as _os
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+
+    # Stub stuck-check to write the [STUCK] alert (simulating
+    # _run_stuck_check_pass's emit_stuck_alert call). The stub also
+    # appends the post-write mtime to stuck_alert_mtimes so the
+    # supervisor's baseline-update path treats our write as a
+    # supervisor-side write (not an operator message).
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
+        inbox.write_text("[STUCK] alpha-aaaa\n", encoding="utf-8")
+        if stuck_alert_mtimes is not None:
+            stuck_alert_mtimes.append(inbox.stat().st_mtime)
+        return supervisor._StuckPassResult(nudges=1, stuck_alerts=1)
+    monkeypatch.setattr(supervisor, "_run_stuck_check_pass", fake_pass)
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], [probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    # stuck_check_every=1 → run stuck pass every iter; force_tick=True →
+    # every iter is forced. Without the baseline bump, the supervisor
+    # would exit after the first stuck-check write.
+    cfg = _adaptive_cfg(stuck_check_every=1)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor reached all-terminal — its OWN [STUCK] writes did NOT
+    # trigger the operator-inbox exit.
+    assert res.exit_reason == "all-terminal"
+
+
+def test_supervisor_does_not_exit_on_stale_inbox_file(fleet_home: Path) -> None:
+    """Codex iter-11 [P1] regress: a pre-existing inbox file (e.g., a
+    [STUCK] alert dropped by emit_stuck_alert itself in a prior tick)
+    must NOT trigger the operator-message-exit on every forced wake.
+    The exit only fires when mtime advances past the start-of-session
+    baseline."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # Pre-existing inbox file — should NOT trigger exit because the
+    # mtime baseline captures its initial state.
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[STUCK] stale\n", encoding="utf-8")
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor reached "all-terminal" — the stale inbox did NOT
+    # trigger a premature operator-message exit.
+    assert res.exit_reason == "all-terminal"
+
+
+def test_reaper_hook_runs_before_reconcile_on_mtime_change(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-1 [P1] regress: when a worker's state.json mtime
+    advances mid-supervisor session (phase=done write), the reaper hook
+    MUST run BEFORE reconcile_one. Otherwise reconcile would flip status
+    + forget the agent_id mapping before the reaper sends /exit — leaking
+    the tmux session as an orphan. Order verified by capturing call
+    ordering."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    call_order: list[str] = []
+
+    def fake_reap(probes):
+        call_order.append("reap")
+
+    def fake_reconcile_one(p):
+        call_order.append("reconcile")
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+        # Touch the state.json so the NEXT iteration sees mtime change.
+        os.utime(a_path, None)
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=fake_reconcile_one,
+        write_state=lambda: None,
+        reaper_hook=fake_reap,
+        log_stream=io.StringIO(),
+    )
+    # First active iteration: reap, then reconcile. Verify reap precedes
+    # reconcile every time both fire.
+    reap_idx = [i for i, c in enumerate(call_order) if c == "reap"]
+    reconcile_idx = [i for i, c in enumerate(call_order) if c == "reconcile"]
+    assert reap_idx, f"reaper hook never fired: {call_order}"
+    if reconcile_idx:
+        # If reconcile fired this iteration, the reap call must precede it.
+        for r_idx in reconcile_idx:
+            preceding_reaps = [i for i in reap_idx if i < r_idx]
+            assert preceding_reaps, (
+                f"reconcile fired before reaper: {call_order}"
+            )
+
+
+def test_reaper_hook_called_each_iteration(fleet_home: Path) -> None:
+    """The reaper_hook is invoked once per supervisor iteration. Verify
+    by counting calls."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    reap_calls: list[int] = []
+
+    def fake_reap(probes):
+        reap_calls.append(len(probes))
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        reaper_hook=fake_reap,
+        log_stream=io.StringIO(),
+    )
+    # res.iterations counts the iteration that exited via "all-terminal"
+    # too — the reaper hook only fires on iterations with active probes.
+    # 3 iterations: 1 + 2 with probes, 3rd refresh returns [] → exit.
+    assert len(reap_calls) >= 1
+    assert all(n == 1 for n in reap_calls)
+    # Total iterations include the empty-probes exit iteration.
+    assert res.iterations >= len(reap_calls)

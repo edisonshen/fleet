@@ -927,25 +927,170 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		ctx.now,
 		coordActiveWindow, ctx.spawnTimeout,
 	)
-	if st == coordSpawnStuck && markerAgentID != "" {
-		sess := tmuxSessionName(markerAgentID)
-		alive := sessionAliveFn(sess)
-		// Path B probe: does the agent record on disk show a recent
-		// last_activity_ts? If yes, the spawn already succeeded and the
-		// marker is stale — heal regardless of tmux state. Path A still
-		// covers the dead-tmux + no-record case for silent spawn deaths.
-		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
-		st, _ = applyStuckSelfHeal(st, markerAgentID, alive, fresh, func() error {
-			return removeCoordSpawnMarkerFn(p.Name)
-		})
+	// Probe tmux liveness once per render. Cheap (single map lookup or
+	// flock probe) but called in three places below (Path A heal
+	// removal, Path C suppression, never-ticked hint). markerAgentID=""
+	// means no marker on disk → no tmux session to probe → false.
+	//
+	// Use sessionProbeOrAliveFn (tristate) instead of sessionAliveFn
+	// (bool) so a tmux transport blip — wrong FLEET_TMUX_SOCKET,
+	// restarting server, EAGAIN — does NOT remove a live coord's
+	// marker and break [a] re-attach. Codex iter-14 P1: bool probe
+	// conflates "dead session" with "couldn't probe," and Path A's
+	// marker removal is irreversible at the next render. The tristate
+	// probe falls back to "treat as alive" on transport errors.
+	sessAlive := false
+	if markerAgentID != "" {
+		sessAlive = sessionProbeOrAliveFn(tmuxSessionName(markerAgentID))
 	}
+
+	// neverTicked is the central gate: when true (no coord-state.json
+	// publication under this spawn), the marker MUST be preserved —
+	// it's the only proof of which agent is coord for the project, and
+	// findExistingCoordForProject reads it on [a] re-attach. The mtime
+	// comparison inside coordNeverTickedThisSpawn tolerates 1s
+	// filesystem-mtime resolution by treating equality as "ticked"
+	// (codex iter-5 P2).
+	neverTicked := coordNeverTickedThisSpawn(ctx.records, markerAgentID, p.LastTick)
+
+	if st == coordSpawnStuck && markerAgentID != "" {
+		// Path A/B heal: only safe to REMOVE the marker when the coord
+		// has ticked under this spawn (lock body / coord-state.json
+		// published — findCoordByLockBody rescues subsequent [a]
+		// re-attach). When the agent record is fresh but the coord
+		// never ticked, fleet-guard is updating last_activity_ts but
+		// /coordinator never published — heal the warning but PRESERVE
+		// the marker so the operator can re-attach (codex iter-5 P1).
+		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+		if !neverTicked {
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
+				return removeCoordSpawnMarkerFn(p.Name)
+			})
+		} else if !sessAlive {
+			// Dead session AND coord never ticked: Path A still heals
+			// and removes the marker (re-attach impossible for a dead
+			// session, so preserving the marker has no benefit and
+			// leaves a stale claim that the next [a] would skip).
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
+				return removeCoordSpawnMarkerFn(p.Name)
+			})
+		}
+	}
+
 	// PART 2b downgrade: stuck → waiting when the agent record has
 	// needs_input=true AND last_activity_ts is within
 	// agentRecordFreshWindow. Codex iter-4 (2026-05-14) added the
 	// freshness gate so a stale needs_input=true flag (set before
 	// claude died while the wrapper-shell survived) doesn't mask a
 	// dead coord — the original stuck warning surfaces in that case.
+	//
+	// Runs BEFORE Path C (codex iter-6 P1): if Path C demoted Stuck
+	// → Idle first, the downgrade-to-Waiting wouldn't fire and the
+	// operator would lose the "coord waiting on input — fleet attach
+	// <id>" cue when /coordinator hasn't ticked yet but Claude has
+	// already paused at a question.
 	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+
+	// Second-chance downgrade for stale-needs_input + live-Claude
+	// (codex iter-8 P2): the freshness gate above leaves a long-lived
+	// waiting-on-input row as Stuck if the operator has been idle for
+	// > agentRecordFreshWindow (10m). Promote Stuck → Waiting so the
+	// operator sees the actionable "fleet attach <id>" cue instead of
+	// "never ticked / Stop hook may be broken."
+	//
+	// agentNeedsInput=true is itself proof that a Stop hook ran (the
+	// flag is set inside Claude during the Stop hook), which implies
+	// reconcile_pid ran — so record.PID is reconciled to Claude's
+	// real PID by this point. The kill(0) probe then confirms Claude
+	// is still alive (filters wrapper-survived-Claude-exited cases).
+	if st == coordSpawnStuck && markerAgentID != "" &&
+		agentNeedsInput(ctx.records, markerAgentID) &&
+		agentClaudeAlive(ctx.records, markerAgentID) {
+		st = coordSpawnWaiting
+	}
+
+	// Path C suppression (2026-05-14 false-positive fix): if heal /
+	// downgrade did not fire and the agent record exists for an alive
+	// tmux session AND Claude is currently alive (kill(record.PID, 0)
+	// succeeds) AND the coord has never published a tick under this
+	// spawn → the spawn pipeline completed AND Claude is still
+	// running. Suppress the red attention chip at the render layer
+	// WITHOUT removing the marker — the marker is the only proof of
+	// which agent is coord for the project in this state (no
+	// coordinator.lock body has been published yet), so the [a]
+	// re-attach path in findExistingCoordForProject still needs it.
+	// The softer coordSpawnNeverTicked hint below surfaces the
+	// underlying problem informationally when the agent has aged past
+	// the cold-start grace window.
+	//
+	// Narrow gate (codex iter-2 P1): Path C only suppresses when the
+	// coord has never ticked under THIS spawn. If the coord previously
+	// ticked (neverTicked=false) and is NOW stale + past spawnTimeout,
+	// the derivation's stuck verdict is RIGHT — the coord booted,
+	// published, and then wedged. The operator needs the attention
+	// chip to surface that as a real hang.
+	//
+	// Process-liveness gate (codex iter-6 / iter-8 / iter-11 P1):
+	// agentClaudeAlive uses kill(record.PID, 0). The two failure
+	// modes for record.PID — (1) spawn.Spawn's fleet-binary fallback
+	// (os.Getpid) and (2) wrapper-pane-shell after Claude exited —
+	// are partially handled:
+	//
+	//   - Mode (1): the fleet binary exits as soon as dispatch
+	//     returns, so kill(0) on its PID returns false naturally.
+	//     Path C correctly keeps the stuck chip.
+	//   - Mode (2): wrapper shell alive → kill(0) true → Path C
+	//     falsely suppresses. fleet-guard's reconcile_pid (in
+	//     skills/fleet-guard/health.py) re-resolves the PID on every
+	//     Stop hook fire, so this window narrows to "before first
+	//     Stop hook + Claude crashed early." This is the trade-off
+	//     called out in codex iter-11 P1: gating on agentEverActivated
+	//     misses the symmetric "Claude alive but Stop hook never
+	//     fired" case (the exact failure the soft hint is designed
+	//     for). Accept the mode-(2) risk for the iter-11 reading.
+	if st == coordSpawnStuck && sessAlive && markerAgentID != "" &&
+		agentRecordExists(ctx.records, markerAgentID) &&
+		neverTicked &&
+		agentClaudeAlive(ctx.records, markerAgentID) {
+		st = coordSpawnIdle
+	}
+
+	// Post-heal informational hint: after Path C downgraded Stuck →
+	// Idle (live tmux + record exists), surface "spawned but never
+	// ticked" if the agent has aged past the cold-start grace window
+	// without publishing a coord-state.json under THIS spawn. Soft
+	// hint (dim), not an attention chip — the agent is alive; the
+	// issue is /coordinator skill registration or Stop-hook config
+	// (project_fleet_home_leak memory has the canonical example).
+	// Gated on a live tmux session so a Path A heal (silent spawn
+	// death) doesn't trigger this hint, and on markerAgentID being
+	// non-empty so we have an ID to render.
+	// Grace window for the never-ticked hint balances two concerns:
+	//   (a) honor operator-shortened FLEET_COORD_SPAWN_TIMEOUT_S so
+	//       there's no silent gap between Path C suppression and the
+	//       diagnostic hint (codex iter-12 P2),
+	//   (b) preserve a minimum cold-start budget so a 60-120s custom
+	//       spawnTimeout does not fire "never ticked" during a
+	//       perfectly healthy 3-5 minute boot (codex iter-17 P2).
+	//
+	// Strategy: clamp between minNeverTickedGrace and
+	// coordSpawnTimeoutDefault. Operators who want the warning
+	// sooner can already lower FLEET_COORD_SPAWN_TIMEOUT_S to change
+	// when Path C triggers; but the never-ticked diagnostic itself
+	// — which accuses the operator's setup of being broken — must
+	// not surface inside the documented cold-start window.
+	grace := ctx.spawnTimeout
+	if grace > coordSpawnTimeoutDefault {
+		grace = coordSpawnTimeoutDefault
+	}
+	if grace < minNeverTickedGrace {
+		grace = minNeverTickedGrace
+	}
+	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
+		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, grace) {
+		st = coordSpawnNeverTicked
+	}
+
 	if line, ok := renderCoordSpawnLineForProject(
 		st, prefix, p.Name, markerAgentID, ctx.now, markerMtime, ctx.tickFrame,
 	); ok {

@@ -41,6 +41,7 @@ from typing import Iterable
 import conflict
 import dispatch as dispatch_mod
 import parse
+import reaper as reaper_mod
 import remote_control
 import supervisor as supervisor_mod
 import worktree as worktree_mod
@@ -263,12 +264,47 @@ def _tick_locked(
     state_path = project_dir / "coord-state.json"
     state = _load_coord_state(state_path)
 
-    # 3. Reconcile in-flight workers.
+    # 2.5. Reaper pass (DESIGN invariant 5). Runs BEFORE reconcile so a
+    # worker whose state.json reports phase=done has its tmux session
+    # killed + record archived BEFORE _apply_reconcile flips status to
+    # in-review/done. Reaper mutates `state` in place (kill_directive_ts
+    # tracking + redispatch_pending flagging). Decisions are surfaced
+    # as raises/errors so the operator sees the hard-kill events.
+    try:
+        reap_decisions = _reap_inflight(
+            f.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=state, now_unix=now_unix,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"reaper: {exc}")
+        reap_decisions = []
+    for dec in reap_decisions:
+        if dec.state == "hard-killed":
+            result.errors.append(
+                f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+            )
+            result.raised += 1
+        elif dec.state == "error":
+            result.errors.append(
+                f"reaper error {dec.slug}: {dec.detail}"
+            )
+
+    # 3. Reconcile in-flight workers. Reaper-gated: a worker whose
+    # reaper lane is still open (kill_directive sent, grace not yet
+    # expired) defers its status flip — _apply_reconcile is suppressed
+    # for that action this tick.
     reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
     reconcile_repo = cwd if cap > 1 else ""
     reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
     for action in reconciled:
+        # Invariant 5 gate: if this action would clear the worker
+        # (terminal-ish transition) but the reaper hasn't completed
+        # its kill cycle yet, defer the apply. The next tick re-runs
+        # reconcile and re-evaluates — once the reaper finishes the
+        # archive, this action proceeds.
+        if action.clear_worker and not _reaper_lane_clear_for(state, action.slug):
+            continue
         try:
             _apply_reconcile(
                 action, project, fleet_bin,
@@ -286,6 +322,12 @@ def _tick_locked(
             if action.clear_worker:
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
+                # Codex iter-2 [P1]: do NOT clear reaper_redispatch_pending
+                # here. The marker is the explicit signal to dispatch a
+                # replacement on the NEXT pass (consumed by the
+                # _promote_redispatch_pending hook below). Clearing it
+                # before dispatch sees it means a failed worker just
+                # lands in `todo` and never gets the promised replacement.
         except Exception as exc:
             result.errors.append(f"reconcile {action.slug}: {exc}")
 
@@ -324,7 +366,30 @@ def _tick_locked(
     # path is a no-op — preserving v0.2.0 byte-identical behavior.
     sentinel_repo = cwd if cap > 1 else ""
     sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+    # Codex iter-5 [P1]: stash deferred sentinels in coord-state so the
+    # next tick can replay them after the reaper lane clears. Watermark
+    # advances normally — the deferred sentinels are queued separately
+    # by source_file so the file itself can be safely "consumed" while
+    # the action still needs to land.
+    deferred_actions: list[_SentinelAction] = []
+    # Process any sentinels that were deferred on a PRIOR tick first.
+    # Prepend them to `drained` so they're attempted before this tick's
+    # fresh batch (FIFO ordering for fairness).
+    prior_deferred = _load_deferred_sentinels(state)
+    drained = prior_deferred + drained
     for action in drained:
+        # Codex iter-3 [P1]: gate worker-clearing sentinels on the
+        # reaper lane, matching reconcile. TASK_DONE_PR / WORKER_FAILED
+        # both forget the agent_id mapping; running them before the
+        # reaper finishes its kill cycle would leave the tmux session
+        # un-addressable on the next reap pass. BLOCKED_QUESTION keeps
+        # the worker alive (operator decides), so it's not gated.
+        # NEW_TASK doesn't touch the in-flight slot at all.
+        if action.kind in ("task_done_pr", "worker_failed") and not (
+            _reaper_lane_clear_for(state, action.slug)
+        ):
+            deferred_actions.append(action)
+            continue
         try:
             _apply_sentinel(
                 action, project, fleet_bin,
@@ -337,18 +402,46 @@ def _tick_locked(
             if action.raised_to_user:
                 result.raised += 1
             # Worker is leaving the in-flight set on TASK_DONE_PR
-            # (status → in-review with closed worker), WORKER_FAILED
-            # (status → todo, worker cleared), and BLOCKED_QUESTION
-            # (status → blocked). Forget the mapping in all three so
-            # the supervisor doesn't keep nudging an inbox owned by
-            # a defunct agent record.
-            if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
+            # (status → in-review with closed worker) and WORKER_FAILED
+            # (status → todo, worker cleared). BLOCKED_QUESTION keeps
+            # the worker ALIVE (status → blocked) so the operator can
+            # answer via the worker's inbox — codex iter-22 [P1]: we
+            # must NOT forget the agent_id in that case; the supervisor
+            # / TUI / manual `fleet rm` all need it as the addressing
+            # handle.
+            if action.kind in ("task_done_pr", "worker_failed"):
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
-            result.errors.append(f"sentinel {action.slug}: {exc}")
+            # Codex iter-18 [P2]: re-add the action to the deferred
+            # queue so a later pass retries. Otherwise a transient
+            # `fleet tasks set/note` failure would permanently drop
+            # the transition (the archive file is already past the
+            # watermark).
+            deferred_actions.append(action)
+            result.errors.append(
+                f"sentinel {action.slug}: {exc} (re-queued for retry)"
+            )
+    # Persist the deferred queue (or clear if nothing deferred this tick).
+    _save_deferred_sentinels(state, deferred_actions)
     if last_seen:
         state["last_archive_scan_ts"] = last_seen
+
+    # 4.5. Consume reaper_redispatch_pending markers (codex iter-2 [P1]).
+    # The reaper flagged slugs whose worker hit phase=failed (judgment=
+    # error-abort) for re-dispatch. Reconcile flipped those slugs to
+    # `todo`; _filter_ready only picks `ready`. Promote pending slugs
+    # from todo → ready so the next _dispatch_ready call sees them.
+    # The marker is consumed (cleared) on a successful promote; a slug
+    # that's already not in todo state (operator intervened, status
+    # diverged) gets its marker dropped without action.
+    try:
+        _consume_reaper_redispatch(
+            project=project, fleet_bin=fleet_bin, home=home,
+            coord_state=state, tasks_path=tasks_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"redispatch promote: {exc}")
 
     # 5. Dispatch ready tasks under cap.
     # Re-read tasks.md after reconcile/drain so the dispatch-side filter
@@ -358,6 +451,20 @@ def _tick_locked(
         f = parse.read(str(tasks_path))
     except Exception as exc:
         result.errors.append(f"tasks.md re-read failed: {exc}")
+        # Codex iter-19 [P1]: persist coord-state before bailing.
+        # _reap_inflight may have opened a reaper lane and the drain
+        # step may have queued deferred sentinels. Dropping those on
+        # a transient parse error would erase the lane gate and let
+        # the next tick clear worker_agent_ids before the kill cycle
+        # finishes — exactly the orphan-tmux shape invariant 5 exists
+        # to prevent. Best-effort save; swallow errors (the next tick
+        # re-derives state from disk).
+        try:
+            _save_coord_state(state_path, state)
+        except Exception as save_exc:  # noqa: BLE001
+            result.errors.append(
+                f"coord-state save on parse-error path failed: {save_exc}"
+            )
         return result
     # 5a. Review handoffs (reviewer-subagent-arch). Detect in-flight
     # tasks whose state.json reports phase=review-pending (→ dispatch
@@ -470,6 +577,7 @@ def _tick_locked(
             home=home,
             fleet_bin=fleet_bin,
             state_path=state_path,
+            coord_id=coord_id,
             result=result,
         )
     return result
@@ -486,6 +594,7 @@ def _run_supervisor(
     home: Path,
     fleet_bin: str,
     state_path: Path,
+    coord_id: str,
     result: TickResult,
 ) -> None:
     """Drive the supervisor loop. Hooks defined here so the supervisor
@@ -536,6 +645,13 @@ def _run_supervisor(
 
         Returns True if any slot was freed (action.new_status in the
         terminal set) so the caller can re-run dispatch to backfill.
+
+        Codex iter-1 [P1]: actions with clear_worker=True are deferred
+        when the reaper lane is still open for that slug — matches the
+        primary tick path's invariant-5 gate. Without this, a worker
+        that wrote phase=done mid-supervisor session could get its
+        status flipped (and worker_agent_ids cleared) before the reaper
+        sent /exit — leaking the tmux session as an orphan.
         """
         try:
             f3 = parse.read(str(tasks_path))
@@ -552,6 +668,14 @@ def _run_supervisor(
         slot_freed = False
         full_map = {t.slug: t for t in f3.tasks}
         for action in actions:
+            # Invariant 5 gate: defer terminal flips while the reaper
+            # still has an open kill cycle for this slug. Primary tick
+            # path runs the same check at _tick_locked's reconcile loop;
+            # supervisor-driven reconciles need the same protection.
+            if action.clear_worker and not _reaper_lane_clear_for(
+                cs, action.slug,
+            ):
+                continue
             try:
                 _apply_reconcile(
                     action, project, fleet_bin,
@@ -570,6 +694,8 @@ def _run_supervisor(
                     # stale handoff keys that block future re-dispatches
                     # for the same slug.
                     _clear_review_handoff_state(cs, action.slug)
+                    # Codex iter-2 [P1]: do NOT clear reaper_redispatch_
+                    # pending here — the dispatch hook is the consumer.
                 # codex iter-1 [P1]: a worker leaving the in-flight
                 # set frees a dispatch slot. Without re-running
                 # _dispatch_ready, with cap=1 the next ready task
@@ -594,7 +720,23 @@ def _run_supervisor(
         ready task waited until supervisor exited because dispatch only
         ran inside the FIRST tick. Re-running here keeps `cap` saturated
         across the entire supervisor session.
+
+        Codex iter-2 [P1]: also consumes reaper_redispatch_pending
+        markers — a slug flagged by the error-abort path needs its
+        status promoted from todo → ready before _dispatch_ready can
+        pick it up.
         """
+        # Consume the redispatch marker BEFORE re-reading tasks.md so
+        # promoted slugs appear as `ready` to _dispatch_ready.
+        cs0 = _load_coord_state(state_path)
+        try:
+            _consume_reaper_redispatch(
+                project=project, fleet_bin=fleet_bin, home=home,
+                coord_state=cs0, tasks_path=tasks_path,
+            )
+            _save_coord_state(state_path, cs0)
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor redispatch: {exc}")
         try:
             f4 = parse.read(str(tasks_path))
         except Exception as exc:  # noqa: BLE001
@@ -665,6 +807,347 @@ def _run_supervisor(
         cs = _load_coord_state(state_path)
         _save_coord_state(state_path, cs)
 
+    # Invariant 4 force-tick: short-circuit the next sleep when there's
+    # a pending inbox event for this coord. Cheap fs scan; the supervisor
+    # consults this on every iteration before computing the sleep budget.
+    #
+    # Codex iter-1 [P1]: the ~/.fleet/inbox/<coord-id>.md file persists
+    # across the entire supervisor session — fleet-guard's coord-side
+    # hook (not the coord skill) clears it. Existence-alone would wedge
+    # this check into "always True" and spin the supervisor at 0-second
+    # sleeps. Baseline the mtime at supervisor entry so only an mtime
+    # ADVANCE post-entry counts as an event.
+    #
+    # Codex iter-2 [P1]: after the FIRST force-tick fires, advance the
+    # baseline + archive watermark to the current values so the same
+    # event doesn't re-fire on the next iteration (which would spin
+    # the supervisor at 0-second sleeps). We mutate the closed-over
+    # baseline + last_seen_archive on every True return.
+    # Codex iter-3 [P3]: use the coord_id tick() already resolved
+    # (passed in as a parameter), not a fresh env read. tick(coord_id=
+    # "...") with FLEET_AGENT_ID unset or stale would otherwise watch
+    # the wrong inbox/archive surface — the supervisor would silently
+    # ignore force-tick events.
+    coord_id_for_force = coord_id or os.environ.get("FLEET_AGENT_ID", "") or ""
+    # Use a mutable singleton dict so the inner hook can update the
+    # baseline without `nonlocal`. The hook reads the current value
+    # before each check and bumps it after a hit.
+    force_tick_baseline = {"mtime": 0.0, "archive": ""}
+    if coord_id_for_force:
+        baseline_path = home / "inbox" / f"{coord_id_for_force}.md"
+        try:
+            force_tick_baseline["mtime"] = baseline_path.stat().st_mtime
+        except OSError:
+            force_tick_baseline["mtime"] = 0.0
+        # Seed the archive watermark from coord-state's last_archive_scan_ts.
+        cs0 = _load_coord_state(state_path)
+        force_tick_baseline["archive"] = str(
+            cs0.get("last_archive_scan_ts", "") or ""
+        )
+
+    def force_tick_check_hook() -> bool:
+        # Codex iter-8 [P2]: the archive watermark lives in coord-state's
+        # `last_archive_scan_ts`. We read it FRESH every call so the
+        # actual drain side (which respects _ARCHIVE_SCAN_CAP of 200
+        # files per pass) is the single source of truth. Previously
+        # this hook eagerly advanced its own baseline to the NEWEST
+        # archive filename — which meant when 201+ files queued, the
+        # drain consumed 200, baseline jumped past all 201, and the
+        # 201st never re-fired force_tick. Now: read disk, trust disk.
+        cs = _load_coord_state(state_path)
+        disk_archive = str(cs.get("last_archive_scan_ts", "") or "")
+        # Keep the closed-over field in sync (used for the no-event
+        # case + a fast-path if the disk read raced).
+        force_tick_baseline["archive"] = disk_archive
+        triggered = supervisor_mod.has_pending_inbox_events(
+            coord_id=coord_id_for_force,
+            fleet_home=home,
+            last_seen_archive=force_tick_baseline["archive"],
+            direct_inbox_mtime_baseline=force_tick_baseline["mtime"],
+        )
+        if triggered:
+            # Advance ONLY the direct-inbox mtime baseline — the archive
+            # baseline advances via the drain side on the same iteration.
+            # Without the direct-inbox advance the same operator message
+            # would refire on every iteration.
+            if coord_id_for_force:
+                direct = home / "inbox" / f"{coord_id_for_force}.md"
+                try:
+                    new_mtime = direct.stat().st_mtime
+                    if new_mtime > force_tick_baseline["mtime"]:
+                        force_tick_baseline["mtime"] = new_mtime
+                except OSError:
+                    pass
+        return triggered
+
+    # Invariant 5 reaper hook. Runs every iteration so a worker that
+    # writes phase=done mid-supervisor session is reaped within the
+    # base poll cadence (5 s default) rather than waiting for the
+    # next stuck-check pass (5 min default).
+    #
+    # Codex iter-3 [P2]: returns the list of slugs whose kill cycle
+    # COMPLETED this iteration (state ∈ {killed, hard-killed}). The
+    # supervisor uses this list to re-trigger reconcile against those
+    # slugs immediately — without it, a worker whose mtime advanced
+    # several polls earlier (when the lane wasn't clear) wouldn't get
+    # its status flip until the periodic full reconcile fires.
+    #
+    # Codex iter-13 [P1]: when the reaper kills a slug, also replay
+    # any deferred sentinels for that slug NOW (during the normal
+    # iteration), not on a future forced wake. The deferred-sentinel
+    # queue would otherwise hold a stale TASK_DONE_PR / WORKER_FAILED
+    # that the next forced wake could replay over already-applied
+    # reconcile transitions — restoring stale PR URLs / rolling
+    # replacement workers back to todo.
+    def reaper_hook_supervisor(probes) -> list[str]:
+        try:
+            f5 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"reaper hook tasks-read: {exc}")
+            return []
+        cs = _load_coord_state(state_path)
+        decisions = _reap_inflight(
+            f5.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=cs, now_unix=time.time(),
+        )
+        reaped: list[str] = []
+        for dec in decisions:
+            if dec.state == "hard-killed":
+                result.errors.append(
+                    f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+                )
+                result.raised += 1
+            elif dec.state == "error":
+                result.errors.append(
+                    f"reaper error {dec.slug}: {dec.detail}"
+                )
+            if dec.state in ("killed", "hard-killed"):
+                reaped.append(dec.slug)
+        # Replay any deferred sentinels whose reaper lane is now
+        # clear. Codex iter-20 [P2]: ALWAYS replay (no `if reaped`
+        # gate), not just after a fresh reap. Sentinel deferrals can
+        # come from:
+        #   (a) reaper-lane-not-clear at apply time — those clear
+        #       when the reaper finishes (still triggered by reaped).
+        #   (b) transient `fleet tasks set/note` failure in either
+        #       drain path — those should retry every iteration
+        #       regardless of reaper state.
+        replay_applied = _replay_deferred_sentinels(
+            project=project, fleet_bin=fleet_bin, home=home,
+            cs=cs, cwd=cwd, cap=cap,
+        )
+        _save_coord_state(state_path, cs)
+        # If the replay flipped task status (slot freed), backfill
+        # the slot via the same dispatch surface the mtime path uses.
+        if replay_applied > 0:
+            _maybe_dispatch_after_reconcile()
+        return reaped
+
+    def _replay_deferred_sentinels(
+        *, project: str, fleet_bin: str, home: Path,
+        cs: dict, cwd: str, cap: int,
+    ) -> int:
+        """Apply queued deferred sentinels whose reaper lane is clear.
+        Called from reaper_hook_supervisor right after a successful
+        reap so stale sentinels don't sit in the queue waiting for
+        the next forced wake (codex iter-13 [P1]).
+
+        Returns the count of sentinels successfully applied this pass.
+        The caller uses this to decide whether to fire
+        _maybe_dispatch_after_reconcile (codex iter-14 [P1]: a replay
+        that frees a slot must trigger dispatch on the SAME tick)."""
+        deferred = _load_deferred_sentinels(cs)
+        if not deferred:
+            return 0
+        try:
+            f_local = parse.read(str(tasks_path))
+        except Exception:
+            return 0
+        tbs = {t.slug: t for t in f_local.tasks}
+        still_deferred: list[_SentinelAction] = []
+        sentinel_repo = cwd if cap > 1 else ""
+        sentinel_tbs = tbs if cap > 1 else None
+        applied = 0
+        for action in deferred:
+            if action.kind in ("task_done_pr", "worker_failed") and not (
+                _reaper_lane_clear_for(cs, action.slug)
+            ):
+                still_deferred.append(action)
+                continue
+            try:
+                _apply_sentinel(
+                    action, project, fleet_bin,
+                    repo=sentinel_repo,
+                    tasks_by_slug=sentinel_tbs,
+                    home=home,
+                    full_tasks_by_slug=tbs,
+                )
+                # Codex iter-23 [P2]: same blocked_question carve-out
+                # as the non-replay drain — blocked workers stay alive,
+                # so we must preserve the agent_id mapping. Only the
+                # terminating sentinels (task_done_pr, worker_failed)
+                # forget the mapping.
+                if action.kind in ("task_done_pr", "worker_failed"):
+                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    _clear_review_handoff_state(cs, action.slug)
+                applied += 1
+            except Exception as exc:  # noqa: BLE001
+                # Codex iter-18 [P2]: re-add the action to the
+                # deferred queue so a later pass retries. Otherwise a
+                # transient `fleet tasks set/note` failure would
+                # permanently drop the TASK_DONE_PR / WORKER_FAILED
+                # transition (the archive file is already past the
+                # last_archive_scan_ts watermark — there's no other
+                # source of truth).
+                still_deferred.append(action)
+                result.errors.append(
+                    f"deferred sentinel {action.slug}: {exc} "
+                    "(re-queued for retry)"
+                )
+        _save_deferred_sentinels(cs, still_deferred)
+        return applied
+
+    # Codex iter-3 [P2]: drain + dispatch on every forced wake so a
+    # NEW_TASK that arrives mid-supervisor session is picked up under
+    # spare cap. Calls _maybe_dispatch_after_reconcile (which itself
+    # consumes reaper_redispatch_pending markers + runs _dispatch_ready);
+    # that's idempotent on a tick where no new task is available.
+    #
+    # Codex iter-4 [P1]: also drain inbox/archive sentinels on the
+    # forced wake. Without this, archive events for in-flight workers
+    # (WORKER_FAILED, TASK_DONE_PR) sit in inbox/archive/ while
+    # supervisor-mode reconcile already requeues / redispatches the
+    # same slug — the next top-level tick then REPLAYS the stale
+    # sentinel through _apply_sentinel, which can roll a replacement
+    # worker back to `todo` or restore an old PR URL. Fix: drain the
+    # archive inside the same wake, advance the watermark to "this
+    # tick consumed everything I had", so replay is impossible.
+    #
+    # Codex iter-8 [P1]: run the reaper BEFORE the drain. For a worker
+    # whose state.json reports phase=done/failed (so the reaper would
+    # judge it complete), but which hasn't yet finished its kill
+    # cycle, we must NOT let the drain's TASK_DONE_PR/WORKER_FAILED
+    # sentinel forget the agent_id before the reaper sends /exit. The
+    # primary tick already runs reaper-before-drain (step 2.5 then 4);
+    # this brings the forced-wake path into alignment.
+    def force_tick_dispatch_hook():
+        _run_reaper_once_supervisor()
+        _drain_inbox_archive_supervisor()
+        _maybe_dispatch_after_reconcile()
+
+    def _run_reaper_once_supervisor():
+        """One-shot reaper pass under the supervisor lock.
+        Mirrors reaper_hook_supervisor's behavior: kills via reaper,
+        replays deferred sentinels for just-reaped slugs, then
+        reconciles those slugs so the status flip lands THIS tick
+        instead of waiting for the next periodic full reconcile
+        (codex iter-15 [P2]: a force-tick-driven reap was previously
+        invisible to the body's reconcile loop because the entry
+        was already cleared by the time the body ran)."""
+        try:
+            f7 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"reaper hook tasks-read: {exc}")
+            return
+        cs = _load_coord_state(state_path)
+        decisions = _reap_inflight(
+            f7.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=cs, now_unix=time.time(),
+        )
+        reaped: list[str] = []
+        for dec in decisions:
+            if dec.state == "hard-killed":
+                result.errors.append(
+                    f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+                )
+                result.raised += 1
+            elif dec.state == "error":
+                result.errors.append(
+                    f"reaper error {dec.slug}: {dec.detail}"
+                )
+            if dec.state in ("killed", "hard-killed"):
+                reaped.append(dec.slug)
+        # Codex iter-20 [P2]: replay deferred sentinels every pass,
+        # not gated on `if reaped`. Transient apply failures need
+        # retries even when no new reap happened.
+        _replay_deferred_sentinels(
+            project=project, fleet_bin=fleet_bin, home=home,
+            cs=cs, cwd=cwd, cap=cap,
+        )
+        _save_coord_state(state_path, cs)
+        # Codex iter-15 [P2]: reconcile the just-reaped slugs in
+        # the same iteration so the status flip lands this tick.
+        # _reconcile_slugs is idempotent on already-flipped slugs.
+        if reaped:
+            try:
+                _reconcile_slugs(reaped)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"force-tick reaper reconcile: {exc}")
+
+    def _drain_inbox_archive_supervisor():
+        """Drain archive sentinels under the supervisor lock.
+
+        Mirrors the primary tick's drain step (loop._tick_locked step 4)
+        with the same reaper-lane gate and the same deferred-sentinel
+        queue (codex iter-5 [P1]) — deferred actions are persisted in
+        coord-state and replayed on the next pass.
+        """
+        try:
+            f6 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor drain tasks-read: {exc}")
+            return
+        cs = _load_coord_state(state_path)
+        tasks_by_slug = {t.slug: t for t in f6.tasks}
+        drained, last_seen = _drain_archive(
+            home / "inbox" / "archive",
+            coord_id=coord_id,
+            since=str(cs.get("last_archive_scan_ts", "") or ""),
+            tasks_by_slug=tasks_by_slug,
+        )
+        prior_deferred = _load_deferred_sentinels(cs)
+        drained = prior_deferred + drained
+        if not drained and not last_seen:
+            return
+        sentinel_repo = cwd if cap > 1 else ""
+        sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+        deferred_actions: list[_SentinelAction] = []
+        for action in drained:
+            if action.kind in ("task_done_pr", "worker_failed") and not (
+                _reaper_lane_clear_for(cs, action.slug)
+            ):
+                deferred_actions.append(action)
+                continue
+            try:
+                _apply_sentinel(
+                    action, project, fleet_bin,
+                    repo=sentinel_repo,
+                    tasks_by_slug=sentinel_tasks_by_slug,
+                    home=home,
+                    full_tasks_by_slug=tasks_by_slug,
+                )
+                # Codex iter-22 [P1]: blocked workers stay ALIVE so
+                # the operator can answer the BLOCKED_QUESTION. We
+                # must NOT forget the agent_id mapping in that case —
+                # otherwise the stuck-check and manual-cleanup paths
+                # lose the only handle on the still-live tmux session.
+                # task_done_pr / worker_failed both terminate the
+                # worker; agent_id cleanup is correct for those.
+                if action.kind in ("task_done_pr", "worker_failed"):
+                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    _clear_review_handoff_state(cs, action.slug)
+            except Exception as exc:  # noqa: BLE001
+                # Codex iter-18 [P2]: re-queue on transient failure.
+                deferred_actions.append(action)
+                result.errors.append(
+                    f"supervisor sentinel {action.slug}: {exc} "
+                    "(re-queued for retry)"
+                )
+        _save_deferred_sentinels(cs, deferred_actions)
+        if last_seen:
+            cs["last_archive_scan_ts"] = last_seen
+        _save_coord_state(state_path, cs)
+
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
         project=project,
@@ -674,6 +1157,17 @@ def _run_supervisor(
         reconcile_one=reconcile_one,
         write_state=write_state_hook,
         periodic_full_reconcile=periodic_full_reconcile,
+        force_tick_check=force_tick_check_hook,
+        force_tick_dispatch=force_tick_dispatch_hook,
+        reaper_hook=reaper_hook_supervisor,
+        coord_id=coord_id,
+        # Codex iter-21 [P3]: share the single mtime baseline that
+        # force_tick_check_hook closed over (force_tick_baseline["mtime"])
+        # so the operator-message-exit gate and the force-tick check
+        # both use the same starting point. Eliminates the two-read
+        # race where an operator write between the two snapshots
+        # could be silenced.
+        direct_inbox_session_baseline=force_tick_baseline["mtime"],
     )
     # Surface supervisor stats as auxiliary tick result fields. We
     # don't mutate TickResult's primary counters because they describe
@@ -689,6 +1183,273 @@ def _supervisor_has_inflight(tasks) -> bool:
         if t.status in ("in-progress", "in-review"):
             return True
     return False
+
+
+# ---------- reaper integration (invariant 5) ----------
+#
+# The reaper judges each in-flight worker on every supervisor poll and on
+# the primary tick path. When the judgment is `complete` or `error-abort`
+# it sends /exit, waits the grace window, falls through to `fleet rm`,
+# and last-resort `kill -9`s the pid.
+#
+# Status-flip ordering: the existing _reconcile_inflight path computes
+# `new_status` and `clear_worker` from state.json. We layer the reaper
+# under it: the reaper runs first to make sure the tmux session is gone
+# (or recorded as in-progress kill); then _apply_reconcile's status flip
+# is the operator-visible commit point. If the reaper still has an open
+# entry for a slug, _apply_reconcile defers the status flip — matches the
+# DESIGN doc: "Before the reaper succeeds, status stays in its prior
+# non-terminal state — so the operator never sees 'task done' with a
+# still-live worker."
+
+
+def _build_reap_inputs(
+    tasks: list[parse.Task],
+    *,
+    project: str,
+    home: Path,
+    agent_id_map: dict[str, str],
+    is_git: bool,
+) -> list[reaper_mod.ReapInputs]:
+    """Build ReapInputs from the in-flight task list.
+
+    Probes every task at status=in-progress or in-review. In-review
+    workers have already exited (the PR is open and we're polling CI);
+    the reaper just confirms the tmux session is gone — the judgment
+    will normally be `complete` (phase=done with pr_url) so we run the
+    archive path even when the subprocess exited cleanly without
+    a `/exit`.
+    """
+    out: list[reaper_mod.ReapInputs] = []
+    for t in tasks:
+        if t.status not in ("in-progress", "in-review"):
+            continue
+        agent_id = agent_id_map.get(t.slug, "")
+        tmux_session = (
+            supervisor_mod.session_name_for_agent(agent_id) if agent_id else ""
+        )
+        worker_state = _read_worker_state(project, t.slug, home=home)
+        pid = 0
+        if worker_state is not None:
+            raw_pid = worker_state.get("pid", 0) or worker_state.get("worker_pid", 0)
+            try:
+                pid = int(raw_pid)
+            except (TypeError, ValueError):
+                pid = 0
+        out.append(reaper_mod.ReapInputs(
+            slug=t.slug,
+            agent_id=agent_id,
+            tmux_session=tmux_session,
+            worker_state=worker_state,
+            task_status=t.status,
+            pid=pid,
+            is_git=is_git,
+        ))
+    return out
+
+
+def _reap_inflight(
+    tasks: list[parse.Task],
+    *,
+    project: str,
+    home: Path,
+    fleet_bin: str,
+    coord_state: dict,
+    now_unix: float,
+) -> list[reaper_mod.ReapDecision]:
+    """Run the reaper against every in-flight task. Mutates coord_state
+    in place; caller persists via _save_coord_state.
+
+    Returns the decisions list (one per probe). The caller is expected
+    to surface stderr-grade [P0] events and translate decisions into
+    tick-result error / raise text where relevant.
+    """
+    if not tasks:
+        return []
+    agent_id_map = supervisor_mod.load_agent_id_map(coord_state)
+    is_git = dispatch_mod.project_is_git(project, fleet_home=str(home))
+    inputs = _build_reap_inputs(
+        tasks, project=project, home=home,
+        agent_id_map=agent_id_map, is_git=is_git,
+    )
+    if not inputs:
+        return []
+    grace = reaper_mod.env_grace_window_s()
+    decisions = reaper_mod.reap_probes(
+        probes_inputs=inputs,
+        coord_state=coord_state,
+        fleet_bin=fleet_bin,
+        now_unix=now_unix,
+        grace_window_s=grace,
+        session_alive_fn=supervisor_mod.tmux_session_alive,
+    )
+    return decisions
+
+
+def _reaper_lane_clear_for(coord_state: dict, slug: str) -> bool:
+    """Wrapper so loop.py callers don't import reaper_mod directly when
+    only this gate is needed. Returns True iff the reaper has no open
+    kill cycle for `slug`."""
+    return reaper_mod.reaper_lane_clear(coord_state, slug)
+
+
+# Codex iter-5 [P1]: deferred sentinel queue in coord-state.
+# Schema under coord-state["deferred_sentinels"]: a list of dicts, one
+# per deferred sentinel action. Each entry preserves the original
+# action's slug + kind + payload + raised_to_user + raise_text +
+# source_file so the next tick can re-apply it without re-reading the
+# archive file. The list is FIFO; new deferrals append, the next tick
+# prepends the list to its fresh drained batch.
+_DEFERRED_SENTINELS_KEY = "deferred_sentinels"
+# Hard cap so a chronic deferral (operator never unblocks) doesn't
+# unbounded-grow coord-state.json. 200 matches _ARCHIVE_SCAN_CAP.
+_DEFERRED_SENTINELS_CAP = 200
+
+
+def _load_deferred_sentinels(coord_state: dict) -> list["_SentinelAction"]:
+    """Return the FIFO list of sentinels deferred on prior ticks."""
+    raw = coord_state.get(_DEFERRED_SENTINELS_KEY, [])
+    if not isinstance(raw, list):
+        return []
+    out: list[_SentinelAction] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug", "") or "")
+        kind = str(entry.get("kind", "") or "")
+        if not slug or kind not in (
+            "task_done_pr", "blocked_question", "worker_failed", "new_task",
+        ):
+            continue
+        out.append(_SentinelAction(
+            slug=slug, kind=kind,
+            payload=str(entry.get("payload", "") or ""),
+            raised_to_user=bool(entry.get("raised_to_user", False)),
+            raise_text=str(entry.get("raise_text", "") or ""),
+            source_file=str(entry.get("source_file", "") or ""),
+        ))
+    return out
+
+
+def _save_deferred_sentinels(
+    coord_state: dict, actions: list["_SentinelAction"],
+) -> None:
+    """Persist the deferred-sentinel queue. Empties the key when the
+    list is empty to keep coord-state.json tidy."""
+    if not actions:
+        coord_state.pop(_DEFERRED_SENTINELS_KEY, None)
+        return
+    # Codex iter-12 [P2]: do NOT drop entries when over cap. The
+    # primary tick's drain advances last_archive_scan_ts past the
+    # source files; if we dropped deferred entries the corresponding
+    # task transitions would be lost permanently. Instead, log loudly
+    # if the queue is unbounded and keep all entries. The cap is now
+    # a "soft warning" threshold rather than a hard truncate.
+    if len(actions) > _DEFERRED_SENTINELS_CAP:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[P0] coord: deferred-sentinel queue has {len(actions)} entries "
+            f"(soft cap {_DEFERRED_SENTINELS_CAP}); reaper-lane churn or "
+            "stuck workers may be blocking sentinel replays. Investigate "
+            "via `fleet status`.\n"
+        )
+        _sys.stderr.flush()
+    coord_state[_DEFERRED_SENTINELS_KEY] = [
+        {
+            "slug": a.slug,
+            "kind": a.kind,
+            "payload": a.payload,
+            "raised_to_user": a.raised_to_user,
+            "raise_text": a.raise_text,
+            "source_file": a.source_file,
+        }
+        for a in actions
+    ]
+
+
+def _consume_reaper_redispatch(
+    *,
+    project: str,
+    fleet_bin: str,
+    home: Path,
+    coord_state: dict,
+    tasks_path: Path,
+) -> None:
+    """Promote `reaper_redispatch_pending` slugs from todo → ready.
+
+    Codex iter-2 [P1]: the reaper sets the redispatch marker for slugs
+    that hit phase=failed (error-abort judgment). Reconcile flips those
+    slugs to `todo`. `_filter_ready` only dispatches status=ready
+    tasks, so without an explicit promotion step a failed worker just
+    sits idle until the operator manually re-runs it.
+
+    Algorithm:
+      - For each slug in the pending set:
+          * Re-read tasks.md (cheap; microseconds).
+          * If the task is at status=todo, shell `fleet tasks set
+            status=ready` so the next _dispatch_ready picks it up.
+          * Drop the marker either way: status=todo+promoted → marker
+            consumed; status=anything-else → marker no longer relevant.
+
+    Best-effort: a shell failure logs but doesn't block other slugs;
+    the next tick retries (the marker stays set on failure).
+    """
+    pending = reaper_mod.load_redispatch_pending(coord_state)
+    if not pending:
+        return
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:
+        return
+    by_slug = {t.slug: t for t in f.tasks}
+    # Codex iter-9 [P1]: when reaper sets redispatch_pending the task
+    # is typically still at status=in-progress (the lane is being
+    # cleared; reconcile flips it to todo on a subsequent tick).
+    # Treating in-progress as "stale" was wrong — drop only the
+    # definitively-terminal statuses; leave in-progress untouched so
+    # the next reconcile pass can flip it and the consume runs against
+    # the new state.
+    #
+    # Codex iter-16 [P2]: include `in-review` in the drop set. A
+    # deferred TASK_DONE_PR replay can move an error-aborted slug
+    # from todo BACK to in-review (recovery: the worker that failed
+    # actually did ship a PR before the failure write). The marker
+    # is then stale; if the PR later hits CI red and reconcile flips
+    # back to todo, the stale marker would re-promote to ready and
+    # spawn an unwanted replacement worker.
+    _DROP_STATUSES = {"done", "blocked", "abandoned", "ready", "in-review"}
+    for slug in list(pending):
+        t = by_slug.get(slug)
+        if t is None:
+            # Task disappeared (archived?) — drop the stale marker.
+            reaper_mod.clear_redispatch_pending(coord_state, slug)
+            continue
+        if t.status == "todo":
+            # Promote todo → ready. _run_fleet raises on failure → the
+            # marker stays set and the next tick retries.
+            try:
+                _run_fleet([
+                    fleet_bin, "tasks", "set", "--project", project,
+                    slug, "status=ready",
+                ])
+                _run_fleet([
+                    fleet_bin, "tasks", "note", "--project", project,
+                    slug,
+                    "reaper: error-abort → re-dispatch (replacement worker)",
+                ])
+                reaper_mod.clear_redispatch_pending(coord_state, slug)
+            except Exception:
+                continue
+            continue
+        if t.status in _DROP_STATUSES:
+            # Operator intervened or task reached a terminal state
+            # where re-dispatch doesn't apply.
+            reaper_mod.clear_redispatch_pending(coord_state, slug)
+            continue
+        # status in-progress/in-review — reaper or reconcile hasn't
+        # finished the transition yet. KEEP the marker; the next tick
+        # consumes it after reconcile flips to todo.
+        continue
 
 
 # ---------- lock helpers ----------
@@ -1683,6 +2444,10 @@ class _SentinelAction:
     payload: str = ""
     raised_to_user: bool = False
     raise_text: str = ""
+    # Codex iter-5 [P1]: source archive filename, set by _drain_archive
+    # so callers that defer (e.g., reaper-lane gate) can roll the
+    # watermark back to before this file rather than losing the event.
+    source_file: str = ""
     # delete_worker_dir is set in _apply_sentinel based on `kind`
     # (task_done_pr / worker_failed → True; blocked_question /
     # new_task → False). It's not part of the parsed sentinel grammar
@@ -1749,6 +2514,10 @@ def _drain_archive(
                 # so we don't re-scan; sticking to one sentinel per
                 # file means we don't keep walking past it.
                 break
+            # Codex iter-5 [P1]: stamp the source filename so callers
+            # that defer (reaper-lane gate) can roll the watermark
+            # back to before this file rather than losing the event.
+            sentinel.source_file = name
             actions.append(sentinel)
             break
     return actions, last_seen

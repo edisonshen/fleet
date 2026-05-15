@@ -73,6 +73,44 @@ def env_poll_interval_s() -> int:
     return _env_int("FLEET_COORD_POLL_INTERVAL_S", 30)
 
 
+def env_poll_base_interval_s() -> int:
+    """Default poll cadence per subagent (invariant 4, "5 seconds per
+    subagent" target). Used by the adaptive driver when the loop is
+    spending time on a single probe; the legacy single-rate driver
+    keeps `env_poll_interval_s()` for back-compat.
+
+    Codex iter-5 [P2]: returns 0 when FLEET_COORD_POLL_BASE_INTERVAL_S
+    is UNSET, so the legacy poll_interval_s wins for deployments that
+    only tuned the old knob. An operator who explicitly sets the new
+    knob (even to its default 5) gets the adaptive driver; an operator
+    who only sets FLEET_COORD_POLL_INTERVAL_S=60 keeps polling every
+    60 s as before. Setting to 0 explicitly also disables adaptive
+    cadence — same shape as the other supervisor knobs.
+    """
+    raw = os.environ.get("FLEET_COORD_POLL_BASE_INTERVAL_S", "")
+    if raw == "":
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    if n < 0:
+        return 0
+    return n
+
+
+def env_poll_backoff_interval_s() -> int:
+    """Dilated poll cadence per subagent after stability window (spec:
+    30 s). Tests pin smaller values."""
+    return _env_int("FLEET_COORD_POLL_BACKOFF_INTERVAL_S", 30)
+
+
+def env_poll_stability_window_s() -> int:
+    """Time a subagent's state must be stable before the per-probe
+    cadence dilates from base to backoff. Spec default 5 min = 300 s."""
+    return _env_int("FLEET_COORD_POLL_STABILITY_WINDOW_S", 300)
+
+
 def env_stuck_check_every() -> int:
     """Run stuck-check every Nth poll. 10 default = 5 min on 30 s polls.
     0 disables stuck-checking entirely (cheap mtime polling continues)."""
@@ -188,6 +226,16 @@ class SupervisorConfig:
     stuck_polls: int = 3                # 0 → fire recovery on first stuck pass
     nudge_cooldown_s: int = 120
     poll_max_s: int = 14400             # hard wall-clock cap
+    # Invariant-4 adaptive cadence (DESIGN-subagent-lifecycle.md §4).
+    #   poll_base_interval_s     — per-probe poll cadence default (5 s).
+    #   poll_backoff_interval_s  — dilated cadence after stability (30 s).
+    #   poll_stability_window_s  — seconds of no state-change before dilation.
+    # poll_base_interval_s=0 falls back to the legacy single-rate driver
+    # (poll_interval_s above) so legacy tests + operators stay byte-
+    # identical to v0.2.x supervisor behavior.
+    poll_base_interval_s: int = 5
+    poll_backoff_interval_s: int = 30
+    poll_stability_window_s: int = 300
 
     @classmethod
     def from_env(cls) -> "SupervisorConfig":
@@ -198,6 +246,9 @@ class SupervisorConfig:
             stuck_polls=env_stuck_polls(),
             nudge_cooldown_s=env_nudge_cooldown_s(),
             poll_max_s=env_poll_max_s(),
+            poll_base_interval_s=env_poll_base_interval_s(),
+            poll_backoff_interval_s=env_poll_backoff_interval_s(),
+            poll_stability_window_s=env_poll_stability_window_s(),
         )
 
 
@@ -634,6 +685,176 @@ def has_active_workers(probes: list[WorkerProbe]) -> bool:
     return len(probes) > 0
 
 
+# ---------- adaptive cadence ----------
+
+
+def compute_next_sleep_s(
+    *,
+    cfg: SupervisorConfig,
+    probes: list[WorkerProbe],
+    last_change_ts: dict[str, float],
+    now_unix: float,
+) -> float:
+    """Return the sleep interval for the next supervisor iteration.
+
+    Each probe has a per-slug "stable since" timestamp tracked in
+    `last_change_ts`. A probe stable for > poll_stability_window_s
+    dilates to poll_backoff_interval_s; otherwise it polls at
+    poll_base_interval_s.
+
+    The loop sleeps for `min(per_probe_cadence)`, so a single newly-
+    active subagent reverts the loop to base cadence (the responsiveness
+    requirement: the spec says "default 5 s per subagent" — the loop
+    must visit each probe within that window).
+
+    poll_base_interval_s <= 0 disables adaptive cadence; we fall back to
+    cfg.poll_interval_s (legacy single-rate). This keeps existing tests
+    that pin poll_base_interval_s=0 byte-identical to the v0.2.x driver.
+    """
+    if cfg.poll_base_interval_s <= 0:
+        return float(cfg.poll_interval_s)
+    if not probes:
+        # Nothing to poll — fall back to base cadence so the outer loop
+        # can re-evaluate has_active_workers in bounded time.
+        return float(cfg.poll_base_interval_s)
+    base = float(cfg.poll_base_interval_s)
+    backoff = float(max(cfg.poll_backoff_interval_s, cfg.poll_base_interval_s))
+    window = float(cfg.poll_stability_window_s)
+    min_interval = backoff
+    for p in probes:
+        last_change = last_change_ts.get(p.slug, now_unix)
+        age = now_unix - last_change
+        if age <= window:
+            return base  # at least one probe is hot — full speed
+        min_interval = min(min_interval, backoff)
+    return min_interval
+
+
+# ---------- force-tick (inbox / queue event) ----------
+
+
+def has_pending_inbox_events(
+    coord_id: str,
+    *,
+    fleet_home: Path,
+    last_seen_archive: str,
+    direct_inbox_mtime_baseline: float = 0.0,
+) -> bool:
+    """Return True iff there's at least one inbox or queue event the
+    coord hasn't processed yet.
+
+    Two surfaces, both cheap fs scans (no parse, no shell):
+      1. ~/.fleet/inbox/<coord_id>.md — operator → coord message AND
+         the dropbox where `emit_stuck_alert` appends [STUCK] lines.
+         Codex iter-1 [P1]: this file is NOT consumed by the coord
+         skill — fleet-guard's SessionStart hook eats it on the next
+         coord-agent turn. During a long supervisor session the file
+         persists, so checking existence alone would wedge
+         `force_tick_check` into "always True", spinning the supervisor
+         at 0-second sleeps. We compare the current mtime against the
+         supervisor's start-of-session baseline (`direct_inbox_mtime
+         _baseline`); only an mtime advance counts as an event.
+         baseline=0.0 (file absent at supervisor start) means "any
+         current mtime triggers an event".
+      2. ~/.fleet/inbox/archive/<coord_id>-*.md — worker → coord archive
+         (the supervisor's force-tick wakes the loop when a worker's
+         response lands during a long backoff sleep). We compare archive
+         filenames against `last_seen_archive` (the watermark loop.py
+         persists). Any name > watermark counts.
+
+    The check is intentionally narrow: a true event triggers a forced
+    immediate poll on the next iteration; false positives just shorten
+    one sleep, so we err toward "skip force-tick" on any I/O hiccup.
+    """
+    if not coord_id:
+        return False
+    # Direct inbox file — check mtime advanced past the supervisor's
+    # baseline. existence-alone would over-trigger because fleet-guard
+    # (not us) clears the file; the file can persist for the lifetime
+    # of the supervisor session if no coord-agent turn fires.
+    direct = fleet_home / "inbox" / f"{coord_id}.md"
+    try:
+        st = direct.stat()
+        if st.st_mtime > direct_inbox_mtime_baseline:
+            return True
+    except OSError:
+        # File missing or unreadable — no event from the direct inbox.
+        pass
+    # Archive sweep for worker responses.
+    archive = fleet_home / "inbox" / "archive"
+    try:
+        entries = archive.iterdir() if archive.is_dir() else iter(())
+    except OSError:
+        return False
+    prefix = coord_id + "-"
+    for entry in entries:
+        try:
+            name = entry.name
+        except OSError:
+            continue
+        if not name.startswith(prefix):
+            continue
+        if last_seen_archive and name <= last_seen_archive:
+            continue
+        return True
+    return False
+
+
+def emit_stuck_alert(
+    coord_id: str,
+    slug: str,
+    *,
+    fleet_home: Path,
+    detail: str,
+    post_write_mtime: list[float] | None = None,
+) -> str:
+    """Drop a [STUCK] inbox alert at ~/.fleet/inbox/<coord_id>.md.
+
+    Invariant 4 explicitly says "surface to operator (TUI badge, optional
+    inbox alert), NOT auto-killed". This is the inbox-alert surface.
+    The supervisor's existing recovery ladder (nudge → escalate → block)
+    is a SEPARATE behavior that legacy operators rely on; toggling it
+    off would regress recovery. The two surfaces coexist:
+      - stuck-alert (this fn): inbox drop so TUI/operator sees the flag.
+      - recovery ladder: actions that touch worker inboxes / tasks.md.
+
+    Returns the path written on success, "" on any error.
+
+    Codex iter-18 [P1]: caller can pass `post_write_mtime` (a list)
+    into which we append the file's mtime IMMEDIATELY AFTER our
+    write. The supervisor uses the highest such mtime as the baseline
+    for the operator-message-exit check, so an operator write that
+    ALSO landed during the same stuck-check pass (with a different
+    mtime) still triggers the exit.
+
+    The write is append-only via O_APPEND so we don't clobber a coord
+    inbox that's already populated with an operator message — fleet-
+    guard's coord-side hook reads the file end-to-end.
+    """
+    if not coord_id or not slug:
+        return ""
+    inbox_dir = fleet_home / "inbox"
+    try:
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return ""
+    target = inbox_dir / f"{coord_id}.md"
+    line = f"[STUCK] worker {slug}: {detail}\n"
+    try:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError:
+        return ""
+    if post_write_mtime is not None:
+        try:
+            post_write_mtime.append(target.stat().st_mtime)
+        except OSError:
+            pass
+    return str(target)
+
+
 def run_supervisor(
     *,
     cfg: SupervisorConfig,
@@ -646,6 +867,11 @@ def run_supervisor(
     reconcile_one: Callable[[WorkerProbe], None],
     write_state: Callable[[], None],
     periodic_full_reconcile: Callable[[], None] | None = None,
+    force_tick_check: Callable[[], bool] | None = None,
+    force_tick_dispatch: Callable[[], None] | None = None,
+    reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
+    coord_id: str = "",
+    direct_inbox_session_baseline: float | None = None,
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -676,12 +902,42 @@ def run_supervisor(
         return res
 
     started_at = now_fn()
+    # Codex iter-11 [P1] + iter-21 [P3]: snapshot the direct-inbox
+    # mtime at session start so the "operator wrote to inbox → exit"
+    # gate fires only when the file actually changes during
+    # supervision. The caller (loop._run_supervisor) may pass an
+    # already-captured baseline — that's the SAME snapshot the
+    # force_tick_check_hook uses, eliminating the two-read race
+    # codex iter-21 [P3] flagged.
+    if direct_inbox_session_baseline is None:
+        direct_inbox_session_baseline = 0.0
+        if coord_id:
+            try:
+                direct_inbox_session_baseline = (
+                    (home / "inbox" / f"{coord_id}.md").stat().st_mtime
+                )
+            except OSError:
+                direct_inbox_session_baseline = 0.0
     last_mtimes: dict[str, float] = {}
+    # Per-slug "last observed state change" timestamp. Drives the
+    # invariant-4 adaptive cadence: probes stable for >
+    # poll_stability_window_s dilate from base to backoff cadence.
+    # Seeded to `started_at` so the loop polls at base cadence until
+    # each probe has accumulated stability_window worth of silence.
+    last_change_ts: dict[str, float] = {}
     poll_count = 0
+    # Codex iter-6 [P2]: track wall-clock cadences for stuck-check and
+    # periodic-reconcile so the adaptive poll driver doesn't make them
+    # 6× more aggressive. Legacy (poll_base_interval_s=0) keeps the old
+    # poll-count behavior because cadence wall-clock = poll_count *
+    # poll_interval_s is exact in that case.
+    last_stuck_check_unix = now_fn()
+    last_periodic_reconcile_unix = now_fn()
 
     probes = refresh_probes()
     for p in probes:
         last_mtimes[p.slug] = safe_mtime(p.state_path)
+        last_change_ts[p.slug] = started_at
 
     if not has_active_workers(probes):
         res.exit_reason = "no-active-workers"
@@ -690,7 +946,9 @@ def run_supervisor(
 
     emit(
         f"[coord] supervisor loop starting: {len(probes)} active workers, "
-        f"poll={cfg.poll_interval_s}s stuck_every={cfg.stuck_check_every} "
+        f"poll={cfg.poll_interval_s}s base={cfg.poll_base_interval_s}s "
+        f"backoff={cfg.poll_backoff_interval_s}s "
+        f"stuck_every={cfg.stuck_check_every} "
         f"threshold={cfg.stuck_threshold_s}s",
         stream=log_stream,
     )
@@ -701,9 +959,81 @@ def run_supervisor(
             emit("[coord] supervisor loop exiting: max duration reached", stream=log_stream)
             break
 
-        sleep_fn(float(cfg.poll_interval_s))
+        # Invariant 4: compute the next sleep adaptively. Probes still
+        # in their stability window force base cadence; otherwise back
+        # off. force_tick_check is the inbox/queue event surface — if
+        # an event is queued we sleep 0 (effectively "skip the wait")
+        # and call force_tick_dispatch so a NEW_TASK / drain event
+        # actually drains + dispatches under cap (codex iter-3 [P2]).
+        forced = False
+        if force_tick_check is not None:
+            try:
+                forced = bool(force_tick_check())
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"force_tick_check: {exc}")
+                forced = False
+        if forced:
+            # Codex iter-19 [P2]: enforce a small floor on consecutive
+            # forced wakes so a chronic force-tick condition (e.g.,
+            # tasks.md parse error preventing watermark advance)
+            # doesn't peg the supervisor at 0-second polls. The
+            # 100-ms floor is large enough to keep CPU usage sane
+            # but small enough that genuine fast-wake handling still
+            # responds quickly.
+            sleep_s = 0.1
+        else:
+            sleep_s = compute_next_sleep_s(
+                cfg=cfg,
+                probes=probes,
+                last_change_ts=last_change_ts,
+                now_unix=now_fn(),
+            )
+        if sleep_s > 0:
+            sleep_fn(sleep_s)
         poll_count += 1
         res.iterations += 1
+
+        # Codex iter-10 [P2]: when the operator wrote to the direct
+        # coord inbox (~/.fleet/inbox/<coord>.md), exit the supervisor
+        # so the next Claude-agent turn fires fleet-guard's
+        # SessionStart hook and surfaces the message. The coord skill
+        # itself doesn't consume that inbox surface (fleet-guard
+        # does), so staying in the supervisor would silence operator
+        # messages indefinitely.
+        #
+        # Codex iter-11 [P1]: gate on mtime ADVANCE relative to the
+        # supervisor's start-of-session snapshot, not just file
+        # existence. A pre-existing inbox file (stale operator message,
+        # or a [STUCK] line dropped by emit_stuck_alert itself) would
+        # otherwise terminate the supervisor on every forced wake —
+        # including archive-driven NEW_TASK / TASK_DONE_PR wakes that
+        # have nothing to do with operator messages.
+        if forced and coord_id:
+            direct = home / "inbox" / f"{coord_id}.md"
+            try:
+                cur_mtime = direct.stat().st_mtime
+                if cur_mtime > direct_inbox_session_baseline:
+                    res.exit_reason = "operator-inbox-message"
+                    emit(
+                        f"[coord] supervisor loop exiting: operator wrote "
+                        f"to inbox {direct.name} (fleet-guard will deliver "
+                        "on next turn)",
+                        stream=log_stream,
+                    )
+                    break
+            except OSError:
+                pass
+
+        # On forced wake, run the dispatch hook so a NEW_TASK arriving
+        # mid-supervisor session is picked up under spare cap. Pre-sleep
+        # tick order: the iteration body below still runs (reconcile +
+        # reaper + stuck-check), so this is purely an additional
+        # dispatch surface for the forced path.
+        if forced and force_tick_dispatch is not None:
+            try:
+                force_tick_dispatch()
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"force_tick_dispatch: {exc}")
 
         # Re-read probes every iteration so a finished worker (whose
         # task transitioned to done/blocked between polls) drops out.
@@ -720,10 +1050,19 @@ def run_supervisor(
         for slug in list(last_mtimes.keys()):
             if slug not in cur_slugs:
                 del last_mtimes[slug]
+        for slug in list(last_change_ts.keys()):
+            if slug not in cur_slugs:
+                del last_change_ts[slug]
         for p in probes:
             last_mtimes.setdefault(p.slug, safe_mtime(p.state_path))
+            last_change_ts.setdefault(p.slug, now_fn())
 
-        # Mtime change detection — cheap stat, no API calls.
+        # Mtime change detection — cheap stat, no API calls. Computed
+        # FIRST so the change list is fixed before either the reaper or
+        # the reconcile pass mutates state.json (the reaper writes
+        # nothing to state.json; the reconcile path may delete the
+        # worker dir, which would flip mtime AFTER reconcile fired —
+        # we don't want that to count as a "changed" tick).
         changed: list[WorkerProbe] = []
         for p in probes:
             cur = safe_mtime(p.state_path)
@@ -731,6 +1070,45 @@ def run_supervisor(
             if cur > prev:
                 changed.append(p)
                 last_mtimes[p.slug] = cur
+                last_change_ts[p.slug] = now_fn()
+
+        # Invariant 5 (reaper) — runs BEFORE reconcile_one (codex iter-1
+        # [P1]). A worker whose state.json mtime just advanced to
+        # phase=done MUST get its /exit + kill-cycle started before
+        # reconcile flips the task status and forgets the agent_id
+        # mapping. Otherwise reconcile clears worker_agent_ids and the
+        # subsequent reaper pass has no tmux session to address — the
+        # tmux session leaks as an orphan (the exact failure shape
+        # invariant 5 exists to prevent). Hook owns its own state
+        # persistence; failures are non-fatal.
+        #
+        # Codex iter-3 [P2]: reaper_hook may return a list of slugs
+        # whose kill cycle COMPLETED this iteration. Those slugs need
+        # an immediate reconcile pass — their state.json mtime probably
+        # hasn't moved (the worker exited cleanly and state.json was
+        # stable for several polls), so without an explicit re-add to
+        # `changed` the status flip would wait for the periodic full
+        # reconcile (5+ minutes default). For cap=1 projects this
+        # blocks the next dispatch.
+        reaped_now: list[str] = []
+        if reaper_hook is not None:
+            try:
+                ret = reaper_hook(probes)
+                if isinstance(ret, list):
+                    reaped_now = [str(s) for s in ret if isinstance(s, str)]
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"reaper_hook: {exc}")
+        # Add the just-reaped slugs to `changed` so reconcile re-runs
+        # against them this iteration (their lane is now clear, the
+        # deferred status flip can proceed).
+        if reaped_now:
+            slug_to_probe = {p.slug: p for p in probes}
+            for slug in reaped_now:
+                p = slug_to_probe.get(slug)
+                if p is None:
+                    continue
+                if p not in changed:
+                    changed.append(p)
 
         if changed:
             for p in changed:
@@ -757,14 +1135,27 @@ def run_supervisor(
             cfg.stuck_check_every if cfg.stuck_check_every > 0
             else _PERIODIC_RECONCILE_FALLBACK_EVERY
         )
+        # Codex iter-6 [P2] + iter-8 [P2]: cadence by WALL-CLOCK time
+        # for BOTH drivers. Adaptive mode varies per-iteration sleep
+        # (5/30 s); legacy mode is now perturbed by forced-wake zero-
+        # sleep iterations (the codex iter-8 [P2] finding). Using
+        # elapsed seconds against the operator-facing target
+        # (poll_interval_s × stuck_check_every) gives "every 5 min by
+        # default" semantics in every mode and shields the recovery
+        # ladder from inbox/archive event bursts.
+        stuck_target_s = float(cfg.poll_interval_s * cfg.stuck_check_every)
+        periodic_target_s = float(cfg.poll_interval_s * reconcile_cadence)
+        now_clock = now_fn()
         run_periodic = (
             periodic_full_reconcile is not None
             and reconcile_cadence > 0
-            and poll_count % reconcile_cadence == 0
+            and periodic_target_s > 0
+            and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
         )
         run_stuck = (
             cfg.stuck_check_every > 0
-            and poll_count % cfg.stuck_check_every == 0
+            and stuck_target_s > 0
+            and (now_clock - last_stuck_check_unix) >= stuck_target_s
         )
         if run_periodic or run_stuck:
             # Periodic full reconcile FIRST. Running before stuck-check
@@ -772,12 +1163,22 @@ def run_supervisor(
             # would otherwise be stuck-flagged on the next pass) drops
             # out of the live-worker probe set BEFORE we evaluate it.
             if run_periodic:
+                last_periodic_reconcile_unix = now_clock
                 try:
                     periodic_full_reconcile()
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"periodic-reconcile: {exc}")
             if run_stuck:
+                last_stuck_check_unix = now_clock
                 res.stuck_check_passes += 1
+                # Codex iter-12 [P1] + iter-18 [P1]: capture the
+                # per-write mtimes of every [STUCK] alert this pass
+                # emits, so we can swallow ONLY our own writes when
+                # bumping direct_inbox_session_baseline. An operator
+                # write that races our alert in the same pass would
+                # have a DIFFERENT mtime — using that as baseline
+                # would silence the operator message.
+                stuck_alert_mtimes: list[float] = []
                 try:
                     stuck_summary = _run_stuck_check_pass(
                         probes=probes,
@@ -786,13 +1187,34 @@ def run_supervisor(
                         fleet_bin=fleet_bin,
                         cfg=cfg,
                         now_unix=now_fn(),
+                        coord_id=coord_id,
                         log_stream=log_stream,
+                        stuck_alert_mtimes=stuck_alert_mtimes,
                     )
                     res.nudges_sent += stuck_summary.nudges
                     res.escalations += stuck_summary.escalations
                     res.blocks += stuck_summary.blocks
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"stuck-check: {exc}")
+                    stuck_summary = _StuckPassResult()
+                # Codex iter-12 [P1]: if the stuck-check pass wrote
+                # to the coord inbox (a [STUCK] alert), advance the
+                # session baseline so the next forced wake doesn't
+                # treat the alert as an operator message.
+                #
+                # Codex iter-18 [P1]: advance the baseline ONLY to
+                # the highest mtime we recorded immediately after our
+                # OWN writes. An operator write that races our pass
+                # has a different (typically later) mtime — it stays
+                # > baseline and triggers the operator-inbox-exit on
+                # the next forced wake. Without per-write capture,
+                # taking the file's final mtime would baseline-over
+                # any concurrent operator write and silence the
+                # operator message for the rest of the session.
+                if coord_id and stuck_alert_mtimes:
+                    new_baseline = max(stuck_alert_mtimes)
+                    if new_baseline > direct_inbox_session_baseline:
+                        direct_inbox_session_baseline = new_baseline
                 # dashboard-accumulation-f-4421 Sub-fix C: agent
                 # auto-archive runs alongside the stuck-check pass at the
                 # same cadence. Best-effort; failures log to stderr and
@@ -824,6 +1246,12 @@ class _StuckPassResult:
     nudges: int = 0
     escalations: int = 0
     blocks: int = 0
+    # Codex iter-13 [P2]: count of [STUCK] inbox alerts emitted to
+    # the coord inbox this pass. Used by run_supervisor to know
+    # whether to swallow the post-pass mtime bump on the session
+    # baseline (only swallow when we actually wrote — otherwise
+    # an operator's concurrent write would be lost).
+    stuck_alerts: int = 0
 
 
 def _run_idle_agent_archive_pass(
@@ -962,6 +1390,8 @@ def _run_stuck_check_pass(
     cfg: SupervisorConfig,
     now_unix: float,
     log_stream,
+    coord_id: str = "",
+    stuck_alert_mtimes: list[float] | None = None,
 ) -> _StuckPassResult:
     """One pass over every probe: load supervisor state, classify, act.
 
@@ -1041,6 +1471,29 @@ def _run_stuck_check_pass(
         #   nudged_at set, no escalated_at, cooldown elapsed → escalate
         #   escalated_at set, cooldown elapsed               → block
         if sup.nudged_at <= 0.0:
+            # Codex iter-5 [P2]: emit the stuck alert FIRST, BEFORE the
+            # nudge attempt. The invariant-4 alert surface must fire
+            # even when the worker has no agent_id mapping (lost during
+            # a coord restart, never registered) or when the nudge
+            # inbox write fails transiently — those are exactly the
+            # cases where the operator most needs the alert.
+            # Codex iter-6 [P3]: use the threaded coord_id; fall back
+            # to the env var only when the caller didn't supply one
+            # (legacy CLI invocation path).
+            alert_coord_id = coord_id or os.environ.get(
+                "FLEET_AGENT_ID", "",
+            ) or ""
+            if alert_coord_id:
+                wrote = emit_stuck_alert(
+                    alert_coord_id, p.slug, fleet_home=home,
+                    detail=(
+                        f"phase={cur_phase or '?'} idle since "
+                        f"{_fmt_ts(now_unix)}"
+                    ),
+                    post_write_mtime=stuck_alert_mtimes,
+                )
+                if wrote:
+                    out.stuck_alerts += 1
             if agent_id and nudge_worker(agent_id, fleet_home=home):
                 sup.nudged_at = now_unix
                 out.nudges += 1
@@ -1048,6 +1501,15 @@ def _run_stuck_check_pass(
                     f"[coord] worker {p.slug} stuck since {_fmt_ts(now_unix)}; nudging",
                     stream=log_stream,
                 )
+            # Codex iter-7 [P2]: if the nudge was NOT actually delivered
+            # (no agent_id, or nudge_worker returned ""), do NOT advance
+            # nudged_at — otherwise the next pass cooldown would mature
+            # and escalate the worker to operator-blocked without any
+            # recovery message having reached it. Leave nudged_at=0 so
+            # the loop retries on the next stuck-check pass; the
+            # stuck-alert above keeps surfacing the situation. The
+            # cooldown-of-cooldowns concern (alert spam) is bounded by
+            # FLEET_COORD_STUCK_CHECK_EVERY (default 5 min cadence).
         elif sup.escalated_at <= 0.0:
             # Need at least one full cooldown after the nudge before
             # escalating, so the worker has a chance to respond.

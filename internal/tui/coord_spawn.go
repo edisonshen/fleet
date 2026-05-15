@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // coordSpawnCtx bundles the per-render inputs the project block needs
@@ -53,9 +54,11 @@ type coordSpawnCtx struct {
 	records      []*agent.Record
 }
 
-// coordSpawnState enumerates the four indicator states the project row
-// can be in with respect to the coord-spawn marker. Naming mirrors the
-// spec language in issue #86 to keep the test names readable.
+// coordSpawnState enumerates the indicator states the project row can
+// be in with respect to the coord-spawn marker: Idle, Spawning, Active,
+// Stuck, Waiting (PART 2b downgrade), and NeverTicked (Path C
+// post-suppression hint). Naming mirrors the spec language in issue #86
+// to keep the test names readable.
 type coordSpawnState int
 
 const (
@@ -92,6 +95,23 @@ const (
 	// only) and the needs_input lookup is local to the project block
 	// that already reads ctx.records.
 	coordSpawnWaiting
+
+	// coordSpawnNeverTicked: the spawn succeeded (tmux session alive AND
+	// the agent record was written to ~/.fleet/agents/<id>.json) but
+	// coord-state.json was never published under this agent's spawn —
+	// i.e. last tick predates the agent's spawned_at, or no coord-state
+	// ever existed, AND we're past the cold-start grace window. This is
+	// a softer informational hint pointing at "Stop hook or /coordinator
+	// skill registration may be broken" — distinct from the "▲ coord
+	// spawn stuck" attention chip, which falsely accused live coords of
+	// being hung (issue: 2026-05-14 false positive on fleet-49bc8a03 in
+	// HANDOFF state at 6% context).
+	//
+	// The render-side gate constructs this state AFTER Path C self-heal
+	// has cleared the marker. Pure derivation (deriveCoordSpawnState)
+	// stays scoped to marker/state mtimes; this state surfaces only via
+	// the project-block path that already loads ctx.records.
+	coordSpawnNeverTicked
 )
 
 // coordSpawnTimeoutDefault is the default age past which a spawn is
@@ -99,6 +119,16 @@ const (
 // laptop top out around 3-5 minutes (issue #86), so 10× that is well
 // past any healthy boot.
 const coordSpawnTimeoutDefault = 10 * time.Minute
+
+// minNeverTickedGrace is the floor on the cold-start grace window
+// used by the soft "spawned but never ticked" hint. Operators can
+// lower FLEET_COORD_SPAWN_TIMEOUT_S to a tight value (60-120s) to
+// make the red stuck chip fire sooner without also forcing the
+// never-ticked diagnostic ("Stop hook or skill registration may be
+// broken") to fire during a perfectly healthy 3-5 minute cold start.
+// 5 minutes covers the upper end of healthy boot per issue #86 spec.
+// Codex iter-17 P2 drove this floor.
+const minNeverTickedGrace = 5 * time.Minute
 
 // coordSpawnTimeoutEnv lets the operator override the stuck threshold
 // without recompiling. Value is parsed once at New() into Model.
@@ -307,6 +337,23 @@ func renderCoordSpawnLineForProject(
 		}
 		body := dimStyle.Render(msg)
 		return prefix + body, true
+	case coordSpawnNeverTicked:
+		// Informational hint, not an attention chip. Path C self-heal
+		// proved the spawn succeeded; this line tells the operator the
+		// /coordinator skill hasn't published a tick under THIS agent
+		// (could indicate Stop hook misconfig, /coordinator skill not
+		// registered, or HOME-pollution leaking into the tmux server —
+		// see project_fleet_home_leak memory). Dim styling so the
+		// operator's eye isn't dragged here; the agent appears in the
+		// regular agent list and they can attach via `fleet attach`.
+		var msg string
+		if markerAgentID != "" {
+			msg = "○ coord " + markerAgentID + " spawned but never ticked — Stop hook or skill registration may be broken"
+		} else {
+			msg = "○ coord for project " + projectName + " spawned but never ticked — Stop hook or skill registration may be broken"
+		}
+		body := dimStyle.Render(msg)
+		return prefix + body, true
 	}
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
 }
@@ -366,26 +413,44 @@ func downgradeStuckOnNeedsInput(
 
 // applyStuckSelfHeal is the issue #96 gap 1 + follow-up self-heal gate.
 // When derivation flagged the row as Stuck but evidence on disk says
-// the spawn either died silently OR already succeeded, the warning is a
-// lie — keeping it forever just trains operators to ignore the chip.
-// Transition Stuck → Idle and remove the stale marker via removeMarker
-// so the next render snaps back to the existing renderer.
+// the spawn either died silently OR already succeeded AND state has
+// been published, the warning is a lie — keeping it forever just trains
+// operators to ignore the chip. Transition Stuck → Idle and remove the
+// stale marker via removeMarker so the next render snaps back to the
+// existing renderer.
 //
-// Two heal paths cover the two ways "marker says stuck but the row
-// isn't really stuck" can happen:
+// Two heal paths preserve the contract that the marker is removed only
+// when re-attach is either impossible (Path A) OR rescued by another
+// authoritative signal (Path B — coord-state.json + lock body published
+// by the ticking agent):
 //
 //	Path A (issue #96): tmux session for the marker's agent ID is
-//	  definitively gone → spawn died silently → heal. (sessionAlive=false)
+//	  definitively gone → spawn died silently → heal + remove marker.
+//	  (sessionAlive=false; the operator cannot re-attach to a dead
+//	  session, so destroying the marker loses no useful state.)
 //
 //	Path B (follow-up): the agent record at ~/.fleet/agents/<id>.json
 //	  has a fresh last_activity_ts → spawn succeeded, the agent is
-//	  ticking, the marker just never got cleared → heal regardless of
-//	  current tmux liveness. (agentRecordFresh=true)
+//	  ticking, AND fleet-guard's per-tick writes imply coord-state.json
+//	  publication AND coordinator.lock body publication → heal +
+//	  remove marker. findCoordByLockBody rescues the subsequent [a]
+//	  re-attach. (agentRecordFresh=true)
 //
-// Both paths are independently sufficient. Either one being true causes
-// the marker to be removed and the state to flip to Idle. This deliberate
-// OR keeps Path B from regressing on tmux probe failures and keeps Path A
-// working when the agent record was never written (silent spawn death).
+// Path C (alive but never ticked — e.g. HANDOFF state, freshly-booted,
+// Stop-hook misconfig) is NOT handled here. The marker is the ONLY
+// proof of which agent is coord for the project in that state (no lock
+// body exists yet), so removing it breaks [a] re-attach in
+// findExistingCoordForProject AND findCoordByLockBody both. See
+// renderCoordSpawnLineForProject's caller in dashboard_view.go for
+// the Path C suppression: it downgrades Stuck → NeverTicked at render
+// time without touching the marker file. The marker stays so the
+// operator can press [a] and re-enter the live session.
+//
+// Both Path A and Path B are independently sufficient. Either being
+// true causes the marker to be removed and the state to flip to Idle.
+// The deliberate OR keeps Path B from regressing on tmux probe failures
+// and keeps Path A working when the agent record was never written
+// (silent spawn death).
 //
 // Inputs are pure: caller supplies the derived state, the agent ID
 // from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
@@ -401,9 +466,12 @@ func downgradeStuckOnNeedsInput(
 //   - markerAgentID is empty (we can't probe a session OR a record we
 //     don't know the name of — fall back to the existing Stuck warning
 //     so the operator still sees something is wrong),
-//   - neither heal path matches: sessionAlive=true AND agentRecordFresh=
+//   - neither A nor B matches: sessionAlive=true AND agentRecordFresh=
 //     false. That's the genuinely-hung case (live tmux, no fresh agent
-//     ticks) the original Stuck warning is designed for.
+//     ticks) the original Stuck warning is designed for. Path C handles
+//     the subset where an agent record exists but is stale (i.e. the
+//     spawn pipeline registered the agent but no Stop-hook tick has
+//     fired yet) at the render layer.
 //
 // Returns the (possibly healed) state and any removal error. The error
 // is informational; callers may log via flash but should still render
@@ -421,9 +489,10 @@ func applyStuckSelfHeal(
 	if markerAgentID == "" {
 		return st, nil
 	}
-	// Heal if EITHER path matches. Path A: dead session. Path B: fresh
-	// agent record (spawn succeeded, marker stale). When neither
-	// condition holds, the operator IS looking at a real hang.
+	// Heal if EITHER A or B matches. Path A: dead session. Path B: fresh
+	// agent record (spawn succeeded, lock body presumed published).
+	// Path C is intentionally NOT collapsed here — see docstring; it
+	// must NOT remove the marker, so its handling lives in the caller.
 	if sessionAlive && !agentRecordFresh {
 		return st, nil
 	}
@@ -471,6 +540,309 @@ func isAgentRecordFresh(records []*agent.Record, id string, now time.Time, windo
 			return false
 		}
 		return now.Sub(r.LastActivityTS) <= window
+	}
+	return false
+}
+
+// agentRecordExists reports whether records contains a non-nil entry
+// matching id. Drives Path C of applyStuckSelfHeal: a marker that names
+// an agent ID for which fleet wrote a record at ~/.fleet/agents/<id>.json
+// is proof the spawn pipeline completed, regardless of the record's
+// freshness. The Path A / B probes already gate on more specific signals
+// (dead tmux, fresh tick); Path C is the catch-all for "spawn succeeded
+// but the agent isn't currently ticking" (HANDOFF state, just-spawned,
+// Stop hook misconfigured) where the stuck-attention chip is the wrong
+// signal to give the operator.
+//
+// Empty id short-circuits to false (we can't match a record we don't
+// know the name of). Nil entries in the slice are tolerated.
+func agentRecordExists(records []*agent.Record, id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// agentProcessAliveFn returns true if the OS process with the given
+// PID is alive. Production points at workers.IsAlive (kill(pid, 0)
+// check); tests swap it to a deterministic map. Path C uses this to
+// distinguish "Claude alive, idle between Stop-hook fires" (suppress
+// red chip) from "tmux wrapper survived after Claude exited" (keep
+// red chip — operator-visible failure).
+//
+// var for stub-ability — same pattern as sessionAliveFn /
+// coordSpawnMarkerFn elsewhere in this file. PID ≤ 0 is treated as
+// "no PID recorded" → false (we can't confirm liveness without a PID,
+// default to "treat as dead" so the stuck warning surfaces).
+var agentProcessAliveFn = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return workersIsAlive(pid)
+}
+
+// workersIsAlive is a thin indirection over workers.IsAlive so the
+// tui package can test agentProcessAliveFn's behavior without taking
+// a direct dependency on the workers package's exported helper. The
+// dependency is one-way (tui → workers) and the indirection here is
+// purely for the test stub seam.
+var workersIsAlive = workers.IsAlive
+
+// agentNeedsInput reports whether the agent record matching id has
+// needs_input=true. Thin lookup helper distinct from
+// downgradeStuckOnNeedsInput (which couples the flag check with the
+// freshness window). The render-layer second-chance downgrade in
+// projectFooterLines pairs this with agentClaudeAlive to trust the
+// flag even when last_activity_ts is stale — fleet-guard only clears
+// needs_input on UserPromptSubmit, so a stale-but-live coord that's
+// been waiting > 10min remains the right operator action ("fleet
+// attach <id>").
+func agentNeedsInput(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return r.NeedsInput
+	}
+	return false
+}
+
+// agentClaudeAlive reports whether the process recorded in the agent
+// record matching id is still alive. Returns false when:
+//   - id is empty, records is nil/empty, or no record matches,
+//   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
+//   - the PID's process is dead (kill(0) returns ESRCH).
+//
+// Path C uses this to distinguish:
+//   - Claude alive, idle between Stop-hook fires (HANDOFF state) →
+//     PID alive → suppress red chip
+//   - Spawn provisional PID dead (os.Getpid() fallback the moment
+//     dispatch returns) → keep red chip — operator-visible failure
+//
+// Trade-offs deferred for v0.1:
+//   - Wrapper-shell fallback (codex iter-24 P1): when
+//     resolveEnginePid times out, spawn.Spawn records the tmux pane's
+//     shell PID. That shell can survive past Claude exiting. The
+//     previous iteration tried argvLooksLikeShellWrapper to detect
+//     this, but it conflicted with supported raw-shell coord commands
+//     (`--command sh`, paneIsRawShellLeaf cases). Without a way to
+//     distinguish "wrapper kept alive after Claude crashed" from
+//     "operator legitimately running a shell-based coord engine,"
+//     Path C may suppress for the former. fleet-guard's reconcile_pid
+//     repairs drifted PIDs on every Stop hook so the window is
+//     bounded; the operator brief explicitly prefers fewer red
+//     false-positives over rare detection of this edge case.
+//   - PID recycle (codex iter-20 P1, iter-22 P1): kill(0) returns
+//     true for any process owning the recycled PID. fleet-guard's
+//     reconcile_pid also repairs this case via the
+//     fleet-coord-<id> disambiguator. The TUI cannot use the same
+//     check because spawn.InjectRemoteControlFlag only fires for
+//     default-shape spawns (`sh -c "claude ..."`).
+//
+// Cost: one kill(0) per render per project (~1μs Linux/macOS).
+// Stub-overridable via agentProcessAliveFn for tests.
+func agentClaudeAlive(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return agentProcessAliveFn(r.PID)
+	}
+	return false
+}
+
+// agentEverActivated reports whether the agent record for id has
+// fired at least one fleet-guard Stop hook since spawn. agent.New()
+// initializes last_activity_ts == spawned_at (same time.Now() call);
+// the Stop hook is the only thing that advances last_activity_ts, and
+// the hook runs from INSIDE Claude on every assistant turn. So
+// last_activity_ts strictly NOT-EQUAL to spawned_at proves a Stop
+// hook fired at least once, which proves Claude was alive after spawn.
+//
+// Used by Path C to distinguish:
+//   - "Claude alive, idle between Stop-hook fires" (HANDOFF state,
+//     waiting on operator) → last_activity_ts != spawned_at → activated
+//     → Path C may suppress the red stuck chip
+//   - "tmux wrapper survived but Claude died at startup before any
+//     Stop-hook fired" → last_activity_ts == spawned_at (same nanosec
+//     value from agent.New()) → NOT activated → keep the red stuck
+//     chip so the operator notices
+//
+// Inequality (not "strictly after") is the right comparison because
+// skills/fleet-guard/health.py writes last_activity_ts with whole-
+// second RFC 3339 precision while agent.New() preserves nanoseconds.
+// A first Stop hook that fires in the same wall-clock second as spawn
+// will write last_activity_ts = "12:00:00Z" while spawned_at remains
+// "12:00:00.123456789Z" — the hook timestamp compares LESS than spawn
+// by up to ~999ms (codex iter-7 P1 fix). Strict after-comparison
+// would misclassify that fast-Stop-hook case as "not activated."
+// Inequality catches both the fast-same-second case and any later
+// second; the only thing it excludes is the exact-equal agent.New()
+// shape, which is what we want.
+//
+// Returns false on the obvious non-applicable cases (empty id, no
+// matching record, zero spawned_at, zero last_activity_ts).
+func agentEverActivated(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() || r.LastActivityTS.IsZero() {
+			return false
+		}
+		return !r.LastActivityTS.Equal(r.SpawnedAt)
+	}
+	return false
+}
+
+// coordNeverTickedThisSpawn reports whether the coord-state.json
+// publication has NOT yet caught up to the agent's spawned_at. Returns
+// true when:
+//   - the agent record exists for id (Path C only makes sense with a
+//     record on disk), AND
+//   - lastTick is zero (no coord-state.json ever) OR predates
+//     spawned_at by more than coordTickMtimeTolerance (a leftover state
+//     file from a previous coord under this project, with slack for
+//     filesystem mtime resolution). Legacy records with zero
+//     spawned_at also count as never-ticked — we can't prove a lock
+//     body / state file exists under this spawn without spawned_at,
+//     and defaulting to "never ticked" preserves the marker so [a]
+//     re-attach still works (codex iter-9 P2: don't allow Path B
+//     marker removal on a record we can't reason about).
+//
+// Used by the render-layer Path C suppression AND by Path A/B's marker-
+// removal gate to distinguish "alive coord that has never ticked under
+// this spawn" (false-positive stuck; preserve marker for re-attach)
+// from "alive coord that ticked successfully then wedged" (genuine
+// stuck — keep the warning so the operator triages via tmux). Without
+// the narrower check Path C would demote every live tmux session to
+// Idle even when LastTick proves the coord successfully booted (codex
+// iter-2 P1), and Path B would delete the marker before the operator
+// could re-attach a never-ticked-but-otherwise-alive coord (codex
+// iter-5 P1).
+//
+// Distinct from agentNeverTickedSinceSpawn, which adds a cold-start
+// grace window before promoting Idle → NeverTicked for the
+// informational hint. The Path C / Path B gate has no grace window
+// (whether the coord has ticked is a binary fact regardless of age),
+// only the mtime-resolution slack.
+func coordNeverTickedThisSpawn(
+	records []*agent.Record,
+	id string,
+	lastTick time.Time,
+) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() {
+			// Legacy / partial-write record without spawned_at. We
+			// cannot prove the coord ticked under THIS spawn (no
+			// reference point) — the project-scoped coord-state.json
+			// may belong to a previous coordinator (codex iter-22 P2).
+			// Default to "never ticked" so Path B does NOT delete the
+			// marker; losing the marker on a legacy live coord would
+			// break [a] re-attach. Codex iter-9 P2.
+			return true
+		}
+		if lastTick.IsZero() {
+			return true
+		}
+		// Strict comparison: lastTick BEFORE spawned_at means the tick
+		// is from a PREVIOUS coord (the coord-state.json file is
+		// project-scoped, so a leftover tick from the prior coord
+		// outlives that coord's lifecycle). We do NOT add a negative
+		// tolerance here — codex iter-14 P2: a 1-second gap between
+		// the old coord's last tick and the new coord's spawn was
+		// being misclassified as "the new coord ticked," letting Path
+		// B remove the marker without proof of publication under this
+		// spawn. Same-second first-tick from THIS spawn is essentially
+		// impossible in production (cold-start takes seconds; first
+		// Stop hook needs ≥1 assistant turn), so dropping the
+		// tolerance has no realistic miss.
+		return lastTick.Before(r.SpawnedAt)
+	}
+	return false
+}
+
+// agentNeverTickedSinceSpawn reports whether a softer "spawned but never
+// ticked" hint should render after Path C self-heal. Returns true when
+// the agent record for id exists AND either (a) spawned_at is zero
+// (legacy record — we can't measure grace, but the marker has aged
+// past spawnTimeout so the operator has waited long enough; codex
+// iter-10 P2) or (b) spawned_at is non-zero, older than graceWindow,
+// AND the last coord-state.json tick (lastTick) either is zero (no
+// state file ever) or predates spawned_at (a stale state from a
+// previous coord under this project).
+//
+// graceWindow is the cold-start budget: cold starts on a fresh laptop
+// top out around 3-5min, so the caller passes coordSpawnTimeoutDefault
+// (10m) in production — beyond that window, "the coord never ticked
+// under this spawn" is informational rather than alarming, and points
+// the operator at /coordinator skill registration or Stop hook config.
+//
+// Returns false on the non-applicable cases:
+//   - empty id, nil/empty records, no matching record,
+//   - non-zero spawned_at within the grace window (cold start may still complete),
+//   - non-zero spawned_at AND lastTick within mtime tolerance of (or
+//     after) spawned_at (a tick already arrived under this agent —
+//     no longer "never ticked").
+func agentNeverTickedSinceSpawn(
+	records []*agent.Record,
+	id string,
+	lastTick time.Time,
+	now time.Time,
+	graceWindow time.Duration,
+) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() {
+			// Legacy record: codex iter-20 P2 — fire the diagnostic
+			// ONLY when no state file has ever existed under this
+			// project. If lastTick is non-zero, a previous coord (or
+			// this one) published state at some point; without
+			// SpawnedAt we can't tell which, but defaulting to "not
+			// never-ticked" (false) preserves the existing
+			// idle-stop/post-active render rather than overlaying a
+			// contradictory "never ticked" message on a legacy row
+			// whose state file proves a tick happened.
+			return lastTick.IsZero()
+		}
+		if now.Sub(r.SpawnedAt) <= graceWindow {
+			return false
+		}
+		// Tick exists AND is on-or-after spawned_at → already ticked.
+		// Strict comparison aligned with coordNeverTickedThisSpawn
+		// (codex iter-14 P2): no tolerance window because a leftover
+		// tick from the previous coord (project-scoped state file)
+		// would otherwise be attributed to this spawn.
+		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
+			return false
+		}
+		return true
 	}
 	return false
 }
