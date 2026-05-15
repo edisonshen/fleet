@@ -1067,43 +1067,28 @@ def run_supervisor(
             cfg.stuck_check_every if cfg.stuck_check_every > 0
             else _PERIODIC_RECONCILE_FALLBACK_EVERY
         )
-        # Codex iter-6 [P2]: when the adaptive driver is active, the
-        # per-poll cadence varies (5 s base, 30 s backoff). Multiplying
-        # poll_count × cfg.poll_interval_s would understate wall-clock
-        # time. Use wall-clock elapsed seconds instead. Legacy path
-        # (poll_base_interval_s=0) uses cfg.poll_interval_s × stuck_
-        # check_every as the wall-clock target — exactly matches the
-        # v0.2.x behavior.
-        adaptive_on = cfg.poll_base_interval_s > 0
-        # Wall-clock thresholds: convert poll-count cadence to seconds
-        # using the legacy interval (poll_interval_s × stuck_check_every)
-        # for both drivers. This preserves the operator-facing
-        # "stuck-check fires every 5 min by default" expectation.
+        # Codex iter-6 [P2] + iter-8 [P2]: cadence by WALL-CLOCK time
+        # for BOTH drivers. Adaptive mode varies per-iteration sleep
+        # (5/30 s); legacy mode is now perturbed by forced-wake zero-
+        # sleep iterations (the codex iter-8 [P2] finding). Using
+        # elapsed seconds against the operator-facing target
+        # (poll_interval_s × stuck_check_every) gives "every 5 min by
+        # default" semantics in every mode and shields the recovery
+        # ladder from inbox/archive event bursts.
         stuck_target_s = float(cfg.poll_interval_s * cfg.stuck_check_every)
         periodic_target_s = float(cfg.poll_interval_s * reconcile_cadence)
         now_clock = now_fn()
-        if adaptive_on:
-            run_periodic = (
-                periodic_full_reconcile is not None
-                and reconcile_cadence > 0
-                and periodic_target_s > 0
-                and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
-            )
-            run_stuck = (
-                cfg.stuck_check_every > 0
-                and stuck_target_s > 0
-                and (now_clock - last_stuck_check_unix) >= stuck_target_s
-            )
-        else:
-            run_periodic = (
-                periodic_full_reconcile is not None
-                and reconcile_cadence > 0
-                and poll_count % reconcile_cadence == 0
-            )
-            run_stuck = (
-                cfg.stuck_check_every > 0
-                and poll_count % cfg.stuck_check_every == 0
-            )
+        run_periodic = (
+            periodic_full_reconcile is not None
+            and reconcile_cadence > 0
+            and periodic_target_s > 0
+            and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
+        )
+        run_stuck = (
+            cfg.stuck_check_every > 0
+            and stuck_target_s > 0
+            and (now_clock - last_stuck_check_unix) >= stuck_target_s
+        )
         if run_periodic or run_stuck:
             # Periodic full reconcile FIRST. Running before stuck-check
             # means a worker that just transitioned to in-review (and

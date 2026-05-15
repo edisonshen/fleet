@@ -822,13 +822,19 @@ def _run_supervisor(
         )
 
     def force_tick_check_hook() -> bool:
-        # Read latest archive watermark from disk so a primary-tick
-        # archive scan that updated coord-state is honored — keeps the
-        # supervisor's view in sync with the tick-side drain.
+        # Codex iter-8 [P2]: the archive watermark lives in coord-state's
+        # `last_archive_scan_ts`. We read it FRESH every call so the
+        # actual drain side (which respects _ARCHIVE_SCAN_CAP of 200
+        # files per pass) is the single source of truth. Previously
+        # this hook eagerly advanced its own baseline to the NEWEST
+        # archive filename — which meant when 201+ files queued, the
+        # drain consumed 200, baseline jumped past all 201, and the
+        # 201st never re-fired force_tick. Now: read disk, trust disk.
         cs = _load_coord_state(state_path)
         disk_archive = str(cs.get("last_archive_scan_ts", "") or "")
-        if disk_archive > force_tick_baseline["archive"]:
-            force_tick_baseline["archive"] = disk_archive
+        # Keep the closed-over field in sync (used for the no-event
+        # case + a fast-path if the disk read raced).
+        force_tick_baseline["archive"] = disk_archive
         triggered = supervisor_mod.has_pending_inbox_events(
             coord_id=coord_id_for_force,
             fleet_home=home,
@@ -836,33 +842,16 @@ def _run_supervisor(
             direct_inbox_mtime_baseline=force_tick_baseline["mtime"],
         )
         if triggered:
-            # Advance baseline + archive watermark so the next iteration
-            # doesn't re-fire on the same event (codex iter-2 [P1]).
-            # Direct inbox: bump baseline to the current mtime so any
-            # further write is required to retrigger.
+            # Advance ONLY the direct-inbox mtime baseline — the archive
+            # baseline advances via the drain side on the same iteration.
+            # Without the direct-inbox advance the same operator message
+            # would refire on every iteration.
             if coord_id_for_force:
                 direct = home / "inbox" / f"{coord_id_for_force}.md"
                 try:
                     new_mtime = direct.stat().st_mtime
                     if new_mtime > force_tick_baseline["mtime"]:
                         force_tick_baseline["mtime"] = new_mtime
-                except OSError:
-                    pass
-                # Archive: walk the dir once to find the newest
-                # post-watermark filename and bump the watermark to
-                # match. This is the same shape _drain_archive uses.
-                archive = home / "inbox" / "archive"
-                try:
-                    if archive.is_dir():
-                        prefix = coord_id_for_force + "-"
-                        names = sorted(
-                            p.name for p in archive.iterdir()
-                            if p.name.startswith(prefix)
-                        )
-                        if names:
-                            newest = names[-1]
-                            if newest > force_tick_baseline["archive"]:
-                                force_tick_baseline["archive"] = newest
                 except OSError:
                     pass
         return triggered
@@ -920,9 +909,47 @@ def _run_supervisor(
     # worker back to `todo` or restore an old PR URL. Fix: drain the
     # archive inside the same wake, advance the watermark to "this
     # tick consumed everything I had", so replay is impossible.
+    #
+    # Codex iter-8 [P1]: run the reaper BEFORE the drain. For a worker
+    # whose state.json reports phase=done/failed (so the reaper would
+    # judge it complete), but which hasn't yet finished its kill
+    # cycle, we must NOT let the drain's TASK_DONE_PR/WORKER_FAILED
+    # sentinel forget the agent_id before the reaper sends /exit. The
+    # primary tick already runs reaper-before-drain (step 2.5 then 4);
+    # this brings the forced-wake path into alignment.
     def force_tick_dispatch_hook():
+        _run_reaper_once_supervisor()
         _drain_inbox_archive_supervisor()
         _maybe_dispatch_after_reconcile()
+
+    def _run_reaper_once_supervisor():
+        """One-shot reaper pass under the supervisor lock.
+        Same body as reaper_hook_supervisor but without the return
+        value (force_tick_dispatch doesn't need to plumb just-reaped
+        slugs through to a reconcile retrigger — the subsequent
+        _drain_inbox_archive_supervisor + _maybe_dispatch_after_
+        reconcile cover the recovery)."""
+        try:
+            f7 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"reaper hook tasks-read: {exc}")
+            return
+        cs = _load_coord_state(state_path)
+        decisions = _reap_inflight(
+            f7.tasks, project=project, home=home, fleet_bin=fleet_bin,
+            coord_state=cs, now_unix=time.time(),
+        )
+        for dec in decisions:
+            if dec.state == "hard-killed":
+                result.errors.append(
+                    f"[P0] reaper hard-killed {dec.slug}: {dec.detail}"
+                )
+                result.raised += 1
+            elif dec.state == "error":
+                result.errors.append(
+                    f"reaper error {dec.slug}: {dec.detail}"
+                )
+        _save_coord_state(state_path, cs)
 
     def _drain_inbox_archive_supervisor():
         """Drain archive sentinels under the supervisor lock.

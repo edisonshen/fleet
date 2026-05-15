@@ -1682,6 +1682,62 @@ def _adaptive_cfg(**overrides) -> supervisor.SupervisorConfig:
     return supervisor.SupervisorConfig(**base)
 
 
+def test_legacy_mode_stuck_check_cadence_uses_wall_clock(fleet_home: Path) -> None:
+    """Codex iter-8 [P2] regress: forced-wake zero-sleep iterations
+    used to inflate poll_count and could trigger the periodic / stuck
+    check ladders prematurely in legacy mode. Wall-clock cadence
+    means a burst of zero-sleep iterations does NOT advance the
+    cadence — only elapsed seconds do."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="1970-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    stuck_count = {"n": 0}
+
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
+        stuck_count["n"] += 1
+        return supervisor._StuckPassResult()
+    import unittest.mock as mock
+    fake_now_state = {"t": 0.0}
+
+    def fake_sleep(s):
+        fake_now_state["t"] += s if s > 0 else 0.0
+
+    seq = iter([[probe]] * 20 + [[]])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _cfg(
+        poll_interval_s=30, stuck_check_every=10,
+    )
+    # All iterations force-tick → zero sleep. With legacy poll-count
+    # cadence, 20 zero-sleep iterations × stuck_check_every=10 would
+    # trigger stuck-check twice. With wall-clock cadence, no time
+    # passes (fake_sleep recorded 0 every iter), so cadence target
+    # (30 × 10 = 300 s) is never reached → zero stuck-checks.
+    with mock.patch.object(supervisor, "_run_stuck_check_pass", fake_pass):
+        supervisor.run_supervisor(
+            cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+            sleep_fn=fake_sleep, now_fn=lambda: fake_now_state["t"],
+            refresh_probes=fake_refresh,
+            reconcile_one=lambda p: None,
+            write_state=lambda: None,
+            force_tick_check=lambda: True,
+            log_stream=io.StringIO(),
+        )
+    assert stuck_count["n"] == 0, (
+        f"forced-wake bursts triggered premature stuck-check: {stuck_count['n']}"
+    )
+
+
 def test_env_legacy_poll_interval_does_not_force_adaptive_cadence(
     monkeypatch,
 ) -> None:
