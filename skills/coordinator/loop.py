@@ -539,6 +539,7 @@ def _tick_locked(
             home=home,
             fleet_bin=fleet_bin,
             state_path=state_path,
+            coord_id=coord_id,
             result=result,
         )
     return result
@@ -555,6 +556,7 @@ def _run_supervisor(
     home: Path,
     fleet_bin: str,
     state_path: Path,
+    coord_id: str,
     result: TickResult,
 ) -> None:
     """Drive the supervisor loop. Hooks defined here so the supervisor
@@ -783,7 +785,12 @@ def _run_supervisor(
     # event doesn't re-fire on the next iteration (which would spin
     # the supervisor at 0-second sleeps). We mutate the closed-over
     # baseline + last_seen_archive on every True return.
-    coord_id_for_force = os.environ.get("FLEET_AGENT_ID", "") or ""
+    # Codex iter-3 [P3]: use the coord_id tick() already resolved
+    # (passed in as a parameter), not a fresh env read. tick(coord_id=
+    # "...") with FLEET_AGENT_ID unset or stale would otherwise watch
+    # the wrong inbox/archive surface — the supervisor would silently
+    # ignore force-tick events.
+    coord_id_for_force = coord_id or os.environ.get("FLEET_AGENT_ID", "") or ""
     # Use a mutable singleton dict so the inner hook can update the
     # baseline without `nonlocal`. The hook reads the current value
     # before each check and bumps it after a hit.
@@ -850,17 +857,25 @@ def _run_supervisor(
     # writes phase=done mid-supervisor session is reaped within the
     # base poll cadence (5 s default) rather than waiting for the
     # next stuck-check pass (5 min default).
-    def reaper_hook_supervisor(probes):
+    #
+    # Codex iter-3 [P2]: returns the list of slugs whose kill cycle
+    # COMPLETED this iteration (state ∈ {killed, hard-killed}). The
+    # supervisor uses this list to re-trigger reconcile against those
+    # slugs immediately — without it, a worker whose mtime advanced
+    # several polls earlier (when the lane wasn't clear) wouldn't get
+    # its status flip until the periodic full reconcile fires.
+    def reaper_hook_supervisor(probes) -> list[str]:
         try:
             f5 = parse.read(str(tasks_path))
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"reaper hook tasks-read: {exc}")
-            return
+            return []
         cs = _load_coord_state(state_path)
         decisions = _reap_inflight(
             f5.tasks, project=project, home=home, fleet_bin=fleet_bin,
             coord_state=cs, now_unix=time.time(),
         )
+        reaped: list[str] = []
         for dec in decisions:
             if dec.state == "hard-killed":
                 result.errors.append(
@@ -871,7 +886,10 @@ def _run_supervisor(
                 result.errors.append(
                     f"reaper error {dec.slug}: {dec.detail}"
                 )
+            if dec.state in ("killed", "hard-killed"):
+                reaped.append(dec.slug)
         _save_coord_state(state_path, cs)
+        return reaped
 
     # Codex iter-3 [P2]: drain + dispatch on every forced wake so a
     # NEW_TASK that arrives mid-supervisor session is picked up under

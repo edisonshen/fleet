@@ -2011,6 +2011,61 @@ def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
     assert res.iterations >= 1
 
 
+def test_reaper_hook_return_triggers_reconcile_for_just_reaped_slugs(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-3 [P2]: when the reaper hook returns a list of slugs
+    whose kill cycle completed THIS iteration, those slugs get added
+    to `changed` so reconcile re-runs against them — closing the
+    "deferred status flip waits for periodic full reconcile" gap that
+    blocks cap=1 dispatch for ~5 min."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="done", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    reconcile_calls: list[str] = []
+
+    def fake_reconcile(p):
+        reconcile_calls.append(p.slug)
+
+    # Reaper hook reports alpha-aaaa just got reaped (returned the slug).
+    def fake_reap(probes):
+        return ["alpha-aaaa"]
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=fake_reconcile,
+        write_state=lambda: None,
+        reaper_hook=fake_reap,
+        log_stream=io.StringIO(),
+    )
+    # Even though state.json mtime didn't advance, reconcile fired
+    # because the reaper hook returned alpha-aaaa as just-reaped.
+    assert "alpha-aaaa" in reconcile_calls, f"reconcile_calls={reconcile_calls}"
+
+
 def test_reaper_hook_runs_before_reconcile_on_mtime_change(
     fleet_home: Path,
 ) -> None:

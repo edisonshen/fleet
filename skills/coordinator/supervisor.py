@@ -841,7 +841,7 @@ def run_supervisor(
     periodic_full_reconcile: Callable[[], None] | None = None,
     force_tick_check: Callable[[], bool] | None = None,
     force_tick_dispatch: Callable[[], None] | None = None,
-    reaper_hook: Callable[[list[WorkerProbe]], None] | None = None,
+    reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -990,11 +990,34 @@ def run_supervisor(
         # tmux session leaks as an orphan (the exact failure shape
         # invariant 5 exists to prevent). Hook owns its own state
         # persistence; failures are non-fatal.
+        #
+        # Codex iter-3 [P2]: reaper_hook may return a list of slugs
+        # whose kill cycle COMPLETED this iteration. Those slugs need
+        # an immediate reconcile pass — their state.json mtime probably
+        # hasn't moved (the worker exited cleanly and state.json was
+        # stable for several polls), so without an explicit re-add to
+        # `changed` the status flip would wait for the periodic full
+        # reconcile (5+ minutes default). For cap=1 projects this
+        # blocks the next dispatch.
+        reaped_now: list[str] = []
         if reaper_hook is not None:
             try:
-                reaper_hook(probes)
+                ret = reaper_hook(probes)
+                if isinstance(ret, list):
+                    reaped_now = [str(s) for s in ret if isinstance(s, str)]
             except Exception as exc:  # noqa: BLE001
                 res.errors.append(f"reaper_hook: {exc}")
+        # Add the just-reaped slugs to `changed` so reconcile re-runs
+        # against them this iteration (their lane is now clear, the
+        # deferred status flip can proceed).
+        if reaped_now:
+            slug_to_probe = {p.slug: p for p in probes}
+            for slug in reaped_now:
+                p = slug_to_probe.get(slug)
+                if p is None:
+                    continue
+                if p not in changed:
+                    changed.append(p)
 
         if changed:
             for p in changed:
