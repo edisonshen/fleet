@@ -1682,6 +1682,31 @@ def _adaptive_cfg(**overrides) -> supervisor.SupervisorConfig:
     return supervisor.SupervisorConfig(**base)
 
 
+def test_env_legacy_poll_interval_does_not_force_adaptive_cadence(
+    monkeypatch,
+) -> None:
+    """Codex iter-5 [P2]: an operator who only sets
+    FLEET_COORD_POLL_INTERVAL_S=60 must keep getting 60 s polls.
+    Without an explicit FLEET_COORD_POLL_BASE_INTERVAL_S, the adaptive
+    cadence stays off (poll_base_interval_s=0)."""
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "60")
+    monkeypatch.delenv("FLEET_COORD_POLL_BASE_INTERVAL_S", raising=False)
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.poll_interval_s == 60
+    # Adaptive cadence disabled — falls through to poll_interval_s.
+    assert cfg.poll_base_interval_s == 0
+
+
+def test_env_explicit_base_interval_enables_adaptive_cadence(
+    monkeypatch,
+) -> None:
+    """Operator who explicitly sets FLEET_COORD_POLL_BASE_INTERVAL_S
+    (even to the default 5) gets the adaptive driver."""
+    monkeypatch.setenv("FLEET_COORD_POLL_BASE_INTERVAL_S", "5")
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.poll_base_interval_s == 5
+
+
 def test_poll_cadence_default_5s() -> None:
     """When no probe has been stable for stability_window, the next
     sleep is poll_base_interval_s (default 5)."""

@@ -79,9 +79,24 @@ def env_poll_base_interval_s() -> int:
     spending time on a single probe; the legacy single-rate driver
     keeps `env_poll_interval_s()` for back-compat.
 
-    Default 5 s; tests pin smaller values. 0 falls back to the legacy
-    single-rate cadence (no adaptive backoff)."""
-    return _env_int("FLEET_COORD_POLL_BASE_INTERVAL_S", 5)
+    Codex iter-5 [P2]: returns 0 when FLEET_COORD_POLL_BASE_INTERVAL_S
+    is UNSET, so the legacy poll_interval_s wins for deployments that
+    only tuned the old knob. An operator who explicitly sets the new
+    knob (even to its default 5) gets the adaptive driver; an operator
+    who only sets FLEET_COORD_POLL_INTERVAL_S=60 keeps polling every
+    60 s as before. Setting to 0 explicitly also disables adaptive
+    cadence — same shape as the other supervisor knobs.
+    """
+    raw = os.environ.get("FLEET_COORD_POLL_BASE_INTERVAL_S", "")
+    if raw == "":
+        return 0
+    try:
+        n = int(raw)
+    except ValueError:
+        return 0
+    if n < 0:
+        return 0
+    return n
 
 
 def env_poll_backoff_interval_s() -> int:
@@ -1328,6 +1343,21 @@ def _run_stuck_check_pass(
         #   nudged_at set, no escalated_at, cooldown elapsed → escalate
         #   escalated_at set, cooldown elapsed               → block
         if sup.nudged_at <= 0.0:
+            # Codex iter-5 [P2]: emit the stuck alert FIRST, BEFORE the
+            # nudge attempt. The invariant-4 alert surface must fire
+            # even when the worker has no agent_id mapping (lost during
+            # a coord restart, never registered) or when the nudge
+            # inbox write fails transiently — those are exactly the
+            # cases where the operator most needs the alert.
+            coord_id = os.environ.get("FLEET_AGENT_ID", "") or ""
+            if coord_id:
+                emit_stuck_alert(
+                    coord_id, p.slug, fleet_home=home,
+                    detail=(
+                        f"phase={cur_phase or '?'} idle since "
+                        f"{_fmt_ts(now_unix)}"
+                    ),
+                )
             if agent_id and nudge_worker(agent_id, fleet_home=home):
                 sup.nudged_at = now_unix
                 out.nudges += 1
@@ -1335,21 +1365,13 @@ def _run_stuck_check_pass(
                     f"[coord] worker {p.slug} stuck since {_fmt_ts(now_unix)}; nudging",
                     stream=log_stream,
                 )
-                # DESIGN invariant 4: surface stuck workers to the
-                # operator via the coord's own inbox so the TUI shows
-                # the alert separately from the per-worker nudge.
-                # Skipped silently when FLEET_AGENT_ID isn't set (test
-                # path or v0.1 manual-coord usage). Failures here are
-                # non-fatal — the nudge already fired.
-                coord_id = os.environ.get("FLEET_AGENT_ID", "") or ""
-                if coord_id:
-                    emit_stuck_alert(
-                        coord_id, p.slug, fleet_home=home,
-                        detail=(
-                            f"phase={cur_phase or '?'} idle since "
-                            f"{_fmt_ts(now_unix)}; nudged"
-                        ),
-                    )
+            else:
+                # No agent_id (or nudge_worker failed). Still record
+                # that we detected stuck this pass so the cooldown
+                # gates work on the next pass — otherwise we'd loop
+                # back into "stuck alert + no progress" on every
+                # stuck-check tick.
+                sup.nudged_at = now_unix
         elif sup.escalated_at <= 0.0:
             # Need at least one full cooldown after the nudge before
             # escalating, so the worker has a chance to respond.

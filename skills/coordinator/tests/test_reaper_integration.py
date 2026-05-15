@@ -355,6 +355,94 @@ def test_redispatch_pending_drops_marker_when_task_not_in_todo(
     assert set_calls == [], set_calls
 
 
+def test_deferred_sentinel_replayed_after_reaper_clears(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Codex iter-5 [P1] regress: when a TASK_DONE_PR/WORKER_FAILED
+    sentinel arrives while the reaper lane is still open for that
+    slug, the action is deferred (stored in coord-state.deferred_
+    sentinels) rather than being applied immediately. After the
+    reaper finishes its kill cycle on a subsequent tick, the deferred
+    sentinel is replayed.
+
+    Watermark still advances normally — the deferred action is
+    preserved via the per-coord queue, not by holding back the
+    watermark.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # Worker dir with phase=done state.json so reconcile + reaper both
+    # see the terminal state. Archive file carries TASK_DONE_PR.
+    workers_dir = fleet_home / "projects" / project / "workers" / "alpha-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    fresh = _dt.datetime.now(tz=_dt.timezone.utc).isoformat().replace(
+        "+00:00", "Z",
+    )
+    (workers_dir / "state.json").write_text(json.dumps({
+        "slug": "alpha-aaaa", "project": project,
+        "phase": "done", "updated_at": fresh,
+        "pr_url": "https://x/y/pull/3",
+    }), encoding="utf-8")
+    archive = fleet_home / "inbox" / "archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    (archive / "cccccc01-20260515-120000Z-msg.md").write_text(
+        "TASK_DONE_PR=alpha-aaaa https://x/y/pull/3\n",
+        encoding="utf-8",
+    )
+    _write_tasks(project_dir, [
+        _make_task("alpha-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    coord_state_path = project_dir / "coord-state.json"
+    coord_state_path.write_text(json.dumps({
+        "worker_agent_ids": {"alpha-aaaa": "aaaaaaaa"},
+    }), encoding="utf-8")
+
+    # Stub kill primitives: tmux alive on tick 1 (grace fires), dead
+    # on tick 2 (kill succeeds). reap_one's first pass starts grace;
+    # second pass archives.
+    alive_iter = iter([True, True, False, False, False, False])
+    monkeypatch.setattr(
+        supervisor, "tmux_session_alive",
+        lambda s: next(alive_iter, False),
+    )
+    monkeypatch.setattr(reaper, "send_exit_directive", lambda s, **kw: True)
+    monkeypatch.setattr(
+        reaper, "run_fleet_rm",
+        lambda fb, aid, timeout_s=30.0: (True, ""),
+    )
+
+    # Tick 1: reaper opens entry (lane not clear). Sentinel deferred.
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home), now_unix=1000.0,
+        )
+    cs1 = json.loads(coord_state_path.read_text())
+    deferred1 = cs1.get("deferred_sentinels", [])
+    assert any(d.get("slug") == "alpha-aaaa" for d in deferred1), (
+        f"sentinel not deferred: {deferred1}"
+    )
+    # Watermark still advanced (the file IS consumed; replay is via
+    # the deferred queue, not file rescan).
+    assert cs1.get("last_archive_scan_ts", ""), "watermark not advanced"
+
+    # Tick 2: grace expired, reaper kills, deferred sentinel replays.
+    fleet_run_recorder.clear()
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            project, coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home), now_unix=1020.0,
+        )
+    cs2 = json.loads(coord_state_path.read_text())
+    # Deferred queue drained.
+    deferred2 = cs2.get("deferred_sentinels", [])
+    assert not any(d.get("slug") == "alpha-aaaa" for d in deferred2), (
+        f"deferred sentinel not replayed: {deferred2}"
+    )
+
+
 def test_force_tick_dispatch_drains_archive_to_advance_watermark(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,

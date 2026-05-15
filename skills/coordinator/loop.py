@@ -366,6 +366,17 @@ def _tick_locked(
     # path is a no-op — preserving v0.2.0 byte-identical behavior.
     sentinel_repo = cwd if cap > 1 else ""
     sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+    # Codex iter-5 [P1]: stash deferred sentinels in coord-state so the
+    # next tick can replay them after the reaper lane clears. Watermark
+    # advances normally — the deferred sentinels are queued separately
+    # by source_file so the file itself can be safely "consumed" while
+    # the action still needs to land.
+    deferred_actions: list[_SentinelAction] = []
+    # Process any sentinels that were deferred on a PRIOR tick first.
+    # Prepend them to `drained` so they're attempted before this tick's
+    # fresh batch (FIFO ordering for fairness).
+    prior_deferred = _load_deferred_sentinels(state)
+    drained = prior_deferred + drained
     for action in drained:
         # Codex iter-3 [P1]: gate worker-clearing sentinels on the
         # reaper lane, matching reconcile. TASK_DONE_PR / WORKER_FAILED
@@ -377,6 +388,7 @@ def _tick_locked(
         if action.kind in ("task_done_pr", "worker_failed") and not (
             _reaper_lane_clear_for(state, action.slug)
         ):
+            deferred_actions.append(action)
             continue
         try:
             _apply_sentinel(
@@ -400,6 +412,8 @@ def _tick_locked(
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
             result.errors.append(f"sentinel {action.slug}: {exc}")
+    # Persist the deferred queue (or clear if nothing deferred this tick).
+    _save_deferred_sentinels(state, deferred_actions)
     if last_seen:
         state["last_archive_scan_ts"] = last_seen
 
@@ -914,9 +928,9 @@ def _run_supervisor(
         """Drain archive sentinels under the supervisor lock.
 
         Mirrors the primary tick's drain step (loop._tick_locked step 4)
-        with one difference: probes for reaper-lane state and skips
-        applying worker-clearing sentinels (TASK_DONE_PR / WORKER_FAILED)
-        when the lane is still open — same gate the primary tick uses.
+        with the same reaper-lane gate and the same deferred-sentinel
+        queue (codex iter-5 [P1]) — deferred actions are persisted in
+        coord-state and replayed on the next pass.
         """
         try:
             f6 = parse.read(str(tasks_path))
@@ -931,14 +945,18 @@ def _run_supervisor(
             since=str(cs.get("last_archive_scan_ts", "") or ""),
             tasks_by_slug=tasks_by_slug,
         )
+        prior_deferred = _load_deferred_sentinels(cs)
+        drained = prior_deferred + drained
         if not drained and not last_seen:
             return
         sentinel_repo = cwd if cap > 1 else ""
         sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+        deferred_actions: list[_SentinelAction] = []
         for action in drained:
             if action.kind in ("task_done_pr", "worker_failed") and not (
                 _reaper_lane_clear_for(cs, action.slug)
             ):
+                deferred_actions.append(action)
                 continue
             try:
                 _apply_sentinel(
@@ -957,6 +975,7 @@ def _run_supervisor(
                 result.errors.append(
                     f"supervisor sentinel {action.slug}: {exc}"
                 )
+        _save_deferred_sentinels(cs, deferred_actions)
         if last_seen:
             cs["last_archive_scan_ts"] = last_seen
         _save_coord_state(state_path, cs)
@@ -1096,6 +1115,70 @@ def _reaper_lane_clear_for(coord_state: dict, slug: str) -> bool:
     only this gate is needed. Returns True iff the reaper has no open
     kill cycle for `slug`."""
     return reaper_mod.reaper_lane_clear(coord_state, slug)
+
+
+# Codex iter-5 [P1]: deferred sentinel queue in coord-state.
+# Schema under coord-state["deferred_sentinels"]: a list of dicts, one
+# per deferred sentinel action. Each entry preserves the original
+# action's slug + kind + payload + raised_to_user + raise_text +
+# source_file so the next tick can re-apply it without re-reading the
+# archive file. The list is FIFO; new deferrals append, the next tick
+# prepends the list to its fresh drained batch.
+_DEFERRED_SENTINELS_KEY = "deferred_sentinels"
+# Hard cap so a chronic deferral (operator never unblocks) doesn't
+# unbounded-grow coord-state.json. 200 matches _ARCHIVE_SCAN_CAP.
+_DEFERRED_SENTINELS_CAP = 200
+
+
+def _load_deferred_sentinels(coord_state: dict) -> list["_SentinelAction"]:
+    """Return the FIFO list of sentinels deferred on prior ticks."""
+    raw = coord_state.get(_DEFERRED_SENTINELS_KEY, [])
+    if not isinstance(raw, list):
+        return []
+    out: list[_SentinelAction] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug", "") or "")
+        kind = str(entry.get("kind", "") or "")
+        if not slug or kind not in (
+            "task_done_pr", "blocked_question", "worker_failed", "new_task",
+        ):
+            continue
+        out.append(_SentinelAction(
+            slug=slug, kind=kind,
+            payload=str(entry.get("payload", "") or ""),
+            raised_to_user=bool(entry.get("raised_to_user", False)),
+            raise_text=str(entry.get("raise_text", "") or ""),
+            source_file=str(entry.get("source_file", "") or ""),
+        ))
+    return out
+
+
+def _save_deferred_sentinels(
+    coord_state: dict, actions: list["_SentinelAction"],
+) -> None:
+    """Persist the deferred-sentinel queue. Empties the key when the
+    list is empty to keep coord-state.json tidy."""
+    if not actions:
+        coord_state.pop(_DEFERRED_SENTINELS_KEY, None)
+        return
+    # Cap the queue size so a chronic-defer state doesn't grow without
+    # bound. Drop oldest entries first (they've been deferred the
+    # longest — most likely operator-attention-needed cases).
+    if len(actions) > _DEFERRED_SENTINELS_CAP:
+        actions = actions[-_DEFERRED_SENTINELS_CAP:]
+    coord_state[_DEFERRED_SENTINELS_KEY] = [
+        {
+            "slug": a.slug,
+            "kind": a.kind,
+            "payload": a.payload,
+            "raised_to_user": a.raised_to_user,
+            "raise_text": a.raise_text,
+            "source_file": a.source_file,
+        }
+        for a in actions
+    ]
 
 
 def _consume_reaper_redispatch(
@@ -2154,6 +2237,10 @@ class _SentinelAction:
     payload: str = ""
     raised_to_user: bool = False
     raise_text: str = ""
+    # Codex iter-5 [P1]: source archive filename, set by _drain_archive
+    # so callers that defer (e.g., reaper-lane gate) can roll the
+    # watermark back to before this file rather than losing the event.
+    source_file: str = ""
     # delete_worker_dir is set in _apply_sentinel based on `kind`
     # (task_done_pr / worker_failed → True; blocked_question /
     # new_task → False). It's not part of the parsed sentinel grammar
@@ -2220,6 +2307,10 @@ def _drain_archive(
                 # so we don't re-scan; sticking to one sentinel per
                 # file means we don't keep walking past it.
                 break
+            # Codex iter-5 [P1]: stamp the source filename so callers
+            # that defer (reaper-lane gate) can roll the watermark
+            # back to before this file rather than losing the event.
+            sentinel.source_file = name
             actions.append(sentinel)
             break
     return actions, last_seen
