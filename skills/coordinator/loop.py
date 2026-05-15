@@ -402,12 +402,14 @@ def _tick_locked(
             if action.raised_to_user:
                 result.raised += 1
             # Worker is leaving the in-flight set on TASK_DONE_PR
-            # (status → in-review with closed worker), WORKER_FAILED
-            # (status → todo, worker cleared), and BLOCKED_QUESTION
-            # (status → blocked). Forget the mapping in all three so
-            # the supervisor doesn't keep nudging an inbox owned by
-            # a defunct agent record.
-            if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
+            # (status → in-review with closed worker) and WORKER_FAILED
+            # (status → todo, worker cleared). BLOCKED_QUESTION keeps
+            # the worker ALIVE (status → blocked) so the operator can
+            # answer via the worker's inbox — codex iter-22 [P1]: we
+            # must NOT forget the agent_id in that case; the supervisor
+            # / TUI / manual `fleet rm` all need it as the addressing
+            # handle.
+            if action.kind in ("task_done_pr", "worker_failed"):
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
@@ -1121,9 +1123,14 @@ def _run_supervisor(
                     home=home,
                     full_tasks_by_slug=tasks_by_slug,
                 )
-                if action.kind in (
-                    "task_done_pr", "worker_failed", "blocked_question",
-                ):
+                # Codex iter-22 [P1]: blocked workers stay ALIVE so
+                # the operator can answer the BLOCKED_QUESTION. We
+                # must NOT forget the agent_id mapping in that case —
+                # otherwise the stuck-check and manual-cleanup paths
+                # lose the only handle on the still-live tmux session.
+                # task_done_pr / worker_failed both terminate the
+                # worker; agent_id cleanup is correct for those.
+                if action.kind in ("task_done_pr", "worker_failed"):
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
             except Exception as exc:  # noqa: BLE001
