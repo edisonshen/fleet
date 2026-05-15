@@ -568,17 +568,44 @@ def reap_one(
     if inp.pid > 0:
         hk_ok = hard_kill_fn(inp.pid)
         if hk_ok:
-            entry.hard_killed = True
-            decision.hard_killed = True
-            decision.state = "hard-killed"
+            # Codex iter-6 [P1]: re-probe tmux AFTER the SIGKILL. The
+            # wrapper-process case (Claude SDK behind a shell) means
+            # the recorded state.json pid might be the inner Claude
+            # pid — SIGKILLing it leaves the shell/tmux session up.
+            # Closing the reaper lane while the session is still alive
+            # is the exact orphan-tmux shape this whole effort exists
+            # to prevent.
+            alive_post_sigkill = (
+                session_alive_fn(inp.tmux_session)
+                if inp.tmux_session else False
+            )
+            if not alive_post_sigkill:
+                entry.hard_killed = True
+                decision.hard_killed = True
+                decision.state = "hard-killed"
+                decision.detail = (
+                    f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid}"
+                )
+                _stderr_log(
+                    f"[P0] reaper: hard-killed worker {inp.slug} "
+                    f"(agent={inp.agent_id} pid={inp.pid}) — fleet rm failed: {err}",
+                    stream=log_stream,
+                )
+                return decision
+            # SIGKILL hit but session survived — pid was a wrapper
+            # child, not the session leader. Fall through to error so
+            # the reaper retains the entry and re-tries next pass.
             decision.detail = (
-                f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid}"
+                f"fleet rm failed ({err}); SIGKILL'd pid {inp.pid} "
+                "but tmux session still alive — wrapper-process case"
             )
             _stderr_log(
-                f"[P0] reaper: hard-killed worker {inp.slug} "
-                f"(agent={inp.agent_id} pid={inp.pid}) — fleet rm failed: {err}",
+                f"[P0] reaper: SIGKILL of {inp.slug} pid {inp.pid} did NOT "
+                f"end tmux session {inp.tmux_session}; manual intervention "
+                f"required — fleet rm err: {err}",
                 stream=log_stream,
             )
+            decision.state = "error"
             return decision
     decision.state = "error"
     decision.detail = (

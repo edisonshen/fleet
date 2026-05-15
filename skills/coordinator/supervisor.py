@@ -857,6 +857,7 @@ def run_supervisor(
     force_tick_check: Callable[[], bool] | None = None,
     force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
+    coord_id: str = "",
     log_stream=None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
@@ -895,6 +896,13 @@ def run_supervisor(
     # each probe has accumulated stability_window worth of silence.
     last_change_ts: dict[str, float] = {}
     poll_count = 0
+    # Codex iter-6 [P2]: track wall-clock cadences for stuck-check and
+    # periodic-reconcile so the adaptive poll driver doesn't make them
+    # 6× more aggressive. Legacy (poll_base_interval_s=0) keeps the old
+    # poll-count behavior because cadence wall-clock = poll_count *
+    # poll_interval_s is exact in that case.
+    last_stuck_check_unix = now_fn()
+    last_periodic_reconcile_unix = now_fn()
 
     probes = refresh_probes()
     for p in probes:
@@ -1059,26 +1067,56 @@ def run_supervisor(
             cfg.stuck_check_every if cfg.stuck_check_every > 0
             else _PERIODIC_RECONCILE_FALLBACK_EVERY
         )
-        run_periodic = (
-            periodic_full_reconcile is not None
-            and reconcile_cadence > 0
-            and poll_count % reconcile_cadence == 0
-        )
-        run_stuck = (
-            cfg.stuck_check_every > 0
-            and poll_count % cfg.stuck_check_every == 0
-        )
+        # Codex iter-6 [P2]: when the adaptive driver is active, the
+        # per-poll cadence varies (5 s base, 30 s backoff). Multiplying
+        # poll_count × cfg.poll_interval_s would understate wall-clock
+        # time. Use wall-clock elapsed seconds instead. Legacy path
+        # (poll_base_interval_s=0) uses cfg.poll_interval_s × stuck_
+        # check_every as the wall-clock target — exactly matches the
+        # v0.2.x behavior.
+        adaptive_on = cfg.poll_base_interval_s > 0
+        # Wall-clock thresholds: convert poll-count cadence to seconds
+        # using the legacy interval (poll_interval_s × stuck_check_every)
+        # for both drivers. This preserves the operator-facing
+        # "stuck-check fires every 5 min by default" expectation.
+        stuck_target_s = float(cfg.poll_interval_s * cfg.stuck_check_every)
+        periodic_target_s = float(cfg.poll_interval_s * reconcile_cadence)
+        now_clock = now_fn()
+        if adaptive_on:
+            run_periodic = (
+                periodic_full_reconcile is not None
+                and reconcile_cadence > 0
+                and periodic_target_s > 0
+                and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
+            )
+            run_stuck = (
+                cfg.stuck_check_every > 0
+                and stuck_target_s > 0
+                and (now_clock - last_stuck_check_unix) >= stuck_target_s
+            )
+        else:
+            run_periodic = (
+                periodic_full_reconcile is not None
+                and reconcile_cadence > 0
+                and poll_count % reconcile_cadence == 0
+            )
+            run_stuck = (
+                cfg.stuck_check_every > 0
+                and poll_count % cfg.stuck_check_every == 0
+            )
         if run_periodic or run_stuck:
             # Periodic full reconcile FIRST. Running before stuck-check
             # means a worker that just transitioned to in-review (and
             # would otherwise be stuck-flagged on the next pass) drops
             # out of the live-worker probe set BEFORE we evaluate it.
             if run_periodic:
+                last_periodic_reconcile_unix = now_clock
                 try:
                     periodic_full_reconcile()
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"periodic-reconcile: {exc}")
             if run_stuck:
+                last_stuck_check_unix = now_clock
                 res.stuck_check_passes += 1
                 try:
                     stuck_summary = _run_stuck_check_pass(
@@ -1088,6 +1126,7 @@ def run_supervisor(
                         fleet_bin=fleet_bin,
                         cfg=cfg,
                         now_unix=now_fn(),
+                        coord_id=coord_id,
                         log_stream=log_stream,
                     )
                     res.nudges_sent += stuck_summary.nudges
@@ -1264,6 +1303,7 @@ def _run_stuck_check_pass(
     cfg: SupervisorConfig,
     now_unix: float,
     log_stream,
+    coord_id: str = "",
 ) -> _StuckPassResult:
     """One pass over every probe: load supervisor state, classify, act.
 
@@ -1349,10 +1389,15 @@ def _run_stuck_check_pass(
             # a coord restart, never registered) or when the nudge
             # inbox write fails transiently — those are exactly the
             # cases where the operator most needs the alert.
-            coord_id = os.environ.get("FLEET_AGENT_ID", "") or ""
-            if coord_id:
+            # Codex iter-6 [P3]: use the threaded coord_id; fall back
+            # to the env var only when the caller didn't supply one
+            # (legacy CLI invocation path).
+            alert_coord_id = coord_id or os.environ.get(
+                "FLEET_AGENT_ID", "",
+            ) or ""
+            if alert_coord_id:
                 emit_stuck_alert(
-                    coord_id, p.slug, fleet_home=home,
+                    alert_coord_id, p.slug, fleet_home=home,
                     detail=(
                         f"phase={cur_phase or '?'} idle since "
                         f"{_fmt_ts(now_unix)}"

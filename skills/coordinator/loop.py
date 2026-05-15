@@ -992,6 +992,7 @@ def _run_supervisor(
         force_tick_check=force_tick_check_hook,
         force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
+        coord_id=coord_id,
     )
     # Surface supervisor stats as auxiliary tick result fields. We
     # don't mutate TickResult's primary counters because they describe

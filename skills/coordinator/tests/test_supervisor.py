@@ -688,7 +688,7 @@ def test_stuck_check_runs_only_every_n_polls(
     # Stub out actual stuck-check pass to count invocations.
     pass_count = {"n": 0}
 
-    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream):
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
         pass_count["n"] += 1
         return supervisor._StuckPassResult()
 
