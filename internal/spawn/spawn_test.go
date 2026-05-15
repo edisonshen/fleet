@@ -59,6 +59,10 @@ func capturePaneArgs(session string) []string {
 
 func TestSpawn_RequiresCommand(t *testing.T) {
 	setupFleetHome(t)
+	// Defensive isolation (codex review iter-10 [P3]): the empty-command
+	// rejection fires before tmux.Spawn, but isolate the socket so a
+	// regression cannot leak onto the operator's default tmux server.
+	tmuxtest.IsolateSocket(t)
 	if _, err := Spawn(Options{}); err == nil {
 		t.Error("expected error for missing command")
 	}

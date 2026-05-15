@@ -255,6 +255,10 @@ func TestListSessionsWithCreated_RoundTripRecordsCreation(t *testing.T) {
 }
 
 func TestSpawn_EmptyCommand(t *testing.T) {
+	// Defensive isolation (codex review iter-10 [P3]): the empty-command
+	// rejection fires before exec.Command, but isolate the socket so a
+	// regression cannot leak onto the operator's default tmux server.
+	tmuxtest.IsolateSocket(t)
 	if err := Spawn("any", "", nil, nil); err == nil {
 		t.Error("expected error for empty command")
 	}

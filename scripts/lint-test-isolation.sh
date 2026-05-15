@@ -56,7 +56,10 @@ cd "$repo_root"
 # `testing.Testing()` is false in the child, so the runtime sink guard
 # doesn't fire — the lint is the only safety net for these. Codex
 # review iter-3 [P2] (2026-05-15) flagged this gap.
-triggers="tmux.Spawn( spawn.Spawn( runDispatch( runHandoff( runHandoffDrain( Resume( runFleet( runTickCap( runTick("
+# Use "|" as the inter-needle separator so individual needles can
+# legally contain spaces (e.g., "= Spawn(" for package-local
+# helper calls like `err := Spawn(...)` minus the `:`).
+triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|Resume(|runFleet(|runTickCap(|runTick(|= Spawn(|:= Spawn("
 
 # Isolation marker substrings. Keep narrow — every entry is an explicit
 # opt-in. The canonical marker is tmuxtest.RequireTmux (see
@@ -72,7 +75,7 @@ triggers="tmux.Spawn( spawn.Spawn( runDispatch( runHandoff( runHandoffDrain( Res
 # `os.Setenv("FLEET_TMUX_SOCKET"` (the rare direct path). Reads /
 # inspections of the var still pass the trigger-bearing helper as a
 # trigger, not a marker.
-markers='tmuxtest.RequireTmux tmuxtest.IsolateSocket requireTmux( isolateTmuxSocket( t.Setenv("FLEET_TMUX_SOCKET os.Setenv("FLEET_TMUX_SOCKET'
+markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET|os.Setenv("FLEET_TMUX_SOCKET'
 
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.
@@ -127,7 +130,8 @@ scan_file() {
       in_str = 0
     }
     function any_substr(haystack, needles_str,    n, arr, i) {
-      n = split(needles_str, arr, " ")
+      # "|" separator so a needle can contain spaces (e.g., "= Spawn(").
+      n = split(needles_str, arr, "|")
       for (i = 1; i <= n; i++) {
         if (arr[i] == "") continue
         if (index(haystack, arr[i]) > 0) return 1
@@ -261,7 +265,8 @@ discover_helpers() {
   local exclude="$3" # don't emit a helper whose name appears here (avoids self-loop)
   awk -v needles="$needles" -v exclude="$exclude" '
     function any_substr(haystack, needles_str,    n, arr, i) {
-      n = split(needles_str, arr, " ")
+      # "|" separator so a needle can contain spaces (e.g., "= Spawn(").
+      n = split(needles_str, arr, "|")
       for (i = 1; i <= n; i++) {
         if (arr[i] == "") continue
         if (index(haystack, arr[i]) > 0) return 1
@@ -342,10 +347,13 @@ discover_helpers() {
         if (saw && func_name != "") {
           emit = 1
           if (exclude != "") {
-            en = split(exclude, ea, " ")
+            # "|"-separated exclude list (same separator as the
+            # needles list). Test for exact match of "<funcName>(".
+            en = split(exclude, ea, "|")
+            target = func_name "("
             for (i = 1; i <= en; i++) {
               if (ea[i] == "") continue
-              if (index(ea[i], func_name "(") > 0) { emit = 0; break }
+              if (ea[i] == target) { emit = 0; break }
             }
           }
           if (emit) printf "%s(\n", func_name
@@ -383,6 +391,17 @@ discover_triggers_in_file() {
   discover_helpers "$1" "$triggers" "$markers"
 }
 
+# Lists are "|"-separated so individual needles can legally contain
+# spaces. Membership-checks use "|<needle>|" anchors (a bracketing
+# delimiter pair) for unambiguous substring testing.
+list_contains() {
+  # $1 = pipe-separated list; $2 = needle.
+  case "|$1|" in
+    *"|$2|"*) return 0;;
+  esac
+  return 1
+}
+
 # --- Marker chain ---
 for pass in 1 2 3; do
   new_markers=""
@@ -390,20 +409,18 @@ for pass in 1 2 3; do
     if skip_file "$f"; then continue; fi
     while IFS= read -r h; do
       [ -n "$h" ] || continue
-      case " $markers " in
-        *" $h "*) ;; # already a marker
-        *) new_markers="$new_markers $h";;
-      esac
+      if list_contains "$markers" "$h"; then continue; fi
+      if list_contains "$new_markers" "$h"; then continue; fi
+      new_markers="$new_markers|$h"
     done < <(discover_markers_in_file "$f")
   done < <(file_lister)
   if [ -z "$new_markers" ]; then break; fi
-  markers="$markers $new_markers"
+  markers="$markers$new_markers"
 done
 
 # --- Trigger chain ---
 # Run AFTER the marker chain so the exclude-list (markers) is final;
-# a Spawn-wrapping helper that ALSO calls an isolation marker (e.g.,
-# a helper that pre-spawns under an already-isolated socket) won't be
+# a Spawn-wrapping helper that ALSO calls an isolation marker won't be
 # misclassified as a trigger sink.
 for pass in 1 2 3; do
   new_triggers=""
@@ -411,14 +428,13 @@ for pass in 1 2 3; do
     if skip_file "$f"; then continue; fi
     while IFS= read -r h; do
       [ -n "$h" ] || continue
-      case " $triggers " in
-        *" $h "*) ;; # already a trigger
-        *) new_triggers="$new_triggers $h";;
-      esac
+      if list_contains "$triggers" "$h"; then continue; fi
+      if list_contains "$new_triggers" "$h"; then continue; fi
+      new_triggers="$new_triggers|$h"
     done < <(discover_triggers_in_file "$f")
   done < <(file_lister)
   if [ -z "$new_triggers" ]; then break; fi
-  triggers="$triggers $new_triggers"
+  triggers="$triggers$new_triggers"
 done
 
 violations=()
