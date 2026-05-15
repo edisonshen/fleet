@@ -6,6 +6,26 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Remote-control session names now carry the project name as a suffix
+  (`fleet-coord-<id>-<project>` and `fleet-handoff-<id>-<project>`).
+  Operators running coords across multiple projects (spark, fleet,
+  rainier, …) can finally distinguish per-project sessions on phone /
+  claude.ai mobile instead of seeing identical `fleet-coord-<8hex>`
+  entries. The handoff doc's printed bash block also narrows the
+  daemon `--remote-control-session-name-prefix` to
+  `fleet-handoff-<project>` (with a project-scoped pgrep guard) so
+  per-project handoff daemons coexist on the host. Suffix-extension
+  shape keeps the legacy `fleet-coord-<id>` and `fleet-handoff-<id>`
+  substrings intact, so `pidresolver` disambiguator matching (Go +
+  Python sides) and `fleet-guard` argv inspection work for both
+  legacy in-flight sessions and new ones without code change. The
+  daemon `--remote-control-session-name-prefix` for the coord side
+  stays the broad `fleet-coord` literal (operator-visible
+  disambiguation only); the handoff side adopts per-project daemon
+  prefixes because the FirstAction bash block is rendered per-doc.
+
 ## [0.10.0] - 2026-05-14
 
 Coord liveness gets a correctness pass and dead coordinators become

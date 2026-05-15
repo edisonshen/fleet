@@ -515,7 +515,11 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// operator-overridden custom --commands, InjectRemoteControlFlag
 	// returns the slice unchanged — we then pass nil as ExecCommand
 	// so spawn.Spawn doesn't see a no-op divergence.
-	rcSessionName := "fleet-handoff-" + req.NewAgentID
+	// Project suffix (rc-session-name-include): same shape as the
+	// operator-triggered handoff path in cmd/fleet/handoff.go —
+	// `fleet-handoff-<new-id>-<project>` so the successor's session
+	// name on claude.ai mobile / web carries the project identifier.
+	rcSessionName := spawn.HandoffRemoteControlSessionName(req.NewAgentID, oldRec.Project)
 	rewrittenExecArgv := spawn.InjectRemoteControlFlag(oldRec.Command, rcSessionName)
 	if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
 		rewrittenExecArgv = nil

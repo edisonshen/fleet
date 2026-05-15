@@ -114,6 +114,48 @@ func InjectRemoteControlFlag(command []string, sessionName string) []string {
 	return out
 }
 
+// CoordRemoteControlSessionName returns the canonical
+// --remote-control session name for a coord-spawn dispatch. Format:
+// `fleet-coord-<id>-<project>` (suffix-extension over the legacy
+// `fleet-coord-<id>` shape).
+//
+// Why suffix-extension and not prefix-replacement: the
+// pidresolver's disambiguator (internal/spawn/pidresolver.go's
+// pidResolveDisambiguator) builds `needle = "fleet-coord-" + agentID`
+// and does substring containment against argv. The new shape remains
+// a strict superstring of the legacy needle, so the resolver works
+// for both legacy in-flight coords and new ones without code change.
+//
+// Same reasoning applies to the Python skill's argv matcher in
+// skills/fleet-guard/health.py:_resolve_self_pid which builds
+// `needle = f"fleet-coord-{agent_id}"`.
+//
+// Empty project falls back to the legacy `fleet-coord-<id>` shape
+// so legacy records (created before agent.Record carried project)
+// and recovery paths that haven't populated project yet still get a
+// well-formed name. Production dispatch always passes a non-empty
+// project (state.ValidateProjectName rejects empty at the dispatch
+// boundary).
+func CoordRemoteControlSessionName(agentID, project string) string {
+	const prefix = "fleet-coord"
+	if project == "" {
+		return prefix + "-" + agentID
+	}
+	return prefix + "-" + agentID + "-" + project
+}
+
+// HandoffRemoteControlSessionName returns the canonical
+// --remote-control session name for a handoff replacement spawn.
+// Format: `fleet-handoff-<id>-<project>`. See
+// CoordRemoteControlSessionName for the suffix-extension rationale.
+func HandoffRemoteControlSessionName(agentID, project string) string {
+	const prefix = "fleet-handoff"
+	if project == "" {
+		return prefix + "-" + agentID
+	}
+	return prefix + "-" + agentID + "-" + project
+}
+
 // SameCommand returns true iff the two argvs are identical
 // element-for-element. Used by the dispatch + handoff coord/handoff
 // spawn paths to detect when InjectRemoteControlFlag returned an

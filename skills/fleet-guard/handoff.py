@@ -84,11 +84,25 @@ _COMMITTED_TYPES = frozenset({TYPE_AUTO_RED, TYPE_PRECOMPACT})
 # break 4a's chain reader. The em dash is U+2014.
 PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 
-# FIRST_ACTION is the body of the "First Action (auto)" section that
-# every handoff doc carries. It instructs the resuming agent to spawn
-# `claude remote-control` in the background so the operator's mobile /
-# claude.ai pairing carries through the fleet-guard handoff. Idempotent
-# (pgrep guards re-launch when the daemon is already up).
+# first_action(project) returns the body of the "First Action (auto)"
+# section for the given project. It instructs the resuming agent to
+# spawn `claude remote-control` in the background so the operator's
+# mobile / claude.ai pairing carries through the fleet-guard handoff.
+# Idempotent (pgrep guards re-launch when the daemon is already up).
+#
+# Per-project (rc-session-name-include): the daemon prefix carries
+# the project name (`fleet-handoff-<project>`) so per-project handoff
+# daemons coexist on the host and the operator can distinguish
+# per-project sessions on phone / claude.ai. The pgrep guard is
+# narrowed on the project-scoped prefix with a word-boundary
+# terminator `( |$)` so a hypothetical longer prefix like
+# `fleet-handoff-sparkX` doesn't false-positive — mirrors the
+# coord-side pattern in skills/coordinator/remote_control.py.
+#
+# Empty project falls back to the legacy generic
+# `--remote-control-session-name-prefix "fleet-handoff"` shape so
+# rendered docs without a project (legacy records / tests) still
+# produce a well-formed bash block.
 #
 # Body order is load-bearing:
 #   1. Bash block: bootstrap the `claude remote-control` daemon (pgrep
@@ -115,24 +129,34 @@ PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 # internal/handoff.FirstAction (Go side) — auto-handoffs (this file) and
 # operator-triggered handoffs (Go) emit the same doc shape, and
 # renderers are tested for byte-equality.
-FIRST_ACTION = (
-    "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
-    "\n"
-    "```bash\n"
-    "( pgrep -f \"claude remote-control\" >/dev/null 2>&1 || \\\n"
-    "  nohup claude remote-control \\\n"
-    "    --remote-control-session-name-prefix \"fleet-handoff\" \\\n"
-    "    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
-    "```\n"
-    "\n"
-    "Use the Bash tool with run_in_background: true.\n"
-    "\n"
-    "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
-    "\n"
-    "Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
-    "\n"
-    "Then continue with the sections below."
-)
+
+
+def first_action(project: str) -> str:
+    prefix = "fleet-handoff"
+    if project:
+        prefix = prefix + "-" + project
+    pgrep_pattern = (
+        "^claude remote-control "
+        "--remote-control-session-name-prefix " + prefix + "( |$)"
+    )
+    return (
+        "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
+        "\n"
+        "```bash\n"
+        f"( pgrep -f '{pgrep_pattern}' >/dev/null 2>&1 || \\\n"
+        "  nohup claude remote-control \\\n"
+        f'    --remote-control-session-name-prefix "{prefix}" \\\n'
+        "    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
+        "```\n"
+        "\n"
+        "Use the Bash tool with run_in_background: true.\n"
+        "\n"
+        "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
+        "\n"
+        "Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
+        "\n"
+        "Then continue with the sections below."
+    )
 
 # Modes where auto-handoff is disabled — see SKILL.md Handoff thresholds.
 THINKING_MODES = frozenset({"plan", "review", "fix"})
@@ -758,7 +782,7 @@ def _render_doc(*, agent_id: str, task_id: str, project: str,
     out.append("---\n\n")
 
     completed = recent_activity.strip() if recent_activity.strip() else PLACEHOLDER
-    out.append(f"## First Action (auto)\n{FIRST_ACTION}\n\n")
+    out.append(f"## First Action (auto)\n{first_action(project)}\n\n")
     out.append(f"## Completed\n{completed}\n\n")
     out.append(f"## Key Decisions\n{PLACEHOLDER}\n\n")
     out.append(f"## Files Modified\n{PLACEHOLDER}\n\n")

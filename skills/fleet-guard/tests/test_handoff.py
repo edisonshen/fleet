@@ -181,9 +181,9 @@ EXPECTED_GOLDEN = (
     b"**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
     b"\n"
     b"```bash\n"
-    b'( pgrep -f "claude remote-control" >/dev/null 2>&1 || \\\n'
+    b"( pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-handoff-myproj( |$)' >/dev/null 2>&1 || \\\n"
     b"  nohup claude remote-control \\\n"
-    b'    --remote-control-session-name-prefix "fleet-handoff" \\\n'
+    b'    --remote-control-session-name-prefix "fleet-handoff-myproj" \\\n'
     b"    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
     b"```\n"
     b"\n"
@@ -254,22 +254,23 @@ class TestRenderByteGolden:
         assert handoff.PLACEHOLDER.encode("utf-8") in got
 
     def test_first_action_carries_remote_control_slash_command(self) -> None:
-        """Issue #56 regression: the FIRST_ACTION paragraph telling the
+        """Issue #56 regression: the first_action paragraph telling the
         agent to run the `/remote-control` slash command must be present
         on every rendered doc. Without it, the daemon (started by the
         bash block above) is listening but the chat session never
         attaches — operator's mobile pairing is lost across handoff.
         The byte-golden above covers exact-byte verification; this test
         gives a focused regression signal that's easy to read when the
-        paragraph drifts."""
+        paragraph drifts.
+        """
         want = (
             b"Then run the slash command `/remote-control` "
             b"(in the chat, not bash) to connect this fresh session "
             b"to your remote-control session."
         )
-        assert want in handoff.FIRST_ACTION.encode("utf-8")
+        assert want in handoff.first_action("myproj").encode("utf-8")
         # Also confirm the rendered doc carries it (covers the scenario
-        # where someone duplicates the constant but skips wiring it
+        # where someone duplicates the function but skips wiring it
         # through the renderer).
         ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
         got = handoff._render_doc(
@@ -286,22 +287,23 @@ class TestRenderByteGolden:
         assert want in got
 
     def test_first_action_instructs_coordinator_run(self) -> None:
-        """handoff-coord-spawn-prompt-fix regression: FIRST_ACTION
+        """handoff-coord-spawn-prompt-fix regression: first_action
         must include a /coordinator slash command paragraph so
         replacement coord sessions resume the supervisor tick loop.
         Without it, ~/.fleet/projects/<p>/.locks/coordinator.lock
         retains the predecessor's 8-hex agent ID and the TUI
-        dashboard's project row shows the OLD coord's name."""
+        dashboard's project row shows the OLD coord's name.
+        """
+        body = handoff.first_action("myproj")
         want = b"Then run the slash command `/coordinator`"
-        assert want in handoff.FIRST_ACTION.encode("utf-8")
+        assert want in body.encode("utf-8")
         # Idempotency note must accompany the instruction so a
         # successor agent inspecting the doc understands why running
         # /coordinator on a non-coord lineage is safe.
-        assert b"idempotent" in handoff.FIRST_ACTION.encode("utf-8")
+        assert b"idempotent" in body.encode("utf-8")
         # Order pin: /remote-control attaches the chat session to the
         # operator's mobile pairing; that must complete BEFORE
         # /coordinator's supervisor startup output begins streaming.
-        body = handoff.FIRST_ACTION
         rc_idx = body.find("`/remote-control`")
         coord_idx = body.find("`/coordinator`")
         assert rc_idx >= 0 and coord_idx >= 0

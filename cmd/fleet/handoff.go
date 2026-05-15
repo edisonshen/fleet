@@ -692,7 +692,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// rewrite. injectRemoteControlFlag returns the slice unchanged
 	// for non-default --command shapes so an operator-supplied
 	// scripted pipeline / alt engine isn't silently mutated.
-	rcSessionName := handoffSessionPrefix + "-" + newID
+	// Project suffix (rc-session-name-include): the operator-visible
+	// handoff session name on claude.ai mobile / web is
+	// `fleet-handoff-<new-id>-<project>` so successor agents from
+	// different projects can be distinguished. Suffix-extension keeps
+	// the legacy `fleet-handoff-<new-id>` substring intact for any
+	// downstream code that grepped on the legacy shape.
+	rcSessionName := buildHandoffRemoteControlSessionName(newID, oldRec.Project)
 	rewrittenExecArgv := injectRemoteControlFlag(command, rcSessionName)
 	if sameCommand(rewrittenExecArgv, command) {
 		// No-op rewrite (custom --command): pass nil so the
