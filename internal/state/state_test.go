@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,111 @@ func TestWriteAtomic_OverwritesExisting(t *testing.T) {
 	}
 	if string(got) != "v2" {
 		t.Errorf("got %q want v2", got)
+	}
+}
+
+// TestWriteAtomic_FsyncsParentDir verifies the parent-dir fsync runs
+// AFTER the rename — durability gate for AtomicCoordSwap's marker
+// commit point. Without the parent-dir fsync, a crash between rename(2)
+// returning and the directory entry hitting disk can leave the renamed
+// file invisible after reboot (data on disk, but no dentry pointing at
+// it). The hook records (dir, error) pairs so the assertion is
+// deterministic without needing syscall tracing.
+func TestWriteAtomic_FsyncsParentDir(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	var calls []string
+	old := fsyncParent
+	fsyncParent = func(dir string) error {
+		calls = append(calls, dir)
+		return old(dir)
+	}
+	t.Cleanup(func() { fsyncParent = old })
+
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("fsyncParent calls = %d; want 1", len(calls))
+	}
+	if calls[0] != tmp {
+		t.Errorf("fsyncParent dir = %q; want %q", calls[0], tmp)
+	}
+}
+
+// TestWriteAtomic_FsyncParentDir_OrderingAfterRename pins the ordering
+// contract: parent-dir fsync runs ONLY after rename completes. If a
+// future refactor moves the fsync earlier (e.g., before close or
+// before rename), the test surfaces the regression.
+func TestWriteAtomic_FsyncParentDir_OrderingAfterRename(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	old := fsyncParent
+	var observed bool
+	fsyncParent = func(dir string) error {
+		// At the moment the parent-dir fsync runs, the renamed file
+		// MUST already exist (rename is the step before this hook).
+		// Probe via os.Lstat which doesn't follow symlinks.
+		if _, err := os.Lstat(dest); err == nil {
+			observed = true
+		}
+		return nil
+	}
+	t.Cleanup(func() { fsyncParent = old })
+
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic: %v", err)
+	}
+	if !observed {
+		t.Errorf("parent-dir fsync ran before rename committed; ordering broken")
+	}
+}
+
+// TestWriteAtomic_FsyncParentDir_FailureLogsButDoesNotError exercises
+// the codex-iter-1 [P1] fix: a post-rename parent-dir fsync failure
+// must NOT propagate as a WriteAtomic error, because the rename ALREADY
+// committed observable state at that point. Existing callers (spawn,
+// AtomicCoordSwap rollback, agent.Write) treat ANY WriteAtomic error
+// as "nothing changed; roll back" — but if the rename succeeded and
+// only the parent-fsync failed, those rollbacks would tear down state
+// that the operator + concurrent processes can already see (committed
+// marker, written agent record, etc.). Best-effort log preserves the
+// durability gap visibility without breaking caller rollback contracts.
+func TestWriteAtomic_FsyncParentDir_FailureLogsButDoesNotError(t *testing.T) {
+	tmp := t.TempDir()
+	dest := filepath.Join(tmp, "out.json")
+
+	oldFsync := fsyncParent
+	oldLog := fsyncFailureLog
+	sentinel := errors.New("simulated parent fsync EIO")
+	fsyncParent = func(dir string) error { return sentinel }
+	var loggedPath string
+	var loggedErr error
+	fsyncFailureLog = func(p string, e error) {
+		loggedPath = p
+		loggedErr = e
+	}
+	t.Cleanup(func() {
+		fsyncParent = oldFsync
+		fsyncFailureLog = oldLog
+	})
+
+	if err := WriteAtomic(dest, []byte("ok")); err != nil {
+		t.Fatalf("WriteAtomic should NOT error on parent-fsync failure (rename already committed): %v", err)
+	}
+	// File MUST exist on disk (rename committed).
+	if _, statErr := os.Stat(dest); statErr != nil {
+		t.Errorf("destination file missing after fsync failure: %v", statErr)
+	}
+	// Log hook must have been called with the destination path + the
+	// underlying error so log analysis can correlate durability gaps.
+	if loggedPath != dest {
+		t.Errorf("fsyncFailureLog path = %q; want %q", loggedPath, dest)
+	}
+	if !errors.Is(loggedErr, sentinel) {
+		t.Errorf("fsyncFailureLog err = %v; want wraps %v", loggedErr, sentinel)
 	}
 }
 

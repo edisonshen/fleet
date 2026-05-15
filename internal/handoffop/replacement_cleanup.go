@@ -116,3 +116,40 @@ func DropReplacementRecord(session, recID string, stderr io.Writer) error {
 	}
 	return nil
 }
+
+// RollbackCoordMarkerIfPointingAt restores the coord-spawn marker to
+// `oldID` when it currently points at `staleNewID`. Used after a
+// replacement record + session have been dropped (DropReplacementRecord)
+// to undo a prior swap's eager marker write — without this, the marker
+// keeps pointing at a deleted ID and the retry path's isCoordSwap check
+// (which only fires on marker == oldRec.ID) misses the swap, letting
+// a duplicate coord spawn.
+//
+// Codex iter-12 [P1]: Resume (handoffop.go:125-134) and the manual
+// handoff recovery path (cmd/fleet/handoff.go:378-387) both fall
+// through to a fresh spawn after dropping a dead replacement. A
+// previous swap may have committed marker == staleNewID before
+// returning ErrOrphanSurvived / ErrOldKillProbeAmbiguous / similar;
+// without rollback, the retry's isCoordSwap goes false, the inline
+// retire path runs (no AtomicCoordSwap), and `[a]` ends up spawning
+// a second coord because the marker still points at the deleted ID.
+//
+// Idempotent: a no-op when project is empty, marker is already at
+// oldID, or marker is anything other than staleNewID. Best-effort —
+// marker write failures print a warning but don't error out, matching
+// the rollback semantics elsewhere in the codebase.
+func RollbackCoordMarkerIfPointingAt(project, oldID, staleNewID string, stderr io.Writer) {
+	if project == "" || staleNewID == "" {
+		return
+	}
+	if state.ReadCoordSpawnMarker(project) != staleNewID {
+		return
+	}
+	if werr := state.WriteCoordSpawnMarker(project, oldID); werr != nil {
+		if stderr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: rollback coord-spawn marker for project %s to %s failed: %v (operator may need to re-write manually)\n",
+				project, oldID, werr)
+		}
+	}
+}

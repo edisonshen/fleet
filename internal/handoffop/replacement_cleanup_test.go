@@ -231,3 +231,95 @@ func TestDropReplacementRecord_EmptyRecID_ReturnsError(t *testing.T) {
 		t.Errorf("expected error on empty recID; got nil")
 	}
 }
+
+// -- codex iter-12 P1: RollbackCoordMarkerIfPointingAt ----------------------
+//
+// The helper restores the coord-spawn marker to oldID when it currently
+// points at staleNewID. Used after a replacement record + session have
+// been dropped, to undo a prior swap's eager marker write so the retry's
+// isCoordSwap detection (`marker == oldRec.ID`) fires correctly.
+
+// TestRollbackCoordMarker_MovesStaleMarker is the happy path: marker
+// points at the deleted new ID, helper rewrites it to old ID.
+func TestRollbackCoordMarker_MovesStaleMarker(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	const oldID = "oldcoord"
+	const staleID = "stalenew"
+
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, staleID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	RollbackCoordMarkerIfPointingAt(project, oldID, staleID, &stderr)
+
+	if got := state.ReadCoordSpawnMarker(project); got != oldID {
+		t.Errorf("marker not rolled back: got %q want %q", got, oldID)
+	}
+}
+
+// TestRollbackCoordMarker_NoOpWhenAlreadyAtOldID pins idempotency:
+// running the rollback twice (e.g., a retry that ran the helper once
+// already) must be safe — marker stays put, no error.
+func TestRollbackCoordMarker_NoOpWhenAlreadyAtOldID(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	const oldID = "oldcoord"
+	const staleID = "stalenew"
+
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, oldID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	RollbackCoordMarkerIfPointingAt(project, oldID, staleID, &stderr)
+
+	if got := state.ReadCoordSpawnMarker(project); got != oldID {
+		t.Errorf("marker mutated unexpectedly: got %q want %q", got, oldID)
+	}
+}
+
+// TestRollbackCoordMarker_NoOpOnUnrelatedMarker pins the guard branch:
+// marker points at some unrelated agent ID, helper must NOT touch it
+// (would corrupt another swap's state).
+func TestRollbackCoordMarker_NoOpOnUnrelatedMarker(t *testing.T) {
+	setupFleetHome(t)
+	const project = "rainier"
+	const oldID = "oldcoord"
+	const staleID = "stalenew"
+	const otherID = "othercoord"
+
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(project, otherID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	RollbackCoordMarkerIfPointingAt(project, oldID, staleID, &stderr)
+
+	if got := state.ReadCoordSpawnMarker(project); got != otherID {
+		t.Errorf("unrelated marker mutated: got %q want %q", got, otherID)
+	}
+}
+
+// TestRollbackCoordMarker_EmptyProject_NoOp pins the input guard:
+// workers and other non-coord agents call with project == "" (worker
+// swaps don't have a per-project coord marker). Must be a silent no-op.
+func TestRollbackCoordMarker_EmptyProject_NoOp(t *testing.T) {
+	setupFleetHome(t)
+
+	var stderr bytes.Buffer
+	RollbackCoordMarkerIfPointingAt("", "old", "stale", &stderr)
+	if stderr.Len() != 0 {
+		t.Errorf("empty-project rollback wrote to stderr: %q", stderr.String())
+	}
+}

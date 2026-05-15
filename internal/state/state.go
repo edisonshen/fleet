@@ -321,16 +321,31 @@ func ValidateSlug(slug string) error {
 	return nil
 }
 
-// WriteAtomic publishes data to path via .tmp + fsync + rename.
-// Implements docs/STATE.md A1 (Atomic file publish).
+// WriteAtomic publishes data to path via .tmp + fsync + rename +
+// parent-dir-fsync. Implements docs/STATE.md A1 (Atomic file publish).
 //
 // Pattern:
 //
-//	write to <path>.tmp.<pid> → fsync → close → rename to <path>
+//	write to <path>.tmp.<pid> → fsync(tmp) → close → rename →
+//	  open(parent) → fsync(parent) → close
 //
 // fsnotify on the reader side fires CREATE the instant the file
 // exists; rename(2) is atomic on POSIX same-fs, so readers never
 // observe a partial write.
+//
+// The trailing parent-dir fsync ensures the rename is durable on
+// POSIX. Without it, a crash between rename(2) returning and the
+// containing directory's dentry being written to disk can leave the
+// renamed file invisible after reboot — the data is on disk in an
+// orphaned inode but the directory entry pointing at it isn't. For
+// coord-spawn markers and other AtomicCoordSwap commit points,
+// "looks committed but reverts on crash" silently breaks the swap
+// invariant.
+//
+// fsyncParent is a package-level seam so tests can detect the call
+// without relying on syscall tracing. Production points at the
+// stdlib's fsync; the test wrapper records every (path, error) pair
+// it sees.
 func WriteAtomic(path string, data []byte) (err error) {
 	tmp := path + ".tmp." + strconv.Itoa(os.Getpid())
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
@@ -356,7 +371,72 @@ func WriteAtomic(path string, data []byte) (err error) {
 	if rerr := os.Rename(tmp, path); rerr != nil {
 		return fmt.Errorf("rename tmp: %w", rerr)
 	}
+	// Parent-dir fsync makes the rename durable across a crash. On
+	// AtomicCoordSwap's marker-rename commit point this is the
+	// difference between "marker flipped, NEW owns" surviving a
+	// kernel panic versus a reboot reverting to OLD.
+	//
+	// Critical: this fsync runs AFTER rename. A failure here means
+	// the rename ALREADY succeeded on disk — `path` resolves to the
+	// new content from this process's perspective and from any other
+	// reader's perspective. We CANNOT propagate the error as a
+	// regular failure: existing callers (spawn.Spawn, AtomicCoordSwap,
+	// agent.Write, etc.) treat a WriteAtomic error as "nothing
+	// changed; roll back" — but in this case the rename DID change
+	// observable state, and rolling back (e.g., killing the just-
+	// spawned NEW agent because we couldn't fsync the parent dir)
+	// would leave on-disk state inconsistent with the rolled-back
+	// in-memory state. Logging via fsyncFailureLog (test-overridable)
+	// surfaces the durability gap without breaking caller semantics.
+	// The cost of a parent-fsync miss is "rename invisible after a
+	// kernel panic that reboots before the dentry flushes" — rare,
+	// and the operator's recovery in that window is the same as for
+	// any other pre-fsync crash (manual triage via `fleet status` +
+	// `fleet rm`).
+	//
+	// Codex review iter-1 [P1]: returning the parent-fsync error from
+	// WriteAtomic let callers treat it as "rename never happened" and
+	// trigger rollback paths against committed state. Fixed by
+	// switching to best-effort log + no error propagation.
+	if perr := fsyncParent(filepath.Dir(path)); perr != nil {
+		fsyncFailureLog(path, perr)
+	}
 	return nil
+}
+
+// fsyncParent is the package-level seam for the parent-dir fsync.
+// Production implementation opens the directory read-only and calls
+// Sync on it. Tests override this to record invocations without
+// needing to spy on the syscall layer.
+var fsyncParent = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	closeErr := d.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
+
+// fsyncFailureLog records a post-rename parent-dir fsync failure
+// without propagating it as a WriteAtomic error. Default writes a
+// note to stderr; tests can override to capture the call without
+// noise.
+//
+// The failure means the rename committed in-memory and observably,
+// but the dentry write to disk might be deferred until the next
+// fsync of any file in that directory. A crash before that flush
+// can leave the renamed file invisible after reboot. Operator
+// recovery for that narrow window is the same as for any pre-fsync
+// crash — `fleet status` + `fleet rm` for stale records, marker
+// re-write if it disappeared.
+var fsyncFailureLog = func(path string, err error) {
+	_, _ = fmt.Fprintf(os.Stderr,
+		"warning: post-rename parent-dir fsync for %s failed: %v (rename is committed in-memory but may not be durable across a crash)\n",
+		path, err)
 }
 
 // ErrNotFound is returned by readers when an expected path is absent.
