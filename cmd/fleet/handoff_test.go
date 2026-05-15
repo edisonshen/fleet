@@ -1184,16 +1184,19 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	}
 
 	// (b) The pane shows the shim's argv echo, which includes the
-	// `--remote-control "fleet-handoff-<id>-<project>"` flag. The
+	// `--remote-control "fleet-handoff-<project>-<id>"` flag. The
 	// shim prints each arg on its own line, so we grep for the
 	// session-name literal directly.
 	//
-	// rc-session-name-include: the project suffix is what makes the
-	// session distinguishable on operator's phone / claude.ai when
-	// multiple projects are running. The seed spawn used
-	// project="rainier", so the rendered flag must end with
-	// `-rainier`.
-	wantFlag := "fleet-handoff-" + rep.ID + "-rainier"
+	// rc-session-name-include: the project name is in the session so
+	// the operator can distinguish per-project sessions on phone /
+	// claude.ai. Order is project-first so the registered name STARTS
+	// WITH the per-project daemon prefix `fleet-handoff-<project>`
+	// the FirstAction bash block launches the daemon under (codex
+	// review iter-2 [P1] regression). The seed spawn used
+	// project="rainier", so the rendered flag must contain
+	// `fleet-handoff-rainier-<rep.ID>`.
+	wantFlag := "fleet-handoff-rainier-" + rep.ID
 	deadline := time.Now().Add(3 * time.Second)
 	var lastOut []byte
 	for time.Now().Before(deadline) {

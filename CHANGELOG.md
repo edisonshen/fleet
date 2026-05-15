@@ -8,23 +8,30 @@ follows [SemVer](https://semver.org/).
 
 ### Changed
 
-- Remote-control session names now carry the project name as a suffix
-  (`fleet-coord-<id>-<project>` and `fleet-handoff-<id>-<project>`).
-  Operators running coords across multiple projects (spark, fleet,
-  rainier, …) can finally distinguish per-project sessions on phone /
-  claude.ai mobile instead of seeing identical `fleet-coord-<8hex>`
-  entries. The handoff doc's printed bash block also narrows the
-  daemon `--remote-control-session-name-prefix` to
-  `fleet-handoff-<project>` (with a project-scoped pgrep guard) so
-  per-project handoff daemons coexist on the host. Suffix-extension
-  shape keeps the legacy `fleet-coord-<id>` and `fleet-handoff-<id>`
-  substrings intact, so `pidresolver` disambiguator matching (Go +
-  Python sides) and `fleet-guard` argv inspection work for both
-  legacy in-flight sessions and new ones without code change. The
-  daemon `--remote-control-session-name-prefix` for the coord side
-  stays the broad `fleet-coord` literal (operator-visible
-  disambiguation only); the handoff side adopts per-project daemon
-  prefixes because the FirstAction bash block is rendered per-doc.
+- Remote-control session names now carry the project name so coords
+  and handoff successors are distinguishable on operator's phone /
+  claude.ai instead of showing as identical `fleet-coord-<8hex>`
+  entries across projects.
+  - **Coord side:** suffix-extension `fleet-coord-<id>-<project>`.
+    The coord daemon's `--remote-control-session-name-prefix` stays
+    the broad `fleet-coord` literal (one daemon for all coords on
+    the host), so the new shape still attaches under the existing
+    prefix filter. The legacy `fleet-coord-<id>` substring stays
+    intact, so `pidresolver` disambiguator matching (Go) and
+    `fleet-guard` argv inspection (Python) keep working for both
+    legacy in-flight coords and new ones without code change.
+  - **Handoff side:** project-first prefix-extension
+    `fleet-handoff-<project>-<id>`. The handoff doc's printed bash
+    block narrows the daemon `--remote-control-session-name-prefix`
+    to `fleet-handoff-<project>` so per-project handoff daemons
+    coexist on the host — the registered session name MUST start
+    with that prefix or the daemon's prefix filter rejects the
+    attach. The pgrep guard escapes `.` in project names so e.g.
+    `v2.1` and `v2a1` daemons don't collide. No production needle
+    matches on `fleet-handoff-<id>`, so the reorder is safe.
+  - Empty-project fallback returns the legacy shapes
+    (`fleet-coord-<id>` / `fleet-handoff-<id>`) for safety on
+    records without a project field.
 
 ## [0.10.0] - 2026-05-14
 

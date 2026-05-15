@@ -79,6 +79,14 @@ func TestCoordSpawn_RemoteControlSessionName_IncludesProject(t *testing.T) {
 // successor coord/agent's --remote-control session name must include
 // the inherited project so the operator can distinguish handoff
 // successors per project on phone / claude.ai.
+//
+// Order: project comes BEFORE id so the session name STARTS with
+// the per-project daemon prefix `fleet-handoff-<project>` that
+// internal/handoff.FirstAction renders into the bash bootstrap.
+// The Claude remote-control daemon only attaches sessions whose name
+// starts with its --remote-control-session-name-prefix value, so the
+// project-first order is the contract that keeps mobile pairing alive
+// across handoffs (codex review iter-2 [P1] regression bracket).
 func TestHandoff_RemoteControlSessionName_IncludesProject(t *testing.T) {
 	const newID = "deadbeef"
 	const project = "rainier"
@@ -97,9 +105,37 @@ func TestHandoff_RemoteControlSessionName_IncludesProject(t *testing.T) {
 		t.Errorf("handoff session name %q must contain project %q",
 			got, project)
 	}
-	want := handoffSessionPrefix + "-" + newID + "-" + project
+	want := handoffSessionPrefix + "-" + project + "-" + newID
 	if got != want {
-		t.Errorf("handoff session name = %q; want %q", got, want)
+		t.Errorf("handoff session name = %q; want %q "+
+			"(project-first order: name must START WITH the "+
+			"per-project daemon prefix `fleet-handoff-<project>` "+
+			"so the daemon attaches the session)",
+			got, want)
+	}
+}
+
+// TestHandoff_RemoteControlSessionName_StartsWithDaemonPrefix is the
+// load-bearing contract codex iter-2 [P1] surfaced. The Claude
+// remote-control daemon launched by internal/handoff.FirstAction(p)
+// runs with `--remote-control-session-name-prefix "fleet-handoff-<p>"`,
+// and its prefix filter only attaches sessions whose name starts
+// with that value. If the session-name format ever drifts away from
+// having `fleet-handoff-<project>` as its literal prefix, every
+// per-project handoff silently breaks /remote-control attach.
+func TestHandoff_RemoteControlSessionName_StartsWithDaemonPrefix(t *testing.T) {
+	const newID = "abcd1234"
+	for _, project := range []string{"spark", "rainier", "v2.1", "fleet"} {
+		got := buildHandoffRemoteControlSessionName(newID, project)
+		daemonPrefix := handoffSessionPrefix + "-" + project
+		if !strings.HasPrefix(got, daemonPrefix) {
+			t.Errorf("handoff session name %q must start with daemon "+
+				"prefix %q (the FirstAction bash block launches the "+
+				"daemon with `--remote-control-session-name-prefix "+
+				"\"%s\"` and the daemon only attaches sessions "+
+				"whose name STARTS WITH that prefix)",
+				got, daemonPrefix, daemonPrefix)
+		}
 	}
 }
 
@@ -128,7 +164,11 @@ func TestCoordSpawn_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 }
 
 // TestHandoff_RemoteControlInjection_IncludesProjectInArgv mirrors
-// the above for the handoff replacement-spawn path.
+// the above for the handoff replacement-spawn path. Order is
+// project-first so the registered session name starts with the
+// per-project daemon prefix (see
+// TestHandoff_RemoteControlSessionName_StartsWithDaemonPrefix for
+// the full rationale).
 func TestHandoff_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
@@ -140,7 +180,7 @@ func TestHandoff_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 	rcSessionName := buildHandoffRemoteControlSessionName(newID, project)
 	rewritten := injectRemoteControlFlag(defaultCmd, rcSessionName)
 
-	want := `--remote-control "fleet-handoff-feedface-fleet"`
+	want := `--remote-control "fleet-handoff-fleet-feedface"`
 	if !strings.Contains(rewritten[2], want) {
 		t.Errorf("rewritten handoff command should embed %q; got %q",
 			want, rewritten[2])

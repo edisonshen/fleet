@@ -146,14 +146,36 @@ func CoordRemoteControlSessionName(agentID, project string) string {
 
 // HandoffRemoteControlSessionName returns the canonical
 // --remote-control session name for a handoff replacement spawn.
-// Format: `fleet-handoff-<id>-<project>`. See
-// CoordRemoteControlSessionName for the suffix-extension rationale.
+// Format: `fleet-handoff-<project>-<id>`.
+//
+// Order is load-bearing: the per-project handoff daemon launched by
+// internal/handoff.FirstAction runs with
+// `--remote-control-session-name-prefix "fleet-handoff-<project>"`
+// — the Claude remote-control daemon only attaches sessions whose
+// name STARTS WITH that prefix. Putting the project FIRST in the
+// session name (before the agent id) keeps the daemon-prefix→
+// session-name match working. The earlier `fleet-handoff-<id>-<project>`
+// shape did NOT start with the daemon prefix and silently broke
+// /remote-control attach for every per-project handoff daemon
+// (codex review iter-2 [P1]).
+//
+// No legacy needle constraint exists for the handoff side: pidresolver
+// (internal/spawn/pidresolver.go) and skills/fleet-guard/health.py
+// only build needles for `fleet-coord-<id>` (the coord-spawn case),
+// not for `fleet-handoff-<id>`. So we're free to reorder the handoff
+// session name without breaking the disambiguator path.
+//
+// Empty project falls back to the legacy `fleet-handoff-<id>` shape
+// for safety on records without a project (pre-v0.x agent.Record
+// schema, recovery edge cases). The handoff bash block also falls
+// back to the broad `fleet-handoff` daemon prefix when project is
+// empty, so the same prefix→session-name match holds.
 func HandoffRemoteControlSessionName(agentID, project string) string {
 	const prefix = "fleet-handoff"
 	if project == "" {
 		return prefix + "-" + agentID
 	}
-	return prefix + "-" + agentID + "-" + project
+	return prefix + "-" + project + "-" + agentID
 }
 
 // SameCommand returns true iff the two argvs are identical
