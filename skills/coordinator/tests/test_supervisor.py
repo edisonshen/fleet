@@ -2221,6 +2221,71 @@ def test_supervisor_exits_when_operator_writes_direct_inbox(
     assert res.exit_reason == "operator-inbox-message"
 
 
+def test_supervisor_own_stuck_alert_does_not_trigger_inbox_exit(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex iter-12 [P1] regress: when _run_stuck_check_pass emits a
+    [STUCK] alert into the coord's own inbox, the supervisor MUST NOT
+    treat that as an operator message and exit. The session baseline
+    is bumped to swallow the supervisor's own write.
+
+    Driven by stubbing the stuck-check pass to write to the inbox
+    directly + asserting the supervisor reaches all-terminal rather
+    than operator-inbox-message exit.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # No pre-existing inbox file — baseline=0; the stub will create it.
+    import os as _os
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+
+    # Stub stuck-check to write the [STUCK] alert (simulating
+    # _run_stuck_check_pass's emit_stuck_alert call).
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
+        inbox.write_text("[STUCK] alpha-aaaa\n", encoding="utf-8")
+        return supervisor._StuckPassResult(nudges=1)
+    monkeypatch.setattr(supervisor, "_run_stuck_check_pass", fake_pass)
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], [probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    # stuck_check_every=1 → run stuck pass every iter; force_tick=True →
+    # every iter is forced. Without the baseline bump, the supervisor
+    # would exit after the first stuck-check write.
+    cfg = _adaptive_cfg(stuck_check_every=1)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor reached all-terminal — its OWN [STUCK] writes did NOT
+    # trigger the operator-inbox exit.
+    assert res.exit_reason == "all-terminal"
+
+
 def test_supervisor_does_not_exit_on_stale_inbox_file(fleet_home: Path) -> None:
     """Codex iter-11 [P1] regress: a pre-existing inbox file (e.g., a
     [STUCK] alert dropped by emit_stuck_alert itself in a prior tick)

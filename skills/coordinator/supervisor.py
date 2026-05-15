@@ -1147,6 +1147,23 @@ def run_supervisor(
             if run_stuck:
                 last_stuck_check_unix = now_clock
                 res.stuck_check_passes += 1
+                # Codex iter-12 [P1]: _run_stuck_check_pass may emit
+                # [STUCK] alerts to the coord's own inbox file via
+                # emit_stuck_alert. That bumps the inbox mtime past
+                # the session baseline and would trigger the
+                # operator-inbox-exit on the next forced wake — the
+                # supervisor would terminate itself mid-recovery-ladder.
+                # Snapshot the inbox mtime BEFORE the pass; if the
+                # pass moved it (i.e., we wrote a [STUCK] alert), bump
+                # the session baseline to swallow the bump.
+                pre_pass_inbox_mtime = direct_inbox_session_baseline
+                if coord_id:
+                    try:
+                        pre_pass_inbox_mtime = (
+                            (home / "inbox" / f"{coord_id}.md").stat().st_mtime
+                        )
+                    except OSError:
+                        pass
                 try:
                     stuck_summary = _run_stuck_check_pass(
                         probes=probes,
@@ -1163,6 +1180,24 @@ def run_supervisor(
                     res.blocks += stuck_summary.blocks
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"stuck-check: {exc}")
+                # Codex iter-12 [P1]: if the stuck-check pass wrote
+                # to the coord inbox (a [STUCK] alert), advance the
+                # session baseline so the next forced wake doesn't
+                # treat the alert as an operator message. We only
+                # bump UP (to the post-pass mtime); if the operator
+                # raced and wrote AFTER the alert, their later mtime
+                # would still exceed the new baseline → exit fires.
+                if coord_id:
+                    try:
+                        post_pass_inbox_mtime = (
+                            (home / "inbox" / f"{coord_id}.md").stat().st_mtime
+                        )
+                        if post_pass_inbox_mtime > pre_pass_inbox_mtime:
+                            direct_inbox_session_baseline = (
+                                post_pass_inbox_mtime
+                            )
+                    except OSError:
+                        pass
                 # dashboard-accumulation-f-4421 Sub-fix C: agent
                 # auto-archive runs alongside the stuck-check pass at the
                 # same cadence. Best-effort; failures log to stderr and

@@ -1191,11 +1191,21 @@ def _save_deferred_sentinels(
     if not actions:
         coord_state.pop(_DEFERRED_SENTINELS_KEY, None)
         return
-    # Cap the queue size so a chronic-defer state doesn't grow without
-    # bound. Drop oldest entries first (they've been deferred the
-    # longest — most likely operator-attention-needed cases).
+    # Codex iter-12 [P2]: do NOT drop entries when over cap. The
+    # primary tick's drain advances last_archive_scan_ts past the
+    # source files; if we dropped deferred entries the corresponding
+    # task transitions would be lost permanently. Instead, log loudly
+    # if the queue is unbounded and keep all entries. The cap is now
+    # a "soft warning" threshold rather than a hard truncate.
     if len(actions) > _DEFERRED_SENTINELS_CAP:
-        actions = actions[-_DEFERRED_SENTINELS_CAP:]
+        import sys as _sys
+        _sys.stderr.write(
+            f"[P0] coord: deferred-sentinel queue has {len(actions)} entries "
+            f"(soft cap {_DEFERRED_SENTINELS_CAP}); reaper-lane churn or "
+            "stuck workers may be blocking sentinel replays. Investigate "
+            "via `fleet status`.\n"
+        )
+        _sys.stderr.flush()
     coord_state[_DEFERRED_SENTINELS_KEY] = [
         {
             "slug": a.slug,
