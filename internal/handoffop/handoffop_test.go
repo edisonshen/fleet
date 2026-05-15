@@ -944,18 +944,19 @@ func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
 }
 
 // TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn pins codex
-// iter-14 [P1]: AtomicCoordSwap preserves the queue on
-// ErrOrphanSurvived / ErrOldKillProbeAmbiguous — NEW exited (lost the
-// coordinator.lock race or crashed) but OLD is still the live coord.
-// On the next drain pass we land in Resume's case-3 outer gate with
-// newRec session dead. Auto-respawning here would stack a second
-// replacement on top of the live OLD coord, recreating the
-// duplicate-coord loop the preserved queue is supposed to avoid.
+// iter-14 [P1] + iter-15 [P1] narrowing: AtomicCoordSwap preserves the
+// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous — NEW exited
+// (lost the coordinator.lock race or crashed) but OLD is still the
+// live coord. Post-commit means marker == newRec.ID. On the next drain
+// pass we land in Resume's case-3 outer gate with newRec session dead.
+// Auto-respawning here would stack a second replacement on top of the
+// live OLD coord, recreating the duplicate-coord loop the preserved
+// queue is supposed to avoid.
 //
-// Post-fix: detect coord-swap-relevant marker state (marker resolves
-// to oldRec.ID OR newRec.ID), then probe OLD. If OLD is still alive,
-// refuse-and-preserve — let the operator triage. If OLD is dead, fall
-// through to the rollback + respawn path.
+// iter-15 narrowing: the refusal only fires on marker == newRec.ID
+// (post-commit). Marker == oldRec.ID (pre-commit) means OLD is the
+// only legitimate coord and respawning is safe — see
+// TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns below.
 func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -1026,5 +1027,85 @@ func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
 	}
 	if !tmux.HasSession(oldRec.TmuxSession) {
 		t.Errorf("oldRec session %s should still be alive", oldRec.TmuxSession)
+	}
+}
+
+// TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns pins codex
+// iter-15 [P1] narrowing: the iter-14 refusal gate must fire ONLY on
+// post-commit state (marker == newRec.ID). A pre-commit crash —
+// previous handoff spawned newRec but failed BEFORE the AtomicCoordSwap
+// step 4 marker write — leaves marker at oldRec.ID. OLD is still the
+// only legitimate coord. Auto-respawning is safe and required (no
+// duplicate-coord risk: no NEW2 because OLD never lost coordinator.lock).
+//
+// Pre-iter-15: my iter-14 predicate `marker == oldRec.ID || marker ==
+// newRec.ID` would refuse this case, blocking automatic recovery and
+// requiring operator intervention. iter-15 narrows the predicate to
+// `marker == newRec.ID` only.
+func TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t) // OLD session stays alive.
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Pre-commit state: marker at oldRec.ID (eager write never landed
+	// or AtomicCoordSwap step 4 never reached).
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	// Plant a stale newRec with a dead session (previous handoff
+	// crashed after spawn but before marker commit).
+	staleNew := agent.New(req.NewAgentID)
+	staleNew.TaskID = oldRec.TaskID
+	staleNew.Project = oldRec.Project
+	staleNew.Cwd = oldRec.Cwd
+	staleNew.Command = oldRec.Command
+	staleNew.TmuxSession = req.NewSession
+	staleNew.SpawnedAt = time.Now().UTC()
+	if err := staleNew.Write(); err != nil {
+		t.Fatalf("plant stale new rec: %v", err)
+	}
+
+	// Outer-gate probe: NEW definitively dead.
+	origAlive := tmuxSessionAliveFn
+	var probedSessions []string
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		probedSessions = append(probedSessions, s)
+		if s == req.NewSession && len(probedSessions) == 1 {
+			return false, nil
+		}
+		return origAlive(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	// Resume must NOT refuse — pre-commit state is safe to auto-recover.
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume on pre-commit stale newRec must succeed; got: %v\n%s", err, out.String())
+	}
+
+	// Fresh replacement spawned + alive.
+	freshRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load fresh: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
+	if !tmux.HasSession(freshRec.TmuxSession) {
+		t.Errorf("fresh replacement session %s not alive", freshRec.TmuxSession)
+	}
+
+	// Marker committed to fresh replacement (AtomicCoordSwap completed
+	// the swap end-to-end on the retry).
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != freshRec.ID {
+		t.Errorf("marker not at fresh replacement: got %q want %q", got, freshRec.ID)
+	}
+
+	// OLD archived (proves the swap committed normally, not refused).
+	if _, lerr := agent.Load(oldRec.ID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Errorf("oldRec should be archived after successful swap: err=%v", lerr)
 	}
 }

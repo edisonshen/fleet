@@ -376,23 +376,24 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"recovery probe: probe replacement %s session %s failed: %w (queue file preserved for operator inspection)",
 					newRec.ID, newRec.TmuxSession, perr)
 			case !alive:
-				// Codex iter-14 [P1]: AtomicCoordSwap preserves the
-				// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous
-				// — NEW may have lost the coordinator.lock race + died
-				// while OLD is still the live coord. Refuse-and-preserve
-				// when this is a coord-swap journal AND OLD is alive;
-				// otherwise an operator-driven retry without first
-				// killing OLD would create a duplicate coord. Operator
-				// can bypass with --force-replacement once OLD is
-				// confirmed dead (or intentionally being replaced).
-				coordSwapJournal := false
-				if oldRec.Project != "" {
-					marker := state.ReadCoordSpawnMarker(oldRec.Project)
-					if marker == oldRec.ID || marker == newRec.ID {
-						coordSwapJournal = true
-					}
+				// Codex iter-14 [P1] + iter-15 [P1] narrowing:
+				// AtomicCoordSwap preserves the queue on ErrOrphanSurvived
+				// / ErrOldKillProbeAmbiguous — NEW may have lost the
+				// coordinator.lock race + died while OLD is still the
+				// live coord. Refuse-and-preserve when the marker proves
+				// the swap COMMITTED (marker == newRec.ID) AND OLD is
+				// alive. Pre-commit crashes (marker == oldRec.ID, or
+				// marker unset) are SAFE to auto-recover — OLD is the
+				// only legitimate live coord, no duplicate-coord risk
+				// from respawning. Operator can pass --force-replacement
+				// to bypass post-commit refusal once OLD is confirmed
+				// dead.
+				coordSwapPostCommit := false
+				if oldRec.Project != "" &&
+					state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
+					coordSwapPostCommit = true
 				}
-				if coordSwapJournal && !opts.forceReplacement {
+				if coordSwapPostCommit && !opts.forceReplacement {
 					oldAlive, probeErr := tmux.SessionAlive(oldRec.TmuxSession)
 					switch {
 					case probeErr != nil:

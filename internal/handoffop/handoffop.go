@@ -132,22 +132,30 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		// replacement on top of a still-alive OLD, recreating the
 		// duplicate-coord loop the preserved queue is meant to avoid.
 		//
-		// Refuse-and-preserve when this is a coord swap (marker
-		// resolves to oldRec.ID OR newRec.ID) AND OLD is still alive.
-		// The operator can triage: kill OLD by hand and re-run drain,
-		// or rerun handoff with --force-replacement once OLD is gone.
-		// Worker handoffs (no marker / marker unrelated) keep the
-		// auto-respawn behavior — they don't have the dashboard
-		// duplicate-coord hazard, and worker-row CAS semantics are
-		// deferred per the v5 plan's Non-goals.
-		coordSwapJournal := false
-		if oldRec.Project != "" {
-			marker := state.ReadCoordSpawnMarker(oldRec.Project)
-			if marker == oldRec.ID || marker == newRec.ID {
-				coordSwapJournal = true
-			}
+		// Codex iter-15 [P1] narrowing: refuse ONLY when marker is at
+		// newRec.ID (post-commit), not at oldRec.ID (pre-commit).
+		//
+		//   - marker == newRec.ID → AtomicCoordSwap's step 4 succeeded
+		//     and step 5 returned ErrOrphanSurvived / ErrOldKillProbeAmbiguous.
+		//     The swap "committed" — NEW briefly owned by the marker —
+		//     and OLD's record was preserved (helper iter-7 P1 stopped
+		//     archiving OLD on these paths). If OLD's tmux is still
+		//     alive (orphan or live coord on another socket), respawning
+		//     here would put a NEW2 competing for coordinator.lock with
+		//     the OLD orphan that's still holding it.
+		//
+		//   - marker == oldRec.ID → previous handoff crashed BEFORE the
+		//     atomic commit (no eager write yet, or eager write failed,
+		//     or the helper rolled the marker back). OLD is still the
+		//     only legitimate coord. Respawning is the correct recovery:
+		//     drop NEW, fresh-spawn a replacement, normal swap path
+		//     completes the handoff.
+		coordSwapPostCommit := false
+		if oldRec.Project != "" &&
+			state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
+			coordSwapPostCommit = true
 		}
-		if coordSwapJournal {
+		if coordSwapPostCommit {
 			oldAlive, probeErr := tmuxSessionAliveFn(oldRec.TmuxSession)
 			switch {
 			case probeErr != nil:
