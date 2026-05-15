@@ -1178,10 +1178,12 @@ func TestRender_WrapperShellPid_PreservesStuck(t *testing.T) {
 	}
 }
 
-// TestArgvLooksLikeShellWrapper_EdgeCases pins the argv classifier
-// contract. The first-token-only check matches fleet-guard's Python
-// implementation; argv with claude in argv[2] (after `sh -c`) still
-// counts as a wrapper because argv[0] is the shell.
+// TestArgvLooksLikeShellWrapper_EdgeCases pins the basename-based
+// classifier contract. The first-token's basename must match a known
+// POSIX shell name; this covers non-system shell paths (Homebrew, Nix,
+// asdf, etc.) that a hardcoded path allowlist would miss (codex
+// iter-17 P1). argv with claude in argv[2] (after `sh -c`) still
+// counts as a wrapper because argv[0]'s basename is the shell.
 func TestArgvLooksLikeShellWrapper_EdgeCases(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1194,11 +1196,20 @@ func TestArgvLooksLikeShellWrapper_EdgeCases(t *testing.T) {
 		{"bash -c → true", "bash -c claude", true},
 		{"/usr/bin/zsh → true", "/usr/bin/zsh", true},
 		{"/usr/local/bin/fish -c → true", "/usr/local/bin/fish -c claude", true},
+		// Homebrew + non-system shell paths (codex iter-17).
+		{"/opt/homebrew/bin/bash -c → true", "/opt/homebrew/bin/bash -c claude", true},
+		{"/opt/homebrew/bin/fish → true", "/opt/homebrew/bin/fish", true},
+		{"/nix/store/abc-bash-5.2/bin/bash → true", "/nix/store/abc-bash-5.2/bin/bash -c claude", true},
+		// Less common shells via basename matching.
+		{"tcsh → true", "tcsh", true},
+		{"/opt/homebrew/bin/zsh → true", "/opt/homebrew/bin/zsh", true},
+		// Non-shell processes.
 		{"claude --remote-control → false (real Claude)", "claude --remote-control", false},
 		{"/usr/local/bin/claude → false", "/usr/local/bin/claude", false},
 		{"node --version → false (non-shell binary)", "node --version", false},
 		{"single-token shell name → true", "sh", true},
 		{"shellish prefix but different binary → false", "shfoo --bar", false},
+		{"basename matches but trailing args → true", "/usr/local/bin/bash --login -c claude", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
