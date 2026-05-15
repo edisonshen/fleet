@@ -867,6 +867,14 @@ def _run_supervisor(
     # slugs immediately — without it, a worker whose mtime advanced
     # several polls earlier (when the lane wasn't clear) wouldn't get
     # its status flip until the periodic full reconcile fires.
+    #
+    # Codex iter-13 [P1]: when the reaper kills a slug, also replay
+    # any deferred sentinels for that slug NOW (during the normal
+    # iteration), not on a future forced wake. The deferred-sentinel
+    # queue would otherwise hold a stale TASK_DONE_PR / WORKER_FAILED
+    # that the next forced wake could replay over already-applied
+    # reconcile transitions — restoring stale PR URLs / rolling
+    # replacement workers back to todo.
     def reaper_hook_supervisor(probes) -> list[str]:
         try:
             f5 = parse.read(str(tasks_path))
@@ -891,8 +899,60 @@ def _run_supervisor(
                 )
             if dec.state in ("killed", "hard-killed"):
                 reaped.append(dec.slug)
+        # Replay any deferred sentinels whose reaper lane is now
+        # clear (just-reaped or never-had-a-lane). Mutates `cs` in
+        # place; we save at the end.
+        if reaped:
+            _replay_deferred_sentinels(
+                project=project, fleet_bin=fleet_bin, home=home,
+                cs=cs, cwd=cwd, cap=cap,
+            )
         _save_coord_state(state_path, cs)
         return reaped
+
+    def _replay_deferred_sentinels(
+        *, project: str, fleet_bin: str, home: Path,
+        cs: dict, cwd: str, cap: int,
+    ) -> None:
+        """Apply queued deferred sentinels whose reaper lane is clear.
+        Called from reaper_hook_supervisor right after a successful
+        reap so stale sentinels don't sit in the queue waiting for
+        the next forced wake (codex iter-13 [P1])."""
+        deferred = _load_deferred_sentinels(cs)
+        if not deferred:
+            return
+        try:
+            f_local = parse.read(str(tasks_path))
+        except Exception:
+            return
+        tbs = {t.slug: t for t in f_local.tasks}
+        still_deferred: list[_SentinelAction] = []
+        sentinel_repo = cwd if cap > 1 else ""
+        sentinel_tbs = tbs if cap > 1 else None
+        for action in deferred:
+            if action.kind in ("task_done_pr", "worker_failed") and not (
+                _reaper_lane_clear_for(cs, action.slug)
+            ):
+                still_deferred.append(action)
+                continue
+            try:
+                _apply_sentinel(
+                    action, project, fleet_bin,
+                    repo=sentinel_repo,
+                    tasks_by_slug=sentinel_tbs,
+                    home=home,
+                    full_tasks_by_slug=tbs,
+                )
+                if action.kind in (
+                    "task_done_pr", "worker_failed", "blocked_question",
+                ):
+                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    _clear_review_handoff_state(cs, action.slug)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(
+                    f"deferred sentinel {action.slug}: {exc}"
+                )
+        _save_deferred_sentinels(cs, still_deferred)
 
     # Codex iter-3 [P2]: drain + dispatch on every forced wake so a
     # NEW_TASK that arrives mid-supervisor session is picked up under

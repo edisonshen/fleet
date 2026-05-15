@@ -1180,14 +1180,24 @@ def run_supervisor(
                     res.blocks += stuck_summary.blocks
                 except Exception as exc:  # noqa: BLE001
                     res.errors.append(f"stuck-check: {exc}")
+                    stuck_summary = _StuckPassResult()
                 # Codex iter-12 [P1]: if the stuck-check pass wrote
                 # to the coord inbox (a [STUCK] alert), advance the
                 # session baseline so the next forced wake doesn't
-                # treat the alert as an operator message. We only
-                # bump UP (to the post-pass mtime); if the operator
-                # raced and wrote AFTER the alert, their later mtime
-                # would still exceed the new baseline → exit fires.
-                if coord_id:
+                # treat the alert as an operator message.
+                #
+                # Codex iter-13 [P2]: ONLY bump baseline when the pass
+                # actually emitted [STUCK] alerts (stuck_summary.
+                # stuck_alerts > 0). Otherwise an operator write that
+                # landed during the same window would get its mtime
+                # baked into the baseline and the operator's message
+                # would never trigger an exit. Worst case (operator
+                # races our alert in the same pass): we'll baseline-
+                # over the operator's write this iteration, but the
+                # operator's NEXT write advances mtime again and
+                # triggers the exit then. Acceptable: bounded delay
+                # equal to one stuck-check cadence.
+                if coord_id and stuck_summary.stuck_alerts > 0:
                     try:
                         post_pass_inbox_mtime = (
                             (home / "inbox" / f"{coord_id}.md").stat().st_mtime
@@ -1229,6 +1239,12 @@ class _StuckPassResult:
     nudges: int = 0
     escalations: int = 0
     blocks: int = 0
+    # Codex iter-13 [P2]: count of [STUCK] inbox alerts emitted to
+    # the coord inbox this pass. Used by run_supervisor to know
+    # whether to swallow the post-pass mtime bump on the session
+    # baseline (only swallow when we actually wrote — otherwise
+    # an operator's concurrent write would be lost).
+    stuck_alerts: int = 0
 
 
 def _run_idle_agent_archive_pass(
@@ -1460,13 +1476,15 @@ def _run_stuck_check_pass(
                 "FLEET_AGENT_ID", "",
             ) or ""
             if alert_coord_id:
-                emit_stuck_alert(
+                wrote = emit_stuck_alert(
                     alert_coord_id, p.slug, fleet_home=home,
                     detail=(
                         f"phase={cur_phase or '?'} idle since "
                         f"{_fmt_ts(now_unix)}"
                     ),
                 )
+                if wrote:
+                    out.stuck_alerts += 1
             if agent_id and nudge_worker(agent_id, fleet_home=home):
                 sup.nudged_at = now_unix
                 out.nudges += 1
