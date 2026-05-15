@@ -657,10 +657,17 @@ func stubAliveSessions(t *testing.T, alive map[string]bool) {
 // tests that need to distinguish "Claude alive" from "wrapper-only"
 // without taking a real OS-process dependency.
 //
-// Also stubs agentProcessArgvFn to return "claude" by default for
-// alive PIDs (i.e. NOT a shell wrapper). Use stubProcessArgv to
-// override the argv per-PID when exercising the wrapper-shell
-// detection path.
+// Also stubs agentProcessArgvFn to return a non-wrapper argv that
+// contains the agent ID needle (via stubProcessAliveAgent) for alive
+// PIDs. Use stubProcessArgv to override the argv per-PID when
+// exercising the wrapper-shell or PID-drift detection paths.
+//
+// Default argv intentionally returns empty string here — empty argv
+// is conservatively "trust kill(0)" per agentClaudeAlive contract, so
+// tests that don't care about the argv check don't need to stub it.
+// Tests targeting Path C with coord-spawn agents (task_id starts
+// with "coord-") MUST also call stubProcessArgvWithNeedle to inject
+// the disambiguator.
 func stubProcessAlive(t *testing.T, alive map[int]bool) {
 	t.Helper()
 	prevAlive := agentProcessAliveFn
@@ -668,11 +675,10 @@ func stubProcessAlive(t *testing.T, alive map[int]bool) {
 	agentProcessAliveFn = func(pid int) bool {
 		return alive[pid]
 	}
+	// Default to empty argv (probe-failure shape) → conservative
+	// trust kill(0) path. Tests that need a specific argv override
+	// via stubProcessArgv.
 	agentProcessArgvFn = func(pid int) string {
-		if alive[pid] {
-			// Default: looks like Claude (NOT a shell wrapper).
-			return "claude --remote-control"
-		}
 		return ""
 	}
 	t.Cleanup(func() {
@@ -1143,6 +1149,113 @@ func TestRender_LiveClaudeStopHookNeverFired_SuppressesStuck(t *testing.T) {
 	}
 	if !strings.Contains(joined, "spawned but never ticked") {
 		t.Errorf("live Claude + no Stop hook: soft never-ticked hint must surface; got:\n%s", joined)
+	}
+}
+
+// TestAgentClaudeAlive_PidDriftDisambiguator pins the codex iter-20
+// [P1] fix: coord-spawn agents (task_id starts with "coord-") inject
+// `fleet-coord-<agent_id>` into argv. If the recorded PID is alive
+// AND its argv is non-shell BUT lacks the disambiguator, the kernel
+// likely recycled the PID into an unrelated process OR
+// resolveEnginePid latched onto a non-coord helper. agentClaudeAlive
+// returns false in that case so Path C does NOT falsely suppress
+// the stuck warning for a recycled PID.
+//
+// Plain (non-coord) records skip the disambiguator check — workers /
+// handoff replacements don't carry the needle.
+func TestAgentClaudeAlive_PidDriftDisambiguator(t *testing.T) {
+	stubProcessAlive(t, map[int]bool{4000: true, 5000: true, 6000: true})
+	stubProcessArgv(t, map[int]string{
+		// Has disambiguator → coord alive
+		4000: "claude --remote-control fleet-coord-abcd1234",
+		// Coord task ID but no disambiguator → PID drift (recycled
+		// into unrelated process or wrong resolution at spawn time).
+		5000: "claude --remote-control",
+		// Plain worker, no disambiguator needed (skipped).
+		6000: "claude --remote-control",
+	})
+
+	cases := []struct {
+		name    string
+		records []*agent.Record
+		id      string
+		want    bool
+	}{
+		{
+			name:    "coord with disambiguator → true",
+			records: []*agent.Record{{ID: "abcd1234", PID: 4000, TaskID: "coord-projects-fleet"}},
+			id:      "abcd1234",
+			want:    true,
+		},
+		{
+			name:    "coord WITHOUT disambiguator → false (PID drift)",
+			records: []*agent.Record{{ID: "abcd1234", PID: 5000, TaskID: "coord-projects-fleet"}},
+			id:      "abcd1234",
+			want:    false,
+		},
+		{
+			name:    "non-coord (worker) without disambiguator → true (no needle expected)",
+			records: []*agent.Record{{ID: "abcd1234", PID: 6000, TaskID: "task-123"}},
+			id:      "abcd1234",
+			want:    true,
+		},
+		{
+			name:    "non-coord with empty TaskID → true (no needle expected)",
+			records: []*agent.Record{{ID: "abcd1234", PID: 6000, TaskID: ""}},
+			id:      "abcd1234",
+			want:    true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentClaudeAlive(tc.records, tc.id)
+			if got != tc.want {
+				t.Errorf("agentClaudeAlive(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRender_PidDrifted_PreservesStuck pins the end-to-end Path C
+// path for codex iter-20 [P1]: coord-spawn agent whose recorded PID's
+// argv no longer carries `fleet-coord-<id>`. Path C must NOT suppress
+// the red stuck chip — the operator needs to see the failure.
+func TestRender_PidDrifted_PreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{7777: true})
+	// Argv is real (non-shell, non-empty) but does NOT contain
+	// fleet-coord-49bc8a03 — kernel recycled the PID.
+	stubProcessArgv(t, map[int]string{
+		7777: "/usr/bin/python3 some_other_script.py",
+	})
+	stubRemoveMarker(t)
+
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			PID:            7777,
+			TaskID:         "coord-projects-fleet",
+			LastActivityTS: spawnedAt,
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("PID drift (recycled into unrelated process): red stuck chip MUST surface; got:\n%s", joined)
 	}
 }
 
@@ -2026,6 +2139,12 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
 	stubProcessAlive(t, map[int]bool{33333: true}) // claude alive
+	// Realistic argv shape: production coord spawns inject
+	// fleet-coord-<id> into argv. With the disambiguator present,
+	// agentClaudeAlive returns true for a coord task_id.
+	stubProcessArgv(t, map[int]string{
+		33333: "claude --remote-control fleet-coord-49bc8a03",
+	})
 	rmCalls := stubRemoveMarker(t)
 
 	// Record on disk: SpawnedAt 15min ago (past coldStart grace),
@@ -2038,6 +2157,7 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 		{
 			ID:             "49bc8a03",
 			PID:            33333,
+			TaskID:         "coord-projects-fleet",
 			LastActivityTS: now.Add(-12 * time.Minute), // stale
 			SpawnedAt:      spawnedAt,
 		},
@@ -2277,13 +2397,24 @@ func TestAgentNeverTickedSinceSpawn_EdgeCases(t *testing.T) {
 			want:    false,
 		},
 		{
-			// codex iter-10 P2 fix: legacy records without SpawnedAt
-			// still surface the never-ticked hint so the row isn't
-			// silent after Path C suppression.
-			name:    "zero SpawnedAt (legacy) → true (surface diagnostic)",
+			// codex iter-10 P2: legacy records without SpawnedAt
+			// AND no state file → surface the never-ticked hint so
+			// the row isn't silent after Path C suppression.
+			name:    "zero SpawnedAt + zero lastTick → true",
 			records: []*agent.Record{{ID: "x"}},
 			id:      "x",
 			want:    true,
+		},
+		{
+			// codex iter-20 P2: legacy records without SpawnedAt
+			// BUT with a state file → assume a tick happened
+			// (existing idle-stop / post-active render covers it),
+			// don't overlay a contradictory never-ticked hint.
+			name:     "zero SpawnedAt + non-zero lastTick → false",
+			records:  []*agent.Record{{ID: "x"}},
+			id:       "x",
+			lastTick: now.Add(-3 * time.Minute),
+			want:     false,
 		},
 		{
 			name:    "spawn within grace window → false",
