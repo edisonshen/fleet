@@ -956,6 +956,31 @@ def run_supervisor(
         poll_count += 1
         res.iterations += 1
 
+        # Codex iter-10 [P2]: when the operator wrote to the direct
+        # coord inbox (~/.fleet/inbox/<coord>.md), exit the supervisor
+        # so the next Claude-agent turn fires fleet-guard's
+        # SessionStart hook and surfaces the message. The coord skill
+        # itself doesn't consume that inbox surface (fleet-guard
+        # does), so staying in the supervisor would silence operator
+        # messages indefinitely. We detect this via direct-inbox mtime
+        # advance: the force_tick_check already tracks it. Archive-
+        # only force-ticks (worker → coord events) do NOT trigger the
+        # exit because force_tick_dispatch handles those internally.
+        if forced and coord_id:
+            direct = home / "inbox" / f"{coord_id}.md"
+            try:
+                if direct.is_file():
+                    res.exit_reason = "operator-inbox-message"
+                    emit(
+                        f"[coord] supervisor loop exiting: operator wrote "
+                        f"to inbox {direct.name} (fleet-guard will deliver "
+                        "on next turn)",
+                        stream=log_stream,
+                    )
+                    break
+            except OSError:
+                pass
+
         # On forced wake, run the dispatch hook so a NEW_TASK arriving
         # mid-supervisor session is picked up under spare cap. Pre-sleep
         # tick order: the iteration body below still runs (reconcile +

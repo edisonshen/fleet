@@ -2147,6 +2147,60 @@ def test_reaper_hook_return_triggers_reconcile_for_just_reaped_slugs(
     assert "alpha-aaaa" in reconcile_calls, f"reconcile_calls={reconcile_calls}"
 
 
+def test_supervisor_exits_when_operator_writes_direct_inbox(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-10 [P2] regress: the coord inbox at
+    ~/.fleet/inbox/<coord>.md is consumed by fleet-guard's
+    SessionStart hook on the NEXT Claude-agent turn, not by the coord
+    skill itself. While the supervisor is running, an operator message
+    sent via `fleet message <coord>` would otherwise stay invisible
+    until the supervisor exits (could be 4 h). Fix: when a direct-
+    inbox file is present on a forced wake, exit the supervisor so
+    the next turn fires fleet-guard.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    # Operator writes to the direct inbox BEFORE the supervisor starts.
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("[OPERATOR] hi\n", encoding="utf-8")
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    res = supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id="c00bf001",
+        log_stream=io.StringIO(),
+    )
+    # Supervisor exited because the operator wrote to the direct inbox.
+    assert res.exit_reason == "operator-inbox-message"
+
+
 def test_reaper_hook_runs_before_reconcile_on_mtime_change(
     fleet_home: Path,
 ) -> None:
