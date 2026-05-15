@@ -1244,33 +1244,46 @@ def _consume_reaper_redispatch(
     except Exception:
         return
     by_slug = {t.slug: t for t in f.tasks}
+    # Codex iter-9 [P1]: when reaper sets redispatch_pending the task
+    # is typically still at status=in-progress (the lane is being
+    # cleared; reconcile flips it to todo on a subsequent tick).
+    # Treating in-progress as "stale" was wrong — drop only the
+    # definitively-terminal statuses; leave in-progress/in-review
+    # markers untouched so the next reconcile pass can flip them and
+    # the consume runs against the new state.
+    _DROP_STATUSES = {"done", "blocked", "abandoned", "ready"}
     for slug in list(pending):
         t = by_slug.get(slug)
         if t is None:
             # Task disappeared (archived?) — drop the stale marker.
             reaper_mod.clear_redispatch_pending(coord_state, slug)
             continue
-        if t.status != "todo":
-            # Operator intervened or reconcile took a different path
-            # (e.g., blocked) — the marker is no longer actionable.
+        if t.status == "todo":
+            # Promote todo → ready. _run_fleet raises on failure → the
+            # marker stays set and the next tick retries.
+            try:
+                _run_fleet([
+                    fleet_bin, "tasks", "set", "--project", project,
+                    slug, "status=ready",
+                ])
+                _run_fleet([
+                    fleet_bin, "tasks", "note", "--project", project,
+                    slug,
+                    "reaper: error-abort → re-dispatch (replacement worker)",
+                ])
+                reaper_mod.clear_redispatch_pending(coord_state, slug)
+            except Exception:
+                continue
+            continue
+        if t.status in _DROP_STATUSES:
+            # Operator intervened or task reached a terminal state
+            # where re-dispatch doesn't apply.
             reaper_mod.clear_redispatch_pending(coord_state, slug)
             continue
-        # Promote todo → ready. _run_fleet raises on failure → the
-        # marker stays set and the next tick retries.
-        try:
-            _run_fleet([
-                fleet_bin, "tasks", "set", "--project", project,
-                slug, "status=ready",
-            ])
-            _run_fleet([
-                fleet_bin, "tasks", "note", "--project", project,
-                slug,
-                "reaper: error-abort → re-dispatch (replacement worker)",
-            ])
-            reaper_mod.clear_redispatch_pending(coord_state, slug)
-        except Exception:
-            # Leave the marker; next tick retries.
-            continue
+        # status in-progress/in-review — reaper or reconcile hasn't
+        # finished the transition yet. KEEP the marker; the next tick
+        # consumes it after reconcile flips to todo.
+        continue
 
 
 # ---------- lock helpers ----------

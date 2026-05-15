@@ -492,6 +492,40 @@ def test_force_tick_dispatch_drains_archive_to_advance_watermark(
     assert cs.get("last_archive_scan_ts", "") == archive_file.name
 
 
+def test_redispatch_pending_preserved_when_task_still_in_progress(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+    monkeypatch,
+) -> None:
+    """Codex iter-9 [P1] regress: when the reaper sets
+    reaper_redispatch_pending DURING the same tick the worker is being
+    killed, the task is typically still at status=in-progress (reconcile
+    hasn't flipped it to todo yet — gated on reaper lane clear). If
+    _consume_reaper_redispatch dropped the marker as "stale" the
+    replacement worker would be silently lost.
+    Fix: keep the marker when status ∈ {in-progress, in-review}.
+    Drop only on terminal/operator-intervened states.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    _write_tasks(project_dir, [
+        _make_task("alpha-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    coord_state_path = project_dir / "coord-state.json"
+    coord_state_path.write_text(json.dumps({
+        "reaper_redispatch_pending": ["alpha-aaaa"],
+    }), encoding="utf-8")
+
+    state = json.loads(coord_state_path.read_text())
+    loop._consume_reaper_redispatch(
+        project=project, fleet_bin="fleet", home=fleet_home,
+        coord_state=state, tasks_path=project_dir / "tasks.md",
+    )
+    # Marker preserved — task still in-progress.
+    pending = state.get("reaper_redispatch_pending", [])
+    assert "alpha-aaaa" in pending
+
+
 def test_redispatch_pending_promotes_todo_to_ready(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
