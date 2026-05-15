@@ -1026,6 +1026,18 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
 			newRec.TmuxSession, perr)
 	} else if !alive {
+		// Codex iter-11 [P1]: a PREVIOUS run may have eagerly moved
+		// the marker to newRec.ID before crashing — by the time we
+		// reach this rollback the marker can already point at the
+		// dead NEW. Restore it to oldRec.ID so dashboard discovery
+		// + a retry's isCoordSwap detection keep working.
+		if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: rollback coord-spawn marker for project %s failed: %v (operator may need to re-write manually)\n",
+					oldRec.Project, werr)
+			}
+		}
 		return fmt.Errorf(
 			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)

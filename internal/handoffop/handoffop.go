@@ -565,6 +565,18 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 			_ = os.Remove(path)
 		}
 		_ = queue.Delete(queuePath)
+		// Codex iter-11 [P1]: the caller (spawnAndRetire / Resume
+		// case-3) may have eagerly moved the marker to newRec.ID
+		// before invoking us. NEW is now dead — restore the marker
+		// to oldRec.ID so dashboard discovery + a retry's
+		// isCoordSwap detection keep working.
+		if isCoordSwap && oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
+			if werr := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); werr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"warning: rollback coord-spawn marker for project %s failed: %v (operator may need to re-write manually)\n",
+					oldRec.Project, werr)
+			}
+		}
 		return fmt.Errorf(
 			"resume: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
 			newRec.ID, newRec.TmuxSession, oldRec.ID)
