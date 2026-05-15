@@ -982,9 +982,12 @@ def _run_supervisor(
                     home=home,
                     full_tasks_by_slug=tbs,
                 )
-                if action.kind in (
-                    "task_done_pr", "worker_failed", "blocked_question",
-                ):
+                # Codex iter-23 [P2]: same blocked_question carve-out
+                # as the non-replay drain — blocked workers stay alive,
+                # so we must preserve the agent_id mapping. Only the
+                # terminating sentinels (task_done_pr, worker_failed)
+                # forget the mapping.
+                if action.kind in ("task_done_pr", "worker_failed"):
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
                 applied += 1
