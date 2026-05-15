@@ -1865,10 +1865,34 @@ def test_stuck_alert_appends_does_not_clobber(fleet_home: Path) -> None:
 
 
 def test_has_pending_inbox_events_true_on_direct_inbox(fleet_home: Path) -> None:
-    """Direct inbox file present → force-tick returns True."""
+    """Direct inbox file present with mtime > baseline → True."""
     (fleet_home / "inbox" / "c00bf001.md").write_text("hi", encoding="utf-8")
+    # Default baseline=0.0 → any mtime triggers event.
     assert supervisor.has_pending_inbox_events(
         "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+    ) is True
+
+
+def test_has_pending_inbox_events_false_when_baseline_matches_mtime(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-1 [P1] regress: a coord inbox file that persists
+    across the supervisor session must NOT keep force-ticking. With
+    baseline = current mtime, only an mtime advance counts."""
+    inbox = fleet_home / "inbox" / "c00bf001.md"
+    inbox.write_text("hi", encoding="utf-8")
+    import os as _os
+    cur_mtime = _os.stat(inbox).st_mtime
+    # Pretend the supervisor recorded this mtime at session start.
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+        direct_inbox_mtime_baseline=cur_mtime,
+    ) is False
+    # Touch the file (advance mtime) — event fires.
+    _os.utime(inbox, (cur_mtime + 10, cur_mtime + 10))
+    assert supervisor.has_pending_inbox_events(
+        "c00bf001", fleet_home=fleet_home, last_seen_archive="",
+        direct_inbox_mtime_baseline=cur_mtime,
     ) is True
 
 
@@ -1949,6 +1973,72 @@ def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
     # never calls sleep_fn — see run_supervisor source).
     assert sleep_calls == []
     assert res.iterations >= 1
+
+
+def test_reaper_hook_runs_before_reconcile_on_mtime_change(
+    fleet_home: Path,
+) -> None:
+    """Codex iter-1 [P1] regress: when a worker's state.json mtime
+    advances mid-supervisor session (phase=done write), the reaper hook
+    MUST run BEFORE reconcile_one. Otherwise reconcile would flip status
+    + forget the agent_id mapping before the reaper sends /exit — leaking
+    the tmux session as an orphan. Order verified by capturing call
+    ordering."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    call_order: list[str] = []
+
+    def fake_reap(probes):
+        call_order.append("reap")
+
+    def fake_reconcile_one(p):
+        call_order.append("reconcile")
+
+    sleep_calls: list[float] = []
+    fake_now = {"t": 0.0}
+
+    def fake_sleep(s):
+        sleep_calls.append(s)
+        fake_now["t"] += s if s > 0 else 1.0
+        # Touch the state.json so the NEXT iteration sees mtime change.
+        os.utime(a_path, None)
+
+    seq = iter([[probe], [probe], []])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    cfg = _adaptive_cfg(stuck_check_every=0)
+    supervisor.run_supervisor(
+        cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: fake_now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=fake_reconcile_one,
+        write_state=lambda: None,
+        reaper_hook=fake_reap,
+        log_stream=io.StringIO(),
+    )
+    # First active iteration: reap, then reconcile. Verify reap precedes
+    # reconcile every time both fire.
+    reap_idx = [i for i, c in enumerate(call_order) if c == "reap"]
+    reconcile_idx = [i for i, c in enumerate(call_order) if c == "reconcile"]
+    assert reap_idx, f"reaper hook never fired: {call_order}"
+    if reconcile_idx:
+        # If reconcile fired this iteration, the reap call must precede it.
+        for r_idx in reconcile_idx:
+            preceding_reaps = [i for i in reap_idx if i < r_idx]
+            assert preceding_reaps, (
+                f"reconcile fired before reaper: {call_order}"
+            )
 
 
 def test_reaper_hook_called_each_iteration(fleet_home: Path) -> None:

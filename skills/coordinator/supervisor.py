@@ -723,12 +723,24 @@ def has_pending_inbox_events(
     *,
     fleet_home: Path,
     last_seen_archive: str,
+    direct_inbox_mtime_baseline: float = 0.0,
 ) -> bool:
     """Return True iff there's at least one inbox or queue event the
     coord hasn't processed yet.
 
     Two surfaces, both cheap fs scans (no parse, no shell):
-      1. ~/.fleet/inbox/<coord_id>.md — operator → coord message.
+      1. ~/.fleet/inbox/<coord_id>.md — operator → coord message AND
+         the dropbox where `emit_stuck_alert` appends [STUCK] lines.
+         Codex iter-1 [P1]: this file is NOT consumed by the coord
+         skill — fleet-guard's SessionStart hook eats it on the next
+         coord-agent turn. During a long supervisor session the file
+         persists, so checking existence alone would wedge
+         `force_tick_check` into "always True", spinning the supervisor
+         at 0-second sleeps. We compare the current mtime against the
+         supervisor's start-of-session baseline (`direct_inbox_mtime
+         _baseline`); only an mtime advance counts as an event.
+         baseline=0.0 (file absent at supervisor start) means "any
+         current mtime triggers an event".
       2. ~/.fleet/inbox/archive/<coord_id>-*.md — worker → coord archive
          (the supervisor's force-tick wakes the loop when a worker's
          response lands during a long backoff sleep). We compare archive
@@ -741,12 +753,17 @@ def has_pending_inbox_events(
     """
     if not coord_id:
         return False
-    # Direct inbox file for operator messages.
+    # Direct inbox file — check mtime advanced past the supervisor's
+    # baseline. existence-alone would over-trigger because fleet-guard
+    # (not us) clears the file; the file can persist for the lifetime
+    # of the supervisor session if no coord-agent turn fires.
     direct = fleet_home / "inbox" / f"{coord_id}.md"
     try:
-        if direct.exists():
+        st = direct.stat()
+        if st.st_mtime > direct_inbox_mtime_baseline:
             return True
     except OSError:
+        # File missing or unreadable — no event from the direct inbox.
         pass
     # Archive sweep for worker responses.
     archive = fleet_home / "inbox" / "archive"
@@ -935,7 +952,12 @@ def run_supervisor(
             last_mtimes.setdefault(p.slug, safe_mtime(p.state_path))
             last_change_ts.setdefault(p.slug, now_fn())
 
-        # Mtime change detection — cheap stat, no API calls.
+        # Mtime change detection — cheap stat, no API calls. Computed
+        # FIRST so the change list is fixed before either the reaper or
+        # the reconcile pass mutates state.json (the reaper writes
+        # nothing to state.json; the reconcile path may delete the
+        # worker dir, which would flip mtime AFTER reconcile fired —
+        # we don't want that to count as a "changed" tick).
         changed: list[WorkerProbe] = []
         for p in probes:
             cur = safe_mtime(p.state_path)
@@ -944,6 +966,21 @@ def run_supervisor(
                 changed.append(p)
                 last_mtimes[p.slug] = cur
                 last_change_ts[p.slug] = now_fn()
+
+        # Invariant 5 (reaper) — runs BEFORE reconcile_one (codex iter-1
+        # [P1]). A worker whose state.json mtime just advanced to
+        # phase=done MUST get its /exit + kill-cycle started before
+        # reconcile flips the task status and forgets the agent_id
+        # mapping. Otherwise reconcile clears worker_agent_ids and the
+        # subsequent reaper pass has no tmux session to address — the
+        # tmux session leaks as an orphan (the exact failure shape
+        # invariant 5 exists to prevent). Hook owns its own state
+        # persistence; failures are non-fatal.
+        if reaper_hook is not None:
+            try:
+                reaper_hook(probes)
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"reaper_hook: {exc}")
 
         if changed:
             for p in changed:
@@ -956,16 +993,6 @@ def run_supervisor(
                 write_state()
             except Exception as exc:  # noqa: BLE001
                 res.errors.append(f"write_state after reconcile: {exc}")
-
-        # Invariant 5 (reaper). The hook runs every iteration so
-        # complete/error-abort judgments are acted on within one poll
-        # cadence (5 s default). Hook owns its own state persistence
-        # via the coord-state.json layer; failures are non-fatal.
-        if reaper_hook is not None:
-            try:
-                reaper_hook(probes)
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"reaper_hook: {exc}")
 
         # Periodic full reconcile + sparse stuck-check. Decoupled
         # cadences: periodic_full_reconcile runs at every

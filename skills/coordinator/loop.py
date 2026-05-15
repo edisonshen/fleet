@@ -576,6 +576,13 @@ def _run_supervisor(
 
         Returns True if any slot was freed (action.new_status in the
         terminal set) so the caller can re-run dispatch to backfill.
+
+        Codex iter-1 [P1]: actions with clear_worker=True are deferred
+        when the reaper lane is still open for that slug — matches the
+        primary tick path's invariant-5 gate. Without this, a worker
+        that wrote phase=done mid-supervisor session could get its
+        status flipped (and worker_agent_ids cleared) before the reaper
+        sent /exit — leaking the tmux session as an orphan.
         """
         try:
             f3 = parse.read(str(tasks_path))
@@ -592,6 +599,14 @@ def _run_supervisor(
         slot_freed = False
         full_map = {t.slug: t for t in f3.tasks}
         for action in actions:
+            # Invariant 5 gate: defer terminal flips while the reaper
+            # still has an open kill cycle for this slug. Primary tick
+            # path runs the same check at _tick_locked's reconcile loop;
+            # supervisor-driven reconciles need the same protection.
+            if action.clear_worker and not _reaper_lane_clear_for(
+                cs, action.slug,
+            ):
+                continue
             try:
                 _apply_reconcile(
                     action, project, fleet_bin,
@@ -610,6 +625,10 @@ def _run_supervisor(
                     # stale handoff keys that block future re-dispatches
                     # for the same slug.
                     _clear_review_handoff_state(cs, action.slug)
+                    # Clear redispatch marker on the same beat as the
+                    # primary tick path does — keeps the ledger clean
+                    # across supervisor + tick transitions.
+                    reaper_mod.clear_redispatch_pending(cs, action.slug)
                 # codex iter-1 [P1]: a worker leaving the in-flight
                 # set frees a dispatch slot. Without re-running
                 # _dispatch_ready, with cap=1 the next ready task
@@ -708,13 +727,30 @@ def _run_supervisor(
     # Invariant 4 force-tick: short-circuit the next sleep when there's
     # a pending inbox event for this coord. Cheap fs scan; the supervisor
     # consults this on every iteration before computing the sleep budget.
+    #
+    # Codex iter-1 [P1]: the ~/.fleet/inbox/<coord-id>.md file persists
+    # across the entire supervisor session — fleet-guard's coord-side
+    # hook (not the coord skill) clears it. Existence-alone would wedge
+    # this check into "always True" and spin the supervisor at 0-second
+    # sleeps. Baseline the mtime at supervisor entry so only an mtime
+    # ADVANCE post-entry counts as an event.
+    coord_id_for_force = os.environ.get("FLEET_AGENT_ID", "") or ""
+    direct_inbox_baseline = 0.0
+    if coord_id_for_force:
+        baseline_path = home / "inbox" / f"{coord_id_for_force}.md"
+        try:
+            direct_inbox_baseline = baseline_path.stat().st_mtime
+        except OSError:
+            direct_inbox_baseline = 0.0
+
     def force_tick_check_hook() -> bool:
         cs = _load_coord_state(state_path)
         watermark = str(cs.get("last_archive_scan_ts", "") or "")
         return supervisor_mod.has_pending_inbox_events(
-            coord_id=os.environ.get("FLEET_AGENT_ID", "") or "",
+            coord_id=coord_id_for_force,
             fleet_home=home,
             last_seen_archive=watermark,
+            direct_inbox_mtime_baseline=direct_inbox_baseline,
         )
 
     # Invariant 5 reaper hook. Runs every iteration so a worker that
