@@ -699,31 +699,31 @@ func agentNeedsInput(records []*agent.Record, id string) bool {
 }
 
 // agentClaudeAlive reports whether the Claude process recorded in the
-// agent record matching id is still alive, is not just a wrapper
-// shell, AND its argv still carries the agent-specific disambiguator
-// (`fleet-coord-<id>`) for coord agents. Returns false when:
+// agent record matching id is still alive AND is not just a wrapper
+// shell. Returns false when:
 //   - id is empty, records is nil/empty, or no record matches,
 //   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
 //   - the PID's process is dead (kill(0) returns ESRCH),
 //   - the PID's argv first-token is a POSIX shell binary, indicating
 //     spawn.Spawn's resolveEnginePid fell back to the tmux pane's
-//     wrapper shell instead of the real Claude process,
-//   - the record is a coord-spawn agent (task_id starts with "coord-")
-//     AND the PID's argv does NOT contain `fleet-coord-<id>`, meaning
-//     the kernel recycled the PID into an unrelated process OR the
-//     resolver latched onto a non-coord process. Codex iter-20 P1
-//     drove this: kill(0) + non-shell argv is insufficient evidence
-//     when PIDs can recycle and resolveEnginePid can mis-attribute.
+//     wrapper shell instead of the real Claude process.
 //
-// Mirror of skills/fleet-guard/health.py:_recorded_pid_looks_like_wrapper
-// (Python side runs the same disambiguator check in reconcile_pid).
+// PID-recycle risk: `kill(pid, 0)` can return true for a recycled PID
+// owned by an unrelated process. fleet-guard's reconcile_pid (Python
+// side) uses a `fleet-coord-<id>` disambiguator to detect this case
+// for default-shape spawns (`sh -c "claude ..."`). The TUI helper
+// previously enforced the same check (codex iter-20) but had to drop
+// it (codex iter-22 P1) because custom-command spawns (`--command`,
+// custom engines, non-Claude wrappers) intentionally skip
+// spawn.InjectRemoteControlFlag — the needle is never injected for
+// those shapes, so requiring it would falsely flag healthy coords as
+// stuck. fleet-guard repairs drifted PIDs on every Stop hook anyway,
+// so the window between PID-recycle and reconciliation is narrow.
+// The residual risk is deferred for v0.1.
 //
 // Probe failures (transient ps blip, EPERM, kernel hiccup) return ""
 // from agentProcessArgvFn, which argvLooksLikeShellWrapper treats as
-// "not a wrapper." The disambiguator check ALSO falls back to "trust
-// kill(0)" on empty argv — we cannot prove PID drift without an argv
-// readout, and the alternative (treating every probe failure as
-// "dead") would flip working coords to stuck on a flaky ps.
+// "not a wrapper." Empty argv → trust kill(0).
 //
 // Cost: one kill(0) (~1μs) + one `ps -o args= -p <pid>` (~10ms macOS)
 // per render per project. Stub-overridable via agentProcessAliveFn
@@ -747,28 +747,6 @@ func agentClaudeAlive(records []*agent.Record, id string) bool {
 		}
 		if argvLooksLikeShellWrapper(argv) {
 			return false
-		}
-		// Disambiguator check (codex iter-20 P1): coord-spawn agents
-		// inject `fleet-coord-<agent_id>` into the spawned engine's
-		// argv (internal/spawn injects this for the resolver to find
-		// the right pane child). If the recorded PID's argv lacks the
-		// needle, the kernel either recycled the PID into an
-		// unrelated process OR resolveEnginePid latched onto a
-		// non-coord helper at dispatch time.
-		//
-		// Restricted to coord-spawn agents to match fleet-guard's
-		// Python health.py check: only coord task_ids ("coord-<...>")
-		// carry the injected disambiguator. Plain workers / handoff
-		// replacements don't get it, so checking would force a false
-		// negative on healthy non-coord agents (Path C suppression
-		// doesn't apply to those rows anyway — they don't have a
-		// coord-spawn marker — but the helper stays correct in
-		// isolation for future callers).
-		if strings.HasPrefix(r.TaskID, "coord-") {
-			needle := "fleet-coord-" + id
-			if !strings.Contains(argv, needle) {
-				return false
-			}
 		}
 		return true
 	}
@@ -867,18 +845,13 @@ func coordNeverTickedThisSpawn(
 		}
 		if r.SpawnedAt.IsZero() {
 			// Legacy / partial-write record without spawned_at. We
-			// can't prove the coord ticked under this spawn (no
-			// reference point). Codex iter-15 P2 split:
-			//   - lastTick non-zero → some coord-state.json exists on
-			//     disk. Could be from this spawn OR a previous one;
-			//     without SpawnedAt we cannot tell. Conservative:
-			//     assume "ticked" so Path C doesn't falsely render
-			//     "never ticked" / hide a real wedge.
-			//   - lastTick zero → no state file at all, no reference
-			//     point. Default to "never ticked" so the marker is
-			//     preserved (codex iter-9 P2) — losing the marker
-			//     breaks [a] re-attach for legacy installs.
-			return lastTick.IsZero()
+			// cannot prove the coord ticked under THIS spawn (no
+			// reference point) — the project-scoped coord-state.json
+			// may belong to a previous coordinator (codex iter-22 P2).
+			// Default to "never ticked" so Path B does NOT delete the
+			// marker; losing the marker on a legacy live coord would
+			// break [a] re-attach. Codex iter-9 P2.
+			return true
 		}
 		if lastTick.IsZero() {
 			return true
