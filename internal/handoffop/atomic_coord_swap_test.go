@@ -526,6 +526,59 @@ func TestAtomicCoordSwap_ReProbe_AmbiguousError(t *testing.T) {
 	}
 }
 
+// TestAtomicCoordSwap_PreSpawned_MarkerAtNew_ProbeError_RollsBackMarker
+// pins codex iter-16 [P1]: when AlreadySpawnedNewRec is set AND the
+// caller pre-eager-wrote marker → newRec.ID, a transient probe failure
+// on NEW must roll the marker back to oldRec.ID. Pre-iter-16 the
+// `perr != nil` branch returned without undoing the eager write,
+// leaving marker pointing at a NEW we never confirmed alive while OLD
+// was still the real coord. Downstream retry paths use
+// `marker == newRec.ID` as a post-commit signal — they'd treat this
+// never-committed state as committed and refuse safe recovery.
+func TestAtomicCoordSwap_PreSpawned_MarkerAtNew_ProbeError_RollsBackMarker(t *testing.T) {
+	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
+	if err := newRec.Write(); err != nil {
+		t.Fatalf("newRec.Write seed: %v", err)
+	}
+	in.AlreadySpawnedNewRec = newRec
+
+	// Simulate the caller's eager marker write to newRec.ID BEFORE
+	// invoking the helper. This is what handoffop.Resume's case-3
+	// path + runHandoff's step 8a-bis do in production.
+	if err := state.WriteCoordSpawnMarker("rainier", "newcoord"); err != nil {
+		t.Fatalf("seed eager marker write: %v", err)
+	}
+
+	fake := &fakeSwap{
+		postReadyAlive: false,
+		postReadyErr:   errors.New("simulated NEW probe transport failure"),
+	}
+	restore := fake.install(t, newRec)
+	defer restore()
+
+	var stderr bytes.Buffer
+	_, err := AtomicCoordSwap(in, &stderr)
+	if err == nil {
+		t.Fatalf("expected probe-error to surface; got nil")
+	}
+	if !strings.Contains(err.Error(), "preserves the record for operator inspection") {
+		t.Errorf("error should preserve NEW record for operator inspection; got: %v", err)
+	}
+
+	// Load-bearing assertion: marker must be rolled back to oldcoord.
+	// Pre-iter-16 this would still be at "newcoord".
+	if got := state.ReadCoordSpawnMarker("rainier"); got != "oldcoord" {
+		t.Errorf("marker not rolled back: got %q want oldcoord", got)
+	}
+
+	// NEW record preserved for operator inspection (the existing
+	// contract — separate from the marker rollback fix).
+	newPath, _ := state.AgentPath("newcoord")
+	if _, statErr := os.Stat(newPath); statErr != nil {
+		t.Errorf("NEW record should be preserved: %v", statErr)
+	}
+}
+
 // TestAtomicCoordSwap_MarkerWrite_Fails: step 4 errors. NEW is alive
 // but not declared as coord — roll back NEW (kill + remove record).
 // Marker unchanged at OLD.
@@ -700,29 +753,44 @@ func TestAtomicCoordSwap_OldKill_ProbeAmbiguous(t *testing.T) {
 // TestAtomicCoordSwap_OldKill_Fails_ButGone: step 5.b returns err but
 // step 5.c reports session is gone (race with operator manual kill).
 // Marker committed; OLD archived; success.
-func TestAtomicCoordSwap_OldKill_Fails_ButGone(t *testing.T) {
+// TestAtomicCoordSwap_OldKill_Fails_PostProbeNotOnSocket pins codex
+// iter-16 [P1]: `tmux.SessionAlive(oldSession) == (false, nil)` only
+// proves OLD is gone on the CURRENT tmux socket. If killErr != nil
+// (we couldn't confirm a kill ran), OLD may be alive on a different
+// socket (cross-socket coord). Pre-iter-16 the helper would archive
+// OLD here and the project could end up with the marker at NEW (which
+// loses the lock race to the hidden OLD) plus OLD archived — no
+// visible live coord. Post-fix: treat as ErrOldKillProbeAmbiguous,
+// preserve OLD record.
+func TestAtomicCoordSwap_OldKill_Fails_PostProbeNotOnSocket(t *testing.T) {
 	in, newRec := seedCoordSwap(t, "rainier", "oldcoord", "newcoord")
 	fake := &fakeSwap{
 		postReadyAlive: true,
 		killErr:        errors.New("simulated kill race"),
-		postKillAlive:  false, // race: gone after kill error
+		postKillAlive:  false, // not on our socket after kill error
 	}
 	restore := fake.install(t, newRec)
 	defer restore()
 
 	var stderr bytes.Buffer
 	res, err := AtomicCoordSwap(in, &stderr)
-	if err != nil {
-		t.Fatalf("AtomicCoordSwap should succeed when post-probe confirms dead despite kill err: %v", err)
+	if err == nil {
+		t.Fatalf("expected ErrOldKillProbeAmbiguous on kill-err + not-on-socket; got nil")
 	}
+	if !errors.Is(err, ErrOldKillProbeAmbiguousSentinel) {
+		t.Errorf("expected ErrOldKillProbeAmbiguous; got: %v", err)
+	}
+	// Marker still committed in step 4 — that's the load-bearing
+	// invariant of the helper.
 	if got := state.ReadCoordSpawnMarker("rainier"); got != "newcoord" {
-		t.Errorf("marker = %q; want newcoord", got)
+		t.Errorf("marker = %q; want newcoord (commit invariant)", got)
 	}
-	if !res.OldArchived {
-		t.Errorf("OldArchived = false; want true")
+	// OLD record MUST be preserved (operator triage).
+	if res.OldArchived {
+		t.Errorf("OldArchived = true; want false (ambiguous cross-socket: preserve OLD for operator triage)")
 	}
-	if !strings.Contains(stderr.String(), "session is gone") {
-		t.Errorf("stderr should note the kill-error-but-session-gone race; got: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "cross-socket") {
+		t.Errorf("stderr should mention cross-socket hazard; got: %s", stderr.String())
 	}
 }
 

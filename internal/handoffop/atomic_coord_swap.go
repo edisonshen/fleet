@@ -325,6 +325,25 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 		// operator inspection; definitive dead surfaces clearly.
 		switch alive, perr := sessionAliveFn(newRec.TmuxSession); {
 		case perr != nil:
+			// Codex iter-16 [P1]: if the caller eagerly wrote
+			// marker → newRec.ID before invoking us (markerAtNew
+			// == true), a probe error here returns without
+			// undoing that write. The marker would stay pointing
+			// at a NEW we never confirmed alive while OLD is
+			// still the real coord, and downstream retry paths
+			// use `marker == newRec.ID` as the post-commit signal
+			// — they'd treat this never-committed state as
+			// committed and refuse safe recovery (or `[a]` would
+			// follow the marker to NEW, missing OLD). Roll the
+			// marker back to OLD before surfacing the probe error,
+			// mirroring the !alive branch below. Best-effort.
+			if markerAtNew {
+				if werr := writeCoordSpawnMarkerFn(in.Project, in.OldRec.ID); werr != nil && stderr != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"warning: atomic coord swap: rollback coord-spawn marker for project %s to %s on pre-spawned probe error failed: %v (operator: re-write manually if dashboard misses OLD)\n",
+						in.Project, in.OldRec.ID, werr)
+				}
+			}
 			return res, fmt.Errorf(
 				"atomic coord swap: probe pre-spawned replacement %s session %s failed: %w (caller's spawn handling preserves the record for operator inspection; marker unchanged at %s)",
 				newRec.ID, newRec.TmuxSession, perr, in.OldRec.ID)
@@ -548,14 +567,50 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 				Inner:      killErr,
 			}
 		default:
-			// alive=false, err=nil — OLD is genuinely dead. Continue
-			// to step 6 (archive). If killErr was non-nil, it was a
-			// race (operator killed manually, OS reaped) — note to
-			// stderr for log correlation.
-			if killErr != nil && stderr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"note: atomic coord swap: kill %s reported error but session is gone: %v\n",
-					in.OldRec.TmuxSession, killErr)
+			// alive=false, err=nil on the CURRENT tmux socket.
+			//
+			// Codex iter-16 [P1]: this does NOT prove OLD is globally
+			// dead — `tmux.SessionAlive` only sees the active socket
+			// (FLEET_TMUX_SOCKET). If OLD was running on a different
+			// tmux socket, kill-session on our socket would fail (or
+			// silently succeed because there's nothing to kill HERE),
+			// and post-probe just confirms "nothing here." Archiving
+			// OLD in step 6 would then strand a still-live coord on
+			// the other socket (the same cross-socket hazard FAILURE
+			// MODE 5 / the perr != nil branch already guard against).
+			//
+			// Distinguisher:
+			//   - killErr == nil: tmux.Kill found the session AND
+			//     killed it (or it was already dead before the kill,
+			//     in which case the swap was already a no-op for OLD
+			//     and archiving is safe — there is no other socket to
+			//     consider; the session lived here and is gone now).
+			//     Continue to step 6.
+			//   - killErr != nil: tmux.Kill could NOT confirm a kill
+			//     ran. Combined with post-probe "not on our socket"
+			//     this is ambiguous — OLD may be alive on a different
+			//     socket. Return ErrOldKillProbeAmbiguous, preserve
+			//     OLD record, surface to operator.
+			if killErr != nil {
+				if stderr != nil {
+					_, _ = fmt.Fprintf(stderr,
+						"[P1] atomic coord swap: kill %s failed (%v) but post-probe says session not on current socket — cannot confirm OLD dead globally (cross-socket coord possible); preserving OLD record for operator triage\n",
+						in.OldRec.TmuxSession, killErr)
+				}
+				if alertErr := dropOrphanIncidentAlert(newRec.ID, in.OldRec.ID, in.OldRec.TmuxSession, in.Project); alertErr != nil {
+					if stderr != nil {
+						_, _ = fmt.Fprintf(stderr,
+							"warning: atomic coord swap: drop cross-socket-ambiguity incident alert: %v\n",
+							alertErr)
+					}
+				}
+				return res, &ErrOldKillProbeAmbiguous{
+					OldSession: in.OldRec.TmuxSession,
+					OldAgentID: in.OldRec.ID,
+					NewAgentID: newRec.ID,
+					Project:    in.Project,
+					ProbeErr:   killErr,
+				}
 			}
 		}
 	}
