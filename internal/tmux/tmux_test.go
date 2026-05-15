@@ -271,6 +271,10 @@ func TestSpawn_EmptyCommand(t *testing.T) {
 // FLEET_TMUX_SOCKET (e.g., pointed at a long-lived operator-owned
 // server) would silently bypass the sink guard.
 func TestSpawn_RefusesInheritedNonTestSocketUnderGoTest(t *testing.T) {
+	// lint-test-isolation:exempt — this test deliberately sets
+	// FLEET_TMUX_SOCKET to a non-canonical value to prove the guard
+	// rejects it. The lint would otherwise flag the test since it
+	// doesn't call the canonical isolation helpers.
 	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/tmux-501/default") // not a /tmp/fleet-test-* path
 
 	err := Spawn("fleet-test-inherited-guard", "", []string{"sleep", "1"}, nil)
@@ -382,7 +386,12 @@ func TestSpawn_FailsWhenSocketUnusable(t *testing.T) {
 	// Override to a deeply nested path that exceeds macOS's 104-byte
 	// UNIX socket limit. tmux either fails to bind (socket too long)
 	// or the surrounding dir doesn't exist.
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/"+strings.Repeat("a", 200)+".sock")
+	//
+	// Codex iter-17 [P2] (2026-05-15): use the canonical
+	// `/tmp/fleet-test-*` prefix so the runtime sink guard (which
+	// requires this prefix) lets us through to exercise the
+	// unwritable-socket failure mode.
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+strings.Repeat("a", 200)+".sock")
 
 	session := "fleet-test-" + randHex(t)
 	err := Spawn(session, "", []string{"sleep", "30"}, nil)

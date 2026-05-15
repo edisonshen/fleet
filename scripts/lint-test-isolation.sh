@@ -75,7 +75,15 @@ triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|Res
 # `os.Setenv("FLEET_TMUX_SOCKET"` (the rare direct path). Reads /
 # inspections of the var still pass the trigger-bearing helper as a
 # trigger, not a marker.
-markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET"|os.Setenv("FLEET_TMUX_SOCKET"'
+#
+# Codex review iter-17 [P2] (2026-05-15): removed `t.Setenv` /
+# `os.Setenv` markers because they allow tests to set
+# FLEET_TMUX_SOCKET to non-canonical values (e.g.,
+# `/tmp/tmux-501/default` for guard-regression tests) and still attest
+# isolation. Tests that need raw env mutation around the guard use
+# the explicit `lint-test-isolation:exempt` marker; everyone else
+# must call the canonical helpers.
+markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket('
 
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.

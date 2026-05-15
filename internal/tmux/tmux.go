@@ -219,19 +219,23 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 	//
 	// Pattern check rationale:
 	//   - Empty FLEET_TMUX_SOCKET → default operator server (REJECT)
-	//   - FLEET_TMUX_SOCKET matches the operator's default-server
-	//     shape `tmux-<uid>/default` (no .sock suffix, no /tmp/ prefix
-	//     guarantee) → likely inherited from the operator (REJECT)
-	//   - Anything ending in `.sock` under /tmp/ → looks like a test
-	//     socket (accept). Includes the canonical `/tmp/fleet-test-*.sock`
-	//     from tmuxtest AND deliberately-malformed test paths like
-	//     `/tmp/aaaa…aaaa.sock` that TestSpawn_FailsWhenSocketUnusable
-	//     uses to exercise the post-spawn safety net.
+	//   - FLEET_TMUX_SOCKET that doesn't follow the canonical
+	//     `/tmp/fleet-test-*.sock` shape → likely inherited from a
+	//     wrapping shell (e.g., operator exported a shared server's
+	//     socket) → REJECT
+	//   - `/tmp/fleet-test-*.sock` → produced by tmuxtest.IsolateSocket
+	//     (the canonical helper) OR by a test that deliberately uses
+	//     the prefix for negative-path coverage (e.g.,
+	//     TestSpawn_FailsWhenSocketUnusable allocates
+	//     `/tmp/fleet-test-aaaa…aaaa.sock` to exercise the
+	//     unwritable-socket failure mode). Accept.
 	//
-	// Codex review iter-12 [P2] introduced the original tightening
-	// (rejecting inherited sockets). Iter-15 [P2] relaxed the strict
-	// `/tmp/fleet-test-*.sock` prefix to any `/tmp/*.sock` so
-	// negative-path tests can exercise unusable-socket failure modes.
+	// Codex review history on this guard:
+	//   - iter-12 [P2]: introduced inherited-socket rejection
+	//   - iter-15 [P2]: relaxed prefix to any /tmp/*.sock — too loose
+	//   - iter-17 [P2]: re-tightened to /tmp/fleet-test-*.sock (this
+	//     version). TestSpawn_FailsWhenSocketUnusable was updated to
+	//     use the canonical prefix.
 	//
 	// The lint at scripts/lint-test-isolation.sh is a static backup;
 	// this runtime guard is the load-bearing safety boundary.
@@ -240,14 +244,8 @@ func Spawn(session, cwd string, command, extraEnv []string) error {
 		if sock == "" {
 			return fmt.Errorf("tmux.Spawn: refusing to use default tmux socket under go test (session %q); call tmuxtest.RequireTmux(t) to isolate FLEET_TMUX_SOCKET", session)
 		}
-		// Accept any path that looks like a test-allocated socket file:
-		// must end in `.sock` AND live under /tmp/. Operator default
-		// sockets (`/tmp/tmux-501/default` — no .sock; nested user
-		// dir without a .sock leaf) fail this check, so inherited
-		// FLEET_TMUX_SOCKET pointing at a long-lived shared server
-		// still gets rejected.
-		if !strings.HasPrefix(sock, "/tmp/") || !strings.HasSuffix(sock, ".sock") {
-			return fmt.Errorf("tmux.Spawn: refusing inherited FLEET_TMUX_SOCKET=%q under go test (session %q); only /tmp/*.sock paths (from tmuxtest.RequireTmux / IsolateSocket or an equivalent per-test allocator) are accepted", sock, session)
+		if !strings.HasPrefix(sock, "/tmp/fleet-test-") || !strings.HasSuffix(sock, ".sock") {
+			return fmt.Errorf("tmux.Spawn: refusing inherited FLEET_TMUX_SOCKET=%q under go test (session %q); only /tmp/fleet-test-*.sock paths (from tmuxtest.RequireTmux / IsolateSocket) are accepted", sock, session)
 		}
 	}
 	args := []string{"new-session", "-d", "-s", session}
