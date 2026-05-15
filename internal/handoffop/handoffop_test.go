@@ -2,11 +2,8 @@ package handoffop
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -29,27 +27,15 @@ func setupFleetHome(t *testing.T) string {
 	return tmp
 }
 
+// requireTmux delegates socket isolation to tmuxtest.RequireTmux (the
+// canonical helper at internal/testutil/tmuxtest) and adds the
+// handoff-specific env pins for fast tests. Postmortem 2026-05-14
+// (orphan tmux leak) + 2026-05-15 follow-up: tmux.Spawn under
+// `go test` refuses to use the default socket; tmuxtest.RequireTmux
+// is the lint-recognized isolation marker.
 func requireTmux(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed; skipping integration test")
-	}
-	var b [3]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
-	// server and remove the socket file on exit so /tmp doesn't fill
-	// up with stale .sock files and the default tmux server doesn't
-	// accumulate fleet-* sessions across the test suite.
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("cleanup: remove %s: %v", sock, err)
-		}
-	})
+	tmuxtest.RequireTmux(t)
 	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
 	// pane for stability. Production windows (500 ms stable / 30 s
 	// max) would balloon the suite; tests pin small values that
@@ -766,30 +752,6 @@ func TestResume_Case3_DefinitiveDeadStillEntersCleanup(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 }
-
-// -- codex iter-12 P1: stale-coord-marker rollback before respawn ----------
-//
-// When a previous coord-swap attempt committed marker → newRec.ID and
-// then returned (e.g., ErrOrphanSurvived / ErrOldKillProbeAmbiguous /
-// readiness-wait crash) WITHOUT rolling back the marker, the queue
-// journal stays. A retry enters Resume's case-3 outer gate, sees the
-// stale replacement record + dead session, calls DropReplacementRecord,
-// then falls through to spawnAndRetire.
-//
-// Pre-fix: the spawnAndRetire isCoordSwap check at line 474-475 only
-// matches marker == oldRec.ID. The marker still points at the deleted
-// staleNewID, so isCoordSwap goes false. The retire path runs inline
-// (no AtomicCoordSwap), the marker is never re-pointed at the new
-// replacement, and the TUI's `[a]` keystroke (which reads the marker
-// to find the live coord) chases the deleted ID and spawns a duplicate.
-//
-// Post-fix: Resume's case-3 cleanup calls
-// RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID,
-// stderr) right after DropReplacementRecord. The marker resets to
-// oldRec.ID, the fall-through's isCoordSwap detects the swap, the
-// AtomicCoordSwap helper commits marker → freshRec.ID, and the TUI's
-// `[a]` finds the new live coord with no duplicate.
-
 func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

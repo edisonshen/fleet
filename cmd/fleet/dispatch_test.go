@@ -113,6 +113,12 @@ func TestDispatch_SendInitialPromptHookCalled(t *testing.T) {
 func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): this test
+	// expects runDispatch to reject the call BEFORE reaching tmux.Spawn.
+	// If the rejection logic ever regresses, the runtime sink guard
+	// would still block the leak — but it's cheaper to isolate the
+	// socket up front than to debug a sink-guard error in CI.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "coord-foo",
 		project: "foo",
@@ -287,6 +293,10 @@ func TestDispatch_ProjectFlagDefault(t *testing.T) {
 func TestDispatch_CoordSpawnRequiresExplicitProject(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): rejection
+	// is expected to fire before tmux.Spawn, but isolate so a logic
+	// regression can't leak onto the operator's default tmux server.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "coord-default", // matches CoordTaskIDPrefix + project="default"
 		project: "default",

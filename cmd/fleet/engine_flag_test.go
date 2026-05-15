@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	cryptorand "crypto/rand"
-	"encoding/hex"
 	"os"
 	"os/exec"
 	"strings"
@@ -14,31 +12,25 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// isolateTmuxSocket sets FLEET_TMUX_SOCKET to a per-test path and
-// registers cleanup that kills the per-test tmux server + removes the
-// socket file. Used by tests that exercise runDispatch (which may
-// reach spawn.Spawn → tmux.Spawn depending on host) but don't want the
-// full requireTmux dance with handoff-tuning env vars. Postmortem
-// 2026-05-14 (orphan tmux leak): any test that may call tmux.Spawn
-// MUST isolate the socket and clean up after itself.
+// isolateTmuxSocket is a thin wrapper over tmuxtest.IsolateSocket. Kept
+// as a local name so existing call sites in this file don't churn.
+// Delegates to IsolateSocket (NOT RequireTmux) because every caller is
+// a rejection-style test whose runDispatch is expected to fail BEFORE
+// reaching tmux.Spawn — using RequireTmux would skip the test on
+// tmux-less CI and regress coverage of the validation paths (codex
+// review iter-1 [P2], 2026-05-15).
+//
+// Postmortem 2026-05-14 (orphan tmux leak) + 2026-05-15 follow-up: any
+// test that may call tmux.Spawn (directly or via spawn.Spawn /
+// runDispatch / runHandoff) MUST isolate FLEET_TMUX_SOCKET — tmux.Spawn
+// under `go test` now returns an error if FLEET_TMUX_SOCKET is empty.
 func isolateTmuxSocket(t *testing.T) string {
 	t.Helper()
-	var b [3]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("cleanup: remove %s: %v", sock, err)
-		}
-	})
-	return sock
+	return tmuxtest.IsolateSocket(t)
 }
 
 // TestDispatch_EngineFlag_Exposed pins that `fleet dispatch --engine ...`
@@ -82,6 +74,10 @@ func TestDispatch_EngineFlag_Exposed(t *testing.T) {
 func TestDispatch_UnknownEngineRejected(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): rejection
+	// fires before tmux.Spawn, but isolating up front matches the
+	// "rather block CI than re-leak production" rule.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "t1",
 		project: "p1",

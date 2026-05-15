@@ -8,56 +8,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 )
 
-// These tests touch the real `tmux` binary. Skip cleanly if it's not
-// installed so CI without tmux still passes.
-//
-// Each test gets its own tmux server via FLEET_TMUX_SOCKET — a short
-// path under /tmp so the macOS Unix-socket length limit isn't hit
-// (TMUX_TMPDIR with t.TempDir()-based paths overflows). Cleans up
-// the server AND removes the socket file on test exit (postmortem
-// 2026-05-14: tests were leaving 2,800+ stale .sock files in /tmp/).
+// requireTmux delegates to the canonical helper in internal/testutil/tmuxtest.
+// Kept as a local wrapper so existing call sites in this file don't churn;
+// the helper takes care of the LookPath skip, FLEET_TMUX_SOCKET setup,
+// and kill-server + socket-file cleanup. See tmuxtest.RequireTmux for the
+// full contract (postmortem 2026-05-14 orphan tmux leak + 2026-05-15
+// follow-up: spawn under `go test` now refuses to use the default socket).
 func requireTmux(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed; skipping integration test")
-	}
-	sock := isolatedSocket(t)
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	cleanupTmuxSocket(t, sock)
-}
-
-// isolatedSocket returns a short /tmp path unique to this test run.
-// 4-hex-char suffix is enough since tests within a process share a
-// single test-binary PID and only one test runs at a time per package.
-func isolatedSocket(t *testing.T) string {
-	t.Helper()
-	return "/tmp/fleet-test-" + randHex(t) + ".sock"
-}
-
-// cleanupTmuxSocket installs a t.Cleanup that kills the per-test tmux
-// server and removes the socket file on test exit. Runs regardless of
-// pass/fail/panic. Errors are swallowed — server may already be dead,
-// socket may already be gone. Postmortem 2026-05-14 (orphan tmux leak):
-// without this, every integration test left a tmux server + a .sock
-// file behind, and a long-running operator's /tmp accumulated thousands
-// of stale sockets plus a session-per-test on the default tmux server.
-func cleanupTmuxSocket(t *testing.T, sock string) {
-	t.Helper()
-	t.Cleanup(func() {
-		// kill-server is idempotent: tmux returns non-zero if the
-		// server isn't running, which is fine — we just want it gone.
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		// Some tmux builds leave the socket file behind even after
-		// kill-server; remove it explicitly.
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			// Don't fail the test on cleanup error — surface it as a
-			// log so the operator can investigate, but the test result
-			// is already recorded.
-			t.Logf("cleanupTmuxSocket: remove %s: %v", sock, err)
-		}
-	})
+	tmuxtest.RequireTmux(t)
 }
 
 // capturePaneArgs builds the args for `tmux capture-pane` against the
@@ -292,8 +255,78 @@ func TestListSessionsWithCreated_RoundTripRecordsCreation(t *testing.T) {
 }
 
 func TestSpawn_EmptyCommand(t *testing.T) {
+	// Defensive isolation (codex review iter-10 [P3]): the empty-command
+	// rejection fires before exec.Command, but isolate the socket so a
+	// regression cannot leak onto the operator's default tmux server.
+	tmuxtest.IsolateSocket(t)
 	if err := Spawn("any", "", nil, nil); err == nil {
 		t.Error("expected error for empty command")
+	}
+}
+
+// TestSpawn_RefusesInheritedNonTestSocketUnderGoTest pins codex review
+// iter-12 [P2]: under `go test`, Spawn must refuse FLEET_TMUX_SOCKET
+// values that don't follow the canonical `/tmp/fleet-test-*.sock`
+// pattern. Without this check, a wrapping shell that exports
+// FLEET_TMUX_SOCKET (e.g., pointed at a long-lived operator-owned
+// server) would silently bypass the sink guard.
+func TestSpawn_RefusesInheritedNonTestSocketUnderGoTest(t *testing.T) {
+	// lint-test-isolation:exempt — this test deliberately sets
+	// FLEET_TMUX_SOCKET to a non-canonical value to prove the guard
+	// rejects it. The lint would otherwise flag the test since it
+	// doesn't call the canonical isolation helpers.
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/tmux-501/default") // not a /tmp/fleet-test-* path
+
+	err := Spawn("fleet-test-inherited-guard", "", []string{"sleep", "1"}, nil)
+	if err == nil {
+		t.Fatal("Spawn must refuse a non-fleet-test FLEET_TMUX_SOCKET under go test")
+	}
+	if !strings.Contains(err.Error(), "inherited FLEET_TMUX_SOCKET") {
+		t.Errorf("error must mention inherited FLEET_TMUX_SOCKET; got %q", err.Error())
+	}
+}
+
+// TestSpawn_RefusesDefaultSocketUnderGoTest is the regression for the
+// sink guard added 2026-05-14 (follow-up to PR #150). Tests that
+// transitively reach tmux.Spawn through runDispatch/runHandoff without
+// calling tmuxtest.RequireTmux(t) used to leak fleet-* sessions onto
+// the operator's default tmux server. The guard makes those leaks
+// impossible: under `go test`, Spawn refuses to run unless
+// FLEET_TMUX_SOCKET is set. AtomicCoordSwap subagent runs on
+// 2026-05-14 produced 10+ orphan sessions before this guard landed.
+//
+// We unset FLEET_TMUX_SOCKET via t.Setenv("", "") — go's t.Setenv
+// restores the prior value on test exit, so we don't have to manage
+// the inherited socket from a wrapping test harness.
+func TestSpawn_RefusesDefaultSocketUnderGoTest(t *testing.T) {
+	// lint-test-isolation:exempt — this test specifically exercises the
+	// sink guard's empty-socket rejection path. It MUST call Spawn
+	// without an isolated socket; the lint would otherwise flag it.
+	// The test itself proves the runtime guard is the safety boundary.
+	//
+	// Force-clear FLEET_TMUX_SOCKET for this test only. t.Setenv with
+	// empty value sets the env var to ""; we use os.Unsetenv to
+	// truly remove it, then register a cleanup that restores it.
+	prev, had := os.LookupEnv("FLEET_TMUX_SOCKET")
+	if err := os.Unsetenv("FLEET_TMUX_SOCKET"); err != nil {
+		t.Fatalf("unset FLEET_TMUX_SOCKET: %v", err)
+	}
+	t.Cleanup(func() {
+		if had {
+			_ = os.Setenv("FLEET_TMUX_SOCKET", prev)
+		}
+	})
+
+	err := Spawn("fleet-test-guard", "", []string{"sleep", "1"}, nil)
+	if err == nil {
+		t.Fatal("Spawn must refuse to use the default tmux socket under go test")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "FLEET_TMUX_SOCKET") {
+		t.Errorf("error must mention FLEET_TMUX_SOCKET; got %q", msg)
+	}
+	if !strings.Contains(msg, "default tmux socket") {
+		t.Errorf("error must mention default tmux socket; got %q", msg)
 	}
 }
 
@@ -353,7 +386,12 @@ func TestSpawn_FailsWhenSocketUnusable(t *testing.T) {
 	// Override to a deeply nested path that exceeds macOS's 104-byte
 	// UNIX socket limit. tmux either fails to bind (socket too long)
 	// or the surrounding dir doesn't exist.
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/"+strings.Repeat("a", 200)+".sock")
+	//
+	// Codex iter-17 [P2] (2026-05-15): use the canonical
+	// `/tmp/fleet-test-*` prefix so the runtime sink guard (which
+	// requires this prefix) lets us through to exercise the
+	// unwritable-socket failure mode.
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+strings.Repeat("a", 200)+".sock")
 
 	session := "fleet-test-" + randHex(t)
 	err := Spawn(session, "", []string{"sleep", "30"}, nil)

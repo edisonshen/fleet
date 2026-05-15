@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -36,28 +35,15 @@ func setupFleetHome(t *testing.T) string {
 	return tmp
 }
 
+// requireTmux delegates socket isolation to tmuxtest.RequireTmux (the
+// canonical helper at internal/testutil/tmuxtest) and adds the
+// handoff-specific env pins. Postmortem 2026-05-14 (orphan tmux leak)
+// + 2026-05-15 follow-up: tmux.Spawn under `go test` refuses to use
+// the default socket; tmuxtest.RequireTmux is the lint-recognized
+// isolation marker.
 func requireTmux(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed; skipping integration test")
-	}
-	// In-process random suffix for FLEET_TMUX_SOCKET — no external
-	// `openssl` dep so tests pass anywhere tmux + Go work.
-	var b [3]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
-	// server AND remove the socket file on exit. Without this, every
-	// integration test leaks one server + one .sock file forever.
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("cleanup: remove %s: %v", sock, err)
-		}
-	})
+	tmuxtest.RequireTmux(t)
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on
@@ -436,29 +422,6 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 	})
 }
 
-// TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait pins
-// codex iter-13 [P1]: in resumeHandoff (the crash-recovery flow), the
-// eager marker write must happen BEFORE the WaitForReadyToPrompt call.
-// Otherwise the marker sits at oldRec.ID for the full up-to-30s boot
-// wait, and if OLD exits during that window the dashboard `[a]` path
-// can't find NEW (record.ID != marker) and spawns a duplicate coord.
-//
-// This test exercises the happy path of resumeHandoff with a coord
-// marker pre-seeded at oldRec.ID. Post-fix:
-//   - eager write commits marker → newRec.ID before the readiness wait
-//   - readiness wait passes (real tmux pane on a long-lived shell)
-//   - AtomicCoordSwap runs, archives old, queue deleted
-//   - final marker stays at newRec.ID (= replacement.ID)
-//
-// Pre-fix this test would still pass at the end (eager write happened
-// later but still happened). The structural defense lives in the
-// inline comment at handoff.go's resumeHandoff isCoordSwap block + the
-// fact that this test asserts the marker is set at all on the recovery
-// path. A regression that re-orders eager-write AFTER the wait would
-// not break this test directly, but it WOULD break
-// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn below
-// (which deletes a stale newRec — the rollback helper is what
-// re-anchors the marker).
 func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)

@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 )
 
@@ -204,6 +205,48 @@ func SessionAlive(session string) (bool, error) {
 func Spawn(session, cwd string, command, extraEnv []string) error {
 	if len(command) == 0 {
 		return errors.New("tmux.Spawn: empty command")
+	}
+	// Sink guard (postmortem 2026-05-14, follow-up to PR #150): inside
+	// `go test`, refuse to create a session unless FLEET_TMUX_SOCKET
+	// points at a per-test socket path. Tests MUST call the shared
+	// `tmuxtest.RequireTmux(t)` (or `IsolateSocket(t)`) helper so the
+	// per-test tmux server is torn down in t.Cleanup. Without this
+	// guard a transitive caller (runDispatch → spawn.Spawn → tmux.Spawn)
+	// can leak fleet-* sessions onto the host server.
+	//
+	// testing.Testing() (Go 1.21+) is true iff the binary was built by
+	// `go test`, so production paths are untouched.
+	//
+	// Pattern check rationale:
+	//   - Empty FLEET_TMUX_SOCKET → default operator server (REJECT)
+	//   - FLEET_TMUX_SOCKET that doesn't follow the canonical
+	//     `/tmp/fleet-test-*.sock` shape → likely inherited from a
+	//     wrapping shell (e.g., operator exported a shared server's
+	//     socket) → REJECT
+	//   - `/tmp/fleet-test-*.sock` → produced by tmuxtest.IsolateSocket
+	//     (the canonical helper) OR by a test that deliberately uses
+	//     the prefix for negative-path coverage (e.g.,
+	//     TestSpawn_FailsWhenSocketUnusable allocates
+	//     `/tmp/fleet-test-aaaa…aaaa.sock` to exercise the
+	//     unwritable-socket failure mode). Accept.
+	//
+	// Codex review history on this guard:
+	//   - iter-12 [P2]: introduced inherited-socket rejection
+	//   - iter-15 [P2]: relaxed prefix to any /tmp/*.sock — too loose
+	//   - iter-17 [P2]: re-tightened to /tmp/fleet-test-*.sock (this
+	//     version). TestSpawn_FailsWhenSocketUnusable was updated to
+	//     use the canonical prefix.
+	//
+	// The lint at scripts/lint-test-isolation.sh is a static backup;
+	// this runtime guard is the load-bearing safety boundary.
+	if testing.Testing() {
+		sock := os.Getenv("FLEET_TMUX_SOCKET")
+		if sock == "" {
+			return fmt.Errorf("tmux.Spawn: refusing to use default tmux socket under go test (session %q); call tmuxtest.RequireTmux(t) to isolate FLEET_TMUX_SOCKET", session)
+		}
+		if !strings.HasPrefix(sock, "/tmp/fleet-test-") || !strings.HasSuffix(sock, ".sock") {
+			return fmt.Errorf("tmux.Spawn: refusing inherited FLEET_TMUX_SOCKET=%q under go test (session %q); only /tmp/fleet-test-*.sock paths (from tmuxtest.RequireTmux / IsolateSocket) are accepted", sock, session)
+		}
 	}
 	args := []string{"new-session", "-d", "-s", session}
 	if cwd != "" {

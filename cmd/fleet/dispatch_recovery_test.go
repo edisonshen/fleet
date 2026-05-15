@@ -863,6 +863,11 @@ func TestRunDispatch_DeadCoord_EngineClampOverridesInheritedCodex(t *testing.T) 
 // claude-code, command is reset to claude wrapper).
 func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 	setupFleetHome(t)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): the codex
+	// rejection fires before any tmux.Spawn, but the runtime sink guard
+	// would block a regression instead of letting it leak. Isolate up
+	// front so the lint passes without relying on the gate's correctness.
+	isolateTmuxSocket(t)
 
 	deadRec := agent.New("c0dexc0de")
 	deadRec.TaskID = "coord-myproj"
@@ -931,6 +936,10 @@ func TestRunDispatch_DeadCoord_CodexRecoveryRejected(t *testing.T) {
 // blocked recovery.)
 func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 	setupFleetHome(t)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): the fresh-
+	// mtime gate fires before tmux.Spawn, but isolating matches the
+	// "rather block CI than re-leak production" rule.
+	isolateTmuxSocket(t)
 
 	deadRec := agent.New("recentdc")
 	deadRec.TaskID = "coord-myproj"
@@ -1223,6 +1232,10 @@ func TestCollectOpenPRs_EmptyCwdReturnsNil(t *testing.T) {
 // Claude-Agent-tool DISPATCH blocks that only claude-code can run.
 func TestRunDispatch_CoordSpawnRejectsCodexEngine(t *testing.T) {
 	setupFleetHome(t)
+	// Defensive isolation (postmortem 2026-05-14 follow-up): the
+	// engine-rejection gate fires before tmux.Spawn, but isolating
+	// matches the "rather block CI than re-leak production" rule.
+	isolateTmuxSocket(t)
 
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
@@ -1486,6 +1499,10 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnUnparseableRecord(t *testing.T) {
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("state.Bootstrap: %v", err)
 	}
+	// Defensive isolation (postmortem 2026-05-14 follow-up): ListStrict
+	// fails before tmux.Spawn, but isolating matches the "rather block
+	// CI than re-leak production" rule.
+	isolateTmuxSocket(t)
 	// Drop a malformed .json into the agents dir. agent.List would
 	// silently skip it; ListStrict reports it via badIDs.
 	badPath := filepath.Join(root, "agents", "corruptr.json")
@@ -1639,6 +1656,10 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError(t *testing.T) {
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("state.Bootstrap: %v", err)
 	}
+	// Defensive isolation (postmortem 2026-05-14 follow-up): agent.List
+	// fails before tmux.Spawn, but isolating matches the "rather block
+	// CI than re-leak production" rule.
+	isolateTmuxSocket(t)
 	// Make the agents directory unreadable so agent.List's ReadDir
 	// errors. chmod 100 (execute-only) lets runDispatch's internal
 	// state.Bootstrap re-run safely (MkdirAll on the already-existing
