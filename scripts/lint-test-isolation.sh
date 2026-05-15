@@ -75,7 +75,7 @@ triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|Res
 # `os.Setenv("FLEET_TMUX_SOCKET"` (the rare direct path). Reads /
 # inspections of the var still pass the trigger-bearing helper as a
 # trigger, not a marker.
-markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET"|os.Setenv("FLEET_TMUX_SOCKET"|lint-test-isolation:exempt'
+markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET"|os.Setenv("FLEET_TMUX_SOCKET"'
 
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.
@@ -118,7 +118,7 @@ skip_file() {
 # we've seen the opening { for the function and matched it.
 scan_file() {
   local f="$1"
-  awk -v file="$f" -v trigs="$triggers" -v marks="$markers" '
+  awk -v file="$f" -v trigs="$triggers" -v marks="$markers" -v exempt_marker="lint-test-isolation:exempt" '
     function reset() {
       in_func = 0
       func_name = ""
@@ -138,65 +138,69 @@ scan_file() {
       }
       return 0
     }
-    # Count code-level braces on this line. Tracks four states:
+    # process_line counts code-level braces AND returns the
+    # COMMENT-STRIPPED version of the line via the global var
+    # `code_line`. String literal CONTENTS are preserved (they may
+    # contain marker arguments like `t.Setenv("FLEET_TMUX_SOCKET", ...)`
+    # that the substring check needs).
+    #
+    # Tracks four states:
     #   - in_raw      = inside Go raw-string (backtick to backtick)
     #   - in_str      = inside Go interpreted string (double-quote)
     #   - in_blkcmt   = inside /* ... */ block comment (multi-line)
     #
-    # Single-line // comments are handled inline: when we see // outside
-    # any string/block-comment, we stop processing the rest of the line.
-    #
-    # Codex review iter-8 [P2] (2026-05-15): without comment-tracking,
-    # a `// {` inside a function body would unbalance the brace counter
-    # and the scanner would silently absorb the entire next function.
-    function count_braces(line,    i, ch, nch, prev, ln) {
+    # Codex review iter-16 [P2] (2026-05-15): comments inside helpers
+    # like `// call requireTmux(t)` previously falsely attested
+    # isolation; iter-16 [P3] flagged the same direction for triggers.
+    function process_line(line,    i, ch, nch, prev, ln) {
+      code_line = ""
       prev = ""
       ln = length(line)
       for (i = 1; i <= ln; i++) {
         ch = substr(line, i, 1)
         if (in_blkcmt) {
-          # Look for */ closing.
           if (ch == "*" && i < ln && substr(line, i+1, 1) == "/") {
             in_blkcmt = 0
-            i++  # consume the /
+            i++
           }
           prev = ch
           continue
         }
         if (in_raw) {
+          # Raw-string contents pass through as code_line. Codex iter-7
+          # confirmed brace-balance matters here; substring matches on
+          # raw string literals are intentional (matching "tmux.Spawn("
+          # inside a sanity test would still detect a trigger).
+          code_line = code_line ch
           if (ch == "`") in_raw = 0
           prev = ch
           continue
         }
         if (in_str) {
+          code_line = code_line ch
           if (ch == "\\" && prev != "\\") { prev = ch; continue }
           if (ch == "\"" && prev != "\\") in_str = 0
           prev = ch
           continue
         }
-        # Plain code state. Check for comment starts first.
         if (ch == "/" && i < ln) {
           nch = substr(line, i+1, 1)
           if (nch == "/") {
-            # Rest of line is a comment; stop processing.
+            # Rest of line is a // comment; stop processing.
             return
           }
           if (nch == "*") {
             in_blkcmt = 1
-            i++  # consume the *
+            i++
             prev = ch
             continue
           }
         }
-        if (ch == "`") {
-          in_raw = 1
-        } else if (ch == "\"") {
-          in_str = 1
-        } else if (ch == "{") {
-          brace++
-        } else if (ch == "}") {
-          brace--
-        }
+        code_line = code_line ch
+        if (ch == "`") in_raw = 1
+        else if (ch == "\"") in_str = 1
+        else if (ch == "{") brace++
+        else if (ch == "}") brace--
         prev = ch
       }
     }
@@ -213,19 +217,21 @@ scan_file() {
       sub(/^func[ \t]+/, "", n)
       sub(/\(.*/, "", n)
       func_name = n
-      # Strip the func declaration prefix (everything up to and including
-      # the opening `{`) and scan only the BODY portion for triggers/
-      # markers on this line. Critical for one-liner tests like
-      # `func TestX(t *testing.T) { runDispatch(...) }`: codex review
-      # iter-14 [P2] (2026-05-15) flagged that the old `next` skipped
-      # the entire declaration line, missing one-line test bodies.
-      body = $0
+      # Process the line to obtain code_line (comments + strings
+      # stripped). Then strip the func-declaration prefix and scan only
+      # the body portion for triggers/markers — critical for one-liner
+      # tests like `func TestX(t *testing.T) { runDispatch(...) }`
+      # (codex iter-14 [P2]).
+      process_line($0)
+      body = code_line
       sub(/^[^{]*\{/, "", body)
       if (body != "") {
         if (any_substr(body, trigs)) saw_trig = 1
         if (any_substr(body, marks)) saw_iso = 1
       }
-      count_braces($0)
+      # The exempt marker `lint-test-isolation:exempt` is intentionally
+      # placed in comments; check the raw line for it separately.
+      if (index($0, exempt_marker) > 0) saw_iso = 1
       if (brace == 0) {
         if (saw_trig && !saw_iso) {
           printf "%s:%d:%s\n", file, start_line, func_name
@@ -235,9 +241,17 @@ scan_file() {
       next
     }
     in_func {
-      if (any_substr($0, trigs)) saw_trig = 1
-      if (any_substr($0, marks)) saw_iso = 1
-      count_braces($0)
+      # Scan code_line (comments/strings stripped) so a comment that
+      # mentions a trigger or marker keyword does not falsely match.
+      # Codex review iter-16 [P3] (2026-05-15).
+      process_line($0)
+      if (code_line != "") {
+        if (any_substr(code_line, trigs)) saw_trig = 1
+        if (any_substr(code_line, marks)) saw_iso = 1
+      }
+      # The exempt marker `lint-test-isolation:exempt` is intentionally
+      # placed in comments; check the raw line for it separately.
+      if (index($0, exempt_marker) > 0) saw_iso = 1
       # Function body ends when brace returns to 0. (The opening { put
       # us at 1 on the declaration line; the matching close brings us
       # back to 0.)
@@ -276,7 +290,7 @@ discover_helpers() {
   local file="$1"
   local needles="$2"
   local exclude="$3" # don't emit a helper whose name appears here (avoids self-loop)
-  awk -v needles="$needles" -v exclude="$exclude" '
+  awk -v needles="$needles" -v exclude="$exclude" -v exempt_marker="lint-test-isolation:exempt" '
     function any_substr(haystack, needles_str,    n, arr, i) {
       # "|" separator so a needle can contain spaces (e.g., "= Spawn(").
       n = split(needles_str, arr, "|")
@@ -295,12 +309,12 @@ discover_helpers() {
       in_str = 0
       in_blkcmt = 0
     }
-    # Go-aware brace tally (see scan_file for the rationale). Tracks
-    # raw-string, double-quoted-string, // line-comment, and /* */
-    # block-comment state. Codex review iter-7 [P2] (raw strings) and
-    # iter-8 [P2] (comments) both surfaced false-negatives where
-    # column-0 `}` inside these constructs falsely ended the function.
-    function count_braces(line,    i, ch, nch, prev, ln) {
+    # process_line — comment-stripped line extraction + brace counting.
+    # String contents pass through (markers may live inside string args
+    # like `t.Setenv("FLEET_TMUX_SOCKET", ...)`). See scan_file for the
+    # full rationale. Codex iter-16 [P2] (2026-05-15).
+    function process_line(line,    i, ch, nch, prev, ln) {
+      code_line = ""
       prev = ""
       ln = length(line)
       for (i = 1; i <= ln; i++) {
@@ -314,11 +328,13 @@ discover_helpers() {
           continue
         }
         if (in_raw) {
+          code_line = code_line ch
           if (ch == "`") in_raw = 0
           prev = ch
           continue
         }
         if (in_str) {
+          code_line = code_line ch
           if (ch == "\\" && prev != "\\") { prev = ch; continue }
           if (ch == "\"" && prev != "\\") in_str = 0
           prev = ch
@@ -329,6 +345,7 @@ discover_helpers() {
           if (nch == "/") return
           if (nch == "*") { in_blkcmt = 1; i++; prev = ch; continue }
         }
+        code_line = code_line ch
         if (ch == "`") in_raw = 1
         else if (ch == "\"") in_str = 1
         else if (ch == "{") brace++
@@ -350,15 +367,14 @@ discover_helpers() {
       func_name = n
       # Skip Test funcs — they are checked, not used as helpers.
       if (substr(func_name, 1, 4) == "Test") { in_func = 0; next }
-      # Scan the BODY portion of this declaration line (everything
-      # after the opening `{`). Required for one-line helper wrappers
-      # like `func withTmux(t *testing.T) { tmuxtest.RequireTmux(t) }`
-      # — codex review iter-14 [P2] (2026-05-15) flagged that the
-      # old `next` made one-liners invisible to recursive discovery.
-      body = $0
+      # Scan the code-only BODY portion of this declaration line.
+      # Required for one-line helper wrappers like
+      # `func withTmux(t *testing.T) { tmuxtest.RequireTmux(t) }`
+      # (codex iter-14 [P2]) + comment/string stripping (iter-16 [P2]).
+      process_line($0)
+      body = code_line
       sub(/^[^{]*\{/, "", body)
       if (body != "" && any_substr(body, needles)) saw = 1
-      count_braces($0)
       if (brace == 0) {
         if (saw && func_name != "") {
           emit = 1
@@ -377,8 +393,9 @@ discover_helpers() {
       next
     }
     in_func {
-      if (any_substr($0, needles)) saw = 1
-      count_braces($0)
+      # Scan code_line (comments + strings stripped) — codex iter-16 [P2].
+      process_line($0)
+      if (code_line != "" && any_substr(code_line, needles)) saw = 1
       if (brace == 0) {
         if (saw && func_name != "") {
           emit = 1
