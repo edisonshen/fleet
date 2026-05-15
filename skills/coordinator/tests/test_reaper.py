@@ -173,15 +173,18 @@ def test_judge_missing_state_is_pending() -> None:
 
 
 def test_reaper_complete_judgment_kills_within_grace() -> None:
-    """First pass: send /exit, record kill_directive_ts. Second pass
-    (after grace): tmux session is gone → archive succeeds."""
+    """First pass with session alive: send /exit, record kill_directive_ts.
+    Second pass (after grace): tmux session is gone → archive succeeds."""
     entry = reaper.ReaperEntry(slug="alpha-aaaa")
     inp = _inp(worker_state={
         "phase": "done", "pr_url": "https://x/y/pull/1",
     })
-    stubs = _stubs(alive=[False])  # post-grace probe: session gone
+    # alive=[True]   — pass 1 first-pass probe (codex iter-3 [P2] fast
+    #                  path: session alive → start grace timer).
+    # alive=[False]  — pass 2 post-grace re-probe: session gone.
+    stubs = _stubs(alive=[True, False])
 
-    # Pass 1: send /exit
+    # Pass 1: probe alive → send /exit
     d1 = reaper.reap_one(
         inp, entry=entry, fleet_bin="fleet",
         now_unix=1000.0, grace_window_s=10,
@@ -208,6 +211,33 @@ def test_reaper_complete_judgment_kills_within_grace() -> None:
     assert d2.state == "killed"
     assert len(stubs.rm_calls) == 1
     assert stubs.rm_calls[0] == ("fleet", "aaaaaaaa")
+
+
+def test_reaper_complete_judgment_already_dead_session_archives_immediately() -> None:
+    """Codex iter-3 [P2]: when the tmux session is ALREADY DEAD on the
+    first reap pass (worker exited cleanly on its own after writing
+    phase=done), the reaper skips the grace timer and archives the
+    record on the same pass. Otherwise we'd wait grace_window_s for
+    nothing."""
+    entry = reaper.ReaperEntry(slug="alpha-aaaa")
+    inp = _inp(worker_state={
+        "phase": "done", "pr_url": "https://x/y/pull/1",
+    })
+    # First-pass probe: session already gone.
+    stubs = _stubs(alive=[False])
+    d = reaper.reap_one(
+        inp, entry=entry, fleet_bin="fleet",
+        now_unix=1000.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    # No grace timer set; archived in one pass.
+    assert d.state == "killed"
+    assert entry.kill_directive_ts == 0.0
+    assert stubs.send_calls == []
+    assert len(stubs.rm_calls) == 1
 
 
 def test_reaper_within_grace_does_not_fleet_rm() -> None:
@@ -351,9 +381,11 @@ def test_reap_probes_persists_state_and_drops_on_kill() -> None:
     inputs = [_inp(worker_state={
         "phase": "done", "pr_url": "https://x/y/pull/1",
     })]
-    stubs = _stubs(alive=[False])
+    # First-pass probe: alive (so grace timer fires);
+    # second-pass probe: dead (grace expired).
+    stubs = _stubs(alive=[True, False])
 
-    # Pass 1: send /exit; entry is opened.
+    # Pass 1: session alive → send /exit; entry is opened.
     decisions = reaper.reap_probes(
         probes_inputs=inputs, coord_state=coord_state,
         fleet_bin="fleet", now_unix=1000.0, grace_window_s=10,
@@ -379,10 +411,15 @@ def test_reap_probes_persists_state_and_drops_on_kill() -> None:
 
 
 def test_error_abort_judgment_kills_and_flags_redispatch() -> None:
-    """phase=failed → reaper kills AND flags slug for re-dispatch."""
+    """phase=failed → reaper kills AND flags slug for re-dispatch.
+
+    Two-pass scenario: first pass session alive → /exit + grace timer;
+    second pass session dead → archive succeeds + redispatch flagged.
+    """
     coord_state: dict = {}
     inputs = [_inp(worker_state={"phase": "failed"})]
-    stubs = _stubs(alive=[False])  # session already gone after grace
+    # First-pass probe: alive (start grace); second-pass: dead.
+    stubs = _stubs(alive=[True, False])
 
     # Pass 1: /exit sent, entry opened.
     decisions = reaper.reap_probes(
@@ -406,6 +443,28 @@ def test_error_abort_judgment_kills_and_flags_redispatch() -> None:
         hard_kill_fn=stubs.hard_kill,
     )
     assert decisions[0].state == "killed"
+    pending = reaper.load_redispatch_pending(coord_state)
+    assert "alpha-aaaa" in pending
+
+
+def test_error_abort_judgment_immediate_kill_when_session_dead() -> None:
+    """Codex iter-3 [P2]: phase=failed worker that already exited (rare
+    but possible — worker crashed before /exit could land) gets archived
+    in one pass + redispatch flagged. No grace wait."""
+    coord_state: dict = {}
+    inputs = [_inp(worker_state={"phase": "failed"})]
+    stubs = _stubs(alive=[False])  # first-pass probe: already dead
+    decisions = reaper.reap_probes(
+        probes_inputs=inputs, coord_state=coord_state,
+        fleet_bin="fleet", now_unix=1000.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    assert decisions[0].judgment == reaper.JUDGE_ERROR_ABORT
+    assert decisions[0].state == "killed"
+    assert stubs.send_calls == []  # no /exit sent on dead session
     pending = reaper.load_redispatch_pending(coord_state)
     assert "alpha-aaaa" in pending
 

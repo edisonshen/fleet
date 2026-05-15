@@ -840,6 +840,7 @@ def run_supervisor(
     write_state: Callable[[], None],
     periodic_full_reconcile: Callable[[], None] | None = None,
     force_tick_check: Callable[[], bool] | None = None,
+    force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], None] | None = None,
     log_stream=None,
 ) -> SupervisorResult:
@@ -908,7 +909,9 @@ def run_supervisor(
         # Invariant 4: compute the next sleep adaptively. Probes still
         # in their stability window force base cadence; otherwise back
         # off. force_tick_check is the inbox/queue event surface — if
-        # an event is queued we sleep 0 (effectively "skip the wait").
+        # an event is queued we sleep 0 (effectively "skip the wait")
+        # and call force_tick_dispatch so a NEW_TASK / drain event
+        # actually drains + dispatches under cap (codex iter-3 [P2]).
         forced = False
         if force_tick_check is not None:
             try:
@@ -929,6 +932,17 @@ def run_supervisor(
             sleep_fn(sleep_s)
         poll_count += 1
         res.iterations += 1
+
+        # On forced wake, run the dispatch hook so a NEW_TASK arriving
+        # mid-supervisor session is picked up under spare cap. Pre-sleep
+        # tick order: the iteration body below still runs (reconcile +
+        # reaper + stuck-check), so this is purely an additional
+        # dispatch surface for the forced path.
+        if forced and force_tick_dispatch is not None:
+            try:
+                force_tick_dispatch()
+            except Exception as exc:  # noqa: BLE001
+                res.errors.append(f"force_tick_dispatch: {exc}")
 
         # Re-read probes every iteration so a finished worker (whose
         # task transitioned to done/blocked between polls) drops out.

@@ -367,6 +367,17 @@ def _tick_locked(
     sentinel_repo = cwd if cap > 1 else ""
     sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
     for action in drained:
+        # Codex iter-3 [P1]: gate worker-clearing sentinels on the
+        # reaper lane, matching reconcile. TASK_DONE_PR / WORKER_FAILED
+        # both forget the agent_id mapping; running them before the
+        # reaper finishes its kill cycle would leave the tmux session
+        # un-addressable on the next reap pass. BLOCKED_QUESTION keeps
+        # the worker alive (operator decides), so it's not gated.
+        # NEW_TASK doesn't touch the in-flight slot at all.
+        if action.kind in ("task_done_pr", "worker_failed") and not (
+            _reaper_lane_clear_for(state, action.slug)
+        ):
+            continue
         try:
             _apply_sentinel(
                 action, project, fleet_bin,
@@ -862,6 +873,14 @@ def _run_supervisor(
                 )
         _save_coord_state(state_path, cs)
 
+    # Codex iter-3 [P2]: drain + dispatch on every forced wake so a
+    # NEW_TASK that arrives mid-supervisor session is picked up under
+    # spare cap. Calls _maybe_dispatch_after_reconcile (which itself
+    # consumes reaper_redispatch_pending markers + runs _dispatch_ready);
+    # that's idempotent on a tick where no new task is available.
+    def force_tick_dispatch_hook():
+        _maybe_dispatch_after_reconcile()
+
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
         project=project,
@@ -872,6 +891,7 @@ def _run_supervisor(
         write_state=write_state_hook,
         periodic_full_reconcile=periodic_full_reconcile,
         force_tick_check=force_tick_check_hook,
+        force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
     )
     # Surface supervisor stats as auxiliary tick result fields. We

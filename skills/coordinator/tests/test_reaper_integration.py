@@ -257,8 +257,16 @@ def test_error_abort_judgment_kills_and_dispatches_replacement(
         "worker_agent_ids": {"broken-aaaa": "aaaaaaaa"},
     }), encoding="utf-8")
 
-    # Stub kill primitives.
-    monkeypatch.setattr(supervisor, "tmux_session_alive", lambda s: False)
+    # Stub kill primitives. Use a probe sequence that simulates the
+    # session being alive on tick 1 (grace timer fires) then dead on
+    # tick 2 (kill succeeds). The legacy "always dead" stub would
+    # short-circuit to the codex iter-3 fast path and skip the two-tick
+    # grace-window assertion this test exists to verify.
+    alive_probes = iter([True, True, False, False, False])
+    monkeypatch.setattr(
+        supervisor, "tmux_session_alive",
+        lambda s: next(alive_probes, False),
+    )
     monkeypatch.setattr(reaper, "send_exit_directive", lambda s, **kw: True)
     monkeypatch.setattr(
         reaper, "run_fleet_rm",

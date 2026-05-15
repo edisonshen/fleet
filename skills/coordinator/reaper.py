@@ -491,7 +491,25 @@ def reap_one(
     # 1. Send /exit if we haven't yet. The send is best-effort: a failed
     #    send-keys still records kill_directive_ts so we move into the
     #    grace timer and the harder kill paths kick in on the next pass.
+    #
+    # Codex iter-3 [P2]: when the tmux session is ALREADY DEAD on the
+    # first reap pass (worker exited cleanly on its own after writing
+    # phase=done), skip the grace timer entirely — there's nothing to
+    # kill, just archive. Otherwise we'd wait FLEET_COORD_REAPER_GRACE_S
+    # for nothing, delaying the task's slot reuse + status advancement.
     if entry.kill_directive_ts <= 0.0:
+        already_dead = (
+            inp.tmux_session and not session_alive_fn(inp.tmux_session)
+        )
+        if already_dead:
+            # Session gone — best-effort archive immediately, drop entry.
+            ok, err = fleet_rm_fn(fleet_bin, inp.agent_id)
+            decision.state = "killed"
+            decision.detail = (
+                "" if ok else
+                f"fleet rm noop (session already dead, archive err: {err})"
+            )
+            return decision
         send_exit_fn(inp.tmux_session)
         entry.kill_directive_ts = now_unix
         decision.state = "directed"
