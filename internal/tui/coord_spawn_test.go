@@ -2086,10 +2086,13 @@ func TestAgentNeverTickedSinceSpawn_EdgeCases(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "zero SpawnedAt (legacy) → false",
+			// codex iter-10 P2 fix: legacy records without SpawnedAt
+			// still surface the never-ticked hint so the row isn't
+			// silent after Path C suppression.
+			name:    "zero SpawnedAt (legacy) → true (surface diagnostic)",
 			records: []*agent.Record{{ID: "x"}},
 			id:      "x",
-			want:    false,
+			want:    true,
 		},
 		{
 			name:    "spawn within grace window → false",
