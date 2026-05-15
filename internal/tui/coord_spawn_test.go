@@ -1052,6 +1052,58 @@ func TestRender_StaleNeedsInputLiveClaudeDowngradesToWaiting(t *testing.T) {
 	}
 }
 
+// TestRender_LiveClaudeStopHookNeverFired_SuppressesStuck pins the
+// codex iter-11 [P1] fix: when spawn.Spawn resolved a real Claude
+// PID at dispatch and Claude is alive but no Stop hook has fired
+// yet (last_activity_ts == spawned_at), the row must NOT show the
+// red stuck warning. The kill(0) probe alone is sufficient (no
+// agentEverActivated double-gate) — fleet-binary fallback PIDs are
+// dead-by-construction (kill(0) false naturally), and the rare
+// wrapper-pane-shell-fallback case is accepted as a v0.1 trade-off
+// per the iter-11 reading.
+//
+// The case this test exercises: cold-start completed (Claude reached
+// "ready"), but Stop hook misconfigured / /coordinator skill not
+// registered so no Stop hook ever fired since spawn. The dim
+// "spawned but never ticked" hint is the correct signal.
+func TestRender_LiveClaudeStopHookNeverFired_SuppressesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	// PID 99999 IS alive (Claude resolved correctly by spawn.Spawn).
+	stubProcessAlive(t, map[int]bool{99999: true})
+	stubRemoveMarker(t)
+
+	// Stop hook never fired: last_activity_ts == spawned_at.
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			PID:            99999,
+			LastActivityTS: spawnedAt,
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("live Claude + no Stop hook: red stuck chip must be suppressed; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "spawned but never ticked") {
+		t.Errorf("live Claude + no Stop hook: soft never-ticked hint must surface; got:\n%s", joined)
+	}
+}
+
 // TestAgentClaudeAlive_EdgeCases pins the process-liveness helper:
 // empty id, no matching record, PID 0, nil-record entries all return
 // false; matching record with alive PID returns true; matching record
