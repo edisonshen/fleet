@@ -697,14 +697,15 @@ const coordTickMtimeTolerance = 2 * time.Second
 // true when:
 //   - the agent record exists for id (Path C only makes sense with a
 //     record on disk), AND
-//   - spawned_at is non-zero (legacy records with zero spawned_at fall
-//     through to "we can't tell" — return false, default to NOT
-//     suppressing the stuck warning since the operator's signal is
-//     load-bearing), AND
 //   - lastTick is zero (no coord-state.json ever) OR predates
 //     spawned_at by more than coordTickMtimeTolerance (a leftover state
 //     file from a previous coord under this project, with slack for
-//     filesystem mtime resolution).
+//     filesystem mtime resolution). Legacy records with zero
+//     spawned_at also count as never-ticked — we can't prove a lock
+//     body / state file exists under this spawn without spawned_at,
+//     and defaulting to "never ticked" preserves the marker so [a]
+//     re-attach still works (codex iter-9 P2: don't allow Path B
+//     marker removal on a record we can't reason about).
 //
 // Used by the render-layer Path C suppression AND by Path A/B's marker-
 // removal gate to distinguish "alive coord that has never ticked under
@@ -735,7 +736,12 @@ func coordNeverTickedThisSpawn(
 			continue
 		}
 		if r.SpawnedAt.IsZero() {
-			return false
+			// Legacy / partial-write record without spawned_at. We
+			// can't prove the coord ticked under this spawn (no
+			// reference point), so default to "never ticked" — that
+			// preserves the marker for [a] re-attach in Path A/B's
+			// caller-level gate.
+			return true
 		}
 		if lastTick.IsZero() {
 			return true

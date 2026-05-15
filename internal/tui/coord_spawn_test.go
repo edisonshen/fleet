@@ -1343,10 +1343,12 @@ func TestCoordNeverTickedThisSpawn_EdgeCases(t *testing.T) {
 			want:    false,
 		},
 		{
-			name:    "zero SpawnedAt → false (legacy, can't tell)",
+			// codex iter-9 P2 fix: default to "never ticked" when
+			// SpawnedAt is missing so Path B can't remove the marker.
+			name:    "zero SpawnedAt → true (legacy, can't prove ticked → preserve marker)",
 			records: []*agent.Record{{ID: "x"}},
 			id:      "x",
-			want:    false,
+			want:    true,
 		},
 		{
 			name:    "zero LastTick, valid SpawnedAt → true (never ticked)",
@@ -1598,27 +1600,40 @@ func TestIsAgentRecordFresh(t *testing.T) {
 	}
 }
 
-// TestProjectRow_FreshAgentRecordSelfHealsLiveSession pins the
-// follow-up bug: marker stuck, agent record fresh (last_activity_ts
-// within freshness window), tmux ALIVE → state heals to Idle, removeMarker
-// called once. This is the exact local scenario the operator hit:
-// `~/.fleet/projects/projects-fleet/.locks/coord-spawn-marker` past
-// timeout, but `~/.fleet/agents/<id>.json` shows a fresh tick AND the
-// tmux session is up.
+// TestProjectRow_FreshAgentRecordSelfHealsLiveSession pins Path B's
+// heal + marker removal: marker stuck, agent record fresh
+// (last_activity_ts within freshness window), tmux ALIVE, coord has
+// ticked under this spawn → state heals to Idle, removeMarker called
+// once. The marker is safe to remove because findCoordByLockBody
+// rescues subsequent [a] re-attach (coord-state.json + lock body
+// published per the LastTick > SpawnedAt evidence).
+//
+// Post codex iter-5: Path B's marker removal is gated on the coord
+// having ticked (LastTick set AND ≥ SpawnedAt). Without that proof,
+// the marker is preserved for re-attach (different test below).
 func TestProjectRow_FreshAgentRecordSelfHealsLiveSession(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "abcd1234")
-	// fleet-abcd1234 IS alive — the bug case. Without Path B this would
-	// have rendered the red "stuck" warning forever.
 	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
 	rmCalls := stubRemoveMarker(t)
 
+	spawnedAt := now.Add(-20 * time.Minute)
 	records := []*agent.Record{
-		{ID: "abcd1234", LastActivityTS: now.Add(-30 * time.Second)}, // fresh
+		{
+			ID:             "abcd1234",
+			LastActivityTS: now.Add(-30 * time.Second), // fresh
+			SpawnedAt:      spawnedAt,
+		},
 	}
-	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	// LastTick AFTER SpawnedAt by 10min — proves the coord booted and
+	// ticked at some point under THIS spawn (post codex iter-5 gate).
+	p := &ProjectRow{
+		Name:     "demo",
+		RepoSlug: "demo",
+		LastTick: now.Add(-10 * time.Minute),
+	}
 	ctx := coordSpawnCtx{
 		now:          now,
 		tickFrame:    0,
@@ -1629,7 +1644,7 @@ func TestProjectRow_FreshAgentRecordSelfHealsLiveSession(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 
 	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("Path B self-heal must suppress stuck warning when agent record is fresh; got:\n%s", joined)
+		t.Errorf("Path B self-heal must suppress stuck warning when agent record is fresh AND ticked; got:\n%s", joined)
 	}
 	if len(*rmCalls) != 1 || (*rmCalls)[0] != "demo" {
 		t.Errorf("expected exactly one remove(demo) call; got %v", *rmCalls)
