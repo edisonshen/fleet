@@ -92,6 +92,23 @@ const (
 	// only) and the needs_input lookup is local to the project block
 	// that already reads ctx.records.
 	coordSpawnWaiting
+
+	// coordSpawnNeverTicked: the spawn succeeded (tmux session alive AND
+	// the agent record was written to ~/.fleet/agents/<id>.json) but
+	// coord-state.json was never published under this agent's spawn —
+	// i.e. last tick predates the agent's spawned_at, or no coord-state
+	// ever existed, AND we're past the cold-start grace window. This is
+	// a softer informational hint pointing at "Stop hook or /coordinator
+	// skill registration may be broken" — distinct from the "▲ coord
+	// spawn stuck" attention chip, which falsely accused live coords of
+	// being hung (issue: 2026-05-14 false positive on fleet-49bc8a03 in
+	// HANDOFF state at 6% context).
+	//
+	// The render-side gate constructs this state AFTER Path C self-heal
+	// has cleared the marker. Pure derivation (deriveCoordSpawnState)
+	// stays scoped to marker/state mtimes; this state surfaces only via
+	// the project-block path that already loads ctx.records.
+	coordSpawnNeverTicked
 )
 
 // coordSpawnTimeoutDefault is the default age past which a spawn is
@@ -307,6 +324,23 @@ func renderCoordSpawnLineForProject(
 		}
 		body := dimStyle.Render(msg)
 		return prefix + body, true
+	case coordSpawnNeverTicked:
+		// Informational hint, not an attention chip. Path C self-heal
+		// proved the spawn succeeded; this line tells the operator the
+		// /coordinator skill hasn't published a tick under THIS agent
+		// (could indicate Stop hook misconfig, /coordinator skill not
+		// registered, or HOME-pollution leaking into the tmux server —
+		// see project_fleet_home_leak memory). Dim styling so the
+		// operator's eye isn't dragged here; the agent appears in the
+		// regular agent list and they can attach via `fleet attach`.
+		var msg string
+		if markerAgentID != "" {
+			msg = "○ coord " + markerAgentID + " spawned but never ticked — Stop hook or skill registration may be broken"
+		} else {
+			msg = "○ coord for project " + projectName + " spawned but never ticked — Stop hook or skill registration may be broken"
+		}
+		body := dimStyle.Render(msg)
+		return prefix + body, true
 	}
 	return renderCoordSpawnLine(st, prefix, now, markerMtime, tickFrame)
 }
@@ -371,7 +405,7 @@ func downgradeStuckOnNeedsInput(
 // Transition Stuck → Idle and remove the stale marker via removeMarker
 // so the next render snaps back to the existing renderer.
 //
-// Two heal paths cover the two ways "marker says stuck but the row
+// Three heal paths cover the ways "marker says stuck but the row
 // isn't really stuck" can happen:
 //
 //	Path A (issue #96): tmux session for the marker's agent ID is
@@ -382,28 +416,46 @@ func downgradeStuckOnNeedsInput(
 //	  ticking, the marker just never got cleared → heal regardless of
 //	  current tmux liveness. (agentRecordFresh=true)
 //
-// Both paths are independently sufficient. Either one being true causes
+//	Path C (2026-05-14 false-positive fix): tmux session is alive AND
+//	  the agent record exists on disk for markerAgentID (regardless of
+//	  freshness) → fleet's spawn pipeline completed (write agent record
+//	  AND start tmux session). Whatever happened to coord-state.json
+//	  publication after that is a separate concern — the SPAWN itself
+//	  succeeded, so the spawn-stuck marker is a lie. This is the case
+//	  that previously caused "▲ coord spawn stuck" to fire on alive
+//	  agents in HANDOFF state, freshly-booted coords idle between
+//	  Stop-hook fires, and coords whose Stop hook stopped firing while
+//	  the agent is otherwise healthy. The narrower "spawned but never
+//	  ticked" signal is surfaced via coordSpawnNeverTicked downstream
+//	  (informational, not an attention chip).
+//
+// All three paths are independently sufficient. Any one being true causes
 // the marker to be removed and the state to flip to Idle. This deliberate
-// OR keeps Path B from regressing on tmux probe failures and keeps Path A
-// working when the agent record was never written (silent spawn death).
+// OR keeps Path B from regressing on tmux probe failures, keeps Path A
+// working when the agent record was never written (silent spawn death),
+// and prevents Path C from regressing on the "alive but never ticked"
+// false positive.
 //
 // Inputs are pure: caller supplies the derived state, the agent ID
 // from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
 // the tmux liveness probe (`tmux.HasSession`), the agent-record-fresh
-// probe (computed from the loaded record's last_activity_ts), and a
-// remover stub. The remover is invoked exactly once per healed row;
-// errors are returned so the caller can surface them in a flash but
-// the healed state is still applied (the warning silently lingering
-// is the worse failure mode).
+// probe (computed from the loaded record's last_activity_ts), the
+// agent-record-exists probe (Path C — record present at all for the
+// marker's agent ID), and a remover stub. The remover is invoked
+// exactly once per healed row; errors are returned so the caller can
+// surface them in a flash but the healed state is still applied (the
+// warning silently lingering is the worse failure mode).
 //
 // Self-heal does NOT fire when:
 //   - state ≠ Stuck (Idle/Spawning/Active are unaffected),
 //   - markerAgentID is empty (we can't probe a session OR a record we
 //     don't know the name of — fall back to the existing Stuck warning
 //     so the operator still sees something is wrong),
-//   - neither heal path matches: sessionAlive=true AND agentRecordFresh=
-//     false. That's the genuinely-hung case (live tmux, no fresh agent
-//     ticks) the original Stuck warning is designed for.
+//   - none of A/B/C match: sessionAlive=true AND agentRecordFresh=false
+//     AND agentRecordExists=false. That's the genuinely-hung case
+//     (live tmux, no fresh agent ticks, no record at all — fleet-guard
+//     never registered the agent) the original Stuck warning is
+//     designed for.
 //
 // Returns the (possibly healed) state and any removal error. The error
 // is informational; callers may log via flash but should still render
@@ -413,6 +465,7 @@ func applyStuckSelfHeal(
 	markerAgentID string,
 	sessionAlive bool,
 	agentRecordFresh bool,
+	agentRecordExists bool,
 	removeMarker func() error,
 ) (coordSpawnState, error) {
 	if st != coordSpawnStuck {
@@ -421,10 +474,18 @@ func applyStuckSelfHeal(
 	if markerAgentID == "" {
 		return st, nil
 	}
-	// Heal if EITHER path matches. Path A: dead session. Path B: fresh
-	// agent record (spawn succeeded, marker stale). When neither
-	// condition holds, the operator IS looking at a real hang.
-	if sessionAlive && !agentRecordFresh {
+	// Heal if ANY path matches.
+	//   Path A: dead tmux session (sessionAlive=false).
+	//   Path B: agent record fresh (agentRecordFresh=true).
+	//   Path C: tmux alive AND agent record present at all.
+	//
+	// Default-deny: only the "live tmux, no record on disk at all"
+	// (sessionAlive && !agentRecordExists && !agentRecordFresh) case
+	// preserves Stuck. agentRecordFresh implies agentRecordExists in
+	// production, but the helper does NOT assume that — defensive in
+	// case a future caller passes them inconsistently from stubs.
+	heal := !sessionAlive || agentRecordFresh || agentRecordExists
+	if !heal {
 		return st, nil
 	}
 	var rmErr error
@@ -471,6 +532,79 @@ func isAgentRecordFresh(records []*agent.Record, id string, now time.Time, windo
 			return false
 		}
 		return now.Sub(r.LastActivityTS) <= window
+	}
+	return false
+}
+
+// agentRecordExists reports whether records contains a non-nil entry
+// matching id. Drives Path C of applyStuckSelfHeal: a marker that names
+// an agent ID for which fleet wrote a record at ~/.fleet/agents/<id>.json
+// is proof the spawn pipeline completed, regardless of the record's
+// freshness. The Path A / B probes already gate on more specific signals
+// (dead tmux, fresh tick); Path C is the catch-all for "spawn succeeded
+// but the agent isn't currently ticking" (HANDOFF state, just-spawned,
+// Stop hook misconfigured) where the stuck-attention chip is the wrong
+// signal to give the operator.
+//
+// Empty id short-circuits to false (we can't match a record we don't
+// know the name of). Nil entries in the slice are tolerated.
+func agentRecordExists(records []*agent.Record, id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// agentNeverTickedSinceSpawn reports whether a softer "spawned but never
+// ticked" hint should render after Path C self-heal. Returns true when
+// the agent record for id exists AND has a non-zero spawned_at older
+// than graceWindow AND the last coord-state.json tick (lastTick) either
+// is zero (no state file ever) or predates spawned_at (a stale state
+// from a previous coord under this project).
+//
+// graceWindow is the cold-start budget: cold starts on a fresh laptop
+// top out around 3-5min, so the caller passes coordSpawnTimeoutDefault
+// (10m) in production — beyond that window, "the coord never ticked
+// under this spawn" is informational rather than alarming, and points
+// the operator at /coordinator skill registration or Stop hook config.
+//
+// Returns false on the obvious non-applicable cases:
+//   - empty id, nil/empty records, no matching record,
+//   - spawned_at is zero (legacy record, can't infer "since spawn"),
+//   - spawn is within the grace window (cold start may still complete),
+//   - lastTick is non-zero AND ≥ spawned_at (a tick already arrived
+//     under this agent — no longer "never ticked").
+func agentNeverTickedSinceSpawn(
+	records []*agent.Record,
+	id string,
+	lastTick time.Time,
+	now time.Time,
+	graceWindow time.Duration,
+) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() {
+			return false
+		}
+		if now.Sub(r.SpawnedAt) <= graceWindow {
+			return false
+		}
+		// Tick exists AND is on-or-after the spawn → already ticked.
+		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
+			return false
+		}
+		return true
 	}
 	return false
 }
