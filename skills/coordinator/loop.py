@@ -901,34 +901,49 @@ def _run_supervisor(
                 reaped.append(dec.slug)
         # Replay any deferred sentinels whose reaper lane is now
         # clear (just-reaped or never-had-a-lane). Mutates `cs` in
-        # place; we save at the end.
+        # place; we save at the end. Returns the count of sentinels
+        # that landed THIS replay — used to gate the post-replay
+        # dispatch hook (codex iter-14 [P1]: a replay that flipped
+        # status to in-review/todo frees a slot that the subsequent
+        # reconcile_one-driven reconcile would miss).
+        replay_applied = 0
         if reaped:
-            _replay_deferred_sentinels(
+            replay_applied = _replay_deferred_sentinels(
                 project=project, fleet_bin=fleet_bin, home=home,
                 cs=cs, cwd=cwd, cap=cap,
             )
         _save_coord_state(state_path, cs)
+        # If the replay flipped task status (slot freed), backfill
+        # the slot via the same dispatch surface the mtime path uses.
+        if replay_applied > 0:
+            _maybe_dispatch_after_reconcile()
         return reaped
 
     def _replay_deferred_sentinels(
         *, project: str, fleet_bin: str, home: Path,
         cs: dict, cwd: str, cap: int,
-    ) -> None:
+    ) -> int:
         """Apply queued deferred sentinels whose reaper lane is clear.
         Called from reaper_hook_supervisor right after a successful
         reap so stale sentinels don't sit in the queue waiting for
-        the next forced wake (codex iter-13 [P1])."""
+        the next forced wake (codex iter-13 [P1]).
+
+        Returns the count of sentinels successfully applied this pass.
+        The caller uses this to decide whether to fire
+        _maybe_dispatch_after_reconcile (codex iter-14 [P1]: a replay
+        that frees a slot must trigger dispatch on the SAME tick)."""
         deferred = _load_deferred_sentinels(cs)
         if not deferred:
-            return
+            return 0
         try:
             f_local = parse.read(str(tasks_path))
         except Exception:
-            return
+            return 0
         tbs = {t.slug: t for t in f_local.tasks}
         still_deferred: list[_SentinelAction] = []
         sentinel_repo = cwd if cap > 1 else ""
         sentinel_tbs = tbs if cap > 1 else None
+        applied = 0
         for action in deferred:
             if action.kind in ("task_done_pr", "worker_failed") and not (
                 _reaper_lane_clear_for(cs, action.slug)
@@ -948,11 +963,13 @@ def _run_supervisor(
                 ):
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
+                applied += 1
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(
                     f"deferred sentinel {action.slug}: {exc}"
                 )
         _save_deferred_sentinels(cs, still_deferred)
+        return applied
 
     # Codex iter-3 [P2]: drain + dispatch on every forced wake so a
     # NEW_TASK that arrives mid-supervisor session is picked up under

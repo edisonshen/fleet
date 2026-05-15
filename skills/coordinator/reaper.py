@@ -733,7 +733,7 @@ def reap_probes(
                 pass
             if decision.judgment == JUDGE_ERROR_ABORT:
                 add_redispatch_pending(coord_state, inp.slug)
-        elif decision.state in ("pending", "no-op"):
+        elif decision.state == "pending":
             # Nothing to persist for non-reapable judgments. If we had
             # an entry from a prior run (e.g., worker recovered from
             # phase=done back to running), drop it so the ledger
@@ -742,6 +742,20 @@ def reap_probes(
                 JUDGE_PENDING, JUDGE_CONTINUE, JUDGE_BLOCKED,
             ):
                 del entries[inp.slug]
+        elif decision.state == "no-op":
+            # Codex iter-14 [P2]: reaper is disabled
+            # (FLEET_COORD_REAPER_DISABLED=1). Preserve any OPEN lane
+            # (kill_directive_ts already set on a prior pass) so the
+            # operator-toggled-disable doesn't accidentally close the
+            # gate while a /exit has been sent but the kill hasn't
+            # completed. Without preservation, reconcile would see a
+            # clear lane, forget the agent_id, and the still-live
+            # tmux session would orphan.
+            if inp.slug not in entries and entry.kill_directive_ts <= 0.0:
+                # Never had an entry; nothing to preserve.
+                pass
+            else:
+                entries[inp.slug] = entry
         elif decision.state == "error":
             # Kill could not proceed — keep the entry so a later pass
             # retries once the operator has fixed the gap (agent_id
