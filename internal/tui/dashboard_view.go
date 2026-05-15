@@ -936,41 +936,60 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		sessAlive = sessionAliveFn(tmuxSessionName(markerAgentID))
 	}
 
-	if st == coordSpawnStuck && markerAgentID != "" {
-		// Path B probe: does the agent record on disk show a recent
-		// last_activity_ts? If yes, the spawn already succeeded and the
-		// marker is stale — heal regardless of tmux state. Path A still
-		// covers the dead-tmux + no-record case for silent spawn deaths.
-		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
-		st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
-			return removeCoordSpawnMarkerFn(p.Name)
-		})
+	// neverTicked is the central gate: when true (no coord-state.json
+	// publication under this spawn), the marker MUST be preserved —
+	// it's the only proof of which agent is coord for the project, and
+	// findExistingCoordForProject reads it on [a] re-attach. The mtime
+	// comparison inside coordNeverTickedThisSpawn tolerates 1s
+	// filesystem-mtime resolution by treating equality as "ticked"
+	// (codex iter-5 P2).
+	neverTicked := coordNeverTickedThisSpawn(ctx.records, markerAgentID, p.LastTick)
 
-		// Path C suppression (2026-05-14 false-positive fix): if Path
-		// A/B did not heal, the agent record exists for an alive tmux
-		// session, AND the coord has never published a tick under this
-		// spawn (no coord-state.json yet, or its mtime predates the
-		// agent's spawned_at), the spawn pipeline completed but no
-		// Stop-hook tick has fired yet (HANDOFF state, freshly-booted,
-		// Stop hook misconfig). Suppress the red attention chip at the
-		// render layer WITHOUT removing the marker — the marker is the
-		// only proof of which agent is coord for the project in this
-		// state (no coordinator.lock body has been published yet), so
-		// the [a] re-attach path in findExistingCoordForProject still
+	if st == coordSpawnStuck && markerAgentID != "" {
+		// Path A/B heal: only safe to REMOVE the marker when the coord
+		// has ticked under this spawn (lock body / coord-state.json
+		// published — findCoordByLockBody rescues subsequent [a]
+		// re-attach). When the agent record is fresh but the coord
+		// never ticked, fleet-guard is updating last_activity_ts but
+		// /coordinator never published — heal the warning but PRESERVE
+		// the marker so the operator can re-attach (codex iter-5 P1).
+		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+		if !neverTicked {
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
+				return removeCoordSpawnMarkerFn(p.Name)
+			})
+		} else if !sessAlive {
+			// Dead session AND coord never ticked: Path A still heals
+			// and removes the marker (re-attach impossible for a dead
+			// session, so preserving the marker has no benefit and
+			// leaves a stale claim that the next [a] would skip).
+			st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
+				return removeCoordSpawnMarkerFn(p.Name)
+			})
+		}
+
+		// Path C suppression (2026-05-14 false-positive fix): if heal
+		// did not fire and the agent record exists for an alive tmux
+		// session AND the coord has never published a tick under this
+		// spawn, the spawn pipeline completed but no Stop-hook tick
+		// has fired yet (HANDOFF state, freshly-booted, Stop hook
+		// misconfig). Suppress the red attention chip at the render
+		// layer WITHOUT removing the marker — the marker is the only
+		// proof of which agent is coord for the project in this state
+		// (no coordinator.lock body has been published yet), so the
+		// [a] re-attach path in findExistingCoordForProject still
 		// needs it. The softer coordSpawnNeverTicked hint below
 		// surfaces the underlying problem informationally when the
 		// agent has aged past the cold-start grace window.
 		//
 		// Narrow gate (codex iter-2 P1): Path C only suppresses when
-		// LastTick is zero OR predates SpawnedAt. If the coord
-		// previously ticked under this spawn (LastTick >= SpawnedAt)
-		// and is NOW stale + past spawnTimeout, the derivation's
-		// stuck verdict is RIGHT — the coord booted, published, and
-		// then wedged. The operator needs the attention chip to
-		// surface that as a real hang, not a false positive.
+		// the coord has never ticked under THIS spawn. If the coord
+		// previously ticked (neverTicked=false) and is NOW stale +
+		// past spawnTimeout, the derivation's stuck verdict is RIGHT —
+		// the coord booted, published, and then wedged. The operator
+		// needs the attention chip to surface that as a real hang.
 		if st == coordSpawnStuck && sessAlive &&
-			agentRecordExists(ctx.records, markerAgentID) &&
-			coordNeverTickedThisSpawn(ctx.records, markerAgentID, p.LastTick) {
+			agentRecordExists(ctx.records, markerAgentID) && neverTicked {
 			st = coordSpawnIdle
 		}
 	}
