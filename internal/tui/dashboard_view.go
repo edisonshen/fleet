@@ -983,17 +983,31 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// already paused at a question.
 	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
 
+	// Second-chance downgrade for stale-needs_input + live-Claude
+	// (codex iter-8 P2): the freshness gate above leaves a long-lived
+	// waiting-on-input row as Stuck if the operator has been idle for
+	// > agentRecordFreshWindow (10m). Once we have the
+	// agentClaudeAlive process probe, we can trust the needs_input
+	// flag regardless of last_activity_ts staleness — fleet-guard only
+	// clears needs_input on UserPromptSubmit, and the kill(0) check
+	// independently confirms Claude is still running. Promote Stuck →
+	// Waiting so the operator sees the actionable "fleet attach <id>"
+	// cue instead of "never ticked / Stop hook may be broken."
+	if st == coordSpawnStuck && markerAgentID != "" &&
+		agentNeedsInput(ctx.records, markerAgentID) &&
+		agentClaudeAlive(ctx.records, markerAgentID) {
+		st = coordSpawnWaiting
+	}
+
 	// Path C suppression (2026-05-14 false-positive fix): if heal /
 	// downgrade did not fire and the agent record exists for an alive
-	// tmux session AND the coord has never published a tick under this
-	// spawn AND Claude has fired at least one Stop hook since spawn
-	// (agentEverActivated — last_activity_ts strictly > spawned_at by
-	// mtime tolerance), the spawn pipeline completed AND Claude
-	// reached at least one Stop hook (proving the process is or was
-	// running; not just a wrapper-shell that survived an early Claude
-	// crash). Suppress the red attention chip at the render layer
-	// WITHOUT removing the marker — the marker is the only proof of
-	// which agent is coord for the project in this state (no
+	// tmux session AND Claude is currently alive (kill(record.PID, 0)
+	// succeeds) AND the coord has never published a tick under this
+	// spawn, the spawn pipeline completed AND Claude is still running
+	// (not just a wrapper-shell that survived a Claude crash).
+	// Suppress the red attention chip at the render layer WITHOUT
+	// removing the marker — the marker is the only proof of which
+	// agent is coord for the project in this state (no
 	// coordinator.lock body has been published yet), so the [a]
 	// re-attach path in findExistingCoordForProject still needs it.
 	// The softer coordSpawnNeverTicked hint below surfaces the
@@ -1007,15 +1021,20 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// published, and then wedged. The operator needs the attention
 	// chip to surface that as a real hang.
 	//
-	// Stop-hook gate (codex iter-6 P1): without agentEverActivated,
-	// Path C suppression would mask "tmux wrapper survived, Claude
-	// died at startup" failures. The record exists from agent.New()
-	// even when Claude crashes immediately; only a Stop-hook fire
-	// proves Claude actually ran.
+	// Process-liveness gate (codex iter-6 / iter-8 P1):
+	// agentClaudeAlive performs a kill(record.PID, 0) probe to
+	// distinguish "Claude alive but idle between Stop-hook fires"
+	// (suppress) from "tmux wrapper survived after Claude exited"
+	// (keep stuck warning). Tmux session liveness alone cannot
+	// disambiguate — the wrapper shell that exec'd Claude keeps the
+	// tmux pane open after Claude exits. Inequality-based
+	// agentEverActivated (an earlier iteration) was insufficient
+	// because Claude could fire one hook then die while the wrapper
+	// stayed alive.
 	if st == coordSpawnStuck && sessAlive && markerAgentID != "" &&
 		agentRecordExists(ctx.records, markerAgentID) &&
 		neverTicked &&
-		agentEverActivated(ctx.records, markerAgentID) {
+		agentClaudeAlive(ctx.records, markerAgentID) {
 		st = coordSpawnIdle
 	}
 

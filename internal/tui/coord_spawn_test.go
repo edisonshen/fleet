@@ -639,6 +639,20 @@ func stubAliveSessions(t *testing.T, alive map[string]bool) {
 	t.Cleanup(func() { sessionAliveFn = prev })
 }
 
+// stubProcessAlive swaps agentProcessAliveFn for a deterministic
+// in-memory map keyed by PID. PIDs not in the map (or with value
+// false) are treated as dead. Restored at test end. Used by Path C
+// tests that need to distinguish "Claude alive" from "wrapper-only"
+// without taking a real OS-process dependency.
+func stubProcessAlive(t *testing.T, alive map[int]bool) {
+	t.Helper()
+	prev := agentProcessAliveFn
+	agentProcessAliveFn = func(pid int) bool {
+		return alive[pid]
+	}
+	t.Cleanup(func() { agentProcessAliveFn = prev })
+}
+
 // stubRemoveMarker swaps removeCoordSpawnMarkerFn for a recording stub
 // so tests can assert the self-heal path triggered. Returns a *[]string
 // of the project names the stub was called with so the test can pin
@@ -938,6 +952,145 @@ func TestRender_WrapperSurvivedClaudeDied_PreservesStuck(t *testing.T) {
 	}
 }
 
+// TestRender_WrapperSurvivedClaudeExited_PreservesStuck pins the codex
+// iter-8 [P1] fix: tmux session alive (wrapper shell still running)
+// but Claude process exited mid-session — agentEverActivated would
+// have been true (one Stop hook fired before the exit), but kill(0)
+// returns false. Path C MUST NOT suppress; the operator needs the red
+// stuck chip to notice the launch failure and respawn.
+//
+// This is the case the inequality-based agentEverActivated check
+// cannot catch: Claude WAS alive long enough to fire a hook, then
+// died. Only the process-liveness probe (agentClaudeAlive) tracks
+// the current state.
+func TestRender_WrapperSurvivedClaudeExited_PreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	// PID 66666 NOT in the alive map → Claude is dead, even though
+	// tmux session and agent record both still exist.
+	stubProcessAlive(t, map[int]bool{})
+	stubRemoveMarker(t)
+
+	// Claude fired one Stop hook then exited. last_activity_ts
+	// reflects that hook (after spawned_at) — inequality-based
+	// agentEverActivated would return true. But kill(66666, 0) fails.
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			PID:            66666,
+			LastActivityTS: now.Add(-13 * time.Minute), // > spawnedAt
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("wrapper-survived-Claude-exited: red stuck chip MUST surface (kill(0) fails); got:\n%s", joined)
+	}
+}
+
+// TestRender_StaleNeedsInputLiveClaudeDowngradesToWaiting pins the
+// codex iter-8 [P2] fix: when needs_input=true AND Claude alive AND
+// last_activity_ts is stale (> agentRecordFreshWindow), the row
+// should render the actionable "coord waiting on input — fleet
+// attach <id>" hint, NOT the "spawned but never ticked" misdirection.
+// fleet-guard only clears needs_input on UserPromptSubmit, so the
+// flag stays authoritative; the kill(0) probe independently confirms
+// Claude is still running and waiting.
+func TestRender_StaleNeedsInputLiveClaudeDowngradesToWaiting(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{77777: true})
+	stubRemoveMarker(t)
+
+	// needs_input=true; last_activity_ts stale (15min ago → past 10m
+	// freshness window so downgradeStuckOnNeedsInput's gate fails);
+	// Claude alive (kill(0) succeeds).
+	spawnedAt := now.Add(-30 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			PID:            77777,
+			LastActivityTS: now.Add(-15 * time.Minute),
+			SpawnedAt:      spawnedAt,
+			NeedsInput:     true,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "waiting on input") {
+		t.Errorf("stale needs_input + live Claude: must render Waiting cue; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "spawned but never ticked") {
+		t.Errorf("Waiting cue must override never-ticked hint; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("Waiting cue must override red stuck chip; got:\n%s", joined)
+	}
+}
+
+// TestAgentClaudeAlive_EdgeCases pins the process-liveness helper:
+// empty id, no matching record, PID 0, nil-record entries all return
+// false; matching record with alive PID returns true; matching record
+// with dead PID returns false.
+func TestAgentClaudeAlive_EdgeCases(t *testing.T) {
+	stubProcessAlive(t, map[int]bool{1000: true, 2000: false})
+
+	cases := []struct {
+		name    string
+		records []*agent.Record
+		id      string
+		want    bool
+	}{
+		{"empty id → false", []*agent.Record{{ID: "x", PID: 1000}}, "", false},
+		{"nil records → false", nil, "x", false},
+		{"no matching id → false", []*agent.Record{{ID: "y", PID: 1000}}, "x", false},
+		{"PID 0 → false (legacy / partial write)", []*agent.Record{{ID: "x", PID: 0}}, "x", false},
+		{"PID alive → true", []*agent.Record{{ID: "x", PID: 1000}}, "x", true},
+		{"PID stubbed dead → false", []*agent.Record{{ID: "x", PID: 2000}}, "x", false},
+		{
+			name: "nil entry tolerated, later match wins",
+			records: []*agent.Record{
+				nil,
+				{ID: "x", PID: 1000},
+			},
+			id:   "x",
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentClaudeAlive(tc.records, tc.id)
+			if got != tc.want {
+				t.Errorf("agentClaudeAlive(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRender_NeedsInputDowngradeBeatsPathC pins the codex iter-6
 // [P1] ordering: when a live coord has needs_input=true (Claude
 // paused at a question) AND coord-state.json never published, the
@@ -950,6 +1103,7 @@ func TestRender_NeedsInputDowngradeBeatsPathC(t *testing.T) {
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{88888: true})
 	stubRemoveMarker(t)
 
 	// Fresh activity (within freshWindow) AND needs_input=true AND
@@ -958,6 +1112,7 @@ func TestRender_NeedsInputDowngradeBeatsPathC(t *testing.T) {
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
+			PID:            88888,
 			LastActivityTS: now.Add(-3 * time.Minute), // fresh
 			SpawnedAt:      spawnedAt,
 			NeedsInput:     true,
@@ -1003,6 +1158,7 @@ func TestRender_FreshRecordNeverTickedPreservesMarker(t *testing.T) {
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{12345: true}) // claude alive
 	rmCalls := stubRemoveMarker(t)
 
 	// last_activity_ts FRESH (within 10m freshWindow) but coord-state
@@ -1012,6 +1168,7 @@ func TestRender_FreshRecordNeverTickedPreservesMarker(t *testing.T) {
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
+			PID:            12345,
 			LastActivityTS: now.Add(-2 * time.Minute), // FRESH
 			SpawnedAt:      spawnedAt,
 		},
@@ -1253,16 +1410,17 @@ func TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck(t *testing.T) 
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{12345: true}) // claude alive
 	rmCalls := stubRemoveMarker(t)
 
-	// Record exists, stale (past 10m freshness window) but
-	// agentEverActivated (last_activity_ts > spawned_at — Claude fired
-	// ≥1 Stop hook since spawn). Path B does NOT fire because the
+	// Record exists, stale (past 10m freshness window) but Claude is
+	// alive (process probe). Path B does NOT fire because the
 	// freshness gate fails; Path C suppresses the stuck chip without
 	// touching the marker.
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
+			PID:            12345,
 			LastActivityTS: now.Add(-15 * time.Minute),
 			SpawnedAt:      now.Add(-30 * time.Minute),
 		},
@@ -1582,14 +1740,15 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 
 // TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC pins
 // the false-positive fix (2026-05-14): marker past timeout, agent record
-// exists with OLD last_activity_ts (beyond freshness window), tmux ALIVE.
+// exists with OLD last_activity_ts (beyond freshness window), tmux ALIVE,
+// Claude process alive.
 //
 // Pre-Path-C this rendered "▲ coord spawn stuck" — the false alarm that
 // drove the operator-facing complaint. Real-world driver: fleet-49bc8a03
 // in HANDOFF state at 6% context, idle between Stop hook fires, working
-// fine. The record's last_activity_ts equals spawned_at because no tick
-// has fired since spawn, but the agent is alive (tmux up) AND fleet's
-// state model registered it (record present).
+// fine. The record's last_activity_ts had not advanced recently, but
+// Claude was alive (kill(0) succeeds) AND fleet's state model
+// registered it (record present).
 //
 // Post-fix this suppresses the attention chip at the render layer
 // WITHOUT removing the marker — [a] re-attach still depends on the
@@ -1603,21 +1762,18 @@ func TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC(t *testing.T) 
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "abcd1234")
 	stubAliveSessions(t, map[string]bool{"fleet-abcd1234": true})
+	stubProcessAlive(t, map[int]bool{22222: true}) // claude alive
 	rmCalls := stubRemoveMarker(t)
 
 	// Stale last_activity_ts AND stale SpawnedAt (older than the
-	// coordSpawnTimeoutDefault grace window). Path C suppresses; the
-	// never-ticked hint surfaces because LastTick is zero (no
-	// coord-state.json has ever been published).
-	//
-	// LastActivityTS > SpawnedAt by enough to clear the
-	// coordTickMtimeTolerance gate — proves Claude fired ≥1 Stop hook
-	// since spawn (agentEverActivated). Without this gate, Path C
-	// would not suppress the wrapper-survives-Claude-dies case (codex
-	// iter-6 P1).
+	// coordSpawnTimeoutDefault grace window). Path C suppresses (Claude
+	// process alive via kill(0)); the never-ticked hint surfaces
+	// because LastTick is zero (no coord-state.json has ever been
+	// published).
 	records := []*agent.Record{
 		{
 			ID:             "abcd1234",
+			PID:            22222,
 			LastActivityTS: now.Add(-30 * time.Minute),
 			SpawnedAt:      now.Add(-1 * time.Hour),
 		},
@@ -1663,20 +1819,20 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{33333: true}) // claude alive
 	rmCalls := stubRemoveMarker(t)
 
 	// Record on disk: SpawnedAt 15min ago (past coldStart grace),
-	// LastActivityTS 10min ago (after SpawnedAt by enough to clear the
-	// coordTickMtimeTolerance gate — i.e. fleet-guard has fired ≥1
-	// Stop hook since spawn so agentEverActivated returns true). The
-	// record is "stale" per Path B's freshness gate (10m+ since
-	// activity); Path C suppresses on existence + activation alone
+	// LastActivityTS 10min ago (stale, but Claude process is alive via
+	// kill(0) probe). Path B does not fire (stale freshness gate);
+	// Path C suppresses on alive-claude + record-exists + never-ticked
 	// (without touching the marker).
 	spawnedAt := now.Add(-15 * time.Minute)
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
-			LastActivityTS: now.Add(-12 * time.Minute), // > spawnedAt by 3min, stale
+			PID:            33333,
+			LastActivityTS: now.Add(-12 * time.Minute), // stale
 			SpawnedAt:      spawnedAt,
 		},
 	}
@@ -1723,12 +1879,14 @@ func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{44444: true}) // claude alive
 	stubRemoveMarker(t)
 
 	spawnedAt := now.Add(-2 * time.Minute) // within 10m grace window
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
+			PID:            44444,
 			LastActivityTS: now.Add(-30 * time.Second), // > spawnedAt → activated
 			SpawnedAt:      spawnedAt,
 		},
@@ -1808,19 +1966,20 @@ func TestRender_IdleNotStuck_NoRedWarning(t *testing.T) {
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubProcessAlive(t, map[int]bool{55555: true}) // claude alive
 	stubRemoveMarker(t)
 
 	// Alive coord in HANDOFF state: spawned 20 minutes ago, Stop hook
 	// has fired (last_activity_ts > spawned_at, but stale relative to
 	// the 10m freshness window — operator's been idle waiting). Maps
-	// to the operator-reported config 1:1; agentEverActivated returns
-	// true (Claude was running long enough to fire at least one Stop
-	// hook), distinguishing this from "tmux wrapper survived a Claude
-	// crash at startup."
+	// to the operator-reported config 1:1; agentClaudeAlive returns
+	// true (kill(record.PID, 0) succeeds), distinguishing this from
+	// "tmux wrapper survived a Claude crash."
 	spawnedAt := now.Add(-20 * time.Minute)
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
+			PID:            55555,
 			LastActivityTS: now.Add(-15 * time.Minute), // > spawnedAt by 5min, stale
 			SpawnedAt:      spawnedAt,
 		},

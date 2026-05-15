@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // coordSpawnCtx bundles the per-render inputs the project block needs
@@ -552,6 +553,81 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 			continue
 		}
 		return true
+	}
+	return false
+}
+
+// agentProcessAliveFn returns true if the OS process with the given
+// PID is alive. Production points at workers.IsAlive (kill(pid, 0)
+// check); tests swap it to a deterministic map. Path C uses this to
+// distinguish "Claude alive, idle between Stop-hook fires" (suppress
+// red chip) from "tmux wrapper survived after Claude exited" (keep
+// red chip — operator-visible failure).
+//
+// var for stub-ability — same pattern as sessionAliveFn /
+// coordSpawnMarkerFn elsewhere in this file. PID ≤ 0 is treated as
+// "no PID recorded" → false (we can't confirm liveness without a PID,
+// default to "treat as dead" so the stuck warning surfaces).
+var agentProcessAliveFn = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	return workersIsAlive(pid)
+}
+
+// workersIsAlive is a thin indirection over workers.IsAlive so the
+// tui package can test agentProcessAliveFn's behavior without taking
+// a direct dependency on the workers package's exported helper. The
+// dependency is one-way (tui → workers) and the indirection here is
+// purely for the test stub seam.
+var workersIsAlive = workers.IsAlive
+
+// agentNeedsInput reports whether the agent record matching id has
+// needs_input=true. Thin lookup helper distinct from
+// downgradeStuckOnNeedsInput (which couples the flag check with the
+// freshness window). The render-layer second-chance downgrade in
+// projectFooterLines pairs this with agentClaudeAlive to trust the
+// flag even when last_activity_ts is stale — fleet-guard only clears
+// needs_input on UserPromptSubmit, so a stale-but-live coord that's
+// been waiting > 10min remains the right operator action ("fleet
+// attach <id>").
+func agentNeedsInput(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return r.NeedsInput
+	}
+	return false
+}
+
+// agentClaudeAlive reports whether the Claude process recorded in the
+// agent record matching id is still alive. Returns false when:
+//   - id is empty, records is nil/empty, or no record matches,
+//   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
+//   - the PID's process is dead (kill(0) returns ESRCH).
+//
+// Path C uses this to distinguish "Claude alive but idle" from "tmux
+// wrapper survived after Claude exited" (codex iter-8 P1). The session
+// liveness probe (tmux.HasSession) cannot distinguish those cases —
+// the wrapper shell that exec'd Claude keeps the tmux pane open even
+// after Claude exits, so sessionAliveFn stays true. PID liveness is
+// the only signal that disambiguates.
+//
+// Single kill(0) per render per project — cheap (Linux: < 1μs; macOS:
+// similar). Stub-overridable via agentProcessAliveFn for tests.
+func agentClaudeAlive(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		return agentProcessAliveFn(r.PID)
 	}
 	return false
 }
