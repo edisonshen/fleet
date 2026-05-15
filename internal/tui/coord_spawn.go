@@ -27,7 +27,6 @@ package tui
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -588,87 +587,6 @@ var agentProcessAliveFn = func(pid int) bool {
 	return workersIsAlive(pid)
 }
 
-// agentProcessArgvFn returns the argv of the process with the given
-// PID, or empty string when the lookup fails or the process is dead.
-// Production runs `ps -p <pid> -o args=` (~10ms per call on macOS);
-// tests swap it to a deterministic map.
-//
-// Path C uses this to detect the wrapper-pane-shell case: when
-// spawn.Spawn's resolveEnginePid fell back to recording the tmux
-// pane's wrapper shell PID (typically `sh -c "...claude..."`), the
-// shell stays alive after Claude exits — kill(0) cannot tell us
-// Claude died. argv inspection identifies the shell-wrapper case
-// directly and keeps the stuck warning visible (codex iter-16 P1).
-//
-// Mirror of skills/fleet-guard/health.py:_recorded_pid_looks_like_wrapper
-// but lives in Go for the dashboard's single-process render path.
-var agentProcessArgvFn = func(pid int) string {
-	if pid <= 0 {
-		return ""
-	}
-	// ps is POSIX-portable; -o args= prints only the argv without a
-	// header. Five-second timeout matches the Python helper. Errors
-	// (transient ps blip, EPERM) return "" → treat as "can't tell"
-	// at the caller; the caller defaults to "alive" so a probe blip
-	// does not flip a healthy row to stuck.
-	cmd := exec.Command("ps", "-o", "args=", "-p", strconv.Itoa(pid))
-	out, err := cmd.Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
-// shellBasenames lists the POSIX shell binary basenames that indicate
-// a wrapper shell rather than an engine process. We match by basename
-// (the trailing path component of argv[0]) rather than a hardcoded
-// list of full paths because the fleet wrapper exits into
-// `exec ${SHELL:-bash} -i`, which on common installs (Homebrew, Nix,
-// asdf, custom prefix, etc.) lives at paths like
-// /opt/homebrew/bin/bash or /nix/store/.../bin/zsh that no fixed
-// allowlist could cover (codex iter-17 P1).
-//
-// Mirror of skills/fleet-guard/health.py:_is_shell_argv intent.
-var shellBasenames = map[string]bool{
-	"sh":    true,
-	"bash":  true,
-	"dash":  true,
-	"zsh":   true,
-	"ksh":   true,
-	"fish":  true,
-	"tcsh":  true,
-	"csh":   true,
-	"mksh":  true,
-	"yash":  true,
-	"posh":  true,
-	"ash":   true,
-	"oksh":  true,
-	"loksh": true,
-}
-
-// argvLooksLikeShellWrapper reports whether argv's first token's
-// basename is a known POSIX shell binary. Empty argv returns false —
-// the caller's "can't tell" default is "treat as alive" which means we
-// do NOT flip a real coord to stuck on a transient ps probe failure.
-//
-// Basename-based matching (codex iter-17 P1): handles non-system
-// shell paths (e.g. /opt/homebrew/bin/bash, /nix/store/.../bin/zsh)
-// that a hardcoded path allowlist could not cover.
-func argvLooksLikeShellWrapper(argv string) bool {
-	if argv == "" {
-		return false
-	}
-	first := argv
-	if idx := strings.IndexAny(argv, " \t"); idx > 0 {
-		first = argv[:idx]
-	}
-	// Strip any leading path component to get the basename.
-	if idx := strings.LastIndex(first, "/"); idx >= 0 {
-		first = first[idx+1:]
-	}
-	return shellBasenames[first]
-}
-
 // workersIsAlive is a thin indirection over workers.IsAlive so the
 // tui package can test agentProcessAliveFn's behavior without taking
 // a direct dependency on the workers package's exported helper. The
@@ -698,36 +616,40 @@ func agentNeedsInput(records []*agent.Record, id string) bool {
 	return false
 }
 
-// agentClaudeAlive reports whether the Claude process recorded in the
-// agent record matching id is still alive AND is not just a wrapper
-// shell. Returns false when:
+// agentClaudeAlive reports whether the process recorded in the agent
+// record matching id is still alive. Returns false when:
 //   - id is empty, records is nil/empty, or no record matches,
 //   - the record's PID is ≤ 0 (legacy / partial write — degrade safely),
-//   - the PID's process is dead (kill(0) returns ESRCH),
-//   - the PID's argv first-token is a POSIX shell binary, indicating
-//     spawn.Spawn's resolveEnginePid fell back to the tmux pane's
-//     wrapper shell instead of the real Claude process.
+//   - the PID's process is dead (kill(0) returns ESRCH).
 //
-// PID-recycle risk: `kill(pid, 0)` can return true for a recycled PID
-// owned by an unrelated process. fleet-guard's reconcile_pid (Python
-// side) uses a `fleet-coord-<id>` disambiguator to detect this case
-// for default-shape spawns (`sh -c "claude ..."`). The TUI helper
-// previously enforced the same check (codex iter-20) but had to drop
-// it (codex iter-22 P1) because custom-command spawns (`--command`,
-// custom engines, non-Claude wrappers) intentionally skip
-// spawn.InjectRemoteControlFlag — the needle is never injected for
-// those shapes, so requiring it would falsely flag healthy coords as
-// stuck. fleet-guard repairs drifted PIDs on every Stop hook anyway,
-// so the window between PID-recycle and reconciliation is narrow.
-// The residual risk is deferred for v0.1.
+// Path C uses this to distinguish:
+//   - Claude alive, idle between Stop-hook fires (HANDOFF state) →
+//     PID alive → suppress red chip
+//   - Spawn provisional PID dead (os.Getpid() fallback the moment
+//     dispatch returns) → keep red chip — operator-visible failure
 //
-// Probe failures (transient ps blip, EPERM, kernel hiccup) return ""
-// from agentProcessArgvFn, which argvLooksLikeShellWrapper treats as
-// "not a wrapper." Empty argv → trust kill(0).
+// Trade-offs deferred for v0.1:
+//   - Wrapper-shell fallback (codex iter-24 P1): when
+//     resolveEnginePid times out, spawn.Spawn records the tmux pane's
+//     shell PID. That shell can survive past Claude exiting. The
+//     previous iteration tried argvLooksLikeShellWrapper to detect
+//     this, but it conflicted with supported raw-shell coord commands
+//     (`--command sh`, paneIsRawShellLeaf cases). Without a way to
+//     distinguish "wrapper kept alive after Claude crashed" from
+//     "operator legitimately running a shell-based coord engine,"
+//     Path C may suppress for the former. fleet-guard's reconcile_pid
+//     repairs drifted PIDs on every Stop hook so the window is
+//     bounded; the operator brief explicitly prefers fewer red
+//     false-positives over rare detection of this edge case.
+//   - PID recycle (codex iter-20 P1, iter-22 P1): kill(0) returns
+//     true for any process owning the recycled PID. fleet-guard's
+//     reconcile_pid also repairs this case via the
+//     fleet-coord-<id> disambiguator. The TUI cannot use the same
+//     check because spawn.InjectRemoteControlFlag only fires for
+//     default-shape spawns (`sh -c "claude ..."`).
 //
-// Cost: one kill(0) (~1μs) + one `ps -o args= -p <pid>` (~10ms macOS)
-// per render per project. Stub-overridable via agentProcessAliveFn
-// AND agentProcessArgvFn for tests.
+// Cost: one kill(0) per render per project (~1μs Linux/macOS).
+// Stub-overridable via agentProcessAliveFn for tests.
 func agentClaudeAlive(records []*agent.Record, id string) bool {
 	if id == "" || len(records) == 0 {
 		return false
@@ -736,19 +658,7 @@ func agentClaudeAlive(records []*agent.Record, id string) bool {
 		if r == nil || r.ID != id {
 			continue
 		}
-		if !agentProcessAliveFn(r.PID) {
-			return false
-		}
-		argv := agentProcessArgvFn(r.PID)
-		// argv probe failures (empty string) conservatively trust
-		// kill(0) — flaky ps does not flip working coords to stuck.
-		if argv == "" {
-			return true
-		}
-		if argvLooksLikeShellWrapper(argv) {
-			return false
-		}
-		return true
+		return agentProcessAliveFn(r.PID)
 	}
 	return false
 }
