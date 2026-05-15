@@ -109,15 +109,19 @@ def test_judge_phase_done_non_git_without_pr_is_complete() -> None:
     assert j == reaper.JUDGE_COMPLETE
 
 
-def test_judge_phase_done_git_without_pr_is_pending() -> None:
-    """Git project + phase=done + no pr_url: worker didn't honor §7 —
-    let the existing reconcile path handle it (requeue), not the reaper."""
+def test_judge_phase_done_git_without_pr_is_error_abort() -> None:
+    """Codex iter-15 [P1]: git project + phase=done + no pr_url means
+    the worker reported done but didn't honor §7 (no PR opened). Treat
+    as ERROR_ABORT so the reaper kills the session AND flags redispatch.
+    Previously returned PENDING; that path let reconcile's "worker died
+    without PR" branch clear worker_agent_ids without killing the tmux
+    session — orphan leak."""
     j = reaper.judge_completion(
         task_status="in-progress",
         worker_state={"phase": "done", "pr_url": ""},
         is_git=True,
     )
-    assert j == reaper.JUDGE_PENDING
+    assert j == reaper.JUDGE_ERROR_ABORT
 
 
 def test_judge_phase_failed_is_error_abort() -> None:

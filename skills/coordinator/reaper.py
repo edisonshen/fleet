@@ -156,11 +156,15 @@ def judge_completion(
         pr_url = str(worker_state.get("pr_url", "") or "")
         if is_git and not pr_url:
             # phase=done without a PR is the spec's "worker reported done
-            # but didn't honor the contract" case. Treat as pending so
-            # the existing reconcile path's "worker died without PR"
-            # branch fires instead — that path requeues the task without
-            # reaper involvement.
-            return JUDGE_PENDING
+            # but didn't honor the contract" case. Codex iter-15 [P1]:
+            # treat this as ERROR_ABORT so the reaper kills the session
+            # AND flags the slug for redispatch. Previously this
+            # returned PENDING with the expectation that reconcile's
+            # "worker died without PR" branch would handle it — but
+            # that branch clears worker_agent_ids without killing the
+            # tmux session, recreating the orphan-leak shape invariant
+            # 5 exists to prevent.
+            return JUDGE_ERROR_ABORT
         return JUDGE_COMPLETE
     if phase in ("review-pending", "review-done"):
         # Three-stage flow handoff phases — the next subagent picks up

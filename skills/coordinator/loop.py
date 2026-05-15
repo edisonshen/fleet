@@ -1001,11 +1001,13 @@ def _run_supervisor(
 
     def _run_reaper_once_supervisor():
         """One-shot reaper pass under the supervisor lock.
-        Same body as reaper_hook_supervisor but without the return
-        value (force_tick_dispatch doesn't need to plumb just-reaped
-        slugs through to a reconcile retrigger — the subsequent
-        _drain_inbox_archive_supervisor + _maybe_dispatch_after_
-        reconcile cover the recovery)."""
+        Mirrors reaper_hook_supervisor's behavior: kills via reaper,
+        replays deferred sentinels for just-reaped slugs, then
+        reconciles those slugs so the status flip lands THIS tick
+        instead of waiting for the next periodic full reconcile
+        (codex iter-15 [P2]: a force-tick-driven reap was previously
+        invisible to the body's reconcile loop because the entry
+        was already cleared by the time the body ran)."""
         try:
             f7 = parse.read(str(tasks_path))
         except Exception as exc:  # noqa: BLE001
@@ -1016,6 +1018,7 @@ def _run_supervisor(
             f7.tasks, project=project, home=home, fleet_bin=fleet_bin,
             coord_state=cs, now_unix=time.time(),
         )
+        reaped: list[str] = []
         for dec in decisions:
             if dec.state == "hard-killed":
                 result.errors.append(
@@ -1026,7 +1029,22 @@ def _run_supervisor(
                 result.errors.append(
                     f"reaper error {dec.slug}: {dec.detail}"
                 )
+            if dec.state in ("killed", "hard-killed"):
+                reaped.append(dec.slug)
+        if reaped:
+            _replay_deferred_sentinels(
+                project=project, fleet_bin=fleet_bin, home=home,
+                cs=cs, cwd=cwd, cap=cap,
+            )
         _save_coord_state(state_path, cs)
+        # Codex iter-15 [P2]: reconcile the just-reaped slugs in
+        # the same iteration so the status flip lands this tick.
+        # _reconcile_slugs is idempotent on already-flipped slugs.
+        if reaped:
+            try:
+                _reconcile_slugs(reaped)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(f"force-tick reaper reconcile: {exc}")
 
     def _drain_inbox_archive_supervisor():
         """Drain archive sentinels under the supervisor lock.
