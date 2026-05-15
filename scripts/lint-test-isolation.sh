@@ -136,6 +136,8 @@ scan_file() {
       brace = 0
       in_raw = 0
       in_str = 0
+      in_blkcmt = 0  # codex iter-18 [P2]: prevent block-comment state
+                     # bleeding from a prior function into the next one.
     }
     function any_substr(haystack, needles_str,    n, arr, i) {
       # "|" separator so a needle can contain spaces (e.g., "= Spawn(").
