@@ -400,62 +400,65 @@ func downgradeStuckOnNeedsInput(
 
 // applyStuckSelfHeal is the issue #96 gap 1 + follow-up self-heal gate.
 // When derivation flagged the row as Stuck but evidence on disk says
-// the spawn either died silently OR already succeeded, the warning is a
-// lie — keeping it forever just trains operators to ignore the chip.
-// Transition Stuck → Idle and remove the stale marker via removeMarker
-// so the next render snaps back to the existing renderer.
+// the spawn either died silently OR already succeeded AND state has
+// been published, the warning is a lie — keeping it forever just trains
+// operators to ignore the chip. Transition Stuck → Idle and remove the
+// stale marker via removeMarker so the next render snaps back to the
+// existing renderer.
 //
-// Three heal paths cover the ways "marker says stuck but the row
-// isn't really stuck" can happen:
+// Two heal paths preserve the contract that the marker is removed only
+// when re-attach is either impossible (Path A) OR rescued by another
+// authoritative signal (Path B — coord-state.json + lock body published
+// by the ticking agent):
 //
 //	Path A (issue #96): tmux session for the marker's agent ID is
-//	  definitively gone → spawn died silently → heal. (sessionAlive=false)
+//	  definitively gone → spawn died silently → heal + remove marker.
+//	  (sessionAlive=false; the operator cannot re-attach to a dead
+//	  session, so destroying the marker loses no useful state.)
 //
 //	Path B (follow-up): the agent record at ~/.fleet/agents/<id>.json
 //	  has a fresh last_activity_ts → spawn succeeded, the agent is
-//	  ticking, the marker just never got cleared → heal regardless of
-//	  current tmux liveness. (agentRecordFresh=true)
+//	  ticking, AND fleet-guard's per-tick writes imply coord-state.json
+//	  publication AND coordinator.lock body publication → heal +
+//	  remove marker. findCoordByLockBody rescues the subsequent [a]
+//	  re-attach. (agentRecordFresh=true)
 //
-//	Path C (2026-05-14 false-positive fix): tmux session is alive AND
-//	  the agent record exists on disk for markerAgentID (regardless of
-//	  freshness) → fleet's spawn pipeline completed (write agent record
-//	  AND start tmux session). Whatever happened to coord-state.json
-//	  publication after that is a separate concern — the SPAWN itself
-//	  succeeded, so the spawn-stuck marker is a lie. This is the case
-//	  that previously caused "▲ coord spawn stuck" to fire on alive
-//	  agents in HANDOFF state, freshly-booted coords idle between
-//	  Stop-hook fires, and coords whose Stop hook stopped firing while
-//	  the agent is otherwise healthy. The narrower "spawned but never
-//	  ticked" signal is surfaced via coordSpawnNeverTicked downstream
-//	  (informational, not an attention chip).
+// Path C (alive but never ticked — e.g. HANDOFF state, freshly-booted,
+// Stop-hook misconfig) is NOT handled here. The marker is the ONLY
+// proof of which agent is coord for the project in that state (no lock
+// body exists yet), so removing it breaks [a] re-attach in
+// findExistingCoordForProject AND findCoordByLockBody both. See
+// renderCoordSpawnLineForProject's caller in dashboard_view.go for
+// the Path C suppression: it downgrades Stuck → NeverTicked at render
+// time without touching the marker file. The marker stays so the
+// operator can press [a] and re-enter the live session.
 //
-// All three paths are independently sufficient. Any one being true causes
-// the marker to be removed and the state to flip to Idle. This deliberate
-// OR keeps Path B from regressing on tmux probe failures, keeps Path A
-// working when the agent record was never written (silent spawn death),
-// and prevents Path C from regressing on the "alive but never ticked"
-// false positive.
+// Both Path A and Path B are independently sufficient. Either being
+// true causes the marker to be removed and the state to flip to Idle.
+// The deliberate OR keeps Path B from regressing on tmux probe failures
+// and keeps Path A working when the agent record was never written
+// (silent spawn death).
 //
 // Inputs are pure: caller supplies the derived state, the agent ID
 // from `state.ReadCoordSpawnMarker` (empty when no body / unreadable),
 // the tmux liveness probe (`tmux.HasSession`), the agent-record-fresh
-// probe (computed from the loaded record's last_activity_ts), the
-// agent-record-exists probe (Path C — record present at all for the
-// marker's agent ID), and a remover stub. The remover is invoked
-// exactly once per healed row; errors are returned so the caller can
-// surface them in a flash but the healed state is still applied (the
-// warning silently lingering is the worse failure mode).
+// probe (computed from the loaded record's last_activity_ts), and a
+// remover stub. The remover is invoked exactly once per healed row;
+// errors are returned so the caller can surface them in a flash but
+// the healed state is still applied (the warning silently lingering
+// is the worse failure mode).
 //
 // Self-heal does NOT fire when:
 //   - state ≠ Stuck (Idle/Spawning/Active are unaffected),
 //   - markerAgentID is empty (we can't probe a session OR a record we
 //     don't know the name of — fall back to the existing Stuck warning
 //     so the operator still sees something is wrong),
-//   - none of A/B/C match: sessionAlive=true AND agentRecordFresh=false
-//     AND agentRecordExists=false. That's the genuinely-hung case
-//     (live tmux, no fresh agent ticks, no record at all — fleet-guard
-//     never registered the agent) the original Stuck warning is
-//     designed for.
+//   - neither A nor B matches: sessionAlive=true AND agentRecordFresh=
+//     false. That's the genuinely-hung case (live tmux, no fresh agent
+//     ticks) the original Stuck warning is designed for. Path C handles
+//     the subset where an agent record exists but is stale (i.e. the
+//     spawn pipeline registered the agent but no Stop-hook tick has
+//     fired yet) at the render layer.
 //
 // Returns the (possibly healed) state and any removal error. The error
 // is informational; callers may log via flash but should still render
@@ -465,7 +468,6 @@ func applyStuckSelfHeal(
 	markerAgentID string,
 	sessionAlive bool,
 	agentRecordFresh bool,
-	agentRecordExists bool,
 	removeMarker func() error,
 ) (coordSpawnState, error) {
 	if st != coordSpawnStuck {
@@ -474,18 +476,11 @@ func applyStuckSelfHeal(
 	if markerAgentID == "" {
 		return st, nil
 	}
-	// Heal if ANY path matches.
-	//   Path A: dead tmux session (sessionAlive=false).
-	//   Path B: agent record fresh (agentRecordFresh=true).
-	//   Path C: tmux alive AND agent record present at all.
-	//
-	// Default-deny: only the "live tmux, no record on disk at all"
-	// (sessionAlive && !agentRecordExists && !agentRecordFresh) case
-	// preserves Stuck. agentRecordFresh implies agentRecordExists in
-	// production, but the helper does NOT assume that — defensive in
-	// case a future caller passes them inconsistently from stubs.
-	heal := !sessionAlive || agentRecordFresh || agentRecordExists
-	if !heal {
+	// Heal if EITHER A or B matches. Path A: dead session. Path B: fresh
+	// agent record (spawn succeeded, lock body presumed published).
+	// Path C is intentionally NOT collapsed here — see docstring; it
+	// must NOT remove the marker, so its handling lives in the caller.
+	if sessionAlive && !agentRecordFresh {
 		return st, nil
 	}
 	var rmErr error

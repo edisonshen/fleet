@@ -661,11 +661,11 @@ func stubRemoveMarker(t *testing.T) *[]string {
 // gone, the helper transitions the state to Idle and invokes the
 // remove callback exactly once. Pure-input test — no disk, no tmux.
 //
-// agentRecordFresh=false AND agentRecordExists=false because Path A's
-// defining case is "no record on disk" — silent spawn death.
+// agentRecordFresh=false because Path A's defining case is "no record
+// on disk OR record is stale" — silent spawn death.
 func TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle(t *testing.T) {
 	rmCalled := 0
-	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, false, false, func() error {
+	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, false, func() error {
 		rmCalled++
 		return nil
 	})
@@ -680,26 +680,28 @@ func TestApplyStuckSelfHeal_DeadSessionTransitionsToIdle(t *testing.T) {
 	}
 }
 
-// TestApplyStuckSelfHeal_LiveSessionNoRecordPreservesStuck: when the
-// tmux session is alive AND no agent record was ever written, the
-// warning is real — fleet-guard never reported in for this agent. The
-// operator should attach via tmux to triage. Heal must NOT fire.
+// TestApplyStuckSelfHeal_LiveSessionStaleRecordPreservesStuck: when the
+// tmux session is alive AND the agent record is NOT fresh (no recent
+// last_activity_ts), applyStuckSelfHeal must NOT remove the marker —
+// re-attach in findExistingCoordForProject depends on the marker
+// pointing at the agent. The render-layer Path C suppression (in
+// projectFooterLines) downgrades Stuck → Idle for these rows WITHOUT
+// touching the marker, but that's separate from this helper.
 //
-// This is the regression case for the Path C false-positive fix: we
-// must not expand healing to "any live session" — only to "live
-// session + record present" (Path C) or "fresh agent record" (Path B).
-// Live session with no record at all stays stuck.
-func TestApplyStuckSelfHeal_LiveSessionNoRecordPreservesStuck(t *testing.T) {
+// This is the regression case for the Path B follow-up: we must not
+// expand healing here to "any live session" — only to "live agent
+// record." The original Path A behavior is preserved.
+func TestApplyStuckSelfHeal_LiveSessionStaleRecordPreservesStuck(t *testing.T) {
 	rmCalled := 0
-	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, false, false, func() error {
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, false, func() error {
 		rmCalled++
 		return nil
 	})
 	if got != coordSpawnStuck {
-		t.Errorf("got %v; want coordSpawnStuck (live session + no record must keep warning)", got)
+		t.Errorf("got %v; want coordSpawnStuck (live session + stale record must NOT remove marker here)", got)
 	}
 	if rmCalled != 0 {
-		t.Errorf("remove invoked %d times for live session + no record; want 0", rmCalled)
+		t.Errorf("remove invoked %d times for live session + stale record; want 0", rmCalled)
 	}
 }
 
@@ -708,11 +710,9 @@ func TestApplyStuckSelfHeal_LiveSessionNoRecordPreservesStuck(t *testing.T) {
 // record at ~/.fleet/agents/<id>.json shows a fresh last_activity_ts
 // AND tmux is alive, the spawn already succeeded and the marker is just
 // stale. Path B heals.
-//
-// Fresh-record implies exists, so exists=true mirrors production.
 func TestApplyStuckSelfHeal_FreshRecordLiveSessionHealsViaPathB(t *testing.T) {
 	rmCalled := 0
-	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, true, true, func() error {
+	got, err := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", true, true, func() error {
 		rmCalled++
 		return nil
 	})
@@ -733,7 +733,7 @@ func TestApplyStuckSelfHeal_FreshRecordLiveSessionHealsViaPathB(t *testing.T) {
 // (operator [x]'d the agent, machine slept, etc). Heal regardless.
 func TestApplyStuckSelfHeal_FreshRecordDeadSessionAlsoHeals(t *testing.T) {
 	rmCalled := 0
-	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, true, true, func() error {
+	got, _ := applyStuckSelfHeal(coordSpawnStuck, "abcd1234", false, true, func() error {
 		rmCalled++
 		return nil
 	})
@@ -750,22 +750,18 @@ func TestApplyStuckSelfHeal_FreshRecordDeadSessionAlsoHeals(t *testing.T) {
 // byte file), we can't probe a session OR a record we don't know the
 // name of — keep the Stuck state and let the operator triage via the
 // soft-fallback hint. Remove must NOT fire (no marker we're confident
-// is stale). This regression test pins the contract under Path B and
-// Path C too: even with agentRecordFresh=true OR agentRecordExists=true,
-// an empty markerAgentID short-circuits before any path probes fire.
+// is stale). This regression test pins the contract under Path B too:
+// even with agentRecordFresh=true, an empty markerAgentID short-circuits.
 func TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck(t *testing.T) {
 	rmCalled := 0
 	for _, alive := range []bool{false, true} {
 		for _, fresh := range []bool{false, true} {
-			for _, exists := range []bool{false, true} {
-				got, _ := applyStuckSelfHeal(coordSpawnStuck, "", alive, fresh, exists, func() error {
-					rmCalled++
-					return nil
-				})
-				if got != coordSpawnStuck {
-					t.Errorf("alive=%v fresh=%v exists=%v: got %v; want coordSpawnStuck (empty agent ID must keep warning)",
-						alive, fresh, exists, got)
-				}
+			got, _ := applyStuckSelfHeal(coordSpawnStuck, "", alive, fresh, func() error {
+				rmCalled++
+				return nil
+			})
+			if got != coordSpawnStuck {
+				t.Errorf("alive=%v fresh=%v: got %v; want coordSpawnStuck (empty agent ID must keep warning)", alive, fresh, got)
 			}
 		}
 	}
@@ -776,7 +772,7 @@ func TestApplyStuckSelfHeal_EmptyAgentIDPreservesStuck(t *testing.T) {
 
 // TestApplyStuckSelfHeal_NonStuckStatesUnaffected: Idle / Spawning /
 // Active / Waiting / NeverTicked are pass-throughs. The helper must
-// never mutate non-Stuck states, even when all heal paths would
+// never mutate non-Stuck states, even when both heal paths would
 // otherwise match — those rows aren't claiming the row is stuck.
 func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	nonStuck := []coordSpawnState{
@@ -788,7 +784,7 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	}
 	for _, st := range nonStuck {
 		rmCalled := 0
-		got, _ := applyStuckSelfHeal(st, "abcd1234", false, true, true, func() error {
+		got, _ := applyStuckSelfHeal(st, "abcd1234", false, true, func() error {
 			rmCalled++
 			return nil
 		})
@@ -801,32 +797,60 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	}
 }
 
-// TestApplyStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck pins
-// the false-positive fix: when tmux is alive AND an agent record exists
-// for markerAgentID (even when the record is stale — last_activity_ts
-// outside the freshness window), the spawn pipeline completed and the
-// marker is a lie. Heal Stuck → Idle and remove the marker.
+// TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck pins the
+// brief-required Path C contract at the render layer (not in
+// applyStuckSelfHeal — see that helper's docstring for why Path C is
+// deliberately separated). With tmux alive AND an agent record on disk
+// for markerAgentID (stale — outside Path B's 10m freshness window),
+// the project block must NOT render the red "▲ coord spawn stuck"
+// warning, even though derivation lands on Stuck because the marker
+// is past spawnTimeout AND coord-state.json is stale. The marker
+// MUST remain on disk so [a] re-attach via findExistingCoordForProject
+// still resolves the live coord.
 //
-// Real-world driver: 2026-05-14, agent fleet-49bc8a03 at 6% context in
-// HANDOFF state, idle between Stop-hook fires, working fine. Tmux up,
-// record on disk with last_activity_ts==spawned_at (never re-stamped).
-// Pre-Path-C: TUI showed red "▲ coord spawn stuck — check tmux session
-// fleet-49bc8a03". Operator-visible lie.
-func TestApplyStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck(t *testing.T) {
-	rmCalled := 0
-	// alive=true, fresh=false (stale record), exists=true → Path C.
-	got, err := applyStuckSelfHeal(coordSpawnStuck, "49bc8a03", true, false, true, func() error {
-		rmCalled++
-		return nil
-	})
-	if err != nil {
-		t.Errorf("unexpected err from self-heal: %v", err)
+// Path C is only meaningful when Path B does not already heal — i.e.
+// when last_activity_ts is older than the freshness window. In
+// realistic fleet-on-disk shapes that means SpawnedAt is also older
+// (last_activity_ts is initialized to SpawnedAt at agent.New()), so
+// the never-ticked hint downstream is expected to render alongside.
+// Asserting Path C's no-marker-removal property is the load-bearing
+// claim of this test.
+func TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	rmCalls := stubRemoveMarker(t)
+
+	// Record exists, stale (past 10m freshness window). Path B does
+	// NOT fire because the freshness gate fails; Path C suppresses the
+	// stuck chip without touching the marker.
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			LastActivityTS: now.Add(-30 * time.Minute),
+			SpawnedAt:      now.Add(-30 * time.Minute),
+		},
 	}
-	if got != coordSpawnIdle {
-		t.Errorf("got %v; want coordSpawnIdle (Path C: live tmux + record exists must heal)", got)
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
 	}
-	if rmCalled != 1 {
-		t.Errorf("remove invoked %d times; want 1", rmCalled)
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("Path C suppression failed: red 'coord spawn stuck' fired; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "▲") {
+		t.Errorf("Path C suppression failed: red attention triangle still present; got:\n%s", joined)
+	}
+	if len(*rmCalls) != 0 {
+		t.Errorf("Path C must NOT remove marker (re-attach depends on it); got %d (%v)", len(*rmCalls), *rmCalls)
 	}
 }
 
@@ -1122,8 +1146,8 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 	}
 }
 
-// TestProjectRow_StaleAgentRecordLiveSessionHealsViaPathC pins the
-// false-positive fix (2026-05-14): marker past timeout, agent record
+// TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC pins
+// the false-positive fix (2026-05-14): marker past timeout, agent record
 // exists with OLD last_activity_ts (beyond freshness window), tmux ALIVE.
 //
 // Pre-Path-C this rendered "▲ coord spawn stuck" — the false alarm that
@@ -1133,12 +1157,13 @@ func TestProjectRow_StaleAgentRecordDeadSessionStillHealsViaPathA(t *testing.T) 
 // has fired since spawn, but the agent is alive (tmux up) AND fleet's
 // state model registered it (record present).
 //
-// Post-Path-C this heals via Path C (tmux alive + record exists). The
-// stuck attention chip suppresses; if the agent is past the cold-start
-// grace window without a tick, the softer coordSpawnNeverTicked hint
-// surfaces the underlying Stop-hook / skill-registration problem
-// without screaming.
-func TestProjectRow_StaleAgentRecordLiveSessionHealsViaPathC(t *testing.T) {
+// Post-fix this suppresses the attention chip at the render layer
+// WITHOUT removing the marker — [a] re-attach still depends on the
+// marker pointing at the agent (findExistingCoordForProject reads
+// coordSpawnMarkerFn). If the agent is past the cold-start grace window
+// without a tick, the softer coordSpawnNeverTicked hint surfaces the
+// underlying Stop-hook / skill-registration problem informationally.
+func TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute)
 	stubMarkerMtime(t, "demo", markerMtime, true)
@@ -1147,9 +1172,9 @@ func TestProjectRow_StaleAgentRecordLiveSessionHealsViaPathC(t *testing.T) {
 	rmCalls := stubRemoveMarker(t)
 
 	// Stale last_activity_ts AND stale SpawnedAt (older than the
-	// coordSpawnTimeoutDefault grace window). Path C heals; the
-	// never-ticked hint surfaces because last_activity_ts predates the
-	// stale-but-non-zero state file (none here — LastTick is zero).
+	// coordSpawnTimeoutDefault grace window). Path C suppresses; the
+	// never-ticked hint surfaces because LastTick is zero (no
+	// coord-state.json has ever been published).
 	records := []*agent.Record{
 		{
 			ID:             "abcd1234",
@@ -1168,13 +1193,13 @@ func TestProjectRow_StaleAgentRecordLiveSessionHealsViaPathC(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 
 	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("Path C must heal live tmux + record exists (stale ok); got:\n%s", joined)
+		t.Errorf("Path C must suppress red chip on live tmux + record exists; got:\n%s", joined)
 	}
-	if len(*rmCalls) != 1 {
-		t.Errorf("expected one remove call via Path C; got %d (%v)", len(*rmCalls), *rmCalls)
+	if len(*rmCalls) != 0 {
+		t.Errorf("Path C must NOT remove marker (would break [a] re-attach); got %d (%v)", len(*rmCalls), *rmCalls)
 	}
 	if !strings.Contains(joined, "spawned but never ticked") {
-		t.Errorf("expected softer 'never ticked' hint after Path C heal; got:\n%s", joined)
+		t.Errorf("expected softer 'never ticked' hint after Path C suppression; got:\n%s", joined)
 	}
 }
 
@@ -1187,8 +1212,9 @@ func TestProjectRow_StaleAgentRecordLiveSessionHealsViaPathC(t *testing.T) {
 // Setup mirrors the real false-positive driver (2026-05-14
 // fleet-49bc8a03): marker past timeout, agent record on disk with
 // SpawnedAt 15min ago AND LastActivityTS == SpawnedAt (no tick stamp
-// since spawn), tmux session up. The Path C heal clears the marker
-// (Stuck → Idle), then the never-ticked detector promotes Idle →
+// since spawn), tmux session up. Path C suppresses Stuck → Idle (the
+// marker stays on disk so [a] re-attach in findExistingCoordForProject
+// still works), then the never-ticked detector promotes Idle →
 // NeverTicked so the operator gets a soft pointer at Stop-hook or
 // /coordinator skill-registration breakage.
 func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
@@ -1201,8 +1227,8 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 
 	// Record on disk: SpawnedAt 15min ago (past coldStart grace),
 	// LastActivityTS == SpawnedAt (no tick has ever fired). The record
-	// is "stale" per Path B's freshness gate but Path C heals on
-	// existence alone.
+	// is "stale" per Path B's freshness gate; Path C suppresses on
+	// existence alone (without touching the marker).
 	spawnedAt := now.Add(-15 * time.Minute)
 	records := []*agent.Record{
 		{
@@ -1231,26 +1257,26 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 	if !strings.Contains(joined, "49bc8a03") {
 		t.Errorf("never-ticked hint must include agent ID; got:\n%s", joined)
 	}
-	if len(*rmCalls) != 1 {
-		t.Errorf("expected exactly one remove call (Path C heal); got %d (%v)", len(*rmCalls), *rmCalls)
+	if len(*rmCalls) != 0 {
+		t.Errorf("Path C must NOT remove marker (would break [a] re-attach); got %d (%v)", len(*rmCalls), *rmCalls)
 	}
 }
 
 // TestRender_NeverTicked_GraceWindowSuppressesHint: during the
 // cold-start grace window (≤ coordSpawnTimeoutDefault since SpawnedAt),
 // the never-ticked hint must NOT fire — the cold start may still
-// complete. The Path C heal still clears the stuck warning (a fresh
-// spawn shouldn't be screaming red either), but no soft hint replaces
-// it because the operator hasn't been waiting long enough to be told
-// there's a problem.
+// complete. Inside the grace window, Path B's freshness gate (record
+// fresh because last_activity_ts is set to SpawnedAt at agent.New)
+// already heals the stuck warning; never-ticked must NOT promote on
+// top of it because the operator hasn't been waiting long enough.
+//
+// Production cannot land in stuck-derivation-AND-fresh-record without
+// operator intervention (the marker would normally be < spawnTimeout
+// when the record is fresh), but the test stubs marker mtime past
+// timeout to exercise the never-ticked grace-window predicate
+// deterministically.
 func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
-	// Marker is past spawn timeout — derivation sends us to Stuck — but
-	// the agent's SpawnedAt is WITHIN the grace window (fresh spawn).
-	// Production cannot land in this exact state without operator
-	// intervention; the test exercises the grace-window gate in the
-	// never-ticked predicate so a future bug doesn't accidentally
-	// promote freshly-spawned coords to NeverTicked.
 	markerMtime := now.Add(-15 * time.Minute)
 	stubMarkerMtime(t, "demo", markerMtime, true)
 	stubMarkerAgentID(t, "demo", "49bc8a03")
@@ -1276,7 +1302,7 @@ func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 
 	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("Path C must still heal even inside grace window; got:\n%s", joined)
+		t.Errorf("stuck must be cleared (Path B fresh-record heal) inside grace window; got:\n%s", joined)
 	}
 	if strings.Contains(joined, "spawned but never ticked") {
 		t.Errorf("never-ticked hint must NOT fire inside grace window; got:\n%s", joined)
