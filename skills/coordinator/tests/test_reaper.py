@@ -381,11 +381,12 @@ def test_reaper_disabled_env_short_circuits(monkeypatch) -> None:
     assert stubs.rm_calls == []
 
 
-def test_reaper_disabled_preserves_open_lane(monkeypatch) -> None:
+def test_reaper_disabled_preserves_open_lane_when_session_alive(monkeypatch) -> None:
     """Codex iter-14 [P2] regress: an open reaper lane
     (kill_directive_ts > 0) must NOT be dropped when reaper is
-    flipped to DISABLED. Otherwise the operator-side reconcile
-    forgets the agent_id while the tmux session is still alive."""
+    flipped to DISABLED if the tmux session is STILL ALIVE.
+    Otherwise the operator-side reconcile forgets the agent_id
+    while the tmux session is still alive."""
     monkeypatch.setenv("FLEET_COORD_REAPER_DISABLED", "1")
     coord_state = {
         "reaper": {
@@ -399,7 +400,8 @@ def test_reaper_disabled_preserves_open_lane(monkeypatch) -> None:
     inputs = [_inp(worker_state={
         "phase": "done", "pr_url": "https://x/y/pull/1",
     })]
-    stubs = _stubs()
+    # session alive — operator hasn't cleaned up yet.
+    stubs = _stubs(alive=[True])
     decisions = reaper.reap_probes(
         probes_inputs=inputs, coord_state=coord_state,
         fleet_bin="fleet", now_unix=1100.0, grace_window_s=10,
@@ -412,6 +414,41 @@ def test_reaper_disabled_preserves_open_lane(monkeypatch) -> None:
     # Entry preserved (operator can re-enable reaper to retry).
     assert "alpha-aaaa" in coord_state.get("reaper", {})
     assert coord_state["reaper"]["alpha-aaaa"]["kill_directive_ts"] == 1000.0
+
+
+def test_reaper_disabled_clears_lane_when_operator_killed_session(monkeypatch) -> None:
+    """Codex iter-20 [P2] regress: when reaper is disabled AND the
+    operator manually ran `fleet rm` (so the tmux session is gone),
+    close the open lane so reconcile can advance the task. Without
+    this, the disabled-reaper + manual-cleanup combo would strand
+    the task indefinitely."""
+    monkeypatch.setenv("FLEET_COORD_REAPER_DISABLED", "1")
+    coord_state = {
+        "reaper": {
+            "alpha-aaaa": {
+                "kill_directive_ts": 1000.0,
+                "hard_killed": False,
+                "judgment": reaper.JUDGE_COMPLETE,
+            }
+        }
+    }
+    inputs = [_inp(worker_state={
+        "phase": "done", "pr_url": "https://x/y/pull/1",
+    })]
+    # session DEAD — operator manually cleaned up via fleet rm.
+    stubs = _stubs(alive=[False])
+    decisions = reaper.reap_probes(
+        probes_inputs=inputs, coord_state=coord_state,
+        fleet_bin="fleet", now_unix=1100.0, grace_window_s=10,
+        session_alive_fn=stubs.session_alive,
+        send_exit_fn=stubs.send_exit,
+        fleet_rm_fn=stubs.fleet_rm,
+        hard_kill_fn=stubs.hard_kill,
+    )
+    assert decisions[0].state == "killed"
+    assert "operator manual cleanup" in decisions[0].detail
+    # Lane closed.
+    assert "alpha-aaaa" not in coord_state.get("reaper", {})
 
 
 def test_reaper_disabled_does_not_open_new_lane(monkeypatch) -> None:

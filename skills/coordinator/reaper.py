@@ -476,6 +476,23 @@ def reap_one(
     decision = ReapDecision(slug=inp.slug)
 
     if env_reaper_disabled():
+        # Codex iter-20 [P2]: when reaper is disabled but the lane is
+        # already open (operator flipped the env mid-cycle), still
+        # probe tmux. If the session is gone (operator manually ran
+        # `fleet rm`, which is the documented fallback), close the
+        # lane so reconcile can proceed. Otherwise the disabled
+        # reaper would strand the task indefinitely.
+        if (
+            entry.kill_directive_ts > 0.0
+            and inp.tmux_session
+            and not session_alive_fn(inp.tmux_session)
+        ):
+            decision.state = "killed"
+            decision.detail = (
+                "reaper disabled, but session is gone "
+                "(operator manual cleanup detected)"
+            )
+            return decision
         decision.state = "no-op"
         decision.detail = "reaper disabled (FLEET_COORD_REAPER_DISABLED=1)"
         return decision

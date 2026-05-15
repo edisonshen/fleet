@@ -922,18 +922,18 @@ def _run_supervisor(
             if dec.state in ("killed", "hard-killed"):
                 reaped.append(dec.slug)
         # Replay any deferred sentinels whose reaper lane is now
-        # clear (just-reaped or never-had-a-lane). Mutates `cs` in
-        # place; we save at the end. Returns the count of sentinels
-        # that landed THIS replay — used to gate the post-replay
-        # dispatch hook (codex iter-14 [P1]: a replay that flipped
-        # status to in-review/todo frees a slot that the subsequent
-        # reconcile_one-driven reconcile would miss).
-        replay_applied = 0
-        if reaped:
-            replay_applied = _replay_deferred_sentinels(
-                project=project, fleet_bin=fleet_bin, home=home,
-                cs=cs, cwd=cwd, cap=cap,
-            )
+        # clear. Codex iter-20 [P2]: ALWAYS replay (no `if reaped`
+        # gate), not just after a fresh reap. Sentinel deferrals can
+        # come from:
+        #   (a) reaper-lane-not-clear at apply time — those clear
+        #       when the reaper finishes (still triggered by reaped).
+        #   (b) transient `fleet tasks set/note` failure in either
+        #       drain path — those should retry every iteration
+        #       regardless of reaper state.
+        replay_applied = _replay_deferred_sentinels(
+            project=project, fleet_bin=fleet_bin, home=home,
+            cs=cs, cwd=cwd, cap=cap,
+        )
         _save_coord_state(state_path, cs)
         # If the replay flipped task status (slot freed), backfill
         # the slot via the same dispatch surface the mtime path uses.
@@ -1062,11 +1062,13 @@ def _run_supervisor(
                 )
             if dec.state in ("killed", "hard-killed"):
                 reaped.append(dec.slug)
-        if reaped:
-            _replay_deferred_sentinels(
-                project=project, fleet_bin=fleet_bin, home=home,
-                cs=cs, cwd=cwd, cap=cap,
-            )
+        # Codex iter-20 [P2]: replay deferred sentinels every pass,
+        # not gated on `if reaped`. Transient apply failures need
+        # retries even when no new reap happened.
+        _replay_deferred_sentinels(
+            project=project, fleet_bin=fleet_bin, home=home,
+            cs=cs, cwd=cwd, cap=cap,
+        )
         _save_coord_state(state_path, cs)
         # Codex iter-15 [P2]: reconcile the just-reaped slugs in
         # the same iteration so the status flip lands this tick.
