@@ -558,24 +558,35 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 
 // agentEverActivated reports whether the agent record for id has
 // fired at least one fleet-guard Stop hook since spawn. agent.New()
-// initializes last_activity_ts == spawned_at; the Stop hook is the
-// only thing that advances last_activity_ts, and the hook runs from
-// INSIDE Claude on every assistant turn. So last_activity_ts strictly
-// greater than spawned_at (with mtime tolerance for FS resolution)
-// proves Claude was alive at least once after spawn.
+// initializes last_activity_ts == spawned_at (same time.Now() call);
+// the Stop hook is the only thing that advances last_activity_ts, and
+// the hook runs from INSIDE Claude on every assistant turn. So
+// last_activity_ts strictly NOT-EQUAL to spawned_at proves a Stop
+// hook fired at least once, which proves Claude was alive after spawn.
 //
 // Used by Path C to distinguish:
 //   - "Claude alive, idle between Stop-hook fires" (HANDOFF state,
-//     waiting on operator) → last_activity_ts > spawned_at → activated
+//     waiting on operator) → last_activity_ts != spawned_at → activated
 //     → Path C may suppress the red stuck chip
 //   - "tmux wrapper survived but Claude died at startup before any
-//     Stop-hook fired" → last_activity_ts == spawned_at → NOT
-//     activated → keep the red stuck chip so the operator notices
+//     Stop-hook fired" → last_activity_ts == spawned_at (same nanosec
+//     value from agent.New()) → NOT activated → keep the red stuck
+//     chip so the operator notices
+//
+// Inequality (not "strictly after") is the right comparison because
+// skills/fleet-guard/health.py writes last_activity_ts with whole-
+// second RFC 3339 precision while agent.New() preserves nanoseconds.
+// A first Stop hook that fires in the same wall-clock second as spawn
+// will write last_activity_ts = "12:00:00Z" while spawned_at remains
+// "12:00:00.123456789Z" — the hook timestamp compares LESS than spawn
+// by up to ~999ms (codex iter-7 P1 fix). Strict after-comparison
+// would misclassify that fast-Stop-hook case as "not activated."
+// Inequality catches both the fast-same-second case and any later
+// second; the only thing it excludes is the exact-equal agent.New()
+// shape, which is what we want.
 //
 // Returns false on the obvious non-applicable cases (empty id, no
-// matching record, zero spawned_at). The mtime tolerance is the same
-// 2s coordTickMtimeTolerance applied to the never-ticked check —
-// covers FS granularity + write skew.
+// matching record, zero spawned_at, zero last_activity_ts).
 func agentEverActivated(records []*agent.Record, id string) bool {
 	if id == "" || len(records) == 0 {
 		return false
@@ -587,12 +598,7 @@ func agentEverActivated(records []*agent.Record, id string) bool {
 		if r.SpawnedAt.IsZero() || r.LastActivityTS.IsZero() {
 			return false
 		}
-		// Strictly after SpawnedAt by more than the mtime tolerance.
-		// On agent.New(), both timestamps are set to the same time.UTC()
-		// value so they compare equal — that's the "never activated"
-		// case. A real Stop hook fire advances LastActivityTS to a later
-		// time.Now().UTC(), which is reliably > tolerance ahead.
-		return r.LastActivityTS.After(r.SpawnedAt.Add(coordTickMtimeTolerance))
+		return !r.LastActivityTS.Equal(r.SpawnedAt)
 	}
 	return false
 }
