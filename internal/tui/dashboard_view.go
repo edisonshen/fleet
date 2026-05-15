@@ -993,7 +993,7 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// death) doesn't trigger this hint, and on markerAgentID being
 	// non-empty so we have an ID to render.
 	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
-		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, coordSpawnTimeoutDefault) {
+		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, ctx.spawnTimeout) {
 		st = coordSpawnNeverTicked
 	}
 
