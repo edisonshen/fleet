@@ -131,13 +131,35 @@ PLACEHOLDER = "_(operator-triggered handoff — fill in before resuming)_"
 # renderers are tested for byte-equality.
 
 
+def _escape_project_for_pgrep(s: str) -> str:
+    """Escape regex metacharacters in the project-scoped daemon prefix
+    when used as a pgrep -f pattern. ValidateProjectName allows
+    `[a-z0-9._-]`; among those only `.` is a regex metacharacter
+    (matches any char). Hyphens are special only inside character
+    classes; underscores are always literal.
+
+    Mirror of internal/handoff.escapeProjectForPgrep on the Go side —
+    keeping the two renderers byte-equal is a load-bearing invariant
+    (test_handoff.TestRenderByteGolden).
+    """
+    return s.replace(".", "\\.")
+
+
 def first_action(project: str) -> str:
     prefix = "fleet-handoff"
     if project:
         prefix = prefix + "-" + project
+    # Escape `.` because ValidateProjectName allows project names like
+    # `v2.1`. Without escaping, the pgrep guard for `fleet-handoff-v2.1`
+    # would also match a daemon for `fleet-handoff-v2a1` (false
+    # positive), causing the bootstrap to skip launching the v2.1
+    # daemon while the replacement agent registers as
+    # `fleet-handoff-<id>-v2.1`, leaving /remote-control with no
+    # compatible daemon to attach to.
     pgrep_pattern = (
         "^claude remote-control "
-        "--remote-control-session-name-prefix " + prefix + "( |$)"
+        "--remote-control-session-name-prefix "
+        + _escape_project_for_pgrep(prefix) + "( |$)"
     )
     return (
         "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"

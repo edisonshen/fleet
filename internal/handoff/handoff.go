@@ -243,7 +243,16 @@ func FirstAction(project string) string {
 	// like `fleet-handoff-sparkX` doesn't false-positive. Mirrors the
 	// coord-side pattern in skills/coordinator/remote_control.py:
 	// spawn_daemon_if_needed.
-	pgrepPattern := "^claude remote-control --remote-control-session-name-prefix " + prefix + "( |$)"
+	//
+	// Regex-escape the prefix because ValidateProjectName allows `.`
+	// in project names (e.g. `v2.1`). Without escaping, `fleet-handoff-v2.1`
+	// would match a daemon for `fleet-handoff-v2a1` (false positive),
+	// causing the bootstrap to skip launching the v2.1 daemon while the
+	// replacement agent still registers as `fleet-handoff-<id>-v2.1`,
+	// leaving /remote-control with no compatible daemon to attach to.
+	// Allowed project chars are `[a-z0-9._-]`; only `.` is a regex
+	// metachar. Escape just that one to keep the rest readable.
+	pgrepPattern := "^claude remote-control --remote-control-session-name-prefix " + escapeProjectForPgrep(prefix) + "( |$)"
 	return "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
 		"\n" +
 		"```bash\n" +
@@ -260,6 +269,29 @@ func FirstAction(project string) string {
 		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
 		"\n" +
 		"Then continue with the sections below."
+}
+
+// escapeProjectForPgrep escapes regex metacharacters that may appear
+// in a project-scoped daemon prefix when used as a pgrep -f pattern.
+// ValidateProjectName allows `[a-z0-9._-]`; among those only `.` is a
+// regex metacharacter (matches any char). Hyphens are special only
+// inside character classes; underscores are always literal. We do not
+// use strings.NewReplacer or regexp.QuoteMeta because we want a
+// targeted, easily-auditable swap that mirrors what
+// skills/fleet-guard/handoff.py:_escape_project_for_pgrep does on the
+// Python side — keeping the two renderers byte-equal is a
+// load-bearing invariant (TestRender_SkillByteGolden).
+func escapeProjectForPgrep(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' {
+			out = append(out, '\\', '.')
+			continue
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 // Render produces the markdown+frontmatter bytes for d.

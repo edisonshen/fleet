@@ -106,3 +106,40 @@ func TestRender_FirstActionUsesDocProject(t *testing.T) {
 			wantQuoted, project, got)
 	}
 }
+
+// TestFirstAction_PgrepEscapesProjectDot pins the regex-escape contract
+// for project names containing `.`. ValidateProjectName allows `.` (e.g.
+// `v2.1`); without escaping the bash block's pgrep pattern would be
+// `^...fleet-handoff-v2.1( |$)` and `.` matches any char — a daemon
+// process for a different project named `v2a1` would mask the launch
+// of the v2.1 daemon, leaving /remote-control with no compatible
+// daemon to attach to. Escaping `.` to `\\.` keeps the match strictly
+// literal so daemons for project `v2.1` and `v2a1` coexist correctly.
+//
+// Codex review iter-1 [P2] regression bracket.
+func TestFirstAction_PgrepEscapesProjectDot(t *testing.T) {
+	const project = "v2.1"
+	body := FirstAction(project)
+
+	// The pgrep -f single-quoted regex must contain the LITERAL
+	// `\.` escape (two chars: backslash then dot). The daemon prefix
+	// flag value in `--remote-control-session-name-prefix "..."`
+	// stays the unescaped literal because that's a shell-quoted
+	// argument, not a regex.
+	const wantEscaped = "fleet-handoff-v2\\.1( |$)"
+	if !strings.Contains(body, wantEscaped) {
+		t.Errorf("FirstAction(%q) pgrep guard must contain %q (escaped "+
+			"`.` so a daemon for `v2a1` doesn't false-positive); got:\n%s",
+			project, wantEscaped, body)
+	}
+	// And the daemon-prefix flag value (the non-regex arg) keeps the
+	// literal `.` so the spawned daemon registers under the correct
+	// project name. Drift here would mean the launched daemon's argv
+	// no longer matches what /remote-control attaches to.
+	const wantLiteralFlag = `--remote-control-session-name-prefix "fleet-handoff-v2.1"`
+	if !strings.Contains(body, wantLiteralFlag) {
+		t.Errorf("FirstAction(%q) daemon-prefix flag must contain %q "+
+			"(literal `.` because the flag value is shell-quoted, not regex); "+
+			"got:\n%s", project, wantLiteralFlag, body)
+	}
+}

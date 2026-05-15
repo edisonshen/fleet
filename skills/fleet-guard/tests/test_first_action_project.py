@@ -113,3 +113,38 @@ class TestFirstActionPerProject:
             "(per-project visibility on phone / claude.ai); got:\n"
             f"{got.decode('utf-8', errors='replace')}"
         )
+
+    def test_first_action_pgrep_escapes_project_dot(self) -> None:
+        """Codex review iter-1 [P2] regression bracket — pin the
+        regex-escape contract for project names containing `.`.
+
+        ValidateProjectName allows `.` (e.g. `v2.1`); without escaping,
+        the bash block's pgrep pattern `^...fleet-handoff-v2.1( |$)`
+        treats `.` as `match-any-char`, so a daemon process for a
+        different project named `v2a1` would mask the launch of the
+        v2.1 daemon, leaving /remote-control with no compatible daemon
+        to attach to. Escaping `.` to `\\.` keeps the match strictly
+        literal so daemons for project `v2.1` and `v2a1` coexist
+        correctly. Mirror of internal/handoff TestFirstAction_PgrepEscapesProjectDot.
+        """
+        body = handoff.first_action("v2.1")
+
+        # The pgrep -f single-quoted regex must contain the LITERAL
+        # `\.` escape (two chars: backslash then dot).
+        want_escaped = "fleet-handoff-v2\\.1( |$)"
+        assert want_escaped in body, (
+            f"first_action('v2.1') pgrep guard must contain {want_escaped!r} "
+            f"(escaped `.` so a daemon for `v2a1` doesn't false-positive); "
+            f"got body:\n{body}"
+        )
+        # The daemon-prefix flag value (a shell-quoted arg, not a
+        # regex) keeps the literal `.` so the spawned daemon registers
+        # under the correct project name.
+        want_literal_flag = (
+            '--remote-control-session-name-prefix "fleet-handoff-v2.1"'
+        )
+        assert want_literal_flag in body, (
+            f"first_action('v2.1') daemon-prefix flag must contain "
+            f"{want_literal_flag!r} (literal `.` because the flag value "
+            f"is shell-quoted, not regex); got body:\n{body}"
+        )
