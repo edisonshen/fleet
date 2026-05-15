@@ -556,6 +556,47 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 	return false
 }
 
+// agentEverActivated reports whether the agent record for id has
+// fired at least one fleet-guard Stop hook since spawn. agent.New()
+// initializes last_activity_ts == spawned_at; the Stop hook is the
+// only thing that advances last_activity_ts, and the hook runs from
+// INSIDE Claude on every assistant turn. So last_activity_ts strictly
+// greater than spawned_at (with mtime tolerance for FS resolution)
+// proves Claude was alive at least once after spawn.
+//
+// Used by Path C to distinguish:
+//   - "Claude alive, idle between Stop-hook fires" (HANDOFF state,
+//     waiting on operator) → last_activity_ts > spawned_at → activated
+//     → Path C may suppress the red stuck chip
+//   - "tmux wrapper survived but Claude died at startup before any
+//     Stop-hook fired" → last_activity_ts == spawned_at → NOT
+//     activated → keep the red stuck chip so the operator notices
+//
+// Returns false on the obvious non-applicable cases (empty id, no
+// matching record, zero spawned_at). The mtime tolerance is the same
+// 2s coordTickMtimeTolerance applied to the never-ticked check —
+// covers FS granularity + write skew.
+func agentEverActivated(records []*agent.Record, id string) bool {
+	if id == "" || len(records) == 0 {
+		return false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != id {
+			continue
+		}
+		if r.SpawnedAt.IsZero() || r.LastActivityTS.IsZero() {
+			return false
+		}
+		// Strictly after SpawnedAt by more than the mtime tolerance.
+		// On agent.New(), both timestamps are set to the same time.UTC()
+		// value so they compare equal — that's the "never activated"
+		// case. A real Stop hook fire advances LastActivityTS to a later
+		// time.Now().UTC(), which is reliably > tolerance ahead.
+		return r.LastActivityTS.After(r.SpawnedAt.Add(coordTickMtimeTolerance))
+	}
+	return false
+}
+
 // coordTickMtimeTolerance is the slack we allow between coord-state.json
 // mtime and the agent's spawned_at when deciding "did this coord ever
 // tick under THIS spawn." Filesystem mtime resolution is 1s on many

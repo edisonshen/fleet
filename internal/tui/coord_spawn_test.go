@@ -797,6 +797,190 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	}
 }
 
+// TestAgentEverActivated_EdgeCases pins the activation-detection
+// helper: equality (agent.New()-shape record before any Stop hook
+// fires) returns false; LastActivityTS within mtime tolerance is
+// still false; strictly after by more than tolerance returns true.
+func TestAgentEverActivated_EdgeCases(t *testing.T) {
+	spawnedAt := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name    string
+		records []*agent.Record
+		id      string
+		want    bool
+	}{
+		{
+			name:    "empty id → false",
+			records: []*agent.Record{{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(time.Hour)}},
+			id:      "",
+			want:    false,
+		},
+		{
+			name:    "nil records → false",
+			records: nil,
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "no matching id → false",
+			records: []*agent.Record{{ID: "y", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(time.Hour)}},
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "zero spawned_at → false",
+			records: []*agent.Record{{ID: "x", LastActivityTS: spawnedAt}},
+			id:      "x",
+			want:    false,
+		},
+		{
+			name:    "zero last_activity_ts → false",
+			records: []*agent.Record{{ID: "x", SpawnedAt: spawnedAt}},
+			id:      "x",
+			want:    false,
+		},
+		{
+			name: "exactly equal (agent.New() shape) → false (not activated)",
+			records: []*agent.Record{
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt},
+			},
+			id:   "x",
+			want: false,
+		},
+		{
+			name: "within mtime tolerance → false",
+			records: []*agent.Record{
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(1 * time.Second)},
+			},
+			id:   "x",
+			want: false,
+		},
+		{
+			name: "exactly at mtime tolerance boundary → false",
+			records: []*agent.Record{
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(coordTickMtimeTolerance)},
+			},
+			id:   "x",
+			want: false,
+		},
+		{
+			name: "strictly past tolerance → true (activated)",
+			records: []*agent.Record{
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(coordTickMtimeTolerance + time.Second)},
+			},
+			id:   "x",
+			want: true,
+		},
+		{
+			name: "minutes past → true",
+			records: []*agent.Record{
+				{ID: "x", SpawnedAt: spawnedAt, LastActivityTS: spawnedAt.Add(5 * time.Minute)},
+			},
+			id:   "x",
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentEverActivated(tc.records, tc.id)
+			if got != tc.want {
+				t.Errorf("agentEverActivated(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRender_WrapperSurvivedClaudeDied_PreservesStuck pins the codex
+// iter-6 [P1] fix: tmux wrapper survived a Claude crash at startup
+// (record was written by agent.New() but no Stop hook ever fired, so
+// last_activity_ts == spawned_at). Path C must NOT suppress the red
+// stuck chip — the operator needs the alert to notice the failure
+// and respawn. agentEverActivated is the gate that distinguishes
+// "Claude is or was running" (LastActivityTS > SpawnedAt by mtime
+// tolerance) from "wrapper alone, Claude never reached a Stop hook."
+func TestRender_WrapperSurvivedClaudeDied_PreservesStuck(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubRemoveMarker(t)
+
+	// agent.New()-shape record: SpawnedAt and LastActivityTS set to
+	// the same time. Claude crashed before any Stop hook fired, but
+	// the tmux wrapper shell is still alive.
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			LastActivityTS: spawnedAt, // same as SpawnedAt → not activated
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("wrapper-only failure: red stuck chip MUST surface (agentEverActivated gate); got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "▲") {
+		t.Errorf("wrapper-only failure: red attention triangle must surface; got:\n%s", joined)
+	}
+}
+
+// TestRender_NeedsInputDowngradeBeatsPathC pins the codex iter-6
+// [P1] ordering: when a live coord has needs_input=true (Claude
+// paused at a question) AND coord-state.json never published, the
+// downgrade to Waiting must run BEFORE Path C suppression. Otherwise
+// Path C demotes Stuck → Idle first and the downgrade never sees
+// Stuck, losing the operator's "fleet attach <id>" cue.
+func TestRender_NeedsInputDowngradeBeatsPathC(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute)
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	stubRemoveMarker(t)
+
+	// Fresh activity (within freshWindow) AND needs_input=true AND
+	// LastTick zero (coord never published a tick).
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			LastActivityTS: now.Add(-3 * time.Minute), // fresh
+			SpawnedAt:      spawnedAt,
+			NeedsInput:     true,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if !strings.Contains(joined, "waiting on input") {
+		t.Errorf("needs_input + fresh + never-ticked: must downgrade to Waiting (not Path C Idle); got:\n%s", joined)
+	}
+	if strings.Contains(joined, "spawned but never ticked") {
+		t.Errorf("Waiting must override the never-ticked hint; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("Waiting must override red stuck chip; got:\n%s", joined)
+	}
+}
+
 // TestRender_FreshRecordNeverTickedPreservesMarker pins the codex
 // iter-5 [P1] fix: when the agent record has a fresh last_activity_ts
 // (Path B's freshness gate would normally fire) BUT coord-state.json
@@ -1068,13 +1252,15 @@ func TestStuckSelfHeal_PathC_TmuxAliveAndRecordExists_ClearsStuck(t *testing.T) 
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
 	rmCalls := stubRemoveMarker(t)
 
-	// Record exists, stale (past 10m freshness window). Path B does
-	// NOT fire because the freshness gate fails; Path C suppresses the
-	// stuck chip without touching the marker.
+	// Record exists, stale (past 10m freshness window) but
+	// agentEverActivated (last_activity_ts > spawned_at — Claude fired
+	// ≥1 Stop hook since spawn). Path B does NOT fire because the
+	// freshness gate fails; Path C suppresses the stuck chip without
+	// touching the marker.
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
-			LastActivityTS: now.Add(-30 * time.Minute),
+			LastActivityTS: now.Add(-15 * time.Minute),
 			SpawnedAt:      now.Add(-30 * time.Minute),
 		},
 	}
@@ -1420,10 +1606,16 @@ func TestProjectRow_StaleAgentRecordLiveSessionSuppressesViaPathC(t *testing.T) 
 	// coordSpawnTimeoutDefault grace window). Path C suppresses; the
 	// never-ticked hint surfaces because LastTick is zero (no
 	// coord-state.json has ever been published).
+	//
+	// LastActivityTS > SpawnedAt by enough to clear the
+	// coordTickMtimeTolerance gate — proves Claude fired ≥1 Stop hook
+	// since spawn (agentEverActivated). Without this gate, Path C
+	// would not suppress the wrapper-survives-Claude-dies case (codex
+	// iter-6 P1).
 	records := []*agent.Record{
 		{
 			ID:             "abcd1234",
-			LastActivityTS: now.Add(-1 * time.Hour),
+			LastActivityTS: now.Add(-30 * time.Minute),
 			SpawnedAt:      now.Add(-1 * time.Hour),
 		},
 	}
@@ -1471,14 +1663,17 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 	rmCalls := stubRemoveMarker(t)
 
 	// Record on disk: SpawnedAt 15min ago (past coldStart grace),
-	// LastActivityTS == SpawnedAt (no tick has ever fired). The record
-	// is "stale" per Path B's freshness gate; Path C suppresses on
-	// existence alone (without touching the marker).
+	// LastActivityTS 10min ago (after SpawnedAt by enough to clear the
+	// coordTickMtimeTolerance gate — i.e. fleet-guard has fired ≥1
+	// Stop hook since spawn so agentEverActivated returns true). The
+	// record is "stale" per Path B's freshness gate (10m+ since
+	// activity); Path C suppresses on existence + activation alone
+	// (without touching the marker).
 	spawnedAt := now.Add(-15 * time.Minute)
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
-			LastActivityTS: spawnedAt,
+			LastActivityTS: now.Add(-12 * time.Minute), // > spawnedAt by 3min, stale
 			SpawnedAt:      spawnedAt,
 		},
 	}
@@ -1510,16 +1705,15 @@ func TestRender_NeverTicked_ShowsNotTickingHint(t *testing.T) {
 // TestRender_NeverTicked_GraceWindowSuppressesHint: during the
 // cold-start grace window (≤ coordSpawnTimeoutDefault since SpawnedAt),
 // the never-ticked hint must NOT fire — the cold start may still
-// complete. Inside the grace window, Path B's freshness gate (record
-// fresh because last_activity_ts is set to SpawnedAt at agent.New)
-// already heals the stuck warning; never-ticked must NOT promote on
-// top of it because the operator hasn't been waiting long enough.
+// complete. The Path C suppression handles the red chip; never-ticked
+// only adds the soft informational hint when waiting has clearly gone
+// beyond healthy.
 //
-// Production cannot land in stuck-derivation-AND-fresh-record without
-// operator intervention (the marker would normally be < spawnTimeout
-// when the record is fresh), but the test stubs marker mtime past
-// timeout to exercise the never-ticked grace-window predicate
-// deterministically.
+// Setup: agent activated (Stop hook fired once, last_activity_ts >
+// spawned_at) but recent enough to be inside the grace window;
+// coord-state.json never published. Path C suppresses Stuck → Idle;
+// never-ticked's grace check sees SpawnedAt within window → suppresses
+// the soft hint.
 func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	markerMtime := now.Add(-15 * time.Minute)
@@ -1532,7 +1726,7 @@ func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
-			LastActivityTS: spawnedAt,
+			LastActivityTS: now.Add(-30 * time.Second), // > spawnedAt → activated
 			SpawnedAt:      spawnedAt,
 		},
 	}
@@ -1547,7 +1741,7 @@ func TestRender_NeverTicked_GraceWindowSuppressesHint(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 
 	if strings.Contains(joined, "coord spawn stuck") {
-		t.Errorf("stuck must be cleared (Path B fresh-record heal) inside grace window; got:\n%s", joined)
+		t.Errorf("stuck must be suppressed (Path C: alive + activated + never-ticked); got:\n%s", joined)
 	}
 	if strings.Contains(joined, "spawned but never ticked") {
 		t.Errorf("never-ticked hint must NOT fire inside grace window; got:\n%s", joined)
@@ -1613,14 +1807,18 @@ func TestRender_IdleNotStuck_NoRedWarning(t *testing.T) {
 	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
 	stubRemoveMarker(t)
 
-	// Alive coord in HANDOFF state: spawned 20 minutes ago,
-	// last_activity == spawned_at (no tick under this spawn). Maps to
-	// the operator-reported config 1:1.
+	// Alive coord in HANDOFF state: spawned 20 minutes ago, Stop hook
+	// has fired (last_activity_ts > spawned_at, but stale relative to
+	// the 10m freshness window — operator's been idle waiting). Maps
+	// to the operator-reported config 1:1; agentEverActivated returns
+	// true (Claude was running long enough to fire at least one Stop
+	// hook), distinguishing this from "tmux wrapper survived a Claude
+	// crash at startup."
 	spawnedAt := now.Add(-20 * time.Minute)
 	records := []*agent.Record{
 		{
 			ID:             "49bc8a03",
-			LastActivityTS: spawnedAt,
+			LastActivityTS: now.Add(-15 * time.Minute), // > spawnedAt by 5min, stale
 			SpawnedAt:      spawnedAt,
 		},
 	}
