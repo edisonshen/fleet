@@ -16,15 +16,21 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
-// isolateTmuxSocket is a thin wrapper over tmuxtest.RequireTmux. Kept
+// isolateTmuxSocket is a thin wrapper over tmuxtest.IsolateSocket. Kept
 // as a local name so existing call sites in this file don't churn.
+// Delegates to IsolateSocket (NOT RequireTmux) because every caller is
+// a rejection-style test whose runDispatch is expected to fail BEFORE
+// reaching tmux.Spawn — using RequireTmux would skip the test on
+// tmux-less CI and regress coverage of the validation paths (codex
+// review iter-1 [P2], 2026-05-15).
+//
 // Postmortem 2026-05-14 (orphan tmux leak) + 2026-05-15 follow-up: any
 // test that may call tmux.Spawn (directly or via spawn.Spawn /
 // runDispatch / runHandoff) MUST isolate FLEET_TMUX_SOCKET — tmux.Spawn
 // under `go test` now returns an error if FLEET_TMUX_SOCKET is empty.
 func isolateTmuxSocket(t *testing.T) string {
 	t.Helper()
-	return tmuxtest.RequireTmux(t)
+	return tmuxtest.IsolateSocket(t)
 }
 
 // TestDispatch_EngineFlag_Exposed pins that `fleet dispatch --engine ...`

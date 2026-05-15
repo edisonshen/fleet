@@ -59,3 +59,39 @@ func TestRequireTmux_UniquePerCall(t *testing.T) {
 		t.Errorf("two RequireTmux calls returned identical sock paths %q", a)
 	}
 }
+
+// TestIsolateSocket_DoesNotSkipWhenTmuxMissing pins codex review iter-1
+// [P2] (2026-05-15): IsolateSocket must NOT call t.Skip on missing tmux,
+// so rejection-style tests in cmd/fleet keep their coverage on tmux-less
+// CI. We exercise the invariant by calling IsolateSocket inside a
+// subtest and verifying it returned (didn't skip) and set the env var.
+// The subtest only knows it was skipped after its inner code ran; we
+// just check the env-var side effect since LookPath cannot be mocked
+// here.
+func TestIsolateSocket_DoesNotSkipWhenTmuxMissing(t *testing.T) {
+	var sock string
+	t.Run("inner", func(t *testing.T) {
+		sock = IsolateSocket(t)
+	})
+	if sock == "" {
+		t.Fatal("IsolateSocket returned empty path — must succeed regardless of tmux availability")
+	}
+	if !strings.HasPrefix(sock, "/tmp/fleet-test-") {
+		t.Errorf("IsolateSocket sock = %q; want /tmp/fleet-test-* prefix", sock)
+	}
+}
+
+// TestIsolatedSocketPath_Width pins the 24-bit (6-hex-char) suffix.
+// Birthday-collision math: with N parallel test sockets, P(collision)
+// grows ~= N^2 / (2 * 2^24). For N ~= 200 dozen, P < 0.001 — safe.
+// (Codex review iter-1 [P2] (2026-05-15) flagged the 16-bit version
+// as collision-realistic.)
+func TestIsolatedSocketPath_Width(t *testing.T) {
+	sock := isolatedSocketPath(t)
+	prefix := "/tmp/fleet-test-"
+	suffix := ".sock"
+	if len(sock) != len(prefix)+6+len(suffix) {
+		t.Errorf("sock %q length %d; want prefix+6hex+suffix = %d",
+			sock, len(sock), len(prefix)+6+len(suffix))
+	}
+}
