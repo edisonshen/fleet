@@ -38,7 +38,18 @@ func requireTmux(t *testing.T) {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
+	t.Setenv("FLEET_TMUX_SOCKET", sock)
+	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
+	// server and remove the socket file on exit so /tmp doesn't fill
+	// up with stale .sock files and the default tmux server doesn't
+	// accumulate fleet-* sessions across the test suite.
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			t.Logf("cleanup: remove %s: %v", sock, err)
+		}
+	})
 	// retireOldAgent calls spawn.SendInitialPrompt, which polls the
 	// pane for stability. Production windows (500 ms stable / 30 s
 	// max) would balloon the suite; tests pin small values that

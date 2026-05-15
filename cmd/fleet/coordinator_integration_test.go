@@ -236,6 +236,16 @@ func (env *integrationEnv) runFleet(t *testing.T, args ...string) string {
 		"HOME="+env.homeDir,
 		"PATH="+env.binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
+	// Postmortem 2026-05-14 (orphan tmux leak): propagate
+	// FLEET_TMUX_SOCKET so the child `fleet` binary's tmux.Spawn
+	// targets the per-test server, not the operator's default.
+	// os.Environ() above DOES include this var (requireTmux set it
+	// via t.Setenv), but the explicit append in cmd.Env after
+	// os.Environ() would still inherit it — so a no-op append here
+	// is for explicitness + future-proofing if the env layering shifts.
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		cmd.Env = append(cmd.Env, "FLEET_TMUX_SOCKET="+sock)
+	}
 	cmd.Dir = env.repoCwd
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -302,6 +312,15 @@ print(json.dumps({
 		// (default 4 h) elapses.
 		"FLEET_COORD_POLL_INTERVAL_S=0",
 	)
+	// Postmortem 2026-05-14 (orphan tmux leak): the python3 driver's
+	// `loop.tick` shells out to `fleet dispatch`, which calls
+	// tmux.Spawn. Without explicit FLEET_TMUX_SOCKET propagation any
+	// drift in the os.Environ() inheritance (e.g., a future PR that
+	// passes cmd.Env = []string{...} directly) silently leaks tmux
+	// sessions onto the operator's default server.
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		cmd.Env = append(cmd.Env, "FLEET_TMUX_SOCKET="+sock)
+	}
 	cmd.Dir = env.repoCwd
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out

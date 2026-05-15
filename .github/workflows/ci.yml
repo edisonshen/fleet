@@ -45,6 +45,13 @@ jobs:
         with:
           version: v2.11.4
 
+      - name: Test isolation lint
+        # Postmortem 2026-05-14 (orphan tmux leak): every *_test.go that
+        # calls tmux.Spawn / spawn.Spawn must isolate FLEET_TMUX_SOCKET
+        # or it leaks tmux sessions onto the operator's default server.
+        # This guard fails CI when a future PR forgets the isolation.
+        run: bash scripts/lint-test-isolation.sh
+
       - name: Test
         run: go test -race -count=1 ./...
 

@@ -17,6 +17,30 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
+// isolateTmuxSocket sets FLEET_TMUX_SOCKET to a per-test path and
+// registers cleanup that kills the per-test tmux server + removes the
+// socket file. Used by tests that exercise runDispatch (which may
+// reach spawn.Spawn → tmux.Spawn depending on host) but don't want the
+// full requireTmux dance with handoff-tuning env vars. Postmortem
+// 2026-05-14 (orphan tmux leak): any test that may call tmux.Spawn
+// MUST isolate the socket and clean up after itself.
+func isolateTmuxSocket(t *testing.T) string {
+	t.Helper()
+	var b [3]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		t.Fatalf("rand.Read: %v", err)
+	}
+	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
+	t.Setenv("FLEET_TMUX_SOCKET", sock)
+	t.Cleanup(func() {
+		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			t.Logf("cleanup: remove %s: %v", sock, err)
+		}
+	})
+	return sock
+}
+
 // TestDispatch_EngineFlag_Exposed pins that `fleet dispatch --engine ...`
 // is a valid invocation — the flag must be visible on the assembled
 // dispatch subcommand WHEN reached through the root cmd (cobra walks
@@ -80,10 +104,16 @@ func TestDispatch_UnknownEngineRejected(t *testing.T) {
 // runDispatch does NOT error with "unknown engine" when the env
 // holds a valid name — we can't easily inspect the agent record
 // without tmux, so this test asserts the gate doesn't reject.
+//
+// FLEET_TMUX_SOCKET is isolated (postmortem 2026-05-14): without
+// the per-test socket, an environment with codex installed would
+// drive runDispatch past the engine gate INTO spawn.Spawn against
+// the operator's default tmux server and leak a session per run.
 func TestDispatch_EngineFromEnv(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
 	t.Setenv("FLEET_ENGINE", "codex")
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "t1",
 		project: "p1",
@@ -175,6 +205,11 @@ func TestDispatch_FleetEngineEnvStamped(t *testing.T) {
 	t.Setenv("FLEET_HOME", root)
 	// Start with env unset; opts.engine carries the intent.
 	t.Setenv("FLEET_ENGINE", "")
+	// FLEET_TMUX_SOCKET isolation (postmortem 2026-05-14): runDispatch
+	// can reach spawn.Spawn before erroring out depending on the host
+	// environment; without isolation it would target the operator's
+	// default tmux server.
+	isolateTmuxSocket(t)
 	opts := &dispatchOpts{
 		taskID:  "t1",
 		project: "p1",
@@ -215,12 +250,9 @@ func TestDispatch_ProgrammaticCommandNotOverriddenByEngine(t *testing.T) {
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
-	// Isolate the tmux socket so concurrent test runs don't collide.
-	var b [3]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// Isolate the tmux socket so concurrent test runs don't collide
+	// AND so the per-test tmux server is cleaned up on exit.
+	isolateTmuxSocket(t)
 	t.Setenv("FLEET_ENGINE", "codex")
 
 	opts := &dispatchOpts{
@@ -285,11 +317,9 @@ func TestDispatch_CobraDefaultCommandSwappedForEngine(t *testing.T) {
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("Bootstrap: %v", err)
 	}
-	var b [3]byte
-	if _, err := cryptorand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-test-"+hex.EncodeToString(b[:])+".sock")
+	// Isolate + cleanup the per-test tmux server. Same rationale as
+	// the sibling test (postmortem 2026-05-14 orphan-tmux-leak).
+	isolateTmuxSocket(t)
 	t.Setenv("FLEET_ENGINE", "codex")
 
 	// Mirror what cobra leaves on the dispatch RunE path when the

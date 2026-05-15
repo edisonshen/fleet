@@ -16,7 +16,8 @@ import (
 // Each test gets its own tmux server via FLEET_TMUX_SOCKET — a short
 // path under /tmp so the macOS Unix-socket length limit isn't hit
 // (TMUX_TMPDIR with t.TempDir()-based paths overflows). Cleans up
-// the server on test exit.
+// the server AND removes the socket file on test exit (postmortem
+// 2026-05-14: tests were leaving 2,800+ stale .sock files in /tmp/).
 func requireTmux(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("tmux"); err != nil {
@@ -24,6 +25,7 @@ func requireTmux(t *testing.T) {
 	}
 	sock := isolatedSocket(t)
 	t.Setenv("FLEET_TMUX_SOCKET", sock)
+	cleanupTmuxSocket(t, sock)
 }
 
 // isolatedSocket returns a short /tmp path unique to this test run.
@@ -32,6 +34,30 @@ func requireTmux(t *testing.T) {
 func isolatedSocket(t *testing.T) string {
 	t.Helper()
 	return "/tmp/fleet-test-" + randHex(t) + ".sock"
+}
+
+// cleanupTmuxSocket installs a t.Cleanup that kills the per-test tmux
+// server and removes the socket file on test exit. Runs regardless of
+// pass/fail/panic. Errors are swallowed — server may already be dead,
+// socket may already be gone. Postmortem 2026-05-14 (orphan tmux leak):
+// without this, every integration test left a tmux server + a .sock
+// file behind, and a long-running operator's /tmp accumulated thousands
+// of stale sockets plus a session-per-test on the default tmux server.
+func cleanupTmuxSocket(t *testing.T, sock string) {
+	t.Helper()
+	t.Cleanup(func() {
+		// kill-server is idempotent: tmux returns non-zero if the
+		// server isn't running, which is fine — we just want it gone.
+		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
+		// Some tmux builds leave the socket file behind even after
+		// kill-server; remove it explicitly.
+		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
+			// Don't fail the test on cleanup error — surface it as a
+			// log so the operator can investigate, but the test result
+			// is already recorded.
+			t.Logf("cleanupTmuxSocket: remove %s: %v", sock, err)
+		}
+	})
 }
 
 // capturePaneArgs builds the args for `tmux capture-pane` against the
@@ -55,6 +81,52 @@ func TestAvailable(t *testing.T) {
 	requireTmux(t)
 	if err := Available(); err != nil {
 		t.Errorf("Available: %v", err)
+	}
+}
+
+// TestRequireTmux_SetsFleetTmuxSocket regresses postmortem 2026-05-14
+// (orphan tmux leak): requireTmux MUST set FLEET_TMUX_SOCKET to a
+// non-empty path before any test code runs, AND must register a
+// cleanup that removes the socket file on exit. Without those two
+// invariants integration tests leak tmux sessions onto the operator's
+// default server and stale .sock files into /tmp.
+//
+// We exercise requireTmux from within a t.Run subtest so we can read
+// FLEET_TMUX_SOCKET both during the subtest (must be set) and after
+// the subtest completes (cleanup must have fired, the socket file
+// must be gone).
+func TestRequireTmux_SetsFleetTmuxSocket(t *testing.T) {
+	// Capture the parent's FLEET_TMUX_SOCKET so we can detect that
+	// requireTmux changed it. The outer test process may have inherited
+	// a socket from a wrapping shell; we just need to see a different
+	// value inside the subtest.
+	parentSock := os.Getenv("FLEET_TMUX_SOCKET")
+
+	var inSock string
+	t.Run("inner", func(t *testing.T) {
+		requireTmux(t) // sets FLEET_TMUX_SOCKET + registers cleanup
+		inSock = os.Getenv("FLEET_TMUX_SOCKET")
+		if inSock == "" {
+			t.Fatal("requireTmux did not set FLEET_TMUX_SOCKET")
+		}
+		if inSock == parentSock {
+			t.Fatalf("requireTmux did not override FLEET_TMUX_SOCKET; still %q", inSock)
+		}
+		if !strings.HasPrefix(inSock, "/tmp/fleet-test-") {
+			t.Errorf("FLEET_TMUX_SOCKET = %q; want /tmp/fleet-test-* prefix", inSock)
+		}
+		// Touch the socket path to verify cleanup actually removes it.
+		// requireTmux only creates the file when tmux later spawns a
+		// session against it, so we forge one here.
+		if err := os.WriteFile(inSock, []byte("probe"), 0o600); err != nil {
+			t.Fatalf("write probe socket file: %v", err)
+		}
+	})
+	// After the subtest's t.Cleanup fires, the socket file must be
+	// gone. (We don't assert on the env var because t.Setenv inside
+	// the subtest restored it on subtest exit.)
+	if _, err := os.Stat(inSock); !os.IsNotExist(err) {
+		t.Errorf("requireTmux cleanup did not remove %s (stat err=%v)", inSock, err)
 	}
 }
 
