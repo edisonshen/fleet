@@ -1020,40 +1020,6 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	}
 	autoResume := !disableAutoResume && pendingSchemaVersion >= 2
 
-	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
-	// wait doubles as a post-spawn liveness check, and a wrapper
-	// that crashes shortly after the previous run's spawn must be
-	// caught here so we don't retire old into nothing (codex iter-9
-	// P1).
-	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
-			newRec.TmuxSession, err)
-	}
-	// SessionAlive (not HasSession) so probe failures don't roll
-	// back a live replacement (codex iter-15 P1).
-	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
-			newRec.TmuxSession, perr)
-	} else if !alive {
-		// Codex iter-11 [P1]: a PREVIOUS run may have eagerly moved
-		// the marker to newRec.ID before crashing — by the time we
-		// reach this rollback the marker can already point at the
-		// dead NEW. Restore it to oldRec.ID so dashboard discovery
-		// + a retry's isCoordSwap detection keep working.
-		if oldRec.Project != "" && state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
-			if werr := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); werr != nil {
-				_, _ = fmt.Fprintf(stderr,
-					"warning: rollback coord-spawn marker for project %s failed: %v (operator may need to re-write manually)\n",
-					oldRec.Project, werr)
-			}
-		}
-		return fmt.Errorf(
-			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
-			newRec.ID, newRec.TmuxSession, oldRec.ID)
-	}
-
 	// Coord swap fast path on the crash-recovery flow too. The
 	// previous run may have:
 	//   - crashed AFTER spawn but BEFORE marker write: marker still
@@ -1063,6 +1029,16 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 	//     step 1.b accepts markerAtNew, step 4 skips the redundant
 	//     rename, retire (kill+archive OLD) proceeds.
 	// (Codex iter-5 [P1], iter-9 [P1].)
+	//
+	// Codex iter-13 [P1]: this block MUST run BEFORE the readiness
+	// wait below. Without the eager marker write happening first,
+	// the marker stays at oldRec.ID through the full up-to-30s boot
+	// wait. If OLD exits during that window (or operator hits `[a]`),
+	// the dashboard can't discover NEW as the coord (record.ID !=
+	// marker) and spawns a duplicate coordinator — the exact race
+	// this whole atomic-swap PR is meant to close. runHandoff already
+	// orders these correctly (step 8a-bis precedes step 8c); the
+	// crash-recovery path must match.
 	//
 	// Eager marker write when marker is still at oldRec.ID, same as
 	// runHandoff — closes the duplicate-coord window during the
@@ -1080,6 +1056,37 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 		case newRec.ID:
 			isCoordSwap = true
 		}
+	}
+
+	// Wait BEFORE killing old (codex iter-8 P1). Always runs — the
+	// wait doubles as a post-spawn liveness check, and a wrapper
+	// that crashes shortly after the previous run's spawn must be
+	// caught here so we don't retire old into nothing (codex iter-9
+	// P1).
+	if err := spawn.WaitForReadyToPrompt(newRec.TmuxSession); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: readiness poll for %s did not converge: %v (proceeding anyway)\n",
+			newRec.TmuxSession, err)
+	}
+	// SessionAlive (not HasSession) so probe failures don't roll
+	// back a live replacement (codex iter-15 P1).
+	if alive, perr := tmux.SessionAlive(newRec.TmuxSession); perr != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: post-readiness probe for %s failed: %v (proceeding anyway)\n",
+			newRec.TmuxSession, perr)
+	} else if !alive {
+		// Codex iter-11 [P1]: the eager marker write above may have
+		// committed marker → newRec.ID before NEW died during the
+		// readiness wait. Restore it to oldRec.ID so dashboard
+		// discovery + a retry's isCoordSwap detection keep working.
+		// Idempotent if marker is already at oldRec.ID (eager write
+		// failed) or unrelated.
+		if isCoordSwap {
+			handoffop.RollbackCoordMarkerIfPointingAt(oldRec.Project, oldRec.ID, newRec.ID, stderr)
+		}
+		return fmt.Errorf(
+			"resume handoff: replacement %s tmux session %s exited during readiness wait; old agent %s untouched, retry handoff",
+			newRec.ID, newRec.TmuxSession, oldRec.ID)
 	}
 	if isCoordSwap {
 		_, swapErr := handoffop.AtomicCoordSwap(handoffop.AtomicCoordSwapInputs{

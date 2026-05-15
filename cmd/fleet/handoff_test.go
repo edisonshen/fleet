@@ -426,6 +426,85 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 	})
 }
 
+// TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait pins
+// codex iter-13 [P1]: in resumeHandoff (the crash-recovery flow), the
+// eager marker write must happen BEFORE the WaitForReadyToPrompt call.
+// Otherwise the marker sits at oldRec.ID for the full up-to-30s boot
+// wait, and if OLD exits during that window the dashboard `[a]` path
+// can't find NEW (record.ID != marker) and spawns a duplicate coord.
+//
+// This test exercises the happy path of resumeHandoff with a coord
+// marker pre-seeded at oldRec.ID. Post-fix:
+//   - eager write commits marker → newRec.ID before the readiness wait
+//   - readiness wait passes (real tmux pane on a long-lived shell)
+//   - AtomicCoordSwap runs, archives old, queue deleted
+//   - final marker stays at newRec.ID (= replacement.ID)
+//
+// Pre-fix this test would still pass at the end (eager write happened
+// later but still happened). The structural defense lives in the
+// inline comment at handoff.go's resumeHandoff isCoordSwap block + the
+// fact that this test asserts the marker is set at all on the recovery
+// path. A regression that re-orders eager-write AFTER the wait would
+// not break this test directly, but it WOULD break
+// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn below
+// (which deletes a stale newRec — the rollback helper is what
+// re-anchors the marker).
+func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	// Seed marker at old.ID so isCoordSwap fires on the recovery path.
+	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(old.Project, old.ID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	// Pre-spawn a live replacement (simulating the crash window
+	// between original spawn and queue.Delete).
+	replacement, err := agentSpawnForTest(t, t.TempDir(),
+		[]string{"sleep", "120"}, old.Project, old.TaskID)
+	if err != nil {
+		t.Fatalf("seed replacement: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
+
+	docPath := "/some/handoffs/" + old.ID + "-stub.md"
+	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    old.ID,
+		HandoffDoc:    docPath,
+		Project:       old.Project,
+		TaskID:        old.TaskID,
+		NewAgentID:    replacement.ID,
+		NewSession:    replacement.TmuxSession,
+	}); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("runHandoff: %v\n%s", err, out.String())
+	}
+
+	// Marker must land at replacement.ID — AtomicCoordSwap's commit
+	// point. Pre-fix iter-13: same end state, but the marker spent
+	// the wait window stuck at old.ID. Test guards the end state;
+	// the structural defense is the code order in resumeHandoff.
+	got := state.ReadCoordSpawnMarker(old.Project)
+	if got != replacement.ID {
+		t.Errorf("coord marker not at replacement after resumeHandoff: got %q want %q",
+			got, replacement.ID)
+	}
+}
+
 // TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn pins
 // codex iter-12 [P1] on the manual-handoff recovery path
 // (cmd/fleet/handoff.go:378-387). When the recovery probe finds a stale
