@@ -59,7 +59,7 @@ cd "$repo_root"
 # Use "|" as the inter-needle separator so individual needles can
 # legally contain spaces (e.g., "= Spawn(" for package-local
 # helper calls like `err := Spawn(...)` minus the `:`).
-triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|Resume(|runFleet(|runTickCap(|runTick(|= Spawn(|:= Spawn("
+triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|runDrain(|Resume(|runFleet(|runTickCap(|runTick(|= Spawn(|:= Spawn("
 
 # Isolation marker substrings. Keep narrow — every entry is an explicit
 # opt-in. The canonical marker is tmuxtest.RequireTmux (see
