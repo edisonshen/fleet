@@ -1382,12 +1382,28 @@ func TestCoordNeverTickedThisSpawn_EdgeCases(t *testing.T) {
 			want:    false,
 		},
 		{
-			// codex iter-9 P2 fix: default to "never ticked" when
-			// SpawnedAt is missing so Path B can't remove the marker.
-			name:    "zero SpawnedAt → true (legacy, can't prove ticked → preserve marker)",
+			// codex iter-9 P2: default to "never ticked" when
+			// SpawnedAt is missing AND no state file exists, so
+			// Path B can't remove the marker.
+			name:    "zero SpawnedAt + zero LastTick → true (legacy, preserve marker)",
 			records: []*agent.Record{{ID: "x"}},
 			id:      "x",
 			want:    true,
+		},
+		{
+			// codex iter-15 P2: if a coord-state.json exists on disk
+			// (legacy record with non-zero LastTick), assume the coord
+			// ticked — without SpawnedAt we can't tell if the tick is
+			// from this spawn or a prior one, but defaulting to
+			// "ticked" prevents Path C from hiding real hangs behind
+			// the soft never-ticked hint for upgraded installs.
+			name: "zero SpawnedAt + non-zero LastTick → false (assume ticked, surface hangs)",
+			records: []*agent.Record{
+				{ID: "x"},
+			},
+			id:       "x",
+			lastTick: now.Add(-5 * time.Minute),
+			want:     false,
 		},
 		{
 			name:    "zero LastTick, valid SpawnedAt → true (never ticked)",

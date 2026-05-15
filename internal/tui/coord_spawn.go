@@ -727,10 +727,17 @@ func coordNeverTickedThisSpawn(
 		if r.SpawnedAt.IsZero() {
 			// Legacy / partial-write record without spawned_at. We
 			// can't prove the coord ticked under this spawn (no
-			// reference point), so default to "never ticked" — that
-			// preserves the marker for [a] re-attach in Path A/B's
-			// caller-level gate.
-			return true
+			// reference point). Codex iter-15 P2 split:
+			//   - lastTick non-zero → some coord-state.json exists on
+			//     disk. Could be from this spawn OR a previous one;
+			//     without SpawnedAt we cannot tell. Conservative:
+			//     assume "ticked" so Path C doesn't falsely render
+			//     "never ticked" / hide a real wedge.
+			//   - lastTick zero → no state file at all, no reference
+			//     point. Default to "never ticked" so the marker is
+			//     preserved (codex iter-9 P2) — losing the marker
+			//     breaks [a] re-attach for legacy installs.
+			return lastTick.IsZero()
 		}
 		if lastTick.IsZero() {
 			return true
