@@ -627,26 +627,34 @@ func TestRemoteControlSessionPrefix_MatchesPythonDaemon(t *testing.T) {
 // byte-equality contract between handoffSessionPrefix in this
 // package's handoff.go and internal/handoff.FirstAction's bash
 // block. The replacement-spawn injection in cmd/fleet/handoff.go
-// (and internal/handoffop/handoffop.go) writes the literal
-// `fleet-handoff-<new-id>` session name; the FirstAction bash
+// (and internal/handoffop/handoffop.go) writes session names of the
+// form `fleet-handoff-<new-id>-<project>`; the FirstAction bash
 // bootstrap launches a daemon with
-// `--remote-control-session-name-prefix "fleet-handoff"`. Drift
-// between them would silently break mobile pairing on handoff.
+// `--remote-control-session-name-prefix "fleet-handoff-<project>"`.
+// Drift between the prefix-shape and the registered-name-shape
+// would silently break mobile pairing on handoff. The shared root
+// (`fleet-handoff`) is what couples them — assert it matches the
+// constant on this side AND appears as the daemon-prefix root in
+// the FirstAction body for any project we render with.
 func TestHandoffSessionPrefix_MatchesFirstActionDaemon(t *testing.T) {
 	if handoffSessionPrefix != "fleet-handoff" {
 		t.Errorf("handoffSessionPrefix = %q; want %q (must match "+
 			"internal/handoff.FirstAction's "+
-			"--remote-control-session-name-prefix value)",
+			"--remote-control-session-name-prefix root)",
 			handoffSessionPrefix, "fleet-handoff")
 	}
-	// Belt-and-braces: the FirstAction body must literally contain
-	// the prefix value so a future docs/style refactor doesn't drop
-	// it. We import handoff.FirstAction here to keep both ends in one
-	// test.
-	if !strings.Contains(handoff.FirstAction, `"`+handoffSessionPrefix+`"`) {
-		t.Errorf("handoff.FirstAction must reference the quoted "+
-			"%q session-name-prefix value; got body that doesn't "+
-			"include it: %q", handoffSessionPrefix, handoff.FirstAction)
+	// Belt-and-braces: render FirstAction for a representative
+	// project and assert the daemon-prefix flag value carries both
+	// the shared root AND the project suffix. A future drop of
+	// either half (e.g. silently reverting to the legacy generic
+	// prefix) breaks here loudly.
+	const project = "rainier"
+	body := handoff.FirstAction(project)
+	wantQuoted := `"` + handoffSessionPrefix + `-` + project + `"`
+	if !strings.Contains(body, wantQuoted) {
+		t.Errorf("handoff.FirstAction(%q) must reference the quoted "+
+			"%s session-name-prefix value; got body that doesn't "+
+			"include it: %q", project, wantQuoted, body)
 	}
 }
 

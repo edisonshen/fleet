@@ -57,10 +57,14 @@ func TestRender_FirstActionAppearsBeforeCompleted(t *testing.T) {
 func TestRender_FirstActionCarriesRemoteControlInvocation(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
+	// Project-scoped (rc-session-name-include): the daemon prefix
+	// + pgrep guard now carry the project name so per-project
+	// daemons coexist and the operator can distinguish per-project
+	// sessions on phone / claude.ai.
 	for _, want := range []string{
-		`pgrep -f "claude remote-control"`,
+		"pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-handoff-rainier",
 		"nohup claude remote-control",
-		`--remote-control-session-name-prefix "fleet-handoff"`,
+		`--remote-control-session-name-prefix "fleet-handoff-rainier"`,
 		"run_in_background: true",
 	} {
 		if !strings.Contains(got, want) {
@@ -284,7 +288,7 @@ func TestRender_SkillByteGolden(t *testing.T) {
 		"handoff_type: \"auto-yellow\"\n" +
 		"---\n" +
 		"\n" +
-		"## First Action (auto)\n" + FirstAction + "\n\n" +
+		"## First Action (auto)\n" + FirstAction(d.Project) + "\n\n" +
 		"## Completed\nWrote tests for foo\n\n" +
 		"## Key Decisions\n" + Placeholder + "\n\n" +
 		"## Files Modified\n" + Placeholder + "\n\n" +

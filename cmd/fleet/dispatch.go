@@ -436,7 +436,14 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// Match the daemon prefix from skills/coordinator/remote_control.py
 		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
 		// without this prefix wouldn't attach to the daemon.
-		rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
+		//
+		// Project suffix (rc-session-name-include): the
+		// operator-visible session name on claude.ai mobile / web is
+		// `fleet-coord-<id>-<project>` so coords across multiple
+		// projects (spark, fleet, rainier, ...) can be told apart.
+		// Suffix-extension keeps the legacy `fleet-coord-<id>`
+		// substring intact for pidresolver disambiguator matching.
+		rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
 		rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
 		// Only set ExecCommand when the rewrite actually changed
 		// something — passing through an unchanged custom --command
@@ -655,7 +662,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 				if !opts.commandExplicit && !legacyRecord && preClampEngine == engineName && len(oldRecord.Command) > 0 {
 					opts.command = append([]string(nil), oldRecord.Command...)
 					if opts.coordSpawn && preAllocatedID != "" {
-						rcSessionName := remoteControlSessionPrefix + "-" + preAllocatedID
+						// Project-suffixed name for the recovered coord
+						// — same shape as the fresh-spawn branch above.
+						rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
 						rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
 						if !sameCommand(rewritten, opts.command) {
 							rewrittenExecArgv = rewritten
@@ -849,6 +858,30 @@ func injectRemoteControlFlag(command []string, sessionName string) []string {
 // sameCommand mirrors the spawn.SameCommand helper. See doc there.
 func sameCommand(a, b []string) bool {
 	return spawn.SameCommand(a, b)
+}
+
+// buildCoordRemoteControlSessionName constructs the per-coord
+// --remote-control session name. The shape
+// `fleet-coord-<id>-<project>` is what the operator sees on
+// claude.ai mobile / web; the project suffix lets them distinguish
+// coords across projects (spark vs fleet vs rainier) instead of
+// seeing identical `fleet-coord-<8hex>` entries.
+//
+// The daemon's --remote-control-session-name-prefix stays the broad
+// `fleet-coord` literal (skills/coordinator/remote_control.py), so any
+// session name starting with that prefix attaches to the same daemon.
+// We don't need a per-project daemon for the coord side; the per-
+// project naming is purely operator-visible disambiguation.
+func buildCoordRemoteControlSessionName(agentID, project string) string {
+	return spawn.CoordRemoteControlSessionName(agentID, project)
+}
+
+// buildHandoffRemoteControlSessionName mirrors
+// buildCoordRemoteControlSessionName for handoff replacements.
+// Format: `fleet-handoff-<id>-<project>`. See the spawn-side helper
+// for the suffix-extension rationale.
+func buildHandoffRemoteControlSessionName(agentID, project string) string {
+	return spawn.HandoffRemoteControlSessionName(agentID, project)
 }
 
 // sendInitialPrompt is a var so tests can stub the tmux interaction.

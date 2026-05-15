@@ -217,26 +217,82 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 // Slash commands run in chat (not bash), so they're separate
 // paragraphs after the bash block, not piped continuations of it.
 //
+// FirstAction renders the body of the "First Action (auto)" section
+// for the given project. The bash block spawns a per-project
+// `claude remote-control` daemon (one per project so the operator
+// can distinguish per-project sessions on phone / claude.ai); the
+// pgrep guard is narrowed on the per-project prefix so daemons for
+// different projects don't mask each other's launch.
+//
+// Empty project falls back to the legacy generic
+// `--remote-control-session-name-prefix "fleet-handoff"` shape so
+// older rendered docs / records that didn't carry a project still
+// produce a well-formed bash block.
+//
 // Issue #31, #56. Must stay byte-identical with
-// skills/fleet-guard/handoff.py FIRST_ACTION constant — the Python skill
-// writes the same handoff doc shape on auto-handoff and renderers are
-// tested for byte-equality.
-const FirstAction = "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
-	"\n" +
-	"```bash\n" +
-	"( pgrep -f \"claude remote-control\" >/dev/null 2>&1 || \\\n" +
-	"  nohup claude remote-control \\\n" +
-	"    --remote-control-session-name-prefix \"fleet-handoff\" \\\n" +
-	"    > /tmp/claude-rc-handoff.log 2>&1 & )\n" +
-	"```\n" +
-	"\n" +
-	"Use the Bash tool with run_in_background: true.\n" +
-	"\n" +
-	"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n" +
-	"\n" +
-	"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
-	"\n" +
-	"Then continue with the sections below."
+// skills/fleet-guard/handoff.py:first_action(project) — the Python
+// skill writes the same handoff doc shape on auto-handoff and
+// renderers are tested for byte-equality.
+func FirstAction(project string) string {
+	prefix := "fleet-handoff"
+	if project != "" {
+		prefix = prefix + "-" + project
+	}
+	// pgrep regex — narrowed on the project-scoped prefix with a
+	// word-boundary terminator `( |$)` so a hypothetical longer prefix
+	// like `fleet-handoff-sparkX` doesn't false-positive. Mirrors the
+	// coord-side pattern in skills/coordinator/remote_control.py:
+	// spawn_daemon_if_needed.
+	//
+	// Regex-escape the prefix because ValidateProjectName allows `.`
+	// in project names (e.g. `v2.1`). Without escaping, `fleet-handoff-v2.1`
+	// would match a daemon for `fleet-handoff-v2a1` (false positive),
+	// causing the bootstrap to skip launching the v2.1 daemon while the
+	// replacement agent still registers as `fleet-handoff-<id>-v2.1`,
+	// leaving /remote-control with no compatible daemon to attach to.
+	// Allowed project chars are `[a-z0-9._-]`; only `.` is a regex
+	// metachar. Escape just that one to keep the rest readable.
+	pgrepPattern := "^claude remote-control --remote-control-session-name-prefix " + escapeProjectForPgrep(prefix) + "( |$)"
+	return "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
+		"\n" +
+		"```bash\n" +
+		"( pgrep -f '" + pgrepPattern + "' >/dev/null 2>&1 || \\\n" +
+		"  nohup claude remote-control \\\n" +
+		"    --remote-control-session-name-prefix \"" + prefix + "\" \\\n" +
+		"    > /tmp/claude-rc-handoff.log 2>&1 & )\n" +
+		"```\n" +
+		"\n" +
+		"Use the Bash tool with run_in_background: true.\n" +
+		"\n" +
+		"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n" +
+		"\n" +
+		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
+		"\n" +
+		"Then continue with the sections below."
+}
+
+// escapeProjectForPgrep escapes regex metacharacters that may appear
+// in a project-scoped daemon prefix when used as a pgrep -f pattern.
+// ValidateProjectName allows `[a-z0-9._-]`; among those only `.` is a
+// regex metacharacter (matches any char). Hyphens are special only
+// inside character classes; underscores are always literal. We do not
+// use strings.NewReplacer or regexp.QuoteMeta because we want a
+// targeted, easily-auditable swap that mirrors what
+// skills/fleet-guard/handoff.py:_escape_project_for_pgrep does on the
+// Python side — keeping the two renderers byte-equal is a
+// load-bearing invariant (TestRender_SkillByteGolden).
+func escapeProjectForPgrep(s string) string {
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' {
+			out = append(out, '\\', '.')
+			continue
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
 
 // Render produces the markdown+frontmatter bytes for d.
 //
@@ -282,7 +338,7 @@ func Render(d *Doc) []byte {
 	fmt.Fprintf(&b, "handoff_type: %q\n", d.Type)
 	b.WriteString("---\n\n")
 
-	fmt.Fprintf(&b, "## First Action (auto)\n%s\n\n", FirstAction)
+	fmt.Fprintf(&b, "## First Action (auto)\n%s\n\n", FirstAction(d.Project))
 	fmt.Fprintf(&b, "## Completed\n%s\n\n", d.Completed)
 	fmt.Fprintf(&b, "## Key Decisions\n%s\n\n", d.KeyDecisions)
 	fmt.Fprintf(&b, "## Files Modified\n%s\n\n", d.FilesModified)
