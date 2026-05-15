@@ -50,14 +50,29 @@ cd "$repo_root"
 # call graph. Add to this list when new transitive entry points appear.
 # (Substring matching via awk index() is portable across BSD/GNU awk —
 # regex with literal '(' chars trips BSD awk's ERE on macOS.)
-triggers="tmux.Spawn( spawn.Spawn( runDispatch( runHandoff( runHandoffDrain( Resume("
+#
+# Subprocess entry points (runFleet, runTickCap) shell out to a child
+# `fleet` binary that calls tmux.Spawn from inside the child process.
+# `testing.Testing()` is false in the child, so the runtime sink guard
+# doesn't fire — the lint is the only safety net for these. Codex
+# review iter-3 [P2] (2026-05-15) flagged this gap.
+triggers="tmux.Spawn( spawn.Spawn( runDispatch( runHandoff( runHandoffDrain( Resume( runFleet( runTickCap( runTick("
 
 # Isolation marker substrings. Keep narrow — every entry is an explicit
 # opt-in. The canonical marker is tmuxtest.RequireTmux (see
 # internal/testutil/tmuxtest). The two-pass scan below adds any
 # non-test helper function that itself calls one of these markers
 # (e.g., setupCoordIntegration → requireTmux → tmuxtest.RequireTmux).
-markers="tmuxtest.RequireTmux requireTmux( isolateTmuxSocket( FLEET_TMUX_SOCKET"
+#
+# Codex review iter-3 [P2] (2026-05-15): the bare substring
+# `FLEET_TMUX_SOCKET` matched any read of the env var (e.g., a helper
+# that forwards it to a subprocess) and falsely attested isolation.
+# Narrow to the two patterns that ACTUALLY set the variable:
+# `t.Setenv("FLEET_TMUX_SOCKET"` (the helper path) and
+# `os.Setenv("FLEET_TMUX_SOCKET"` (the rare direct path). Reads /
+# inspections of the var still pass the trigger-bearing helper as a
+# trigger, not a marker.
+markers='tmuxtest.RequireTmux requireTmux( isolateTmuxSocket( t.Setenv("FLEET_TMUX_SOCKET os.Setenv("FLEET_TMUX_SOCKET'
 
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.
