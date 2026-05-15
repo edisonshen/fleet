@@ -376,6 +376,35 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 					"recovery probe: probe replacement %s session %s failed: %w (queue file preserved for operator inspection)",
 					newRec.ID, newRec.TmuxSession, perr)
 			case !alive:
+				// Codex iter-14 [P1]: AtomicCoordSwap preserves the
+				// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous
+				// — NEW may have lost the coordinator.lock race + died
+				// while OLD is still the live coord. Refuse-and-preserve
+				// when this is a coord-swap journal AND OLD is alive;
+				// otherwise an operator-driven retry without first
+				// killing OLD would create a duplicate coord. Operator
+				// can bypass with --force-replacement once OLD is
+				// confirmed dead (or intentionally being replaced).
+				coordSwapJournal := false
+				if oldRec.Project != "" {
+					marker := state.ReadCoordSpawnMarker(oldRec.Project)
+					if marker == oldRec.ID || marker == newRec.ID {
+						coordSwapJournal = true
+					}
+				}
+				if coordSwapJournal && !opts.forceReplacement {
+					oldAlive, probeErr := tmux.SessionAlive(oldRec.TmuxSession)
+					switch {
+					case probeErr != nil:
+						return fmt.Errorf(
+							"recovery probe: replacement %s session %s appears dead but probing old coord %s session %s failed: %w (queue preserved; retry once probe is reliable, or pass --force-replacement)",
+							newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, probeErr)
+					case oldAlive:
+						return fmt.Errorf(
+							"recovery probe: replacement %s session %s exited but old coord %s session %s is still alive — refusing auto-respawn (would create duplicate coord); kill the orphan replacement or old coord manually then re-run, or pass --force-replacement to spawn anyway (queue preserved at %s)",
+							newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, pendingPath)
+					}
+				}
 				// fix/orphan-tmux-sweeper-and-leak-plug: pair the record
 				// removal with tmux.Kill (idempotent + SessionAlive-backed)
 				// so a transient probe failure inside Kill can't delete the

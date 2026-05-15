@@ -123,6 +123,57 @@ func Resume(req queue.SpawnFresh, queuePath string,
 			"resume: probe replacement %s session %s failed: %w (record preserved for operator inspection)",
 			newRec.ID, newRec.TmuxSession, perr)
 	case !alive:
+		// Codex iter-14 [P1]: AtomicCoordSwap preserves the queue
+		// journal on ErrOrphanSurvived / ErrOldKillProbeAmbiguous —
+		// the cases where NEW may have lost the coordinator.lock race
+		// + exited, while OLD is still the live coord. On the next
+		// drain / watcher pass we land here with newRec session
+		// definitively dead. Auto-respawning would put a SECOND
+		// replacement on top of a still-alive OLD, recreating the
+		// duplicate-coord loop the preserved queue is meant to avoid.
+		//
+		// Refuse-and-preserve when this is a coord swap (marker
+		// resolves to oldRec.ID OR newRec.ID) AND OLD is still alive.
+		// The operator can triage: kill OLD by hand and re-run drain,
+		// or rerun handoff with --force-replacement once OLD is gone.
+		// Worker handoffs (no marker / marker unrelated) keep the
+		// auto-respawn behavior — they don't have the dashboard
+		// duplicate-coord hazard, and worker-row CAS semantics are
+		// deferred per the v5 plan's Non-goals.
+		coordSwapJournal := false
+		if oldRec.Project != "" {
+			marker := state.ReadCoordSpawnMarker(oldRec.Project)
+			if marker == oldRec.ID || marker == newRec.ID {
+				coordSwapJournal = true
+			}
+		}
+		if coordSwapJournal {
+			oldAlive, probeErr := tmuxSessionAliveFn(oldRec.TmuxSession)
+			switch {
+			case probeErr != nil:
+				// Ambiguous OLD probe — refuse rather than risk
+				// respawning into a live coord. Queue stays so the
+				// next pass (or operator's explicit `fleet handoff`)
+				// can retry once the probe is reliable.
+				return fmt.Errorf(
+					"resume: replacement %s session %s appears dead but probing old coord %s session %s failed: %w (queue preserved; investigate manually)",
+					newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, probeErr)
+			case oldAlive:
+				// OLD coord is still alive — typically because the
+				// previous AtomicCoordSwap returned ErrOrphanSurvived
+				// or ErrOldKillProbeAmbiguous and preserved OLD.
+				// Auto-respawning here would compound the problem
+				// with a second replacement competing for the same
+				// coordinator.lock. Refuse, leave queue intact, surface
+				// the orphan to the operator.
+				return fmt.Errorf(
+					"resume: replacement %s session %s exited but old coord %s session %s is still alive — refusing auto-respawn (would create duplicate coord); kill the orphan replacement or the old coord manually, then re-run fleet drain (queue preserved at %s)",
+					newRec.ID, newRec.TmuxSession, oldRec.ID, oldRec.TmuxSession, queuePath)
+			}
+			// OLD is definitively dead — safe to drop NEW and spawn
+			// fresh. Falls through to DropReplacementRecord + rollback
+			// + spawnAndRetire below.
+		}
 		if dropErr := DropReplacementRecord(newRec.TmuxSession, newRec.ID, stderr); dropErr != nil {
 			return fmt.Errorf(
 				"resume: stale replacement %s session %s appeared dead but cleanup failed (%w); spawn fresh aborted",

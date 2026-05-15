@@ -809,6 +809,12 @@ func TestResume_StaleCoordMarker_RolledBackBeforeRespawn(t *testing.T) {
 		t.Fatalf("plant stale new rec: %v", err)
 	}
 
+	// Kill OLD's session so iter-14's "old still alive" refusal gate
+	// passes (this test exercises the rollback + respawn path; the
+	// refusal path is covered separately by
+	// TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn).
+	_ = tmux.Kill(oldRec.TmuxSession)
+
 	// Force the outer-gate probe to report "definitively dead" on the
 	// first call so cleanup fires deterministically.
 	origAlive := tmuxSessionAliveFn
@@ -934,5 +940,91 @@ func TestResume_StaleCoordMarker_NonCoord_NoRollback(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(freshRec.TmuxSession) })
 	if !tmux.HasSession(freshRec.TmuxSession) {
 		t.Errorf("fresh replacement session %s not alive", freshRec.TmuxSession)
+	}
+}
+
+// TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn pins codex
+// iter-14 [P1]: AtomicCoordSwap preserves the queue on
+// ErrOrphanSurvived / ErrOldKillProbeAmbiguous — NEW exited (lost the
+// coordinator.lock race or crashed) but OLD is still the live coord.
+// On the next drain pass we land in Resume's case-3 outer gate with
+// newRec session dead. Auto-respawning here would stack a second
+// replacement on top of the live OLD coord, recreating the
+// duplicate-coord loop the preserved queue is supposed to avoid.
+//
+// Post-fix: detect coord-swap-relevant marker state (marker resolves
+// to oldRec.ID OR newRec.ID), then probe OLD. If OLD is still alive,
+// refuse-and-preserve — let the operator triage. If OLD is dead, fall
+// through to the rollback + respawn path.
+func TestResume_StaleCoordMarker_OldStillAlive_RefusesRespawn(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t) // OLD session alive for the duration of the test.
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	// Marker at newRec.ID (committed by a prior swap that returned
+	// ErrOrphanSurvived / ErrOldKillProbeAmbiguous before retire).
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, req.NewAgentID); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+
+	// Plant a stale replacement record with a dead session (the helper
+	// session string we never spawned).
+	staleNew := agent.New(req.NewAgentID)
+	staleNew.TaskID = oldRec.TaskID
+	staleNew.Project = oldRec.Project
+	staleNew.Cwd = oldRec.Cwd
+	staleNew.Command = oldRec.Command
+	staleNew.TmuxSession = req.NewSession
+	staleNew.SpawnedAt = time.Now().UTC()
+	if err := staleNew.Write(); err != nil {
+		t.Fatalf("plant stale new rec: %v", err)
+	}
+
+	// Outer-gate probe says NEW is definitively dead. OLD probes fall
+	// through to real tmux.SessionAlive — OLD is alive (spawnSeedAgent).
+	origAlive := tmuxSessionAliveFn
+	tmuxSessionAliveFn = func(s string) (bool, error) {
+		if s == req.NewSession {
+			return false, nil
+		}
+		return origAlive(s)
+	}
+	t.Cleanup(func() { tmuxSessionAliveFn = origAlive })
+
+	out := &bytes.Buffer{}
+	err := Resume(req, qp, 0, out, out)
+	if err == nil {
+		t.Fatalf("Resume must refuse when OLD coord still alive; got nil error\n%s", out.String())
+	}
+	if !strings.Contains(err.Error(), "still alive") || !strings.Contains(err.Error(), "duplicate coord") {
+		t.Errorf("expected refusal mentioning 'still alive' + 'duplicate coord'; got: %v", err)
+	}
+
+	// Stale newRec record MUST NOT have been deleted (operator triage).
+	if _, lerr := agent.Load(staleNew.ID); lerr != nil {
+		t.Errorf("stale newRec record should be preserved for operator inspection; got load err=%v", lerr)
+	}
+
+	// Marker untouched.
+	if got := state.ReadCoordSpawnMarker(oldRec.Project); got != req.NewAgentID {
+		t.Errorf("marker mutated on refusal: got %q want %q", got, req.NewAgentID)
+	}
+
+	// Queue file must persist so the next pass (or operator's
+	// triage-then-retry) can resume.
+	if _, qerr := os.Stat(qp); qerr != nil {
+		t.Errorf("queue file should be preserved on refusal: stat err=%v", qerr)
+	}
+
+	// OLD record + session untouched.
+	if _, lerr := agent.Load(oldRec.ID); lerr != nil {
+		t.Errorf("oldRec should still be live: %v", lerr)
+	}
+	if !tmux.HasSession(oldRec.TmuxSession) {
+		t.Errorf("oldRec session %s should still be alive", oldRec.TmuxSession)
 	}
 }
