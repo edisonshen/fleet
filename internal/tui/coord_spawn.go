@@ -54,9 +54,11 @@ type coordSpawnCtx struct {
 	records      []*agent.Record
 }
 
-// coordSpawnState enumerates the four indicator states the project row
-// can be in with respect to the coord-spawn marker. Naming mirrors the
-// spec language in issue #86 to keep the test names readable.
+// coordSpawnState enumerates the indicator states the project row can
+// be in with respect to the coord-spawn marker: Idle, Spawning, Active,
+// Stuck, Waiting (PART 2b downgrade), and NeverTicked (Path C
+// post-suppression hint). Naming mirrors the spec language in issue #86
+// to keep the test names readable.
 type coordSpawnState int
 
 const (
