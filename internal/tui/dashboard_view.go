@@ -1065,24 +1065,26 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// Gated on a live tmux session so a Path A heal (silent spawn
 	// death) doesn't trigger this hint, and on markerAgentID being
 	// non-empty so we have an ID to render.
-	// Grace window for the never-ticked hint tracks the same threshold
-	// that caused Stuck → Idle via Path C: ctx.spawnTimeout (which is
-	// FLEET_COORD_SPAWN_TIMEOUT_S or coordSpawnTimeoutDefault). Codex
-	// iter-12 P2: using a fixed 10m budget would silence the row for
-	// up to 9 minutes after a shorter operator-configured timeout
-	// expired — exactly the period where the operator wants to see
-	// the diagnostic. With the same threshold, the soft hint surfaces
-	// in the same render that Path C clears the red chip, so there's
-	// no silent gap.
+	// Grace window for the never-ticked hint balances two concerns:
+	//   (a) honor operator-shortened FLEET_COORD_SPAWN_TIMEOUT_S so
+	//       there's no silent gap between Path C suppression and the
+	//       diagnostic hint (codex iter-12 P2),
+	//   (b) preserve a minimum cold-start budget so a 60-120s custom
+	//       spawnTimeout does not fire "never ticked" during a
+	//       perfectly healthy 3-5 minute boot (codex iter-17 P2).
 	//
-	// Caps at coordSpawnTimeoutDefault (10m) for very LARGE custom
-	// timeouts: a 30m FLEET_COORD_SPAWN_TIMEOUT_S would otherwise
-	// suppress the hint for 30m past the cold-start budget. Take the
-	// min so the hint never fires later than 10min past spawn even
-	// when the operator wants the red chip pushed out further.
+	// Strategy: clamp between minNeverTickedGrace and
+	// coordSpawnTimeoutDefault. Operators who want the warning
+	// sooner can already lower FLEET_COORD_SPAWN_TIMEOUT_S to change
+	// when Path C triggers; but the never-ticked diagnostic itself
+	// — which accuses the operator's setup of being broken — must
+	// not surface inside the documented cold-start window.
 	grace := ctx.spawnTimeout
 	if grace > coordSpawnTimeoutDefault {
 		grace = coordSpawnTimeoutDefault
+	}
+	if grace < minNeverTickedGrace {
+		grace = minNeverTickedGrace
 	}
 	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
 		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, grace) {

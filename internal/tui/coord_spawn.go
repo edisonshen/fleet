@@ -121,6 +121,16 @@ const (
 // past any healthy boot.
 const coordSpawnTimeoutDefault = 10 * time.Minute
 
+// minNeverTickedGrace is the floor on the cold-start grace window
+// used by the soft "spawned but never ticked" hint. Operators can
+// lower FLEET_COORD_SPAWN_TIMEOUT_S to a tight value (60-120s) to
+// make the red stuck chip fire sooner without also forcing the
+// never-ticked diagnostic ("Stop hook or skill registration may be
+// broken") to fire during a perfectly healthy 3-5 minute cold start.
+// 5 minutes covers the upper end of healthy boot per issue #86 spec.
+// Codex iter-17 P2 drove this floor.
+const minNeverTickedGrace = 5 * time.Minute
+
 // coordSpawnTimeoutEnv lets the operator override the stuck threshold
 // without recompiling. Value is parsed once at New() into Model.
 const coordSpawnTimeoutEnv = "FLEET_COORD_SPAWN_TIMEOUT_S"
@@ -609,23 +619,41 @@ var agentProcessArgvFn = func(pid int) string {
 	return strings.TrimSpace(string(out))
 }
 
-// shellArgvPrefixes lists the POSIX shell binary names that indicate
-// a wrapper shell rather than an engine process. Mirror of
-// skills/fleet-guard/health.py:_is_shell_argv. The check is
-// argv[0]-only (whitespace-split first token), so a process whose
-// first argv component matches one of these is treated as a wrapper.
-var shellArgvPrefixes = []string{
-	"sh", "bash", "dash", "zsh", "ksh", "fish",
-	"/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh", "/bin/ksh",
-	"/usr/bin/sh", "/usr/bin/bash", "/usr/bin/dash",
-	"/usr/bin/zsh", "/usr/bin/ksh", "/usr/bin/fish",
-	"/usr/local/bin/bash", "/usr/local/bin/zsh", "/usr/local/bin/fish",
+// shellBasenames lists the POSIX shell binary basenames that indicate
+// a wrapper shell rather than an engine process. We match by basename
+// (the trailing path component of argv[0]) rather than a hardcoded
+// list of full paths because the fleet wrapper exits into
+// `exec ${SHELL:-bash} -i`, which on common installs (Homebrew, Nix,
+// asdf, custom prefix, etc.) lives at paths like
+// /opt/homebrew/bin/bash or /nix/store/.../bin/zsh that no fixed
+// allowlist could cover (codex iter-17 P1).
+//
+// Mirror of skills/fleet-guard/health.py:_is_shell_argv intent.
+var shellBasenames = map[string]bool{
+	"sh":    true,
+	"bash":  true,
+	"dash":  true,
+	"zsh":   true,
+	"ksh":   true,
+	"fish":  true,
+	"tcsh":  true,
+	"csh":   true,
+	"mksh":  true,
+	"yash":  true,
+	"posh":  true,
+	"ash":   true,
+	"oksh":  true,
+	"loksh": true,
 }
 
-// argvLooksLikeShellWrapper reports whether argv's first token is a
-// known POSIX shell binary. Empty argv returns false — the caller's
-// "can't tell" default is "treat as alive" which means we do NOT
-// flip a real coord to stuck on a transient ps probe failure.
+// argvLooksLikeShellWrapper reports whether argv's first token's
+// basename is a known POSIX shell binary. Empty argv returns false —
+// the caller's "can't tell" default is "treat as alive" which means we
+// do NOT flip a real coord to stuck on a transient ps probe failure.
+//
+// Basename-based matching (codex iter-17 P1): handles non-system
+// shell paths (e.g. /opt/homebrew/bin/bash, /nix/store/.../bin/zsh)
+// that a hardcoded path allowlist could not cover.
 func argvLooksLikeShellWrapper(argv string) bool {
 	if argv == "" {
 		return false
@@ -634,12 +662,11 @@ func argvLooksLikeShellWrapper(argv string) bool {
 	if idx := strings.IndexAny(argv, " \t"); idx > 0 {
 		first = argv[:idx]
 	}
-	for _, prefix := range shellArgvPrefixes {
-		if first == prefix {
-			return true
-		}
+	// Strip any leading path component to get the basename.
+	if idx := strings.LastIndex(first, "/"); idx >= 0 {
+		first = first[idx+1:]
 	}
-	return false
+	return shellBasenames[first]
 }
 
 // workersIsAlive is a thin indirection over workers.IsAlive so the
