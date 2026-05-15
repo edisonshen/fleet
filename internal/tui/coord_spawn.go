@@ -556,6 +556,19 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 	return false
 }
 
+// coordTickMtimeTolerance is the slack we allow between coord-state.json
+// mtime and the agent's spawned_at when deciding "did this coord ever
+// tick under THIS spawn." Filesystem mtime resolution is 1s on many
+// production filesystems (ext4 default, HFS+, exFAT); without slack a
+// tick that landed in the SAME second as the spawn could compare as
+// strictly less-than spawned_at and be misclassified as "never ticked"
+// (codex iter-5 P2). 2s gives one second of mtime granularity plus a
+// second of skew between Go's UTC time.Now() and the kernel's mtime
+// stamp on a separate writer process. Larger tolerances would risk
+// catching a leftover tick from a previous coord whose spawn was
+// near-simultaneous — vanishingly rare since agent IDs are random hex.
+const coordTickMtimeTolerance = 2 * time.Second
+
 // coordNeverTickedThisSpawn reports whether the coord-state.json
 // publication has NOT yet caught up to the agent's spawned_at. Returns
 // true when:
@@ -566,24 +579,26 @@ func agentRecordExists(records []*agent.Record, id string) bool {
 //     suppressing the stuck warning since the operator's signal is
 //     load-bearing), AND
 //   - lastTick is zero (no coord-state.json ever) OR predates
-//     spawned_at (a leftover state file from a previous coord under
-//     this project).
+//     spawned_at by more than coordTickMtimeTolerance (a leftover state
+//     file from a previous coord under this project, with slack for
+//     filesystem mtime resolution).
 //
-// Used by the render-layer Path C suppression to distinguish "alive
-// coord that has never ticked under this spawn" (false-positive
-// stuck) from "alive coord that ticked successfully then wedged"
-// (genuine stuck — keep the warning so the operator triages via
-// tmux). The narrower check is the codex iter-2 [P1] fix: without
-// it Path C demotes every live tmux session to Idle even when
-// LastTick proves the coord successfully booted, hiding real hangs.
+// Used by the render-layer Path C suppression AND by Path A/B's marker-
+// removal gate to distinguish "alive coord that has never ticked under
+// this spawn" (false-positive stuck; preserve marker for re-attach)
+// from "alive coord that ticked successfully then wedged" (genuine
+// stuck — keep the warning so the operator triages via tmux). Without
+// the narrower check Path C would demote every live tmux session to
+// Idle even when LastTick proves the coord successfully booted (codex
+// iter-2 P1), and Path B would delete the marker before the operator
+// could re-attach a never-ticked-but-otherwise-alive coord (codex
+// iter-5 P1).
 //
-// Distinct from agentNeverTickedSinceSpawn, which adds a grace
-// window before promoting Idle → NeverTicked for the informational
-// hint. Path C suppression has no grace window (a stuck-derivation
-// row that's never ticked under this spawn is always a false
-// positive regardless of age — the grace window only matters for
-// "should we tell the operator there's a problem with the Stop
-// hook?", not for "should we hide the red warning?").
+// Distinct from agentNeverTickedSinceSpawn, which adds a cold-start
+// grace window before promoting Idle → NeverTicked for the
+// informational hint. The Path C / Path B gate has no grace window
+// (whether the coord has ticked is a binary fact regardless of age),
+// only the mtime-resolution slack.
 func coordNeverTickedThisSpawn(
 	records []*agent.Record,
 	id string,
@@ -599,10 +614,16 @@ func coordNeverTickedThisSpawn(
 		if r.SpawnedAt.IsZero() {
 			return false
 		}
-		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
-			return false
+		if lastTick.IsZero() {
+			return true
 		}
-		return true
+		// Treat lastTick within tolerance of (or after) spawned_at as
+		// "ticked." Filesystem mtime resolution + write skew can leave
+		// a real first tick comparing strictly less-than spawned_at;
+		// without tolerance the helper would misclassify it as
+		// never-ticked and Path C would hide a real hang.
+		threshold := r.SpawnedAt.Add(-coordTickMtimeTolerance)
+		return lastTick.Before(threshold)
 	}
 	return false
 }
@@ -646,8 +667,12 @@ func agentNeverTickedSinceSpawn(
 		if now.Sub(r.SpawnedAt) <= graceWindow {
 			return false
 		}
-		// Tick exists AND is on-or-after the spawn → already ticked.
-		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
+		// Tick exists AND is within coordTickMtimeTolerance of (or
+		// after) spawned_at → already ticked. Same FS-mtime slack as
+		// coordNeverTickedThisSpawn (codex iter-5 P2) — a real first
+		// tick whose mtime rounded down to the same second as
+		// SpawnedAt must NOT be misclassified as "never ticked."
+		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt.Add(-coordTickMtimeTolerance)) {
 			return false
 		}
 		return true

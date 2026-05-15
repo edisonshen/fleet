@@ -797,6 +797,126 @@ func TestApplyStuckSelfHeal_NonStuckStatesUnaffected(t *testing.T) {
 	}
 }
 
+// TestRender_FreshRecordNeverTickedPreservesMarker pins the codex
+// iter-5 [P1] fix: when the agent record has a fresh last_activity_ts
+// (Path B's freshness gate would normally fire) BUT coord-state.json
+// has never been published under this spawn, the marker MUST be
+// preserved. Otherwise the operator loses the only signal that points
+// at this agent for [a] re-attach, AND the next render drops the
+// never-ticked diagnostic entirely (markerAgentID becomes empty).
+//
+// Real scenario: fleet-guard updates the agent record via Stop hook
+// (so last_activity_ts is fresh), but /coordinator skill is broken /
+// misconfigured / not registered → no coord-state.json publication.
+// Operator is interacting with the misconfigured coord — Path B's
+// fresh-record signal lies if the coord didn't actually publish.
+func TestRender_FreshRecordNeverTickedPreservesMarker(t *testing.T) {
+	now := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	markerMtime := now.Add(-15 * time.Minute) // past 10m timeout
+	stubMarkerMtime(t, "demo", markerMtime, true)
+	stubMarkerAgentID(t, "demo", "49bc8a03")
+	stubAliveSessions(t, map[string]bool{"fleet-49bc8a03": true})
+	rmCalls := stubRemoveMarker(t)
+
+	// last_activity_ts FRESH (within 10m freshWindow) but coord-state
+	// never published (LastTick is zero). Pre-iter-5 fix: Path B
+	// removed the marker; this PR's gate prevents the removal.
+	spawnedAt := now.Add(-15 * time.Minute)
+	records := []*agent.Record{
+		{
+			ID:             "49bc8a03",
+			LastActivityTS: now.Add(-2 * time.Minute), // FRESH
+			SpawnedAt:      spawnedAt,
+		},
+	}
+	p := &ProjectRow{Name: "demo", RepoSlug: "demo"}
+	ctx := coordSpawnCtx{
+		now:          now,
+		tickFrame:    0,
+		spawnTimeout: 10 * time.Minute,
+		records:      records,
+	}
+	lines := projectBlockLines(p, 100, false, ctx)
+	joined := strings.Join(lines, "\n")
+
+	if len(*rmCalls) != 0 {
+		t.Errorf("never-ticked + fresh record: marker must NOT be removed (re-attach depends on it); got %d (%v)",
+			len(*rmCalls), *rmCalls)
+	}
+	if strings.Contains(joined, "coord spawn stuck") {
+		t.Errorf("never-ticked + fresh record: red stuck chip must be suppressed; got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "spawned but never ticked") {
+		t.Errorf("never-ticked + fresh record + past grace window: soft hint must surface; got:\n%s", joined)
+	}
+}
+
+// TestCoordNeverTickedThisSpawn_MtimeTolerance pins the codex iter-5
+// [P2] fix: filesystem mtime resolution (1s on many filesystems) plus
+// write-skew can leave a real first tick comparing strictly less-than
+// spawned_at. Without the coordTickMtimeTolerance slack, that tick
+// would be misclassified as "never ticked" and a real wedge would be
+// hidden.
+//
+// Test cases pin the exact boundary: a tick within tolerance of (or
+// after) spawned_at counts as "ticked"; a tick more than tolerance
+// older counts as "never ticked / leftover from prior coord."
+func TestCoordNeverTickedThisSpawn_MtimeTolerance(t *testing.T) {
+	spawnedAt := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
+	rec := &agent.Record{ID: "x", SpawnedAt: spawnedAt}
+	records := []*agent.Record{rec}
+
+	cases := []struct {
+		name     string
+		lastTick time.Time
+		want     bool // true = "never ticked"
+	}{
+		{
+			name:     "tick exactly at spawn → ticked",
+			lastTick: spawnedAt,
+			want:     false,
+		},
+		{
+			name:     "tick 500ms before spawn (within 2s slack) → ticked",
+			lastTick: spawnedAt.Add(-500 * time.Millisecond),
+			want:     false,
+		},
+		{
+			name:     "tick 1s before spawn (within 2s slack) → ticked",
+			lastTick: spawnedAt.Add(-1 * time.Second),
+			want:     false,
+		},
+		{
+			name:     "tick 2s before spawn (boundary) → ticked",
+			lastTick: spawnedAt.Add(-2 * time.Second),
+			want:     false,
+		},
+		{
+			name:     "tick 3s before spawn (past slack) → never ticked",
+			lastTick: spawnedAt.Add(-3 * time.Second),
+			want:     true,
+		},
+		{
+			name:     "tick 1h before spawn → never ticked (leftover)",
+			lastTick: spawnedAt.Add(-1 * time.Hour),
+			want:     true,
+		},
+		{
+			name:     "tick 1m after spawn → ticked",
+			lastTick: spawnedAt.Add(1 * time.Minute),
+			want:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coordNeverTickedThisSpawn(records, "x", tc.lastTick)
+			if got != tc.want {
+				t.Errorf("coordNeverTickedThisSpawn(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestRender_PreviouslyTickedAlreadyWedged_PreservesStuck pins the
 // codex iter-2 [P1] gate on Path C: when an alive coord already
 // published a coord-state.json tick under THIS spawn (LastTick ≥
