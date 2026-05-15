@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 )
 
@@ -204,6 +205,20 @@ func SessionAlive(session string) (bool, error) {
 func Spawn(session, cwd string, command, extraEnv []string) error {
 	if len(command) == 0 {
 		return errors.New("tmux.Spawn: empty command")
+	}
+	// Sink guard (postmortem 2026-05-14, follow-up to PR #150): inside
+	// `go test`, refuse to create a session on the operator's default
+	// tmux socket. Tests MUST set FLEET_TMUX_SOCKET via the shared
+	// `tmuxtest.RequireTmux(t)` helper so per-test sessions live on an
+	// isolated server that's torn down in t.Cleanup. Without this guard
+	// a transitive caller (runDispatch → spawn.Spawn → tmux.Spawn) can
+	// leak fleet-* sessions onto the host server. testing.Testing()
+	// (Go 1.21+) is true iff the binary was built by `go test`, so
+	// production paths are untouched. The lint at
+	// scripts/lint-test-isolation.sh is a static backup; this runtime
+	// guard is the load-bearing safety boundary.
+	if testing.Testing() && os.Getenv("FLEET_TMUX_SOCKET") == "" {
+		return fmt.Errorf("tmux.Spawn: refusing to use default tmux socket under go test (session %q); call tmuxtest.RequireTmux(t) to isolate FLEET_TMUX_SOCKET", session)
 	}
 	args := []string{"new-session", "-d", "-s", session}
 	if cwd != "" {

@@ -2,8 +2,6 @@ package spawn
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,6 +15,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -30,30 +29,15 @@ func setupFleetHome(t *testing.T) string {
 	return tmp
 }
 
+// requireTmux delegates socket isolation to tmuxtest.RequireTmux (the
+// canonical helper at internal/testutil/tmuxtest) and adds the
+// spawn-specific env pin. Postmortem 2026-05-14 (orphan tmux leak) +
+// follow-up 2026-05-15: tmux.Spawn under `go test` refuses to use the
+// default socket, and tmuxtest.RequireTmux is the lint-recognized
+// isolation marker.
 func requireTmux(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed; skipping integration test")
-	}
-	// Per-test tmux server via FLEET_TMUX_SOCKET so cross-package
-	// parallel runs don't contend on the host's default tmux server.
-	// In-process random suffix — no openssl/external-tool dep.
-	var b [3]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
-	// server AND remove the socket file on exit so /tmp doesn't fill
-	// up with stale fleet-test-*.sock files and the default tmux server
-	// doesn't accumulate fleet-* sessions.
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("cleanup: remove %s: %v", sock, err)
-		}
-	})
+	tmuxtest.RequireTmux(t)
 	// Speed up the pid-resolver poll budget in tests. Production uses
 	// 10s; tests with synthetic commands ("sleep 30", "sh -c sleep 60")
 	// will never find a "claude" descendant, so the resolver will run

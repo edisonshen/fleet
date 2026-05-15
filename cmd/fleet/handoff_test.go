@@ -2,8 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +13,7 @@ import (
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -36,28 +35,15 @@ func setupFleetHome(t *testing.T) string {
 	return tmp
 }
 
+// requireTmux delegates socket isolation to tmuxtest.RequireTmux (the
+// canonical helper at internal/testutil/tmuxtest) and adds the
+// handoff-specific env pins. Postmortem 2026-05-14 (orphan tmux leak)
+// + 2026-05-15 follow-up: tmux.Spawn under `go test` refuses to use
+// the default socket; tmuxtest.RequireTmux is the lint-recognized
+// isolation marker.
 func requireTmux(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("tmux"); err != nil {
-		t.Skip("tmux not installed; skipping integration test")
-	}
-	// In-process random suffix for FLEET_TMUX_SOCKET — no external
-	// `openssl` dep so tests pass anywhere tmux + Go work.
-	var b [3]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
-	sock := "/tmp/fleet-test-" + hex.EncodeToString(b[:]) + ".sock"
-	t.Setenv("FLEET_TMUX_SOCKET", sock)
-	// Postmortem 2026-05-14 (orphan tmux leak): kill the per-test tmux
-	// server AND remove the socket file on exit. Without this, every
-	// integration test leaks one server + one .sock file forever.
-	t.Cleanup(func() {
-		_ = exec.Command("tmux", "-S", sock, "kill-server").Run()
-		if err := os.Remove(sock); err != nil && !os.IsNotExist(err) {
-			t.Logf("cleanup: remove %s: %v", sock, err)
-		}
-	})
+	tmuxtest.RequireTmux(t)
 	// runHandoff calls spawn.SendInitialPrompt between step 8a and
 	// step 9; the helper polls pane stability before typing. Pin
 	// small windows so tests don't pay the production 30 s cap on
@@ -434,291 +420,6 @@ func agentSpawnForTest(t *testing.T, cwd string, command []string, project, task
 		Cwd:     cwd,
 		Command: command,
 	})
-}
-
-// TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait pins
-// codex iter-13 [P1]: in resumeHandoff (the crash-recovery flow), the
-// eager marker write must happen BEFORE the WaitForReadyToPrompt call.
-// Otherwise the marker sits at oldRec.ID for the full up-to-30s boot
-// wait, and if OLD exits during that window the dashboard `[a]` path
-// can't find NEW (record.ID != marker) and spawns a duplicate coord.
-//
-// This test exercises the happy path of resumeHandoff with a coord
-// marker pre-seeded at oldRec.ID. Post-fix:
-//   - eager write commits marker → newRec.ID before the readiness wait
-//   - readiness wait passes (real tmux pane on a long-lived shell)
-//   - AtomicCoordSwap runs, archives old, queue deleted
-//   - final marker stays at newRec.ID (= replacement.ID)
-//
-// Pre-fix this test would still pass at the end (eager write happened
-// later but still happened). The structural defense lives in the
-// inline comment at handoff.go's resumeHandoff isCoordSwap block + the
-// fact that this test asserts the marker is set at all on the recovery
-// path. A regression that re-orders eager-write AFTER the wait would
-// not break this test directly, but it WOULD break
-// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn below
-// (which deletes a stale newRec — the rollback helper is what
-// re-anchors the marker).
-func TestHandoff_ResumeHandoff_CoordMarker_WritesBeforeReadinessWait(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	// Seed marker at old.ID so isCoordSwap fires on the recovery path.
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	if err := state.WriteCoordSpawnMarker(old.Project, old.ID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	// Pre-spawn a live replacement (simulating the crash window
-	// between original spawn and queue.Delete).
-	replacement, err := agentSpawnForTest(t, t.TempDir(),
-		[]string{"sleep", "120"}, old.Project, old.TaskID)
-	if err != nil {
-		t.Fatalf("seed replacement: %v", err)
-	}
-	t.Cleanup(func() { _ = tmux.Kill(replacement.TmuxSession) })
-
-	docPath := "/some/handoffs/" + old.ID + "-stub.md"
-	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
-		SchemaVersion: queue.SchemaVersion,
-		OldAgentID:    old.ID,
-		HandoffDoc:    docPath,
-		Project:       old.Project,
-		TaskID:        old.TaskID,
-		NewAgentID:    replacement.ID,
-		NewSession:    replacement.TmuxSession,
-	}); err != nil {
-		t.Fatalf("seed queue: %v", err)
-	}
-
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		graceMillis: 0,
-	}, out, out); err != nil {
-		t.Fatalf("runHandoff: %v\n%s", err, out.String())
-	}
-
-	// Marker must land at replacement.ID — AtomicCoordSwap's commit
-	// point. Pre-fix iter-13: same end state, but the marker spent
-	// the wait window stuck at old.ID. Test guards the end state;
-	// the structural defense is the code order in resumeHandoff.
-	got := state.ReadCoordSpawnMarker(old.Project)
-	if got != replacement.ID {
-		t.Errorf("coord marker not at replacement after resumeHandoff: got %q want %q",
-			got, replacement.ID)
-	}
-}
-
-// TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn pins
-// codex iter-12 [P1] on the manual-handoff recovery path
-// (cmd/fleet/handoff.go:378-387). When the recovery probe finds a stale
-// replacement record with a dead tmux session, it drops the record and
-// falls through to the normal spawn flow. A previous coord-swap attempt
-// may have committed marker → staleNew.ID before failing; without
-// rolling back the marker, the fall-through's isCoordSwap detection at
-// line 693-694 (`marker == oldRec.ID`) returns false, the inline retire
-// path runs (no AtomicCoordSwap), and the marker is left pointing at
-// the deleted ID — letting `[a]` spawn a duplicate coord.
-//
-// Post-fix: the cleanup branch calls
-// handoffop.RollbackCoordMarkerIfPointingAt before the fall-through.
-// The marker steps back to oldRec.ID, isCoordSwap fires on the retry,
-// AtomicCoordSwap commits marker → fresh replacement's ID.
-func TestHandoff_RecoveryProbe_StaleMarker_RolledBackBeforeRespawn(t *testing.T) {
-	requireTmux(t)
-	tmp := setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	// Seed coord marker → old.ID (a real coord setup) THEN stomp it to
-	// a fake "previous attempt" newAgentID, simulating the stale
-	// marker a prior crashed swap would leave behind.
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	const staleNewID = "stalenew"
-	if err := state.WriteCoordSpawnMarker(old.Project, staleNewID); err != nil {
-		t.Fatalf("seed stale marker: %v", err)
-	}
-
-	// Plant a stale replacement record whose tmux session is dead
-	// (the session string points at a name we never spawned, so
-	// tmux.SessionAlive returns (false, nil) definitively).
-	staleNew := agent.New(staleNewID)
-	staleNew.TaskID = old.TaskID
-	staleNew.Project = old.Project
-	staleNew.Cwd = old.Cwd
-	staleNew.Command = old.Command
-	staleNew.TmuxSession = "fleet-stalenew-dead"
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	// Seed queue file so runHandoff enters the recovery probe.
-	docPath := filepath.Join(tmp, "handoffs", old.ID+"-stub.md")
-	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(docPath, []byte("stub doc"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
-		SchemaVersion: queue.SchemaVersion,
-		OldAgentID:    old.ID,
-		HandoffDoc:    docPath,
-		Project:       old.Project,
-		TaskID:        old.TaskID,
-		NewAgentID:    staleNewID,
-		NewSession:    staleNew.TmuxSession,
-	}); err != nil {
-		t.Fatalf("seed queue: %v", err)
-	}
-
-	// Run handoff with --force-replacement so the iter-14 P1 refusal
-	// gate (which protects against duplicate-coord respawns when OLD
-	// is still alive) is bypassed. This test specifically exercises
-	// the iter-12 P1 rollback path; the iter-14 refusal gate is
-	// covered by TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn
-	// below.
-	out := &bytes.Buffer{}
-	if err := runHandoff(&handoffOpts{
-		oldID:            old.ID,
-		cwd:              old.Cwd,
-		command:          []string{"sleep", "60"},
-		graceMillis:      0,
-		forceReplacement: true,
-	}, out, out); err != nil {
-		t.Fatalf("runHandoff: %v\n%s", err, out.String())
-	}
-
-	// Exactly one live agent remains — the fresh replacement. The
-	// stale newRec record is gone, the old one is archived.
-	live := listLive(t)
-	if len(live) != 1 {
-		t.Fatalf("expected 1 live agent post-handoff, got %d: %+v", len(live), live)
-	}
-	fresh := live[0]
-	t.Cleanup(func() { _ = tmux.Kill(fresh.TmuxSession) })
-
-	// Stale record must be gone (DropReplacementRecord ran).
-	if _, err := os.Stat(filepath.Join(tmp, "agents", staleNewID+".json")); !os.IsNotExist(err) {
-		t.Errorf("stale replacement record should be deleted: stat err=%v", err)
-	}
-
-	// Old archived.
-	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); !os.IsNotExist(err) {
-		t.Errorf("old live record should be archived (not in live dir): stat err=%v", err)
-	}
-
-	// Marker must point at the FRESH replacement, NOT the deleted
-	// staleNewID. Pre-fix this assertion failed because isCoordSwap
-	// went false on the retry (marker == staleNewID, not == old.ID)
-	// and the inline retire path never moved the marker.
-	got := state.ReadCoordSpawnMarker(old.Project)
-	if got != fresh.ID {
-		t.Errorf("coord marker not at fresh replacement: got %q want %q (staleNewID=%q, old.ID=%q)",
-			got, fresh.ID, staleNewID, old.ID)
-	}
-}
-
-// TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn pins codex
-// iter-14 [P1] on the manual-handoff recovery path
-// (cmd/fleet/handoff.go:378-410). When AtomicCoordSwap preserves the
-// queue on ErrOrphanSurvived / ErrOldKillProbeAmbiguous, the next
-// `fleet handoff` invocation lands in the recovery probe with newRec
-// session dead but OLD still alive. Auto-respawning would create a
-// duplicate coord.
-//
-// Post-fix: refuse-and-preserve when marker resolves to oldRec.ID or
-// newRec.ID AND OLD's session is alive. Operator can pass
-// --force-replacement once OLD is confirmed dead.
-func TestHandoff_RecoveryProbe_OldCoordAlive_RefusesRespawn(t *testing.T) {
-	requireTmux(t)
-	tmp := setupFleetHome(t)
-
-	old := seedAgent(t)
-	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
-
-	if _, err := state.EnsureProjectInitialized(old.Project); err != nil {
-		t.Fatalf("EnsureProjectInitialized: %v", err)
-	}
-	const staleNewID = "stalenew"
-	if err := state.WriteCoordSpawnMarker(old.Project, staleNewID); err != nil {
-		t.Fatalf("seed marker: %v", err)
-	}
-
-	staleNew := agent.New(staleNewID)
-	staleNew.TaskID = old.TaskID
-	staleNew.Project = old.Project
-	staleNew.Cwd = old.Cwd
-	staleNew.Command = old.Command
-	staleNew.TmuxSession = "fleet-stalenew-dead"
-	staleNew.SpawnedAt = time.Now().UTC()
-	if err := staleNew.Write(); err != nil {
-		t.Fatalf("plant stale new rec: %v", err)
-	}
-
-	docPath := filepath.Join(tmp, "handoffs", old.ID+"-stub.md")
-	if err := os.MkdirAll(filepath.Dir(docPath), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(docPath, []byte("stub doc"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := queue.WriteSpawnFresh(queue.SpawnFresh{
-		SchemaVersion: queue.SchemaVersion,
-		OldAgentID:    old.ID,
-		HandoffDoc:    docPath,
-		Project:       old.Project,
-		TaskID:        old.TaskID,
-		NewAgentID:    staleNewID,
-		NewSession:    staleNew.TmuxSession,
-	}); err != nil {
-		t.Fatalf("seed queue: %v", err)
-	}
-
-	// Run WITHOUT --force-replacement. Must refuse — OLD's session is
-	// alive (seedAgent left it running), marker == newRec.ID (coord
-	// swap journal), so the iter-14 gate fires.
-	out := &bytes.Buffer{}
-	err := runHandoff(&handoffOpts{
-		oldID:       old.ID,
-		cwd:         old.Cwd,
-		command:     []string{"sleep", "60"},
-		graceMillis: 0,
-	}, out, out)
-	if err == nil {
-		t.Fatalf("expected handoff to refuse when OLD coord still alive; got nil\n%s", out.String())
-	}
-	if !strings.Contains(err.Error(), "still alive") || !strings.Contains(err.Error(), "duplicate coord") {
-		t.Errorf("expected refusal mentioning 'still alive' + 'duplicate coord'; got: %v", err)
-	}
-
-	// State must be preserved:
-	if _, err := os.Stat(filepath.Join(tmp, "agents", staleNewID+".json")); err != nil {
-		t.Errorf("stale newRec should be preserved on refusal: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(tmp, "agents", old.ID+".json")); err != nil {
-		t.Errorf("old record should remain live (not archived): %v", err)
-	}
-	if !tmux.HasSession(old.TmuxSession) {
-		t.Errorf("old session should still be alive")
-	}
-	queuePath := filepath.Join(tmp, "queue", "spawn-fresh-"+old.ID+".json")
-	if _, err := os.Stat(queuePath); err != nil {
-		t.Errorf("queue file should persist on refusal: %v", err)
-	}
-	if got := state.ReadCoordSpawnMarker(old.Project); got != staleNewID {
-		t.Errorf("marker mutated on refusal: got %q want %q", got, staleNewID)
-	}
 }
 
 func TestHandoff_AbortsWhenReplacementDiesAtStartup(t *testing.T) {
