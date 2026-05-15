@@ -194,6 +194,17 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		// double-spawn risk. Abort so the operator can investigate.
 		return fmt.Errorf("recovery probe: read queue file %s failed: %w", pendingPath, perr)
 	case pending.NewAgentID != "":
+		// Codex iter-18 [P1] (deferred — known recovery gap): if OLD
+		// is gone because the operator manually ran `fleet rm <OLD>`
+		// (e.g., per the instruction in *ErrOrphanSurvived /
+		// *ErrOldKillProbeAmbiguous) AND NEW has since exited, this
+		// branch surfaces "task has no live agent" instead of
+		// respawning. Auto-respawn would need a fresh agent ID +
+		// reconstructed spawn.Options (the queue file's NewAgentID is
+		// already consumed and NewRecSpec is not carried verbatim).
+		// Operator workaround: `fleet dispatch --resume <handoff-doc>`
+		// after the queue file is cleaned up. Deferred to a follow-up
+		// PR alongside the "swap-committed sentinel" structural fix.
 		oldRec, lerr := agent.Load(opts.oldID)
 		switch {
 		case errors.Is(lerr, state.ErrNotFound):
@@ -388,6 +399,22 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				// from respawning. Operator can pass --force-replacement
 				// to bypass post-commit refusal once OLD is confirmed
 				// dead.
+				//
+				// Codex iter-18 [P1] (deferred — known limitation,
+				// conservative stance): The eager marker write later
+				// in runHandoff (see "8a-bis. Detect coord swap vs
+				// worker handoff + eager marker") moves marker →
+				// newRec.ID BEFORE the swap commits. A crash in that
+				// pre-commit window leaves marker == newRec.ID with no
+				// real commit, and this branch treats it as post-commit
+				// — refusing auto-respawn instead of dropping the dead
+				// NEW + retrying. Distinguishing pre-commit-eager-write
+				// from post-commit-real-commit on disk requires a
+				// separate "swap-committed" sentinel written only by
+				// AtomicCoordSwap step 4; deferred to a follow-up PR.
+				// Current behavior errs conservative; operator
+				// workaround is `--force-replacement` once OLD is
+				// confirmed dead.
 				coordSwapPostCommit := false
 				if oldRec.Project != "" &&
 					state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {

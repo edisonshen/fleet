@@ -71,6 +71,20 @@ func Resume(req queue.SpawnFresh, queuePath string,
 	//    handoff completed successfully and only the queue file is stale.
 	//    Reuse cmd/fleet/handoff.go's existing semantics: verify the
 	//    declared replacement is alive before declaring success-noop.
+	//
+	// Codex iter-18 [P1] (deferred — known recovery gap): if OLD is gone
+	// because the operator manually ran `fleet rm <OLD>` (e.g., per the
+	// instruction in *ErrOrphanSurvived / *ErrOldKillProbeAmbiguous) AND
+	// NEW has since exited, cleanUpStaleQueue surfaces "task has no live
+	// agent" instead of respawning. Auto-respawn from this state requires
+	// pre-allocating a fresh agent ID (the queue file's NewAgentID is
+	// already consumed) and threading the original handoff doc + project
+	// context into a fresh spawn — non-trivial because the recovery path
+	// would need spawn.Options reconstructed from the queue journal, which
+	// does not currently carry NewRecSpec verbatim. Operator workaround:
+	// `fleet dispatch --resume <handoff-doc>` after the queue file is
+	// cleaned up manually. Deferred to a follow-up PR alongside the
+	// "swap-committed sentinel" structural fix.
 	oldRec, lerr := agent.Load(req.OldAgentID)
 	switch {
 	case errors.Is(lerr, state.ErrNotFound):
@@ -150,6 +164,23 @@ func Resume(req queue.SpawnFresh, queuePath string,
 		//     only legitimate coord. Respawning is the correct recovery:
 		//     drop NEW, fresh-spawn a replacement, normal swap path
 		//     completes the handoff.
+		//
+		// Codex iter-18 [P1] (deferred — known limitation, conservative
+		// stance): The eager marker write in spawnAndRetire (search
+		// "Eager marker write — closes the duplicate-coord window")
+		// moves marker → newRec.ID BEFORE retireOldAgent invokes
+		// AtomicCoordSwap. A crash in that pre-commit window leaves
+		// marker == newRec.ID with no real commit having happened, and
+		// this branch treats it as post-commit (refuses auto-respawn
+		// instead of dropping the dead NEW + retrying the swap).
+		// Distinguishing pre-commit-eager-write from post-commit-real-
+		// commit on disk requires a separate "swap-committed" sentinel
+		// written only by AtomicCoordSwap step 4 — a structural addition
+		// deferred to a follow-up PR. Current behavior errs conservative
+		// (preserves the queue, surfaces refusal to operator) rather
+		// than risk auto-respawning into a real ErrOrphanSurvived state.
+		// Operator workaround: `--force-replacement` on `fleet handoff`,
+		// or manually rewriting the marker to oldRec.ID before retry.
 		coordSwapPostCommit := false
 		if oldRec.Project != "" &&
 			state.ReadCoordSpawnMarker(oldRec.Project) == newRec.ID {
