@@ -1880,14 +1880,15 @@ def test_poll_cadence_force_tick_on_inbox_event(fleet_home: Path) -> None:
         force_tick_check=fake_force,
         log_stream=io.StringIO(),
     )
-    # Iter 1: force-tick fired → no sleep recorded (sleep_s=0 skipped).
-    # Iter 2: force-tick False → exactly one sleep_fn call.
+    # Iter 1: force-tick fired → 0.1s throttle sleep (codex iter-19
+    # [P2]: floor on forced wakes to prevent spin on parse-error
+    # spin scenarios).
+    # Iter 2: force-tick False → full base/backoff cadence (5 or 30 s).
     assert force_calls["n"] >= 2
-    assert any(s > 0 for s in sleep_calls), sleep_calls
-    # The very first sleep call must be the one AFTER force-tick was
-    # False (i.e., the force-tick first-iteration triggers no sleep).
-    # The sleep we DO see is a base/backoff cadence (5 or 30 s).
-    assert sleep_calls[0] in (5.0, 30.0)
+    assert any(s >= 5.0 for s in sleep_calls), sleep_calls
+    # The first sleep is the throttle for the forced wake; the second
+    # is the genuine cadence sleep after force-tick returned False.
+    assert sleep_calls[0] == 0.1
     assert res.exit_reason == "all-terminal"
 
 
@@ -2075,7 +2076,9 @@ def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
         except StopIteration:
             return []
 
-    # ALWAYS force-tick → no sleeps recorded at all.
+    # ALWAYS force-tick → 0.1s throttle on each iteration (codex
+    # iter-19 [P2]: floor on forced wakes to prevent spin on
+    # parse-error scenarios).
     cfg = _adaptive_cfg(stuck_check_every=0)
     res = supervisor.run_supervisor(
         cfg=cfg, project="fleet", home=fleet_home, fleet_bin="fleet",
@@ -2086,9 +2089,8 @@ def test_supervisor_force_tick_skips_sleep_when_inbox_event_pending(
         force_tick_check=lambda: True,
         log_stream=io.StringIO(),
     )
-    # Every iteration's sleep_fn invocation was bypassed (sleep_s=0
-    # never calls sleep_fn — see run_supervisor source).
-    assert sleep_calls == []
+    # Every forced iteration applied the 0.1s throttle.
+    assert all(s == 0.1 for s in sleep_calls), sleep_calls
     assert res.iterations >= 1
 
 

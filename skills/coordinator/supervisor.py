@@ -969,7 +969,14 @@ def run_supervisor(
                 res.errors.append(f"force_tick_check: {exc}")
                 forced = False
         if forced:
-            sleep_s = 0.0
+            # Codex iter-19 [P2]: enforce a small floor on consecutive
+            # forced wakes so a chronic force-tick condition (e.g.,
+            # tasks.md parse error preventing watermark advance)
+            # doesn't peg the supervisor at 0-second polls. The
+            # 100-ms floor is large enough to keep CPU usage sane
+            # but small enough that genuine fast-wake handling still
+            # responds quickly.
+            sleep_s = 0.1
         else:
             sleep_s = compute_next_sleep_s(
                 cfg=cfg,

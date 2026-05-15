@@ -449,6 +449,20 @@ def _tick_locked(
         f = parse.read(str(tasks_path))
     except Exception as exc:
         result.errors.append(f"tasks.md re-read failed: {exc}")
+        # Codex iter-19 [P1]: persist coord-state before bailing.
+        # _reap_inflight may have opened a reaper lane and the drain
+        # step may have queued deferred sentinels. Dropping those on
+        # a transient parse error would erase the lane gate and let
+        # the next tick clear worker_agent_ids before the kill cycle
+        # finishes — exactly the orphan-tmux shape invariant 5 exists
+        # to prevent. Best-effort save; swallow errors (the next tick
+        # re-derives state from disk).
+        try:
+            _save_coord_state(state_path, state)
+        except Exception as save_exc:  # noqa: BLE001
+            result.errors.append(
+                f"coord-state save on parse-error path failed: {save_exc}"
+            )
         return result
     # 5a. Review handoffs (reviewer-subagent-arch). Detect in-flight
     # tasks whose state.json reports phase=review-pending (→ dispatch
