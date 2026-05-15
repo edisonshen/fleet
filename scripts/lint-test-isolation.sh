@@ -75,7 +75,7 @@ triggers="tmux.Spawn(|spawn.Spawn(|runDispatch(|runHandoff(|runHandoffDrain(|Res
 # `os.Setenv("FLEET_TMUX_SOCKET"` (the rare direct path). Reads /
 # inspections of the var still pass the trigger-bearing helper as a
 # trigger, not a marker.
-markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET"|lint-test-isolation:exempt'
+markers='tmuxtest.RequireTmux|tmuxtest.IsolateSocket|requireTmux(|isolateTmuxSocket(|t.Setenv("FLEET_TMUX_SOCKET"|os.Setenv("FLEET_TMUX_SOCKET"|lint-test-isolation:exempt'
 
 # Enumerate test files. Use git when inside a repo so vendored/untracked
 # artifacts are skipped; fall back to find otherwise.
@@ -213,12 +213,25 @@ scan_file() {
       sub(/^func[ \t]+/, "", n)
       sub(/\(.*/, "", n)
       func_name = n
-      # Count the braces on the function-declaration line so the
-      # opening `{` is registered (most go func decls put `{` on
-      # the same line). Trigger/marker scan is suppressed for this
-      # one line — a test named TestXxx_SuggestsResume would
-      # otherwise match the "Resume(" substring on its declaration.
+      # Strip the func declaration prefix (everything up to and including
+      # the opening `{`) and scan only the BODY portion for triggers/
+      # markers on this line. Critical for one-liner tests like
+      # `func TestX(t *testing.T) { runDispatch(...) }`: codex review
+      # iter-14 [P2] (2026-05-15) flagged that the old `next` skipped
+      # the entire declaration line, missing one-line test bodies.
+      body = $0
+      sub(/^[^{]*\{/, "", body)
+      if (body != "") {
+        if (any_substr(body, trigs)) saw_trig = 1
+        if (any_substr(body, marks)) saw_iso = 1
+      }
       count_braces($0)
+      if (brace == 0) {
+        if (saw_trig && !saw_iso) {
+          printf "%s:%d:%s\n", file, start_line, func_name
+        }
+        reset()
+      }
       next
     }
     in_func {
@@ -337,7 +350,30 @@ discover_helpers() {
       func_name = n
       # Skip Test funcs — they are checked, not used as helpers.
       if (substr(func_name, 1, 4) == "Test") { in_func = 0; next }
+      # Scan the BODY portion of this declaration line (everything
+      # after the opening `{`). Required for one-line helper wrappers
+      # like `func withTmux(t *testing.T) { tmuxtest.RequireTmux(t) }`
+      # — codex review iter-14 [P2] (2026-05-15) flagged that the
+      # old `next` made one-liners invisible to recursive discovery.
+      body = $0
+      sub(/^[^{]*\{/, "", body)
+      if (body != "" && any_substr(body, needles)) saw = 1
       count_braces($0)
+      if (brace == 0) {
+        if (saw && func_name != "") {
+          emit = 1
+          if (exclude != "") {
+            en = split(exclude, ea, "|")
+            target = func_name "("
+            for (i = 1; i <= en; i++) {
+              if (ea[i] == "") continue
+              if (ea[i] == target) { emit = 0; break }
+            }
+          }
+          if (emit) printf "%s(\n", func_name
+        }
+        reset()
+      }
       next
     }
     in_func {
