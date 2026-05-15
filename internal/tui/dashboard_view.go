@@ -927,18 +927,13 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		ctx.now,
 		coordActiveWindow, ctx.spawnTimeout,
 	)
-	// Probe tmux + agent-record state once per render — both the
-	// self-heal gate and the post-heal "spawned but never ticked" hint
-	// need them. Cheap (single map lookup + slice scan) so probing
-	// unconditionally is fine; markerAgentID="" short-circuits the
-	// probes themselves to no-op.
-	var (
-		sessAlive    bool
-		recordExists bool
-	)
+	// Probe tmux liveness once per render. Cheap (single map lookup or
+	// flock probe) but called in two places below (Path A/B heal and
+	// Path C suppression / never-ticked hint). markerAgentID="" means
+	// no marker on disk → no tmux session to probe → false.
+	sessAlive := false
 	if markerAgentID != "" {
 		sessAlive = sessionAliveFn(tmuxSessionName(markerAgentID))
-		recordExists = agentRecordExists(ctx.records, markerAgentID)
 	}
 
 	if st == coordSpawnStuck && markerAgentID != "" {
@@ -947,15 +942,25 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		// marker is stale — heal regardless of tmux state. Path A still
 		// covers the dead-tmux + no-record case for silent spawn deaths.
 		fresh := isAgentRecordFresh(ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
-		// Path C (2026-05-14 false-positive fix): tmux alive AND agent
-		// record present → spawn pipeline completed. Heals the "alive
-		// but never ticked" case (HANDOFF, freshly-booted, Stop-hook
-		// misconfig) that previously emitted a red attention chip on
-		// healthy coords. The softer "never-ticked" hint below surfaces
-		// the underlying problem informationally.
-		st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, recordExists, func() error {
+		st, _ = applyStuckSelfHeal(st, markerAgentID, sessAlive, fresh, func() error {
 			return removeCoordSpawnMarkerFn(p.Name)
 		})
+
+		// Path C suppression (2026-05-14 false-positive fix): if Path
+		// A/B did not heal and the agent record exists for an alive
+		// tmux session, the spawn pipeline completed but no Stop-hook
+		// tick has fired yet (HANDOFF state, freshly-booted, Stop hook
+		// misconfig). Suppress the red attention chip at the render
+		// layer WITHOUT removing the marker — the marker is the only
+		// proof of which agent is coord for the project in this state
+		// (no coordinator.lock body has been published yet), so the
+		// [a] re-attach path in findExistingCoordForProject still needs
+		// it. The softer coordSpawnNeverTicked hint below surfaces the
+		// underlying problem informationally when the agent has aged
+		// past the cold-start grace window.
+		if st == coordSpawnStuck && sessAlive && agentRecordExists(ctx.records, markerAgentID) {
+			st = coordSpawnIdle
+		}
 	}
 	// PART 2b downgrade: stuck → waiting when the agent record has
 	// needs_input=true AND last_activity_ts is within
@@ -965,15 +970,16 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 	// dead coord — the original stuck warning surfaces in that case.
 	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
 
-	// Post-heal informational hint: after Path C cleared the marker,
-	// surface "spawned but never ticked" if the agent is alive (tmux
-	// session up — distinguishes from Path A silent-spawn-death heal)
-	// AND has aged past the cold-start grace window without publishing
-	// a coord-state.json under THIS spawn. Soft hint (dim), not an
-	// attention chip — the agent is alive; the issue is /coordinator
-	// skill registration or Stop-hook config (project_fleet_home_leak
-	// memory has the canonical example). Gated on Idle so Spawning /
-	// Stuck / Waiting / Active rows render their existing line.
+	// Post-heal informational hint: after Path C downgraded Stuck →
+	// Idle (live tmux + record exists), surface "spawned but never
+	// ticked" if the agent has aged past the cold-start grace window
+	// without publishing a coord-state.json under THIS spawn. Soft
+	// hint (dim), not an attention chip — the agent is alive; the
+	// issue is /coordinator skill registration or Stop-hook config
+	// (project_fleet_home_leak memory has the canonical example).
+	// Gated on a live tmux session so a Path A heal (silent spawn
+	// death) doesn't trigger this hint, and on markerAgentID being
+	// non-empty so we have an ID to render.
 	if st == coordSpawnIdle && markerAgentID != "" && sessAlive &&
 		agentNeverTickedSinceSpawn(ctx.records, markerAgentID, p.LastTick, ctx.now, coordSpawnTimeoutDefault) {
 		st = coordSpawnNeverTicked
