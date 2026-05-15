@@ -134,44 +134,64 @@ scan_file() {
       }
       return 0
     }
-    # Count code-level braces on this line, advancing in_raw / in_str.
-    # Returns 0; mutates brace, in_raw, in_str as side effects.
-    # We process character by character so a `}` inside a raw string
-    # or inside double-quoted string does NOT count.
+    # Count code-level braces on this line. Tracks four states:
+    #   - in_raw      = inside Go raw-string (backtick to backtick)
+    #   - in_str      = inside Go interpreted string (double-quote)
+    #   - in_blkcmt   = inside /* ... */ block comment (multi-line)
     #
-    # Limitations: backslash escape inside double-quoted strings is
-    # handled (\" doesn-t terminate). Line comments (// ...) and block
-    # comments (/* ... */) inside CODE are NOT tracked — they can
-    # contain `{` or `}` but they almost never appear in test bodies
-    # at column 0, and a misclassification would surface as a false
-    # POSITIVE (the lint flags a function early) which the operator
-    # can then re-tune. We do not allow the function-body end to be
-    # missed by treating comments as code — that would be the
-    # silent-bypass direction the prior version failed in.
-    function count_braces(line,    i, ch, prev) {
+    # Single-line // comments are handled inline: when we see // outside
+    # any string/block-comment, we stop processing the rest of the line.
+    #
+    # Codex review iter-8 [P2] (2026-05-15): without comment-tracking,
+    # a `// {` inside a function body would unbalance the brace counter
+    # and the scanner would silently absorb the entire next function.
+    function count_braces(line,    i, ch, nch, prev, ln) {
       prev = ""
-      for (i = 1; i <= length(line); i++) {
+      ln = length(line)
+      for (i = 1; i <= ln; i++) {
         ch = substr(line, i, 1)
+        if (in_blkcmt) {
+          # Look for */ closing.
+          if (ch == "*" && i < ln && substr(line, i+1, 1) == "/") {
+            in_blkcmt = 0
+            i++  # consume the /
+          }
+          prev = ch
+          continue
+        }
         if (in_raw) {
           if (ch == "`") in_raw = 0
-        } else if (in_str) {
-          if (ch == "\\" && prev != "\\") {
-            # consume the escaped char by setting prev to a marker
-            # that prev != "\\" check below picks up
+          prev = ch
+          continue
+        }
+        if (in_str) {
+          if (ch == "\\" && prev != "\\") { prev = ch; continue }
+          if (ch == "\"" && prev != "\\") in_str = 0
+          prev = ch
+          continue
+        }
+        # Plain code state. Check for comment starts first.
+        if (ch == "/" && i < ln) {
+          nch = substr(line, i+1, 1)
+          if (nch == "/") {
+            # Rest of line is a comment; stop processing.
+            return
+          }
+          if (nch == "*") {
+            in_blkcmt = 1
+            i++  # consume the *
             prev = ch
             continue
           }
-          if (ch == "\"" && prev != "\\") in_str = 0
-        } else {
-          if (ch == "`") {
-            in_raw = 1
-          } else if (ch == "\"") {
-            in_str = 1
-          } else if (ch == "{") {
-            brace++
-          } else if (ch == "}") {
-            brace--
-          }
+        }
+        if (ch == "`") {
+          in_raw = 1
+        } else if (ch == "\"") {
+          in_str = 1
+        } else if (ch == "{") {
+          brace++
+        } else if (ch == "}") {
+          brace--
         }
         prev = ch
       }
@@ -255,25 +275,46 @@ discover_helpers() {
       brace = 0
       in_raw = 0
       in_str = 0
+      in_blkcmt = 0
     }
     # Go-aware brace tally (see scan_file for the rationale). Tracks
-    # raw-string and double-quoted-string state so column-0 `}` inside
-    # a string literal does not falsely end the function body.
-    function count_braces(line,    i, ch, prev) {
+    # raw-string, double-quoted-string, // line-comment, and /* */
+    # block-comment state. Codex review iter-7 [P2] (raw strings) and
+    # iter-8 [P2] (comments) both surfaced false-negatives where
+    # column-0 `}` inside these constructs falsely ended the function.
+    function count_braces(line,    i, ch, nch, prev, ln) {
       prev = ""
-      for (i = 1; i <= length(line); i++) {
+      ln = length(line)
+      for (i = 1; i <= ln; i++) {
         ch = substr(line, i, 1)
+        if (in_blkcmt) {
+          if (ch == "*" && i < ln && substr(line, i+1, 1) == "/") {
+            in_blkcmt = 0
+            i++
+          }
+          prev = ch
+          continue
+        }
         if (in_raw) {
           if (ch == "`") in_raw = 0
-        } else if (in_str) {
+          prev = ch
+          continue
+        }
+        if (in_str) {
           if (ch == "\\" && prev != "\\") { prev = ch; continue }
           if (ch == "\"" && prev != "\\") in_str = 0
-        } else {
-          if (ch == "`") in_raw = 1
-          else if (ch == "\"") in_str = 1
-          else if (ch == "{") brace++
-          else if (ch == "}") brace--
+          prev = ch
+          continue
         }
+        if (ch == "/" && i < ln) {
+          nch = substr(line, i+1, 1)
+          if (nch == "/") return
+          if (nch == "*") { in_blkcmt = 1; i++; prev = ch; continue }
+        }
+        if (ch == "`") in_raw = 1
+        else if (ch == "\"") in_str = 1
+        else if (ch == "{") brace++
+        else if (ch == "}") brace--
         prev = ch
       }
     }
