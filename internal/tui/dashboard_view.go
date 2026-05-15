@@ -928,12 +928,20 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 		coordActiveWindow, ctx.spawnTimeout,
 	)
 	// Probe tmux liveness once per render. Cheap (single map lookup or
-	// flock probe) but called in two places below (Path A/B heal and
-	// Path C suppression / never-ticked hint). markerAgentID="" means
-	// no marker on disk → no tmux session to probe → false.
+	// flock probe) but called in three places below (Path A heal
+	// removal, Path C suppression, never-ticked hint). markerAgentID=""
+	// means no marker on disk → no tmux session to probe → false.
+	//
+	// Use sessionProbeOrAliveFn (tristate) instead of sessionAliveFn
+	// (bool) so a tmux transport blip — wrong FLEET_TMUX_SOCKET,
+	// restarting server, EAGAIN — does NOT remove a live coord's
+	// marker and break [a] re-attach. Codex iter-14 P1: bool probe
+	// conflates "dead session" with "couldn't probe," and Path A's
+	// marker removal is irreversible at the next render. The tristate
+	// probe falls back to "treat as alive" on transport errors.
 	sessAlive := false
 	if markerAgentID != "" {
-		sessAlive = sessionAliveFn(tmuxSessionName(markerAgentID))
+		sessAlive = sessionProbeOrAliveFn(tmuxSessionName(markerAgentID))
 	}
 
 	// neverTicked is the central gate: when true (no coord-state.json
