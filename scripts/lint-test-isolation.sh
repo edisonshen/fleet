@@ -97,15 +97,22 @@ skip_file() {
 
 # Per-function scan in awk. Emits one line per offending function:
 #   <file>:<startline>:<funcname>
-# Algorithm:
-#   - Track `func TestXxx(...)` line as start.
-#   - Brace counter increments on every `{` outside strings/comments. We
-#     simplify by counting raw braces — Go code with literal braces in
-#     strings is rare in test bodies and would produce a false positive
-#     that prompts a quick lint re-tune; never a silent bypass.
-#   - When the brace counter returns to 0, the function body has ended.
-#   - Inside the body, accumulate a marker bitmask: trigger=1, marker=2.
-#   - At end, if trigger seen AND marker NOT seen, print the offender.
+#
+# Algorithm (codex review iter-7 [P2], 2026-05-15): proper Go-aware
+# brace counting. A naive "first column-0 }" detector misclassifies a
+# raw-string-literal that spans multiple lines and contains a line
+# starting with `}` (or any string with such content). Real Go code in
+# this repo has that shape — `cmd/fleet/handoff_test.go` builds a
+# legacy JSON via a multi-line `` `…` `` raw string whose first line
+# after the open-brace puts `}` at column 0.
+#
+# Tracker state per line:
+#   - in_raw  = inside Go raw-string (backtick to backtick), braces ignored
+#   - in_str  = inside Go interpreted string (double-quote), braces ignored
+#   - brace   = net depth of {} characters outside strings/comments
+#
+# Function body ends when brace returns to 0 having gone above 0 — i.e.,
+# we've seen the opening { for the function and matched it.
 scan_file() {
   local f="$1"
   awk -v file="$f" -v trigs="$triggers" -v marks="$markers" '
@@ -115,6 +122,9 @@ scan_file() {
       start_line = 0
       saw_trig = 0
       saw_iso = 0
+      brace = 0
+      in_raw = 0
+      in_str = 0
     }
     function any_substr(haystack, needles_str,    n, arr, i) {
       n = split(needles_str, arr, " ")
@@ -124,13 +134,53 @@ scan_file() {
       }
       return 0
     }
-    BEGIN {
-      reset()
+    # Count code-level braces on this line, advancing in_raw / in_str.
+    # Returns 0; mutates brace, in_raw, in_str as side effects.
+    # We process character by character so a `}` inside a raw string
+    # or inside double-quoted string does NOT count.
+    #
+    # Limitations: backslash escape inside double-quoted strings is
+    # handled (\" doesn-t terminate). Line comments (// ...) and block
+    # comments (/* ... */) inside CODE are NOT tracked — they can
+    # contain `{` or `}` but they almost never appear in test bodies
+    # at column 0, and a misclassification would surface as a false
+    # POSITIVE (the lint flags a function early) which the operator
+    # can then re-tune. We do not allow the function-body end to be
+    # missed by treating comments as code — that would be the
+    # silent-bypass direction the prior version failed in.
+    function count_braces(line,    i, ch, prev) {
+      prev = ""
+      for (i = 1; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (in_raw) {
+          if (ch == "`") in_raw = 0
+        } else if (in_str) {
+          if (ch == "\\" && prev != "\\") {
+            # consume the escaped char by setting prev to a marker
+            # that prev != "\\" check below picks up
+            prev = ch
+            continue
+          }
+          if (ch == "\"" && prev != "\\") in_str = 0
+        } else {
+          if (ch == "`") {
+            in_raw = 1
+          } else if (ch == "\"") {
+            in_str = 1
+          } else if (ch == "{") {
+            brace++
+          } else if (ch == "}") {
+            brace--
+          }
+        }
+        prev = ch
+      }
     }
-    # Function start: "func TestXxx(" at column 0. We only lint exported
-    # Test functions — helpers (lowercase names) are checked indirectly:
-    # if a Test function calls a helper that ends up at tmux.Spawn but
-    # never mentions an isolation marker, the Test will be flagged.
+    BEGIN { reset() }
+    # Function start: "func TestXxx(" at column 0. We only lint
+    # exported Test functions — helpers (lowercase names) become
+    # additional triggers/markers via discover_helpers and are
+    # checked indirectly through their callers.
     /^func Test[A-Za-z0-9_]*\(/ {
       reset()
       in_func = 1
@@ -139,16 +189,22 @@ scan_file() {
       sub(/^func[ \t]+/, "", n)
       sub(/\(.*/, "", n)
       func_name = n
-      # Skip trigger/marker scan for the function-declaration line:
-      # a test named TestXxx_SuggestsResume would otherwise match the
-      # "Resume(" substring on its own declaration.
+      # Count the braces on the function-declaration line so the
+      # opening `{` is registered (most go func decls put `{` on
+      # the same line). Trigger/marker scan is suppressed for this
+      # one line — a test named TestXxx_SuggestsResume would
+      # otherwise match the "Resume(" substring on its declaration.
+      count_braces($0)
       next
     }
     in_func {
       if (any_substr($0, trigs)) saw_trig = 1
       if (any_substr($0, marks)) saw_iso = 1
-      # End of function: closing brace at column 0.
-      if ($0 ~ /^}/) {
+      count_braces($0)
+      # Function body ends when brace returns to 0. (The opening { put
+      # us at 1 on the declaration line; the matching close brings us
+      # back to 0.)
+      if (brace == 0) {
         if (saw_trig && !saw_iso) {
           printf "%s:%d:%s\n", file, start_line, func_name
         }
@@ -196,6 +252,30 @@ discover_helpers() {
       in_func = 0
       func_name = ""
       saw = 0
+      brace = 0
+      in_raw = 0
+      in_str = 0
+    }
+    # Go-aware brace tally (see scan_file for the rationale). Tracks
+    # raw-string and double-quoted-string state so column-0 `}` inside
+    # a string literal does not falsely end the function body.
+    function count_braces(line,    i, ch, prev) {
+      prev = ""
+      for (i = 1; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (in_raw) {
+          if (ch == "`") in_raw = 0
+        } else if (in_str) {
+          if (ch == "\\" && prev != "\\") { prev = ch; continue }
+          if (ch == "\"" && prev != "\\") in_str = 0
+        } else {
+          if (ch == "`") in_raw = 1
+          else if (ch == "\"") in_str = 1
+          else if (ch == "{") brace++
+          else if (ch == "}") brace--
+        }
+        prev = ch
+      }
     }
     BEGIN { reset() }
     /^func / {
@@ -210,18 +290,15 @@ discover_helpers() {
       sub(/\(.*/, "", n)
       func_name = n
       # Skip Test funcs — they are checked, not used as helpers.
-      if (substr(func_name, 1, 4) == "Test") in_func = 0
+      if (substr(func_name, 1, 4) == "Test") { in_func = 0; next }
+      count_braces($0)
       next
     }
     in_func {
       if (any_substr($0, needles)) saw = 1
-      if ($0 ~ /^}/) {
+      count_braces($0)
+      if (brace == 0) {
         if (saw && func_name != "") {
-          # Suppress helpers whose name is in the exclude list — this
-          # prevents trigger-bearing helpers that ALSO call markers from
-          # being emitted as triggers (e.g. setupCoordIntegration calls
-          # requireTmux and seeds tmux; we want it as a marker, not a
-          # trigger).
           emit = 1
           if (exclude != "") {
             en = split(exclude, ea, " ")
