@@ -896,8 +896,70 @@ def _run_supervisor(
     # spare cap. Calls _maybe_dispatch_after_reconcile (which itself
     # consumes reaper_redispatch_pending markers + runs _dispatch_ready);
     # that's idempotent on a tick where no new task is available.
+    #
+    # Codex iter-4 [P1]: also drain inbox/archive sentinels on the
+    # forced wake. Without this, archive events for in-flight workers
+    # (WORKER_FAILED, TASK_DONE_PR) sit in inbox/archive/ while
+    # supervisor-mode reconcile already requeues / redispatches the
+    # same slug — the next top-level tick then REPLAYS the stale
+    # sentinel through _apply_sentinel, which can roll a replacement
+    # worker back to `todo` or restore an old PR URL. Fix: drain the
+    # archive inside the same wake, advance the watermark to "this
+    # tick consumed everything I had", so replay is impossible.
     def force_tick_dispatch_hook():
+        _drain_inbox_archive_supervisor()
         _maybe_dispatch_after_reconcile()
+
+    def _drain_inbox_archive_supervisor():
+        """Drain archive sentinels under the supervisor lock.
+
+        Mirrors the primary tick's drain step (loop._tick_locked step 4)
+        with one difference: probes for reaper-lane state and skips
+        applying worker-clearing sentinels (TASK_DONE_PR / WORKER_FAILED)
+        when the lane is still open — same gate the primary tick uses.
+        """
+        try:
+            f6 = parse.read(str(tasks_path))
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"supervisor drain tasks-read: {exc}")
+            return
+        cs = _load_coord_state(state_path)
+        tasks_by_slug = {t.slug: t for t in f6.tasks}
+        drained, last_seen = _drain_archive(
+            home / "inbox" / "archive",
+            coord_id=coord_id,
+            since=str(cs.get("last_archive_scan_ts", "") or ""),
+            tasks_by_slug=tasks_by_slug,
+        )
+        if not drained and not last_seen:
+            return
+        sentinel_repo = cwd if cap > 1 else ""
+        sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+        for action in drained:
+            if action.kind in ("task_done_pr", "worker_failed") and not (
+                _reaper_lane_clear_for(cs, action.slug)
+            ):
+                continue
+            try:
+                _apply_sentinel(
+                    action, project, fleet_bin,
+                    repo=sentinel_repo,
+                    tasks_by_slug=sentinel_tasks_by_slug,
+                    home=home,
+                    full_tasks_by_slug=tasks_by_slug,
+                )
+                if action.kind in (
+                    "task_done_pr", "worker_failed", "blocked_question",
+                ):
+                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    _clear_review_handoff_state(cs, action.slug)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(
+                    f"supervisor sentinel {action.slug}: {exc}"
+                )
+        if last_seen:
+            cs["last_archive_scan_ts"] = last_seen
+        _save_coord_state(state_path, cs)
 
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import json
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -488,6 +489,54 @@ def test_reap_probes_pending_judgment_no_entry_kept() -> None:
     assert "reaper" not in coord_state or "alpha-aaaa" not in coord_state.get(
         "reaper", {}
     )
+
+
+# ---------- hard_kill_pid primitive ----------
+
+
+def test_hard_kill_pid_returns_false_on_process_lookup_error(monkeypatch) -> None:
+    """Codex iter-4 [P1]: ProcessLookupError must return False, NOT True.
+    The caller invokes hard_kill_pid AFTER confirming the tmux session
+    is still alive — if the pid is missing but the session lives, we
+    didn't actually kill anything; reporting True would falsely close
+    the kill cycle and orphan the session."""
+    import os as _os
+
+    def boom(pid, sig):
+        raise ProcessLookupError("no such process")
+
+    monkeypatch.setattr(_os, "kill", boom)
+    assert reaper.hard_kill_pid(12345) is False
+
+
+def test_hard_kill_pid_returns_true_on_signal_delivery(monkeypatch) -> None:
+    """Happy path: os.kill returns normally → True."""
+    import os as _os
+    called: list[tuple[int, int]] = []
+
+    def fake_kill(pid, sig):
+        called.append((pid, sig))
+
+    monkeypatch.setattr(_os, "kill", fake_kill)
+    assert reaper.hard_kill_pid(12345) is True
+    assert called == [(12345, signal.SIGKILL)] or called[0][0] == 12345
+
+
+def test_hard_kill_pid_returns_false_on_permission_error(monkeypatch) -> None:
+    """Cross-uid kill → False so the caller can escalate."""
+    import os as _os
+
+    def boom(pid, sig):
+        raise PermissionError("not yours")
+
+    monkeypatch.setattr(_os, "kill", boom)
+    assert reaper.hard_kill_pid(12345) is False
+
+
+def test_hard_kill_pid_rejects_zero_pid() -> None:
+    """Defensive: pid<=0 → False."""
+    assert reaper.hard_kill_pid(0) is False
+    assert reaper.hard_kill_pid(-1) is False
 
 
 # ---------- reaper_lane_clear gate ----------

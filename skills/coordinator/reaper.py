@@ -350,21 +350,36 @@ def run_fleet_rm(
 
 
 def hard_kill_pid(pid: int) -> bool:
-    """SIGKILL the pid. Returns True if signal delivered (or pid was
-    already gone). False on permission error / signal failure.
+    """SIGKILL the pid. Returns True ONLY if the signal was delivered
+    successfully. False on permission error, signal failure, or
+    ProcessLookupError (pid already gone).
 
     Invariant-5 escape hatch: only called when the grace window has
     expired, `fleet rm` failed, and the tmux session is STILL alive on
     re-probe. Logs loudly at the caller — operator must see
     "had to SIGKILL".
+
+    Codex iter-4 [P1]: ProcessLookupError used to return True, but the
+    caller only invokes hard_kill_pid AFTER confirming the tmux session
+    is still alive. A worker wrapper that uses a shell wrapper around
+    the Claude SDK keeps the tmux session alive even after the inner
+    Claude pid dies cleanly; state.json's pid might be that inner pid.
+    Returning True on ProcessLookupError in that case would falsely
+    claim "kill succeeded" → reaper drops the entry → tmux session
+    orphans. The conservative answer: ProcessLookupError means we
+    couldn't actually kill anything via this pid; report False so the
+    caller falls through to the error branch (which logs [P0] for
+    operator triage).
     """
     if pid <= 0:
         return False
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        # Already dead — treat as success.
-        return True
+        # PID is gone but the caller already confirmed the tmux
+        # session is alive — we did NOT kill the session. Report
+        # failure so the caller can escalate.
+        return False
     except (PermissionError, OSError):
         return False
     return True
