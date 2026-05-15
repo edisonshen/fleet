@@ -620,23 +620,35 @@ func stubMarkerAgentID(t *testing.T, project, agentID string) {
 	t.Cleanup(func() { coordSpawnMarkerFn = prev })
 }
 
-// stubAliveSessions swaps sessionAliveFn for a deterministic in-memory
-// map: present-and-true → alive, present-and-false or absent → dead.
-// Restored at test end. Mirrors the existing tmux.HasSession contract
-// (definitive bool — the conflated probe-error case is irrelevant for
-// the self-heal path; we err toward "treat as alive" only when the
-// session was deliberately stubbed dead).
+// stubAliveSessions swaps sessionAliveFn AND sessionProbeOrAliveFn for
+// a deterministic in-memory map: present-and-true → alive,
+// present-and-false or absent → dead. Restored at test end.
+//
+// Stubbing both is necessary (codex iter-18 P1): sessionProbeOrAliveFn
+// falls through to the REAL sessionProbeFn (tmux.SessionAlive) when
+// sessionAliveFn returns false. Without overriding sessionProbeOrAliveFn,
+// dashboard render tests that need definitive-dead sessions would
+// depend on the host machine's tmux state — non-deterministic across
+// developers' workstations and CI environments. Both probes share the
+// same map so a test only needs to describe the world once.
 //
 // Distinct from the keys_test.go helper `stubSessionAlive` (struct,
 // dead-set) — this is the inverse-shape variant for self-heal tests
 // where the alive-set is the natural way to describe the world.
 func stubAliveSessions(t *testing.T, alive map[string]bool) {
 	t.Helper()
-	prev := sessionAliveFn
+	prevAlive := sessionAliveFn
+	prevProbeOrAlive := sessionProbeOrAliveFn
 	sessionAliveFn = func(session string) bool {
 		return alive[session]
 	}
-	t.Cleanup(func() { sessionAliveFn = prev })
+	sessionProbeOrAliveFn = func(session string) bool {
+		return alive[session]
+	}
+	t.Cleanup(func() {
+		sessionAliveFn = prevAlive
+		sessionProbeOrAliveFn = prevProbeOrAlive
+	})
 }
 
 // stubProcessAlive swaps agentProcessAliveFn for a deterministic
