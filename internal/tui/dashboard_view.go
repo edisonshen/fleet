@@ -967,39 +967,57 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 				return removeCoordSpawnMarkerFn(p.Name)
 			})
 		}
-
-		// Path C suppression (2026-05-14 false-positive fix): if heal
-		// did not fire and the agent record exists for an alive tmux
-		// session AND the coord has never published a tick under this
-		// spawn, the spawn pipeline completed but no Stop-hook tick
-		// has fired yet (HANDOFF state, freshly-booted, Stop hook
-		// misconfig). Suppress the red attention chip at the render
-		// layer WITHOUT removing the marker — the marker is the only
-		// proof of which agent is coord for the project in this state
-		// (no coordinator.lock body has been published yet), so the
-		// [a] re-attach path in findExistingCoordForProject still
-		// needs it. The softer coordSpawnNeverTicked hint below
-		// surfaces the underlying problem informationally when the
-		// agent has aged past the cold-start grace window.
-		//
-		// Narrow gate (codex iter-2 P1): Path C only suppresses when
-		// the coord has never ticked under THIS spawn. If the coord
-		// previously ticked (neverTicked=false) and is NOW stale +
-		// past spawnTimeout, the derivation's stuck verdict is RIGHT —
-		// the coord booted, published, and then wedged. The operator
-		// needs the attention chip to surface that as a real hang.
-		if st == coordSpawnStuck && sessAlive &&
-			agentRecordExists(ctx.records, markerAgentID) && neverTicked {
-			st = coordSpawnIdle
-		}
 	}
+
 	// PART 2b downgrade: stuck → waiting when the agent record has
 	// needs_input=true AND last_activity_ts is within
 	// agentRecordFreshWindow. Codex iter-4 (2026-05-14) added the
 	// freshness gate so a stale needs_input=true flag (set before
 	// claude died while the wrapper-shell survived) doesn't mask a
 	// dead coord — the original stuck warning surfaces in that case.
+	//
+	// Runs BEFORE Path C (codex iter-6 P1): if Path C demoted Stuck
+	// → Idle first, the downgrade-to-Waiting wouldn't fire and the
+	// operator would lose the "coord waiting on input — fleet attach
+	// <id>" cue when /coordinator hasn't ticked yet but Claude has
+	// already paused at a question.
 	st = downgradeStuckOnNeedsInput(st, ctx.records, markerAgentID, ctx.now, agentRecordFreshWindow)
+
+	// Path C suppression (2026-05-14 false-positive fix): if heal /
+	// downgrade did not fire and the agent record exists for an alive
+	// tmux session AND the coord has never published a tick under this
+	// spawn AND Claude has fired at least one Stop hook since spawn
+	// (agentEverActivated — last_activity_ts strictly > spawned_at by
+	// mtime tolerance), the spawn pipeline completed AND Claude
+	// reached at least one Stop hook (proving the process is or was
+	// running; not just a wrapper-shell that survived an early Claude
+	// crash). Suppress the red attention chip at the render layer
+	// WITHOUT removing the marker — the marker is the only proof of
+	// which agent is coord for the project in this state (no
+	// coordinator.lock body has been published yet), so the [a]
+	// re-attach path in findExistingCoordForProject still needs it.
+	// The softer coordSpawnNeverTicked hint below surfaces the
+	// underlying problem informationally when the agent has aged past
+	// the cold-start grace window.
+	//
+	// Narrow gate (codex iter-2 P1): Path C only suppresses when the
+	// coord has never ticked under THIS spawn. If the coord previously
+	// ticked (neverTicked=false) and is NOW stale + past spawnTimeout,
+	// the derivation's stuck verdict is RIGHT — the coord booted,
+	// published, and then wedged. The operator needs the attention
+	// chip to surface that as a real hang.
+	//
+	// Stop-hook gate (codex iter-6 P1): without agentEverActivated,
+	// Path C suppression would mask "tmux wrapper survived, Claude
+	// died at startup" failures. The record exists from agent.New()
+	// even when Claude crashes immediately; only a Stop-hook fire
+	// proves Claude actually ran.
+	if st == coordSpawnStuck && sessAlive && markerAgentID != "" &&
+		agentRecordExists(ctx.records, markerAgentID) &&
+		neverTicked &&
+		agentEverActivated(ctx.records, markerAgentID) {
+		st = coordSpawnIdle
+	}
 
 	// Post-heal informational hint: after Path C downgraded Stuck →
 	// Idle (live tmux + record exists), surface "spawned but never
