@@ -1247,17 +1247,14 @@ func TestRender_FreshRecordNeverTickedPreservesMarker(t *testing.T) {
 	}
 }
 
-// TestCoordNeverTickedThisSpawn_MtimeTolerance pins the codex iter-5
-// [P2] fix: filesystem mtime resolution (1s on many filesystems) plus
-// write-skew can leave a real first tick comparing strictly less-than
-// spawned_at. Without the coordTickMtimeTolerance slack, that tick
-// would be misclassified as "never ticked" and a real wedge would be
-// hidden.
-//
-// Test cases pin the exact boundary: a tick within tolerance of (or
-// after) spawned_at counts as "ticked"; a tick more than tolerance
-// older counts as "never ticked / leftover from prior coord."
-func TestCoordNeverTickedThisSpawn_MtimeTolerance(t *testing.T) {
+// TestCoordNeverTickedThisSpawn_MtimePrecision pins the codex iter-14
+// [P2] strict-comparison contract: any lastTick BEFORE spawned_at is
+// "never ticked under this spawn" (i.e. it's a leftover from the
+// previous coord under this project, since coord-state.json is
+// project-scoped). No tolerance: a 1-second gap between old coord's
+// last tick and new coord's spawn would otherwise be misclassified as
+// "new coord ticked," letting Path B remove the marker without proof.
+func TestCoordNeverTickedThisSpawn_MtimePrecision(t *testing.T) {
 	spawnedAt := time.Date(2026, 5, 9, 12, 0, 0, 0, time.UTC)
 	rec := &agent.Record{ID: "x", SpawnedAt: spawnedAt}
 	records := []*agent.Record{rec}
@@ -1273,23 +1270,13 @@ func TestCoordNeverTickedThisSpawn_MtimeTolerance(t *testing.T) {
 			want:     false,
 		},
 		{
-			name:     "tick 500ms before spawn (within 2s slack) → ticked",
-			lastTick: spawnedAt.Add(-500 * time.Millisecond),
-			want:     false,
+			name:     "tick 1ns before spawn → never ticked (strict)",
+			lastTick: spawnedAt.Add(-1 * time.Nanosecond),
+			want:     true,
 		},
 		{
-			name:     "tick 1s before spawn (within 2s slack) → ticked",
+			name:     "tick 1s before spawn → never ticked (leftover from prior coord)",
 			lastTick: spawnedAt.Add(-1 * time.Second),
-			want:     false,
-		},
-		{
-			name:     "tick 2s before spawn (boundary) → ticked",
-			lastTick: spawnedAt.Add(-2 * time.Second),
-			want:     false,
-		},
-		{
-			name:     "tick 3s before spawn (past slack) → never ticked",
-			lastTick: spawnedAt.Add(-3 * time.Second),
 			want:     true,
 		},
 		{

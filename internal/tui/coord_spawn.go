@@ -681,19 +681,6 @@ func agentEverActivated(records []*agent.Record, id string) bool {
 	return false
 }
 
-// coordTickMtimeTolerance is the slack we allow between coord-state.json
-// mtime and the agent's spawned_at when deciding "did this coord ever
-// tick under THIS spawn." Filesystem mtime resolution is 1s on many
-// production filesystems (ext4 default, HFS+, exFAT); without slack a
-// tick that landed in the SAME second as the spawn could compare as
-// strictly less-than spawned_at and be misclassified as "never ticked"
-// (codex iter-5 P2). 2s gives one second of mtime granularity plus a
-// second of skew between Go's UTC time.Now() and the kernel's mtime
-// stamp on a separate writer process. Larger tolerances would risk
-// catching a leftover tick from a previous coord whose spawn was
-// near-simultaneous — vanishingly rare since agent IDs are random hex.
-const coordTickMtimeTolerance = 2 * time.Second
-
 // coordNeverTickedThisSpawn reports whether the coord-state.json
 // publication has NOT yet caught up to the agent's spawned_at. Returns
 // true when:
@@ -748,13 +735,19 @@ func coordNeverTickedThisSpawn(
 		if lastTick.IsZero() {
 			return true
 		}
-		// Treat lastTick within tolerance of (or after) spawned_at as
-		// "ticked." Filesystem mtime resolution + write skew can leave
-		// a real first tick comparing strictly less-than spawned_at;
-		// without tolerance the helper would misclassify it as
-		// never-ticked and Path C would hide a real hang.
-		threshold := r.SpawnedAt.Add(-coordTickMtimeTolerance)
-		return lastTick.Before(threshold)
+		// Strict comparison: lastTick BEFORE spawned_at means the tick
+		// is from a PREVIOUS coord (the coord-state.json file is
+		// project-scoped, so a leftover tick from the prior coord
+		// outlives that coord's lifecycle). We do NOT add a negative
+		// tolerance here — codex iter-14 P2: a 1-second gap between
+		// the old coord's last tick and the new coord's spawn was
+		// being misclassified as "the new coord ticked," letting Path
+		// B remove the marker without proof of publication under this
+		// spawn. Same-second first-tick from THIS spawn is essentially
+		// impossible in production (cold-start takes seconds; first
+		// Stop hook needs ≥1 assistant turn), so dropping the
+		// tolerance has no realistic miss.
+		return lastTick.Before(r.SpawnedAt)
 	}
 	return false
 }
@@ -805,12 +798,12 @@ func agentNeverTickedSinceSpawn(
 		if now.Sub(r.SpawnedAt) <= graceWindow {
 			return false
 		}
-		// Tick exists AND is within coordTickMtimeTolerance of (or
-		// after) spawned_at → already ticked. Same FS-mtime slack as
-		// coordNeverTickedThisSpawn (codex iter-5 P2) — a real first
-		// tick whose mtime rounded down to the same second as
-		// SpawnedAt must NOT be misclassified as "never ticked."
-		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt.Add(-coordTickMtimeTolerance)) {
+		// Tick exists AND is on-or-after spawned_at → already ticked.
+		// Strict comparison aligned with coordNeverTickedThisSpawn
+		// (codex iter-14 P2): no tolerance window because a leftover
+		// tick from the previous coord (project-scoped state file)
+		// would otherwise be attributed to this spawn.
+		if !lastTick.IsZero() && !lastTick.Before(r.SpawnedAt) {
 			return false
 		}
 		return true
