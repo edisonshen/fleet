@@ -806,6 +806,7 @@ def emit_stuck_alert(
     *,
     fleet_home: Path,
     detail: str,
+    post_write_mtime: list[float] | None = None,
 ) -> str:
     """Drop a [STUCK] inbox alert at ~/.fleet/inbox/<coord_id>.md.
 
@@ -818,6 +819,13 @@ def emit_stuck_alert(
       - recovery ladder: actions that touch worker inboxes / tasks.md.
 
     Returns the path written on success, "" on any error.
+
+    Codex iter-18 [P1]: caller can pass `post_write_mtime` (a list)
+    into which we append the file's mtime IMMEDIATELY AFTER our
+    write. The supervisor uses the highest such mtime as the baseline
+    for the operator-message-exit check, so an operator write that
+    ALSO landed during the same stuck-check pass (with a different
+    mtime) still triggers the exit.
 
     The write is append-only via O_APPEND so we don't clobber a coord
     inbox that's already populated with an operator message — fleet-
@@ -839,6 +847,11 @@ def emit_stuck_alert(
             os.fsync(fh.fileno())
     except OSError:
         return ""
+    if post_write_mtime is not None:
+        try:
+            post_write_mtime.append(target.stat().st_mtime)
+        except OSError:
+            pass
     return str(target)
 
 
@@ -1147,23 +1160,14 @@ def run_supervisor(
             if run_stuck:
                 last_stuck_check_unix = now_clock
                 res.stuck_check_passes += 1
-                # Codex iter-12 [P1]: _run_stuck_check_pass may emit
-                # [STUCK] alerts to the coord's own inbox file via
-                # emit_stuck_alert. That bumps the inbox mtime past
-                # the session baseline and would trigger the
-                # operator-inbox-exit on the next forced wake — the
-                # supervisor would terminate itself mid-recovery-ladder.
-                # Snapshot the inbox mtime BEFORE the pass; if the
-                # pass moved it (i.e., we wrote a [STUCK] alert), bump
-                # the session baseline to swallow the bump.
-                pre_pass_inbox_mtime = direct_inbox_session_baseline
-                if coord_id:
-                    try:
-                        pre_pass_inbox_mtime = (
-                            (home / "inbox" / f"{coord_id}.md").stat().st_mtime
-                        )
-                    except OSError:
-                        pass
+                # Codex iter-12 [P1] + iter-18 [P1]: capture the
+                # per-write mtimes of every [STUCK] alert this pass
+                # emits, so we can swallow ONLY our own writes when
+                # bumping direct_inbox_session_baseline. An operator
+                # write that races our alert in the same pass would
+                # have a DIFFERENT mtime — using that as baseline
+                # would silence the operator message.
+                stuck_alert_mtimes: list[float] = []
                 try:
                     stuck_summary = _run_stuck_check_pass(
                         probes=probes,
@@ -1174,6 +1178,7 @@ def run_supervisor(
                         now_unix=now_fn(),
                         coord_id=coord_id,
                         log_stream=log_stream,
+                        stuck_alert_mtimes=stuck_alert_mtimes,
                     )
                     res.nudges_sent += stuck_summary.nudges
                     res.escalations += stuck_summary.escalations
@@ -1186,28 +1191,19 @@ def run_supervisor(
                 # session baseline so the next forced wake doesn't
                 # treat the alert as an operator message.
                 #
-                # Codex iter-13 [P2]: ONLY bump baseline when the pass
-                # actually emitted [STUCK] alerts (stuck_summary.
-                # stuck_alerts > 0). Otherwise an operator write that
-                # landed during the same window would get its mtime
-                # baked into the baseline and the operator's message
-                # would never trigger an exit. Worst case (operator
-                # races our alert in the same pass): we'll baseline-
-                # over the operator's write this iteration, but the
-                # operator's NEXT write advances mtime again and
-                # triggers the exit then. Acceptable: bounded delay
-                # equal to one stuck-check cadence.
-                if coord_id and stuck_summary.stuck_alerts > 0:
-                    try:
-                        post_pass_inbox_mtime = (
-                            (home / "inbox" / f"{coord_id}.md").stat().st_mtime
-                        )
-                        if post_pass_inbox_mtime > pre_pass_inbox_mtime:
-                            direct_inbox_session_baseline = (
-                                post_pass_inbox_mtime
-                            )
-                    except OSError:
-                        pass
+                # Codex iter-18 [P1]: advance the baseline ONLY to
+                # the highest mtime we recorded immediately after our
+                # OWN writes. An operator write that races our pass
+                # has a different (typically later) mtime — it stays
+                # > baseline and triggers the operator-inbox-exit on
+                # the next forced wake. Without per-write capture,
+                # taking the file's final mtime would baseline-over
+                # any concurrent operator write and silence the
+                # operator message for the rest of the session.
+                if coord_id and stuck_alert_mtimes:
+                    new_baseline = max(stuck_alert_mtimes)
+                    if new_baseline > direct_inbox_session_baseline:
+                        direct_inbox_session_baseline = new_baseline
                 # dashboard-accumulation-f-4421 Sub-fix C: agent
                 # auto-archive runs alongside the stuck-check pass at the
                 # same cadence. Best-effort; failures log to stderr and
@@ -1384,6 +1380,7 @@ def _run_stuck_check_pass(
     now_unix: float,
     log_stream,
     coord_id: str = "",
+    stuck_alert_mtimes: list[float] | None = None,
 ) -> _StuckPassResult:
     """One pass over every probe: load supervisor state, classify, act.
 
@@ -1482,6 +1479,7 @@ def _run_stuck_check_pass(
                         f"phase={cur_phase or '?'} idle since "
                         f"{_fmt_ts(now_unix)}"
                     ),
+                    post_write_mtime=stuck_alert_mtimes,
                 )
                 if wrote:
                     out.stuck_alerts += 1

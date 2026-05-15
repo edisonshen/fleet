@@ -411,7 +411,15 @@ def _tick_locked(
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
-            result.errors.append(f"sentinel {action.slug}: {exc}")
+            # Codex iter-18 [P2]: re-add the action to the deferred
+            # queue so a later pass retries. Otherwise a transient
+            # `fleet tasks set/note` failure would permanently drop
+            # the transition (the archive file is already past the
+            # watermark).
+            deferred_actions.append(action)
+            result.errors.append(
+                f"sentinel {action.slug}: {exc} (re-queued for retry)"
+            )
     # Persist the deferred queue (or clear if nothing deferred this tick).
     _save_deferred_sentinels(state, deferred_actions)
     if last_seen:
@@ -965,8 +973,17 @@ def _run_supervisor(
                     _clear_review_handoff_state(cs, action.slug)
                 applied += 1
             except Exception as exc:  # noqa: BLE001
+                # Codex iter-18 [P2]: re-add the action to the
+                # deferred queue so a later pass retries. Otherwise a
+                # transient `fleet tasks set/note` failure would
+                # permanently drop the TASK_DONE_PR / WORKER_FAILED
+                # transition (the archive file is already past the
+                # last_archive_scan_ts watermark — there's no other
+                # source of truth).
+                still_deferred.append(action)
                 result.errors.append(
-                    f"deferred sentinel {action.slug}: {exc}"
+                    f"deferred sentinel {action.slug}: {exc} "
+                    "(re-queued for retry)"
                 )
         _save_deferred_sentinels(cs, still_deferred)
         return applied
@@ -1094,8 +1111,11 @@ def _run_supervisor(
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
             except Exception as exc:  # noqa: BLE001
+                # Codex iter-18 [P2]: re-queue on transient failure.
+                deferred_actions.append(action)
                 result.errors.append(
-                    f"supervisor sentinel {action.slug}: {exc}"
+                    f"supervisor sentinel {action.slug}: {exc} "
+                    "(re-queued for retry)"
                 )
         _save_deferred_sentinels(cs, deferred_actions)
         if last_seen:

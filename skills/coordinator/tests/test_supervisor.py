@@ -688,7 +688,7 @@ def test_stuck_check_runs_only_every_n_polls(
     # Stub out actual stuck-check pass to count invocations.
     pass_count = {"n": 0}
 
-    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
         pass_count["n"] += 1
         return supervisor._StuckPassResult()
 
@@ -1698,7 +1698,7 @@ def test_legacy_mode_stuck_check_cadence_uses_wall_clock(fleet_home: Path) -> No
     )
     stuck_count = {"n": 0}
 
-    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
         stuck_count["n"] += 1
         return supervisor._StuckPassResult()
     import unittest.mock as mock
@@ -2246,10 +2246,15 @@ def test_supervisor_own_stuck_alert_does_not_trigger_inbox_exit(
     inbox = fleet_home / "inbox" / "c00bf001.md"
 
     # Stub stuck-check to write the [STUCK] alert (simulating
-    # _run_stuck_check_pass's emit_stuck_alert call).
-    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id=""):
+    # _run_stuck_check_pass's emit_stuck_alert call). The stub also
+    # appends the post-write mtime to stuck_alert_mtimes so the
+    # supervisor's baseline-update path treats our write as a
+    # supervisor-side write (not an operator message).
+    def fake_pass(*, probes, project, home, fleet_bin, cfg, now_unix, log_stream, coord_id="", stuck_alert_mtimes=None):
         inbox.write_text("[STUCK] alpha-aaaa\n", encoding="utf-8")
-        return supervisor._StuckPassResult(nudges=1)
+        if stuck_alert_mtimes is not None:
+            stuck_alert_mtimes.append(inbox.stat().st_mtime)
+        return supervisor._StuckPassResult(nudges=1, stuck_alerts=1)
     monkeypatch.setattr(supervisor, "_run_stuck_check_pass", fake_pass)
 
     sleep_calls: list[float] = []
