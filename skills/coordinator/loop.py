@@ -512,6 +512,12 @@ def _tick_locked(
                 _record_review_handoff_dispatched(
                     state, action.slug, action.handoff_phase,
                 )
+                # Codex iter-5 [P1]: forget the pending-acquire entry
+                # AFTER _apply_dispatch_handoff lands. Symmetric to
+                # the primary tick + supervisor consumers.
+                supervisor_mod.forget_pending_acquire_agent_id(
+                    state, action.slug,
+                )
             if action.dispatch_instruction:
                 result.dispatch_instructions.append(action.dispatch_instruction)
             result.dispatched += 1
@@ -547,6 +553,16 @@ def _tick_locked(
             # is a single durable lookup.
             if action.agent_id:
                 supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
+            # Codex iter-5 [P1]: forget the pending-acquire entry only
+            # AFTER the apply chain has landed. Doing it inside
+            # _dispatch_ready (right after a successful acquire-prompt)
+            # would leak the claim on any apply-stage failure: the task
+            # stays `ready`, next tick mints a fresh id, and the
+            # original journal/inbox sit orphaned.
+            if action.agent_id:
+                supervisor_mod.forget_pending_acquire_agent_id(
+                    state, action.slug,
+                )
             # Issue #84 Phase A: surface the DISPATCH block so the
             # coord agent (Claude) can invoke the Agent tool. We
             # collect AFTER _apply_dispatch — the status flip /
@@ -815,6 +831,11 @@ def _run_supervisor(
                 _apply_dispatch(action, project, fleet_bin)
                 if action.agent_id:
                     supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
+                    # Codex iter-5 [P1]: same caller-side forget as the
+                    # primary tick path — only AFTER apply succeeds.
+                    supervisor_mod.forget_pending_acquire_agent_id(
+                        cs, action.slug,
+                    )
                 # Issue #84 Phase A: supervisor-loop dispatches still
                 # need to publish the DISPATCH block so the coord
                 # agent can spawn the Agent subagent. Without this,
@@ -3129,12 +3150,14 @@ def _dispatch_ready(
                 error=f"acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
-        # Acquire succeeded — clear any pending-acquire entry so the
-        # NEXT dispatch for this slug (post-terminal) mints fresh.
-        if coord_state is not None:
-            supervisor_mod.forget_pending_acquire_agent_id(
-                coord_state, t.slug,
-            )
+        # NOTE: do NOT forget the pending-acquire entry here. The
+        # acquire succeeded, but the subsequent _apply_dispatch (run
+        # in the caller) may still fail mid-way (status flip, workers
+        # update, or note write). If we cleared here and the apply
+        # then failed, the task would stay `ready`, the next tick
+        # would mint a fresh id, and the original claim+inbox would
+        # leak. Codex iter-5 [P1]: the caller clears the pending
+        # entry AFTER _apply_dispatch lands successfully.
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
@@ -3331,10 +3354,12 @@ def _dispatch_review_handoffs(
                 error=f"handoff acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
-        if coord_state is not None:
-            supervisor_mod.forget_pending_acquire_agent_id(
-                coord_state, t.slug,
-            )
+        # NOTE: same rationale as _dispatch_ready — defer the
+        # forget_pending_acquire_agent_id call until after
+        # _apply_dispatch_handoff lands. A handoff apply failure after
+        # a successful acquire would otherwise leak the new reviewer/
+        # finisher claim because next-tick mint would skip the
+        # recovery path.
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,

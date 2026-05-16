@@ -883,9 +883,9 @@ def test_acquire_success_clears_pending_acquire_entry(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
 ) -> None:
-    """Successful acquire clears any stale pending-acquire entry so a
-    SUBSEQUENT dispatch for the same slug (post-terminal) mints a fresh
-    agent_id rather than reusing the now-stale id."""
+    """Successful acquire+apply clears any stale pending-acquire entry
+    so a SUBSEQUENT dispatch for the same slug (post-terminal) mints a
+    fresh agent_id rather than reusing the now-stale id."""
     _write_tasks(project_dir, [_make_task("clear-aaaa", status="ready")])
     _seed_coord_state(project_dir, agent_id_map={})
     state_path = project_dir / "coord-state.json"
@@ -901,6 +901,70 @@ def test_acquire_success_clears_pending_acquire_entry(
     )
     state_after = json.loads(state_path.read_text())
     assert state_after.get("pending_acquire_agent_ids", {}) == {}
+
+
+def test_apply_dispatch_failure_preserves_pending_acquire(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-5 [P1]: if _apply_dispatch fails AFTER acquire-prompt
+    succeeded, the pending-acquire entry MUST be preserved so the next
+    tick retries with the SAME id (hitting the controller's recovery
+    branch). Without preservation, the original claim+inbox leak.
+
+    Setup: pre-seed a pending entry (simulating a prior tick where
+    acquire failed AFTER writing the journal). This tick's acquire
+    succeeds (recovery path), but apply then fails. The pending entry
+    must still be there at the end.
+    """
+    _write_tasks(project_dir, [_make_task("apply-fail-aa", status="ready")])
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"apply-fail-aa": "abadcafe"}
+    state_path.write_text(json.dumps(state))
+
+    # Pin mint to a different id so the test confirms the pending id
+    # was reused (and not the freshly minted one).
+    dispatch_subprocess.append("99887766")
+
+    # _apply_dispatch invokes _run_fleet for status flips etc.
+    # Patch _run_fleet to raise an exception so apply fails AFTER
+    # the acquire-prompt has already succeeded.
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated fleet binary fault during apply")
+
+    monkeypatch.setattr(loop, "_run_fleet", boom)
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    # _apply_dispatch raised, so the try/except in the consumer logged
+    # an error and did NOT count this as dispatched.
+    assert result.dispatched == 0
+    assert any("apply-fail-aa" in e for e in result.errors), (
+        f"expected error surfacing for apply-fail-aa; errors={result.errors!r}"
+    )
+
+    # Confirm the acquire-prompt was called with the REUSED pending id.
+    acquire_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "acquire-prompt"]
+    ]
+    assert len(acquire_calls) == 1
+    assert acquire_calls[0][3] == "abadcafe", (
+        f"expected pending agent_id reuse; argv={acquire_calls[0]!r}"
+    )
+
+    # CRITICAL: the pending-acquire entry MUST still be there so the
+    # next tick can retry with the same agent_id.
+    state_after = json.loads(state_path.read_text())
+    pending = state_after.get("pending_acquire_agent_ids", {})
+    assert pending.get("apply-fail-aa") == "abadcafe", (
+        f"apply failure must preserve pending agent_id for retry; "
+        f"pending={pending!r}"
+    )
 
 
 def test_tick_respects_cap_one_with_two_ready(
