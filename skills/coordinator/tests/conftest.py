@@ -25,6 +25,41 @@ if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
 
 
+# rc-listener-bootstrap-sk-3e98: set FLEET_RC_BOOTSTRAP_DISABLED before
+# any test imports the skill modules. Mirrors the Go-side TestMain
+# pattern in cmd/fleet/main_test.go. Without this, `loop.tick()` tests
+# (and any other path through remote_control.spawn_daemon_if_needed)
+# would fork a real `claude remote-control` listener on every test run,
+# registering with the operator's Claude Code service and pushing a
+# mobile notification per `pytest skills/` invocation.
+#
+# Process-env vs autouse session fixture: setting the env at module
+# import time guarantees coverage even for tests that monkeypatch the
+# env in their own fixtures BEFORE the autouse fixture runs (pytest
+# resolves env-touching fixtures in declaration order; module-level
+# `os.environ` writes happen at collection time which is strictly
+# earlier). The session fixture below is belt-and-suspenders for cases
+# where a hostile test deleted the env in setup.
+os.environ.setdefault("FLEET_RC_BOOTSTRAP_DISABLED", "1")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _disable_rc_bootstrap_session() -> None:
+    """Session-wide gate against accidental `claude remote-control`
+    spawns during the pytest run. The env-var read in
+    remote_control.spawn_daemon_if_needed (and the parallel sites
+    documented in skills/coordinator/SKILL.md) short-circuits when this
+    is set to any non-empty value.
+
+    Tests that need the production-default behaviour (the bootstrap
+    actually invokes subprocess.Popen with the bash payload) call
+    `enable_rc_bootstrap_for_test(monkeypatch)` from
+    test_rc_bootstrap_env_gate.py — that helper clears the env for
+    one test, then pytest's monkeypatch fixture restores it on teardown.
+    """
+    os.environ["FLEET_RC_BOOTSTRAP_DISABLED"] = "1"
+
+
 @pytest.fixture(autouse=True)
 def _disable_supervisor_by_default(monkeypatch):
     """Default: supervisor disabled. Tests that need it set their own
