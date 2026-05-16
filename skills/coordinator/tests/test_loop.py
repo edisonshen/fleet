@@ -1519,6 +1519,49 @@ def test_handoff_release_error_stashes_prior_id_for_retry(
     )
 
 
+def test_retry_pending_releases_retries_in_review(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-16 [P1]: in-review tasks have already exited the
+    worker phase (PR is open, worker dead). The retry-pending-
+    releases pass MUST attempt re-release here, not treat in-review
+    as a live state. Otherwise a worker→PR transition that hit a
+    transient release error orphans the claim until the PR closes.
+    """
+    _write_tasks(project_dir, [
+        _make_task("review-rel", status="in-review",
+                   pr_url="https://github.com/x/y/pull/9"),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"review-rel": "cccccccc"},
+    )
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_release_agent_ids"] = {"review-rel": ["cccccccc"]}
+    state_path.write_text(json.dumps(state))
+    inbox = fleet_home / "inbox" / "cccccccc.md"
+    inbox.write_text("orphaned in-review prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Retry pass fired the release.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "cccccccc" for c in release_calls), (
+        f"in-review slug must allow retry-pending-release; "
+        f"calls={release_calls!r}"
+    )
+    # On terminal success, pending_release entry cleared.
+    state_after = json.loads(state_path.read_text())
+    assert state_after.get("pending_release_agent_ids", {}) == {}
+
+
 def test_retry_pending_releases_drops_on_success(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess,

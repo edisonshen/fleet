@@ -2751,9 +2751,14 @@ def _retry_pending_releases(
         f = parse.read(
             str(home / "projects" / project / "tasks.md"),
         )
+        # Codex iter-16 [P1]: in-review tasks have already exited
+        # their worker phase (PR is open, worker is dead). The old
+        # coord_prompt_inbox claim must be reclaimable here. Only
+        # `ready` and `in-progress` count as "live worker that we
+        # must not tear down by mistake".
         live_statuses = {
             t.slug: t.status for t in f.tasks
-            if t.status in ("ready", "in-progress", "in-review")
+            if t.status in ("ready", "in-progress")
         }
     except Exception:  # noqa: BLE001
         # On parse error, fall back to map-presence check (more
