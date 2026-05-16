@@ -353,3 +353,113 @@ func TestInspect_Cases(t *testing.T) {
 		t.Errorf("inspect post-release Outcome = %q; want absent", res.Outcome)
 	}
 }
+
+// TestAcquireAndDeliver_LiveClaimWithMissingFileRecovers is the codex
+// iter-3 [P1] regression: if the journal records ClaimLive but the
+// inbox file is gone (manual cleanup, partial recovery, sweeper-
+// without-journal-write), AcquireCoordPromptInbox MUST re-create the
+// file rather than returning `already_acquired` with a stale path.
+func TestAcquireAndDeliver_LiveClaimWithMissingFileRecovers(t *testing.T) {
+	withFleetHome(t)
+	pinNow(t, time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC))
+
+	id := mustNewID(t, "deadf00d")
+	first, err := AcquireCoordPromptInbox(AcquireCoordPromptInboxOptions{
+		DispatchID: id,
+		Content:    strings.NewReader("first prompt"),
+	})
+	if err != nil {
+		t.Fatalf("first Acquire: %v", err)
+	}
+	// Simulate the file going missing (manual cleanup, half-recovered
+	// state) while the journal still says ClaimLive.
+	if err := os.Remove(first.Path); err != nil {
+		t.Fatalf("simulate inbox missing: %v", err)
+	}
+
+	// Second acquire must REPAIR — not return already_acquired with a
+	// path that no longer exists.
+	second, err := AcquireCoordPromptInbox(AcquireCoordPromptInboxOptions{
+		DispatchID: id,
+		Content:    strings.NewReader("second prompt"),
+	})
+	if err != nil {
+		t.Fatalf("second Acquire (recovery): %v", err)
+	}
+	if second.Outcome != OutcomeAcquired {
+		t.Errorf("recovery Outcome = %q; want acquired (re-created)", second.Outcome)
+	}
+	body, err := os.ReadFile(second.Path)
+	if err != nil {
+		t.Fatalf("read recovered inbox: %v", err)
+	}
+	if !strings.Contains(string(body), "second prompt") {
+		t.Errorf("recovered inbox body = %q; want second prompt", body)
+	}
+	// Journal still has exactly one live claim (the new one).
+	j, err := LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal: %v", err)
+	}
+	live := 0
+	for _, c := range j.Claims {
+		if c.State == ClaimLive {
+			live++
+		}
+	}
+	if live != 1 {
+		t.Errorf("expected exactly 1 live claim after recovery; got %d (claims=%+v)", live, j.Claims)
+	}
+}
+
+// TestReleaseCoordPromptInbox_LiveClaimMissingFileFlipsJournal is the
+// codex iter-3 [P2] regression: when the inbox file disappears
+// independently of the journal, Release was returning `already_released`
+// without flipping the journal claim from ClaimLive → ClaimReleased.
+// This leaked a live journal entry after every normal task completion
+// that happened to run after a manual inbox cleanup. The fix routes
+// this case through controller.Release so the journal advances.
+func TestReleaseCoordPromptInbox_LiveClaimMissingFileFlipsJournal(t *testing.T) {
+	withFleetHome(t)
+	pinNow(t, time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC))
+
+	id := mustNewID(t, "abcd1234")
+	first, err := AcquireCoordPromptInbox(AcquireCoordPromptInboxOptions{
+		DispatchID: id,
+		Content:    strings.NewReader("prompt"),
+	})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	// File disappears outside the controller's view; journal still
+	// records ClaimLive.
+	if err := os.Remove(first.Path); err != nil {
+		t.Fatalf("simulate inbox missing: %v", err)
+	}
+
+	res, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{
+		DispatchID: id,
+	})
+	if err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	// Outcome should be `released` (the journal flip was the actual
+	// release work; file unlink was a no-op).
+	if res.Outcome != OutcomeReleased {
+		t.Errorf("Release Outcome = %q; want released (journal must advance)", res.Outcome)
+	}
+	// Journal claim MUST be released; recl_state must be complete
+	// because exec_state was bumped to done by ReleaseCoordPromptInbox.
+	j, err := LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal: %v", err)
+	}
+	if idx := j.findClaim(KindCoordPromptInbox); idx < 0 {
+		t.Fatalf("claim missing entirely; want one released claim")
+	} else if j.Claims[idx].State != ClaimReleased {
+		t.Errorf("claim state = %q; want released", j.Claims[idx].State)
+	}
+	if j.ReclState != ReclComplete {
+		t.Errorf("recl_state = %q; want complete (all claims released + exec terminal)", j.ReclState)
+	}
+}

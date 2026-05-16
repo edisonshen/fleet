@@ -154,14 +154,37 @@ func (c *coordPromptInboxController) AcquireAndDeliver(j *Journal, claim Deliver
 	if claim.OwnerID == "" {
 		return errors.New("coordPromptInboxController: claim OwnerID required")
 	}
-	// Idempotency: a live claim with the same kind is already acquired.
+	// Idempotency: a live claim with the same kind is already acquired,
+	// BUT only when the on-disk inbox file actually exists. Codex iter-3
+	// [P1]: if the journal records ClaimLive but the file is gone
+	// (manual cleanup, partial recovery, sweeper-without-journal-write),
+	// we MUST re-run the full write rather than handing the caller
+	// `already_acquired` with a path that points to nothing. Inspect()
+	// already returns DeliveryAbsent for this shape; the controller has
+	// to make the same decision here so the recovery path is consistent
+	// from either entry point.
 	if i := j.findClaim(claim.Kind); i >= 0 {
 		if j.Claims[i].State == ClaimLive {
-			return ErrAlreadyAcquired
+			var existing DeliveryClaim
+			fileMissing := false
+			if uerr := json.Unmarshal(j.Claims[i].Data, &existing); uerr == nil {
+				if existing.Path != "" {
+					if _, statErr := os.Stat(existing.Path); statErr != nil && errors.Is(statErr, os.ErrNotExist) {
+						fileMissing = true
+					}
+				}
+			}
+			if !fileMissing {
+				return ErrAlreadyAcquired
+			}
+			// Live claim + missing file → recoverable. Drop the stale
+			// entry and fall through to the full allocate/write/live
+			// sequence below. The new entry uses the caller-supplied
+			// claim (fresh CreatedAt, current OwnerID).
 		}
-		// Allocating + released states are recoverable; we re-attempt
-		// the full write. The simplest path is to remove the prior
-		// entry and re-run.
+		// Allocating + released + live-with-missing-file states are
+		// recoverable; we re-attempt the full write. The simplest path
+		// is to remove the prior entry and re-run.
 		j.Claims = append(j.Claims[:i], j.Claims[i+1:]...)
 	}
 
