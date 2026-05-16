@@ -452,6 +452,7 @@ func TestInjectRemoteControlFlag_AnchoredInsertion(t *testing.T) {
 // The remote-control auto-attach is a coord-spawn-only convenience
 // for the documented Claude Code default shape.
 func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cases := [][]string{
 		// Custom argv (no shell wrap).
 		{"claude", "--print", "do something"},
@@ -488,6 +489,7 @@ func TestInjectRemoteControlFlag_NoOpForCustomCommand(t *testing.T) {
 // wrapper. See TestInjectRemoteControlFlag_ShellWrapper in
 // internal/spawn/argv_test.go for the positive cases.
 func TestInjectRemoteControlFlag_StrictShapeMatch(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cases := []struct {
 		name string
 		argv []string
@@ -559,6 +561,7 @@ func TestDefaultClaudeWrapperScript_MatchesFlagDefault(t *testing.T) {
 // cobra's flag parser); silently mutating it would corrupt later
 // reads of the same flag value.
 func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	// Use the real default wrapper script so the strict-shape match
 	// (codex review #73 iter-3 P2) actually triggers the rewrite path
 	// — otherwise this test would pass trivially via the early-return
