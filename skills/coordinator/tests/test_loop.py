@@ -1231,24 +1231,24 @@ def test_reconcile_release_error_stashes_for_retry(
     assert state.get("worker_agent_ids", {}).get("rec-rel-aa") == "feedface"
 
 
-def test_sweep_non_inflight_releases_blocked_slugs(
+def test_sweep_non_inflight_releases_todo_slugs(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess,
 ) -> None:
-    """Codex iter-10 [P2]: a slug whose status is `blocked` with a
+    """Codex iter-10 [P2]: a slug whose status is `todo` with a
     tracked agent_id must have its claim released and mapping cleared.
-    Without this sweep, an operator-driven blocked transition leaves
+    Without this sweep, an operator-driven todo transition leaves
     the journal/inbox orphaned because reconcile only processes
     in-progress / in-review.
     """
     _write_tasks(project_dir, [
-        _make_task("blocked-rel", status="blocked", worker_pid=0),
+        _make_task("todo-rel-aa", status="todo", worker_pid=0),
     ])
     _seed_coord_state(
-        project_dir, agent_id_map={"blocked-rel": "5aaaaaaa"},
+        project_dir, agent_id_map={"todo-rel-aa": "5aaaaaaa"},
     )
     inbox = fleet_home / "inbox" / "5aaaaaaa.md"
-    inbox.write_text("blocked worker prompt\n", encoding="utf-8")
+    inbox.write_text("todo worker prompt\n", encoding="utf-8")
 
     loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
@@ -1260,10 +1260,46 @@ def test_sweep_non_inflight_releases_blocked_slugs(
         if c[1:3] == ["claims", "release"]
     ]
     assert any(c[3] == "5aaaaaaa" for c in release_calls), (
-        f"sweep should release blocked slug; calls={release_calls!r}"
+        f"sweep should release todo slug; calls={release_calls!r}"
     )
     state = json.loads((project_dir / "coord-state.json").read_text())
-    assert "blocked-rel" not in state.get("worker_agent_ids", {})
+    assert "todo-rel-aa" not in state.get("worker_agent_ids", {})
+
+
+def test_sweep_preserves_blocked_worker_inbox(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-13 [P1]: BLOCKED_QUESTION carve-out — blocked
+    workers stay ALIVE so the operator can answer through the same
+    inbox. The non-inflight sweep MUST NOT release `blocked` slugs.
+    """
+    _write_tasks(project_dir, [
+        _make_task("blocked-keep", status="blocked", worker_pid=0),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"blocked-keep": "ab10cked"},
+    )
+    inbox = fleet_home / "inbox" / "ab10cked.md"
+    inbox.write_text("blocked worker prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Inbox preserved, agent_id mapping preserved.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    spurious = [c for c in release_calls if c[3] == "ab10cked"]
+    assert spurious == [], (
+        f"blocked slug must NOT be swept; release_calls={release_calls!r}"
+    )
+    assert inbox.exists(), "blocked inbox must remain (answer-blocked workflow)"
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state.get("worker_agent_ids", {}).get("blocked-keep") == "ab10cked"
 
 
 def test_sweep_non_inflight_does_not_touch_ready_slugs(

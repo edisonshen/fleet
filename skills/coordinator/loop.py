@@ -900,6 +900,46 @@ def _run_supervisor(
         # from inside _dispatch_ready survive into the consumer's
         # _save_coord_state call below.
         cs = _load_coord_state(state_path)
+        # Codex iter-13 [P1]: also fire the review-handoff dispatch
+        # path in supervisor mode. The primary tick wires it, but the
+        # supervisor's long-running loop only called _dispatch_ready
+        # — so a worker that hit phase=review-pending or review-done
+        # AFTER the initial tick would never have a reviewer/finisher
+        # spawned until the supervisor exits and a fresh top-level
+        # tick runs. _reconcile_inflight explicitly skips handoff
+        # phases, so this is the only place that drives the three-
+        # stage flow during a supervisor session.
+        handoffs = _dispatch_review_handoffs(
+            tasks=f4.tasks,
+            project=project,
+            fleet_bin=fleet_bin,
+            fleet_home=str(home),
+            home=home,
+            coord_state=cs,
+        )
+        for action in handoffs:
+            if action.error:
+                result.errors.append(
+                    f"supervisor handoff {action.slug}: {action.error}"
+                )
+                continue
+            if action.agent_id:
+                supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
+            try:
+                _apply_dispatch_handoff(action, project, fleet_bin)
+                if action.agent_id:
+                    _record_review_handoff_dispatched(
+                        cs, action.slug, action.handoff_phase,
+                    )
+                    supervisor_mod.forget_pending_acquire_agent_id(
+                        cs, action.slug,
+                    )
+                if action.dispatch_instruction:
+                    result.dispatch_instructions.append(action.dispatch_instruction)
+            except Exception as exc:  # noqa: BLE001
+                result.errors.append(
+                    f"supervisor handoff apply {action.slug}: {exc}"
+                )
         new_dispatched = _dispatch_ready(
             tasks=f4.tasks,
             project=project,
@@ -3205,14 +3245,23 @@ def _sweep_non_inflight_claim_state(
     if not tracked_slugs:
         return
     task_status = {t.slug: t.status for t in tasks}
-    # Codex iter-10 / iter-12 scope: we touch slugs in one of these
-    # buckets:
+    # Codex iter-10 / iter-12 / iter-13 scope: we touch slugs in
+    # one of these buckets:
     #
     #   - Operator-driven non-inflight non-done states
-    #     (`todo`, `blocked`, `abandoned`): both worker_agent_ids
-    #     and pending_acquire_agent_ids ids are released. Reconcile
-    #     / sentinel paths only target in-progress / in-review, so
+    #     (`todo`, `abandoned`): both worker_agent_ids and
+    #     pending_acquire_agent_ids ids are released. Reconcile /
+    #     sentinel paths only target in-progress / in-review, so
     #     these slugs would otherwise orphan their claims.
+    #
+    #   - Codex iter-13 [P1] EXCLUSION: `blocked` deliberately
+    #     OMITTED. _apply_sentinel's BLOCKED_QUESTION path keeps
+    #     worker_agent_ids alive on purpose so the operator can
+    #     answer the still-running worker through the same inbox
+    #     (answer-blocked workflow). Sweeping `blocked` slugs here
+    #     would strip the inbox+claim within one tick. Operator-
+    #     driven manual blocked (no live worker behind it) is rare
+    #     and PR4 sweeper handles that case.
     #
     #   - `ready` slugs with a worker_agent_ids entry (codex iter-12
     #     [P1]): an operator manually flipped a dispatched task
@@ -3227,7 +3276,7 @@ def _sweep_non_inflight_claim_state(
     #     archived/removed the row but the in-memory map still
     #     tracks an agent_id. The slug will never come back through
     #     reconcile so we release here.
-    sweep_statuses = {"todo", "blocked", "abandoned"}
+    sweep_statuses = {"todo", "abandoned"}
     for slug in tracked_slugs:
         status = task_status.get(slug, "")
         wid = agent_id_map.get(slug, "")
