@@ -3389,7 +3389,15 @@ def _sweep_non_inflight_claim_state(
             )
             if _release_outcome_is_terminal(release_outcome):
                 if source == "worker":
-                    supervisor_mod.forget_agent_id(coord_state, slug)
+                    # Codex iter-15 [P1]: in the ready_reset case,
+                    # preserve pending_acquire so _dispatch_ready can
+                    # reuse the half-written claim's id via the
+                    # recovery branch. forget_agent_id's default also
+                    # clears pending — opt out for this case only.
+                    supervisor_mod.forget_agent_id(
+                        coord_state, slug,
+                        also_pending=not ready_reset,
+                    )
                 if source == "pending":
                     supervisor_mod.forget_pending_acquire_agent_id(
                         coord_state, slug,

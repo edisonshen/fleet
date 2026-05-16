@@ -1122,6 +1122,60 @@ def test_sweep_releases_ready_with_worker_mapping(
     assert state.get("worker_agent_ids", {}).get("ready-reset-aa") == "99887766"
 
 
+def test_ready_reset_sweep_preserves_pending_acquire(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-15 [P1]: a `ready` task with BOTH worker_agent_ids
+    AND pending_acquire_agent_ids (apply-failed-after-acquire shape)
+    must have its STALE worker entry released, but the pending-
+    acquire entry MUST be preserved so _dispatch_ready can reuse
+    it via the recovery branch. Without this, forget_agent_id's
+    cascading clear of pending would force a fresh mint and leak
+    the half-written claim.
+    """
+    _write_tasks(project_dir, [_make_task("dual-map-aa", status="ready")])
+    _seed_coord_state(
+        project_dir, agent_id_map={"dual-map-aa": "1eeee101"},
+    )
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"dual-map-aa": "2bbbbb02"}
+    state_path.write_text(json.dumps(state))
+    inbox_stale = fleet_home / "inbox" / "1eeee101.md"
+    inbox_stale.write_text("stale worker prompt\n", encoding="utf-8")
+    inbox_pending = fleet_home / "inbox" / "2bbbbb02.md"
+    inbox_pending.write_text("half-written prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Stale worker id was released.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "1eeee101" for c in release_calls), (
+        f"stale worker id must be released; calls={release_calls!r}"
+    )
+    # Pending id used by dispatch (acquire fired against it).
+    acquire_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "acquire-prompt"]
+    ]
+    assert any(c[3] == "2bbbbb02" for c in acquire_calls), (
+        f"pending id must be reused via dispatch; calls={acquire_calls!r}"
+    )
+    # Post-tick state: worker_agent_ids now has the pending id (which
+    # the successful dispatch promoted); the original stale id is gone.
+    state_after = json.loads(state_path.read_text())
+    assert state_after.get("worker_agent_ids", {}).get("dual-map-aa") == "2bbbbb02"
+    # pending_acquire cleared on dispatch success.
+    assert state_after.get("pending_acquire_agent_ids", {}) == {}
+
+
 def test_sweep_releases_archived_slugs(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess,

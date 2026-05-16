@@ -562,8 +562,19 @@ def remember_agent_id(coord_state: dict, slug: str, agent_id: str) -> None:
     coord_state[_AGENT_IDS_KEY] = raw
 
 
-def forget_agent_id(coord_state: dict, slug: str) -> None:
-    """Drop the mapping when a task transitions to terminal."""
+def forget_agent_id(
+    coord_state: dict, slug: str, *, also_pending: bool = True,
+) -> None:
+    """Drop the slug → agent_id mapping when a task transitions to
+    terminal.
+
+    Codex iter-15 [P1]: the `also_pending` flag (default True for
+    back-compat) lets the caller opt out of clearing the parallel
+    pending-acquire entry. The ready-reset sweep path needs this:
+    it forgets the stale worker_agent_ids entry while preserving
+    the pending-acquire id so _dispatch_ready can reuse it via
+    the recovery branch in the SAME tick.
+    """
     raw = coord_state.get(_AGENT_IDS_KEY, {})
     if isinstance(raw, dict) and slug in raw:
         del raw[slug]
@@ -577,7 +588,12 @@ def forget_agent_id(coord_state: dict, slug: str) -> None:
     # transitioning to terminal (todo / done / blocked) by any path
     # means the previous attempt is conclusively over — any orphaned
     # pending agent_id should not bleed into the NEXT dispatch attempt.
-    forget_pending_acquire_agent_id(coord_state, slug)
+    # Codex iter-15 [P1]: the ready-reset sweep path passes
+    # also_pending=False so it can release ONLY the stale worker id
+    # while leaving the pending-acquire id for _dispatch_ready to
+    # reuse on the same tick.
+    if also_pending:
+        forget_pending_acquire_agent_id(coord_state, slug)
 
 
 def load_pending_acquire_agent_id_map(coord_state: dict) -> dict[str, str]:
