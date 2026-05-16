@@ -324,14 +324,21 @@ def _tick_locked(
                 # claim BEFORE forget_agent_id so we still have the
                 # mapping at release time. Best-effort; non-success
                 # logs to stderr but never blocks the status flip.
-                _release_coord_prompt_inbox(
+                # Codex iter-7 [P1]: only forget the mapping on
+                # terminal release outcomes — a transient `error`
+                # keeps the mapping so the next sweep/reconcile can
+                # retry the release. _clear_review_handoff_state runs
+                # unconditionally because its keys are tracked by
+                # slug (not agent_id) and are stale either way.
+                release_outcome = _release_coord_prompt_inbox(
                     slug=action.slug,
                     agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
                     fleet_bin=fleet_bin,
                     fleet_home=home,
                     site=f"primary-reconcile new_status={action.new_status}",
                 )
-                supervisor_mod.forget_agent_id(state, action.slug)
+                if _release_outcome_is_terminal(release_outcome):
+                    supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
                 # Codex iter-2 [P1]: do NOT clear reaper_redispatch_pending
                 # here. The marker is the explicit signal to dispatch a
@@ -426,14 +433,17 @@ def _tick_locked(
                 # BEFORE forget_agent_id (same ordering rule as the
                 # reconcile site). BLOCKED_QUESTION deliberately skipped
                 # — the operator may write back via answer-blocked.
-                _release_coord_prompt_inbox(
+                # Codex iter-7 [P1]: gate forget on the outcome so
+                # transient release errors don't drop the mapping.
+                release_outcome = _release_coord_prompt_inbox(
                     slug=action.slug,
                     agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
                     fleet_bin=fleet_bin,
                     fleet_home=home,
                     site=f"primary-sentinel kind={action.kind}",
                 )
-                supervisor_mod.forget_agent_id(state, action.slug)
+                if _release_outcome_is_terminal(release_outcome):
+                    supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
             # Codex iter-18 [P2]: re-add the action to the deferred
@@ -506,13 +516,18 @@ def _tick_locked(
         if action.error:
             result.errors.append(f"handoff {action.slug}: {action.error}")
             continue
+        # Codex iter-7 [P1]: persist agent_id BEFORE handoff apply.
+        # _apply_dispatch_handoff has its own mid-apply failure modes
+        # (note write, status mutations); upfront persistence keeps
+        # the orphan-claim recovery path viable.
+        if action.agent_id:
+            supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
+            _record_review_handoff_dispatched(
+                state, action.slug, action.handoff_phase,
+            )
         try:
             _apply_dispatch_handoff(action, project, fleet_bin)
             if action.agent_id:
-                supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
-                _record_review_handoff_dispatched(
-                    state, action.slug, action.handoff_phase,
-                )
                 # Codex iter-5 [P1]: forget the pending-acquire entry
                 # AFTER _apply_dispatch_handoff lands. Symmetric to
                 # the primary tick + supervisor consumers.
@@ -546,14 +561,21 @@ def _tick_locked(
         if action.error:
             result.errors.append(f"dispatch {action.slug}: {action.error}")
             continue
+        # Codex iter-7 [P1]: persist slug → agent_id BEFORE
+        # _apply_dispatch runs. _apply_dispatch fires several CLI
+        # mutations after the claim has already been acquired (status
+        # flip, branch set, workers update, worker_pid, note). If any
+        # mid-apply step fails after `status=in-progress` lands, the
+        # task is no longer `ready` so the pending-acquire retry
+        # never fires; without the agent_id in coord_state, the
+        # subsequent reconcile/sweep can't release the orphaned
+        # claim. Persisting upfront ensures the release wires always
+        # have a handle. Save state once after the loop (heartbeat)
+        # so a partial apply still durably records the mapping.
+        if action.agent_id:
+            supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
         try:
             _apply_dispatch(action, project, fleet_bin)
-            # Persist slug → agent_id so the supervisor loop can address
-            # the worker's inbox for nudges without re-parsing tasks.md.
-            # Notes accumulate over re-dispatches; coord-state's mapping
-            # is a single durable lookup.
-            if action.agent_id:
-                supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
             # Codex iter-5 [P1]: forget the pending-acquire entry only
             # AFTER the apply chain has landed. Doing it inside
             # _dispatch_ready (right after a successful acquire-prompt)
@@ -740,14 +762,16 @@ def _run_supervisor(
                     # PR1 dispatch-lifecycle: release coord_prompt_inbox
                     # BEFORE forget_agent_id (same ordering rule as the
                     # primary tick reconcile site).
-                    _release_coord_prompt_inbox(
+                    # Codex iter-7 [P1]: gate forget on outcome.
+                    release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
                         agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-reconcile new_status={action.new_status}",
                     )
-                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    if _release_outcome_is_terminal(release_outcome):
+                        supervisor_mod.forget_agent_id(cs, action.slug)
                     # Three-stage flow (reviewer-subagent-arch): clear
                     # the review-handoff dispatched markers in sync
                     # with the agent_id forget, mirroring the same
@@ -828,10 +852,15 @@ def _run_supervisor(
                     f"supervisor dispatch {action.slug}: {action.error}"
                 )
                 continue
+            # Codex iter-7 [P1]: persist agent_id BEFORE apply (same
+            # rationale as the primary tick consumer — mid-apply
+            # failures must still leave the slug→agent_id record so
+            # the orphaned claim is releasable on the next reconcile).
+            if action.agent_id:
+                supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
             try:
                 _apply_dispatch(action, project, fleet_bin)
                 if action.agent_id:
-                    supervisor_mod.remember_agent_id(cs, action.slug, action.agent_id)
                     # Codex iter-5 [P1]: same caller-side forget as the
                     # primary tick path — only AFTER apply succeeds.
                     supervisor_mod.forget_pending_acquire_agent_id(
@@ -1075,14 +1104,18 @@ def _run_supervisor(
                     # an already_released outcome is common when the
                     # primary drain already ran — that's still a success
                     # outcome (idempotent by design).
-                    _release_coord_prompt_inbox(
+                    # Codex iter-7 [P1]: gate forget on outcome so
+                    # transient release errors don't lose the only
+                    # retry handle.
+                    release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
                         agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-sentinel-replay kind={action.kind}",
                     )
-                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    if _release_outcome_is_terminal(release_outcome):
+                        supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
                 applied += 1
             except Exception as exc:  # noqa: BLE001
@@ -1231,14 +1264,16 @@ def _run_supervisor(
                     # PR1 dispatch-lifecycle: release the
                     # coord_prompt_inbox before forget — same ordering
                     # rule as the primary drain.
-                    _release_coord_prompt_inbox(
+                    # Codex iter-7 [P1]: gate forget on outcome.
+                    release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
                         agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-sentinel-drain kind={action.kind}",
                     )
-                    supervisor_mod.forget_agent_id(cs, action.slug)
+                    if _release_outcome_is_terminal(release_outcome):
+                        supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
             except Exception as exc:  # noqa: BLE001
                 # Codex iter-18 [P2]: re-queue on transient failure.
@@ -2477,7 +2512,7 @@ def _release_coord_prompt_inbox(
     fleet_bin: str,
     fleet_home: Path | str | None,
     site: str,
-) -> None:
+) -> str:
     """Best-effort release of a worker's coord_prompt_inbox claim.
 
     Wraps `dispatch_mod.release_coord_prompt_inbox` so terminal-
@@ -2489,13 +2524,20 @@ def _release_coord_prompt_inbox(
 
     No-op (silently) when agent_id is empty — the caller may not have
     a mapping (e.g., a sentinel from a pre-PR1 worker that never went
-    through the acquire-prompt path).
+    through the acquire-prompt path). Returns "" in the no-op case.
+
+    Returns the outcome string ("released", "already_released",
+    "absent", "not_owned", "error", or "" when skipped) so callers
+    can decide whether to forget the agent_id mapping. Codex iter-7
+    [P1]: a transient `error` outcome must NOT trigger forget — the
+    mapping is the only handle the next reconcile has for retrying
+    the release; dropping it permanently leaks the claim.
 
     `fleet_home` accepts a Path or str (loop.py uses Path internally,
     dispatch_mod expects a string env var) — we coerce here.
     """
     if not agent_id:
-        return
+        return ""
     home_arg: str | None
     if fleet_home is None:
         home_arg = None
@@ -2517,13 +2559,13 @@ def _release_coord_prompt_inbox(
             f"slug={slug} agent_id={agent_id}: {exc}",
             file=sys.stderr,
         )
-        return
+        return dispatch_mod.RELEASE_OUTCOME_ERROR
     outcome = response.get("outcome", "")
     if outcome in (
         dispatch_mod.RELEASE_OUTCOME_RELEASED,
         dispatch_mod.RELEASE_OUTCOME_ALREADY_RELEASED,
     ):
-        return
+        return outcome
     # Non-success outcomes: log but don't fail. absent + not_owned are
     # expected in race scenarios; error indicates a fleet-binary fault
     # that the PR4 sweeper will reconcile on its next sweep.
@@ -2534,6 +2576,31 @@ def _release_coord_prompt_inbox(
         f"slug={slug} agent_id={agent_id} outcome={outcome!r}"
         + (f" error={err}" if err else ""),
         file=sys.stderr,
+    )
+    return outcome or dispatch_mod.RELEASE_OUTCOME_ERROR
+
+
+def _release_outcome_is_terminal(outcome: str) -> bool:
+    """Codex iter-7 [P1]: only treat these outcomes as final so
+    forget_agent_id is safe.
+
+    released         — happy path; claim torn down.
+    already_released — idempotent success.
+    absent           — no claim or journal on disk. The mapping is
+                       stale; safe to forget.
+    not_owned        — another host owns the claim. Keeping the
+                       mapping would mislead our supervisor into
+                       addressing a worker we don't control; safe to
+                       forget on our side.
+
+    `error` and empty string are NOT terminal — keep the mapping so
+    the next sweep / reconcile can retry the release.
+    """
+    return outcome in (
+        dispatch_mod.RELEASE_OUTCOME_RELEASED,
+        dispatch_mod.RELEASE_OUTCOME_ALREADY_RELEASED,
+        dispatch_mod.RELEASE_OUTCOME_ABSENT,
+        dispatch_mod.RELEASE_OUTCOME_NOT_OWNED,
     )
 
 
@@ -2920,14 +2987,16 @@ def _sweep_done_worker_dirs(
         # when the slug isn't tracked.
         agent_id = agent_id_map.get(t.slug, "")
         if agent_id and coord_state is not None:
-            _release_coord_prompt_inbox(
+            # Codex iter-7 [P1]: gate forget on outcome.
+            release_outcome = _release_coord_prompt_inbox(
                 slug=t.slug,
                 agent_id=agent_id,
                 fleet_bin=fleet_bin,
                 fleet_home=fleet_home,
                 site="sweep-done-operator-driven",
             )
-            supervisor_mod.forget_agent_id(coord_state, t.slug)
+            if _release_outcome_is_terminal(release_outcome):
+                supervisor_mod.forget_agent_id(coord_state, t.slug)
             _clear_review_handoff_state(coord_state, t.slug)
         # Stat-first short-circuit: workers.Delete is idempotent on
         # ENOENT, but firing the CLI every tick on every done task

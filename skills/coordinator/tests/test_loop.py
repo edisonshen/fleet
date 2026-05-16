@@ -903,6 +903,87 @@ def test_acquire_success_clears_pending_acquire_entry(
     assert state_after.get("pending_acquire_agent_ids", {}) == {}
 
 
+def test_release_error_preserves_agent_id_mapping(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-7 [P1]: when `fleet claims release` returns an error
+    outcome (transient fault — binary missing, journal write race), the
+    slug → agent_id mapping MUST be preserved so the next sweep /
+    reconcile can retry the release. Forgetting on `error` permanently
+    leaks the journal/inbox claim.
+    """
+    _write_tasks(project_dir, [
+        _make_task("rel-err-aaaa", status="in-progress", worker_pid=1, pr_url=""),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"rel-err-aaaa": "feedfeed"},
+    )
+
+    # Stub the dispatch_mod helper to return an error envelope (NOT a
+    # success outcome). The wrapper's outcome propagates up.
+    import dispatch as dispatch_mod
+
+    def _err_release(*args, **kwargs):
+        return {
+            "outcome": dispatch_mod.RELEASE_OUTCOME_ERROR,
+            "error": "simulated transient fault",
+        }
+
+    monkeypatch.setattr(
+        dispatch_mod, "release_coord_prompt_inbox", _err_release,
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    # CRITICAL: mapping preserved on error outcome.
+    assert state.get("worker_agent_ids", {}).get("rel-err-aaaa") == "feedfeed", (
+        "release error must NOT drop the agent_id mapping; "
+        f"state={state!r}"
+    )
+
+
+def test_remember_agent_id_persists_before_apply(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-7 [P1]: agent_id MUST be persisted in coord_state
+    BEFORE _apply_dispatch runs. _apply_dispatch performs several CLI
+    mutations (status, branch, workers update, note); if any fails
+    after the claim has been acquired, the task is no longer `ready`
+    so the pending-acquire retry never fires. Without an upfront
+    remember_agent_id call, the next reconcile has no handle to
+    release the orphaned claim.
+    """
+    _write_tasks(project_dir, [_make_task("upfront-aa", status="ready")])
+    dispatch_subprocess.append("acefacef")
+
+    # Patch _run_fleet to raise on first call so _apply_dispatch
+    # fails immediately (BEFORE the status flip even lands). The
+    # remember_agent_id call must have already happened.
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated apply fault")
+
+    monkeypatch.setattr(loop, "_run_fleet", boom)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    # CRITICAL: mapping persisted even though apply failed.
+    assert state.get("worker_agent_ids", {}).get("upfront-aa") == "acefacef", (
+        "agent_id must be remembered BEFORE apply runs; "
+        f"state={state!r}"
+    )
+
+
 def test_sweep_done_worker_dirs_releases_claim(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
