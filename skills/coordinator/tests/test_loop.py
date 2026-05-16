@@ -770,6 +770,139 @@ def test_terminal_release_skipped_when_no_agent_id_known(
     )
 
 
+# ---------- acquire-prompt failure handling (codex iter-4 [P1]) ----------
+
+
+def test_acquire_failure_does_not_leak_agent_id_to_worker_map(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-4 [P1]: a failed acquire-prompt MUST NOT record the
+    minted agent_id in worker_agent_ids. Otherwise the supervisor
+    addresses a worker that was never actually spawned."""
+    _write_tasks(project_dir, [_make_task("acq-aaaa", status="ready")])
+    dispatch_subprocess.append("c0ffee01")
+
+    # Patch acquire_coord_prompt_inbox to always raise.
+    import dispatch as dispatch_mod
+
+    def _fail(*args, **kwargs):
+        raise dispatch_mod.AcquirePromptError("error", 1, "simulated fault")
+
+    monkeypatch.setattr(dispatch_mod, "acquire_coord_prompt_inbox", _fail)
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert result.dispatched == 0, (
+        "failed acquire must not count as a successful dispatch"
+    )
+    assert any("acq-aaaa" in e for e in result.errors), (
+        f"expected error surfacing for acq-aaaa; errors={result.errors!r}"
+    )
+    coord_state = json.loads(
+        (project_dir / "coord-state.json").read_text(encoding="utf-8")
+    )
+    # CRITICAL: the failed agent_id must NOT be in worker_agent_ids.
+    assert "acq-aaaa" not in coord_state.get("worker_agent_ids", {})
+
+
+def test_acquire_failure_persists_pending_agent_id_for_retry(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-4 [P1]: a failed acquire-prompt MUST persist the
+    minted agent_id as a pending-acquire entry so the next tick retries
+    with the SAME id and can hit AcquireCoordPromptInbox's recovery
+    branch."""
+    _write_tasks(project_dir, [_make_task("retry-aaaa", status="ready")])
+    dispatch_subprocess.append("baaaaad1")
+
+    import dispatch as dispatch_mod
+
+    def _fail(*args, **kwargs):
+        raise dispatch_mod.AcquirePromptError("error", 1, "simulated journal-write fault")
+
+    monkeypatch.setattr(dispatch_mod, "acquire_coord_prompt_inbox", _fail)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    coord_state = json.loads(
+        (project_dir / "coord-state.json").read_text(encoding="utf-8")
+    )
+    pending = coord_state.get("pending_acquire_agent_ids", {})
+    assert pending.get("retry-aaaa") == "baaaaad1", (
+        f"pending agent_id not persisted: pending={pending!r}"
+    )
+
+
+def test_acquire_retry_reuses_pending_agent_id(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-4 [P1]: when a pending-acquire entry exists for a
+    slug, the next dispatch attempt MUST reuse it (not mint a new
+    agent_id). This is the load-bearing invariant that lets
+    AcquireCoordPromptInbox's recovery branch heal a half-written
+    journal."""
+    _write_tasks(project_dir, [_make_task("reuse-aaaa", status="ready")])
+    # Seed coord-state with a pending-acquire entry from a prior tick.
+    _seed_coord_state(project_dir, agent_id_map={})  # ensure file exists
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"reuse-aaaa": "deadc0de"}
+    state_path.write_text(json.dumps(state))
+
+    # Pin mint_agent_id to a DIFFERENT id so the test can confirm reuse.
+    dispatch_subprocess.append("fffffff1")
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert result.dispatched == 1
+    # The acquire-prompt argv must carry the pending id, not the
+    # mint-stack id.
+    acquire_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "acquire-prompt"]
+    ]
+    assert len(acquire_calls) == 1
+    assert acquire_calls[0][3] == "deadc0de", (
+        f"retry should reuse pending agent_id; argv={acquire_calls[0]!r}"
+    )
+    # Post-success, the pending entry must be cleared.
+    state_after = json.loads(state_path.read_text())
+    assert "reuse-aaaa" not in state_after.get("pending_acquire_agent_ids", {})
+
+
+def test_acquire_success_clears_pending_acquire_entry(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Successful acquire clears any stale pending-acquire entry so a
+    SUBSEQUENT dispatch for the same slug (post-terminal) mints a fresh
+    agent_id rather than reusing the now-stale id."""
+    _write_tasks(project_dir, [_make_task("clear-aaaa", status="ready")])
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"clear-aaaa": "abcd9999"}
+    state_path.write_text(json.dumps(state))
+
+    dispatch_subprocess.append("99999999")  # ignored — reuse should win
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    state_after = json.loads(state_path.read_text())
+    assert state_after.get("pending_acquire_agent_ids", {}) == {}
+
+
 def test_tick_respects_cap_one_with_two_ready(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,
@@ -815,12 +948,17 @@ def test_tick_skips_ready_tasks_with_unsatisfied_deps(
         _make_task("blocked-bbbb", status="ready", depends_on=["dep-aaaa"]),
     ])
     dispatch_subprocess.append("abcdef01")
+    # cap=1 keeps us in single-worker mode so we don't trip on the
+    # worktree-path subprocess emulation gap (the test fixture doesn't
+    # patch `fleet workers worktree-path`). Dep filtering is the same
+    # in either mode; cap=1 ensures only the one candidate is picked
+    # even before dep filtering would matter.
     result = loop.tick(
         "fleet", coord_id="cccccc01", cwd="/repo",
-        cap=2, fleet_home=str(fleet_home),
+        cap=1, fleet_home=str(fleet_home),
     )
-    # cap=2 — but blocked-bbbb has unsatisfied dep, dep-aaaa is the
-    # only candidate. Exactly one dispatched.
+    # blocked-bbbb has unsatisfied dep; dep-aaaa is the only candidate.
+    # Exactly one dispatched.
     assert result.dispatched == 1
 
 

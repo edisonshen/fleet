@@ -153,27 +153,54 @@ func ReleaseCoordPromptInbox(opts ReleaseCoordPromptInboxOptions) (ReleaseResult
 	if err != nil {
 		return ReleaseResult{}, err
 	}
-	// Codex iter-3 [P2]: Inspect returns DeliveryAbsent for both
-	// "claim already released/absent" AND "claim still live but file
-	// missing on disk". The two cases need different treatment:
+	// Codex iter-3 [P2] + iter-4 [P1]: Inspect returns DeliveryAbsent
+	// for any of (a) no journal claim, (b) claim already released,
+	// (c) claim live + file missing, (d) claim in transient state
+	// (ClaimReleasing — crashed mid-teardown). Cases (c) and (d) are
+	// recoverable through controller.Release:
 	//
-	//   - claim released/no-claim → truly nothing to do; recompute
-	//     recl_state and return already_released.
-	//   - claim live + file gone  → the journal still has a live entry
-	//     that must be flipped to released, otherwise the live journal
-	//     leaks even though the resource is gone. Fall through to the
-	//     normal Release(j, caller) path; controller.Release tolerates
-	//     ENOENT on the file unlink (step 4 of the Release flow), so a
-	//     missing file is non-fatal — only the journal flip matters.
-	liveButFileGone := false
+	//   - ClaimLive    + file gone     → controller.Release tolerates
+	//                                     ENOENT on the file unlink
+	//                                     (step 4) and still flips
+	//                                     the journal to released.
+	//   - ClaimReleasing               → controller.Release re-runs
+	//                                     steps 4 + 5; the journal
+	//                                     advances from releasing →
+	//                                     released. Without this, a
+	//                                     prior teardown failure
+	//                                     (transient unlink/rename
+	//                                     error) becomes permanent
+	//                                     leakage on the journal.
+	//   - ClaimAllocating               → similarly transient; not in
+	//                                     the canonical release path
+	//                                     (acquire failed mid-write),
+	//                                     but routing through Release
+	//                                     is correct: it'll find the
+	//                                     allocating claim and the
+	//                                     teardown completes the
+	//                                     reclamation. controller.
+	//                                     Release returns
+	//                                     ErrAlreadyReleased only on
+	//                                     ClaimReleased, so the
+	//                                     allocating + releasing
+	//                                     states fall through.
+	//
+	// Only (a) "no claim at all" and (b) "claim explicitly released"
+	// are truly nothing-to-do and short-circuit to already_released.
+	needsRelease := false
 	if existing != nil && status == DeliveryAbsent {
 		if idx := j.findClaim(KindCoordPromptInbox); idx >= 0 {
-			if j.Claims[idx].State == ClaimLive {
-				liveButFileGone = true
+			st := j.Claims[idx].State
+			if st != ClaimReleased {
+				// Any non-released state (live + missing file,
+				// releasing, allocating) is recoverable through
+				// controller.Release. Falling through advances the
+				// journal even when the resource is already gone.
+				needsRelease = true
 			}
 		}
 	}
-	if (status == DeliveryAbsent || existing == nil) && !liveButFileGone {
+	if (status == DeliveryAbsent || existing == nil) && !needsRelease {
 		// Recompute recl_state: if no live delivery claims and journal
 		// is terminal, mark complete.
 		if existing != nil {

@@ -524,8 +524,21 @@ def _tick_locked(
         cap=cap,
         fleet_bin=fleet_bin,
         fleet_home=str(home),
+        coord_state=state,
     )
     for action in dispatched:
+        # Codex iter-4 [P1]: an acquire-prompt failure populates
+        # action.error AND, prior to this gate, also leaked a freshly-
+        # minted agent_id into the success path because the caller
+        # checked only `if action.agent_id`. _apply_dispatch returns
+        # silently on action.error, but the subsequent
+        # remember_agent_id + result.dispatched += 1 would still fire
+        # — falsely recording a dispatch the runtime never actually
+        # made. Surface the error and skip, mirroring the handoff
+        # loop's pre-existing gate.
+        if action.error:
+            result.errors.append(f"dispatch {action.slug}: {action.error}")
+            continue
         try:
             _apply_dispatch(action, project, fleet_bin)
             # Persist slug → agent_id so the supervisor loop can address
@@ -774,6 +787,11 @@ def _run_supervisor(
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"supervisor dispatch read: {exc}")
             return
+        # Codex iter-4 [P1]: load the state ONCE and reuse it across
+        # _dispatch_ready + the consumer loop so pending-acquire writes
+        # from inside _dispatch_ready survive into the consumer's
+        # _save_coord_state call below.
+        cs = _load_coord_state(state_path)
         new_dispatched = _dispatch_ready(
             tasks=f4.tasks,
             project=project,
@@ -781,9 +799,18 @@ def _run_supervisor(
             cap=cap,
             fleet_bin=fleet_bin,
             fleet_home=str(home),
+            coord_state=cs,
         )
-        cs = _load_coord_state(state_path)
         for action in new_dispatched:
+            # Codex iter-4 [P1]: gate on action.error so an
+            # acquire-prompt failure doesn't get remembered as a
+            # successful dispatch with a stale agent_id (see the
+            # matching gate on the primary tick dispatch loop).
+            if action.error:
+                result.errors.append(
+                    f"supervisor dispatch {action.slug}: {action.error}"
+                )
+                continue
             try:
                 _apply_dispatch(action, project, fleet_bin)
                 if action.agent_id:
@@ -2940,6 +2967,7 @@ def _dispatch_ready(
     cap: int,
     fleet_bin: str,
     fleet_home: str,
+    coord_state: dict | None = None,
 ) -> list[_DispatchAction]:
     """Filter to dispatchable candidates, sort by priority, dispatch
     under cap. Returns the actions we successfully (or unsuccessfully)
@@ -3046,7 +3074,19 @@ def _dispatch_ready(
         # suffered. Direct `dispatch_mod.write_worker_inbox` stays in
         # the module for handoff_resume.py:366; PR2 migrates that and
         # retires the helper.
-        agent_id = dispatch_mod.mint_agent_id()
+        #
+        # Codex iter-4 [P1]: a prior tick may have minted an agent_id
+        # whose acquire-prompt failed AFTER writing the journal /
+        # inbox. We MUST retry with the same id so
+        # AcquireCoordPromptInbox's idempotent / recovery path can
+        # finish the half-written claim. Without reusing the id, the
+        # orphaned journal sits forever (PR4 sweeper eventually
+        # reclaims, but PR1 should not depend on that escape hatch).
+        pending_map = (
+            supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
+            if coord_state is not None else {}
+        )
+        agent_id = pending_map.get(t.slug) or dispatch_mod.mint_agent_id()
         try:
             inbox_path = dispatch_mod.acquire_coord_prompt_inbox(
                 agent_id, prompt,
@@ -3060,19 +3100,41 @@ def _dispatch_ready(
             # leave the task in `ready` for the next tick to retry. The
             # action carries the error so loop.py's caller surfaces it
             # in the tick summary.
+            #
+            # Codex iter-4 [P1]: also persist the agent_id as a
+            # pending-acquire entry so the NEXT tick reuses it. This
+            # is the key to hitting AcquireCoordPromptInbox's recovery
+            # branch for half-written journals.
+            if coord_state is not None:
+                supervisor_mod.remember_pending_acquire_agent_id(
+                    coord_state, t.slug, agent_id,
+                )
+            # agent_id="" on the error action so callers can't
+            # mistakenly treat the failed dispatch as successful (see
+            # the action.error gates in the dispatch consumer loops).
             actions.append(_DispatchAction(
-                slug=t.slug, agent_id=agent_id,
+                slug=t.slug,
                 error=f"acquire coord_prompt_inbox failed "
                       f"(outcome={exc.outcome}, exit={exc.exit_code}): "
                       f"{exc.message}",
             ))
             continue
         except Exception as exc:  # noqa: BLE001
+            if coord_state is not None:
+                supervisor_mod.remember_pending_acquire_agent_id(
+                    coord_state, t.slug, agent_id,
+                )
             actions.append(_DispatchAction(
-                slug=t.slug, agent_id=agent_id,
+                slug=t.slug,
                 error=f"acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
+        # Acquire succeeded — clear any pending-acquire entry so the
+        # NEXT dispatch for this slug (post-terminal) mints fresh.
+        if coord_state is not None:
+            supervisor_mod.forget_pending_acquire_agent_id(
+                coord_state, t.slug,
+            )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
@@ -3194,7 +3256,19 @@ def _dispatch_review_handoffs(
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
             continue
 
-        agent_id = dispatch_mod.mint_agent_id()
+        # Codex iter-4 [P1]: same pending-acquire reuse pattern as
+        # _dispatch_ready. A handoff acquire that failed mid-journal-
+        # write on a prior tick must retry with the same agent_id so
+        # the recovery path can heal the half-written claim.
+        pending_handoff_map = (
+            supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
+            if coord_state is not None else {}
+        )
+        # Pending-acquire entries from _dispatch_ready and from
+        # _dispatch_review_handoffs share the same keyspace (slug);
+        # this is correct because at any given time only ONE
+        # acquire-prompt is in-flight per slug.
+        agent_id = pending_handoff_map.get(t.slug) or dispatch_mod.mint_agent_id()
         # PR1 dispatch-lifecycle: release the PRIOR dispatch's
         # coord_prompt_inbox claim BEFORE acquiring the next one. The
         # worker/reviewer that just emitted phase=review-pending or
@@ -3207,19 +3281,21 @@ def _dispatch_review_handoffs(
         # stderr; the handoff still proceeds. We look up the prior
         # agent_id via the supervisor's slug → agent_id map (the only
         # in-memory record of the outgoing subagent's identity).
-        if coord_state is not None:
+        #
+        # Skip the release when we're reusing a pending agent_id —
+        # the prior worker's agent_id is the one we're recovering, so
+        # releasing it would conflict with the acquire that follows.
+        if coord_state is not None and t.slug not in pending_handoff_map:
             prior_agent_id = supervisor_mod.load_agent_id_map(
                 coord_state,
             ).get(t.slug, "")
-        else:
-            prior_agent_id = ""
-        _release_coord_prompt_inbox(
-            slug=t.slug,
-            agent_id=prior_agent_id,
-            fleet_bin=fleet_bin,
-            fleet_home=home,
-            site=f"handoff phase={phase}",
-        )
+            _release_coord_prompt_inbox(
+                slug=t.slug,
+                agent_id=prior_agent_id,
+                fleet_bin=fleet_bin,
+                fleet_home=home,
+                site=f"handoff phase={phase}",
+            )
         # PR1 dispatch-lifecycle migration: same as _dispatch_ready,
         # but dispatch_kind reflects review-pending → "reviewer" and
         # review-done → "finisher" so the journal owner string + dispatch
@@ -3234,19 +3310,31 @@ def _dispatch_review_handoffs(
                 fleet_home=fleet_home,
             )
         except dispatch_mod.AcquirePromptError as exc:
+            if coord_state is not None:
+                supervisor_mod.remember_pending_acquire_agent_id(
+                    coord_state, t.slug, agent_id,
+                )
             actions.append(_DispatchAction(
-                slug=t.slug, agent_id=agent_id,
+                slug=t.slug,
                 error=f"handoff acquire coord_prompt_inbox failed "
                       f"(outcome={exc.outcome}, exit={exc.exit_code}): "
                       f"{exc.message}",
             ))
             continue
         except Exception as exc:  # noqa: BLE001
+            if coord_state is not None:
+                supervisor_mod.remember_pending_acquire_agent_id(
+                    coord_state, t.slug, agent_id,
+                )
             actions.append(_DispatchAction(
-                slug=t.slug, agent_id=agent_id,
+                slug=t.slug,
                 error=f"handoff acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
+        if coord_state is not None:
+            supervisor_mod.forget_pending_acquire_agent_id(
+                coord_state, t.slug,
+            )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,

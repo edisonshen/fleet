@@ -412,6 +412,71 @@ func TestAcquireAndDeliver_LiveClaimWithMissingFileRecovers(t *testing.T) {
 	}
 }
 
+// TestReleaseCoordPromptInbox_ReleasingStateRetries is the codex
+// iter-4 [P1] regression: if controller.Release crashed between
+// flipping the claim to ClaimReleasing and finalizing the unlink/
+// rename, the next release attempt previously returned
+// already_released without retrying — leaving the journal stuck at
+// releasing forever. The fix routes ClaimReleasing through
+// controller.Release so the journal advances to released.
+func TestReleaseCoordPromptInbox_ReleasingStateRetries(t *testing.T) {
+	withFleetHome(t)
+	pinNow(t, time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC))
+
+	id := mustNewID(t, "ababcdcd")
+	// Acquire to get a live claim.
+	first, err := AcquireCoordPromptInbox(AcquireCoordPromptInboxOptions{
+		DispatchID: id,
+		Content:    strings.NewReader("prompt"),
+	})
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	// Manually flip the journal's claim to ClaimReleasing (without
+	// performing the unlink) — simulates a controller.Release crash
+	// between step 3 (flip to releasing) and step 5 (flip to released).
+	j, err := LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal: %v", err)
+	}
+	idx := j.findClaim(KindCoordPromptInbox)
+	if idx < 0 {
+		t.Fatalf("claim missing")
+	}
+	j.Claims[idx].State = ClaimReleasing
+	if err := SaveJournal(j); err != nil {
+		t.Fatalf("save releasing: %v", err)
+	}
+
+	// File is still on disk (the crash happened before unlink).
+	if _, err := os.Stat(first.Path); err != nil {
+		t.Fatalf("inbox should still exist: %v", err)
+	}
+
+	// Release retry must complete the teardown.
+	res, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{
+		DispatchID: id,
+	})
+	if err != nil {
+		t.Fatalf("Release retry: %v", err)
+	}
+	if res.Outcome != OutcomeReleased {
+		t.Errorf("retry Outcome = %q; want released", res.Outcome)
+	}
+	if _, err := os.Stat(first.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("inbox not unlinked on retry: %v", err)
+	}
+	// Journal claim advanced.
+	j2, err := LoadJournal(id)
+	if err != nil {
+		t.Fatalf("LoadJournal post-retry: %v", err)
+	}
+	if j2.Claims[idx].State != ClaimReleased {
+		t.Errorf("claim state = %q after retry; want released", j2.Claims[idx].State)
+	}
+}
+
 // TestReleaseCoordPromptInbox_LiveClaimMissingFileFlipsJournal is the
 // codex iter-3 [P2] regression: when the inbox file disappears
 // independently of the journal, Release was returning `already_released`

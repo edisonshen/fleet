@@ -1230,13 +1230,37 @@ def test_loop_dispatch_persists_agent_id_mapping(
     # the mint to a known token so the assertion is deterministic.
     monkeypatch.setattr(loop, "_run_fleet", lambda *a, **kw: None)
 
-    def fake_dispatch_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+    def fake_dispatch_run(
+        cmd, capture_output=True, text=True, timeout=None, check=False,
+        input=None, env=None,
+    ):
         if cmd[1:3] == ["standards", "show"]:
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="# Standards\n", stderr="",
             )
         if cmd[1:3] == ["learnings", "list"]:
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        # PR1 dispatch-lifecycle: emulate `fleet claims acquire-prompt`
+        # so the per-tick dispatch actually succeeds (acquire writes the
+        # inbox file + returns the JSON envelope). Codex iter-4 [P1]: an
+        # acquire failure no longer leaks the failed agent_id into the
+        # worker_agent_ids mapping, so the test's terminal assertion
+        # now requires a SUCCESSFUL acquire to set the expected entry.
+        if cmd[1:3] == ["claims", "acquire-prompt"]:
+            agent_id = cmd[3]
+            fleet_home = (env or os.environ).get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+            inbox_dir = os.path.join(fleet_home, "inbox")
+            os.makedirs(inbox_dir, exist_ok=True)
+            path = os.path.join(inbox_dir, f"{agent_id}.md")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write((input or "") + ("\n" if (input or "") and not (input or "").endswith("\n") else ""))
+            envelope = (
+                f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+                f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=envelope, stderr="",
+            )
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     import dispatch as dispatch_mod  # noqa: F811
