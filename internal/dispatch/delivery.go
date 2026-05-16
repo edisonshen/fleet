@@ -290,6 +290,17 @@ func (c *coordPromptInboxController) Release(j *Journal, callerClaim DeliveryCla
 		return ErrNotOwned
 	}
 
+	// Effective preserve: a release-time --preserve override (carried
+	// on callerClaim) wins over the acquire-time value baked into the
+	// on-disk claim. The high-level wrapper merges opts.Preserve with
+	// existing.Preserve and passes the union here; codex iter-2 [P2]
+	// — without honoring callerClaim.Preserve the documented CLI
+	// override was a no-op when the original acquire had Preserve=false.
+	effectivePreserve := callerClaim.Preserve || diskClaim.Preserve
+	// Persist the effective flag onto the claim so post-release
+	// inspections reflect the actual teardown shape.
+	diskClaim.Preserve = effectivePreserve
+
 	// Step 3 — flip to releasing.
 	releasingData, err := json.Marshal(diskClaim)
 	if err != nil {
@@ -306,7 +317,7 @@ func (c *coordPromptInboxController) Release(j *Journal, callerClaim DeliveryCla
 	}
 
 	// Step 4 — teardown.
-	if diskClaim.Preserve {
+	if effectivePreserve {
 		arch, perr := CoordPromptInboxArchivePath(diskClaim.OwnerID)
 		if perr != nil {
 			return fmt.Errorf("resolve archive path: %w", perr)

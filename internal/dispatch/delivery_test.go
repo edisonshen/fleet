@@ -275,6 +275,39 @@ func TestRelease_Preserve(t *testing.T) {
 	}
 }
 
+// TestRelease_PreserveOverride is the codex iter-2 [P2] regression: a
+// release-time --preserve override must archive even when the original
+// acquire ran with Preserve=false. The bug pre-fix branched on the
+// stored on-disk Preserve flag and silently dropped the override.
+func TestRelease_PreserveOverride(t *testing.T) {
+	root := withFleetHome(t)
+	pinNow(t, time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC))
+
+	id := mustNewID(t, "0b0b0b0b")
+	if _, err := AcquireCoordPromptInbox(AcquireCoordPromptInboxOptions{
+		DispatchID: id,
+		Content:    strings.NewReader("prompt"),
+		// Acquire with Preserve=false (the default).
+	}); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	if _, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{
+		DispatchID: id,
+		// CLI override: archive even though acquire said unlink.
+		Preserve: true,
+	}); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	livePath, _ := CoordPromptInboxPath(id)
+	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("live inbox still present: %v", err)
+	}
+	archPath := filepath.Join(root, "inbox", "archive", id.String()+".md")
+	if _, err := os.Stat(archPath); err != nil {
+		t.Errorf("archived inbox missing under --preserve override: %v", err)
+	}
+}
+
 // TestInspect_Cases covers Present | Absent across the lifecycle:
 //
 //	absent (no journal) → absent (journal but no claim) → present (live)
