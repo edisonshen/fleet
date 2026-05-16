@@ -1,0 +1,1338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DESIGN: Dispatch Lifecycle Primitive — v9 draft</title>
+<style>
+:root {
+  --bg: #fdfdfc;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #0066cc;
+  --border: #e3e3e0;
+  --code-bg: #f4f4f1;
+  --code-fg: #1a1a1a;
+  --table-stripe: #f9f9f7;
+  --blockquote-border: #d0d0cd;
+  --blockquote-bg: #f7f7f4;
+  --kbd-bg: #f0f0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --fg: #e8e8e6;
+    --muted: #9a9a98;
+    --accent: #7ab8ff;
+    --border: #333331;
+    --code-bg: #252523;
+    --code-fg: #e8e8e6;
+    --table-stripe: #222220;
+    --blockquote-border: #444442;
+    --blockquote-bg: #222220;
+    --kbd-bg: #2e2e2c;
+  }
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  gap: 2rem;
+}
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: 1fr; }
+  .toc { position: static !important; max-height: none !important; }
+}
+.toc {
+  position: sticky;
+  top: 1rem;
+  align-self: start;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  font-size: 14px;
+  padding-right: 0.5rem;
+}
+.toc h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 0.5rem 0;
+  font-weight: 600;
+}
+.toc ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.toc ul ul { padding-left: 1rem; }
+.toc li { margin: 0.25rem 0; }
+.toc a {
+  color: var(--fg);
+  text-decoration: none;
+  display: block;
+  padding: 0.15rem 0;
+  border-left: 2px solid transparent;
+  padding-left: 0.5rem;
+  margin-left: -0.5rem;
+  transition: color 0.1s, border-color 0.1s;
+}
+.toc a:hover {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+main {
+  min-width: 0;
+}
+.doc-meta {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.doc-meta strong { color: var(--fg); }
+h1, h2, h3, h4, h5, h6 {
+  margin: 1.8em 0 0.5em 0;
+  line-height: 1.25;
+  font-weight: 600;
+}
+h1 { font-size: 2rem; margin-top: 0; }
+h2 { font-size: 1.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.2rem; }
+h4 { font-size: 1.05rem; }
+h5, h6 { font-size: 1rem; color: var(--muted); }
+h1 .anchor, h2 .anchor, h3 .anchor, h4 .anchor, h5 .anchor, h6 .anchor {
+  visibility: hidden;
+  margin-left: 0.3rem;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 400;
+}
+h1:hover .anchor, h2:hover .anchor, h3:hover .anchor,
+h4:hover .anchor, h5:hover .anchor, h6:hover .anchor {
+  visibility: visible;
+}
+p { margin: 0.8em 0; }
+a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+ul, ol { padding-left: 1.5rem; }
+li { margin: 0.3em 0; }
+strong { font-weight: 600; }
+em { font-style: italic; }
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1rem 1.2rem;
+  border-radius: 5px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+}
+pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+blockquote {
+  border-left: 3px solid var(--blockquote-border);
+  background: var(--blockquote-bg);
+  margin: 1em 0;
+  padding: 0.5em 1em;
+  color: var(--fg);
+  font-style: normal;
+}
+blockquote p:first-child { margin-top: 0; }
+blockquote p:last-child { margin-bottom: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 14px;
+  display: block;
+  overflow-x: auto;
+}
+thead { background: var(--table-stripe); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+kbd {
+  background: var(--kbd-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  box-shadow: 0 1px 0 var(--border);
+}
+.toc-anchor {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+input[type="checkbox"][disabled] { margin-right: 0.4em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc" aria-label="table of contents">
+    <h2>Contents</h2>
+    <div class="toc">
+<ul>
+<li><a href="#tldr-for-implementers">TL;DR for implementers</a></li>
+<li><a href="#tldr">TL;DR</a></li>
+<li><a href="#motivation-the-recurring-leak-pattern">Motivation — the recurring leak pattern</a><ul>
+<li><a href="#prior-attempt-internallifecycle-issue-101">Prior attempt: internal/lifecycle/ (issue #101)</a></li>
+</ul>
+</li>
+<li><a href="#goals">Goals</a></li>
+<li><a href="#non-goals">Non-goals</a></li>
+<li><a href="#resource-semantic-classes-5">Resource semantic classes (5)</a><ul>
+<li><a href="#delivery-kinds-codex-round-2-split">Delivery kinds — codex round 2 split</a></li>
+<li><a href="#mapping-to-v1-resource-kinds-9-total-now-was-7">Mapping to v1 resource kinds (9 total now, was 7)</a></li>
+<li><a href="#explicit-never-sweep-as-leaks-audit-class">Explicit "never sweep as leaks" (audit class)</a></li>
+</ul>
+</li>
+<li><a href="#typed-claim-controllers">Typed claim controllers</a><ul>
+<li><a href="#exclusive-controllers">Exclusive controllers</a></li>
+<li><a href="#shared-adoptable-controller">Shared / Adoptable controller</a></li>
+<li><a href="#derived-reconciler">Derived reconciler</a></li>
+<li><a href="#delivery-controller-3-kinds-common-shape">Delivery controller (3 kinds; common shape)</a></li>
+<li><a href="#audit-artifacts-no-controller">Audit artifacts (no controller)</a></li>
+<li><a href="#journal">Journal</a></li>
+</ul>
+</li>
+<li><a href="#manifest-store">Manifest store</a></li>
+<li><a href="#atomicity-contract">Atomicity contract</a><ul>
+<li><a href="#per-claim-2-phase">Per-claim 2-phase</a></li>
+<li><a href="#same-file-atomicity-codex-round-2-fix">Same-file atomicity (codex round 2 fix)</a></li>
+<li><a href="#acquire-is-go-side-python-shells-out-via-fleet-claims">Acquire is Go-side; Python shells out via fleet claims</a></li>
+</ul>
+</li>
+<li><a href="#state-machines">State machines</a><ul>
+<li><a href="#execution-state-per-dispatch">Execution state (per dispatch)</a></li>
+<li><a href="#reclamation-state-per-dispatch">Reclamation state (per dispatch)</a></li>
+<li><a href="#per-claim-state-per-resource">Per-claim state (per resource)</a></li>
+</ul>
+</li>
+<li><a href="#replace-operation-folds-atomic-coord-swap-v6">Replace operation (folds atomic-coord-swap-v6)</a><ul>
+<li><a href="#codex-findings-all-answered">Codex findings — all answered</a></li>
+</ul>
+</li>
+<li><a href="#sweeper-modes">Sweeper modes</a><ul>
+<li><a href="#mode-1-orphan-detection-orphans">Mode 1: Orphan detection (--orphans)</a></li>
+<li><a href="#mode-2-release-retry-retry-releases">Mode 2: Release retry (--retry-releases)</a></li>
+<li><a href="#mode-3-derived-reconciliation-reconcile-derived">Mode 3: Derived reconciliation (--reconcile-derived)</a></li>
+<li><a href="#default-all-three-modes">Default: all three modes</a></li>
+<li><a href="#per-resource-ttls">Per-resource TTLs</a></li>
+</ul>
+</li>
+<li><a href="#observability">Observability</a></li>
+<li><a href="#repo-cleanup-what-dies-with-the-refactor">Repo cleanup — what dies with the refactor</a><ul>
+<li><a href="#per-pr-code-retirement">Per-PR code retirement</a></li>
+<li><a href="#per-pr-docs-retirement">Per-PR docs retirement</a></li>
+<li><a href="#stale-p3-tasks-to-triage-during-pr2-pr3">Stale P3 tasks to triage during PR2-PR3</a></li>
+<li><a href="#untracked-file-audit-pre-pr1-prep">Untracked-file audit (pre-PR1 prep)</a></li>
+<li><a href="#one-shot-leak-sweep-pre-pr2-prep">One-shot leak sweep (pre-PR2 prep)</a></li>
+<li><a href="#memory-entries-to-retire-revise-post-merge">Memory entries to retire / revise (post-merge)</a></li>
+</ul>
+</li>
+<li><a href="#migration-strategy">Migration strategy</a><ul>
+<li><a href="#forward-only">Forward-only</a></li>
+<li><a href="#pr1-pr2-overlap-codex-round-2-catch-round-3-refinement">PR1 ↔ PR2 overlap (codex round 2 catch + round 3 refinement)</a></li>
+<li><a href="#pre-migration-leak-sweep-one-shot">Pre-migration leak sweep (one-shot)</a></li>
+</ul>
+</li>
+<li><a href="#vertical-slice-sequencing-4-stacked-prs">Vertical-slice sequencing — 4 stacked PRs</a><ul>
+<li><a href="#codex-round-2-pr1-must-be-minimal">Codex round 2: PR1 must be MINIMAL</a></li>
+</ul>
+</li>
+<li><a href="#error-policy">Error policy</a></li>
+<li><a href="#open-questions-codex-round-3-answered-all">Open questions — codex round 3 answered all</a></li>
+<li><a href="#failure-modes-cross-pr-test-plan">Failure modes (cross-PR test plan)</a></li>
+<li><a href="#test-infrastructure-plan-eng-review-a9-decision">Test infrastructure (plan-eng-review A9 decision)</a></li>
+<li><a href="#test-plan-cross-cutting">Test plan (cross-cutting)</a></li>
+<li><a href="#risks-mitigations">Risks &amp; mitigations</a></li>
+<li><a href="#decision-log">Decision log</a></li>
+<li><a href="#open-items-before-draft-freeze">Open items before draft-freeze</a></li>
+</ul>
+</div>
+
+  </nav>
+  <main>
+    <div class="doc-meta">
+      <strong>Source:</strong> <code>DESIGN-dispatch-lifecycle.md</code> &mdash;
+      <strong>Rendered:</strong> 2026-05-16 00:44 UTC &mdash;
+      Agents read the <code>.md</code>; humans read the <code>.html</code>.
+    </div>
+    <h1 id="design-dispatch-lifecycle-primitive-v9-draft">DESIGN: Dispatch Lifecycle Primitive — v9 draft<a class="anchor" href="#design-dispatch-lifecycle-primitive-v9-draft" title="Permalink to this section">¶</a></h1>
+<p><strong>Status:</strong> DRAFT v9 — codex rounds 1-8 + plan-eng-review findings folded in; operator approval pending</p>
+<hr>
+<h2 id="tldr-for-implementers">TL;DR for implementers<a class="anchor" href="#tldr-for-implementers" title="Permalink to this section">¶</a></h2>
+<p>You are reading this because you're about to implement a PR in this re-arch (1-4) OR you're reviewing one. Read this section first; dive into the full spec below as needed.</p>
+<p><strong>What we're building:</strong> A single dispatch-lifecycle primitive at <code>internal/dispatch/</code> that owns resource cleanup for every kind of dispatch (worker, reviewer, finisher, coord). Replaces today's scattered per-resource cleanup hooks. 9 resource kinds across 5 semantic classes (Exclusive, Shared/Adoptable, Derived, Delivery, Audit).</p>
+<p><strong>Why we're building it:</strong> Two leak postmortems in 48h (orphan-tmux 2026-05-13, stale-inbox 2026-05-15) showed per-resource spot-fixes scale linearly. Disease is the architecture, not the bugs.</p>
+<p><strong>Load-bearing invariants:</strong>
+- <code>DispatchID == agent_id</code> (8-hex, same shape as today's <code>mint_agent_id</code>). Promoted to a named type in PR1 with a constructor test.
+- <code>state == terminal ⇒ all claims released</code> (per-class semantics).
+- Single store: claims live inline in <code>~/.fleet/dispatches/&lt;id&gt;.json</code>. No separate claim-files dir.
+- <code>host_id</code> + <code>tmux_socket</code> on every claim; sweeper refuses cross-* reclaim.
+- Replace's atomic commit = <code>coord_spawn_marker</code> claim CAS (not a journal flip).</p>
+<p><strong>PR sequencing (4 stacked PRs over ~3 weeks):</strong>
+1. <strong>PR1</strong> — <code>internal/dispatch/</code> scaffold + Delivery controller for <code>coord_prompt_inbox</code> only + migrate <code>loop.py</code> call sites to <code>fleet claims acquire-prompt</code>. Closes today's 30-file leak. ~900 LoC.
+2. <strong>PR2</strong> — expand to remaining Delivery kinds + Exclusive (tmux/agent_record) + Adoptable (worker_dir/worktree). ~1700 LoC.
+3. <strong>PR3</strong> — coord_spawn_marker Exclusive + <code>Replace</code> operation (folds atomic-coord-swap-v6 with all codex findings). ~1800 LoC.
+4. <strong>PR4</strong> — unified <code>sweep-leaks</code> sweeper + observability + archive pruner. ~1300 LoC.</p>
+<p><strong>Gotchas (read these before writing code):</strong>
+- Replace's ownership proof is a <strong>nonce file</strong> at <code>~/.fleet/projects/&lt;p&gt;/coord-replace-nonces/&lt;NEW.DispatchID&gt;-&lt;replaceNonce&gt;.json</code> (not coord-state.json). OLD lacks the nonce value; that's the only barrier.
+- Adoptable lock is per-<code>task_slug</code> (not per-<code>{kind, task_slug}</code>) — covers worker_dir + worktree bundle. Default 10s wait timeout.
+- <code>coord_prompt_inbox</code> is read by the <strong>coord agent</strong> (passes content to Agent-tool), not the subagent's first turn. Doc/code mismatch fixed.
+- Resume-prompt is 3-phase prepare → deliver → ack with <code>delivery_id</code> for receiver-side dedup. Persistent cache at <code>~/.fleet/projects/&lt;p&gt;/resume-prompts-seen.json</code>.</p>
+<p><strong>Plan-eng-review decisions (2026-05-15) applied below:</strong> test infra via <code>internal/testutil/tmuxtest</code> + boundary fakes; golden-file CLI contract tests; PR1 ships a CRITICAL E2E regression test + kill-9 recovery test; PR4 ships archive pruner alongside sweeper; <code>AdoptableLockTimeout = 10s</code>; <code>DispatchID</code> named type.</p>
+<hr>
+<p><strong>Author:</strong> coord agent + codex (round 1+2 co-author)
+<strong>Reviewers:</strong> codex (round 3 pending), plan-eng-review (pending), operator (approval gate)
+<strong>Target version:</strong> v0.11.0 (vertical-slice PR1, then PR2-PR4 over ~3 weeks)
+<strong>Created:</strong> 2026-05-15
+<strong>Supersedes:</strong> <code>atomic-coord-swap-v6-uni-b09b</code> task spec (folded in as <code>Replace</code> in PR3); <code>internal/lifecycle/</code> package (issue #101 prior partial attempt at same problem — retired in PR4)</p>
+<hr>
+<h2 id="tldr">TL;DR<a class="anchor" href="#tldr" title="Permalink to this section">¶</a></h2>
+<p>Replace fleet's scattered per-resource cleanup hooks with <strong>one journal store + typed claim controllers</strong> keyed by 5 resource semantic classes (<code>exclusive</code>, <code>shared-adoptable</code>, <code>derived</code>, <code>delivery</code>, <code>audit</code>). Every fleet-created resource is owned by a <code>Dispatch</code> journal that holds its claims inline. Terminal transitions trigger conditional <code>Release</code> per claim controller — never an undifferentiated "delete this".</p>
+<p>PR1 ships a <strong>strictly minimal vertical slice</strong>: just the <code>coord_prompt_inbox</code> Delivery kind, closing today's 30-file leak end-to-end. The other six resource kinds + Replace + sweeper come in PR2-PR4. The refactor also retires <code>internal/lifecycle/</code> (issue #101) and ~9 stale tasks alongside the code that supersedes them.</p>
+<hr>
+<h2 id="motivation-the-recurring-leak-pattern">Motivation — the recurring leak pattern<a class="anchor" href="#motivation-the-recurring-leak-pattern" title="Permalink to this section">¶</a></h2>
+<p>Fleet has shipped two near-identical resource-leak postmortems in 48 hours:</p>
+<table>
+<thead>
+<tr>
+<th>Date</th>
+<th>Postmortem</th>
+<th>Resources leaked</th>
+<th>Spot-fix shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-05-13</td>
+<td><code>docs/postmortems/2026-05-14-orphan-tmux-leak.md</code></td>
+<td>68 orphan tmux → Mac OOM × 2</td>
+<td>Tristate <code>SessionAlive()</code> + <code>prune-orphan-tmux</code> (PRs #146 #148)</td>
+</tr>
+<tr>
+<td>2026-05-15</td>
+<td>(this design)</td>
+<td>30 stale inbox files, 2 orphan worktrees, 4 supervisor ghosts</td>
+<td>TBD — this design</td>
+</tr>
+</tbody>
+</table>
+<p>Both bugs have the same shape: resource created, no destroy gate at the corresponding terminal transition, resource leaks. Per-resource spot-fixes scale linearly with resource types; the disease is the architecture.</p>
+<p>Codex round 1 surfaced a deeper truth: <strong>fleet's "resources" are NOT homogeneous</strong> — they fall into 5 semantic classes. Codex round 2 surfaced a second truth: <strong>what looked like ONE resource kind (<code>inbox_file</code>) is actually three</strong>, each with a different lifetime story.</p>
+<p>This design proposes: <strong>one journal store + typed claim controllers, one controller per resource KIND (not class), with shared infrastructure per class.</strong></p>
+<h3 id="prior-attempt-internallifecycle-issue-101">Prior attempt: <code>internal/lifecycle/</code> (issue #101)<a class="anchor" href="#prior-attempt-internallifecycle-issue-101" title="Permalink to this section">¶</a></h3>
+<p>A previous PR introduced <code>internal/lifecycle/</code> with <code>Classify()</code> (5 abstract states) + <code>OnTerminal()</code> (per-entity cleanup delegate). It's the right <em>abstract shape</em> but only orchestrates — entity packages still own their own cleanup. The leaks keep coming because the entity-package cleanup is what's incomplete. <strong>v0.11's primitive subsumes <code>internal/lifecycle/</code></strong> and retires it.</p>
+<hr>
+<h2 id="goals">Goals<a class="anchor" href="#goals" title="Permalink to this section">¶</a></h2>
+<ol>
+<li><strong>One execution journal per dispatch</strong>, with claim records inline (no separate claim store).</li>
+<li><strong>One typed controller per resource KIND</strong>, sharing infrastructure within its class.</li>
+<li><strong>Adding a resource = pick the class + write a controller.</strong> No new ad-hoc cleanup site.</li>
+<li><strong>Coord swap is <code>Replace</code></strong> — a specific call shape on the Exclusive controller for the <code>coord_spawn_marker</code>.</li>
+<li><strong>Forward-only migration; one-shot manual sweep for legacy leaks.</strong></li>
+<li><strong>Vertical-slice rollout</strong> — PR1 proves the model on coord_prompt_inbox (the actual leak) before scaffolding others.</li>
+<li><strong>Refactor cleans the repo</strong> — code/docs/tasks that exist <em>because of</em> the old pattern get retired alongside the new code.</li>
+</ol>
+<h2 id="non-goals">Non-goals<a class="anchor" href="#non-goals" title="Permalink to this section">¶</a></h2>
+<ul>
+<li>Cross-machine coordination (single-host invariant; multi-machine sync is out of scope).</li>
+<li>Backfilling manifests for pre-v0.11 dispatches in flight at upgrade time.</li>
+<li>Changing the on-disk shape of any resource itself (paths/names unchanged).</li>
+<li>Replacing tasks.md as the source of truth for tasks.</li>
+<li>A general-purpose ownership/CAS framework — the primitive is fleet-shaped, not a library.</li>
+<li>Removing operator/audit artifacts.</li>
+</ul>
+<hr>
+<h2 id="resource-semantic-classes-5">Resource semantic classes (5)<a class="anchor" href="#resource-semantic-classes-5" title="Permalink to this section">¶</a></h2>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Members</th>
+<th>Ownership story</th>
+<th>Release semantics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Exclusive</strong></td>
+<td><code>tmux_session</code>, <code>agent_record</code>, <code>coord_spawn_marker</code></td>
+<td>One owner; named by dispatch ID or project.</td>
+<td>Owner can release. Non-owner cannot.</td>
+</tr>
+<tr>
+<td><strong>Shared / Adoptable</strong></td>
+<td><code>worker_dir</code>, <code>worktree</code></td>
+<td>Named by <strong>task slug</strong>. Reused across redispatches (worker → reviewer → finisher all share).</td>
+<td>Release ONLY when the <em>task</em> is terminal-and-archived in tasks.md. Dispatch terminal alone is insufficient.</td>
+</tr>
+<tr>
+<td><strong>Derived projection</strong></td>
+<td><code>supervisor_entry</code>, <code>worker_agent_ids_entry</code></td>
+<td>Reconciled from desired state. Not first-class state.</td>
+<td>Reconciled, never released. Sweeper compares vs desired and prunes ghosts.</td>
+</tr>
+<tr>
+<td><strong>Delivery envelope</strong></td>
+<td><code>coord_prompt_inbox</code>, <code>handoff_resume_inbox</code>, <code>remote_control_inbox</code></td>
+<td>One-shot read-and-discard. <strong>Three distinct kinds, same class</strong> — they share atomicity primitives but have separate release semantics.</td>
+<td>Each kind defines its own. See per-kind table below.</td>
+</tr>
+<tr>
+<td><strong>Audit artifact</strong></td>
+<td><code>archive/*</code> entries, subagent WIP, postmortems, design docs, <code>~/.fleet/incidents/</code>, <code>projects/&lt;p&gt;/subagents/*.json</code></td>
+<td>Intentional retention.</td>
+<td><strong>NEVER swept as leaks.</strong> Sweeper excludes these paths.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="delivery-kinds-codex-round-2-split">Delivery kinds — codex round 2 split<a class="anchor" href="#delivery-kinds-codex-round-2-split" title="Permalink to this section">¶</a></h3>
+<p>What v2 called <code>inbox_file</code> is actually three different lifetimes sharing a path shape (<code>~/.fleet/inbox/&lt;id&gt;.md</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Writer</th>
+<th>Reader</th>
+<th>Release semantics</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>coord_prompt_inbox</code></td>
+<td><code>skills/coordinator/dispatch.py::write_worker_inbox</code> (called by <code>loop.py:_dispatch_ready</code> and <code>_dispatch_review_handoffs</code>)</td>
+<td>The <strong>coord agent</strong> reads the file body and passes its content as Agent-tool <code>prompt</code> parameter (coord_prompt_inbox is staging, not first-turn injection).</td>
+<td>Release on dispatch terminal (done/blocked/failed). Default unlink; <code>preserve=true</code> archives. <strong>This is the source of the 30-file leak.</strong></td>
+</tr>
+<tr>
+<td><code>handoff_resume_inbox</code></td>
+<td><code>skills/coordinator/handoff_resume.py:366</code> (rewrites a <code>coord_prompt_inbox</code>)</td>
+<td>The resumed subagent</td>
+<td>NOT a separate file on disk — same path as the <code>coord_prompt_inbox</code> it rewrites. Rewrite atomically transfers ownership via the Delivery controller's <code>Rewrite()</code> op; old dispatch's Release becomes no-op (different owner_id).</td>
+</tr>
+<tr>
+<td><code>remote_control_inbox</code></td>
+<td><code>skills/coordinator/remote_control.py:269</code></td>
+<td>The remote-control bootstrap session</td>
+<td>Release on RC session bootstrap completion. Distinct retention policy (operator may inspect the bootstrap content for debugging).</td>
+</tr>
+</tbody>
+</table>
+<p>PR1 only ships <code>coord_prompt_inbox</code>. The other two land in PR2.</p>
+<h3 id="mapping-to-v1-resource-kinds-9-total-now-was-7">Mapping to v1 resource kinds (9 total now, was 7)<a class="anchor" href="#mapping-to-v1-resource-kinds-9-total-now-was-7" title="Permalink to this section">¶</a></h3>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Class</th>
+<th>Today's name shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>tmux_session</code></td>
+<td>Exclusive</td>
+<td><code>fleet-&lt;agent_id&gt;</code></td>
+</tr>
+<tr>
+<td><code>agent_record</code></td>
+<td>Exclusive</td>
+<td><code>~/.fleet/agents/&lt;agent_id&gt;.json</code></td>
+</tr>
+<tr>
+<td><code>coord_spawn_marker</code></td>
+<td>Exclusive (singleton per project)</td>
+<td><code>~/.fleet/projects/&lt;p&gt;/coord-spawn-marker</code></td>
+</tr>
+<tr>
+<td><code>coord_prompt_inbox</code></td>
+<td>Delivery</td>
+<td><code>~/.fleet/inbox/&lt;agent_id&gt;.md</code></td>
+</tr>
+<tr>
+<td><code>handoff_resume_inbox</code></td>
+<td>Delivery (rewrite-in-place of coord_prompt_inbox)</td>
+<td>same path, transferred ownership</td>
+</tr>
+<tr>
+<td><code>remote_control_inbox</code></td>
+<td>Delivery</td>
+<td><code>~/.fleet/inbox/&lt;agent_id&gt;.md</code> (distinguished by writer registration)</td>
+</tr>
+<tr>
+<td><code>worker_dir</code></td>
+<td>Shared / Adoptable</td>
+<td><code>~/.fleet/projects/&lt;p&gt;/workers/&lt;slug&gt;/</code></td>
+</tr>
+<tr>
+<td><code>worktree</code></td>
+<td>Shared / Adoptable</td>
+<td><code>~/.fleet/projects/&lt;p&gt;/worktrees/&lt;slug&gt;/</code> + <code>worker/&lt;slug&gt;</code> branch</td>
+</tr>
+<tr>
+<td><code>supervisor_entry</code></td>
+<td>Derived</td>
+<td><code>coord-state.json[supervisor][&lt;slug&gt;]</code> + <code>worker_agent_ids[&lt;slug&gt;]</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="explicit-never-sweep-as-leaks-audit-class">Explicit "never sweep as leaks" (audit class)<a class="anchor" href="#explicit-never-sweep-as-leaks-audit-class" title="Permalink to this section">¶</a></h3>
+<ul>
+<li><code>~/.fleet/agents/archive/</code> — historical agent records.</li>
+<li><code>~/.fleet/inbox/archive/</code> — fleet-guard archived inboxes.</li>
+<li><code>~/.fleet/dispatches/archive/</code> — completed dispatch journals.</li>
+<li><code>~/.fleet/subagent-wip/</code> — CLAUDE.md §2 phase logs (operator audit).</li>
+<li><code>~/.fleet/incidents/</code> — codex round 2 catch: incident dirs are operator-retained.</li>
+<li><code>~/.fleet/projects/&lt;p&gt;/subagents/*.json</code> — codex round 2 catch: subagent metadata for TUI history.</li>
+<li>Queue files (<code>~/.fleet/queue/</code>) — self-cleaning via <code>fleet drain</code>.</li>
+<li>Lock files (<code>*.lock</code>) — NB-flock, auto-released.</li>
+<li>All <code>docs/**</code> and <code>docs/postmortems/**</code> — versioned with the repo.</li>
+</ul>
+<hr>
+<h2 id="typed-claim-controllers">Typed claim controllers<a class="anchor" href="#typed-claim-controllers" title="Permalink to this section">¶</a></h2>
+<p>One controller per resource KIND. Class-level interfaces define the <strong>shape</strong>; per-kind controllers implement the specific semantics.</p>
+<h3 id="exclusive-controllers">Exclusive controllers<a class="anchor" href="#exclusive-controllers" title="Permalink to this section">¶</a></h3>
+<pre><code class="language-go">// internal/dispatch/exclusive.go
+
+type ExclusiveClaim struct {
+    Kind         string  // &quot;tmux_session&quot; | &quot;agent_record&quot; | &quot;coord_spawn_marker&quot;
+    ID           string  // resource-local identifier
+    OwnerID      DispatchID
+    HostID       string                 // hostname when claimed
+    TmuxSocket   string  `json:&quot;,omitempty&quot;`  // codex round 2: same-host different-socket discriminator (tmux_session only)
+    State        ClaimState              // allocating | live | releasing | released
+    CreatedAt    time.Time
+    ReleasedAt   *time.Time `json:&quot;,omitempty&quot;`
+    Meta         json.RawMessage         // kind-specific payload
+}
+
+type ExclusiveController interface {
+    // AcquireAndRecord wraps resource creation + claim record in one Go-side
+    // transaction. spawn closure does the actual create; controller writes
+    // the claim file as allocating (pre-spawn), runs spawn(), then atomically
+    // flips claim to live. The journal's ClaimRef is appended in the same
+    // transaction (the journal file is co-located; updates use tmp+rename
+    // with the journal as the durable record — see &quot;Manifest store&quot; below).
+    AcquireAndRecord(ctx context.Context, j *Journal, claim ExclusiveClaim, spawn func() error) error
+
+    // Inspect returns kind-specific normalized status; &quot;unknown&quot; =&gt; do not touch.
+    Inspect(ctx context.Context, claim ExclusiveClaim) (Status, error)
+    // Per kind:
+    //   tmux_session:       Alive | Dead | Unknown
+    //   agent_record:       Live  | Archived | Missing
+    //   coord_spawn_marker: Self  | Other    | Missing
+
+    // Release succeeds only if the on-disk owner still matches claim.OwnerID
+    // AND (for tmux_session) the socket still matches claim.TmuxSocket. Otherwise
+    // ErrNotOwned (idempotent: already-released is success).
+    Release(ctx context.Context, claim ExclusiveClaim) error
+}
+</code></pre>
+<h3 id="shared-adoptable-controller">Shared / Adoptable controller<a class="anchor" href="#shared-adoptable-controller" title="Permalink to this section">¶</a></h3>
+<pre><code class="language-go">// internal/dispatch/adoptable.go
+
+type AdoptableClaim struct {
+    Kind        string         // &quot;worker_dir&quot; | &quot;worktree&quot;
+    TaskSlug    string         // the key (NOT dispatch_id)
+    CurrentOwner DispatchID
+    Generation  uint64         // monotonic per {kind, task_slug} successful owner change; never resets
+    History     []AdoptionRecord
+    HostID      string
+    State       ClaimState
+    Meta        json.RawMessage
+}
+
+type AdoptionRecord struct {
+    DispatchID DispatchID
+    DispatchKind string
+    AdoptedAt  time.Time
+    ReleasedAt *time.Time
+}
+
+type AdoptableController interface {
+    // AcquireOrAdopt creates the resource (if absent) or adopts the existing one,
+    // incrementing Generation. The current claim is the atomic holder.
+    AcquireOrAdopt(ctx context.Context, j *Journal, claim AdoptableClaim, create func() error) error
+
+    Inspect(ctx context.Context, claim AdoptableClaim) (Status, error)
+    // Registered | Absent | Unknown
+
+    // ReleaseIfTaskTerminal: release ONLY if the task slug is terminal AND
+    // archived in tasks.md. Reads tasks.md authoritatively via internal/tasks
+    // — NOT via shell-out (codex round 2: &quot;task terminal + archived must come
+    // from one concrete source of truth, not a shell-out closure&quot;).
+    ReleaseIfTaskTerminal(ctx context.Context, claim AdoptableClaim) error
+}
+</code></pre>
+<p>Stale-owner adoption rule (codex round 2 fix): if <code>CurrentOwner</code>'s dispatch is exec-terminal (done/blocked/failed) AND the claim is still <code>live</code>, the next AcquireOrAdopt <strong>CAN</strong> take over — proof of the prior dispatch's terminal state via journal lookup. The Adoptable controller performs this CAS atomically.</p>
+<p><strong>Codex round 4 fix — per-<code>task_slug</code> lock (covers whole adoptable bundle).</strong> Round 3 introduced per-<code>{kind, task_slug}</code> lock, which serialized worker_dir contenders separately from worktree contenders for the same task. Round 4 caught the split-ownership hole: contender A could win worker_dir while contender B wins worktree, leaving the worker_dir + worktree halves of the bundle owned by different dispatches. v5 widens the lock to <strong>per-<code>task_slug</code> only</strong> — one lock at <code>~/.fleet/claims-locks/&lt;task_slug&gt;.lock</code> covers ALL adoptable claims for that task (worker_dir + worktree + any future kinds in this class).</p>
+<p>AcquireOrAdopt:</p>
+<ol>
+<li>NB-flock the per-<code>task_slug</code> lock file (blocking with timeout, OR returns <code>ErrClaimContested</code> immediately, caller chooses).</li>
+<li>Inside the lock: scan all journals referencing the task_slug to determine the current authoritative owners for every adoptable kind.</li>
+<li>Run the CAS for the kind being adopted: write current dispatch's journal as new owner; release lock.</li>
+</ol>
+<p>The lock is NOT held across <code>create</code> closure execution — only across the CAS read+write. Spawn-side races on resource creation are caught by underlying primitive idempotency. The bundle-wide lock guarantees that worker_dir + worktree adoptions on the same task_slug are always serialized.</p>
+<h3 id="derived-reconciler">Derived reconciler<a class="anchor" href="#derived-reconciler" title="Permalink to this section">¶</a></h3>
+<pre><code class="language-go">// internal/dispatch/derived.go
+
+type DerivedReconciler interface {
+    // Reconcile recomputes the projection from desired state.
+    // Desired state authority order: tasks.md &gt; coord-state.json (codex round 2).
+    // Removes ghost entries (in projection but not desired);
+    // adds missing entries (in desired but not projection).
+    Reconcile(ctx context.Context, project string) error
+}
+</code></pre>
+<p>Called by the sweeper, never by terminal transitions.</p>
+<h3 id="delivery-controller-3-kinds-common-shape">Delivery controller (3 kinds; common shape)<a class="anchor" href="#delivery-controller-3-kinds-common-shape" title="Permalink to this section">¶</a></h3>
+<pre><code class="language-go">// internal/dispatch/delivery.go
+
+type DeliveryClaim struct {
+    Kind     string     // &quot;coord_prompt_inbox&quot; | &quot;handoff_resume_inbox&quot; | &quot;remote_control_inbox&quot;
+    ID       string
+    OwnerID  DispatchID
+    HostID   string
+    State    ClaimState
+    Preserve bool       // archive instead of unlink on release
+}
+
+type DeliveryController interface {
+    AcquireAndDeliver(ctx context.Context, j *Journal, claim DeliveryClaim, content io.Reader) error
+
+    Inspect(ctx context.Context, claim DeliveryClaim) (Status, error)
+    // Present | Absent
+
+    Release(ctx context.Context, claim DeliveryClaim) error
+
+    // Rewrite: atomic content + ownership transfer (handoff_resume).
+    // The new claim's OwnerID supersedes; old dispatch's Release becomes no-op.
+    Rewrite(ctx context.Context, j *Journal, claim DeliveryClaim, newOwner DispatchID, content io.Reader) error
+}
+</code></pre>
+<h3 id="audit-artifacts-no-controller">Audit artifacts (no controller)<a class="anchor" href="#audit-artifacts-no-controller" title="Permalink to this section">¶</a></h3>
+<p>Excluded from the manifest. Sweeper's directory-walk skips them.</p>
+<h3 id="journal">Journal<a class="anchor" href="#journal" title="Permalink to this section">¶</a></h3>
+<pre><code class="language-go">// internal/dispatch/journal.go
+
+type ExecState string
+const (
+    ExecPending  = &quot;pending&quot;
+    ExecInFlight = &quot;in_flight&quot;
+    ExecDone     = &quot;done&quot;
+    ExecBlocked  = &quot;blocked&quot;
+    ExecFailed   = &quot;failed&quot;
+)
+
+type ReclState string
+const (
+    ReclPending  = &quot;pending&quot;
+    ReclPartial  = &quot;partial&quot;
+    ReclComplete = &quot;complete&quot;
+    ReclBlocked  = &quot;blocked&quot;
+)
+
+type Journal struct {
+    ID            DispatchID `json:&quot;id&quot;`
+    Kind          string     `json:&quot;kind&quot;`   // &quot;worker&quot;, &quot;reviewer&quot;, &quot;finisher&quot;, &quot;coord&quot;, &quot;fix&quot;, &quot;rebase&quot;
+    Owner         string     `json:&quot;owner&quot;`  // &quot;project/&lt;p&gt;/slug/&lt;s&gt;&quot; or &quot;coord/&lt;p&gt;&quot;
+    HostID        string     `json:&quot;host_id&quot;`
+    TmuxSocket    string     `json:&quot;tmux_socket,omitempty&quot;`  // for any kind that includes tmux_session
+    SchemaVer     string     `json:&quot;schema&quot;`
+    CreatedAt     time.Time  `json:&quot;created_at&quot;`
+    UpdatedAt     time.Time  `json:&quot;updated_at&quot;`
+    ExecState     ExecState  `json:&quot;exec_state&quot;`
+    ReclState     ReclState  `json:&quot;recl_state&quot;`
+    BlockedReason string     `json:&quot;blocked_reason,omitempty&quot;`
+    Claims        []ClaimInline `json:&quot;claims&quot;`  // CLAIM DATA STORED INLINE (codex round 2 — single store)
+}
+
+type ClaimInline struct {
+    Class string          `json:&quot;class&quot;`
+    Kind  string          `json:&quot;kind&quot;`
+    State ClaimState      `json:&quot;state&quot;`
+    Data  json.RawMessage `json:&quot;data&quot;`  // serialized ExclusiveClaim / AdoptableClaim / DeliveryClaim
+}
+</code></pre>
+<p><strong>Single store, single source of truth.</strong> No separate <code>~/.fleet/claims/</code> directory. All claim state lives inside the journal file. Updates are atomic tmp+rename of the journal. This eliminates codex round 2's split-brain repair class.</p>
+<hr>
+<h2 id="manifest-store">Manifest store<a class="anchor" href="#manifest-store" title="Permalink to this section">¶</a></h2>
+<pre><code>~/.fleet/dispatches/
+├── &lt;dispatch-id&gt;.json              # execution journal — contains inline claims
+└── archive/
+    └── &lt;dispatch-id&gt;-&lt;stamp&gt;.json  # terminal+recl_complete journals
+</code></pre>
+<p>One file per dispatch. Atomic tmp+rename writes. Updates serialize through a per-file flock to handle concurrent reads/writes from controllers + sweeper.</p>
+<p>Shared/Adoptable resources are special: their claim data appears inline in EACH dispatch that holds an adoption record. The <code>CurrentOwner</code> field in the claim determines who can release. The Adoptable controller's <code>AcquireOrAdopt</code> CAS reads ALL dispatches that reference the same task_slug to resolve the current owner authoritatively — this is <code>O(N_dispatches_per_task)</code> which is small (≤ 3 for worker→reviewer→finisher).</p>
+<hr>
+<h2 id="atomicity-contract">Atomicity contract<a class="anchor" href="#atomicity-contract" title="Permalink to this section">¶</a></h2>
+<h3 id="per-claim-2-phase">Per-claim 2-phase<a class="anchor" href="#per-claim-2-phase" title="Permalink to this section">¶</a></h3>
+<p>Each claim transitions through <code>allocating → live → releasing → released</code>:</p>
+<ol>
+<li><strong>Allocating.</strong> Append claim to the journal with <code>state=allocating</code>. Journal tmp+rename. This is the intent-to-create journal entry.</li>
+<li><strong>Live.</strong> Call the resource-creation closure. On success, atomic-update the journal — flip the claim to <code>state=live</code> (tmp+rename of the journal again). On failure, flip claim to <code>failed-alloc</code>; the sweeper drops the claim entry on next pass.</li>
+<li><strong>Releasing.</strong> Terminal exec_state triggers Release. Controller flips claim to <code>state=releasing</code>. Performs teardown. On success, flips to <code>released</code>. Idempotent on retry.</li>
+<li><strong>Released.</strong> Sweeper archives the journal once all owned claims are <code>released</code>.</li>
+</ol>
+<h3 id="same-file-atomicity-codex-round-2-fix">Same-file atomicity (codex round 2 fix)<a class="anchor" href="#same-file-atomicity-codex-round-2-fix" title="Permalink to this section">¶</a></h3>
+<p>v2's two-store split required cross-file atomicity (a real distributed-systems problem). v3 keeps everything in <strong>one journal file</strong> — same-file tmp+rename is durable + atomic. No cross-store reconciliation needed.</p>
+<p>The tradeoff: each AcquireAnd* call rewrites the entire journal file. Journal files are small (a few KB even with 4-7 claims); the rewrite cost is acceptable. The benefit: no split-brain.</p>
+<h3 id="acquire-is-go-side-python-shells-out-via-fleet-claims">Acquire is Go-side; Python shells out via <code>fleet claims</code><a class="anchor" href="#acquire-is-go-side-python-shells-out-via-fleet-claims" title="Permalink to this section">¶</a></h3>
+<p>Codex round 2: don't put internal helpers under <code>fleet dispatch</code>. New CLI namespace: <code>fleet claims</code> (hidden subtree).</p>
+<pre><code>fleet claims acquire-prompt &lt;dispatch-id&gt; --owner=&lt;task-slug&gt; --host-id=&lt;hostname&gt; \
+  --tmux-socket=&lt;path&gt;            # read content from stdin
+fleet claims release &lt;dispatch-id&gt; --kind=&lt;kind&gt;
+fleet claims rewrite-prompt &lt;new-dispatch-id&gt; --target-old-id=&lt;old-dispatch-id&gt;  # stdin content
+fleet claims inspect &lt;dispatch-id&gt;  # JSON output for tooling
+</code></pre>
+<p><strong>Outcome enums</strong> (codex round 3 — stable exit codes + JSON <code>outcome</code> field):</p>
+<table>
+<thead>
+<tr>
+<th>Outcome</th>
+<th>Exit</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>acquired</code></td>
+<td>0</td>
+<td>New claim created.</td>
+</tr>
+<tr>
+<td><code>already_acquired</code></td>
+<td>0</td>
+<td>Claim with this dispatch_id + kind already exists; idempotent success.</td>
+</tr>
+<tr>
+<td><code>released</code></td>
+<td>0</td>
+<td>Release succeeded.</td>
+</tr>
+<tr>
+<td><code>already_released</code></td>
+<td>0</td>
+<td>Claim was already released; idempotent success.</td>
+</tr>
+<tr>
+<td><code>not_owned</code></td>
+<td>10</td>
+<td>Release attempted but on-disk owner != caller dispatch_id. Caller error or stale state.</td>
+</tr>
+<tr>
+<td><code>absent</code></td>
+<td>11</td>
+<td>Inspect target doesn't exist.</td>
+</tr>
+<tr>
+<td><code>contested</code></td>
+<td>12</td>
+<td>Per-<code>task_slug</code> adoptable bundle lock held; caller should retry or backoff.</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td>1</td>
+<td>Catch-all for unexpected failures (disk full, permission, etc.).</td>
+</tr>
+</tbody>
+</table>
+<p>JSON output shape:</p>
+<pre><code class="language-json">{&quot;outcome&quot;: &quot;acquired&quot;, &quot;dispatch_id&quot;: &quot;a690424b&quot;, &quot;kind&quot;: &quot;coord_prompt_inbox&quot;, &quot;path&quot;: &quot;/Users/pinkbear/.fleet/inbox/a690424b.md&quot;}
+</code></pre>
+<p>All <code>fleet claims</code> subcommands:
+- Read prompt content from stdin (no <code>--content-file</code> flag — avoids path leaks).
+- Output JSON on stdout. Stable schema (outcome + kind-specific fields).
+- Stable exit codes per the table above.
+- Hidden from <code>fleet --help</code> (internal helpers).</p>
+<hr>
+<h2 id="state-machines">State machines<a class="anchor" href="#state-machines" title="Permalink to this section">¶</a></h2>
+<h3 id="execution-state-per-dispatch">Execution state (per dispatch)<a class="anchor" href="#execution-state-per-dispatch" title="Permalink to this section">¶</a></h3>
+<pre><code>pending → in_flight → { done | blocked | failed }
+</code></pre>
+<h3 id="reclamation-state-per-dispatch">Reclamation state (per dispatch)<a class="anchor" href="#reclamation-state-per-dispatch" title="Permalink to this section">¶</a></h3>
+<pre><code>pending → { complete | partial | blocked }
+</code></pre>
+<p>Driven by per-claim release results.</p>
+<h3 id="per-claim-state-per-resource">Per-claim state (per resource)<a class="anchor" href="#per-claim-state-per-resource" title="Permalink to this section">¶</a></h3>
+<pre><code>allocating → live → releasing → released
+                 ↓
+            (failed-alloc)
+</code></pre>
+<hr>
+<h2 id="replace-operation-folds-atomic-coord-swap-v6">Replace operation (folds atomic-coord-swap-v6)<a class="anchor" href="#replace-operation-folds-atomic-coord-swap-v6" title="Permalink to this section">¶</a></h2>
+<p><strong>Atomic-commit point:</strong> the <code>coord_spawn_marker</code> Exclusive claim's owner CAS.</p>
+<p><code>Replace(project, oldDispatchID, newDispatch *Journal) error</code>:</p>
+<ol start="0">
+<li>Generate <code>replaceNonce = uuid()</code>. Used in step 4 spawn env + step 6 proof check + step 7 cleanup.</li>
+<li>Read <code>oldDispatch</code> journal. Precondition: <code>exec_state ∈ {in_flight, pending}</code>.</li>
+<li>Acquire <code>swap.lock</code> (NB-flock — same as today).</li>
+<li>Read <code>coord_spawn_marker</code> claim's <code>CurrentOwner</code> for the project. Three cases:
+   - <code>== oldDispatchID</code> → expected; proceed.
+   - <code>== newDispatchID</code> → prior Replace got partway; skip to step 8.
+   - <code>== ""</code> or missing → OldIsDead path; create marker fresh in step 7.</li>
+<li>Spawn <code>newDispatch</code>: tmux + agent_record + coord_prompt_inbox via AcquireAndRecord (controller writes claim allocating → live). <strong>Spawn env includes <code>FLEET_REPLACE_NONCE=&lt;replaceNonce&gt;</code> + <code>FLEET_DISPATCH_ID=&lt;newDispatchID&gt;</code> + <code>FLEET_PROJECT=&lt;project&gt;</code>.</strong> OLD's process does not have these envs and cannot observe <code>replaceNonce</code>.</li>
+<li><strong>Pre-commit idempotent ownership trigger</strong> — caller-supplied closure tells <code>newDispatch</code> to <em>boot the /coordinator skill</em>. Send via send-keys (TUI [a]) or synth handoff doc preamble (queue path). Trigger is a "wake up" signal; safe to retry. Full work-starting resume prompt is sent post-commit (step 9).</li>
+<li><strong>Ownership proof gate</strong> (codex round 4 fix — replaced last-writer-wins holder_id with NEW-only nonce file):
+   - <strong>(a) NEW's tmux SessionAlive == Alive</strong> via <code>internal/tmux.SessionAlive(socket, "fleet-&lt;NEW.ID&gt;")</code> — proves the session booted.
+   - <strong>(b) NEW's replace nonce file exists at the expected path with the expected content.</strong> Replace generates <code>nonce = uuid()</code> at step 0; spawns NEW with <code>FLEET_REPLACE_NONCE=&lt;nonce&gt;</code> env (step 4); NEW's first /coordinator tick, on detecting that env var, atomically writes <code>~/.fleet/projects/&lt;p&gt;/coord-replace-nonces/&lt;NEW.DispatchID&gt;-&lt;nonce&gt;.json</code> containing <code>{"nonce": "&lt;nonce&gt;", "dispatch_id": "&lt;NEW.DispatchID&gt;", "wrote_at": "&lt;ts&gt;"}</code>. <strong>Filename includes the nonce</strong> (codex round 6 P2 fix) so DispatchID birthday collisions (32-bit ID space — <code>agent.NewID</code> is 8 hex = 4.55% collision risk by 20k IDs per <code>internal/agent/agent.go:209</code>) never clobber a prior Replace's audit record. Replace polls this exact path; success criterion: file exists AND <code>nonce</code> matches AND <code>dispatch_id == NEW.DispatchID</code> AND <code>consumed_at</code> is null (codex round 5 fix — see step 7). <strong>OLD has the env var path knowledge (any process can list <code>~/.fleet/</code>), and OLD can discover NEW.DispatchID via <code>tmux ls</code> enumeration once NEW boots.</strong> The single barrier is the nonce VALUE: it's passed only through NEW's spawn env (<code>FLEET_REPLACE_NONCE</code>), so OLD doesn't have it absent a process-env read (a same-UID concern; same-UID is the entire fleet trust boundary anyway). Codex round 5 P2: don't overclaim. The proof is "OLD lacks the nonce value", not "OLD is structurally locked out of the path or ID".
+   - <strong>(c) marker readback sanity check</strong> — re-read <code>coord_spawn_marker</code> claim; if <code>Self</code> (already NEW.ID), prior Replace partial; skip to step 8. If <code>Other</code> (third dispatch we don't know), FAILURE_MODE_6. If <code>Missing</code> or OLD, proceed to step 7. NOT a proof signal — concurrency safety only.
+   - Timeout: <code>dispatch.OwnershipProofTimeout</code> constant, default 30s (caller-overridable).
+   - On timeout: Release all NEW claims, drop NEW journal, leave OLD untouched. Return <code>ErrOwnershipNotProven</code>.</li>
+</ol>
+<p><strong>Code-side: where the nonce file gets written.</strong> Add to <code>skills/coordinator/loop.py</code>'s <code>_tick_locked</code> <strong>at the very top, before <code>bootstrap_remote_control()</code> and any other first-tick work</strong> (codex round 5 placement note): if <code>FLEET_REPLACE_NONCE</code> env is set AND the per-dispatch nonce file's content does NOT already match this dispatch's nonce + dispatch_id, write it atomically (tmp+rename). The check is content-based, not absence-based: an already-correctly-written nonce file is left alone; a missing-or-mismatched one gets (re)written. This naturally idempotent because:</p>
+<ul>
+<li>On first tick: file absent → write.</li>
+<li>On subsequent ticks: file present with matching content → skip.</li>
+<li>On step-7-aftermath: the file is NOT unlinked (codex round 5 P1 fix — see step 7 below) so future ticks keep skipping.</li>
+</ul>
+<p>The dispatch ID comes from <code>FLEET_DISPATCH_ID</code> env (new, set by Replace step 4's spawn).</p>
+<p><strong>Nonce file lifecycle (codex round 5 P1 fix):</strong> Replace step 7 does NOT unlink the nonce file. Instead, after the marker CAS commits, Replace atomically updates the nonce file's content to add <code>consumed_at=&lt;ts&gt;</code>. The file persists as a per-Replace audit record (truly per-Replace given the nonce-in-filename — codex round 6 P2). NEW's first-tick logic sees the file has matching nonce + dispatch_id and skips writing. A sweeper TTL (30 days, configurable via <code>FLEET_REPLACE_NONCE_RETENTION_DAYS</code>) reaps consumed nonce files; non-consumed ones (<code>consumed_at == null</code>) older than the Replace timeout window get logged as stale-replace evidence for operator review, <strong>never auto-deleted</strong> (codex round 6: rollback path also doesn't auto-delete; operator triages stale evidence manually).</p>
+<p>This eliminates the round-5 P1 hole: there's no longer a state where step-7 unlink + later-tick env-rewrite can recreate a stale-looking nonce file.
+7. <strong>ATOMIC COMMIT</strong> — CAS the <code>coord_spawn_marker</code> claim's <code>CurrentOwner</code>: <code>oldDispatchID → newDispatchID</code> (or <code>"" → newDispatchID</code>). Atomic tmp+rename. <strong>Then atomic-update the nonce file</strong> at <code>~/.fleet/projects/&lt;p&gt;/coord-replace-nonces/&lt;NEW.DispatchID&gt;-&lt;replaceNonce&gt;.json</code> (path matches step 6 / step 0 — codex round 7 P2 fix; <code>replaceNonce</code> is in scope from step 0) to add <code>consumed_at=&lt;ts&gt;</code> (preserves the nonce + dispatch_id audit trail; ensures NEW's later ticks skip the rewrite — codex round 5 P1). This is Replace's commit point.
+8. <strong>Post-commit 3-phase resume prompt</strong> (codex round 3 fix — add <code>delivery_id</code> for deliver-side dedup):
+   - <strong>prepare</strong>: write <code>resume_prompt.prepared_at</code> + <code>resume_prompt.delivery_id = uuid()</code> to NEW journal. Atomic. The delivery_id is the deduplication token; once minted, it persists across retries.
+   - <strong>deliver</strong>: send the work-starting content via the caller-supplied closure. The closure MUST receive the delivery_id and embed it in the delivered content (as a frontmatter field for synth-doc path, or as a comment marker for send-keys path). The receiver checks: if it has previously seen this delivery_id, it skips (delivered_already). The transport-side dedup means a delivery that succeeds but loses its ack-write can be safely retried with the same delivery_id; the receiver no-ops the second delivery.
+   - <strong>ack</strong>: on closure success, write <code>resume_prompt.delivered_at</code> to NEW journal (delivery_id already there from prepare).
+   - On retry: controller reads NEW journal; if <code>delivered_at != null</code> skip (success); if <code>prepared_at != null &amp;&amp; delivered_at == null</code> retry deliver+ack with SAME delivery_id (receiver dedups). If neither set, full sequence.
+   - <strong>Receiver-side dedup</strong>: a small JSON cache at <code>~/.fleet/projects/&lt;p&gt;/resume-prompts-seen.json</code> keyed by delivery_id (TTL 7 days). The coord skill checks this cache on its first tick after spawn; if its delivery_id is present, skip the resume-prompt action (already delivered in a prior attempt). Cache is per-host (delivery_ids are host-scoped via HostID in the journal).
+9. <strong>(Live-old) Old retire.</strong> SendKeys(OLD, <code>/exit</code>) + grace + tmux.Kill. Probe SessionAlive — if still Alive, FAILURE_MODE_5.
+10. Flip <code>oldDispatch.exec_state = done</code>. Reclaim against OLD's claims (excludes coord_spawn_marker — now owned by NEW).
+11. Release <code>swap.lock</code>. Return success.</p>
+<h3 id="codex-findings-all-answered">Codex findings — all answered<a class="anchor" href="#codex-findings-all-answered" title="Permalink to this section">¶</a></h3>
+<ul>
+<li><strong>R2-finding-4 ownership-proof on broken coord.lock assumption</strong> — step 6 uses SessionAlive + NEW-only nonce file readback + marker readback as a concurrency sanity check. None of these rely on coordinator.lock body. The lock is a per-tick mutex; we treat it as such. (Earlier v3 used mtime advance and v4 used holder_id; both were last-writer-wins and didn't prove NEW. v5's nonce file is the load-bearing proof.)</li>
+<li><strong>R2-finding-6 exactly-once resume prompt</strong> — step 8 is 3-phase prepare/deliver/ack with journal-anchored idempotency.</li>
+<li><strong>R1-finding-4 marker compatibility {OLD, NEW, missing}</strong> — step 3 enumerates all three.</li>
+<li><strong>R1-finding-3 live-old duplicate-coord contract</strong> — steps 6-9 keep OLD alive until NEW proves ownership; the per-tick coordinator.lock still serializes which one is the active writer.</li>
+</ul>
+<hr>
+<h2 id="sweeper-modes">Sweeper modes<a class="anchor" href="#sweeper-modes" title="Permalink to this section">¶</a></h2>
+<p><code>fleet maintenance sweep-leaks</code> — three modes:</p>
+<h3 id="mode-1-orphan-detection-orphans">Mode 1: Orphan detection (<code>--orphans</code>)<a class="anchor" href="#mode-1-orphan-detection-orphans" title="Permalink to this section">¶</a></h3>
+<p>Walks <strong>on-disk resources NOT in any journal</strong>. Default dry-run; <code>--kill</code> cleans.</p>
+<p>This is the v0.11 back-compat pass for pre-v0.11 leaks. Goes away after v0.11.0 ships (all in-flight dispatches use new system; sweeper no longer finds journal-less resources except via bug).</p>
+<h3 id="mode-2-release-retry-retry-releases">Mode 2: Release retry (<code>--retry-releases</code>)<a class="anchor" href="#mode-2-release-retry-retry-releases" title="Permalink to this section">¶</a></h3>
+<p>Walks <strong>journals with <code>exec_state ∈ terminal</code> and <code>recl_state ∈ {partial, blocked}</code></strong>. For each, retries <code>Release</code> on un-released claims. Idempotent.</p>
+<h3 id="mode-3-derived-reconciliation-reconcile-derived">Mode 3: Derived reconciliation (<code>--reconcile-derived</code>)<a class="anchor" href="#mode-3-derived-reconciliation-reconcile-derived" title="Permalink to this section">¶</a></h3>
+<p>Walks <strong>derived projections</strong> (coord-state.json supervisor maps). Compares against tasks.md (authority per codex round 2). Prunes ghosts; adds missing entries.</p>
+<h3 id="default-all-three-modes">Default: all three modes<a class="anchor" href="#default-all-three-modes" title="Permalink to this section">¶</a></h3>
+<p><code>fleet maintenance sweep-leaks</code> (no flags) runs orphans → release-retry → reconcile-derived.</p>
+<p><strong>No split-brain mode needed</strong> (codex round 2: one-store design eliminates this entire class).</p>
+<h3 id="per-resource-ttls">Per-resource TTLs<a class="anchor" href="#per-resource-ttls" title="Permalink to this section">¶</a></h3>
+<ul>
+<li><code>tmux_session</code>: 90s post-terminal.</li>
+<li><code>coord_prompt_inbox</code>: 168h post-terminal.</li>
+<li><code>handoff_resume_inbox</code>: not applicable (no on-disk lifecycle of its own).</li>
+<li><code>remote_control_inbox</code>: 24h post-terminal.</li>
+<li><code>worker_dir</code>: based on TASK terminal+archived (Adoptable semantics, not TTL).</li>
+<li><code>worktree</code>: based on TASK terminal+archived.</li>
+<li><code>agent_record</code>: 0s — archive on dispatch terminal.</li>
+<li><code>coord_spawn_marker</code>: never swept — owned by <code>Replace</code>.</li>
+</ul>
+<hr>
+<h2 id="observability">Observability<a class="anchor" href="#observability" title="Permalink to this section">¶</a></h2>
+<ol>
+<li><strong><code>fleet dispatches list</code></strong> — active dispatches with exec_state + recl_state + claim counts.</li>
+<li><strong><code>fleet dispatches show &lt;id&gt;</code></strong> — full journal + per-claim inspection results + age.</li>
+<li><strong><code>fleet claims list &lt;class&gt; &lt;kind&gt;</code></strong> — list all claims of a kind. Reads across journals.</li>
+<li><strong>TUI status banner</strong> — yellow when <code>count(dispatches with recl_state ∈ {partial, blocked}) &gt; 0</code>.</li>
+<li><strong><code>fleet status</code> project row</strong> — <code>dispatches: 4 active, 0 blocked-reclaim</code>.</li>
+</ol>
+<hr>
+<h2 id="repo-cleanup-what-dies-with-the-refactor">Repo cleanup — what dies with the refactor<a class="anchor" href="#repo-cleanup-what-dies-with-the-refactor" title="Permalink to this section">¶</a></h2>
+<p>Each PR retires the cruft it supersedes. No separate "tidying" PR.</p>
+<h3 id="per-pr-code-retirement">Per-PR code retirement<a class="anchor" href="#per-pr-code-retirement" title="Permalink to this section">¶</a></h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Class</th>
+<th>Retired by</th>
+<th>Replacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>internal/lifecycle/</code> (issue #101 package + tests)</td>
+<td>code</td>
+<td>PR4</td>
+<td>Subsumed by <code>internal/dispatch/</code>. Migrate <code>Classify</code>/<code>OnTerminal</code> callers.</td>
+</tr>
+<tr>
+<td><code>skills/coordinator/loop.py:_maybe_delete_worker_dir</code> worker-dir branch</td>
+<td>code</td>
+<td>PR2</td>
+<td>Adoptable <code>ReleaseIfTaskTerminal</code></td>
+</tr>
+<tr>
+<td><code>skills/coordinator/loop.py:_sweep_done_worker_dirs</code></td>
+<td>code</td>
+<td>PR2</td>
+<td>Adoptable sweeper hook</td>
+</tr>
+<tr>
+<td><code>skills/coordinator/supervisor.py:forget_agent_id</code></td>
+<td>code</td>
+<td>PR2 (thin call into derived reconciler)</td>
+<td>Derived reconciler</td>
+</tr>
+<tr>
+<td><code>skills/fleet-guard/inbox.py:archive()</code></td>
+<td>code</td>
+<td>PR2</td>
+<td>Delivery controller <code>Release(preserve=true)</code></td>
+</tr>
+<tr>
+<td><code>skills/coordinator/loop.py:_dispatch_ready</code> inbox-write call</td>
+<td>code</td>
+<td>PR1</td>
+<td><code>fleet claims acquire-prompt</code> (Delivery controller AcquireAndDeliver)</td>
+</tr>
+<tr>
+<td><code>skills/coordinator/loop.py:_dispatch_review_handoffs</code> inbox-write calls (×2)</td>
+<td>code</td>
+<td>PR1</td>
+<td><code>fleet claims acquire-prompt</code></td>
+</tr>
+<tr>
+<td><code>skills/coordinator/dispatch.py:write_worker_inbox</code> helper (final removal)</td>
+<td>code</td>
+<td>PR2</td>
+<td>All callers migrated to <code>fleet claims</code></td>
+</tr>
+<tr>
+<td><code>skills/coordinator/handoff_resume.py:366</code> inbox-rewrite path</td>
+<td>code</td>
+<td>PR2</td>
+<td>Delivery controller <code>Rewrite</code></td>
+</tr>
+<tr>
+<td><code>skills/coordinator/remote_control.py:269</code> inbox writer</td>
+<td>code</td>
+<td>PR2</td>
+<td>Delivery controller <code>AcquireAndDeliver</code> (remote_control_inbox kind)</td>
+</tr>
+<tr>
+<td><code>internal/handoffop/atomic_coord_swap.go</code> body</td>
+<td>code</td>
+<td>PR3</td>
+<td><code>Replace</code> in <code>internal/dispatch/</code></td>
+</tr>
+<tr>
+<td><code>cmd/fleet/dispatch_recovery.go</code> (entire file)</td>
+<td>code</td>
+<td>PR3</td>
+<td><code>Replace(OldIsDead=true)</code> path</td>
+</tr>
+<tr>
+<td><code>internal/handoffop/replacement_cleanup.go</code></td>
+<td>code</td>
+<td>PR3</td>
+<td>Exclusive controller <code>Release</code></td>
+</tr>
+<tr>
+<td><code>cmd/fleet/maintenance.go:prune-orphan-tmux</code> body</td>
+<td>code</td>
+<td>PR4</td>
+<td><code>sweep-leaks --orphans</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="per-pr-docs-retirement">Per-PR docs retirement<a class="anchor" href="#per-pr-docs-retirement" title="Permalink to this section">¶</a></h3>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Retired by</th>
+<th>Replacement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>docs/PLAN-v0.2-coordinator.md</code> per-resource-cleanup language</td>
+<td>PR2</td>
+<td>Reference DESIGN-dispatch-lifecycle.md</td>
+</tr>
+<tr>
+<td><code>docs/ENG-v0.2-coordinator.md</code> per-resource-cleanup language</td>
+<td>PR2</td>
+<td>Same</td>
+</tr>
+<tr>
+<td><code>docs/postmortems/2026-05-14-orphan-tmux-leak.md</code> (currently untracked)</td>
+<td>PR1 — commit as-is; PR4 — append "v0.11 supersedes" note</td>
+<td>Append note</td>
+</tr>
+<tr>
+<td><code>skills/coordinator/SKILL.md</code> references to retired helpers</td>
+<td>PR2</td>
+<td>Reference primitive</td>
+</tr>
+</tbody>
+</table>
+<h3 id="stale-p3-tasks-to-triage-during-pr2-pr3">Stale P3 tasks to triage during PR2-PR3<a class="anchor" href="#stale-p3-tasks-to-triage-during-pr2-pr3" title="Permalink to this section">¶</a></h3>
+<p>Each gets per-task decision: <strong>fold</strong> / <strong>keep</strong> / <strong>archive</strong>.</p>
+<ul>
+<li><code>tmux-probe-tristate-heal-9c1c</code> — likely fold into PR4.</li>
+<li><code>reconcile-pid-docstring-94b9</code> — likely fold into PR2.</li>
+<li><code>fleet-pid-resolve-s-prop-0ab2</code> — triage PR1.</li>
+<li><code>resolver-revalidate-tent-6006</code> — likely archive.</li>
+<li><code>spawn-pane-unreachable-p-2857</code> — likely fold into PR2.</li>
+<li><code>resolver-direct-cmd-fast-59d3</code> — triage PR2.</li>
+<li><code>reconcile-handoff-sessio-c89b</code> — likely fold into PR3.</li>
+<li><code>reconcile-worker-pid-rec-dea0</code> — likely fold into PR2.</li>
+<li><code>tui-dead-coord-sweep-7844</code> — likely fold into PR4.</li>
+</ul>
+<h3 id="untracked-file-audit-pre-pr1-prep">Untracked-file audit (pre-PR1 prep)<a class="anchor" href="#untracked-file-audit-pre-pr1-prep" title="Permalink to this section">¶</a></h3>
+<p>Operator review before PR1 lands:</p>
+<ol>
+<li><code>internal/testutil/tmuxtest/tmuxtest.go</code> + <code>tmuxtest_test.go</code> — uncommitted local edits adding a new test + docstring updates. Decision: commit-as-precursor OR drop.</li>
+<li><code>.claude/</code> directory — operator-local Claude Code settings. Add to <code>.gitignore</code> if not already.</li>
+<li><code>docs/postmortems/2026-05-14-orphan-tmux-leak.md</code> — commit in PR1 (load-bearing context).</li>
+<li><strong><code>docs/DESIGN-dispatch-lifecycle.{md,html}</code></strong> + <strong><code>scripts/render-design-doc.py</code></strong> (codex round 2 catch) — commit in PR1 (the design doc + renderer ARE the spec; checking them in makes the spec versioned with the code).</li>
+</ol>
+<h3 id="one-shot-leak-sweep-pre-pr2-prep">One-shot leak sweep (pre-PR2 prep)<a class="anchor" href="#one-shot-leak-sweep-pre-pr2-prep" title="Permalink to this section">¶</a></h3>
+<ul>
+<li>30 stale coord_prompt_inbox files → unlink.</li>
+<li>2 orphan worktrees → <code>git worktree remove --force</code>.</li>
+<li>4 supervisor ghosts → jq-edit coord-state.json.</li>
+<li>2 detached procs → inspect; kill only if confirmed orphan.</li>
+</ul>
+<p>Script: <code>scripts/v0-11-pre-migration-sweep.sh</code>. Delivered with PR2; deleted after v0.11.0 ships.</p>
+<h3 id="memory-entries-to-retire-revise-post-merge">Memory entries to retire / revise (post-merge)<a class="anchor" href="#memory-entries-to-retire-revise-post-merge" title="Permalink to this section">¶</a></h3>
+<ul>
+<li><code>project_v02_coordinator_design.md</code> — references may be stale.</li>
+<li>Feedback memories tied to per-resource cleanup — re-check during PR4.</li>
+</ul>
+<hr>
+<h2 id="migration-strategy">Migration strategy<a class="anchor" href="#migration-strategy" title="Permalink to this section">¶</a></h2>
+<h3 id="forward-only">Forward-only<a class="anchor" href="#forward-only" title="Permalink to this section">¶</a></h3>
+<ul>
+<li>v0.11 introduces the primitive. New dispatches use it from PR1 (for coord_prompt_inbox) onward; PR2 for the remaining kinds.</li>
+<li>Pre-v0.11 dispatches in flight at upgrade time: pre-v0.11 cleanup paths still execute. Sweeper <code>--orphans</code> mode catches leaks via probe-and-delete.</li>
+<li>"No journal ≠ orphan" rule: sweeper only sweeps known legacy name shapes (<code>^fleet-&lt;8hex&gt;$</code> tmux, <code>^&lt;8hex&gt;.md$</code> inbox under <code>~/.fleet/inbox/</code>, worktrees under <code>projects/*/worktrees/</code>). Unknown names are logged only.</li>
+</ul>
+<h3 id="pr1-pr2-overlap-codex-round-2-catch-round-3-refinement">PR1 ↔ PR2 overlap (codex round 2 catch + round 3 refinement)<a class="anchor" href="#pr1-pr2-overlap-codex-round-2-catch-round-3-refinement" title="Permalink to this section">¶</a></h3>
+<p>During PR1's release window, inbox files have two possible writers:
+- Pre-PR1: <code>dispatch.py:write_worker_inbox</code> (direct write).
+- Post-PR1: <code>fleet claims acquire-prompt</code> (controller-managed; journal entry exists).</p>
+<p>Distinguish via <strong>journal lookup, not name shape.</strong> <code>dispatch_id == agent_id</code> is the invariant (today's <code>mint_agent_id</code> is what becomes dispatch_id; the mapping is identity for fleet-spawned subagent dispatches). If <code>~/.fleet/dispatches/&lt;agent_id&gt;.json</code> exists with a <code>coord_prompt_inbox</code> claim referencing the file → managed. Otherwise legacy.</p>
+<p><strong>Codex round 3 — PR1 helper scope narrowing.</strong> v3's PR1 migrated <code>dispatch.py:write_worker_inbox</code> wholesale, but that helper is also called by <code>handoff_resume.py:366</code> (in-place resume rewrite — PR2 surface). PR1 migration is narrowed to <strong>only the loop.py call sites that produce coord_prompt_inbox</strong>:
+- <code>loop.py:_dispatch_ready</code> (worker dispatch path) — migrate to <code>fleet claims acquire-prompt</code>.
+- <code>loop.py:_dispatch_review_handoffs</code> (reviewer + finisher dispatch paths) — migrate to <code>fleet claims acquire-prompt</code>.</p>
+<p>The helper <code>dispatch.py:write_worker_inbox</code> itself is NOT removed in PR1 — <code>handoff_resume.py:366</code> still uses it. PR2 migrates the helper's remaining caller (handoff_resume) and finally retires <code>write_worker_inbox</code>.</p>
+<h3 id="pre-migration-leak-sweep-one-shot">Pre-migration leak sweep (one-shot)<a class="anchor" href="#pre-migration-leak-sweep-one-shot" title="Permalink to this section">¶</a></h3>
+<p>Documented above.</p>
+<hr>
+<h2 id="vertical-slice-sequencing-4-stacked-prs">Vertical-slice sequencing — 4 stacked PRs<a class="anchor" href="#vertical-slice-sequencing-4-stacked-prs" title="Permalink to this section">¶</a></h2>
+<h3 id="codex-round-2-pr1-must-be-minimal">Codex round 2: PR1 must be MINIMAL<a class="anchor" href="#codex-round-2-pr1-must-be-minimal" title="Permalink to this section">¶</a></h3>
+<p>v2's PR1 included Delivery controller spanning 3 inbox writers. v3 narrows to <strong>just <code>coord_prompt_inbox</code></strong> — the writer at <code>dispatch.py:913</code> that produces today's 30-file leak. The other Delivery kinds (<code>handoff_resume_inbox</code>, <code>remote_control_inbox</code>) move to PR2.</p>
+<table>
+<thead>
+<tr>
+<th>PR</th>
+<th>Scope</th>
+<th>Approx LoC</th>
+<th>Closes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>PR1</strong> Vertical slice (coord_prompt_inbox only)</td>
+<td><code>internal/dispatch/</code> scaffolding: <code>Journal</code>, state enums, manifest store, <code>fleet claims</code> CLI namespace, <code>DispatchID</code> named type (plan-eng A6). Delivery controller — coord_prompt_inbox kind ONLY. <code>skills/coordinator/loop.py:_dispatch_ready</code> and <code>_dispatch_review_handoffs</code> migrate to <code>fleet claims acquire-prompt</code>. <code>dispatch.py:write_worker_inbox</code> helper STAYS in PR1 (still used by <code>handoff_resume.py:366</code>; retires in PR2). Terminal-transition reclaim releases the inbox. <code>scripts/v0-11-pre-migration-sweep.sh</code>. Untracked-file audit (operator-driven before PR1 lands). <strong>CRITICAL tests (plan-eng-review):</strong> E2E regression test using <code>internal/testutil/tmuxtest</code> (dispatch → terminal → inbox-unlinked-and-journal-archived); kill-9 mid-AcquireAndDeliver recovery test; golden-file contract tests for <code>fleet claims</code> CLI (<code>cmd/fleet/testdata/claims/*.json</code>).</td>
+<td>~900 + ~250 test</td>
+<td>The 30-file inbox leak</td>
+</tr>
+<tr>
+<td><strong>PR2</strong> Expand Delivery + add Exclusive + Adoptable</td>
+<td>Delivery: handoff_resume_inbox + remote_control_inbox. Exclusive controllers: tmux_session, agent_record. Adoptable controllers: worker_dir, worktree. Spawn path migrates. Worker dispatch creates 4 claims. Reviewer/finisher reuse worker_dir via AcquireOrAdopt. Retires <code>_maybe_delete_worker_dir</code>, <code>_sweep_done_worker_dirs</code>, <code>forget_agent_id</code> worker-dir branch, <code>fleet-guard inbox.archive</code>, <code>handoff_resume.py:366</code>, <code>remote_control.py:269</code>. Triages 4-5 P3 tasks.</td>
+<td>~1700</td>
+<td>Multi-kind delivery + adoption bugs</td>
+</tr>
+<tr>
+<td><strong>PR3</strong> Replace (coord swap)</td>
+<td><code>coord_spawn_marker</code> Exclusive. <code>Replace</code> function — folds atomic-coord-swap-v6 with all codex findings answered. 4 call sites flow through Replace. Retires <code>atomic_coord_swap.go</code> body + <code>dispatch_recovery.go</code> + <code>replacement_cleanup.go</code>. Triages 2 P3 tasks.</td>
+<td>~1800</td>
+<td>Coord swap leaks + answers swap-v6 codex findings</td>
+</tr>
+<tr>
+<td><strong>PR4</strong> Sweeper + observability + cleanup + <strong>archive pruner</strong></td>
+<td><code>sweep-leaks</code> 3 modes. <code>dispatches list/show</code>, <code>claims list</code>. TUI banner. Derived reconciler. <strong>Archive pruner (plan-eng A4):</strong> <code>fleet maintenance prune-dispatch-archive --older-than 90d</code>, defaults retain 90 days; triggered manually or by sweeper when archive size &gt; 100MB. Retires <code>prune-orphan-tmux</code> body + <code>internal/lifecycle/</code> package. Docs updates. Final P3 triage.</td>
+<td>~1300 + ~150 pruner</td>
+<td>Remaining sweeper coverage + observability + archive growth bound</td>
+</tr>
+</tbody>
+</table>
+<p><code>atomic-coord-swap-v6-uni-b09b</code> is folded into PR3. <code>internal/lifecycle/</code> (issue #101) retires in PR4.</p>
+<hr>
+<h2 id="error-policy">Error policy<a class="anchor" href="#error-policy" title="Permalink to this section">¶</a></h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Claim allocation closure fails</td>
+<td>Claim flips to <code>failed-alloc</code>; sweeper drops on next pass.</td>
+</tr>
+<tr>
+<td>Claim live but resource missing on Inspect</td>
+<td>Sweeper Release no-ops; claim flips to <code>released</code>.</td>
+</tr>
+<tr>
+<td>Release returns error 3+ times within 1h</td>
+<td>Claim flips to <code>releasing-blocked</code>. Journal <code>recl_state=blocked</code>. Operator-visible.</td>
+</tr>
+<tr>
+<td>Inspect returns Unknown</td>
+<td>Treat as "don't touch". Never sweep on Unknown (codex round 1 lesson).</td>
+</tr>
+<tr>
+<td>Journal write fails (disk full, perms)</td>
+<td>Caller error. No resources created (AcquireAnd* is atomic).</td>
+</tr>
+<tr>
+<td>Cross-host claim attempt (HostID mismatch)</td>
+<td><code>ErrCrossHostClaim</code>. Operator resolves manually.</td>
+</tr>
+<tr>
+<td>Same-host, different tmux socket (codex round 2 fix)</td>
+<td><code>ErrCrossSocketClaim</code>. Operator resolves.</td>
+</tr>
+<tr>
+<td><code>marker == NEW.ID</code> on Replace entry</td>
+<td>Treat as in-flight resume; skip to step 8 (post-commit resume prompt).</td>
+</tr>
+<tr>
+<td>Two dispatches AcquireOrAdopt same Adoptable bundle (any kind for same task_slug)</td>
+<td>Per-<code>task_slug</code> bundle lock at <code>~/.fleet/claims-locks/&lt;task_slug&gt;.lock</code> (NB-flock). Loser returns <code>contested</code> immediately OR blocks until <code>AdoptableLockTimeout</code> (plan-eng CQ3: <strong>default 10s</strong>; caller can override via context deadline). On retry, reads the post-CAS state and either adopts or no-ops. CurrentOwner per-kind is authoritative; the bundle lock guarantees all kinds for the same task_slug serialize.</td>
+</tr>
+<tr>
+<td>Resume-prompt deliver fails after prepare write</td>
+<td>Claim has <code>prepared_at</code> + <code>delivery_id</code> but no <code>delivered_at</code>. On retry, controller redelivers with the SAME <code>delivery_id</code> (idempotency token). Receiver dedup cache (<code>~/.fleet/projects/&lt;p&gt;/resume-prompts-seen.json</code>) no-ops the duplicate if it already saw the delivery_id.</td>
+</tr>
+<tr>
+<td>Resume-prompt ack write lost (deliver succeeded but <code>delivered_at</code> write failed)</td>
+<td>Claim still in <code>prepared_at != null, delivered_at == null</code>. Retry path: same as above (redeliver with same delivery_id; receiver dedups; ack write retries).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="open-questions-codex-round-3-answered-all">Open questions — codex round 3 answered all<a class="anchor" href="#open-questions-codex-round-3-answered-all" title="Permalink to this section">¶</a></h2>
+<p>Round 3 answered all 5 outstanding round-2 questions:</p>
+<ol>
+<li><strong>AcquireOrAdopt CAS correctness</strong> — codex round 3 surfaced stale-read window with per-journal flock alone; round 4 surfaced the split-ownership hole if the lock is per-<code>{kind, task_slug}</code>. v5 resolution: <strong>per-<code>task_slug</code> bundle lock</strong> covering all adoptable kinds for the task (see Adoptable controller above).</li>
+<li><strong>Sweeper authority</strong> — codex round 3: operator-invoked sufficient for v0.11.0. Daemon deferred to v0.11.x.</li>
+<li><strong>Resume-prompt failure recovery</strong> — codex round 3: 3-phase <code>prepared + delivered + ack</code> is correct; ack-observed-by-caller fourth phase not needed. Missing piece (now applied): <code>delivery_id</code> for transport-side dedup so a deliver-success-ack-lost retry doesn't duplicate.</li>
+<li><strong><code>fleet claims</code> visibility</strong> — codex round 3: keep hidden for v0.11.0. Stable JSON + stable exit codes (now in CLI section) is what matters, not discoverability.</li>
+<li><strong>Migration race upgrade hook</strong> — codex round 3: acceptable to defer, provided legacy resources are handled by conservative orphan-detection logic only and never by managed-release paths. The "no journal ≠ orphan" rule plus name-shape matching satisfies this.</li>
+</ol>
+<hr>
+<h2 id="failure-modes-cross-pr-test-plan">Failure modes (cross-PR test plan)<a class="anchor" href="#failure-modes-cross-pr-test-plan" title="Permalink to this section">¶</a></h2>
+<ol>
+<li>Coord crashes between AcquireAndDeliver prepare-write and actual file write → journal has claim in <code>allocating</code>, no file. Sweeper drops claim on next pass.</li>
+<li>Coord crashes between file write and claim-flip-to-live → file exists, claim in <code>allocating</code>. Sweeper Inspects, finds file present, flips claim to <code>live</code>.</li>
+<li>Coord crashes during Replace step 7 (CAS) → marker not yet written but NEW's other claims live (including nonce file). Sweeper detects via nonce-file + marker readback; if NEW's coord still alive (nonce file present, valid, <code>consumed_at == null</code>), retries CAS. If NEW's coord is dead AND nonce file is unconsumed past timeout, marks it as stale-replace evidence for operator triage — <strong>never auto-deletes</strong> (codex round 6 P2: operator inspects unconsumed nonces; rollback Releases NEW's other claims but leaves the nonce file).</li>
+<li>Worker dispatch ends at phase=blocked → Delivery releases inbox; Adoptable defers (task not archived); Exclusive archives agent record.</li>
+<li>Handoff-resume reads + rewrites inbox → Rewrite atomically transfers ownership; old dispatch's Release becomes no-op.</li>
+<li>Operator runs sweep-leaks --kill while a dispatch is mid-reclaim → idempotent; both passes complete same resources.</li>
+<li>Cross-host (Dropbox-synced ~/.fleet) → claim has different HostID. Sweeper refuses cross-host reclaim. TUI warns.</li>
+<li>Same-host, different tmux socket → claim has different TmuxSocket. Sweeper refuses cross-socket reclaim.</li>
+<li>Resume-prompt 3-phase, ack write fails → controller can recover from journal state.</li>
+</ol>
+<hr>
+<h2 id="test-infrastructure-plan-eng-review-a9-decision">Test infrastructure (plan-eng-review A9 decision)<a class="anchor" href="#test-infrastructure-plan-eng-review-a9-decision" title="Permalink to this section">¶</a></h2>
+<p>All integration tests use <strong>real tmux via <code>internal/testutil/tmuxtest</code></strong> (already in repo) for per-test tmux server isolation. Boundary fakes for:
+- fleet-guard heartbeat writer (mock the agent JSON updates).
+- coord-state writer (in-memory map; test asserts state at boundaries).
+- Agent-tool return (mock subagent termination + state.json updates).</p>
+<p>The pattern follows <code>internal/handoffop/atomic_coord_swap_test.go</code> today. PR1 lays the groundwork (one E2E test); PR2/PR3/PR4 build on it.</p>
+<p>Lessons from the 8-round codex arc inform the test architecture: every state machine codex flagged (holder_id flap, marker-readback ordering, nonce path mismatch, ack-write-lost recovery) needs an explicit test exercising the race. Mocking tmux entirely would miss exactly this class — codex's findings prove it.</p>
+<h2 id="test-plan-cross-cutting">Test plan (cross-cutting)<a class="anchor" href="#test-plan-cross-cutting" title="Permalink to this section">¶</a></h2>
+<p><strong>PR1:</strong>
+- Delivery controller (coord_prompt_inbox only) unit tests: AcquireAndDeliver atomicity, Release idempotent.
+- Worker dispatch end-to-end: spawn → terminal → inbox unlinked. Verify via <code>/tmp/fleet-leak-scan.sh</code>.
+- Crash-recovery: kill coord mid-AcquireAndDeliver, sweeper recovers.
+- Pre-migration sweep dry-run lists known leaks; --kill cleans.</p>
+<p><strong>PR2:</strong>
+- Delivery: handoff_resume_inbox + remote_control_inbox + Rewrite atomicity.
+- Exclusive controllers + per-kind status enums (Alive/Dead/Unknown for tmux; Live/Archived/Missing for agent_record).
+- Adoptable: worker → reviewer → finisher adoption; ReleaseIfTaskTerminal no-ops mid-task.
+- Cross-socket refusal (same-host different-tmux-socket).
+- P3 task triage results in PR description.</p>
+<p><strong>PR3:</strong>
+- Replace × 5 failure modes × 4 call sites.
+- Ownership proof step 6: SessionAlive + replace-nonce-file presence + marker readback (sanity check).
+- Race test: NEW writes its nonce file; verify OLD's concurrent tick CANNOT write a colliding entry. OLD's process lacks <code>FLEET_REPLACE_NONCE</code> (env-scoped to NEW's spawn); even though OLD can learn NEW.DispatchID from <code>tmux ls</code>, the path includes the nonce so OLD has no way to construct the correct filename without the nonce VALUE.
+- Nonce file lifecycle: Replace step 7 commit atomic-updates <code>consumed_at</code>; abort/rollback path leaves the file unconsumed for operator triage (no auto-delete). 30-day TTL sweeper retires consumed nonces; unconsumed ones surface as operator-visible stale-replace evidence.
+- 3-phase resume prompt with each step failing.
+- <code>marker == NEW.ID</code> recovery.
+- OldIsDead path.
+- P3 task triage.</p>
+<p><strong>PR4:</strong>
+- Sweeper modes 1+2+3 end-to-end.
+- <code>internal/lifecycle/</code> callers migrated; package deletable.
+- TUI banner; <code>fleet dispatches/claims</code> outputs.
+- Final P3 triage. Memory updates.
+- Leak-scan CI gate: post-test-suite <code>sweep-leaks --dry-run</code> returns 0.</p>
+<hr>
+<h2 id="risks-mitigations">Risks &amp; mitigations<a class="anchor" href="#risks-mitigations" title="Permalink to this section">¶</a></h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Re-arch introduces new bugs</td>
+<td>Per-PR test suites; PR1 minimal blast radius; regression tests for specific bugs closed.</td>
+</tr>
+<tr>
+<td>3-week delivery → other P1 work blocked</td>
+<td>Other P1s (release-v0-10-0-cut, coord-rolling-checkpoint) ship in parallel. Only swap-v6 + #101 are folded in. PR #135 stays paused.</td>
+</tr>
+<tr>
+<td>Premature abstraction</td>
+<td>Vertical slice in PR1 validates controllers end-to-end before PR2 expansion.</td>
+</tr>
+<tr>
+<td>Manifest store growth</td>
+<td>Archive subdir; operator pruning out of scope v0.11.</td>
+</tr>
+<tr>
+<td>Migration race v0.10 → v0.11</td>
+<td>Pre-v0.11 cleanup still executes; sweeper --orphans catches legacy.</td>
+</tr>
+<tr>
+<td>Cross-host / cross-socket</td>
+<td>Explicit single-machine v1 invariant + HostID + TmuxSocket on every claim + sweeper refuses cross-* reclaim.</td>
+</tr>
+<tr>
+<td>Mid-PR triage discovers complexity</td>
+<td>Triage can defer to "keep as separate task"; doesn't block PR.</td>
+</tr>
+<tr>
+<td>Same-file flock contention under load</td>
+<td>Per-dispatch journal; multiple dispatches don't contend on each other's journals. Within one dispatch, claim acquisitions are serialized by design.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="decision-log">Decision log<a class="anchor" href="#decision-log" title="Permalink to this section">¶</a></h2>
+<ul>
+<li><strong>2026-05-15</strong> — Operator approved re-architecture after seeing inbox leak as 2nd instance of pattern within 48h.</li>
+<li><strong>2026-05-15</strong> — Operator chose "drive design conversation with codex" → 3 codex rounds + plan-eng-review.</li>
+<li><strong>2026-05-15</strong> — <code>atomic-coord-swap-v6-uni-b09b</code> folded into PR3. <code>internal/lifecycle/</code> (issue #101) folded into PR4.</li>
+<li><strong>2026-05-15</strong> — PR #135 (codex-engine MVP) stays paused.</li>
+<li><strong>2026-05-15</strong> — 3 operator-approved shape decisions: ONE primitive + typed controllers; vertical slice; 5 resource classes.</li>
+<li><strong>2026-05-15</strong> — Operator added: repo cleanup is part of refactor scope.</li>
+<li><strong>2026-05-15</strong> — Codex round 1 critique folded (typed controllers, vertical slice, host_id, Inspect vs Probe, 5 classes).</li>
+<li><strong>2026-05-15</strong> — plan-eng-review decisions folded (v9):</li>
+<li>A9 (test infra): real-tmux via <code>internal/testutil/tmuxtest</code> + boundary fakes for fleet-guard, coord-state, Agent-tool returns. New "Test infrastructure" section.</li>
+<li>A6 (ID invariant): <code>DispatchID</code> as named type wrapping agent_id; constructor test pins 8-hex shape + cross-language (Go ↔ Python) byte-equal.</li>
+<li>A1 (CLI contract): golden-file tests in <code>cmd/fleet/claims_test.go</code> with fixtures under <code>cmd/fleet/testdata/claims/</code>. One fixture per (subcommand, outcome) pair.</li>
+<li>A4 (archive growth): ship <code>prune-dispatch-archive</code> in PR4 alongside sweeper. Default 90-day retention; auto-trigger at &gt;100MB archive size. Eliminates the indefinite-deferral risk.</li>
+<li>CQ3 (lock timeout): <code>AdoptableLockTimeout = 10 * time.Second</code> constant; caller overridable via context deadline.</li>
+<li>CQ1 (doc structure): added "TL;DR for implementers" section at top — 10-line summary, invariants, gotchas, PR sequencing. Decision log stays inline as institutional memory.</li>
+<li>T1 (regression test): PR1 ships CRITICAL E2E regression test — full dispatch → terminal → inbox-unlinked-and-journal-archived cycle.</li>
+<li>T2 (crash recovery): PR1 ships explicit kill-9 mid-AcquireAndDeliver recovery test. Sweeper drops orphaned <code>allocating</code> claims.</li>
+<li><strong>2026-05-15</strong> — Codex round 7 critique folded (v8):</li>
+<li>Step 7 path reference fixed to match step 6's <code>&lt;NEW.DispatchID&gt;-&lt;replaceNonce&gt;.json</code> (was lagging behind v7's filename widening). One-line behavioral-bug fix codex caught.</li>
+<li><strong>2026-05-15</strong> — Codex round 6 critique folded (v7):</li>
+<li>Nonce filename widened from <code>&lt;NEW.DispatchID&gt;.json</code> to <code>&lt;NEW.DispatchID&gt;-&lt;nonce&gt;.json</code>. Closes round-6 P2 (32-bit DispatchID birthday collision could clobber an older Replace's audit record).</li>
+<li>Failure-modes section + PR3 test-plan: scrubbed remaining stale "24h TTL auto-delete" + "step 7 unlinks" + "OLD lacks NEW.DispatchID" prose. Aligned with v6's no-auto-delete + nonce-value-as-barrier model.</li>
+<li>Stale-replace evidence is now explicitly never auto-deleted (sweeper logs it; operator triages).</li>
+<li><strong>2026-05-15</strong> — Codex round 5 critique folded (v6):</li>
+<li>Replace step 7: <strong>stop unlinking the nonce file</strong>. Instead, atomically update it to add <code>consumed_at=&lt;ts&gt;</code>. Closes round-5 P1 (the unlink-and-rewrite hole). Nonce file becomes a permanent per-Replace audit record; 30-day TTL sweeper handles retention. Non-consumed nonces older than the Replace timeout are operator-visible stale-replace evidence, not auto-deleted.</li>
+<li>Nonce-file first-tick write gate: content-match (not absence-match). Idempotent across re-ticks regardless of file state changes.</li>
+<li>Nonce-write hook explicitly placed at top of <code>_tick_locked</code>, before <code>bootstrap_remote_control()</code> (codex round 5 placement note).</li>
+<li>R4.1 prose tightened: OLD CAN learn NEW.DispatchID (via tmux ls) and the nonce file path. The proof's actual barrier is the nonce VALUE (env-var, same-UID boundary). Removed structural-impossibility overclaim.</li>
+<li>Stale references scrubbed: lock outcome table, error table (per-task_slug bundle lock), answered-question section.</li>
+<li><strong>2026-05-15</strong> — Codex round 4 critique folded (v5):</li>
+<li>Replace step 6: <code>holder_id</code> in coord-state.json replaced with <strong>per-NEW-dispatch nonce file</strong> under <code>~/.fleet/projects/&lt;p&gt;/coord-replace-nonces/</code> (filename shape evolved to <code>&lt;NEW.DispatchID&gt;-&lt;replaceNonce&gt;.json</code> in v7 to avoid DispatchID-collision clobber; see Replace step 6/7 for the canonical path). Closes round-4 R3.1 last-writer-wins flap — OLD lacks the nonce VALUE (env-var, same-UID boundary). [Note: v6 prose overclaimed structural impossibility; round 5 P2 + round 6 P3 fixes corrected this to "OLD lacks the nonce value".]</li>
+<li>Adoptable lock widened from per-<code>{kind, task_slug}</code> to per-<code>task_slug</code> (drops kind segment). One lock covers worker_dir + worktree bundle. Closes round-4 R3.3 split-ownership hole.</li>
+<li>Stale-prose scrub: <code>mtime advance</code> references removed (no longer the proof signal). <code>ack_id</code> row in error table rewritten to use <code>delivery_id</code> model. PR1 table row aligned with prose (loop.py call sites migrate; helper stays for PR2).</li>
+<li><strong>2026-05-15</strong> — Codex round 3 critique folded (v4):</li>
+<li>Replace step 6 ownership proof: added NEW-specific <code>coord-state.holder_id</code> signal written by NEW's first /coordinator tick. Marker readback demoted to sanity check.</li>
+<li>PR1 helper scope narrowed: migrate only <code>loop.py</code> call sites; leave <code>dispatch.py:write_worker_inbox</code> helper for PR2 (<code>handoff_resume.py:366</code> still uses it).</li>
+<li>Adoptable AcquireOrAdopt: added per-<code>{kind, task_slug}</code> lock under <code>~/.fleet/claims-locks/</code>. Mirrors existing <code>internal/workers/workers.go:423</code> pattern.</li>
+<li>Resume-prompt 3-phase: added <code>delivery_id</code> minted at prepare, embedded in delivered content, receiver-side dedup cache at <code>~/.fleet/projects/&lt;p&gt;/resume-prompts-seen.json</code>.</li>
+<li><code>fleet claims</code> CLI: stable outcome enums (<code>acquired | already_acquired | released | already_released | not_owned | absent | contested | error</code>) with stable exit codes + JSON <code>outcome</code> field. <code>rewrite-prompt</code> consumes stdin.</li>
+<li>Pinned <code>dispatch_id == agent_id</code> invariant in PR1↔PR2 overlap rule.</li>
+<li>Doc/code mismatch fixed: coord_prompt_inbox is read by the coord agent (passes content to Agent tool), not the subagent's first turn.</li>
+<li>All 5 round-3 open questions answered authoritatively; section consolidated.</li>
+<li><strong>2026-05-15</strong> — Codex round 2 critique folded (v3):</li>
+<li>Collapsed to ONE manifest store (claims inline in journal). Eliminates split-brain.</li>
+<li>Split inbox into 3 Delivery kinds (coord_prompt, handoff_resume, remote_control).</li>
+<li>Replace ownership proof: drop coordinator.lock body assumption; use SessionAlive + marker readback + mtime advance.</li>
+<li>Added <code>tmux_socket</code> field to discriminate same-host different-socket case.</li>
+<li>PR1 strictly minimal: coord_prompt_inbox only.</li>
+<li>CLI moved off <code>fleet dispatch</code> to hidden <code>fleet claims</code>.</li>
+<li>Resume prompt: 3-phase prepare/deliver/ack.</li>
+<li>Audit class extended: <code>~/.fleet/incidents/</code>, <code>projects/&lt;p&gt;/subagents/</code>.</li>
+<li>Open questions answered: per-resource files, monotonic Generation per {kind, task_slug}, tasks.md wins for derived, AcquireOrAdopt task-terminal reads from <code>internal/tasks</code> not shell-out.</li>
+</ul>
+<hr>
+<h2 id="open-items-before-draft-freeze">Open items before draft-freeze<a class="anchor" href="#open-items-before-draft-freeze" title="Permalink to this section">¶</a></h2>
+<ul>
+<li>[ ] Codex round 3 review of v3 → PASS or NEEDS_REVISION.</li>
+<li>[ ] <code>/plan-eng-review</code> lock-in (after codex clean).</li>
+<li>[ ] Operator final approval (G2 gate).</li>
+<li>[ ] After approval: file PR1-PR4 as P1 tasks; dispatch worker on PR1 (vertical slice).</li>
+<li>[ ] Operator pre-PR1 prep:</li>
+<li>[ ] Untracked-file audit decision (<code>internal/testutil/tmuxtest</code>).</li>
+<li>[ ] Approve pre-migration sweep script (dry-run before --kill).</li>
+</ul>
+  </main>
+</div>
+</body>
+</html>

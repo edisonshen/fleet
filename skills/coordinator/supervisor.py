@@ -449,6 +449,23 @@ def emit(line: str, *, stream=None) -> None:
 _SUPERVISOR_KEY = "supervisor"
 _AGENT_IDS_KEY = "worker_agent_ids"
 _SUBAGENT_IDS_KEY = "worker_subagent_ids"
+# Codex iter-4 [P1] (dispatch-lifecycle PR1 follow-up): pending acquire
+# IDs are dispatch IDs minted on a tick where `fleet claims acquire-
+# prompt` FAILED. The next tick must retry with the SAME id so the
+# AcquireCoordPromptInbox idempotent / recovery path can heal a half-
+# written journal/inbox. Without this, every acquire-prompt failure
+# orphans a journal that nothing in PR1 reclaims.
+_PENDING_ACQUIRE_IDS_KEY = "pending_acquire_agent_ids"
+# Codex iter-9 [P1]: pending release IDs are agent_ids whose
+# `fleet claims release` returned an `error` outcome (transient
+# fault). They live keyed by slug but value is a LIST because a single
+# slug can accumulate multiple unreleased ids over its lifecycle —
+# e.g., a handoff that overwrites worker_agent_ids with the new
+# subagent's id while the prior subagent's release retry is still
+# pending. The next sweep / reconcile retries every entry; success
+# (or absent/not_owned/already_released) removes the id from the
+# list; a slug with an empty list is dropped from the map.
+_PENDING_RELEASE_IDS_KEY = "pending_release_agent_ids"
 
 # Claude Agent-tool subagent IDs are opaque strings produced by the host
 # Claude Code session. Phase C only needs them as display tokens — we
@@ -545,8 +562,19 @@ def remember_agent_id(coord_state: dict, slug: str, agent_id: str) -> None:
     coord_state[_AGENT_IDS_KEY] = raw
 
 
-def forget_agent_id(coord_state: dict, slug: str) -> None:
-    """Drop the mapping when a task transitions to terminal."""
+def forget_agent_id(
+    coord_state: dict, slug: str, *, also_pending: bool = True,
+) -> None:
+    """Drop the slug → agent_id mapping when a task transitions to
+    terminal.
+
+    Codex iter-15 [P1]: the `also_pending` flag (default True for
+    back-compat) lets the caller opt out of clearing the parallel
+    pending-acquire entry. The ready-reset sweep path needs this:
+    it forgets the stale worker_agent_ids entry while preserving
+    the pending-acquire id so _dispatch_ready can reuse it via
+    the recovery branch in the SAME tick.
+    """
     raw = coord_state.get(_AGENT_IDS_KEY, {})
     if isinstance(raw, dict) and slug in raw:
         del raw[slug]
@@ -556,6 +584,122 @@ def forget_agent_id(coord_state: dict, slug: str) -> None:
     # terminal task. Keys diverge only when a coord forgets to call
     # register_subagent (silent miss → empty chip), never when forgetting.
     forget_subagent_id(coord_state, slug)
+    # Codex iter-4 [P1]: also clear any pending-acquire entry. A slug
+    # transitioning to terminal (todo / done / blocked) by any path
+    # means the previous attempt is conclusively over — any orphaned
+    # pending agent_id should not bleed into the NEXT dispatch attempt.
+    # Codex iter-15 [P1]: the ready-reset sweep path passes
+    # also_pending=False so it can release ONLY the stale worker id
+    # while leaving the pending-acquire id for _dispatch_ready to
+    # reuse on the same tick.
+    if also_pending:
+        forget_pending_acquire_agent_id(coord_state, slug)
+
+
+def load_pending_acquire_agent_id_map(coord_state: dict) -> dict[str, str]:
+    """Return the slug → pending-acquire agent_id map.
+
+    A non-empty entry for slug S means a prior tick minted that
+    agent_id and called `fleet claims acquire-prompt` for it but the
+    CLI returned an error outcome. The journal/inbox may be half-
+    written. The next dispatch attempt for S must reuse the SAME id
+    so AcquireCoordPromptInbox's recovery branch (live-claim-with-
+    missing-file) can complete the half-written acquire instead of
+    orphaning a journal.
+    """
+    raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and isinstance(v, str) and _is_agent_id(v):
+            out[k] = v
+    return out
+
+
+def remember_pending_acquire_agent_id(
+    coord_state: dict, slug: str, agent_id: str,
+) -> None:
+    """Persist a slug → pending-acquire agent_id so the next tick
+    retries with the same id and can hit the recovery path."""
+    if not slug or not _is_agent_id(agent_id):
+        return
+    raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    raw[slug] = agent_id
+    coord_state[_PENDING_ACQUIRE_IDS_KEY] = raw
+
+
+def forget_pending_acquire_agent_id(coord_state: dict, slug: str) -> None:
+    """Drop the pending-acquire mapping on success or terminal."""
+    raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
+    if isinstance(raw, dict) and slug in raw:
+        del raw[slug]
+        coord_state[_PENDING_ACQUIRE_IDS_KEY] = raw
+
+
+def load_pending_release_agent_ids(
+    coord_state: dict,
+) -> dict[str, list[str]]:
+    """Return slug → list[agent_id] of releases that need retry.
+
+    Codex iter-9 [P1]: when `fleet claims release` returns `error`
+    during handoff, the new dispatch overwrites worker_agent_ids
+    with the new subagent's id. The prior id is captured here so
+    sweep / reconcile can retry the release without losing the
+    only handle.
+    """
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, list):
+            continue
+        ids = [x for x in v if isinstance(x, str) and _is_agent_id(x)]
+        if ids:
+            out[k] = ids
+    return out
+
+
+def remember_pending_release_agent_id(
+    coord_state: dict, slug: str, agent_id: str,
+) -> None:
+    """Append an agent_id whose release failed transiently to the
+    per-slug retry list. Deduped per slug."""
+    if not slug or not _is_agent_id(agent_id):
+        return
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    existing = raw.get(slug, [])
+    if not isinstance(existing, list):
+        existing = []
+    if agent_id not in existing:
+        existing.append(agent_id)
+    raw[slug] = existing
+    coord_state[_PENDING_RELEASE_IDS_KEY] = raw
+
+
+def forget_pending_release_agent_id(
+    coord_state: dict, slug: str, agent_id: str,
+) -> None:
+    """Drop one agent_id from a slug's retry list. If the list goes
+    empty, drop the slug key entirely."""
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return
+    existing = raw.get(slug, [])
+    if not isinstance(existing, list):
+        return
+    if agent_id in existing:
+        existing.remove(agent_id)
+    if existing:
+        raw[slug] = existing
+    else:
+        raw.pop(slug, None)
+    coord_state[_PENDING_RELEASE_IDS_KEY] = raw
 
 
 def load_subagent_id_map(coord_state: dict) -> dict[str, str]:

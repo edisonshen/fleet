@@ -1,0 +1,6 @@
+{
+  "outcome": "error",
+  "dispatch_id": "not-hex",
+  "kind": "coord_prompt_inbox",
+  "error": "\u003cMESSAGE-ELIDED\u003e"
+}
