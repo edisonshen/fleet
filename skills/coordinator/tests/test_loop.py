@@ -948,6 +948,105 @@ def test_release_error_preserves_agent_id_mapping(
     )
 
 
+def test_apply_failure_after_acquire_success_persists_pending(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-8 [P1]: when acquire-prompt succeeds but
+    _apply_dispatch later fails, the pending-acquire entry MUST be
+    populated so the next tick reuses the SAME agent_id. Without
+    pending population on acquire success, the next tick mints
+    fresh and orphans the journal+inbox.
+    """
+    _write_tasks(project_dir, [_make_task("acq-ok-apply-fail", status="ready")])
+    dispatch_subprocess.append("a1b2c3d4")
+
+    # Patch _run_fleet so _apply_dispatch fails immediately, AFTER
+    # acquire-prompt has already succeeded (acquire goes through
+    # dispatch.subprocess.run, not loop._run_fleet).
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated apply fault")
+
+    monkeypatch.setattr(loop, "_run_fleet", boom)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    pending = state.get("pending_acquire_agent_ids", {})
+    assert pending.get("acq-ok-apply-fail") == "a1b2c3d4", (
+        "acquire-success + apply-fail must leave pending entry for retry; "
+        f"pending={pending!r}"
+    )
+
+
+def test_apply_success_clears_pending_acquire(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Acquire-success + apply-success leaves pending_acquire_agent_ids
+    empty so the NEXT dispatch for the slug (post-terminal) mints
+    fresh. Pair to test_apply_failure_after_acquire_success_persists_
+    pending — the success path's clear is the load-bearing inverse.
+    """
+    _write_tasks(project_dir, [_make_task("happy-path-aa", status="ready")])
+    dispatch_subprocess.append("baadf00d")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    # Apply succeeded → pending cleared.
+    assert state.get("pending_acquire_agent_ids", {}) == {}
+    # Worker_agent_ids still has the mapping.
+    assert state.get("worker_agent_ids", {}).get("happy-path-aa") == "baadf00d"
+
+
+def test_handoff_marker_not_set_when_apply_fails(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-8 [P1]: review_handoffs_dispatched marker MUST NOT
+    be set when _apply_dispatch_handoff fails. Otherwise the next
+    tick sees `slug:phase` as already-dispatched and suppresses the
+    reviewer/finisher retry; the task stays stuck.
+    """
+    _write_tasks(project_dir, [
+        _make_task("ho-mark-aa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "ho-mark-aa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    _seed_coord_state(
+        project_dir, agent_id_map={"ho-mark-aa": "deadbeef"},
+    )
+    dispatch_subprocess.append("ee111e11")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated handoff apply fault")
+
+    monkeypatch.setattr(loop, "_run_fleet", boom)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    # CRITICAL: handoff marker must NOT have been set.
+    marker_key = "ho-mark-aa:review-pending"
+    handoffs = state.get("review_handoffs_dispatched", [])
+    assert marker_key not in handoffs, (
+        f"handoff apply failure must not record the dispatched marker; "
+        f"state={state!r}"
+    )
+
+
 def test_remember_agent_id_persists_before_apply(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess, monkeypatch,

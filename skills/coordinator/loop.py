@@ -522,12 +522,19 @@ def _tick_locked(
         # the orphan-claim recovery path viable.
         if action.agent_id:
             supervisor_mod.remember_agent_id(state, action.slug, action.agent_id)
-            _record_review_handoff_dispatched(
-                state, action.slug, action.handoff_phase,
-            )
         try:
             _apply_dispatch_handoff(action, project, fleet_bin)
             if action.agent_id:
+                # Codex iter-8 [P1]: record the review-handoff marker
+                # ONLY after apply succeeds. The marker (slug:phase)
+                # suppresses re-dispatch on subsequent ticks; if apply
+                # fails before we drop it, the next tick sees the
+                # marker as already-dispatched and never retries —
+                # the task stays stuck at review-pending / review-done
+                # with no replacement subagent.
+                _record_review_handoff_dispatched(
+                    state, action.slug, action.handoff_phase,
+                )
                 # Codex iter-5 [P1]: forget the pending-acquire entry
                 # AFTER _apply_dispatch_handoff lands. Symmetric to
                 # the primary tick + supervisor consumers.
@@ -3205,6 +3212,13 @@ def _dispatch_ready(
         # finish the half-written claim. Without reusing the id, the
         # orphaned journal sits forever (PR4 sweeper eventually
         # reclaims, but PR1 should not depend on that escape hatch).
+        #
+        # Codex iter-8 [P1]: pending_acquire_agent_ids is now ALSO
+        # populated on every acquire-success (cleared on apply-
+        # success). That single map covers both gaps:
+        #   - acquire failed half-way (pending set by except branch)
+        #   - acquire OK but apply failed (pending set after success)
+        # The next-tick retry reuses the same id either way.
         pending_map = (
             supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
             if coord_state is not None else {}
@@ -3252,14 +3266,22 @@ def _dispatch_ready(
                 error=f"acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
-        # NOTE: do NOT forget the pending-acquire entry here. The
-        # acquire succeeded, but the subsequent _apply_dispatch (run
-        # in the caller) may still fail mid-way (status flip, workers
-        # update, or note write). If we cleared here and the apply
-        # then failed, the task would stay `ready`, the next tick
-        # would mint a fresh id, and the original claim+inbox would
-        # leak. Codex iter-5 [P1]: the caller clears the pending
-        # entry AFTER _apply_dispatch lands successfully.
+        # Acquire succeeded. Codex iter-8 [P1]: persist a pending-
+        # acquire entry NOW (alongside the action that the caller
+        # will turn into worker_agent_ids). The caller clears this
+        # pending entry AFTER _apply_dispatch succeeds. The two
+        # in-flight states are:
+        #   - "acquire failed half-way" → pending set by except branch
+        #   - "acquire OK but apply may fail" → pending set right here
+        # Either way, pending_acquire_agent_ids tells the next tick:
+        # "this slug already has a journal+inbox keyed off THIS id;
+        # reuse it for any retry". On apply success the caller
+        # clears the entry and pending becomes empty again, so a
+        # SUBSEQUENT dispatch after terminal forget mints fresh.
+        if coord_state is not None:
+            supervisor_mod.remember_pending_acquire_agent_id(
+                coord_state, t.slug, agent_id,
+            )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
@@ -3385,6 +3407,11 @@ def _dispatch_review_handoffs(
         # _dispatch_ready. A handoff acquire that failed mid-journal-
         # write on a prior tick must retry with the same agent_id so
         # the recovery path can heal the half-written claim.
+        #
+        # Codex iter-8 [P1]: pending_acquire_agent_ids is now set
+        # on EVERY acquire-success (cleared on apply-success), so it
+        # also catches the apply-failed-mid-chain scenario. A retry
+        # here that finds a pending entry MUST reuse it.
         pending_handoff_map = (
             supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
             if coord_state is not None else {}
@@ -3456,12 +3483,15 @@ def _dispatch_review_handoffs(
                 error=f"handoff acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
-        # NOTE: same rationale as _dispatch_ready — defer the
-        # forget_pending_acquire_agent_id call until after
-        # _apply_dispatch_handoff lands. A handoff apply failure after
-        # a successful acquire would otherwise leak the new reviewer/
-        # finisher claim because next-tick mint would skip the
-        # recovery path.
+        # Acquire succeeded. Codex iter-8 [P1]: persist pending entry
+        # now so a subsequent handoff-apply failure leaves an
+        # explicit retry breadcrumb (the next tick reuses this id
+        # via load_pending_acquire_agent_id_map). The caller clears
+        # this entry after _apply_dispatch_handoff lands.
+        if coord_state is not None:
+            supervisor_mod.remember_pending_acquire_agent_id(
+                coord_state, t.slug, agent_id,
+            )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=t.slug,
