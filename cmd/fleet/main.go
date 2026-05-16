@@ -112,6 +112,7 @@ Engine selection:
 	root.AddCommand(newPeekCmd())
 	root.AddCommand(newProjectCmd())
 	root.AddCommand(newMaintenanceCmd())
+	root.AddCommand(newClaimsCmd())
 	return root
 }
 
@@ -234,6 +235,16 @@ func main() {
 		os.Args = append([]string{os.Args[0]}, rewriteEngineShorthand(os.Args[1:])...)
 	}
 	if err := newRootCmd().Execute(); err != nil {
+		// `fleet claims` carries stable exit codes via an errClaimsError
+		// sentinel that wraps the outcome string. Non-claims errors
+		// keep the historical exit-1 + stderr-message behavior.
+		if outcome := claimsOutcomeFromErr(err); outcome != "" {
+			// The JSON envelope has already been written to stdout by
+			// the claims subcommand; suppress the stderr "error: ..."
+			// noise to keep the response shape clean for the Python
+			// caller (json.loads on stdout).
+			os.Exit(claimsExitCode(outcome))
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
