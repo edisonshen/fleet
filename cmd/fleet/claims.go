@@ -20,14 +20,14 @@
 //     out via fleet claims").
 //   - Emit a JSON envelope on stdout: `{"outcome": "...", ...}`.
 //   - Exit with a STABLE code per outcome (plan-eng A1):
-//       acquired         → 0
-//       already_acquired → 0
-//       released         → 0
-//       already_released → 0
-//       not_owned        → 10
-//       absent           → 11
-//       contested        → 12 (reserved for PR2 per-task_slug lock)
-//       error            → 1
+//     acquired         → 0
+//     already_acquired → 0
+//     released         → 0
+//     already_released → 0
+//     not_owned        → 10
+//     absent           → 11
+//     contested        → 12 (reserved for PR2 per-task_slug lock)
+//     error            → 1
 //
 // Golden-file contract tests in cmd/fleet/testdata/claims/*.json pin
 // the JSON schema + outcome enums; the CLI is the public boundary the

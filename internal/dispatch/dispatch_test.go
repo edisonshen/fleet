@@ -35,18 +35,18 @@ func TestNewDispatchID_Valid(t *testing.T) {
 // up in a journal path or inbox filename.
 func TestNewDispatchID_Invalid(t *testing.T) {
 	bad := []string{
-		"",                  // empty
-		"abcdef0",           // 7 chars
-		"abcdef012",         // 9 chars
-		"ABCDEF01",          // uppercase
-		"abcdefgh",          // non-hex letters
-		"abcd ef0",          // space
-		"abc-def0",          // hyphen
-		"agent_a690424b",    // legacy "agent_" prefix
-		"a690424b\n",        // trailing whitespace
-		"  a690424b",        // leading whitespace
-		"a 690424b",         // middle space
-		"00000000\x00",      // embedded NUL
+		"",               // empty
+		"abcdef0",        // 7 chars
+		"abcdef012",      // 9 chars
+		"ABCDEF01",       // uppercase
+		"abcdefgh",       // non-hex letters
+		"abcd ef0",       // space
+		"abc-def0",       // hyphen
+		"agent_a690424b", // legacy "agent_" prefix
+		"a690424b\n",     // trailing whitespace
+		"  a690424b",     // leading whitespace
+		"a 690424b",      // middle space
+		"00000000\x00",   // embedded NUL
 		strings.Repeat("a", 64),
 	}
 	for _, c := range bad {

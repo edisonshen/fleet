@@ -181,8 +181,8 @@ func (d DispatchID) String() string { return string(d) }
 //	          flip(releasing) -> teardown -> flip(released)
 type Journal struct {
 	ID            DispatchID    `json:"id"`
-	Kind          string        `json:"kind"`   // "worker" | "reviewer" | "finisher" | "coord" | "fix" | "rebase"
-	Owner         string        `json:"owner"`  // "project/<p>/slug/<s>" or "coord/<p>"
+	Kind          string        `json:"kind"`  // "worker" | "reviewer" | "finisher" | "coord" | "fix" | "rebase"
+	Owner         string        `json:"owner"` // "project/<p>/slug/<s>" or "coord/<p>"
 	HostID        string        `json:"host_id"`
 	TmuxSocket    string        `json:"tmux_socket,omitempty"`
 	SchemaVersion string        `json:"schema"`

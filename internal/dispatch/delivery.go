@@ -130,9 +130,9 @@ type coordPromptInboxController struct{}
 // AcquireAndDeliver writes the inbox file under a journal-managed
 // claim. The flow is:
 //
-//	1. Append claim(state=allocating) to journal, save journal.
-//	2. state.WriteAtomic the inbox file.
-//	3. Flip claim to state=live in journal, save journal.
+//  1. Append claim(state=allocating) to journal, save journal.
+//  2. state.WriteAtomic the inbox file.
+//  3. Flip claim to state=live in journal, save journal.
 //
 // At step-1 failure the journal is unchanged. At step-2 failure the
 // journal has an `allocating` claim but no file; the sweeper drops
@@ -249,15 +249,15 @@ func (c *coordPromptInboxController) Inspect(j *Journal, kind string) (DeliveryS
 
 // Release tears down a coord_prompt_inbox delivery. Steps:
 //
-//	1. If on-disk claim is already `released`, return ErrAlreadyReleased
-//	   (idempotent success).
-//	2. If on-disk claim's OwnerID != caller's claim, return ErrNotOwned.
-//	3. Flip claim to `releasing` in journal, save.
-//	4. Unlink (preserve=false) or rename to archive (preserve=true) the
-//	   resource file. Tolerate ENOENT (file already gone is success).
-//	5. Flip claim to `released`, save.
-//	6. Recompute journal recl_state — when ALL claims are released and
-//	   exec_state is terminal, set recl_state = complete.
+//  1. If on-disk claim is already `released`, return ErrAlreadyReleased
+//     (idempotent success).
+//  2. If on-disk claim's OwnerID != caller's claim, return ErrNotOwned.
+//  3. Flip claim to `releasing` in journal, save.
+//  4. Unlink (preserve=false) or rename to archive (preserve=true) the
+//     resource file. Tolerate ENOENT (file already gone is success).
+//  5. Flip claim to `released`, save.
+//  6. Recompute journal recl_state — when ALL claims are released and
+//     exec_state is terminal, set recl_state = complete.
 //
 // Cross-host check: if the on-disk claim's HostID is set and differs
 // from the caller's HostID, returns ErrNotOwned. Same-host is the v0.11

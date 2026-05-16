@@ -36,11 +36,11 @@ type AcquireResult struct {
 
 // AcquireCoordPromptInbox is the high-level API the CLI uses. It:
 //
-//	1. Loads (or creates) the journal for the dispatch.
-//	2. If a live coord_prompt_inbox claim already exists, returns
-//	   `already_acquired` with the existing path (idempotent retry).
-//	3. Otherwise runs the controller AcquireAndDeliver and returns
-//	   `acquired`.
+//  1. Loads (or creates) the journal for the dispatch.
+//  2. If a live coord_prompt_inbox claim already exists, returns
+//     `already_acquired` with the existing path (idempotent retry).
+//  3. Otherwise runs the controller AcquireAndDeliver and returns
+//     `acquired`.
 //
 // The journal kind is "worker" if Opts.Kind is empty; this is the
 // PR1-default because today's only call sites are loop.py worker /
