@@ -330,15 +330,28 @@ def _tick_locked(
                 # retry the release. _clear_review_handoff_state runs
                 # unconditionally because its keys are tracked by
                 # slug (not agent_id) and are stale either way.
+                terminal_agent_id = supervisor_mod.load_agent_id_map(
+                    state,
+                ).get(action.slug, "")
                 release_outcome = _release_coord_prompt_inbox(
                     slug=action.slug,
-                    agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
+                    agent_id=terminal_agent_id,
                     fleet_bin=fleet_bin,
                     fleet_home=home,
                     site=f"primary-reconcile new_status={action.new_status}",
                 )
                 if _release_outcome_is_terminal(release_outcome):
                     supervisor_mod.forget_agent_id(state, action.slug)
+                elif terminal_agent_id:
+                    # Codex iter-10 [P1]: non-done terminal transitions
+                    # (todo / blocked) leave the slug out of the in-
+                    # flight set; subsequent ticks won't reach this
+                    # release wire again. Stash the id in
+                    # pending_release_agent_ids so the retry-pending-
+                    # releases pass can re-attempt until terminal.
+                    supervisor_mod.remember_pending_release_agent_id(
+                        state, action.slug, terminal_agent_id,
+                    )
                 _clear_review_handoff_state(state, action.slug)
                 # Codex iter-2 [P1]: do NOT clear reaper_redispatch_pending
                 # here. The marker is the explicit signal to dispatch a
@@ -370,6 +383,21 @@ def _tick_locked(
         result.reconciled += swept
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"sweep done worker dirs: {exc}")
+
+    # 3.55. Codex iter-10 [P2]: sweep claim state for slugs whose
+    # status was manually flipped to a non-in-flight non-done state
+    # (todo / blocked / abandoned / etc). The reconcile path only
+    # sees in-progress / in-review, and _sweep_done_worker_dirs only
+    # handles done — without this sweep, an operator's manual
+    # `fleet tasks set <slug> status=todo` leaves the journal/inbox
+    # orphaned.
+    try:
+        _sweep_non_inflight_claim_state(
+            f.tasks, project, fleet_bin, home=home,
+            coord_state=state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"sweep non-inflight claims: {exc}")
 
     # 3.6. Codex iter-9 [P1]: retry releases that failed transiently
     # on prior ticks (e.g., handoff release while `fleet claims
@@ -450,15 +478,24 @@ def _tick_locked(
                 # — the operator may write back via answer-blocked.
                 # Codex iter-7 [P1]: gate forget on the outcome so
                 # transient release errors don't drop the mapping.
+                terminal_agent_id = supervisor_mod.load_agent_id_map(
+                    state,
+                ).get(action.slug, "")
                 release_outcome = _release_coord_prompt_inbox(
                     slug=action.slug,
-                    agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
+                    agent_id=terminal_agent_id,
                     fleet_bin=fleet_bin,
                     fleet_home=home,
                     site=f"primary-sentinel kind={action.kind}",
                 )
                 if _release_outcome_is_terminal(release_outcome):
                     supervisor_mod.forget_agent_id(state, action.slug)
+                elif terminal_agent_id:
+                    # Codex iter-10 [P1]: stash for retry — see
+                    # primary-reconcile wire for rationale.
+                    supervisor_mod.remember_pending_release_agent_id(
+                        state, action.slug, terminal_agent_id,
+                    )
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
             # Codex iter-18 [P2]: re-add the action to the deferred
@@ -785,15 +822,23 @@ def _run_supervisor(
                     # BEFORE forget_agent_id (same ordering rule as the
                     # primary tick reconcile site).
                     # Codex iter-7 [P1]: gate forget on outcome.
+                    terminal_agent_id = supervisor_mod.load_agent_id_map(
+                        cs,
+                    ).get(action.slug, "")
                     release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
-                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        agent_id=terminal_agent_id,
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-reconcile new_status={action.new_status}",
                     )
                     if _release_outcome_is_terminal(release_outcome):
                         supervisor_mod.forget_agent_id(cs, action.slug)
+                    elif terminal_agent_id:
+                        # Codex iter-10 [P1]: stash for retry.
+                        supervisor_mod.remember_pending_release_agent_id(
+                            cs, action.slug, terminal_agent_id,
+                        )
                     # Three-stage flow (reviewer-subagent-arch): clear
                     # the review-handoff dispatched markers in sync
                     # with the agent_id forget, mirroring the same
@@ -1129,15 +1174,23 @@ def _run_supervisor(
                     # Codex iter-7 [P1]: gate forget on outcome so
                     # transient release errors don't lose the only
                     # retry handle.
+                    terminal_agent_id = supervisor_mod.load_agent_id_map(
+                        cs,
+                    ).get(action.slug, "")
                     release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
-                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        agent_id=terminal_agent_id,
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-sentinel-replay kind={action.kind}",
                     )
                     if _release_outcome_is_terminal(release_outcome):
                         supervisor_mod.forget_agent_id(cs, action.slug)
+                    elif terminal_agent_id:
+                        # Codex iter-10 [P1]: stash for retry.
+                        supervisor_mod.remember_pending_release_agent_id(
+                            cs, action.slug, terminal_agent_id,
+                        )
                     _clear_review_handoff_state(cs, action.slug)
                 applied += 1
             except Exception as exc:  # noqa: BLE001
@@ -1287,15 +1340,23 @@ def _run_supervisor(
                     # coord_prompt_inbox before forget — same ordering
                     # rule as the primary drain.
                     # Codex iter-7 [P1]: gate forget on outcome.
+                    terminal_agent_id = supervisor_mod.load_agent_id_map(
+                        cs,
+                    ).get(action.slug, "")
                     release_outcome = _release_coord_prompt_inbox(
                         slug=action.slug,
-                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        agent_id=terminal_agent_id,
                         fleet_bin=fleet_bin,
                         fleet_home=home,
                         site=f"supervisor-sentinel-drain kind={action.kind}",
                     )
                     if _release_outcome_is_terminal(release_outcome):
                         supervisor_mod.forget_agent_id(cs, action.slug)
+                    elif terminal_agent_id:
+                        # Codex iter-10 [P1]: stash for retry.
+                        supervisor_mod.remember_pending_release_agent_id(
+                            cs, action.slug, terminal_agent_id,
+                        )
                     _clear_review_handoff_state(cs, action.slug)
             except Exception as exc:  # noqa: BLE001
                 # Codex iter-18 [P2]: re-queue on transient failure.
@@ -3080,6 +3141,12 @@ def _sweep_done_worker_dirs(
                         supervisor_mod.forget_pending_acquire_agent_id(
                             coord_state, t.slug,
                         )
+                else:
+                    # Codex iter-10 [P1]: stash for retry. The next
+                    # tick's _retry_pending_releases will re-attempt.
+                    supervisor_mod.remember_pending_release_agent_id(
+                        coord_state, t.slug, cand,
+                    )
             if candidate_ids:
                 _clear_review_handoff_state(coord_state, t.slug)
         # Stat-first short-circuit: workers.Delete is idempotent on
@@ -3097,6 +3164,91 @@ def _sweep_done_worker_dirs(
         _maybe_delete_worker_dir(t.slug, fleet_bin, project)
         swept += 1
     return swept
+
+
+def _sweep_non_inflight_claim_state(
+    tasks: list[parse.Task],
+    project: str,
+    fleet_bin: str,
+    *,
+    home: Path | None = None,
+    coord_state: dict | None = None,
+) -> None:
+    """Codex iter-10 [P2]: release coord_prompt_inbox claims + clear
+    map entries for slugs that an operator manually flipped to a non-
+    in-flight status OTHER than done (`todo`, `blocked`,
+    `abandoned`, `in-review`).
+
+    Reconcile / sentinel paths only fire while status is in-progress /
+    in-review, so an operator's manual `fleet tasks set <slug>
+    status=todo` would leave any tracked agent_id orphaned in
+    coord_state with a live journal+inbox. This sweep walks every
+    slug present in worker_agent_ids OR pending_acquire_agent_ids
+    and, when the corresponding task is no longer dispatch-actionable
+    (status not in `in-progress` / `in-review`), releases the claim
+    and drops the map entry.
+
+    Best-effort: never raises. The `done` case is already covered by
+    _sweep_done_worker_dirs, so we explicitly exclude it here to
+    avoid double-attempt.
+
+    Note: this sweep deliberately targets only slugs that show up in
+    one of the in-memory maps. A slug with no tracked agent_id (legacy
+    pre-PR1, or already-released) is a no-op.
+    """
+    if not project or coord_state is None:
+        return
+    fleet_home = home if home is not None else _resolve_home(None)
+    agent_id_map = supervisor_mod.load_agent_id_map(coord_state)
+    pending_acquire_map = supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
+    tracked_slugs = set(agent_id_map.keys()) | set(pending_acquire_map.keys())
+    if not tracked_slugs:
+        return
+    task_status = {t.slug: t.status for t in tasks}
+    # Codex iter-10 [P2] scope: we ONLY touch slugs whose status is
+    # explicitly one of the post-dispatch-but-not-done operator
+    # states. `ready` means "about to be dispatched" — the next
+    # dispatch tick uses the pending-acquire entry to retry the
+    # half-written claim, so we must NOT preempt that here.
+    # `in-progress` + `in-review` are normal lifecycle states.
+    # `done` is owned by _sweep_done_worker_dirs.
+    sweep_statuses = {"todo", "blocked", "abandoned"}
+    for slug in tracked_slugs:
+        status = task_status.get(slug, "")
+        if status not in sweep_statuses:
+            continue
+        # Operator manually flipped a dispatched task to a non-
+        # inflight non-done state. Claim cleanup is now our
+        # responsibility — the reconcile/sentinel paths won't fire
+        # because they only target in-progress / in-review.
+        candidate_ids: list[str] = []
+        wid = agent_id_map.get(slug, "")
+        if wid:
+            candidate_ids.append(wid)
+        pid = pending_acquire_map.get(slug, "")
+        if pid and pid not in candidate_ids:
+            candidate_ids.append(pid)
+        for cand in candidate_ids:
+            release_outcome = _release_coord_prompt_inbox(
+                slug=slug,
+                agent_id=cand,
+                fleet_bin=fleet_bin,
+                fleet_home=fleet_home,
+                site=f"sweep-non-inflight status={status!r} id={cand}",
+            )
+            if _release_outcome_is_terminal(release_outcome):
+                if cand == wid:
+                    supervisor_mod.forget_agent_id(coord_state, slug)
+                if cand == pid:
+                    supervisor_mod.forget_pending_acquire_agent_id(
+                        coord_state, slug,
+                    )
+            else:
+                supervisor_mod.remember_pending_release_agent_id(
+                    coord_state, slug, cand,
+                )
+        if candidate_ids:
+            _clear_review_handoff_state(coord_state, slug)
 
 
 def _maybe_remove_worktree(

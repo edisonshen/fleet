@@ -1083,6 +1083,129 @@ def test_remember_agent_id_persists_before_apply(
     )
 
 
+def test_reconcile_release_error_stashes_for_retry(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-10 [P1]: reconcile terminal release returning `error`
+    must stash the id in pending_release_agent_ids so the retry pass
+    can re-attempt. Otherwise a slug transitioning to todo/blocked
+    leaves the in-flight set permanently with its claim orphaned.
+    """
+    _write_tasks(project_dir, [
+        _make_task("rec-rel-aa", status="in-progress", worker_pid=1, pr_url=""),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"rec-rel-aa": "feedface"},
+    )
+
+    import dispatch as dispatch_mod
+
+    def _err_release(*args, **kwargs):
+        return {
+            "outcome": dispatch_mod.RELEASE_OUTCOME_ERROR,
+            "error": "simulated transient release fault",
+        }
+
+    monkeypatch.setattr(
+        dispatch_mod, "release_coord_prompt_inbox", _err_release,
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    pending_releases = state.get("pending_release_agent_ids", {})
+    assert "feedface" in pending_releases.get("rec-rel-aa", []), (
+        f"reconcile release error must stash for retry; "
+        f"pending_release={pending_releases!r}"
+    )
+    # worker_agent_ids preserved (so we still have the handle).
+    assert state.get("worker_agent_ids", {}).get("rec-rel-aa") == "feedface"
+
+
+def test_sweep_non_inflight_releases_blocked_slugs(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-10 [P2]: a slug whose status is `blocked` with a
+    tracked agent_id must have its claim released and mapping cleared.
+    Without this sweep, an operator-driven blocked transition leaves
+    the journal/inbox orphaned because reconcile only processes
+    in-progress / in-review.
+    """
+    _write_tasks(project_dir, [
+        _make_task("blocked-rel", status="blocked", worker_pid=0),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"blocked-rel": "5aaaaaaa"},
+    )
+    inbox = fleet_home / "inbox" / "5aaaaaaa.md"
+    inbox.write_text("blocked worker prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "5aaaaaaa" for c in release_calls), (
+        f"sweep should release blocked slug; calls={release_calls!r}"
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert "blocked-rel" not in state.get("worker_agent_ids", {})
+
+
+def test_sweep_non_inflight_does_not_touch_ready_slugs(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-10 [P2] scope guard: `ready` slugs are about to be
+    dispatched — the next tick uses pending_acquire_agent_ids to retry
+    a half-written claim. The non-inflight sweep MUST NOT preempt
+    this by releasing the pending claim before dispatch can hit the
+    recovery path.
+    """
+    _write_tasks(project_dir, [_make_task("ready-keep", status="ready")])
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"ready-keep": "5aaaaaaa"}
+    state_path.write_text(json.dumps(state))
+    inbox = fleet_home / "inbox" / "5aaaaaaa.md"
+    inbox.write_text("half-written prompt\n", encoding="utf-8")
+    dispatch_subprocess.append("99887766")  # ignored — reuse should win
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # No spurious release for the ready slug.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    spurious = [c for c in release_calls if c[3] == "5aaaaaaa"]
+    # The dispatch should have hit the acquire path with the pending
+    # id (recovery flow); release should not fire from the sweep.
+    # Note: dispatch SUCCESS clears pending and remembers in
+    # worker_agent_ids, so the post-tick state.json is the
+    # authoritative check.
+    state_after = json.loads(state_path.read_text())
+    assert state_after.get("worker_agent_ids", {}).get("ready-keep") == "5aaaaaaa", (
+        f"ready slug must reuse pending id on dispatch (no spurious release); "
+        f"release_calls={release_calls!r} state={state_after!r}"
+    )
+    assert state_after.get("pending_acquire_agent_ids", {}) == {}
+
+
 def test_handoff_release_error_stashes_prior_id_for_retry(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess, monkeypatch,
