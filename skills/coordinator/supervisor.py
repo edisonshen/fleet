@@ -456,6 +456,16 @@ _SUBAGENT_IDS_KEY = "worker_subagent_ids"
 # written journal/inbox. Without this, every acquire-prompt failure
 # orphans a journal that nothing in PR1 reclaims.
 _PENDING_ACQUIRE_IDS_KEY = "pending_acquire_agent_ids"
+# Codex iter-9 [P1]: pending release IDs are agent_ids whose
+# `fleet claims release` returned an `error` outcome (transient
+# fault). They live keyed by slug but value is a LIST because a single
+# slug can accumulate multiple unreleased ids over its lifecycle —
+# e.g., a handoff that overwrites worker_agent_ids with the new
+# subagent's id while the prior subagent's release retry is still
+# pending. The next sweep / reconcile retries every entry; success
+# (or absent/not_owned/already_released) removes the id from the
+# list; a slug with an empty list is dropped from the map.
+_PENDING_RELEASE_IDS_KEY = "pending_release_agent_ids"
 
 # Claude Agent-tool subagent IDs are opaque strings produced by the host
 # Claude Code session. Phase C only needs them as display tokens — we
@@ -611,6 +621,69 @@ def forget_pending_acquire_agent_id(coord_state: dict, slug: str) -> None:
     if isinstance(raw, dict) and slug in raw:
         del raw[slug]
         coord_state[_PENDING_ACQUIRE_IDS_KEY] = raw
+
+
+def load_pending_release_agent_ids(
+    coord_state: dict,
+) -> dict[str, list[str]]:
+    """Return slug → list[agent_id] of releases that need retry.
+
+    Codex iter-9 [P1]: when `fleet claims release` returns `error`
+    during handoff, the new dispatch overwrites worker_agent_ids
+    with the new subagent's id. The prior id is captured here so
+    sweep / reconcile can retry the release without losing the
+    only handle.
+    """
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, list):
+            continue
+        ids = [x for x in v if isinstance(x, str) and _is_agent_id(x)]
+        if ids:
+            out[k] = ids
+    return out
+
+
+def remember_pending_release_agent_id(
+    coord_state: dict, slug: str, agent_id: str,
+) -> None:
+    """Append an agent_id whose release failed transiently to the
+    per-slug retry list. Deduped per slug."""
+    if not slug or not _is_agent_id(agent_id):
+        return
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    existing = raw.get(slug, [])
+    if not isinstance(existing, list):
+        existing = []
+    if agent_id not in existing:
+        existing.append(agent_id)
+    raw[slug] = existing
+    coord_state[_PENDING_RELEASE_IDS_KEY] = raw
+
+
+def forget_pending_release_agent_id(
+    coord_state: dict, slug: str, agent_id: str,
+) -> None:
+    """Drop one agent_id from a slug's retry list. If the list goes
+    empty, drop the slug key entirely."""
+    raw = coord_state.get(_PENDING_RELEASE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return
+    existing = raw.get(slug, [])
+    if not isinstance(existing, list):
+        return
+    if agent_id in existing:
+        existing.remove(agent_id)
+    if existing:
+        raw[slug] = existing
+    else:
+        raw.pop(slug, None)
+    coord_state[_PENDING_RELEASE_IDS_KEY] = raw
 
 
 def load_subagent_id_map(coord_state: dict) -> dict[str, str]:

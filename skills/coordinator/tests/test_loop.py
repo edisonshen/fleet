@@ -1083,6 +1083,145 @@ def test_remember_agent_id_persists_before_apply(
     )
 
 
+def test_handoff_release_error_stashes_prior_id_for_retry(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-9 [P1]: if the handoff's release of the prior
+    subagent's claim fails transiently, the new dispatch is about
+    to overwrite worker_agent_ids — the only handle on the prior
+    claim. The prior agent_id MUST be stashed in
+    pending_release_agent_ids so a later sweep / reconcile can
+    retry the release.
+    """
+    _write_tasks(project_dir, [
+        _make_task("ho-rel-err-a", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "ho-rel-err-a"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    _seed_coord_state(
+        project_dir, agent_id_map={"ho-rel-err-a": "ab10ab10"},
+    )
+    dispatch_subprocess.append("ee111e11")
+
+    # Stub release to return error. The retry pass will then attempt
+    # to release the stashed id; let's stub it to keep failing so we
+    # can observe the persistence shape.
+    import dispatch as dispatch_mod
+
+    def _err_release(*args, **kwargs):
+        return {
+            "outcome": dispatch_mod.RELEASE_OUTCOME_ERROR,
+            "error": "simulated handoff release fault",
+        }
+
+    monkeypatch.setattr(
+        dispatch_mod, "release_coord_prompt_inbox", _err_release,
+    )
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    # CRITICAL: prior worker's agent_id stashed for retry.
+    pending_releases = state.get("pending_release_agent_ids", {})
+    assert "ab10ab10" in pending_releases.get("ho-rel-err-a", []), (
+        f"prior id must be stashed after release failure; "
+        f"pending_release={pending_releases!r}"
+    )
+
+
+def test_retry_pending_releases_drops_on_success(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """The retry pass at tick top consumes pending_release_agent_ids:
+    successful release on retry removes the entry; the next sweep
+    sees an empty map.
+    """
+    _write_tasks(project_dir, [_make_task("retry-aa", status="todo")])
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_release_agent_ids"] = {"retry-aa": ["fa11ed1d"]}
+    state_path.write_text(json.dumps(state))
+    # Seed the inbox file so the emulator's release returns
+    # `released` (not `already_released` — both terminal, either is
+    # fine; we just need a deterministic terminal outcome).
+    inbox = fleet_home / "inbox" / "fa11ed1d.md"
+    inbox.write_text("orphaned prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Release fired for the stashed id.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "fa11ed1d" for c in release_calls), (
+        f"retry pass should release the stashed id; calls={release_calls!r}"
+    )
+    # Entry dropped on terminal success.
+    state_after = json.loads(state_path.read_text())
+    assert state_after.get("pending_release_agent_ids", {}) == {}
+
+
+def test_sweep_done_releases_pending_acquire_too(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-9 [P2]: operator-driven `status=done` sweep MUST
+    release claims tracked in pending_acquire_agent_ids too. A failed
+    acquire creates the journal/inbox but never populates
+    worker_agent_ids; if the operator marks done before the retry,
+    the half-written claim leaks.
+    """
+    _write_tasks(project_dir, [
+        _make_task("acq-fail-done", status="done", worker_pid=0,
+                   pr_url="https://github.com/x/y/pull/3"),
+    ])
+    # Worker dir present so the existing sweep stat-check fires.
+    workers_dir = project_dir / "workers" / "acq-fail-done"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "done"}), encoding="utf-8",
+    )
+    # No worker_agent_ids entry (acquire failed before any apply).
+    # Pending-acquire entry from the half-written acquire.
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"acq-fail-done": "ba1fba1f"}
+    state_path.write_text(json.dumps(state))
+    inbox = fleet_home / "inbox" / "ba1fba1f.md"
+    inbox.write_text("half-written prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Release fired for the pending-acquire id.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "ba1fba1f" for c in release_calls), (
+        f"sweep must release pending-acquire id; calls={release_calls!r}"
+    )
+    state_after = json.loads(state_path.read_text())
+    # Pending entry cleared.
+    assert state_after.get("pending_acquire_agent_ids", {}) == {}
+
+
 def test_sweep_done_worker_dirs_releases_claim(
     fleet_home: Path, project_dir: Path,
     fleet_run_recorder, dispatch_subprocess,

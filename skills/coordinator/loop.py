@@ -371,6 +371,21 @@ def _tick_locked(
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"sweep done worker dirs: {exc}")
 
+    # 3.6. Codex iter-9 [P1]: retry releases that failed transiently
+    # on prior ticks (e.g., handoff release while `fleet claims
+    # release` returned an `error` outcome, or any release that
+    # couldn't drop the agent_id mapping because the outcome wasn't
+    # terminal). Each entry is an agent_id whose journal/inbox may
+    # still be live; retry until success or until PR4 sweeper picks
+    # it up.
+    try:
+        _retry_pending_releases(
+            project=project, fleet_bin=fleet_bin, home=home,
+            coord_state=state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"retry pending releases: {exc}")
+
     # 4. Drain inbox archive sentinels.
     tasks_by_slug = {t.slug: t for t in f.tasks}
     drained, last_seen = _drain_archive(
@@ -2587,6 +2602,42 @@ def _release_coord_prompt_inbox(
     return outcome or dispatch_mod.RELEASE_OUTCOME_ERROR
 
 
+def _retry_pending_releases(
+    *,
+    project: str,
+    fleet_bin: str,
+    home: Path,
+    coord_state: dict,
+) -> None:
+    """Retry releases that failed transiently on prior ticks.
+
+    Codex iter-9 [P1]: handoff release errors stash the prior
+    agent_id in pending_release_agent_ids (because the new
+    dispatch overwrites worker_agent_ids and would lose the
+    handle). This retry pass walks the map and tries each release;
+    terminal outcomes (released, already_released, absent,
+    not_owned) drop the entry. Non-terminal outcomes (error) leave
+    the entry for the next tick.
+
+    Best-effort: never raises; logs via _release_coord_prompt_inbox's
+    stderr path.
+    """
+    pending = supervisor_mod.load_pending_release_agent_ids(coord_state)
+    for slug, ids in pending.items():
+        for agent_id in list(ids):
+            outcome = _release_coord_prompt_inbox(
+                slug=slug,
+                agent_id=agent_id,
+                fleet_bin=fleet_bin,
+                fleet_home=home,
+                site=f"retry-pending-release agent={agent_id}",
+            )
+            if _release_outcome_is_terminal(outcome):
+                supervisor_mod.forget_pending_release_agent_id(
+                    coord_state, slug, agent_id,
+                )
+
+
 def _release_outcome_is_terminal(outcome: str) -> bool:
     """Codex iter-7 [P1]: only treat these outcomes as final so
     forget_agent_id is safe.
@@ -2982,6 +3033,15 @@ def _sweep_done_worker_dirs(
         supervisor_mod.load_agent_id_map(coord_state)
         if coord_state is not None else {}
     )
+    # Codex iter-9 [P2]: a slug that the operator marks `done` may
+    # have a half-written claim from a failed acquire (tracked in
+    # pending_acquire_agent_ids) without ever populating
+    # worker_agent_ids. The sweep must release THAT id too so the
+    # operator-done path doesn't leak the half-written journal.
+    pending_acquire_map = (
+        supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
+        if coord_state is not None else {}
+    )
     swept = 0
     for t in tasks:
         if t.status != "done":
@@ -2992,19 +3052,36 @@ def _sweep_done_worker_dirs(
         # Run the release wire FIRST so a worker_dir-already-gone slug
         # still triggers cleanup. The agent_id_map probe is a no-op
         # when the slug isn't tracked.
-        agent_id = agent_id_map.get(t.slug, "")
-        if agent_id and coord_state is not None:
-            # Codex iter-7 [P1]: gate forget on outcome.
-            release_outcome = _release_coord_prompt_inbox(
-                slug=t.slug,
-                agent_id=agent_id,
-                fleet_bin=fleet_bin,
-                fleet_home=fleet_home,
-                site="sweep-done-operator-driven",
-            )
-            if _release_outcome_is_terminal(release_outcome):
-                supervisor_mod.forget_agent_id(coord_state, t.slug)
-            _clear_review_handoff_state(coord_state, t.slug)
+        if coord_state is not None:
+            # Collect both worker_agent_ids and pending_acquire_agent_ids
+            # candidates. Dedupe in case they happen to be the same id.
+            candidate_ids: list[str] = []
+            wid = agent_id_map.get(t.slug, "")
+            if wid:
+                candidate_ids.append(wid)
+            pid = pending_acquire_map.get(t.slug, "")
+            if pid and pid not in candidate_ids:
+                candidate_ids.append(pid)
+            for cand in candidate_ids:
+                # Codex iter-7 [P1]: gate forget on outcome.
+                release_outcome = _release_coord_prompt_inbox(
+                    slug=t.slug,
+                    agent_id=cand,
+                    fleet_bin=fleet_bin,
+                    fleet_home=fleet_home,
+                    site=f"sweep-done-operator-driven id={cand}",
+                )
+                if _release_outcome_is_terminal(release_outcome):
+                    # Drop both maps — the slug is operator-done, so
+                    # any pending entry is moot now.
+                    if cand == wid:
+                        supervisor_mod.forget_agent_id(coord_state, t.slug)
+                    if cand == pid:
+                        supervisor_mod.forget_pending_acquire_agent_id(
+                            coord_state, t.slug,
+                        )
+            if candidate_ids:
+                _clear_review_handoff_state(coord_state, t.slug)
         # Stat-first short-circuit: workers.Delete is idempotent on
         # ENOENT, but firing the CLI every tick on every done task
         # would emit "already gone" noise to stderr. The on-disk
@@ -3441,13 +3518,29 @@ def _dispatch_review_handoffs(
             prior_agent_id = supervisor_mod.load_agent_id_map(
                 coord_state,
             ).get(t.slug, "")
-            _release_coord_prompt_inbox(
+            release_outcome = _release_coord_prompt_inbox(
                 slug=t.slug,
                 agent_id=prior_agent_id,
                 fleet_bin=fleet_bin,
                 fleet_home=home,
                 site=f"handoff phase={phase}",
             )
+            # Codex iter-9 [P1]: if the handoff release failed
+            # transiently, the new subagent dispatch is about to
+            # overwrite worker_agent_ids with its own id — that would
+            # permanently lose the only handle on the prior subagent's
+            # claim. Stash the prior_agent_id in pending_release_
+            # agent_ids so a later sweep / reconcile can retry. Only
+            # do this when the outcome is non-terminal AND we have a
+            # real agent_id (skip when prior_agent_id was empty —
+            # e.g., legacy pre-PR1 worker).
+            if (
+                prior_agent_id
+                and not _release_outcome_is_terminal(release_outcome)
+            ):
+                supervisor_mod.remember_pending_release_agent_id(
+                    coord_state, t.slug, prior_agent_id,
+                )
         # PR1 dispatch-lifecycle migration: same as _dispatch_ready,
         # but dispatch_kind reflects review-pending → "reviewer" and
         # review-done → "finisher" so the journal owner string + dispatch
