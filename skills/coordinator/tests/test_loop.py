@@ -903,6 +903,55 @@ def test_acquire_success_clears_pending_acquire_entry(
     assert state_after.get("pending_acquire_agent_ids", {}) == {}
 
 
+def test_sweep_done_worker_dirs_releases_claim(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Codex iter-6 [P2]: operator-driven `fleet tasks set status=done`
+    bypasses the reconcile/sentinel apply paths that normally call
+    _release_coord_prompt_inbox. The _sweep_done_worker_dirs defense-
+    in-depth path MUST also release the claim + forget the agent_id
+    so the inbox/journal don't leak indefinitely for manually-completed
+    tasks.
+    """
+    # Task at status=done with a worker dir on disk + an agent_id
+    # mapping from when it was in-progress.
+    _write_tasks(project_dir, [
+        _make_task("manual-done", status="done", worker_pid=0,
+                   pr_url="https://github.com/x/y/pull/1"),
+    ])
+    workers_dir = project_dir / "workers" / "manual-done"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "done"}), encoding="utf-8",
+    )
+    _seed_coord_state(
+        project_dir, agent_id_map={"manual-done": "deadbeef"},
+    )
+    inbox = fleet_home / "inbox" / "deadbeef.md"
+    inbox.write_text("manual-done worker prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Release fired for the manually-done task.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "deadbeef" for c in release_calls), (
+        f"sweep should have released manual-done's claim; "
+        f"seen={release_calls!r}"
+    )
+    # Inbox file unlinked.
+    assert not inbox.exists()
+    # Agent_id mapping forgotten.
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert "manual-done" not in state.get("worker_agent_ids", {})
+
+
 def test_apply_dispatch_failure_preserves_pending_acquire(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess, monkeypatch,

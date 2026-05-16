@@ -358,6 +358,7 @@ def _tick_locked(
     try:
         swept = _sweep_done_worker_dirs(
             f.tasks, project, fleet_bin, home=home,
+            coord_state=state,
         )
         result.reconciled += swept
     except Exception as exc:  # noqa: BLE001
@@ -2867,6 +2868,7 @@ def _sweep_done_worker_dirs(
     fleet_bin: str,
     *,
     home: Path | None = None,
+    coord_state: dict | None = None,
 ) -> int:
     """Defense-in-depth: rm-rf workers/<slug>/ for tasks at status=done
     whose worker dir still exists.
@@ -2878,6 +2880,14 @@ def _sweep_done_worker_dirs(
         delete_worker_dir wiring,
       - any race where the task flipped done elsewhere while a stale
         worker dir lingered.
+
+    Codex iter-6 [P2]: ALSO release the coord_prompt_inbox claim +
+    forget the agent_id mapping for the same tasks. Operator-driven
+    `fleet tasks set status=done` skips the reconcile/sentinel apply
+    path that would normally call _release_coord_prompt_inbox, so
+    without this wire the PR1 journal/inbox claim leaks indefinitely
+    for every manually-completed task. The release is best-effort:
+    a non-success outcome only logs to stderr.
 
     Skip on tasks already done from a prior tick: existence-check the
     workers/<slug>/ dir up-front. If absent, the sweep is a no-op for
@@ -2892,10 +2902,33 @@ def _sweep_done_worker_dirs(
         return 0
     fleet_home = home if home is not None else _resolve_home(None)
     project_workers = fleet_home / "projects" / project / "workers"
+    # Codex iter-6 [P2]: cache the agent_id map once per sweep to
+    # avoid re-loading the dict for every done task.
+    agent_id_map = (
+        supervisor_mod.load_agent_id_map(coord_state)
+        if coord_state is not None else {}
+    )
     swept = 0
     for t in tasks:
         if t.status != "done":
             continue
+        # Codex iter-6 [P2]: even if the worker dir is already gone
+        # (sweep already ran on a prior tick), the slug may still have
+        # a live coord_prompt_inbox claim from when it was in-progress.
+        # Run the release wire FIRST so a worker_dir-already-gone slug
+        # still triggers cleanup. The agent_id_map probe is a no-op
+        # when the slug isn't tracked.
+        agent_id = agent_id_map.get(t.slug, "")
+        if agent_id and coord_state is not None:
+            _release_coord_prompt_inbox(
+                slug=t.slug,
+                agent_id=agent_id,
+                fleet_bin=fleet_bin,
+                fleet_home=fleet_home,
+                site="sweep-done-operator-driven",
+            )
+            supervisor_mod.forget_agent_id(coord_state, t.slug)
+            _clear_review_handoff_state(coord_state, t.slug)
         # Stat-first short-circuit: workers.Delete is idempotent on
         # ENOENT, but firing the CLI every tick on every done task
         # would emit "already gone" noise to stderr. The on-disk
