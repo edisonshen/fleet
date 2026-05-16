@@ -2720,12 +2720,74 @@ def _retry_pending_releases(
     not_owned) drop the entry. Non-terminal outcomes (error) leave
     the entry for the next tick.
 
+    Codex iter-13 [P1]: SKIP any pending-release id that is
+    currently the slug's live worker_agent_ids[slug] OR
+    pending_acquire_agent_ids[slug] entry. The scenario: a
+    `ready` task with both maps populated has the worker map
+    swept; the sweep's release returns error and stashes the
+    same id; _dispatch_ready then reuses the pending id and
+    repopulates worker_agent_ids with it. The retry pass on the
+    next tick would otherwise tear down the live claim. The
+    active maps win — drop the pending-release entry instead.
+
     Best-effort: never raises; logs via _release_coord_prompt_inbox's
     stderr path.
     """
     pending = supervisor_mod.load_pending_release_agent_ids(coord_state)
+    if not pending:
+        return
+    # Codex iter-13 [P1]: skip ids whose slug is currently
+    # dispatchable (the worker is/will-be alive). The dangerous
+    # scenario the codex finding describes: a `ready` task with both
+    # worker_agent_ids AND pending_acquire_agent_ids gets swept; the
+    # sweep's release errors and stashes; _dispatch_ready then
+    # reuses the same id; the next retry pass would tear down the
+    # live worker. We discriminate via TASK STATUS (read fresh from
+    # tasks.md), not just the map presence: a stale worker_agent_ids
+    # entry after a failed release for a terminal-transitioned slug
+    # (status=todo/done/blocked/abandoned) is STILL leaked and
+    # should be retried.
+    try:
+        f = parse.read(
+            str(home / "projects" / project / "tasks.md"),
+        )
+        live_statuses = {
+            t.slug: t.status for t in f.tasks
+            if t.status in ("ready", "in-progress", "in-review")
+        }
+    except Exception:  # noqa: BLE001
+        # On parse error, fall back to map-presence check (more
+        # conservative — match iter-13's original semantics).
+        active_worker = supervisor_mod.load_agent_id_map(coord_state)
+        active_pending = supervisor_mod.load_pending_acquire_agent_id_map(
+            coord_state,
+        )
+        live_statuses = {}
+        for s in list(pending.keys()):
+            if (
+                active_worker.get(s) in pending[s]
+                or active_pending.get(s) in pending[s]
+            ):
+                live_statuses[s] = "in-progress"  # placeholder
+    active_worker = supervisor_mod.load_agent_id_map(coord_state)
+    active_pending = supervisor_mod.load_pending_acquire_agent_id_map(
+        coord_state,
+    )
     for slug, ids in pending.items():
         for agent_id in list(ids):
+            # Skip when the slug is in a live (dispatchable / in-flight)
+            # state AND the id is currently the active worker/pending
+            # entry. Both conditions must hold so a stale
+            # worker_agent_ids entry on a terminal slug still gets
+            # its retry.
+            if slug in live_statuses and (
+                active_worker.get(slug) == agent_id
+                or active_pending.get(slug) == agent_id
+            ):
+                supervisor_mod.forget_pending_release_agent_id(
+                    coord_state, slug, agent_id,
+                )
+                continue
             outcome = _release_coord_prompt_inbox(
                 slug=slug,
                 agent_id=agent_id,
@@ -3245,8 +3307,8 @@ def _sweep_non_inflight_claim_state(
     if not tracked_slugs:
         return
     task_status = {t.slug: t.status for t in tasks}
-    # Codex iter-10 / iter-12 / iter-13 scope: we touch slugs in
-    # one of these buckets:
+    # Codex iter-10 / iter-12 / iter-13 / iter-14 scope: we touch
+    # slugs in one of these buckets:
     #
     #   - Operator-driven non-inflight non-done states
     #     (`todo`, `abandoned`): both worker_agent_ids and
@@ -3254,14 +3316,13 @@ def _sweep_non_inflight_claim_state(
     #     sentinel paths only target in-progress / in-review, so
     #     these slugs would otherwise orphan their claims.
     #
-    #   - Codex iter-13 [P1] EXCLUSION: `blocked` deliberately
-    #     OMITTED. _apply_sentinel's BLOCKED_QUESTION path keeps
-    #     worker_agent_ids alive on purpose so the operator can
-    #     answer the still-running worker through the same inbox
-    #     (answer-blocked workflow). Sweeping `blocked` slugs here
-    #     would strip the inbox+claim within one tick. Operator-
-    #     driven manual blocked (no live worker behind it) is rare
-    #     and PR4 sweeper handles that case.
+    #   - Codex iter-14 [P2]: `blocked` with worker dir GONE.
+    #     The BLOCKED_QUESTION lifecycle keeps the worker running
+    #     and its worker_dir present (state.json updated). A
+    #     manual operator-driven `blocked` transition with no live
+    #     worker has its worker_dir missing/absent. We use that as
+    #     the discriminator. Existing worker_dir → preserve (live
+    #     BLOCKED_QUESTION); missing worker_dir → sweep (manual).
     #
     #   - `ready` slugs with a worker_agent_ids entry (codex iter-12
     #     [P1]): an operator manually flipped a dispatched task
@@ -3277,6 +3338,9 @@ def _sweep_non_inflight_claim_state(
     #     tracks an agent_id. The slug will never come back through
     #     reconcile so we release here.
     sweep_statuses = {"todo", "abandoned"}
+    # For `blocked` slugs we need the worker_dir-existence check
+    # below — they're a conditional inclusion.
+    project_workers = fleet_home / "projects" / project / "workers"
     for slug in tracked_slugs:
         status = task_status.get(slug, "")
         wid = agent_id_map.get(slug, "")
@@ -3286,9 +3350,25 @@ def _sweep_non_inflight_claim_state(
         # absent from tasks.md AND has any tracked id: archived slug
         # cleanup (P2).
         archived = (slug not in task_status) and (bool(wid) or bool(pid))
+        # Codex iter-14 [P2]: blocked + worker_dir GONE → operator-
+        # driven manual blocked (no live worker). The
+        # BLOCKED_QUESTION lifecycle keeps the worker dir alive.
+        blocked_manual = False
+        if status == "blocked":
+            try:
+                if not (project_workers / slug).is_dir():
+                    blocked_manual = True
+            except OSError:
+                # Stat fault: stay conservative and don't sweep.
+                pass
         # in-progress / in-review / done / ready-only-pending: skip
         # (lifecycle paths handle them).
-        if status not in sweep_statuses and not ready_reset and not archived:
+        if (
+            status not in sweep_statuses
+            and not ready_reset
+            and not archived
+            and not blocked_manual
+        ):
             continue
         # On ready_reset we ONLY want to release the worker_agent_ids
         # id — pending_acquire (if present) is the half-written

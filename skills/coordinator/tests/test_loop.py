@@ -1195,6 +1195,13 @@ def test_reconcile_release_error_stashes_for_retry(
     must stash the id in pending_release_agent_ids so the retry pass
     can re-attempt. Otherwise a slug transitioning to todo/blocked
     leaves the in-flight set permanently with its claim orphaned.
+
+    Codex iter-13 [P1] interaction: the retry pass deliberately skips
+    ids whose slug is in a live (ready/in-progress/in-review) state
+    AND whose id matches the active worker/pending entry — to avoid
+    tearing down a re-dispatched live claim. So the test must verify
+    the stash happens INSIDE the reconcile apply, before the retry
+    pass's skip evaluation runs in a later tick.
     """
     _write_tasks(project_dir, [
         _make_task("rec-rel-aa", status="in-progress", worker_pid=1, pr_url=""),
@@ -1214,6 +1221,22 @@ def test_reconcile_release_error_stashes_for_retry(
     monkeypatch.setattr(
         dispatch_mod, "release_coord_prompt_inbox", _err_release,
     )
+    # Intercept _retry_pending_releases at its first invocation so we
+    # can inspect coord_state right after reconcile but before the
+    # retry pass has a chance to clear the stash. Iter-13's skip-on-
+    # live-status logic would otherwise drop the entry once the test
+    # fixture mock fails to flip status to todo (the real _run_fleet
+    # mutates tasks.md; the recorder stub doesn't).
+    captured = {}
+
+    real_retry = loop._retry_pending_releases
+
+    def capture_then_skip(**kw):
+        captured["state"] = dict(kw["coord_state"])
+        # Do NOT call real_retry — we want to observe the post-reconcile
+        # stash before the retry pass clears it.
+
+    monkeypatch.setattr(loop, "_retry_pending_releases", capture_then_skip)
 
     with patch.object(loop, "_pid_alive", return_value=False):
         loop.tick(
@@ -1221,14 +1244,13 @@ def test_reconcile_release_error_stashes_for_retry(
             fleet_home=str(fleet_home),
         )
 
-    state = json.loads((project_dir / "coord-state.json").read_text())
-    pending_releases = state.get("pending_release_agent_ids", {})
+    pending_releases = captured.get("state", {}).get("pending_release_agent_ids", {})
     assert "feedface" in pending_releases.get("rec-rel-aa", []), (
         f"reconcile release error must stash for retry; "
         f"pending_release={pending_releases!r}"
     )
     # worker_agent_ids preserved (so we still have the handle).
-    assert state.get("worker_agent_ids", {}).get("rec-rel-aa") == "feedface"
+    assert captured.get("state", {}).get("worker_agent_ids", {}).get("rec-rel-aa") == "feedface"
 
 
 def test_sweep_non_inflight_releases_todo_slugs(
@@ -1270,13 +1292,20 @@ def test_sweep_preserves_blocked_worker_inbox(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess,
 ) -> None:
-    """Codex iter-13 [P1]: BLOCKED_QUESTION carve-out — blocked
-    workers stay ALIVE so the operator can answer through the same
-    inbox. The non-inflight sweep MUST NOT release `blocked` slugs.
+    """Codex iter-13 [P1] + iter-14 [P2]: BLOCKED_QUESTION carve-out —
+    blocked workers stay ALIVE so the operator can answer through the
+    same inbox. Discriminator: worker_dir present → live worker (skip).
     """
     _write_tasks(project_dir, [
         _make_task("blocked-keep", status="blocked", worker_pid=0),
     ])
+    # Worker dir present + state.json with non-terminal phase =
+    # BLOCKED_QUESTION lifecycle.
+    workers_dir = project_dir / "workers" / "blocked-keep"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "in-progress"}), encoding="utf-8",
+    )
     _seed_coord_state(
         project_dir, agent_id_map={"blocked-keep": "ab10cked"},
     )
@@ -1295,11 +1324,48 @@ def test_sweep_preserves_blocked_worker_inbox(
     ]
     spurious = [c for c in release_calls if c[3] == "ab10cked"]
     assert spurious == [], (
-        f"blocked slug must NOT be swept; release_calls={release_calls!r}"
+        f"blocked slug with worker dir must NOT be swept; "
+        f"release_calls={release_calls!r}"
     )
     assert inbox.exists(), "blocked inbox must remain (answer-blocked workflow)"
     state = json.loads((project_dir / "coord-state.json").read_text())
     assert state.get("worker_agent_ids", {}).get("blocked-keep") == "ab10cked"
+
+
+def test_sweep_releases_manual_blocked_no_worker_dir(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-14 [P2]: operator-driven `blocked` with no live
+    worker (worker_dir absent) MUST be swept. Discriminator: worker
+    dir GONE → manual blocked. Otherwise the manual blocked claim
+    leaks indefinitely.
+    """
+    _write_tasks(project_dir, [
+        _make_task("blocked-manual", status="blocked", worker_pid=0),
+    ])
+    # No worker_dir present (operator manually flipped to blocked).
+    _seed_coord_state(
+        project_dir, agent_id_map={"blocked-manual": "ee100eee"},
+    )
+    inbox = fleet_home / "inbox" / "ee100eee.md"
+    inbox.write_text("stale prompt\n", encoding="utf-8")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "ee100eee" for c in release_calls), (
+        f"manual blocked (no worker_dir) MUST be swept; "
+        f"release_calls={release_calls!r}"
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert "blocked-manual" not in state.get("worker_agent_ids", {})
 
 
 def test_sweep_non_inflight_does_not_touch_ready_slugs(
