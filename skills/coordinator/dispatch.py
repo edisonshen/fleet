@@ -945,6 +945,153 @@ def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = N
     return target
 
 
+class AcquirePromptError(RuntimeError):
+    """Raised when `fleet claims acquire-prompt` returns a non-success
+    outcome (anything other than `acquired` or `already_acquired`).
+
+    DESIGN-dispatch-lifecycle.md §"Acquire is Go-side; Python shells
+    out via fleet claims" — the Python side has no way to mutate the
+    journal atomically, so claim acquisition MUST shell out to the Go
+    binary. This exception type lets loop.py distinguish "transient
+    Go-side failure (rerun next tick)" from "malformed local state
+    (don't retry blindly)".
+
+    Attributes:
+        outcome: the JSON `outcome` field from the CLI response, or
+            "error" when no JSON envelope was returned (e.g., binary
+            missing).
+        exit_code: the CLI exit code (0 for success outcomes; 10/11/12/1
+            for failure shapes per the stable exit-code table).
+        message: human-readable error text (CLI's `error` field, or
+            stderr fallback).
+    """
+
+    def __init__(self, outcome: str, exit_code: int, message: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.exit_code = exit_code
+        self.message = message
+
+
+def acquire_coord_prompt_inbox(
+    agent_id: str,
+    prompt: str,
+    *,
+    owner: str,
+    dispatch_kind: str = "worker",
+    host_id: str | None = None,
+    tmux_socket: str | None = None,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> str:
+    """Acquire a coord_prompt_inbox Delivery claim via `fleet claims`.
+
+    Replaces the direct call to `write_worker_inbox` for the two
+    loop.py call sites that produce coord_prompt_inbox files (worker
+    dispatch + reviewer/finisher handoff). DESIGN-dispatch-lifecycle.md
+    PR1 migrates ONLY these two call sites; the helper `write_worker_inbox`
+    itself stays in PR1 because handoff_resume.py:366 still uses it
+    (retires in PR2 via the Rewrite controller op).
+
+    Flow:
+      1. Mint dispatch_id == agent_id (the load-bearing invariant).
+      2. Shell out: `fleet claims acquire-prompt <agent_id> --owner=<o>
+         --host-id=<h> [--tmux-socket=<s>] --dispatch-kind=<k>` with
+         the prompt piped on stdin.
+      3. Parse the JSON envelope from stdout.
+      4. On `acquired` or `already_acquired`: return the inbox path
+         (`response["path"]`).
+      5. On anything else: raise AcquirePromptError carrying the
+         outcome + exit code + message so loop.py can decide whether
+         to defer the slug to the next tick.
+
+    Args mirror the controller's surface area:
+      agent_id:      8-hex (validated locally to fail-fast before subprocess).
+      prompt:        the file body.
+      owner:         the task slug or owner label recorded in the journal.
+      dispatch_kind: "worker" | "reviewer" | "finisher".
+      host_id:       defaults to socket.gethostname().
+      tmux_socket:   carried for forward-compat (PR2 uses it for
+                     same-host different-socket discrimination).
+      fleet_bin:     override the `fleet` binary path (tests).
+      fleet_home:    override FLEET_HOME (tests).
+      timeout_s:     subprocess timeout.
+
+    Returns the absolute inbox path. Raises AcquirePromptError on
+    non-success.
+    """
+    if not _AGENT_ID_FULL_RE.fullmatch(agent_id):
+        raise ValueError(f"invalid agent_id {agent_id!r}: expected 8 hex chars")
+
+    cmd = [fleet_bin, "claims", "acquire-prompt", agent_id, "--owner", owner,
+           "--dispatch-kind", dispatch_kind]
+    if host_id:
+        cmd += ["--host-id", host_id]
+    if tmux_socket:
+        cmd += ["--tmux-socket", tmux_socket]
+
+    env = os.environ.copy()
+    if fleet_home:
+        env["FLEET_HOME"] = fleet_home
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        raise AcquirePromptError(
+            "error", 1,
+            f"fleet binary not found: {exc}",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise AcquirePromptError(
+            "error", 1,
+            f"fleet claims acquire-prompt timed out after {timeout_s}s",
+        ) from exc
+
+    response = _parse_claims_response(proc.stdout)
+    outcome = response.get("outcome", "")
+    if outcome in {"acquired", "already_acquired"}:
+        path = response.get("path", "")
+        if not path:
+            raise AcquirePromptError(
+                outcome, proc.returncode,
+                "claims response missing 'path' field",
+            )
+        return path
+    # Failure outcomes (or `error`, or empty stdout).
+    message = response.get("error") or (proc.stderr or "").strip() or (
+        f"fleet claims acquire-prompt returned outcome={outcome!r} "
+        f"exit={proc.returncode}"
+    )
+    raise AcquirePromptError(outcome or "error", proc.returncode, message)
+
+
+def _parse_claims_response(stdout: str) -> dict:
+    """Parse the last JSON envelope from `fleet claims` stdout.
+
+    The CLI emits one JSON object per call. Defensive: if the CLI ever
+    interleaves log noise (it doesn't today), we still pick the last
+    well-formed JSON object so the envelope contract is robust to
+    that future state.
+    """
+    if not stdout:
+        return {}
+    last_line = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+    try:
+        parsed = json.loads(last_line)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def fetch_standards(project: str, *, fleet_bin: str = "fleet", timeout_s: float = 10.0) -> str:
     """Run `fleet standards show --merged` and return stdout.
 

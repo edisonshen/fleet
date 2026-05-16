@@ -128,7 +128,8 @@ def dispatch_subprocess(monkeypatch):
     """
     ids = _DispatchSubprocessHandle()
 
-    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False,
+                 input=None, env=None):
         ids.seen_cmds.append(list(cmd))
         if cmd[1:3] == ["standards", "show"]:
             return subprocess.CompletedProcess(
@@ -137,6 +138,30 @@ def dispatch_subprocess(monkeypatch):
         if cmd[1:3] == ["learnings", "list"]:
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout="", stderr="",
+            )
+        # PR1 dispatch-lifecycle: loop.py now shells out to
+        # `fleet claims acquire-prompt` instead of writing the inbox
+        # file directly. Emulate the real CLI by writing the inbox
+        # file under the test's FLEET_HOME and returning the expected
+        # JSON envelope on stdout. The `input` kwarg carries the prompt
+        # body (piped via subprocess.run(input=prompt)).
+        if cmd[1:3] == ["claims", "acquire-prompt"]:
+            agent_id = cmd[3]
+            fleet_home = (env or os.environ).get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+            inbox_dir = os.path.join(fleet_home, "inbox")
+            os.makedirs(inbox_dir, exist_ok=True)
+            path = os.path.join(inbox_dir, f"{agent_id}.md")
+            body = input or ""
+            if body and not body.endswith("\n"):
+                body = body + "\n"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            envelope = (
+                f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+                f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=envelope, stderr="",
             )
         return subprocess.CompletedProcess(
             args=cmd, returncode=0, stdout="", stderr="",
@@ -1113,11 +1138,34 @@ def test_main_writes_json_summary_on_run(
     monkeypatch.setenv("FLEET_PROJECT", "fleet")
     # Issue #84 Phase A: dispatch.subprocess.run still gets called
     # for fetch_standards / fetch_learnings; mock it to a no-op.
+    # PR1 dispatch-lifecycle: also intercept `fleet claims
+    # acquire-prompt` so the loop migration writes the inbox file +
+    # parses a real envelope.
     fake = subprocess.CompletedProcess(
         args=[], returncode=0, stdout="", stderr="",
     )
 
-    def fake_run(cmd, capture_output=True, text=True, timeout=None, check=False):
+    def fake_run(cmd, capture_output=True, text=True, timeout=None,
+                 check=False, input=None, env=None):
+        if len(cmd) >= 4 and cmd[1:3] == ["claims", "acquire-prompt"]:
+            agent_id = cmd[3]
+            run_env = env or os.environ
+            home = run_env.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+            inbox_dir = os.path.join(home, "inbox")
+            os.makedirs(inbox_dir, exist_ok=True)
+            path = os.path.join(inbox_dir, f"{agent_id}.md")
+            body = input or ""
+            if body and not body.endswith("\n"):
+                body = body + "\n"
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            envelope = (
+                f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+                f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=envelope, stderr="",
+            )
         return fake
 
     monkeypatch.setattr(dispatch.subprocess, "run", fake_run)

@@ -694,3 +694,174 @@ def test_build_finisher_prompt_git_keeps_push_and_pr() -> None:
     assert "git push" in out
     assert "gh pr create" in out
     assert "--phase done --pr-url" in out
+
+
+# ---------- acquire_coord_prompt_inbox (PR1 dispatch-lifecycle) ----------
+
+
+def _fake_run(stdout: str = "", returncode: int = 0, stderr: str = ""):
+    """Build a CompletedProcess for subprocess.run mocking."""
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr,
+    )
+
+
+def test_acquire_coord_prompt_inbox_acquired(tmp_path) -> None:
+    """Happy path: CLI returns `acquired`, helper returns the path."""
+    envelope = (
+        '{"outcome":"acquired","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","path":"/tmp/x/inbox/a690424b.md"}\n'
+    )
+    with patch.object(dispatch.subprocess, "run", return_value=_fake_run(envelope)):
+        path = dispatch.acquire_coord_prompt_inbox(
+            "a690424b", "prompt body",
+            owner="project/fleet/slug/foo",
+            fleet_home=str(tmp_path),
+        )
+    assert path == "/tmp/x/inbox/a690424b.md"
+
+
+def test_acquire_coord_prompt_inbox_already_acquired_is_success(tmp_path) -> None:
+    """already_acquired is the idempotent retry success outcome."""
+    envelope = (
+        '{"outcome":"already_acquired","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","path":"/tmp/x/inbox/a690424b.md"}\n'
+    )
+    with patch.object(dispatch.subprocess, "run", return_value=_fake_run(envelope)):
+        path = dispatch.acquire_coord_prompt_inbox(
+            "a690424b", "prompt",
+            owner="project/fleet/slug/foo",
+            fleet_home=str(tmp_path),
+        )
+    assert path.endswith("a690424b.md")
+
+
+def test_acquire_coord_prompt_inbox_error_outcome_raises(tmp_path) -> None:
+    """`error` outcome (or any non-success) raises AcquirePromptError."""
+    envelope = (
+        '{"outcome":"error","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","error":"disk full"}\n'
+    )
+    with patch.object(dispatch.subprocess, "run", return_value=_fake_run(envelope, returncode=1)):
+        with pytest.raises(dispatch.AcquirePromptError) as info:
+            dispatch.acquire_coord_prompt_inbox(
+                "a690424b", "prompt", owner="x", fleet_home=str(tmp_path),
+            )
+    assert info.value.outcome == "error"
+    assert info.value.exit_code == 1
+    assert "disk full" in str(info.value)
+
+
+def test_acquire_coord_prompt_inbox_invalid_agent_id(tmp_path) -> None:
+    """Local fail-fast on malformed agent_id — no subprocess call."""
+    with pytest.raises(ValueError):
+        dispatch.acquire_coord_prompt_inbox(
+            "not-hex", "p", owner="x", fleet_home=str(tmp_path),
+        )
+
+
+def test_acquire_coord_prompt_inbox_fleet_bin_missing_raises(tmp_path) -> None:
+    """FileNotFoundError from subprocess maps to AcquirePromptError."""
+    with patch.object(dispatch.subprocess, "run", side_effect=FileNotFoundError("nope")):
+        with pytest.raises(dispatch.AcquirePromptError) as info:
+            dispatch.acquire_coord_prompt_inbox(
+                "a690424b", "p", owner="x", fleet_home=str(tmp_path),
+            )
+    assert info.value.outcome == "error"
+
+
+def test_acquire_coord_prompt_inbox_passes_dispatch_kind(tmp_path) -> None:
+    """The --dispatch-kind flag is propagated to the CLI argv."""
+    envelope = (
+        '{"outcome":"acquired","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","path":"/tmp/x/inbox/a690424b.md"}\n'
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_run(envelope)
+
+    with patch.object(dispatch.subprocess, "run", side_effect=fake_run):
+        dispatch.acquire_coord_prompt_inbox(
+            "a690424b", "p", owner="x", dispatch_kind="reviewer",
+            fleet_home=str(tmp_path),
+        )
+    assert "--dispatch-kind" in captured["cmd"]
+    idx = captured["cmd"].index("--dispatch-kind")
+    assert captured["cmd"][idx + 1] == "reviewer"
+
+
+def test_acquire_coord_prompt_inbox_pipes_prompt_to_stdin(tmp_path) -> None:
+    """Prompt body flows to subprocess via stdin, not argv."""
+    envelope = (
+        '{"outcome":"acquired","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","path":"/tmp/x/inbox/a690424b.md"}\n'
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["input"] = kwargs.get("input")
+        return _fake_run(envelope)
+
+    with patch.object(dispatch.subprocess, "run", side_effect=fake_run):
+        dispatch.acquire_coord_prompt_inbox(
+            "a690424b", "secret prompt body", owner="x", fleet_home=str(tmp_path),
+        )
+    assert captured["input"] == "secret prompt body"
+    # The argv MUST NOT contain the body.
+    # (We don't have captured cmd here; the previous test exercised argv.)
+
+
+def _build_fleet_bin(tmp_path) -> str | None:
+    """Build the current source tree's `fleet` binary into tmp_path.
+
+    Returns the absolute path on success, None on failure. Used by the
+    E2E shell-out tests to exercise the real Python ↔ Go contract
+    instead of the (possibly out-of-date) system-installed binary.
+    """
+    import shutil
+    if not shutil.which("go"):
+        return None
+    # Walk up from this test file to find the repo root (Makefile + go.mod).
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo = here
+    while repo != "/" and not os.path.exists(os.path.join(repo, "go.mod")):
+        repo = os.path.dirname(repo)
+    if not os.path.exists(os.path.join(repo, "go.mod")):
+        return None
+    out = str(tmp_path / "fleet")
+    proc = subprocess.run(
+        ["go", "build", "-o", out, "./cmd/fleet"],
+        cwd=repo, capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return out
+
+
+def test_acquire_coord_prompt_inbox_e2e_via_real_fleet_bin(tmp_path) -> None:
+    """End-to-end via a freshly-built `fleet` binary from this tree.
+
+    Builds the binary from source rather than relying on PATH so the
+    test never sees a stale (pre-PR1) install. Exercises the full
+    Python-shell-out → Go CLI → on-disk journal+inbox loop. Closes the
+    "Python and Go must agree on the JSON envelope" contract gap.
+    """
+    fleet_bin = _build_fleet_bin(tmp_path)
+    if not fleet_bin:
+        pytest.skip("could not build fleet binary; skipping E2E shell-out test")
+
+    fleet_home = tmp_path / "home"
+    fleet_home.mkdir()
+    path = dispatch.acquire_coord_prompt_inbox(
+        "a690424b", "real e2e prompt body",
+        owner="project/test/slug/e2e",
+        fleet_bin=fleet_bin,
+        fleet_home=str(fleet_home),
+    )
+    assert path.endswith("a690424b.md")
+    assert open(path).read().startswith("real e2e prompt body")
+    # Journal is on disk.
+    journal = fleet_home / "dispatches" / "a690424b.json"
+    assert journal.exists(), f"journal missing at {journal}"

@@ -39,6 +39,38 @@ def _err(stderr: str, returncode: int = 1) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr=stderr)
 
 
+def _maybe_claims_emulator(cmd, kwargs):
+    """Emulate `fleet claims acquire-prompt` for loop.py tests that
+    intercept subprocess.run.
+
+    PR1 dispatch-lifecycle migration: loop.py now calls
+    `fleet claims acquire-prompt` to write the inbox file. Tests that
+    patched dispatch_mod.subprocess.run pre-PR1 didn't need to handle
+    this argv shape; this helper preserves the existing fixture API by
+    writing the inbox file + returning the JSON envelope automatically
+    whenever the patched run sees the claims argv. Returns None when
+    cmd isn't a claims call (caller falls through to its own routing).
+    """
+    if len(cmd) < 3 or cmd[1:3] != ["claims", "acquire-prompt"]:
+        return None
+    agent_id = cmd[3]
+    env = kwargs.get("env") or os.environ
+    fleet_home = env.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+    inbox_dir = os.path.join(fleet_home, "inbox")
+    os.makedirs(inbox_dir, exist_ok=True)
+    path = os.path.join(inbox_dir, f"{agent_id}.md")
+    body = kwargs.get("input") or ""
+    if body and not body.endswith("\n"):
+        body = body + "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+    envelope = (
+        f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+        f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+    )
+    return _ok(stdout=envelope)
+
+
 def test_compute_worktree_path_invokes_fleet_cli() -> None:
     fake = _ok(
         stdout="/Users/op/.fleet/projects/proj/worktrees/alpha-1234/\n",
@@ -327,6 +359,10 @@ def test_dispatch_ready_cap1_does_not_invoke_worktree(tmp_path) -> None:
 
     def _runner(cmd, *args, **kwargs):
         calls.append(list(cmd))
+        # PR1 dispatch-lifecycle: emulate fleet claims acquire-prompt.
+        emu = _maybe_claims_emulator(cmd, kwargs)
+        if emu is not None:
+            return emu
         return _ok()
 
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
@@ -374,6 +410,11 @@ def _make_subprocess_router(routes: dict, calls: list | None = None):
         for prefix, result in routes.items():
             if tuple(cmd[: len(prefix)]) == prefix:
                 return result
+        # PR1 dispatch-lifecycle: emulate fleet claims acquire-prompt
+        # when no test-specific route matches.
+        emu = _maybe_claims_emulator(cmd, _kwargs)
+        if emu is not None:
+            return emu
         return _ok()
     return _run
 

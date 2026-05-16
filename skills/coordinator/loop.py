@@ -2887,15 +2887,40 @@ def _dispatch_ready(
         # in coord's chat ("N local agents") instead of detached tmux
         # sessions. The Python skill never calls `fleet dispatch` for
         # workers anymore (the Go CLI stays for v0.1 manual use).
+        #
+        # PR1 of dispatch-lifecycle re-arch (DESIGN-dispatch-lifecycle.md):
+        # inbox write goes through `fleet claims acquire-prompt` so the
+        # coord_prompt_inbox file is owned by a journal at
+        # ~/.fleet/dispatches/<agent_id>.json — its Release on terminal
+        # transition closes the 30-file leak the prior architecture
+        # suffered. Direct `dispatch_mod.write_worker_inbox` stays in
+        # the module for handoff_resume.py:366; PR2 migrates that and
+        # retires the helper.
         agent_id = dispatch_mod.mint_agent_id()
         try:
-            inbox_path = dispatch_mod.write_worker_inbox(
-                agent_id, prompt, fleet_home=fleet_home,
+            inbox_path = dispatch_mod.acquire_coord_prompt_inbox(
+                agent_id, prompt,
+                owner=f"project/{project}/slug/{t.slug}",
+                dispatch_kind="worker",
+                fleet_bin=fleet_bin,
+                fleet_home=fleet_home,
             )
-        except Exception as exc:
+        except dispatch_mod.AcquirePromptError as exc:
+            # On error outcome (binary missing, journal write race),
+            # leave the task in `ready` for the next tick to retry. The
+            # action carries the error so loop.py's caller surfaces it
+            # in the tick summary.
             actions.append(_DispatchAction(
                 slug=t.slug, agent_id=agent_id,
-                error=f"inbox write failed: {exc}",
+                error=f"acquire coord_prompt_inbox failed "
+                      f"(outcome={exc.outcome}, exit={exc.exit_code}): "
+                      f"{exc.message}",
+            ))
+            continue
+        except Exception as exc:  # noqa: BLE001
+            actions.append(_DispatchAction(
+                slug=t.slug, agent_id=agent_id,
+                error=f"acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
         try:
@@ -3020,14 +3045,31 @@ def _dispatch_review_handoffs(
             continue
 
         agent_id = dispatch_mod.mint_agent_id()
+        # PR1 dispatch-lifecycle migration: same as _dispatch_ready,
+        # but dispatch_kind reflects review-pending → "reviewer" and
+        # review-done → "finisher" so the journal owner string + dispatch
+        # role match the actual subagent shape. handoff_phase is the
+        # current phase the worker exited at (set above).
         try:
-            inbox_path = dispatch_mod.write_worker_inbox(
-                agent_id, prompt, fleet_home=fleet_home,
+            inbox_path = dispatch_mod.acquire_coord_prompt_inbox(
+                agent_id, prompt,
+                owner=f"project/{project}/slug/{t.slug}",
+                dispatch_kind=("reviewer" if phase == "review-pending" else "finisher"),
+                fleet_bin=fleet_bin,
+                fleet_home=fleet_home,
             )
+        except dispatch_mod.AcquirePromptError as exc:
+            actions.append(_DispatchAction(
+                slug=t.slug, agent_id=agent_id,
+                error=f"handoff acquire coord_prompt_inbox failed "
+                      f"(outcome={exc.outcome}, exit={exc.exit_code}): "
+                      f"{exc.message}",
+            ))
+            continue
         except Exception as exc:  # noqa: BLE001
             actions.append(_DispatchAction(
                 slug=t.slug, agent_id=agent_id,
-                error=f"handoff inbox write failed: {exc}",
+                error=f"handoff acquire coord_prompt_inbox failed: {exc}",
             ))
             continue
         try:
