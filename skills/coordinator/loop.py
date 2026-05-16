@@ -3205,30 +3205,52 @@ def _sweep_non_inflight_claim_state(
     if not tracked_slugs:
         return
     task_status = {t.slug: t.status for t in tasks}
-    # Codex iter-10 [P2] scope: we ONLY touch slugs whose status is
-    # explicitly one of the post-dispatch-but-not-done operator
-    # states. `ready` means "about to be dispatched" — the next
-    # dispatch tick uses the pending-acquire entry to retry the
-    # half-written claim, so we must NOT preempt that here.
-    # `in-progress` + `in-review` are normal lifecycle states.
-    # `done` is owned by _sweep_done_worker_dirs.
+    # Codex iter-10 / iter-12 scope: we touch slugs in one of these
+    # buckets:
+    #
+    #   - Operator-driven non-inflight non-done states
+    #     (`todo`, `blocked`, `abandoned`): both worker_agent_ids
+    #     and pending_acquire_agent_ids ids are released. Reconcile
+    #     / sentinel paths only target in-progress / in-review, so
+    #     these slugs would otherwise orphan their claims.
+    #
+    #   - `ready` slugs with a worker_agent_ids entry (codex iter-12
+    #     [P1]): an operator manually flipped a dispatched task
+    #     back to ready. Without releasing the old claim,
+    #     _filter_ready picks the task up and double-dispatches.
+    #     Only worker_agent_ids triggers this; pending_acquire on a
+    #     `ready` slug is the recovery scenario (next dispatch
+    #     reuses the id), so we explicitly skip pending-only ready
+    #     slugs.
+    #
+    #   - Slugs absent from tasks.md (codex iter-12 [P2]): operator
+    #     archived/removed the row but the in-memory map still
+    #     tracks an agent_id. The slug will never come back through
+    #     reconcile so we release here.
     sweep_statuses = {"todo", "blocked", "abandoned"}
     for slug in tracked_slugs:
         status = task_status.get(slug, "")
-        if status not in sweep_statuses:
-            continue
-        # Operator manually flipped a dispatched task to a non-
-        # inflight non-done state. Claim cleanup is now our
-        # responsibility — the reconcile/sentinel paths won't fire
-        # because they only target in-progress / in-review.
-        candidate_ids: list[str] = []
         wid = agent_id_map.get(slug, "")
-        if wid:
-            candidate_ids.append(wid)
         pid = pending_acquire_map.get(slug, "")
-        if pid and pid not in candidate_ids:
-            candidate_ids.append(pid)
-        for cand in candidate_ids:
+        # ready + worker_agent_ids: operator-driven reset (P1).
+        ready_reset = (status == "ready") and bool(wid)
+        # absent from tasks.md AND has any tracked id: archived slug
+        # cleanup (P2).
+        archived = (slug not in task_status) and (bool(wid) or bool(pid))
+        # in-progress / in-review / done / ready-only-pending: skip
+        # (lifecycle paths handle them).
+        if status not in sweep_statuses and not ready_reset and not archived:
+            continue
+        # On ready_reset we ONLY want to release the worker_agent_ids
+        # id — pending_acquire (if present) is the half-written
+        # acquire for the next dispatch attempt and must stay so the
+        # dispatch path can reuse it.
+        candidate_ids: list[tuple[str, str]] = []  # [(id, source)]
+        if wid:
+            candidate_ids.append((wid, "worker"))
+        if not ready_reset and pid and pid != wid:
+            candidate_ids.append((pid, "pending"))
+        for cand, source in candidate_ids:
             release_outcome = _release_coord_prompt_inbox(
                 slug=slug,
                 agent_id=cand,
@@ -3237,9 +3259,9 @@ def _sweep_non_inflight_claim_state(
                 site=f"sweep-non-inflight status={status!r} id={cand}",
             )
             if _release_outcome_is_terminal(release_outcome):
-                if cand == wid:
+                if source == "worker":
                     supervisor_mod.forget_agent_id(coord_state, slug)
-                if cand == pid:
+                if source == "pending":
                     supervisor_mod.forget_pending_acquire_agent_id(
                         coord_state, slug,
                     )

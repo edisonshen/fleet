@@ -1083,6 +1083,110 @@ def test_remember_agent_id_persists_before_apply(
     )
 
 
+def test_sweep_releases_ready_with_worker_mapping(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-12 [P1]: an operator manually flipping a dispatched
+    task back to `ready` while worker_agent_ids still tracks the old
+    agent_id MUST trigger release before _dispatch_ready picks the
+    task up again (otherwise the task double-dispatches under a new
+    id and the prior claim leaks).
+    """
+    _write_tasks(project_dir, [
+        _make_task("ready-reset-aa", status="ready"),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"ready-reset-aa": "ababab01"},
+    )
+    inbox = fleet_home / "inbox" / "ababab01.md"
+    inbox.write_text("prior worker prompt\n", encoding="utf-8")
+    dispatch_subprocess.append("99887766")  # pinned mint for new dispatch
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Old id was released.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "ababab01" for c in release_calls), (
+        f"sweep must release stale worker_agent_ids before redispatch; "
+        f"release_calls={release_calls!r}"
+    )
+    # worker_agent_ids replaced by the NEW dispatch's id (not the old).
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state.get("worker_agent_ids", {}).get("ready-reset-aa") == "99887766"
+
+
+def test_sweep_releases_archived_slugs(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-12 [P2]: an operator who archived/removed a tracked
+    slug from tasks.md leaves the agent_id orphaned in coord_state.
+    The sweep MUST release the claim and clear the maps for slugs
+    absent from tasks.md.
+    """
+    # tasks.md has NO entry for the tracked slug (operator archived).
+    _write_tasks(project_dir, [_make_task("present-bbbb", status="ready")])
+    _seed_coord_state(
+        project_dir, agent_id_map={"archived-aa": "deadc0de"},
+    )
+    inbox = fleet_home / "inbox" / "deadc0de.md"
+    inbox.write_text("archived worker prompt\n", encoding="utf-8")
+    dispatch_subprocess.append("11111111")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "deadc0de" for c in release_calls), (
+        f"sweep must release archived slug; release_calls={release_calls!r}"
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert "archived-aa" not in state.get("worker_agent_ids", {})
+
+
+def test_sweep_ready_with_only_pending_does_not_release(
+    fleet_home: Path, project_dir: Path,
+    dispatch_subprocess,
+) -> None:
+    """Codex iter-12 [P1] scope guard: a `ready` slug whose ONLY
+    tracked entry is in pending_acquire_agent_ids is in the recovery
+    path (next dispatch reuses the id). The sweep must NOT release
+    it; only the worker_agent_ids case triggers the ready_reset
+    cleanup.
+    """
+    _write_tasks(project_dir, [_make_task("ready-pending-aa", status="ready")])
+    _seed_coord_state(project_dir, agent_id_map={})
+    state_path = project_dir / "coord-state.json"
+    state = json.loads(state_path.read_text())
+    state["pending_acquire_agent_ids"] = {"ready-pending-aa": "fa11ed10"}
+    state_path.write_text(json.dumps(state))
+    inbox = fleet_home / "inbox" / "fa11ed10.md"
+    inbox.write_text("half-written prompt\n", encoding="utf-8")
+    dispatch_subprocess.append("99999999")  # ignored — reuse should win
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # The sweep did NOT release the pending id — dispatch reused it.
+    state_after = json.loads(state_path.read_text())
+    # Successful dispatch + apply → pending cleared, worker_agent_ids set.
+    assert state_after.get("worker_agent_ids", {}).get("ready-pending-aa") == "fa11ed10"
+
+
 def test_reconcile_release_error_stashes_for_retry(
     fleet_home: Path, project_dir: Path,
     dispatch_subprocess, monkeypatch,
