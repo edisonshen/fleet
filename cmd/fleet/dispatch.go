@@ -851,7 +851,37 @@ var defaultClaudeCommand = []string{"sh", "-c", defaultClaudeWrapperScript}
 // internal/spawn so internal/handoffop (the auto-handoff drain) can
 // use the same rewrite without a cross-package import-cycle through
 // cmd/fleet.
+//
+// FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
+// when the env var is set to any non-empty value, this wrapper
+// returns the input slice unchanged — no `--remote-control "<name>"`
+// injection. The single cmd/fleet gate covers all three call sites
+// (coord-spawn at dispatch.go, dispatch recovery, and handoff
+// replacement at cmd/fleet/handoff.go) which together cover every
+// path that drags the real `claude` binary into a remote-control
+// attach during `go test`. The package-shared TestMain in
+// main_test.go pins the env var so test runs do NOT spawn real
+// listeners that ping the operator's mobile (the regression PR2 hit:
+// 29+ codex iterations × 1 listener per run = dozens of pings).
+//
+// Production behaviour is preserved: with the env var unset (the
+// default for `fleet` invocations from a normal shell), the wrapper
+// falls through to spawn.InjectRemoteControlFlag and rewrites the
+// shell-wrapped claude body exactly as before.
+//
+// The gate is intentionally placed in the cmd/fleet wrapper rather
+// than inside spawn.InjectRemoteControlFlag itself so that the
+// library's own tests in internal/spawn/argv_test.go remain
+// unaffected by the env var (they pin the library contract, not the
+// process-wide behaviour). The auto-handoff drain in
+// internal/handoffop uses spawn.InjectRemoteControlFlag directly,
+// but its tests never exercise the default claude wrapper (they
+// seed with `sleep 60` and other benign argvs), so no parallel gate
+// is needed there.
 func injectRemoteControlFlag(command []string, sessionName string) []string {
+	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
+		return command
+	}
 	return spawn.InjectRemoteControlFlag(command, sessionName)
 }
 

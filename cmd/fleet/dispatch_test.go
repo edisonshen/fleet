@@ -360,6 +360,7 @@ func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 // claude's own flag parser sees --remote-control adjacent to the
 // binary regardless of which downstream flags appear.
 func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice, ok := flag.Value.(pflag.SliceValue)
@@ -410,6 +411,7 @@ func TestInjectRemoteControlFlag_RewritesDefaultShellWrapper(t *testing.T) {
 // be safe for any operator-supplied wrapper, not just the default one
 // where we know which substrings to rewrite.
 func TestInjectRemoteControlFlag_AnchoredInsertion(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -589,6 +591,7 @@ func TestInjectRemoteControlFlag_DoesNotMutateInput(t *testing.T) {
 // the agent_id, so the registered session is unique per coord and
 // matches the daemon's filter (codex review #73 iter-2 P1).
 func TestInjectRemoteControlFlag_SessionNameMatchesAgentID(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	const agentID = "1a2b3c4d"
 	sessionName := remoteControlSessionPrefix + "-" + agentID
 	cmd := newDispatchCmd()
@@ -672,6 +675,7 @@ func TestHandoffSessionPrefix_MatchesFirstActionDaemon(t *testing.T) {
 // invariant that fleet-handoff and fleet-coord rewrites are produced
 // by a single code path.
 func TestHandoffReplacement_InjectsRemoteControlFlag(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -717,6 +721,7 @@ func TestHandoffReplacement_InjectsRemoteControlFlag(t *testing.T) {
 // agent's first tick so worst-case is brief. The seed_inbox path
 // remains as a belt-and-braces fallback.
 func TestDispatch_CoordSpawn_AlwaysInjectsRemoteControl(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -789,6 +794,7 @@ func TestDispatch_NonCoordSpawn_CommandHasNoRemoteControlFlag(t *testing.T) {
 // `if opts.coordSpawn { ... command = injectRemoteControlFlag(...) }`)
 // gives us mechanical coverage of the contract.
 func TestDispatch_CoordSpawn_CommandIncludesRemoteControlFlag(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
