@@ -320,6 +320,17 @@ def _tick_locked(
             # transition that cleared worker_pid). Keeps the map size
             # bounded across long-running supervisor sessions.
             if action.clear_worker:
+                # PR1 dispatch-lifecycle: release the coord_prompt_inbox
+                # claim BEFORE forget_agent_id so we still have the
+                # mapping at release time. Best-effort; non-success
+                # logs to stderr but never blocks the status flip.
+                _release_coord_prompt_inbox(
+                    slug=action.slug,
+                    agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
+                    fleet_bin=fleet_bin,
+                    fleet_home=home,
+                    site=f"primary-reconcile new_status={action.new_status}",
+                )
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
                 # Codex iter-2 [P1]: do NOT clear reaper_redispatch_pending
@@ -410,6 +421,17 @@ def _tick_locked(
             # / TUI / manual `fleet rm` all need it as the addressing
             # handle.
             if action.kind in ("task_done_pr", "worker_failed"):
+                # PR1 dispatch-lifecycle: release the coord_prompt_inbox
+                # BEFORE forget_agent_id (same ordering rule as the
+                # reconcile site). BLOCKED_QUESTION deliberately skipped
+                # — the operator may write back via answer-blocked.
+                _release_coord_prompt_inbox(
+                    slug=action.slug,
+                    agent_id=supervisor_mod.load_agent_id_map(state).get(action.slug, ""),
+                    fleet_bin=fleet_bin,
+                    fleet_home=home,
+                    site=f"primary-sentinel kind={action.kind}",
+                )
                 supervisor_mod.forget_agent_id(state, action.slug)
                 _clear_review_handoff_state(state, action.slug)
         except Exception as exc:
@@ -685,6 +707,16 @@ def _run_supervisor(
                     full_tasks_by_slug=full_map,
                 )
                 if action.clear_worker:
+                    # PR1 dispatch-lifecycle: release coord_prompt_inbox
+                    # BEFORE forget_agent_id (same ordering rule as the
+                    # primary tick reconcile site).
+                    _release_coord_prompt_inbox(
+                        slug=action.slug,
+                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        fleet_bin=fleet_bin,
+                        fleet_home=home,
+                        site=f"supervisor-reconcile new_status={action.new_status}",
+                    )
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     # Three-stage flow (reviewer-subagent-arch): clear
                     # the review-handoff dispatched markers in sync
@@ -988,6 +1020,19 @@ def _run_supervisor(
                 # terminating sentinels (task_done_pr, worker_failed)
                 # forget the mapping.
                 if action.kind in ("task_done_pr", "worker_failed"):
+                    # PR1 dispatch-lifecycle: release coord_prompt_inbox
+                    # at the same beat as forget. Replay-deferred drain
+                    # can run multiple ticks after the worker exited, so
+                    # an already_released outcome is common when the
+                    # primary drain already ran — that's still a success
+                    # outcome (idempotent by design).
+                    _release_coord_prompt_inbox(
+                        slug=action.slug,
+                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        fleet_bin=fleet_bin,
+                        fleet_home=home,
+                        site=f"supervisor-sentinel-replay kind={action.kind}",
+                    )
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
                 applied += 1
@@ -1134,6 +1179,16 @@ def _run_supervisor(
                 # task_done_pr / worker_failed both terminate the
                 # worker; agent_id cleanup is correct for those.
                 if action.kind in ("task_done_pr", "worker_failed"):
+                    # PR1 dispatch-lifecycle: release the
+                    # coord_prompt_inbox before forget — same ordering
+                    # rule as the primary drain.
+                    _release_coord_prompt_inbox(
+                        slug=action.slug,
+                        agent_id=supervisor_mod.load_agent_id_map(cs).get(action.slug, ""),
+                        fleet_bin=fleet_bin,
+                        fleet_home=home,
+                        site=f"supervisor-sentinel-drain kind={action.kind}",
+                    )
                     supervisor_mod.forget_agent_id(cs, action.slug)
                     _clear_review_handoff_state(cs, action.slug)
             except Exception as exc:  # noqa: BLE001
@@ -2338,6 +2393,101 @@ def _gh_run_json(cmd: list[str], *, timeout_s: float):
         return None, f"json decode: {exc}"
 
 
+# ---------- terminal release wrapper (PR1 dispatch-lifecycle) ----------
+#
+#  forget_agent_id (state)        coord_prompt_inbox release flow
+#  -----------------------        -------------------------------
+#       │                                  │
+#       ▼                                  ▼
+#   slug → agent_id           ┌───────────────────────────┐
+#   mapping cleared           │ dispatch.release_coord_   │
+#       │                     │ prompt_inbox via          │
+#       │                     │ `fleet claims release`    │
+#       │                     │ (best-effort, no raise)   │
+#       ▼                     └────────────┬──────────────┘
+#   _apply_reconcile/                       │
+#   _apply_sentinel terminal              outcome: released |
+#   branches → status flip                already_released |
+#                                          absent | not_owned |
+#                                          error
+#                                            │
+#                                            ▼
+#                                   stderr log on non-success.
+#                                   Never blocks status flip.
+#
+# Ordering rule: release runs BEFORE forget_agent_id so we still know
+# the agent_id at the moment the release fires. The supervisor's two
+# paths (primary tick + supervisor loop) and the handoff path all
+# share the same wrapper to keep the contract uniform.
+
+
+def _release_coord_prompt_inbox(
+    *,
+    slug: str,
+    agent_id: str,
+    fleet_bin: str,
+    fleet_home: Path | str | None,
+    site: str,
+) -> None:
+    """Best-effort release of a worker's coord_prompt_inbox claim.
+
+    Wraps `dispatch_mod.release_coord_prompt_inbox` so terminal-
+    transition sites (primary tick reconcile/drain, supervisor
+    reconcile/drain, replay-deferred drain, handoff) share one
+    invocation shape. Never raises; logs non-success outcomes to
+    stderr with the `site` tag so post-mortem analysis can correlate
+    a leaked inbox to the path that should have released it.
+
+    No-op (silently) when agent_id is empty — the caller may not have
+    a mapping (e.g., a sentinel from a pre-PR1 worker that never went
+    through the acquire-prompt path).
+
+    `fleet_home` accepts a Path or str (loop.py uses Path internally,
+    dispatch_mod expects a string env var) — we coerce here.
+    """
+    if not agent_id:
+        return
+    home_arg: str | None
+    if fleet_home is None:
+        home_arg = None
+    else:
+        home_arg = str(fleet_home)
+    try:
+        response = dispatch_mod.release_coord_prompt_inbox(
+            agent_id,
+            fleet_bin=fleet_bin,
+            fleet_home=home_arg,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # The helper is documented as never-raising, but a programmer
+        # error (e.g., a future refactor accidentally re-raising) must
+        # not crash the terminal-transition path.
+        import sys
+        print(
+            f"coord: release coord_prompt_inbox crashed at {site} "
+            f"slug={slug} agent_id={agent_id}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    outcome = response.get("outcome", "")
+    if outcome in (
+        dispatch_mod.RELEASE_OUTCOME_RELEASED,
+        dispatch_mod.RELEASE_OUTCOME_ALREADY_RELEASED,
+    ):
+        return
+    # Non-success outcomes: log but don't fail. absent + not_owned are
+    # expected in race scenarios; error indicates a fleet-binary fault
+    # that the PR4 sweeper will reconcile on its next sweep.
+    import sys
+    err = response.get("error", "")
+    print(
+        f"coord: release coord_prompt_inbox non-success at {site} "
+        f"slug={slug} agent_id={agent_id} outcome={outcome!r}"
+        + (f" error={err}" if err else ""),
+        file=sys.stderr,
+    )
+
+
 def _apply_reconcile(
     action: _ReconcileAction,
     project: str,
@@ -3045,6 +3195,31 @@ def _dispatch_review_handoffs(
             continue
 
         agent_id = dispatch_mod.mint_agent_id()
+        # PR1 dispatch-lifecycle: release the PRIOR dispatch's
+        # coord_prompt_inbox claim BEFORE acquiring the next one. The
+        # worker/reviewer that just emitted phase=review-pending or
+        # review-done has reached a terminal phase from THIS coord's
+        # perspective — its inbox + journal must be reclaimed before
+        # the next stage's subagent dispatches. Without this, every
+        # successful handoff leaks one inbox + one journal file.
+        #
+        # Best-effort: a non-success release outcome only logs to
+        # stderr; the handoff still proceeds. We look up the prior
+        # agent_id via the supervisor's slug → agent_id map (the only
+        # in-memory record of the outgoing subagent's identity).
+        if coord_state is not None:
+            prior_agent_id = supervisor_mod.load_agent_id_map(
+                coord_state,
+            ).get(t.slug, "")
+        else:
+            prior_agent_id = ""
+        _release_coord_prompt_inbox(
+            slug=t.slug,
+            agent_id=prior_agent_id,
+            fleet_bin=fleet_bin,
+            fleet_home=home,
+            site=f"handoff phase={phase}",
+        )
         # PR1 dispatch-lifecycle migration: same as _dispatch_ready,
         # but dispatch_kind reflects review-pending → "reviewer" and
         # review-done → "finisher" so the journal owner string + dispatch

@@ -1074,6 +1074,133 @@ def acquire_coord_prompt_inbox(
     raise AcquirePromptError(outcome or "error", proc.returncode, message)
 
 
+# Stable outcome strings returned by `fleet claims release` (see
+# cmd/fleet/claims.go + internal/dispatch). `released` and
+# `already_released` are both success (idempotent); `absent` /
+# `not_owned` are non-fatal terminal-race outcomes; everything else
+# is an `error` shape the caller logs and otherwise ignores. The
+# release helper never raises — terminal cleanup must not block task
+# progression on a transient `fleet` failure.
+RELEASE_OUTCOME_RELEASED = "released"
+RELEASE_OUTCOME_ALREADY_RELEASED = "already_released"
+RELEASE_OUTCOME_ABSENT = "absent"
+RELEASE_OUTCOME_NOT_OWNED = "not_owned"
+RELEASE_OUTCOME_ERROR = "error"
+
+
+def release_coord_prompt_inbox(
+    agent_id: str,
+    *,
+    host_id: str | None = None,
+    preserve: bool = False,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict:
+    """Release a coord_prompt_inbox Delivery claim via `fleet claims release`.
+
+    Symmetric to `acquire_coord_prompt_inbox`. DESIGN-dispatch-lifecycle.md
+    PR1 promises "Terminal-transition reclaim releases the inbox"; this
+    helper wires the Python coord half. Best-effort by design: never
+    raises. The returned dict carries the parsed CLI envelope with an
+    `outcome` field; callers (loop.py wrappers) log non-success
+    outcomes but do NOT abort the terminal transition. Rationale: the
+    inbox/journal leak is a defense-in-depth problem the PR4 sweeper
+    also catches; a terminal status flip blocked by a `fleet claims`
+    failure would be far worse than a stale inbox file.
+
+    Flow:
+      1. Validate agent_id locally. Malformed → return synthetic error
+         envelope (no subprocess).
+      2. Shell out: `fleet claims release <agent_id> --kind=coord_prompt_inbox
+         [--host-id=<h>] [--preserve]`.
+      3. Parse the JSON envelope from stdout.
+      4. Return the dict. Caller branches on `outcome`.
+
+    Outcomes the helper passes through:
+      - released         → claim was live, file unlinked (or archived
+                            when --preserve), journal updated to released.
+      - already_released → claim was already released (idempotent
+                            success, e.g., supervisor + primary tick
+                            race).
+      - absent           → no claim/journal on disk (e.g., a worker that
+                            never actually dispatched, or the file was
+                            manually removed). Non-fatal.
+      - not_owned        → cross-host refusal. Non-fatal: another host's
+                            coord owns the claim; we don't touch it.
+      - error            → CLI failed (binary missing, write race). The
+                            caller logs and continues; PR4 sweeper will
+                            reconcile any leaked file.
+
+    Args:
+      agent_id:   8-hex dispatch_id (== worker agent_id).
+      host_id:    optional override; defaults to fleet's HostID() on
+                  the Go side when omitted.
+      preserve:   when True, archive the inbox instead of unlinking
+                  (overrides the value recorded at acquire-time).
+      fleet_bin:  binary path (tests).
+      fleet_home: FLEET_HOME override (tests).
+      timeout_s:  subprocess timeout.
+
+    Returns the envelope dict. Always contains an `outcome` key; a
+    synthetic `{"outcome": "error", "error": "<msg>"}` is returned
+    for local failures (bad agent_id, FileNotFoundError, timeout)
+    rather than raising.
+    """
+    if not _AGENT_ID_FULL_RE.fullmatch(agent_id):
+        return {
+            "outcome": RELEASE_OUTCOME_ERROR,
+            "error": f"invalid agent_id {agent_id!r}: expected 8 hex chars",
+        }
+
+    cmd = [fleet_bin, "claims", "release", agent_id,
+           "--kind", "coord_prompt_inbox"]
+    if host_id:
+        cmd += ["--host-id", host_id]
+    if preserve:
+        cmd += ["--preserve"]
+
+    env = os.environ.copy()
+    if fleet_home:
+        env["FLEET_HOME"] = fleet_home
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+            env=env,
+        )
+    except FileNotFoundError as exc:
+        return {
+            "outcome": RELEASE_OUTCOME_ERROR,
+            "error": f"fleet binary not found: {exc}",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "outcome": RELEASE_OUTCOME_ERROR,
+            "error": f"fleet claims release timed out after {timeout_s}s",
+        }
+
+    response = _parse_claims_response(proc.stdout)
+    if not response:
+        # Empty / unparseable stdout — synthesize the error envelope so
+        # callers always have an outcome to branch on.
+        stderr = (proc.stderr or "").strip()
+        return {
+            "outcome": RELEASE_OUTCOME_ERROR,
+            "error": (
+                stderr
+                or f"fleet claims release returned no envelope (exit={proc.returncode})"
+            ),
+        }
+    # Pass through whatever outcome the CLI emitted, even unknown ones —
+    # the caller's `outcome in {...}` check is the routing decision.
+    return response
+
+
 def _parse_claims_response(stdout: str) -> dict:
     """Parse the last JSON envelope from `fleet claims` stdout.
 

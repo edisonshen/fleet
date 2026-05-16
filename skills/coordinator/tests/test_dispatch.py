@@ -865,3 +865,185 @@ def test_acquire_coord_prompt_inbox_e2e_via_real_fleet_bin(tmp_path) -> None:
     # Journal is on disk.
     journal = fleet_home / "dispatches" / "a690424b.json"
     assert journal.exists(), f"journal missing at {journal}"
+
+
+# ---------- release_coord_prompt_inbox (PR1 dispatch-lifecycle) ----------
+
+
+def test_release_coord_prompt_inbox_released(tmp_path) -> None:
+    """Happy path: CLI returns `released`, helper returns the envelope."""
+    envelope = (
+        '{"outcome":"released","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","path":"/tmp/x/inbox/a690424b.md"}\n'
+    )
+    with patch.object(dispatch.subprocess, "run", return_value=_fake_run(envelope)):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_RELEASED
+    assert out["dispatch_id"] == "a690424b"
+
+
+def test_release_coord_prompt_inbox_already_released_is_success(tmp_path) -> None:
+    """already_released is the idempotent re-release success outcome."""
+    envelope = (
+        '{"outcome":"already_released","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox"}\n'
+    )
+    with patch.object(dispatch.subprocess, "run", return_value=_fake_run(envelope)):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ALREADY_RELEASED
+
+
+def test_release_coord_prompt_inbox_absent_is_passed_through(tmp_path) -> None:
+    """absent is a non-fatal terminal-race outcome (no claim on disk)."""
+    envelope = (
+        '{"outcome":"absent","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox"}\n'
+    )
+    # absent is exit code 11 on the CLI side; the helper does NOT branch
+    # on returncode — it passes through the parsed outcome unchanged.
+    with patch.object(
+        dispatch.subprocess, "run",
+        return_value=_fake_run(envelope, returncode=11),
+    ):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ABSENT
+
+
+def test_release_coord_prompt_inbox_not_owned_is_passed_through(tmp_path) -> None:
+    """not_owned is the cross-host refusal outcome."""
+    envelope = (
+        '{"outcome":"not_owned","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox"}\n'
+    )
+    with patch.object(
+        dispatch.subprocess, "run",
+        return_value=_fake_run(envelope, returncode=10),
+    ):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_NOT_OWNED
+
+
+def test_release_coord_prompt_inbox_error_outcome_returns_envelope(tmp_path) -> None:
+    """`error` outcome does NOT raise — helper is best-effort by contract."""
+    envelope = (
+        '{"outcome":"error","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox","error":"journal write race"}\n'
+    )
+    with patch.object(
+        dispatch.subprocess, "run",
+        return_value=_fake_run(envelope, returncode=1),
+    ):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    # No exception. Caller branches on outcome.
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ERROR
+    assert out.get("error") == "journal write race"
+
+
+def test_release_coord_prompt_inbox_invalid_agent_id_returns_error(tmp_path) -> None:
+    """Malformed agent_id returns synthetic error envelope — no subprocess."""
+    with patch.object(dispatch.subprocess, "run") as mock_run:
+        out = dispatch.release_coord_prompt_inbox(
+            "not-hex", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ERROR
+    assert "invalid agent_id" in out["error"]
+    mock_run.assert_not_called()
+
+
+def test_release_coord_prompt_inbox_fleet_bin_missing_returns_error(tmp_path) -> None:
+    """FileNotFoundError from subprocess maps to synthetic error envelope."""
+    with patch.object(
+        dispatch.subprocess, "run",
+        side_effect=FileNotFoundError("no such binary"),
+    ):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ERROR
+    assert "not found" in out["error"]
+
+
+def test_release_coord_prompt_inbox_empty_stdout_returns_error(tmp_path) -> None:
+    """Empty stdout with non-zero exit synthesizes an error envelope."""
+    with patch.object(
+        dispatch.subprocess, "run",
+        return_value=_fake_run("", returncode=1, stderr="boom"),
+    ):
+        out = dispatch.release_coord_prompt_inbox(
+            "a690424b", fleet_home=str(tmp_path),
+        )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_ERROR
+    # The stderr is surfaced when stdout is empty.
+    assert "boom" in out["error"]
+
+
+def test_release_coord_prompt_inbox_passes_preserve_flag(tmp_path) -> None:
+    """The --preserve flag is propagated to the CLI argv when requested."""
+    envelope = (
+        '{"outcome":"released","dispatch_id":"a690424b",'
+        '"kind":"coord_prompt_inbox"}\n'
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _fake_run(envelope)
+
+    with patch.object(dispatch.subprocess, "run", side_effect=fake_run):
+        dispatch.release_coord_prompt_inbox(
+            "a690424b", preserve=True, fleet_home=str(tmp_path),
+        )
+    assert "--preserve" in captured["cmd"]
+
+
+def test_release_coord_prompt_inbox_e2e_via_real_fleet_bin(tmp_path) -> None:
+    """End-to-end: build fleet, acquire, release, assert files gone."""
+    fleet_bin = _build_fleet_bin(tmp_path)
+    if not fleet_bin:
+        pytest.skip("could not build fleet binary; skipping E2E shell-out test")
+
+    fleet_home = tmp_path / "home"
+    fleet_home.mkdir()
+    # Acquire first so there's a claim to release.
+    inbox_path = dispatch.acquire_coord_prompt_inbox(
+        "a690424b", "e2e release prompt body",
+        owner="project/test/slug/release-e2e",
+        fleet_bin=fleet_bin,
+        fleet_home=str(fleet_home),
+    )
+    journal = fleet_home / "dispatches" / "a690424b.json"
+    assert journal.exists()
+    assert os.path.exists(inbox_path)
+
+    out = dispatch.release_coord_prompt_inbox(
+        "a690424b",
+        fleet_bin=fleet_bin,
+        fleet_home=str(fleet_home),
+    )
+    assert out["outcome"] == dispatch.RELEASE_OUTCOME_RELEASED
+    # Inbox file unlinked by default (preserve=False).
+    assert not os.path.exists(inbox_path), (
+        f"inbox file still present after release: {inbox_path}"
+    )
+    # A second release is idempotent (already_released).
+    out2 = dispatch.release_coord_prompt_inbox(
+        "a690424b",
+        fleet_bin=fleet_bin,
+        fleet_home=str(fleet_home),
+    )
+    assert out2["outcome"] in (
+        dispatch.RELEASE_OUTCOME_ALREADY_RELEASED,
+        # CLI may report absent when both inbox and journal were
+        # cleaned up by the first release; either is valid idempotent.
+        dispatch.RELEASE_OUTCOME_ABSENT,
+    )

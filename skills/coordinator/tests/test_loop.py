@@ -163,6 +163,28 @@ def dispatch_subprocess(monkeypatch):
             return subprocess.CompletedProcess(
                 args=cmd, returncode=0, stdout=envelope, stderr="",
             )
+        # PR1 dispatch-lifecycle: also emulate `fleet claims release`
+        # so terminal-transition wire sites in loop.py don't spam stderr
+        # with synthetic-error envelopes. The emulator unlinks the
+        # acquire-mirror file (best-effort) and emits a released envelope.
+        if cmd[1:3] == ["claims", "release"]:
+            agent_id = cmd[3]
+            fleet_home = (env or os.environ).get("FLEET_HOME") or os.path.expanduser("~/.fleet")
+            path = os.path.join(fleet_home, "inbox", f"{agent_id}.md")
+            outcome = "released"
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                outcome = "already_released"
+            except OSError:
+                pass
+            envelope = (
+                f'{{"outcome":"{outcome}","dispatch_id":"{agent_id}",'
+                f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+            )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=envelope, stderr="",
+            )
         return subprocess.CompletedProcess(
             args=cmd, returncode=0, stdout="", stderr="",
         )
@@ -419,6 +441,333 @@ def test_slug_mismatch_sentinel_ignored(
     # didn't supply a real dispatch chain in this test fixture's
     # subprocess stub — but it doesn't matter for this assertion).
     assert result.drained == 0
+
+
+# ---------- terminal release wire sites (PR1 dispatch-lifecycle) ----------
+#
+# Codex iter-3 [P1]: terminal-transition sites in loop.py must shell out
+# to `fleet claims release` so the coord_prompt_inbox + journal are
+# reclaimed when a worker hits a terminal phase. These tests assert the
+# release shell-out fires at each of the 5 sites (primary reconcile,
+# primary sentinel, supervisor reconcile, supervisor drain, supervisor
+# replay-deferred drain, handoff) and inspect the dispatch_subprocess
+# seen_cmds recorder to confirm the call was made for the right
+# agent_id.
+
+
+def _seed_coord_state(
+    project_dir: Path, *, agent_id_map: dict[str, str],
+) -> None:
+    """Write a coord-state.json with the supplied slug → agent_id map.
+
+    Mirrors supervisor_mod.remember_agent_id's on-disk shape so the
+    in-tick lookup in _release_coord_prompt_inbox finds the agent_id
+    for terminal transitions on already-in-progress workers.
+    """
+    state_path = project_dir / "coord-state.json"
+    state = {}
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
+    state["worker_agent_ids"] = dict(agent_id_map)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_reconcile_terminal_releases_coord_prompt_inbox(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Wire site #1: primary tick reconcile clear_worker path.
+
+    A worker that died without opening a PR transitions to status=todo
+    with clear_worker=True. The release wire MUST fire `fleet claims
+    release <agent_id>` BEFORE forget_agent_id drops the mapping.
+    """
+    _write_tasks(project_dir, [
+        _make_task("dying-aaaa", status="in-progress", worker_pid=1, pr_url=""),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"dying-aaaa": "deadbe01"},
+    )
+    # Also seed the inbox file so the emulator has something to unlink.
+    inbox = fleet_home / "inbox" / "deadbe01.md"
+    inbox.write_text("worker prompt body\n", encoding="utf-8")
+
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    # Release call fired for the worker's agent_id.
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert len(release_calls) >= 1, (
+        f"expected fleet claims release; seen_cmds={dispatch_subprocess.seen_cmds!r}"
+    )
+    assert release_calls[0][3] == "deadbe01"
+    # Inbox file unlinked by the emulator.
+    assert not inbox.exists(), "release wire should unlink the inbox"
+    # Mapping forgotten AFTER release ran (we can't observe ordering
+    # post-hoc, but we can verify the final state).
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert "dying-aaaa" not in state.get("worker_agent_ids", {})
+
+
+def test_sentinel_task_done_pr_releases_coord_prompt_inbox(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Wire site #2: primary tick TASK_DONE_PR sentinel drain.
+
+    A worker that posted TASK_DONE_PR has reached TerminalSuccess. The
+    release wire MUST fire as part of the apply path.
+    """
+    _write_tasks(project_dir, [
+        _make_task("done-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"done-aaaa": "feedf001"},
+    )
+    inbox = fleet_home / "inbox" / "feedf001.md"
+    inbox.write_text("done worker prompt\n", encoding="utf-8")
+    coord = "cccccc01"
+    _write_archive(
+        fleet_home, coord, "20260506-120000Z",
+        "TASK_DONE_PR=done-aaaa https://github.com/x/y/pull/42\n",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        result = loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    assert result.drained == 1
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert len(release_calls) >= 1, (
+        f"expected fleet claims release; seen_cmds={dispatch_subprocess.seen_cmds!r}"
+    )
+    assert release_calls[0][3] == "feedf001"
+    assert not inbox.exists()
+
+
+def test_sentinel_worker_failed_releases_coord_prompt_inbox(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Wire site #2 cont.: WORKER_FAILED sentinel also releases."""
+    _write_tasks(project_dir, [
+        _make_task("fail-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"fail-aaaa": "deaddead"},
+    )
+    inbox = fleet_home / "inbox" / "deaddead.md"
+    inbox.write_text("failed worker prompt\n", encoding="utf-8")
+    coord = "cccccc01"
+    _write_archive(
+        fleet_home, coord, "20260506-120000Z",
+        "WORKER_FAILED=fail-aaaa panic in worker\n",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert any(c[3] == "deaddead" for c in release_calls)
+    assert not inbox.exists()
+
+
+def test_sentinel_blocked_question_does_NOT_release(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """BLOCKED_QUESTION carve-out: blocked workers stay alive so the
+    operator can answer via the inbox. The release wire MUST NOT fire."""
+    _write_tasks(project_dir, [
+        _make_task("blocked-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"blocked-aaaa": "ab0ckedd"},
+    )
+    inbox = fleet_home / "inbox" / "ab0ckedd.md"
+    inbox.write_text("blocked worker prompt\n", encoding="utf-8")
+    coord = "cccccc01"
+    _write_archive(
+        fleet_home, coord, "20260506-120000Z",
+        "BLOCKED_QUESTION=blocked-aaaa What is the API key for X?\n",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    # Critical: NO release for the blocked agent_id.
+    assert not any(c[3] == "ab0ckedd" for c in release_calls), (
+        f"BLOCKED_QUESTION should NOT release: seen={release_calls!r}"
+    )
+    # Inbox file kept (operator may write back via answer-blocked).
+    assert inbox.exists()
+    # And the agent_id mapping is preserved.
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state.get("worker_agent_ids", {}).get("blocked-aaaa") == "ab0ckedd"
+
+
+def test_terminal_release_is_idempotent_across_double_drain(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Two consecutive ticks with the same sentinel must not crash.
+
+    Second tick has nothing to drain (watermark advanced) so no second
+    release fires — release is naturally tied to the apply path.
+    """
+    _write_tasks(project_dir, [
+        _make_task("dupe-aaaa", status="in-progress", worker_pid=99999),
+    ])
+    _seed_coord_state(
+        project_dir, agent_id_map={"dupe-aaaa": "1dedface"},
+    )
+    inbox = fleet_home / "inbox" / "1dedface.md"
+    inbox.write_text("dupe worker prompt\n", encoding="utf-8")
+    coord = "cccccc01"
+    _write_archive(
+        fleet_home, coord, "20260506-120000Z",
+        "TASK_DONE_PR=dupe-aaaa https://github.com/x/y/pull/9\n",
+    )
+    with patch.object(loop, "_pid_alive", return_value=True):
+        loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    first_releases = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert len(first_releases) == 1
+    assert not inbox.exists()
+
+    # Second tick — same archive file, watermark advanced. No re-release.
+    pre_count = len(dispatch_subprocess.seen_cmds)
+    with patch.object(loop, "_pid_alive", return_value=True):
+        loop.tick(
+            "fleet", coord_id=coord, cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+    post_count = len(dispatch_subprocess.seen_cmds)
+    second_releases = [
+        c for c in dispatch_subprocess.seen_cmds[pre_count:]
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert second_releases == [], (
+        f"second tick should not re-release: {second_releases!r}"
+    )
+    assert post_count >= pre_count  # may include fetch_learnings etc.
+
+
+def test_handoff_release_runs_before_acquire(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Wire site #6: handoff in _dispatch_review_handoffs releases the
+    PRIOR dispatch's claim BEFORE acquiring the next stage's claim.
+
+    Without this, every successful review-pending → reviewer or
+    review-done → finisher transition leaks one inbox + one journal.
+    """
+    # A task in-progress whose worker has exited (worker_pid=0) and
+    # whose state.json reports phase=review-pending → handoff to
+    # reviewer.
+    _write_tasks(project_dir, [
+        _make_task("handoff-aaaa", status="in-progress", worker_pid=0),
+    ])
+    # Seed the prior worker's agent_id so the handoff release has
+    # something to look up.
+    _seed_coord_state(
+        project_dir, agent_id_map={"handoff-aaaa": "abcd0001"},
+    )
+    # Drop the worker's state.json (phase=review-pending).
+    workers_dir = project_dir / "workers" / "handoff-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}),
+        encoding="utf-8",
+    )
+    inbox_prior = fleet_home / "inbox" / "abcd0001.md"
+    inbox_prior.write_text("worker prompt\n", encoding="utf-8")
+    # Pin the reviewer's agent_id for assertion.
+    dispatch_subprocess.append("ee111e11")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # Inspect argv order: release for abcd0001 must precede
+    # acquire-prompt for reviewer1.
+    seen = dispatch_subprocess.seen_cmds
+    release_idx = next(
+        (i for i, c in enumerate(seen)
+         if c[1:3] == ["claims", "release"] and c[3] == "abcd0001"),
+        None,
+    )
+    acquire_idx = next(
+        (i for i, c in enumerate(seen)
+         if c[1:3] == ["claims", "acquire-prompt"] and c[3] == "ee111e11"),
+        None,
+    )
+    assert release_idx is not None, (
+        f"handoff did not release prior agent_id; seen={seen!r}"
+    )
+    assert acquire_idx is not None, "handoff did not acquire new claim"
+    assert release_idx < acquire_idx, (
+        f"release must run BEFORE acquire: release@{release_idx} >= acquire@{acquire_idx}"
+    )
+    # The prior worker's inbox is unlinked.
+    assert not inbox_prior.exists()
+
+
+def test_terminal_release_skipped_when_no_agent_id_known(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Defensive: if the coord-state has no agent_id for the slug (e.g.,
+    legacy pre-PR1 worker), the release wire is a silent no-op rather
+    than a crash. PR4 sweeper will reconcile any leaked file."""
+    _write_tasks(project_dir, [
+        _make_task("legacy-aaaa", status="in-progress", worker_pid=1),
+    ])
+    # No coord-state seeded → empty agent_id map.
+    with patch.object(loop, "_pid_alive", return_value=False):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    release_calls = [
+        c for c in dispatch_subprocess.seen_cmds
+        if c[1:3] == ["claims", "release"]
+    ]
+    assert release_calls == [], (
+        f"release should not fire without an agent_id: {release_calls!r}"
+    )
 
 
 def test_tick_respects_cap_one_with_two_ready(

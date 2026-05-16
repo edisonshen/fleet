@@ -40,35 +40,53 @@ def _err(stderr: str, returncode: int = 1) -> subprocess.CompletedProcess:
 
 
 def _maybe_claims_emulator(cmd, kwargs):
-    """Emulate `fleet claims acquire-prompt` for loop.py tests that
-    intercept subprocess.run.
+    """Emulate `fleet claims acquire-prompt` + `release` for loop.py
+    tests that intercept subprocess.run.
 
     PR1 dispatch-lifecycle migration: loop.py now calls
-    `fleet claims acquire-prompt` to write the inbox file. Tests that
-    patched dispatch_mod.subprocess.run pre-PR1 didn't need to handle
-    this argv shape; this helper preserves the existing fixture API by
-    writing the inbox file + returning the JSON envelope automatically
-    whenever the patched run sees the claims argv. Returns None when
-    cmd isn't a claims call (caller falls through to its own routing).
+    `fleet claims acquire-prompt` to write the inbox file and
+    `fleet claims release` to unlink it on terminal transitions.
+    Tests that patched dispatch_mod.subprocess.run pre-PR1 didn't
+    need to handle these argv shapes; this helper preserves the
+    existing fixture API by emulating the side effects + envelope
+    automatically. Returns None when cmd isn't a claims call (caller
+    falls through to its own routing).
     """
-    if len(cmd) < 3 or cmd[1:3] != ["claims", "acquire-prompt"]:
+    if len(cmd) < 4:
         return None
-    agent_id = cmd[3]
     env = kwargs.get("env") or os.environ
     fleet_home = env.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
-    inbox_dir = os.path.join(fleet_home, "inbox")
-    os.makedirs(inbox_dir, exist_ok=True)
-    path = os.path.join(inbox_dir, f"{agent_id}.md")
-    body = kwargs.get("input") or ""
-    if body and not body.endswith("\n"):
-        body = body + "\n"
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    envelope = (
-        f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
-        f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
-    )
-    return _ok(stdout=envelope)
+    if cmd[1:3] == ["claims", "acquire-prompt"]:
+        agent_id = cmd[3]
+        inbox_dir = os.path.join(fleet_home, "inbox")
+        os.makedirs(inbox_dir, exist_ok=True)
+        path = os.path.join(inbox_dir, f"{agent_id}.md")
+        body = kwargs.get("input") or ""
+        if body and not body.endswith("\n"):
+            body = body + "\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        envelope = (
+            f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+            f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+        )
+        return _ok(stdout=envelope)
+    if cmd[1:3] == ["claims", "release"]:
+        agent_id = cmd[3]
+        path = os.path.join(fleet_home, "inbox", f"{agent_id}.md")
+        outcome = "released"
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            outcome = "already_released"
+        except OSError:
+            pass
+        envelope = (
+            f'{{"outcome":"{outcome}","dispatch_id":"{agent_id}",'
+            f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+        )
+        return _ok(stdout=envelope)
+    return None
 
 
 def test_compute_worktree_path_invokes_fleet_cli() -> None:

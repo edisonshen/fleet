@@ -46,32 +46,51 @@ def _in_progress(slug: str, spec: str = "") -> parse.Task:
 
 
 def _claims_emulator(cmd, kwargs):
-    """Emulate fleet claims acquire-prompt: write inbox + emit envelope.
+    """Emulate fleet claims acquire-prompt + release: write/unlink inbox
+    + emit envelope.
 
     PR1 dispatch-lifecycle: loop.py shells out to `fleet claims
-    acquire-prompt` rather than writing the inbox directly. Tests
-    that intercept subprocess.run need to emulate the CLI's side
-    effects (file written) AND its JSON envelope output so the
-    Python caller can parse a valid response.
+    acquire-prompt` and `fleet claims release` rather than writing
+    the inbox directly. Tests that intercept subprocess.run need to
+    emulate the CLI's side effects (file written / unlinked) AND its
+    JSON envelope output so the Python caller can parse a valid
+    response.
     """
-    if len(cmd) < 4 or cmd[1:3] != ["claims", "acquire-prompt"]:
+    if len(cmd) < 4:
         return None
-    agent_id = cmd[3]
     env = kwargs.get("env") or os.environ
     fleet_home = env.get("FLEET_HOME") or os.path.expanduser("~/.fleet")
-    inbox_dir = os.path.join(fleet_home, "inbox")
-    os.makedirs(inbox_dir, exist_ok=True)
-    path = os.path.join(inbox_dir, f"{agent_id}.md")
-    body = kwargs.get("input") or ""
-    if body and not body.endswith("\n"):
-        body = body + "\n"
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(body)
-    envelope = (
-        f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
-        f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
-    )
-    return _ok(stdout=envelope)
+    if cmd[1:3] == ["claims", "acquire-prompt"]:
+        agent_id = cmd[3]
+        inbox_dir = os.path.join(fleet_home, "inbox")
+        os.makedirs(inbox_dir, exist_ok=True)
+        path = os.path.join(inbox_dir, f"{agent_id}.md")
+        body = kwargs.get("input") or ""
+        if body and not body.endswith("\n"):
+            body = body + "\n"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        envelope = (
+            f'{{"outcome":"acquired","dispatch_id":"{agent_id}",'
+            f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+        )
+        return _ok(stdout=envelope)
+    if cmd[1:3] == ["claims", "release"]:
+        agent_id = cmd[3]
+        path = os.path.join(fleet_home, "inbox", f"{agent_id}.md")
+        outcome = "released"
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            outcome = "already_released"
+        except OSError:
+            pass
+        envelope = (
+            f'{{"outcome":"{outcome}","dispatch_id":"{agent_id}",'
+            f'"kind":"coord_prompt_inbox","path":"{path}"}}\n'
+        )
+        return _ok(stdout=envelope)
+    return None
 
 
 def _make_router(routes: dict, calls: list | None = None):
