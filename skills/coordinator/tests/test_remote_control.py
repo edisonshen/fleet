@@ -64,7 +64,34 @@ def fake_popen(monkeypatch: pytest.MonkeyPatch) -> _FakePopen:
     return fake
 
 
+def _enable_rc_bootstrap_for_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear FLEET_RC_BOOTSTRAP_DISABLED for the duration of one test.
+
+    rc-listener-bootstrap-sk-3e98: the session-autouse fixture in
+    skills/coordinator/tests/conftest.py sets the env var to "1" for
+    the whole pytest run, which makes `spawn_daemon_if_needed` short-
+    circuit before subprocess.Popen fires. The legacy tests in this
+    file assert the SHAPE of the bash bootstrap command (pgrep guard,
+    nohup flags, devnull streams) and therefore need the production
+    code path to run end-to-end. The Popen patched in via fake_popen
+    is the _FakePopen above — calling it doesn't fork a real listener,
+    so opting back in here is safe.
+
+    Mirror of cmd/fleet/rc_bootstrap_env_test.go::enableRCBootstrapForTest.
+    """
+    monkeypatch.delenv("FLEET_RC_BOOTSTRAP_DISABLED", raising=False)
+
+
 class TestSpawnDaemonIfNeeded:
+    @pytest.fixture(autouse=True)
+    def _opt_in_rc_bootstrap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every test in this class asserts on the SHAPE of the bash
+        bootstrap that spawn_daemon_if_needed produces. The session
+        env-gate (conftest.py) would short-circuit before the bash
+        payload is built; opt in per-class so the production code path
+        runs against the _FakePopen-mocked subprocess.Popen."""
+        _enable_rc_bootstrap_for_test(monkeypatch)
+
     def test_invokes_bash_with_narrow_pgrep_guard(
         self, fake_popen: _FakePopen,
     ) -> None:
@@ -420,11 +447,17 @@ class TestBootstrap:
     def test_first_call_writes_marker_and_inbox(
         self, fleet_home: Path, fake_popen: _FakePopen,
         isolated_bootstrap_log: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """End-to-end happy path: marker absent → daemon attempted +
         inbox seeded + marker written. Returns STATUS_OK. No log line
         — the OK path is silent (quiet success per BOOTSTRAP_LOG
         contract)."""
+        # rc-listener-bootstrap-sk-3e98: assert "daemon attempted"
+        # requires opting back into the bash-bootstrap path (the
+        # session env-gate would otherwise short-circuit before Popen
+        # fires, making fake_popen.daemon_calls stay empty).
+        _enable_rc_bootstrap_for_test(monkeypatch)
         status = remote_control.bootstrap_remote_control(
             "myproj", "abcd1234", fleet_home=fleet_home,
         )
@@ -470,10 +503,14 @@ class TestBootstrap:
 
     def test_per_coord_marker_isolation(
         self, fleet_home: Path, fake_popen: _FakePopen,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A new coord_id (post-handoff replacement) re-bootstraps,
         even when an old coord's marker exists. The marker filename
         carries the coord_id suffix so old + new are independent."""
+        # rc-listener-bootstrap-sk-3e98: assert "daemon attempt fired"
+        # requires opting back into the bash-bootstrap path.
+        _enable_rc_bootstrap_for_test(monkeypatch)
         proj_dir = fleet_home / "projects" / "myproj"
         proj_dir.mkdir(parents=True)
         # Old coord's marker.
@@ -618,6 +655,9 @@ class TestBootstrap:
         re-launch). Returns STATUS_FAILED_SEED + log line so the
         operator can grep BOOTSTRAP_LOG. Distinct from the
         inbox-busy path above (which is self-healing and quiet)."""
+        # rc-listener-bootstrap-sk-3e98: assert "daemon was still
+        # attempted" requires opting back into the bash-bootstrap path.
+        _enable_rc_bootstrap_for_test(monkeypatch)
         # Force seed_inbox to return False without touching disk.
         monkeypatch.setattr(
             remote_control, "seed_inbox", lambda *_args, **_kwargs: False,
@@ -724,6 +764,11 @@ class TestLoopIntegration:
         """Run loop.tick() against an empty project. Bootstrap fires
         on the first tick (Popen invoked + inbox file present + marker
         file present)."""
+        # rc-listener-bootstrap-sk-3e98: assert "Popen invoked" requires
+        # opting back into the bash-bootstrap path (session env-gate
+        # would otherwise short-circuit spawn_daemon_if_needed before
+        # Popen fires).
+        _enable_rc_bootstrap_for_test(monkeypatch)
         import loop
         home = tmp_path / "fleet"
         home.mkdir()

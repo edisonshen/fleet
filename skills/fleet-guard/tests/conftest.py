@@ -18,6 +18,30 @@ if _SKILL_DIR not in sys.path:
     sys.path.insert(0, _SKILL_DIR)
 
 
+# rc-listener-bootstrap-sk-3e98: defense-in-depth env-gate for fleet-
+# guard tests. handoff.first_action() returns the bash bootstrap as a
+# STRING (it's never exec'd from Python — operator/agent runs it
+# manually), so this isn't strictly required today. But the gate keeps
+# fleet-guard symmetric with the coordinator-side gate AND insulates
+# against a future change that adds an exec'd bootstrap path here
+# (issue #56-style auto-spawn in handoff itself).
+#
+# Set at module-import time so any test that loads the handoff module
+# inherits the gate before the first import; the autouse session
+# fixture below re-asserts it for hostile-test scenarios.
+os.environ.setdefault("FLEET_RC_BOOTSTRAP_DISABLED", "1")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _disable_rc_bootstrap_session_fleet_guard() -> None:
+    """Mirror of skills/coordinator/tests/conftest.py session gate.
+    Lives here for defense in depth: handoff.first_action returns
+    markdown today (no exec under pytest), but any future fleet-guard
+    code that shells out to `claude remote-control` will inherit the
+    gate without extra wiring."""
+    os.environ["FLEET_RC_BOOTSTRAP_DISABLED"] = "1"
+
+
 @pytest.fixture(autouse=True)
 def _silence_kick_drain(monkeypatch: pytest.MonkeyPatch) -> None:
     """Producer-triggers-drain (`main._on_stop` / `_on_precompact` call

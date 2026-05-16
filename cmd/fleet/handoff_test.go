@@ -1102,6 +1102,7 @@ func TestHandoff_DeadSession_RecoveryStillWinsWhenPendingExists(t *testing.T) {
 // params, then `printf '%s\n' "$@"` echoes them so the pane shows the
 // effective argv. This sidesteps claude's TUI overwriting the pane.
 func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	requireTmux(t)
 	setupFleetHome(t)
 

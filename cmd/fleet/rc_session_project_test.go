@@ -145,6 +145,7 @@ func TestHandoff_RemoteControlSessionName_StartsWithDaemonPrefix(t *testing.T) {
 // `--remote-control "fleet-coord-<id>-<project>"`. Pre-fix this test
 // would see only `fleet-coord-<id>` (no project suffix).
 func TestCoordSpawn_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)
@@ -170,6 +171,7 @@ func TestCoordSpawn_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
 // TestHandoff_RemoteControlSessionName_StartsWithDaemonPrefix for
 // the full rationale).
 func TestHandoff_RemoteControlInjection_IncludesProjectInArgv(t *testing.T) {
+	enableRCBootstrapForTest(t)
 	cmd := newDispatchCmd()
 	flag := cmd.Flag("command")
 	slice := flag.Value.(pflag.SliceValue)

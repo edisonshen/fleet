@@ -313,6 +313,28 @@ def spawn_daemon_if_needed() -> bool:
     `--remote-control-session-name-prefix fleet-coord` literal so
     fleet-handoff daemons no longer mask the coord launch.
     """
+    # FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
+    # symmetric with the Go-side cmd/fleet/dispatch.go gate at
+    # injectRemoteControlFlag. When this env var is set to any non-
+    # empty value, skip the bash bootstrap entirely so `pytest skills/`
+    # runs don't fork a real `claude remote-control` listener that
+    # registers with the operator's Claude Code service and pushes a
+    # mobile notification. Production behaviour (env unset) is
+    # preserved — the subprocess.Popen path below runs as before.
+    #
+    # Returns True (no-op success) so callers (bootstrap_remote_control)
+    # don't treat the skip as a spawn failure and log a spurious
+    # "spawn failed" line to BOOTSTRAP_LOG on every tick.
+    #
+    # The session-scoped autouse fixture in
+    # skills/coordinator/tests/conftest.py sets the env for the whole
+    # pytest run; legacy `_FakePopen`-style tests that assert on the
+    # bash shell shape call `enable_rc_bootstrap_for_test(monkeypatch)`
+    # (see test_rc_bootstrap_env_gate.py) to opt back in — mirror of
+    # the Go-side `enableRCBootstrapForTest(t)` helper in
+    # cmd/fleet/rc_bootstrap_env_test.go.
+    if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
+        return True
     # ASCII flow:
     #
     #   pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-coord( |$)'
