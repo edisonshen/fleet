@@ -39,7 +39,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 
 	"github.com/spf13/cobra"
 
@@ -333,7 +332,3 @@ func claimsOutcomeFromErr(err error) string {
 	}
 	return ""
 }
-
-// Make sure os import (used by main.go's exit path) is referenced if
-// the package is built with only this file.
-var _ = os.Stdin

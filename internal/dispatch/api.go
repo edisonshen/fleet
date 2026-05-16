@@ -2,7 +2,6 @@ package dispatch
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"os"
 )
@@ -304,6 +303,3 @@ func HostID() string {
 // interface at compile time — guards against accidental signature drift
 // when PR2 adds Rewrite().
 var _ DeliveryController = (*coordPromptInboxController)(nil)
-
-// _ silences "fmt imported and not used" — used by the controller file.
-var _ = fmt.Sprintf
