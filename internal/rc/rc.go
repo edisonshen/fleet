@@ -389,8 +389,22 @@ func Down(project string) (string, error) {
 		markerHad := MarkerPresent(project)
 		cur, stateErr := ReadState(project)
 		stateHad := stateErr == nil
+		// codex round-4 P2: distinguish "state file missing" from
+		// "state file present but malformed". The latter is exactly
+		// the case `fleet rc reset` exists to clean up — if we
+		// returned already_released and skipped RemoveState, the
+		// operator would be stuck with a corrupt rc-state.json that
+		// `fleet rc status` keeps failing on. Surface a stderr
+		// diagnostic so they know we cleaned a corrupt file (not
+		// just a missing one) before falling through to cleanup.
+		stateCorrupt := stateErr != nil && !errors.Is(stateErr, ErrStateMissing)
+		if stateCorrupt {
+			fmt.Fprintf(os.Stderr,
+				"rc.Down: project %q has malformed rc-state.json (%v); removing it as part of teardown\n",
+				project, stateErr)
+		}
 
-		if !markerHad && !stateHad {
+		if !markerHad && !stateHad && !stateCorrupt {
 			return OutcomeAlreadyReleased, nil
 		}
 
@@ -665,19 +679,23 @@ func SetKillFnForTest(fn func(int)) func() {
 	return func() { killFn = prev }
 }
 
-// pgrepDetect shells out to `pgrep -af "claude.*remote-control"` to
-// find candidate listener PIDs, filters by session_prefix in argv,
-// then verifies cwd matches workingDir via `lsof -a -p <pid> -d cwd`.
+// pgrepDetect finds candidate listener PIDs via `pgrep -f
+// "claude.*remote-control"` (portable: macOS/Linux/BSD all support
+// -f matching against argv). For each candidate, it then inspects
+// argv via `ps -p <pid> -o args=` to filter on SessionPrefix, and
+// verifies cwd matches workingDir via `lsof -a -p <pid> -d cwd`.
 //
-// codex P2 (round-3 catch): the previous stub always returned false,
-// making the duplicate-spawn refusal gate dead code in production.
-// This impl restores it.
+// codex round-3 P2: the previous stub always returned false, making
+// the duplicate-spawn refusal gate dead code. codex round-4 P2:
+// the first restoration used `pgrep -a` which is Linux-only — on
+// macOS/BSD it fails and the gate degraded to false again. This
+// version uses only portable flags and per-PID `ps` for argv.
 //
-// Best-effort: missing pgrep/lsof on minimal containers emits a
-// one-line stderr diagnostic so the operator knows the gate is
-// degraded (surface-don't-silo), then returns false. A false
-// negative just allows a fresh spawn — same outcome as no listener
-// alive — so the operator can still recover via `fleet rc reset`.
+// Best-effort: missing pgrep/ps/lsof emits a one-line stderr
+// diagnostic so the operator knows the gate is degraded (surface-
+// don't-silo), then returns false. A false negative just allows a
+// fresh spawn — same outcome as no listener alive — so recovery
+// stays available via `fleet rc reset`.
 //
 // pgrep exit semantics:
 //
@@ -688,7 +706,7 @@ func pgrepDetect(workingDir string) (bool, error) {
 	if workingDir == "" {
 		return false, nil
 	}
-	out, err := exec.Command("pgrep", "-af", "claude.*remote-control").Output()
+	out, err := exec.Command("pgrep", "-f", "claude.*remote-control").Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return false, nil // no matches
@@ -698,22 +716,22 @@ func pgrepDetect(workingDir string) (bool, error) {
 			err)
 		return false, nil
 	}
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if line == "" || !strings.Contains(line, SessionPrefix) {
+	for _, pidStr := range strings.Fields(string(out)) {
+		pid, perr := strconv.Atoi(pidStr)
+		if perr != nil || pid <= 0 {
 			continue
 		}
-		sp := strings.IndexByte(line, ' ')
-		if sp <= 0 {
+		argsOut, aerr := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+		if aerr != nil {
+			// ps refusal usually means the process exited between
+			// pgrep and ps — treat as no match for this PID.
 			continue
 		}
-		pid, perr := strconv.Atoi(line[:sp])
-		if perr != nil {
+		if !strings.Contains(string(argsOut), SessionPrefix) {
 			continue
 		}
 		cwdOut, lerr := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 		if lerr != nil {
-			// Couldn't read cwd — surface once per Up call so the
-			// operator knows the gate degraded gracefully.
 			fmt.Fprintf(os.Stderr,
 				"rc: lsof unavailable for pid %d; duplicate-spawn refusal gate degraded (%v)\n",
 				pid, lerr)

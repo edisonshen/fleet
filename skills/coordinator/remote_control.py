@@ -369,9 +369,19 @@ def spawn_daemon_if_needed(project: str = "") -> bool:
     # The Go side handles working_dir resolution (meta.json + live
     # coord fallback) so the Python side doesn't need to thread it
     # through.
+    #
+    # codex round-4 P2: honor FLEET_BIN before falling back to PATH.
+    # Fleet-spawned agents have this env stamped (see internal/spawn)
+    # so side-loaded or `go run ./cmd/fleet` installs work without
+    # the binary being on PATH. Without this lookup, those installs
+    # FileNotFoundError out → spawn returns False → bootstrap returns
+    # STATUS_NOT_ENABLED → coord never gets RC even after operator
+    # enables it. Surface a stderr diagnostic if the resolved bin
+    # doesn't exist so the operator can correlate.
+    fleet_bin = os.environ.get("FLEET_BIN") or "fleet"
     try:
         result = subprocess.run(
-            ["fleet", "rc", "up", project, "--respawn-only", "--idempotent"],
+            [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -390,10 +400,14 @@ def spawn_daemon_if_needed(project: str = "") -> bool:
             return False
         return True
     except FileNotFoundError:
-        # `fleet` binary not on PATH — extremely unlikely (the coord
-        # skill is invoked from a fleet-managed shell), but fail-soft.
+        # Resolved fleet binary missing — extremely unlikely (the coord
+        # skill is invoked from a fleet-managed shell with FLEET_BIN
+        # stamped), but fail-soft + surface the resolved path so the
+        # operator can diagnose side-loaded installs.
         print(
-            "coord remote-control: fleet binary not found; listener not spawned",
+            f"coord remote-control: fleet binary {fleet_bin!r} not found "
+            f"(FLEET_BIN={os.environ.get('FLEET_BIN', '')!r}); "
+            f"listener not spawned",
             file=sys.stderr,
         )
         return False

@@ -83,6 +83,38 @@ func TestUp_IdempotentReAcquireReturnsAlreadyAcquired(t *testing.T) {
 	}
 }
 
+// TestDown_RemovesCorruptStateEvenWithoutMarker (codex round-4 P2):
+// `fleet rc reset` (which delegates to Down) exists to clean corrupt
+// rc-state.json. The pre-fix code returned already_released when the
+// marker was absent, skipping RemoveState, leaving the operator stuck
+// with a state file that `fleet rc status` keeps choking on. Now the
+// path distinguishes ErrStateMissing from parse errors and proceeds
+// to teardown even with marker absent + state corrupt.
+func TestDown_RemovesCorruptStateEvenWithoutMarker(t *testing.T) {
+	root := withFleetHome(t)
+	// Marker absent. Write a malformed rc-state.json that ReadState
+	// will refuse to parse.
+	projDir := root + "/projects/demo"
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	statePath := projDir + "/rc-state.json"
+	if err := os.WriteFile(statePath, []byte("{not valid json}"), 0o644); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+
+	out, err := Down("demo")
+	if err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if out != OutcomeReleased {
+		t.Fatalf("outcome=%q want %q (corrupt state must be cleaned, not skipped)", out, OutcomeReleased)
+	}
+	if _, statErr := os.Stat(statePath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("corrupt rc-state.json should have been removed; stat err=%v", statErr)
+	}
+}
+
 // TestUp_AdoptVerifyFailRespawns (codex round-3 P2): if the recorded
 // PID is alive but argv does not match session_prefix (kernel PID
 // reuse, external kill), Up must NOT return already_acquired with
