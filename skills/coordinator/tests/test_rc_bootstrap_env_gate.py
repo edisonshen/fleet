@@ -308,6 +308,55 @@ class TestBootstrapRemoteControlGate:
         )
 
 
+class TestBootstrapHonorsNotEnabled:
+    """codex round-3 P2: when `fleet rc up --respawn-only --idempotent`
+    returns exit 10 (outcome=not_enabled — operator hasn't run
+    `fleet rc up <project>`), spawn_daemon_if_needed returns False.
+    The OUTER bootstrap caller must respect that: no inbox seed, no
+    per-coord marker write. Otherwise the marker blocks future ticks
+    from retrying once the operator enables RC.
+    """
+
+    def test_not_enabled_skips_inbox_and_marker(
+        self,
+        fleet_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        enable_rc_bootstrap_for_test(monkeypatch)
+
+        def _fake_run(args, **kwargs):
+            # exit 10 = outcome=not_enabled (Go side rc.OutcomeNotEnabled
+            # mapping). spawn_daemon_if_needed treats any non-zero as
+            # False per S1 contract.
+            return type("R", (), {"returncode": 10})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_NOT_ENABLED, (
+            f"bootstrap must surface not_enabled when fleet rc up "
+            f"returns exit 10; got {status!r}"
+        )
+        # CRITICAL: marker must NOT be written. The next tick must
+        # retry once the operator enables RC.
+        marker = (
+            fleet_home / "projects" / "myproj"
+            / ".remote-control-bootstrap-abcd1234"
+        )
+        assert not marker.exists(), (
+            "bootstrap marker must NOT be written when RC is not "
+            "enabled; otherwise the coord never retries after the "
+            "operator enables RC"
+        )
+        # And no inbox seed — the operator would otherwise see a
+        # /remote-control prompt for a daemon that isn't there.
+        assert not (fleet_home / "inbox" / "abcd1234.md").exists(), (
+            "inbox seed must NOT fire when RC is not enabled"
+        )
+
+
 class TestLoopTickDoesNotSpawnUnderGate:
     """The original P0 bug: pytest skills/ runs caused listener spawns.
     loop.tick() is the entry the test suite hammers — pin that it

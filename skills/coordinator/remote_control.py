@@ -140,6 +140,7 @@ STATUS_OK = "ok"
 STATUS_SKIPPED_MARKER = "skipped_marker"
 STATUS_SKIPPED_INVALID = "skipped_invalid"
 STATUS_SKIPPED_NO_ARGS = "skipped_no_args"
+STATUS_NOT_ENABLED = "not_enabled"
 # Inbox path was occupied (operator pre-queued a message via
 # `fleet message <coord_id>` between dispatch and first tick). Don't
 # clobber — retry next tick after fleet-guard's Stop hook delivers +
@@ -265,7 +266,30 @@ def bootstrap_remote_control(
     # In practice the agent's Stop fire is many seconds after this
     # call so the order doesn't matter for correctness, but the
     # narrative order matches the agent's observed sequence.
-    spawn_daemon_if_needed(project)
+    #
+    # codex round-3 P2: respect the spawn return. With --respawn-only
+    # the Go side returns exit 10 (not_enabled) when the operator
+    # hasn't run `fleet rc up <project>`. Previously we ignored that
+    # and still seeded the inbox + wrote the per-coord bootstrap
+    # marker, which (a) put a misleading /remote-control prompt in
+    # front of the operator and (b) blocked retry forever (the marker
+    # makes future ticks skip this whole function). Now: surface the
+    # state to the operator and leave the marker absent so the next
+    # tick retries once they enable RC.
+    if not spawn_daemon_if_needed(project):
+        _bootstrap_log(
+            STATUS_NOT_ENABLED,
+            project=project,
+            coord_id=coord_id,
+            detail=(
+                f"spawn_daemon_if_needed returned False for project "
+                f"{project!r}. Most likely cause: RC is not enabled — "
+                f"run `fleet rc up {project}` to enable mobile pairing "
+                f"for this project. Inbox/marker intentionally skipped "
+                f"so the next coord tick retries."
+            ),
+        )
+        return STATUS_NOT_ENABLED
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:
         # Pre-check above already eliminated the "inbox path exists"

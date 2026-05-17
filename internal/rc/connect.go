@@ -141,17 +141,36 @@ func selectTarget(project, coordID string) (*agent.Record, error) {
 	}
 
 	// (3) fail with diagnostic — list candidates.
+	//
+	// codex round-3 P2: filter on the coord TaskID convention
+	// "coord-<project>" so the fallback NEVER targets a worker
+	// pane. If a project has live workers but no live coord,
+	// `fleet rc connect` would otherwise send `/remote-control`
+	// keystrokes into the worker pane and report success — a
+	// silo'd misroute we surface as a clear refusal instead.
+	coordTaskID := "coord-" + project
 	var alive []*agent.Record
+	var nonCoordAlive int
 	for _, r := range records {
 		if r == nil || r.Project != project {
 			continue
 		}
-		if sessionAliveFn(r.TmuxSession) {
-			alive = append(alive, r)
+		if !sessionAliveFn(r.TmuxSession) {
+			continue
 		}
+		if r.TaskID != coordTaskID {
+			nonCoordAlive++
+			continue
+		}
+		alive = append(alive, r)
 	}
 	if len(alive) == 0 {
-		return nil, fmt.Errorf("rc.Connect: no live coord for project %q (run `fleet dispatch ...` first)", project)
+		if nonCoordAlive > 0 {
+			return nil, fmt.Errorf(
+				"rc.Connect: no live coord for project %q (%d live non-coord agent(s) found; run `fleet dispatch --coord-spawn ...` to spawn a coord first)",
+				project, nonCoordAlive)
+		}
+		return nil, fmt.Errorf("rc.Connect: no live coord for project %q (run `fleet dispatch --coord-spawn ...` first)", project)
 	}
 	if len(alive) == 1 {
 		// Single live coord, no marker — accept it. Operator's

@@ -51,6 +51,11 @@ func TestUp_FreshAcquireWritesMarkerAndState(t *testing.T) {
 func TestUp_IdempotentReAcquireReturnsAlreadyAcquired(t *testing.T) {
 	withFleetHome(t)
 	stubAgentListEmpty(t)
+	// Stub argv verifier so the test PID (os.Getpid()) is treated as
+	// a real listener — production checks `ps -p <pid> -o args=` for
+	// the session_prefix, which the test process obviously fails.
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	defer restoreVerify()
 
 	host, _ := os.Hostname()
 	// Pre-write state.json so the idempotent branch fires.
@@ -75,6 +80,42 @@ func TestUp_IdempotentReAcquireReturnsAlreadyAcquired(t *testing.T) {
 	// Marker should now be present even though we didn't pre-write it.
 	if !MarkerPresent("demo") {
 		t.Fatalf("idempotent Up should re-publish marker if absent")
+	}
+}
+
+// TestUp_AdoptVerifyFailRespawns (codex round-3 P2): if the recorded
+// PID is alive but argv does not match session_prefix (kernel PID
+// reuse, external kill), Up must NOT return already_acquired with
+// the stale PID. It falls through to a fresh spawn so RC actually
+// works. Surface-don't-silo: a stderr diagnostic is emitted too,
+// but we don't assert that — just the outcome.
+func TestUp_AdoptVerifyFailRespawns(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+
+	// Stub argv verifier to refuse — pretend the PID was recycled
+	// for an unrelated process.
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return false })
+	defer restoreVerify()
+
+	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", SkipSpawn: true, InjectedPID: os.Getpid()})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAcquired {
+		t.Fatalf("outcome=%q want %q (fresh spawn, not already_acquired)", out, OutcomeAcquired)
 	}
 }
 
@@ -302,6 +343,8 @@ func TestUp_RespawnOnlyRefusesToCreateMarker(t *testing.T) {
 func TestUp_RespawnOnlyWithMarkerProceeds(t *testing.T) {
 	withFleetHome(t)
 	stubAgentListEmpty(t)
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	defer restoreVerify()
 
 	// Operator has opted in.
 	if err := WriteMarker("demo"); err != nil {

@@ -82,6 +82,29 @@ def _enable_rc_bootstrap_for_test(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FLEET_RC_BOOTSTRAP_DISABLED", raising=False)
 
 
+def _stub_fleet_rc_up_success(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Mock subprocess.run so `fleet rc up ...` returns returncode=0.
+
+    codex round-3 P2: bootstrap_remote_control now honors a False
+    return from spawn_daemon_if_needed (the silo bug it closes). Tests
+    that exercise the bootstrap happy path need the rc-up shell-out to
+    succeed; without this helper the un-mocked subprocess.run reaches
+    real fake_popen (which can't __enter__) and bootstrap correctly
+    surfaces STATUS_NOT_ENABLED instead of STATUS_OK.
+
+    Returns a list that will collect every subprocess.run call's argv,
+    so callers can assert on the call shape.
+    """
+    calls: list[list[str]] = []
+
+    def _fake_run(args, **kwargs):
+        calls.append(list(args))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+    return calls
+
+
 class TestSpawnDaemonIfNeeded:
     """v0.12 spawn_daemon_if_needed contract (DESIGN-rc-listener-
     lifecycle.md §"Attach-surface gates" S1): the Python side shells
@@ -394,6 +417,7 @@ class TestBootstrap:
         # session env-gate would otherwise short-circuit before Popen
         # fires, making fake_popen.daemon_calls stay empty).
         _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
         status = remote_control.bootstrap_remote_control(
             "myproj", "abcd1234", fleet_home=fleet_home,
         )
@@ -404,8 +428,9 @@ class TestBootstrap:
             / ".remote-control-bootstrap-abcd1234"
         )
         assert marker.exists()
-        # Daemon was attempted exactly once.
-        assert len(fake_popen.calls) == 1
+        # rc-up shell-out fired exactly once (v0.12: subprocess.run, not
+        # the legacy Popen-based bash bootstrap).
+        assert len([c for c in rc_calls if c[:3] == ["fleet", "rc", "up"]]) == 1
         # Quiet success: no bootstrap log entry written.
         assert not isolated_bootstrap_log.exists(), (
             "happy path should be silent; got log content: "
@@ -447,6 +472,7 @@ class TestBootstrap:
         # rc-listener-bootstrap-sk-3e98: assert "daemon attempt fired"
         # requires opting back into the bash-bootstrap path.
         _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
         proj_dir = fleet_home / "projects" / "myproj"
         proj_dir.mkdir(parents=True)
         # Old coord's marker.
@@ -460,8 +486,8 @@ class TestBootstrap:
         assert (proj_dir / ".remote-control-bootstrap-bbbb2222").exists()
         # Old coord's marker still exists (we don't touch it).
         assert (proj_dir / ".remote-control-bootstrap-aaaa1111").exists()
-        # Daemon attempt fired for the new coord.
-        assert len(fake_popen.calls) == 1
+        # rc-up shell-out fired exactly once for the new coord.
+        assert len([c for c in rc_calls if c[:3] == ["fleet", "rc", "up"]]) == 1
 
     def test_missing_project_returns_skipped_no_args(
         self, fleet_home: Path, fake_popen: _FakePopen,
@@ -594,6 +620,7 @@ class TestBootstrap:
         # rc-listener-bootstrap-sk-3e98: assert "daemon was still
         # attempted" requires opting back into the bash-bootstrap path.
         _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
         # Force seed_inbox to return False without touching disk.
         monkeypatch.setattr(
             remote_control, "seed_inbox", lambda *_args, **_kwargs: False,
@@ -607,8 +634,9 @@ class TestBootstrap:
             / ".remote-control-bootstrap-abcd1234"
         )
         assert not marker.exists()
-        # Daemon was still attempted — pgrep guards re-launch on retry.
-        assert len(fake_popen.calls) == 1
+        # rc-up shell-out still fired — daemon respawn-only is
+        # cheap, idempotent, and decoupled from seed_inbox failure.
+        assert len([c for c in rc_calls if c[:3] == ["fleet", "rc", "up"]]) == 1
         # Failure is observable.
         assert isolated_bootstrap_log.exists()
         log = isolated_bootstrap_log.read_text(encoding="utf-8")
@@ -705,6 +733,7 @@ class TestLoopIntegration:
         # would otherwise short-circuit spawn_daemon_if_needed before
         # Popen fires).
         _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
         import loop
         home = tmp_path / "fleet"
         home.mkdir()
@@ -727,8 +756,8 @@ class TestLoopIntegration:
             fleet_home=str(home),
             now_unix=1735689600.0,
         )
-        # Bootstrap fired: Popen invoked once.
-        assert len(fake_popen.calls) == 1
+        # Bootstrap fired: rc-up shell-out invoked at least once.
+        assert any(c[:3] == ["fleet", "rc", "up"] for c in rc_calls)
         # Inbox seeded.
         assert (home / "inbox" / "abcd1234.md").exists()
         # Marker written.

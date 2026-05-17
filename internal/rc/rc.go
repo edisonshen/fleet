@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -267,22 +268,44 @@ func Up(project string, opts UpOpts) (string, error) {
 		}
 
 		// (3) Idempotent re-Up: existing state.json + alive PID +
-		// matching host → return already_acquired.
+		// matching host + argv matches session_prefix → return
+		// already_acquired. The argv check (codex round-3 P2)
+		// closes the PID-reuse hole: between listener exit and
+		// next Up, the kernel can recycle the PID for an unrelated
+		// process. Without the argv verify we'd claim
+		// already_acquired and the listener would silently be
+		// dead. Falling through on verify-fail respawns the
+		// listener AND emits a stderr diagnostic so the operator
+		// learns about the underlying state drift (surface, don't
+		// silo).
 		if cur, err := ReadState(project); err == nil {
 			host, _ := os.Hostname()
 			if opts.AdoptIfFleetOwned && cur.PID > 0 && workers.IsAlive(cur.PID) && cur.HostID == host {
-				// Ensure marker is present even if operator rm'd it
-				// while listener kept running (codex round 2: this is
-				// "re-up the marker, not the listener" semantics).
-				if !MarkerPresent(project) {
-					if _, err := state.EnsureProjectInitialized(project); err != nil {
-						return OutcomeError, err
-					}
-					if err := WriteMarker(project); err != nil {
-						return OutcomeError, err
-					}
+				prefix := cur.SessionPrefix
+				if prefix == "" {
+					prefix = SessionPrefix
 				}
-				return OutcomeAlreadyAcquired, nil
+				if verifyPIDIsListener(cur.PID, prefix) {
+					// Ensure marker is present even if operator rm'd it
+					// while listener kept running (codex round 2: this
+					// is "re-up the marker, not the listener" semantics).
+					if !MarkerPresent(project) {
+						if _, err := state.EnsureProjectInitialized(project); err != nil {
+							return OutcomeError, err
+						}
+						if err := WriteMarker(project); err != nil {
+							return OutcomeError, err
+						}
+					}
+					return OutcomeAlreadyAcquired, nil
+				}
+				// argv mismatch — kernel PID reuse OR external kill.
+				// Tell the operator what we observed before falling
+				// through to fresh spawn. They can correlate with any
+				// downstream weirdness (mobile push gaps, etc.).
+				fmt.Fprintf(os.Stderr,
+					"rc.Up: project %q has recorded PID %d alive but argv does not match session_prefix %q; treating as dead and respawning (likely kernel PID reuse or external kill)\n",
+					project, cur.PID, prefix)
 			}
 		}
 
@@ -642,19 +665,65 @@ func SetKillFnForTest(fn func(int)) func() {
 	return func() { killFn = prev }
 }
 
-// pgrepDetect is the default implementation. Returns false on any
-// pgrep error (no matches → exit 1, which we treat as "no listener
-// alive" — the conservative answer for the duplicate-spawn refusal
-// gate; a false negative here just allows a fresh spawn, which is
-// the same outcome as not having had a listener at all).
+// pgrepDetect shells out to `pgrep -af "claude.*remote-control"` to
+// find candidate listener PIDs, filters by session_prefix in argv,
+// then verifies cwd matches workingDir via `lsof -a -p <pid> -d cwd`.
 //
-// NB: production is best-effort; we don't want pgrep absence on
-// minimal Linux containers to break Up.
+// codex P2 (round-3 catch): the previous stub always returned false,
+// making the duplicate-spawn refusal gate dead code in production.
+// This impl restores it.
+//
+// Best-effort: missing pgrep/lsof on minimal containers emits a
+// one-line stderr diagnostic so the operator knows the gate is
+// degraded (surface-don't-silo), then returns false. A false
+// negative just allows a fresh spawn — same outcome as no listener
+// alive — so the operator can still recover via `fleet rc reset`.
+//
+// pgrep exit semantics:
+//
+//	0 → matches found
+//	1 → no matches (NOT an error — treat as "no listener")
+//	2/3 → syntax / system error (surface diagnostic)
 func pgrepDetect(workingDir string) (bool, error) {
-	// Without pgrep available, return false — the gate just becomes
-	// "spawn anyway". The dup-refusal test stubs this via
-	// SetDetectListenerForTest, so the production path's accuracy
-	// is best-effort but not load-bearing for the unit test.
-	_ = workingDir
+	if workingDir == "" {
+		return false, nil
+	}
+	out, err := exec.Command("pgrep", "-af", "claude.*remote-control").Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return false, nil // no matches
+		}
+		fmt.Fprintf(os.Stderr,
+			"rc: pgrep unavailable; duplicate-spawn refusal gate degraded (%v)\n",
+			err)
+		return false, nil
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" || !strings.Contains(line, SessionPrefix) {
+			continue
+		}
+		sp := strings.IndexByte(line, ' ')
+		if sp <= 0 {
+			continue
+		}
+		pid, perr := strconv.Atoi(line[:sp])
+		if perr != nil {
+			continue
+		}
+		cwdOut, lerr := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+		if lerr != nil {
+			// Couldn't read cwd — surface once per Up call so the
+			// operator knows the gate degraded gracefully.
+			fmt.Fprintf(os.Stderr,
+				"rc: lsof unavailable for pid %d; duplicate-spawn refusal gate degraded (%v)\n",
+				pid, lerr)
+			continue
+		}
+		for _, l := range strings.Split(string(cwdOut), "\n") {
+			if strings.HasPrefix(l, "n") && l[1:] == workingDir {
+				return true, nil
+			}
+		}
+	}
 	return false, nil
 }
