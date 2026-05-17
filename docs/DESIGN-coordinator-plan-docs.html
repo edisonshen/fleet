@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coordinator Plan Docs</title>
+<style>
+:root {
+  --bg: #fdfdfc;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #0066cc;
+  --border: #e3e3e0;
+  --code-bg: #f4f4f1;
+  --code-fg: #1a1a1a;
+  --table-stripe: #f9f9f7;
+  --blockquote-border: #d0d0cd;
+  --blockquote-bg: #f7f7f4;
+  --kbd-bg: #f0f0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --fg: #e8e8e6;
+    --muted: #9a9a98;
+    --accent: #7ab8ff;
+    --border: #333331;
+    --code-bg: #252523;
+    --code-fg: #e8e8e6;
+    --table-stripe: #222220;
+    --blockquote-border: #444442;
+    --blockquote-bg: #222220;
+    --kbd-bg: #2e2e2c;
+  }
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  gap: 2rem;
+}
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: 1fr; }
+  .toc { position: static !important; max-height: none !important; }
+}
+.toc {
+  position: sticky;
+  top: 1rem;
+  align-self: start;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  font-size: 14px;
+  padding-right: 0.5rem;
+}
+.toc h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 0.5rem 0;
+  font-weight: 600;
+}
+.toc ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.toc ul ul { padding-left: 1rem; }
+.toc li { margin: 0.25rem 0; }
+.toc a {
+  color: var(--fg);
+  text-decoration: none;
+  display: block;
+  padding: 0.15rem 0;
+  border-left: 2px solid transparent;
+  padding-left: 0.5rem;
+  margin-left: -0.5rem;
+  transition: color 0.1s, border-color 0.1s;
+}
+.toc a:hover {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+main {
+  min-width: 0;
+}
+.doc-meta {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.doc-meta strong { color: var(--fg); }
+h1, h2, h3, h4, h5, h6 {
+  margin: 1.8em 0 0.5em 0;
+  line-height: 1.25;
+  font-weight: 600;
+}
+h1 { font-size: 2rem; margin-top: 0; }
+h2 { font-size: 1.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.2rem; }
+h4 { font-size: 1.05rem; }
+h5, h6 { font-size: 1rem; color: var(--muted); }
+h1 .anchor, h2 .anchor, h3 .anchor, h4 .anchor, h5 .anchor, h6 .anchor {
+  visibility: hidden;
+  margin-left: 0.3rem;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 400;
+}
+h1:hover .anchor, h2:hover .anchor, h3:hover .anchor,
+h4:hover .anchor, h5:hover .anchor, h6:hover .anchor {
+  visibility: visible;
+}
+p { margin: 0.8em 0; }
+a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+ul, ol { padding-left: 1.5rem; }
+li { margin: 0.3em 0; }
+strong { font-weight: 600; }
+em { font-style: italic; }
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1rem 1.2rem;
+  border-radius: 5px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+}
+pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+blockquote {
+  border-left: 3px solid var(--blockquote-border);
+  background: var(--blockquote-bg);
+  margin: 1em 0;
+  padding: 0.5em 1em;
+  color: var(--fg);
+  font-style: normal;
+}
+blockquote p:first-child { margin-top: 0; }
+blockquote p:last-child { margin-bottom: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 14px;
+  display: block;
+  overflow-x: auto;
+}
+thead { background: var(--table-stripe); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+kbd {
+  background: var(--kbd-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  box-shadow: 0 1px 0 var(--border);
+}
+.toc-anchor {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+input[type="checkbox"][disabled] { margin-right: 0.4em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc" aria-label="table of contents">
+    <h2>Contents</h2>
+    <div class="toc">
+<ul>
+<li><a href="#summary">Summary</a></li>
+<li><a href="#design-decisions">Design Decisions</a></li>
+<li><a href="#task-split">Task Split</a></li>
+<li><a href="#test-plan">Test Plan</a></li>
+<li><a href="#assumptions">Assumptions</a></li>
+</ul>
+</div>
+
+  </nav>
+  <main>
+    <div class="doc-meta">
+      <strong>Source:</strong> <code>DESIGN-coordinator-plan-docs.md</code> &mdash;
+      <strong>Rendered:</strong> 2026-05-17 18:59 UTC &mdash;
+      Agents read the <code>.md</code>; humans read the <code>.html</code>.
+    </div>
+    <h1 id="coordinator-plan-docs">Coordinator Plan Docs<a class="anchor" href="#coordinator-plan-docs" title="Permalink to this section">¶</a></h1>
+<p>Approved at: 2026-05-17T18:20:25Z</p>
+<h2 id="summary">Summary<a class="anchor" href="#summary" title="Permalink to this section">¶</a></h2>
+<p>Fleet coordinators previously moved directly from an approved chat plan to task
+splitting:</p>
+<pre><code class="language-text">DISCUSS -&gt; SPLIT -&gt; TASK LIST -&gt; IMPLEMENT -&gt; PR-TRACK -&gt; DONE
+</code></pre>
+<p>That loses the plan as a durable artifact, and it gives workers only a task row
+instead of a durable task-level brief. The corrected workflow inserts mandatory
+<code>PLAN-DOC</code> and <code>TASK-PLAN-DOC</code> gates:</p>
+<pre><code class="language-text">DISCUSS -&gt; PLAN-DOC -&gt; SPLIT -&gt; TASK LIST -&gt; TASK-PLAN-DOC -&gt; IMPLEMENT -&gt; PR-TRACK -&gt; DONE
+</code></pre>
+<p>The coordinator saves approved implementation plans to the project's docs
+folder before filing tasks. It then saves a worker-ready task plan doc before
+promoting any task to implementation. These docs become durable sources for
+handoffs, review, and future projdoc publishing.</p>
+<h2 id="design-decisions">Design Decisions<a class="anchor" href="#design-decisions" title="Permalink to this section">¶</a></h2>
+<ol>
+<li>The coordinator may write plan docs, but may not implement code inline.
+   This is a narrow mutation exception to the coordinator role boundary.</li>
+<li>The gate applies only to implementation plans that lead to tasks. Casual
+   discussion, status checks, and exploratory Q&amp;A do not need docs.</li>
+<li>The default target is the active project's <code>docs/</code> folder when one exists.
+   If the project has no clear docs location, the coordinator asks before
+   writing.</li>
+<li>Markdown is the source of truth. Implementation plans use
+   <code>DESIGN-&lt;kebab-topic&gt;.md</code>; task plans use <code>TASK-PLAN-&lt;slug&gt;.md</code>.</li>
+<li>If the project has a renderer such as <code>scripts/render-design-doc.py</code>, the
+   coordinator also writes the matching <code>.html</code> next to each Markdown file.</li>
+<li>If the design doc save/render fails, the coordinator raises hand and does
+   not proceed to task splitting.</li>
+<li>The task plan must be worker-visible before promotion. The coordinator
+   either embeds the plan in Spec/Acceptance or appends a link such as
+   <code>fleet tasks note --project &lt;project&gt; &lt;slug&gt; --section spec "Task plan: docs/TASK-PLAN-&lt;slug&gt;.md"</code>.</li>
+<li>If a task plan doc save/render fails, the task stays unpromoted and no
+   worker is dispatched for it.</li>
+</ol>
+<h2 id="task-split">Task Split<a class="anchor" href="#task-split" title="Permalink to this section">¶</a></h2>
+<ol>
+<li>Update <code>skills/coordinator/SKILL.md</code> so handed-off coordinators know the
+   eight-step flow and the narrow plan-doc write exceptions.</li>
+<li>Update <code>internal/tui/keys.go</code> so freshly spawned coordinators receive the
+   same PLAN-DOC and TASK-PLAN-DOC gates in their first-turn prompt.</li>
+<li>Make fresh dashboard-spawned coordinators start in the registered project
+   repo path from <code>meta.json</code> so relative <code>docs/</code> writes land in the target
+   checkout.</li>
+<li>Update operator-facing docs in <code>docs/COORDINATOR-WORKFLOW.md</code> and
+   <code>README.md</code>.</li>
+<li>Add tests pinning the skill text, spawn prompt markers, and project cwd
+   resolution.</li>
+<li>Pin that TASK-PLAN-DOC is linked into worker-visible task text before
+   promotion.</li>
+<li>Add this design doc and render its HTML companion.</li>
+</ol>
+<h2 id="test-plan">Test Plan<a class="anchor" href="#test-plan" title="Permalink to this section">¶</a></h2>
+<ul>
+<li><code>python3 -m pytest skills/coordinator/tests/test_skill_md.py -q</code></li>
+<li><code>go test ./internal/tui -run CoordSpawnPrompt</code></li>
+<li><code>go build ./...</code></li>
+<li><code>python3 -m pytest skills/ -q</code></li>
+</ul>
+<h2 id="assumptions">Assumptions<a class="anchor" href="#assumptions" title="Permalink to this section">¶</a></h2>
+<ul>
+<li>A coordinator writes the approved plan doc itself; no planner worker is
+  needed just to persist the design.</li>
+<li>The docs folder is an approved write target for design and task plan docs
+  only.</li>
+<li><code>fleet project add</code> metadata is the authoritative repo path for a fresh
+  coord. Same-project worker records may point at worktrees, so they are only a
+  legacy fallback when <code>meta.json</code> is absent.</li>
+<li>Rendering HTML is best-effort when the project has a renderer, but a render
+  failure blocks task splitting or task promotion until fixed or explicitly
+  waived by the operator.</li>
+<li>Existing installed coordinator skill copies should be refreshed after the
+  source change lands.</li>
+</ul>
+  </main>
+</div>
+</body>
+</html>

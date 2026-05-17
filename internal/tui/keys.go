@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -1322,21 +1323,19 @@ func findExistingCoordForProject(records []*agent.Record, projectName string) (*
 // freshly-spawned coord agent.
 //
 // Precedence:
-//  1. Any existing agent record tagged with the same Project — reuse
-//     its Cwd. Operators dispatch agents into the project's actual
-//     repo, so this is the most accurate signal.
-//  2. The TUI process's own cwd via os.Getwd() — works when the
+//  1. The registered project meta.json repo_path. Fresh dashboard
+//     coord spawns need this path because PLAN-DOC/TASK-PLAN-DOC write
+//     relative docs/ files in the target project.
+//  2. Any existing agent record tagged with the same Project — legacy
+//     fallback for projects registered before meta.json existed.
+//  3. The TUI process's own cwd via os.Getwd() — works when the
 //     operator launched `fleet` from inside the project repo.
-//  3. Empty string — `fleet dispatch` resolves empty cwd to caller's
+//  4. Empty string — `fleet dispatch` resolves empty cwd to caller's
 //     wd, same as (2). Acceptable fallback.
-//
-// The coord skill operates on ~/.fleet/projects/<name>/, not on the
-// repo, so the cwd choice is mostly cosmetic — it sets where the
-// agent's tmux session lands and where /coordinator's first
-// directory-relative shell commands resolve. Wrong cwd doesn't break
-// correctness; it just nudges the agent toward the wrong starting
-// directory.
 func coordCwdForProject(records []*agent.Record, projectName string) string {
+	if meta, err := projects.Read(projectName); err == nil && meta.RepoPath != "" {
+		return meta.RepoPath
+	}
 	for _, r := range records {
 		if r != nil && r.Project == projectName && r.Cwd != "" {
 			return r.Cwd
@@ -1455,8 +1454,8 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 
 // coordSpawnPrompt builds the first-turn prompt body for a freshly
 // spawned coord agent (issue #80). The body hard-constrains the agent's
-// role to discuss-and-dispatch; implementation work is delegated to
-// detached workers via the fleet CLI.
+// role to discuss, save approved plan docs, save task plan docs, and dispatch;
+// implementation work is delegated to detached workers via the fleet CLI.
 //
 // The wording is mirrored verbatim by skills/coordinator/SKILL.md's
 // "## Coord agent role" section so the constraint survives context
@@ -1467,26 +1466,30 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 func coordSpawnPrompt(projectName string) string {
 	return fmt.Sprintf(`You are a Fleet COORDINATOR agent for project %s.
 
-ROLE — discuss design with the operator, file tasks, dispatch workers. NEVER:
+ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers. NEVER:
 - Edit code files (no Edit, Write, NotebookEdit on source code).
 - Run tests (no `+"`go test`"+`, `+"`pytest`"+`, etc. — workers handle this).
 - Implement features inline.
-- Run any tool that mutates the project source tree.
+- Run any tool that mutates the project source tree, except the narrow PLAN-DOC and TASK-PLAN-DOC steps below.
 
 DELEGATE — for any implementation, testing, or code-touching work:
 1. Discuss design with the operator until aligned.
-2. File a task via `+"`fleet tasks add --project %s --spec <body>`"+`.
-3. Promote the task with `+"`fleet tasks promote <slug>`"+` when ready.
-4. The /coordinator skill auto-dispatches a worker on next tick.
-5. Track progress via the supervisor loop.
+2. PLAN-DOC: save the approved implementation plan as `+"`docs/DESIGN-<kebab-topic>.md`"+` and render `+"`docs/DESIGN-<kebab-topic>.html`"+` when the project has a renderer.
+3. File tasks via `+"`fleet tasks add --project %s --spec <body>`"+` while keeping them unpromoted.
+4. TASK-PLAN-DOC: save `+"`docs/TASK-PLAN-<slug>.md`"+` and render `+"`docs/TASK-PLAN-<slug>.html`"+` when supported.
+5. Add the task plan path to worker-visible task text, e.g. `+"`fleet tasks note --project %s <slug> --section spec \"Task plan: docs/TASK-PLAN-<slug>.md\"`"+`.
+6. Promote the task with `+"`fleet tasks promote <slug>`"+` only after its task plan doc exists and is linked or embedded.
+7. The /coordinator skill auto-dispatches a worker on next tick.
+8. Track progress via the supervisor loop.
 
 ALLOWED — your toolbox is intentionally narrow:
 - Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
+- Write/render approved implementation plan docs and per-task plan docs under the project's approved docs folder only (`+"`docs/`"+` when present).
 - Run fleet CLI: `+"`fleet tasks {add,list,show,set,note,promote}`"+`, `+"`fleet workers list`"+`, `+"`fleet peek`"+`, `+"`fleet learnings`"+`, `+"`fleet standards show`"+`.
 - Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
 - Talk to the operator about design, scope, priority.
 
-Run /coordinator now to begin the supervisor loop.`, projectName, projectName)
+Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName)
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:

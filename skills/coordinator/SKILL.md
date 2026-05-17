@@ -1,266 +1,180 @@
 ---
 name: coordinator
-description: Per-project coordinator that owns tasks.md, dispatches workers as Claude Agent-tool subagents (run_in_background), monitors PR/CI via gh, and raises hand to the operator only when human input is needed. Reads tasks.md (read-only via parse.py) and mutates exclusively through the fleet CLI (`fleet tasks set`, `fleet tasks note`, etc.) — Go remains the authoritative writer. One coordinator per project enforced via NB-flock on coordinator.lock. v0.2 single-worker mode by default; cap > 1 enabled when worktrees land in v0.2.x.
+description: Per-project coordinator that owns tasks.md, saves approved plan docs, dispatches worker/reviewer/finisher Agent subagents, monitors PR/CI, and raises hand only when human input is needed. Mutates task state only through fleet CLI. One coordinator per project is enforced by coordinator.lock.
 ---
 
 # coordinator
 
-Per-project tick loop for Fleet v0.2. Replaces the operator-driven hand-pick-and-dispatch flow with an autonomous coordinator that watches a markdown task list and feeds workers through the existing v0.1 dispatch primitives.
-
-The skill ships agent-side. Each Stop hook fire (or operator-triggered `fleet message <coord_id> ...`) runs `loop.tick()` once and exits. Restart equals resume from disk state — there is no daemon, no shared memory, no asyncio.
-
-Source of truth: `docs/PLAN-v0.2-coordinator.md` (the what + why) and `docs/ENG-v0.2-coordinator.md` (the how — package shapes, sequence diagrams, perf budget, test plan). The skill mirrors the algorithm in those docs; deviations are bugs.
+Runtime contract for a Fleet coordinator. Keep this file short: coordinators read
+it on startup and after handoff, so every line spends context. Long rationale
+lives in `docs/COORDINATOR-WORKFLOW.md`, `docs/PLAN-v0.2-coordinator.md`, and
+`docs/ENG-v0.2-coordinator.md`.
 
 ## Coord agent role
 
-The Claude Code session running this skill is a **coordinator**, not a worker. The agent's job is to discuss design with the operator, file tasks, and dispatch workers. Implementation, testing, and any code-touching work goes to detached worker agents — never inline in the coord's own session.
+The Claude Code session running this skill is a **coordinator**, not a worker.
+It discusses design, writes approved plan docs, files tasks, dispatches Agent
+subagents, and shepherds PRs. It does not implement features inline.
 
-This section mirrors the first-turn dispatch prompt (`coordSpawnPrompt` in `internal/tui/keys.go`) so the constraint survives context handoffs: a successor coord re-reads `SKILL.md` on its first turn but does NOT see the original spawn prompt.
-
-**ROLE — discuss design with the operator, file tasks, dispatch workers. NEVER:**
-- Edit code files (no Edit, Write, NotebookEdit on source code).
-- Run tests (no `go test`, `pytest`, etc. — workers handle this).
+**ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers. NEVER:**
+- Edit code files.
+- Run implementation tests (`go test`, `pytest`, etc.); workers handle them.
 - Implement features inline.
-- Run any tool that mutates the project source tree.
+- Run any source-tree mutation except the PLAN-DOC and TASK-PLAN-DOC gates.
 
-**DELEGATE — for any implementation, testing, or code-touching work:**
-1. Discuss design with the operator until aligned.
-2. File a task via `fleet tasks add --project <project> --spec <body>`.
-3. Promote the task with `fleet tasks promote <slug>` when ready.
-4. The /coordinator skill auto-dispatches a worker on next tick.
-5. Track progress via the supervisor loop.
+**DELEGATE — for implementation, testing, or code-touching work:**
+1. Discuss design until the operator approves the implementation plan.
+2. PLAN-DOC: save `docs/DESIGN-<kebab-topic>.md`; render
+   `docs/DESIGN-<kebab-topic>.html` when the project has a renderer.
+3. File tasks via `fleet tasks add --project <project> --spec <body>`; keep
+   them unpromoted.
+4. TASK-PLAN-DOC: save `docs/TASK-PLAN-<slug>.md`; render `.html` when
+   supported.
+5. Add the doc path to worker-visible task Spec/Acceptance, e.g.
+   `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
+6. `fleet tasks promote <slug>` happens only after the task plan doc exists
+   and is linked or embedded in the task.
+7. Run `/coordinator`; the tick dispatches the next ready worker.
+8. Track workers and PRs through the supervisor loop.
 
-**ALLOWED — the toolbox is intentionally narrow:**
-- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
-- Run fleet CLI: `fleet tasks {add,list,show,set,note,promote}`, `fleet workers list`, `fleet peek`, `fleet learnings`, `fleet standards show`.
-- Run gh CLI for status: `gh pr view`, `gh pr checks`, `gh issue view`.
-- Talk to the operator about design, scope, priority.
+**ALLOWED — narrow toolbox:**
+- Read files and run non-mutating searches for design discussion.
+- Write/render approved implementation plan docs and per-task plan docs under
+  the active project's approved docs folder only (`docs/` when present; ask
+  only if the project has no clear docs location).
+- Run `fleet tasks {add,list,show,set,note,promote}`, `fleet workers list`,
+  `fleet peek`, `fleet learnings`, and `fleet standards show`.
+- Run read-only `gh` status commands.
+- Talk to the operator about scope, priority, blockers, and decisions.
 
-If the operator says "implement X" or "fix this bug", the right response is "that's worker work — let me file the task and dispatch", NOT to start editing files. The coord is a manager; a coord that does the work itself burns the operator's main context on what should be a detached session.
+The plan-doc gates are the coordinator's only source-tree mutation exceptions.
+If PLAN-DOC save/render fails, the coord raises hand and does **not** proceed to SPLIT.
+If TASK-PLAN-DOC save/render fails, the coord leaves that task unpromoted and
+does not proceed to IMPLEMENT for it.
 
-## Workflow runbook — the six-step canon
+## Workflow
 
-This is the load-bearing description of how a coord runs an end-to-end engagement. Every coord follows these six steps in order. Operator-readable mirror lives at [`docs/COORDINATOR-WORKFLOW.md`](../../docs/COORDINATOR-WORKFLOW.md).
+Every engagement follows this eight-step order:
 
-```
-1. DISCUSS           plan + eng detail + testing plan; iterate to operator approval (G2)
-2. SPLIT             approved plan → tasks.md (inline ≤10, planner-subagent >10) (G1)
-3. TASK LIST         one-line goal per task; status lives in structured fields (G5)
-4. IMPLEMENT         dispatch one impl-subagent per task; cap=1 (G7); subagents follow §4
-5. PR-TRACK          poll CI via async-waits (G4); on fail → fix-subagent (G3)
-6. DONE              fleet tasks set pr_url=<url> + status=done; advance; raise-hand if empty
+```text
+1. DISCUSS        plan + engineering detail + tests; operator approval is G2
+2. PLAN-DOC       save docs/DESIGN-<topic>.md (+ .html when renderer exists)
+3. SPLIT          approved plan -> tasks.md, inline <=10 or planner >10
+4. TASK LIST      one-line goal per task; structured state remains in fields
+5. TASK-PLAN-DOC  save docs/TASK-PLAN-<slug>.md (+ .html), link in task, promote
+6. IMPLEMENT      worker -> reviewer -> finisher; cap=1 by default
+7. PR-TRACK       async PR/CI shepherding; fix/rebase subagents when needed
+8. DONE           set pr_url + status=done; advance or raise hand when empty
 ```
 
 ### Step 1 — DISCUSS
 
-Operator brings a problem. Coord drives a planning conversation: scope, engineering detail, testing plan, edge cases. Use plan mode + AskUserQuestion when ambiguity is real; resolve in the chat thread when it's not. **No work dispatches until the operator approves the plan.** This is the only approval gate (G2).
+Ground the plan by reading code/docs with non-mutating tools. Ask questions only
+when repo inspection cannot resolve the ambiguity. No work dispatches until the
+operator approves the implementation plan.
 
-Tools allowed: Read / Grep / Bash (non-mutating) on the project tree to ground the discussion. No Edit, no Write on source.
+### Step 2 — PLAN-DOC
 
-### Step 2 — SPLIT
+Before splitting tasks, save the approved implementation plan.
 
-Once the plan is approved, split it into tasks.
+- Scope: implementation plans that lead to tasks; not casual Q&A/status chats.
+- Filename: `docs/DESIGN-<kebab-topic>.md`.
+- Render: `docs/DESIGN-<kebab-topic>.html` when a renderer such as
+  `scripts/render-design-doc.py` exists.
+- Contents: summary, design decisions, task split, test plan, assumptions, and
+  approval timestamp.
 
-- **Inline split (≤10 tasks):** the coord writes each task via `fleet tasks add --project <p> --spec <body>` then promotes ready ones with `fleet tasks promote <slug>`.
-- **Planner-subagent (>10 tasks):** dispatch a single Agent-tool subagent whose only job is to produce the task list. Its return contract is the list of slugs it created; it exits without dispatching workers.
+### Step 3 — SPLIT
 
-Threshold = 10 (G1). Above that, splitting inline burns the coord's context for no benefit; below it, the indirection through a planner adds latency without saving anything.
+Turn the approved plan doc into tasks.
 
-### Step 3 — TASK LIST
+- `<=10` tasks: add inline via `fleet tasks add`.
+- `>10` tasks: dispatch one planner subagent whose only job is to create the
+  task list and return the slugs.
+- Do not promote tasks yet; promotion waits for TASK-PLAN-DOC.
 
-Each task line in tasks.md is a **one-line summary** of the goal. Format:
+### Step 4 — TASK LIST
 
-```
+Each task keeps a short human-scannable goal in tasks.md:
+
+```text
 - <slug>: <one-line goal>
 ```
 
-Status, branch, pr_url, worker_pid, notes — all live in the structured fields under the task heading; `fleet tasks` already enforces the schema. The one-liner is what humans scan; the fields are what the coord acts on. See `docs/STATE.md` for the full per-task field set.
+Status, branch, pr_url, worker_pid, notes, and dependencies stay in structured
+fields managed by `fleet tasks`.
 
-### Step 4 — IMPLEMENT (three-stage flow)
+### Step 5 — TASK-PLAN-DOC
 
-Starting at the reviewer-subagent-arch landing, every task is implemented by **three** subagents dispatched serially, not one. The split exists because the single-subagent flow let workers bypass /review entirely — observed on the operator's second laptop. Structural enforcement is at the state-layer phase=push validator (see `internal/workers/workers.go:validateReviewGate`); the skill drives the orchestration.
+Before any task is promoted to ready, save its worker-ready task plan doc.
 
-```
-   worker             reviewer              finisher
-   ──────             ────────              ────────
-   TDD red/green/  →  /review iter loop  →  git push
-   refactor +         + codex review +      gh pr create
-   local commits      fix commits           fleet workers
-   (no /review,       (no push)             update --phase
-   no push)                                 done --pr-url
-                      flip --phase          flip --phase
-   flip --phase       review-done +         done
-   review-pending     terminal review_*
-   + EXIT             status + EXIT         EXIT
-```
+- Filename: `docs/TASK-PLAN-<slug>.md`.
+- Render: `docs/TASK-PLAN-<slug>.html` when supported.
+- Contents: parent design doc link, task goal, acceptance criteria,
+  expected files/surfaces, tests, non-goals, dependencies, and approval
+  timestamp.
+- Worker visibility: before promotion, either embed the task plan in Spec or
+  append its path to Spec/Acceptance, for example:
+  `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
+- Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
+  linked or embedded in worker-visible task text.
 
-**State transitions on workers/<slug>/state.json (all single-writer):**
+### Step 6 — IMPLEMENT
 
-| Subagent | Reads | Writes |
-|----------|-------|--------|
-| worker   | (n/a — fresh state) | `phase` through tdd-red/-green/-refactor → review-pending |
-| reviewer | phase=review-pending | `phase` review-claude/review-codex (in loop) → review-done; `review_claude_status`, `review_claude_rounds`, `review_codex_status`, `review_codex_rounds`, `review_codex_skip_reason` (terminal write at review-done) |
-| finisher | phase=review-done + terminal review_* fields | `phase` push (gated by `validateReviewGate`) → done; `pr_url` |
+Implementation is a three-stage flow across separate Agent subagents:
 
-**Coord dispatch logic (`loop._dispatch_review_handoffs`):**
-
-1. Initial dispatch (status=ready → in-progress): worker subagent. Prompt built by `dispatch.build_worker_prompt`.
-2. On next tick after worker exits at phase=review-pending: reviewer subagent. Prompt built by `dispatch.build_reviewer_prompt`. Worker dir + branch unchanged.
-3. On next tick after reviewer exits at phase=review-done: finisher subagent. Prompt built by `dispatch.build_finisher_prompt`. Worker dir + branch unchanged.
-4. On next tick after finisher writes phase=done: existing reconcile path takes over (status=in-review, then in-review→done on CI green merge).
-
-The coord-state.json field `review_handoffs_dispatched` is the dedup signal: each handoff key is `<slug>:<phase>`, added when the DISPATCH block is emitted, cleared when the slug reaches a terminal task state. Without this, a slow reviewer would be respawned every tick.
-
-**Codex skip allowlist (load-bearing):** `--review-codex-skip-reason` accepts only `rate-limited`, `unavailable`, or `no-git` (non-git projects — see "## Non-git projects" below). The workers CLI rejects anything else at the flag layer (`cmd/fleet/workers.go:allowedCodexSkipReasonsCLI`); the state layer rejects on direct WriteState calls (`internal/workers/workers.go:allowedCodexSkipReasons`). /review (gstack skill) is NEVER skippable — the CLI rejects `--review-claude-status=skipped` outright.
-
-**The coord does NOT foreground-poll any of the three subagents.** The harness fires a `<task-notification>` when each subagent returns; the coord runs `/coordinator` on the next assistant turn, the tick reads state.json, and the next handoff fires automatically.
-
-**Dispatch template (any of the three subagents):** prompt must reference the global Subagent Dispatch Contract by name, list the task slug as the WIP tag (`~/.fleet/subagent-wip/<slug>.md`), state explicit non-goals so the subagent doesn't expand scope. v0.2 cap is 1 in flight per project (G7); cap > 1 worktree mode is unchanged by the three-stage flow.
-
-### Step 5 — PR-TRACK
-
-When the impl-subagent returns with a PR URL, the coord **shepherds**
-the PR to merge — does not just watch it. A PR you own does not stop at
-a single terminal event between open and merge: it can flip BEHIND
-(another PR landed), DIRTY (conflict), CI-red, or CHANGES_REQUESTED.
-The coord wakes on **any** of those, acts, and re-spawns the watch.
-
-The full polling pattern + per-state action matrix + worktree-isolation
-rule live in the `## Async waits` → `### PR shepherding` subsection of
-`~/.fleet/standards.md` (mirror at
-[`docs/STANDARDS-BASELINE.md`](../../docs/STANDARDS-BASELINE.md)) — the
-coord inherits that subsection through the merged standards block.
-**Read it.** The short form below references it; the matrix lives
-there.
-
-1. **Notify the operator** with the PR URL (push, don't ask). No
-   "should I open the PR?" dialog — that ship sailed at step 1.
-2. **Shepherd the PR** with one background `until` loop per PR
-   (`Bash(run_in_background=true)`), waking on actionable states:
-   `state != OPEN` OR `mergeStateStatus == BEHIND` OR
-   `mergeStateStatus == DIRTY` OR any `statusCheckRollup[].conclusion
-   == FAILURE` OR `reviewDecision == CHANGES_REQUESTED`. The harness
-   `<task-notification>` resumes the coord when the loop exits. On
-   wake, dispatch by predicate (matrix below) and **re-spawn the
-   loop** so the PR is always under an active watch. (G4 — async
-   waits.)
-3. **On CI fail** (G3): dispatch a **fix-subagent** against the SAME
-   branch with the failure log. Fix-subagent has the same §4 review
-   contract as the impl-subagent. Iterate until CI is green. No retry
-   cap — fix-subagents keep dispatching until the diff lands or the
-   operator intervenes manually.
-4. **On BEHIND or DIRTY**: dispatch a **rebase-subagent** on an
-   isolated git worktree (`git worktree add /tmp/fleet-<task>-<pr>
-   <branch>`) with explicit "rebase only, no scope changes"
-   instructions. Markdown conflicts resolve as additive (keep both
-   sides). Substantive Go-code business-logic conflicts: abort +
-   raise-hand — operators decide merge semantics, not coords.
-5. **On CHANGES_REQUESTED**: address straightforward feedback (typo /
-   style) inline; raise-hand for substantive design feedback or
-   scope-change requests.
-6. **On TERMINAL MERGED** → step 6 (DONE).
-7. **On TERMINAL CLOSED-without-merge**: raise-hand — was the work
-   abandoned?
-
-**Fix-subagent dispatch template (skeleton):**
-
-```
-You are a fix-subagent for task <slug>. The PR at <url> failed CI:
-<paste failure log>
-
-Fix the failure. Stay on branch <branch>. Iterate codex + /review until clean.
-Push, do NOT close+reopen the PR. Return the PR URL and a one-line summary
-of the fix. WIP at ~/.fleet/subagent-wip/<slug>.md (resume if present).
+```text
+worker                reviewer                  finisher
+------                --------                  --------
+code + tests       -> /review + codex loop   -> push + PR
+local commits         no push                    gated by review state
+phase=review-pending  phase=review-done          phase=done + pr_url
 ```
 
-**Rebase-subagent dispatch template (skeleton):**
+Rules:
+- The worker exits at `review-pending`; it does not run `/review` and does not
+  push.
+- The reviewer loops until `/review` and codex are clean. Codex skip reasons
+  are allowlisted to `rate-limited`, `unavailable`, or `no-git`; `/review` is
+  never skippable.
+- The finisher pushes and opens the PR only when review terminal fields satisfy
+  the worker state validator.
+- v0.2 default parallelism is 1. Higher parallelism uses worktrees and conflict
+  checks.
 
-```
-You are a rebase-subagent for task <slug>. PR <url> has rebase conflicts
-against <base>. Rebase ONLY — no scope changes, no opportunistic refactors.
-If a conflict requires business-logic decisions, return BLOCKED with the
-conflict hunks. Otherwise rebase, run the verify suite, push --force-with-
-lease, return the PR URL.
-```
+### Step 7 — PR-TRACK
 
-### Step 6 — DONE
+Shepherd every PR you own. Watch for terminal close/merge, CI failure, BEHIND,
+DIRTY, and CHANGES_REQUESTED. Use async waits: a background `until ...; do
+sleep 30; done` loop should wake the coord with a task notification.
 
-CI green + PR merged → coord runs (`fleet tasks set` accepts one `key=value` per call, so this is two invocations):
+Actions:
+- CI red: dispatch a fix-subagent on the same branch.
+- BEHIND/DIRTY: dispatch a rebase-subagent in an isolated worktree.
+- Substantive conflict or design feedback: raise hand.
+- Merged: Step 8.
+- Closed without merge: raise hand.
+
+### Step 8 — DONE
+
+When CI is green and the PR is merged:
 
 ```bash
 fleet tasks set <slug> pr_url=<url>
 fleet tasks set <slug> status=done
 ```
 
-Advance to the next task in priority order. When the task list is empty, the coord raises hand: `"all tasks done; next direction?"` and waits.
+Then advance to the next ready task. If the queue is empty, raise hand instead
+of auto-dispatching backlog work.
 
-### Approval gate (G2)
+## Worker dispatch protocol
 
-There is **one** approval gate: step 1. After the operator approves the plan, the coord runs steps 2 → 6 autonomously. The coord raises hand only when:
+`loop.py` cannot invoke the host Agent tool. It emits DISPATCH blocks and the
+coord agent must act on them immediately.
 
-- An impl- / fix- / rebase-subagent returns BLOCKED (preserve the WIP file path; surface to operator).
-- The impl-subagent discovers mid-implementation that the plan is wrong (scope-change discovery — the plan needs revision before more dispatches).
-- A new P0 message lands in `~/.fleet/inbox/<coord-id>.md`.
+Block shape:
 
-Anything else — CI pending, rebase trivial, subagent iterating — is normal flow and stays autonomous.
-
-### State documents (G5) — three kinds, three owners
-
-| Doc | Path | Owner | Purpose |
-|-----|------|-------|---------|
-| Subagent doc | `~/.fleet/subagent-wip/<task-tag>.md` | impl- / fix- / rebase-subagent | Phase log per the global CLAUDE.md §2 contract. Coord reads on BLOCKED to recover; otherwise treats as opaque. |
-| **Progress doc** (NEW) | `~/.fleet/projects/<project>/workflow.md` | **coord** | Operator-readable phase log. One row per task with `phase = discussing \| approved \| dispatched \| reviewing \| pr-open \| merged \| blocked`. Atomic publish (`.tmp` + rename + fsync). |
-| Coord doc | `~/.fleet/agents/<coord-id>.json` | fleet-guard heartbeat | Live-state source for the TUI. No coord-side change — documented here for completeness. |
-
-The **progress doc** schema:
-
-```
----
-schema: v1
-project: <name>
-updated_at: <RFC3339 UTC>
----
-
-# workflow
-
-## <slug-1>
-- phase: <discussing | approved | dispatched | reviewing | pr-open | merged | blocked>
-- updated_at: <RFC3339 UTC>
-- pr_url: <url or empty>
-- note: <optional one-line context>
-
-## <slug-2>
-...
-```
-
-Atomic publish is mandatory — a partial write that fleet-guard or a TUI render reads is worse than no file. The coord uses the same tmp-fd → fsync → `os.replace` dance as `dispatch.write_worker_inbox` (`dispatch.py:354`). The TUI rendering of `workflow.md` is out of scope for this revision; the file is operator-readable via plain `cat` for now.
-
-### Mid-flight intervention (G6)
-
-The coord polls `~/.fleet/inbox/<coord-id>.md` **each turn** (fleet-guard already routes operator → agent messages to that path). A new P0 message preempts after the current atomic step completes — meaning the coord finishes the in-flight tool call (one CLI mutation, one Agent dispatch) and then handles the message before continuing the loop. **Do not interrupt mid-tool-call**; partial state at a tool boundary is the only invariant.
-
-### Parallelism cap (G7)
-
-v0.2 enforces **one** impl-subagent at a time per project. Two layers of enforcement:
-
-1. `coordinator.lock` (NB-flock) — only one coord process per project (`SKILL.md` two-coord-race section).
-2. The dispatch-loop active-count guard at step 5 of the loop algorithm above (`active >= cap: break`).
-
-**Do not add new locking.** Cap > 1 lifts via `coord-config.json:parallelism > 1` once worktrees ship in v0.2.x; the existing conflict heuristic (`conflict.py` + `loop._has_conflict_with_inflight`) handles the file-overlap concern.
-
-### Async-waits citation (G4)
-
-CI tracking uses `~/.fleet/standards.md` `## Async waits` verbatim — background-bash + `until` loop + `<task-notification>` resume. Do not invent a parallel mechanism. The 30 s poll interval matches PR-merge cadence; tighten only when the operator explicitly asks for faster reaction time on a particular task.
-
-## Worker dispatch protocol (issue #84 Phase A)
-
-Workers are spawned as **Agent-tool subagents** of this coord agent's Claude session — NOT as detached tmux sessions. They appear in the operator's chat as "N local agents" (Claude-native indicator) and the coord supervisor reads their `state.json` files identically to the v0.2.0 detached-tmux flow.
-
-The Python skill (`/coordinator`) cannot invoke Claude's Agent tool directly — Agent is a Claude tool, not a Python API. Instead, the skill emits structured `DISPATCH:` blocks on stdout and YOU (the coord agent) act on them.
-
-**Block format the skill emits:**
-
-```
+```text
 DISPATCH: <slug>
   agent_id: <8hex>
   description: <short>
@@ -270,406 +184,133 @@ DISPATCH: <slug>
 END_DISPATCH
 ```
 
-**What you (the coord agent) MUST do every time you see a DISPATCH block:**
-
-1. Read the file at `prompt_file` (absolute path under `~/.fleet/inbox/<agent_id>.md`).
-2. Invoke the Agent tool exactly once with these parameters:
-   - `description` = the value on the `description:` line.
-   - `prompt` = the full content of the prompt file (the body, verbatim).
-   - `subagent_type` = the value on the `subagent_type:` line (currently `general-purpose`).
-   - `run_in_background` = `true` (workers are async; they write progress to `state.json` and the supervisor loop reconciles).
-3. **Capture the Agent tool's return `subagent_id`** (the opaque token the host Claude session generates per Agent call — visible in the Agent call's response object). Immediately register it so the fleet TUI can cross-reference its worker rows with Claude's "N local agents" indicator (issue #94 Phase C):
-
-   ```bash
-   python3 /path/to/skills/coordinator/register_subagent.py \
-     --project <project> <slug> <subagent_id>
-   ```
-
-   Use `Bash(run_in_background=false)` — the call is brief (it RMW's `coord-state.json` under the project's coord lock and exits). On rare contention failures (`coord lock busy after N attempts`) the chip simply stays empty and the worker still runs; do NOT block dispatch on a register failure. Skip this step only when the host Claude does not surface a `subagent_id` for the dispatch (offline mode, mocking).
-4. One Agent call per DISPATCH block (and one register_subagent call per Agent call). Do this BEFORE the next assistant turn — the dispatch contract is "tick output → spawn subagent" with no detour through prose, design discussion, or other tool calls.
-5. The skill has already written the inbox file, minted the `agent_id`, flipped tasks.md to `status=in-progress`, and recorded the agent_id as a note. You are NOT responsible for any of that bookkeeping — only for invoking the Agent tool and registering the returned subagent_id.
-
-If you see N DISPATCH blocks in one tick output, you make N Agent calls (one per block) on this turn before doing anything else.
-
-**Why this matters:** if you skip the Agent call, the worker subagent never spawns. The task sits in `status=in-progress` in tasks.md and the supervisor loop tries to reconcile a worker that doesn't exist. Reliability of this protocol depends on you following it every time without fail. The supervisor will eventually flip the task back to `todo` after stuck-check timeout, but that's hours of lost time.
-
-Phase B (issue #93) covered the `[a]` task-attach replacement on the TUI side and coord-handoff continuity (see "## Resume after handoff" below). Phase C (issue #94) added the `register_subagent` step above + TUI subagent_id rendering.
-
-## Resume after handoff (issue #93 Phase B2)
-
-When fleet-guard hands off the coord at 50/70% context, any in-flight worker subagents the outgoing coord had spawned via the Agent tool die with the parent process. The successor coord (a freshly-spawned Claude session inheriting the role) MUST re-issue the Agent calls for those workers on its first turn — otherwise the workers' WIP files sit orphaned and the operator's next `fleet tasks` poll surfaces stuck-in-progress rows.
-
-The handoff doc carries enough state for this to be deterministic:
-
-- Frontmatter `previous_handoff: <path>` — the chain pointer. Empty / null on the first handoff for the agent.
-- `## Active Subagents` body section — one machine-readable line per in-flight worker, written by `fleet-guard/handoff.py` from the outgoing coord's `coord-state.json:worker_agent_ids` map. v0.8.3+ row shape is 7 fields per entry:
-
-  ```
-  - task="<slug>" branch="worker/<slug>" phase="<phase>" status="<status>" pr_url="<url>" agent_id="<hex>" subagent_id="<id>"
-  ```
-
-  Legacy 5-field rows (pre-v0.8.3, no `status`/`pr_url`) still parse — both default to `""` and the successor falls back to the pre-enrichment "always re-dispatch Agent" behavior.
-
-- `## Open PRs` body section (v0.8.3+) — one markdown bullet per open worker PR captured via `gh pr list --state open --search "head:worker/"` at handoff time:
-
-  ```
-  - #<num> <title> — <head-branch> — <url>
-  ```
-
-  Empty list renders `_(no open PRs)_`. The successor coord re-spawns one shepherd `until`-loop per URL listed, so CI/merge state stays observed across handoff even for PRs whose task already dropped from `coord-state.json:worker_agent_ids` (worker finished, PR not yet merged).
-
-**What you (the coord agent) MUST do on first turn after a handoff:**
-
-1. Read your handoff doc (the `## First Action (auto)` section already directs you there). The doc path is in your spawn prompt or in tasks.md.
-2. Run the resume helper:
-
-   ```bash
-   python3 /path/to/skills/coordinator/handoff_resume.py <handoff-doc-path>
-   ```
-
-   The helper:
-   - Parses the `## Active Subagents` section into a typed list, surfacing `status` + `pr_url` per entry.
-   - For each entry, branches on the new state:
-     - `status=in-review` (PR open) → SKIP Agent re-dispatch. The shepherd until-loop (one per Open PRs URL) covers it.
-     - `status=done/abandoned/blocked` → terminal. Drop the entry; no resume action.
-     - `status=in-progress` with empty `pr_url` (or legacy empty status) → re-dispatch Agent from WIP. Helper checks `~/.fleet/subagent-wip/<task-tag>.md` exists; rewrites the worker's inbox file (`~/.fleet/inbox/<agent_id>.md`) with a "RESUMING" preamble; emits a DISPATCH block on stdout.
-   - Parses the `## Open PRs` section and emits one `# open-pr-shepherd: <url> — respawn watch loop` line to stderr per URL — these are hints for you (the coord) to re-establish the shepherd `until gh pr view <url> --json mergedAt --jq '.mergedAt != null'; do sleep <interval>; done` watch loops on the next supervisor tick.
-3. For each DISPATCH block in the helper's stdout, follow the exact same protocol as "## Worker dispatch protocol" above — one Agent tool invocation per block, `run_in_background: true`, `prompt` = the body of the inbox file referenced in the block.
-
-The resume preamble explicitly tells the worker subagent to read its WIP first and continue from `next_steps` rather than restart — this is the CLAUDE.md §2 contract (Subagent Dispatch — bake in WIP checkpoints + resumability) operationalized across coord handoff.
-
-If the helper emits zero DISPATCH blocks AND zero open-PR shepherd hints, the outgoing coord had no in-flight workers and no open PRs (the steady-state case) — proceed with the regular `/coordinator` tick. The helper writes a one-line footer to stderr in this case so the absence is observable.
-
-**Skipped entries** (helper writes them to stderr as `# task <slug>: ...`) are not errors — they're entries whose WIP or inbox files have been pruned (worker finished cleanly), whose `agent_id` was malformed, OR whose `status` indicated the work is in-review / terminal (the Open PRs shepherd hints cover the in-review case). The successor coord moves on; the supervisor stuck-check will catch any task that stayed in-progress without a worker.
-
-## Invocation
-
-The coordinator agent is dispatched via existing `fleet dispatch`:
+For each block:
+1. Read `prompt_file`.
+2. Invoke the Agent tool once. Use `description`, full prompt body,
+   `subagent_type=general-purpose`, and `run_in_background=true`.
+3. Capture the returned `subagent_id`.
+4. Best-effort register it:
 
 ```bash
-fleet dispatch fleet-coord-<project> \
-  --project <project> \
-  --cwd <repo-path> \
-  --command "claude 'Run the /coordinator skill loop for project <project>.'"
+python3 /path/to/skills/coordinator/register_subagent.py \
+  --project <project> <slug> <subagent_id>
 ```
 
-Agent-side environment (set by `fleet dispatch`):
+One Agent call per DISPATCH block. If a tick emits N blocks, make N Agent calls
+before doing anything else. Skip registration only if no `subagent_id` is
+available or the brief register call hits lock contention; the worker still
+runs.
 
-- `FLEET_AGENT_ID` — coord's 8-hex ID. Without it the skill exits silently (fleet-guard discipline).
-- `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests.
-- `FLEET_PROJECT` — set by the dispatch path; falls back to argv[0] when invoked manually.
-- `FLEET_RC_BOOTSTRAP_DISABLED` — when set to any non-empty value, the coord skips spawning the background `claude remote-control` daemon in `remote_control.spawn_daemon_if_needed`. Symmetric with the Go-side gate at `cmd/fleet/dispatch.go:injectRemoteControlFlag` (rc-listener-bootstrap-sk-3e98). Set by `skills/coordinator/tests/conftest.py` for the whole pytest session so test runs don't fork real listeners that register with the operator's Claude Code service and emit mobile push notifications. Production sets this to nothing (the daemon spawn is exactly what carries the operator's mobile/claude.ai pairing through to fresh coord sessions).
+## Resume after handoff
 
-The skill does NOT need a hook payload — `loop.main` reads `FLEET_PROJECT` (or argv) and runs one tick. The tick is short (target < 500ms p99 per ENG §8.1) and emits a JSON summary to stdout.
+On first turn after coordinator handoff:
 
-## Files this skill writes
+1. Read the handoff doc named in the spawn prompt. Follow `previous_handoff`
+   links only when needed.
+2. Run:
 
-| Path | Content | Atomicity |
-|------|---------|-----------|
-| `~/.fleet/projects/<p>/.locks/coordinator.lock` | flock target (zero-byte) | NB acquired per tick, released on exit |
-| `~/.fleet/projects/<p>/coord-state.json` | `last_archive_scan_ts`, `worker_agent_ids`, `supervisor.<slug>` (nudged_at, escalated_at, consecutive_stuck_polls, last_phase) | tmp + rename + fsync |
-| `~/.fleet/inbox/<worker_id>.md` | freshly built worker prompt for one dispatch, OR a stuck-idle nudge body (issue #79) | tmp + rename + fsync |
-
-## Files this skill reads (config)
-
-| Path | Content | Default |
-|------|---------|---------|
-| `~/.fleet/projects/<p>/coord-config.json` | `{"parallelism": <int 1..50>}` | `{"parallelism": 1}` (single-worker mode) |
-
-`parallelism > 1` enables worktree-mode dispatch: each worker gets a
-git worktree at `~/.fleet/projects/<p>/worktrees/<slug>/` branched
-`worker/<slug>` off the repo's HEAD. Worker cwd is the worktree, not
-the main repo. Worktrees are removed via `git worktree remove --force`
-when the worker's task transitions to `in-review` (TASK_DONE_PR
-sentinel) or `done` (CI merged via reconcile). The branch lives on so
-the PR stays valid; only the working tree is freed.
-
-The skill does NOT write `tasks.md` directly. Every mutation goes through `fleet tasks set <slug> <key>=<value>` or `fleet tasks note <slug> <text>`, so Go remains the only writer of the per-project task registry. parse.py is read-only inside the skill.
-
-## Loop algorithm
-
-```
-1. NB-flock coordinator.lock
-   on EWOULDBLOCK → log + exit 0  ("another tick in progress, skipping")
-
-1.5. Orphan worktree cleanup (cap > 1 only):
-     `git -C <repo> worktree prune` — drops registry entries whose dirs
-     are missing (e.g. coord crashed mid-tick after `git worktree add`).
-     Idempotent and best-effort; failures log to stderr but never abort
-     the tick. cap=1 mode skips this step (worktrees never created).
-
-2. tasks   = parse(tasks.md)              # parse.py — read-only mirror of internal/tasks
-   stds   = `fleet standards show --merged --project <p>`
-   learn  = `fleet learnings list --project <p> --limit 20`
-
-3. Reconcile in-flight workers:
-   for t in tasks where status in {in-progress, in-review}:
-     if t.worker_pid is alive (kill -0):     skip
-     elif t.pr_url:
-       ci = gh pr checks <url> --json state,conclusion
-       all green + merged       → status=done, clear worker
-       all green + not merged   → status=in-review, raise "ready to merge"
-       not mergeable            → status=todo, clear worker, note "rebase needed"
-       failed                   → status=todo, clear worker, note "CI red <url>", raise
-       pending                  → leave as-is until next tick
-     else:
-       status=todo, clear worker, note "worker died without PR"
-   apply via `fleet tasks set/note`
-
-4. Drain inbox archive:
-   for f in ~/.fleet/inbox/archive/<coord_id>-*.md (newer than last_archive_scan_ts):
-     for line in f:
-       TASK_DONE_PR=<slug> <url>      → set pr_url, status=in-review
-       BLOCKED_QUESTION=<slug> <txt>  → status=blocked, note BLOCKED_QUESTION
-       WORKER_FAILED=<slug> <reason>  → status=todo, clear worker, note WORKER_FAILED
-       NEW_TASK=<slug>                → wake-only (no mutation)
-   persist last_archive_scan_ts to coord-state.json
-
-5. Dispatch ready tasks under cap (default 1; coord-config.json overrides):
-   active = count(status==in-progress)
-   for t in sort_by_priority(tasks where status==ready and deps_satisfied):
-     if active >= cap: break
-     # cap > 1 only: skip on file-overlap with any in-flight worker.
-     # Conservative — a task with no Files: line is treated as "could
-     # touch anything" and is skipped while any worker is in flight.
-     # Operators opt out per task by adding `Files: <path-with-ext>`
-     # to Spec / Acceptance / Notes (a real path, not a wildcard;
-     # the heuristic regex requires a file extension).
-     if cap > 1 and _has_conflict_with_inflight(t, in_flight_after_dispatch): continue
-     # cap > 1: per-slug git worktree under projects/<p>/worktrees/<slug>
-     if cap > 1:
-       wt = `fleet workers worktree-path --project <p> <slug>`
-       `git -C <repo> worktree add <wt> -b worker/<slug>`
-       worker_cwd = wt
-     else:
-       worker_cwd = repo
-     prompt = build_worker_prompt(t, stds, learn, branch=worker/<slug>)
-     # Issue #84 Phase A: skill mints agent_id, writes inbox, emits a
-     # DISPATCH block. Coord agent (Claude session) reads the block
-     # and invokes the Agent tool with run_in_background=true. The
-     # Python skill no longer shells out to `fleet dispatch` for
-     # workers — that path stayed for v0.1 manual use only.
-     agent_id = mint_agent_id()                           # 8-hex token
-     write_worker_inbox(agent_id, prompt)                # ~/.fleet/inbox/<agent>.md
-     emit DISPATCH block on stdout                        # coord acts on it
-     `fleet tasks set <slug> status=in-progress`
-     `fleet tasks set <slug> branch=worker/<slug>`
-     `fleet tasks set <slug> worktree=<wt>`               # cap > 1 only
-     `fleet tasks note <slug> "dispatched as agent <agent_id>"`
-     active += 1
-
-6. Return TickResult{skipped, parsed, reconciled, drained, dispatched, raised, errors}
-
-7. Supervisor loop (issue #79). After the initial reconcile/drain/dispatch pass, the coord
-   keeps the lock and watches in-flight workers via cheap state.json mtime polling. When a
-   worker's mtime advances, scoped reconcile fires for that one slug. Every Nth poll a
-   sparse stuck-check pass walks all probes and runs the recovery ladder for any worker that
-   has gone idle (heartbeat stale + counter ≥ threshold + tmux session alive).
-
-   Recovery ladder (per worker, per stuck-check pass):
-     no nudge yet            → write inbox `[OPERATOR] You appear idle. ...`; record nudged_at
-     nudged + cooldown elapsed → `fleet tasks set <slug> status=blocked`; append note
-                                  `STUCK_IDLE_ESCALATED: <reason>`; record escalated_at
-     escalated + cooldown elapsed → `fleet workers update <slug> --phase blocked --reason ...`
-
-   Env-overridable knobs:
-     FLEET_COORD_POLL_INTERVAL_S    default 30 (0 → supervisor disabled, single-tick fallback)
-     FLEET_COORD_STUCK_CHECK_EVERY  default 10 (every 10 polls = 5 min on 30 s base)
-     FLEET_COORD_STUCK_THRESHOLD_S  default 180 (3 min stale heartbeat)
-     FLEET_COORD_STUCK_POLLS        default 3 (consecutive stuck passes before recovery)
-     FLEET_COORD_NUDGE_COOLDOWN_S   default 120
-     FLEET_COORD_POLL_MAX_S         default 14400 (4 h hard cap)
+```bash
+python3 /path/to/skills/coordinator/handoff_resume.py <handoff-doc-path>
 ```
 
-The fleet CLI commands above came from Phase B (`fleet tasks {add,list,show,set,note,archive,promote}`, `fleet learnings {add,list,prune}`, `fleet standards {show,edit}`, `fleet workers {list,prune}`, `fleet peek <slug>`). Their argv contracts must stay stable for this skill — see `cmd/fleet/tasks.go` etc.
+3. For every DISPATCH block it emits, use the Worker dispatch protocol above.
+4. The helper reads `Active Subagents`, checks WIP files, rewrites inbox prompts
+   with a resume preamble, and skips entries already `in-review` or terminal.
+5. For open PR hints, respawn PR shepherd waits on the next supervisor tick.
 
-## Worker prompt template
+Skipped entries are not automatically errors; stale WIP/inbox files are common
+after clean worker exits.
 
-Built fresh per dispatch by `dispatch.build_worker_prompt(task, project, standards_md, learnings_text, *, is_git=True)`. ENG §6.5 specifies the layout. Hard cap 16KB rendered; oversized prompts raise `PromptTooLargeError` and the loop records the failure rather than dispatch. `is_git=False` is set by `loop.py` for projects whose `meta.json` declares `is_git: false` (see "## Non-git projects" below); the rendered prompt swaps branch + commit steps for in-place edits but keeps the same phase machine.
+## Tick Invocation
 
-The rendered prompt is:
+Normal manual tick:
 
-```
-You are a Fleet worker for task: <slug>
-Project: <project>
-Branch: worker/<slug>
-
-You are running as a Fleet-dispatched Claude session. The operator is NOT
-watching this terminal — communicate progress via `fleet workers update
-<slug> --phase <p>` after every phase boundary. Exit cleanly (Ctrl-D /
-/exit) once you reach phase=done or phase=blocked; the coordinator polls
-workers/<slug>/state.json to know when to advance the task.
-
-State file:  ~/.fleet/projects/<p>/workers/<slug>/state.json
-Output log:  ~/.fleet/projects/<p>/workers/<slug>/output.log
-
-## Task
-<### Spec body, verbatim from tasks.md>
-
-## Acceptance
-<### Acceptance body, verbatim>
-
-## Standards (the bar — non-negotiable)
-<merged content from `fleet standards show --merged`>
-
-## Relevant prior learnings
-<top entries from `fleet learnings list --limit=20`, ≤500 chars × 5>
-(section omitted entirely when no learnings recorded)
-
-## Required workflow (three-stage flow — reviewer-subagent-arch)
-
-You write CODE + TESTS, commit them locally, and EXIT at phase=review-pending.
-A separate reviewer subagent runs /review + codex. A separate finisher subagent
-pushes + opens the PR. You do NOT run /review yourself. You do NOT push.
-
-  fleet workers update <slug> --project <project> --phase branch
-1. git checkout -b worker/<slug>
-  ... (TDD red/green/refactor → review-pending → EXIT)
-
-## Constraints
-- Stay on this task. File incidental bugs (max 3/session, honor system).
-- Do NOT edit tasks.md or standards.md directly.
-- Stuck → fleet workers update <slug> --project <project> --phase blocked --reason "<one line>"
+```bash
+python3 /path/to/skills/coordinator/loop.py <project>
 ```
 
-Every `fleet workers update` invocation in the rendered prompt includes `--project <project>` so heartbeats land in the right `~/.fleet/projects/<project>/workers/...` tree even when the worker's cwd basename differs from the project name.
+Fleet-dispatched coords get:
+- `FLEET_AGENT_ID`
+- `FLEET_PROJECT`
+- `FLEET_HOME` (defaults to `~/.fleet`)
+- optional `FLEET_RC_BOOTSTRAP_DISABLED` for tests
 
-The `## Standards (the bar — non-negotiable)` block in the rendered prompt inlines whatever `fleet standards show --merged` emits. The fleet-shipped baseline (seeded by `fleet init`) carries Testing, Code review, and Async waits sections — see [`docs/STANDARDS-BASELINE.md`](../../docs/STANDARDS-BASELINE.md). The Async waits section is the canonical recipe workers should reach for when reconcile or post-push paths need to wait on PR-merge / CI-green / deploy-finish state changes (issue [#105](https://github.com/edisonshen/fleet/issues/105)): a `Bash(run_in_background=true)` call running an `until <check>; do sleep 30; done` loop fires a `<task-notification>` on exit so the worker resumes without foreground sleep chains, operator pings, or prompt-cache thrash.
+The tick acquires `coordinator.lock`, parses tasks, drains inbox archive,
+reconciles workers/PRs, dispatches ready work under cap, writes workflow state,
+and returns a small JSON result. If the lock is busy, exit cleanly.
 
-`dispatch.write_worker_inbox(agent_id, prompt)` drops the rendered prompt at `~/.fleet/inbox/<agent_id>.md`. The coord agent (Claude session) reads that file and passes the body verbatim as the Agent tool's `prompt` parameter (issue #84 Phase A). fleet-guard's SessionStart hook injection from the v0.1/v0.2.0 era still works for any tmux-spawned worker (e.g., a manual `fleet dispatch` invocation), but the coord skill itself no longer takes that path — workers are Agent subagents now.
+## Files
 
-## Non-git projects
+Writes:
+- `~/.fleet/projects/<project>/coord-state.json`
+- `~/.fleet/projects/<project>/workflow.md`
+- `~/.fleet/inbox/<agent_id>.md`
+- approved docs under project `docs/` during PLAN-DOC/TASK-PLAN-DOC
 
-`fleet project add <path>` accepts directories without a `.git` entry. The project's `meta.json` records `is_git: false` and the coordinator's dispatch path adapts as follows. Operator clarification 2026-05-12: **"same SOP, just no push pr step"** — the three-stage flow (worker → reviewer → finisher) is preserved; only the finisher's mechanical actions change.
+Reads:
+- `~/.fleet/projects/<project>/tasks.md`
+- `~/.fleet/projects/<project>/coord-config.json`
+- worker `state.json` files
+- merged standards and learnings via Fleet CLI
 
-What's the same as a git project:
-- **Phase machine** — workers progress through `starting → branch → tdd-red → tdd-green → tdd-refactor → review-pending` and exit. Reviewer flips `review-claude → review-codex → review-done`. Finisher writes `done`.
-- **Three subagents** — one worker, one reviewer, one finisher. Each is a separate Agent-tool dispatch with its own agent_id.
-- **/review is MANDATORY** — `/review` (gstack skill) runs in the reviewer subagent and is never skippable. Same loop, same iter-on-P0/P1 contract.
-- **Phase=blocked + raise-to-operator** — failure modes route through the same reconcile path.
+Do not write `tasks.md` directly. Use Fleet CLI mutations only.
 
-What's different:
-- **No branch creation.** Workers edit files in the project directory in place. `worker/<slug>` branch instructions are omitted from the worker prompt.
-- **No commits.** Each TDD phase (`tdd-red`, `tdd-green`, `tdd-refactor`) updates files in place; the worker prompt says "no commit" explicitly.
-- **codex review SKIPPED with reason `no-git`.** `codex review --base origin/main` needs a git diff to operate; for non-git the reviewer's terminal write is `--review-codex-status skipped --review-codex-skip-reason no-git`. The workers CLI allowlists `no-git` alongside `rate-limited` and `unavailable`.
-- **Finisher does NOT push, does NOT open a PR.** The terminal call is `fleet workers update <slug> --phase done --exit 0` (no `--pr-url`). The workers package's `phase=done` precondition is relaxed for non-git projects (the gate that requires `pr_url` fires only when `meta.GitMode() == true`). The finisher appends a one-line diff summary via `fleet tasks note <slug> "finisher: <summary>"` so the operator sees the deliverable in `fleet tasks show`.
-- **phase=push is REJECTED** for non-git projects (`ErrPhasePushNonGit`). The dispatch path skips push entirely; a buggy finisher that tries to write `phase=push` gets a clear error pointing it at `phase=done` directly.
+## Sentinels
 
-Use cases for non-git mode:
-- Debug / polish sessions on a scratch directory.
-- One-off file generation (docs, configs, fixtures) outside a repo.
-- Working directories the operator deliberately keeps off git.
+Inbox archive lines:
 
-Not in scope for the non-git mode (per the launch spec — file follow-ups if needed):
-- No TUI badge differentiating git vs. non-git projects in the dashboard.
-- No auto-`git init` — operator's explicit choice to register without git.
-- No per-task git override — the per-project `is_git` flag is the only switch.
-
-The `project_is_git` lookup is one cheap file read per tick (`~/.fleet/projects/<p>/meta.json`). Missing file, missing `is_git` field, or malformed JSON all default to `true` (git-mode) — the conservative branch keeps legacy projects (pre-v0.9) behaving exactly as before.
-
-## Sentinel grammar (worker → coord)
-
-Workers write status reports to their own `state.json` in v0.2's revised contract (ENG §6.2). The coord watches via the inbox archive when a worker uses `fleet message <coord_id>` to bubble status. Each archive file MUST contain at most one sentinel per line, scoped by task slug:
-
-```
-TASK_DONE_PR=<slug> <pr-url>            # worker post-PR-push
-BLOCKED_QUESTION=<slug> <one-line text> # worker stuck, needs operator
-WORKER_FAILED=<slug> <reason>           # worker hit unrecoverable error
-NEW_TASK=<slug>                         # operator (`fleet tasks add`) wake
+```text
+TASK_DONE_PR=<slug> <pr-url>
+BLOCKED_QUESTION=<slug> <one-line text>
+WORKER_FAILED=<slug> <reason>
+NEW_TASK=<slug>
 ```
 
-Slug-keyed payloads are the C2 invariant (worker status reports never mix). The drain logic mutates only the task whose slug matches; unknown slugs are silently ignored. `_parse_sentinel` lives in `loop.py` for the canonical grammar.
+Slug mismatch means ignore and log. A sentinel mutates only its own slug.
 
-## Reconcile + raise-hand
+## Non-git Projects
 
-When a task is in-progress or in-review and its worker is no longer alive (worker_pid dead AND `workers/<slug>/state.json` either missing, stale, or terminal), the coord decides the next status from two signals in order:
+Same phases, no branch/commit/push/PR. Reviewer records codex as skipped with
+reason `no-git`; `/review` remains mandatory. Finisher writes `phase=done`
+directly and notes the diff summary.
 
-1. **State.json terminal phase (in-progress only).** If the worker exited with `phase=done` + `pr_url`, flip to `in-review`, transcribe the PR URL onto tasks.md, raise "worker shipped". `phase=blocked` + reason → flip to `blocked`, raise. `phase=failed` → requeue to `todo`, clear pr_url, raise. The terminal-phase branch is gated to `status=in-progress` so subsequent ticks (already in-review) drive CI checks instead of re-flipping.
-2. **PR URL + `gh pr checks` (in-review or fallback).** When the task is in-review or when in-progress fell through (no terminal state), the coord queries CI:
-   - All green + merged → `status=done`.
-   - All green + not merged → `status=in-review`, raise ("ready to merge").
-   - Not mergeable → `status=todo`, clear worker, note "rebase needed" (keeps pr_url — same branch, different rebase).
-   - Failed → `status=todo`, clear worker, **clear pr_url** (next worker opens a NEW PR), raise "CI red".
-   - Pending → leave as-is.
-   - No PR URL at all → `status=todo`, clear worker, note "worker died without PR".
+## Failure Modes
 
-`gh pr checks` is hit synchronously per tick. ENG §8.2 caches results on `coord-state.json:pr_check_cache` for 5 minutes; v0.2.0 ships without the cache (300ms cost is invisible in idle ticks). v0.2.1 may add it.
+- Parse error: skip tick and report parse error.
+- Lock busy: skip tick, no mutation.
+- Prompt too large: leave task ready/todo and report error.
+- Worker died without PR: requeue and note.
+- CI red: requeue/fix-subagent path.
+- Rebase conflict requiring business semantics: raise hand.
+- Reviewer tries to bypass terminal review fields: workers state validator
+  rejects push/done phase.
 
-## Two-coord race
+## Module Map
 
-Second coord on the same project hits NB-flock EWOULDBLOCK. It logs + exits cleanly (`TickResult.skipped=True, reason="lock-busy"`). Operator notices via `fleet status` showing two coord rows; one is no-op. Cleanup: `fleet rm <id>` for the redundant coord.
-
-## Auto-idle-stop (deferred)
-
-PLAN §6 specifies coord auto-stops after 4h of zero active tasks. v0.2.0 does NOT implement this — the coord ticks until manually killed. v0.2.x adds the idle-streak tracking on `coord-state.json` and the clean-exit path.
-
-## Coordinator handoff (C1)
-
-The coord agent is itself under fleet-guard supervision. At 50%/70% context, fleet-guard hands it off. Because tasks.md is the source of truth and `coord-state.json` carries last_archive_scan_ts on disk, the successor coord re-reads tasks.md on its first tick, reconciles in-flight workers via `worker_pid` alive-check, and resumes. ENG §5.6 walks through this in detail.
-
-The skill's tick lifecycle is intentionally lean (no in-process state survives across hook fires) so handoff is clean by construction.
-
-## Failure modes
-
-| Failure | Behavior |
-|---------|----------|
-| tasks.md parse error | `tick()` returns `skipped=True, reason="parse-error"` and records the error. Coord logs to stderr; operator fixes manually. |
-| Two coordinators race | NB-flock makes the second exit cleanly. |
-| Coord agent skips a DISPATCH block | Worker never spawns. Task stays in `status=in-progress`; supervisor stuck-check eventually flips to `todo` and re-dispatches. Mitigation: SKILL.md "Worker dispatch protocol" pins the contract; review skipping behavior on every coord handoff. |
-| Inbox write fails (permissions, disk full) | Recorded in `TickResult.errors`; the candidate task stays in ready, retried next tick. No DISPATCH block emitted, no Agent call attempted. |
-| `fleet tasks set` exits non-zero | Recorded; partial mutations possible (e.g. status set but note not). Next reconcile catches it. |
-| `gh pr checks` errors / not installed | `_CIResult(error=...)` — caller leaves the task as-is until next tick. |
-| Inbox archive scan finds nothing | Tick proceeds normally. |
-| Slug mismatch in a sentinel | Logged via `errors[]`; no mutation. |
-| Prompt over hard cap | `PromptTooLargeError` — task NOT dispatched; recorded in errors. Operator shrinks standards/learnings/spec. |
-| Reviewer subagent flips phase=push without recording terminal `review_*_status` | `validateReviewGate` in `internal/workers/workers.go` rejects the write with `ErrPhaseRequiresReview`. The reviewer sees the workers CLI error and is expected to retry the update with `--review-claude-status passed` + `--review-codex-status {passed,skipped}`. Structural enforcement — a buggy reviewer can't accidentally let an unreviewed PR reach the finisher. |
-| Codex skip reason outside the allowlist | The workers CLI flag layer rejects `--review-codex-skip-reason <reason>` upfront when reason is not `rate-limited`, `unavailable`, or `no-git`. The reviewer must record an allowed reason or refuse to flip phase=review-done (instead flipping phase=blocked with the reason inlined). |
-
-## Tools used
-
-- `python3` ≥ 3.9 (stdlib only — `subprocess`, `pathlib`, `re`, `tempfile`, `fcntl`, `json`).
-- `fleet` binary on PATH (provides Phase B CLI: `fleet tasks ...`, `fleet learnings ...`, `fleet standards ...`, `fleet message`, `fleet workers update`). Issue #84 Phase A: the coord skill no longer shells out to `fleet dispatch` for worker spawn — that path stays for v0.1 manual use only.
-- `gh` binary on PATH for PR-status checks. Optional: when missing, the reconcile path skips CI evaluation and leaves PR'd tasks as in-review.
-
-## Hook bindings
-
-Unlike fleet-guard, this skill is NOT bound to Claude Code hooks via `~/.claude/settings.json`. It runs as a normal slash-skill the coord agent invokes on its own (`/coordinator`). The Stop hook still drives the cadence — the coord's own assistant turns trigger Stop, fleet-guard ticks, and at the natural sleep boundary the coord runs `/coordinator` again.
-
-## Module layout
-
-| File | Purpose |
-|------|---------|
-| `SKILL.md` | This document. Frontmatter + invocation + loop-in-prose + worker prompt template. |
-| `loop.py` | One-tick driver. Public entry: `tick(project, ...)` and `main(argv)`. |
-| `parse.py` | Python mirror of `internal/tasks` — read-only inside the skill, byte-equal with Go. |
-| `dispatch.py` | Worker / reviewer / finisher prompt assembly (`build_worker_prompt`, `build_reviewer_prompt`, `build_finisher_prompt`) + `mint_agent_id` + DISPATCH-block formatter + inbox writer (issue #84 Phase A — no longer shells out to `fleet dispatch`; reviewer-subagent-arch added the reviewer + finisher builders). |
-| `conflict.py` | File-overlap heuristic for cap > 1 (default cap=1 never exercises this). Optimistic on no-paths inputs. |
-| `loop._has_conflict_with_inflight` | Conservative loop-side wrapper: a task with no `Files:` line is treated as matching every in-flight task. Operators opt out per task by adding `Files: <real-path>`. |
-| `workflow_state.py` | Atomic-publish writer for `~/.fleet/projects/<p>/workflow.md` — the operator-readable phase log per task (G5). Tmp-fd → fsync → `os.replace`; no daemon, no in-process state. |
+- `loop.py` — tick driver and dispatch block emission.
+- `parse.py` — read-only Python task parser mirror.
+- `dispatch.py` — worker/reviewer/finisher prompt builders and inbox writes.
+- `workflow_state.py` — atomic `workflow.md` writer.
+- `handoff_resume.py` — successor coord resume helper.
+- `register_subagent.py` — records host Agent `subagent_id`.
+- `remote_control.py`, `supervisor.py`, `reaper.py`, `worktree.py` — runtime
+  helpers.
 
 ## Tests
 
+```bash
+python3 -m pytest skills/coordinator/tests/ -q
 ```
-python3 -m pytest skills/coordinator/tests/ -v
+
+Use targeted tests while editing this skill:
+
+```bash
+python3 -m pytest skills/coordinator/tests/test_skill_md.py -q
+go test ./internal/tui -run CoordSpawnPrompt
 ```
 
-Critical cases (mirrored from ENG §7.2):
+## Hook Bindings
 
-- `test_parse.py::test_round_trip_byte_equal` — every fixture in `internal/tasks/testdata/` round-trips byte-equal in Python (CI gate against parser drift).
-- `test_loop.py::test_tick_drains_per_task_sentinels` — C2 invariant: two slugs, two archive files, no cross-mutation.
-- `test_loop.py::test_tick_no_op_under_lock_held` — second tick exits cleanly under lock contention.
-- `test_loop.py::test_slug_mismatch_sentinel_ignored` — unknown slug logs WARN but mutates nothing.
-- `test_loop.py::test_tick_skips_on_parse_error` — corrupt tasks.md doesn't crash the coord.
-- `test_dispatch.py::test_dispatch_worker_invokes_correct_argv` — exact argv to `fleet dispatch`.
-- `test_dispatch.py::test_write_worker_inbox_atomic_and_under_fleet_home` — inbox stub is tmp+rename.
-- `test_conflict.py::*` — file-overlap heuristic positive + negative cases.
-- `test_loop_conflict.py::*` — loop-side conservative wrapper at cap > 1: skip overlapping tasks, allow disjoint, conservative skip on no-Files candidates, cap=1 bypass.
-
-The fleet binary itself is never invoked in unit tests; subprocess.run is mocked. End-to-end coverage lives in `cmd/fleet/coordinator_integration_test.go` (Phase D).
-
-## Why these design choices
-
-- **Skill is Python, parser ships in Go and Python.** Two parsers mean a CI-gated byte-equality contract. Removing one would force the other side to call out (Go shelling to Python skill = brittle; Python shelling to a Go binary on every tick = expensive). PLAN §"Code: skill side vs Go side".
-- **Mutations through CLI, not Python writes.** Single writer per aggregate (STATE.md A2). Skill stays read-only on disk; locking and validation live in Go. Adding a parallel Python writer would require porting state.LockProjectState semantics.
-- **One tick per invocation, no daemon.** Stateless reentry over markdown-as-truth is the Ralph rule. Restart equals resume; coord-state.json is the only across-tick state, and it's a couple of timestamps. Every per-task fact lives in tasks.md, every per-worker fact lives in workers/<slug>/state.json or agents/<id>.json.
-- **NB-flock per tick, not per coord lifetime.** Flock auto-releases when the Python process exits, so re-acquiring on every tick is the documented pattern (ENG §4.3). Survives coord restarts and handoffs without leaking the lock.
+This skill is not bound directly to Codex/Claude hooks. It runs as a slash-skill
+or via the coordinator spawn prompt. Fleet-guard hooks may cause future ticks by
+resuming the coord session, but `loop.py` stays stateless across invocations.
