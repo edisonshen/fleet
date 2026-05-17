@@ -265,7 +265,7 @@ def bootstrap_remote_control(
     # In practice the agent's Stop fire is many seconds after this
     # call so the order doesn't matter for correctness, but the
     # narrative order matches the agent's observed sequence.
-    spawn_daemon_if_needed()
+    spawn_daemon_if_needed(project)
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:
         # Pre-check above already eliminated the "inbox path exists"
@@ -291,110 +291,85 @@ def bootstrap_remote_control(
     return STATUS_OK
 
 
-def spawn_daemon_if_needed() -> bool:
-    """Spawn `claude remote-control` (fleet-coord prefix) in the
-    background if not already running. Idempotent at the **fleet-coord
-    daemon level**: pgrep guards only re-launch when a daemon with the
-    SAME `fleet-coord` session-name-prefix is already up.
+def spawn_daemon_if_needed(project: str = "") -> bool:
+    """v0.12 (DESIGN-rc-listener-lifecycle.md §"Attach-surface gates"
+    S1): shell out to `fleet rc up <project> --idempotent` so the Go
+    controller (internal/rc) is the SINGLE owner of spawn / marker /
+    state. The parallel pgrep+nohup path is gone — keeping it would
+    re-introduce the "two writers, two opinions" hazard the v0.12
+    architecture closes.
 
-    Returns True if the spawn shell command ran without raising
-    (regardless of whether pgrep matched — the shell handles both
-    branches). Returns False if subprocess.Popen itself failed (no
-    shell, no claude binary, etc.). Logs to /tmp/claude-rc-coord.log.
+    Behaviour:
+      - Marker absent for project → Go `fleet rc up` no-ops on the
+        marker (rc.Enabled returns false; fleet rc up creates the
+        marker AND spawns the listener). Returns True.
+      - Marker present, listener alive → Go returns
+        outcome=already_acquired exit 0. Returns True.
+      - Operator hasn't opted in (no marker, no project arg) →
+        skip entirely; returns True (no spawn, no-op).
 
-    PRIOR BUG (this fix's regression pin): the previous pgrep pattern
-    was the broad `claude remote-control` match, which ALSO matched a
-    `fleet-handoff`-prefixed daemon (started by
-    internal/handoff.FirstAction). When the operator had a handoff
-    daemon running, the coord skill would silently skip its own daemon
-    spawn — so mobile claude.ai pairing for fleet-coord-* sessions
-    never worked. Mirror cmd/fleet/dispatch.go:remoteControlDaemonRunning
-    by anchoring the regex on `^claude` AND the
-    `--remote-control-session-name-prefix fleet-coord` literal so
-    fleet-handoff daemons no longer mask the coord launch.
+    PR #157 env-gate (`FLEET_RC_BOOTSTRAP_DISABLED`) is kept as
+    defense-in-depth through v0.12; it short-circuits BEFORE the
+    fleet-rc-up shell-out. The CI invariant test
+    (rc_invariant_test.go) proves the marker-gate is sufficient on
+    its own; v0.13 retires the env-gate after field-proof.
+
+    project is the per-project name (matches Go-side
+    state.ValidateProjectName). Empty project means "we're not in a
+    project-supervised coord" (legacy / unsupervised lineage) — the
+    function returns True (no-op) without invoking fleet.
     """
-    # FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
-    # symmetric with the Go-side cmd/fleet/dispatch.go gate at
-    # injectRemoteControlFlag. When this env var is set to any non-
-    # empty value, skip the bash bootstrap entirely so `pytest skills/`
-    # runs don't fork a real `claude remote-control` listener that
-    # registers with the operator's Claude Code service and pushes a
-    # mobile notification. Production behaviour (env unset) is
-    # preserved — the subprocess.Popen path below runs as before.
-    #
-    # Returns True (no-op success) so callers (bootstrap_remote_control)
-    # don't treat the skip as a spawn failure and log a spurious
-    # "spawn failed" line to BOOTSTRAP_LOG on every tick.
-    #
-    # The session-scoped autouse fixture in
-    # skills/coordinator/tests/conftest.py sets the env for the whole
-    # pytest run; legacy `_FakePopen`-style tests that assert on the
-    # bash shell shape call `enable_rc_bootstrap_for_test(monkeypatch)`
-    # (see test_rc_bootstrap_env_gate.py) to opt back in — mirror of
-    # the Go-side `enableRCBootstrapForTest(t)` helper in
-    # cmd/fleet/rc_bootstrap_env_test.go.
+    # Primary gate: marker absence. Without an explicit project the
+    # function cannot make a per-project decision, so we no-op.
+    if not project:
+        return True
+    # FLEET_RC_BOOTSTRAP_DISABLED env-gate (defense-in-depth from PR
+    # #157, retired in v0.13). Test runs set this so pytest never
+    # forks a real `claude remote-control` listener.
     if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
         return True
-    # ASCII flow:
-    #
-    #   pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-coord( |$)'
-    #     |
-    #     +-- no match (or pgrep itself missing)
-    #     |     -> launch nohup ... fleet-coord daemon
-    #     |
-    #     +-- match (fleet-coord daemon already up)
-    #           -> silent no-op (the `||` short-circuits)
-    #
-    # Regex anchors:
-    #   ^claude     — argv[0] must literally be `claude`. Excludes the
-    #                 transient `bash -c '... nohup claude ...'`
-    #                 bootstrap subprocess this very function spawns.
-    #   fleet-coord — daemon session-name-prefix flag value. UNQUOTED:
-    #                 shell quotes around the value (we still write
-    #                 them on the launch command for legibility) are
-    #                 stripped before exec, so the live daemon's argv
-    #                 carries the bare `fleet-coord` token.
-    #   ( |$)       — terminate at a word boundary so a hypothetical
-    #                 longer prefix like "fleet-coordX" does NOT
-    #                 false-positive.
-    pgrep_pattern = (
-        r"^claude remote-control "
-        r"--remote-control-session-name-prefix fleet-coord( |$)"
-    )
-    cmd = (
-        f"pgrep -f '{pgrep_pattern}' >/dev/null 2>&1 || "
-        "nohup claude remote-control "
-        '--remote-control-session-name-prefix "fleet-coord" '
-        f"> {_DAEMON_LOG} 2>&1 &"
-    )
+    # Shell out to the Go controller. --idempotent maps to Up's
+    # already_acquired semantics: exit 0 when the listener is already
+    # alive AND the marker is present. The Go side handles
+    # working_dir resolution (meta.json + live coord fallback) so the
+    # Python side doesn't need to thread it through.
     try:
-        # start_new_session detaches the spawned shell from our process
-        # group; subprocess.Popen with a string + shell=True is the
-        # canonical way to fork-and-forget a daemon. We don't wait —
-        # the `&` inside the shell already backgrounds the claude
-        # process, but DEVNULL-ing stdout/stderr keeps any pgrep noise
-        # from leaking onto the coord's stdout (which the skill emits
-        # JSON on).
-        subprocess.Popen(
-            ["bash", "-c", cmd],
+        result = subprocess.run(
+            ["fleet", "rc", "up", project, "--idempotent"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            timeout=10,
+            check=False,
         )
+        # Exit 0 = acquired or already_acquired (both success). Any
+        # other exit (10/11/12/1) is logged but not raised — the
+        # caller treats this as fail-soft per S1 contract.
+        if result.returncode != 0:
+            print(
+                f"coord remote-control: fleet rc up {project!r} exit "
+                f"{result.returncode}; listener may not be alive",
+                file=sys.stderr,
+            )
+            return False
         return True
     except FileNotFoundError:
-        # bash missing on the host — extremely unlikely, but fail-soft.
-        # Operator will see no remote-control attachment; the inbox
-        # seed still goes out.
+        # `fleet` binary not on PATH — extremely unlikely (the coord
+        # skill is invoked from a fleet-managed shell), but fail-soft.
         print(
-            "coord remote-control: bash not found; daemon not spawned",
+            "coord remote-control: fleet binary not found; listener not spawned",
+            file=sys.stderr,
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        print(
+            f"coord remote-control: fleet rc up {project!r} timed out (>10s)",
             file=sys.stderr,
         )
         return False
     except Exception as exc:
         print(
-            f"coord remote-control: daemon spawn failed: {exc}",
+            f"coord remote-control: fleet rc up failed: {exc}",
             file=sys.stderr,
         )
         return False

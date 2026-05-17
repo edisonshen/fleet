@@ -172,63 +172,65 @@ class TestSpawnDaemonGate:
             f"got {len(recording_popen.calls)} Popen call(s)"
         )
 
-    def test_env_unset_invokes_popen(
+    def test_env_unset_invokes_fleet_rc_up(
         self,
-        recording_popen: _RecordingPopen,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With the env cleared via enable_rc_bootstrap_for_test, the
-        production code path runs end-to-end and Popen is invoked
-        exactly once with the bash bootstrap shell command. This pins
-        the production-default behaviour so we don't accidentally
-        remove the spawn entirely."""
+        """v0.12: with the env cleared, the production code path shells
+        out to `fleet rc up <project> --idempotent` via subprocess.run.
+        Pins the new Go-controller-owns-spawn contract (S1)."""
         enable_rc_bootstrap_for_test(monkeypatch)
-        ok = remote_control.spawn_daemon_if_needed()
+        calls: list[list[str]] = []
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
-        assert len(recording_popen.calls) == 1
-        args, _kwargs = recording_popen.calls[0]
-        assert args[0] == "bash"
-        assert args[1] == "-c"
-        # The bash payload still contains the nohup claude remote-control
-        # bootstrap; the gate is at the wrapper, not inside the shell.
-        assert "nohup claude remote-control" in args[2]
+        assert calls == [["fleet", "rc", "up", "demo", "--idempotent"]]
 
     @pytest.mark.parametrize("value", ["1", "true", "yes", "anything"])
     def test_any_nonempty_value_disables(
         self,
-        recording_popen: _RecordingPopen,
         monkeypatch: pytest.MonkeyPatch,
         value: str,
     ) -> None:
         """Match Go-side semantics: env var set to ANY non-empty value
         disables the bootstrap. cmd/fleet/dispatch.go gates on
-        `os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != ""`; the Python
-        gate must use the same predicate so an operator setting the
-        var to "true" (a natural choice) doesn't silently fail open."""
+        `os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != ""`."""
         monkeypatch.setenv("FLEET_RC_BOOTSTRAP_DISABLED", value)
-        ok = remote_control.spawn_daemon_if_needed()
+        calls: list[list[str]] = []
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
-        assert recording_popen.calls == [], (
-            f"value {value!r} must disable the bootstrap; got "
-            f"{len(recording_popen.calls)} Popen call(s)"
+        assert calls == [], (
+            f"value {value!r} must disable the bootstrap; got {calls}"
         )
 
     def test_empty_string_enables_production_path(
         self,
-        recording_popen: _RecordingPopen,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Edge case symmetric with the Go side: env var EXPLICITLY set
-        to "" (empty string) is treated as unset → production path
-        runs. This matches `t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")`
-        on the Go side."""
+        """Edge case: env var EXPLICITLY set to "" is treated as unset
+        → production path runs."""
         monkeypatch.setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
-        ok = remote_control.spawn_daemon_if_needed()
+        calls: list[list[str]] = []
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
-        assert len(recording_popen.calls) == 1, (
-            "empty env value must enable the production spawn path; "
-            f"got {len(recording_popen.calls)} Popen call(s)"
-        )
+        assert calls == [["fleet", "rc", "up", "demo", "--idempotent"]]
 
 
 class TestBootstrapRemoteControlGate:
@@ -273,27 +275,32 @@ class TestBootstrapRemoteControlGate:
             f"{len(recording_popen.bash_bootstrap_calls)} bootstrap call(s)"
         )
 
-    def test_ungated_bootstrap_invokes_popen(
+    def test_ungated_bootstrap_invokes_fleet_rc_up(
         self,
         fleet_home: Path,
-        recording_popen: _RecordingPopen,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Production-default behaviour: env unset → bootstrap fires
-        the full path including the bash bootstrap subprocess.Popen.
-        Pins the production contract so future refactors don't
-        silently break it."""
+        """v0.12: with env unset, bootstrap_remote_control shells out
+        to `fleet rc up <project> --idempotent` (S1 contract — the Go
+        controller owns spawn; Python is a thin caller)."""
         enable_rc_bootstrap_for_test(monkeypatch)
+        run_calls: list[list[str]] = []
+
+        def _fake_run(args, **kwargs):
+            run_calls.append(list(args))
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
         status = remote_control.bootstrap_remote_control(
             "myproj", "abcd1234", fleet_home=fleet_home,
         )
         assert status == remote_control.STATUS_OK
-        # Exactly one bash bootstrap call. Other Popen sites (fleet
-        # claims acquire-prompt) may also fire — we only check the
-        # bootstrap-emit path.
-        assert len(recording_popen.bash_bootstrap_calls) == 1, (
-            "ungated bootstrap must invoke the bash bootstrap exactly "
-            f"once; got {len(recording_popen.bash_bootstrap_calls)}"
+        # The bootstrap chain calls spawn_daemon_if_needed("myproj"),
+        # which shells out exactly once. Other subprocess.run sites
+        # (fleet claims) may also fire — filter to the rc-up call.
+        rc_calls = [c for c in run_calls if c[:3] == ["fleet", "rc", "up"]]
+        assert len(rc_calls) == 1, (
+            f"bootstrap must invoke `fleet rc up` exactly once; got {rc_calls}"
         )
 
 

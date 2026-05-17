@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -53,6 +54,17 @@ func pruneDirSaneOK() error { return nil }
 // records are filtered. Output format exposes id / project / task /
 // spawned-at and a one-line remediation suggestion.
 func TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC(t *testing.T) {
+	rcTestFleetHome(t)
+	// v0.12: the survey now distinguishes "RC enabled but missing
+	// flag" (real remediation: handoff) from "RC not enabled for
+	// project" (no action). Write the marker so the test agent's
+	// project is in the rc-enabled bucket, mirroring the original
+	// "agent should be flagged" intent.
+	if err := rc.WriteMarker("projects-fleet"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.RemoveMarker("projects-fleet") })
+
 	now := time.Date(2026, 5, 9, 13, 20, 42, 0, time.UTC)
 	records := []*agent.Record{
 		{
@@ -102,9 +114,10 @@ func TestMaintenanceBootstrapReport_FlagsLiveAgentsMissingRC(t *testing.T) {
 	}
 	got := out.String()
 
-	// Header counts only the live + missing record (ca7eb43e).
-	if !strings.Contains(got, "1 live agent(s) missing --remote-control") {
-		t.Errorf("expected '1 live agent(s) missing --remote-control' header; got:\n%s", got)
+	// v0.12 header: distinguishes RC-enabled-but-missing from
+	// RC-not-enabled. Test agent is RC-enabled (marker present).
+	if !strings.Contains(got, "1 live agent(s) with RC enabled but missing --remote-control") {
+		t.Errorf("expected v0.12 RC-enabled-missing header; got:\n%s", got)
 	}
 	if !strings.Contains(got, "ca7eb43e") {
 		t.Errorf("expected ca7eb43e in report; got:\n%s", got)

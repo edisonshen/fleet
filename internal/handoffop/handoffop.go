@@ -25,6 +25,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -523,7 +524,12 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// `fleet-handoff-<project>` (the Claude remote-control daemon's
 	// session-name-prefix filter).
 	rcSessionName := spawn.HandoffRemoteControlSessionName(req.NewAgentID, oldRec.Project)
-	rewrittenExecArgv := spawn.InjectRemoteControlFlag(oldRec.Command, rcSessionName)
+	// v0.12 (DESIGN §"Attach-surface gates" I3): use the project-aware
+	// rc.GateAttachFlag helper. Auto-handoff drain hits this code path
+	// without going through cmd/fleet's wrapper, so the dedicated
+	// helper carries the same FLEET_RC_BOOTSTRAP_DISABLED + rc.Enabled
+	// two-layer gate (rather than re-implementing it here).
+	rewrittenExecArgv := rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
 	if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
 		rewrittenExecArgv = nil
 	}

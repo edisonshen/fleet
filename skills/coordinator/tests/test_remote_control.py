@@ -83,174 +83,105 @@ def _enable_rc_bootstrap_for_test(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestSpawnDaemonIfNeeded:
+    """v0.12 spawn_daemon_if_needed contract (DESIGN-rc-listener-
+    lifecycle.md §"Attach-surface gates" S1): the Python side shells
+    out to `fleet rc up <project> --idempotent`; the Go controller
+    (internal/rc) is the SINGLE owner of spawn / marker / state.
+    """
+
     @pytest.fixture(autouse=True)
     def _opt_in_rc_bootstrap(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Every test in this class asserts on the SHAPE of the bash
-        bootstrap that spawn_daemon_if_needed produces. The session
-        env-gate (conftest.py) would short-circuit before the bash
-        payload is built; opt in per-class so the production code path
-        runs against the _FakePopen-mocked subprocess.Popen."""
+        """Disable the FLEET_RC_BOOTSTRAP_DISABLED env-gate for the
+        duration of each test so we exercise the production path
+        (subprocess.run shell-out)."""
         _enable_rc_bootstrap_for_test(monkeypatch)
 
-    def test_invokes_bash_with_narrow_pgrep_guard(
-        self, fake_popen: _FakePopen,
-    ) -> None:
-        """REGRESSION PIN — fix/remote-control-coord-injection (P0):
-
-        The pgrep guard must match ONLY the fleet-coord-prefixed daemon,
-        NOT all `claude remote-control` processes. The previous broad
-        guard (`pgrep -f "claude remote-control"`) silently skipped the
-        fleet-coord daemon launch whenever a fleet-handoff daemon was
-        running, breaking mobile claude.ai pairing for every coord on
-        the operator's host. This test pins the narrow form symmetric
-        with cmd/fleet/dispatch.go's remoteControlDaemonRunning regex.
-        """
+    def test_no_project_no_op(self, fake_popen: _FakePopen) -> None:
+        """Without a project arg, the function is a no-op (no
+        subprocess fired, returns True). Legacy / unsupervised
+        lineages take this path."""
         ok = remote_control.spawn_daemon_if_needed()
         assert ok is True
-        assert len(fake_popen.calls) == 1
-        args, _kwargs = fake_popen.calls[0]
-        assert args[0] == "bash"
-        assert args[1] == "-c"
-        cmd = args[2]
-        # The guard must reference pgrep -f explicitly.
-        assert "pgrep -f " in cmd, (
-            f"missing pgrep guard in spawn shell command: {cmd!r}"
-        )
-        # Anchor on `^claude` so the bootstrap's own bash subprocess
-        # (whose argv[0] is "bash") never matches.
-        assert "^claude " in cmd, (
-            "pgrep pattern must anchor with ^claude to exclude the "
-            f"bash bootstrap subprocess; got: {cmd!r}"
-        )
-        # Must reference the fleet-coord prefix flag-name + value,
-        # NOT just `claude remote-control` — the previous bug was a
-        # broad match that also caught fleet-handoff daemons.
-        assert "--remote-control-session-name-prefix fleet-coord" in cmd, (
-            "pgrep pattern must match the fleet-coord prefix flag, "
-            f"not just `claude remote-control`; got: {cmd!r}"
-        )
-        # The unquoted token (live daemon's argv has shell-quotes
-        # stripped before exec). A hypothetical longer prefix like
-        # `fleet-coordX` should NOT match.
-        assert "fleet-coord( |$)" in cmd or "fleet-coord$" in cmd, (
-            "pgrep pattern must terminate the fleet-coord token at a "
-            f"word boundary so longer prefixes don't false-positive: {cmd!r}"
-        )
-        assert "nohup claude remote-control" in cmd
-        # Coord-specific log path so operator can distinguish
-        # bootstrap vs handoff invocations.
-        assert "/tmp/claude-rc-coord.log" in cmd
-        # Background `&` keeps the daemon alive past the coord tick.
-        assert cmd.rstrip().endswith("&")
+        assert fake_popen.calls == []
 
-    def test_pgrep_pattern_does_not_match_fleet_handoff_daemon(
-        self, fake_popen: _FakePopen,
+    def test_shells_out_to_fleet_rc_up(
+        self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """REGRESSION PIN — operator-reported P0:
-
-        The previous broad pgrep pattern matched a fleet-handoff daemon
-        and silently skipped the fleet-coord daemon launch. We extract
-        the pattern from the bash command and compile it as a regex,
-        then verify representative argv strings.
-
-        This is the critical test: a fleet-handoff daemon must NOT
-        cause the coord launch to be skipped. The regex must match a
-        live fleet-coord daemon (so we don't double-launch it) AND must
-        NOT match a fleet-handoff daemon.
+        """v0.12 contract: the function shells out to
+        `fleet rc up <project> --idempotent` via subprocess.run.
         """
-        import re as _re
+        calls: list[list[str]] = []
 
-        remote_control.spawn_daemon_if_needed()
-        cmd = fake_popen.calls[0][0][2]
-        # Extract the pgrep pattern. The shell form is:
-        #   pgrep -f '<pattern>' >/dev/null 2>&1 || ...
-        # We pull the single-quoted pattern out.
-        m = _re.search(r"pgrep -f '([^']+)'", cmd)
-        assert m is not None, (
-            f"could not locate pgrep -f '<pattern>' in shell cmd: {cmd!r}"
+        class _FakeResult:
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeResult(0)
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo")
+        assert ok is True
+        assert len(calls) == 1
+        assert calls[0] == ["fleet", "rc", "up", "demo", "--idempotent"]
+
+    def test_returns_false_on_nonzero_exit(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exit codes 10/11/12/1 from `fleet rc up` mean "listener
+        not alive" — spawn_daemon_if_needed returns False (fail-soft)."""
+        class _FakeResult:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+
+        monkeypatch.setattr(
+            remote_control.subprocess, "run",
+            lambda args, **kwargs: _FakeResult(10),
         )
-        pattern = m.group(1)
-        compiled = _re.compile(pattern)
-
-        cases = [
-            (
-                "live fleet-coord daemon — must MATCH (avoid double-launch)",
-                "claude remote-control --remote-control-session-name-prefix fleet-coord",
-                True,
-            ),
-            (
-                "live fleet-coord daemon with trailing args — must MATCH",
-                "claude remote-control --remote-control-session-name-prefix fleet-coord --some-other-flag",
-                True,
-            ),
-            (
-                "live fleet-handoff daemon — must NOT match (the bug)",
-                "claude remote-control --remote-control-session-name-prefix fleet-handoff",
-                False,
-            ),
-            (
-                "transient bash bootstrap subprocess — argv[0] is bash, must NOT match",
-                'bash -c pgrep -f \'^claude remote-control --remote-control-session-name-prefix fleet-coord( |$)\' >/dev/null 2>&1 || nohup claude remote-control --remote-control-session-name-prefix "fleet-coord"',
-                False,
-            ),
-            (
-                "spurious process mentioning fleet-coord in a log path — must NOT match",
-                "tail -f /tmp/fleet-coord.log",
-                False,
-            ),
-            (
-                "longer prefix fleet-coordX — must NOT match (word-boundary)",
-                "claude remote-control --remote-control-session-name-prefix fleet-coordX",
-                False,
-            ),
-        ]
-        for name, cmdline, want in cases:
-            got = bool(compiled.search(cmdline))
-            assert got == want, (
-                f"{name}: pattern {pattern!r} against {cmdline!r}: "
-                f"got match={got}, want {want}"
-            )
-
-    def test_detached_session(self, fake_popen: _FakePopen) -> None:
-        """start_new_session=True detaches from the coord's process
-        group, so the daemon survives tick exit + parent SIGHUP."""
-        remote_control.spawn_daemon_if_needed()
-        _args, kwargs = fake_popen.calls[0]
-        assert kwargs.get("start_new_session") is True
-
-    def test_devnull_streams(self, fake_popen: _FakePopen) -> None:
-        """stdout/stderr must be DEVNULL so any pgrep noise doesn't
-        leak onto the coord's stdout (which the skill emits a JSON
-        summary on)."""
-        import subprocess as _sp
-        remote_control.spawn_daemon_if_needed()
-        _args, kwargs = fake_popen.calls[0]
-        assert kwargs.get("stdin") == _sp.DEVNULL
-        assert kwargs.get("stdout") == _sp.DEVNULL
-        assert kwargs.get("stderr") == _sp.DEVNULL
+        ok = remote_control.spawn_daemon_if_needed("demo")
+        assert ok is False
 
     def test_filenotfound_returns_false_no_raise(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """bash missing on the host: log + return False, never raise.
-        This is the documented fail-soft posture — coord proceeds, the
-        operator just doesn't get auto-pairing."""
-        fake = _FakePopen()
-        fake.raise_on_call = FileNotFoundError("bash")
-        monkeypatch.setattr(remote_control.subprocess, "Popen", fake)
-        ok = remote_control.spawn_daemon_if_needed()
+        """fleet binary missing → log + return False, never raise.
+        Fail-soft."""
+        def _raise_fnf(args, **kwargs):
+            raise FileNotFoundError("fleet")
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _raise_fnf)
+        ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is False
 
     def test_generic_exception_returns_false_no_raise(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Any other Popen failure (e.g. resource limits) is logged
-        + returns False. Same fail-soft posture."""
-        fake = _FakePopen()
-        fake.raise_on_call = OSError("EMFILE")
-        monkeypatch.setattr(remote_control.subprocess, "Popen", fake)
-        ok = remote_control.spawn_daemon_if_needed()
+        """Any other subprocess failure is logged + returns False."""
+        def _raise(args, **kwargs):
+            raise OSError("EMFILE")
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _raise)
+        ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is False
+
+    def test_env_gate_disables_shell_out(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """FLEET_RC_BOOTSTRAP_DISABLED=1 short-circuits even with a
+        project arg — defense-in-depth from PR #157, kept through
+        v0.12 per CI invariant test."""
+        monkeypatch.setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
+        calls: list[list[str]] = []
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return type("R", (), {"returncode": 0})()
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo")
+        assert ok is True
+        assert calls == []
 
 
 # ---------- seed_inbox ----------

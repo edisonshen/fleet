@@ -146,34 +146,38 @@ def _escape_project_for_pgrep(s: str) -> str:
 
 
 def first_action(project: str) -> str:
-    prefix = "fleet-handoff"
-    if project:
-        prefix = prefix + "-" + project
-    # Escape `.` because ValidateProjectName allows project names like
-    # `v2.1`. Without escaping, the pgrep guard for `fleet-handoff-v2.1`
-    # would also match a daemon for `fleet-handoff-v2a1` (false
-    # positive), causing the bootstrap to skip launching the v2.1
-    # daemon while the replacement agent registers as
-    # `fleet-handoff-<id>-v2.1`, leaving /remote-control with no
-    # compatible daemon to attach to.
-    pgrep_pattern = (
-        "^claude remote-control "
-        "--remote-control-session-name-prefix "
-        + _escape_project_for_pgrep(prefix) + "( |$)"
-    )
+    """Return the v0.12 operator-instruction body for the "First Action
+    (auto)" handoff section.
+
+    v0.12 (DESIGN-rc-listener-lifecycle.md §"Handoff doc rewrite"):
+    the embedded bash bootstrap is GONE. The body directs the operator
+    to run `fleet rc connect <project>` to re-attach mobile/web
+    pairing — a small UX regression (operator types one command) for a
+    large architectural win (no bash exec from a markdown file → no
+    5,620-mobile-push regressions from a stuck reviewer loop).
+
+    Empty project falls back to `<project>` placeholder text so legacy
+    records / tests produce well-formed output.
+
+    MUST stay byte-identical with internal/handoff.FirstAction (Go).
+    Both renderers are tested for byte-equality
+    (TestRender_SkillByteGolden + EXPECTED_GOLDEN here in Python).
+    """
+    display = project if project else "<project>"
     return (
-        "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
+        "To re-attach mobile/web pairing for this coord, run in your terminal:\n"
         "\n"
-        "```bash\n"
-        f"( pgrep -f '{pgrep_pattern}' >/dev/null 2>&1 || \\\n"
-        "  nohup claude remote-control \\\n"
-        f'    --remote-control-session-name-prefix "{prefix}" \\\n'
-        "    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
-        "```\n"
+        f"    fleet rc connect {display}\n"
         "\n"
-        "Use the Bash tool with run_in_background: true.\n"
+        "(Or `/remote-control` from within Claude Code.) The pairing resumes\n"
+        "from where the previous coord left off, provided RC was previously\n"
+        f"enabled via `fleet rc up {display}`.\n"
         "\n"
-        "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
+        "If RC was not previously enabled, run:\n"
+        "\n"
+        f"    fleet rc up {display}\n"
+        "\n"
+        f"first, then `fleet rc connect {display}`.\n"
         "\n"
         "Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
         "\n"

@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DESIGN: Remote-Control Listener as Operator-Managed Project Resource</title>
+<style>
+:root {
+  --bg: #fdfdfc;
+  --fg: #1a1a1a;
+  --muted: #6b6b6b;
+  --accent: #0066cc;
+  --border: #e3e3e0;
+  --code-bg: #f4f4f1;
+  --code-fg: #1a1a1a;
+  --table-stripe: #f9f9f7;
+  --blockquote-border: #d0d0cd;
+  --blockquote-bg: #f7f7f4;
+  --kbd-bg: #f0f0ec;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1a1a1a;
+    --fg: #e8e8e6;
+    --muted: #9a9a98;
+    --accent: #7ab8ff;
+    --border: #333331;
+    --code-bg: #252523;
+    --code-fg: #e8e8e6;
+    --table-stripe: #222220;
+    --blockquote-border: #444442;
+    --blockquote-bg: #222220;
+    --kbd-bg: #2e2e2c;
+  }
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  max-width: 1240px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  gap: 2rem;
+}
+@media (max-width: 900px) {
+  .wrap { grid-template-columns: 1fr; }
+  .toc { position: static !important; max-height: none !important; }
+}
+.toc {
+  position: sticky;
+  top: 1rem;
+  align-self: start;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
+  font-size: 14px;
+  padding-right: 0.5rem;
+}
+.toc h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 0.5rem 0;
+  font-weight: 600;
+}
+.toc ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.toc ul ul { padding-left: 1rem; }
+.toc li { margin: 0.25rem 0; }
+.toc a {
+  color: var(--fg);
+  text-decoration: none;
+  display: block;
+  padding: 0.15rem 0;
+  border-left: 2px solid transparent;
+  padding-left: 0.5rem;
+  margin-left: -0.5rem;
+  transition: color 0.1s, border-color 0.1s;
+}
+.toc a:hover {
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+main {
+  min-width: 0;
+}
+.doc-meta {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+.doc-meta strong { color: var(--fg); }
+h1, h2, h3, h4, h5, h6 {
+  margin: 1.8em 0 0.5em 0;
+  line-height: 1.25;
+  font-weight: 600;
+}
+h1 { font-size: 2rem; margin-top: 0; }
+h2 { font-size: 1.5rem; padding-bottom: 0.3rem; border-bottom: 1px solid var(--border); }
+h3 { font-size: 1.2rem; }
+h4 { font-size: 1.05rem; }
+h5, h6 { font-size: 1rem; color: var(--muted); }
+h1 .anchor, h2 .anchor, h3 .anchor, h4 .anchor, h5 .anchor, h6 .anchor {
+  visibility: hidden;
+  margin-left: 0.3rem;
+  text-decoration: none;
+  color: var(--muted);
+  font-weight: 400;
+}
+h1:hover .anchor, h2:hover .anchor, h3:hover .anchor,
+h4:hover .anchor, h5:hover .anchor, h6:hover .anchor {
+  visibility: visible;
+}
+p { margin: 0.8em 0; }
+a { color: var(--accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+ul, ol { padding-left: 1.5rem; }
+li { margin: 0.3em 0; }
+strong { font-weight: 600; }
+em { font-style: italic; }
+code {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1rem 1.2rem;
+  border-radius: 5px;
+  overflow-x: auto;
+  font-size: 13.5px;
+  line-height: 1.5;
+  border: 1px solid var(--border);
+}
+pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+}
+blockquote {
+  border-left: 3px solid var(--blockquote-border);
+  background: var(--blockquote-bg);
+  margin: 1em 0;
+  padding: 0.5em 1em;
+  color: var(--fg);
+  font-style: normal;
+}
+blockquote p:first-child { margin-top: 0; }
+blockquote p:last-child { margin-bottom: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1em 0;
+  font-size: 14px;
+  display: block;
+  overflow-x: auto;
+}
+thead { background: var(--table-stripe); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.8rem;
+  text-align: left;
+  vertical-align: top;
+}
+th { font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--table-stripe); }
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 2em 0;
+}
+kbd {
+  background: var(--kbd-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.1em 0.4em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+  box-shadow: 0 1px 0 var(--border);
+}
+.toc-anchor {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+input[type="checkbox"][disabled] { margin-right: 0.4em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc" aria-label="table of contents">
+    <h2>Contents</h2>
+    <div class="toc">
+<ul>
+<li><a href="#tldr-for-implementers">TL;DR for implementers</a></li>
+<li><a href="#motivation-the-leak-pattern-compounded">Motivation — the leak pattern compounded</a></li>
+<li><a href="#goals-revised-per-codex-round-1">Goals (revised per codex round 1)</a></li>
+<li><a href="#non-goals">Non-goals</a></li>
+<li><a href="#resource-shape-project-scoped-controller">Resource shape — project-scoped controller</a><ul>
+<li><a href="#storage-layout">Storage layout</a></li>
+<li><a href="#adoption-policy-codex-round-1-fix">Adoption policy (codex round 1 fix)</a></li>
+<li><a href="#service-side-management-codex-round-2-correction">Service-side management (codex round 2 correction)</a></li>
+</ul>
+</li>
+<li><a href="#attach-surface-gates-the-complete-6-site-inventory-codex-round-1">Attach-surface gates — the complete 6-site inventory (codex round 1)</a><ul>
+<li><a href="#daemon-spawn-sites-3">Daemon-spawn sites (3)</a></li>
+<li><a href="#flag-injection-sites-3-codex-round-1-catch">Flag-injection sites (3) — codex round 1 catch</a></li>
+<li><a href="#cmdfleetmaintenancego348-351-codex-round-1-catch">cmd/fleet/maintenance.go:348-351 (codex round 1 catch)</a></li>
+<li><a href="#defense-in-depth-pr-157-env-gate-stays">Defense-in-depth: PR #157 env-gate stays</a></li>
+</ul>
+</li>
+<li><a href="#fleet-rc-cli">fleet rc CLI</a><ul>
+<li><a href="#fleet-rc-connect-drives-the-in-session-remote-control-slash-command-codex-round-2-fix">fleet rc connect — drives the in-session /remote-control slash command (codex round 2 fix)</a></li>
+<li><a href="#stable-json-output-exit-codes">Stable JSON output + exit codes</a></li>
+<li><a href="#remote-control-skill-rewiring">/remote-control skill rewiring</a></li>
+</ul>
+</li>
+<li><a href="#handoff-doc-rewrite-codex-round-1-finding">Handoff doc rewrite (codex round 1 finding)</a></li>
+<li><a href="#test-fake-path-prepend-pattern-codex-round-1">Test fake — PATH-prepend pattern (codex round 1)</a><ul>
+<li><a href="#layer-1-injectable-command-runner-seam">Layer 1: Injectable command-runner seam</a></li>
+<li><a href="#layer-2-path-prepended-fake-claude-binary">Layer 2: PATH-prepended fake claude binary</a></li>
+<li><a href="#acceptance-gate-ci-invariant">Acceptance gate (CI invariant)</a></li>
+</ul>
+</li>
+<li><a href="#marker-file-shape-codex-round-1-flat-wins">Marker file shape (codex round 1: flat wins)</a></li>
+<li><a href="#sequencing-codex-round-1-standalone-not-folded-into-pr3">Sequencing (codex round 1: standalone, NOT folded into PR3)</a><ul>
+<li><a href="#standalone-pr-recommended">Standalone PR (recommended)</a></li>
+<li><a href="#dependency-on-dispatch-lifecycle">Dependency on dispatch-lifecycle</a></li>
+</ul>
+</li>
+<li><a href="#plan-eng-review-decisions-2026-05-16">Plan-eng-review decisions (2026-05-16)</a></li>
+<li><a href="#migration-v011x-v0120">Migration — v0.11.x → v0.12.0</a></li>
+<li><a href="#working-dir-provenance-explicit-resolution-order-codex-round-3-p11">Working-dir provenance — explicit resolution order (codex round 3 P1.1)</a><ul>
+<li><a href="#working-dir-rename-mid-lifecycle-codex-round-3-free-form">Working-dir rename mid-lifecycle (codex round 3 free-form)</a></li>
+</ul>
+</li>
+<li><a href="#multi-coord-per-project-target-selection-codex-round-3-free-form">Multi-coord-per-project — target selection (codex round 3 free-form)</a></li>
+<li><a href="#pr4-sweeper-integration-schema-codex-round-3-free-form">PR4 sweeper integration schema (codex round 3 free-form)</a></li>
+<li><a href="#claude-cli-surface-verify-via-smoke-test-caveat-codex-round-3">Claude CLI surface — verify-via-smoke-test caveat (codex round 3)</a></li>
+<li><a href="#risks-open-questions-round-12-mostly-answered-remaining-for-round-4">Risks / open questions (round 1+2 mostly answered; remaining for round 4)</a></li>
+<li><a href="#failure-modes-acceptance">Failure modes / acceptance</a><ul>
+<li><a href="#cross-cutting-acceptance">Cross-cutting acceptance</a></li>
+</ul>
+</li>
+<li><a href="#decision-log">Decision log</a></li>
+<li><a href="#open-items-before-draft-freeze">Open items before draft-freeze</a></li>
+</ul>
+</div>
+
+  </nav>
+  <main>
+    <div class="doc-meta">
+      <strong>Source:</strong> <code>DESIGN-rc-listener-lifecycle.md</code> &mdash;
+      <strong>Rendered:</strong> 2026-05-17 06:20 UTC &mdash;
+      Agents read the <code>.md</code>; humans read the <code>.html</code>.
+    </div>
+    <h1 id="design-remote-control-listener-as-operator-managed-project-resource">DESIGN: Remote-Control Listener as Operator-Managed Project Resource<a class="anchor" href="#design-remote-control-listener-as-operator-managed-project-resource" title="Permalink to this section">¶</a></h1>
+<p><strong>Status:</strong> v8 ✅ <strong>plan-eng-review CLEARED</strong> — codex rounds 1-7 + plan-eng 5 decisions folded in. Ready for operator final approval (G2) → file P1 task → dispatch.
+<strong>Author:</strong> coord agent (Feng Shen's session, post-PR-#157-spam-incident)
+<strong>Reviewers:</strong> codex (round 1 returned NEEDS_REVISION_BEFORE_DRAFTING; round 2+ pending), plan-eng-review (pending), operator (G2 approval gate)
+<strong>Target version:</strong> v0.12.0 — independent of dispatch-lifecycle stack
+<strong>Created:</strong> 2026-05-16
+<strong>Supersedes:</strong> PR #157 (<code>FLEET_RC_BOOTSTRAP_DISABLED</code> env-gate) — kept as test-time defense-in-depth during migration; retired in v0.13 once marker-gate is proven.
+<strong>Related (NOT fold-into):</strong> <code>docs/DESIGN-dispatch-lifecycle.md</code> shares the boring-by-default infrastructure (state.WriteAtomic, project locks, sweeper patterns) but <strong>RC is NOT a dispatch claim</strong>. Codex round 1: "RC is operator-managed and spans many dispatches; reusing dispatch claims is not [the right reuse]."</p>
+<hr>
+<h2 id="tldr-for-implementers">TL;DR for implementers<a class="anchor" href="#tldr-for-implementers" title="Permalink to this section">¶</a></h2>
+<p>The <code>claude remote-control</code> listener daemon is currently spawned as an <strong>implicit side effect</strong> across multiple fleet code paths. PR #157 patched test-path spam with an env-gate; steady-state implicit spawn is still there. The 10-hour zombie-reviewer incident produced ~5,620 mobile push events.</p>
+<p><strong>This design replaces patches with architecture:</strong>
+- <strong><code>internal/rc</code> package</strong> — a project-scoped controller; <strong>single owner of spawn, lock, state</strong> (codex round 2: S1 routes through the controller, not just gates on <code>Enabled</code>).
+- <strong>Flat marker file</strong> <code>~/.fleet/projects/&lt;p&gt;/rc-enabled</code> (matches <code>coord-spawn-marker</code> shape).
+- <strong><code>rc-state.json</code></strong> with full ownership fields (pid, host_id, working_dir, session_prefix, last_spawn_at, last_error) — codex round 2 schema completion.
+- <strong>All 6 attach/spawn surfaces</strong> route through <code>rc.Up/Down/Connect/Inspect</code>.
+- <strong><code>fleet rc up/down/connect/status/list/reset</code> CLI</strong> — operator-explicit lifecycle control.
+- <strong>Project isolation via Claude daemon's directory-keyed registry</strong>, NOT via session-name-prefix filtering. Daemon prefix stays <code>fleet-coord</code> (legacy-compatible); the daemon's dir/name registry distinguishes per-project listeners. Sidesteps the coord-session-rename problem (codex round 2).
+- <strong>Handoff docs become operator-instruction text</strong> — no bash exec.
+- <strong><code>fleet rc connect</code> drives the in-session <code>/remote-control</code> slash-command</strong> via <code>tmux send-keys</code> to the coord's tmux session — NOT external PID surgery (codex round 2 fix).
+- <strong><code>rc.Down</code> kills local PID + removes marker; that's the teardown.</strong> No <code>claude daemon remote-control remove</code> in the teardown path (codex round 2: that API is for the dir registry, not live-listener cleanup).
+- <strong>Test fake</strong> — PATH-prepend <code>claude</code> script + injectable command-runner seam.
+- <strong>Standalone PR</strong> (NOT folded into dispatch-lifecycle PR3).</p>
+<p>Operator behavior after v0.12:
+- Mobile pairing wanted for a project: <code>fleet rc up &lt;project&gt;</code> once.
+- Stop bridge: <code>fleet rc down &lt;project&gt;</code>.
+- Already-running coord without RC: <code>fleet rc connect &lt;project&gt;</code> (attach existing live session).
+- Nothing implicit. No respawn loops. No mobile spam from tests.</p>
+<hr>
+<h2 id="motivation-the-leak-pattern-compounded">Motivation — the leak pattern compounded<a class="anchor" href="#motivation-the-leak-pattern-compounded" title="Permalink to this section">¶</a></h2>
+<p>[Unchanged from v1; see decision log for evolution.]</p>
+<p>The session that produced this design discovered fleet's leak issues compound into <strong>two patterns</strong>:</p>
+<ul>
+<li><strong>Pattern A: Resource lifecycle gap</strong> — covered by dispatch-lifecycle re-arch.</li>
+<li><strong>Pattern B: Implicit-spawn side effect</strong> — the RC listener falls here. The 10-hour zombie-reviewer in this session exec'd the bootstrap ~590 times via <code>go test</code> invoking <code>runHandoff()</code>. PR #157 patched test boundaries; the <strong>steady-state implicit spawn loop is still present</strong> (<code>skills/coordinator/remote_control.py:294-369</code> ticks every 30s).</li>
+</ul>
+<p>This design treats RC as <strong>operator-managed project state</strong>, not implicit dispatch side effect.</p>
+<hr>
+<h2 id="goals-revised-per-codex-round-1">Goals (revised per codex round 1)<a class="anchor" href="#goals-revised-per-codex-round-1" title="Permalink to this section">¶</a></h2>
+<ol>
+<li><strong>Listener-spawn is an explicit operator action</strong> keyed by a per-project marker.</li>
+<li><strong>Listener is managed by a dedicated <code>internal/rc</code> controller</strong> with its own lifecycle (NOT a dispatch claim).</li>
+<li><strong>All 6 attach/spawn surfaces gate on <code>rc.Enabled(project)</code></strong> (the inventory is now complete).</li>
+<li><strong>Operator-facing <code>fleet rc</code> CLI</strong> with <code>up/down/connect/status/list/reset</code>.</li>
+<li><strong><code>/remote-control</code> skill becomes a thin wrapper</strong> around <code>fleet rc up</code> + <code>fleet rc connect</code>.</li>
+<li><strong>Test paths cannot spawn the listener</strong> via two layers: PATH-prepended fake <code>claude</code> binary + marker absence + env-gate.</li>
+<li><strong>Production handoff continuity preserved</strong> when operator opted in. Handoff docs <strong>direct operator to <code>fleet rc connect</code></strong>; they do NOT embed raw bootstrap bash.</li>
+<li><strong>Adoption refused unless Fleet-owned</strong> — never adopt arbitrary listeners by pgrep PID alone (codex round 1: "not safe enough").</li>
+</ol>
+<h2 id="non-goals">Non-goals<a class="anchor" href="#non-goals" title="Permalink to this section">¶</a></h2>
+<ul>
+<li>Cross-machine marker sync (single-host invariant).</li>
+<li>Auto-migration of existing pairings; operator opts in per-project at v0.12 cutover.</li>
+<li>Removing the listener mechanism entirely.</li>
+<li>Service-side state cleanup beyond what Claude Code's <code>claude daemon remote-control remove</code> offers.</li>
+<li>Reusing the dispatch-claim primitive (codex round 1: wrong ownership model).</li>
+</ul>
+<hr>
+<h2 id="resource-shape-project-scoped-controller">Resource shape — project-scoped controller<a class="anchor" href="#resource-shape-project-scoped-controller" title="Permalink to this section">¶</a></h2>
+<pre><code class="language-go">// internal/rc/rc.go — NEW PACKAGE
+
+package rc
+
+// Enabled returns true iff the per-project rc-enabled marker exists.
+// This is the SINGLE source of truth for &quot;should listener spawn for this
+// project&quot;. Every attach/spawn surface in fleet calls this helper.
+func Enabled(project string) bool { ... }
+
+// Up creates the marker + spawns the listener (or adopts a Fleet-owned
+// one). Idempotent. Returns Outcome for stable CLI exit codes.
+func Up(project string, opts UpOpts) (Outcome, error) { ... }
+
+// Down kills the listener Fleet owns + removes the marker. Idempotent.
+func Down(project string) (Outcome, error) { ... }
+
+// Connect attaches the current operator session (interactive claude in
+// this terminal) to the project's existing listener. Used by the
+// /remote-control skill when a coord is ALREADY running and operator
+// just enabled RC after the fact. NOT a spawn — only a state mutation
+// + send-keys equivalent for the operator's UX.
+func Connect(project string) (Outcome, error) { ... }
+
+// Status returns observed state (marker present? listener PID? last error?).
+func Status(project string) (State, error) { ... }
+
+// List enumerates all projects with markers present.
+func List() ([]string, error) { ... }
+
+// Reset is the operator-emergency-stop: remove ALL markers + kill ALL
+// Fleet-owned listeners across all projects.
+func Reset() error { ... }
+
+type Outcome string  // mirrors fleet claims outcome enum
+
+type UpOpts struct {
+    AdoptIfFleetOwned bool  // default true — adopt if state.json says it's ours
+    AdoptIfUnknown    bool  // default FALSE — codex round 1: don't adopt arbitrary PIDs
+}
+
+type State struct {
+    Project       string
+    Enabled       bool      // marker present
+    ListenerPID   int       // 0 if not spawned by Fleet
+    HostID        string    // hostname when spawned (codex round 2 schema completion)
+    WorkingDir    string    // operator's project working dir at spawn time; used by Claude daemon's directory-keyed registry
+    SessionPrefix string    // &quot;fleet-coord&quot; — legacy global prefix; per-project isolation is via WorkingDir
+    LastSpawnAt   time.Time
+    LastError     string    // empty on success
+}
+</code></pre>
+<h3 id="storage-layout">Storage layout<a class="anchor" href="#storage-layout" title="Permalink to this section">¶</a></h3>
+<pre><code>~/.fleet/projects/&lt;project&gt;/
+├── rc-enabled                # FLAT marker file (zero bytes; matches coord-spawn-marker shape).
+│                             # Presence = &quot;operator opted in for this project&quot;.
+└── rc-state.json             # REQUIRED Fleet-side ownership record:
+                              # {schema, project, pid, host_id, working_dir, session_prefix,
+                              #  last_spawn_at, last_error}
+                              # Written atomically by rc.Up; read by Status + sweeper.
+                              # If absent: rc.Up creates it; controller NEVER falls back to
+                              # prefix-scan adoption (codex round 3+4: prefix-only is unsafe).
+                              # Duplicate-spawn rule (codex round 2): marker present + state.json
+                              # absent + Fleet-owned process alive in working_dir → refuse spawn
+                              # AND refuse adopt; operator must `fleet rc reset` + re-up.
+~/.fleet/claims-locks/rc-&lt;project&gt;.lock  # NB-flock for Up/Down/Connect concurrency.
+</code></pre>
+<p>Codex round 1 specifically chose:
+- <strong>Flat marker</strong> over JSON (matches <code>coord-spawn-marker</code> flat-text convention at <code>internal/state/state.go:528-566</code>).
+- <strong>Separate state file</strong> if metadata needed (don't pollute marker semantics).</p>
+<h3 id="adoption-policy-codex-round-1-fix">Adoption policy (codex round 1 fix)<a class="anchor" href="#adoption-policy-codex-round-1-fix" title="Permalink to this section">¶</a></h3>
+<p><code>rc.Up</code> does NOT pgrep + adopt arbitrary matching processes. Two rules:</p>
+<ol>
+<li><strong>Adopt if Fleet-owned:</strong> If <code>rc-state.json</code> exists, has a PID, and that PID is alive AND its argv matches the recorded session_prefix, adopt it (idempotent re-Up). This proves Fleet spawned it.</li>
+<li><strong>Refuse unknown adoption by default:</strong> If marker absent OR state.json absent OR PID mismatch → spawn a new listener. If a NON-Fleet listener happens to match the same prefix, log a conflict warning and let the operator resolve with <code>fleet rc reset</code> (which kills both).</li>
+</ol>
+<p>Override: <code>UpOpts.AdoptIfUnknown=true</code> for power users. Not exposed via CLI v1.</p>
+<h3 id="service-side-management-codex-round-2-correction">Service-side management (codex round 2 correction)<a class="anchor" href="#service-side-management-codex-round-2-correction" title="Permalink to this section">¶</a></h3>
+<p>Claude CLI exposes <code>claude daemon remote-control add/remove/list</code>, but <strong>that is for the directory/server REGISTRY</strong>, NOT for tearing down a live-listener process (codex round 2). The cleanup path is:</p>
+<ol>
+<li><strong><code>rc.Down</code> teardown:</strong> kill local PID (SIGTERM, then SIGKILL after 10s grace); remove marker; remove <code>rc-state.json</code>. That's it. The Claude service times out its own stale session entries on its own timeline.</li>
+<li><strong>Optional registry hygiene:</strong> <code>rc.Reset</code> (operator emergency) may additionally invoke <code>claude daemon remote-control remove &lt;working_dir&gt;</code> to clean the dir-registry entry. Not in the per-project <code>Down</code> path — <code>Reset</code> only.</li>
+</ol>
+<p>The earlier v2 proposal of <code>claude daemon remote-control remove "fleet-coord-&lt;project&gt;"</code> as a teardown semantic was wrong; codex round 2 caught the API-surface mismatch.</p>
+<hr>
+<h2 id="attach-surface-gates-the-complete-6-site-inventory-codex-round-1">Attach-surface gates — the complete 6-site inventory (codex round 1)<a class="anchor" href="#attach-surface-gates-the-complete-6-site-inventory-codex-round-1" title="Permalink to this section">¶</a></h2>
+<p>Every site in fleet that either spawns the daemon OR injects the <code>--remote-control</code> flag onto a claude argv now calls <code>rc.Enabled(project)</code>. Spawn-only sites are 3; flag-injection sites are 3 more — codex round 1 caught that I'd conflated them.</p>
+<h3 id="daemon-spawn-sites-3">Daemon-spawn sites (3)<a class="anchor" href="#daemon-spawn-sites-3" title="Permalink to this section">¶</a></h3>
+<table>
+<thead>
+<tr>
+<th>Site</th>
+<th>Today</th>
+<th>Post-design</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>(S1)</strong> <code>skills/coordinator/remote_control.py:spawn_daemon_if_needed</code></td>
+<td>Coord tick respawns global <code>fleet-coord</code> daemon every 30s if absent</td>
+<td><strong>Routes through controller</strong> (codex round 2): the Python function shells out via <code>subprocess.run(["fleet", "rc", "up", project, "--idempotent"])</code> and returns based on outcome. Python no longer does its own pgrep/spawn — Go controller is the single owner. Per-project isolation via Claude daemon's dir-registry (working_dir field in rc-state.json), not prefix-filter renaming.</td>
+</tr>
+<tr>
+<td><strong>(S2)</strong> <code>internal/handoff/handoff.go:FirstAction</code></td>
+<td>Embeds raw <code>pgrep \|\| nohup claude remote-control</code> bash in handoff doc</td>
+<td><strong>Removes the bootstrap entirely.</strong> Replaces with: "To re-attach mobile/web pairing, run <code>fleet rc connect &lt;project&gt;</code> in your terminal." Handoff doc becomes operator instructions, not exec'd bash.</td>
+</tr>
+<tr>
+<td><strong>(S3)</strong> <code>skills/fleet-guard/handoff.py:first_action</code></td>
+<td>Python byte-mirror of S2</td>
+<td>Same as S2 — operator-instruction string, not bash. Byte-golden invariant preserved by updating BOTH sides symmetrically (Python <code>EXPECTED_GOLDEN</code> + Go <code>TestRender_SkillByteGolden</code> both rewrite).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="flag-injection-sites-3-codex-round-1-catch">Flag-injection sites (3) — codex round 1 catch<a class="anchor" href="#flag-injection-sites-3-codex-round-1-catch" title="Permalink to this section">¶</a></h3>
+<table>
+<thead>
+<tr>
+<th>Site</th>
+<th>Today</th>
+<th>Post-design</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>(I1)</strong> <code>cmd/fleet/dispatch.go:injectRemoteControlFlag</code> (the PR #157 chokepoint)</td>
+<td>PR #157 env-gates this</td>
+<td>Add <code>rc.Enabled(project)</code> check; PR #157 env-gate stays as defense-in-depth. Returns input argv unchanged if marker absent OR env set. <strong>No coord session-name change</strong> — daemon prefix stays <code>fleet-coord</code>; per-project isolation via dir-registry (codex round 2).</td>
+</tr>
+<tr>
+<td><strong>(I2)</strong> <code>cmd/fleet/handoff.go:704-705</code></td>
+<td>Injects <code>--remote-control</code> on handoff replacement spawn</td>
+<td>Gate on <code>rc.Enabled(project)</code>. Codex round 1 catch.</td>
+</tr>
+<tr>
+<td><strong>(I3)</strong> <code>internal/handoffop/handoffop.go:525-526</code></td>
+<td>Auto-handoff drain's injection point</td>
+<td>Currently calls <code>spawn.InjectRemoteControlFlag</code> DIRECTLY, bypassing cmd/fleet wrapper. <strong>New: dedicated <code>rc.GateAttachFlag(project, argv)</code> helper in <code>internal/rc/</code> package</strong> is the chokepoint. I3 calls this helper (NOT the cmd/fleet wrapper). Project-aware. Codex round 2 explicit catch: "v2 needs a project-aware gate/helper here, not just 'same as I2' in prose."</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cmdfleetmaintenancego348-351-codex-round-1-catch"><code>cmd/fleet/maintenance.go:348-351</code> (codex round 1 catch)<a class="anchor" href="#cmdfleetmaintenancego348-351-codex-round-1-catch" title="Permalink to this section">¶</a></h3>
+<p>The <code>fleet maintenance</code> survey reports "agents missing --remote-control" as if it's always a bug. After this design, agents legitimately lack the flag when their project hasn't opted in. The survey output is rewritten to say "no RC enabled" or "RC enabled but not connected" depending on <code>rc.Status</code> per project.</p>
+<h3 id="defense-in-depth-pr-157-env-gate-stays">Defense-in-depth: PR #157 env-gate stays<a class="anchor" href="#defense-in-depth-pr-157-env-gate-stays" title="Permalink to this section">¶</a></h3>
+<p><code>FLEET_RC_BOOTSTRAP_DISABLED=1</code> remains the test-suite default. Marker absence is the primary gate; env is the secondary. Tests can't spawn even if the marker is somehow present.</p>
+<hr>
+<h2 id="fleet-rc-cli"><code>fleet rc</code> CLI<a class="anchor" href="#fleet-rc-cli" title="Permalink to this section">¶</a></h2>
+<pre><code>fleet rc up &lt;project&gt; [--cwd &lt;path&gt;]              # acquire: create marker + spawn listener (or adopt Fleet-owned)
+fleet rc down &lt;project&gt;                            # release: SIGTERM PID + remove marker + remove rc-state.json
+fleet rc connect &lt;project&gt; [--coord &lt;id&gt;]          # attach: send /remote-control to coord's tmux pane
+fleet rc status [&lt;project&gt;] [--healthy]            # observability: marker + PID + last_error; --healthy probes claude daemon (plan-eng A1)
+fleet rc list                                      # all projects with markers present
+fleet rc reset [&lt;project&gt;]                         # emergency: kill all Fleet-owned listeners; optionally also invoke `claude daemon remote-control remove` for registry hygiene
+</code></pre>
+<p><strong>Note (codex round 3 P2 hygiene):</strong> <code>fleet rc down</code> does NOT invoke <code>claude daemon remote-control remove</code>. The local PID kill IS the teardown; the daemon-registry call is operator emergency only via <code>reset</code>.</p>
+<h3 id="fleet-rc-connect-drives-the-in-session-remote-control-slash-command-codex-round-2-fix"><code>fleet rc connect</code> — drives the in-session <code>/remote-control</code> slash command (codex round 2 fix)<a class="anchor" href="#fleet-rc-connect-drives-the-in-session-remote-control-slash-command-codex-round-2-fix" title="Permalink to this section">¶</a></h3>
+<p>Codex round 2 confirmed: external "attach this existing claude PID by injecting <code>--remote-control</code>" is NOT a supported Claude CLI API. The only attach path is the in-session <code>/remote-control</code> slash command that the operator's claude session already supports.</p>
+<p><code>fleet rc connect &lt;project&gt; [--coord &lt;id&gt;]</code>:</p>
+<ol>
+<li>
+<p>Verify marker present and listener alive for <code>&lt;project&gt;</code>.</p>
+</li>
+<li>
+<p><strong>Target selection — authoritative, not first-record</strong> (codex round 3 P1.2):
+   - If <code>--coord &lt;id&gt;</code> provided: use that coord.
+   - Else: find the <strong>lock-body holder</strong> for the project's <code>coordinator.lock</code> (the canonical "active coord" signal — see <code>internal/tui/rows.go:241-327</code>).
+   - Else (boot window): find the <strong>coord-spawn-marker holder</strong> at <code>~/.fleet/projects/&lt;p&gt;/coord-spawn-marker</code>.
+   - Else: fail with <code>multiple coords for project; specify --coord &lt;id&gt;</code> (with listing of candidates from <code>fleet workers list</code>).</p>
+</li>
+<li>
+<p><strong>Submit-verified send</strong> — mirror <code>internal/spawn/spawn.go:199,281,327</code> contract exactly (codex round 5 P1, factual correction):
+   - <strong>Readiness-stability wait:</strong> <code>tmux capture-pane</code> the target pane; <strong>poll every 100ms</strong> until content is stable for <strong>500ms continuous</strong>, with a <strong>30s overall timeout</strong>. After stability, add a <strong>1.5s post-stability buffer</strong> before typing (matches spawn.go's pre-type settle).
+   - <strong>Split-send:</strong> <code>tmux send-keys -t &lt;session&gt; /remote-control</code> (text only, NO trailing newline). Then <code>tmux send-keys -t &lt;session&gt; Enter</code> as a SEPARATE call. Raw <code>"\n"</code> in the text burst can paste-without-submit.
+   - <strong>Verify submission (best-effort, ONE retry — codex round 6):</strong> re-capture pane after the first Enter. If <code>/remote-control</code> is still visible at the bottom band: sleep <code>postSendRetryDelay</code> (matches spawn.go's named constant), send Enter ONCE MORE, re-verify. If STILL visible after that second Enter, fall back to manual-Enter warning: <strong>prompt operator to press Enter manually</strong> in their tmux pane. Do NOT hard-fail.
+   - <strong>Outcome reporting:</strong> success on first-attempt verify → <code>{outcome: connected}</code>. Success after retry → <code>{outcome: connected, retried: true}</code>. Manual-Enter fallback (post-retry the prompt is still visible) → <code>{outcome: connected, warn: "prompt_unsubmitted_after_retry — operator press Enter in coord pane to submit /remote-control"}</code> (codex round 7: spawn.go's warning fires after a positive re-check, not on inconclusive capture; label reflects the actual condition). The CLI's exit code remains 0 in all three cases (matches spawn.go's best-effort stance).</p>
+</li>
+<li>
+<p>Print operator-readable status: <code>Sent /remote-control to coord &lt;id&gt; (tmux: fleet-&lt;id&gt;). Check terminal for QR code / URL.</code></p>
+</li>
+<li>
+<p>If no coord running: <code>No live coord for project '&lt;p&gt;'. Run 'fleet dispatch ...' first, then 'fleet rc connect'.</code></p>
+</li>
+</ol>
+<p>This sidesteps the impossible PID-injection mechanism. The operator's existing UX (typing <code>/remote-control</code> manually in a coord's tmux pane) is preserved; <code>fleet rc connect</code> automates the typing <strong>safely</strong> with submit verification.</p>
+<h3 id="stable-json-output-exit-codes">Stable JSON output + exit codes<a class="anchor" href="#stable-json-output-exit-codes" title="Permalink to this section">¶</a></h3>
+<p>Mirrors <code>fleet claims</code> outcome enum:
+- <code>enabled</code> / <code>already_enabled</code> (0)
+- <code>disabled</code> / <code>already_disabled</code> (0)
+- <code>connected</code> (0)
+- <code>not_enabled</code> (10) — <code>connect</code> invoked but no marker
+- <code>not_owned</code> (10) — Fleet found a non-Fleet listener; refusal
+- <code>absent</code> (11) — Inspect target doesn't exist
+- <code>contested</code> (12) — Per-project lock held
+- <code>error</code> (1) — Catch-all</p>
+<h3 id="remote-control-skill-rewiring"><code>/remote-control</code> skill rewiring<a class="anchor" href="#remote-control-skill-rewiring" title="Permalink to this section">¶</a></h3>
+<p>Today (pre-design): spawns global listener with shell bootstrap.</p>
+<p>Post-design:
+1. Detect current project from cwd basename (or operator arg).
+2. Run <code>fleet rc up &lt;project&gt;</code> (creates marker + spawns / adopts).
+3. Run <code>fleet rc connect &lt;project&gt;</code> (attaches current session).
+4. Print URL.</p>
+<p>Backwards-compat for non-fleet cwd: fall back to a per-machine <code>fleet-coord</code> prefix; skill output flags the non-project mode so operator knows.</p>
+<hr>
+<h2 id="handoff-doc-rewrite-codex-round-1-finding">Handoff doc rewrite (codex round 1 finding)<a class="anchor" href="#handoff-doc-rewrite-codex-round-1-finding" title="Permalink to this section">¶</a></h2>
+<p>The current handoff doc's <code>## First Action (auto)</code> section embeds raw bootstrap bash. Codex round 1: "a handoff doc should not embed raw daemon bootstrap at all after this redesign; it should tell the operator to run <code>fleet rc connect</code> or <code>/remote-control</code>."</p>
+<p>New shape:</p>
+<pre><code class="language-markdown">## First Action (auto)
+
+To re-attach mobile/web pairing for this coord, run in your terminal:
+
+    fleet rc connect &lt;project&gt;
+
+(Or `/remote-control` from within Claude Code.) The pairing will resume
+from where the previous coord left off, provided RC was previously
+enabled via `fleet rc up &lt;project&gt;`.
+
+If RC was not previously enabled, run:
+
+    fleet rc up &lt;project&gt;
+
+first, then `fleet rc connect &lt;project&gt;`.
+</code></pre>
+<p>This is operator-instruction text. NO bash exec. The handoff continuity story moves from "automated re-bootstrap on read" to "operator runs one command on handoff resume" — a small UX regression but a large architectural win.</p>
+<p>If operator wants the automated continuity: they keep <code>rc-enabled</code> marker present across handoffs (it's persisted state, not per-session). Then the NEW coord's first tick observes <code>rc.Enabled(project)=true</code> AND no listener alive → spawns one. So automated continuity DOES work via the spawn site (S1), just not via the handoff doc.</p>
+<p>The handoff-doc rewrite is mainly to remove the dangerous "exec arbitrary bash from a markdown file" semantics that caused the test pollution.</p>
+<hr>
+<h2 id="test-fake-path-prepend-pattern-codex-round-1">Test fake — PATH-prepend pattern (codex round 1)<a class="anchor" href="#test-fake-path-prepend-pattern-codex-round-1" title="Permalink to this section">¶</a></h2>
+<p>Two-layer test boundary:</p>
+<h3 id="layer-1-injectable-command-runner-seam">Layer 1: Injectable command-runner seam<a class="anchor" href="#layer-1-injectable-command-runner-seam" title="Permalink to this section">¶</a></h3>
+<p><code>internal/rc/rc.go</code> calls <code>spawn.Spawn(...)</code> or equivalent abstraction, not <code>exec.Command</code> directly. Tests substitute a fake spawn-runner that records argv and returns synthesized PID + alive state.</p>
+<h3 id="layer-2-path-prepended-fake-claude-binary">Layer 2: PATH-prepended fake <code>claude</code> binary<a class="anchor" href="#layer-2-path-prepended-fake-claude-binary" title="Permalink to this section">¶</a></h3>
+<p>For end-to-end integration tests where the real <code>claude</code> binary's argv parsing matters:</p>
+<pre><code class="language-bash"># In t.TempDir():
+cat &gt; &quot;$TMPDIR/claude&quot; &lt;&lt;'EOF'
+#!/bin/sh
+echo &quot;argv: $@&quot; &gt;&gt; /tmp/fake-claude-invocations.log
+# If invoked as 'claude remote-control', print Connected to stderr and wait.
+if [ &quot;$1&quot; = &quot;remote-control&quot; ]; then
+    echo &quot;Connected · fleet · (fake)&quot; &gt;&amp;2
+    # Wait for SIGTERM
+    trap 'exit 0' TERM
+    sleep 9999 &amp;
+    wait $!
+fi
+EOF
+chmod +x &quot;$TMPDIR/claude&quot;
+export PATH=&quot;$TMPDIR:$PATH&quot;
+</code></pre>
+<p>Tests that exercise RC explicitly use the fake binary. The fake responds to SIGTERM cleanly (no leak). It NEVER connects to the Claude Code service — so no mobile push.</p>
+<h3 id="acceptance-gate-ci-invariant">Acceptance gate (CI invariant)<a class="anchor" href="#acceptance-gate-ci-invariant" title="Permalink to this section">¶</a></h3>
+<p>After running the FULL test suite (<code>go test ./...</code> + <code>pytest skills/</code>), verify NO process matches <code>claude remote-control --remote-control-session-name-prefix fleet-coord</code>. CI test fails the build on any spawn.</p>
+<hr>
+<h2 id="marker-file-shape-codex-round-1-flat-wins">Marker file shape (codex round 1: flat wins)<a class="anchor" href="#marker-file-shape-codex-round-1-flat-wins" title="Permalink to this section">¶</a></h2>
+<p><code>~/.fleet/projects/&lt;p&gt;/rc-enabled</code> — <strong>flat, zero-byte</strong> marker file. Matches <code>coord-spawn-marker</code>'s convention at <code>internal/state/state.go:528-566</code>.</p>
+<p><code>~/.fleet/projects/&lt;p&gt;/rc-state.json</code> — <strong>REQUIRED</strong> state file. The controller writes it on every successful <code>rc.Up</code>; controller cannot adopt or reconcile without it. (Codex round 3 P2 hygiene: removed prior "optional" wording in this section that contradicted the "required" claim below.)</p>
+<pre><code class="language-json">{
+  &quot;schema&quot;: &quot;v1&quot;,
+  &quot;project&quot;: &quot;projects-fleet&quot;,
+  &quot;pid&quot;: 12345,
+  &quot;host_id&quot;: &quot;operator-mac.local&quot;,
+  &quot;working_dir&quot;: &quot;/Users/pinkbear/projects/fleet&quot;,
+  &quot;session_prefix&quot;: &quot;fleet-coord&quot;,
+  &quot;last_spawn_at&quot;: &quot;2026-05-16T20:00:00Z&quot;,
+  &quot;last_error&quot;: &quot;&quot;
+}
+</code></pre>
+<p><strong>Duplicate-spawn rule (codex round 2):</strong> if marker is present, state.json absent, but a process matching <code>claude remote-control --remote-control-session-name-prefix fleet-coord</code> is alive in this project's working dir → controller refuses to spawn a duplicate AND refuses to adopt by PID alone. Operator must <code>fleet rc reset</code> (kills, removes marker, fresh slate) and re-<code>up</code>. This is the conservative default; an <code>--adopt-unknown</code> flag is not exposed.</p>
+<p>Read by <code>rc.Status</code> and the sweeper. <strong>No prefix-scan fallback exists</strong> (codex round 4: prefix-only adoption is unsafe; conflicts with the "broad <code>fleet-coord</code> prefix + dir isolation" model). If state.json absent and operator is asking about state, <code>rc.Status</code> returns <code>{enabled: &lt;marker presence&gt;, pid: 0, last_error: "no state.json"}</code> and operator can <code>fleet rc reset</code> + fresh <code>up</code> to re-establish ownership.</p>
+<p>Atomic tmp+rename writes (matches <code>state.WriteAtomic</code> pattern). Operator can <code>rm</code> either file manually for emergency override.</p>
+<hr>
+<h2 id="sequencing-codex-round-1-standalone-not-folded-into-pr3">Sequencing (codex round 1: standalone, NOT folded into PR3)<a class="anchor" href="#sequencing-codex-round-1-standalone-not-folded-into-pr3" title="Permalink to this section">¶</a></h2>
+<p>Codex round 1 explicit: "folding this into PR3 makes review harder, not cleaner. PR3 is already the Replace/coord-swap proof step. RC is a different ownership model. Reusing <code>state.WriteAtomic</code>, project locks, and sweeper patterns is good; reusing dispatch claims is not."</p>
+<h3 id="standalone-pr-recommended">Standalone PR (recommended)<a class="anchor" href="#standalone-pr-recommended" title="Permalink to this section">¶</a></h3>
+<ul>
+<li>Branched off main (or latest landed dispatch-lifecycle PR).</li>
+<li>~1500 LoC: <code>internal/rc</code> (300) + <code>cmd/fleet/rc.go</code> CLI (250) + 6 attach-surface gates (200) + handoff doc rewrite (100) + tests (650).</li>
+<li>Lands independently of PR2-PR4.</li>
+</ul>
+<h3 id="dependency-on-dispatch-lifecycle">Dependency on dispatch-lifecycle<a class="anchor" href="#dependency-on-dispatch-lifecycle" title="Permalink to this section">¶</a></h3>
+<p>None at the controller level (codex round 1: different ownership model). BUT this design DOES reuse:
+- <code>internal/state.WriteAtomic</code> pattern for marker + state files.
+- Project-lock file shape from dispatch-lifecycle Adoptable.
+- Sweeper integration: <code>fleet maintenance sweep-leaks</code> (PR4) calls <code>rc.SweepAllProjects()</code> to detect orphan listeners (Fleet-owned PID alive but marker absent → release).</p>
+<p>PR4 adds a sweeper hook AFTER this RC PR lands. Order: this RC PR → PR4 (or vice versa with a small forward-compat note).</p>
+<hr>
+<h2 id="plan-eng-review-decisions-2026-05-16">Plan-eng-review decisions (2026-05-16)<a class="anchor" href="#plan-eng-review-decisions-2026-05-16" title="Permalink to this section">¶</a></h2>
+<p>Applied to v8:</p>
+<ol>
+<li>
+<p><strong>A1 — <code>--healthy</code> probe.</strong> <code>fleet rc status --healthy</code> calls <code>claude daemon remote-control list</code> and matches against recorded <code>session_prefix</code>. Reports <code>healthy | dead-no-service-entry | dead-pid</code> with diagnostic. ~30 LoC. Without it, first signal of broken bridge is silent mobile-no-push.</p>
+</li>
+<li>
+<p><strong>A2 — no v0.11→v0.12 migration step.</strong> Operator clarification: state continuity for projects comes from <code>tasks.md</code> + WIP files (already persistent across versions); <code>rc-state.json</code> is per-listener-spawn metadata, not load-bearing project state. Operators run <code>fleet rc up &lt;p&gt;</code> when ready; old behavior decays as legacy listeners die or get killed. No migration runbook needed.</p>
+</li>
+<li>
+<p><strong>A3 — CI invariant test in v0.12 itself.</strong> Before v0.13 retires <code>FLEET_RC_BOOTSTRAP_DISABLED</code>, v0.12 must include a test that explicitly UNSETS the env-gate, runs the full test suite, and asserts pre/post pgrep snapshot identical. Pins marker-gate as sufficient. ~50 LoC.</p>
+</li>
+<li>
+<p><strong>T1 — E2E test infrastructure: real-tmux + fake claude.</strong> Use <code>internal/testutil/tmuxtest</code> for tmux server isolation. Inject a fake <code>claude</code> script as the "coord" pane that prints a prompt + reads stdin. <code>fleet rc connect</code> tests against this fake. Tests the full send-keys + verification + retry + fallback path. ~150 LoC. Mirrors dispatch-lifecycle PR3 test infra.</p>
+</li>
+<li>
+<p><strong>T2 — critical duplicate-spawn refusal test.</strong> Setup: write marker, simulate Fleet-owned process via fake binary, delete rc-state.json. Call <code>rc.Up</code>. Assert outcome ∈ {<code>contested</code>, <code>not_owned</code>}, NO new spawn, NO state.json rewrite. Pins the unsafe-adopt path codex round 2 explicitly closed. ~50 LoC.</p>
+</li>
+</ol>
+<hr>
+<h2 id="migration-v011x-v0120">Migration — v0.11.x → v0.12.0<a class="anchor" href="#migration-v011x-v0120" title="Permalink to this section">¶</a></h2>
+<p>v0.12 introduces:
+- <code>internal/rc</code> controller.
+- <code>fleet rc</code> CLI.
+- 6 attach-surface gates.
+- Handoff doc rewrite (operator-instruction text replaces bash).
+- Test fake pattern + acceptance gate.</p>
+<p>v0.12 does NOT auto-create markers. Operator opts in per-project.</p>
+<p>Migration steps for operator (one-time):
+1. Upgrade to v0.12.
+2. For each project where mobile pairing is wanted: <code>fleet rc up &lt;project&gt;</code>.
+3. For currently-running coords without RC: <code>fleet rc connect &lt;project&gt;</code> (or accept that mobile pairing comes back on next coord boot).
+4. Verify with <code>fleet rc status</code>.</p>
+<p>The PR #157 env-gate stays through v0.12. v0.13 retires the env-gate after marker-gate is field-proven.</p>
+<hr>
+<h2 id="working-dir-provenance-explicit-resolution-order-codex-round-3-p11">Working-dir provenance — explicit resolution order (codex round 3 P1.1)<a class="anchor" href="#working-dir-provenance-explicit-resolution-order-codex-round-3-p11" title="Permalink to this section">¶</a></h2>
+<p><code>rc.Up(project)</code> needs the canonical working_dir for the Claude daemon's directory-keyed registry. Today, fleet stores project cwd in three potentially-stale places. Resolution order (codex round 3 explicit):</p>
+<ol>
+<li><strong><code>--cwd &lt;path&gt;</code> CLI flag</strong> if provided (operator override, highest priority).</li>
+<li><strong><code>~/.fleet/projects/&lt;p&gt;/meta.json:repo_path</code></strong> if present.</li>
+<li><strong>Live coord record <code>.Cwd</code></strong> from <code>internal/agent/agent.go:94-99</code> (any alive agent for this project; uses the first alive one).</li>
+<li><strong>Fail with diagnostic:</strong> <code>cannot determine working dir for project '&lt;p&gt;'; pass --cwd &lt;path&gt;, OR re-register the project from the repo root with 'cd &lt;path&gt; &amp;&amp; fleet project add &lt;path&gt;' so meta.json carries repo_path</code> (codex round 5: <code>fleet project add &lt;path&gt;</code> is positional, no <code>--cwd</code> flag per <code>cmd/fleet/project.go:45,47</code>).</li>
+</ol>
+<p>The resolved working_dir gets persisted into <code>rc-state.json:working_dir</code>. Subsequent operations (<code>Down</code>, <code>Reset</code>, sweep) use the persisted value — the source-of-truth file, not re-derivation.</p>
+<h3 id="working-dir-rename-mid-lifecycle-codex-round-3-free-form">Working-dir rename mid-lifecycle (codex round 3 free-form)<a class="anchor" href="#working-dir-rename-mid-lifecycle-codex-round-3-free-form" title="Permalink to this section">¶</a></h3>
+<p>If operator renames or moves the project directory while listener is alive:
+- The live listener keeps running (Claude daemon doesn't know about the rename).
+- <code>rc-state.json:working_dir</code> becomes stale.
+- Future <code>Inspect</code>/<code>Down</code>/<code>Sweep</code> keyed on <code>working_dir</code> find no daemon registry entry → may falsely declare orphan / refuse cleanup.</p>
+<p><strong>Operator must:</strong>
+1. <code>fleet rc down &lt;project&gt;</code> — kills the listener using the stale working_dir match (best-effort).
+2. Manually update <code>~/.fleet/projects/&lt;p&gt;/meta.json:repo_path</code> to the new path.
+3. <code>fleet rc up &lt;project&gt; --cwd &lt;new-path&gt;</code> — fresh spawn keyed on new dir.</p>
+<p>This is documented as an explicit lifecycle break, not a feature.</p>
+<h2 id="multi-coord-per-project-target-selection-codex-round-3-free-form">Multi-coord-per-project — target selection (codex round 3 free-form)<a class="anchor" href="#multi-coord-per-project-target-selection-codex-round-3-free-form" title="Permalink to this section">¶</a></h2>
+<p>If operator runs multiple coord agents for the same project (multi-tmux-window dev), <code>fleet rc connect</code> needs a deterministic target. Already specified in §<code>fleet rc connect</code> step 2. Summary: lock-body holder &gt; coord-spawn-marker holder &gt; require <code>--coord &lt;id&gt;</code>.</p>
+<p>The marker file itself is per-project, not per-coord; one listener serves all coords for that project via Claude daemon's per-directory model.</p>
+<h2 id="pr4-sweeper-integration-schema-codex-round-3-free-form">PR4 sweeper integration schema (codex round 3 free-form)<a class="anchor" href="#pr4-sweeper-integration-schema-codex-round-3-free-form" title="Permalink to this section">¶</a></h2>
+<p>PR4's <code>fleet maintenance sweep-leaks --orphans</code> calls <code>rc.SweepAllProjects()</code>. The sweeper:</p>
+<ol>
+<li>Enumerates <code>~/.fleet/projects/*/rc-state.json</code>.</li>
+<li>For each: probe PID alive AND argv matches recorded prefix AND host_id matches current host.</li>
+<li>Mismatches:
+   - Marker absent but <code>rc-state.json</code> says PID alive → orphan; release.
+   - Marker present but PID dead → respawn candidate (Up loop will pick it up; sweeper doesn't spawn directly).
+   - Cross-host (host_id mismatch) → log + refuse (cross-machine cleanup is unsafe).</li>
+<li><strong>Never kill on prefix-only evidence</strong> — must have rc-state.json saying Fleet owns the PID.</li>
+</ol>
+<p>Schema confirmed (codex round 3): <code>schema, project, pid, host_id, working_dir, session_prefix, last_spawn_at, last_error</code>.</p>
+<h2 id="claude-cli-surface-verify-via-smoke-test-caveat-codex-round-3">Claude CLI surface — verify-via-smoke-test caveat (codex round 3)<a class="anchor" href="#claude-cli-surface-verify-via-smoke-test-caveat-codex-round-3" title="Permalink to this section">¶</a></h2>
+<p>Codex round 3 noted that local <code>claude --help</code> exposes <code>--remote-control</code> flags but <code>claude remote-control --help</code> requires login and <code>claude daemon remote-control --help</code> falls back to generic. The doc treats the daemon-registry surface as "verify via smoke test", not settled fact. v0.12 worker dispatch must include a smoke-test step:</p>
+<ol>
+<li><code>claude daemon remote-control list</code> — verify subcommand exists.</li>
+<li><code>claude daemon remote-control add /tmp/test-dir</code> then <code>... remove /tmp/test-dir</code> — verify add/remove cycle.</li>
+<li>If unsupported: fall back to local-PID-kill semantics only (already the primary teardown path); <code>reset</code> skips the daemon-registry call.</li>
+</ol>
+<h2 id="risks-open-questions-round-12-mostly-answered-remaining-for-round-4">Risks / open questions (round 1+2 mostly answered; remaining for round 4)<a class="anchor" href="#risks-open-questions-round-12-mostly-answered-remaining-for-round-4" title="Permalink to this section">¶</a></h2>
+<ol>
+<li>
+<p><strong>Adopt-unknown override.</strong> v2 design refuses non-Fleet listener adoption by default. Should there be an operator escape hatch (<code>fleet rc up --force-adopt</code>)? v1 leans no; v2 confirms no — <code>fleet rc reset</code> + fresh <code>up</code> is the recovery path.</p>
+</li>
+<li>
+<p>[RESOLVED round 2+3] <code>fleet rc connect</code> uses tmux send-keys to coord pane (submit-verified per spawn.Spawn pattern), not PID injection.</p>
+</li>
+<li>
+<p><strong>Multi-terminal operator.</strong> If operator has 4 active coords across 4 projects, each with markers set, they want mobile pairing on all 4. Does <code>fleet rc up</code> on each project produce 4 independent listeners with project-scoped prefixes? Round 2: codex confirm Claude's daemon registry supports this concurrency.</p>
+</li>
+<li>
+<p><strong>Handoff doc backward-compat.</strong> Existing handoff docs in <code>~/.fleet/handoff/</code> were rendered with the OLD bash-bootstrap section. If a v0.12 coord reads a v0.11-rendered handoff doc on resume, what happens? v2 design: the bash is no longer auto-exec'd by anything (the doc is markdown that the operator reads). Old docs harmless. Round 2: codex confirm no automated code path actually exec's the markdown section.</p>
+</li>
+<li>
+<p><strong>Coord spawn before RC enabled.</strong> Operator spawns coord at T=0. At T=10min, operator runs <code>fleet rc up</code>. Coord has been running without <code>--remote-control</code>. <code>fleet rc connect</code> attaches the live session. Round 2: codex confirm Claude CLI supports retroactive attachment of a non-RC session.</p>
+</li>
+<li>
+<p><strong>Two coords for the same project.</strong> If operator has two coords for the same project (multi-tmux-window setup), do they share one listener or fight over the marker? v2 design: shared listener (project-scoped, not coord-scoped). The marker reflects per-project intent. Round 2: codex confirm.</p>
+</li>
+<li>
+<p><strong>Stale <code>rc-state.json</code>.</strong> If state.json says PID=12345 but actual listener is dead, <code>Inspect</code> returns <code>Dead</code>. Next <code>Up</code> re-spawns. Race window between Inspect and Up: another process spawns concurrently. Per-project lock catches this. Round 2: codex confirm.</p>
+</li>
+</ol>
+<hr>
+<h2 id="failure-modes-acceptance">Failure modes / acceptance<a class="anchor" href="#failure-modes-acceptance" title="Permalink to this section">¶</a></h2>
+<table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fleet rc up</code> exec fails</td>
+<td>Drop marker + state.json. Return diagnostic (auth missing, claude binary missing, network). Idempotent retry.</td>
+</tr>
+<tr>
+<td>Listener dies after Up</td>
+<td><code>rc.Status</code> returns <code>Dead</code>. Next coord tick (S1) re-spawns if marker present. Sweeper releases orphan if marker absent.</td>
+</tr>
+<tr>
+<td>Operator removes marker manually (rm file)</td>
+<td>Coord tick stops respawning. Existing listener kept alive until SIGTERM. Sweeper detects mismatch (state.json PID alive but no marker) → releases.</td>
+</tr>
+<tr>
+<td>Concurrent <code>fleet rc up</code></td>
+<td>Per-project NB-flock; loser sees <code>already_enabled</code> and returns.</td>
+</tr>
+<tr>
+<td>Service-side <code>claude daemon remote-control remove</code> fails (only invoked from <code>rc.Reset</code>, not <code>rc.Down</code>)</td>
+<td>Log warning, continue with local kill. Service eventually times out its own session entry.</td>
+</tr>
+<tr>
+<td>Cross-host claim attempt</td>
+<td><code>state.json</code> carries <code>host_id</code>; mismatch → refuse. Mirrors dispatch-lifecycle invariant.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cross-cutting-acceptance">Cross-cutting acceptance<a class="anchor" href="#cross-cutting-acceptance" title="Permalink to this section">¶</a></h3>
+<ul>
+<li><code>pgrep -f 'claude remote-control --remote-control-session-name-prefix fleet-coord'</code> returns empty after <code>go test ./...</code> AND <code>pytest skills/</code> (CI gate).</li>
+<li><code>fleet rc up projects-fleet &amp;&amp; fleet rc status projects-fleet</code> shows <code>enabled=true pid=&lt;int&gt;</code>.</li>
+<li><code>fleet rc down projects-fleet &amp;&amp; pgrep ...</code> returns empty.</li>
+<li>Operator running 4 coord agents observes mobile push only for projects they explicitly <code>fleet rc up</code>'d.</li>
+<li>Migration: pre-v0.12 handoff docs in <code>~/.fleet/handoff/</code> don't break under v0.12 readers.</li>
+</ul>
+<hr>
+<h2 id="decision-log">Decision log<a class="anchor" href="#decision-log" title="Permalink to this section">¶</a></h2>
+<ul>
+<li><strong>2026-05-16</strong> — Operator decision post-PR-#157: "completed fix leak bug completely from architecture, not just patch, patch, patch". This design replaces env-gate-as-patch with architecture.</li>
+<li><strong>2026-05-16</strong> — v1 drafted: proposed <code>rc_listener_daemon</code> as Exclusive dispatch claim, fold into dispatch-lifecycle PR3.</li>
+<li><strong>2026-05-16</strong> — Codex round 1 verdict: NEEDS_REVISION_BEFORE_DRAFTING. Findings folded into v2:</li>
+<li>RC is operator-managed, spans many dispatches → standalone <code>internal/rc</code> controller, NOT a dispatch claim.</li>
+<li>Inventory was 4 paths; actual is 6 (3 spawn + 3 flag-injection). Added <code>cmd/fleet/handoff.go:704</code> and <code>internal/handoffop/handoffop.go:525</code>.</li>
+<li>Path 3 in v1 was wrong (flag injection, not daemon spawn).</li>
+<li>Marker = flat (matches coord-spawn-marker). Separate <code>rc-state.json</code> for metadata.</li>
+<li>Adopt-existing refused by default (codex: not safe to adopt arbitrary PIDs).</li>
+<li>Service-side cleanup: <code>claude daemon remote-control remove</code>, NOT <code>claude remote-control --stop</code>.</li>
+<li>Add <code>fleet rc connect</code> for retroactive attach.</li>
+<li>Handoff doc: instruction text, NOT raw bash exec.</li>
+<li>Test fake: PATH-prepended <code>claude</code> script + injectable runner seam.</li>
+<li>Maintenance.go survey rewrite for "agents missing --remote-control" semantics.</li>
+<li>Standalone PR, NOT folded into dispatch-lifecycle PR3.</li>
+<li><strong>2026-05-16</strong> — Sequencing: standalone PR off main. ~1500 LoC. Independent of PR2-PR4 land cadence.</li>
+<li><strong>2026-05-16</strong> — plan-eng-review CLEARED ✅ (v8). 5 decisions applied:</li>
+<li>A1: <code>fleet rc status --healthy</code> probes <code>claude daemon remote-control list</code>.</li>
+<li>A2: no migration step; tasks.md + WIP files carry project state continuity.</li>
+<li>A3: CI invariant test in v0.12 — env-gate disabled, zero listener spawn assertion.</li>
+<li>T1: E2E real-tmux + fake claude binary for <code>connect</code> flow.</li>
+<li>T2: critical duplicate-spawn refusal test (marker + no-state + Fleet-PID-alive).</li>
+<li><strong>2026-05-16</strong> — Codex round 7: ✅ <strong>PASS_TO_PLAN_ENG_REVIEW</strong>. One nit folded (v7-final):</li>
+<li>Warn label changed from <code>verification_inconclusive</code> → <code>prompt_unsubmitted_after_retry</code> (semantic fidelity to spawn.go:327-348: the warning fires AFTER positive re-check that prompt is still visible post-retry, NOT on inconclusive capture; the inconclusive-capture case is treated as success per spawn.go:375).</li>
+<li>Codex-rounds phase complete (7 rounds: 1-2 NEEDS_REVISION_BEFORE_DRAFTING → 3-6 CONTINUE_DESIGN → 7 PASS).</li>
+<li><strong>2026-05-16</strong> — Codex round 6 single-nit fix folded (v7):</li>
+<li>Send/verify retry policy: spawn.go does ONE explicit retry (first Enter → verify → sleep <code>postSendRetryDelay</code> → second Enter → verify → manual-warning fallback). v6 said "no retry loop" — incorrect. v7 matches: one explicit retry then warning.</li>
+<li><strong>2026-05-16</strong> — Codex round 5 factual corrections folded (v6):</li>
+<li>Send/verify mechanism matches actual <code>spawn.go</code> numbers: poll 100ms, stable 500ms continuous, 30s timeout, 1.5s post-stability buffer.</li>
+<li>Send verification posture: best-effort (matches spawn.go's "manual Enter may be needed"), not hard-fail-on-mismatch. Prompts operator instead of erroring; returns success with <code>warn_verification_inconclusive</code>.</li>
+<li>Working-dir diagnostic: <code>fleet project add &lt;path&gt;</code> is positional (no <code>--cwd</code> flag). Operator runs from project root or passes absolute path; meta.json captures repo_path automatically.</li>
+<li><strong>2026-05-16</strong> — Codex round 4 critique folded (v5):</li>
+<li>Send/verification mechanism rewritten to match <code>spawn.go:199,281,327</code> contract exactly: readiness-stability wait → split text + Enter → verify prompt-no-longer-visible (not "echo appears") → ONE Enter retry (not 3).</li>
+<li>Storage-layout ASCII block scrubbed: <code>rc-state.json</code> "OPTIONAL" → "REQUIRED"; prefix-scan fallback removed; duplicate-spawn rule inlined.</li>
+<li>"Read by <code>rc.Status</code> and sweeper" section: prefix-scan fallback removed; operator path is <code>reset</code> + re-up.</li>
+<li>rc-state.json JSON example: <code>project</code> field added (schema match with PR4 sweeper section).</li>
+<li>Working-dir failure diagnostic: <code>fleet projects set-cwd</code> → <code>fleet project add &lt;path&gt;</code> (the real CLI is positional, no <code>--cwd</code> flag, per <code>cmd/fleet/project.go:45,47</code> — codex round 5 catch).</li>
+<li><strong>2026-05-16</strong> — Codex round 3 critique folded (v4):</li>
+<li>Working-dir provenance: explicit resolution order (<code>--cwd &gt; meta.json.repo_path &gt; live coord .Cwd &gt; fail</code>). Persisted to rc-state.json:working_dir.</li>
+<li>Working-dir rename mid-lifecycle: documented as explicit lifecycle break; operator must <code>down</code> + manual meta.json edit + <code>up --cwd &lt;new&gt;</code>.</li>
+<li><code>fleet rc connect</code> target selection: lock-body holder &gt; coord-spawn-marker holder &gt; require <code>--coord</code> flag.</li>
+<li><code>fleet rc connect</code> send mechanism: submit-verified per <code>internal/spawn/spawn.go:171-293</code> pattern (capture-pane readiness check, separate text + Enter sends, capture-pane echo verification, 3 retries).</li>
+<li>PR4 sweeper schema: <code>rc.SweepAllProjects()</code> called from <code>--orphans</code> mode. Never kill on prefix-only; refuse cross-host.</li>
+<li>Claude CLI daemon-registry: verify via smoke test in v0.12 worker; fall back to PID-kill-only if unsupported.</li>
+<li>Stale doc text scrubbed: <code>rc-state.json</code> "optional" wording removed, <code>fleet rc down</code> synopsis fixed, old Q2 PID-injection mention deleted, failure table row scoped to Reset path.</li>
+<li><strong>2026-05-16</strong> — Codex round 2 critique folded (v3):</li>
+<li>S1 routes through controller (Python shells out to <code>fleet rc up</code>; not parallel spawn logic).</li>
+<li><code>fleet rc connect</code> drives in-session <code>/remote-control</code> via <code>tmux send-keys</code> (not PID injection — that API doesn't exist).</li>
+<li><code>rc.Down</code> teardown is local PID kill + marker removal only. <code>claude daemon remote-control remove</code> moved to <code>rc.Reset</code> emergency path only (it's a directory-registry API, not a live-listener teardown).</li>
+<li>Coord session naming stays <code>fleet-coord-&lt;id&gt;-&lt;project&gt;</code>. Project isolation via Claude daemon's directory-keyed registry (working_dir in state.json), NOT session-name-prefix filter. Sidesteps the rename collision.</li>
+<li><code>rc-state.json</code> schema completed: added <code>host_id</code>, <code>working_dir</code>.</li>
+<li><code>rc-state.json</code> becomes required (not optional) — controller needs it to prove Fleet ownership for adoption.</li>
+<li>Duplicate-spawn rule: marker present, state.json missing, but Fleet-owned process alive in working_dir → refuse spawn, refuse adopt, require <code>reset</code>.</li>
+<li>I3 chokepoint: dedicated <code>rc.GateAttachFlag(project, argv)</code> helper. Not "same as I2".</li>
+</ul>
+<hr>
+<h2 id="open-items-before-draft-freeze">Open items before draft-freeze<a class="anchor" href="#open-items-before-draft-freeze" title="Permalink to this section">¶</a></h2>
+<ul>
+<li>[ ] Codex round 2 review of v2 → fold findings.</li>
+<li>[ ] Codex round 3+ until clean for two consecutive runs.</li>
+<li>[ ] <code>/plan-eng-review</code> lock-in.</li>
+<li>[ ] Operator final approval (G2 gate).</li>
+<li>[ ] After approval: file P1 task <code>rc-listener-managed-controller</code> and dispatch worker (manual finalize, no Agent-subagent run-in-background — lesson from PR2 zombie).</li>
+</ul>
+  </main>
+</div>
+</body>
+</html>

@@ -702,7 +702,13 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// (the Claude remote-control daemon only attaches sessions whose
 	// name starts with its --remote-control-session-name-prefix).
 	rcSessionName := buildHandoffRemoteControlSessionName(newID, oldRec.Project)
-	rewrittenExecArgv := injectRemoteControlFlag(command, rcSessionName)
+	// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
+	// per-project rc-enabled marker. Without it (operator hasn't
+	// run `fleet rc up <project>`), the handoff replacement does
+	// NOT carry --remote-control. FirstAction's operator-instruction
+	// text tells the operator to run `fleet rc connect <project>`
+	// in their terminal to re-attach pairing.
+	rewrittenExecArgv := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
 	if sameCommand(rewrittenExecArgv, command) {
 		// No-op rewrite (custom --command): pass nil so the
 		// persisted record and tmux exec are identical (avoids a
