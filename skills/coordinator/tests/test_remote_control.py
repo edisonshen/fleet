@@ -108,7 +108,10 @@ class TestSpawnDaemonIfNeeded:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """v0.12 contract: the function shells out to
-        `fleet rc up <project> --idempotent` via subprocess.run.
+        `fleet rc up <project> --respawn-only --idempotent` via
+        subprocess.run. --respawn-only (codex P1 catch) ensures the
+        Python coord-tick path NEVER auto-creates a marker for a
+        project the operator hasn't opted in to.
         """
         calls: list[list[str]] = []
 
@@ -124,7 +127,9 @@ class TestSpawnDaemonIfNeeded:
         ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
         assert len(calls) == 1
-        assert calls[0] == ["fleet", "rc", "up", "demo", "--idempotent"]
+        assert calls[0] == [
+            "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
+        ]
 
     def test_returns_false_on_nonzero_exit(
         self, monkeypatch: pytest.MonkeyPatch,

@@ -189,7 +189,9 @@ class TestSpawnDaemonGate:
         monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
         ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
-        assert calls == [["fleet", "rc", "up", "demo", "--idempotent"]]
+        assert calls == [
+            ["fleet", "rc", "up", "demo", "--respawn-only", "--idempotent"],
+        ]
 
     @pytest.mark.parametrize("value", ["1", "true", "yes", "anything"])
     def test_any_nonempty_value_disables(
@@ -230,7 +232,9 @@ class TestSpawnDaemonGate:
         monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
         ok = remote_control.spawn_daemon_if_needed("demo")
         assert ok is True
-        assert calls == [["fleet", "rc", "up", "demo", "--idempotent"]]
+        assert calls == [
+            ["fleet", "rc", "up", "demo", "--respawn-only", "--idempotent"],
+        ]
 
 
 class TestBootstrapRemoteControlGate:
