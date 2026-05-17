@@ -122,25 +122,27 @@ See docs/DESIGN-rc-listener-lifecycle.md for the design spec.`,
 func newRCUpCmd() *cobra.Command {
 	var cwd string
 	var idempotent bool
+	var respawnOnly bool
 	cmd := &cobra.Command{
 		Use:   "up <project>",
 		Short: "Enable RC for project (create marker + spawn listener; idempotent)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runRCUp(c.OutOrStdout(), args[0], cwd, idempotent)
+			return runRCUp(c.OutOrStdout(), args[0], cwd, idempotent, respawnOnly)
 		},
 	}
 	cmd.Flags().StringVar(&cwd, "cwd", "", "explicit working_dir override (highest priority resolution source)")
 	cmd.Flags().BoolVar(&idempotent, "idempotent", false, "skill-friendly invocation: never error when already up (alias for stable-zero exit on already_acquired)")
+	cmd.Flags().BoolVar(&respawnOnly, "respawn-only", false, "respawn dead listener only; refuse to create marker (Python coord-tick safety: never auto-enable RC on a project the operator hasn't opted in to)")
 	_ = idempotent // currently absorbed by Up's idempotent semantics
 	return cmd
 }
 
-func runRCUp(stdout io.Writer, project, cwd string, _ bool) error {
+func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "up", Project: project, Error: err.Error()})
 	}
-	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd})
+	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd, RespawnOnly: respawnOnly})
 	resp := rcResponse{Outcome: out, Cmd: "up", Project: project}
 	if err != nil {
 		resp.Error = err.Error()

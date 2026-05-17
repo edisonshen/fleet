@@ -262,6 +262,225 @@ func TestGateAttachFlag_RespectsEnvGate(t *testing.T) {
 	}
 }
 
+// TestUp_RespawnOnlyRefusesToCreateMarker (codex P1): the Python
+// coord tick uses `fleet rc up <p> --respawn-only --idempotent` so
+// the implicit-respawn path NEVER auto-enables RC on a project the
+// operator hasn't opted in to. Marker absent + RespawnOnly=true MUST
+// return OutcomeNotEnabled with no marker write and no state write.
+func TestUp_RespawnOnlyRefusesToCreateMarker(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+
+	if MarkerPresent("demo") {
+		t.Fatalf("precondition: marker should be absent")
+	}
+
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: os.Getpid(),
+		RespawnOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeNotEnabled {
+		t.Fatalf("outcome=%q want %q", out, OutcomeNotEnabled)
+	}
+	if MarkerPresent("demo") {
+		t.Fatalf("RespawnOnly must NOT create marker for un-enabled project")
+	}
+	if _, sErr := ReadState("demo"); !errors.Is(sErr, ErrStateMissing) {
+		t.Fatalf("RespawnOnly must NOT write rc-state.json; ReadState err=%v", sErr)
+	}
+}
+
+// TestUp_RespawnOnlyWithMarkerProceeds (codex P1 follow-through):
+// when the marker IS present (operator opted in), --respawn-only
+// behaves like a normal Up — adopts an alive listener, respawns a
+// dead one. This test covers the adopt path.
+func TestUp_RespawnOnlyWithMarkerProceeds(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+
+	// Operator has opted in.
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: os.Getpid(),
+		RespawnOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAlreadyAcquired {
+		t.Fatalf("outcome=%q want %q", out, OutcomeAlreadyAcquired)
+	}
+}
+
+// TestDown_SkipsKillOnPIDReuse (codex P1): if the recorded PID is
+// alive but its argv no longer matches our session_prefix (kernel
+// recycled the PID for an unrelated process), Down must NOT signal
+// it. Marker/state cleanup still proceeds.
+func TestDown_SkipsKillOnPIDReuse(t *testing.T) {
+	withFleetHome(t)
+
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	// Stub the verifier to refuse — pretend the PID is recycled.
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return false })
+	defer restoreVerify()
+
+	var killCalls int
+	restoreKill := SetKillFnForTest(func(pid int) { killCalls++ })
+	defer restoreKill()
+
+	out, err := Down("demo")
+	if err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if out != OutcomeReleased {
+		t.Fatalf("outcome=%q want %q", out, OutcomeReleased)
+	}
+	if killCalls != 0 {
+		t.Fatalf("kill must be skipped on PID-reuse; got %d call(s)", killCalls)
+	}
+	if MarkerPresent("demo") {
+		t.Fatalf("marker should be removed even when kill is skipped")
+	}
+	if _, sErr := ReadState("demo"); !errors.Is(sErr, ErrStateMissing) {
+		t.Fatalf("state should be removed even when kill is skipped; err=%v", sErr)
+	}
+}
+
+// TestDown_KillsWhenPIDVerified (codex P1, positive path): when
+// the verifier confirms argv matches, Down DOES signal the PID.
+func TestDown_KillsWhenPIDVerified(t *testing.T) {
+	withFleetHome(t)
+
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	defer restoreVerify()
+
+	var killCalls int
+	restoreKill := SetKillFnForTest(func(pid int) { killCalls++ })
+	defer restoreKill()
+
+	out, err := Down("demo")
+	if err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if out != OutcomeReleased {
+		t.Fatalf("outcome=%q want %q", out, OutcomeReleased)
+	}
+	if killCalls != 1 {
+		t.Fatalf("kill must fire when PID is verified; got %d call(s)", killCalls)
+	}
+}
+
+// TestSweepAllProjects_ReleasesMarkerlessOrphans (codex P2): the
+// sweeper's whole point is to release entries where rc-state.json
+// claims a live PID but the marker is gone (operator rm'd it
+// manually). List() filters those out, so the sweeper MUST iterate
+// rc-state.json directly. Pre-list-based sweep would never see
+// these orphans.
+func TestSweepAllProjects_ReleasesMarkerlessOrphans(t *testing.T) {
+	withFleetHome(t)
+
+	// "orphan": state.json present + alive PID + marker absent.
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "orphan",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/orphan",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	// "healthy": state.json present + alive PID + marker present.
+	if err := WriteMarker("healthy"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project:       "healthy",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/healthy",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	// Stub verifier so Down doesn't refuse to kill (it's our own
+	// PID).
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) {})
+	defer restoreKill()
+
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects: %v", err)
+	}
+
+	// Orphan: state should be cleaned up (Down ran).
+	if _, err := ReadState("orphan"); !errors.Is(err, ErrStateMissing) {
+		t.Fatalf("orphan state should be cleaned; err=%v", err)
+	}
+	// Healthy: untouched.
+	if !MarkerPresent("healthy") {
+		t.Fatalf("healthy marker should be preserved by sweep")
+	}
+	if _, err := ReadState("healthy"); err != nil {
+		t.Fatalf("healthy state should be preserved by sweep; err=%v", err)
+	}
+}
+
 // equalArgv is a tiny helper to dodge a slices import.
 func equalArgv(a, b []string) bool {
 	if len(a) != len(b) {

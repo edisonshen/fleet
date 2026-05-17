@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -68,6 +69,15 @@ type UpOpts struct {
 	// InjectedPID (test seam) overrides the recorded PID when
 	// SkipSpawn is true. 0 falls through to os.Getpid().
 	InjectedPID int
+
+	// RespawnOnly (codex P1): when true, Up MUST refuse to create a
+	// marker. It only operates on already-enabled projects — i.e.,
+	// re-spawn the listener if the recorded PID is dead, or no-op if
+	// alive. Marker absent => return OutcomeNotEnabled with no
+	// filesystem mutation. The Python coord tick uses this flag so the
+	// idempotent fleet-rc-up shell-out NEVER auto-enables RC on a
+	// project the operator hasn't opted in to.
+	RespawnOnly bool
 }
 
 // State is the snapshot Status / Inspect return. Mirrors the
@@ -188,9 +198,17 @@ var defaultSpawner spawner = func(workingDir string) (int, error) {
 		},
 	}
 	// argv shape pins what tests grep for + the pgrep sentinel.
-	argv := []string{"claude", "remote-control",
+	// Resolve `claude` against PATH before exec — os.StartProcess
+	// does NOT search PATH on a bare name (codex review iter-1 [P1]:
+	// without LookPath, fleet rc up fails on every install where
+	// `claude` is only on PATH, not in cwd).
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return 0, fmt.Errorf("rc.spawn: claude binary not found on PATH: %w", err)
+	}
+	argv := []string{bin, "remote-control",
 		"--remote-control-session-name-prefix", SessionPrefix}
-	proc, err := os.StartProcess("claude", argv, attr)
+	proc, err := os.StartProcess(bin, argv, attr)
 	if err != nil {
 		return 0, fmt.Errorf("rc.spawn: %w", err)
 	}
@@ -238,6 +256,16 @@ func Up(project string, opts UpOpts) (string, error) {
 	}
 
 	return withLock(project, func() (string, error) {
+		// (0) RespawnOnly gate (codex P1, Python coord tick safety):
+		// when the caller is the implicit-respawn path (Python skill
+		// shelling out every tick), Up must NEVER auto-create a marker
+		// for a project the operator hasn't explicitly enabled. If the
+		// marker is absent here, return OutcomeNotEnabled and touch
+		// nothing else.
+		if opts.RespawnOnly && !MarkerPresent(project) {
+			return OutcomeNotEnabled, nil
+		}
+
 		// (3) Idempotent re-Up: existing state.json + alive PID +
 		// matching host → return already_acquired.
 		if cur, err := ReadState(project); err == nil {
@@ -347,11 +375,27 @@ func Down(project string) (string, error) {
 		// refusal: if host_id doesn't match, log + skip the kill (we
 		// can't safely signal a remote-PID). Marker still gets
 		// removed locally so the gate fires off.
+		//
+		// codex P1 (PID-reuse defense): between the listener exiting
+		// and Down running, the kernel can recycle the PID for an
+		// unrelated process (a Make build, a different daemon). We
+		// MUST NOT SIGTERM/SIGKILL such a process. Before signaling,
+		// verify the PID's argv still matches our recorded
+		// session_prefix. If it doesn't (or the probe fails), skip
+		// the kill and fall through to marker/state cleanup — better
+		// to leak a now-dead listener for the sweeper than to murder
+		// the user's terminal multiplexer.
 		if stateHad && cur.PID > 0 {
 			host, _ := os.Hostname()
 			if cur.HostID == "" || cur.HostID == host {
 				if workers.IsAlive(cur.PID) {
-					killFn(cur.PID)
+					prefix := cur.SessionPrefix
+					if prefix == "" {
+						prefix = SessionPrefix
+					}
+					if verifyPIDIsListener(cur.PID, prefix) {
+						killFn(cur.PID)
+					}
 				}
 			}
 			// Cross-host: silently skip kill, fall through to marker
@@ -449,13 +493,29 @@ func Reset(project string) (string, error) {
 //
 // Never kills on prefix-only evidence; state.json must claim Fleet
 // ownership (codex round 3 free-form).
+//
+// codex P2 (sweep-source correctness): the orphan-cleanup case we
+// most care about is exactly the one List() can't reach — marker
+// gone (=> List excludes it) but rc-state.json still on disk
+// pointing at a live PID. Iterate rc-state.json directly via
+// filepath.Glob so the sweeper actually sees the orphans it's
+// supposed to release.
 func SweepAllProjects() error {
-	projs, err := List()
+	root, err := state.Root()
 	if err != nil {
 		return err
 	}
+	matches, err := filepath.Glob(filepath.Join(root, "projects", "*", "rc-state.json"))
+	if err != nil {
+		return fmt.Errorf("rc.SweepAllProjects: glob: %w", err)
+	}
 	host, _ := os.Hostname()
-	for _, p := range projs {
+	for _, m := range matches {
+		// projects/<name>/rc-state.json — pull the <name> segment.
+		p := filepath.Base(filepath.Dir(m))
+		if p == "" || strings.HasPrefix(p, ".") {
+			continue
+		}
 		cur, err := ReadState(p)
 		if err != nil {
 			continue
@@ -498,6 +558,60 @@ func SetDetectListenerForTest(fn func(workingDir string) (bool, error)) func() {
 	prev := detectListenerFn
 	detectListenerFn = fn
 	return func() { detectListenerFn = prev }
+}
+
+// verifyPIDIsListenerFn is the test seam for PID-reuse defense.
+// Production uses psArgsVerify (shells out to `ps -p <pid> -o
+// args=` and checks for the session_prefix token). Tests stub to
+// return true so unit tests don't need a live process whose argv
+// matches the expected pattern.
+var verifyPIDIsListenerFn = psArgsVerify
+
+// verifyPIDIsListener returns true iff the OS reports a process at
+// pid whose argv contains both "claude" + "remote-control" tokens
+// AND the recorded session_prefix. False means "don't kill —
+// either the PID is recycled or we can't tell."
+//
+// codex P1 mitigation: never signal a PID without checking what
+// process owns it now.
+func verifyPIDIsListener(pid int, sessionPrefix string) bool {
+	if pid <= 0 || sessionPrefix == "" {
+		return false
+	}
+	return verifyPIDIsListenerFn(pid, sessionPrefix)
+}
+
+// SetVerifyPIDIsListenerForTest swaps verifyPIDIsListenerFn;
+// returns a restore func tests defer.
+func SetVerifyPIDIsListenerForTest(fn func(pid int, sessionPrefix string) bool) func() {
+	prev := verifyPIDIsListenerFn
+	verifyPIDIsListenerFn = fn
+	return func() { verifyPIDIsListenerFn = prev }
+}
+
+// psArgsVerify is the production verifier. Uses `ps -p <pid> -o
+// args=` (portable across macOS/Linux/BSD). On any error or empty
+// output, returns false — the conservative answer: "don't kill
+// because we can't prove the PID is ours."
+func psArgsVerify(pid int, sessionPrefix string) bool {
+	out, err := exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "args=").Output()
+	if err != nil {
+		return false
+	}
+	args := strings.TrimSpace(string(out))
+	if args == "" {
+		return false
+	}
+	if !strings.Contains(args, "claude") {
+		return false
+	}
+	if !strings.Contains(args, "remote-control") {
+		return false
+	}
+	if !strings.Contains(args, sessionPrefix) {
+		return false
+	}
+	return true
 }
 
 // killFn is the test seam for Down's listener teardown. Production

@@ -293,18 +293,28 @@ def bootstrap_remote_control(
 
 def spawn_daemon_if_needed(project: str = "") -> bool:
     """v0.12 (DESIGN-rc-listener-lifecycle.md §"Attach-surface gates"
-    S1): shell out to `fleet rc up <project> --idempotent` so the Go
-    controller (internal/rc) is the SINGLE owner of spawn / marker /
-    state. The parallel pgrep+nohup path is gone — keeping it would
-    re-introduce the "two writers, two opinions" hazard the v0.12
-    architecture closes.
+    S1): shell out to `fleet rc up <project> --respawn-only
+    --idempotent` so the Go controller (internal/rc) is the SINGLE
+    owner of spawn / marker / state. The parallel pgrep+nohup path is
+    gone — keeping it would re-introduce the "two writers, two
+    opinions" hazard the v0.12 architecture closes.
+
+    CRITICAL — codex P1 finding: the coord tick must NEVER auto-create
+    a marker for a project the operator hasn't opted in to. That would
+    silently reintroduce the implicit-spawn bug v0.12 exists to fix
+    (10-hour zombie reviewer → 5,620 mobile pushes). --respawn-only
+    makes the Go side return outcome=not_enabled (exit 0) when the
+    marker is absent: no spawn, no marker write, no state mutation.
+    Only `fleet rc up <project>` (without --respawn-only — i.e.,
+    operator-driven) is allowed to enable RC for a project.
 
     Behaviour:
-      - Marker absent for project → Go `fleet rc up` no-ops on the
-        marker (rc.Enabled returns false; fleet rc up creates the
-        marker AND spawns the listener). Returns True.
+      - Marker absent for project → Go returns outcome=not_enabled
+        exit 0 (no spawn, no marker write). Returns True.
       - Marker present, listener alive → Go returns
         outcome=already_acquired exit 0. Returns True.
+      - Marker present, listener dead → Go respawns + writes new
+        state.json. Returns True on success.
       - Operator hasn't opted in (no marker, no project arg) →
         skip entirely; returns True (no spawn, no-op).
 
@@ -328,14 +338,16 @@ def spawn_daemon_if_needed(project: str = "") -> bool:
     # forks a real `claude remote-control` listener.
     if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
         return True
-    # Shell out to the Go controller. --idempotent maps to Up's
-    # already_acquired semantics: exit 0 when the listener is already
-    # alive AND the marker is present. The Go side handles
-    # working_dir resolution (meta.json + live coord fallback) so the
-    # Python side doesn't need to thread it through.
+    # Shell out to the Go controller. --respawn-only refuses to create
+    # the marker (the coord tick is the implicit-respawn path; only
+    # an explicit `fleet rc up <project>` from the operator enables
+    # RC). --idempotent maps to Up's already_acquired semantics.
+    # The Go side handles working_dir resolution (meta.json + live
+    # coord fallback) so the Python side doesn't need to thread it
+    # through.
     try:
         result = subprocess.run(
-            ["fleet", "rc", "up", project, "--idempotent"],
+            ["fleet", "rc", "up", project, "--respawn-only", "--idempotent"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
