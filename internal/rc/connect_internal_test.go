@@ -1,11 +1,53 @@
 package rc
 
 import (
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
 )
+
+// TestConnect_RefusesWhenListenerPIDDead (codex round-5 P1): if the
+// recorded listener PID is dead, Connect must refuse with an
+// operator-actionable error instead of silently driving
+// /remote-control into the coord pane (where it would attach to no
+// daemon and report success).
+func TestConnect_RefusesWhenListenerPIDDead(t *testing.T) {
+	withFleetHome(t)
+
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	host, _ := os.Hostname()
+	// Pick a PID that's almost certainly not alive. PID 999999 is
+	// well above the default kernel pid_max on most systems and
+	// IsAlive will return false. Using something like 1 (init) or
+	// os.Getpid() would defeat the test.
+	deadPID := 999999
+	if err := WriteState(RecordedState{
+		Project:       "demo",
+		PID:           deadPID,
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	res, err := Connect("demo", ConnectOpts{})
+	if err == nil {
+		t.Fatalf("Connect must refuse dead-listener attach; got success res=%+v", res)
+	}
+	if res.Outcome != OutcomeNotEnabled {
+		t.Fatalf("outcome=%q want %q (listener-dead is operator-actionable)", res.Outcome, OutcomeNotEnabled)
+	}
+	if !strings.Contains(err.Error(), "not alive") {
+		t.Fatalf("error must surface 'not alive' for operator clarity; got %q", err)
+	}
+}
 
 // TestSelectTarget_FallbackFiltersCoordOnly (codex round-3 P2): when
 // the coord-spawn-marker is absent or stale, selectTarget's fallback

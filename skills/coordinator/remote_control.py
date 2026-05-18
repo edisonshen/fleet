@@ -267,15 +267,23 @@ def bootstrap_remote_control(
     # call so the order doesn't matter for correctness, but the
     # narrative order matches the agent's observed sequence.
     #
-    # codex round-3 P2: respect the spawn return. With --respawn-only
-    # the Go side returns exit 10 (not_enabled) when the operator
-    # hasn't run `fleet rc up <project>`. Previously we ignored that
-    # and still seeded the inbox + wrote the per-coord bootstrap
-    # marker, which (a) put a misleading /remote-control prompt in
-    # front of the operator and (b) blocked retry forever (the marker
-    # makes future ticks skip this whole function). Now: surface the
-    # state to the operator and leave the marker absent so the next
-    # tick retries once they enable RC.
+    # codex round-3 + round-5 P2: respect the spawn return AND avoid
+    # log spam. With --respawn-only the Go side returns exit 10
+    # (not_enabled) when the operator hasn't run `fleet rc up
+    # <project>`. The original v0.12 code ignored that and silently
+    # wrote a misleading marker. The R3 fix surfaced the state but
+    # retried every tick (log spam). This R5 version writes the
+    # per-coord bootstrap marker on not_enabled so future ticks of
+    # THIS coord skip the function entirely (quiet steady-state),
+    # while still logging ONCE so the operator knows RC was skipped.
+    #
+    # Recovery path (per design doc):
+    #   1. operator runs `fleet rc up <project>` to enable.
+    #   2. operator runs `fleet rc connect <project>` to attach the
+    #      running coord. The connect step does the attach
+    #      explicitly, so we don't need to retry-spawn here.
+    #   3. on next handoff the replacement coord gets a fresh
+    #      coord_id → fresh per-coord marker → re-evaluates RC state.
     if not spawn_daemon_if_needed(project):
         _bootstrap_log(
             STATUS_NOT_ENABLED,
@@ -284,11 +292,17 @@ def bootstrap_remote_control(
             detail=(
                 f"spawn_daemon_if_needed returned False for project "
                 f"{project!r}. Most likely cause: RC is not enabled — "
-                f"run `fleet rc up {project}` to enable mobile pairing "
-                f"for this project. Inbox/marker intentionally skipped "
-                f"so the next coord tick retries."
+                f"run `fleet rc up {project}` + `fleet rc connect "
+                f"{project}` to enable mobile pairing. Writing per-"
+                f"coord marker so future ticks no-op until handoff."
             ),
         )
+        # Write the per-coord marker so subsequent ticks of this same
+        # coord short-circuit at the top of bootstrap_remote_control.
+        # Inbox is intentionally left unwritten — there's no daemon
+        # for /remote-control to attach to, and surfacing a misleading
+        # prompt was the original silo bug.
+        _write_marker(marker)
         return STATUS_NOT_ENABLED
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:

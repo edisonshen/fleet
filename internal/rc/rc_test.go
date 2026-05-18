@@ -54,7 +54,7 @@ func TestUp_IdempotentReAcquireReturnsAlreadyAcquired(t *testing.T) {
 	// Stub argv verifier so the test PID (os.Getpid()) is treated as
 	// a real listener — production checks `ps -p <pid> -o args=` for
 	// the session_prefix, which the test process obviously fails.
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
 
 	host, _ := os.Hostname()
@@ -115,6 +115,73 @@ func TestDown_RemovesCorruptStateEvenWithoutMarker(t *testing.T) {
 	}
 }
 
+// TestResetAll_EnumeratesMarkerlessState (codex round-5 P2): the
+// emergency reset-all path must catch projects with a markerless
+// rc-state.json — that's the corruption case `fleet rc reset` is
+// for. Without the glob, the pre-fix code returned success while
+// silently leaving the state file behind.
+func TestResetAll_EnumeratesMarkerlessState(t *testing.T) {
+	root := withFleetHome(t)
+	stubAgentListEmpty(t)
+
+	// Markered project (List path).
+	if err := WriteMarker("markered"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project:       "markered",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/markered",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState markered: %v", err)
+	}
+
+	// Markerless state-only project (glob path).
+	projDir := root + "/projects/orphan"
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project:       "orphan",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/orphan",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState orphan: %v", err)
+	}
+	if MarkerPresent("orphan") {
+		t.Fatalf("test precondition: orphan must have no marker")
+	}
+
+	// Stub verifier + kill so Down doesn't error or signal the test
+	// process. The verifier returning true means Down would call
+	// killFn, which we stub to a no-op.
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) {})
+	defer restoreKill()
+
+	out, err := Reset("")
+	if err != nil {
+		t.Fatalf("Reset(\"\"): %v", err)
+	}
+	if out != OutcomeReleased {
+		t.Fatalf("outcome=%q want %q", out, OutcomeReleased)
+	}
+	if _, sErr := ReadState("markered"); !errors.Is(sErr, ErrStateMissing) {
+		t.Fatalf("markered state should be removed; err=%v", sErr)
+	}
+	if _, sErr := ReadState("orphan"); !errors.Is(sErr, ErrStateMissing) {
+		t.Fatalf("orphan (markerless) state should be removed by reset-all; err=%v", sErr)
+	}
+}
+
 // TestUp_AdoptVerifyFailRespawns (codex round-3 P2): if the recorded
 // PID is alive but argv does not match session_prefix (kernel PID
 // reuse, external kill), Up must NOT return already_acquired with
@@ -139,7 +206,7 @@ func TestUp_AdoptVerifyFailRespawns(t *testing.T) {
 
 	// Stub argv verifier to refuse — pretend the PID was recycled
 	// for an unrelated process.
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return false })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return false })
 	defer restoreVerify()
 
 	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", SkipSpawn: true, InjectedPID: os.Getpid()})
@@ -375,7 +442,7 @@ func TestUp_RespawnOnlyRefusesToCreateMarker(t *testing.T) {
 func TestUp_RespawnOnlyWithMarkerProceeds(t *testing.T) {
 	withFleetHome(t)
 	stubAgentListEmpty(t)
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
 
 	// Operator has opted in.
@@ -431,7 +498,7 @@ func TestDown_SkipsKillOnPIDReuse(t *testing.T) {
 	}
 
 	// Stub the verifier to refuse — pretend the PID is recycled.
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return false })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return false })
 	defer restoreVerify()
 
 	var killCalls int
@@ -476,7 +543,7 @@ func TestDown_KillsWhenPIDVerified(t *testing.T) {
 		t.Fatalf("WriteState: %v", err)
 	}
 
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
 
 	var killCalls int
@@ -534,7 +601,7 @@ func TestSweepAllProjects_ReleasesMarkerlessOrphans(t *testing.T) {
 
 	// Stub verifier so Down doesn't refuse to kill (it's our own
 	// PID).
-	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix string) bool { return true })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
 	restoreKill := SetKillFnForTest(func(pid int) {})
 	defer restoreKill()

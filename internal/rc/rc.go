@@ -285,7 +285,7 @@ func Up(project string, opts UpOpts) (string, error) {
 				if prefix == "" {
 					prefix = SessionPrefix
 				}
-				if verifyPIDIsListener(cur.PID, prefix) {
+				if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
 					// Ensure marker is present even if operator rm'd it
 					// while listener kept running (codex round 2: this
 					// is "re-up the marker, not the listener" semantics).
@@ -299,13 +299,13 @@ func Up(project string, opts UpOpts) (string, error) {
 					}
 					return OutcomeAlreadyAcquired, nil
 				}
-				// argv mismatch — kernel PID reuse OR external kill.
-				// Tell the operator what we observed before falling
-				// through to fresh spawn. They can correlate with any
-				// downstream weirdness (mobile push gaps, etc.).
+				// argv/cwd mismatch — kernel PID reuse (possibly by
+				// another project's listener), external kill, or moved
+				// working_dir. Tell the operator what we observed
+				// before falling through to fresh spawn.
 				fmt.Fprintf(os.Stderr,
-					"rc.Up: project %q has recorded PID %d alive but argv does not match session_prefix %q; treating as dead and respawning (likely kernel PID reuse or external kill)\n",
-					project, cur.PID, prefix)
+					"rc.Up: project %q has recorded PID %d alive but does not match recorded session_prefix %q + working_dir %q; treating as dead and respawning (likely kernel PID reuse, cross-project reuse, or external kill)\n",
+					project, cur.PID, prefix, cur.WorkingDir)
 			}
 		}
 
@@ -430,8 +430,17 @@ func Down(project string) (string, error) {
 					if prefix == "" {
 						prefix = SessionPrefix
 					}
-					if verifyPIDIsListener(cur.PID, prefix) {
+					if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
 						killFn(cur.PID)
+					} else {
+						// argv/cwd mismatch — most likely the PID was
+						// recycled, possibly by another project's
+						// fleet-coord listener (every project shares
+						// the prefix). Refusing to kill avoids
+						// terminating an unrelated listener.
+						fmt.Fprintf(os.Stderr,
+							"rc.Down: project %q recorded PID %d alive but argv/cwd does not match recorded session_prefix %q + working_dir %q; skipping kill (likely PID reuse — possibly by another project's listener)\n",
+							project, cur.PID, prefix, cur.WorkingDir)
 					}
 				}
 			}
@@ -504,14 +513,39 @@ func List() ([]string, error) {
 //
 // Operator emergency: when state.json is corrupt or pointing at a
 // dead PID, Reset gives a clean slate.
+//
+// codex round-5 P2: reset-all must enumerate BOTH markered projects
+// (via List) AND markerless state files (via Glob). The latter is
+// exactly the corruption case `fleet rc reset` exists to clean.
+// Without the glob, a project that had its marker removed manually
+// but kept its rc-state.json would silently survive reset-all.
 func Reset(project string) (string, error) {
 	if project == "" {
-		// Reset-all: enumerate List, Down each.
-		projs, err := List()
-		if err != nil {
+		seen := map[string]struct{}{}
+
+		// Markered projects (the common case).
+		if projs, err := List(); err == nil {
+			for _, p := range projs {
+				seen[p] = struct{}{}
+			}
+		} else {
 			return OutcomeError, err
 		}
-		for _, p := range projs {
+
+		// Add markerless state-only projects so emergency cleanup
+		// actually catches them.
+		if root, err := state.Root(); err == nil {
+			matches, _ := filepath.Glob(filepath.Join(root, "projects", "*", "rc-state.json"))
+			for _, m := range matches {
+				p := filepath.Base(filepath.Dir(m))
+				if p == "" || strings.HasPrefix(p, ".") {
+					continue
+				}
+				seen[p] = struct{}{}
+			}
+		}
+
+		for p := range seen {
 			if _, err := Down(p); err != nil {
 				// Continue; best-effort across all projects.
 				_ = err
@@ -599,38 +633,45 @@ func SetDetectListenerForTest(fn func(workingDir string) (bool, error)) func() {
 
 // verifyPIDIsListenerFn is the test seam for PID-reuse defense.
 // Production uses psArgsVerify (shells out to `ps -p <pid> -o
-// args=` and checks for the session_prefix token). Tests stub to
-// return true so unit tests don't need a live process whose argv
-// matches the expected pattern.
+// args=` + lsof for cwd). Tests stub to return true so unit tests
+// don't need a live process whose argv + cwd match.
 var verifyPIDIsListenerFn = psArgsVerify
 
 // verifyPIDIsListener returns true iff the OS reports a process at
-// pid whose argv contains both "claude" + "remote-control" tokens
-// AND the recorded session_prefix. False means "don't kill —
-// either the PID is recycled or we can't tell."
+// pid whose argv contains "claude" + "remote-control" + the
+// recorded session_prefix AND whose cwd matches expectedCwd. Both
+// checks are required: every project shares the "fleet-coord"
+// session_prefix, so argv-only matching can't distinguish project
+// A's listener from project B's after PID reuse (codex round-5 P1).
 //
-// codex P1 mitigation: never signal a PID without checking what
-// process owns it now.
-func verifyPIDIsListener(pid int, sessionPrefix string) bool {
+// expectedCwd == "" disables the cwd check — only callers without a
+// recorded working_dir should pass empty (none in production; some
+// test fixtures).
+//
+// codex P1 mitigation: never adopt or signal a PID without checking
+// who owns it now AND that the working_dir matches.
+func verifyPIDIsListener(pid int, sessionPrefix, expectedCwd string) bool {
 	if pid <= 0 || sessionPrefix == "" {
 		return false
 	}
-	return verifyPIDIsListenerFn(pid, sessionPrefix)
+	return verifyPIDIsListenerFn(pid, sessionPrefix, expectedCwd)
 }
 
 // SetVerifyPIDIsListenerForTest swaps verifyPIDIsListenerFn;
 // returns a restore func tests defer.
-func SetVerifyPIDIsListenerForTest(fn func(pid int, sessionPrefix string) bool) func() {
+func SetVerifyPIDIsListenerForTest(fn func(pid int, sessionPrefix, expectedCwd string) bool) func() {
 	prev := verifyPIDIsListenerFn
 	verifyPIDIsListenerFn = fn
 	return func() { verifyPIDIsListenerFn = prev }
 }
 
-// psArgsVerify is the production verifier. Uses `ps -p <pid> -o
-// args=` (portable across macOS/Linux/BSD). On any error or empty
-// output, returns false — the conservative answer: "don't kill
-// because we can't prove the PID is ours."
-func psArgsVerify(pid int, sessionPrefix string) bool {
+// psArgsVerify is the production verifier. Two probes:
+//   1. `ps -p <pid> -o args=` for argv (portable to macOS/Linux/BSD).
+//   2. `lsof -a -p <pid> -d cwd -Fn` for working_dir.
+//
+// On any probe failure, returns false — the conservative answer:
+// "don't trust the PID because we can't prove it's ours."
+func psArgsVerify(pid int, sessionPrefix, expectedCwd string) bool {
 	out, err := exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "args=").Output()
 	if err != nil {
 		return false
@@ -648,7 +689,23 @@ func psArgsVerify(pid int, sessionPrefix string) bool {
 	if !strings.Contains(args, sessionPrefix) {
 		return false
 	}
-	return true
+	// Empty expectedCwd: legacy / test fixture — accept argv match.
+	// Production callers always pass a non-empty value.
+	if expectedCwd == "" {
+		return true
+	}
+	cwdOut, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		// Can't read cwd → conservative refusal. Don't risk killing
+		// another project's listener (or adopting a recycled PID).
+		return false
+	}
+	for _, l := range strings.Split(string(cwdOut), "\n") {
+		if strings.HasPrefix(l, "n") && l[1:] == expectedCwd {
+			return true
+		}
+	}
+	return false
 }
 
 // killFn is the test seam for Down's listener teardown. Production

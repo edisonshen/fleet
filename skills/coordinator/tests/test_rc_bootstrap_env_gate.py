@@ -309,15 +309,21 @@ class TestBootstrapRemoteControlGate:
 
 
 class TestBootstrapHonorsNotEnabled:
-    """codex round-3 P2: when `fleet rc up --respawn-only --idempotent`
-    returns exit 10 (outcome=not_enabled — operator hasn't run
-    `fleet rc up <project>`), spawn_daemon_if_needed returns False.
-    The OUTER bootstrap caller must respect that: no inbox seed, no
-    per-coord marker write. Otherwise the marker blocks future ticks
-    from retrying once the operator enables RC.
+    """codex round-3 + round-5 P2 (combined contract): when `fleet rc up
+    --respawn-only --idempotent` returns exit 10 (not_enabled), the
+    outer bootstrap MUST:
+      - log STATUS_NOT_ENABLED once,
+      - NOT seed the inbox (no daemon = misleading prompt),
+      - WRITE the per-coord marker so future ticks skip the function
+        entirely (codex round-5 P2: avoid per-tick spam).
+
+    Recovery is operator-driven: `fleet rc up <project>` then
+    `fleet rc connect <project>` to attach the running coord. The
+    next-handoff coord gets a fresh coord_id → fresh marker → fresh
+    evaluation.
     """
 
-    def test_not_enabled_skips_inbox_and_marker(
+    def test_not_enabled_skips_inbox_writes_marker(
         self,
         fleet_home: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -339,19 +345,18 @@ class TestBootstrapHonorsNotEnabled:
             f"bootstrap must surface not_enabled when fleet rc up "
             f"returns exit 10; got {status!r}"
         )
-        # CRITICAL: marker must NOT be written. The next tick must
-        # retry once the operator enables RC.
+        # codex R5: the per-coord marker IS written so future ticks
+        # skip — quiet steady-state instead of every-tick spam.
         marker = (
             fleet_home / "projects" / "myproj"
             / ".remote-control-bootstrap-abcd1234"
         )
-        assert not marker.exists(), (
-            "bootstrap marker must NOT be written when RC is not "
-            "enabled; otherwise the coord never retries after the "
-            "operator enables RC"
+        assert marker.exists(), (
+            "per-coord bootstrap marker MUST be written on "
+            "not_enabled so subsequent ticks no-op (avoid log spam)"
         )
-        # And no inbox seed — the operator would otherwise see a
-        # /remote-control prompt for a daemon that isn't there.
+        # But no inbox seed — there's no daemon for /remote-control
+        # to attach to. Misleading prompt was the original silo bug.
         assert not (fleet_home / "inbox" / "abcd1234.md").exists(), (
             "inbox seed must NOT fire when RC is not enabled"
         )

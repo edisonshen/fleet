@@ -51,6 +51,28 @@ func Connect(project string, opts ConnectOpts) (ConnectResult, error) {
 		return ConnectResult{Outcome: OutcomeNotEnabled}, fmt.Errorf("rc.Connect: marker absent for project %q (run `fleet rc up %s` first)", project, project)
 	}
 
+	// codex round-5 P1: verify the listener PID is alive before
+	// driving /remote-control into the coord pane. Without this
+	// check, a daemon crash or reboot makes Connect silently report
+	// "connected" while the slash command finds no daemon to attach
+	// to. Surface the dead-listener case so the operator can
+	// respawn instead of debugging a phantom attach.
+	if st, sErr := ReadState(project); sErr == nil {
+		if st.PID > 0 && !workers.IsAlive(st.PID) {
+			return ConnectResult{
+					Outcome: OutcomeNotEnabled,
+					Error:   fmt.Sprintf("rc.Connect: recorded listener PID %d for project %q is not alive (daemon crashed or machine rebooted); run `fleet rc up %s` to respawn", st.PID, project, project),
+				},
+				fmt.Errorf("rc.Connect: recorded listener PID %d for project %q is not alive; run `fleet rc up %s` to respawn", st.PID, project, project)
+		}
+	} else if errors.Is(sErr, ErrStateMissing) {
+		return ConnectResult{
+				Outcome: OutcomeNotEnabled,
+				Error:   fmt.Sprintf("rc.Connect: rc-state.json missing for project %q (marker present but no listener record); run `fleet rc up %s` to recover", project, project),
+			},
+			fmt.Errorf("rc.Connect: rc-state.json missing for project %q; run `fleet rc up %s` to recover", project, project)
+	}
+
 	rec, err := selectTarget(project, opts.CoordID)
 	if err != nil {
 		return ConnectResult{Outcome: OutcomeAbsent, Error: err.Error()}, err
