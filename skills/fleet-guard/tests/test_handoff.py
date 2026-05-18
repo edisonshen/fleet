@@ -178,18 +178,19 @@ EXPECTED_GOLDEN = (
     b"---\n"
     b"\n"
     b"## First Action (auto)\n"
-    b"**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n"
+    b"To re-attach mobile/web pairing for this coord, run in your terminal:\n"
     b"\n"
-    b"```bash\n"
-    b"( pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-handoff-myproj( |$)' >/dev/null 2>&1 || \\\n"
-    b"  nohup claude remote-control \\\n"
-    b'    --remote-control-session-name-prefix "fleet-handoff-myproj" \\\n'
-    b"    > /tmp/claude-rc-handoff.log 2>&1 & )\n"
-    b"```\n"
+    b"    fleet rc connect myproj\n"
     b"\n"
-    b"Use the Bash tool with run_in_background: true.\n"
+    b"(Or `/remote-control` from within Claude Code.) The pairing resumes\n"
+    b"from where the previous coord left off, provided RC was previously\n"
+    b"enabled via `fleet rc up myproj`.\n"
     b"\n"
-    b"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n"
+    b"If RC was not previously enabled, run:\n"
+    b"\n"
+    b"    fleet rc up myproj\n"
+    b"\n"
+    b"first, then `fleet rc connect myproj`.\n"
     b"\n"
     b"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent \xe2\x80\x94 running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n"
     b"\n"
@@ -253,25 +254,22 @@ class TestRenderByteGolden:
         # the body never has a literal blank section.
         assert handoff.PLACEHOLDER.encode("utf-8") in got
 
-    def test_first_action_carries_remote_control_slash_command(self) -> None:
-        """Issue #56 regression: the first_action paragraph telling the
-        agent to run the `/remote-control` slash command must be present
-        on every rendered doc. Without it, the daemon (started by the
-        bash block above) is listening but the chat session never
-        attaches — operator's mobile pairing is lost across handoff.
-        The byte-golden above covers exact-byte verification; this test
-        gives a focused regression signal that's easy to read when the
-        paragraph drifts.
+    def test_first_action_carries_fleet_rc_connect(self) -> None:
+        """v0.12 contract: the First Action body directs the operator
+        to run `fleet rc connect <project>` and mentions
+        `/remote-control` parenthetically as the in-session alternative.
+        Bash bootstrap is gone (DESIGN-rc-listener-lifecycle.md §"Handoff
+        doc rewrite"). The byte-golden above covers exact-byte
+        verification; this test gives a focused regression signal.
         """
-        want = (
-            b"Then run the slash command `/remote-control` "
-            b"(in the chat, not bash) to connect this fresh session "
-            b"to your remote-control session."
-        )
-        assert want in handoff.first_action("myproj").encode("utf-8")
-        # Also confirm the rendered doc carries it (covers the scenario
-        # where someone duplicates the function but skips wiring it
-        # through the renderer).
+        body = handoff.first_action("myproj").encode("utf-8")
+        for want in (
+            b"fleet rc connect myproj",
+            b"fleet rc up myproj",
+            b"`/remote-control`",
+        ):
+            assert want in body, f"first_action body missing {want!r}"
+        # Also confirm the rendered doc carries it.
         ts = datetime(2026, 4, 28, 12, 34, 56, tzinfo=timezone.utc)
         got = handoff._render_doc(
             agent_id="abcd1234",
@@ -284,7 +282,7 @@ class TestRenderByteGolden:
             ts=ts,
             recent_activity="x",
         )
-        assert want in got
+        assert b"fleet rc connect myproj" in got
 
     def test_first_action_instructs_coordinator_run(self) -> None:
         """handoff-coord-spawn-prompt-fix regression: first_action

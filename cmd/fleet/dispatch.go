@@ -11,6 +11,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -444,7 +445,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// Suffix-extension keeps the legacy `fleet-coord-<id>`
 		// substring intact for pidresolver disambiguator matching.
 		rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
-		rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
+		rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
 		// Only set ExecCommand when the rewrite actually changed
 		// something — passing through an unchanged custom --command
 		// avoids a no-op divergence between Command and ExecCommand
@@ -665,7 +666,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 						// Project-suffixed name for the recovered coord
 						// — same shape as the fresh-spawn branch above.
 						rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
-						rewritten := injectRemoteControlFlag(opts.command, rcSessionName)
+						rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
 						if !sameCommand(rewritten, opts.command) {
 							rewrittenExecArgv = rewritten
 						} else {
@@ -855,31 +856,43 @@ var defaultClaudeCommand = []string{"sh", "-c", defaultClaudeWrapperScript}
 // FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
 // when the env var is set to any non-empty value, this wrapper
 // returns the input slice unchanged — no `--remote-control "<name>"`
-// injection. The single cmd/fleet gate covers all three call sites
-// (coord-spawn at dispatch.go, dispatch recovery, and handoff
-// replacement at cmd/fleet/handoff.go) which together cover every
-// path that drags the real `claude` binary into a remote-control
-// attach during `go test`. The package-shared TestMain in
-// main_test.go pins the env var so test runs do NOT spawn real
-// listeners that ping the operator's mobile (the regression PR2 hit:
-// 29+ codex iterations × 1 listener per run = dozens of pings).
+// injection. Kept through v0.12 as a belt-and-suspenders gate for
+// test paths that might somehow set a marker; v0.13 retires it once
+// the marker-gate (rc-enabled) is field-proven via the v0.12
+// CI-invariant test (rc_invariant_test.go).
 //
-// Production behaviour is preserved: with the env var unset (the
-// default for `fleet` invocations from a normal shell), the wrapper
-// falls through to spawn.InjectRemoteControlFlag and rewrites the
-// shell-wrapped claude body exactly as before.
-//
-// The gate is intentionally placed in the cmd/fleet wrapper rather
-// than inside spawn.InjectRemoteControlFlag itself so that the
-// library's own tests in internal/spawn/argv_test.go remain
-// unaffected by the env var (they pin the library contract, not the
-// process-wide behaviour). The auto-handoff drain in
-// internal/handoffop uses spawn.InjectRemoteControlFlag directly,
-// but its tests never exercise the default claude wrapper (they
-// seed with `sleep 60` and other benign argvs), so no parallel gate
-// is needed there.
+// NB: this signature stays 2-arg for backwards-compat with the
+// existing dispatch_test.go / rc_bootstrap_env_test.go pinning the
+// env-gate contract. Project-aware callers use
+// injectRemoteControlFlagProject below.
 func injectRemoteControlFlag(command []string, sessionName string) []string {
 	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
+		return command
+	}
+	return spawn.InjectRemoteControlFlag(command, sessionName)
+}
+
+// injectRemoteControlFlagProject is the v0.12 project-aware variant.
+// Adds an rc.Enabled(project) check on top of the existing env-gate.
+// Used by coord-spawn + dispatch-recovery (handoff replacement uses
+// the same gate at cmd/fleet/handoff.go).
+//
+// Two-layer gate (v0.12 DESIGN-rc-listener-lifecycle.md §"Attach-
+// surface gates"):
+//
+//  1. PRIMARY: rc.Enabled(project) — per-project marker. Absent means
+//     operator hasn't opted in; no flag injection.
+//  2. SECONDARY (defense-in-depth from PR #157, retired in v0.13):
+//     FLEET_RC_BOOTSTRAP_DISABLED env var.
+//
+// Empty project (legacy / untargeted dispatch) returns false from
+// rc.Enabled, so the gate fires the same way as for projects-without-
+// markers.
+func injectRemoteControlFlagProject(command []string, sessionName, project string) []string {
+	if os.Getenv("FLEET_RC_BOOTSTRAP_DISABLED") != "" {
+		return command
+	}
+	if !rc.Enabled(project) {
 		return command
 	}
 	return spawn.InjectRemoteControlFlag(command, sessionName)

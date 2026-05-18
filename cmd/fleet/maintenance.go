@@ -28,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -378,6 +379,12 @@ Exit codes:
 // runMaintenanceBootstrapRemoteControl is the testable core. The
 // listFn / hasSessionFn injection lets tests substitute fake
 // agent-store and tmux-presence views (no real tmux required).
+//
+// v0.12 (DESIGN-rc-listener-lifecycle.md §"cmd/fleet/maintenance.go:
+// 348-351 survey rewrite"): the survey now differentiates "RC not
+// enabled for project" (operator opt-out, no remediation needed)
+// from "RC enabled but agent's persisted argv lacks the flag"
+// (legacy / pre-v0.12 agent that needs a handoff to re-attach).
 func runMaintenanceBootstrapRemoteControl(
 	stdout io.Writer,
 	listFn func() ([]*agent.Record, error),
@@ -394,7 +401,8 @@ func runMaintenanceBootstrapRemoteControl(
 		spawnedAt string
 		session   string
 	}
-	var report []missing
+	var rcEnabledMissing []missing
+	var rcDisabledSkipped []missing
 	for _, r := range records {
 		if r == nil {
 			continue
@@ -408,33 +416,60 @@ func runMaintenanceBootstrapRemoteControl(
 			// the report.
 			continue
 		}
-		report = append(report, missing{
+		m := missing{
 			id:        r.ID,
 			project:   r.Project,
 			taskID:    r.TaskID,
 			spawnedAt: r.SpawnedAt.UTC().Format("2006-01-02T15:04:05Z"),
 			session:   r.TmuxSession,
-		})
+		}
+		if rc.Enabled(r.Project) {
+			rcEnabledMissing = append(rcEnabledMissing, m)
+		} else {
+			rcDisabledSkipped = append(rcDisabledSkipped, m)
+		}
 	}
-	if len(report) == 0 {
+
+	if len(rcEnabledMissing) == 0 && len(rcDisabledSkipped) == 0 {
 		_, _ = fmt.Fprintln(stdout, "no live agents are missing --remote-control")
 		return nil
 	}
-	// Stable order: by spawnedAt ascending, then ID. So the operator
-	// sees the oldest "stuck without remote-control" agents first.
-	sort.SliceStable(report, func(i, j int) bool {
-		if report[i].spawnedAt != report[j].spawnedAt {
-			return report[i].spawnedAt < report[j].spawnedAt
-		}
-		return report[i].id < report[j].id
-	})
-	_, _ = fmt.Fprintf(stdout,
-		"%d live agent(s) missing --remote-control:\n\n", len(report))
-	for _, m := range report {
+
+	sortFn := func(s []missing) {
+		sort.SliceStable(s, func(i, j int) bool {
+			if s[i].spawnedAt != s[j].spawnedAt {
+				return s[i].spawnedAt < s[j].spawnedAt
+			}
+			return s[i].id < s[j].id
+		})
+	}
+	sortFn(rcEnabledMissing)
+	sortFn(rcDisabledSkipped)
+
+	if len(rcEnabledMissing) > 0 {
 		_, _ = fmt.Fprintf(stdout,
-			"  %s  project=%s  task=%s  spawned=%s\n"+
-				"     remediation: fleet handoff %s   (replacement spawn auto-injects the flag)\n\n",
-			m.id, m.project, m.taskID, m.spawnedAt, m.id)
+			"%d live agent(s) with RC enabled but missing --remote-control:\n\n",
+			len(rcEnabledMissing))
+		for _, m := range rcEnabledMissing {
+			_, _ = fmt.Fprintf(stdout,
+				"  %s  project=%s  task=%s  spawned=%s\n"+
+					"     remediation: fleet handoff %s   (replacement spawn auto-injects the flag)\n"+
+					"                  or: fleet rc connect %s    (drives /remote-control on the live coord)\n\n",
+				m.id, m.project, m.taskID, m.spawnedAt, m.id, m.project)
+		}
+	}
+	if len(rcDisabledSkipped) > 0 {
+		_, _ = fmt.Fprintf(stdout,
+			"%d live agent(s) without --remote-control (RC NOT enabled for project — no action needed):\n\n",
+			len(rcDisabledSkipped))
+		for _, m := range rcDisabledSkipped {
+			_, _ = fmt.Fprintf(stdout,
+				"  %s  project=%s  task=%s  spawned=%s\n"+
+					"     status: RC opt-in absent (no `~/.fleet/projects/%s/rc-enabled` marker)\n"+
+					"     remediation (only if pairing wanted): fleet rc up %s && fleet rc connect %s\n\n",
+				m.id, m.project, m.taskID, m.spawnedAt,
+				m.project, m.project, m.project)
+		}
 	}
 	return nil
 }

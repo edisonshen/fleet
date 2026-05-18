@@ -140,6 +140,7 @@ STATUS_OK = "ok"
 STATUS_SKIPPED_MARKER = "skipped_marker"
 STATUS_SKIPPED_INVALID = "skipped_invalid"
 STATUS_SKIPPED_NO_ARGS = "skipped_no_args"
+STATUS_NOT_ENABLED = "not_enabled"
 # Inbox path was occupied (operator pre-queued a message via
 # `fleet message <coord_id>` between dispatch and first tick). Don't
 # clobber — retry next tick after fleet-guard's Stop hook delivers +
@@ -265,7 +266,50 @@ def bootstrap_remote_control(
     # In practice the agent's Stop fire is many seconds after this
     # call so the order doesn't matter for correctness, but the
     # narrative order matches the agent's observed sequence.
-    spawn_daemon_if_needed()
+    #
+    # codex R3 + R5 + R6 P2 combined contract: distinguish the THREE
+    # outcomes of spawn so transient failures stay retriable while
+    # the operator-decided not_enabled state latches quiet.
+    #
+    #   - SPAWN_OK            → proceed: seed inbox + write marker.
+    #   - SPAWN_NOT_ENABLED   → log once, write per-coord marker
+    #                           (quiet steady-state until handoff).
+    #                           Recovery is operator-explicit:
+    #                           `fleet rc up <p>` + `fleet rc connect <p>`.
+    #   - SPAWN_TRANSIENT_ERROR → log, DON'T write marker so next tick
+    #                           retries (fleet binary missing /
+    #                           timeout / lock contest etc.).
+    spawn_status = spawn_daemon_status(project)
+    if spawn_status == SPAWN_NOT_ENABLED:
+        _bootstrap_log(
+            STATUS_NOT_ENABLED,
+            project=project,
+            coord_id=coord_id,
+            detail=(
+                f"RC not enabled for project {project!r}. Run "
+                f"`fleet rc up {project}` + `fleet rc connect "
+                f"{project}` to enable mobile pairing. Writing per-"
+                f"coord marker so future ticks no-op until handoff."
+            ),
+        )
+        _write_marker(marker)
+        return STATUS_NOT_ENABLED
+    if spawn_status == SPAWN_TRANSIENT_ERROR:
+        # Transient (fleet binary missing, subprocess timeout, etc.).
+        # Surface to operator-readable BOOTSTRAP_LOG and DON'T write
+        # the marker so the next coord tick retries cleanly once the
+        # transient resolves.
+        _bootstrap_log(
+            STATUS_FAILED_SEED,  # reuse the existing "retry-next-tick" log status
+            project=project,
+            coord_id=coord_id,
+            detail=(
+                f"spawn_daemon_status returned transient_error for "
+                f"project {project!r}; marker intentionally left "
+                f"unwritten so next tick retries"
+            ),
+        )
+        return STATUS_FAILED_SEED
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:
         # Pre-check above already eliminated the "inbox path exists"
@@ -291,113 +335,117 @@ def bootstrap_remote_control(
     return STATUS_OK
 
 
-def spawn_daemon_if_needed() -> bool:
-    """Spawn `claude remote-control` (fleet-coord prefix) in the
-    background if not already running. Idempotent at the **fleet-coord
-    daemon level**: pgrep guards only re-launch when a daemon with the
-    SAME `fleet-coord` session-name-prefix is already up.
+# Distinct return reasons from spawn_daemon_if_needed. Callers that
+# care about the difference (bootstrap_remote_control) use these.
+SPAWN_OK = "ok"
+SPAWN_NOT_ENABLED = "not_enabled"
+SPAWN_TRANSIENT_ERROR = "transient_error"
 
-    Returns True if the spawn shell command ran without raising
-    (regardless of whether pgrep matched — the shell handles both
-    branches). Returns False if subprocess.Popen itself failed (no
-    shell, no claude binary, etc.). Logs to /tmp/claude-rc-coord.log.
 
-    PRIOR BUG (this fix's regression pin): the previous pgrep pattern
-    was the broad `claude remote-control` match, which ALSO matched a
-    `fleet-handoff`-prefixed daemon (started by
-    internal/handoff.FirstAction). When the operator had a handoff
-    daemon running, the coord skill would silently skip its own daemon
-    spawn — so mobile claude.ai pairing for fleet-coord-* sessions
-    never worked. Mirror cmd/fleet/dispatch.go:remoteControlDaemonRunning
-    by anchoring the regex on `^claude` AND the
-    `--remote-control-session-name-prefix fleet-coord` literal so
-    fleet-handoff daemons no longer mask the coord launch.
+def spawn_daemon_status(project: str = "") -> str:
+    """Tri-state version of spawn_daemon_if_needed (codex round-6 P2).
+    Returns SPAWN_OK / SPAWN_NOT_ENABLED / SPAWN_TRANSIENT_ERROR so
+    callers can distinguish "operator hasn't opted in" (quiet steady-
+    state) from "fleet binary missing / timeout / lock contest" (must
+    retry next tick).
     """
-    # FLEET_RC_BOOTSTRAP_DISABLED gate (rc-listener-bootstrap-sk-3e98):
-    # symmetric with the Go-side cmd/fleet/dispatch.go gate at
-    # injectRemoteControlFlag. When this env var is set to any non-
-    # empty value, skip the bash bootstrap entirely so `pytest skills/`
-    # runs don't fork a real `claude remote-control` listener that
-    # registers with the operator's Claude Code service and pushes a
-    # mobile notification. Production behaviour (env unset) is
-    # preserved — the subprocess.Popen path below runs as before.
-    #
-    # Returns True (no-op success) so callers (bootstrap_remote_control)
-    # don't treat the skip as a spawn failure and log a spurious
-    # "spawn failed" line to BOOTSTRAP_LOG on every tick.
-    #
-    # The session-scoped autouse fixture in
-    # skills/coordinator/tests/conftest.py sets the env for the whole
-    # pytest run; legacy `_FakePopen`-style tests that assert on the
-    # bash shell shape call `enable_rc_bootstrap_for_test(monkeypatch)`
-    # (see test_rc_bootstrap_env_gate.py) to opt back in — mirror of
-    # the Go-side `enableRCBootstrapForTest(t)` helper in
-    # cmd/fleet/rc_bootstrap_env_test.go.
+    if not project:
+        return SPAWN_OK
     if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
-        return True
-    # ASCII flow:
-    #
-    #   pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-coord( |$)'
-    #     |
-    #     +-- no match (or pgrep itself missing)
-    #     |     -> launch nohup ... fleet-coord daemon
-    #     |
-    #     +-- match (fleet-coord daemon already up)
-    #           -> silent no-op (the `||` short-circuits)
-    #
-    # Regex anchors:
-    #   ^claude     — argv[0] must literally be `claude`. Excludes the
-    #                 transient `bash -c '... nohup claude ...'`
-    #                 bootstrap subprocess this very function spawns.
-    #   fleet-coord — daemon session-name-prefix flag value. UNQUOTED:
-    #                 shell quotes around the value (we still write
-    #                 them on the launch command for legibility) are
-    #                 stripped before exec, so the live daemon's argv
-    #                 carries the bare `fleet-coord` token.
-    #   ( |$)       — terminate at a word boundary so a hypothetical
-    #                 longer prefix like "fleet-coordX" does NOT
-    #                 false-positive.
-    pgrep_pattern = (
-        r"^claude remote-control "
-        r"--remote-control-session-name-prefix fleet-coord( |$)"
-    )
-    cmd = (
-        f"pgrep -f '{pgrep_pattern}' >/dev/null 2>&1 || "
-        "nohup claude remote-control "
-        '--remote-control-session-name-prefix "fleet-coord" '
-        f"> {_DAEMON_LOG} 2>&1 &"
-    )
+        return SPAWN_OK
+    fleet_bin = os.environ.get("FLEET_BIN") or "fleet"
     try:
-        # start_new_session detaches the spawned shell from our process
-        # group; subprocess.Popen with a string + shell=True is the
-        # canonical way to fork-and-forget a daemon. We don't wait —
-        # the `&` inside the shell already backgrounds the claude
-        # process, but DEVNULL-ing stdout/stderr keeps any pgrep noise
-        # from leaking onto the coord's stdout (which the skill emits
-        # JSON on).
-        subprocess.Popen(
-            ["bash", "-c", cmd],
+        result = subprocess.run(
+            [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            timeout=10,
+            check=False,
         )
-        return True
-    except FileNotFoundError:
-        # bash missing on the host — extremely unlikely, but fail-soft.
-        # Operator will see no remote-control attachment; the inbox
-        # seed still goes out.
+        if result.returncode == 0:
+            return SPAWN_OK
+        # Go side: 10 = not_enabled / not_owned, 11 = absent,
+        # 12 = contested, 1 = error. Only exit 10 is a real
+        # "operator hasn't enabled RC" signal we should latch on.
+        # Everything else is transient and the next tick should retry.
+        if result.returncode == 10:
+            return SPAWN_NOT_ENABLED
         print(
-            "coord remote-control: bash not found; daemon not spawned",
+            f"coord remote-control: fleet rc up {project!r} exit "
+            f"{result.returncode}; transient — will retry next tick",
             file=sys.stderr,
         )
-        return False
+        return SPAWN_TRANSIENT_ERROR
+    except FileNotFoundError:
+        print(
+            f"coord remote-control: fleet binary {fleet_bin!r} not found "
+            f"(FLEET_BIN={os.environ.get('FLEET_BIN', '')!r}); "
+            f"transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
+    except subprocess.TimeoutExpired:
+        print(
+            f"coord remote-control: fleet rc up {project!r} timed out "
+            f"(>10s); transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
     except Exception as exc:
         print(
-            f"coord remote-control: daemon spawn failed: {exc}",
+            f"coord remote-control: fleet rc up {project!r} failed: "
+            f"{exc}; transient — will retry next tick",
             file=sys.stderr,
         )
-        return False
+        return SPAWN_TRANSIENT_ERROR
+
+
+def spawn_daemon_if_needed(project: str = "") -> bool:
+    """v0.12 (DESIGN-rc-listener-lifecycle.md §"Attach-surface gates"
+    S1): shell out to `fleet rc up <project> --respawn-only
+    --idempotent` so the Go controller (internal/rc) is the SINGLE
+    owner of spawn / marker / state. The parallel pgrep+nohup path is
+    gone — keeping it would re-introduce the "two writers, two
+    opinions" hazard the v0.12 architecture closes.
+
+    CRITICAL — codex P1 finding: the coord tick must NEVER auto-create
+    a marker for a project the operator hasn't opted in to. That would
+    silently reintroduce the implicit-spawn bug v0.12 exists to fix
+    (10-hour zombie reviewer → 5,620 mobile pushes). --respawn-only
+    makes the Go side return outcome=not_enabled (exit 0) when the
+    marker is absent: no spawn, no marker write, no state mutation.
+    Only `fleet rc up <project>` (without --respawn-only — i.e.,
+    operator-driven) is allowed to enable RC for a project.
+
+    Behaviour:
+      - Marker absent for project → Go returns outcome=not_enabled
+        exit 0 (no spawn, no marker write). Returns True.
+      - Marker present, listener alive → Go returns
+        outcome=already_acquired exit 0. Returns True.
+      - Marker present, listener dead → Go respawns + writes new
+        state.json. Returns True on success.
+      - Operator hasn't opted in (no marker, no project arg) →
+        skip entirely; returns True (no spawn, no-op).
+
+    PR #157 env-gate (`FLEET_RC_BOOTSTRAP_DISABLED`) is kept as
+    defense-in-depth through v0.12; it short-circuits BEFORE the
+    fleet-rc-up shell-out. The CI invariant test
+    (rc_invariant_test.go) proves the marker-gate is sufficient on
+    its own; v0.13 retires the env-gate after field-proof.
+
+    project is the per-project name (matches Go-side
+    state.ValidateProjectName). Empty project means "we're not in a
+    project-supervised coord" (legacy / unsupervised lineage) — the
+    function returns True (no-op) without invoking fleet.
+    """
+    # Bool-shaped legacy contract: True = "OK or quiet no-op",
+    # False = "transient or hard failure". Bootstrap callers that
+    # need to distinguish should use spawn_daemon_status directly
+    # (codex round-6 P2). Tests that pre-date the split also use
+    # this entry point.
+    status = spawn_daemon_status(project)
+    return status == SPAWN_OK
 
 
 def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:

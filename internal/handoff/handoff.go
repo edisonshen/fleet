@@ -188,110 +188,63 @@ func NewManualStub(agentID, taskID, project string, number int, prev *string, ts
 }
 
 // FirstAction is the body of the "First Action (auto)" section that
-// every handoff doc carries. It instructs the resuming agent to spawn
-// `claude remote-control` in the background so the operator's mobile /
-// claude.ai pairing carries through the fleet-guard handoff. Idempotent
-// (pgrep guards re-launch when the daemon is already up).
+// every handoff doc carries.
+//
+// v0.12 rewrite (DESIGN-rc-listener-lifecycle.md §"Handoff doc
+// rewrite"): the bash bootstrap block is GONE. The new first-action
+// is operator-instruction markdown — a small UX regression (operator
+// types one command on resume) traded for a large architectural win
+// (no exec'd bash from a markdown file → no 5,620-mobile-push
+// regressions from a stuck reviewer loop).
 //
 // Body order is load-bearing:
 //
-//  1. Bash block: bootstrap the `claude remote-control` daemon (pgrep
-//     guard makes it idempotent).
-//  2. `/remote-control` slash command (issue #56): attach this fresh
-//     chat session to the daemon so the operator's mobile pairing
-//     reconnects. Must run BEFORE /coordinator so any supervisor
-//     startup output streams through the operator's mobile.
-//  3. `/coordinator` slash command (handoff-coord-spawn-prompt-fix):
-//     resume the per-project supervisor loop so the new agent
-//     acquires ~/.fleet/projects/<p>/.locks/coordinator.lock with its
-//     own 8-hex ID. Without this paragraph, replacement coord
-//     sessions never run /coordinator — the predecessor's lock body
-//     persists, the TUI dashboard's coord display shows the OLD ID,
-//     and the task queue stops draining silently. Universal
-//     (non-coord lineages also get the line) because /coordinator is
-//     idempotent: NB-flock skips when held, and a non-coord cwd has
-//     no project to supervise → exit clean. The cost of running it
-//     in worker handoffs is one no-op slash command; the cost of
-//     forgetting it on coord handoffs is silent supervisor death.
+//  1. Instruction: run `fleet rc connect <project>` in a terminal to
+//     re-attach mobile/web pairing. Or `/remote-control` from inside
+//     Claude Code (the in-session slash-command). Pairing resumes from
+//     where the previous coord left off PROVIDED RC was previously
+//     enabled via `fleet rc up <project>` — the per-project marker is
+//     the operator opt-in signal (Single source of truth).
+//  2. `/coordinator` slash command: resume the per-project supervisor
+//     loop (idempotent — NB-flock skips when held). Same load-bearing
+//     paragraph as before; universal (worker handoffs also run it as
+//     a no-op).
 //
-// Slash commands run in chat (not bash), so they're separate
-// paragraphs after the bash block, not piped continuations of it.
+// Slash commands run in chat (not bash). NO bash block. The "exec
+// arbitrary bash from a markdown file" semantics that caused the
+// test pollution is gone.
 //
-// FirstAction renders the body of the "First Action (auto)" section
-// for the given project. The bash block spawns a per-project
-// `claude remote-control` daemon (one per project so the operator
-// can distinguish per-project sessions on phone / claude.ai); the
-// pgrep guard is narrowed on the per-project prefix so daemons for
-// different projects don't mask each other's launch.
-//
-// Empty project falls back to the legacy generic
-// `--remote-control-session-name-prefix "fleet-handoff"` shape so
-// older rendered docs / records that didn't carry a project still
-// produce a well-formed bash block.
-//
-// Issue #31, #56. Must stay byte-identical with
+// Issue #31, #56 (closed under v0.12). Must stay byte-identical with
 // skills/fleet-guard/handoff.py:first_action(project) — the Python
 // skill writes the same handoff doc shape on auto-handoff and
-// renderers are tested for byte-equality.
+// renderers are tested for byte-equality (TestRender_SkillByteGolden).
+//
+// Empty project falls back to `<project>` placeholder text — older
+// records / legacy paths that don't carry a project still produce a
+// well-formed instruction (operator substitutes the project name
+// manually).
 func FirstAction(project string) string {
-	prefix := "fleet-handoff"
-	if project != "" {
-		prefix = prefix + "-" + project
+	display := project
+	if display == "" {
+		display = "<project>"
 	}
-	// pgrep regex — narrowed on the project-scoped prefix with a
-	// word-boundary terminator `( |$)` so a hypothetical longer prefix
-	// like `fleet-handoff-sparkX` doesn't false-positive. Mirrors the
-	// coord-side pattern in skills/coordinator/remote_control.py:
-	// spawn_daemon_if_needed.
-	//
-	// Regex-escape the prefix because ValidateProjectName allows `.`
-	// in project names (e.g. `v2.1`). Without escaping, `fleet-handoff-v2.1`
-	// would match a daemon for `fleet-handoff-v2a1` (false positive),
-	// causing the bootstrap to skip launching the v2.1 daemon while the
-	// replacement agent still registers as `fleet-handoff-<id>-v2.1`,
-	// leaving /remote-control with no compatible daemon to attach to.
-	// Allowed project chars are `[a-z0-9._-]`; only `.` is a regex
-	// metachar. Escape just that one to keep the rest readable.
-	pgrepPattern := "^claude remote-control --remote-control-session-name-prefix " + escapeProjectForPgrep(prefix) + "( |$)"
-	return "**Run this BEFORE anything else** to reconnect the new instance to Remote Control:\n" +
+	return "To re-attach mobile/web pairing for this coord, run in your terminal:\n" +
 		"\n" +
-		"```bash\n" +
-		"( pgrep -f '" + pgrepPattern + "' >/dev/null 2>&1 || \\\n" +
-		"  nohup claude remote-control \\\n" +
-		"    --remote-control-session-name-prefix \"" + prefix + "\" \\\n" +
-		"    > /tmp/claude-rc-handoff.log 2>&1 & )\n" +
-		"```\n" +
+		"    fleet rc connect " + display + "\n" +
 		"\n" +
-		"Use the Bash tool with run_in_background: true.\n" +
+		"(Or `/remote-control` from within Claude Code.) The pairing resumes\n" +
+		"from where the previous coord left off, provided RC was previously\n" +
+		"enabled via `fleet rc up " + display + "`.\n" +
 		"\n" +
-		"Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session.\n" +
+		"If RC was not previously enabled, run:\n" +
+		"\n" +
+		"    fleet rc up " + display + "\n" +
+		"\n" +
+		"first, then `fleet rc connect " + display + "`.\n" +
 		"\n" +
 		"Then run the slash command `/coordinator` (in the chat, not bash) to resume the per-project supervisor tick loop. The /coordinator skill is idempotent — running it on a coord session that already holds the NB-flock is a no-op (the flock skips when held), and on a non-coord lineage it exits cleanly with no project to supervise.\n" +
 		"\n" +
 		"Then continue with the sections below."
-}
-
-// escapeProjectForPgrep escapes regex metacharacters that may appear
-// in a project-scoped daemon prefix when used as a pgrep -f pattern.
-// ValidateProjectName allows `[a-z0-9._-]`; among those only `.` is a
-// regex metacharacter (matches any char). Hyphens are special only
-// inside character classes; underscores are always literal. We do not
-// use strings.NewReplacer or regexp.QuoteMeta because we want a
-// targeted, easily-auditable swap that mirrors what
-// skills/fleet-guard/handoff.py:_escape_project_for_pgrep does on the
-// Python side — keeping the two renderers byte-equal is a
-// load-bearing invariant (TestRender_SkillByteGolden).
-func escapeProjectForPgrep(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '.' {
-			out = append(out, '\\', '.')
-			continue
-		}
-		out = append(out, c)
-	}
-	return string(out)
 }
 
 // Render produces the markdown+frontmatter bytes for d.

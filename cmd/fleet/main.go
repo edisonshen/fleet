@@ -113,6 +113,7 @@ Engine selection:
 	root.AddCommand(newProjectCmd())
 	root.AddCommand(newMaintenanceCmd())
 	root.AddCommand(newClaimsCmd())
+	root.AddCommand(newRCCmd())
 	return root
 }
 
@@ -244,6 +245,12 @@ func main() {
 			// noise to keep the response shape clean for the Python
 			// caller (json.loads on stdout).
 			os.Exit(claimsExitCode(outcome))
+		}
+		if outcome := rcOutcomeFromErr(err); outcome != "" {
+			// Same shape as claims: rc subcommands write the JSON
+			// envelope to stdout and signal exit via the errRC
+			// sentinel. Skill consumers parse stdout, not stderr.
+			os.Exit(rcExitCode(outcome))
 		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

@@ -11,6 +11,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
@@ -1105,6 +1106,16 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	enableRCBootstrapForTest(t)
 	requireTmux(t)
 	setupFleetHome(t)
+	// v0.12: the handoff path now gates --remote-control injection
+	// on the per-project rc-enabled marker (DESIGN-rc-listener-
+	// lifecycle.md §"Attach-surface gates" I2). Without the marker
+	// the replacement spawn correctly does NOT carry the flag. The
+	// contract under test here is the WITH-marker path, so opt in
+	// for the duration of the test.
+	if err := rc.WriteMarker("rainier"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	t.Cleanup(func() { _ = rc.RemoveMarker("rainier") })
 
 	// Wrapper body that (a) starts with `claude ` (matcher trigger),
 	// (b) is observable in the pane regardless of whether claude is
@@ -1185,19 +1196,20 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	}
 
 	// (b) The pane shows the shim's argv echo, which includes the
-	// `--remote-control "fleet-handoff-<project>-<id>"` flag. The
+	// `--remote-control "fleet-coord-<id>-<project>"` flag. The
 	// shim prints each arg on its own line, so we grep for the
 	// session-name literal directly.
 	//
-	// rc-session-name-include: the project name is in the session so
-	// the operator can distinguish per-project sessions on phone /
-	// claude.ai. Order is project-first so the registered name STARTS
-	// WITH the per-project daemon prefix `fleet-handoff-<project>`
-	// the FirstAction bash block launches the daemon under (codex
-	// review iter-2 [P1] regression). The seed spawn used
-	// project="rainier", so the rendered flag must contain
-	// `fleet-handoff-rainier-<rep.ID>`.
-	wantFlag := "fleet-handoff-rainier-" + rep.ID
+	// codex round-6 P1: post-v0.12 the only listener prefix is
+	// `fleet-coord` (started by `fleet rc up`). The per-handoff
+	// bash bootstrap that previously launched a daemon under
+	// `fleet-handoff-<project>` is gone — replaced by operator-
+	// instruction markdown in FirstAction. Injecting any other
+	// prefix into the replacement coord would point at a daemon
+	// the live listener can't see → silent pairing failure post-
+	// handoff. So the rendered flag must use the coord shape:
+	// `fleet-coord-<rep.ID>-rainier`.
+	wantFlag := "fleet-coord-" + rep.ID + "-rainier"
 	deadline := time.Now().Add(3 * time.Second)
 	var lastOut []byte
 	for time.Now().Before(deadline) {

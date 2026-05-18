@@ -701,8 +701,23 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// internal/handoff.FirstAction renders into the bash bootstrap
 	// (the Claude remote-control daemon only attaches sessions whose
 	// name starts with its --remote-control-session-name-prefix).
-	rcSessionName := buildHandoffRemoteControlSessionName(newID, oldRec.Project)
-	rewrittenExecArgv := injectRemoteControlFlag(command, rcSessionName)
+	//
+	// codex round-6 P1: post-v0.12 there is no longer a per-handoff
+	// bash bootstrap (S2/S3 gates replaced it with operator-instruction
+	// markdown). The only live listener now is the one `fleet rc up`
+	// starts with prefix "fleet-coord". Injecting "fleet-handoff-..."
+	// session names into the replacement coord would point at a prefix
+	// the listener can't see → silent pairing failure post-handoff.
+	// Use the coord session-name shape so the single live listener
+	// matches both fresh-spawn and handoff replacements.
+	rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
+	// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
+	// per-project rc-enabled marker. Without it (operator hasn't
+	// run `fleet rc up <project>`), the handoff replacement does
+	// NOT carry --remote-control. FirstAction's operator-instruction
+	// text tells the operator to run `fleet rc connect <project>`
+	// in their terminal to re-attach pairing.
+	rewrittenExecArgv := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
 	if sameCommand(rewrittenExecArgv, command) {
 		// No-op rewrite (custom --command): pass nil so the
 		// persisted record and tmux exec are identical (avoids a

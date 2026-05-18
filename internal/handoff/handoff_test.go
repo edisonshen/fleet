@@ -54,39 +54,42 @@ func TestRender_FirstActionAppearsBeforeCompleted(t *testing.T) {
 	}
 }
 
-func TestRender_FirstActionCarriesRemoteControlInvocation(t *testing.T) {
+// TestRender_FirstActionCarriesFleetRCConnect pins the v0.12 contract:
+// the First Action body directs the operator to run `fleet rc connect
+// <project>` to re-attach mobile/web pairing. The bash bootstrap is
+// gone (DESIGN-rc-listener-lifecycle.md §"Handoff doc rewrite").
+func TestRender_FirstActionCarriesFleetRCConnect(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
-	// Project-scoped (rc-session-name-include): the daemon prefix
-	// + pgrep guard now carry the project name so per-project
-	// daemons coexist and the operator can distinguish per-project
-	// sessions on phone / claude.ai.
 	for _, want := range []string{
-		"pgrep -f '^claude remote-control --remote-control-session-name-prefix fleet-handoff-rainier",
-		"nohup claude remote-control",
-		`--remote-control-session-name-prefix "fleet-handoff-rainier"`,
-		"run_in_background: true",
+		"fleet rc connect rainier",
+		"fleet rc up rainier",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("First Action body missing %q", want)
 		}
 	}
+	for _, forbidden := range []string{
+		"nohup claude remote-control",
+		"pgrep -f",
+		"```bash",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("First Action body MUST NOT contain %q (v0.12 retired bash bootstrap):\n%s", forbidden, got)
+		}
+	}
 }
 
-// TestRender_FirstActionCarriesRemoteControlSlashCommand pins the
-// issue #56 paragraph that tells the resuming agent to run the
-// `/remote-control` slash command after the daemon is up. Without it,
-// the daemon listens but the chat session never attaches and the
-// operator's mobile pairing is lost across handoff. The byte-golden
-// (TestRender_SkillByteGolden) covers exact-byte verification; this
-// test gives a focused regression signal that's easier to read when
-// the paragraph drifts.
-func TestRender_FirstActionCarriesRemoteControlSlashCommand(t *testing.T) {
+// TestRender_FirstActionMentionsRemoteControlSlashCommand pins the
+// `/remote-control` reference — v0.12 keeps the in-session slash
+// command as the alternative path (codex round 2: it's the only
+// supported attach API). The body mentions it parenthetically.
+func TestRender_FirstActionMentionsRemoteControlSlashCommand(t *testing.T) {
 	d := NewManualStub("a1b2c3d4", "auth-fix", "rainier", 1, nil, time.Now().UTC())
 	got := string(Render(d))
-	want := "Then run the slash command `/remote-control` (in the chat, not bash) to connect this fresh session to your remote-control session."
+	want := "`/remote-control`"
 	if !strings.Contains(got, want) {
-		t.Errorf("First Action body missing /remote-control slash command instruction:\n%s", got)
+		t.Errorf("First Action body missing %q reference:\n%s", want, got)
 	}
 }
 
