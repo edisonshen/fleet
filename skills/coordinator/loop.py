@@ -2578,22 +2578,25 @@ def _reconcile_inflight(
                 # phase=done without pr_url, or phase=blocked
                 # without reason — fall through to pr_url + CI; the
                 # worker didn't honor the contract.
-        # Branch->PR fallback for tasks that reach this point with
-        # an empty pr_url. Two reaching cases:
-        #   - status=in-review (the t.status check above falls through
-        #     here without entering the in-progress block).
-        #   - status=in-progress where no terminal-state action fired
-        #     and no mid_phase short-circuit triggered.
-        # Codex review round 1 [P1]: this MUST run AFTER terminal-
-        # state classification (above) so a re-dispatched worker that
-        # wrote phase=failed / phase=blocked / phase=done is NOT
-        # masked by a stale PR left by a prior attempt on the SAME
-        # branch. Fresh state.json wins over GitHub state.
-        if not t.pr_url:
-            action = _branch_pr_fallback_action(t)
-            if action is not None:
-                actions.append(action)
-                continue
+        # SITE 2 of the branch->PR fallback was REMOVED in codex review
+        # round 3 [P1]: when a retried task reuses worker/<slug> after
+        # a CI-red attempt, the branch can still carry an older PR. If
+        # the new worker dies BEFORE writing state.json (and thus
+        # neither mid_phase nor terminal-state above produces a signal),
+        # the fallback at this site would have picked up the stale PR
+        # and flipped the fresh failure back to in-review/done —
+        # masking the operator's need to re-dispatch.
+        #
+        # The original load-bearing case (rc-listener-impl-v0-12-ed95
+        # stuck at phase=review-pending) is still handled by SITE 1
+        # inside the mid_phase short-circuit — state.json is present
+        # there (just frozen), which proves the worker reached a
+        # PR-creating phase. SITE 2's purpose was to also catch the
+        # in-review-with-empty-pr_url case, but without a per-attempt
+        # epoch we can't tell which PR (if any) belongs to the current
+        # attempt. The conservative choice — fall through to the
+        # "worker died without PR" requeue — lets the operator
+        # explicitly own that recovery.
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:

@@ -605,45 +605,111 @@ def test_terminal_done_with_pr_url_wins_over_stale_branch_pr(
     assert gh_mock.call_count == 0
 
 
-def test_in_review_with_empty_pr_url_triggers_branch_fallback(
+def test_in_progress_no_state_json_does_not_pick_up_stale_branch_pr(
     fleet_home: Path, monkeypatch,
 ) -> None:
-    """Reviewer-added: in-review tasks fall through to the
-    `if not t.pr_url:` site in _reconcile_inflight (NOT the mid_phase
-    short-circuit, since that's gated on t.status == "in-progress").
-    Verify the fallback fires for status=in-review with empty pr_url
-    and a merged PR on the branch.
+    """Codex reviewer round 3 [P1] regression (core case): re-dispatched
+    in-progress task, branch reused from prior attempt (still has an
+    OPEN PR on GitHub), new worker dies BEFORE writing state.json.
 
-    This guards the second fallback call site added by the codex iter-1
-    fix — without it, an in-review task whose pr_url was cleared would
-    fall straight through to the `else: worker died without PR` requeue
-    and silently lose its merged PR.
+    SITE 2 of the fallback was removed precisely because in this state
+    we have no way to tell whether the branch PR belongs to the current
+    attempt or a prior one. The conservative move is to fall through to
+    the legacy "worker died without PR" requeue.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # No state.json — new worker died before writing any state.
+    # tasks.md.pr_url is empty (cleared by previous CI-red reconcile).
+
+    t = _make_task(
+        "retry-bare", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/retry-bare",
+    )
+
+    stale_pr = loop._PRSummary(
+        number=500, state="OPEN",
+        url="https://github.com/x/y/pull/500",
+        merged_at=None,
+        created_at="2026-05-14T00:00:00Z",
+    )
+
+    def boom(*a, **kw):
+        raise AssertionError(
+            "SITE 2 fallback must not run — codex round 3 [P1] gate",
+        )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", side_effect=boom):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    # Fall through to legacy "worker died without PR" requeue.
+    assert len(actions) == 1, f"expected 1 action, got {actions}"
+    a = actions[0]
+    assert a.new_status == "todo"
+    assert a.delete_worker_dir is True
+    assert a.set_pr_url == "", "stale branch PR must NOT leak in"
+    _ = stale_pr
+
+
+def test_in_review_with_empty_pr_url_does_not_trigger_stale_branch_pr(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 3 [P1] regression: SITE 2 of the fallback
+    (post-terminal-state fall-through) was REMOVED because it would
+    pick up stale branch PRs from prior attempts.
+
+    Specifically: an in-review task whose pr_url was cleared by the
+    operator (or by a CI-red reconcile that didn't immediately
+    re-flip back to in-progress) cannot prove that a branch PR
+    belongs to the current attempt. Without a per-attempt epoch
+    timestamp, the safer choice is to fall through to the existing
+    "worker died without PR" requeue — letting the operator explicitly
+    own the recovery.
+
+    The original load-bearing case (rc-listener-impl-v0-12-ed95 stuck
+    at phase=review-pending) is still handled by SITE 1 inside the
+    mid_phase short-circuit, where state.json proves the worker
+    reached a PR-creating phase.
     """
     monkeypatch.setenv("FLEET_HOME", str(fleet_home))
     project = "fleet"
     # No state.json — worker dead, dir gone, status=in-review with empty
-    # pr_url (e.g., manually cleared by operator after a transient issue).
+    # pr_url. A stale MERGED PR exists on the branch from a prior attempt.
 
     t = _make_task(
-        "in-review-stuck", status="in-review",
-        worker_pid=0, pr_url="", branch="worker/in-review-stuck",
+        "in-review-no-pr", status="in-review",
+        worker_pid=0, pr_url="", branch="worker/in-review-no-pr",
     )
 
-    pr = loop._PRSummary(
+    stale_pr = loop._PRSummary(
         number=77, state="MERGED",
         url="https://github.com/x/y/pull/77",
         merged_at="2026-05-18T05:00:00Z",
         created_at="2026-05-18T00:00:00Z",
     )
 
+    # If the fallback fired, it would call _gh_pr_by_branch. Patch it to
+    # raise so any accidental invocation is loud (codex round 3 [P1]
+    # explicitly says: don't fire SITE 2 without per-attempt provenance).
+    def boom(*a, **kw):
+        raise AssertionError(
+            "SITE 2 fallback must not run — codex round 3 [P1] gate",
+        )
+
     with patch.object(loop, "_pid_alive", return_value=False), \
-         patch.object(loop, "_gh_pr_by_branch", return_value=pr):
+         patch.object(loop, "_gh_pr_by_branch", side_effect=boom):
         actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
 
-    assert len(actions) == 1
+    # In-review with empty pr_url falls through to the existing legacy
+    # `else: worker died without PR` requeue — task flips to todo with
+    # delete_worker_dir=True. The stale branch PR is NOT picked up.
+    assert len(actions) == 1, f"expected 1 action, got {actions}"
     a = actions[0]
-    assert a.new_status == "done"
-    assert a.set_pr_url == "https://github.com/x/y/pull/77"
+    assert a.new_status == "todo", f"expected todo, got {a.new_status}"
+    assert a.delete_worker_dir is True
+    assert a.set_pr_url == "", "stale branch PR must NOT leak in"
+    _ = stale_pr  # silence "unused"
 
 
 # ---------- Part C: periodic supervisor reconcile catches stale state.json ----------
