@@ -2678,7 +2678,13 @@ def test_reconcile_done_phase_triggers_workers_delete(
         if c[1:3] == ["workers", "delete"]:
             delete_idx = i
     assert delete_idx > 0, f"workers delete not invoked: {fleet_run_recorder}"
-    assert pr_idx > 0, f"pr_url set not invoked: {fleet_run_recorder}"
+    # Codex-driven _apply_reconcile ordering fix (Part B of
+    # reconcile-pr-by-branch-f3ef): pr_url is now written FIRST among
+    # the tasks.md mutations, so its index may be 0. Earlier this test
+    # asserted `pr_idx > 0` which was an artifact of the buggy
+    # status-before-pr_url ordering. The load-bearing invariant is
+    # pr_url before workers delete, asserted on the next line.
+    assert pr_idx >= 0, f"pr_url set not invoked: {fleet_run_recorder}"
     assert pr_idx < delete_idx, "pr_url must be persisted BEFORE workers delete"
 
 
