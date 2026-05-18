@@ -1002,6 +1002,95 @@ func TestWaitForReadyToPrompt_SkipsBufferOnUnstable(t *testing.T) {
 	}
 }
 
+// TestWaitForPaneStable_DeadlineBoundedOnUnstable pins the deadline
+// contract for the unstable-pane error path deterministically. The
+// pre-fix code checked the deadline AFTER capture but BEFORE a full
+// poll-interval sleep, so the last iteration could pay one extra
+// poll-interval of wall-time past maxWait — which, under CI
+// scheduler jitter, periodically tripped the integration test's
+// slack. The fix: check at the loop HEADER and cap the trailing
+// sleep at remaining-to-deadline.
+//
+// We exercise waitForPaneStableWithDeps directly with a fake clock
+// and an always-changing capture (so stability never converges and
+// the function MUST exit via the deadline path). Total simulated
+// elapsed time must equal exactly maxWait (no overshoot) because
+// the fake "sleep" advances the clock by exactly the requested
+// duration with no jitter.
+func TestWaitForPaneStable_DeadlineBoundedOnUnstable(t *testing.T) {
+	const (
+		stableWindow = 200 * time.Millisecond
+		maxWait      = 300 * time.Millisecond
+	)
+	// Fake clock advanced by sleepFn. Captures count up so the
+	// always-changing-capture path is exercised (stableSince resets
+	// every iteration).
+	clock := time.Unix(0, 0)
+	nowFn := func() time.Time { return clock }
+	sleepFn := func(d time.Duration) { clock = clock.Add(d) }
+
+	captureCount := 0
+	captureFn := func() ([]byte, error) {
+		captureCount++
+		return []byte(fmt.Sprintf("frame-%d", captureCount)), nil
+	}
+
+	start := clock
+	err := waitForPaneStableWithDeps(stableWindow, maxWait,
+		captureFn, sleepFn, nowFn)
+	elapsed := clock.Sub(start)
+
+	if err == nil {
+		t.Fatal("expected deadline error on always-changing pane; got nil")
+	}
+	if elapsed > maxWait {
+		t.Errorf("waitForPaneStable overshot deadline: elapsed=%s maxWait=%s — deadline check must run at loop header AND cap the trailing sleep",
+			elapsed, maxWait)
+	}
+	// Sanity: we must have polled enough that the deadline path is
+	// genuinely the exit (not a no-op).
+	if captureCount < 2 {
+		t.Errorf("captureCount=%d; want ≥ 2 (function exited before polling meaningfully)",
+			captureCount)
+	}
+}
+
+// TestWaitForPaneStable_ConvergesOnStable pins the happy path of the
+// extracted core: when capture returns the same bytes across two
+// polls separated by stableWindow, the function returns nil before
+// maxWait. Uses the same fake-clock seam as the deadline test so
+// the assertion is deterministic.
+func TestWaitForPaneStable_ConvergesOnStable(t *testing.T) {
+	const (
+		stableWindow = 200 * time.Millisecond
+		maxWait      = 2 * time.Second
+	)
+	clock := time.Unix(0, 0)
+	nowFn := func() time.Time { return clock }
+	sleepFn := func(d time.Duration) { clock = clock.Add(d) }
+
+	// Capture returns the SAME bytes every call → stable from poll 2
+	// onward; stableSince first set on poll 2, function returns on
+	// the iteration where now()-stableSince >= stableWindow.
+	captureFn := func() ([]byte, error) {
+		return []byte("steady"), nil
+	}
+
+	start := clock
+	if err := waitForPaneStableWithDeps(stableWindow, maxWait,
+		captureFn, sleepFn, nowFn); err != nil {
+		t.Fatalf("waitForPaneStable returned error on steady pane: %v", err)
+	}
+	elapsed := clock.Sub(start)
+	// Must converge within the stability window plus a couple of
+	// poll-intervals (first-pass primes prev; second pass sets
+	// stableSince; subsequent passes accumulate stable time).
+	if elapsed >= maxWait {
+		t.Errorf("waitForPaneStable did not converge before maxWait: elapsed=%s",
+			elapsed)
+	}
+}
+
 // TestSendPromptKeys_VerifiesSubmittedHappyPath pins issue #65 Fix
 // C: when the prompt is no longer in the pane's bottom band after
 // Enter, the verifier reports "submitted" and does NOT send a retry
