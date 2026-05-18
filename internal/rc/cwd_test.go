@@ -46,7 +46,7 @@ func TestResolveWorkingDir_LiveCoord(t *testing.T) {
 	withFleetHome(t)
 	prev := agentList
 	agentList = func() ([]*agent.Record, error) {
-		return []*agent.Record{{ID: "abc", Project: "demo", Cwd: "/from/coord"}}, nil
+		return []*agent.Record{{ID: "abc", Project: "demo", TaskID: "coord-demo", Cwd: "/from/coord"}}, nil
 	}
 	defer func() { agentList = prev }()
 
@@ -80,8 +80,8 @@ func TestResolveWorkingDir_SkipsStaleAgentRecord(t *testing.T) {
 	prev := agentList
 	agentList = func() ([]*agent.Record, error) {
 		return []*agent.Record{
-			{ID: "stale", Project: "demo", Cwd: "/from/stale", TmuxSession: "dead-session"},
-			{ID: "live", Project: "demo", Cwd: "/from/live", TmuxSession: "alive-session"},
+			{ID: "stale", Project: "demo", TaskID: "coord-demo", Cwd: "/from/stale", TmuxSession: "dead-session"},
+			{ID: "live", Project: "demo", TaskID: "coord-demo", Cwd: "/from/live", TmuxSession: "alive-session"},
 		}, nil
 	}
 	defer func() { agentList = prev }()
@@ -101,13 +101,38 @@ func TestResolveWorkingDir_SkipsStaleAgentRecord(t *testing.T) {
 	}
 }
 
+// TestResolveWorkingDir_SkipsWorkerRecord (codex round-9 P2): a
+// worker agent for the project (TaskID != "coord-<project>") must
+// not be used as a Cwd source. The worker's Cwd is its worktree
+// path, not the project root; registering the listener there would
+// mismatch the coord pane's directory-keyed Claude registry.
+func TestResolveWorkingDir_SkipsWorkerRecord(t *testing.T) {
+	withFleetHome(t)
+	prev := agentList
+	agentList = func() ([]*agent.Record, error) {
+		return []*agent.Record{
+			{ID: "worker-1", Project: "demo", TaskID: "auth-refresh", Cwd: "/worktrees/auth-refresh"},
+			{ID: "coord-1", Project: "demo", TaskID: "coord-demo", Cwd: "/repo/demo"},
+		}, nil
+	}
+	defer func() { agentList = prev }()
+
+	got, err := ResolveWorkingDir("demo", "")
+	if err != nil {
+		t.Fatalf("ResolveWorkingDir: %v", err)
+	}
+	if got != "/repo/demo" {
+		t.Fatalf("expected /repo/demo (worker record skipped); got %q", got)
+	}
+}
+
 func TestResolveWorkingDir_LiveCoordSkipsWrongProject(t *testing.T) {
 	withFleetHome(t)
 	prev := agentList
 	agentList = func() ([]*agent.Record, error) {
 		return []*agent.Record{
-			{ID: "wrong", Project: "other", Cwd: "/from/other"},
-			{ID: "right", Project: "demo", Cwd: "/from/demo"},
+			{ID: "wrong", Project: "other", TaskID: "coord-other", Cwd: "/from/other"},
+			{ID: "right", Project: "demo", TaskID: "coord-demo", Cwd: "/from/demo"},
 		}, nil
 	}
 	defer func() { agentList = prev }()

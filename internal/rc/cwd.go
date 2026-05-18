@@ -47,18 +47,26 @@ func ResolveWorkingDir(project, override string) (string, error) {
 	}
 
 	// (3) Live coord's recorded Cwd. agent.List enumerates all agents
-	// in ~/.fleet/agents/; we walk for the FIRST alive agent matching
-	// project. Tests can stub via ResolveWorkingDirAgentList (var seam
-	// below) but production uses agent.List directly.
+	// in ~/.fleet/agents/; we walk for the FIRST alive COORD agent
+	// matching project. Workers are filtered out — their Cwd is the
+	// worktree path, not the project root, and registering the
+	// listener there would mismatch the coord pane's directory-keyed
+	// Claude registry (codex round-9 P2). Tests can stub via
+	// ResolveWorkingDirAgentList (var seam below) but production
+	// uses agent.List directly.
 	//
 	// codex round-8 P2: skip records whose tmux session is no longer
 	// alive. Live JSON files routinely outlive crashed agents — without
 	// the liveness check a stale crashed-coord record could win over
 	// the active coord and register the listener under the wrong
 	// working_dir, breaking every later directory-keyed verify.
+	coordTaskID := "coord-" + project
 	if records, err := agentList(); err == nil {
 		for _, rec := range records {
 			if rec == nil || rec.Project != project {
+				continue
+			}
+			if rec.TaskID != coordTaskID {
 				continue
 			}
 			if rec.Cwd == "" {

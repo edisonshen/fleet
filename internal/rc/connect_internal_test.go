@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // TestConnect_RefusesOnCorruptState (codex round-7 P2): corrupt
@@ -75,6 +76,44 @@ func TestConnect_RefusesWhenListenerPIDDead(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "not alive") {
 		t.Fatalf("error must surface 'not alive' for operator clarity; got %q", err)
+	}
+}
+
+// TestSelectTarget_MarkerPointingAtWorkerRefused (codex round-9 P2):
+// if the coord-spawn-marker is stale or hand-edited so it points at
+// a live worker (TaskID != "coord-<project>"), selectTarget must
+// refuse rather than send /remote-control into the worker pane.
+func TestSelectTarget_MarkerPointingAtWorkerRefused(t *testing.T) {
+	withFleetHome(t)
+
+	// Initialize the project dir + marker via the public state helpers
+	// so the test exercises the production write path.
+	if _, err := state.EnsureProjectInitialized("demo"); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker("demo", "worker-aaaa"); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	worker := &agent.Record{
+		ID:          "worker-aaaa",
+		TmuxSession: "fleet-worker",
+		Project:     "demo",
+		TaskID:      "auth-refresh", // NOT coord-demo
+	}
+	restore := SetConnectFnsForTest(
+		func() ([]*agent.Record, error) { return []*agent.Record{worker}, nil },
+		func(session string) bool { return true },
+		nil, nil,
+	)
+	defer restore()
+
+	_, err := selectTarget("demo", "")
+	if err == nil {
+		t.Fatalf("selectTarget must refuse a marker pointing at a worker")
+	}
+	if !strings.Contains(err.Error(), "not coord") {
+		t.Fatalf("error must surface 'not coord' for operator clarity; got %q", err)
 	}
 }
 

@@ -175,6 +175,13 @@ func selectTarget(project, coordID string) (*agent.Record, error) {
 	}
 
 	// (2) coord-spawn-marker holder.
+	//
+	// codex round-9 P2: validate TaskID before accepting the marker
+	// target. A stale or hand-edited marker pointing at a live worker
+	// would otherwise have /remote-control keystrokes sent into the
+	// worker pane — the fallback at step (3) already filters workers,
+	// apply the same gate here.
+	coordTaskID := "coord-" + project
 	markerID := state.ReadCoordSpawnMarker(project)
 	if markerID != "" {
 		for _, r := range records {
@@ -183,6 +190,9 @@ func selectTarget(project, coordID string) (*agent.Record, error) {
 			}
 			if r.Project != "" && r.Project != project {
 				continue
+			}
+			if r.TaskID != coordTaskID {
+				return nil, fmt.Errorf("rc.Connect: coord-spawn-marker for project %q points at agent %q whose TaskID is %q (not coord); run `fleet dispatch --coord-spawn ...` to spawn a real coord", project, markerID, r.TaskID)
 			}
 			if !sessionAliveFn(r.TmuxSession) {
 				return nil, fmt.Errorf("rc.Connect: coord-spawn-marker points at %q but its tmux session is dead", markerID)
@@ -199,7 +209,7 @@ func selectTarget(project, coordID string) (*agent.Record, error) {
 	// `fleet rc connect` would otherwise send `/remote-control`
 	// keystrokes into the worker pane and report success — a
 	// silo'd misroute we surface as a clear refusal instead.
-	coordTaskID := "coord-" + project
+	// (coordTaskID declared at top of selectTarget.)
 	var alive []*agent.Record
 	var nonCoordAlive int
 	for _, r := range records {
