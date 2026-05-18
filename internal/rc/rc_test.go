@@ -115,6 +115,30 @@ func TestDown_RemovesCorruptStateEvenWithoutMarker(t *testing.T) {
 	}
 }
 
+// TestResolveWorkingDir_CanonicalizesRelativeOverride (codex round-6
+// P2): when the operator passes `--cwd .`, the resolved value must
+// be the absolute path. Without canonicalization, rc-state.json
+// stores "." but lsof reports the absolute cwd — every later
+// argv/cwd verify-fails, breaking Down/Connect.
+func TestResolveWorkingDir_CanonicalizesRelativeOverride(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+
+	got, err := ResolveWorkingDir("demo", ".")
+	if err != nil {
+		t.Fatalf("ResolveWorkingDir: %v", err)
+	}
+	if got == "." || got == "" {
+		t.Fatalf("override must be canonicalized to absolute path; got %q", got)
+	}
+	// Absolute paths start with / on Unix. We're not asserting an
+	// exact value (depends on test runner's cwd) — just that it
+	// LOOKS absolute. filepath.Abs guarantees this.
+	if got[0] != '/' {
+		t.Fatalf("resolved path %q should be absolute (start with /)", got)
+	}
+}
+
 // TestResetAll_EnumeratesMarkerlessState (codex round-5 P2): the
 // emergency reset-all path must catch projects with a markerless
 // rc-state.json — that's the corruption case `fleet rc reset` is

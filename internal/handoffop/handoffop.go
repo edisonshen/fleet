@@ -516,14 +516,15 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// operator-overridden custom --commands, InjectRemoteControlFlag
 	// returns the slice unchanged — we then pass nil as ExecCommand
 	// so spawn.Spawn doesn't see a no-op divergence.
-	// Project-first prefix (rc-session-name-include): same shape as
-	// the operator-triggered handoff path in cmd/fleet/handoff.go —
-	// `fleet-handoff-<project>-<new-id>` so the successor's session
-	// name on claude.ai mobile / web carries the project identifier
-	// AND starts with the per-project daemon prefix
-	// `fleet-handoff-<project>` (the Claude remote-control daemon's
-	// session-name-prefix filter).
-	rcSessionName := spawn.HandoffRemoteControlSessionName(req.NewAgentID, oldRec.Project)
+	// codex round-6 P1: post-v0.12 only one listener prefix exists
+	// (`fleet-coord`, started by `fleet rc up`). The legacy per-
+	// handoff `fleet-handoff-<project>` daemon went away when the
+	// S2/S3 gates replaced the embedded bash bootstrap with operator-
+	// instruction markdown. Injecting "fleet-handoff-..." into the
+	// replacement coord would point at a prefix the live listener
+	// can't see → silent pairing failure post-auto-handoff. Mirror
+	// cmd/fleet/handoff.go: use the coord session-name shape.
+	rcSessionName := spawn.CoordRemoteControlSessionName(req.NewAgentID, oldRec.Project)
 	// v0.12 (DESIGN §"Attach-surface gates" I3): use the project-aware
 	// rc.GateAttachFlag helper. Auto-handoff drain hits this code path
 	// without going through cmd/fleet's wrapper, so the dedicated

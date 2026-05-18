@@ -267,43 +267,49 @@ def bootstrap_remote_control(
     # call so the order doesn't matter for correctness, but the
     # narrative order matches the agent's observed sequence.
     #
-    # codex round-3 + round-5 P2: respect the spawn return AND avoid
-    # log spam. With --respawn-only the Go side returns exit 10
-    # (not_enabled) when the operator hasn't run `fleet rc up
-    # <project>`. The original v0.12 code ignored that and silently
-    # wrote a misleading marker. The R3 fix surfaced the state but
-    # retried every tick (log spam). This R5 version writes the
-    # per-coord bootstrap marker on not_enabled so future ticks of
-    # THIS coord skip the function entirely (quiet steady-state),
-    # while still logging ONCE so the operator knows RC was skipped.
+    # codex R3 + R5 + R6 P2 combined contract: distinguish the THREE
+    # outcomes of spawn so transient failures stay retriable while
+    # the operator-decided not_enabled state latches quiet.
     #
-    # Recovery path (per design doc):
-    #   1. operator runs `fleet rc up <project>` to enable.
-    #   2. operator runs `fleet rc connect <project>` to attach the
-    #      running coord. The connect step does the attach
-    #      explicitly, so we don't need to retry-spawn here.
-    #   3. on next handoff the replacement coord gets a fresh
-    #      coord_id → fresh per-coord marker → re-evaluates RC state.
-    if not spawn_daemon_if_needed(project):
+    #   - SPAWN_OK            → proceed: seed inbox + write marker.
+    #   - SPAWN_NOT_ENABLED   → log once, write per-coord marker
+    #                           (quiet steady-state until handoff).
+    #                           Recovery is operator-explicit:
+    #                           `fleet rc up <p>` + `fleet rc connect <p>`.
+    #   - SPAWN_TRANSIENT_ERROR → log, DON'T write marker so next tick
+    #                           retries (fleet binary missing /
+    #                           timeout / lock contest etc.).
+    spawn_status = spawn_daemon_status(project)
+    if spawn_status == SPAWN_NOT_ENABLED:
         _bootstrap_log(
             STATUS_NOT_ENABLED,
             project=project,
             coord_id=coord_id,
             detail=(
-                f"spawn_daemon_if_needed returned False for project "
-                f"{project!r}. Most likely cause: RC is not enabled — "
-                f"run `fleet rc up {project}` + `fleet rc connect "
+                f"RC not enabled for project {project!r}. Run "
+                f"`fleet rc up {project}` + `fleet rc connect "
                 f"{project}` to enable mobile pairing. Writing per-"
                 f"coord marker so future ticks no-op until handoff."
             ),
         )
-        # Write the per-coord marker so subsequent ticks of this same
-        # coord short-circuit at the top of bootstrap_remote_control.
-        # Inbox is intentionally left unwritten — there's no daemon
-        # for /remote-control to attach to, and surfacing a misleading
-        # prompt was the original silo bug.
         _write_marker(marker)
         return STATUS_NOT_ENABLED
+    if spawn_status == SPAWN_TRANSIENT_ERROR:
+        # Transient (fleet binary missing, subprocess timeout, etc.).
+        # Surface to operator-readable BOOTSTRAP_LOG and DON'T write
+        # the marker so the next coord tick retries cleanly once the
+        # transient resolves.
+        _bootstrap_log(
+            STATUS_FAILED_SEED,  # reuse the existing "retry-next-tick" log status
+            project=project,
+            coord_id=coord_id,
+            detail=(
+                f"spawn_daemon_status returned transient_error for "
+                f"project {project!r}; marker intentionally left "
+                f"unwritten so next tick retries"
+            ),
+        )
+        return STATUS_FAILED_SEED
     seed_ok = seed_inbox(coord_id, fleet_home=home)
     if not seed_ok:
         # Pre-check above already eliminated the "inbox path exists"
@@ -327,6 +333,72 @@ def bootstrap_remote_control(
         )
         return STATUS_FAILED_MARKER
     return STATUS_OK
+
+
+# Distinct return reasons from spawn_daemon_if_needed. Callers that
+# care about the difference (bootstrap_remote_control) use these.
+SPAWN_OK = "ok"
+SPAWN_NOT_ENABLED = "not_enabled"
+SPAWN_TRANSIENT_ERROR = "transient_error"
+
+
+def spawn_daemon_status(project: str = "") -> str:
+    """Tri-state version of spawn_daemon_if_needed (codex round-6 P2).
+    Returns SPAWN_OK / SPAWN_NOT_ENABLED / SPAWN_TRANSIENT_ERROR so
+    callers can distinguish "operator hasn't opted in" (quiet steady-
+    state) from "fleet binary missing / timeout / lock contest" (must
+    retry next tick).
+    """
+    if not project:
+        return SPAWN_OK
+    if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
+        return SPAWN_OK
+    fleet_bin = os.environ.get("FLEET_BIN") or "fleet"
+    try:
+        result = subprocess.run(
+            [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            return SPAWN_OK
+        # Go side: 10 = not_enabled / not_owned, 11 = absent,
+        # 12 = contested, 1 = error. Only exit 10 is a real
+        # "operator hasn't enabled RC" signal we should latch on.
+        # Everything else is transient and the next tick should retry.
+        if result.returncode == 10:
+            return SPAWN_NOT_ENABLED
+        print(
+            f"coord remote-control: fleet rc up {project!r} exit "
+            f"{result.returncode}; transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
+    except FileNotFoundError:
+        print(
+            f"coord remote-control: fleet binary {fleet_bin!r} not found "
+            f"(FLEET_BIN={os.environ.get('FLEET_BIN', '')!r}); "
+            f"transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
+    except subprocess.TimeoutExpired:
+        print(
+            f"coord remote-control: fleet rc up {project!r} timed out "
+            f"(>10s); transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
+    except Exception as exc:
+        print(
+            f"coord remote-control: fleet rc up {project!r} failed: "
+            f"{exc}; transient — will retry next tick",
+            file=sys.stderr,
+        )
+        return SPAWN_TRANSIENT_ERROR
 
 
 def spawn_daemon_if_needed(project: str = "") -> bool:
@@ -367,76 +439,13 @@ def spawn_daemon_if_needed(project: str = "") -> bool:
     project-supervised coord" (legacy / unsupervised lineage) — the
     function returns True (no-op) without invoking fleet.
     """
-    # Primary gate: marker absence. Without an explicit project the
-    # function cannot make a per-project decision, so we no-op.
-    if not project:
-        return True
-    # FLEET_RC_BOOTSTRAP_DISABLED env-gate (defense-in-depth from PR
-    # #157, retired in v0.13). Test runs set this so pytest never
-    # forks a real `claude remote-control` listener.
-    if os.environ.get("FLEET_RC_BOOTSTRAP_DISABLED", ""):
-        return True
-    # Shell out to the Go controller. --respawn-only refuses to create
-    # the marker (the coord tick is the implicit-respawn path; only
-    # an explicit `fleet rc up <project>` from the operator enables
-    # RC). --idempotent maps to Up's already_acquired semantics.
-    # The Go side handles working_dir resolution (meta.json + live
-    # coord fallback) so the Python side doesn't need to thread it
-    # through.
-    #
-    # codex round-4 P2: honor FLEET_BIN before falling back to PATH.
-    # Fleet-spawned agents have this env stamped (see internal/spawn)
-    # so side-loaded or `go run ./cmd/fleet` installs work without
-    # the binary being on PATH. Without this lookup, those installs
-    # FileNotFoundError out → spawn returns False → bootstrap returns
-    # STATUS_NOT_ENABLED → coord never gets RC even after operator
-    # enables it. Surface a stderr diagnostic if the resolved bin
-    # doesn't exist so the operator can correlate.
-    fleet_bin = os.environ.get("FLEET_BIN") or "fleet"
-    try:
-        result = subprocess.run(
-            [fleet_bin, "rc", "up", project, "--respawn-only", "--idempotent"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-        # Exit 0 = acquired or already_acquired (both success). Any
-        # other exit (10/11/12/1) is logged but not raised — the
-        # caller treats this as fail-soft per S1 contract.
-        if result.returncode != 0:
-            print(
-                f"coord remote-control: fleet rc up {project!r} exit "
-                f"{result.returncode}; listener may not be alive",
-                file=sys.stderr,
-            )
-            return False
-        return True
-    except FileNotFoundError:
-        # Resolved fleet binary missing — extremely unlikely (the coord
-        # skill is invoked from a fleet-managed shell with FLEET_BIN
-        # stamped), but fail-soft + surface the resolved path so the
-        # operator can diagnose side-loaded installs.
-        print(
-            f"coord remote-control: fleet binary {fleet_bin!r} not found "
-            f"(FLEET_BIN={os.environ.get('FLEET_BIN', '')!r}); "
-            f"listener not spawned",
-            file=sys.stderr,
-        )
-        return False
-    except subprocess.TimeoutExpired:
-        print(
-            f"coord remote-control: fleet rc up {project!r} timed out (>10s)",
-            file=sys.stderr,
-        )
-        return False
-    except Exception as exc:
-        print(
-            f"coord remote-control: fleet rc up failed: {exc}",
-            file=sys.stderr,
-        )
-        return False
+    # Bool-shaped legacy contract: True = "OK or quiet no-op",
+    # False = "transient or hard failure". Bootstrap callers that
+    # need to distinguish should use spawn_daemon_status directly
+    # (codex round-6 P2). Tests that pre-date the split also use
+    # this entry point.
+    status = spawn_daemon_status(project)
+    return status == SPAWN_OK
 
 
 def seed_inbox(coord_id: str, *, fleet_home: Path | None = None) -> bool:

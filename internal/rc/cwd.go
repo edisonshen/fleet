@@ -3,6 +3,7 @@ package rc
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/projects"
@@ -23,20 +24,25 @@ var ErrCwdUnresolvable = errors.New("rc: cannot determine working dir")
 //  3. First alive agent for project's .Cwd (any role).
 //  4. Fail with ErrCwdUnresolvable.
 //
-// The override is taken verbatim — empty string falls through.
+// All resolved values are canonicalized to absolute paths via
+// filepath.Abs before being returned (codex round-6 P2). Relative
+// inputs like `--cwd .` would otherwise be persisted to
+// rc-state.json verbatim and break lsof-based cwd comparisons in
+// Down / Reset / Connect (lsof always reports absolute cwd).
+//
 // Callers persist the resolved value into rc-state.json:working_dir
 // so subsequent operations (Down, Sweep) use the recorded source-of-
 // truth rather than re-deriving (which can drift if meta.json moves).
 func ResolveWorkingDir(project, override string) (string, error) {
 	if override != "" {
-		return override, nil
+		return canonicalCwd(override)
 	}
 
 	// (2) meta.json:repo_path — the operator's `fleet project add <path>`
 	// commit. Set on every git-mode project; absent on legacy or hand-
 	// edited trees.
 	if m, err := projects.Read(project); err == nil && m.RepoPath != "" {
-		return m.RepoPath, nil
+		return canonicalCwd(m.RepoPath)
 	}
 
 	// (3) Live coord's recorded Cwd. agent.List enumerates all agents
@@ -51,11 +57,24 @@ func ResolveWorkingDir(project, override string) (string, error) {
 			if rec.Cwd == "" {
 				continue
 			}
-			return rec.Cwd, nil
+			return canonicalCwd(rec.Cwd)
 		}
 	}
 
 	return "", fmt.Errorf("%w for project %q: pass --cwd <path>, OR re-register the project from the repo root with 'cd <path> && fleet project add <path>' so meta.json carries repo_path", ErrCwdUnresolvable, project)
+}
+
+// canonicalCwd converts a possibly-relative path to absolute via
+// filepath.Abs. On failure (extremely rare — would imply the working
+// directory is itself unreadable), returns the input verbatim so the
+// caller still gets a non-empty string and we degrade rather than
+// hard-fail Up.
+func canonicalCwd(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p, nil
+	}
+	return abs, nil
 }
 
 // agentList is a test seam so cwd_test.go can inject synthetic agent

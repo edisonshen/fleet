@@ -51,19 +51,37 @@ func Connect(project string, opts ConnectOpts) (ConnectResult, error) {
 		return ConnectResult{Outcome: OutcomeNotEnabled}, fmt.Errorf("rc.Connect: marker absent for project %q (run `fleet rc up %s` first)", project, project)
 	}
 
-	// codex round-5 P1: verify the listener PID is alive before
-	// driving /remote-control into the coord pane. Without this
-	// check, a daemon crash or reboot makes Connect silently report
-	// "connected" while the slash command finds no daemon to attach
-	// to. Surface the dead-listener case so the operator can
-	// respawn instead of debugging a phantom attach.
+	// codex round-5 P1 + round-6 P2: verify the listener PID is
+	// alive AND argv/cwd-matched before driving /remote-control
+	// into the coord pane. Without both, a daemon crash, PID=0
+	// state record from a spawn failure, or PID-reuse by an
+	// unrelated process makes Connect silently report "connected"
+	// while the slash command finds no real daemon to attach to.
 	if st, sErr := ReadState(project); sErr == nil {
-		if st.PID > 0 && !workers.IsAlive(st.PID) {
+		if st.PID <= 0 {
+			return ConnectResult{
+					Outcome: OutcomeNotEnabled,
+					Error:   fmt.Sprintf("rc.Connect: rc-state.json for project %q has no recorded listener PID (likely a prior spawn failure); run `fleet rc up %s` to respawn", project, project),
+				},
+				fmt.Errorf("rc.Connect: rc-state.json for project %q has PID=%d; run `fleet rc up %s` to respawn", project, st.PID, project)
+		}
+		if !workers.IsAlive(st.PID) {
 			return ConnectResult{
 					Outcome: OutcomeNotEnabled,
 					Error:   fmt.Sprintf("rc.Connect: recorded listener PID %d for project %q is not alive (daemon crashed or machine rebooted); run `fleet rc up %s` to respawn", st.PID, project, project),
 				},
 				fmt.Errorf("rc.Connect: recorded listener PID %d for project %q is not alive; run `fleet rc up %s` to respawn", st.PID, project, project)
+		}
+		prefix := st.SessionPrefix
+		if prefix == "" {
+			prefix = SessionPrefix
+		}
+		if !verifyPIDIsListener(st.PID, prefix, st.WorkingDir) {
+			return ConnectResult{
+					Outcome: OutcomeNotEnabled,
+					Error:   fmt.Sprintf("rc.Connect: recorded listener PID %d for project %q is alive but argv/cwd does not match recorded session_prefix %q + working_dir %q (likely PID reuse or stale state); run `fleet rc up %s` to respawn", st.PID, project, prefix, st.WorkingDir, project),
+				},
+				fmt.Errorf("rc.Connect: recorded listener PID %d for project %q does not match recorded argv/cwd; run `fleet rc up %s` to respawn", st.PID, project, project)
 		}
 	} else if errors.Is(sErr, ErrStateMissing) {
 		return ConnectResult{

@@ -1196,19 +1196,20 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	}
 
 	// (b) The pane shows the shim's argv echo, which includes the
-	// `--remote-control "fleet-handoff-<project>-<id>"` flag. The
+	// `--remote-control "fleet-coord-<id>-<project>"` flag. The
 	// shim prints each arg on its own line, so we grep for the
 	// session-name literal directly.
 	//
-	// rc-session-name-include: the project name is in the session so
-	// the operator can distinguish per-project sessions on phone /
-	// claude.ai. Order is project-first so the registered name STARTS
-	// WITH the per-project daemon prefix `fleet-handoff-<project>`
-	// the FirstAction bash block launches the daemon under (codex
-	// review iter-2 [P1] regression). The seed spawn used
-	// project="rainier", so the rendered flag must contain
-	// `fleet-handoff-rainier-<rep.ID>`.
-	wantFlag := "fleet-handoff-rainier-" + rep.ID
+	// codex round-6 P1: post-v0.12 the only listener prefix is
+	// `fleet-coord` (started by `fleet rc up`). The per-handoff
+	// bash bootstrap that previously launched a daemon under
+	// `fleet-handoff-<project>` is gone — replaced by operator-
+	// instruction markdown in FirstAction. Injecting any other
+	// prefix into the replacement coord would point at a daemon
+	// the live listener can't see → silent pairing failure post-
+	// handoff. So the rendered flag must use the coord shape:
+	// `fleet-coord-<rep.ID>-rainier`.
+	wantFlag := "fleet-coord-" + rep.ID + "-rainier"
 	deadline := time.Now().Add(3 * time.Second)
 	var lastOut []byte
 	for time.Now().Before(deadline) {
