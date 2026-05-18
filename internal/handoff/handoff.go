@@ -247,29 +247,6 @@ func FirstAction(project string) string {
 		"Then continue with the sections below."
 }
 
-// escapeProjectForPgrep escapes regex metacharacters that may appear
-// in a project-scoped daemon prefix when used as a pgrep -f pattern.
-// ValidateProjectName allows `[a-z0-9._-]`; among those only `.` is a
-// regex metacharacter (matches any char). Hyphens are special only
-// inside character classes; underscores are always literal. We do not
-// use strings.NewReplacer or regexp.QuoteMeta because we want a
-// targeted, easily-auditable swap that mirrors what
-// skills/fleet-guard/handoff.py:_escape_project_for_pgrep does on the
-// Python side — keeping the two renderers byte-equal is a
-// load-bearing invariant (TestRender_SkillByteGolden).
-func escapeProjectForPgrep(s string) string {
-	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '.' {
-			out = append(out, '\\', '.')
-			continue
-		}
-		out = append(out, c)
-	}
-	return string(out)
-}
-
 // Render produces the markdown+frontmatter bytes for d.
 //
 // Frontmatter is hand-rolled YAML so we avoid pulling in a YAML
