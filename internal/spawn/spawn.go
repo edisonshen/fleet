@@ -431,12 +431,46 @@ func SendInitialPrompt(session, prompt string) error {
 // wrappers never converge and every handoff stalls for the full
 // maxWait.
 func waitForPaneStable(session string, stableWindow, maxWait time.Duration) error {
-	deadline := time.Now().Add(maxWait)
+	return waitForPaneStableWithDeps(stableWindow, maxWait,
+		func() ([]byte, error) { return tmux.CapturePane(session) },
+		time.Sleep, time.Now)
+}
+
+// waitForPaneStableWithDeps is waitForPaneStable's testable core.
+// Seams: capture (pane-content fetch), sleep (between polls), now
+// (deadline math). Tests inject a fake clock + fake capture so the
+// deadline contract can be exercised deterministically without real
+// time or a real tmux server.
+//
+// Deadline discipline: the check happens at the LOOP HEADER, before
+// any blocking call. The trailing sleep is capped at the remaining
+// time-to-deadline, so a single scheduler-jittered sleep cannot
+// push elapsed past maxWait by more than the OS's wakeup slop. The
+// pre-fix code checked the deadline AFTER the capture but BEFORE
+// the sleep, then unconditionally slept the full poll interval —
+// on a busy CI runner that left elapsed ≈ maxWait + 100ms +
+// scheduler-jitter, which periodically tripped the
+// SkipsBufferOnUnstable test's 2s slack.
+func waitForPaneStableWithDeps(
+	stableWindow, maxWait time.Duration,
+	capture func() ([]byte, error),
+	sleep func(time.Duration),
+	now func() time.Time,
+) error {
+	start := now()
+	deadline := start.Add(maxWait)
 	var prev []byte
 	first := true
 	stableSince := time.Time{}
 	for {
-		cur, err := tmux.CapturePane(session)
+		// Deadline check at the loop HEADER, before capture or sleep.
+		// Guarantees we never start a fresh poll iteration past the
+		// budget. A fresh deadline check also runs after the
+		// (capped) sleep on the next iteration's header pass.
+		if !now().Before(deadline) {
+			return fmt.Errorf("pane did not stabilize within %s", maxWait)
+		}
+		cur, err := capture()
 		if err != nil {
 			return err
 		}
@@ -445,8 +479,8 @@ func waitForPaneStable(session string, stableWindow, maxWait time.Duration) erro
 		// stable, otherwise reset the stable timer.
 		if !first && bytes.Equal(cur, prev) {
 			if stableSince.IsZero() {
-				stableSince = time.Now()
-			} else if time.Since(stableSince) >= stableWindow {
+				stableSince = now()
+			} else if now().Sub(stableSince) >= stableWindow {
 				return nil
 			}
 		} else {
@@ -454,10 +488,18 @@ func waitForPaneStable(session string, stableWindow, maxWait time.Duration) erro
 		}
 		prev = cur
 		first = false
-		if time.Now().After(deadline) {
-			return fmt.Errorf("pane did not stabilize within %s", maxWait)
+		// Cap the sleep at remaining time-to-deadline so a full
+		// poll-interval sleep can't overshoot. If remaining <= 0
+		// the next loop header trips the deadline immediately.
+		remaining := deadline.Sub(now())
+		if remaining <= 0 {
+			continue
 		}
-		time.Sleep(initialPromptPollInterval)
+		nap := initialPromptPollInterval
+		if remaining < nap {
+			nap = remaining
+		}
+		sleep(nap)
 	}
 }
 
