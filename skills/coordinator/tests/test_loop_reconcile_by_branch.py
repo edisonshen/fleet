@@ -459,6 +459,153 @@ def test_reconcile_fallback_runs_before_review_pending_short_circuit(
     assert actions[0].set_pr_url == "https://github.com/x/y/pull/99"
 
 
+# ---------- Reviewer round 5 (codex [P1]): per-attempt provenance gate ----------
+
+
+def test_site1_skips_stale_branch_pr_older_than_started_at(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 5 [P1] regression: at SITE 1 (inside the
+    mid_phase review-pending/review-done short-circuit), a branch PR
+    whose createdAt is OLDER than the current worker's
+    state.json.started_at must be IGNORED. It's from a prior attempt.
+
+    Scenario: prior attempt opened PR A on worker/<slug>. CI red.
+    Reconcile cleared pr_url, deleted worker dir. New worker
+    re-dispatched, fresh state.json with new started_at. New worker
+    reached phase=review-pending but did NOT open a new PR yet
+    (review-pending is BEFORE the finisher opens the PR in the v0.2
+    three-stage flow). State.json now stale.
+
+    Without the provenance gate, SITE 1 would pick up PR A (stale)
+    and flip the task to in-review/done with the wrong URL —
+    skipping the reviewer/finisher for the new local commits.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    # New worker started AFTER the stale PR was created.
+    started_at = "2026-05-18T00:00:00Z"
+    stale_pr_created = "2026-05-15T00:00:00Z"
+
+    _write_state(fleet_home, project, "retry-no-pr", {
+        "slug": "retry-no-pr", "project": project,
+        "phase": "review-pending",
+        "started_at": started_at,
+        "updated_at": "2026-05-18T00:30:00Z",
+    })
+
+    t = _make_task(
+        "retry-no-pr", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/retry-no-pr",
+    )
+
+    # The stale PR is OPEN — without the provenance gate, SITE 1 would
+    # treat it as the recovered PR and flip to in-review.
+    stale_pr = loop._PRSummary(
+        number=100, state="OPEN",
+        url="https://github.com/x/y/pull/100",
+        merged_at=None,
+        created_at=stale_pr_created,
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=stale_pr):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    # No action: provenance gate rejected the stale PR; mid_phase
+    # short-circuit then `continue`s without classifying. The next
+    # tick will either find a fresh PR (after the finisher runs) or
+    # stay stuck waiting for operator intervention.
+    assert actions == [], (
+        f"stale PR must be ignored; got {actions} — provenance gate "
+        f"missing or broken"
+    )
+
+
+def test_site1_accepts_fresh_branch_pr_newer_than_started_at(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 5 [P1] sibling: the provenance gate must
+    NOT block legitimate recovery. A PR opened AFTER the current
+    worker's started_at belongs to this attempt — the original
+    rc-listener-impl-v0-12-ed95 case where the off-rails finisher
+    opened a real PR.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    started_at = "2026-05-17T07:30:00Z"
+    fresh_pr_created = "2026-05-17T07:40:00Z"  # 10 min after worker start
+
+    _write_state(fleet_home, project, "rc-listener-like", {
+        "slug": "rc-listener-like", "project": project,
+        "phase": "review-pending",
+        "started_at": started_at,
+        "updated_at": "2026-05-17T07:47:00Z",
+    })
+
+    t = _make_task(
+        "rc-listener-like", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/rc-listener-like",
+    )
+
+    fresh_pr = loop._PRSummary(
+        number=159, state="MERGED",
+        url="https://github.com/edisonshen/fleet/pull/159",
+        merged_at="2026-05-18T04:52:00Z",
+        created_at=fresh_pr_created,
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=fresh_pr):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.new_status == "done"
+    assert a.set_pr_url == "https://github.com/edisonshen/fleet/pull/159"
+
+
+def test_site1_accepts_pr_when_no_started_at_recorded(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Backwards-compat: older state.json files (pre-three-stage-flow,
+    or pre-v0.2-StartedAt-population) may lack started_at. In that
+    case the provenance gate is skipped (min_pr_created_at=""). The
+    existing fallback semantics still apply.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    # No started_at field — older state.json shape.
+    _write_state(fleet_home, project, "no-started-at", {
+        "slug": "no-started-at", "project": project,
+        "phase": "review-pending",
+        "updated_at": "2026-05-17T07:47:00Z",
+    })
+
+    t = _make_task(
+        "no-started-at", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/no-started-at",
+    )
+
+    pr = loop._PRSummary(
+        number=160, state="MERGED",
+        url="https://github.com/x/y/pull/160",
+        merged_at="2026-05-18T04:00:00Z",
+        created_at="2026-05-17T00:00:00Z",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=pr):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    # Gate disabled → original fallback fires.
+    assert len(actions) == 1
+    assert actions[0].new_status == "done"
+
+
 # ---------- Reviewer round 1 (codex [P1]): terminal state wins over branch fallback ----------
 
 

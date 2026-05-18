@@ -2272,10 +2272,14 @@ def _gh_pr_by_branch(branch: str, timeout_s: float = 5.0) -> _PRSummary | None:
     )
 
 
-def _branch_pr_fallback_action(t: parse.Task) -> _ReconcileAction | None:
+def _branch_pr_fallback_action(
+    t: parse.Task,
+    *,
+    min_pr_created_at: str = "",
+) -> _ReconcileAction | None:
     """Branch->PR recovery action for stuck tasks. Returns None if no
     fallback applies (no branch, pr_url already set, gh unavailable,
-    PR not found, or PR closed-unmerged).
+    PR not found, PR closed-unmerged, or PR too old).
 
     Callers MUST run this AFTER honoring any fresh terminal state in
     state.json (phase=failed / phase=blocked / phase=done with pr_url).
@@ -2283,6 +2287,13 @@ def _branch_pr_fallback_action(t: parse.Task) -> _ReconcileAction | None:
     be classified from a stale PR left by a prior attempt on the SAME
     branch — flipping the task to in-review/done and masking the fresh
     terminal failure signal (codex review round 1 [P1]).
+
+    `min_pr_created_at` is the per-attempt epoch (ISO 8601 string) —
+    typically state.json.started_at. When set, the helper requires
+    `pr.created_at >= min_pr_created_at` so a stale PR opened by a
+    prior attempt on the SAME branch never wins (codex review round 5
+    [P1]). When empty, no provenance gate is applied — caller is
+    responsible for proving freshness another way.
     """
     if t.pr_url:
         return None
@@ -2290,6 +2301,16 @@ def _branch_pr_fallback_action(t: parse.Task) -> _ReconcileAction | None:
         return None
     pr = _gh_pr_by_branch(t.branch)
     if pr is None:
+        return None
+    # Per-attempt provenance gate: if the caller supplied a per-attempt
+    # epoch (state.json.started_at), require the PR to be at least as
+    # new. Stale PRs from prior attempts on the same reused branch
+    # would otherwise be misattributed to the current worker.
+    #
+    # String comparison is correct here: ISO 8601 UTC timestamps sort
+    # lexicographically the same as chronologically. Both fields are
+    # GitHub-controlled / Go-time.Now-controlled.
+    if min_pr_created_at and pr.created_at < min_pr_created_at:
         return None
     if pr.merged_at:
         # PR merged — flip to done. delete_worker_dir so the now-junk
@@ -2500,11 +2521,20 @@ def _reconcile_inflight(
                 # v2 §Design Part A; codex review round 1 [P1] moved
                 # this check to AFTER any fresh terminal state below
                 # (phase=failed / phase=blocked / phase=done with
-                # pr_url) — but the codex finding does NOT apply to
-                # review-pending/review-done, since those are mid-
-                # pipeline phases, not terminal ones. A merged PR on
-                # a stuck-handoff branch is always the right signal.
-                action = _branch_pr_fallback_action(t)
+                # pr_url).
+                #
+                # Codex review round 5 [P1]: pass state.json.started_at
+                # as a per-attempt epoch. If a prior attempt opened a
+                # PR on the SAME worker/<slug> branch and the new
+                # worker reached review-pending/review-done without
+                # opening its own PR, the stale PR would otherwise
+                # win. The provenance gate (pr.created_at >=
+                # started_at) keeps the fallback from misattributing
+                # a prior-attempt PR to the current worker.
+                started_at = str(mid_phase.get("started_at", "") or "")
+                action = _branch_pr_fallback_action(
+                    t, min_pr_created_at=started_at,
+                )
                 if action is not None:
                     actions.append(action)
                 continue
