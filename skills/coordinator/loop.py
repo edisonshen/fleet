@@ -2272,6 +2272,58 @@ def _gh_pr_by_branch(branch: str, timeout_s: float = 5.0) -> _PRSummary | None:
     )
 
 
+def _branch_pr_fallback_action(t: parse.Task) -> _ReconcileAction | None:
+    """Branch->PR recovery action for stuck tasks. Returns None if no
+    fallback applies (no branch, pr_url already set, gh unavailable,
+    PR not found, or PR closed-unmerged).
+
+    Callers MUST run this AFTER honoring any fresh terminal state in
+    state.json (phase=failed / phase=blocked / phase=done with pr_url).
+    Otherwise a re-dispatched worker that died with phase=failed could
+    be classified from a stale PR left by a prior attempt on the SAME
+    branch — flipping the task to in-review/done and masking the fresh
+    terminal failure signal (codex review round 1 [P1]).
+    """
+    if t.pr_url:
+        return None
+    if not t.branch:
+        return None
+    pr = _gh_pr_by_branch(t.branch)
+    if pr is None:
+        return None
+    if pr.merged_at:
+        # PR merged — flip to done. delete_worker_dir so the now-junk
+        # dir doesn't accumulate. Raise to operator so they see the
+        # recovery in `fleet status`.
+        return _ReconcileAction(
+            slug=t.slug, new_status="done",
+            set_pr_url=pr.url,
+            clear_worker=True,
+            delete_worker_dir=True,
+            note=f"PR {pr.url} merged outside state machine",
+            raised_to_user=True,
+            raise_text=f"reconcile recovered {t.slug}: {pr.url}",
+        )
+    if pr.state == "OPEN":
+        # PR open — flip to in-review. The next tick's gh pr checks
+        # path drives CI -> done. Keep the worker dir (operator may
+        # want to re-dispatch a fix off the same checkout); only
+        # clear worker_pid.
+        return _ReconcileAction(
+            slug=t.slug, new_status="in-review",
+            set_pr_url=pr.url,
+            clear_worker=True,
+            note=f"PR {pr.url} open; recovered from branch",
+            raised_to_user=True,
+            raise_text=f"reconcile recovered {t.slug}: {pr.url}",
+        )
+    # CLOSED-unmerged: operator decides. Leaving the task untouched is
+    # the safe call — auto-requeue would lose the worker's history;
+    # auto-archive would mask the decision the operator still needs to
+    # make.
+    return None
+
+
 def _audit_archived_subagents(
     project: str,
     home: Path,
@@ -2408,57 +2460,6 @@ def _reconcile_inflight(
             continue
         if _is_worker_alive(t, project, home=home):
             continue
-        # Fallback: worker is gone, tasks.md has no pr_url, but the
-        # worker may have shipped a PR outside the v0.2 state machine
-        # (off-rails finisher; operator-driven manual merge). Branch
-        # name is the durable handle — look up the PR by head ref and
-        # transcribe the result back to tasks.md.
-        #
-        # ORDERING: this MUST run BEFORE the mid-phase
-        # review-pending/review-done short-circuit below. Otherwise
-        # stuck-handoff tasks (state.json frozen at review-pending,
-        # PR already merged on GitHub) remain invisible to reconcile
-        # forever — that's the symptom rc-listener-impl-v0-12-ed95
-        # exhibited for ~4h. See docs/DESIGN-reconcile-pr-by-branch.md
-        # v2 §Design Part A.
-        #
-        # Gating: skip if pr_url is already set (the gh pr checks path
-        # owns the decision) or if branch is empty (no durable handle).
-        if not t.pr_url and t.branch:
-            pr = _gh_pr_by_branch(t.branch)
-            if pr is not None:
-                if pr.merged_at:
-                    # PR merged — flip to done. delete_worker_dir so
-                    # the now-junk dir doesn't accumulate. Raise to
-                    # operator so they see the recovery in `fleet status`.
-                    actions.append(_ReconcileAction(
-                        slug=t.slug, new_status="done",
-                        set_pr_url=pr.url,
-                        clear_worker=True,
-                        delete_worker_dir=True,
-                        note=f"PR {pr.url} merged outside state machine",
-                        raised_to_user=True,
-                        raise_text=f"reconcile recovered {t.slug}: {pr.url}",
-                    ))
-                    continue
-                if pr.state == "OPEN":
-                    # PR open — flip to in-review. The next tick's gh
-                    # pr checks path drives CI → done. Keep the worker
-                    # dir (operator may want to re-dispatch a fix off
-                    # the same checkout); only clear worker_pid.
-                    actions.append(_ReconcileAction(
-                        slug=t.slug, new_status="in-review",
-                        set_pr_url=pr.url,
-                        clear_worker=True,
-                        note=f"PR {pr.url} open; recovered from branch",
-                        raised_to_user=True,
-                        raise_text=f"reconcile recovered {t.slug}: {pr.url}",
-                    ))
-                    continue
-                # CLOSED-unmerged: operator decides. Leaving the task
-                # untouched is the safe call — auto-requeue would lose
-                # the worker's history; auto-archive would mask the
-                # decision the operator still needs to make.
         # Worker is gone. Before falling through to pr_url + CI, check
         # whether state.json reports a terminal phase. v0.2 workers
         # only signal completion via `fleet workers update --phase done
@@ -2488,6 +2489,24 @@ def _reconcile_inflight(
             if mid_phase is not None and mid_phase.get("phase", "") in (
                 "review-pending", "review-done",
             ):
+                # Stuck-handoff recovery: state.json frozen at review-
+                # pending/review-done (handoff chain went off-rails)
+                # but the worker may have shipped a PR outside the
+                # v0.2 state machine. Try branch->PR lookup before
+                # the short-circuit — without this, a merged PR on
+                # the worker's branch stays invisible to reconcile
+                # forever (rc-listener-impl-v0-12-ed95 spent ~4h
+                # stuck on this). See DESIGN-reconcile-pr-by-branch.md
+                # v2 §Design Part A; codex review round 1 [P1] moved
+                # this check to AFTER any fresh terminal state below
+                # (phase=failed / phase=blocked / phase=done with
+                # pr_url) — but the codex finding does NOT apply to
+                # review-pending/review-done, since those are mid-
+                # pipeline phases, not terminal ones. A merged PR on
+                # a stuck-handoff branch is always the right signal.
+                action = _branch_pr_fallback_action(t)
+                if action is not None:
+                    actions.append(action)
                 continue
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
@@ -2559,6 +2578,22 @@ def _reconcile_inflight(
                 # phase=done without pr_url, or phase=blocked
                 # without reason — fall through to pr_url + CI; the
                 # worker didn't honor the contract.
+        # Branch->PR fallback for tasks that reach this point with
+        # an empty pr_url. Two reaching cases:
+        #   - status=in-review (the t.status check above falls through
+        #     here without entering the in-progress block).
+        #   - status=in-progress where no terminal-state action fired
+        #     and no mid_phase short-circuit triggered.
+        # Codex review round 1 [P1]: this MUST run AFTER terminal-
+        # state classification (above) so a re-dispatched worker that
+        # wrote phase=failed / phase=blocked / phase=done is NOT
+        # masked by a stale PR left by a prior attempt on the SAME
+        # branch. Fresh state.json wins over GitHub state.
+        if not t.pr_url:
+            action = _branch_pr_fallback_action(t)
+            if action is not None:
+                actions.append(action)
+                continue
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:

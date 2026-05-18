@@ -459,6 +459,152 @@ def test_reconcile_fallback_runs_before_review_pending_short_circuit(
     assert actions[0].set_pr_url == "https://github.com/x/y/pull/99"
 
 
+# ---------- Reviewer round 1 (codex [P1]): terminal state wins over branch fallback ----------
+
+
+def test_terminal_failed_state_wins_over_stale_branch_pr(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 1 [P1] regression: a re-dispatched worker that
+    writes phase=failed must NOT be overridden by a stale PR left on the
+    same branch by a prior attempt.
+
+    Scenario: worker for slug X shipped a PR. CI went red. Reconcile
+    flipped to todo and cleared pr_url. Operator re-dispatched. New
+    worker died with phase=failed on the SAME branch. The branch still
+    has the prior OPEN PR on GitHub.
+
+    Correct behavior: classify as failed (requeue to todo + clear_pr_url +
+    delete_worker_dir). The stale branch PR must NOT override.
+
+    Before the fix this masked fresh terminal failures behind stale
+    branch state — silent regression.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    _write_state(fleet_home, project, "retry-fail", {
+        "slug": "retry-fail", "project": project,
+        "phase": "failed", "updated_at": _now_z(),
+    })
+
+    t = _make_task(
+        "retry-fail", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/retry-fail",
+    )
+
+    # Stale OPEN PR from a prior attempt — must NOT be acted on.
+    stale_pr = loop._PRSummary(
+        number=200, state="OPEN",
+        url="https://github.com/x/y/pull/200",
+        merged_at=None,
+        created_at="2026-05-15T00:00:00Z",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=stale_pr) as gh_mock:
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1, f"expected 1 action, got {actions}"
+    a = actions[0]
+    # Fresh terminal state wins: requeue to todo with clear_pr_url=True
+    # and delete_worker_dir=True (matches the `phase == "failed"` branch
+    # in _reconcile_inflight).
+    assert a.new_status == "todo", f"expected todo, got {a.new_status}"
+    assert a.clear_pr_url is True, "must clear pr_url on failed retry"
+    assert a.delete_worker_dir is True
+    # set_pr_url must NOT be the stale URL.
+    assert a.set_pr_url == "", f"stale PR leaked into action: {a.set_pr_url}"
+    # And critically, _gh_pr_by_branch must NOT have been called (terminal
+    # state fires first; the fallback never runs in this code path).
+    assert gh_mock.call_count == 0, (
+        "branch->PR lookup must not run when terminal state is present "
+        "(codex review round 1 [P1])"
+    )
+
+
+def test_terminal_blocked_state_wins_over_stale_branch_pr(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 1 [P1] regression (sibling): same constraint
+    for phase=blocked. The blocked reason is the load-bearing signal —
+    a stale branch PR must not mask it.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    _write_state(fleet_home, project, "retry-blocked", {
+        "slug": "retry-blocked", "project": project,
+        "phase": "blocked", "blocked_reason": "needs operator decision",
+        "updated_at": _now_z(),
+    })
+
+    t = _make_task(
+        "retry-blocked", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/retry-blocked",
+    )
+
+    stale_pr = loop._PRSummary(
+        number=201, state="MERGED",
+        url="https://github.com/x/y/pull/201",
+        merged_at="2026-05-15T01:00:00Z",
+        created_at="2026-05-15T00:00:00Z",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=stale_pr) as gh_mock:
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.new_status == "blocked"
+    assert "needs operator decision" in (a.note or a.raise_text or "")
+    assert a.set_pr_url == ""
+    assert gh_mock.call_count == 0
+
+
+def test_terminal_done_with_pr_url_wins_over_stale_branch_pr(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex reviewer round 1 [P1] regression (sibling): phase=done with
+    pr_url written by the worker must win. The worker's pr_url is the
+    authoritative signal; a stale branch PR (e.g., a closed-without-merge
+    PR from a prior attempt) must not be picked up instead.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    _write_state(fleet_home, project, "done-fresh", {
+        "slug": "done-fresh", "project": project,
+        "phase": "done",
+        "pr_url": "https://github.com/x/y/pull/300",
+        "updated_at": _now_z(),
+    })
+
+    t = _make_task(
+        "done-fresh", status="in-progress",
+        worker_pid=99999, pr_url="", branch="worker/done-fresh",
+    )
+
+    stale_pr = loop._PRSummary(
+        number=299, state="CLOSED",
+        url="https://github.com/x/y/pull/299",
+        merged_at=None,
+        created_at="2026-05-15T00:00:00Z",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=stale_pr) as gh_mock:
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.new_status == "in-review"
+    # The fresh state.json pr_url must be used, NOT the stale branch PR.
+    assert a.set_pr_url == "https://github.com/x/y/pull/300"
+    assert gh_mock.call_count == 0
+
+
 # ---------- Part C: periodic supervisor reconcile catches stale state.json ----------
 
 
