@@ -9,6 +9,35 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 )
 
+// TestConnect_RefusesOnCorruptState (codex round-7 P2): corrupt
+// rc-state.json must fail closed with an actionable reset/up
+// message, not fall through to selectTarget + sendFn.
+func TestConnect_RefusesOnCorruptState(t *testing.T) {
+	root := withFleetHome(t)
+
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	// Write malformed JSON directly.
+	if err := os.MkdirAll(root+"/projects/demo", 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(root+"/projects/demo/rc-state.json", []byte("{not json}"), 0o644); err != nil {
+		t.Fatalf("write corrupt state: %v", err)
+	}
+
+	res, err := Connect("demo", ConnectOpts{})
+	if err == nil {
+		t.Fatalf("Connect must refuse on corrupt rc-state.json; got success res=%+v", res)
+	}
+	if res.Outcome != OutcomeNotEnabled {
+		t.Fatalf("outcome=%q want %q", res.Outcome, OutcomeNotEnabled)
+	}
+	if !strings.Contains(err.Error(), "malformed") {
+		t.Fatalf("error must surface 'malformed' for operator clarity; got %q", err)
+	}
+}
+
 // TestConnect_RefusesWhenListenerPIDDead (codex round-5 P1): if the
 // recorded listener PID is dead, Connect must refuse with an
 // operator-actionable error instead of silently driving

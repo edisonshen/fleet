@@ -7,6 +7,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 	"github.com/edisonshen/fleet/internal/workers"
 )
 
@@ -89,6 +90,16 @@ func Connect(project string, opts ConnectOpts) (ConnectResult, error) {
 				Error:   fmt.Sprintf("rc.Connect: rc-state.json missing for project %q (marker present but no listener record); run `fleet rc up %s` to recover", project, project),
 			},
 			fmt.Errorf("rc.Connect: rc-state.json missing for project %q; run `fleet rc up %s` to recover", project, project)
+	} else {
+		// codex round-7 P2: corrupt rc-state.json. Same recovery
+		// path as `fleet rc reset` (codex R4-2). Refuse rather than
+		// silently driving /remote-control into the coord pane —
+		// we have no way to prove a listener exists or matches.
+		return ConnectResult{
+				Outcome: OutcomeNotEnabled,
+				Error:   fmt.Sprintf("rc.Connect: rc-state.json for project %q is malformed (%v); run `fleet rc reset %s` then `fleet rc up %s` to recover", project, sErr, project, project),
+			},
+			fmt.Errorf("rc.Connect: rc-state.json for project %q is malformed: %v", project, sErr)
 	}
 
 	rec, err := selectTarget(project, opts.CoordID)
@@ -243,17 +254,19 @@ func joinAgentIDs(records []*agent.Record) string {
 
 var agentListFn = func() ([]*agent.Record, error) { return agent.List() }
 
-// sessionAliveFn defaults to workers.IsAlive on the recorded tmux
-// PID, but Connect operates on tmux *session names*, not PIDs. The
-// production check shells out to tmux has-session; in v0.12 we
-// keep a permissive default ("tmux session probably alive") because
-// Connect's send path will surface the real error if the session is
-// gone (tmux send-keys returns non-zero). Tests stub for determinism.
+// sessionAliveFn probes whether a tmux session is actually alive
+// via `tmux has-session`. selectTarget uses this to filter coord
+// candidates BEFORE deciding zero/one/multiple — without a real
+// probe (codex round-7 P2), stale agent records survived alongside
+// the live coord and made `fleet rc connect` falsely refuse with
+// "multiple coords" while marker-pointed-at-dead targets passed
+// through until send-keys eventually failed. Tests stub for
+// determinism.
 var sessionAliveFn = func(session string) bool {
 	if session == "" {
 		return false
 	}
-	return true // best-effort default; production relies on send-keys error
+	return tmux.HasSession(session)
 }
 
 // readyWaitFn polls the tmux pane for stability before sending. Test
