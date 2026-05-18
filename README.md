@@ -92,9 +92,12 @@ From the dashboard:
 2. Move the cursor to the project row and press `[a]` to spawn its
    coordinator.
 3. In the coord's tmux session, describe a problem in plain English.
-   The coord runs DISCUSS → SPLIT → TASK LIST with you.
-4. Approve the split. The coord writes `tasks.md` and starts
-   dispatching workers on its next tick.
+   The coord runs DISCUSS → PLAN-DOC → SPLIT → TASK LIST →
+   TASK-PLAN-DOC with you.
+4. Approve the plan. The coord saves the approved implementation plan
+   under the project's `docs/` folder, writes `tasks.md`, saves
+   per-task plan docs, then starts the worker/reviewer/finisher flow on
+   its next tick.
 5. Watch progress in the dashboard. Press `[a]` on a worker row to
    peek at its heartbeat; press `[h]` to force a handoff if context
    is hot.
@@ -127,8 +130,8 @@ doc and a fresh agent picks the work up.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the design rationale and
 [docs/COORDINATOR-WORKFLOW.md](docs/COORDINATOR-WORKFLOW.md) for the
-six-step engagement flow (DISCUSS → SPLIT → TASK LIST → IMPLEMENT →
-PR-TRACK → DONE).
+eight-step engagement flow (DISCUSS → PLAN-DOC → SPLIT → TASK LIST →
+TASK-PLAN-DOC → IMPLEMENT → PR-TRACK → DONE).
 
 ## More
 

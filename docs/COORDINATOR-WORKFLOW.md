@@ -1,34 +1,31 @@
 # Coordinator workflow — what to expect
 
-This is the operator-facing reference for how a Fleet coordinator runs an end-to-end engagement. The coord's own runbook (the same six steps, written for the agent) lives at [`skills/coordinator/SKILL.md`](../skills/coordinator/SKILL.md). If the two ever drift, the SKILL is the source of truth — file an issue.
+This is the operator-facing reference for how a Fleet coordinator runs an end-to-end engagement. The coord's own runbook (the same eight steps, written for the agent) lives at [`skills/coordinator/SKILL.md`](../skills/coordinator/SKILL.md). If the two ever drift, the SKILL is the source of truth — file an issue.
 
 ## TL;DR
 
-You hand a coord a problem. It plans with you, splits, dispatches workers, watches CI, ships PRs, and only interrupts you when something genuinely needs human input.
+You hand a coord a problem. It plans with you, saves the approved implementation plan as a durable doc, splits, saves worker-ready task plan docs, dispatches task subagents, watches CI, ships PRs, and only interrupts you when something genuinely needs human input.
 
 ```
                     operator approves plan (G2)
                               │
-   1. DISCUSS  ───────────────┼──→  2. SPLIT  ──→  3. TASK LIST  ──→  4. IMPLEMENT
-   plan + eng + tests         │     ≤10 inline       one-line goal       one impl-subagent
-   AskUserQuestion            │     >10 planner-     status in            per task; cap=1
-   until approved             │     subagent (G1)    structured fields    (G7); §4 reviews
-                              │                                                │
-                              ▼                                                ▼
-                       autonomous from                              5. PR-TRACK
-                       step 2 onward                                async-waits CI poll (G4)
-                                                                    fail → fix-subagent (cap=3) (G3)
-                                                                    rebase trivial → rebase-subagent
-                                                                    rebase non-trivial → raise-hand
-                                                                                │
-                                                                                ▼
-                                                                          6. DONE
-                                                                          fleet tasks set pr_url=…
-                                                                          fleet tasks set status=done
-                                                                          advance; loop until empty
+   1. DISCUSS  ───────┼→ 2. PLAN-DOC ─→ 3. SPLIT ─→ 4. TASK LIST ─→ 5. TASK-PLAN-DOC ─→ 6. IMPLEMENT
+   plan + tests       │  DESIGN-<topic>  ≤10 inline    one-line goal    TASK-PLAN-<slug>     worker→reviewer→finisher
+   until approved     │  .md + .html     >10 planner   status fields    .md + .html          cap=1 task by default
+                      │                                                                               │
+                      ▼                                                                               ▼
+              autonomous after                                                                7. PR-TRACK
+              PLAN-DOC succeeds                                                               async-waits CI poll (G4)
+                                                                                               fail → fix-subagent (G3)
+                                                                                               rebase non-trivial → raise-hand
+                                                                                                           │
+                                                                                                           ▼
+                                                                                                     8. DONE
+                                                                                                     set pr_url + status=done
+                                                                                                     advance until empty
 ```
 
-## The six steps
+## The eight steps
 
 ### 1. DISCUSS
 
@@ -38,16 +35,28 @@ What you do: answer questions, refine scope, approve the plan when you're satisf
 
 What the coord does: read code (Read / Grep / non-mutating Bash) to ground the discussion. It will not edit source files at this step.
 
-### 2. SPLIT
+### 2. PLAN-DOC
 
-Once you approve, the coord splits the plan into tasks.
+Once you approve an implementation plan, the coord saves it before it files tasks. This keeps the design decision durable and makes future publishing to `/projdoc/` automatic once a watcher is installed.
 
-- **Inline (≤10 tasks):** the coord writes them itself via `fleet tasks add`.
-- **Planner-subagent (>10 tasks):** the coord dispatches a single subagent whose only job is to produce the task list. It exits without dispatching workers — that's step 4.
+- Scope: implementation plans only. Status chats, casual Q&A, and exploratory discussion do not need docs.
+- Default location: the active project's `docs/` folder when present. If the project has no clear docs location, the coord asks before writing.
+- Filename: `DESIGN-<kebab-topic>.md`.
+- Companion render: if the project has a renderer such as `scripts/render-design-doc.py`, the coord also writes `DESIGN-<kebab-topic>.html`.
+- Required contents: summary, design decisions, task split, test plan, assumptions, and approval timestamp.
+
+This and TASK-PLAN-DOC are the coord's only source-tree mutation exceptions. If save or render fails, the coord raises hand and does not split tasks.
+
+### 3. SPLIT
+
+Once the plan doc exists, the coord splits the plan into tasks.
+
+- **Inline (≤10 tasks):** the coord writes them itself via `fleet tasks add`; promotion waits for TASK-PLAN-DOC.
+- **Planner-subagent (>10 tasks):** the coord dispatches a single subagent whose only job is to produce the task list. It exits without dispatching workers — that's step 5.
 
 Threshold = 10 (G1). You'll see a series of `fleet tasks add ...` invocations or a single Agent-tool dispatch labelled "planner".
 
-### 3. TASK LIST
+### 4. TASK LIST
 
 Each task ends up as a one-line goal in `~/.fleet/projects/<project>/tasks.md`:
 
@@ -57,23 +66,30 @@ Each task ends up as a one-line goal in `~/.fleet/projects/<project>/tasks.md`:
 
 Status, branch, PR URL, worker PID, notes — all in structured fields under the task heading. Run `fleet tasks list` to see the current view; `fleet tasks show <slug>` for full detail. The schema is enforced by `fleet tasks` itself — see [`docs/STATE.md`](STATE.md) for the field set.
 
-### 4. IMPLEMENT
+### 5. TASK-PLAN-DOC
 
-The coord dispatches **one** impl-subagent per task. v0.2 cap is 1 in flight per project (G7). When worktrees land in v0.2.x via `coord-config.json:parallelism`, the cap lifts.
+Before implementation, the coord saves a worker-ready task plan doc for each implementation task.
 
-Each impl-subagent follows the global Subagent Dispatch Contract:
+- Filename: `docs/TASK-PLAN-<slug>.md`, plus `.html` when a renderer is available.
+- Contents: parent design doc, task goal, acceptance criteria, expected files/surfaces, tests, non-goals, dependencies, and approval timestamp.
+- Worker visibility: the coord links or embeds the task plan in worker-visible task text before promotion, for example `fleet tasks note --project <project> <slug> --section spec "Task plan: docs/TASK-PLAN-<slug>.md"`.
+- Promotion: the coord runs `fleet tasks promote <slug>` only after the task plan doc exists, the HTML render succeeds when configured, and the task text points workers at the plan.
 
-- Reads `~/.claude/CLAUDE.md` and the project `CLAUDE.md` first.
-- Writes WIP checkpoints to `~/.fleet/subagent-wip/<task-tag>.md`.
-- Runs **codex review + /review skill** in multiple rounds until both return clean.
-- Pushes its branch and opens its PR autonomously when reviewers are clean (no operator gate at the push step — that gate was step 1).
-- Returns the PR URL (or `BLOCKED` with reason).
+If save or render fails, that task stays unpromoted and no worker is dispatched for it.
+
+### 6. IMPLEMENT
+
+The coord dispatches one active implementation task at a time by default (G7). Each task moves through three detached subagents: worker → reviewer → finisher.
+
+- **Worker:** writes code and tests, commits locally, updates `phase=review-pending`, then exits. It does not run review and does not push.
+- **Reviewer:** runs `/review` and `codex review` until clean, fixes any P0/P1 findings with tests, records terminal review fields, updates `phase=review-done`, then exits. `/review` is never skippable; codex can be recorded as skipped only for the allowed reasons.
+- **Finisher:** verifies terminal review fields, pushes the branch, opens the PR, records `phase=done + pr_url`, then exits.
 
 The coord does NOT foreground-poll the subagent. It resumes off the harness's `<task-notification>` when the subagent finishes.
 
-### 5. PR-TRACK
+### 7. PR-TRACK
 
-The impl-subagent returns a PR URL. The coord:
+The finisher returns a PR URL. The coord:
 
 1. **Tells you** about the PR (no permission ask — that ship sailed at step 1).
 2. **Watches CI** using the `## Async waits` pattern from `~/.fleet/standards.md` (G4): a single background bash with an `until` loop polling `gh pr view --json state`, resumed by `<task-notification>` when CI flips. No foreground polling, no prompt-cache thrash.
@@ -81,9 +97,9 @@ The impl-subagent returns a PR URL. The coord:
 4. **On rebase conflict** (G3):
    - Mechanical (e.g., parallel CHANGELOG.md edits) → **rebase-subagent** with strict "rebase only, no scope changes" instructions.
    - Business-logic conflict → raise-hand. Operators decide rebase semantics, not coords.
-5. **On merge** → step 6.
+5. **On merge** → step 8.
 
-### 6. DONE
+### 8. DONE
 
 CI green + PR merged → coord runs `fleet tasks set <slug> pr_url=<url>` followed by `fleet tasks set <slug> status=done` (the CLI accepts one `key=value` per call). Coord advances to the next task.
 
@@ -91,9 +107,9 @@ When the task list is empty: `"all tasks done; next direction?"` — and the coo
 
 ## Approval gate (G2)
 
-There is exactly **one** approval gate: step 1. After plan approval, the coord runs steps 2–6 autonomously. It raises hand only when:
+There is exactly **one** approval gate: step 1. After plan approval, the coord saves the plan doc, then runs steps 3-8 autonomously. It raises hand only when:
 
-- A subagent (impl / fix / rebase) returns `BLOCKED`.
+- A subagent (worker / reviewer / finisher / fix / rebase) returns `BLOCKED`.
 - The CI fix-loop hits cap=3 on a single task.
 - An impl-subagent discovers mid-implementation that the plan is wrong (scope-change discovery).
 - A new P0 message lands in `~/.fleet/inbox/<coord-id>.md`.
@@ -106,7 +122,7 @@ Three kinds of doc, three owners:
 
 | Doc | Path | Owner | What it's for |
 |-----|------|-------|---------------|
-| Subagent doc | `~/.fleet/subagent-wip/<task-tag>.md` | impl- / fix- / rebase-subagent | Phase log per the global Subagent Dispatch Contract. Coord reads on BLOCKED to recover. |
+| Subagent doc | `~/.fleet/subagent-wip/<task-tag>.md` | worker / reviewer / finisher / fix / rebase subagent | Phase log per the global Subagent Dispatch Contract. Coord reads on BLOCKED to recover. |
 | Progress doc | `~/.fleet/projects/<project>/workflow.md` | **coord** | Operator-readable phase log. One section per task with `phase = discussing \| approved \| dispatched \| reviewing \| pr-open \| merged \| blocked`. |
 | Coord doc | `~/.fleet/agents/<coord-id>.json` | fleet-guard | Live-state heartbeat the TUI renders. No coord-side change. |
 

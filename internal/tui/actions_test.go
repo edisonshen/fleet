@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
 	"github.com/edisonshen/fleet/internal/workers"
@@ -1989,22 +1990,69 @@ func TestHelpOverlay_AttachDescriptionMentionsProjects(t *testing.T) {
 	}
 }
 
-// TestCoordCwdForProject_PrefersAgentRecordCwd verifies the cwd
-// resolution: when an agent record carries the matching Project tag
-// AND a Cwd, we reuse it. Otherwise fall back to TUI's cwd.
-func TestCoordCwdForProject_PrefersAgentRecordCwd(t *testing.T) {
+// TestCoordCwdForProject_ProjectMetaBeatsAgentRecordCwd pins fresh
+// coord spawns after PLAN-DOC/TASK-PLAN-DOC: worker records may point
+// at worktrees, so the registered project repo path must win.
+func TestCoordCwdForProject_ProjectMetaBeatsAgentRecordCwd(t *testing.T) {
+	withFleetHome(t)
+	r := agent.New("a1")
+	r.Project = "demo"
+	r.Cwd = "/Users/op/projects/demo-worktree"
+	repo := t.TempDir()
+	if err := projects.Write("demo", projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: repo,
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(true),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+	got := coordCwdForProject([]*agent.Record{r}, "demo")
+	if got != repo {
+		t.Errorf("coordCwdForProject should prefer meta repo_path over agent Cwd; got %q want %q", got, repo)
+	}
+}
+
+// TestCoordCwdForProject_PrefersAgentRecordWhenMetaAbsent verifies the
+// legacy fallback: projects registered before meta.json still reuse a
+// same-project agent cwd before falling back to the TUI process cwd.
+func TestCoordCwdForProject_PrefersAgentRecordWhenMetaAbsent(t *testing.T) {
+	withFleetHome(t)
 	r := agent.New("a1")
 	r.Project = "demo"
 	r.Cwd = "/Users/op/projects/demo"
 	got := coordCwdForProject([]*agent.Record{r}, "demo")
 	if got != "/Users/op/projects/demo" {
-		t.Errorf("coordCwdForProject should prefer agent record's Cwd; got %q", got)
+		t.Errorf("coordCwdForProject should use agent record Cwd when meta is absent; got %q", got)
+	}
+}
+
+// TestCoordCwdForProject_UsesProjectMetaRepoPath pins fresh coord
+// spawns: when no same-project agent record exists, the coord must
+// start in the registered repo so PLAN-DOC/TASK-PLAN-DOC writes land
+// in that project's docs/ directory rather than the dashboard cwd.
+func TestCoordCwdForProject_UsesProjectMetaRepoPath(t *testing.T) {
+	withFleetHome(t)
+	repo := t.TempDir()
+	if err := projects.Write("demo", projects.Meta{
+		Schema:   projects.SchemaVersion,
+		RepoPath: repo,
+		AddedAt:  time.Now().UTC(),
+		IsGit:    projects.BoolPtr(true),
+	}); err != nil {
+		t.Fatalf("write project meta: %v", err)
+	}
+
+	got := coordCwdForProject(nil, "demo")
+	if got != repo {
+		t.Errorf("coordCwdForProject should use meta repo_path; got %q want %q", got, repo)
 	}
 }
 
 // TestCoordCwdForProject_FallsBackToWd: with no matching agent record,
-// we fall through to os.Getwd().
+// or project metadata, we fall through to os.Getwd().
 func TestCoordCwdForProject_FallsBackToWd(t *testing.T) {
+	withFleetHome(t)
 	got := coordCwdForProject(nil, "ghost-project")
 	wd, _ := os.Getwd()
 	if got != wd {
@@ -2808,6 +2856,28 @@ func TestCoordSpawnPrompt_IncludesProjectName(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "--project demo-proj") {
 		t.Errorf("coordSpawnPrompt(%q) missing fleet tasks add --project demo-proj:\n%s", "demo-proj", prompt)
+	}
+}
+
+// TestCoordSpawnPrompt_IncludesPlanDocGate pins the coordinator's
+// durable-plan handoff: approved implementation plans must be saved as
+// docs before the coord files tasks or dispatches workers.
+func TestCoordSpawnPrompt_IncludesPlanDocGate(t *testing.T) {
+	prompt := coordSpawnPrompt("demo")
+	for _, marker := range []string{
+		"PLAN-DOC",
+		"TASK-PLAN-DOC",
+		"docs/DESIGN-<kebab-topic>.md",
+		"docs/DESIGN-<kebab-topic>.html",
+		"docs/TASK-PLAN-<slug>.md",
+		"docs/TASK-PLAN-<slug>.html",
+		"fleet tasks note --project demo <slug> --section spec",
+		"linked or embedded",
+		"approved implementation plan",
+	} {
+		if !strings.Contains(prompt, marker) {
+			t.Errorf("coordSpawnPrompt(%q) missing %q marker:\n%s", "demo", marker, prompt)
+		}
 	}
 }
 
