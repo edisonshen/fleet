@@ -66,6 +66,41 @@ def test_skill_md_role_section_names_dispatch_path():
         )
 
 
+def test_skill_md_requires_plan_doc_before_split():
+    """Approved implementation plans must be durable docs before the
+    coord mutates tasks.md. This pins the PLAN-DOC gate between DISCUSS
+    and SPLIT so a handed-off coord does not regress to chat-only plans."""
+    body = _read_skill_md()
+    assert "PLAN-DOC" in body
+    assert "Before splitting tasks" in body
+    assert "approved implementation plan" in body
+    assert "docs/DESIGN-<kebab-topic>.md" in body
+
+
+def test_skill_md_requires_task_plan_doc_before_implement():
+    """Task-level docs must exist before promotion/implementation so each
+    worker has a durable worker-ready plan, not just a tasks.md row."""
+    body = _read_skill_md()
+    assert "TASK-PLAN-DOC" in body
+    assert "Before any task is promoted to ready" in body
+    assert "docs/TASK-PLAN-<slug>.md" in body
+    assert "fleet tasks note --project <project> <slug> --section spec" in body
+    assert "worker-visible task text" in body
+    assert "fleet tasks promote <slug>` happens only after" in body
+
+
+def test_skill_md_names_narrow_plan_doc_write_exception():
+    """The coord remains read-only on code; the only source-tree write it
+    may perform is saving/rendering approved plan docs under docs/."""
+    body = _read_skill_md()
+    for needle in (
+        "source-tree mutation exceptions",
+        "Write/render approved implementation plan docs and per-task plan docs",
+        "does **not** proceed to SPLIT",
+    ):
+        assert needle in body
+
+
 # ---------- Worker dispatch protocol (issue #84 Phase A) ----------
 
 
@@ -177,26 +212,26 @@ def test_skill_md_dispatch_protocol_names_register_subagent():
         )
 
 
-# ---------- three-stage flow §4 documentation (reviewer-subagent-arch) ----------
+# ---------- three-stage flow §6 documentation (reviewer-subagent-arch) ----------
 
 
-def test_skill_md_step4_documents_three_stage_flow():
-    """The Step 4 IMPLEMENT section must spell out the worker →
+def test_skill_md_step6_documents_three_stage_flow():
+    """The Step 6 IMPLEMENT section must spell out the worker →
     reviewer → finisher split. Drift here lets handed-off coords
     revert to the old single-subagent dispatch pattern, which is the
     structural failure mode the three-stage flow exists to prevent."""
     body = _read_skill_md()
     # Section heading.
-    assert "### Step 4 — IMPLEMENT" in body
-    # The three-stage phrase has to appear in the §4 prose so future
+    assert "### Step 6 — IMPLEMENT" in body
+    # The three-stage phrase has to appear in the IMPLEMENT prose so future
     # readers grep for it.
     assert "three-stage flow" in body or "three subagents" in body
     # Each of the three roles is named.
     for role in ("worker", "reviewer", "finisher"):
-        assert role in body, f"SKILL.md §4 missing role {role!r}"
+        assert role in body, f"SKILL.md IMPLEMENT section missing role {role!r}"
     # The handoff phases.
     for phase in ("review-pending", "review-done"):
-        assert phase in body, f"SKILL.md §4 missing handoff phase {phase!r}"
+        assert phase in body, f"SKILL.md IMPLEMENT section missing handoff phase {phase!r}"
     # The codex skip allowlist is documented (operator-readable guard).
     assert "rate-limited" in body and "unavailable" in body
     # /review is never skippable (load-bearing reviewer).
