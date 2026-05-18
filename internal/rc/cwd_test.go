@@ -71,6 +71,36 @@ func TestResolveWorkingDir_FailsCleanly(t *testing.T) {
 	}
 }
 
+// TestResolveWorkingDir_SkipsStaleAgentRecord (codex round-8 P2):
+// when multiple agents have records for the project but only one
+// is alive (TmuxSession returns true on the probe), the live one
+// wins regardless of file-system order.
+func TestResolveWorkingDir_SkipsStaleAgentRecord(t *testing.T) {
+	withFleetHome(t)
+	prev := agentList
+	agentList = func() ([]*agent.Record, error) {
+		return []*agent.Record{
+			{ID: "stale", Project: "demo", Cwd: "/from/stale", TmuxSession: "dead-session"},
+			{ID: "live", Project: "demo", Cwd: "/from/live", TmuxSession: "alive-session"},
+		}, nil
+	}
+	defer func() { agentList = prev }()
+
+	prevProbe := tmuxHasSessionFn
+	tmuxHasSessionFn = func(session string) bool {
+		return session == "alive-session"
+	}
+	defer func() { tmuxHasSessionFn = prevProbe }()
+
+	got, err := ResolveWorkingDir("demo", "")
+	if err != nil {
+		t.Fatalf("ResolveWorkingDir: %v", err)
+	}
+	if got != "/from/live" {
+		t.Fatalf("expected /from/live (stale record skipped); got %q", got)
+	}
+}
+
 func TestResolveWorkingDir_LiveCoordSkipsWrongProject(t *testing.T) {
 	withFleetHome(t)
 	prev := agentList

@@ -7,6 +7,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/projects"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // ErrCwdUnresolvable is returned by ResolveWorkingDir when none of
@@ -49,12 +50,21 @@ func ResolveWorkingDir(project, override string) (string, error) {
 	// in ~/.fleet/agents/; we walk for the FIRST alive agent matching
 	// project. Tests can stub via ResolveWorkingDirAgentList (var seam
 	// below) but production uses agent.List directly.
+	//
+	// codex round-8 P2: skip records whose tmux session is no longer
+	// alive. Live JSON files routinely outlive crashed agents — without
+	// the liveness check a stale crashed-coord record could win over
+	// the active coord and register the listener under the wrong
+	// working_dir, breaking every later directory-keyed verify.
 	if records, err := agentList(); err == nil {
 		for _, rec := range records {
 			if rec == nil || rec.Project != project {
 				continue
 			}
 			if rec.Cwd == "" {
+				continue
+			}
+			if !sessionAliveForCwd(rec.TmuxSession) {
 				continue
 			}
 			return canonicalCwd(rec.Cwd)
@@ -81,3 +91,21 @@ func canonicalCwd(p string) (string, error) {
 // records without touching ~/.fleet/agents/ globally. Production uses
 // agent.List which reads from disk.
 var agentList = func() ([]*agent.Record, error) { return agent.List() }
+
+// sessionAliveForCwd probes whether an agent record's tmux session is
+// still alive. Test seam — defaults to tmux.HasSession; cwd_test.go
+// stubs to control liveness without driving a real tmux server.
+// Empty session means the record predates tmux integration; accept
+// it (legacy compatibility).
+var sessionAliveForCwd = func(session string) bool {
+	if session == "" {
+		return true
+	}
+	return tmuxHasSessionFn(session)
+}
+
+// tmuxHasSessionFn is the inner test seam. Production hits the real
+// tmux binary via internal/tmux.HasSession; tests can override
+// without touching sessionAliveForCwd's "empty session = legacy"
+// branch.
+var tmuxHasSessionFn = tmux.HasSession

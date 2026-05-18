@@ -696,9 +696,19 @@ func psArgsVerify(pid int, sessionPrefix, expectedCwd string) bool {
 	}
 	cwdOut, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 	if err != nil {
-		// Can't read cwd → conservative refusal. Don't risk killing
-		// another project's listener (or adopting a recycled PID).
-		return false
+		// codex round-8 P1 regression-fix: hosts without lsof
+		// (minimal Linux containers, locked-down systems) shouldn't
+		// hard-fail every adopt/connect/down — that would respawn
+		// duplicate listeners on every coord tick. lsof is not a
+		// documented runtime dependency. Degrade to argv-only match
+		// (still better than the pre-R5 baseline which had no
+		// argv check at all). Surface the degraded mode so the
+		// operator can install lsof to restore cross-project
+		// PID-reuse defense.
+		fmt.Fprintf(os.Stderr,
+			"rc: lsof unavailable for pid %d (%v); falling back to argv-only PID verify (install lsof to restore cross-project PID-reuse defense)\n",
+			pid, err)
+		return true
 	}
 	for _, l := range strings.Split(string(cwdOut), "\n") {
 		if strings.HasPrefix(l, "n") && l[1:] == expectedCwd {
