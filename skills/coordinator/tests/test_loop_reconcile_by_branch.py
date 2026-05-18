@@ -605,6 +605,47 @@ def test_terminal_done_with_pr_url_wins_over_stale_branch_pr(
     assert gh_mock.call_count == 0
 
 
+def test_in_review_with_empty_pr_url_triggers_branch_fallback(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Reviewer-added: in-review tasks fall through to the
+    `if not t.pr_url:` site in _reconcile_inflight (NOT the mid_phase
+    short-circuit, since that's gated on t.status == "in-progress").
+    Verify the fallback fires for status=in-review with empty pr_url
+    and a merged PR on the branch.
+
+    This guards the second fallback call site added by the codex iter-1
+    fix — without it, an in-review task whose pr_url was cleared would
+    fall straight through to the `else: worker died without PR` requeue
+    and silently lose its merged PR.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+    # No state.json — worker dead, dir gone, status=in-review with empty
+    # pr_url (e.g., manually cleared by operator after a transient issue).
+
+    t = _make_task(
+        "in-review-stuck", status="in-review",
+        worker_pid=0, pr_url="", branch="worker/in-review-stuck",
+    )
+
+    pr = loop._PRSummary(
+        number=77, state="MERGED",
+        url="https://github.com/x/y/pull/77",
+        merged_at="2026-05-18T05:00:00Z",
+        created_at="2026-05-18T00:00:00Z",
+    )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", return_value=pr):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.new_status == "done"
+    assert a.set_pr_url == "https://github.com/x/y/pull/77"
+
+
 # ---------- Part C: periodic supervisor reconcile catches stale state.json ----------
 
 
