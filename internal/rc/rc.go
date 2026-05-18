@@ -666,8 +666,8 @@ func SetVerifyPIDIsListenerForTest(fn func(pid int, sessionPrefix, expectedCwd s
 }
 
 // psArgsVerify is the production verifier. Two probes:
-//   1. `ps -p <pid> -o args=` for argv (portable to macOS/Linux/BSD).
-//   2. `lsof -a -p <pid> -d cwd -Fn` for working_dir.
+//  1. `ps -p <pid> -o args=` for argv (portable to macOS/Linux/BSD).
+//  2. `lsof -a -p <pid> -d cwd -Fn` for working_dir.
 //
 // On any probe failure, returns false — the conservative answer:
 // "don't trust the PID because we can't prove it's ours."
