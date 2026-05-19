@@ -41,6 +41,7 @@ import (
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/rc"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // runDispatchIgnoringSpawnErr invokes runDispatch with a clean
@@ -311,3 +312,75 @@ func TestCoordSpawn_MarkerWriteFailure_Degrades(t *testing.T) {
 type writeMarkerStubErr struct{ msg string }
 
 func (e *writeMarkerStubErr) Error() string { return e.msg }
+
+// TestIsCoordHandoffForProject_GatesOnCoordSpawnMarker is the codex
+// review iter-1 [P1] regression: handoff replacements MUST gate the
+// rc-enabled marker auto-write on whether the OLD agent is actually
+// the project's coord (coord-spawn marker resolves to oldRec.ID).
+// Without this gate, a `fleet handoff <worker-id>` for a worker in a
+// project with no rc-enabled marker would auto-opt the project into
+// RC and inject --remote-control into the worker replacement's argv,
+// violating the v0.12 push-storm protection that keeps workers /
+// subagents on strict opt-in.
+//
+// We test the predicate directly (not via runHandoff) because the
+// gate's correctness IS the predicate; runHandoff's early-exit gates
+// (tmux probe / dead-session archive / legacy-record refusal) would
+// short-circuit before reaching the marker write in CI without tmux,
+// and exercising those gates only proves the marker isn't written —
+// not WHY it isn't written. The predicate test isolates the gate
+// from the surrounding handoff state machine.
+func TestIsCoordHandoffForProject_GatesOnCoordSpawnMarker(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	const project = "test-handoff-gate"
+	const coordID = "aaaaaaaa"
+	const workerID = "bbbbbbbb"
+
+	// Sub-test matrix: empty project / unset marker / marker == workerID
+	// / marker == coordID. Only the last case should report true.
+	cases := []struct {
+		name      string
+		project   string
+		agentID   string
+		setMarker string // "" = don't write marker
+		want      bool
+	}{
+		{"empty project rejects", "", coordID, "", false},
+		{"unset marker rejects", project, coordID, "", false},
+		{"marker points elsewhere rejects",
+			project, workerID, coordID, false},
+		{"marker matches agentID accepts",
+			project, coordID, coordID, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each sub-test gets a fresh project dir so markers from a
+			// previous case don't leak. WriteCoordSpawnMarker stamps
+			// the marker file; absent setMarker, the previous case's
+			// marker would otherwise persist across iterations.
+			subHome := t.TempDir()
+			t.Setenv("FLEET_HOME", subHome)
+			if tc.setMarker != "" {
+				// state.WriteCoordSpawnMarker requires the per-project
+				// .locks/ parent to exist; bootstrap initialises ~/.fleet
+				// + the project tree.
+				if _, err := state.Bootstrap(); err != nil {
+					t.Fatalf("setup Bootstrap: %v", err)
+				}
+				if _, err := state.EnsureProjectInitialized(tc.project); err != nil {
+					t.Fatalf("setup EnsureProjectInitialized: %v", err)
+				}
+				if err := state.WriteCoordSpawnMarker(tc.project, tc.setMarker); err != nil {
+					t.Fatalf("setup WriteCoordSpawnMarker: %v", err)
+				}
+			}
+			got := isCoordHandoffForProject(tc.project, tc.agentID)
+			if got != tc.want {
+				t.Errorf("isCoordHandoffForProject(%q, %q) with marker=%q: got %v, want %v",
+					tc.project, tc.agentID, tc.setMarker, got, tc.want)
+			}
+		})
+	}
+}

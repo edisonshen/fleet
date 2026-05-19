@@ -144,6 +144,25 @@ outgoing record and increments handoff_number by 1.`,
 // double-spawn. Per-agent (not per-project) so concurrent handoffs
 // on DIFFERENT agents in the same project run in parallel.
 //
+// isCoordHandoffForProject reports whether the agent identified by
+// (project, agentID) IS the project's current coord — i.e. the
+// coord-spawn marker for project resolves to agentID. Used by
+// runHandoff / resumeHandoff to gate the v0.12.1 rc-enabled auto-
+// write (DESIGN-rc-coord-auto-marker.md, codex review iter-1 [P1]):
+// only coord handoffs auto-opt the project into RC; worker handoffs
+// preserve the strict opt-in carve-out that protects against the
+// push-storm class of failures.
+//
+// Empty project is "not a coord handoff" by definition — mirrors
+// the defensive shape used by rc.Enabled and the existing
+// isCoordSwap detection in runHandoff at the post-spawn step.
+func isCoordHandoffForProject(project, agentID string) bool {
+	if project == "" {
+		return false
+	}
+	return state.ReadCoordSpawnMarker(project) == agentID
+}
+
 // Crash safety: the queue file (step 5) is the journal entry. If we
 // crash between step 5 and step 11 (Delete), a future drainer (4b
 // TUI background loop) sees a stale queue file pointing at an
@@ -711,15 +730,26 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// Use the coord session-name shape so the single live listener
 	// matches both fresh-spawn and handoff replacements.
 	// v0.12.1 P0 (DESIGN-rc-coord-auto-marker.md, operator G2
-	// 2026-05-18): handoff replacements ARE coords too — auto-opt-in
-	// to RC so the rc.Enabled gate inside injectRemoteControlFlagProject
-	// below passes. Common case is idempotent (marker already present
-	// from the predecessor coord's auto-write); guards against the
-	// degenerate case where the marker was removed between the
-	// predecessor's spawn and this handoff (e.g. operator ran
-	// `fleet rc down <project>` then realized they want pairing back).
-	// Failure is non-fatal — operator can recover via `fleet rc up`.
-	if oldRec.Project != "" {
+	// 2026-05-18): coord handoff replacements ARE coords too —
+	// auto-opt-in to RC so the rc.Enabled gate inside
+	// injectRemoteControlFlagProject below passes. Common case is
+	// idempotent (marker already present from the predecessor coord's
+	// auto-write); guards against the degenerate case where the
+	// marker was removed between the predecessor's spawn and this
+	// handoff (e.g. operator ran `fleet rc down <project>` then
+	// realized they want pairing back). Failure is non-fatal —
+	// operator can recover via `fleet rc up`.
+	//
+	// codex review iter-1 [P1]: gate on isCoordHandoffForProject.
+	// `fleet handoff` runs for BOTH coord and worker handoffs (same
+	// code path; agent type comes from oldRec). Writing the rc-enabled
+	// marker on a worker handoff would (a) inject --remote-control
+	// into the worker replacement's argv via the helper below,
+	// violating the v0.12 push-storm protection (workers/subagents
+	// stay strict opt-in), and (b) globally opt the project into RC.
+	// Detect coord via the coord-spawn marker (mirrors line ~817
+	// isCoordSwap check); skip on workers.
+	if isCoordHandoffForProject(oldRec.Project, oldRec.ID) {
 		if err := writeMarkerFn(oldRec.Project); err != nil {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"warning: rc.WriteMarker(%q) failed during handoff: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
