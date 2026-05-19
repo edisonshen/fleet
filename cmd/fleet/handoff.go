@@ -740,15 +740,30 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// realized they want pairing back). Failure is non-fatal —
 	// operator can recover via `fleet rc up`.
 	//
-	// codex review iter-1 [P1]: gate on isCoordHandoffForProject.
+	// codex review iter-1 [P1] + iter-5 [P1]: gate BOTH the marker
+	// write AND the --remote-control inject on isCoordHandoffForProject.
 	// `fleet handoff` runs for BOTH coord and worker handoffs (same
-	// code path; agent type comes from oldRec). Writing the rc-enabled
-	// marker on a worker handoff would (a) inject --remote-control
-	// into the worker replacement's argv via the helper below,
-	// violating the v0.12 push-storm protection (workers/subagents
-	// stay strict opt-in), and (b) globally opt the project into RC.
+	// code path; agent type comes from oldRec). Two separate hazards
+	// motivate the dual gate:
+	//
+	//   (1) Writing the rc-enabled marker on a worker handoff would
+	//       globally opt the project into RC, undoing an operator's
+	//       explicit opt-out via `fleet rc down`. Fixed in iter-1.
+	//
+	//   (2) Even WITHOUT writing the marker, the helper below
+	//       (injectRemoteControlFlagProject) consults
+	//       rc.Enabled(project) — which is project-wide. If ANOTHER
+	//       agent (e.g., the project's coord) already triggered the
+	//       auto-write, a worker handoff would silently inherit RC
+	//       attach, violating the v0.12 push-storm protection (workers
+	//       and subagents stay strict opt-in even when the project is
+	//       RC-enabled). Iter-5 [P1] catches this; gate the inject on
+	//       isCoordHandoff so the handoff carve-out matches the
+	//       dispatch-side carve-out (opts.coordSpawn).
+	//
 	// Detect coord via the coord-spawn marker (mirrors line ~817
 	// isCoordSwap check); skip on workers.
+	var rewrittenExecArgv []string
 	if isCoordHandoffForProject(oldRec.Project, oldRec.ID) {
 		if err := writeMarkerFn(oldRec.Project); err != nil {
 			// Use injected stderr for parity with the rest of
@@ -757,21 +772,21 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 				"warning: rc.WriteMarker(%q) failed during handoff: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
 				oldRec.Project, err, oldRec.Project)
 		}
-	}
 
-	rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
-	// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
-	// per-project rc-enabled marker. Without it (operator hasn't
-	// run `fleet rc up <project>`), the handoff replacement does
-	// NOT carry --remote-control. FirstAction's operator-instruction
-	// text tells the operator to run `fleet rc connect <project>`
-	// in their terminal to re-attach pairing.
-	rewrittenExecArgv := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
-	if sameCommand(rewrittenExecArgv, command) {
-		// No-op rewrite (custom --command): pass nil so the
-		// persisted record and tmux exec are identical (avoids a
-		// confusing Command/ExecCommand divergence in spawn.Options).
-		rewrittenExecArgv = nil
+		// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
+		// per-project rc-enabled marker. Without it (operator hasn't
+		// run `fleet rc up <project>`), the handoff replacement does
+		// NOT carry --remote-control. FirstAction's operator-instruction
+		// text tells the operator to run `fleet rc connect <project>`
+		// in their terminal to re-attach pairing.
+		rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
+		rewritten := injectRemoteControlFlagProject(command, rcSessionName, oldRec.Project)
+		// Only set ExecCommand when the rewrite actually changed
+		// something — passing through an unchanged custom --command
+		// avoids a no-op Command/ExecCommand divergence in spawn.Options.
+		if !sameCommand(rewritten, command) {
+			rewrittenExecArgv = rewritten
+		}
 	}
 
 	newRec, err := spawn.Spawn(spawn.Options{

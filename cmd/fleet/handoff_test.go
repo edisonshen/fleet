@@ -1167,6 +1167,19 @@ func TestHandoff_ReplacementSpawnedWithRemoteControlFlag(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(first.TmuxSession) })
 
+	// v0.12.1 (codex review iter-5 [P1]): the handoff inject is now
+	// gated on isCoordHandoffForProject so worker handoffs in
+	// RC-enabled projects don't silently inherit --remote-control.
+	// This test exercises the WITH-coord path (the contract it was
+	// written to pin); seed the coord-spawn marker pointing at the
+	// outgoing agent so it counts as the project's coord.
+	if _, err := state.EnsureProjectInitialized("rainier"); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker("rainier", first.ID); err != nil {
+		t.Fatalf("seed coord-spawn marker: %v", err)
+	}
+
 	// Run handoff. Command/cwd inherited from the outgoing record.
 	out := &bytes.Buffer{}
 	if err := runHandoff(&handoffOpts{
