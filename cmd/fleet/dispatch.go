@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/rc"
@@ -243,7 +244,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// enter this branch — only coord-spawn dispatches need the gate,
 	// matching the original design's scope.
 	if opts.coordSpawn && opts.project != "" {
-		release, err := acquireCoordSpawnLock(opts.project)
+		release, err := coordlock.Acquire(opts.project)
 		if err != nil {
 			return err
 		}
