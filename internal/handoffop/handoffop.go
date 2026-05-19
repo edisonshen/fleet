@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
@@ -585,6 +586,30 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// gate coverage without driving full spawnAndRetire.
 	var rewrittenExecArgv []string
 	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
+		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;
+		// codex iter-1 [P1] from the v2 reviewer): acquire the SAME
+		// project-level coord-spawn lock that cmd/fleet/dispatch.go
+		// uses, so a TUI `[a]` racing an in-flight drain replacement
+		// contends on the lock rather than slipping past it.
+		//
+		// Warn-and-continue (not fail-fast) on contention: this drain
+		// path has a queue file ALREADY committed by the producer
+		// (fleet-guard auto-handoff / TUI [h] / crash-recovery retry).
+		// Bailing out would orphan the queue file. The dispatch CLI
+		// can fail-fast because nothing on disk has been mutated yet.
+		// The duplicate-coord risk window persists in the contended
+		// case, but the queue file is preserved for retry — operator
+		// trade documented in design Change 7.
+		release, lockErr := coordlock.Acquire(oldRec.Project)
+		if lockErr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: coordlock.Acquire(%q) contended during drain handoff: %v "+
+					"(continuing; duplicate-coord risk window is the spawn time)\n",
+				oldRec.Project, lockErr)
+		} else {
+			defer release()
+		}
+
 		// v0.12.2 P0 (DESIGN-coord-spawn-atomic-gate.md Change 6;
 		// closes PR #163 deferred [P2] (2)): backfill the rc-enabled
 		// marker for the project BEFORE the inject so a pre-v0.12.1
