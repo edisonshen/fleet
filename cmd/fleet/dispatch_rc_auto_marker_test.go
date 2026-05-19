@@ -313,6 +313,62 @@ type writeMarkerStubErr struct{ msg string }
 
 func (e *writeMarkerStubErr) Error() string { return e.msg }
 
+// TestCoordSpawn_MarkerNotWrittenWhenSpawnRefused is the codex review
+// iter-4 [P1] regression: the rc-enabled marker auto-write MUST NOT
+// fire when a downstream refusal gate (ListStrict unparseable record,
+// live-coord veto, FLEET_MAX_SESSIONS) rejects the dispatch. Without
+// this lifecycle gate, a refused coord-spawn would silently undo the
+// operator's `fleet rc down <project>` opt-out — the marker is back
+// in place even though no new coord was created.
+//
+// Drives the ListStrict refusal gate by seeding a corrupt agent JSON
+// file under FLEET_HOME/agents/ before dispatch. The bad-records check
+// at runDispatch:520-530 returns before the (moved) marker write site,
+// so we assert the marker is absent post-refusal.
+func TestCoordSpawn_MarkerNotWrittenWhenSpawnRefused(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
+
+	// Seed a corrupt agent record so ListStrict refuses to enumerate.
+	// runDispatch's --coord-spawn branch returns at line ~520 with
+	// "unparseable record(s)" before reaching the marker write that
+	// was moved to after the spawn-decision gates (codex iter-4 [P1]).
+	agentsDir := filepath.Join(fleetHome, "agents")
+	if err := os.MkdirAll(agentsDir, 0o755); err != nil {
+		t.Fatalf("setup mkdir agents: %v", err)
+	}
+	corruptPath := filepath.Join(agentsDir, "corrupt0.json")
+	if err := os.WriteFile(corruptPath, []byte("{not valid json}"), 0o644); err != nil {
+		t.Fatalf("setup corrupt record: %v", err)
+	}
+
+	const project = "test-refused-no-marker"
+	opts := &dispatchOpts{
+		taskID:          "coord-" + project,
+		project:         project,
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	isolateTmuxSocket(t)
+	var out bytes.Buffer
+	err := runDispatch(opts, &out)
+	if err == nil {
+		t.Fatal("expected corrupt agent record to refuse the dispatch; got nil error")
+	}
+	if !strings.Contains(err.Error(), "unparseable") {
+		t.Fatalf("expected ListStrict 'unparseable record' refusal; got %q", err.Error())
+	}
+
+	markerPath := filepath.Join(fleetHome, "projects", project, rc.MarkerFilename)
+	if _, statErr := os.Stat(markerPath); statErr == nil {
+		t.Fatalf("refused coord-spawn must NOT auto-write rc-enabled marker; found %s on disk (lifecycle regression — operator's `fleet rc down` would be silently undone by refused dispatches)",
+			markerPath)
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("unexpected stat err for %s: %v", markerPath, statErr)
+	}
+}
+
 // TestIsCoordHandoffForProject_GatesOnCoordSpawnMarker is the codex
 // review iter-1 [P1] regression: handoff replacements MUST gate the
 // rc-enabled marker auto-write on whether the OLD agent is actually
