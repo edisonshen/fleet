@@ -47,6 +47,24 @@ var sessionListProbe = tmux.ListSessions
 // so tests inject deterministic fakes.
 var sessionAliveProbe = tmux.SessionAlive
 
+// writeMarkerFn is the seam for the v0.12.2 P0 drain-path RC marker
+// backfill (DESIGN-coord-spawn-atomic-gate.md). Production wires
+// rc.WriteMarker; tests stub to count invocations and exercise the
+// non-fatal-on-failure contract pinned by
+// TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal.
+//
+// Mirrors cmd/fleet/dispatch.go's writeMarkerFn seam: the handoffop
+// package can't import cmd/fleet (would cycle), so each package
+// carries its own seam wired to the same rc.WriteMarker production
+// implementation.
+//
+// Closes PR #163's deferred [P2] (2): cmd/fleet/handoff.go (PR #163)
+// writes the marker before the inject for operator-triggered handoffs;
+// internal/handoffop/handoffop.go (this seam) does the same for
+// drain-path (auto-handoff + crash recovery) handoffs so pre-v0.12.1
+// coords get RC backfilled on their next handoff.
+var writeMarkerFn = rc.WriteMarker
+
 // isCoordHandoffForAgent reports whether (project, agentID) identifies
 // the project's current coord — i.e. the coord-spawn marker resolves
 // to agentID. spawnAndRetire calls this to gate the v0.12.1 RC inject
@@ -567,6 +585,27 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// gate coverage without driving full spawnAndRetire.
 	var rewrittenExecArgv []string
 	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
+		// v0.12.2 P0 (DESIGN-coord-spawn-atomic-gate.md Change 6;
+		// closes PR #163 deferred [P2] (2)): backfill the rc-enabled
+		// marker for the project BEFORE the inject so a pre-v0.12.1
+		// coord whose project never had the marker written still
+		// gets RC on its drain-path replacement. Without this, the
+		// rc.Enabled(project) gate inside rc.GateAttachFlag returns
+		// false → inject no-ops → the replacement coord boots
+		// without --remote-control, breaking mobile / claude.ai
+		// pairing for the operator.
+		//
+		// Mirrors cmd/fleet/handoff.go's marker-write-before-inject
+		// pattern (PR #163 line 768). Failure is non-fatal: log a
+		// warning to stderr and continue — the inject will then
+		// no-op gracefully (the gate's other half), and the
+		// operator can recover via `fleet rc up <project>`.
+		if err := writeMarkerFn(oldRec.Project); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: rc.WriteMarker(%q) failed during drain handoff: %v "+
+					"(continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
+				oldRec.Project, err, oldRec.Project)
+		}
 		rewrittenExecArgv = rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
 		if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
 			rewrittenExecArgv = nil
