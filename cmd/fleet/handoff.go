@@ -751,7 +751,9 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// isCoordSwap check); skip on workers.
 	if isCoordHandoffForProject(oldRec.Project, oldRec.ID) {
 		if err := writeMarkerFn(oldRec.Project); err != nil {
-			_, _ = fmt.Fprintf(os.Stderr,
+			// Use injected stderr for parity with the rest of
+			// runHandoff's warnings (codex review iter-3 [P3]).
+			_, _ = fmt.Fprintf(stderr,
 				"warning: rc.WriteMarker(%q) failed during handoff: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
 				oldRec.Project, err, oldRec.Project)
 		}
