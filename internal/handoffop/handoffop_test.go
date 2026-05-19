@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
@@ -1301,5 +1302,174 @@ func TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal(t *testing.T) {
 	// via `fleet rc up <project>`. Mirrors dispatch.go's warning shape.
 	if !strings.Contains(stderr.String(), "rc.WriteMarker") {
 		t.Errorf("expected stderr warning mentioning rc.WriteMarker; got: %q", stderr.String())
+	}
+}
+
+// TestDrainAndDispatch_ShareSameLock is T7 (v3 Change 7): the drain
+// path inside spawnAndRetire (the isCoordHandoffForAgent branch) MUST
+// acquire the SAME project-level lock that cmd/fleet/dispatch.go uses,
+// so a TUI `[a]` racing an in-flight drain replacement contends on the
+// lock rather than slipping past it.
+//
+// Proxy for "concurrent dispatcher": hold coordlock.Acquire(project)
+// directly from this test. Then call Resume to trigger the drain path
+// for the same project. The drain branch should observe the
+// contention via the warning string defined in DESIGN-coord-spawn-
+// atomic-gate.md §Change 7 ("coordlock.Acquire(%q) contended during
+// drain handoff").
+func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	// Marker = oldRec.ID so isCoordHandoffForAgent fires.
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	// Hold the lock outside Resume — simulates a concurrent
+	// `fleet dispatch --coord-spawn` that's mid-flight when the
+	// drain triggers.
+	release, err := coordlock.Acquire(oldRec.Project)
+	if err != nil {
+		t.Fatalf("outer coordlock.Acquire: %v", err)
+	}
+	defer release()
+
+	// Stub writeMarkerFn so a side effect of the drain block does
+	// not depend on the rc package's real disk state.
+	prev := writeMarkerFn
+	writeMarkerFn = func(string) error { return nil }
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	rerr := Resume(req, qp, 0, stdout, stderr)
+
+	// Drain emits the warning, then continues. The contract is
+	// warn-and-continue per design Change 7 — a queue file is
+	// already committed, so the drain cannot fail-fast like the
+	// dispatch CLI can.
+	if !strings.Contains(stderr.String(), "coordlock.Acquire") {
+		t.Errorf("expected drain stderr to mention coordlock.Acquire contention; got: %q", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "contended during drain handoff") {
+		t.Errorf("expected drain stderr to mention 'contended during drain handoff'; got: %q", stderr.String())
+	}
+
+	// Resume's overall return is allowed to be nil (warn-and-continue
+	// proceeded to spawn) OR a downstream error unrelated to the
+	// lock contention. The invariant we care about: the lock
+	// contention itself MUST NOT be the cause of any error returned.
+	if rerr != nil && strings.Contains(rerr.Error(), "coordlock.Acquire") {
+		t.Fatalf("lock contention MUST be non-fatal on drain path; surfaced as: %v", rerr)
+	}
+
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+}
+
+// TestDrain_LockReleasedOnReturn is T8 (v3 Change 7): the drain block's
+// defer release() actually frees the lock after the drain returns. We
+// run Resume to completion (no outer holder), then attempt a fresh
+// coordlock.Acquire — it should succeed, proving the drain released.
+func TestDrain_LockReleasedOnReturn(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	prev := writeMarkerFn
+	writeMarkerFn = func(string) error { return nil }
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, stdout, stderr); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, stderr.String())
+	}
+
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+
+	// After Resume returns, the lock must be free. A fresh acquire
+	// proves the drain's defer release() fired.
+	release, err := coordlock.Acquire(oldRec.Project)
+	if err != nil {
+		t.Fatalf("post-Resume coordlock.Acquire: lock still held; defer release() did not fire: %v", err)
+	}
+	release()
+}
+
+// TestDrain_ContentionDegradesGracefully is T9 (v3 Change 7): the drain
+// block warns-and-continues when the lock is held by another caller.
+// The replacement still spawns and the queue file still gets consumed —
+// the trade documented in design §Change 7 ("Why warn-and-continue
+// (not fail-fast) on drain path") is that the duplicate-coord risk
+// window persists for the contended drain, but the queue file is
+// preserved (the dispatch CLI's fail-fast contract assumes no on-disk
+// commit; the drain path has one).
+func TestDrain_ContentionDegradesGracefully(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	// Hold the lock from outside for the entire Resume.
+	release, err := coordlock.Acquire(oldRec.Project)
+	if err != nil {
+		t.Fatalf("outer coordlock.Acquire: %v", err)
+	}
+	defer release()
+
+	prev := writeMarkerFn
+	writeMarkerFn = func(string) error { return nil }
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	rerr := Resume(req, qp, 0, stdout, stderr)
+
+	// The drain MUST continue past the lock contention and spawn
+	// the replacement. The new agent record should be visible after
+	// Resume returns. If Resume returned an error, it must NOT be
+	// attributable to the lock (downstream spawn/retire failures
+	// are unrelated to this assertion).
+	if rerr != nil && strings.Contains(rerr.Error(), "coordlock.Acquire") {
+		t.Fatalf("contention MUST degrade gracefully on drain path; surfaced as fatal: %v", rerr)
+	}
+
+	if _, lerr := agent.Load(req.NewAgentID); lerr != nil {
+		t.Fatalf("replacement agent record missing after contended drain — drain did not warn-and-continue: %v", lerr)
+	}
+
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+
+	// Warning shape is fixed by design Change 7 for operator
+	// recognizability.
+	if !strings.Contains(stderr.String(), "coordlock.Acquire") {
+		t.Errorf("expected stderr to mention coordlock.Acquire warning; got: %q", stderr.String())
 	}
 }
