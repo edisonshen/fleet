@@ -43,7 +43,7 @@ import (
 	"github.com/edisonshen/fleet/internal/rc"
 )
 
-// runDispatchExpectingSpawnFailure invokes runDispatch with a clean
+// runDispatchIgnoringSpawnErr invokes runDispatch with a clean
 // FLEET_HOME and isolated tmux socket. In CI without a real tmux server
 // (the dominant case) runDispatch fails at tmux.Available or spawn.Spawn
 // — both AFTER the coord-spawn branch's marker write. The error itself
