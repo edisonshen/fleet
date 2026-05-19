@@ -988,3 +988,124 @@ def test_apply_reconcile_writes_pr_url_before_status() -> None:
         f"status (#{status_idx}) must be written BEFORE worker_pid "
         f"(#{worker_pid_idx}); calls={calls}"
     )
+
+
+# ---------- Codex iter-6 [P1] partial-apply recovery ----------
+
+
+def test_partial_apply_pr_url_in_progress_falls_through_to_ci_poll(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Codex iter-6 [P1] regression: if a prior tick's _apply_reconcile
+    crashed between the set_pr_url write and the status= write, tasks.md
+    is left at status=in-progress WITH a durable pr_url, while state.json
+    is still review-pending/review-done.
+
+    Before the fix, the SITE 1 mid_phase short-circuit always
+    `continue`d after calling the fallback helper. The helper short-
+    circuits (returns None) when t.pr_url is already set — so the
+    pr_url+CI poll branch below was never reached, and the task was
+    stuck forever at in-progress with a real PR URL attached.
+
+    The fix: when the fallback returns None AND t.pr_url is set, fall
+    through. The existing `if t.pr_url: ci = _gh_pr_checks(...)` block
+    now drives the partial-apply task forward to in-review/done/etc.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    # Stuck handoff state: state.json frozen at phase=review-pending.
+    _write_state(fleet_home, project, "partial-apply", {
+        "slug": "partial-apply", "project": project,
+        "phase": "review-pending",
+        "started_at": "2026-05-18T00:00:00Z",
+        "updated_at": "2026-05-18T07:33:00Z",
+    })
+
+    # Task is at status=in-progress (status= write crashed) but pr_url is
+    # already durable from the prior tick's first half of the apply.
+    t = _make_task(
+        "partial-apply", status="in-progress",
+        worker_pid=12345,
+        pr_url="https://github.com/edisonshen/fleet/pull/200",
+        branch="worker/partial-apply",
+    )
+
+    # The fallback helper would short-circuit on t.pr_url and return None.
+    # Patch _gh_pr_by_branch to raise: if it gets called, the test fails
+    # loudly (the helper should not even reach the gh call when t.pr_url
+    # is set).
+    def boom(*a, **kw):
+        raise AssertionError(
+            "_gh_pr_by_branch must not run when t.pr_url is already set",
+        )
+
+    # _gh_pr_checks returns CI-green + merged so the task progresses to
+    # done. This is the load-bearing assertion: the CI poll branch WAS
+    # entered. If the bug regressed, no action would emit.
+    ci_done = loop._CIResult(all_green=True, merged=True)
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", side_effect=boom), \
+         patch.object(loop, "_gh_pr_checks", return_value=ci_done):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    assert len(actions) == 1, (
+        f"expected 1 action (CI poll path), got {actions} — fall-through bug"
+    )
+    a = actions[0]
+    assert a.new_status == "done", f"expected done, got {a.new_status}"
+    assert a.delete_worker_dir is True
+
+
+def test_partial_apply_no_pr_url_still_short_circuits(
+    fleet_home: Path, monkeypatch,
+) -> None:
+    """Companion to test_partial_apply_pr_url_in_progress_falls_through:
+    confirms the fix is correctly gated on t.pr_url. When t.pr_url is
+    EMPTY (the original stuck-handoff case with no PR yet), the
+    short-circuit MUST still fire — otherwise we'd fall through to the
+    "worker died without PR" branch and incorrectly requeue the task
+    to todo while a reviewer/finisher dispatch may still be in flight.
+    """
+    monkeypatch.setenv("FLEET_HOME", str(fleet_home))
+    project = "fleet"
+
+    # Stuck handoff state, but the worker never opened a PR yet (the
+    # original rc-listener-impl-v0-12-ed95 shape BEFORE any PR existed).
+    _write_state(fleet_home, project, "stuck-no-pr", {
+        "slug": "stuck-no-pr", "project": project,
+        "phase": "review-pending",
+        "started_at": "2026-05-18T00:00:00Z",
+        "updated_at": "2026-05-18T07:33:00Z",
+    })
+
+    t = _make_task(
+        "stuck-no-pr", status="in-progress",
+        worker_pid=12345, pr_url="",  # no PR yet
+        branch="worker/stuck-no-pr",
+    )
+
+    # _gh_pr_by_branch returns None (no PR on the branch yet, matching
+    # the in-flight handoff case).
+    def no_pr(*a, **kw):
+        return None
+
+    # _gh_pr_checks must NOT run — task has no pr_url and the
+    # short-circuit must keep the fall-through-to-requeue branch closed.
+    def ci_boom(*a, **kw):
+        raise AssertionError(
+            "_gh_pr_checks must not run when t.pr_url is empty in this path",
+        )
+
+    with patch.object(loop, "_pid_alive", return_value=False), \
+         patch.object(loop, "_gh_pr_by_branch", side_effect=no_pr), \
+         patch.object(loop, "_gh_pr_checks", side_effect=ci_boom):
+        actions = loop._reconcile_inflight([t], project, "fleet", home=fleet_home)
+
+    # No action emitted: the mid_phase short-circuit prevented the
+    # legacy "worker died" requeue. The handoff dispatch path owns
+    # recovery for this case.
+    assert actions == [], (
+        f"expected no action (handoff dispatch owns recovery), got {actions}"
+    )

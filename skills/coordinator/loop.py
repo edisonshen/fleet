@@ -2537,7 +2537,24 @@ def _reconcile_inflight(
                 )
                 if action is not None:
                     actions.append(action)
-                continue
+                    continue
+                # Codex iter-6 [P1] partial-apply recovery: if a prior
+                # tick's _apply_reconcile crashed between the set_pr_url
+                # write and the status= write, tasks.md is left at
+                # status=in-progress WITH a durable pr_url, while
+                # state.json is still review-pending/review-done. The
+                # fallback helper short-circuits when t.pr_url is set
+                # (returns None), so a naked `continue` here would skip
+                # the pr_url+CI poll below and leave the task stuck
+                # forever. When the fallback action is None AND
+                # t.pr_url is already present, fall through so the
+                # `if t.pr_url:` block can drive CI -> done/rebase.
+                # When t.pr_url is empty (no recovery available, fresh
+                # stuck-handoff with no PR yet), keep the short-circuit
+                # — falling through would mis-classify it as "worker
+                # died without PR" and requeue to todo.
+                if not t.pr_url:
+                    continue
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
                 phase, pr_url, blocked_reason = terminal
