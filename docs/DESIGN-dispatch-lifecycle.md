@@ -809,10 +809,97 @@ Lessons from the 8-round codex arc inform the test architecture: every state mac
 
 ## Open items before draft-freeze
 
-- [ ] Codex round 3 review of v3 → PASS or NEEDS_REVISION.
-- [ ] `/plan-eng-review` lock-in (after codex clean).
-- [ ] Operator final approval (G2 gate).
-- [ ] After approval: file PR1-PR4 as P1 tasks; dispatch worker on PR1 (vertical slice).
-- [ ] Operator pre-PR1 prep:
-  - [ ] Untracked-file audit decision (`internal/testutil/tmuxtest`).
-  - [ ] Approve pre-migration sweep script (dry-run before --kill).
+- [x] Codex round 3 review of v3 → PASS.
+- [x] `/plan-eng-review` lock-in.
+- [x] Operator final approval (G2 gate).
+- [x] After approval: file PR1-PR4 as P1 tasks; dispatch worker on PR1 (vertical slice).
+- [x] Operator pre-PR1 prep:
+  - [x] Untracked-file audit decision (`internal/testutil/tmuxtest`).
+  - [x] Approve pre-migration sweep script (dry-run before --kill).
+
+---
+
+## 2026-05-18 PR2 SCOPE AMENDMENT (post-#159 land)
+
+PR1 (#156, `d1afda0`) merged 2026-05-15. PR2 worker dispatched 2026-05-16 against base `d1afda0`. PR2 was PAUSED 2026-05-16 after a zombie reviewer subagent ran ~10h and emitted ~33,500 mobile push events. **Independently**, the operator + a separate worker built and shipped `internal/rc/` (PR #159, `d5b3ad0`, merged 2026-05-18T04:52Z) to address RC-listener lifecycle as a separate concern — see `docs/DESIGN-rc-listener-lifecycle.md`. PR #159 explicitly states "RC is not a dispatch claim."
+
+PR2 is now structurally stale: its branch was cut from `d1afda0` and does not include `internal/rc/`. Rebasing onto current `main` will produce massive conflicts (the branch will appear to delete `internal/rc/` from the new base).
+
+A scope-review subagent (Explore, read-only) ran 2026-05-18 and recommended Option B — continue with narrowed scope. The three operator-deferred decisions were resolved by the dd05ec05 coord session 2026-05-18 under the "do not wait for operator input" directive:
+
+### Decision Q1 — `remote_control_inbox` Delivery kind
+
+**RESOLUTION: DROP IT ENTIRELY.**
+
+- Drop the `KindRemoteControlInbox` constant in `internal/dispatch/dispatch.go:~112`.
+- Drop `acquire_remote_control_inbox` in `skills/coordinator/dispatch.py`.
+- Drop the CLI `--kind=remote_control_inbox` widening for `acquire-prompt` and `release`.
+- **DO NOT** migrate `skills/coordinator/remote_control.py:269` to the Delivery controller. PR #159 owns RC lifecycle; `seed_inbox` is RC infrastructure, not a Delivery envelope.
+- Keep the test scaffolding shape for the other 3 Delivery kinds; the PR2 branch already has `delivery_pr2_test.go::TestDeliveryRcRoundTrip` — keep `TestDeliveryHandoffResumeRoundTrip` but DROP the RC round-trip test.
+
+**Why:** PR #159's design (`DESIGN-rc-listener-lifecycle.md`) explicitly states "RC is not a dispatch claim." Adding a Delivery kind for `remote_control_inbox` after RC is independently owned would be a hostile takeover of the RC lifecycle. Keeping a no-op constant is dead code (memory: "no premature abstractions"). Building a Delivery adapter (option c) adds complexity for zero current consumers. Scope-review subagent recommended drop at 8/10 confidence.
+
+### Decision Q2 — Original PR3 disposition
+
+**RESOLUTION: CANCEL PR3 entirely. Stack rewires 4→3 PRs.**
+
+Original PR3 was `coord_spawn_marker` Exclusive + `Replace` operation for atomic coord swap. **PR #151 (`aa0aa67`) already shipped atomic-coord-swap independently** — see `internal/handoffop/atomic_coord_swap.go`.
+
+- Fleet task `dispatch-lifecycle-pr3-r-8ebc` set to `status=abandoned` (2026-05-18) with note "Superseded by PR #151."
+- The original PR4 sweeper/observability/archive-pruner work is now the only remaining stacked PR after PR2. Rename PR4 → PR3 in mental model; do not bother updating the existing fleet task slug.
+- `internal/handoffop/atomic_coord_swap.go` body, `cmd/fleet/dispatch_recovery.go`, `internal/handoffop/replacement_cleanup.go` — these were marked for retirement in original PR3. Triage:
+  - If they're already retired by PR #151's landing, no PR2 action needed.
+  - If they still exist on main, file a P3 follow-up task; do NOT bundle into PR2.
+
+### Decision Q3 — Cleanup-hook retirement timing
+
+**RESOLUTION: SHIP PR2 WITH HOOKS TRANSITIONAL.** Fast-follows are already filed.
+
+PR2's original §"Per-PR code retirement" lists 4 hooks:
+1. `loop.py::_maybe_delete_worker_dir` worker-dir branch
+2. `loop.py::_sweep_done_worker_dirs`
+3. `supervisor.py::forget_agent_id` worker-dir branch
+4. `fleet-guard/inbox.py::archive()`
+
+Only #4 can be retired cleanly in PR2 — the Delivery controller's `Release(preserve=true)` replaces it. The first 3 require **Adoptable claims registered at spawn time**, which needs a `TaskID-at-spawn` fix that's outside PR2's scope.
+
+PR2 ships:
+- Delivery + Exclusive controllers (full).
+- Adoptable controllers (code + tests).
+- Spawn-path registers tmux + agent_record claims (Exclusive only — they have IDs at spawn).
+- Worker_dir / worktree Adoptable claims are NOT registered at spawn (deferred — no TaskID at spawn time without the upstream fix).
+- Hook #4 retired (`fleet-guard/inbox.py::archive()`).
+- Hooks #1-3 marked "DEPRECATED — retires when spawn-path Adoptable registration lands" but still functional.
+- PR2 body documents the transitional state.
+
+Fast-follow tasks already filed:
+- `pr2-fastfollow-retire-wo-6e7f` (P2) — retire `_maybe_delete_worker_dir` worker-dir branch
+- `pr2-fastfollow-spawn-ado-ffd8` (P2) — Adoptable claim registration at spawn
+- `pr2-fastfollow-adoptable-3de5` (P3) — Adoptable claim hook migration
+- `pr2-fastfollow-history-r-24a2` (P3) — history retention for adoption records
+- `pr2-fastfollow-rc-claim-3ac9` (P3) — RC claim alignment (low priority now that PR #159 owns RC)
+- `pr2-fastfollow-worktree-1712` (P3) — worktree adoption follow-up
+- `pr2-fastfollow-rollback-82d0` (P3) — rollback path
+
+**Why:** Memory `feedback_ship_basic_first.md` — "Ship basic functionality fast, then iterate while using." The narrowed PR2 is already large. Bundling the spawn-path TaskID fix would balloon it further and re-trigger the zombie-reviewer hazard that paused PR2 in the first place. Fast-follows are already triaged.
+
+### PR2 rebase mechanics
+
+- Check out `worker/dispatch-lifecycle-pr2-e-396f`.
+- Rebase onto current `origin/main` (note: after the reconcile-pr-by-branch PR lands, HEAD will advance — PR2 worker should rebase onto whatever main HEAD is at dispatch time, not the literal commit cited here).
+- Conflict resolution per Q1: drop ALL `remote_control_inbox` references in:
+  - `internal/dispatch/dispatch.go` (the kind constant)
+  - `internal/dispatch/delivery.go` (Rewrite + 2 new kinds → keep only `handoff_resume_inbox`)
+  - `cmd/fleet/claims.go` (drop the `--kind=remote_control_inbox` path)
+  - `cmd/fleet/claims_pr2_test.go` + `cmd/fleet/testdata/claims/acquire-prompt-remote-control-acquired.json` (drop)
+  - `skills/coordinator/dispatch.py` (`acquire_remote_control_inbox` + `KIND_REMOTE_CONTROL_INBOX`)
+  - `skills/coordinator/remote_control.py:269` — leave the existing `seed_inbox` path unchanged
+  - `internal/dispatch/delivery_pr2_test.go` (drop the RC round-trip test)
+- Keep ALL other PR2 work: Exclusive controllers, Adoptable controllers, handoff_resume_inbox Rewrite, CLI subtree (minus RC), spawn-path tmux+agent_record claims, hook #4 retirement.
+- Open as NEW PR (the old branch was never pushed to origin).
+
+Expected dispatch shape: 1 rebase worker → reviewer loop (codex + /review, 2-4 rounds typical given the rebase surface) → finisher pushes + opens PR.
+
+### Restoration note (2026-05-18)
+
+This SCOPE AMENDMENT section was inadvertently destroyed once during the reconcile-pr-by-branch worker's working-tree cleanup at Phase 4 (the worker reverted what it perceived as unrelated diff hunks). Restored from coord memory. The PR2 rebase worker dispatched 2026-05-18 must re-read this design doc on its first turn (or after any `git checkout` it performs) to pick up the amendment.

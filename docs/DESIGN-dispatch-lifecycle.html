@@ -289,6 +289,14 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 <li><a href="#risks-mitigations">Risks &amp; mitigations</a></li>
 <li><a href="#decision-log">Decision log</a></li>
 <li><a href="#open-items-before-draft-freeze">Open items before draft-freeze</a></li>
+<li><a href="#2026-05-18-pr2-scope-amendment-post-159-land">2026-05-18 PR2 SCOPE AMENDMENT (post-#159 land)</a><ul>
+<li><a href="#decision-q1-remote_control_inbox-delivery-kind">Decision Q1 — remote_control_inbox Delivery kind</a></li>
+<li><a href="#decision-q2-original-pr3-disposition">Decision Q2 — Original PR3 disposition</a></li>
+<li><a href="#decision-q3-cleanup-hook-retirement-timing">Decision Q3 — Cleanup-hook retirement timing</a></li>
+<li><a href="#pr2-rebase-mechanics">PR2 rebase mechanics</a></li>
+<li><a href="#restoration-note-2026-05-18">Restoration note (2026-05-18)</a></li>
+</ul>
+</li>
 </ul>
 </div>
 
@@ -296,7 +304,7 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
   <main>
     <div class="doc-meta">
       <strong>Source:</strong> <code>DESIGN-dispatch-lifecycle.md</code> &mdash;
-      <strong>Rendered:</strong> 2026-05-16 00:44 UTC &mdash;
+      <strong>Rendered:</strong> 2026-05-18 07:36 UTC &mdash;
       Agents read the <code>.md</code>; humans read the <code>.html</code>.
     </div>
     <h1 id="design-dispatch-lifecycle-primitive-v9-draft">DESIGN: Dispatch Lifecycle Primitive — v9 draft<a class="anchor" href="#design-dispatch-lifecycle-primitive-v9-draft" title="Permalink to this section">¶</a></h1>
@@ -1324,14 +1332,82 @@ fleet claims inspect &lt;dispatch-id&gt;  # JSON output for tooling
 <hr>
 <h2 id="open-items-before-draft-freeze">Open items before draft-freeze<a class="anchor" href="#open-items-before-draft-freeze" title="Permalink to this section">¶</a></h2>
 <ul>
-<li>[ ] Codex round 3 review of v3 → PASS or NEEDS_REVISION.</li>
-<li>[ ] <code>/plan-eng-review</code> lock-in (after codex clean).</li>
-<li>[ ] Operator final approval (G2 gate).</li>
-<li>[ ] After approval: file PR1-PR4 as P1 tasks; dispatch worker on PR1 (vertical slice).</li>
-<li>[ ] Operator pre-PR1 prep:</li>
-<li>[ ] Untracked-file audit decision (<code>internal/testutil/tmuxtest</code>).</li>
-<li>[ ] Approve pre-migration sweep script (dry-run before --kill).</li>
+<li>[x] Codex round 3 review of v3 → PASS.</li>
+<li>[x] <code>/plan-eng-review</code> lock-in.</li>
+<li>[x] Operator final approval (G2 gate).</li>
+<li>[x] After approval: file PR1-PR4 as P1 tasks; dispatch worker on PR1 (vertical slice).</li>
+<li>[x] Operator pre-PR1 prep:</li>
+<li>[x] Untracked-file audit decision (<code>internal/testutil/tmuxtest</code>).</li>
+<li>[x] Approve pre-migration sweep script (dry-run before --kill).</li>
 </ul>
+<hr>
+<h2 id="2026-05-18-pr2-scope-amendment-post-159-land">2026-05-18 PR2 SCOPE AMENDMENT (post-#159 land)<a class="anchor" href="#2026-05-18-pr2-scope-amendment-post-159-land" title="Permalink to this section">¶</a></h2>
+<p>PR1 (#156, <code>d1afda0</code>) merged 2026-05-15. PR2 worker dispatched 2026-05-16 against base <code>d1afda0</code>. PR2 was PAUSED 2026-05-16 after a zombie reviewer subagent ran ~10h and emitted ~33,500 mobile push events. <strong>Independently</strong>, the operator + a separate worker built and shipped <code>internal/rc/</code> (PR #159, <code>d5b3ad0</code>, merged 2026-05-18T04:52Z) to address RC-listener lifecycle as a separate concern — see <code>docs/DESIGN-rc-listener-lifecycle.md</code>. PR #159 explicitly states "RC is not a dispatch claim."</p>
+<p>PR2 is now structurally stale: its branch was cut from <code>d1afda0</code> and does not include <code>internal/rc/</code>. Rebasing onto current <code>main</code> will produce massive conflicts (the branch will appear to delete <code>internal/rc/</code> from the new base).</p>
+<p>A scope-review subagent (Explore, read-only) ran 2026-05-18 and recommended Option B — continue with narrowed scope. The three operator-deferred decisions were resolved by the dd05ec05 coord session 2026-05-18 under the "do not wait for operator input" directive:</p>
+<h3 id="decision-q1-remote_control_inbox-delivery-kind">Decision Q1 — <code>remote_control_inbox</code> Delivery kind<a class="anchor" href="#decision-q1-remote_control_inbox-delivery-kind" title="Permalink to this section">¶</a></h3>
+<p><strong>RESOLUTION: DROP IT ENTIRELY.</strong></p>
+<ul>
+<li>Drop the <code>KindRemoteControlInbox</code> constant in <code>internal/dispatch/dispatch.go:~112</code>.</li>
+<li>Drop <code>acquire_remote_control_inbox</code> in <code>skills/coordinator/dispatch.py</code>.</li>
+<li>Drop the CLI <code>--kind=remote_control_inbox</code> widening for <code>acquire-prompt</code> and <code>release</code>.</li>
+<li><strong>DO NOT</strong> migrate <code>skills/coordinator/remote_control.py:269</code> to the Delivery controller. PR #159 owns RC lifecycle; <code>seed_inbox</code> is RC infrastructure, not a Delivery envelope.</li>
+<li>Keep the test scaffolding shape for the other 3 Delivery kinds; the PR2 branch already has <code>delivery_pr2_test.go::TestDeliveryRcRoundTrip</code> — keep <code>TestDeliveryHandoffResumeRoundTrip</code> but DROP the RC round-trip test.</li>
+</ul>
+<p><strong>Why:</strong> PR #159's design (<code>DESIGN-rc-listener-lifecycle.md</code>) explicitly states "RC is not a dispatch claim." Adding a Delivery kind for <code>remote_control_inbox</code> after RC is independently owned would be a hostile takeover of the RC lifecycle. Keeping a no-op constant is dead code (memory: "no premature abstractions"). Building a Delivery adapter (option c) adds complexity for zero current consumers. Scope-review subagent recommended drop at 8/10 confidence.</p>
+<h3 id="decision-q2-original-pr3-disposition">Decision Q2 — Original PR3 disposition<a class="anchor" href="#decision-q2-original-pr3-disposition" title="Permalink to this section">¶</a></h3>
+<p><strong>RESOLUTION: CANCEL PR3 entirely. Stack rewires 4→3 PRs.</strong></p>
+<p>Original PR3 was <code>coord_spawn_marker</code> Exclusive + <code>Replace</code> operation for atomic coord swap. <strong>PR #151 (<code>aa0aa67</code>) already shipped atomic-coord-swap independently</strong> — see <code>internal/handoffop/atomic_coord_swap.go</code>.</p>
+<ul>
+<li>Fleet task <code>dispatch-lifecycle-pr3-r-8ebc</code> set to <code>status=abandoned</code> (2026-05-18) with note "Superseded by PR #151."</li>
+<li>The original PR4 sweeper/observability/archive-pruner work is now the only remaining stacked PR after PR2. Rename PR4 → PR3 in mental model; do not bother updating the existing fleet task slug.</li>
+<li><code>internal/handoffop/atomic_coord_swap.go</code> body, <code>cmd/fleet/dispatch_recovery.go</code>, <code>internal/handoffop/replacement_cleanup.go</code> — these were marked for retirement in original PR3. Triage:</li>
+<li>If they're already retired by PR #151's landing, no PR2 action needed.</li>
+<li>If they still exist on main, file a P3 follow-up task; do NOT bundle into PR2.</li>
+</ul>
+<h3 id="decision-q3-cleanup-hook-retirement-timing">Decision Q3 — Cleanup-hook retirement timing<a class="anchor" href="#decision-q3-cleanup-hook-retirement-timing" title="Permalink to this section">¶</a></h3>
+<p><strong>RESOLUTION: SHIP PR2 WITH HOOKS TRANSITIONAL.</strong> Fast-follows are already filed.</p>
+<p>PR2's original §"Per-PR code retirement" lists 4 hooks:
+1. <code>loop.py::_maybe_delete_worker_dir</code> worker-dir branch
+2. <code>loop.py::_sweep_done_worker_dirs</code>
+3. <code>supervisor.py::forget_agent_id</code> worker-dir branch
+4. <code>fleet-guard/inbox.py::archive()</code></p>
+<p>Only #4 can be retired cleanly in PR2 — the Delivery controller's <code>Release(preserve=true)</code> replaces it. The first 3 require <strong>Adoptable claims registered at spawn time</strong>, which needs a <code>TaskID-at-spawn</code> fix that's outside PR2's scope.</p>
+<p>PR2 ships:
+- Delivery + Exclusive controllers (full).
+- Adoptable controllers (code + tests).
+- Spawn-path registers tmux + agent_record claims (Exclusive only — they have IDs at spawn).
+- Worker_dir / worktree Adoptable claims are NOT registered at spawn (deferred — no TaskID at spawn time without the upstream fix).
+- Hook #4 retired (<code>fleet-guard/inbox.py::archive()</code>).
+- Hooks #1-3 marked "DEPRECATED — retires when spawn-path Adoptable registration lands" but still functional.
+- PR2 body documents the transitional state.</p>
+<p>Fast-follow tasks already filed:
+- <code>pr2-fastfollow-retire-wo-6e7f</code> (P2) — retire <code>_maybe_delete_worker_dir</code> worker-dir branch
+- <code>pr2-fastfollow-spawn-ado-ffd8</code> (P2) — Adoptable claim registration at spawn
+- <code>pr2-fastfollow-adoptable-3de5</code> (P3) — Adoptable claim hook migration
+- <code>pr2-fastfollow-history-r-24a2</code> (P3) — history retention for adoption records
+- <code>pr2-fastfollow-rc-claim-3ac9</code> (P3) — RC claim alignment (low priority now that PR #159 owns RC)
+- <code>pr2-fastfollow-worktree-1712</code> (P3) — worktree adoption follow-up
+- <code>pr2-fastfollow-rollback-82d0</code> (P3) — rollback path</p>
+<p><strong>Why:</strong> Memory <code>feedback_ship_basic_first.md</code> — "Ship basic functionality fast, then iterate while using." The narrowed PR2 is already large. Bundling the spawn-path TaskID fix would balloon it further and re-trigger the zombie-reviewer hazard that paused PR2 in the first place. Fast-follows are already triaged.</p>
+<h3 id="pr2-rebase-mechanics">PR2 rebase mechanics<a class="anchor" href="#pr2-rebase-mechanics" title="Permalink to this section">¶</a></h3>
+<ul>
+<li>Check out <code>worker/dispatch-lifecycle-pr2-e-396f</code>.</li>
+<li>Rebase onto current <code>origin/main</code> (note: after the reconcile-pr-by-branch PR lands, HEAD will advance — PR2 worker should rebase onto whatever main HEAD is at dispatch time, not the literal commit cited here).</li>
+<li>Conflict resolution per Q1: drop ALL <code>remote_control_inbox</code> references in:</li>
+<li><code>internal/dispatch/dispatch.go</code> (the kind constant)</li>
+<li><code>internal/dispatch/delivery.go</code> (Rewrite + 2 new kinds → keep only <code>handoff_resume_inbox</code>)</li>
+<li><code>cmd/fleet/claims.go</code> (drop the <code>--kind=remote_control_inbox</code> path)</li>
+<li><code>cmd/fleet/claims_pr2_test.go</code> + <code>cmd/fleet/testdata/claims/acquire-prompt-remote-control-acquired.json</code> (drop)</li>
+<li><code>skills/coordinator/dispatch.py</code> (<code>acquire_remote_control_inbox</code> + <code>KIND_REMOTE_CONTROL_INBOX</code>)</li>
+<li><code>skills/coordinator/remote_control.py:269</code> — leave the existing <code>seed_inbox</code> path unchanged</li>
+<li><code>internal/dispatch/delivery_pr2_test.go</code> (drop the RC round-trip test)</li>
+<li>Keep ALL other PR2 work: Exclusive controllers, Adoptable controllers, handoff_resume_inbox Rewrite, CLI subtree (minus RC), spawn-path tmux+agent_record claims, hook #4 retirement.</li>
+<li>Open as NEW PR (the old branch was never pushed to origin).</li>
+</ul>
+<p>Expected dispatch shape: 1 rebase worker → reviewer loop (codex + /review, 2-4 rounds typical given the rebase surface) → finisher pushes + opens PR.</p>
+<h3 id="restoration-note-2026-05-18">Restoration note (2026-05-18)<a class="anchor" href="#restoration-note-2026-05-18" title="Permalink to this section">¶</a></h3>
+<p>This SCOPE AMENDMENT section was inadvertently destroyed once during the reconcile-pr-by-branch worker's working-tree cleanup at Phase 4 (the worker reverted what it perceived as unrelated diff hunks). Restored from coord memory. The PR2 rebase worker dispatched 2026-05-18 must re-read this design doc on its first turn (or after any <code>git checkout</code> it performs) to pick up the amendment.</p>
   </main>
 </div>
 </body>
