@@ -221,6 +221,34 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if err := tmux.Available(); err != nil {
 		return err
 	}
+	// v0.12.2 P0 atomic coord-spawn gate. NB-flock per project
+	// (~/.fleet/projects/<p>/.locks/coord-spawn.lock) serializes the
+	// (live-coord-veto + agent-record-write + spawn-invocation) tuple
+	// for concurrent `fleet dispatch --coord-spawn` against the same
+	// project. Closes the TOCTOU race between TUI [a] double-press +
+	// in-flight handoff replacement that produced duplicate coords
+	// for projects-spark on 2026-05-19 (agents 72ea51b4 + 04f00601).
+	//
+	// Acquired BEFORE the veto/records-list read at line ~526; held
+	// through the dead-coord recovery probe, marker write, and
+	// spawn.Spawn; released on runDispatch return via defer.
+	//
+	// The existing live-coord veto at line ~526 stays as defense in
+	// depth: the flock catches in-process / same-host concurrent
+	// dispatchers (the dominant case); the veto still catches
+	// cross-tmux-socket scenarios where the flock file might be on a
+	// different mount.
+	//
+	// Workers / Agent-tool subagents (opts.coordSpawn=false) DO NOT
+	// enter this branch — only coord-spawn dispatches need the gate,
+	// matching the original design's scope.
+	if opts.coordSpawn && opts.project != "" {
+		release, err := acquireCoordSpawnLock(opts.project)
+		if err != nil {
+			return err
+		}
+		defer release()
+	}
 	// Resolve engine BEFORE the rest of the validation so the agent
 	// record's engine field is settled when spawn runs. Precedence:
 	//   1. opts.engine (programmatic only — tests + Options struct;
