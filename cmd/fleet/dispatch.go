@@ -23,6 +23,16 @@ import (
 // pass closures instead).
 var tmuxHasSession = tmux.HasSession
 
+// writeMarkerFn is the seam for the v0.12.1 P0 coord-spawn auto-marker
+// write (DESIGN-rc-coord-auto-marker.md). Production wires
+// rc.WriteMarker; tests stub to exercise the non-fatal-on-failure
+// contract pinned by TestCoordSpawn_MarkerWriteFailure_Degrades.
+//
+// Both dispatch.go (coord-spawn branch) and handoff.go (coord
+// replacement branch) call through this var, so a single test stub
+// covers both auto-marker call sites.
+var writeMarkerFn = rc.WriteMarker
+
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
 type dispatchOpts struct {
@@ -434,6 +444,33 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	var rewrittenExecArgv []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
+
+		// v0.12.1 P0 (DESIGN-rc-coord-auto-marker.md, operator G2
+		// 2026-05-18): coord-spawn auto-opts-in to RC so the
+		// rc.Enabled(project) gate inside injectRemoteControlFlagProject
+		// passes on the same dispatch. Without this, freshly-dispatched
+		// coords spawn with plain claude argv and `/remote-control` +
+		// `fleet rc connect <project>` return `not_enabled` until the
+		// operator manually runs `fleet rc up`.
+		//
+		// Scope carve-out: workers / Agent-tool subagents
+		// (opts.coordSpawn=false) do NOT enter this branch, so the
+		// v0.12 push-storm protection that targeted runaway reviewer
+		// subagents is preserved — only coords are auto-opted-in.
+		//
+		// Empty-project guard mirrors rc.Enabled's defensive shape.
+		// Failure is non-fatal: log a warning and continue with plain
+		// claude argv (operator can still recover with `fleet rc up`).
+		// The marker write happens BEFORE the inject call, in the same
+		// goroutine — no race; same dispatch reads what it just wrote.
+		if opts.project != "" {
+			if err := writeMarkerFn(opts.project); err != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: rc.WriteMarker(%q) failed: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
+					opts.project, err, opts.project)
+			}
+		}
+
 		// Match the daemon prefix from skills/coordinator/remote_control.py
 		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
 		// without this prefix wouldn't attach to the daemon.

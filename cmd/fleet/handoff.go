@@ -710,6 +710,23 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 	// the listener can't see → silent pairing failure post-handoff.
 	// Use the coord session-name shape so the single live listener
 	// matches both fresh-spawn and handoff replacements.
+	// v0.12.1 P0 (DESIGN-rc-coord-auto-marker.md, operator G2
+	// 2026-05-18): handoff replacements ARE coords too — auto-opt-in
+	// to RC so the rc.Enabled gate inside injectRemoteControlFlagProject
+	// below passes. Common case is idempotent (marker already present
+	// from the predecessor coord's auto-write); guards against the
+	// degenerate case where the marker was removed between the
+	// predecessor's spawn and this handoff (e.g. operator ran
+	// `fleet rc down <project>` then realized they want pairing back).
+	// Failure is non-fatal — operator can recover via `fleet rc up`.
+	if oldRec.Project != "" {
+		if err := writeMarkerFn(oldRec.Project); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: rc.WriteMarker(%q) failed during handoff: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
+				oldRec.Project, err, oldRec.Project)
+		}
+	}
+
 	rcSessionName := buildCoordRemoteControlSessionName(newID, oldRec.Project)
 	// v0.12 (DESIGN §"Attach-surface gates" I2): gate on the
 	// per-project rc-enabled marker. Without it (operator hasn't
