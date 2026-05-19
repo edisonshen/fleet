@@ -587,28 +587,36 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	var rewrittenExecArgv []string
 	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
 		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;
-		// codex iter-1 [P1] from the v2 reviewer): acquire the SAME
+		// codex iter-1 [P1] from the v2 reviewer + v3 reviewer codex
+		// iter-1 [P1] on warn-and-continue): acquire the SAME
 		// project-level coord-spawn lock that cmd/fleet/dispatch.go
 		// uses, so a TUI `[a]` racing an in-flight drain replacement
 		// contends on the lock rather than slipping past it.
 		//
-		// Warn-and-continue (not fail-fast) on contention: this drain
-		// path has a queue file ALREADY committed by the producer
-		// (fleet-guard auto-handoff / TUI [h] / crash-recovery retry).
-		// Bailing out would orphan the queue file. The dispatch CLI
-		// can fail-fast because nothing on disk has been mutated yet.
-		// The duplicate-coord risk window persists in the contended
-		// case, but the queue file is preserved for retry — operator
-		// trade documented in design Change 7.
+		// Fail-fast on contention (corrected from design v3 §Change 7
+		// "warn-and-continue" rationale): the design's claim that
+		// "bailing out would orphan the queue file" is the inverse of
+		// the actual semantics. queue.Delete only runs on the SUCCESS
+		// path of spawnAndRetire (line ~387 / line ~796 / line ~868);
+		// returning here BEFORE the spawn preserves the queue file
+		// untouched, and the drain loop (fleet drain / fsnotify
+		// watcher) retries the same queue file in the next cycle by
+		// which time the contending lock holder will have released.
+		// Continuing past contention would actually CONSUME the queue
+		// file AND race — defeating the gate's whole purpose. Codex
+		// surfaced this in the v3 review.
 		release, lockErr := coordlock.Acquire(oldRec.Project)
 		if lockErr != nil {
 			_, _ = fmt.Fprintf(stderr,
 				"warning: coordlock.Acquire(%q) contended during drain handoff: %v "+
-					"(continuing; duplicate-coord risk window is the spawn time)\n",
+					"(deferring; queue file preserved for retry next drain cycle)\n",
 				oldRec.Project, lockErr)
-		} else {
-			defer release()
+			return fmt.Errorf(
+				"drain: coord-spawn lock contended for project %q: %w "+
+					"(queue file preserved for retry)",
+				oldRec.Project, lockErr)
 		}
+		defer release()
 
 		// v0.12.2 P0 (DESIGN-coord-spawn-atomic-gate.md Change 6;
 		// closes PR #163 deferred [P2] (2)): backfill the rc-enabled

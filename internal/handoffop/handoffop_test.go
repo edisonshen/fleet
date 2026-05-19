@@ -1313,10 +1313,17 @@ func TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal(t *testing.T) {
 //
 // Proxy for "concurrent dispatcher": hold coordlock.Acquire(project)
 // directly from this test. Then call Resume to trigger the drain path
-// for the same project. The drain branch should observe the
-// contention via the warning string defined in DESIGN-coord-spawn-
-// atomic-gate.md §Change 7 ("coordlock.Acquire(%q) contended during
-// drain handoff").
+// for the same project. The drain branch MUST fail-fast (return error
+// attributable to the lock) and MUST NOT spawn a replacement agent —
+// the queue file is preserved untouched (queue.Delete only runs on the
+// spawnAndRetire success path, which we bail out of before reaching).
+// The drain loop / fsnotify watcher retries next cycle when the lock
+// holder has released.
+//
+// Codex iter-1 [P1] in the v3 review surfaced that the original
+// warn-and-continue contract from design v3 §Change 7 actually CONSUMED
+// the queue file via queue.Delete on success while racing — defeating
+// the gate's whole purpose. Fail-fast is the correct contract.
 func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -1350,10 +1357,18 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	rerr := Resume(req, qp, 0, stdout, stderr)
 
-	// Drain emits the warning, then continues. The contract is
-	// warn-and-continue per design Change 7 — a queue file is
-	// already committed, so the drain cannot fail-fast like the
-	// dispatch CLI can.
+	// Resume MUST return error and the error MUST be attributable
+	// to the lock contention — that's how drainOne knows to leave
+	// the queue file for retry next cycle.
+	if rerr == nil {
+		t.Fatal("expected drain Resume to return error on lock contention; got nil")
+	}
+	if !strings.Contains(rerr.Error(), "coord-spawn lock contended") {
+		t.Fatalf("expected error to mention 'coord-spawn lock contended'; got: %v", rerr)
+	}
+
+	// Warning still goes to stderr so the operator can see what
+	// happened in real time.
 	if !strings.Contains(stderr.String(), "coordlock.Acquire") {
 		t.Errorf("expected drain stderr to mention coordlock.Acquire contention; got: %q", stderr.String())
 	}
@@ -1361,16 +1376,12 @@ func TestDrainAndDispatch_ShareSameLock(t *testing.T) {
 		t.Errorf("expected drain stderr to mention 'contended during drain handoff'; got: %q", stderr.String())
 	}
 
-	// Resume's overall return is allowed to be nil (warn-and-continue
-	// proceeded to spawn) OR a downstream error unrelated to the
-	// lock contention. The invariant we care about: the lock
-	// contention itself MUST NOT be the cause of any error returned.
-	if rerr != nil && strings.Contains(rerr.Error(), "coordlock.Acquire") {
-		t.Fatalf("lock contention MUST be non-fatal on drain path; surfaced as: %v", rerr)
-	}
-
-	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
-		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	// CRITICAL invariant: no replacement agent record was written.
+	// If a record exists, the drain raced past the lock — the bug
+	// codex iter-1 surfaced.
+	if _, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Fatalf("replacement agent %s was spawned despite lock contention — fail-fast contract broken",
+			req.NewAgentID)
 	}
 }
 
@@ -1414,15 +1425,20 @@ func TestDrain_LockReleasedOnReturn(t *testing.T) {
 	release()
 }
 
-// TestDrain_ContentionDegradesGracefully is T9 (v3 Change 7): the drain
-// block warns-and-continues when the lock is held by another caller.
-// The replacement still spawns and the queue file still gets consumed —
-// the trade documented in design §Change 7 ("Why warn-and-continue
-// (not fail-fast) on drain path") is that the duplicate-coord risk
-// window persists for the contended drain, but the queue file is
-// preserved (the dispatch CLI's fail-fast contract assumes no on-disk
-// commit; the drain path has one).
-func TestDrain_ContentionDegradesGracefully(t *testing.T) {
+// TestDrain_ContentionPreservesQueueFile is T9 (v3 Change 7 corrected
+// per v3 reviewer codex iter-1 [P1]): when the drain hits lock
+// contention, it MUST NOT delete the queue file. The queue file must
+// remain on disk so the next drain cycle / fsnotify-driven retry can
+// re-process it after the lock holder releases.
+//
+// This is the inverse of the original design v3 §Change 7 rationale
+// ("queue file would be orphaned if we bail") — the actual semantics
+// are that queue.Delete only runs on the spawnAndRetire success path
+// (lines ~387, ~796, ~868), so returning early from the
+// isCoordHandoffForAgent block preserves the queue file untouched.
+// Continuing past contention would consume the queue file AND race —
+// defeating the entire atomic gate.
+func TestDrain_ContentionPreservesQueueFile(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 	oldRec := spawnSeedAgent(t)
@@ -1450,25 +1466,29 @@ func TestDrain_ContentionDegradesGracefully(t *testing.T) {
 	stderr := &bytes.Buffer{}
 	rerr := Resume(req, qp, 0, stdout, stderr)
 
-	// The drain MUST continue past the lock contention and spawn
-	// the replacement. The new agent record should be visible after
-	// Resume returns. If Resume returned an error, it must NOT be
-	// attributable to the lock (downstream spawn/retire failures
-	// are unrelated to this assertion).
-	if rerr != nil && strings.Contains(rerr.Error(), "coordlock.Acquire") {
-		t.Fatalf("contention MUST degrade gracefully on drain path; surfaced as fatal: %v", rerr)
+	// Drain MUST fail-fast with the lock-contention error.
+	if rerr == nil {
+		t.Fatal("expected drain Resume to return error on lock contention; got nil")
+	}
+	if !strings.Contains(rerr.Error(), "coord-spawn lock contended") {
+		t.Fatalf("expected error to mention 'coord-spawn lock contended'; got: %v", rerr)
 	}
 
-	if _, lerr := agent.Load(req.NewAgentID); lerr != nil {
-		t.Fatalf("replacement agent record missing after contended drain — drain did not warn-and-continue: %v", lerr)
+	// CRITICAL invariant: queue file MUST still exist on disk.
+	// This is what the next drain cycle picks up to retry.
+	if _, statErr := os.Stat(qp); statErr != nil {
+		t.Fatalf("queue file %s was deleted on lock contention — bug: fleet drain has no retry signal: %v",
+			qp, statErr)
 	}
 
-	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
-		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	// CRITICAL invariant: no replacement agent record was written.
+	if _, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Fatalf("replacement agent %s was spawned despite lock contention — fail-fast contract broken",
+			req.NewAgentID)
 	}
 
-	// Warning shape is fixed by design Change 7 for operator
-	// recognizability.
+	// Warning still emitted to stderr so the operator can see the
+	// contention live.
 	if !strings.Contains(stderr.String(), "coordlock.Acquire") {
 		t.Errorf("expected stderr to mention coordlock.Acquire warning; got: %q", stderr.String())
 	}
