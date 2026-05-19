@@ -25,6 +25,7 @@ import (
 //     lock; serializes ticks of an ALREADY-spawned coord)
 //   - the state-package "state.lock" (per-project tasks.md/learnings.md
 //     write serialization)
+//
 // Different concerns, sibling files under the same .locks/ dir.
 //
 // Mode: LOCK_EX | LOCK_NB. The first dispatcher to acquire holds it
