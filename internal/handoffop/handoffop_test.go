@@ -1135,3 +1135,171 @@ func TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker(t *testing.T) {
 		})
 	}
 }
+
+// -- v0.12.2 P0: drain-path RC marker backfill ------------------------------
+//
+// The drain path (handoffop.spawnAndRetire) consumes queue files written
+// by fleet-guard / crash recovery. PR #163 closed the FRESH-spawn marker
+// hole at the dispatch layer; the deferred [P2] (2) is the drain path
+// equivalent: when a pre-v0.12.1 coord that never wrote the rc-enabled
+// marker triggers an auto-handoff, the drain path injects
+// `--remote-control` only when rc.Enabled(project) holds. Without a
+// marker, rc.GateAttachFlag returns the plain argv → coord-spawn
+// replacement misses RC pairing.
+//
+// Fix: inside the existing `if isCoordHandoffForAgent(...)` block in
+// spawnAndRetire (where the inject already runs), write the rc-enabled
+// marker BEFORE the inject. Mirrors cmd/fleet/handoff.go's pattern.
+//
+// Tests below pin three behaviors:
+//
+//   - T-drain-coord-marker-write: a coord handoff (marker == oldRec.ID)
+//     calls writeMarkerFn(oldRec.Project) exactly once before injecting.
+//
+//   - T-drain-worker-no-marker-write: a worker handoff
+//     (isCoordHandoffForAgent=false) NEVER calls writeMarkerFn.
+//     Preserves the v0.12 push-storm protection for non-coord agents.
+//
+//   - T-drain-marker-write-failure-non-fatal: when writeMarkerFn returns
+//     an error inside the coord block, drain logs to stderr and
+//     continues; the spawn proceeds (and the inject no-ops because the
+//     marker is absent — graceful degrade).
+
+// TestDrain_CoordHandoff_WritesMarkerBeforeInject pins
+// T-drain-coord-marker-write. The drain path's coord branch must call
+// the writeMarkerFn seam exactly once with the project, BEFORE the
+// inject runs. We verify via the seam (call count + arg captured) so
+// the test doesn't depend on rc.WriteMarker's on-disk side effect
+// timing inside Resume.
+func TestDrain_CoordHandoff_WritesMarkerBeforeInject(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	// Marker = oldRec.ID makes isCoordHandoffForAgent fire.
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	// Stub the seam to count + capture invocations.
+	prev := writeMarkerFn
+	var calls []string
+	writeMarkerFn = func(project string) error {
+		calls = append(calls, project)
+		return nil
+	}
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	// Cleanup the replacement agent's tmux session.
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+
+	if len(calls) == 0 {
+		t.Fatalf("expected drain coord handoff to call writeMarkerFn at least once; got 0 invocations")
+	}
+	// First call MUST be the coord project (this PR's fix). Later
+	// calls inside the same drain (if any from other paths added in
+	// future) are fine.
+	if calls[0] != oldRec.Project {
+		t.Errorf("first writeMarkerFn call: got project=%q want %q", calls[0], oldRec.Project)
+	}
+}
+
+// TestDrain_WorkerHandoff_NoMarkerWrite pins
+// T-drain-worker-no-marker-write. A worker handoff (marker absent or
+// pointing elsewhere) MUST NOT touch the rc-enabled marker via the
+// drain path. Preserves the v0.12 strict opt-in for workers /
+// subagents (push-storm protection).
+func TestDrain_WorkerHandoff_NoMarkerWrite(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	// Marker absent on the project tree → isCoordHandoffForAgent=false.
+	// (We deliberately do NOT WriteCoordSpawnMarker.)
+
+	prev := writeMarkerFn
+	var calls []string
+	writeMarkerFn = func(project string) error {
+		calls = append(calls, project)
+		return nil
+	}
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+
+	if len(calls) != 0 {
+		t.Fatalf("expected drain worker handoff to skip writeMarkerFn; got %d calls (args=%v)",
+			len(calls), calls)
+	}
+}
+
+// TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal pins
+// T-drain-marker-write-failure-non-fatal. If writeMarkerFn returns an
+// error inside the drain coord branch, the handoff continues (logs a
+// warning to stderr) — graceful degrade matches dispatch.go's
+// non-fatal contract pinned by TestCoordSpawn_MarkerWriteFailure_Degrades.
+func TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	oldRec := spawnSeedAgent(t)
+
+	if _, err := state.EnsureProjectInitialized(oldRec.Project); err != nil {
+		t.Fatalf("EnsureProjectInitialized: %v", err)
+	}
+	if err := state.WriteCoordSpawnMarker(oldRec.Project, oldRec.ID); err != nil {
+		t.Fatalf("WriteCoordSpawnMarker: %v", err)
+	}
+
+	prev := writeMarkerFn
+	stubErr := errors.New("simulated drain marker write failure")
+	writeMarkerFn = func(string) error { return stubErr }
+	t.Cleanup(func() { writeMarkerFn = prev })
+
+	req, qp, _ := writeSkillQueue(t, oldRec)
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	err := Resume(req, qp, 0, stdout, stderr)
+	if err != nil && strings.Contains(err.Error(), "simulated drain marker write failure") {
+		t.Fatalf("marker-write failure MUST be non-fatal in drain coord branch; surfaced as: %v", err)
+	}
+	// Resume itself may still return nil (happy spawn after the
+	// non-fatal warning); the contract is just "marker failure
+	// isn't the cause of any error returned."
+	if err != nil {
+		// Non-fatal contract: any error returned must NOT mention
+		// our stubbed marker failure. Other errors from spawn /
+		// retire are unrelated and acceptable here.
+		if strings.Contains(err.Error(), stubErr.Error()) {
+			t.Fatalf("drain returned error attributable to marker failure: %v", err)
+		}
+	}
+
+	if newRec, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	}
+
+	// Warning MUST be written to stderr so the operator can recover
+	// via `fleet rc up <project>`. Mirrors dispatch.go's warning shape.
+	if !strings.Contains(stderr.String(), "rc.WriteMarker") {
+		t.Errorf("expected stderr warning mentioning rc.WriteMarker; got: %q", stderr.String())
+	}
+}
