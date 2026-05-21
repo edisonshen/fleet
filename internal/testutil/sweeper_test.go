@@ -18,9 +18,10 @@ import (
 //   - Seed an unrelated `other.sock` — must be kept (out of fleet's
 //     blast radius per feedback_user_owns_tmux_config.md).
 //
-// The sweeper is a thin wrapper over `internal/gc.Reconcile(KindSockets,
-// Apply=true)`; the dir argument exists so the test can run against
-// `t.TempDir()` instead of mutating the operator's real `/tmp/`.
+// The sweeper is a self-contained re-implementation of the KindSockets
+// subset of `internal/gc.Reconcile` — see sweeper.go:14-23 for the
+// import-cycle rationale. The `dir` argument exists so the test can run
+// against `t.TempDir()` instead of mutating the operator's real `/tmp/`.
 //
 // Why the test seeds files via os.WriteFile + os.Chtimes (not via
 // `touch -t ...`): we need deterministic, host-portable mtimes. Calling
@@ -84,28 +85,27 @@ func TestSweep_MissingDir_IsNoop(t *testing.T) {
 	}
 }
 
-// TestSweep_LiveSocketKept pins the live-socket guard: if a stale-by-mtime
-// socket still has a tmux server bound (SocketLive=true in production),
-// the sweeper must NOT remove it. Codex iter-4 fix in internal/gc lives
-// upstream; this test confirms the sweeper inherits the behavior because
-// it routes through gc.Reconcile with the production SocketLive probe.
+// TestSweep_NonDirectoryPath_ReturnsWrappedError pins the error-wrapping
+// contract: if SweepDir is called against a path that exists but is not a
+// directory, it returns a wrapped read error (not a panic). This is the
+// "operator pointed FLEET_TMUX_SOCKET at a file" / "concurrent rename"
+// defensive case.
 //
-// Test strategy: we cannot easily spawn a real tmux server bound to a
-// temp socket inside a unit test (TMUX_TMPDIR path-length quirks on
-// macOS), so instead we seed a stale socket file AND ensure the bound
-// server check is exercised. The production probe runs `tmux -S <path>
-// list-sessions`; on a temp socket file with no server bound, that
-// exits non-zero → SocketLive=false → removal proceeds. This case is
-// already covered by the first test. The live-bound case is fully
-// covered by internal/gc/gc_test.go:TestReconcile_SocketLive_*.
-//
-// This sub-test simply asserts the sweeper does not bypass the
-// gc.Reconcile path by checking that the public API surface is the
-// thin wrapper described in DESIGN.md §PR-B.
-func TestSweep_UsesGCReconcile(t *testing.T) {
-	// Sentinel value: the sweeper should fail gracefully on a path it
-	// cannot read, not panic. We point at a file (not a dir) and expect
-	// a wrapped read error.
+// What this test does NOT cover (intentional gap, documented for the
+// next reader): the live-socket-kept branch (`socketLive() == true`
+// keeps the socket). Spawning a real tmux server on a temp socket
+// inside a unit test is awkward on macOS (TMUX_TMPDIR path-length
+// limits) and the value-add is marginal — the production probe is a
+// 4-line `tmux -S <path> list-sessions` call exercised on every actual
+// `fleet gc` invocation. Per PR-B's import-cycle design call
+// (sweeper.go:14-23), this package does NOT import internal/gc, so the
+// upstream TestReconcile_SocketLive_* tests in internal/gc/gc_test.go
+// no longer cover this sweeper's `socketLive()` — that copy is its own
+// surface. Acceptable because the implementation is a literal one-liner
+// shell-out; if it grows (e.g., flock probing or server-version
+// matching), revisit and add a tmuxtest.RequireTmux-backed coverage
+// test here.
+func TestSweep_NonDirectoryPath_ReturnsWrappedError(t *testing.T) {
 	tmp := t.TempDir()
 	notADir := filepath.Join(tmp, "iamafile")
 	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
