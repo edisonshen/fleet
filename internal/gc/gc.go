@@ -332,6 +332,15 @@ func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
 		if opts.Project != "" && rec.Project != opts.Project {
 			continue
 		}
+		// Empty TmuxSession is unprobeable (codex iter-3 [P1]) — legacy
+		// or partially-populated records would have `tmux has-session
+		// -t ""` rejected with an ambiguous error that COULD match the
+		// "no such session" branch and falsely classify the record as
+		// dead. Mirrors internal/tui/model.go's conservative-treat-as-
+		// live behavior for empty TmuxSession.
+		if strings.TrimSpace(rec.TmuxSession) == "" {
+			continue
+		}
 		alive, perr := deps.SessionAlive(rec.TmuxSession)
 		if perr != nil {
 			// Probe failed — refuse to act on ambiguous state.
@@ -762,6 +771,14 @@ func removeGitWorktree(path string) error {
 // violating feedback_surface_dont_silo.md. The bare directory still
 // shows up under `--project <name>` enumeration so the operator can
 // triage manually.
+//
+// Parser: lightweight fence-aware reader (taskStatusInFile). Codex
+// iter-3 [P1]: an earlier naive line-scanning parser could be spoofed
+// by a `## task: <live-slug>` block embedded inside a fenced markdown
+// example, classifying the live worktree as terminal and removing it
+// under --apply. taskStatusInFile now tracks `inFence` state across
+// the whole file (mirroring internal/tasks/tasks.go parse() at line
+// 241+) so fenced examples cannot impersonate structural headers.
 func isTaskTerminalOnDisk(project, slug string) (bool, error) {
 	dir, err := state.ProjectDir(project)
 	if err != nil {
@@ -781,17 +798,37 @@ func isTaskTerminalOnDisk(project, slug string) (bool, error) {
 	return false, nil
 }
 
-// taskStatusInFile parses one tasks.md file looking for `## task: <slug>`
-// followed by a `- status: <value>` bullet within the block. Returns:
+// taskStatusInFile parses one tasks.md / tasks-archive.md file looking
+// for `## task: <slug>` followed by a `- status: <value>` bullet
+// within the block. Returns:
 //
 //	terminal=true, found=true   — status is done or abandoned
 //	terminal=false, found=true  — status is anything else
 //	found=false                 — slug not present in this file
 //
-// The parser is deliberately minimal: we don't want to depend on the
-// full tasks package (it pulls in a per-project flock) for a read-only
-// status check. The grammar is stable (ENG §3.1) and the parse here
-// only cares about two tokens.
+// Fence-aware: lines inside ```-delimited fenced code blocks are body
+// content, NOT structural headers. Codex iter-3 [P1]: without this
+// guard, a `## task: <live-slug>` block embedded inside a fenced
+// markdown example could spoof a terminal status for the live worktree
+// and `fleet gc --apply --kinds worktrees` would delete it. The
+// canonical parser at internal/tasks/tasks.go enforces the same fence
+// rule (`inFence` toggle); we replicate the toggle here rather than
+// call tasks.Read because the canonical reader is strict about the 10
+// required bullets (status, priority, worker_pid, ...) which legitimate
+// hand-edited / pre-v0.6 task files may not carry. Surface-don't-silo
+// + only-care-about-status → narrowest fence-aware reader is the right
+// shape for a read-only sweep classifier.
+//
+// Grammar (subset of ENG §3.1):
+//
+//	task-header := "## task: " <slug>
+//	body        := lines until next ## header or EOF, fences inert
+//	status      := "- status: " <value>
+//
+// The parser is deliberately minimal (no validator for the other
+// 9 bullets) because gc only needs the status token; richer parsing
+// would re-create the brittleness the canonical reader's strict mode
+// exposes.
 func taskStatusInFile(path, slug string) (terminal, found bool, err error) {
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
@@ -802,15 +839,38 @@ func taskStatusInFile(path, slug string) (terminal, found bool, err error) {
 	}
 	wantHeader := "## task: " + slug
 	lines := strings.Split(string(data), "\n")
+	inFence := false
 	for i, line := range lines {
+		// Fence toggle MUST run before the header check so that the
+		// opening ``` itself doesn't get mistaken for body content of
+		// the previous block. Mirrors internal/tasks/tasks.go parse()
+		// at line 241+.
+		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
 		trimmed := strings.TrimSpace(line)
 		if trimmed != wantHeader {
 			continue
 		}
 		// Scan forward until the next `## ` header (block boundary) or
-		// EOF, looking for `- status:` bullet.
+		// EOF, looking for `- status:` bullet. Honor fence state in
+		// the inner scan too — a fenced block inside Notes can
+		// legitimately contain `- status: done` as example text.
+		innerFence := false
 		for j := i + 1; j < len(lines); j++ {
-			lt := strings.TrimSpace(lines[j])
+			lj := lines[j]
+			if strings.HasPrefix(strings.TrimLeft(lj, " \t"), "```") {
+				innerFence = !innerFence
+				continue
+			}
+			if innerFence {
+				continue
+			}
+			lt := strings.TrimSpace(lj)
 			if strings.HasPrefix(lt, "## ") {
 				break
 			}

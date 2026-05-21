@@ -810,3 +810,93 @@ func TestReconcile_OrphanTmux_FreshnessFromDeps_FallsThroughPastWindow(t *testin
 		t.Fatalf("verb=%q want %q", a.Verb, VerbSurface)
 	}
 }
+
+// ----- codex iter-3 [P1] regression tests -----
+
+// TestIsTaskTerminalOnDisk_FencedSpoofIgnored pins the fix for codex
+// iter-3 [P1]: the naive line-scanning parser could be tricked by a
+// `## task: <live-slug>` block embedded inside a fenced markdown
+// example, classifying a live worktree as terminal and removing it
+// under --apply. Switching to the canonical tasks.Read parser
+// (internal/tasks/tasks.go parse() honors `inFence`) closes the hole.
+//
+// Test layout: an in-progress task with the SAME slug appears verbatim
+// inside a fenced code block in tasksMD. The naive parser saw the
+// fenced occurrence and reported done. The canonical parser sees
+// only the real header (the first one) which is in-progress.
+func TestIsTaskTerminalOnDisk_FencedSpoofIgnored(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Build the file content carefully — the fenced block reproduces
+	// the exact shape the naive parser used to misread. The canonical
+	// parser MUST treat the fenced text as body content of the live
+	// task and refuse to classify it as terminal.
+	tasksMD := "## task: live-slug-aaaa\n" +
+		"- status: in-progress\n" +
+		"- priority: P1\n" +
+		"- created: 2026-05-20T00:00:00Z\n" +
+		"- updated: 2026-05-20T00:00:00Z\n" +
+		"\n" +
+		"### Notes\n" +
+		"Example of a done block (do NOT reap me):\n" +
+		"```markdown\n" +
+		"## task: live-slug-aaaa\n" +
+		"- status: done\n" +
+		"```\n"
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tasksMD), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	terminal, err := isTaskTerminalOnDisk("alpha", "live-slug-aaaa")
+	if err != nil {
+		t.Fatalf("isTaskTerminalOnDisk: %v", err)
+	}
+	if terminal {
+		t.Fatalf("fenced-done block spoofed isTaskTerminalOnDisk; expected false (the real header is in-progress)")
+	}
+}
+
+// TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped pins the fix
+// for codex iter-3 [P1]: legacy / partially populated agent records
+// with empty TmuxSession would get `tmux has-session -t ""` probed,
+// which CAN match an ambiguous error string and falsely classify the
+// record as dead → archive. Skip empty sessions entirely.
+func TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		return []*agent.Record{
+			{ID: "legacy-record-aabb", TmuxSession: ""}, // empty session
+		}, nil
+	}
+	probed := false
+	deps.SessionAlive = func(string) (bool, error) {
+		probed = true
+		// If we ever get here, the test FAILS — we should never probe
+		// an empty session name.
+		return false, nil
+	}
+	var archived []string
+	deps.ArchiveAgent = func(r *agent.Record) error {
+		archived = append(archived, r.ID)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindOrphanAgents}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if probed {
+		t.Fatalf("SessionAlive was called for empty TmuxSession; must be skipped before probe")
+	}
+	if len(archived) != 0 {
+		t.Fatalf("archived %v for empty TmuxSession; must be skipped", archived)
+	}
+	if _, ok := findAction(got, KindOrphanAgents, "legacy-record-aabb"); ok {
+		t.Fatalf("legacy empty-session record produced action: %+v", got.Actions)
+	}
+}
