@@ -899,6 +899,37 @@ func TestReconcile_SocketLive_PreservesBoundSocket(t *testing.T) {
 	}
 }
 
+// TestReconcile_SocketLive_PreservesBoundSocketInDryRun pins the fix
+// for codex iter-5 [P2]: dry-run must show the SAME planned action
+// as --apply (the report IS the plan). Without applying SocketLive
+// in dry-run, an operator running `fleet gc` would see
+// `verb=would-remove` for a bound socket that `fleet gc --apply`
+// would actually surface.
+func TestReconcile_SocketLive_PreservesBoundSocketInDryRun(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour)
+	deps := stubDeps(now)
+	livePath := "/tmp/fleet-test-dryrun-bind.sock"
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: livePath, ModTime: old}}, nil
+	}
+	deps.SocketLive = func(p string) bool { return p == livePath }
+
+	// Apply=false (dry-run) — must STILL surface the live-bound socket.
+	got, err := Reconcile(Options{Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindSockets}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindSockets, livePath)
+	if !ok {
+		t.Fatalf("dry-run did not surface live-bound socket: %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dry-run verb=%q want %q (must match --apply behavior)", a.Verb, VerbSurface)
+	}
+}
+
 // TestReconcile_SocketLive_DeadSocketStillRemoved is the negative
 // counterpart: when SocketLive returns false, the classifier removes
 // the socket as before. Confirms the new gate doesn't accidentally

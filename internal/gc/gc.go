@@ -309,7 +309,13 @@ func reconcileSockets(r *Report, opts Options, deps Deps) error {
 		// bound server (subsequent `tmux -S <sock>` from new clients
 		// would fail to connect). Surface (don't remove) when a live
 		// server still responds.
-		if opts.Apply && deps.SocketLive != nil && deps.SocketLive(s.Path) {
+		//
+		// Apply this gate in BOTH dry-run and apply mode (codex iter-5
+		// [P2]): the dry-run report is the planned-action list, so it
+		// must agree with what --apply will actually do. Without this,
+		// dry-run prints `verb=would-remove` for a socket --apply would
+		// surface, which silently misleads operators.
+		if deps.SocketLive != nil && deps.SocketLive(s.Path) {
 			r.Actions = append(r.Actions, Action{
 				Kind: KindSockets, Target: s.Path, Verb: VerbSurface,
 				Reason: fmt.Sprintf("age=%s exceeds max-age=%s but tmux server still bound (keeping); kill the server first if you want to reap",
