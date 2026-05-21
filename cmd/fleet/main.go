@@ -115,6 +115,7 @@ Engine selection:
 	root.AddCommand(newClaimsCmd())
 	root.AddCommand(newRCCmd())
 	root.AddCommand(newGCCmd())
+	root.AddCommand(newCoordRunCmd())
 	return root
 }
 

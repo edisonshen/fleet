@@ -4,10 +4,10 @@
 //
 // The three side-effects MUST all fire on every call:
 //
-//	1. tmux.Kill(session)  — best-effort, non-fatal.
-//	2. Move ~/.fleet/agents/<id>.json → ~/.fleet/agents/archive/<id>-<UTC-ts>.json.
-//	3. Remove ~/.fleet/projects/<p>/.locks/coord-spawn-marker if its
-//	   body equals <id>. Other-ID markers are preserved.
+//  1. tmux.Kill(session)  — best-effort, non-fatal.
+//  2. Move ~/.fleet/agents/<id>.json → ~/.fleet/agents/archive/<id>-<UTC-ts>.json.
+//  3. Remove ~/.fleet/projects/<p>/.locks/coord-spawn-marker if its
+//     body equals <id>. Other-ID markers are preserved.
 //
 // Panic-safety: each step runs in its own goroutine-local
 // `func() { defer recover(); ... }()` so a panic in one (e.g. a buggy
@@ -77,7 +77,10 @@ func TestCleanup_CleanExitPath(t *testing.T) {
 	const (
 		agentID = "abcd1234"
 		project = "test-project"
-		session = "fleet-coord-abcd1234-test-project"
+		// tmux.SessionName is the canonical "fleet-<id>"; coord-spawn
+		// records this as the agent's TmuxSession, and Cleanup uses the
+		// same helper to derive what to kill.
+		session = "fleet-abcd1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
 	markerPath := writeMarker(t, project, agentID)
@@ -171,7 +174,7 @@ func TestCleanup_MarkerClearedWhenMatched(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			helperFleetHome(t)
 			const project = "marker-test"
-			writeAgentRecord(t, tc.agentID, project, "fleet-coord-"+tc.agentID+"-"+project)
+			writeAgentRecord(t, tc.agentID, project, "fleet-"+tc.agentID)
 			markerPath := writeMarker(t, project, tc.markerBody)
 
 			deps := Deps{KillTmux: func(string) error { return nil }}
@@ -199,7 +202,7 @@ func TestCleanup_PanicViaDefer(t *testing.T) {
 	const (
 		agentID = "panic1234"
 		project = "panic-test"
-		session = "fleet-coord-panic1234-panic-test"
+		session = "fleet-panic1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
 	markerPath := writeMarker(t, project, agentID)
@@ -244,7 +247,7 @@ func TestCleanup_IdempotentOnMissingRecord(t *testing.T) {
 	const (
 		agentID = "idem1234"
 		project = "idem-test"
-		session = "fleet-coord-idem1234-idem-test"
+		session = "fleet-idem1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
 	writeMarker(t, project, agentID)
@@ -268,7 +271,7 @@ func TestCleanup_TmuxKillErrorIsNonFatal(t *testing.T) {
 	const (
 		agentID = "errk1234"
 		project = "errk-test"
-		session = "fleet-coord-errk1234-errk-test"
+		session = "fleet-errk1234"
 	)
 	writeAgentRecord(t, agentID, project, session)
 	markerPath := writeMarker(t, project, agentID)

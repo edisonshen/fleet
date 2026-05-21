@@ -85,7 +85,7 @@ func TestCoordRun_CleanExitPath(t *testing.T) {
 	const (
 		agentID = "exit1234"
 		project = "exit-test"
-		session = "fleet-coord-exit1234-exit-test"
+		session = "fleet-exit1234"
 	)
 	markerPath := coordRunTestHome(t, agentID, project, session)
 
@@ -114,7 +114,7 @@ func TestCoordRun_SignalReapsTmuxAndArchivesRecord(t *testing.T) {
 	const (
 		agentID = "sig12345"
 		project = "sig-test"
-		session = "fleet-coord-sig12345-sig-test"
+		session = "fleet-sig12345"
 	)
 	markerPath := coordRunTestHome(t, agentID, project, session)
 
@@ -161,7 +161,7 @@ func TestCoordRun_PanicViaDefer(t *testing.T) {
 	const (
 		agentID = "pan12345"
 		project = "pan-test"
-		session = "fleet-coord-pan12345-pan-test"
+		session = "fleet-pan12345"
 	)
 	markerPath := coordRunTestHome(t, agentID, project, session)
 
@@ -205,7 +205,7 @@ func TestCoordRun_RealOSSignal(t *testing.T) {
 	const (
 		agentID = "ossig123"
 		project = "ossig-test"
-		session = "fleet-coord-ossig123-ossig-test"
+		session = "fleet-ossig123"
 	)
 	markerPath := coordRunTestHome(t, agentID, project, session)
 
