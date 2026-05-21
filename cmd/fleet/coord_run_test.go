@@ -244,3 +244,54 @@ func TestCoordRun_RealOSSignal(t *testing.T) {
 	}
 	assertCleanupRan(t, agentID, markerPath)
 }
+
+// TestCoordRun_RealOSSignal_SIGHUP pins the codex iter-1 P1 fix:
+// `tmux kill-window` / `tmux kill-session` sends SIGHUP, not SIGTERM,
+// to the pane's foreground process. If notifyCoordRun doesn't trap
+// SIGHUP, the Go default action (terminate without running defers)
+// fires and cleanup is skipped — exactly the failure mode PR-C is
+// supposed to eliminate. This test sends a real SIGHUP to the current
+// process and asserts cleanup ran end-to-end.
+//
+// Skipped when FLEET_SKIP_SIGNAL_TESTS is set (same gate as the SIGTERM
+// variant) so CI containers that can't deliver signals reliably don't
+// abort the whole suite.
+func TestCoordRun_RealOSSignal_SIGHUP(t *testing.T) {
+	if os.Getenv("FLEET_SKIP_SIGNAL_TESTS") != "" {
+		t.Skip("FLEET_SKIP_SIGNAL_TESTS set; skipping real-OS-signal test")
+	}
+	const (
+		agentID = "hup12345"
+		project = "hup-test"
+		session = "fleet-hup12345"
+	)
+	markerPath := coordRunTestHome(t, agentID, project, session)
+
+	opts := coordRunOpts{
+		agentID:  agentID,
+		project:  project,
+		session:  session,
+		argv:     []string{"sleep", "30"},
+		killTmux: func(string) error { return nil },
+	}
+
+	ready := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- notifyCoordRun(opts.withReady(func() { close(ready) }), os.Stdout, os.Stderr)
+	}()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("notifyCoordRun did not signal ready within 5s")
+	}
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("kill self with SIGHUP: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("notifyCoordRun did not return within 10s of SIGHUP")
+	}
+	assertCleanupRan(t, agentID, markerPath)
+}

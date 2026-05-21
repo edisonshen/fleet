@@ -146,20 +146,27 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 // runCoordRun in isolation (with their own context) AND the real
 // signal-handler path end-to-end.
 //
-// SIGTERM + SIGINT are the two operator-issued kill signals fleet
-// cares about:
-//   - SIGTERM is what `tmux kill-window` / `tmux kill-session` send
-//     to the foreground process; the operator using Fleet's normal
-//     kill paths from the TUI hits this code path.
+// SIGTERM + SIGINT + SIGHUP are the three operator-issued kill signals
+// fleet cares about:
+//   - SIGHUP is what tmux sends to the pane's foreground process when
+//     the pane / window / session is torn down (`tmux kill-window`,
+//     `tmux kill-session`, `tmux kill-server`, or the operator detaches
+//     a session whose `remain-on-exit` is off and the last process is
+//     reaped). Without trapping SIGHUP, the Go default action is to
+//     terminate WITHOUT running defers — exactly the bug the cleanup
+//     defer is supposed to fix. Trap it explicitly. (Codex iter-1 P1.)
+//   - SIGTERM is what `kill <pid>` / `tmux kill-session -t <name>`
+//     (when the session has no tty client) sends to the foreground
+//     process; standard graceful-kill signal.
 //   - SIGINT is Ctrl-C inside an attached session.
 //
-// Both cancel the child's context, which exec.CommandContext
-// translates to SIGTERM on the child (cancel-the-cmd, not the
-// process directly — that gives the child a moment to flush before
-// the kernel reaps it).
+// All three cancel the child's context, which exec.CommandContext
+// translates to SIGKILL on the child after a short grace period
+// (cancel-the-cmd, not the process directly — that gives the child a
+// moment to flush before the kernel reaps it).
 func notifyCoordRun(opts coordRunOpts, stdout, stderr io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(),
-		syscall.SIGTERM, syscall.SIGINT)
+		syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer cancel()
 	// Synchronization hook for tests that need to know the handler is
 	// installed before they send a signal. Production leaves nil.
