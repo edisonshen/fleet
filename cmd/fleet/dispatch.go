@@ -23,6 +23,16 @@ import (
 // pass closures instead).
 var tmuxHasSession = tmux.HasSession
 
+// writeMarkerFn is the seam for the v0.12.1 P0 coord-spawn auto-marker
+// write (DESIGN-rc-coord-auto-marker.md). Production wires
+// rc.WriteMarker; tests stub to exercise the non-fatal-on-failure
+// contract pinned by TestCoordSpawn_MarkerWriteFailure_Degrades.
+//
+// Both dispatch.go (coord-spawn branch) and handoff.go (coord
+// replacement branch) call through this var, so a single test stub
+// covers both auto-marker call sites.
+var writeMarkerFn = rc.WriteMarker
+
 // dispatchOpts captures cobra-parsed flags so the run() func is testable
 // without poking at globals.
 type dispatchOpts struct {
@@ -434,25 +444,19 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	var rewrittenExecArgv []string
 	if opts.coordSpawn {
 		preAllocatedID = agent.NewID()
-		// Match the daemon prefix from skills/coordinator/remote_control.py
-		// (`--remote-control-session-name-prefix "fleet-coord"`). Names
-		// without this prefix wouldn't attach to the daemon.
-		//
-		// Project suffix (rc-session-name-include): the
-		// operator-visible session name on claude.ai mobile / web is
-		// `fleet-coord-<id>-<project>` so coords across multiple
-		// projects (spark, fleet, rainier, ...) can be told apart.
-		// Suffix-extension keeps the legacy `fleet-coord-<id>`
-		// substring intact for pidresolver disambiguator matching.
-		rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
-		rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
-		// Only set ExecCommand when the rewrite actually changed
-		// something — passing through an unchanged custom --command
-		// avoids a no-op divergence between Command and ExecCommand
-		// in spawn.Options.
-		if !sameCommand(rewritten, opts.command) {
-			rewrittenExecArgv = rewritten
-		}
+		// v0.12.1 P0: marker write + fresh-spawn inject were originally
+		// here, before the early-refusal gates (ListStrict, live-coord
+		// veto, FLEET_MAX_SESSIONS, dead-coord recovery). Codex review
+		// iter-4 [P1] caught the lifecycle hole: writing the rc-enabled
+		// marker before knowing whether the spawn will actually proceed
+		// can persist RC opt-in for a project even when the spawn is
+		// refused. The pathological case: operator runs `fleet rc down
+		// <project>`, then `fleet dispatch --coord-spawn` writes the
+		// marker back, then the live-coord veto refuses (existing coord
+		// alive) — net effect is the opt-out is silently undone with
+		// no new coord. Both moved DOWN to after the gates, immediately
+		// before spawn.Spawn (see "v0.12.1 deferred marker+inject" block
+		// near line ~724).
 	}
 
 	// Pre-fetch the agent record list ONCE so the live-coord veto AND
@@ -710,6 +714,58 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if !opts.noAutoResumeExplicit && oldRecord != nil && oldRecord.DisableAutoResume {
 		disableAutoResume = true
 	}
+
+	// v0.12.1 P0 deferred marker+inject (DESIGN-rc-coord-auto-marker.md,
+	// operator G2 2026-05-18; codex review iter-4 [P1]): coord-spawn
+	// auto-opts-in to RC so the rc.Enabled(project) gate inside
+	// injectRemoteControlFlagProject passes on the same dispatch.
+	// Without this, freshly-dispatched coords spawn with plain claude
+	// argv and `/remote-control` + `fleet rc connect <project>` return
+	// `not_enabled` until the operator manually runs `fleet rc up`.
+	//
+	// Runs HERE (after ListStrict / live-coord veto / FLEET_MAX_SESSIONS
+	// / dead-coord recovery — all the gates that can refuse the spawn),
+	// not back at the original site near line ~445. Earlier placement
+	// could persist the rc-enabled marker even when the spawn was
+	// rejected, silently undoing an operator's `fleet rc down`.
+	//
+	// Scope carve-out: workers / Agent-tool subagents
+	// (opts.coordSpawn=false) do NOT enter this branch, so the v0.12
+	// push-storm protection that targeted runaway reviewer subagents
+	// is preserved — only coords are auto-opted-in.
+	//
+	// Recovery-spawn argv inheritance (the inject inside the
+	// findRecoveryCandidate block above at line ~673) ALSO consumes
+	// this marker: that path runs AFTER the gates so its inject
+	// either reads the marker we just wrote here, or — if recovery
+	// already wrote rewrittenExecArgv — we leave it untouched
+	// (sameCommand short-circuit below).
+	//
+	// Failure is non-fatal: log a warning and continue with plain
+	// claude argv (operator can still recover with `fleet rc up`).
+	if opts.coordSpawn && opts.project != "" {
+		if err := writeMarkerFn(opts.project); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: rc.WriteMarker(%q) failed: %v (continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
+				opts.project, err, opts.project)
+		}
+		// Only inject when the recovery path didn't already set
+		// rewrittenExecArgv (skips wasted work + avoids double-rewriting
+		// a custom command). The recovery-spawn inject at line ~673
+		// runs inside the dead-coord-recovery branch; if it fired,
+		// rewrittenExecArgv is set and we honor it as-is. Otherwise,
+		// this is a fresh-spawn coord (or a recovery that inherited
+		// the engine-default wrapper without inheriting opts.command)
+		// and we do the rewrite here.
+		if rewrittenExecArgv == nil {
+			rcSessionName := buildCoordRemoteControlSessionName(preAllocatedID, opts.project)
+			rewritten := injectRemoteControlFlagProject(opts.command, rcSessionName, opts.project)
+			if !sameCommand(rewritten, opts.command) {
+				rewrittenExecArgv = rewritten
+			}
+		}
+	}
+
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,

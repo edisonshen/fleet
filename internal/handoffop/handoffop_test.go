@@ -1082,3 +1082,56 @@ func TestResume_PreCommitStaleNewRec_OldAlive_StillRespawns(t *testing.T) {
 		t.Errorf("oldRec should be archived after successful swap: err=%v", lerr)
 	}
 }
+
+// TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker is the codex
+// review iter-7 [P1] regression: spawnAndRetire's --remote-control
+// inject (rc.GateAttachFlag) MUST gate on whether the OLD agent is
+// the project's coord, not just on the project-wide rc-enabled
+// marker. Without this, a worker handoff resumed via fleet drain /
+// crash recovery would silently inherit RC attach once the v0.12.1
+// coord-spawn auto-write had marked the project — defeating the
+// strict opt-in carve-out for workers / subagents.
+//
+// Mirrors cmd/fleet/handoff.go's predicate test (T6) for the auto-
+// drain path. Tests the predicate directly because spawnAndRetire's
+// inject site is a 1-line gated expression — the predicate's
+// correctness IS the gate's correctness, and exercising it through
+// spawn.Spawn would require either tmux or a deeper test double.
+func TestIsCoordHandoffForAgent_GatesOnCoordSpawnMarker(t *testing.T) {
+	const project = "test-drain-gate"
+	const coordID = "ccccdddd"
+	const workerID = "wwwweeee"
+
+	cases := []struct {
+		name      string
+		project   string
+		agentID   string
+		setMarker string
+		want      bool
+	}{
+		{"empty project rejects", "", coordID, "", false},
+		{"unset marker rejects", project, coordID, "", false},
+		{"marker points elsewhere rejects",
+			project, workerID, coordID, false},
+		{"marker matches agentID accepts",
+			project, coordID, coordID, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupFleetHome(t)
+			if tc.setMarker != "" {
+				if _, err := state.EnsureProjectInitialized(tc.project); err != nil {
+					t.Fatalf("EnsureProjectInitialized: %v", err)
+				}
+				if err := state.WriteCoordSpawnMarker(tc.project, tc.setMarker); err != nil {
+					t.Fatalf("WriteCoordSpawnMarker: %v", err)
+				}
+			}
+			got := isCoordHandoffForAgent(tc.project, tc.agentID)
+			if got != tc.want {
+				t.Errorf("isCoordHandoffForAgent(%q, %q) with marker=%q: got %v, want %v",
+					tc.project, tc.agentID, tc.setMarker, got, tc.want)
+			}
+		})
+	}
+}

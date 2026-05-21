@@ -47,6 +47,25 @@ var sessionListProbe = tmux.ListSessions
 // so tests inject deterministic fakes.
 var sessionAliveProbe = tmux.SessionAlive
 
+// isCoordHandoffForAgent reports whether (project, agentID) identifies
+// the project's current coord — i.e. the coord-spawn marker resolves
+// to agentID. spawnAndRetire calls this to gate the v0.12.1 RC inject
+// (codex review iter-7 [P1]): worker handoffs that happen during
+// fleet drain / crash recovery must NOT silently inherit
+// --remote-control just because the project is RC-enabled — that
+// would reopen the v0.12 push-storm class for the auto-drained
+// successor agent.
+//
+// Mirrors cmd/fleet/handoff.go's isCoordHandoffForProject (same
+// predicate, package-local copy to keep the handoffop package self-
+// contained without importing cmd/fleet/main).
+func isCoordHandoffForAgent(project, agentID string) bool {
+	if project == "" {
+		return false
+	}
+	return state.ReadCoordSpawnMarker(project) == agentID
+}
+
 // Resume completes a handoff for which the queue file already exists.
 // Two producers create such queue files:
 //
@@ -530,9 +549,28 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// without going through cmd/fleet's wrapper, so the dedicated
 	// helper carries the same FLEET_RC_BOOTSTRAP_DISABLED + rc.Enabled
 	// two-layer gate (rather than re-implementing it here).
-	rewrittenExecArgv := rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
-	if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
-		rewrittenExecArgv = nil
+	//
+	// v0.12.1 codex review iter-7 [P1]: ALSO gate on isCoordHandoff
+	// — the project-wide rc-enabled marker is now auto-written by
+	// coord-spawn (DESIGN-rc-coord-auto-marker.md), so worker handoffs
+	// resumed via fleet drain / crash recovery would silently inherit
+	// --remote-control after any coord in the same project triggered
+	// the auto-write. The strict opt-in carve-out for workers /
+	// subagents (v0.12 push-storm protection) requires gating EVERY
+	// RC inject site that runs during a handoff, not just the marker
+	// write site. Mirrors cmd/fleet/handoff.go and dispatch.go.
+	//
+	// The predicate matches the post-spawn isCoordSwap detector at
+	// line ~602 below — same fact (coord-spawn marker resolves to
+	// oldRec.ID), used at two points (pre-inject + post-spawn marker
+	// transfer). Extracted as isCoordHandoffForAgent for unit-testable
+	// gate coverage without driving full spawnAndRetire.
+	var rewrittenExecArgv []string
+	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
+		rewrittenExecArgv = rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
+		if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
+			rewrittenExecArgv = nil
+		}
 	}
 
 	newRec, err := spawn.Spawn(spawn.Options{

@@ -33,6 +33,20 @@ Operator behavior after v0.12:
 - Already-running coord without RC: `fleet rc connect <project>` (attach existing live session).
 - Nothing implicit. No respawn loops. No mobile spam from tests.
 
+**v0.12.1 amendment (coord-spawn auto-opt-in)** — see
+`docs/DESIGN-rc-coord-auto-marker.md` (operator G2 2026-05-18). The
+"operator-explicit opt-in" stance is narrowed to "explicit for workers
+and subagents, automatic for coords": `fleet dispatch --coord-spawn`
+auto-writes the per-project `rc-enabled` marker BEFORE the existing
+inject helper runs, so `/remote-control` and `fleet rc connect
+<project>` work out-of-the-box for every freshly-dispatched coord
+without a separate `fleet rc up` step. Workers and Agent-tool
+subagents (`opts.coordSpawn=false`) DO NOT enter the modified branch
+— they keep the strict opt-in semantics that protected against the
+runaway reviewer-subagent push-storm. `FLEET_RC_BOOTSTRAP_DISABLED=1`
+still wins inside the inject helper (env-gate precedence preserved
+through v0.13's marker-only retirement).
+
 ---
 
 ## Motivation — the leak pattern compounded

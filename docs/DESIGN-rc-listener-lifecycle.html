@@ -272,7 +272,7 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
   <main>
     <div class="doc-meta">
       <strong>Source:</strong> <code>DESIGN-rc-listener-lifecycle.md</code> &mdash;
-      <strong>Rendered:</strong> 2026-05-17 06:20 UTC &mdash;
+      <strong>Rendered:</strong> 2026-05-19 02:36 UTC &mdash;
       Agents read the <code>.md</code>; humans read the <code>.html</code>.
     </div>
     <h1 id="design-remote-control-listener-as-operator-managed-project-resource">DESIGN: Remote-Control Listener as Operator-Managed Project Resource<a class="anchor" href="#design-remote-control-listener-as-operator-managed-project-resource" title="Permalink to this section">¶</a></h1>
@@ -303,6 +303,19 @@ input[type="checkbox"][disabled] { margin-right: 0.4em; }
 - Stop bridge: <code>fleet rc down &lt;project&gt;</code>.
 - Already-running coord without RC: <code>fleet rc connect &lt;project&gt;</code> (attach existing live session).
 - Nothing implicit. No respawn loops. No mobile spam from tests.</p>
+<p><strong>v0.12.1 amendment (coord-spawn auto-opt-in)</strong> — see
+<code>docs/DESIGN-rc-coord-auto-marker.md</code> (operator G2 2026-05-18). The
+"operator-explicit opt-in" stance is narrowed to "explicit for workers
+and subagents, automatic for coords": <code>fleet dispatch --coord-spawn</code>
+auto-writes the per-project <code>rc-enabled</code> marker BEFORE the existing
+inject helper runs, so <code>/remote-control</code> and <code>fleet rc connect
+&lt;project&gt;</code> work out-of-the-box for every freshly-dispatched coord
+without a separate <code>fleet rc up</code> step. Workers and Agent-tool
+subagents (<code>opts.coordSpawn=false</code>) DO NOT enter the modified branch
+— they keep the strict opt-in semantics that protected against the
+runaway reviewer-subagent push-storm. <code>FLEET_RC_BOOTSTRAP_DISABLED=1</code>
+still wins inside the inject helper (env-gate precedence preserved
+through v0.13's marker-only retirement).</p>
 <hr>
 <h2 id="motivation-the-leak-pattern-compounded">Motivation — the leak pattern compounded<a class="anchor" href="#motivation-the-leak-pattern-compounded" title="Permalink to this section">¶</a></h2>
 <p>[Unchanged from v1; see decision log for evolution.]</p>
@@ -433,7 +446,7 @@ type State struct {
 <tr>
 <td><strong>(S1)</strong> <code>skills/coordinator/remote_control.py:spawn_daemon_if_needed</code></td>
 <td>Coord tick respawns global <code>fleet-coord</code> daemon every 30s if absent</td>
-<td><strong>Routes through controller</strong> (codex round 2): the Python function shells out via <code>subprocess.run(["fleet", "rc", "up", project, "--idempotent"])</code> and returns based on outcome. Python no longer does its own pgrep/spawn — Go controller is the single owner. Per-project isolation via Claude daemon's dir-registry (working_dir field in rc-state.json), not prefix-filter renaming.</td>
+<td><strong>Routes through controller</strong> (codex round 2): the Python function shells out via <code>subprocess.run(["fleet", "rc", "up", project, "--respawn-only", "--idempotent"])</code> and returns based on outcome. <code>--respawn-only</code> (post-impl codex P1 catch) makes Go return <code>not_enabled</code> exit 0 when the marker is absent — the implicit-respawn path MUST never auto-create a marker, only the operator-explicit <code>fleet rc up &lt;project&gt;</code> does. Python no longer does its own pgrep/spawn — Go controller is the single owner. Per-project isolation via Claude daemon's dir-registry (working_dir field in rc-state.json), not prefix-filter renaming.</td>
 </tr>
 <tr>
 <td><strong>(S2)</strong> <code>internal/handoff/handoff.go:FirstAction</code></td>
