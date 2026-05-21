@@ -52,8 +52,39 @@ jobs:
         # This guard fails CI when a future PR forgets the isolation.
         run: bash scripts/lint-test-isolation.sh
 
+      - name: Pre-test leak sentinel
+        # fleet#165 PR-B (per feedback_fleet_owns_its_resources.md): a
+        # green CI run with /tmp/fleet-test-* debris left over is NOT a
+        # green run. We touch a sentinel here so the post-test assertion
+        # can scope its leak check to files created during THIS run only,
+        # ignoring any pre-existing /tmp/fleet-test-* on dev machines
+        # (CI runners are clean, but the same workflow file is also
+        # exercised by act / local-runner emulators).
+        run: touch /tmp/fleet-test-ci-sentinel
+
       - name: Test
         run: go test -race -count=1 ./...
+
+      - name: Assert no /tmp/fleet-test-* leak
+        # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
+        # reaps stale fleet-test-*.sock files at every package's TestMain
+        # boundary; this step catches any leak that bypasses the sweeper
+        # (e.g., a future test that creates a leak with a different
+        # naming pattern, or a panic that wedges before the post-test
+        # sweep). Scoped to files NEWER than the pre-test sentinel so a
+        # local dev machine running `act` doesn't fail on pre-existing
+        # /tmp/fleet-test-* from before this PR landed.
+        run: |
+          leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
+            -newer /tmp/fleet-test-ci-sentinel \
+            ! -name 'fleet-test-ci-sentinel' 2>/dev/null || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::leaked /tmp/fleet-test-* files from this CI run:"
+            echo "$leaked"
+            ls -la $leaked 2>/dev/null || true
+            exit 1
+          fi
+          echo "no /tmp/fleet-test-* leak detected"
 
       - name: Python tests
         run: python3 -m pytest skills/ -q
