@@ -125,6 +125,14 @@ type Deps struct {
 	// Sockets.
 	ListSockets  func() ([]SocketInfo, error)
 	RemoveSocket func(path string) error
+	// SocketLive probes whether a tmux server is bound to the given
+	// /tmp/fleet-test-*.sock path. Returns true if a live server
+	// responds, false on "no server" / "connection refused" / file-
+	// gone errors. Used to skip unlinking sockets that a long-running
+	// test fixture is still bound to (codex iter-4 [P1]). Nil =
+	// liveness probe disabled (legacy unit tests that pre-date this
+	// gate); production wiring is socketLiveOnDisk via DefaultDeps.
+	SocketLive func(path string) bool
 
 	// Agents.
 	ListAgents   func() ([]*agent.Record, error)
@@ -295,6 +303,20 @@ func reconcileSockets(r *Report, opts Options, deps Deps) error {
 		if age < opts.MaxAge {
 			continue // within freshness window — keep
 		}
+		// Liveness gate (codex iter-4 [P1]): a long-running tmux test
+		// fixture can still be bound to a fleet-test-*.sock whose
+		// mtime drifted past --max-age. Removing it would strand the
+		// bound server (subsequent `tmux -S <sock>` from new clients
+		// would fail to connect). Surface (don't remove) when a live
+		// server still responds.
+		if opts.Apply && deps.SocketLive != nil && deps.SocketLive(s.Path) {
+			r.Actions = append(r.Actions, Action{
+				Kind: KindSockets, Target: s.Path, Verb: VerbSurface,
+				Reason: fmt.Sprintf("age=%s exceeds max-age=%s but tmux server still bound (keeping); kill the server first if you want to reap",
+					humanDuration(age), humanDuration(opts.MaxAge)),
+			})
+			continue
+		}
 		act := Action{Kind: KindSockets, Target: s.Path, Verb: VerbWouldRemove,
 			Reason: fmt.Sprintf("age=%s exceeds max-age=%s", humanDuration(age), humanDuration(opts.MaxAge))}
 		if opts.Apply {
@@ -320,6 +342,21 @@ func reconcileSockets(r *Report, opts Options, deps Deps) error {
 // Project scope: when opts.Project is set, only records matching that
 // project are considered. Records with empty Project field are
 // included only when opts.Project is empty (the global sweep).
+//
+// MULTI-SOCKET CONSTRAINT (codex iter-4 [P1], inherited fleet-wide):
+// tmux.SessionAlive probes the CURRENT FLEET_TMUX_SOCKET (see
+// internal/tmux/tmux.go:tmuxArgs). agent.Record does not persist the
+// socket path it was spawned on, so a live agent on a different
+// socket can appear "missing" to this classifier and be archived.
+// The same constraint exists in cmd/fleet/handoff.go (SessionAlive at
+// handoff.go:281/397/402/817/820/etc — see the explicit acknowledgement
+// at handoff.go:444). Fixing this properly requires persisting the
+// socket path in agent.Record, which is a schema change tracked
+// separately. Operators running `fleet gc --apply` from a shell with
+// FLEET_TMUX_SOCKET set differently from spawn time can mis-archive;
+// the runGC entrypoint prints a stderr warning when FLEET_TMUX_SOCKET
+// is set + Apply=true + KindOrphanAgents is enabled, so the operator
+// can abort. Defaults (dry-run, FLEET_TMUX_SOCKET unset) are safe.
 func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
 	records, err := deps.ListAgents()
 	if err != nil {
@@ -562,6 +599,7 @@ func DefaultDeps() Deps {
 		Now:                 time.Now,
 		ListSockets:         func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
 		RemoveSocket:        removeSocketFile,
+		SocketLive:          socketLiveOnDisk,
 		ListAgents:          agent.List,
 		ListAgentsStrict:    agent.ListStrict,
 		ArchiveAgent:        func(r *agent.Record) error { return r.Archive() },
@@ -658,6 +696,30 @@ func removeSocketFile(path string) error {
 		return err
 	}
 	return nil
+}
+
+// socketLiveOnDisk probes whether a tmux server is currently bound to
+// the given socket path. Returns true ONLY if `tmux -S <path>
+// list-sessions` succeeds (or exits with non-empty output indicating a
+// server). Anything else (file gone, connection refused, no server
+// running) returns false.
+//
+// Codex iter-4 [P1]: prevents `fleet gc --apply` from unlinking a
+// live tmux socket whose mtime drifted past --max-age. Without this,
+// a long-running test fixture's clients would lose ability to connect
+// (`tmux -S <path>` would fail to find the socket file).
+func socketLiveOnDisk(path string) bool {
+	// Cheap file probe first — if the path isn't even there, no server.
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	cmd := exec.Command("tmux", "-S", path, "list-sessions")
+	if err := cmd.Run(); err != nil {
+		// Non-zero exit = no server / no sessions / connection refused.
+		// All of those are "not live" for our purposes.
+		return false
+	}
+	return true
 }
 
 // listProjectsOnDisk enumerates ~/.fleet/projects/<name>/ — every

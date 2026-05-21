@@ -15,6 +15,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -92,10 +93,27 @@ Exit codes:
 // the production Deps, and renders the Report. Stdout = the per-action
 // list + summary; stderr = any classifier-level errors that didn't
 // abort the whole sweep.
+//
+// Multi-socket safety warning (codex iter-4 [P1]): when
+// FLEET_TMUX_SOCKET is set AND --apply AND orphan-agents is in the
+// active kinds list, print a stderr warning. The classifier probes
+// the CURRENT socket; agents spawned against a different socket may
+// look orphan and get archived. See reconcileOrphanAgents docstring.
 func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 	kinds, err := parseKindsCSV(f.kindsCSV)
 	if err != nil {
 		return err
+	}
+	if f.apply && hasKind(kinds, gc.KindOrphanAgents) {
+		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: FLEET_TMUX_SOCKET=%s is set; orphan-agents probes use THIS socket.\n"+
+					"  Agent records do not persist their spawn-time socket. If any live agent\n"+
+					"  was spawned against a different FLEET_TMUX_SOCKET, --apply may archive it\n"+
+					"  as orphan. Re-run with FLEET_TMUX_SOCKET unset (default) OR drop\n"+
+					"  --kinds=orphan-agents from this sweep to skip the agent-archive pass.\n",
+				sock)
+		}
 	}
 	opts := gc.Options{
 		Apply:      f.apply,
@@ -113,6 +131,18 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		_, _ = fmt.Fprintf(stderr, "warning: %v (continuing)\n", rerr)
 	}
 	return nil
+}
+
+// hasKind is a local helper to check Kind membership in the parsed
+// list. Mirrors the same one in internal/gc but kept local to avoid
+// exporting it from the gc package just for this one call site.
+func hasKind(ks []gc.Kind, target gc.Kind) bool {
+	for _, k := range ks {
+		if k == target {
+			return true
+		}
+	}
+	return false
 }
 
 // parseKindsCSV converts the --kinds flag value into a gc.Kind slice.

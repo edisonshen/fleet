@@ -859,6 +859,79 @@ func TestIsTaskTerminalOnDisk_FencedSpoofIgnored(t *testing.T) {
 	}
 }
 
+// TestReconcile_SocketLive_PreservesBoundSocket pins the fix for
+// codex iter-4 [P1]: a long-running tmux test fixture can still be
+// bound to a fleet-test-*.sock whose mtime drifted past --max-age.
+// Removing it would strand the bound server. Under --apply with
+// SocketLive=true, the classifier must surface (Verb=surface) instead
+// of removing.
+func TestReconcile_SocketLive_PreservesBoundSocket(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour) // older than 24h max-age
+	deps := stubDeps(now)
+	livePath := "/tmp/fleet-test-livebind.sock"
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: livePath, ModTime: old}}, nil
+	}
+	deps.SocketLive = func(p string) bool {
+		return p == livePath // bound server still responds
+	}
+	var removed []string
+	deps.RemoveSocket = func(p string) error {
+		removed = append(removed, p)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindSockets}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("live-bound socket removed: %v", removed)
+	}
+	a, ok := findAction(got, KindSockets, livePath)
+	if !ok {
+		t.Fatalf("live-bound socket not surfaced: %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("verb=%q want %q (live socket should be surfaced not removed)", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_SocketLive_DeadSocketStillRemoved is the negative
+// counterpart: when SocketLive returns false, the classifier removes
+// the socket as before. Confirms the new gate doesn't accidentally
+// disable removal for genuinely orphan sockets.
+func TestReconcile_SocketLive_DeadSocketStillRemoved(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour)
+	deps := stubDeps(now)
+	deadPath := "/tmp/fleet-test-deadbind.sock"
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: deadPath, ModTime: old}}, nil
+	}
+	deps.SocketLive = func(p string) bool { return false }
+	var removed []string
+	deps.RemoveSocket = func(p string) error {
+		removed = append(removed, p)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindSockets}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != deadPath {
+		t.Fatalf("dead socket not removed; removed=%v", removed)
+	}
+	a, ok := findAction(got, KindSockets, deadPath)
+	if !ok || a.Verb != VerbRemoved {
+		t.Fatalf("dead socket action wrong: %+v", got.Actions)
+	}
+}
+
 // TestIsTaskTerminalOnDisk_ArchivedNonTerminalStatus_TreatedTerminal
 // pins the fix for codex iter-3 [P2]: fleet tasks archive moves rows
 // verbatim without coercing status to done, so an operator-forced
