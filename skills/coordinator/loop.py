@@ -2182,6 +2182,169 @@ def _probe_branch_prs(branch: str) -> list[dict]:
     return out
 
 
+# ---------- branch->PR fallback for stuck-without-pr_url reconcile ----------
+#
+# Recovery net for the case where a worker shipped a PR outside the
+# v0.2 state-machine contract (off-rails finisher; operator-driven
+# manual merge). state.json is stuck at a non-terminal phase
+# (typically review-pending), tasks.md.pr_url is empty, but a merged
+# (or open) PR exists on the worker's branch. Without this lookup the
+# reconcile path has no signal and the task stays in-progress forever.
+#
+# See docs/DESIGN-reconcile-pr-by-branch.md v2 — codex round 1 tightened
+# the lookup contract: `--head <branch>` (not `--search head:<branch>`),
+# `--limit 10` (not 1), newest-by-createdAt wins. The 10-PR cap is a
+# safety bound; the same branch can have multiple PRs if a retry
+# reopened a stale branch, and `--limit 1` would non-deterministically
+# pick the wrong one.
+
+
+@dataclass
+class _PRSummary:
+    """Minimal projection of a `gh pr list` row.
+
+    Returned by _gh_pr_by_branch. The caller (reconcile fallback) only
+    needs the four fields below to decide:
+      - merged_at non-None → flip task to done (PR shipped).
+      - state == "OPEN"    → flip task to in-review.
+      - state == "CLOSED" with merged_at None → no action (operator
+        decides; never auto-requeue).
+
+    state mirrors GitHub's enum: OPEN | CLOSED | MERGED.
+    """
+    number: int
+    state: str
+    url: str
+    merged_at: str | None
+    created_at: str
+
+
+def _gh_pr_by_branch(branch: str, timeout_s: float = 5.0) -> _PRSummary | None:
+    """Look up the newest PR whose head ref matches `branch`.
+
+    Used by the reconcile fallback to recover tasks whose pr_url was
+    never recorded. Mirrors _probe_branch_prs() but returns a richer
+    projection (state + mergedAt + url) and applies newest-by-createdAt
+    tiebreaking explicitly.
+
+    Returns None on any failure (gh missing, timeout, non-zero exit,
+    empty result, parse error). NEVER raises; an unavailable GitHub
+    must not requeue a stale handoff.
+
+    Cost: one gh shell-out (~200ms typical), bounded to `timeout_s`.
+    """
+    if not branch:
+        return None
+    cmd = [
+        "gh", "pr", "list",
+        "--head", branch,
+        "--state", "all",
+        "--json", "number,state,url,mergedAt,createdAt,updatedAt,headRefName",
+        "--limit", "10",
+    ]
+    data, err = _gh_run_json(cmd, timeout_s=timeout_s)
+    if err or not isinstance(data, list) or not data:
+        return None
+    # Pick the newest by createdAt; tie-break on highest `number`. Both
+    # fields are GitHub-controlled; the same numeric ordering applies
+    # to ISO-8601 strings so a simple max() with a tuple key works.
+    best: dict | None = None
+    best_key: tuple[str, int] = ("", 0)
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        created = str(entry.get("createdAt", "") or "")
+        num = entry.get("number")
+        if not isinstance(num, int):
+            continue
+        key = (created, num)
+        if best is None or key > best_key:
+            best = entry
+            best_key = key
+    if best is None:
+        return None
+    return _PRSummary(
+        number=int(best.get("number", 0)),
+        state=str(best.get("state", "") or ""),
+        url=str(best.get("url", "") or ""),
+        merged_at=(str(best["mergedAt"]) if best.get("mergedAt") else None),
+        created_at=str(best.get("createdAt", "") or ""),
+    )
+
+
+def _branch_pr_fallback_action(
+    t: parse.Task,
+    *,
+    min_pr_created_at: str = "",
+) -> _ReconcileAction | None:
+    """Branch->PR recovery action for stuck tasks. Returns None if no
+    fallback applies (no branch, pr_url already set, gh unavailable,
+    PR not found, PR closed-unmerged, or PR too old).
+
+    Callers MUST run this AFTER honoring any fresh terminal state in
+    state.json (phase=failed / phase=blocked / phase=done with pr_url).
+    Otherwise a re-dispatched worker that died with phase=failed could
+    be classified from a stale PR left by a prior attempt on the SAME
+    branch — flipping the task to in-review/done and masking the fresh
+    terminal failure signal (codex review round 1 [P1]).
+
+    `min_pr_created_at` is the per-attempt epoch (ISO 8601 string) —
+    typically state.json.started_at. When set, the helper requires
+    `pr.created_at >= min_pr_created_at` so a stale PR opened by a
+    prior attempt on the SAME branch never wins (codex review round 5
+    [P1]). When empty, no provenance gate is applied — caller is
+    responsible for proving freshness another way.
+    """
+    if t.pr_url:
+        return None
+    if not t.branch:
+        return None
+    pr = _gh_pr_by_branch(t.branch)
+    if pr is None:
+        return None
+    # Per-attempt provenance gate: if the caller supplied a per-attempt
+    # epoch (state.json.started_at), require the PR to be at least as
+    # new. Stale PRs from prior attempts on the same reused branch
+    # would otherwise be misattributed to the current worker.
+    #
+    # String comparison is correct here: ISO 8601 UTC timestamps sort
+    # lexicographically the same as chronologically. Both fields are
+    # GitHub-controlled / Go-time.Now-controlled.
+    if min_pr_created_at and pr.created_at < min_pr_created_at:
+        return None
+    if pr.merged_at:
+        # PR merged — flip to done. delete_worker_dir so the now-junk
+        # dir doesn't accumulate. Raise to operator so they see the
+        # recovery in `fleet status`.
+        return _ReconcileAction(
+            slug=t.slug, new_status="done",
+            set_pr_url=pr.url,
+            clear_worker=True,
+            delete_worker_dir=True,
+            note=f"PR {pr.url} merged outside state machine",
+            raised_to_user=True,
+            raise_text=f"reconcile recovered {t.slug}: {pr.url}",
+        )
+    if pr.state == "OPEN":
+        # PR open — flip to in-review. The next tick's gh pr checks
+        # path drives CI -> done. Keep the worker dir (operator may
+        # want to re-dispatch a fix off the same checkout); only
+        # clear worker_pid.
+        return _ReconcileAction(
+            slug=t.slug, new_status="in-review",
+            set_pr_url=pr.url,
+            clear_worker=True,
+            note=f"PR {pr.url} open; recovered from branch",
+            raised_to_user=True,
+            raise_text=f"reconcile recovered {t.slug}: {pr.url}",
+        )
+    # CLOSED-unmerged: operator decides. Leaving the task untouched is
+    # the safe call — auto-requeue would lose the worker's history;
+    # auto-archive would mask the decision the operator still needs to
+    # make.
+    return None
+
+
 def _audit_archived_subagents(
     project: str,
     home: Path,
@@ -2347,7 +2510,51 @@ def _reconcile_inflight(
             if mid_phase is not None and mid_phase.get("phase", "") in (
                 "review-pending", "review-done",
             ):
-                continue
+                # Stuck-handoff recovery: state.json frozen at review-
+                # pending/review-done (handoff chain went off-rails)
+                # but the worker may have shipped a PR outside the
+                # v0.2 state machine. Try branch->PR lookup before
+                # the short-circuit — without this, a merged PR on
+                # the worker's branch stays invisible to reconcile
+                # forever (rc-listener-impl-v0-12-ed95 spent ~4h
+                # stuck on this). See DESIGN-reconcile-pr-by-branch.md
+                # v2 §Design Part A; codex review round 1 [P1] moved
+                # this check to AFTER any fresh terminal state below
+                # (phase=failed / phase=blocked / phase=done with
+                # pr_url).
+                #
+                # Codex review round 5 [P1]: pass state.json.started_at
+                # as a per-attempt epoch. If a prior attempt opened a
+                # PR on the SAME worker/<slug> branch and the new
+                # worker reached review-pending/review-done without
+                # opening its own PR, the stale PR would otherwise
+                # win. The provenance gate (pr.created_at >=
+                # started_at) keeps the fallback from misattributing
+                # a prior-attempt PR to the current worker.
+                started_at = str(mid_phase.get("started_at", "") or "")
+                action = _branch_pr_fallback_action(
+                    t, min_pr_created_at=started_at,
+                )
+                if action is not None:
+                    actions.append(action)
+                    continue
+                # Codex iter-6 [P1] partial-apply recovery: if a prior
+                # tick's _apply_reconcile crashed between the set_pr_url
+                # write and the status= write, tasks.md is left at
+                # status=in-progress WITH a durable pr_url, while
+                # state.json is still review-pending/review-done. The
+                # fallback helper short-circuits when t.pr_url is set
+                # (returns None), so a naked `continue` here would skip
+                # the pr_url+CI poll below and leave the task stuck
+                # forever. When the fallback action is None AND
+                # t.pr_url is already present, fall through so the
+                # `if t.pr_url:` block can drive CI -> done/rebase.
+                # When t.pr_url is empty (no recovery available, fresh
+                # stuck-handoff with no PR yet), keep the short-circuit
+                # — falling through would mis-classify it as "worker
+                # died without PR" and requeue to todo.
+                if not t.pr_url:
+                    continue
             terminal = _worker_terminal_state(project, t.slug, home=home)
             if terminal is not None:
                 phase, pr_url, blocked_reason = terminal
@@ -2418,6 +2625,25 @@ def _reconcile_inflight(
                 # phase=done without pr_url, or phase=blocked
                 # without reason — fall through to pr_url + CI; the
                 # worker didn't honor the contract.
+        # SITE 2 of the branch->PR fallback was REMOVED in codex review
+        # round 3 [P1]: when a retried task reuses worker/<slug> after
+        # a CI-red attempt, the branch can still carry an older PR. If
+        # the new worker dies BEFORE writing state.json (and thus
+        # neither mid_phase nor terminal-state above produces a signal),
+        # the fallback at this site would have picked up the stale PR
+        # and flipped the fresh failure back to in-review/done —
+        # masking the operator's need to re-dispatch.
+        #
+        # The original load-bearing case (rc-listener-impl-v0-12-ed95
+        # stuck at phase=review-pending) is still handled by SITE 1
+        # inside the mid_phase short-circuit — state.json is present
+        # there (just frozen), which proves the worker reached a
+        # PR-creating phase. SITE 2's purpose was to also catch the
+        # in-review-with-empty-pr_url case, but without a per-attempt
+        # epoch we can't tell which PR (if any) belongs to the current
+        # attempt. The conservative choice — fall through to the
+        # "worker died without PR" requeue — lets the operator
+        # explicitly own that recovery.
         if t.pr_url:
             ci = _gh_pr_checks(t.pr_url)
             if ci.all_green and ci.merged:
@@ -2860,12 +3086,24 @@ def _apply_reconcile(
     # #101): the PR URL MUST land on tasks.md BEFORE the worker dir is
     # rm-rf'd. set_pr_url runs ahead of delete_worker_dir; otherwise a
     # crash between them would lose the operator-visible PR link.
-    if action.new_status:
-        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
+    #
+    # Within the tasks.md mutations themselves, the order is:
+    #   1. clear_pr_url  — durable before the rest.
+    #   2. set_pr_url    — durable before the status flip; otherwise
+    #      a crash between status=in-review and pr_url=<url> leaves
+    #      the task at in-review with empty pr_url, invisible to both
+    #      the gh pr checks path (no URL to poll) AND the fallback
+    #      (pr_url is non-empty so the fallback skips). Matches the
+    #      _apply_sentinel() task_done_pr ordering at loop.py:3083-3084.
+    #   3. new_status    — only after pr_url is durable.
+    #   4. clear_worker  — post-transition cleanup.
+    #   5. delete_worker_dir — last.
     if action.clear_pr_url:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "pr_url="])
     if action.set_pr_url:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
+    if action.new_status:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     if action.clear_worker:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
