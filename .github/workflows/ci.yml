@@ -74,6 +74,15 @@ jobs:
         # sweep). Scoped to files NEWER than the pre-test sentinel so a
         # local dev machine running `act` doesn't fail on pre-existing
         # /tmp/fleet-test-* from before this PR landed.
+        #
+        # `if: always()` (codex iter-1 [P2]): the leak gate must run on
+        # the failure/panic path too — that's the exact case the comment
+        # above promises to catch. Without `if: always()`, GitHub Actions
+        # defaults to `if: success()` and silently skips this step when
+        # `go test` fails, defeating the gate. We still want the overall
+        # job to fail on leak detection (exit 1 below), so `always()`
+        # only re-enables the step; it does not mask test failures.
+        if: always()
         run: |
           leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
             -newer /tmp/fleet-test-ci-sentinel \
