@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,11 +45,19 @@ func stubDeps(now time.Time) Deps {
 		SessionAlive: func(string) (bool, error) {
 			return true, nil // pretend alive unless overridden
 		},
+		// Default to "sane" so the existing tests that don't care about
+		// the agent-dir-sanity gate continue passing. Regression tests
+		// for codex iter-1 [P1] override this to return an error.
+		AgentDirSane: func() error { return nil },
 		ListSessions: func() ([]tmux.SessionInfo, error) { return nil, nil },
 		KillSession: func(string) error {
 			return errors.New("stubDeps: KillSession should not run")
 		},
-		ListProjects: func() ([]string, error) { return nil, nil },
+		// Default freshness mirrors the constant floor; tests for the
+		// dynamic ceiling (codex iter-1 [P1]) override this to a longer
+		// window to exercise the FLEET_PID_RESOLVE_S scaling.
+		OrphanTmuxFreshness: func() time.Duration { return OrphanTmuxMinFreshness },
+		ListProjects:        func() ([]string, error) { return nil, nil },
 		ListWorktrees: func(string) ([]WorktreeEntry, error) {
 			return nil, nil
 		},
@@ -632,4 +641,125 @@ func contains(ss []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// ----- codex iter-1 [P1] regression tests -----
+
+// TestReconcile_OrphanTmux_AgentDirUnavailable_FailsClosed pins the
+// fix for codex iter-1 [P1]: when the live-agent state root is missing
+// or unreadable, ListAgents() returns an empty slice — every live
+// fleet-<id> tmux session then looks unmatched, and --aggressive
+// --apply would mass-terminate healthy agents. The orphan-tmux pass
+// MUST fail closed (return the AgentDirSane error, produce no kill
+// actions) instead of trusting the empty agent listing.
+func TestReconcile_OrphanTmux_AgentDirUnavailable_FailsClosed(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour) // past freshness floor
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		// A live agent's session — would look orphan without the
+		// agent-dir-sanity gate because ListAgents returns nil.
+		return []tmux.SessionInfo{{Name: "fleet-aabbccdd", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		// Simulate the "dir missing → empty listing" failure mode.
+		return nil, nil
+	}
+	deps.AgentDirSane = func() error {
+		return errors.New("stat agent dir: no such file or directory (simulated)")
+	}
+	var killed []string
+	deps.KillSession = func(name string) error {
+		killed = append(killed, name)
+		return nil
+	}
+
+	got, err := Reconcile(Options{
+		Apply: true, Aggressive: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindOrphanTmux},
+	}, deps)
+	if err == nil {
+		t.Fatalf("Reconcile must surface AgentDirSane error; got nil")
+	}
+	if !strings.Contains(err.Error(), "agent dir") {
+		t.Fatalf("error %q does not mention agent dir", err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("orphan-tmux killed %v with agent dir unavailable; must fail closed", killed)
+	}
+	for _, a := range got.Actions {
+		if a.Kind == KindOrphanTmux {
+			t.Fatalf("orphan-tmux action produced despite AgentDirSane error: %+v", a)
+		}
+	}
+}
+
+// TestReconcile_OrphanTmux_FreshnessFromDeps_RespectsDynamic pins the
+// fix for codex iter-1 [P1]: the freshness window MUST scale with the
+// configured spawn budget (FLEET_PID_RESOLVE_S via spawn.PidResolveTimeout()
+// in production). If the operator raised the pid-resolve timeout for a
+// slow-spawn engine, a legitimate in-flight spawn can still be inside
+// the record-write window past 90s — and --aggressive --apply with the
+// old hard-coded floor would kill it. With the dep returning a longer
+// freshness window, the same session must be skipped.
+func TestReconcile_OrphanTmux_FreshnessFromDeps_RespectsDynamic(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	// 3 minutes old — past the 90s constant floor, but inside the
+	// 5-minute dynamic window the operator wired up.
+	created := now.Add(-3 * time.Minute)
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-bbccddee", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	deps.OrphanTmuxFreshness = func() time.Duration { return 5 * time.Minute }
+	var killed []string
+	deps.KillSession = func(name string) error {
+		killed = append(killed, name)
+		return nil
+	}
+
+	got, err := Reconcile(Options{
+		Apply: true, Aggressive: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindOrphanTmux},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("session inside dynamic freshness window killed: %v", killed)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-bbccddee"); ok {
+		t.Fatalf("session inside dynamic freshness window flagged: %+v", got.Actions)
+	}
+}
+
+// TestReconcile_OrphanTmux_FreshnessFromDeps_FallsThroughPastWindow is
+// the positive counterpart: once the session ages past the dynamic
+// window, it IS classified — so the dep doesn't accidentally disable
+// classification entirely.
+func TestReconcile_OrphanTmux_FreshnessFromDeps_FallsThroughPastWindow(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-10 * time.Minute) // past the 5-minute window
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-ccddeeff", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	deps.OrphanTmuxFreshness = func() time.Duration { return 5 * time.Minute }
+
+	got, err := Reconcile(Options{
+		Apply: false, Aggressive: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindOrphanTmux},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-ccddeeff")
+	if !ok {
+		t.Fatalf("session past dynamic freshness window NOT flagged: %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("verb=%q want %q", a.Verb, VerbSurface)
+	}
 }

@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -129,10 +130,29 @@ type Deps struct {
 	ListAgents   func() ([]*agent.Record, error)
 	ArchiveAgent func(*agent.Record) error
 	SessionAlive func(name string) (bool, error)
+	// AgentDirSane verifies the live-agent state root is readable
+	// BEFORE the orphan-tmux classifier consumes the agent listing.
+	// Fails closed for the orphan-tmux pass (codex iter-1 [P1]):
+	// without this gate, a missing/corrupted ~/.fleet/agents directory
+	// makes ListAgents() return an empty slice, every live fleet-*
+	// tmux session looks unmatched, and --aggressive --apply mass-
+	// terminates live agents. Mirrors cmd/fleet/maintenance.go's
+	// agentDirSane precondition for fleet maintenance prune-orphan-tmux.
+	AgentDirSane func() error
 
 	// Tmux.
 	ListSessions func() ([]tmux.SessionInfo, error)
 	KillSession  func(name string) error
+	// OrphanTmuxFreshness returns the freshness window below which a
+	// record-absent fleet-<id> session is treated as an in-flight spawn
+	// (kept, never killed). MUST agree with the spawn path's record-write
+	// budget: spawn.Spawn creates tmux first, resolves the engine pid
+	// (up to spawn.PidResolveTimeout()), then writes the record — a
+	// fixed 90s window can be too short on slow-spawn engines where the
+	// operator raised FLEET_PID_RESOLVE_S (codex iter-1 [P1]). Default
+	// wiring mirrors cmd/fleet/maintenance.go:pruneOrphanTmuxFreshness =
+	// max(OrphanTmuxMinFreshness, 2 * spawn.PidResolveTimeout()).
+	OrphanTmuxFreshness func() time.Duration
 
 	// Worktrees.
 	ListProjects   func() ([]string, error)
@@ -333,6 +353,15 @@ func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
 //
 // Aggressive=true upgrades the surface action to would-kill / killed,
 // matching the documented escape hatch (--aggressive on the CLI).
+//
+// Fails closed when AgentDirSane reports the live-agent state root is
+// unavailable: an empty ListAgents() in that case is a read failure,
+// not "every session is orphan", so classifying based on it would
+// mass-terminate live agents under --aggressive --apply. The whole
+// orphan-tmux pass is skipped and the error is recorded so the
+// operator sees the gap (surface-don't-silo via Reconcile's first-err
+// return) — same shape as cmd/fleet/maintenance.go's agentDirSane gate
+// for fleet maintenance prune-orphan-tmux (codex iter-1 [P1]).
 func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 	sessions, err := deps.ListSessions()
 	if err != nil {
@@ -340,6 +369,11 @@ func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 	}
 	if len(sessions) == 0 {
 		return nil
+	}
+	if deps.AgentDirSane != nil {
+		if err := deps.AgentDirSane(); err != nil {
+			return fmt.Errorf("agent dir sanity check: %w", err)
+		}
 	}
 	records, err := deps.ListAgents()
 	if err != nil {
@@ -355,6 +389,12 @@ func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 		}
 		liveIDs[rec.ID] = struct{}{}
 		liveSessions[rec.TmuxSession] = struct{}{}
+	}
+	freshness := OrphanTmuxMinFreshness
+	if deps.OrphanTmuxFreshness != nil {
+		if dyn := deps.OrphanTmuxFreshness(); dyn > freshness {
+			freshness = dyn
+		}
 	}
 	now := deps.Now()
 	for _, s := range sessions {
@@ -378,8 +418,10 @@ func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 		// Freshness gate: a brand-new tmux session whose agent record
 		// is still being written must not be classified as orphan.
 		// Zero Created (parse failure) → treat as fresh-unknown
-		// (conservative, refuse to act).
-		if s.Created.IsZero() || now.Sub(s.Created) < OrphanTmuxMinFreshness {
+		// (conservative, refuse to act). Window scales with
+		// FLEET_PID_RESOLVE_S via OrphanTmuxFreshness (codex iter-1 [P1])
+		// so a slow-spawn engine's in-flight replacement isn't killed.
+		if s.Created.IsZero() || now.Sub(s.Created) < freshness {
 			continue
 		}
 		act := Action{Kind: KindOrphanTmux, Target: s.Name, Verb: VerbSurface,
@@ -479,19 +521,59 @@ func humanDuration(d time.Duration) string {
 // real call for each hook."
 func DefaultDeps() Deps {
 	return Deps{
-		Now:            time.Now,
-		ListSockets:    func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
-		RemoveSocket:   removeSocketFile,
-		ListAgents:     agent.List,
-		ArchiveAgent:   func(r *agent.Record) error { return r.Archive() },
-		SessionAlive:   tmux.SessionAlive,
-		ListSessions:   tmux.ListSessionsWithCreated,
-		KillSession:    tmux.Kill,
-		ListProjects:   listProjectsOnDisk,
-		ListWorktrees:  listProjectWorktrees,
-		RemoveWorktree: removeGitWorktree,
-		IsTaskTerminal: isTaskTerminalOnDisk,
+		Now:                 time.Now,
+		ListSockets:         func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		RemoveSocket:        removeSocketFile,
+		ListAgents:          agent.List,
+		ArchiveAgent:        func(r *agent.Record) error { return r.Archive() },
+		SessionAlive:        tmux.SessionAlive,
+		AgentDirSane:        agentDirSane,
+		ListSessions:        tmux.ListSessionsWithCreated,
+		KillSession:         tmux.Kill,
+		OrphanTmuxFreshness: orphanTmuxFreshness,
+		ListProjects:        listProjectsOnDisk,
+		ListWorktrees:       listProjectWorktrees,
+		RemoveWorktree:      removeGitWorktree,
+		IsTaskTerminal:      isTaskTerminalOnDisk,
 	}
+}
+
+// agentDirSane is the production AgentDirSane wired into DefaultDeps.
+// Mirrors cmd/fleet/maintenance.go:agentDirSane — duplicated rather than
+// imported because cmd/fleet → internal/gc is the dependency direction
+// (gc cannot depend back on cmd/fleet). Returns an error when the
+// live-agent state root is missing or not a directory; the orphan-tmux
+// classifier fails closed on that error.
+func agentDirSane() error {
+	dir, err := state.AgentDir()
+	if err != nil {
+		return fmt.Errorf("resolve agent dir: %w", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat agent dir %s: %w (live-agent state root unavailable — refusing to sweep, every session would misclassify as orphan)",
+			dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("agent dir %s exists but is not a directory (live-agent state root corrupted — refusing to sweep)",
+			dir)
+	}
+	return nil
+}
+
+// orphanTmuxFreshness mirrors cmd/fleet/maintenance.go:pruneOrphanTmuxFreshness.
+// Both call sites must agree: spawn.Spawn creates the tmux session, then
+// resolves the engine pid (up to spawn.PidResolveTimeout()), then writes
+// the record. The freshness floor has to outlast that whole window or
+// fleet gc --aggressive --apply will kill an in-flight replacement.
+//
+// Returns max(OrphanTmuxMinFreshness, 2 * spawn.PidResolveTimeout()).
+func orphanTmuxFreshness() time.Duration {
+	dynamicCeiling := 2 * spawn.PidResolveTimeout()
+	if dynamicCeiling > OrphanTmuxMinFreshness {
+		return dynamicCeiling
+	}
+	return OrphanTmuxMinFreshness
 }
 
 // scanSocketsDir returns every entry matching fleet-test-*.sock under
