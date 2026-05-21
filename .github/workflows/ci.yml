@@ -65,6 +65,9 @@ jobs:
       - name: Test
         run: go test -race -count=1 ./...
 
+      - name: Python tests
+        run: python3 -m pytest skills/ -q
+
       - name: Assert no /tmp/fleet-test-* leak
         # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
         # reaps stale fleet-test-*.sock files at every package's TestMain
@@ -82,6 +85,13 @@ jobs:
         # `go test` fails, defeating the gate. We still want the overall
         # job to fail on leak detection (exit 1 below), so `always()`
         # only re-enables the step; it does not mask test failures.
+        #
+        # Step order (codex iter-5 [P2]): placed AFTER both `go test`
+        # AND `python3 -m pytest skills/` so any pytest that touches
+        # /tmp/fleet-test-* is also covered. Today's pytest suite only
+        # exercises the Python skill scaffold (no Go tmux paths), but
+        # defense-in-depth keeps the gate honest if a future skill test
+        # ever shells out to tmux.
         if: always()
         run: |
           leaked=$(find /tmp -maxdepth 1 -name 'fleet-test-*' \
@@ -94,6 +104,3 @@ jobs:
             exit 1
           fi
           echo "no /tmp/fleet-test-* leak detected"
-
-      - name: Python tests
-        run: python3 -m pytest skills/ -q
