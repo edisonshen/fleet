@@ -1,0 +1,583 @@
+package gc
+
+import (
+	"errors"
+	"os"
+	"path/filepath"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/tmux"
+)
+
+// TDD-red suite for fleet#165 PR-A. Each test stubs the Reconcile Deps
+// struct so the unit under test never touches the operator's real
+// ~/.fleet/ or /tmp/ state. Production wiring (DefaultDeps) is covered
+// indirectly by the CLI smoke tests in cmd/fleet/gc_test.go.
+//
+// Layout per kind:
+//
+//	sockets       — file-based, t.TempDir() instead of /tmp, max-age gate
+//	orphan-agents — agent.Record fixture + fake SessionAlive
+//	orphan-tmux   — tmux.SessionInfo + fake agent record presence
+//	worktrees     — fake worktree listing + terminal-task probe
+//
+// Every test asserts both the Report content (planned action) AND the
+// actual side effects (or lack thereof in dry-run / surface paths).
+
+// stubDeps gives every test the same baseline: deterministic Now,
+// empty slices everywhere, no-op mutators. Tests override only the
+// fields they exercise.
+func stubDeps(now time.Time) Deps {
+	return Deps{
+		Now:       func() time.Time { return now },
+		ListSockets: func() ([]SocketInfo, error) { return nil, nil },
+		RemoveSocket: func(string) error {
+			return errors.New("stubDeps: RemoveSocket should not run")
+		},
+		ListAgents: func() ([]*agent.Record, error) { return nil, nil },
+		ArchiveAgent: func(*agent.Record) error {
+			return errors.New("stubDeps: ArchiveAgent should not run")
+		},
+		SessionAlive: func(string) (bool, error) {
+			return true, nil // pretend alive unless overridden
+		},
+		ListSessions: func() ([]tmux.SessionInfo, error) { return nil, nil },
+		KillSession: func(string) error {
+			return errors.New("stubDeps: KillSession should not run")
+		},
+		ListProjects: func() ([]string, error) { return nil, nil },
+		ListWorktrees: func(string) ([]WorktreeEntry, error) {
+			return nil, nil
+		},
+		RemoveWorktree: func(string) error {
+			return errors.New("stubDeps: RemoveWorktree should not run")
+		},
+		IsTaskTerminal: func(string, string) (bool, error) {
+			return false, nil
+		},
+	}
+}
+
+func defaultKinds() []Kind {
+	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees}
+}
+
+func findAction(r Report, kind Kind, target string) (Action, bool) {
+	for _, a := range r.Actions {
+		if a.Kind == kind && a.Target == target {
+			return a, true
+		}
+	}
+	return Action{}, false
+}
+
+func TestReconcile_OldSocketRemoved(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour) // older than 24h max-age
+	deps := stubDeps(now)
+	socketPath := "/tmp/fleet-test-aaaaaa.sock"
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: socketPath, ModTime: old}}, nil
+	}
+	var removed []string
+	deps.RemoveSocket = func(p string) error {
+		removed = append(removed, p)
+		return nil
+	}
+
+	// Dry-run: report contains would-remove; nothing removed.
+	dry, err := Reconcile(Options{Apply: false, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+	a, ok := findAction(dry, KindSockets, socketPath)
+	if !ok {
+		t.Fatalf("missing sockets action; got %+v", dry.Actions)
+	}
+	if a.Verb != VerbWouldRemove {
+		t.Fatalf("dry-run socket action=%q, want %q", a.Verb, VerbWouldRemove)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("dry-run removed %v sockets; want 0", removed)
+	}
+
+	// Apply: actually removes.
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile apply: %v", err)
+	}
+	a, ok = findAction(got, KindSockets, socketPath)
+	if !ok {
+		t.Fatalf("missing sockets action under apply; got %+v", got.Actions)
+	}
+	if a.Verb != VerbRemoved {
+		t.Fatalf("apply socket action=%q, want %q", a.Verb, VerbRemoved)
+	}
+	if len(removed) != 1 || removed[0] != socketPath {
+		t.Fatalf("removed=%v, want [%s]", removed, socketPath)
+	}
+}
+
+func TestReconcile_RecentSocketKept(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	recent := now.Add(-1 * time.Hour) // within 24h max-age
+	deps := stubDeps(now)
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: "/tmp/fleet-test-bbbbbb.sock", ModTime: recent}}, nil
+	}
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindSockets, "/tmp/fleet-test-bbbbbb.sock"); ok {
+		t.Fatalf("recent socket appeared in report; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_OrphanAgentRecord_ArchivedOnApply(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	rec := &agent.Record{ID: "deadbeef", TmuxSession: "fleet-deadbeef"}
+	deps.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{rec}, nil }
+	// tmux session is GONE.
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-deadbeef" {
+			return false, nil
+		}
+		return true, nil
+	}
+	var archived []string
+	deps.ArchiveAgent = func(r *agent.Record) error {
+		archived = append(archived, r.ID)
+		return nil
+	}
+
+	// Dry-run.
+	dry, err := Reconcile(Options{Apply: false, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+	a, ok := findAction(dry, KindOrphanAgents, "deadbeef")
+	if !ok {
+		t.Fatalf("missing orphan-agents action; got %+v", dry.Actions)
+	}
+	if a.Verb != VerbWouldArchive {
+		t.Fatalf("dry-run orphan-agent action=%q, want %q", a.Verb, VerbWouldArchive)
+	}
+	if len(archived) != 0 {
+		t.Fatalf("dry-run archived %v; want 0", archived)
+	}
+
+	// Apply.
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile apply: %v", err)
+	}
+	a, ok = findAction(got, KindOrphanAgents, "deadbeef")
+	if !ok || a.Verb != VerbArchived {
+		t.Fatalf("apply orphan-agent action; got %+v", got.Actions)
+	}
+	if len(archived) != 1 || archived[0] != "deadbeef" {
+		t.Fatalf("archived=%v, want [deadbeef]", archived)
+	}
+}
+
+func TestReconcile_HealthyAgent_Unchanged(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	rec := &agent.Record{ID: "livecafe", TmuxSession: "fleet-livecafe"}
+	deps.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{rec}, nil }
+	deps.SessionAlive = func(string) (bool, error) { return true, nil }
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanAgents, "livecafe"); ok {
+		t.Fatalf("healthy agent flagged orphan; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_OrphanTmuxSession_SurfacedNotKilled(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour) // safely past freshness floor
+	deps := stubDeps(now)
+	// Session exists; NO agent record matches the suffix.
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-0a0a0a0a", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	// Default Aggressive=false. Even with --apply, surface only.
+	got, err := Reconcile(Options{Apply: true, Aggressive: false, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanTmux, "fleet-0a0a0a0a")
+	if !ok {
+		t.Fatalf("missing orphan-tmux action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("orphan-tmux action=%q, want %q (surface-only by default per feedback_surface_dont_silo + feedback_user_owns_tmux_config)",
+			a.Verb, VerbSurface)
+	}
+}
+
+func TestReconcile_OrphanTmuxSession_AggressiveKills(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour)
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-0b0b0b0b", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	var killed []string
+	deps.KillSession = func(name string) error {
+		killed = append(killed, name)
+		return nil
+	}
+
+	// --aggressive + dry-run = would-kill, no side effect.
+	dry, err := Reconcile(Options{Apply: false, Aggressive: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+	a, ok := findAction(dry, KindOrphanTmux, "fleet-0b0b0b0b")
+	if !ok || a.Verb != VerbWouldKill {
+		t.Fatalf("dry-run aggressive action; got %+v", dry.Actions)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("dry-run killed %v; want 0", killed)
+	}
+
+	// --aggressive + --apply = killed.
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile apply: %v", err)
+	}
+	a, ok = findAction(got, KindOrphanTmux, "fleet-0b0b0b0b")
+	if !ok || a.Verb != VerbKilled {
+		t.Fatalf("apply aggressive action; got %+v", got.Actions)
+	}
+	if len(killed) != 1 || killed[0] != "fleet-0b0b0b0b" {
+		t.Fatalf("killed=%v, want [fleet-0b0b0b0b]", killed)
+	}
+}
+
+func TestReconcile_OrphanTmuxFresh_SkippedEvenAggressive(t *testing.T) {
+	// Same freshness floor as fleet maintenance prune-orphan-tmux:
+	// a record-absent session younger than the floor is not yet an
+	// orphan (likely an in-flight spawn). Even --aggressive must NOT
+	// touch it. Reuses pruneOrphanTmuxMinFreshness's 90s rationale.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-30 * time.Second) // fresher than 90s floor
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-fffeeedd", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-fffeeedd"); ok {
+		t.Fatalf("fresh tmux session flagged; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_NonFleetTmuxSession_Ignored(t *testing.T) {
+	// Sessions whose name doesn't match the fleet-<8-hex> shape are
+	// outside fleet's blast radius (feedback_user_owns_tmux_config).
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour)
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{
+			{Name: "main", Created: created},
+			{Name: "fleet-debug", Created: created},     // not 8-hex
+			{Name: "fleet-coord-839b11ff", Created: created}, // not bare 8-hex
+		}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) { return nil, nil }
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, a := range got.Actions {
+		if a.Kind == KindOrphanTmux {
+			t.Fatalf("non-fleet session classified: %+v", a)
+		}
+	}
+}
+
+func TestReconcile_WorktreeOfDoneTask_Removed(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListProjects = func() ([]string, error) { return []string{"projects-fleet"}, nil }
+	deps.ListWorktrees = func(project string) ([]WorktreeEntry, error) {
+		if project != "projects-fleet" {
+			return nil, nil
+		}
+		return []WorktreeEntry{{Project: project, Slug: "old-feature-aaaa", Path: "/fake/wt/old-feature-aaaa"}}, nil
+	}
+	deps.IsTaskTerminal = func(project, slug string) (bool, error) {
+		return project == "projects-fleet" && slug == "old-feature-aaaa", nil
+	}
+	var removed []string
+	deps.RemoveWorktree = func(path string) error {
+		removed = append(removed, path)
+		return nil
+	}
+
+	dry, err := Reconcile(Options{Apply: false, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+	a, ok := findAction(dry, KindWorktrees, "/fake/wt/old-feature-aaaa")
+	if !ok || a.Verb != VerbWouldRemove {
+		t.Fatalf("dry-run worktree action; got %+v", dry.Actions)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("dry-run removed=%v", removed)
+	}
+
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile apply: %v", err)
+	}
+	a, ok = findAction(got, KindWorktrees, "/fake/wt/old-feature-aaaa")
+	if !ok || a.Verb != VerbRemoved {
+		t.Fatalf("apply worktree action; got %+v", got.Actions)
+	}
+	if len(removed) != 1 || removed[0] != "/fake/wt/old-feature-aaaa" {
+		t.Fatalf("removed=%v, want [/fake/wt/old-feature-aaaa]", removed)
+	}
+}
+
+func TestReconcile_WorktreeOfActiveTask_Kept(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListProjects = func() ([]string, error) { return []string{"projects-fleet"}, nil }
+	deps.ListWorktrees = func(project string) ([]WorktreeEntry, error) {
+		return []WorktreeEntry{{Project: project, Slug: "live-task-bbbb", Path: "/fake/wt/live-task-bbbb"}}, nil
+	}
+	deps.IsTaskTerminal = func(string, string) (bool, error) {
+		return false, nil // task is in-progress
+	}
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindWorktrees, "/fake/wt/live-task-bbbb"); ok {
+		t.Fatalf("active-task worktree flagged; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_DryRun_NeverMutates(t *testing.T) {
+	// Comprehensive negative invariant: every applyable mutator path
+	// (RemoveSocket, ArchiveAgent, KillSession, RemoveWorktree) must
+	// be silent when Apply=false, even if the planner says it would
+	// act on every kind.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour)
+	deps := stubDeps(now)
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: "/tmp/fleet-test-cccccc.sock", ModTime: old}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		return []*agent.Record{{ID: "01010101", TmuxSession: "fleet-01010101"}}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) { return false, nil }
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		// Session whose suffix doesn't match the listed agent record →
+		// orphan tmux candidate.
+		return []tmux.SessionInfo{{Name: "fleet-02020202", Created: old}}, nil
+	}
+	deps.ListProjects = func() ([]string, error) { return []string{"p"}, nil }
+	deps.ListWorktrees = func(string) ([]WorktreeEntry, error) {
+		return []WorktreeEntry{{Project: "p", Slug: "done-task", Path: "/fake/wt/done"}}, nil
+	}
+	deps.IsTaskTerminal = func(string, string) (bool, error) { return true, nil }
+
+	// Mutators must not be called.
+	deps.RemoveSocket = func(string) error { t.Fatal("RemoveSocket called under dry-run"); return nil }
+	deps.ArchiveAgent = func(*agent.Record) error { t.Fatal("ArchiveAgent called under dry-run"); return nil }
+	deps.KillSession = func(string) error { t.Fatal("KillSession called under dry-run"); return nil }
+	deps.RemoveWorktree = func(string) error { t.Fatal("RemoveWorktree called under dry-run"); return nil }
+
+	if _, err := Reconcile(Options{Apply: false, Aggressive: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps); err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+}
+
+func TestReconcile_KindsFilter(t *testing.T) {
+	// --kinds=sockets only — agent, tmux, worktree paths must not run.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-25 * time.Hour)
+	deps := stubDeps(now)
+	deps.ListSockets = func() ([]SocketInfo, error) {
+		return []SocketInfo{{Path: "/tmp/fleet-test-dddddd.sock", ModTime: old}}, nil
+	}
+	deps.RemoveSocket = func(string) error { return nil }
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		t.Fatal("ListAgents called under --kinds=sockets")
+		return nil, nil
+	}
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		t.Fatal("ListSessions called under --kinds=sockets")
+		return nil, nil
+	}
+	deps.ListProjects = func() ([]string, error) {
+		t.Fatal("ListProjects called under --kinds=sockets")
+		return nil, nil
+	}
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: []Kind{KindSockets}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(got.Actions) != 1 {
+		t.Fatalf("actions=%+v; want exactly 1 sockets action", got.Actions)
+	}
+	if got.Actions[0].Kind != KindSockets {
+		t.Fatalf("actions[0].Kind=%q, want sockets", got.Actions[0].Kind)
+	}
+}
+
+func TestReconcile_ProjectScope(t *testing.T) {
+	// --project filters worktree + agent enumeration. Other projects
+	// must not be touched. Sockets are global (no project scope) and
+	// remain in the report regardless.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	listed := []string{}
+	deps.ListProjects = func() ([]string, error) {
+		// Reconcile MUST NOT call ListProjects when Project is set —
+		// it should target the named project directly.
+		t.Fatal("ListProjects called under --project scope")
+		return nil, nil
+	}
+	deps.ListWorktrees = func(p string) ([]WorktreeEntry, error) {
+		listed = append(listed, p)
+		return nil, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		return []*agent.Record{
+			{ID: "11111111", TmuxSession: "fleet-11111111", Project: "alpha"},
+			{ID: "22222222", TmuxSession: "fleet-22222222", Project: "beta"},
+		}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) { return false, nil }
+	deps.ArchiveAgent = func(r *agent.Record) error {
+		if r.Project != "alpha" {
+			t.Fatalf("ArchiveAgent on out-of-scope record: %+v", r)
+		}
+		return nil
+	}
+	got, err := Reconcile(Options{Apply: true, Project: "alpha", MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !contains(listed, "alpha") || contains(listed, "beta") {
+		t.Fatalf("worktree list scope=%v; want only [alpha]", listed)
+	}
+	// agent action only for alpha record.
+	if _, ok := findAction(got, KindOrphanAgents, "11111111"); !ok {
+		t.Fatalf("missing alpha agent action; got %+v", got.Actions)
+	}
+	if _, ok := findAction(got, KindOrphanAgents, "22222222"); ok {
+		t.Fatalf("beta agent flagged out-of-scope; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_SessionAliveProbeError_PreservesAgent(t *testing.T) {
+	// If the tmux probe fails (transport error, lost server), the
+	// orphan-agent classifier must NOT archive the record — that
+	// would mistake a transient tmux failure for a dead session and
+	// strand the operator's live agent. Mirrors tmux.SessionAlive's
+	// own "alive=false, err!=nil = ambiguous, do not act" contract.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	rec := &agent.Record{ID: "33333333", TmuxSession: "fleet-33333333"}
+	deps.ListAgents = func() ([]*agent.Record, error) { return []*agent.Record{rec}, nil }
+	deps.SessionAlive = func(string) (bool, error) {
+		return false, errors.New("simulated transport error")
+	}
+	deps.ArchiveAgent = func(*agent.Record) error {
+		t.Fatal("ArchiveAgent called on probe-error ambiguous record")
+		return nil
+	}
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanAgents, "33333333"); ok {
+		t.Fatalf("probe-error record flagged orphan; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_OrphanTmux_MatchedByLiveAgent_Skipped(t *testing.T) {
+	// The orphan-tmux classifier must skip sessions whose suffix
+	// matches a live agent record (the agent's own session). Without
+	// this, every healthy fleet-* session would surface in the
+	// report.
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour)
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		return []tmux.SessionInfo{{Name: "fleet-44444444", Created: created}}, nil
+	}
+	deps.ListAgents = func() ([]*agent.Record, error) {
+		return []*agent.Record{{ID: "44444444", TmuxSession: "fleet-44444444"}}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) { return true, nil }
+	got, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: defaultKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-44444444"); ok {
+		t.Fatalf("session matched to live agent flagged orphan; got %+v", got.Actions)
+	}
+}
+
+// ----- helpers for production-dep tests (SocketInfo path) -----
+
+// TestDefaultSocketLister_ScansTmp covers the production glob to make
+// sure /tmp/fleet-test-*.sock files are picked up via the default
+// Deps wiring. Uses a temp dir to avoid touching the operator's real
+// /tmp (cleanup is mandatory — feedback_fleet_owns_its_resources).
+func TestDefaultSocketLister_ScansTmp(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{
+		"fleet-test-aaaaaa.sock",
+		"fleet-test-bbbbbb.sock",
+		"other-fleet.sock",
+	} {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+	}
+	infos, err := scanSocketsDir(dir)
+	if err != nil {
+		t.Fatalf("scanSocketsDir: %v", err)
+	}
+	var got []string
+	for _, i := range infos {
+		got = append(got, filepath.Base(i.Path))
+	}
+	sort.Strings(got)
+	want := []string{"fleet-test-aaaaaa.sock", "fleet-test-bbbbbb.sock"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("scanSocketsDir got %v, want %v", got, want)
+	}
+}
+
+func contains(ss []string, target string) bool {
+	for _, s := range ss {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}
