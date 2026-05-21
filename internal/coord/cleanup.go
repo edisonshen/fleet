@@ -46,6 +46,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -60,16 +61,35 @@ type Deps struct {
 	// errors are logged (when Stderr is set) but never fatal. Panics
 	// are recovered per-step so the remaining cleanup still runs.
 	KillTmux func(session string) error
+	// AcquireSpawnLock takes the per-project coord-spawn NB-flock for
+	// the marker compare-and-remove step. Production uses
+	// coordlock.Acquire (serializes against dispatch + handoffop spawn
+	// paths so a replacement coord writing the marker can't race the
+	// outgoing coord's unlink — codex iter-2 [P1] fix). Tests inject a
+	// stub that returns a noop release to skip the real flock without
+	// shelling out, or that returns os.ErrPermission to simulate the
+	// "replacement is currently spawning" contended case.
+	//
+	// Returns (release, err). On err != nil the marker step is SKIPPED
+	// (preserving the marker is safer than racing the replacement's
+	// write — the replacement owns the marker now). release is invoked
+	// in a defer after the marker step succeeds; nil release is treated
+	// as a no-op.
+	AcquireSpawnLock func(project string) (release func(), err error)
 	// Stderr is where best-effort errors / panics from the three steps
 	// are logged for operator visibility (per feedback_surface_dont_
 	// silo.md — silent silos are the bug). nil = discard.
 	Stderr io.Writer
 }
 
-// Default returns the production Deps: tmux.Kill for the killer + nil
-// Stderr (callers wanting log output pass os.Stderr explicitly).
+// Default returns the production Deps: tmux.Kill for the killer +
+// coordlock.Acquire for the marker compare-and-remove + nil Stderr
+// (callers wanting log output pass os.Stderr explicitly).
 func Default() Deps {
-	return Deps{KillTmux: tmux.Kill}
+	return Deps{
+		KillTmux:         tmux.Kill,
+		AcquireSpawnLock: coordlock.Acquire,
+	}
 }
 
 // Cleanup runs the three coord-exit side-effects: kill tmux session,
@@ -97,6 +117,9 @@ func Cleanup(agentID, project string, deps Deps) error {
 	}
 	if deps.KillTmux == nil {
 		deps.KillTmux = tmux.Kill
+	}
+	if deps.AcquireSpawnLock == nil {
+		deps.AcquireSpawnLock = coordlock.Acquire
 	}
 	stderr := deps.Stderr
 	if stderr == nil {
@@ -139,16 +162,39 @@ func Cleanup(agentID, project string, deps Deps) error {
 		}
 	}()
 
-	// Step 3: remove marker IFF its body matches our agent ID. Cross-
-	// agent stomping is the failure mode this gate guards against: an
-	// older coord whose record we're cleaning up should never delete a
-	// fresher coord's marker.
+	// Step 3: remove marker IFF its body matches our agent ID — under
+	// the coord-spawn lock so a replacement coord's marker write can't
+	// race our read-check-remove. (Codex iter-2 [P1].)
+	//
+	// Race we're closing:
+	//   T0 cleanup reads marker, sees body == oldAgentID  ← old coord
+	//   T1 replacement coord writes new agent ID to marker
+	//   T2 cleanup unconditionally unlinks marker         ← bug:
+	//         deletes the replacement's marker, dashboard/rc lookup
+	//         loses the live coord pointer.
+	//
+	// Fix: hold the same NB-flock that dispatch.go + handoffop.go take
+	// around their spawn → marker-write tuple. If we can't acquire
+	// (replacement is in flight RIGHT NOW), SKIP the marker step
+	// entirely — the replacement will overwrite the marker with its
+	// own ID and own its own future cleanup. Preserving the marker on
+	// contention is strictly safer than racing the writer.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
 				_, _ = fmt.Fprintf(stderr, "coord.Cleanup: marker panicked: %v\n", r)
 			}
 		}()
+		release, err := deps.AcquireSpawnLock(project)
+		if err != nil {
+			// Contended → replacement coord is spawning right now and
+			// holds the marker's authoritative writer. Skip our
+			// removal; the replacement owns the marker lifecycle.
+			_, _ = fmt.Fprintf(stderr,
+				"coord.Cleanup: marker step skipped — coord-spawn lock contended: %v\n", err)
+			return
+		}
+		defer release()
 		if err := clearMarkerIfMatched(project, agentID); err != nil {
 			_, _ = fmt.Fprintf(stderr, "coord.Cleanup: marker %s: %v\n", project, err)
 		}

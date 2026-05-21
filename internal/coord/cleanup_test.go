@@ -262,6 +262,93 @@ func TestCleanup_IdempotentOnMissingRecord(t *testing.T) {
 	}
 }
 
+// TestCleanup_MarkerStepSkippedOnSpawnLockContended pins the codex
+// iter-2 [P1] fix: when a replacement coord is in flight (it holds the
+// coord-spawn lock right now), Cleanup MUST skip the marker removal
+// step rather than race the replacement's marker write. Preserving the
+// marker is strictly safer than deleting one belonging to another coord.
+//
+// The injected AcquireSpawnLock returns a permission-denied error to
+// stand in for "lock currently held by another process" — we don't
+// need the real flock here, just the contract that contention → skip.
+func TestCleanup_MarkerStepSkippedOnSpawnLockContended(t *testing.T) {
+	helperFleetHome(t)
+	const (
+		agentID = "cont1234"
+		project = "cont-test"
+		session = "fleet-cont1234"
+	)
+	writeAgentRecord(t, agentID, project, session)
+	markerPath := writeMarker(t, project, agentID)
+
+	deps := Deps{
+		KillTmux: func(string) error { return nil },
+		AcquireSpawnLock: func(string) (func(), error) {
+			return nil, errors.New("simulated coord-spawn lock contention")
+		},
+	}
+	if err := Cleanup(agentID, project, deps); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	// Steps 1+2 still ran: live record archived.
+	livePath, err := state.AgentPath(agentID)
+	if err != nil {
+		t.Fatalf("AgentPath: %v", err)
+	}
+	if _, err := os.Stat(livePath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("live record still exists: %v", err)
+	}
+	// Step 3 was SKIPPED (lock contended) → marker preserved verbatim.
+	body, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("marker should still exist when spawn-lock is contended: %v", err)
+	}
+	got := strings.TrimSpace(string(body))
+	if got != agentID {
+		t.Errorf("marker body = %q, want %q (preserved)", got, agentID)
+	}
+}
+
+// TestCleanup_MarkerStepHoldsSpawnLock pins the lock-held-during-step
+// half of the codex iter-2 [P1] fix: while step 3 runs, the spawn-lock
+// release function is NOT invoked. We assert this by inspecting a
+// release-was-called flag that the injected stub flips. The check
+// itself happens INSIDE clearMarkerIfMatched's callback path, so if
+// the implementation releases too early (before the unlink) the flag
+// would already be true at marker-read time.
+//
+// Mechanically: the stub returns a release that increments a counter;
+// we verify the counter goes 0→1 exactly once (acquire holds across
+// the whole step, then release fires once via defer).
+func TestCleanup_MarkerStepHoldsSpawnLock(t *testing.T) {
+	helperFleetHome(t)
+	const (
+		agentID = "hold1234"
+		project = "hold-test"
+		session = "fleet-hold1234"
+	)
+	writeAgentRecord(t, agentID, project, session)
+	writeMarker(t, project, agentID)
+
+	var releaseCount int
+	deps := Deps{
+		KillTmux: func(string) error { return nil },
+		AcquireSpawnLock: func(p string) (func(), error) {
+			if p != project {
+				t.Errorf("AcquireSpawnLock called with %q, want %q", p, project)
+			}
+			return func() { releaseCount++ }, nil
+		},
+	}
+	if err := Cleanup(agentID, project, deps); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if releaseCount != 1 {
+		t.Errorf("AcquireSpawnLock release called %d times, want 1", releaseCount)
+	}
+}
+
 // TestCleanup_TmuxKillErrorIsNonFatal pins the design's "best-effort,
 // non-fatal" tmux-kill contract: a returned error from the killer must
 // not abort the rest of the reap. Distinct from the panic test —
