@@ -843,39 +843,43 @@ func taskStatusInFile(path, slug string) (terminal, found bool, err error) {
 	for i, line := range lines {
 		// Fence toggle MUST run before the header check so that the
 		// opening ``` itself doesn't get mistaken for body content of
-		// the previous block. Mirrors internal/tasks/tasks.go parse()
-		// at line 241+.
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "```") {
+		// the previous block. Fences are recognized at column 0 only
+		// (matching internal/tasks/tasks.go parse() line 241+) — an
+		// indented "```" is example text, not a fence boundary.
+		if strings.HasPrefix(line, "```") {
 			inFence = !inFence
 			continue
 		}
 		if inFence {
 			continue
 		}
-		trimmed := strings.TrimSpace(line)
-		if trimmed != wantHeader {
+		// Codex iter-3 [P2]: structural headers live at column 0. An
+		// indented `    ## task: <slug>` is example/body text and must
+		// not match. Mirrors the canonical parser's column-0 rule.
+		if line != wantHeader {
 			continue
 		}
-		// Scan forward until the next `## ` header (block boundary) or
-		// EOF, looking for `- status:` bullet. Honor fence state in
-		// the inner scan too — a fenced block inside Notes can
-		// legitimately contain `- status: done` as example text.
+		// Scan forward until the next column-0 `## ` header (block
+		// boundary) or EOF, looking for the column-0 `- status:`
+		// bullet. Honor fence state in the inner scan too — a fenced
+		// block inside Notes can legitimately contain `- status: done`
+		// as example text. Indented `- status:` bullets are body text
+		// (the spec/acceptance/notes sub-bullets) and don't count.
 		innerFence := false
 		for j := i + 1; j < len(lines); j++ {
 			lj := lines[j]
-			if strings.HasPrefix(strings.TrimLeft(lj, " \t"), "```") {
+			if strings.HasPrefix(lj, "```") {
 				innerFence = !innerFence
 				continue
 			}
 			if innerFence {
 				continue
 			}
-			lt := strings.TrimSpace(lj)
-			if strings.HasPrefix(lt, "## ") {
+			if strings.HasPrefix(lj, "## ") {
 				break
 			}
-			if strings.HasPrefix(lt, "- status:") {
-				val := strings.TrimSpace(strings.TrimPrefix(lt, "- status:"))
+			if strings.HasPrefix(lj, "- status:") {
+				val := strings.TrimSpace(strings.TrimPrefix(lj, "- status:"))
 				return val == "done" || val == "abandoned", true, nil
 			}
 		}

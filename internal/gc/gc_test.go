@@ -859,6 +859,44 @@ func TestIsTaskTerminalOnDisk_FencedSpoofIgnored(t *testing.T) {
 	}
 }
 
+// TestIsTaskTerminalOnDisk_IndentedSpoofIgnored pins the fix for codex
+// iter-3 [P2]: an indented `    ## task: <live-slug>` followed by
+// `    - status: done` is example text (sub-bullet under Spec/Notes,
+// or unfenced markdown), not a structural task header. Trimming
+// leading whitespace before matching would let indented examples
+// spoof a terminal status. Mirror the canonical parser's column-0
+// rule: only column-0 `## task:` headers count as structural
+// boundaries.
+func TestIsTaskTerminalOnDisk_IndentedSpoofIgnored(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Indented header inside a Notes section. Real header is in-progress;
+	// indented "example" header says done. The classifier must use the
+	// real one.
+	tasksMD := "## task: live-slug-aaaa\n" +
+		"- status: in-progress\n" +
+		"- priority: P1\n" +
+		"\n" +
+		"### Notes\n" +
+		"Example (do NOT reap me; this is an indented markdown example):\n" +
+		"    ## task: live-slug-aaaa\n" +
+		"    - status: done\n"
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tasksMD), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	terminal, err := isTaskTerminalOnDisk("alpha", "live-slug-aaaa")
+	if err != nil {
+		t.Fatalf("isTaskTerminalOnDisk: %v", err)
+	}
+	if terminal {
+		t.Fatalf("indented `## task:` example spoofed terminal status; expected false")
+	}
+}
+
 // TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped pins the fix
 // for codex iter-3 [P1]: legacy / partially populated agent records
 // with empty TmuxSession would get `tmux has-session -t ""` probed,
