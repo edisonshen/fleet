@@ -2,20 +2,44 @@
 // `fleet gc`. Scope = fleet's own resources only (per
 // feedback_fleet_owns_its_resources.md): /tmp/fleet-test-*.sock,
 // ~/.fleet/agents/*.json records whose tmux session is gone,
-// fleet-* tmux sessions with no live agent record, and worktrees
-// under ~/.fleet/projects/*/worktrees/ whose task has reached a
-// terminal status.
+// fleet-* tmux sessions with no live agent record (surfaced by default,
+// killed only with --aggressive per feedback_surface_dont_silo.md +
+// feedback_user_owns_tmux_config.md), and worktrees under
+// ~/.fleet/projects/*/worktrees/ whose task has reached a terminal
+// status (done | abandoned).
 //
-// Tdd-red stub: Reconcile + scanSocketsDir + the Deps/Options/Report
-// types compile but every function returns zero values. The accompanying
-// _test.go suite drives the contract that the tdd-green pass must
-// satisfy.
+// The package is also reused by PR-D's automatic reconciliation in
+// `fleet status` / `fleet dispatch` — that path calls Reconcile with
+// Apply=false to surface orphans to the operator without auto-mutating.
+//
+// Reconciliation flow:
+//
+//	Options + Deps  ─→  Reconcile  ─→  Report (Action list)
+//	                       │
+//	    ┌──────────────────┼──────────────────┐
+//	    ▼                  ▼                  ▼
+//	sockets        orphan-agents        orphan-tmux       worktrees
+//	(/tmp glob,    (~/.fleet/agents     (tmux ls,         (per-project
+//	max-age gate)  cross-checked vs     freshness floor,  worktrees,
+//	               tmux.SessionAlive)   agent-record      task terminal
+//	                                    match)            gate)
+//
+// Side effects only fire when Options.Apply is true. Dry-run produces
+// the same Report with would-* verbs and never invokes any mutator.
 package gc
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -29,6 +53,9 @@ const (
 	KindOrphanTmux   Kind = "orphan-tmux"
 	KindWorktrees    Kind = "worktrees"
 )
+
+// AllKinds is the default --kinds set when the flag is omitted.
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -46,9 +73,9 @@ const (
 	VerbKilled       Verb = "killed"
 )
 
-// SocketInfo is the minimal shape Reconcile needs for sockets:
-// path on disk + last-modified time. The default lister
-// (scanSocketsDir) populates both from os.Stat; tests fabricate
+// SocketInfo is the minimal shape Reconcile needs for sockets: path on
+// disk + last-modified time. The default lister (scanSocketsDir +
+// DefaultListSockets) populates both from os.Stat; tests fabricate
 // arbitrary mtimes to exercise the max-age boundary.
 type SocketInfo struct {
 	Path    string
@@ -67,11 +94,21 @@ type WorktreeEntry struct {
 // Options drives Reconcile's behavior. All fields are explicit so the
 // CLI flag wiring (cmd/fleet/gc.go) reads as a 1:1 translation.
 type Options struct {
-	Apply      bool
+	// Apply=false is dry-run (default). Apply=true actually mutates.
+	Apply bool
+	// Aggressive opts in to auto-killing orphan tmux sessions. Default
+	// false surfaces them only — see feedback_surface_dont_silo.md and
+	// feedback_user_owns_tmux_config.md.
 	Aggressive bool
-	MaxAge     time.Duration
-	Kinds      []Kind
-	Project    string // empty = all projects (for worktrees + agent scope)
+	// MaxAge gates socket removal (a socket younger than MaxAge is
+	// kept). Default 24h applied at the CLI layer.
+	MaxAge time.Duration
+	// Kinds names which families to consider. Empty falls through to
+	// AllKinds at the CLI layer; Reconcile itself treats nil/empty as
+	// "do nothing" so callers get the explicit-opt-in default.
+	Kinds []Kind
+	// Project scopes worktree + agent enumeration. Empty = all projects.
+	Project string
 }
 
 // Deps groups every external read/write Reconcile needs. Tests stub
@@ -80,14 +117,24 @@ type Options struct {
 // boundary obvious for PR-D's automatic reconciliation in
 // `fleet status` / `fleet dispatch`.
 type Deps struct {
-	Now            func() time.Time
-	ListSockets    func() ([]SocketInfo, error)
-	RemoveSocket   func(path string) error
-	ListAgents     func() ([]*agent.Record, error)
-	ArchiveAgent   func(*agent.Record) error
-	SessionAlive   func(name string) (bool, error)
-	ListSessions   func() ([]tmux.SessionInfo, error)
-	KillSession    func(name string) error
+	// Now is the wall-clock source for age comparisons. Tests pin it
+	// for determinism.
+	Now func() time.Time
+
+	// Sockets.
+	ListSockets  func() ([]SocketInfo, error)
+	RemoveSocket func(path string) error
+
+	// Agents.
+	ListAgents   func() ([]*agent.Record, error)
+	ArchiveAgent func(*agent.Record) error
+	SessionAlive func(name string) (bool, error)
+
+	// Tmux.
+	ListSessions func() ([]tmux.SessionInfo, error)
+	KillSession  func(name string) error
+
+	// Worktrees.
 	ListProjects   func() ([]string, error)
 	ListWorktrees  func(project string) ([]WorktreeEntry, error)
 	RemoveWorktree func(path string) error
@@ -111,13 +158,547 @@ type Report struct {
 	Actions []Action
 }
 
-// Reconcile is the package's only entrypoint. TDD-red: empty body.
-func Reconcile(_ Options, _ Deps) (Report, error) { //nolint:unused
-	return Report{}, nil
+// OrphanTmuxMinFreshness is the floor for "this fleet-* tmux session
+// might still be a brand-new spawn whose agent record is mid-write".
+// Mirrors cmd/fleet/maintenance.go:pruneOrphanTmuxMinFreshness — the
+// classification gate is the same shape, so the freshness window must
+// agree. Sessions younger than this are NEVER touched, even under
+// --aggressive (codex review iter-2/3 [P1] history on prune-orphan-tmux).
+const OrphanTmuxMinFreshness = 90 * time.Second
+
+// fleetAgentIDPattern matches the agent ID format produced by
+// agent.NewID(): 8 lowercase hex characters (happy path), OR the
+// crypto/rand fallback shape "t%07x" with the value masked to 32 bits
+// (which yields t+7hex or t+8hex). Sessions whose suffix doesn't match
+// are out of fleet's blast radius (operator-owned tmux config —
+// feedback_user_owns_tmux_config.md).
+var fleetAgentIDPattern = regexp.MustCompile(`^([0-9a-f]{8}|t[0-9a-f]{7,8})$`)
+
+// hasKind is a tiny membership check on the Kinds opt-in list.
+func hasKind(kinds []Kind, k Kind) bool {
+	for _, x := range kinds {
+		if x == k {
+			return true
+		}
+	}
+	return false
 }
 
-// scanSocketsDir lists /tmp (or the provided dir) for the
-// fleet-test-*.sock pattern. TDD-red: empty.
-func scanSocketsDir(_ string) ([]SocketInfo, error) { //nolint:unused
-	return nil, nil
+// Reconcile runs the four classifiers, executes any side effects gated
+// by Apply, and returns the Report. A nil/empty Options.Kinds is a
+// no-op (callers must explicitly opt in to each family).
+//
+// Errors from individual classifier reads are returned wrapped — the
+// CLI surfaces them on stderr but still prints whatever actions were
+// produced before the failure. Mutator errors are recorded as
+// per-action Reason text and a separate stderr line in the CLI; they
+// do NOT abort the whole sweep (one bad worktree must not strand the
+// other three families).
+func Reconcile(opts Options, deps Deps) (Report, error) {
+	var r Report
+	var firstErr error
+	recordErr := func(e error) {
+		if firstErr == nil {
+			firstErr = e
+		}
+	}
+
+	if hasKind(opts.Kinds, KindSockets) {
+		if err := reconcileSockets(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("sockets: %w", err))
+		}
+	}
+	if hasKind(opts.Kinds, KindOrphanAgents) {
+		if err := reconcileOrphanAgents(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("orphan-agents: %w", err))
+		}
+	}
+	if hasKind(opts.Kinds, KindOrphanTmux) {
+		if err := reconcileOrphanTmux(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("orphan-tmux: %w", err))
+		}
+	}
+	if hasKind(opts.Kinds, KindWorktrees) {
+		if err := reconcileWorktrees(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("worktrees: %w", err))
+		}
+	}
+
+	// Stable order: Kind primary, Target secondary. Tests rely on
+	// findAction() (linear scan) so the order is for human-readable
+	// output, not for assertion order.
+	sort.SliceStable(r.Actions, func(i, j int) bool {
+		if r.Actions[i].Kind != r.Actions[j].Kind {
+			return kindRank(r.Actions[i].Kind) < kindRank(r.Actions[j].Kind)
+		}
+		return r.Actions[i].Target < r.Actions[j].Target
+	})
+	return r, firstErr
+}
+
+func kindRank(k Kind) int {
+	switch k {
+	case KindSockets:
+		return 0
+	case KindOrphanAgents:
+		return 1
+	case KindOrphanTmux:
+		return 2
+	case KindWorktrees:
+		return 3
+	}
+	return 99
+}
+
+// reconcileSockets walks SocketInfo list, filters by MaxAge gate, and
+// either records would-remove or actually removes the file via
+// RemoveSocket. /tmp/fleet-test-*.sock files older than MaxAge are
+// orphan test debris (per feedback_fleet_owns_its_resources.md the
+// existing leak peaked at 3,570 of them).
+func reconcileSockets(r *Report, opts Options, deps Deps) error {
+	infos, err := deps.ListSockets()
+	if err != nil {
+		return err
+	}
+	now := deps.Now()
+	for _, s := range infos {
+		age := now.Sub(s.ModTime)
+		if age < opts.MaxAge {
+			continue // within freshness window — keep
+		}
+		act := Action{Kind: KindSockets, Target: s.Path, Verb: VerbWouldRemove,
+			Reason: fmt.Sprintf("age=%s exceeds max-age=%s", humanDuration(age), humanDuration(opts.MaxAge))}
+		if opts.Apply {
+			if rerr := deps.RemoveSocket(s.Path); rerr != nil {
+				act.Reason = fmt.Sprintf("remove failed: %v", rerr)
+			} else {
+				act.Verb = VerbRemoved
+			}
+		}
+		r.Actions = append(r.Actions, act)
+	}
+	return nil
+}
+
+// reconcileOrphanAgents enumerates ~/.fleet/agents/*.json and, for
+// each, probes the declared tmux session. Records whose session is
+// definitively gone (SessionAlive returns alive=false, err=nil) are
+// candidates to archive. Probe errors (transport failure, ambiguous
+// state) leave the record alone — surface-don't-silo means we don't
+// archive a live agent on a transient probe miss
+// (feedback_surface_dont_silo.md + SessionAlive's own contract).
+//
+// Project scope: when opts.Project is set, only records matching that
+// project are considered. Records with empty Project field are
+// included only when opts.Project is empty (the global sweep).
+func reconcileOrphanAgents(r *Report, opts Options, deps Deps) error {
+	records, err := deps.ListAgents()
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		if rec == nil {
+			continue
+		}
+		if opts.Project != "" && rec.Project != opts.Project {
+			continue
+		}
+		alive, perr := deps.SessionAlive(rec.TmuxSession)
+		if perr != nil {
+			// Probe failed — refuse to act on ambiguous state.
+			continue
+		}
+		if alive {
+			continue
+		}
+		act := Action{Kind: KindOrphanAgents, Target: rec.ID, Verb: VerbWouldArchive,
+			Reason: fmt.Sprintf("tmux session %s gone", rec.TmuxSession)}
+		if opts.Apply {
+			if aerr := deps.ArchiveAgent(rec); aerr != nil {
+				act.Reason = fmt.Sprintf("archive failed: %v", aerr)
+			} else {
+				act.Verb = VerbArchived
+			}
+		}
+		r.Actions = append(r.Actions, act)
+	}
+	return nil
+}
+
+// reconcileOrphanTmux finds fleet-* sessions whose ID suffix has no
+// matching live agent record AND that are past the freshness floor.
+// Default behavior surfaces (Verb=surface) without killing —
+// feedback_surface_dont_silo.md + feedback_user_owns_tmux_config.md
+// say we don't auto-mutate operator-owned tmux state on a maybe.
+//
+// Aggressive=true upgrades the surface action to would-kill / killed,
+// matching the documented escape hatch (--aggressive on the CLI).
+func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
+	sessions, err := deps.ListSessions()
+	if err != nil {
+		return err
+	}
+	if len(sessions) == 0 {
+		return nil
+	}
+	records, err := deps.ListAgents()
+	if err != nil {
+		return err
+	}
+	// Build a set of live agent IDs (and their session names) to
+	// short-circuit the per-session probe.
+	liveIDs := make(map[string]struct{}, len(records))
+	liveSessions := make(map[string]struct{}, len(records))
+	for _, rec := range records {
+		if rec == nil {
+			continue
+		}
+		liveIDs[rec.ID] = struct{}{}
+		liveSessions[rec.TmuxSession] = struct{}{}
+	}
+	now := deps.Now()
+	for _, s := range sessions {
+		if !strings.HasPrefix(s.Name, "fleet-") {
+			continue // not fleet's session
+		}
+		id := strings.TrimPrefix(s.Name, "fleet-")
+		if id == "" || !fleetAgentIDPattern.MatchString(id) {
+			// Non-agent fleet-* session (e.g. fleet-coord-839b11ff or
+			// operator's manually named fleet-debug). Out of scope —
+			// reaping those would violate the user-owns-tmux-config
+			// boundary on a heuristic match.
+			continue
+		}
+		if _, ok := liveIDs[id]; ok {
+			continue // session belongs to a live agent record
+		}
+		if _, ok := liveSessions[s.Name]; ok {
+			continue
+		}
+		// Freshness gate: a brand-new tmux session whose agent record
+		// is still being written must not be classified as orphan.
+		// Zero Created (parse failure) → treat as fresh-unknown
+		// (conservative, refuse to act).
+		if s.Created.IsZero() || now.Sub(s.Created) < OrphanTmuxMinFreshness {
+			continue
+		}
+		act := Action{Kind: KindOrphanTmux, Target: s.Name, Verb: VerbSurface,
+			Reason: fmt.Sprintf("no agent record; kill manually with `tmux kill-session -t %s` or rerun with --aggressive --apply", s.Name)}
+		if opts.Aggressive {
+			act.Verb = VerbWouldKill
+			act.Reason = fmt.Sprintf("no agent record (age=%s)", humanDuration(now.Sub(s.Created)))
+			if opts.Apply {
+				if kerr := deps.KillSession(s.Name); kerr != nil {
+					act.Reason = fmt.Sprintf("kill failed: %v", kerr)
+				} else {
+					act.Verb = VerbKilled
+				}
+			}
+		}
+		r.Actions = append(r.Actions, act)
+	}
+	return nil
+}
+
+// reconcileWorktrees walks ~/.fleet/projects/<project>/worktrees/<slug>/
+// directories and removes those whose corresponding task has reached a
+// terminal status (done | abandoned). Active-task worktrees stay put —
+// the worker may be mid-rebase / mid-push.
+//
+// Project scope: empty opts.Project enumerates every project via
+// ListProjects; an explicit name skips enumeration and calls
+// ListWorktrees(project) directly.
+func reconcileWorktrees(r *Report, opts Options, deps Deps) error {
+	var projects []string
+	if opts.Project != "" {
+		projects = []string{opts.Project}
+	} else {
+		ps, err := deps.ListProjects()
+		if err != nil {
+			return err
+		}
+		projects = ps
+	}
+	for _, p := range projects {
+		entries, err := deps.ListWorktrees(p)
+		if err != nil {
+			// Per-project failure is recorded as a synthetic action so
+			// the operator sees it without it tanking the whole sweep.
+			r.Actions = append(r.Actions, Action{
+				Kind: KindWorktrees, Target: p, Verb: VerbSurface,
+				Reason: fmt.Sprintf("list worktrees failed: %v", err),
+			})
+			continue
+		}
+		for _, e := range entries {
+			terminal, terr := deps.IsTaskTerminal(e.Project, e.Slug)
+			if terr != nil {
+				// Probe failed — leave alone (surface-don't-silo).
+				continue
+			}
+			if !terminal {
+				continue
+			}
+			act := Action{Kind: KindWorktrees, Target: e.Path, Verb: VerbWouldRemove,
+				Reason: fmt.Sprintf("task %s/%s reached terminal status", e.Project, e.Slug)}
+			if opts.Apply {
+				if rerr := deps.RemoveWorktree(e.Path); rerr != nil {
+					act.Reason = fmt.Sprintf("remove failed: %v", rerr)
+				} else {
+					act.Verb = VerbRemoved
+				}
+			}
+			r.Actions = append(r.Actions, act)
+		}
+	}
+	return nil
+}
+
+// humanDuration formats a duration in a compact form. Used in Reason
+// fields so the CLI output reads well without a heavyweight formatter.
+func humanDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Round(time.Second).Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Round(time.Minute).Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Round(time.Hour).Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Round(time.Hour)/24/time.Hour))
+	}
+}
+
+// ----------------- production wiring (DefaultDeps) ------------------
+
+// DefaultDeps returns the production Deps wired to ~/.fleet/, /tmp/,
+// the tmux binary, the agent package, and git for worktree removal.
+//
+// All the heavy lifting lives in helpers under this comment so the
+// returned struct is one screenful and trivially reads as "here's the
+// real call for each hook."
+func DefaultDeps() Deps {
+	return Deps{
+		Now:            time.Now,
+		ListSockets:    func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		RemoveSocket:   removeSocketFile,
+		ListAgents:     agent.List,
+		ArchiveAgent:   func(r *agent.Record) error { return r.Archive() },
+		SessionAlive:   tmux.SessionAlive,
+		ListSessions:   tmux.ListSessionsWithCreated,
+		KillSession:    tmux.Kill,
+		ListProjects:   listProjectsOnDisk,
+		ListWorktrees:  listProjectWorktrees,
+		RemoveWorktree: removeGitWorktree,
+		IsTaskTerminal: isTaskTerminalOnDisk,
+	}
+}
+
+// scanSocketsDir returns every entry matching fleet-test-*.sock under
+// dir. Used by the production socket lister with dir=/tmp. Both files
+// AND directories are honored — fleet's own temp-dir convention spawns
+// some test fixtures into /tmp/fleet-test-<hex>/ trees, and those leak
+// the same way.
+func scanSocketsDir(dir string) ([]SocketInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", dir, err)
+	}
+	var infos []SocketInfo
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "fleet-test-") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".sock") {
+			// Out of scope — `fleet-test-*` without `.sock` includes
+			// tmuxtest's temp-dir contents which Go's t.TempDir
+			// already reaps. Future expansion can broaden this.
+			continue
+		}
+		fullPath := filepath.Join(dir, name)
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		infos = append(infos, SocketInfo{Path: fullPath, ModTime: info.ModTime()})
+	}
+	return infos, nil
+}
+
+// removeSocketFile is the production RemoveSocket. Tolerates a
+// concurrent removal (ENOENT collapses to nil) so two operators
+// running `fleet gc --apply` back-to-back don't see spurious errors.
+func removeSocketFile(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// listProjectsOnDisk enumerates ~/.fleet/projects/<name>/ — every
+// directory entry is a project, except the reserved `.locks` subdir.
+// Unknown ~/.fleet root (FLEET_HOME unset, home dir resolution
+// failure) returns the error so the operator sees the gap; an empty
+// projects/ dir returns (nil, nil).
+func listProjectsOnDisk() ([]string, error) {
+	root, err := state.Root()
+	if err != nil {
+		return nil, err
+	}
+	pdir := filepath.Join(root, "projects")
+	entries, err := os.ReadDir(pdir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", pdir, err)
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name == ".locks" {
+			continue
+		}
+		if err := state.ValidateProjectName(name); err != nil {
+			// Hand-edited / pre-validation legacy entry — skip rather
+			// than fail closed; operator-visible via the rest of the
+			// fleet CLI.
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// listProjectWorktrees scans ~/.fleet/projects/<project>/worktrees/
+// and yields one WorktreeEntry per directory. Slug = dir basename.
+func listProjectWorktrees(project string) ([]WorktreeEntry, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	wtRoot := filepath.Join(filepath.Clean(dir), "worktrees")
+	entries, err := os.ReadDir(wtRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", wtRoot, err)
+	}
+	var out []WorktreeEntry
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, WorktreeEntry{
+			Project: project,
+			Slug:    e.Name(),
+			Path:    filepath.Join(wtRoot, e.Name()),
+		})
+	}
+	return out, nil
+}
+
+// removeGitWorktree runs `git -C <path> worktree remove --force <path>`.
+// `-C <worktree-path>` makes git auto-resolve the linked main repo via
+// the `gitdir:` pointer in the worktree's .git file, so the caller
+// doesn't need to know where the canonical repo lives.
+//
+// Best-effort: if the path is already gone, return nil. If git itself
+// fails, return the wrapped error — the caller surfaces it on the
+// per-action Reason field.
+func removeGitWorktree(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	cmd := exec.Command("git", "-C", path, "worktree", "remove", "--force", path)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git worktree remove %s: %w (%s)", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// isTaskTerminalOnDisk reads <project>/tasks.md AND
+// <project>/tasks-archive.md and returns true when slug appears with
+// status=done OR status=abandoned in either file. Archived tasks are
+// terminal by definition, so a slug only found in tasks-archive.md is
+// also terminal.
+//
+// On read error, returns (false, err) so the caller's surface-don't-
+// silo gate keeps the worktree.
+func isTaskTerminalOnDisk(project, slug string) (bool, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return false, err
+	}
+	for _, fname := range []string{"tasks.md", "tasks-archive.md"} {
+		path := filepath.Join(filepath.Clean(dir), fname)
+		terminal, found, ferr := taskStatusInFile(path, slug)
+		if ferr != nil {
+			return false, ferr
+		}
+		if found {
+			return terminal, nil
+		}
+	}
+	// Slug not in either file → assume the worktree is orphaned (the
+	// task record is gone), which is itself a terminal state.
+	return true, nil
+}
+
+// taskStatusInFile parses one tasks.md file looking for `## task: <slug>`
+// followed by a `- status: <value>` bullet within the block. Returns:
+//
+//	terminal=true, found=true   — status is done or abandoned
+//	terminal=false, found=true  — status is anything else
+//	found=false                 — slug not present in this file
+//
+// The parser is deliberately minimal: we don't want to depend on the
+// full tasks package (it pulls in a per-project flock) for a read-only
+// status check. The grammar is stable (ENG §3.1) and the parse here
+// only cares about two tokens.
+func taskStatusInFile(path, slug string) (terminal, found bool, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("read %s: %w", path, rerr)
+	}
+	wantHeader := "## task: " + slug
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != wantHeader {
+			continue
+		}
+		// Scan forward until the next `## ` header (block boundary) or
+		// EOF, looking for `- status:` bullet.
+		for j := i + 1; j < len(lines); j++ {
+			lt := strings.TrimSpace(lines[j])
+			if strings.HasPrefix(lt, "## ") {
+				break
+			}
+			if strings.HasPrefix(lt, "- status:") {
+				val := strings.TrimSpace(strings.TrimPrefix(lt, "- status:"))
+				return val == "done" || val == "abandoned", true, nil
+			}
+		}
+		// Found the block but no status bullet — defensive: treat as
+		// non-terminal (don't reap on a malformed entry).
+		return false, true, nil
+	}
+	return false, false, nil
 }

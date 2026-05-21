@@ -114,6 +114,7 @@ Engine selection:
 	root.AddCommand(newMaintenanceCmd())
 	root.AddCommand(newClaimsCmd())
 	root.AddCommand(newRCCmd())
+	root.AddCommand(newGCCmd())
 	return root
 }
 

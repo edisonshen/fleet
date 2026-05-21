@@ -32,7 +32,7 @@ import (
 // fields they exercise.
 func stubDeps(now time.Time) Deps {
 	return Deps{
-		Now:       func() time.Time { return now },
+		Now:         func() time.Time { return now },
 		ListSockets: func() ([]SocketInfo, error) { return nil, nil },
 		RemoveSocket: func(string) error {
 			return errors.New("stubDeps: RemoveSocket should not run")
@@ -295,7 +295,7 @@ func TestReconcile_NonFleetTmuxSession_Ignored(t *testing.T) {
 	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
 		return []tmux.SessionInfo{
 			{Name: "main", Created: created},
-			{Name: "fleet-debug", Created: created},     // not 8-hex
+			{Name: "fleet-debug", Created: created},          // not 8-hex
 			{Name: "fleet-coord-839b11ff", Created: created}, // not bare 8-hex
 		}, nil
 	}
