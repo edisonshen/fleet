@@ -542,6 +542,58 @@ func TestReconcile_OrphanTmux_MatchedByLiveAgent_Skipped(t *testing.T) {
 
 // ----- helpers for production-dep tests (SocketInfo path) -----
 
+// TestIsTaskTerminalOnDisk covers the production tasks.md parser
+// behavior smoked during PR-A: a worktree-dir slug that doesn't match
+// any task entry must NOT be classified as terminal (operator-side
+// rename / truncated slug / partial workflow — surface-don't-silo
+// rather than silently delete the directory). Done/abandoned tasks in
+// tasks.md or tasks-archive.md ARE terminal.
+func TestIsTaskTerminalOnDisk(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tasksMD := `## task: live-slug-aaaa
+- status: in-progress
+- priority: P1
+
+## task: done-slug-bbbb
+- status: done
+- priority: P2
+`
+	archiveMD := `## task: abandoned-slug-cccc
+- status: abandoned
+- priority: P3
+`
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tasksMD), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pdir, "tasks-archive.md"), []byte(archiveMD), 0o644); err != nil {
+		t.Fatalf("write tasks-archive.md: %v", err)
+	}
+	cases := []struct {
+		slug     string
+		terminal bool
+	}{
+		{"live-slug-aaaa", false},
+		{"done-slug-bbbb", true},
+		{"abandoned-slug-cccc", true},
+		{"unknown-slug-eeee", false}, // critical: missing-slug = keep
+	}
+	for _, c := range cases {
+		got, err := isTaskTerminalOnDisk("alpha", c.slug)
+		if err != nil {
+			t.Errorf("isTaskTerminalOnDisk(%s): %v", c.slug, err)
+			continue
+		}
+		if got != c.terminal {
+			t.Errorf("isTaskTerminalOnDisk(%s) = %v, want %v", c.slug, got, c.terminal)
+		}
+	}
+}
+
 // TestDefaultSocketLister_ScansTmp covers the production glob to make
 // sure /tmp/fleet-test-*.sock files are picked up via the default
 // Deps wiring. Uses a temp dir to avoid touching the operator's real

@@ -638,6 +638,18 @@ func removeGitWorktree(path string) error {
 //
 // On read error, returns (false, err) so the caller's surface-don't-
 // silo gate keeps the worktree.
+//
+// Slug not present in either file → returns (false, nil). The worktree
+// is kept. Rationale: a worktree dir whose name doesn't match any task
+// entry could be an operator-side rename, a partial workflow, or a
+// truncated slug (the worktree dir basename sometimes drops the trailing
+// `-<random>` suffix — `dispatch-lifecycle-pr2` directory vs
+// `dispatch-lifecycle-pr2-e-396f` task slug, observed during PR-A smoke
+// test). Auto-removing on absent task entry would delete work that
+// `fleet gc` couldn't tie back to a clear "done|abandoned" signal,
+// violating feedback_surface_dont_silo.md. The bare directory still
+// shows up under `--project <name>` enumeration so the operator can
+// triage manually.
 func isTaskTerminalOnDisk(project, slug string) (bool, error) {
 	dir, err := state.ProjectDir(project)
 	if err != nil {
@@ -653,9 +665,8 @@ func isTaskTerminalOnDisk(project, slug string) (bool, error) {
 			return terminal, nil
 		}
 	}
-	// Slug not in either file → assume the worktree is orphaned (the
-	// task record is gone), which is itself a terminal state.
-	return true, nil
+	// Slug not in either file → keep the worktree. See doc above.
+	return false, nil
 }
 
 // taskStatusInFile parses one tasks.md file looking for `## task: <slug>`
