@@ -139,6 +139,15 @@ type Deps struct {
 	// terminates live agents. Mirrors cmd/fleet/maintenance.go's
 	// agentDirSane precondition for fleet maintenance prune-orphan-tmux.
 	AgentDirSane func() error
+	// ListAgentsStrict returns the good records AND the IDs of records
+	// that exist on disk but failed to parse. Used by the orphan-tmux
+	// classifier as the strict gate (codex iter-2 [P1]): if any record
+	// is malformed, its matching fleet-<id> tmux session would look
+	// unmatched (because the silent-skip in ListAgents drops it from
+	// liveIDs) and could be killed under --aggressive --apply. The
+	// classifier fails closed when len(badIDs) > 0 — same shape as the
+	// dispatch --coord-spawn split-brain veto (codex iter-17).
+	ListAgentsStrict func() (good []*agent.Record, badIDs []string, err error)
 
 	// Tmux.
 	ListSessions func() ([]tmux.SessionInfo, error)
@@ -375,9 +384,29 @@ func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 			return fmt.Errorf("agent dir sanity check: %w", err)
 		}
 	}
-	records, err := deps.ListAgents()
-	if err != nil {
-		return err
+	// Prefer the strict lister: if any record on disk failed to parse,
+	// its matching fleet-<id> session would look unmatched and could be
+	// killed under --aggressive --apply (codex iter-2 [P1]). Fail closed
+	// before consuming the listing — same shape as dispatch --coord-spawn
+	// split-brain veto.
+	var records []*agent.Record
+	if deps.ListAgentsStrict != nil {
+		good, badIDs, lerr := deps.ListAgentsStrict()
+		if lerr != nil {
+			return lerr
+		}
+		if len(badIDs) > 0 {
+			sort.Strings(badIDs)
+			return fmt.Errorf("agent listing has %d unparseable record(s) %v — refusing to classify orphan-tmux (matching live session could misclassify and be killed)",
+				len(badIDs), badIDs)
+		}
+		records = good
+	} else {
+		var err2 error
+		records, err2 = deps.ListAgents()
+		if err2 != nil {
+			return err2
+		}
 	}
 	// Build a set of live agent IDs (and their session names) to
 	// short-circuit the per-session probe.
@@ -525,6 +554,7 @@ func DefaultDeps() Deps {
 		ListSockets:         func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
 		RemoveSocket:        removeSocketFile,
 		ListAgents:          agent.List,
+		ListAgentsStrict:    agent.ListStrict,
 		ArchiveAgent:        func(r *agent.Record) error { return r.Archive() },
 		SessionAlive:        tmux.SessionAlive,
 		AgentDirSane:        agentDirSane,

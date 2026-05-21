@@ -734,6 +734,53 @@ func TestReconcile_OrphanTmux_FreshnessFromDeps_RespectsDynamic(t *testing.T) {
 	}
 }
 
+// TestReconcile_OrphanTmux_UnparseableAgent_FailsClosed pins the
+// fix for codex iter-2 [P1]: when a record on disk is malformed,
+// agent.List() silently skips it, so the matching fleet-<id> tmux
+// session is absent from the in-memory live set and would be killed
+// as an orphan under --aggressive --apply. Wiring through
+// ListAgentsStrict forces a fail-closed when badIDs is non-empty,
+// same shape as the dispatch --coord-spawn split-brain veto.
+func TestReconcile_OrphanTmux_UnparseableAgent_FailsClosed(t *testing.T) {
+	now := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
+	created := now.Add(-2 * time.Hour) // past freshness floor
+	deps := stubDeps(now)
+	deps.ListSessions = func() ([]tmux.SessionInfo, error) {
+		// A live agent's session — would look orphan because its
+		// record failed to parse and was silently dropped.
+		return []tmux.SessionInfo{{Name: "fleet-deadbeef", Created: created}}, nil
+	}
+	deps.ListAgentsStrict = func() ([]*agent.Record, []string, error) {
+		// Simulate an unparseable record on disk: it does NOT appear
+		// in good[], but its ID is in badIDs[].
+		return nil, []string{"deadbeef"}, nil
+	}
+	var killed []string
+	deps.KillSession = func(name string) error {
+		killed = append(killed, name)
+		return nil
+	}
+
+	got, err := Reconcile(Options{
+		Apply: true, Aggressive: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindOrphanTmux},
+	}, deps)
+	if err == nil {
+		t.Fatalf("Reconcile must surface unparseable-record error; got nil")
+	}
+	if !strings.Contains(err.Error(), "unparseable") {
+		t.Fatalf("error %q does not mention unparseable records", err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("orphan-tmux killed %v with unparseable records; must fail closed", killed)
+	}
+	for _, a := range got.Actions {
+		if a.Kind == KindOrphanTmux {
+			t.Fatalf("orphan-tmux action produced despite bad records: %+v", a)
+		}
+	}
+}
+
 // TestReconcile_OrphanTmux_FreshnessFromDeps_FallsThroughPastWindow is
 // the positive counterpart: once the session ages past the dynamic
 // window, it IS classified — so the dep doesn't accidentally disable
