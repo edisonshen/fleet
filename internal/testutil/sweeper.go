@@ -12,18 +12,24 @@
 // t.Cleanup runs, the next test package's TestMain reaps the orphan
 // at startup and on exit.
 //
-// Implementation: thin wrapper over internal/gc.Reconcile so the
-// sweep logic and the `fleet gc` CLI share one code path. Anything
-// gc.Reconcile considers safe to reap, the test-suite sweeper reaps
-// too — no duplicate policy.
+// Why this package does NOT import internal/gc: gc imports tmux,
+// spawn, agent, state. The test packages most likely to leak sockets
+// (internal/tmux, internal/spawn) are gc's own dependencies — pulling
+// gc back in via testutil would create import cycles in test builds.
+// The sweep policy here is intentionally a small subset of gc's
+// (sockets only, no orphan-agents / orphan-tmux / worktrees) so the
+// duplication is one strscan loop, not a maintenance burden. The
+// `fleet gc` CLI still uses the full gc.Reconcile path for operator-
+// invoked cleanup; this sweeper is just the test-infrastructure half.
 package testutil
 
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
-
-	"github.com/edisonshen/fleet/internal/gc"
 )
 
 // Sweep reaps stale /tmp/fleet-test-*.sock files older than maxAge.
@@ -51,68 +57,71 @@ func Sweep(maxAge time.Duration) error {
 // Behavior is identical to the production call (which uses /tmp) — the
 // dir parameter exists only so the unit test in sweeper_test.go can
 // run against t.TempDir() instead of mutating the operator's real /tmp.
+//
+// Algorithm matches internal/gc.reconcileSockets for the KindSockets
+// family:
+//
+//  1. List entries matching fleet-test-*.sock under dir.
+//  2. Skip entries younger than maxAge (within freshness window).
+//  3. Probe whether a tmux server is still bound to the socket. If
+//     yes, keep it (removing a live socket would strand the bound
+//     server's clients — see codex iter-4 [P1] history in
+//     internal/gc/gc.go:295).
+//  4. Otherwise unlink. ENOENT collapses to success (concurrent
+//     removal is fine).
 func SweepDir(dir string, maxAge time.Duration) error {
-	deps := gc.DefaultDeps()
-	// Override the production socket lister so it scans the test's
-	// chosen dir instead of /tmp. Everything else (the live-socket
-	// probe, removal, max-age gate) stays on the production wiring.
-	deps.ListSockets = func() ([]gc.SocketInfo, error) {
-		return scanSocketsDirShim(dir)
-	}
-	// Override RemoveSocket to also be predictable on temp paths.
-	deps.RemoveSocket = func(path string) error {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	// Pin time.Now via DefaultDeps; callers don't need to inject one.
-	_, err := gc.Reconcile(gc.Options{
-		Apply:  true,
-		MaxAge: maxAge,
-		Kinds:  []gc.Kind{gc.KindSockets},
-	}, deps)
-	if err != nil {
-		return fmt.Errorf("testutil.SweepDir(%s): %w", dir, err)
-	}
-	return nil
-}
-
-// scanSocketsDirShim mirrors internal/gc.scanSocketsDir (which is
-// unexported). Keeping a tiny private copy here avoids exporting an
-// internal helper from the gc package just for test infrastructure
-// reuse, and lets SweepDir scan an arbitrary directory for the unit
-// test without touching production wiring.
-func scanSocketsDirShim(dir string) ([]gc.SocketInfo, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil
 		}
-		return nil, fmt.Errorf("read %s: %w", dir, err)
+		return fmt.Errorf("testutil.SweepDir read %s: %w", dir, err)
 	}
-	var infos []gc.SocketInfo
+	now := time.Now()
+	var firstErr error
 	for _, e := range entries {
 		name := e.Name()
-		if len(name) < len("fleet-test-") || name[:len("fleet-test-")] != "fleet-test-" {
+		if !strings.HasPrefix(name, "fleet-test-") {
 			continue
 		}
-		if !hasDotSockSuffix(name) {
+		if !strings.HasSuffix(name, ".sock") {
+			// Out of scope — `fleet-test-*` without `.sock` includes
+			// tmuxtest's temp-dir contents which Go's t.TempDir
+			// already reaps. Mirrors scanSocketsDir in internal/gc.
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		infos = append(infos, gc.SocketInfo{
-			Path:    dir + string(os.PathSeparator) + name,
-			ModTime: info.ModTime(),
-		})
+		if now.Sub(info.ModTime()) < maxAge {
+			continue // within freshness window — keep
+		}
+		path := filepath.Join(dir, name)
+		if socketLive(path) {
+			continue // live tmux server still bound — keep
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("testutil.SweepDir remove %s: %w", path, err)
+			}
+		}
 	}
-	return infos, nil
+	return firstErr
 }
 
-func hasDotSockSuffix(name string) bool {
-	const sfx = ".sock"
-	return len(name) >= len(sfx) && name[len(name)-len(sfx):] == sfx
+// socketLive probes whether a tmux server is bound to path. Returns
+// true ONLY if `tmux -S <path> list-sessions` succeeds. File-gone /
+// no-server / probe-error all map to false. Mirrors
+// internal/gc.socketLiveOnDisk — duplicated here rather than imported
+// to keep this package out of the gc dependency tree (gc → tmux →
+// would cycle back if tmux's TestMain imported testutil → gc).
+func socketLive(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	if err := exec.Command("tmux", "-S", path, "list-sessions").Run(); err != nil {
+		return false
+	}
+	return true
 }
