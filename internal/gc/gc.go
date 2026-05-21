@@ -784,15 +784,32 @@ func isTaskTerminalOnDisk(project, slug string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	for _, fname := range []string{"tasks.md", "tasks-archive.md"} {
-		path := filepath.Join(filepath.Clean(dir), fname)
-		terminal, found, ferr := taskStatusInFile(path, slug)
-		if ferr != nil {
-			return false, ferr
-		}
-		if found {
-			return terminal, nil
-		}
+	// tasks.md is checked first: live status (done|abandoned) is
+	// terminal, anything else (in-progress, todo, ready, blocked,
+	// in-review) is non-terminal.
+	tasksPath := filepath.Join(filepath.Clean(dir), "tasks.md")
+	terminal, found, ferr := taskStatusInFile(tasksPath, slug)
+	if ferr != nil {
+		return false, ferr
+	}
+	if found {
+		return terminal, nil
+	}
+	// tasks-archive.md: presence ALONE is terminal regardless of
+	// the recorded status. `fleet tasks archive` (internal/tasks.go
+	// Archive) moves rows verbatim without forcing status=done, so an
+	// operator-forced archive of an `in-progress` task leaves the slug
+	// in tasks-archive.md with status=in-progress. The worktree for an
+	// archived row is unambiguously inactive (the task is no longer in
+	// the live list), so the docstring's "archived tasks are terminal
+	// by definition" rule is the right gate (codex iter-3 [P2]).
+	archivePath := filepath.Join(filepath.Clean(dir), "tasks-archive.md")
+	_, foundInArchive, aerr := taskStatusInFile(archivePath, slug)
+	if aerr != nil {
+		return false, aerr
+	}
+	if foundInArchive {
+		return true, nil
 	}
 	// Slug not in either file → keep the worktree. See doc above.
 	return false, nil

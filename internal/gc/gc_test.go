@@ -859,6 +859,43 @@ func TestIsTaskTerminalOnDisk_FencedSpoofIgnored(t *testing.T) {
 	}
 }
 
+// TestIsTaskTerminalOnDisk_ArchivedNonTerminalStatus_TreatedTerminal
+// pins the fix for codex iter-3 [P2]: fleet tasks archive moves rows
+// verbatim without coercing status to done, so an operator-forced
+// archive of an in-progress task lands in tasks-archive.md with
+// status=in-progress. Per the function's docstring ("archived tasks
+// are terminal by definition"), the worktree for that slug must be
+// classified as terminal, otherwise the archive class of leak is
+// permanently unreapable.
+func TestIsTaskTerminalOnDisk_ArchivedNonTerminalStatus_TreatedTerminal(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Empty tasks.md (so the slug is found ONLY in tasks-archive.md).
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(""), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	// Archive contains the slug with status=in-progress (operator-
+	// forced archive of a live task — Archive moves rows verbatim).
+	archiveMD := `## task: forced-archive-slug
+- status: in-progress
+- priority: P2
+`
+	if err := os.WriteFile(filepath.Join(pdir, "tasks-archive.md"), []byte(archiveMD), 0o644); err != nil {
+		t.Fatalf("write tasks-archive.md: %v", err)
+	}
+	terminal, err := isTaskTerminalOnDisk("alpha", "forced-archive-slug")
+	if err != nil {
+		t.Fatalf("isTaskTerminalOnDisk: %v", err)
+	}
+	if !terminal {
+		t.Fatalf("archived in-progress slug should be terminal (presence in archive = terminal by definition)")
+	}
+}
+
 // TestIsTaskTerminalOnDisk_IndentedSpoofIgnored pins the fix for codex
 // iter-3 [P2]: an indented `    ## task: <live-slug>` followed by
 // `    - status: done` is example text (sub-bullet under Spec/Notes,
