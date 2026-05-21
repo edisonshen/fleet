@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/queue"
 	"github.com/edisonshen/fleet/internal/rc"
@@ -46,6 +47,24 @@ var sessionListProbe = tmux.ListSessions
 // tmux.SessionAlive's contract. Indirected via a package-level var
 // so tests inject deterministic fakes.
 var sessionAliveProbe = tmux.SessionAlive
+
+// writeMarkerFn is the seam for the v0.12.2 P0 drain-path RC marker
+// backfill (DESIGN-coord-spawn-atomic-gate.md). Production wires
+// rc.WriteMarker; tests stub to count invocations and exercise the
+// non-fatal-on-failure contract pinned by
+// TestDrain_CoordHandoff_MarkerWriteFailure_NonFatal.
+//
+// Mirrors cmd/fleet/dispatch.go's writeMarkerFn seam: the handoffop
+// package can't import cmd/fleet (would cycle), so each package
+// carries its own seam wired to the same rc.WriteMarker production
+// implementation.
+//
+// Closes PR #163's deferred [P2] (2): cmd/fleet/handoff.go (PR #163)
+// writes the marker before the inject for operator-triggered handoffs;
+// internal/handoffop/handoffop.go (this seam) does the same for
+// drain-path (auto-handoff + crash recovery) handoffs so pre-v0.12.1
+// coords get RC backfilled on their next handoff.
+var writeMarkerFn = rc.WriteMarker
 
 // isCoordHandoffForAgent reports whether (project, agentID) identifies
 // the project's current coord — i.e. the coord-spawn marker resolves
@@ -567,6 +586,59 @@ func spawnAndRetire(req queue.SpawnFresh, queuePath string,
 	// gate coverage without driving full spawnAndRetire.
 	var rewrittenExecArgv []string
 	if isCoordHandoffForAgent(oldRec.Project, oldRec.ID) {
+		// v0.12.2 P0 v3 (DESIGN-coord-spawn-atomic-gate.md §Change 7;
+		// codex iter-1 [P1] from the v2 reviewer + v3 reviewer codex
+		// iter-1 [P1] on warn-and-continue): acquire the SAME
+		// project-level coord-spawn lock that cmd/fleet/dispatch.go
+		// uses, so a TUI `[a]` racing an in-flight drain replacement
+		// contends on the lock rather than slipping past it.
+		//
+		// Fail-fast on contention (corrected from design v3 §Change 7
+		// "warn-and-continue" rationale): the design's claim that
+		// "bailing out would orphan the queue file" is the inverse of
+		// the actual semantics. queue.Delete only runs on the SUCCESS
+		// path of spawnAndRetire (line ~387 / line ~796 / line ~868);
+		// returning here BEFORE the spawn preserves the queue file
+		// untouched, and the drain loop (fleet drain / fsnotify
+		// watcher) retries the same queue file in the next cycle by
+		// which time the contending lock holder will have released.
+		// Continuing past contention would actually CONSUME the queue
+		// file AND race — defeating the gate's whole purpose. Codex
+		// surfaced this in the v3 review.
+		release, lockErr := coordlock.Acquire(oldRec.Project)
+		if lockErr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: coordlock.Acquire(%q) contended during drain handoff: %v "+
+					"(deferring; queue file preserved for retry next drain cycle)\n",
+				oldRec.Project, lockErr)
+			return fmt.Errorf(
+				"drain: coord-spawn lock contended for project %q: %w "+
+					"(queue file preserved for retry)",
+				oldRec.Project, lockErr)
+		}
+		defer release()
+
+		// v0.12.2 P0 (DESIGN-coord-spawn-atomic-gate.md Change 6;
+		// closes PR #163 deferred [P2] (2)): backfill the rc-enabled
+		// marker for the project BEFORE the inject so a pre-v0.12.1
+		// coord whose project never had the marker written still
+		// gets RC on its drain-path replacement. Without this, the
+		// rc.Enabled(project) gate inside rc.GateAttachFlag returns
+		// false → inject no-ops → the replacement coord boots
+		// without --remote-control, breaking mobile / claude.ai
+		// pairing for the operator.
+		//
+		// Mirrors cmd/fleet/handoff.go's marker-write-before-inject
+		// pattern (PR #163 line 768). Failure is non-fatal: log a
+		// warning to stderr and continue — the inject will then
+		// no-op gracefully (the gate's other half), and the
+		// operator can recover via `fleet rc up <project>`.
+		if err := writeMarkerFn(oldRec.Project); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: rc.WriteMarker(%q) failed during drain handoff: %v "+
+					"(continuing with plain claude argv; run `fleet rc up %s` to recover)\n",
+				oldRec.Project, err, oldRec.Project)
+		}
 		rewrittenExecArgv = rc.GateAttachFlag(oldRec.Project, oldRec.Command, rcSessionName)
 		if spawn.SameCommand(rewrittenExecArgv, oldRec.Command) {
 			rewrittenExecArgv = nil
