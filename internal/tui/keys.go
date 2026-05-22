@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -1376,14 +1377,48 @@ var writeCoordSpawnMarkerFn = writeCoordSpawnMarkerLocked
 // race: cleanup acquires lock after dispatch released, reads old
 // marker body, TUI writes new id (outside lock), cleanup unlinks the
 // just-written new marker.
+//
+// Retry budget (codex iter-6 [P1]): coordlock.Acquire is non-blocking
+// (LOCK_NB) and returns EWOULDBLOCK on contention. The previous fail-
+// fast behavior was wrong for THIS caller: TUI invokes us AFTER a
+// successful spawn — failing the marker write strands the new coord
+// (record exists, marker doesn't, dashboard misses it). cleanup holds
+// the lock for microseconds while it captures + restores the marker;
+// a short retry budget rides over that window without making the
+// operator wait noticeably. Dispatch / drain callers stay fail-fast
+// because their criticial sections are longer and contention there
+// means a real concurrent spawn, not a transient cleanup blip.
+//
+// Budget: 2 seconds total at 50ms intervals = 40 attempts. Well over
+// the upper bound for a cleanup compare-and-remove; well under the
+// human-perceptible latency floor (the TUI is already mid-attach when
+// this runs).
 func writeCoordSpawnMarkerLocked(projectName, agentID string) error {
-	release, err := coordlock.Acquire(projectName)
-	if err != nil {
-		return fmt.Errorf("writeCoordSpawnMarker: acquire coord-spawn lock: %w", err)
+	const (
+		retryInterval = 50 * time.Millisecond
+		retryBudget   = 2 * time.Second
+	)
+	deadline := time.Now().Add(retryBudget)
+	var lastErr error
+	for {
+		release, err := coordlockAcquireFn(projectName)
+		if err == nil {
+			defer release()
+			return state.WriteCoordSpawnMarker(projectName, agentID)
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("writeCoordSpawnMarker: coord-spawn lock contended after %s of retries: %w",
+				retryBudget, lastErr)
+		}
+		time.Sleep(retryInterval)
 	}
-	defer release()
-	return state.WriteCoordSpawnMarker(projectName, agentID)
 }
+
+// coordlockAcquireFn is the seam that the marker-lock unit test
+// stubs to deterministically simulate contention without spinning
+// up a real flock holder for the full 2s budget.
+var coordlockAcquireFn = coordlock.Acquire
 
 // dispatchAgentIDPattern matches the first line of `fleet dispatch`
 // stdout: "agent <8-hex-id> spawned". We extract the ID so the

@@ -11,9 +11,8 @@
 package tui
 
 import (
-	"os"
+	"errors"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -58,85 +57,88 @@ func TestWriteCoordSpawnMarkerLocked_WritesAndReleases(t *testing.T) {
 	release()
 }
 
-// TestWriteCoordSpawnMarkerLocked_BlocksConcurrentCleanup is the
-// race-closing pin: while writeCoordSpawnMarkerLocked is running, a
-// concurrent coord.Cleanup-style coordlock.Acquire call must FAIL
-// (non-blocking) — proving the marker write holds the lock for the
-// duration of the write. The race codex iter-3 [P1] flagged depended
-// on TUI write NOT taking the lock; this test pins that it does.
-func TestWriteCoordSpawnMarkerLocked_BlocksConcurrentCleanup(t *testing.T) {
+// TestWriteCoordSpawnMarkerLocked_RetriesAndSucceedsAfterContention
+// pins the codex iter-6 [P1] fix: the marker write retries on
+// EWOULDBLOCK rather than fail-fast. We stub coordlockAcquireFn to
+// return contention for the first N attempts then succeed, and
+// assert the marker is ultimately written and the lock-acquire is
+// invoked > 1 time.
+func TestWriteCoordSpawnMarkerLocked_RetriesAndSucceedsAfterContention(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())
 	if _, err := state.Bootstrap(); err != nil {
 		t.Fatalf("bootstrap: %v", err)
 	}
 	const (
-		project = "lock-race-test"
-		agentID = "race1234"
+		project = "retry-success-test"
+		agentID = "rtry1234"
 	)
 	if _, err := state.EnsureProjectInitialized(project); err != nil {
 		t.Fatalf("ensure project: %v", err)
 	}
 
-	// Hijack state.WriteCoordSpawnMarker via a temporary swap so we
-	// can pause inside the lock-held section. We can't monkey-patch
-	// state from here; instead, we hold the lock manually from a
-	// goroutine that simulates "writeCoordSpawnMarkerLocked is in
-	// flight" and assert a concurrent Acquire bounces.
-	holdReady := make(chan struct{})
-	holdDone := make(chan struct{})
-	var contendErr atomic.Value
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		release, err := coordlock.Acquire(project)
-		if err != nil {
-			t.Errorf("holder Acquire: %v", err)
-			close(holdReady)
-			return
+	prev := coordlockAcquireFn
+	t.Cleanup(func() { coordlockAcquireFn = prev })
+
+	var attempts int32
+	const contendFor = 3 // first 3 attempts contend; 4th succeeds.
+	coordlockAcquireFn = func(p string) (func(), error) {
+		n := atomic.AddInt32(&attempts, 1)
+		if n <= contendFor {
+			return nil, errors.New("simulated coord-spawn lock contention")
 		}
-		close(holdReady)
-		<-holdDone
-		release()
-	}()
-
-	select {
-	case <-holdReady:
-	case <-time.After(5 * time.Second):
-		close(holdDone)
-		wg.Wait()
-		t.Fatal("holder goroutine did not acquire within 5s")
+		return func() {}, nil
 	}
 
-	// Now writeCoordSpawnMarkerLocked must fail-fast (NB-flock
-	// EWOULDBLOCK) because the holder goroutine has the lock.
-	err := writeCoordSpawnMarkerLocked(project, agentID)
-	if err == nil {
-		close(holdDone)
-		wg.Wait()
-		t.Fatal("writeCoordSpawnMarkerLocked succeeded while lock was held — expected EWOULDBLOCK")
+	if err := writeCoordSpawnMarkerLocked(project, agentID); err != nil {
+		t.Fatalf("writeCoordSpawnMarkerLocked: %v", err)
 	}
-	contendErr.Store(err.Error())
-
-	close(holdDone)
-	wg.Wait()
-
-	got := contendErr.Load().(string)
-	if !strings.Contains(got, "coord-spawn") && !strings.Contains(got, "in progress") {
-		t.Errorf("contended error %q does not surface the lock-contention reason", got)
+	body := state.ReadCoordSpawnMarker(project)
+	if body != agentID {
+		t.Errorf("marker body = %q, want %q (written after retry)", body, agentID)
 	}
-
-	// Marker must NOT have been written (the write was blocked).
-	if _, err := os.Stat(mustMarkerPath(t, project)); err == nil {
-		t.Error("marker exists after blocked write — write should have been atomic-fail")
+	if got := atomic.LoadInt32(&attempts); got <= 1 {
+		t.Errorf("expected > 1 Acquire attempt (retry path), got %d", got)
 	}
 }
 
-func mustMarkerPath(t *testing.T, project string) string {
-	t.Helper()
-	p, err := state.CoordSpawnMarkerPath(project)
-	if err != nil {
-		t.Fatalf("CoordSpawnMarkerPath: %v", err)
+// TestWriteCoordSpawnMarkerLocked_FailsAfterRetryBudget pins the
+// budget bound: persistent contention eventually surfaces an error
+// rather than hanging forever. The stub returns contention every
+// time; we assert the function returns within reasonable bounds and
+// carries the operator-facing message.
+func TestWriteCoordSpawnMarkerLocked_FailsAfterRetryBudget(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
 	}
-	return p
+	const (
+		project = "retry-fail-test"
+		agentID = "rfl12345"
+	)
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	prev := coordlockAcquireFn
+	t.Cleanup(func() { coordlockAcquireFn = prev })
+	coordlockAcquireFn = func(string) (func(), error) {
+		return nil, errors.New("permanently contended")
+	}
+
+	start := time.Now()
+	err := writeCoordSpawnMarkerLocked(project, agentID)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("writeCoordSpawnMarkerLocked: expected error after budget exhausted, got nil")
+	}
+	if !strings.Contains(err.Error(), "contended") {
+		t.Errorf("error %q does not surface contention reason", err)
+	}
+	// Budget is 2s; allow a generous upper bound on slow CI.
+	if elapsed > 5*time.Second {
+		t.Errorf("retry took %v, expected ~2s", elapsed)
+	}
+	if elapsed < 1*time.Second {
+		t.Errorf("retry took only %v; expected at least ~1s of retries", elapsed)
+	}
 }
