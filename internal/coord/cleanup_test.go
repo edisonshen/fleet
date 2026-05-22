@@ -403,6 +403,69 @@ func TestCleanup_MarkerAtomicCaptureRestoresWhenBodyChanges(t *testing.T) {
 	}
 }
 
+// TestCleanup_MarkerRestoreUsesLinkNotRename pins the codex iter-5
+// [P1] fix: the non-match restore path uses os.Link (atomic +
+// EEXIST-on-occupied-dest), NOT os.Rename (which would silently
+// clobber a concurrent writer's NEW marker).
+//
+// We can't easily inject a writer mid-clearMarkerIfMatched, so we
+// pin the LOWER-LEVEL invariant instead: os.Link must fail with
+// os.ErrExist when the destination is already populated. A regression
+// to os.Rename would silently succeed (overwriting the dest) and this
+// test would fail.
+//
+// This is the contract the post-capture restore relies on. Concrete
+// fix: cleanup.go's clearMarkerIfMatched uses os.Link(side, marker)
+// and treats os.ErrExist as "writer beat us — leave their NEW marker
+// alone, drop our captured stale copy."
+func TestCleanup_MarkerRestoreUsesLinkNotRename(t *testing.T) {
+	helperFleetHome(t)
+	const (
+		project = "restore-race-test"
+		newID   = "NEWNEWNN"
+	)
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+
+	markerPath, err := state.CoordSpawnMarkerPath(project)
+	if err != nil {
+		t.Fatalf("CoordSpawnMarkerPath: %v", err)
+	}
+
+	// Pre-position a NEW marker at the canonical path (simulating a
+	// writer that ran between cleanup's capture and cleanup's
+	// restore) and a stale captured side file.
+	stalePath := markerPath + ".clearing.test"
+	if err := os.WriteFile(stalePath, []byte("OLDOLDOL\n"), 0o644); err != nil {
+		t.Fatalf("seed side: %v", err)
+	}
+	defer func() { _ = os.Remove(stalePath) }()
+	if err := os.WriteFile(markerPath, []byte(newID+"\n"), 0o644); err != nil {
+		t.Fatalf("seed new marker: %v", err)
+	}
+
+	// The contract under test: os.Link(stale, marker) MUST fail with
+	// ErrExist because marker already exists. A regression to
+	// os.Rename would succeed and silently clobber the new marker.
+	err = os.Link(stalePath, markerPath)
+	if err == nil {
+		t.Fatal("os.Link did NOT fail on existing dest — cannot rely on it for non-clobber restore")
+	}
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("os.Link err = %v, want os.ErrExist (was %T)", err, err)
+	}
+
+	// Marker contents must still be the NEW body, NOT the stale one.
+	got, rerr := os.ReadFile(markerPath)
+	if rerr != nil {
+		t.Fatalf("read marker after attempted clobber: %v", rerr)
+	}
+	if strings.TrimSpace(string(got)) != newID {
+		t.Errorf("marker body = %q, want %q (NEW preserved)", got, newID)
+	}
+}
+
 // TestCleanup_TmuxKillErrorIsNonFatal pins the design's "best-effort,
 // non-fatal" tmux-kill contract: a returned error from the killer must
 // not abort the rest of the reap. Distinct from the panic test —

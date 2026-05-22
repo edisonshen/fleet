@@ -322,14 +322,33 @@ func clearMarkerIfMatched(project, agentID string) error {
 		}
 		return nil
 	}
-	// Body belongs to a different coord — restore the marker so the
-	// real coord's pointer is preserved.
-	if err := os.Rename(sidePath, markerPath); err != nil {
-		// Restoration failed. Best-effort cleanup of the side file so
-		// it doesn't accumulate in .locks/. The marker is lost in this
-		// pathological case, but we'd rather report than silo.
+	// Body belongs to a different coord — restore the captured marker
+	// IF AND ONLY IF the canonical marker path is still empty. Codex
+	// iter-5 [P1]: a naive os.Rename(side, marker) would CLOBBER a
+	// NEW marker that a concurrent writer dropped in between our
+	// capture and our restore. os.Link is atomic + fails with EEXIST
+	// when the destination is already populated — exactly the
+	// non-overwrite semantic we want. (POSIX has no portable
+	// RENAME_NOREPLACE; link+unlink is the standard workaround.)
+	if err := os.Link(sidePath, markerPath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			// Writer beat us to it — a NEW marker is at the canonical
+			// path. Leave it. Drop our captured stale copy.
+			if rerr := os.Remove(sidePath); rerr != nil {
+				return fmt.Errorf("remove side after writer-win: %w", rerr)
+			}
+			return nil
+		}
+		// Genuine error — best-effort scrub of the side file so it
+		// doesn't accumulate in .locks/. Marker is lost in this
+		// pathological case; surface rather than silo.
 		_ = os.Remove(sidePath)
 		return fmt.Errorf("restore non-matching marker: %w (side file removed; live marker lost)", err)
+	}
+	// Link succeeded — now drop the side path (the inode lives on at
+	// markerPath via the link).
+	if err := os.Remove(sidePath); err != nil {
+		return fmt.Errorf("remove side after restore: %w", err)
 	}
 	return nil
 }
