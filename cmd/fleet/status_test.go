@@ -579,6 +579,14 @@ func TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint(t *testing.T) {
 	if strings.Contains(out, "preserve for dead-coord recovery") {
 		t.Errorf("worker orphan-agents row must NOT show the coord-recovery rationale; got:\n%s", out)
 	}
+	// Codex review PR-D iter-5 [P2]: the worker-record hint must
+	// flag the multi-socket caveat so the operator doesn't blindly
+	// run `fleet gc --apply` from a shell with a different
+	// FLEET_TMUX_SOCKET than the agent's spawn socket (would archive
+	// a live agent silently).
+	if !strings.Contains(out, "check FLEET_TMUX_SOCKET first") {
+		t.Errorf("worker orphan-agents hint must include the multi-socket warning (codex PR-D iter-5 [P2]); got:\n%s", out)
+	}
 }
 
 // TestStatus_SurfacesOrphanTmuxSession pins the orphan-tmux surface:

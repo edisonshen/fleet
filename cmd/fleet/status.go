@@ -252,6 +252,7 @@ func isCoordRecord(r *agent.Record) bool {
 //
 //	sockets                       → fleet gc --apply --kinds=sockets
 //	orphan-agents (worker record) → fleet gc --apply --kinds=orphan-agents
+//	                                (check FLEET_TMUX_SOCKET first — see warning)
 //	orphan-agents (coord record)  → fleet rm <id>  (recovery-safe; do NOT run
 //	                                fleet gc --apply --kinds=orphan-agents)
 //	orphan-tmux                   → tmux kill-session -t <name>  (surface, NOT auto-kill)
@@ -262,12 +263,22 @@ func isCoordRecord(r *agent.Record) bool {
 // operator has to read + confirm before killing a session that might
 // belong to a different operator's workflow (feedback_user_owns_tmux_config).
 //
-// orphan-agents coord-record carve-out (codex review PR-D iter-4
-// [P2]): the global `fleet gc --apply --kinds=orphan-agents` would
-// also reap the coord record, breaking dead-coord recovery for the
-// project. The hint instead names the operator-scoped `fleet rm
-// <id>` plus a "preserve for recovery" tag so the operator triages
-// before destroying recovery state.
+// orphan-agents has TWO carve-outs:
+//
+//   - Coord-record carve-out (codex review PR-D iter-4 [P2]): the
+//     global `fleet gc --apply --kinds=orphan-agents` would reap the
+//     coord record, breaking dead-coord recovery for that project.
+//     The hint names the operator-scoped `fleet rm <id>` plus a
+//     "preserve for recovery" tag.
+//   - Multi-socket warning (codex review PR-D iter-5 [P2]): for
+//     worker records, the hint includes a "check FLEET_TMUX_SOCKET
+//     first" caveat. agent.Record does not persist its spawn-time
+//     tmux socket; running `fleet gc --apply` from a shell with a
+//     different socket than the agent's can silently archive a live
+//     agent. The actual `fleet gc --apply` already emits its own
+//     stderr warning when FLEET_TMUX_SOCKET is set; the hint surface
+//     here points at that safety check so the operator notices
+//     before they fire the command.
 func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 	switch a.Kind {
 	case gc.KindOrphanTmux:
@@ -276,7 +287,7 @@ func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 		if isCoordRecord(rec) {
 			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
 		}
-		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
+		return fmt.Sprintf("fleet gc --apply --kinds=%s  (check FLEET_TMUX_SOCKET first — multi-socket spawn can mis-archive live agents)", a.Kind)
 	case gc.KindSockets, gc.KindWorktrees:
 		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
 	default:
