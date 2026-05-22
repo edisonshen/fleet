@@ -3,6 +3,9 @@ package main
 import (
 	"os"
 	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/testutil"
 )
 
 // TestMain is the package-shared test entrypoint for cmd/fleet.
@@ -29,6 +32,11 @@ import (
 // (handoff_test, dispatch_test, dispatch_recovery_test, autoinit_test,
 // drain_test); since Go forbids multiple TestMain in one package, a
 // single shared TestMain here covers all of them.
+//
+// fleet#165 PR-B: also reaps stale /tmp/fleet-test-*.sock debris at
+// suite start AND end. Belt-and-suspenders for the case where a test
+// panics before its tmuxtest.RequireTmux cleanup fires. See
+// internal/testutil/sweeper.go for the wrapper contract.
 func TestMain(m *testing.M) {
 	// Setenv (not t.Setenv) — there is no *testing.T available in
 	// TestMain; we set the env globally for the whole test binary.
@@ -43,5 +51,8 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1"); err != nil {
 		panic("TestMain: os.Setenv FLEET_RC_BOOTSTRAP_DISABLED failed: " + err.Error())
 	}
-	os.Exit(m.Run())
+	_ = testutil.Sweep(time.Hour) // start-of-run; best-effort
+	code := m.Run()
+	_ = testutil.Sweep(time.Hour) // end-of-run; best-effort
+	os.Exit(code)
 }
