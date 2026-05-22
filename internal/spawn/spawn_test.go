@@ -57,6 +57,21 @@ func capturePaneArgs(session string) []string {
 	return args
 }
 
+// showEnvironmentArgs builds tmux args for `show-environment -t
+// <session>` routed through the per-test FLEET_TMUX_SOCKET. Used by
+// the FLEET_PROJECT injection regression tests (fleet#170): asserting
+// directly on session env (set via `new-session -e KEY=VAL`) is more
+// deterministic than echoing into the pane and polling capture-pane,
+// because tmux returns the env synchronously without depending on
+// shell start latency.
+func showEnvironmentArgs(session string) []string {
+	args := []string{"show-environment", "-t", session}
+	if sock := os.Getenv("FLEET_TMUX_SOCKET"); sock != "" {
+		args = append([]string{"-S", sock}, args...)
+	}
+	return args
+}
+
 func TestSpawn_RequiresCommand(t *testing.T) {
 	setupFleetHome(t)
 	// Defensive isolation (codex review iter-10 [P3]): the empty-command
@@ -1391,6 +1406,126 @@ func TestSpawn_FleetAgentIDInEnv(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
+// TestSpawn_InjectsFleetProject_FreshDispatch regresses fleet#170
+// (P0). The /coordinator skill reads FLEET_PROJECT from the agent's
+// session env to know which project's queue to drain; when Spawn fails
+// to inject it, the skill silently falls back to a cwd-derived project
+// and supervises the wrong queue. Live evidence: a coord launched on
+// 2026-05-22 supervised an unrelated project for the entire session
+// because its tmux env had FLEET_AGENT_ID + FLEET_BIN + FLEET_ENGINE
+// but no FLEET_PROJECT.
+//
+// Fresh-dispatch branch: opts.Project flows directly into rec.Project,
+// so the env entry must mirror opts.Project.
+func TestSpawn_InjectsFleetProject_FreshDispatch(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cmd := []string{"sh", "-c", "exec cat"}
+	rec, err := Spawn(Options{
+		TaskID:  "t",
+		Project: "myproj",
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	out, err := exec.Command("tmux", showEnvironmentArgs(rec.TmuxSession)...).Output()
+	if err != nil {
+		t.Fatalf("tmux show-environment: %v", err)
+	}
+	want := "FLEET_PROJECT=myproj"
+	if !strings.Contains(string(out), want) {
+		t.Errorf("expected %q in session env:\n%s", want, string(out))
+	}
+}
+
+// TestSpawn_InjectsFleetProject_FromOldRecord regresses fleet#170 on
+// the handoff branch. When Spawn is called with opts.OldRecord (manual
+// `fleet handoff` or recovery-synth replacement), rec.Project inherits
+// OldRecord.Project — the tmux env must reflect THAT, not opts.Project
+// (which the handoff caller typically leaves zero). The original
+// production bug was that a recovery-synth handoff for a project-A
+// agent landed a replacement whose env had no FLEET_PROJECT at all, so
+// the coord skill picked the cwd-derived project (a different repo)
+// and supervised the wrong queue.
+func TestSpawn_InjectsFleetProject_FromOldRecord(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	old := agent.New("aaaa1111")
+	old.TaskID = "handoff-task"
+	old.Project = "oldproj"
+	old.Engine = "claude-code"
+	old.Role = "executor"
+	old.Mode = "execute"
+
+	cmd := []string{"sh", "-c", "exec cat"}
+	rec, err := Spawn(Options{
+		OldRecord: old,
+		Command:   cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	if rec.Project != "oldproj" {
+		t.Fatalf("rec.Project = %q, want oldproj (OldRecord inheritance)",
+			rec.Project)
+	}
+
+	out, err := exec.Command("tmux", showEnvironmentArgs(rec.TmuxSession)...).Output()
+	if err != nil {
+		t.Fatalf("tmux show-environment: %v", err)
+	}
+	want := "FLEET_PROJECT=oldproj"
+	if !strings.Contains(string(out), want) {
+		t.Errorf("expected %q in session env (handoff branch must mirror OldRecord.Project):\n%s",
+			want, string(out))
+	}
+}
+
+// TestSpawn_OmitsFleetProject_WhenEmpty regresses fleet#170's third
+// acceptance criterion: legacy / untargeted dispatch (no opts.Project
+// and no OldRecord) must NOT emit a FLEET_PROJECT= entry. The skill's
+// "no project" branch keys off `FLEET_PROJECT` being unset; emitting
+// FLEET_PROJECT= (empty value) would silently break it.
+func TestSpawn_OmitsFleetProject_WhenEmpty(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	cmd := []string{"sh", "-c", "exec cat"}
+	rec, err := Spawn(Options{
+		Command: cmd,
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	out, err := exec.Command("tmux", showEnvironmentArgs(rec.TmuxSession)...).Output()
+	if err != nil {
+		t.Fatalf("tmux show-environment: %v", err)
+	}
+	// `tmux show-environment` prints `-FLEET_PROJECT` for an *unset*
+	// variable (the leading `-` marks "this name is unset in the
+	// session env"). The bug we're guarding is the *set-empty* case
+	// (`FLEET_PROJECT=`), which would override the skill's unset-check
+	// with an empty string. Scan line-by-line so the negative match
+	// can't be confused by a partial substring in another variable's
+	// value.
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "FLEET_PROJECT=") {
+			t.Errorf("session env contains %q for empty-project dispatch; "+
+				"want no FLEET_PROJECT= line (full env:\n%s)", line, string(out))
+		}
+	}
 }
 
 // TestSpawn_ExecCommandRunsButPersistsCleanCommand pins issue #73's
