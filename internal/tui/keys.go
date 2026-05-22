@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -1347,10 +1349,76 @@ func coordCwdForProject(records []*agent.Record, projectName string) string {
 	return ""
 }
 
-// writeCoordSpawnMarkerFn writes the coord-spawn marker file. var so
-// tests can stub the disk write. Production calls
-// state.WriteCoordSpawnMarker.
-var writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
+// writeCoordSpawnMarkerFn writes the coord-spawn marker file under the
+// per-project coord-spawn NB-flock so a concurrent coord.Cleanup on an
+// older agent can't race our write (codex iter-3 [P1]: TUI marker write
+// happens AFTER `fleet dispatch` releases its own coordlock, so without
+// re-acquiring here the old coord's cleanup can interleave between our
+// read and our unlink — even though cleanup itself holds the lock for
+// its compare-and-remove step, the TUI write outside the lock reopens
+// the race window).
+//
+// On contention (extremely rare — another dispatch / drain is in flight
+// for the same project), we surface the error to the caller so the TUI
+// flash message stays accurate. The caller already handles a non-nil
+// werr by warning the operator that marker write failed (model.go:718).
+//
+// var so tests can stub the disk write (test helpers in
+// internal/tui/keys_test.go install a fake that records calls without
+// hitting FLEET_HOME or shelling out to flock).
+var writeCoordSpawnMarkerFn = writeCoordSpawnMarkerLocked
+
+// writeCoordSpawnMarkerLocked is the production implementation of
+// writeCoordSpawnMarkerFn: acquire coord-spawn lock, write marker,
+// release. The lock is the SAME one cmd/fleet/dispatch.go +
+// internal/handoffop + internal/coord/cleanup take for their own
+// marker-touching sections, so all four writers / clearers serialize
+// cleanly. Without this serialization, codex iter-3 [P1] showed the
+// race: cleanup acquires lock after dispatch released, reads old
+// marker body, TUI writes new id (outside lock), cleanup unlinks the
+// just-written new marker.
+//
+// Retry budget (codex iter-6 [P1]): coordlock.Acquire is non-blocking
+// (LOCK_NB) and returns EWOULDBLOCK on contention. The previous fail-
+// fast behavior was wrong for THIS caller: TUI invokes us AFTER a
+// successful spawn — failing the marker write strands the new coord
+// (record exists, marker doesn't, dashboard misses it). cleanup holds
+// the lock for microseconds while it captures + restores the marker;
+// a short retry budget rides over that window without making the
+// operator wait noticeably. Dispatch / drain callers stay fail-fast
+// because their criticial sections are longer and contention there
+// means a real concurrent spawn, not a transient cleanup blip.
+//
+// Budget: 2 seconds total at 50ms intervals = 40 attempts. Well over
+// the upper bound for a cleanup compare-and-remove; well under the
+// human-perceptible latency floor (the TUI is already mid-attach when
+// this runs).
+func writeCoordSpawnMarkerLocked(projectName, agentID string) error {
+	const (
+		retryInterval = 50 * time.Millisecond
+		retryBudget   = 2 * time.Second
+	)
+	deadline := time.Now().Add(retryBudget)
+	var lastErr error
+	for {
+		release, err := coordlockAcquireFn(projectName)
+		if err == nil {
+			defer release()
+			return state.WriteCoordSpawnMarker(projectName, agentID)
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("writeCoordSpawnMarker: coord-spawn lock contended after %s of retries: %w",
+				retryBudget, lastErr)
+		}
+		time.Sleep(retryInterval)
+	}
+}
+
+// coordlockAcquireFn is the seam that the marker-lock unit test
+// stubs to deterministically simulate contention without spinning
+// up a real flock holder for the full 2s budget.
+var coordlockAcquireFn = coordlock.Acquire
 
 // dispatchAgentIDPattern matches the first line of `fleet dispatch`
 // stdout: "agent <8-hex-id> spawned". We extract the ID so the
