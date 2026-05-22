@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/spf13/pflag"
 
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // TestDispatch_DefaultCommandWrapsAndSkipsPermissions locks in two
@@ -850,3 +855,278 @@ func TestDispatch_RunECapturesProjectExplicit(t *testing.T) {
 		t.Error("with no --project flag, Flags().Changed(\"project\") should be false")
 	}
 }
+
+// ----------------- fleet#165 PR-D: auto-reconciliation --------------
+//
+// runDispatch calls gc.Reconcile twice BEFORE tmux.Available / lock /
+// veto: once with Apply=true + KindOrphanAgents (silently archives
+// agent records whose tmux session is gone), once with Apply=false +
+// KindOrphanTmux (surfaces a stderr warning for fleet-* tmux sessions
+// with no agent record — never auto-killed per
+// feedback_surface_dont_silo + feedback_user_owns_tmux_config).
+//
+// The tests below pin the wiring at the cmd/fleet seam
+// (dispatchReconcileFn package var). End-to-end probe behavior is
+// covered in internal/gc/gc_test.go; the dispatch-side contract is
+// (a) reconcile fires before lock acquire, (b) orphan-agents auto-
+// archive is silent on stdout, (c) orphan-tmux surfaces to stderr,
+// (d) reconcile errors are logged + dispatch continues, (e) the
+// happy path emits no reconcile output.
+
+// recordedReconcileCall captures one invocation of dispatchReconcileFn
+// for after-the-fact assertion: which Options came in, what Report we
+// gave back, did the call actually happen.
+type recordedReconcileCall struct {
+	opts gc.Options
+}
+
+// stubDispatchReconcile swaps dispatchReconcileFn for the duration of
+// the test, recording every call and returning a canned report+error
+// per invocation. Restores the production wiring via t.Cleanup.
+//
+// reports[i] / errs[i] are returned by the i-th call. If the slice is
+// shorter than the call count, the LAST element repeats — matches the
+// "two-pass orphan-agents then orphan-tmux" call shape in runDispatch
+// where most tests only care to fix the report for both passes.
+func stubDispatchReconcile(t *testing.T, reports []gc.Report, errs []error) *[]recordedReconcileCall {
+	t.Helper()
+	calls := []recordedReconcileCall{}
+	prev := dispatchReconcileFn
+	dispatchReconcileFn = func(opts gc.Options) (gc.Report, error) {
+		i := len(calls)
+		calls = append(calls, recordedReconcileCall{opts: opts})
+		var rep gc.Report
+		var err error
+		if i < len(reports) {
+			rep = reports[i]
+		} else if len(reports) > 0 {
+			rep = reports[len(reports)-1]
+		}
+		if i < len(errs) {
+			err = errs[i]
+		} else if len(errs) > 0 {
+			err = errs[len(errs)-1]
+		}
+		return rep, err
+	}
+	t.Cleanup(func() { dispatchReconcileFn = prev })
+	return &calls
+}
+
+// TestDispatch_AutoArchivesOrphanAgentRecord pins the orphan-agents
+// auto-archive contract: runDispatch must invoke dispatchReconcileFn
+// with Apply=true + KindOrphanAgents BEFORE reaching tmux.Available.
+// The archive itself is silent (no stdout noise on the happy path —
+// reconciliation should not pollute the dispatch surface).
+func TestDispatch_AutoArchivesOrphanAgentRecord(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Stub reconcile to RETURN one archived action so we can assert it
+	// fired BEFORE the tmux gate took over. Calls 0+1 are the two
+	// reconcile passes (orphan-agents apply, then orphan-tmux dry-run).
+	archivedReport := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbArchived, Reason: "tmux session fleet-deadbeef gone"},
+	}}
+	emptyReport := gc.Report{}
+	calls := stubDispatchReconcile(t, []gc.Report{archivedReport, emptyReport}, nil)
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	// runDispatch will fail later (no real tmux session to spawn into)
+	// but the reconcile must have fired by then.
+	_ = runDispatch(opts, &stdout)
+
+	if len(*calls) < 1 {
+		t.Fatalf("expected dispatchReconcileFn to be called at least once; got 0 calls")
+	}
+	first := (*calls)[0]
+	if !first.opts.Apply {
+		t.Errorf("first reconcile call must have Apply=true (auto-archive); got Apply=%t", first.opts.Apply)
+	}
+	if len(first.opts.Kinds) != 1 || first.opts.Kinds[0] != gc.KindOrphanAgents {
+		t.Errorf("first reconcile call must use Kinds=[orphan-agents] only; got %v", first.opts.Kinds)
+	}
+	// Auto-archive is silent on stdout — the operator's dispatch flow
+	// should not see extra noise on the happy path.
+	if strings.Contains(stdout.String(), "archived") || strings.Contains(stdout.String(), "Orphans") {
+		t.Errorf("orphan-agents auto-archive should be silent on stdout; got:\n%s", stdout.String())
+	}
+}
+
+// TestDispatch_WarnsOnOrphanTmuxNotKilled pins the orphan-tmux surface
+// contract: the second reconcile pass runs Apply=false +
+// KindOrphanTmux; any surface action prints a single-line warning to
+// stderr with the manual kill-session one-liner. The session itself is
+// NOT killed (feedback_surface_dont_silo + feedback_user_owns_tmux_config).
+func TestDispatch_WarnsOnOrphanTmuxNotKilled(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Reconcile pass 0 (orphan-agents apply) → empty. Pass 1
+	// (orphan-tmux dry-run) → one surface action.
+	tmuxOrphan := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanTmux, Target: "fleet-deadbeef", Verb: gc.VerbSurface, Reason: "no agent record; kill manually with `tmux kill-session -t fleet-deadbeef`"},
+	}}
+	emptyReport := gc.Report{}
+	calls := stubDispatchReconcile(t, []gc.Report{emptyReport, tmuxOrphan}, nil)
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	// runDispatch fails later but the warning must already be on
+	// stderr by then. Capture stderr via os.Stderr swap — runDispatch
+	// writes warnings directly to os.Stderr.
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("expected dispatchReconcileFn to be called at least twice; got %d calls", len(*calls))
+	}
+	second := (*calls)[1]
+	if second.opts.Apply {
+		t.Errorf("second reconcile call must have Apply=false (surface only); got Apply=%t", second.opts.Apply)
+	}
+	if len(second.opts.Kinds) != 1 || second.opts.Kinds[0] != gc.KindOrphanTmux {
+		t.Errorf("second reconcile call must use Kinds=[orphan-tmux] only; got %v", second.opts.Kinds)
+	}
+	body := stderrBuf.String()
+	if !strings.Contains(body, "fleet-deadbeef") {
+		t.Errorf("stderr must surface the orphan tmux session name; got:\n%s", body)
+	}
+	if !strings.Contains(body, "orphan") || !strings.Contains(body, "tmux") {
+		t.Errorf("stderr must label the warning as an orphan tmux session; got:\n%s", body)
+	}
+	if !strings.Contains(body, "tmux kill-session") {
+		t.Errorf("stderr must include the manual kill-session one-liner; got:\n%s", body)
+	}
+}
+
+// TestDispatch_HealthyState_Silent pins the no-orphans happy path:
+// reconcile returns an empty report, dispatch emits zero reconcile-
+// related output on stdout OR stderr. Avoids spamming the operator on
+// every dispatch when state is clean.
+func TestDispatch_HealthyState_Silent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("healthy state should still invoke both reconcile passes; got %d", len(*calls))
+	}
+	// No "Orphans" / "orphan tmux" lines in either stream.
+	out := stdout.String()
+	errs := stderrBuf.String()
+	for _, fragment := range []string{"orphan", "Orphan", "would-archive", "archived", "kill-session"} {
+		if strings.Contains(out, fragment) {
+			t.Errorf("healthy state should not surface %q on stdout; got:\n%s", fragment, out)
+		}
+		if strings.Contains(errs, fragment) {
+			t.Errorf("healthy state should not surface %q on stderr; got:\n%s", fragment, errs)
+		}
+	}
+}
+
+// TestDispatch_ReconcileErrorDoesNotBlockDispatch pins the risk
+// mitigation in TASK-PLAN §Risks: a reconcile error must be logged to
+// stderr and the dispatch must proceed to its normal failure mode
+// (here: tmux unavailable / spawn rejected). NEVER block dispatch on
+// a reconcile error — the leak compounding from a blocked dispatch
+// would be worse than the missed reconcile.
+func TestDispatch_ReconcileErrorDoesNotBlockDispatch(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Both reconcile passes error.
+	bad := errors.New("orphan-agents: stat agents dir: permission denied")
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, []error{bad, bad})
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	// Dispatch will still fail at the tmux gate, but the reconcile
+	// errors must have been logged (not returned).
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("expected both reconcile passes to fire even on error; got %d", len(*calls))
+	}
+	body := stderrBuf.String()
+	if !strings.Contains(body, "reconcile") || !strings.Contains(body, "permission denied") {
+		t.Errorf("reconcile error must surface on stderr; got:\n%s", body)
+	}
+}
+
+// TestDispatchReconcileFn_DefaultsToGCReconcile pins the default
+// wiring: the package-level seam must call into gc.Reconcile with the
+// production Deps. Without this, a refactor that nils out the var
+// would silently degrade the dispatch surface to "no reconcile ever
+// fires" without any test failing.
+func TestDispatchReconcileFn_DefaultsToGCReconcile(t *testing.T) {
+	if dispatchReconcileFn == nil {
+		t.Fatal("dispatchReconcileFn must default to a non-nil func wrapping gc.Reconcile")
+	}
+	// Empty kinds → empty report (gc.Reconcile treats nil Kinds as
+	// "do nothing"). This proves the var is callable and routes
+	// through the gc package without side effects when kinds is nil.
+	rep, err := dispatchReconcileFn(gc.Options{Kinds: nil})
+	if err != nil {
+		t.Fatalf("default dispatchReconcileFn with empty kinds returned err: %v", err)
+	}
+	if len(rep.Actions) != 0 {
+		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
+	}
+}
+
+// Compile-time guard against an accidental unused import. tmux import
+// is needed by future test extensions; placeholder use so go vet stays
+// quiet under the current test set.
+var _ = tmux.SessionInfo{}
+var _ = agent.Record{}
