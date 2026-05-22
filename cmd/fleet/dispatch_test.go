@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/spf13/pflag"
 
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // TestDispatch_DefaultCommandWrapsAndSkipsPermissions locks in two
@@ -850,3 +855,605 @@ func TestDispatch_RunECapturesProjectExplicit(t *testing.T) {
 		t.Error("with no --project flag, Flags().Changed(\"project\") should be false")
 	}
 }
+
+// ----------------- fleet#165 PR-D: auto-reconciliation --------------
+//
+// runDispatch calls gc.Reconcile twice BEFORE tmux.Available / lock /
+// veto: once with Apply=true + KindOrphanAgents (silently archives
+// agent records whose tmux session is gone), once with Apply=false +
+// KindOrphanTmux (surfaces a stderr warning for fleet-* tmux sessions
+// with no agent record — never auto-killed per
+// feedback_surface_dont_silo + feedback_user_owns_tmux_config).
+//
+// The tests below pin the wiring at the cmd/fleet seam
+// (dispatchReconcileFn package var). End-to-end probe behavior is
+// covered in internal/gc/gc_test.go; the dispatch-side contract is
+// (a) reconcile fires before lock acquire, (b) orphan-agents auto-
+// archive is silent on stdout, (c) orphan-tmux surfaces to stderr,
+// (d) reconcile errors are logged + dispatch continues, (e) the
+// happy path emits no reconcile output.
+
+// recordedReconcileCall captures one invocation of dispatchReconcileFn
+// for after-the-fact assertion: which Options came in, what Report we
+// gave back, did the call actually happen.
+type recordedReconcileCall struct {
+	opts gc.Options
+}
+
+// stubDispatchReconcile swaps dispatchReconcileFn for the duration of
+// the test, recording every call and returning a canned report+error
+// per invocation. Restores the production wiring via t.Cleanup.
+//
+// reports[i] / errs[i] are returned by the i-th call. If the slice is
+// shorter than the call count, the LAST element repeats — matches the
+// "two-pass orphan-agents then orphan-tmux" call shape in runDispatch
+// where most tests only care to fix the report for both passes.
+func stubDispatchReconcile(t *testing.T, reports []gc.Report, errs []error) *[]recordedReconcileCall {
+	t.Helper()
+	calls := []recordedReconcileCall{}
+	prev := dispatchReconcileFn
+	dispatchReconcileFn = func(opts gc.Options) (gc.Report, error) {
+		i := len(calls)
+		calls = append(calls, recordedReconcileCall{opts: opts})
+		var rep gc.Report
+		var err error
+		if i < len(reports) {
+			rep = reports[i]
+		} else if len(reports) > 0 {
+			rep = reports[len(reports)-1]
+		}
+		if i < len(errs) {
+			err = errs[i]
+		} else if len(errs) > 0 {
+			err = errs[len(errs)-1]
+		}
+		return rep, err
+	}
+	t.Cleanup(func() { dispatchReconcileFn = prev })
+	return &calls
+}
+
+// TestDispatch_SurfacesOrphanAgentRecord pins the orphan-agents
+// SURFACE-ONLY wiring contract at the runDispatch level (codex
+// review PR-D iter-2 [P1] downgraded the original auto-archive to
+// surface-only). The gc classifier must run BEFORE reaching
+// tmux.Available with Apply=false + Kinds=[orphan-agents]; the
+// dispatch layer then emits one stderr line per would-archive
+// candidate so the operator can review and reap manually. The
+// dispatch path NEVER mutates agent records itself because the gc
+// classifier cannot prove a record is truly orphan without the spawn-
+// time tmux socket persisted on agent.Record (out-of-scope schema
+// change).
+func TestDispatch_SurfacesOrphanAgentRecord(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Stub reconcile to RETURN one would-archive action so we can
+	// assert it fired BEFORE the tmux gate took over. Calls 0+1 are
+	// the two reconcile passes (orphan-agents dry-run, then
+	// orphan-tmux dry-run).
+	wouldArchiveReport := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-deadbeef gone"},
+	}}
+	emptyReport := gc.Report{}
+	calls := stubDispatchReconcile(t, []gc.Report{wouldArchiveReport, emptyReport}, nil)
+	stubDispatchAgentList(t, []*agent.Record{
+		{ID: "deadbeef", TaskID: "some-task", Project: "p1"},
+	})
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 1 {
+		t.Fatalf("expected dispatchReconcileFn to be called at least once; got 0 calls")
+	}
+	first := (*calls)[0]
+	if first.opts.Apply {
+		t.Errorf("first reconcile call must have Apply=false (surface only); got Apply=%t", first.opts.Apply)
+	}
+	if len(first.opts.Kinds) != 1 || first.opts.Kinds[0] != gc.KindOrphanAgents {
+		t.Errorf("first reconcile call must use Kinds=[orphan-agents] only; got %v", first.opts.Kinds)
+	}
+	body := stderrBuf.String()
+	if !strings.Contains(body, "deadbeef") {
+		t.Errorf("stderr must surface the orphan agent ID; got:\n%s", body)
+	}
+	if !strings.Contains(body, "some-task") {
+		t.Errorf("stderr must include task_id for triage; got:\n%s", body)
+	}
+	// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]):
+	// safer than the global gc command when a mixed orphans list
+	// contains coord records the operator wants to preserve.
+	if !strings.Contains(body, "fleet rm deadbeef") {
+		t.Errorf("stderr must include the per-record `fleet rm <id>` one-liner; got:\n%s", body)
+	}
+	// Stdout must not gain orphan noise (the dispatch happy path
+	// stays clean for scripted callers parsing stdout).
+	if strings.Contains(stdout.String(), "orphan") || strings.Contains(stdout.String(), "Orphans") {
+		t.Errorf("dispatch stdout must stay clean; got:\n%s", stdout.String())
+	}
+}
+
+// TestDispatch_WarnsOnOrphanTmuxNotKilled pins the orphan-tmux surface
+// contract: the second reconcile pass runs Apply=false +
+// KindOrphanTmux; any surface action prints a single-line warning to
+// stderr with the manual kill-session one-liner. The session itself is
+// NOT killed (feedback_surface_dont_silo + feedback_user_owns_tmux_config).
+func TestDispatch_WarnsOnOrphanTmuxNotKilled(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Reconcile pass 0 (orphan-agents apply) → empty. Pass 1
+	// (orphan-tmux dry-run) → one surface action.
+	tmuxOrphan := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanTmux, Target: "fleet-deadbeef", Verb: gc.VerbSurface, Reason: "no agent record; kill manually with `tmux kill-session -t fleet-deadbeef`"},
+	}}
+	emptyReport := gc.Report{}
+	calls := stubDispatchReconcile(t, []gc.Report{emptyReport, tmuxOrphan}, nil)
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	// runDispatch fails later but the warning must already be on
+	// stderr by then. Capture stderr via os.Stderr swap — runDispatch
+	// writes warnings directly to os.Stderr.
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("expected dispatchReconcileFn to be called at least twice; got %d calls", len(*calls))
+	}
+	second := (*calls)[1]
+	if second.opts.Apply {
+		t.Errorf("second reconcile call must have Apply=false (surface only); got Apply=%t", second.opts.Apply)
+	}
+	if len(second.opts.Kinds) != 1 || second.opts.Kinds[0] != gc.KindOrphanTmux {
+		t.Errorf("second reconcile call must use Kinds=[orphan-tmux] only; got %v", second.opts.Kinds)
+	}
+	body := stderrBuf.String()
+	if !strings.Contains(body, "fleet-deadbeef") {
+		t.Errorf("stderr must surface the orphan tmux session name; got:\n%s", body)
+	}
+	if !strings.Contains(body, "orphan") || !strings.Contains(body, "tmux") {
+		t.Errorf("stderr must label the warning as an orphan tmux session; got:\n%s", body)
+	}
+	// Codex PR-D iter-7 [P2] added the -S $FLEET_TMUX_SOCKET prefix
+	// when the env var is set (which it is via isolateTmuxSocket).
+	// Match the kill-session token (suffix) rather than the bare
+	// `tmux kill-session` prefix.
+	if !strings.Contains(body, "kill-session -t fleet-deadbeef") {
+		t.Errorf("stderr must include the manual kill-session one-liner; got:\n%s", body)
+	}
+}
+
+// TestDispatch_HealthyState_Silent pins the no-orphans happy path:
+// reconcile returns an empty report, dispatch emits zero reconcile-
+// related output on stdout OR stderr. Avoids spamming the operator on
+// every dispatch when state is clean.
+func TestDispatch_HealthyState_Silent(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("healthy state should still invoke both reconcile passes; got %d", len(*calls))
+	}
+	// No "Orphans" / "orphan tmux" lines in either stream.
+	out := stdout.String()
+	errs := stderrBuf.String()
+	for _, fragment := range []string{"orphan", "Orphan", "would-archive", "archived", "kill-session"} {
+		if strings.Contains(out, fragment) {
+			t.Errorf("healthy state should not surface %q on stdout; got:\n%s", fragment, out)
+		}
+		if strings.Contains(errs, fragment) {
+			t.Errorf("healthy state should not surface %q on stderr; got:\n%s", fragment, errs)
+		}
+	}
+}
+
+// TestDispatch_ReconcileErrorDoesNotBlockDispatch pins the risk
+// mitigation in TASK-PLAN §Risks: a reconcile error must be logged to
+// stderr and the dispatch must proceed to its normal failure mode
+// (here: tmux unavailable / spawn rejected). NEVER block dispatch on
+// a reconcile error — the leak compounding from a blocked dispatch
+// would be worse than the missed reconcile.
+func TestDispatch_ReconcileErrorDoesNotBlockDispatch(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Both reconcile passes error.
+	bad := errors.New("orphan-agents: stat agents dir: permission denied")
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, []error{bad, bad})
+
+	opts := &dispatchOpts{
+		taskID:  "some-task",
+		project: "p1",
+	}
+	var stdout bytes.Buffer
+	prevStderr := os.Stderr
+	rPipe, wPipe, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("os.Pipe: %v", perr)
+	}
+	os.Stderr = wPipe
+	// Dispatch will still fail at the tmux gate, but the reconcile
+	// errors must have been logged (not returned).
+	_ = runDispatch(opts, &stdout)
+	_ = wPipe.Close()
+	os.Stderr = prevStderr
+	stderrBuf := new(bytes.Buffer)
+	_, _ = stderrBuf.ReadFrom(rPipe)
+	_ = rPipe.Close()
+
+	if len(*calls) < 2 {
+		t.Fatalf("expected both reconcile passes to fire even on error; got %d", len(*calls))
+	}
+	body := stderrBuf.String()
+	if !strings.Contains(body, "reconcile") || !strings.Contains(body, "permission denied") {
+		t.Errorf("reconcile error must surface on stderr; got:\n%s", body)
+	}
+}
+
+// TestDispatch_CoordSpawn_SkipsOrphanAgentsPass pins the
+// dead-coord-recovery compatibility carve-out: --coord-spawn
+// dispatches MUST NOT run the orphan-agents reconcile pass at all
+// (codex PR-D iter-2 [P1] downgraded auto-archive to surface-only,
+// but coord-spawn skips the whole pass to avoid noise during the
+// recovery flow). The orphan-tmux surface still runs (informational
+// only).
+//
+// Regression: the original auto-archive shape broke 7
+// dispatch_recovery tests by archiving the seeded dead-coord
+// fixtures before the recovery branch ran. The surface-only shape
+// can't archive but a duplicate "orphan agent" warning during a
+// recovery dispatch would still confuse the operator triaging why
+// recovery fired.
+func TestDispatch_CoordSpawn_SkipsOrphanAgentsPass(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Stub: record every reconcile call so we can inspect the kinds
+	// that fired. The coord-spawn path should fire only the
+	// orphan-tmux surface pass, not the orphan-agents pass.
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
+
+	opts := &dispatchOpts{
+		taskID:          "coord-foo",
+		project:         "foo",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	var stdout bytes.Buffer
+	_ = runDispatch(opts, &stdout)
+
+	for _, c := range *calls {
+		// orphan-agents pass: ANY call with Kinds=[orphan-agents]
+		// (regardless of Apply value) must NEVER fire under
+		// --coord-spawn.
+		if len(c.opts.Kinds) == 1 &&
+			c.opts.Kinds[0] == gc.KindOrphanAgents {
+			t.Errorf("--coord-spawn dispatch must skip the orphan-agents pass entirely; got Kinds=[orphan-agents]")
+		}
+	}
+	// Sanity: the orphan-tmux surface pass should still fire (it's
+	// informational and doesn't risk dead-coord-recovery).
+	var sawOrphanTmux bool
+	for _, c := range *calls {
+		if !c.opts.Apply &&
+			len(c.opts.Kinds) == 1 &&
+			c.opts.Kinds[0] == gc.KindOrphanTmux {
+			sawOrphanTmux = true
+		}
+	}
+	if !sawOrphanTmux {
+		t.Errorf("--coord-spawn dispatch must still fire the orphan-tmux surface pass; got %d calls", len(*calls))
+	}
+}
+
+// TestDispatchReconcileFn_DefaultsToGCReconcile pins the default
+// wiring: the package-level seam must call into gc.Reconcile with the
+// production Deps. Without this, a refactor that nils out the var
+// would silently degrade the dispatch surface to "no reconcile ever
+// fires" without any test failing.
+func TestDispatchReconcileFn_DefaultsToGCReconcile(t *testing.T) {
+	if dispatchReconcileFn == nil {
+		t.Fatal("dispatchReconcileFn must default to a non-nil func wrapping gc.Reconcile")
+	}
+	// Empty kinds → empty report (gc.Reconcile treats nil Kinds as
+	// "do nothing"). This proves the var is callable and routes
+	// through the gc package without side effects when kinds is nil.
+	rep, err := dispatchReconcileFn(gc.Options{Kinds: nil})
+	if err != nil {
+		t.Fatalf("default dispatchReconcileFn with empty kinds returned err: %v", err)
+	}
+	if len(rep.Actions) != 0 {
+		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
+	}
+}
+
+// ----------------- codex review PR-D iter-2 [P1] regressions ---------
+//
+// surfaceOrphanAgentsFromReport emits one stderr warning per gc
+// would-archive candidate (surface-only; dispatch path NEVER mutates
+// records itself because agent.Record lacks the spawn-time socket
+// needed to prove orphan status). These tests pin the helper's
+// output shape so a regression that flips back to auto-archive
+// would fail loudly.
+
+// stubDispatchAgentList swaps dispatchAgentListFn for the test's
+// duration, returning a canned slice of records. Restores production
+// wiring via t.Cleanup.
+func stubDispatchAgentList(t *testing.T, records []*agent.Record) {
+	t.Helper()
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) { return records, nil }
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+}
+
+// TestShouldSkipArchiveForRecovery pins the per-record filter that
+// any future auto-archive path MUST honor: coord records (TaskID
+// prefix coord-) outlive worker dispatches so the dead-coord
+// recovery branch (findRecoveryCandidate at dispatch.go:~659) can
+// consume them on the next --coord-spawn against that project.
+//
+// The helper itself is defense-in-depth today (the dispatch path is
+// fully surface-only per codex PR-D iter-2 [P1]). The test pins the
+// invariant so re-enabling auto-archive in a future change can't
+// silently destroy recovery state.
+func TestShouldSkipArchiveForRecovery(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  *agent.Record
+		want bool
+	}{
+		{
+			name: "coord-record-same-project-skipped",
+			rec:  &agent.Record{ID: "aaaa1111", TaskID: "coord-projects-fleet", Project: "projects-fleet"},
+			want: true,
+		},
+		{
+			name: "coord-record-other-project-skipped",
+			rec:  &agent.Record{ID: "bbbb2222", TaskID: "coord-rainier", Project: "rainier"},
+			want: true,
+		},
+		{
+			name: "worker-record-not-skipped",
+			rec:  &agent.Record{ID: "cccc3333", TaskID: "fix-some-bug-1234", Project: "projects-fleet"},
+			want: false,
+		},
+		{
+			name: "benign-coord-cache-warm-also-skipped",
+			rec:  &agent.Record{ID: "dddd4444", TaskID: "coord-cache-warm", Project: "ops"},
+			// "coord-cache-warm" starts with "coord-" so it IS skipped.
+			// False positives are cheaper than false negatives in the
+			// recovery-preservation direction.
+			want: true,
+		},
+		{
+			name: "nil-record-skipped",
+			rec:  nil,
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldSkipArchiveForRecovery(tc.rec); got != tc.want {
+				t.Errorf("shouldSkipArchiveForRecovery(%v) = %t; want %t",
+					tc.rec, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSurfaceOrphanAgentsFromReport_EnrichesWithTaskAndProject pins
+// the warning shape: each would-archive action surfaces with the
+// agent ID, task_id, project, and the manual `fleet gc --apply`
+// one-liner. dispatchAgentListFn provides the enrichment lookup.
+func TestSurfaceOrphanAgentsFromReport_EnrichesWithTaskAndProject(t *testing.T) {
+	rec := &agent.Record{ID: "11111111", TaskID: "fix-bug", Project: "p1"}
+	stubDispatchAgentList(t, []*agent.Record{rec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "11111111", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-11111111 gone"},
+	}}
+	var stderr bytes.Buffer
+	surfaceOrphanAgentsFromReport(&stderr, report)
+
+	body := stderr.String()
+	for _, want := range []string{
+		"11111111", "fix-bug", "p1",
+		// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+		"fleet rm 11111111",
+		// Multi-socket verification caveat (codex PR-D iter-5 [P2]).
+		"FLEET_TMUX_SOCKET",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stderr must contain %q; got:\n%s", want, body)
+		}
+	}
+	// Worker-record hint must NOT recommend the global gc command —
+	// a mixed orphans list with a coord record would let the
+	// operator reap recovery state by accident.
+	if strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("worker-record hint must NOT name the destructive global gc command (codex PR-D iter-6 [P2]); got:\n%s", body)
+	}
+}
+
+// TestSurfaceOrphanAgentsFromReport_CoordRecord_RecoverySafeHint pins
+// the codex review PR-D iter-3 [P2] fix: when a worker dispatch
+// surfaces a coord record (TaskID prefix "coord-"), the warning MUST
+// NOT name the global `fleet gc --apply --kinds=orphan-agents`
+// command — following that hint would reap this very coord record
+// and break the dead-coord recovery branch on the next --coord-spawn
+// for that project. The recovery-safe hint is `fleet rm <id>`
+// (operator-scoped to the specific record they're sure they want
+// gone), paired with an explicit "do NOT run fleet gc --apply..."
+// nudge so the operator can't follow the wrong remediation by
+// accident.
+func TestSurfaceOrphanAgentsFromReport_CoordRecord_RecoverySafeHint(t *testing.T) {
+	coordRec := &agent.Record{ID: "abababab", TaskID: "coord-spark", Project: "spark"}
+	stubDispatchAgentList(t, []*agent.Record{coordRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "abababab", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-abababab gone"},
+	}}
+	var stderr bytes.Buffer
+	surfaceOrphanAgentsFromReport(&stderr, report)
+
+	body := stderr.String()
+	// Must surface the record + its identity (operator triage data).
+	for _, want := range []string{"abababab", "coord-spark", "spark"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stderr must include %q for triage; got:\n%s", want, body)
+		}
+	}
+	// Must include the recovery-safe one-liner (operator-scoped).
+	if !strings.Contains(body, "fleet rm abababab") {
+		t.Errorf("stderr must include recovery-safe `fleet rm <id>` hint; got:\n%s", body)
+	}
+	// Must explicitly warn against the destructive global cleanup
+	// command — without this, the operator's muscle memory could
+	// follow the worker-record hint and reap the coord record.
+	if !strings.Contains(body, "do NOT run `fleet gc --apply --kinds=orphan-agents`") {
+		t.Errorf("stderr must explicitly warn against `fleet gc --apply --kinds=orphan-agents` for coord records (codex PR-D iter-3 [P2]); got:\n%s", body)
+	}
+	// Must NOT advise running the global archive command for this
+	// record — the negative assertion paired with the explicit "do
+	// NOT" string above pins both directions.
+	if strings.Count(body, "fleet gc --apply --kinds=orphan-agents") > 1 {
+		t.Errorf("stderr must mention `fleet gc --apply...` AT MOST once (only in the do-NOT warning); got %d occurrences:\n%s",
+			strings.Count(body, "fleet gc --apply --kinds=orphan-agents"), body)
+	}
+}
+
+// TestSurfaceOrphanAgentsFromReport_BothSocketStates_AlwaysSurfaces
+// pins the surface-only contract under BOTH FLEET_TMUX_SOCKET states
+// (set + unset). The dispatch path NEVER auto-archives because
+// agent.Record does not persist the spawn-time socket — both states
+// can mis-identify a live agent as orphan (codex review PR-D iter-2
+// [P1]). Surface is the only safe move.
+func TestSurfaceOrphanAgentsFromReport_BothSocketStates_AlwaysSurfaces(t *testing.T) {
+	for _, sock := range []string{"", "/tmp/fleet-other.sock"} {
+		t.Run("socket="+sock, func(t *testing.T) {
+			t.Setenv("FLEET_TMUX_SOCKET", sock)
+			rec := &agent.Record{ID: "22222222", TaskID: "fix-other", Project: "p2"}
+			stubDispatchAgentList(t, []*agent.Record{rec})
+
+			report := gc.Report{Actions: []gc.Action{
+				{Kind: gc.KindOrphanAgents, Target: "22222222", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-22222222 gone"},
+			}}
+			var stderr bytes.Buffer
+			surfaceOrphanAgentsFromReport(&stderr, report)
+
+			body := stderr.String()
+			if !strings.Contains(body, "22222222") {
+				t.Errorf("FLEET_TMUX_SOCKET=%q: stderr must surface candidate; got:\n%s", sock, body)
+			}
+			// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+			if !strings.Contains(body, "fleet rm 22222222") {
+				t.Errorf("FLEET_TMUX_SOCKET=%q: stderr must include per-record `fleet rm` one-liner; got:\n%s", sock, body)
+			}
+		})
+	}
+}
+
+// TestSurfaceOrphanAgentsFromReport_EmptyReport_NoListLookup pins
+// the zero-orphan path: empty report short-circuits before
+// dispatchAgentListFn fires (avoids spurious filesystem reads when
+// there's nothing to surface).
+func TestSurfaceOrphanAgentsFromReport_EmptyReport_NoListLookup(t *testing.T) {
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) {
+		t.Fatal("dispatchAgentListFn must not be called on empty report")
+		return nil, nil
+	}
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+
+	var stderr bytes.Buffer
+	surfaceOrphanAgentsFromReport(&stderr, gc.Report{})
+
+	if stderr.Len() != 0 {
+		t.Errorf("empty report should produce no stderr output; got:\n%s",
+			stderr.String())
+	}
+}
+
+// TestSurfaceOrphanAgentsFromReport_ListErrorFallsBackToBareID pins
+// the resilience contract: if agent.List fails (permission, mount),
+// surface still happens with the bare ID. The dispatch path
+// surfaces the candidate either way — the operator can match the ID
+// against ~/.fleet/agents/<id>.json manually.
+func TestSurfaceOrphanAgentsFromReport_ListErrorFallsBackToBareID(t *testing.T) {
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) {
+		return nil, errors.New("permission denied")
+	}
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "33333333", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-33333333 gone"},
+	}}
+	var stderr bytes.Buffer
+	surfaceOrphanAgentsFromReport(&stderr, report)
+
+	body := stderr.String()
+	if !strings.Contains(body, "33333333") {
+		t.Errorf("stderr must surface candidate even when enrichment fails; got:\n%s", body)
+	}
+	// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+	if !strings.Contains(body, "fleet rm 33333333") {
+		t.Errorf("stderr must include per-record `fleet rm <id>` one-liner; got:\n%s", body)
+	}
+}
+
+// Compile-time guard against an accidental unused import. tmux import
+// is needed by future test extensions; placeholder use so go vet stays
+// quiet under the current test set.
+var _ = tmux.SessionInfo{}
+var _ = agent.Record{}

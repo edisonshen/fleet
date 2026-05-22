@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 )
 
 // errProbeFail is a sentinel returned by the injected listFn in
@@ -426,5 +429,330 @@ func TestStatus_SessionCapBanner_AbsentOnProbeFailure(t *testing.T) {
 	if strings.Contains(stderr.String(), "WARNING") {
 		t.Errorf("probe failure should not emit banner; stderr:\n%s",
 			stderr.String())
+	}
+}
+
+// ----------------- fleet#165 PR-D: auto-reconciliation --------------
+//
+// runStatus calls gc.Reconcile(Apply=false, Kinds=all) AFTER the
+// agent table renders. Any actions returned are surfaced under an
+// "Orphans (operator action)" section with a per-kind cleanup
+// one-liner. Empty report → section omitted (no noise on healthy
+// state). Reconcile errors → logged to stderr, status still exits 0
+// (informational view — should never block triage).
+//
+// The tests below pin the wiring at the cmd/fleet seam
+// (statusReconcileFn package var). End-to-end probe behavior is
+// covered in internal/gc/gc_test.go.
+
+// stubStatusReconcile swaps statusReconcileFn for the test's duration,
+// returning a canned report+error and recording the Options it saw.
+// Restores the production wiring via t.Cleanup.
+func stubStatusReconcile(t *testing.T, report gc.Report, err error) *gc.Options {
+	t.Helper()
+	captured := &gc.Options{}
+	prev := statusReconcileFn
+	statusReconcileFn = func(opts gc.Options) (gc.Report, error) {
+		*captured = opts
+		return report, err
+	}
+	t.Cleanup(func() { statusReconcileFn = prev })
+	return captured
+}
+
+// TestStatus_SurfacesOrphanAgentRecord pins the orphan-agents surface:
+// when reconcile returns a would-archive action, runStatus must print
+// it under "Orphans (operator action)" with the cleanup command. Exit
+// code is implicit — runStatus returning nil error.
+//
+// No record is seeded in FLEET_HOME so statusAgentListFn returns
+// empty; isCoordRecord(nil) is false; the worker-record hint shape
+// applies (`fleet rm <id>` per-record per codex PR-D iter-6 [P2]).
+func TestStatus_SurfacesOrphanAgentRecord(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-deadbeef gone"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Orphans") {
+		t.Errorf("stdout should surface an Orphans section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "deadbeef") {
+		t.Errorf("stdout should name the orphan agent ID; got:\n%s", out)
+	}
+	// Per-record `fleet rm <id>` hint (worker-record shape; coord
+	// records get a different hint with a stronger warning).
+	if !strings.Contains(out, "fleet rm deadbeef") {
+		t.Errorf("orphan-agents row should suggest per-record `fleet rm <id>`; got:\n%s", out)
+	}
+}
+
+// stubStatusAgentList swaps statusAgentListFn for the test's
+// duration, returning a canned slice of records. Restores production
+// wiring via t.Cleanup.
+func stubStatusAgentList(t *testing.T, records []*agent.Record) {
+	t.Helper()
+	prev := statusAgentListFn
+	statusAgentListFn = func() ([]*agent.Record, error) { return records, nil }
+	t.Cleanup(func() { statusAgentListFn = prev })
+}
+
+// TestStatus_SurfacesOrphanCoordRecord_RecoverySafeHint pins the
+// codex review PR-D iter-4 [P2] fix: when `fleet status` surfaces an
+// orphan agent whose TaskID has prefix "coord-", the cleanup hint
+// MUST be the operator-scoped `fleet rm <id>` (with a "do NOT run
+// fleet gc --apply" nudge) — NOT the generic global archive command,
+// which would reap the coord record and break dead-coord recovery
+// for that project on the next --coord-spawn.
+//
+// Mirrors the dispatch-side guard in surfaceOrphanAgentsFromReport;
+// status and dispatch must agree on the hint shape because both
+// surface the same gc classifier output.
+func TestStatus_SurfacesOrphanCoordRecord_RecoverySafeHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	coordRec := &agent.Record{ID: "cdcdcdcd", TaskID: "coord-spark", Project: "spark"}
+	stubStatusAgentList(t, []*agent.Record{coordRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "cdcdcdcd", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-cdcdcdcd gone"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	// Must include the orphans section + the coord ID.
+	if !strings.Contains(out, "Orphans") || !strings.Contains(out, "cdcdcdcd") {
+		t.Errorf("stdout should surface the coord record in the orphans section; got:\n%s", out)
+	}
+	// Must include recovery-safe hint.
+	if !strings.Contains(out, "fleet rm cdcdcdcd") {
+		t.Errorf("orphan-agents coord row should suggest `fleet rm <id>` not the global archive; got:\n%s", out)
+	}
+	if !strings.Contains(out, "do NOT run `fleet gc --apply --kinds=orphan-agents`") {
+		t.Errorf("orphan-agents coord row must warn against the destructive global archive (codex PR-D iter-4 [P2]); got:\n%s", out)
+	}
+	if !strings.Contains(out, "preserve for dead-coord recovery") {
+		t.Errorf("orphan-agents coord row should explain the recovery preservation rationale; got:\n%s", out)
+	}
+}
+
+// TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint pins the
+// counter-case: a worker record (TaskID does NOT start with "coord-")
+// still gets the existing `fleet gc --apply --kinds=orphan-agents`
+// hint. This is the operator's cleanup muscle-memory path; the new
+// coord carve-out must not break it.
+func TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	workerRec := &agent.Record{ID: "ababcdcd", TaskID: "fix-some-bug", Project: "p1"}
+	stubStatusAgentList(t, []*agent.Record{workerRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "ababcdcd", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-ababcdcd gone"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	// Codex review PR-D iter-6 [P2]: worker rows use per-record
+	// `fleet rm <id>` (NOT the global `fleet gc --apply
+	// --kinds=orphan-agents`). The bulk command would also reap
+	// coord records that appear in the same orphans table, defeating
+	// the coord-row preservation hint.
+	if !strings.Contains(out, "fleet rm ababcdcd") {
+		t.Errorf("worker orphan-agents row must use per-record `fleet rm <id>` (codex PR-D iter-6 [P2]); got:\n%s", out)
+	}
+	if strings.Contains(out, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("worker orphan-agents row must NOT recommend the global gc command (it would reap adjacent coord records); got:\n%s", out)
+	}
+	if strings.Contains(out, "preserve for dead-coord recovery") {
+		t.Errorf("worker orphan-agents row must NOT show the coord-recovery rationale; got:\n%s", out)
+	}
+	// Multi-socket caveat preserved (codex PR-D iter-5 [P2]): even
+	// per-record `fleet rm` from a shell with a mismatched
+	// FLEET_TMUX_SOCKET could remove a record that points at a live
+	// agent on another socket. The hint mentions the verification.
+	if !strings.Contains(out, "FLEET_TMUX_SOCKET") {
+		t.Errorf("worker orphan-agents hint must reference FLEET_TMUX_SOCKET verification (codex PR-D iter-5 [P2]); got:\n%s", out)
+	}
+}
+
+// TestStatus_SurfacesOrphanTmuxSession pins the orphan-tmux surface:
+// surface action prints with the `tmux kill-session -t ...` one-liner.
+// The session is NEVER auto-killed from `fleet status`
+// (feedback_surface_dont_silo + feedback_user_owns_tmux_config).
+func TestStatus_SurfacesOrphanTmuxSession(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanTmux, Target: "fleet-c0ffee01", Verb: gc.VerbSurface, Reason: "no agent record"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Orphans") {
+		t.Errorf("stdout should surface an Orphans section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet-c0ffee01") {
+		t.Errorf("stdout should name the orphan tmux session; got:\n%s", out)
+	}
+	if !strings.Contains(out, "tmux kill-session -t fleet-c0ffee01") {
+		t.Errorf("orphan-tmux row should suggest the kill-session one-liner; got:\n%s", out)
+	}
+}
+
+// TestStatus_SurfacesOrphanTmuxSession_CustomSocketHint pins the
+// codex review PR-D iter-7 [P2] fix: when FLEET_TMUX_SOCKET is set,
+// the orphan-tmux hint must include `-S $FLEET_TMUX_SOCKET` so the
+// copy-paste actually talks to the right tmux server. The reconcile
+// probe uses fleet's tmux helpers (always pass -S); the bare `tmux
+// kill-session` would talk to the default server and either no-op
+// (no such session) or kill a same-named session on the wrong
+// server.
+func TestStatus_SurfacesOrphanTmuxSession_CustomSocketHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-custom-abc.sock")
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanTmux, Target: "fleet-c0ffee01", Verb: gc.VerbSurface, Reason: "no agent record"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "tmux -S /tmp/fleet-custom-abc.sock kill-session -t fleet-c0ffee01") {
+		t.Errorf("orphan-tmux hint must include -S $FLEET_TMUX_SOCKET (codex PR-D iter-7 [P2]); got:\n%s", out)
+	}
+}
+
+// TestStatus_HealthyState_NoOrphanSection pins the no-noise contract:
+// empty reconcile report → no Orphans section in stdout.
+func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	stubStatusReconcile(t, gc.Report{}, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	for _, fragment := range []string{"Orphans", "would-archive", "kill-session"} {
+		if strings.Contains(out, fragment) {
+			t.Errorf("healthy state should not surface %q on stdout; got:\n%s", fragment, out)
+		}
+	}
+}
+
+// TestStatus_ReconcilePassesAllKinds pins the call shape: status
+// surfaces ALL four kinds (sockets, orphan-agents, orphan-tmux,
+// worktrees), so the reconcile Options must opt into all of them and
+// run dry-run (Apply=false).
+func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	opts := stubStatusReconcile(t, gc.Report{}, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if opts.Apply {
+		t.Errorf("status reconcile must be dry-run (Apply=false); got Apply=%t", opts.Apply)
+	}
+	// Must include all four kinds so the operator sees a complete
+	// picture of orphan state.
+	wantKinds := map[gc.Kind]bool{
+		gc.KindSockets: true, gc.KindOrphanAgents: true,
+		gc.KindOrphanTmux: true, gc.KindWorktrees: true,
+	}
+	got := map[gc.Kind]bool{}
+	for _, k := range opts.Kinds {
+		got[k] = true
+	}
+	for k := range wantKinds {
+		if !got[k] {
+			t.Errorf("status reconcile missing kind %q; opts.Kinds=%v", k, opts.Kinds)
+		}
+	}
+}
+
+// TestStatus_ReconcileError_LoggedNotReturned pins the
+// surface-don't-silo contract: a reconcile error must reach stderr
+// AND status must still exit 0 (informational view). Returning err
+// would surface as a non-zero exit, but `fleet status` is a
+// read-only triage command — a reconcile probe failure shouldn't
+// stop the operator from seeing the agent table.
+func TestStatus_ReconcileError_LoggedNotReturned(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	bad := errors.New("reconcile probe failure: stat agent dir: permission denied")
+	stubStatusReconcile(t, gc.Report{}, bad)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Errorf("reconcile error must NOT propagate as runStatus return; got %v", err)
+	}
+	if !strings.Contains(stderr.String(), "reconcile") {
+		t.Errorf("reconcile error must be logged to stderr; got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "permission denied") {
+		t.Errorf("reconcile error message must be preserved on stderr; got:\n%s", stderr.String())
+	}
+}
+
+// TestStatusReconcileFn_DefaultsToGCReconcile pins the default wiring:
+// the seam must call into gc.Reconcile with production Deps when no
+// test stub is installed. Without this, a refactor that nils the var
+// would silently degrade status to "no reconcile ever fires" without
+// any test failing.
+func TestStatusReconcileFn_DefaultsToGCReconcile(t *testing.T) {
+	if statusReconcileFn == nil {
+		t.Fatal("statusReconcileFn must default to a non-nil func wrapping gc.Reconcile")
+	}
+	// Empty kinds → empty report (gc.Reconcile treats nil Kinds as
+	// "do nothing"). Proves the var is callable + routes through gc
+	// without side effects.
+	rep, err := statusReconcileFn(gc.Options{Kinds: nil})
+	if err != nil {
+		t.Fatalf("default statusReconcileFn with empty kinds returned err: %v", err)
+	}
+	if len(rep.Actions) != 0 {
+		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -11,12 +12,64 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// dispatchReconcileFn is the package-level seam for the auto-reconcile
+// passes that run at the top of runDispatch (fleet#165 PR-D). Both
+// passes are dry-run at the gc layer AND surface-only at the dispatch
+// layer:
+//
+//  1. Apply=false, Kinds=[orphan-agents] — classify which records
+//     have no live tmux session on the CURRENT FLEET_TMUX_SOCKET.
+//     surfaceOrphanAgentsFromReport emits a stderr warning per
+//     candidate (with the `fleet gc --apply --kinds=orphan-agents`
+//     one-liner) so the operator can review + archive explicitly.
+//  2. Apply=false, Kinds=[orphan-tmux]   — surface a stderr warning
+//     for fleet-* tmux sessions with no agent record. NEVER auto-
+//     killed (feedback_surface_dont_silo + feedback_user_owns_tmux_config —
+//     could belong to a different operator's session).
+//
+// Why surface-only (not auto-archive) for orphan-agents — codex
+// review PR-D iter-2 [P1]: agent.Record does NOT persist its
+// spawn-time tmux socket. The gc classifier probes the CURRENT
+// FLEET_TMUX_SOCKET (default if unset), so a record whose agent is
+// live on a CUSTOM socket looks orphan on the default socket — and
+// vice versa. There is no environment-side check this dispatch path
+// can use to prove ownership; both "FLEET_TMUX_SOCKET set" AND
+// "FLEET_TMUX_SOCKET unset" cases can mis-identify a live agent as
+// orphan. Per feedback_surface_dont_silo.md the right move is to
+// surface (don't silently destroy) and let the operator decide via
+// `fleet gc --apply --kinds=orphan-agents` from a shell where they
+// know the socket state.
+//
+// The companion coord-recovery skip (TaskID prefix coord- → never
+// archive) becomes moot in the surface-only model, but is preserved
+// in the helper as defense-in-depth in case a future change re-
+// enables auto-archive.
+//
+// Production wraps gc.Reconcile(opts, gc.DefaultDeps()); tests stub
+// the var to inject canned reports without touching real state. Both
+// passes run BEFORE the coord-spawn lock acquire / live-coord veto so
+// orphan records don't pollute those decisions.
+//
+// Reconcile errors NEVER block dispatch — logged to stderr + continue.
+// Risk mitigation in TASK-PLAN §Risks: a leaked dispatch from a
+// blocked-by-reconcile path compounds worse than a missed reconcile.
+var dispatchReconcileFn = func(opts gc.Options) (gc.Report, error) {
+	return gc.Reconcile(opts, gc.DefaultDeps())
+}
+
+// dispatchReconcileMaxAge mirrors statusReconcileMaxAge — sockets-age
+// classifier floor matches the operator-invoked `fleet gc` default.
+// Not used by the dispatch path today (only orphan-agents +
+// orphan-tmux kinds run here), but declared for future expansion.
+const dispatchReconcileMaxAge = 24 * time.Hour
 
 // tmuxHasSession is the production sessionAliveProbe for
 // findRecoveryCandidate. Wraps tmux.HasSession; the indirection keeps
@@ -219,6 +272,33 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
+	// fleet#165 PR-D auto-reconciliation. Runs BEFORE tmux.Available
+	// and the coord-spawn lock so orphan resources surface as a
+	// one-time-per-dispatch nudge during the operator's normal
+	// workflow (no `fleet gc` invocation required to discover state).
+	//
+	// Both passes are SURFACE-ONLY (codex review PR-D iter-2 [P1]):
+	// agent.Record does not persist its spawn-time tmux socket, so
+	// the gc classifier cannot prove a record is truly orphan from
+	// the dispatch path. Auto-archiving on ambiguous state would
+	// silently destroy live agents whose tmux session is on a custom
+	// socket. Per feedback_surface_dont_silo.md the dispatch path
+	// surfaces the candidates and lets the operator run `fleet gc
+	// --apply --kinds=orphan-agents` (or `fleet rm <id>`) from a
+	// shell where they know the socket state. Same shape as the
+	// orphan-tmux surface (no kill, just warning).
+	//
+	//   - --coord-spawn dispatches SKIP the orphan-agents surface
+	//     entirely. The coord-spawn path has its own live-coord-veto
+	//     + dead-coord-recovery branch (further down in this
+	//     function) and additional orphan-agent noise would confuse
+	//     the recovery flow. The orphan-tmux surface still runs.
+	//   - Worker dispatches surface BOTH orphan-agents and orphan-
+	//     tmux candidates to stderr.
+	//
+	// Failure path is non-blocking: reconcile errors log to stderr +
+	// continue (TASK-PLAN §Risks). Healthy state emits zero output.
+	runDispatchReconcile(os.Stderr, opts.coordSpawn)
 	if err := tmux.Available(); err != nil {
 		return err
 	}
@@ -1027,4 +1107,194 @@ var sendInitialPrompt = func(session, prompt string) (submitted bool, err error)
 			session, werr)
 	}
 	return spawn.SendPromptKeysVerified(session, prompt)
+}
+
+// dispatchAgentListFn is the production seam used by
+// surfaceOrphanAgentsFromReport to enrich each gc Action with the
+// record's TaskID/Project for a more useful operator warning line.
+// Production wraps agent.List; tests override the var to inject
+// canned record slices without touching ~/.fleet/agents.
+var dispatchAgentListFn = func() ([]*agent.Record, error) { return agent.List() }
+
+// shouldSkipArchiveForRecovery reports whether an orphan-agents
+// archive on the dispatch path MUST skip the given record. Currently
+// the dispatch path is fully surface-only (codex review PR-D iter-2
+// [P1]) so this helper is defense-in-depth — preserved so that any
+// future change re-enabling auto-archive can't silently destroy
+// dead-coord recovery state.
+//
+// Load-bearing case: any record whose TaskID starts with
+// CoordTaskIDPrefix ("coord-") is a coordinator record. Archiving it
+// on a worker dispatch would block a later `fleet dispatch
+// --coord-spawn` against that project from running
+// findRecoveryCandidate, breaking dead-coord recovery.
+//
+// The CoordTaskIDPrefix check covers BOTH the project this dispatch
+// targets AND every other project's coord records that happen to be
+// on disk. A worker dispatch against project A must not collateral-
+// archive project B's dead coord record — recovery is per-project.
+func shouldSkipArchiveForRecovery(r *agent.Record) bool {
+	if r == nil {
+		return true
+	}
+	return strings.HasPrefix(r.TaskID, CoordTaskIDPrefix)
+}
+
+// runDispatchReconcile fires the two reconcile passes documented on
+// dispatchReconcileFn. Errors are non-fatal — logged to stderr and
+// swallowed so the dispatch path can proceed to its normal failure
+// modes (tmux unavailable, lock contention, spawn error) without a
+// reconcile probe failure compounding into "dispatch refuses to run".
+//
+// Pass 1 (skipped when isCoordSpawn=true): Apply=false,
+// Kinds=[orphan-agents] — every would-archive action prints one
+// stderr line of the shape:
+//
+//	warning: orphan agent record <id> (task=<task_id>, project=<project>)
+//	  on this tmux socket; archive manually with
+//	  `fleet gc --apply --kinds=orphan-agents` from a shell where you
+//	  know the socket state (record does not persist spawn-time socket).
+//
+// Surface (don't auto-archive) per feedback_surface_dont_silo +
+// codex review PR-D iter-2 [P1]: the gc classifier cannot prove a
+// record is truly orphan because agent.Record does not persist its
+// spawn-time socket. A live agent on a custom socket looks orphan to
+// a dispatch on the default socket, and vice versa. Surface lets the
+// operator decide.
+//
+// Pass 1 is also skipped wholesale when isCoordSpawn=true: the
+// coord-spawn path has its own live-coord-veto + dead-coord-recovery
+// branch (further down in runDispatch); additional orphan-agent
+// noise during a recovery flow is confusing.
+//
+// Pass 2 (always fires): Apply=false, Kinds=[orphan-tmux] — every
+// surface action prints one stderr line of the shape:
+//
+//	warning: orphan tmux session <name> has no agent record;
+//	  kill manually with `tmux kill-session -t <name>`
+//
+// Surface (don't auto-kill) per feedback_surface_dont_silo +
+// feedback_user_owns_tmux_config — fleet-named sessions outside the
+// current operator's record set may belong to a different workflow.
+//
+// stderr is io.Writer (not *os.File) so callers can redirect for
+// tests via the standard os.Stderr swap pattern.
+func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
+	// Pass 1: orphan agent records → surface only. Coord-spawn
+	// dispatches skip the whole pass to avoid noise during the
+	// recovery flow.
+	if !isCoordSpawn {
+		report, err := dispatchReconcileFn(gc.Options{
+			Apply:  false,
+			MaxAge: dispatchReconcileMaxAge,
+			Kinds:  []gc.Kind{gc.KindOrphanAgents},
+		})
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: reconcile (orphan-agents) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
+				err)
+		}
+		surfaceOrphanAgentsFromReport(stderr, report)
+	}
+	// Pass 2: orphan tmux sessions → surface only, never kill. Runs
+	// in BOTH worker and coord-spawn paths because it doesn't mutate
+	// state — just informs the operator about accumulating leaks.
+	report, err := dispatchReconcileFn(gc.Options{
+		Apply:  false,
+		MaxAge: dispatchReconcileMaxAge,
+		Kinds:  []gc.Kind{gc.KindOrphanTmux},
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: reconcile (orphan-tmux) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
+			err)
+	}
+	for _, a := range report.Actions {
+		if a.Kind != gc.KindOrphanTmux {
+			continue
+		}
+		// Codex review PR-D iter-7 [P2]: include -S $FLEET_TMUX_SOCKET
+		// in the kill-session hint when set. The reconcile probe
+		// found the orphan session via fleet's tmux helpers which
+		// always pass -S; the bare `tmux kill-session -t <name>`
+		// hint would talk to the default server instead. Mirrors
+		// status.go's orphanCleanupHint.
+		killCmd := fmt.Sprintf("tmux kill-session -t %s", a.Target)
+		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+			killCmd = fmt.Sprintf("tmux -S %s kill-session -t %s", sock, a.Target)
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"warning: orphan tmux session %s has no agent record; kill manually with `%s`\n",
+			a.Target, killCmd)
+	}
+}
+
+// surfaceOrphanAgentsFromReport emits one stderr line per orphan-agents
+// would-archive action so the operator can review and decide whether
+// to archive. The dispatch path NEVER mutates agent records itself
+// (codex review PR-D iter-2 [P1]) because the gc classifier cannot
+// prove a record is truly orphan without persisting the spawn-time
+// tmux socket on agent.Record (out-of-scope schema change). Surface-
+// only here mirrors the orphan-tmux pass and the feedback_surface_
+// dont_silo.md guidance.
+//
+// Hint shapes (kept in sync with status.go's orphanCleanupHint per
+// codex review PR-D iter-6 [P2]):
+//
+//   - Coord records (TaskID prefix "coord-"): name `fleet rm <id>`
+//     plus an explicit "do NOT run `fleet gc --apply
+//     --kinds=orphan-agents`" warning. The global archive would
+//     also reap this coord record, disabling dead-coord recovery.
+//   - Worker records: name per-record `fleet rm <id>` (NOT the
+//     global gc command). A mixed orphans list with a worker row
+//     AND a coord row would otherwise let an operator follow the
+//     worker hint and reap the coord record too — codex iter-6
+//     [P2] caught that footgun.
+//
+// The helper enriches the warning with TaskID + Project (a useful
+// triage signal) by re-looking-up records via dispatchAgentListFn;
+// when the list fails or a record vanished between probe + lookup,
+// the line falls back to the bare ID + worker-shaped command (the
+// recovery-safe hint requires knowing the task_id, which we don't
+// have without the record). Empty report short-circuits before the
+// listing call.
+func surfaceOrphanAgentsFromReport(stderr io.Writer, report gc.Report) {
+	if len(report.Actions) == 0 {
+		return
+	}
+	// Best-effort record enrichment; failure is non-fatal.
+	byID := map[string]*agent.Record{}
+	if records, lerr := dispatchAgentListFn(); lerr == nil {
+		for _, r := range records {
+			if r == nil {
+				continue
+			}
+			byID[r.ID] = r
+		}
+	}
+	for _, a := range report.Actions {
+		if a.Kind != gc.KindOrphanAgents {
+			continue
+		}
+		rec, ok := byID[a.Target]
+		if ok && shouldSkipArchiveForRecovery(rec) {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: orphan coord record %s (task=%s, project=%s) — %s; preserve for dead-coord recovery, or archive with `fleet rm %s` ONLY if you're sure no --coord-spawn against project %s will need it (do NOT run `fleet gc --apply --kinds=orphan-agents` — that reaps this record too)\n",
+				rec.ID, rec.TaskID, rec.Project, a.Reason, rec.ID, rec.Project)
+			continue
+		}
+		taskID := "?"
+		project := "?"
+		if ok {
+			if rec.TaskID != "" {
+				taskID = rec.TaskID
+			}
+			if rec.Project != "" {
+				project = rec.Project
+			}
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"warning: orphan agent record %s (task=%s, project=%s) — %s; archive manually with `fleet rm %s` (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running — record does not persist spawn-time socket)\n",
+			a.Target, taskID, project, a.Reason, a.Target)
+	}
 }
