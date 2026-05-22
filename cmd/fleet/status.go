@@ -285,6 +285,16 @@ func isCoordRecord(r *agent.Record) bool {
 func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 	switch a.Kind {
 	case gc.KindOrphanTmux:
+		// Codex review PR-D iter-7 [P2]: include -S $FLEET_TMUX_SOCKET
+		// in the kill-session hint when the env var is set. The
+		// reconcile probe found the orphan session via fleet's tmux
+		// helpers which always pass -S; the copied `tmux kill-session
+		// -t <name>` would talk to the default server instead and
+		// either no-op or kill a same-named session on the wrong
+		// server.
+		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+			return fmt.Sprintf("tmux -S %s kill-session -t %s", sock, a.Target)
+		}
 		return fmt.Sprintf("tmux kill-session -t %s", a.Target)
 	case gc.KindOrphanAgents:
 		if isCoordRecord(rec) {

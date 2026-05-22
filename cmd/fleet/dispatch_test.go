@@ -1044,7 +1044,11 @@ func TestDispatch_WarnsOnOrphanTmuxNotKilled(t *testing.T) {
 	if !strings.Contains(body, "orphan") || !strings.Contains(body, "tmux") {
 		t.Errorf("stderr must label the warning as an orphan tmux session; got:\n%s", body)
 	}
-	if !strings.Contains(body, "tmux kill-session") {
+	// Codex PR-D iter-7 [P2] added the -S $FLEET_TMUX_SOCKET prefix
+	// when the env var is set (which it is via isolateTmuxSocket).
+	// Match the kill-session token (suffix) rather than the bare
+	// `tmux kill-session` prefix.
+	if !strings.Contains(body, "kill-session -t fleet-deadbeef") {
 		t.Errorf("stderr must include the manual kill-session one-liner; got:\n%s", body)
 	}
 }

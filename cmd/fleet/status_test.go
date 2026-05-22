@@ -627,6 +627,35 @@ func TestStatus_SurfacesOrphanTmuxSession(t *testing.T) {
 	}
 }
 
+// TestStatus_SurfacesOrphanTmuxSession_CustomSocketHint pins the
+// codex review PR-D iter-7 [P2] fix: when FLEET_TMUX_SOCKET is set,
+// the orphan-tmux hint must include `-S $FLEET_TMUX_SOCKET` so the
+// copy-paste actually talks to the right tmux server. The reconcile
+// probe uses fleet's tmux helpers (always pass -S); the bare `tmux
+// kill-session` would talk to the default server and either no-op
+// (no such session) or kill a same-named session on the wrong
+// server.
+func TestStatus_SurfacesOrphanTmuxSession_CustomSocketHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-custom-abc.sock")
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanTmux, Target: "fleet-c0ffee01", Verb: gc.VerbSurface, Reason: "no agent record"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "tmux -S /tmp/fleet-custom-abc.sock kill-session -t fleet-c0ffee01") {
+		t.Errorf("orphan-tmux hint must include -S $FLEET_TMUX_SOCKET (codex PR-D iter-7 [P2]); got:\n%s", out)
+	}
+}
+
 // TestStatus_HealthyState_NoOrphanSection pins the no-noise contract:
 // empty reconcile report → no Orphans section in stdout.
 func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {

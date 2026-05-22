@@ -1213,9 +1213,19 @@ func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
 		if a.Kind != gc.KindOrphanTmux {
 			continue
 		}
+		// Codex review PR-D iter-7 [P2]: include -S $FLEET_TMUX_SOCKET
+		// in the kill-session hint when set. The reconcile probe
+		// found the orphan session via fleet's tmux helpers which
+		// always pass -S; the bare `tmux kill-session -t <name>`
+		// hint would talk to the default server instead. Mirrors
+		// status.go's orphanCleanupHint.
+		killCmd := fmt.Sprintf("tmux kill-session -t %s", a.Target)
+		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+			killCmd = fmt.Sprintf("tmux -S %s kill-session -t %s", sock, a.Target)
+		}
 		_, _ = fmt.Fprintf(stderr,
-			"warning: orphan tmux session %s has no agent record; kill manually with `tmux kill-session -t %s`\n",
-			a.Target, a.Target)
+			"warning: orphan tmux session %s has no agent record; kill manually with `%s`\n",
+			a.Target, killCmd)
 	}
 }
 
