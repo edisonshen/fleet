@@ -666,6 +666,25 @@ func Spawn(opts Options) (*agent.Record, error) {
 	if exe, err := os.Executable(); err == nil {
 		extraEnv = append(extraEnv, "FLEET_BIN="+exe)
 	}
+	// FLEET_PROJECT is stamped from the agent's intrinsic project
+	// (record-derived, not shell-env-derived — see propagatedRuntimeEnv
+	// rationale below for why this is NOT a propagated var). The
+	// /coordinator skill reads it to pick which project's queue to
+	// supervise; without it the skill falls back to a cwd-derived
+	// project, which silently misroutes any coord whose cwd doesn't
+	// match its record. Mirror the rec.Project resolution that happens
+	// further down (handoff branch inherits OldRecord.Project; fresh
+	// dispatch uses opts.Project). Empty project (legacy / untargeted
+	// dispatch) skips emission so the skill's "no project" branch still
+	// fires; an explicit FLEET_PROJECT= entry with an empty value would
+	// override the unset-check and break that path. Regresses fleet#170.
+	effectiveProject := opts.Project
+	if opts.OldRecord != nil && opts.OldRecord.Project != "" {
+		effectiveProject = opts.OldRecord.Project
+	}
+	if effectiveProject != "" {
+		extraEnv = append(extraEnv, "FLEET_PROJECT="+effectiveProject)
+	}
 	// Propagate operator-set FLEET_* knobs. FLEET_ENGINE is a special
 	// case on the handoff branch: the replacement agent inherits
 	// OldRecord.Engine (set below), so its env must match the record
