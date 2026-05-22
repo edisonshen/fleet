@@ -1094,12 +1094,15 @@ var sendInitialPrompt = func(session, prompt string) (submitted bool, err error)
 // modes (tmux unavailable, lock contention, spawn error) without a
 // reconcile probe failure compounding into "dispatch refuses to run".
 //
-// Pass 1: Apply=true, Kinds=[orphan-agents] — silent on success
-// (per-action archive is unambiguous fleet-owned cleanup, not
-// operator-visible noise).
+// Pass 1 (skipped when isCoordSpawn=true): Apply=true,
+// Kinds=[orphan-agents] — silent on success (per-action archive is
+// unambiguous fleet-owned cleanup, not operator-visible noise). See
+// the caller-side comment for the coord-spawn skip rationale —
+// short version: the coord-spawn path has its own live-coord-veto +
+// dead-coord-recovery branch that wants the dead record left on disk.
 //
-// Pass 2: Apply=false, Kinds=[orphan-tmux] — every surface action
-// prints one stderr line of the shape:
+// Pass 2 (always fires): Apply=false, Kinds=[orphan-tmux] — every
+// surface action prints one stderr line of the shape:
 //
 //	warning: orphan tmux session <name> has no agent record;
 //	  kill manually with `tmux kill-session -t <name>`
@@ -1110,18 +1113,24 @@ var sendInitialPrompt = func(session, prompt string) (submitted bool, err error)
 //
 // stderr is io.Writer (not *os.File) so callers can redirect for
 // tests via the standard os.Stderr swap pattern.
-func runDispatchReconcile(stderr io.Writer) {
-	// Pass 1: orphan agent records → auto-archive.
-	if _, err := dispatchReconcileFn(gc.Options{
-		Apply:  true,
-		MaxAge: dispatchReconcileMaxAge,
-		Kinds:  []gc.Kind{gc.KindOrphanAgents},
-	}); err != nil {
-		_, _ = fmt.Fprintf(stderr,
-			"warning: reconcile (orphan-agents) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
-			err)
+func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
+	// Pass 1: orphan agent records → auto-archive (worker dispatches
+	// only). Coord-spawn dispatches MUST skip this so the dead-coord
+	// recovery branch in runDispatch can still consume on-disk records.
+	if !isCoordSpawn {
+		if _, err := dispatchReconcileFn(gc.Options{
+			Apply:  true,
+			MaxAge: dispatchReconcileMaxAge,
+			Kinds:  []gc.Kind{gc.KindOrphanAgents},
+		}); err != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: reconcile (orphan-agents) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
+				err)
+		}
 	}
-	// Pass 2: orphan tmux sessions → surface only, never kill.
+	// Pass 2: orphan tmux sessions → surface only, never kill. Runs
+	// in BOTH worker and coord-spawn paths because it doesn't mutate
+	// state — just informs the operator about accumulating leaks.
 	report, err := dispatchReconcileFn(gc.Options{
 		Apply:  false,
 		MaxAge: dispatchReconcileMaxAge,

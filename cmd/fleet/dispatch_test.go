@@ -1104,6 +1104,63 @@ func TestDispatch_ReconcileErrorDoesNotBlockDispatch(t *testing.T) {
 	}
 }
 
+// TestDispatch_CoordSpawn_SkipsOrphanAgentsArchive pins the
+// dead-coord-recovery compatibility carve-out: --coord-spawn
+// dispatches MUST NOT run the orphan-agents auto-archive pass.
+// The coord-spawn path has its own live-coord-veto + dead-coord-
+// recovery branch (further down in runDispatch) that depends on the
+// dead record staying on disk so the successor can inherit cwd,
+// command, engine, and DisableAutoResume. Auto-archiving here would
+// undo that decision and break dead-coord recovery on every
+// coord-spawn against a dead lineage. The orphan-tmux surface still
+// runs (informational only).
+//
+// Regression: this gate was added after the initial dispatch
+// reconcile broke 7 dispatch_recovery tests by archiving the seeded
+// dead-coord fixtures before the recovery branch ran. See WIP
+// Phase 3 in ~/.fleet/subagent-wip/cleanup-pr-d-reconciliat-cc39.md.
+func TestDispatch_CoordSpawn_SkipsOrphanAgentsArchive(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+	// Stub: record every reconcile call so we can inspect the kinds
+	// that fired. The coord-spawn path should fire only the
+	// orphan-tmux surface pass, not the orphan-agents apply pass.
+	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
+
+	opts := &dispatchOpts{
+		taskID:          "coord-foo",
+		project:         "foo",
+		projectExplicit: true,
+		coordSpawn:      true,
+	}
+	var stdout bytes.Buffer
+	_ = runDispatch(opts, &stdout)
+
+	for _, c := range *calls {
+		// orphan-agents apply pass: Apply=true, Kinds=[orphan-agents].
+		// That combination must NEVER fire under --coord-spawn.
+		if c.opts.Apply &&
+			len(c.opts.Kinds) == 1 &&
+			c.opts.Kinds[0] == gc.KindOrphanAgents {
+			t.Errorf("--coord-spawn dispatch must skip the orphan-agents auto-archive pass; got Apply=true Kinds=[orphan-agents]")
+		}
+	}
+	// Sanity: the orphan-tmux surface pass should still fire (it's
+	// informational and doesn't risk dead-coord-recovery).
+	var sawOrphanTmux bool
+	for _, c := range *calls {
+		if !c.opts.Apply &&
+			len(c.opts.Kinds) == 1 &&
+			c.opts.Kinds[0] == gc.KindOrphanTmux {
+			sawOrphanTmux = true
+		}
+	}
+	if !sawOrphanTmux {
+		t.Errorf("--coord-spawn dispatch must still fire the orphan-tmux surface pass; got %d calls", len(*calls))
+	}
+}
+
 // TestDispatchReconcileFn_DefaultsToGCReconcile pins the default
 // wiring: the package-level seam must call into gc.Reconcile with the
 // production Deps. Without this, a refactor that nils out the var
