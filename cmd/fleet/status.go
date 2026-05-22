@@ -13,9 +13,31 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/version"
 )
+
+// statusReconcileFn is the package-level seam for the auto-reconcile
+// pass that runs at the end of runStatus. Production wraps
+// gc.Reconcile(opts, gc.DefaultDeps()); tests override the var to
+// inject canned reports without touching the real /tmp/ + ~/.fleet/.
+//
+// See fleet#165 PR-D in docs/DESIGN-cleanup-fleet-owns-resources.md.
+// Status is informational — never mutates state (Apply=false hard-
+// wired by the runStatus caller), never blocks on a reconcile error
+// (logs to stderr + continues), and surfaces orphans under an
+// explicit operator-action section so the operator can copy-paste
+// the cleanup command.
+var statusReconcileFn = func(opts gc.Options) (gc.Report, error) {
+	return gc.Reconcile(opts, gc.DefaultDeps())
+}
+
+// statusReconcileMaxAge gates the socket-age classifier inside the
+// reconcile pass. Mirrors gcDefaultMaxAge (cmd/fleet/gc.go) so the
+// status surface and the operator-invoked `fleet gc` see consistent
+// "what is orphan" definitions.
+const statusReconcileMaxAge = 24 * time.Hour
 
 type statusOpts struct {
 	jsonOut bool
@@ -121,6 +143,13 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 	// reading stdout aren't broken by the banner.
 	emitSessionCapBanner(stderr)
 
+	// Auto-reconcile pass (fleet#165 PR-D). Dry-run only — status is
+	// informational and must NEVER mutate state. Errors log to stderr
+	// + continue; a probe failure shouldn't stop the operator from
+	// seeing the agent table (surface-don't-silo, but the surface for
+	// `fleet status` is a non-fatal stderr line, not a non-zero exit).
+	emitOrphanReconcileSection(stdout, stderr)
+
 	// Upgrade nudge footer. Pure read against ~/.fleet/version_check.json;
 	// silent when no cache, no upgrade, or dev build. Same source of
 	// truth as the TUI banner — single chip, identical format.
@@ -128,6 +157,72 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 		_, _ = fmt.Fprintln(stdout, nudge)
 	}
 	return nil
+}
+
+// emitOrphanReconcileSection runs the dry-run reconcile pass at the
+// end of `fleet status` and renders any orphans under an explicit
+// "Orphans (operator action):" section with a per-action cleanup
+// one-liner. Empty report → section omitted (no noise on healthy
+// state). Reconcile errors → logged to stderr, section still emitted
+// for whatever actions DID come back (gc.Reconcile returns partial
+// results on per-classifier errors).
+//
+// Layout — one line per orphan, columns are <kind> <target> <cmd>:
+//
+//	Orphans (operator action):
+//	  orphan-agents   abcd1234       fleet gc --apply --kinds=orphan-agents
+//	  orphan-tmux     fleet-deadbef  tmux kill-session -t fleet-deadbef
+//	  sockets         /tmp/...sock   fleet gc --apply --kinds=sockets
+//	  worktrees       /path/to/wt    fleet gc --apply --kinds=worktrees
+//
+// gc.Reconcile already returns r.Actions in a stable order (kind →
+// target), so no extra sorting needed here.
+func emitOrphanReconcileSection(stdout, stderr io.Writer) {
+	opts := gc.Options{
+		Apply:  false,
+		MaxAge: statusReconcileMaxAge,
+		Kinds:  gc.AllKinds,
+	}
+	report, err := statusReconcileFn(opts)
+	if err != nil {
+		// Surface (don't silo) but keep going — the operator still
+		// gets whatever actions the reconcile DID classify.
+		_, _ = fmt.Fprintf(stderr, "warning: reconcile probe failed: %v (status output still informational)\n", err)
+	}
+	if len(report.Actions) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(stdout, "")
+	_, _ = fmt.Fprintln(stdout, "Orphans (operator action):")
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	for _, a := range report.Actions {
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\n", a.Kind, a.Target, orphanCleanupHint(a))
+	}
+	_ = tw.Flush()
+}
+
+// orphanCleanupHint returns the copy-paste cleanup command for one
+// orphan action. The hints are stable strings — pinned by tests so a
+// careless edit can't silently break operator muscle memory.
+//
+//	sockets       → fleet gc --apply --kinds=sockets
+//	orphan-agents → fleet gc --apply --kinds=orphan-agents
+//	orphan-tmux   → tmux kill-session -t <name>  (surface, NOT auto-kill)
+//	worktrees     → fleet gc --apply --kinds=worktrees
+//
+// orphan-tmux is the surface-don't-silo case: the cleanup hint names
+// the manual tmux command rather than `fleet gc --aggressive` so the
+// operator has to read + confirm before killing a session that might
+// belong to a different operator's workflow (feedback_user_owns_tmux_config).
+func orphanCleanupHint(a gc.Action) string {
+	switch a.Kind {
+	case gc.KindOrphanTmux:
+		return fmt.Sprintf("tmux kill-session -t %s", a.Target)
+	case gc.KindSockets, gc.KindOrphanAgents, gc.KindWorktrees:
+		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
+	default:
+		return "(unknown — run `fleet gc` for details)"
+	}
 }
 
 // statusSessionListFn / statusSessionExistsFn are overridable for

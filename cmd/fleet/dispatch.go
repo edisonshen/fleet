@@ -11,12 +11,43 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/enginecfg"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// dispatchReconcileFn is the package-level seam for the auto-reconcile
+// passes that run at the top of runDispatch (fleet#165 PR-D). Two
+// passes per dispatch:
+//
+//  1. Apply=true, Kinds=[orphan-agents]  — auto-archive agent records
+//     whose tmux session is gone. Unambiguous fleet-owned cleanup
+//     per feedback_fleet_owns_its_resources.md; silent on success.
+//  2. Apply=false, Kinds=[orphan-tmux]   — surface a stderr warning
+//     for fleet-* tmux sessions with no agent record. NEVER auto-
+//     killed (feedback_surface_dont_silo + feedback_user_owns_tmux_config —
+//     could belong to a different operator's session).
+//
+// Production wraps gc.Reconcile(opts, gc.DefaultDeps()); tests stub
+// the var to inject canned reports without touching real state. Both
+// passes run BEFORE the coord-spawn lock acquire / live-coord veto so
+// orphan records don't pollute those decisions.
+//
+// Reconcile errors NEVER block dispatch — logged to stderr + continue.
+// Risk mitigation in TASK-PLAN §Risks: a leaked dispatch from a
+// blocked-by-reconcile path compounds worse than a missed reconcile.
+var dispatchReconcileFn = func(opts gc.Options) (gc.Report, error) {
+	return gc.Reconcile(opts, gc.DefaultDeps())
+}
+
+// dispatchReconcileMaxAge mirrors statusReconcileMaxAge — sockets-age
+// classifier floor matches the operator-invoked `fleet gc` default.
+// Not used by the dispatch path today (only orphan-agents +
+// orphan-tmux kinds run here), but declared for future expansion.
+const dispatchReconcileMaxAge = 24 * time.Hour
 
 // tmuxHasSession is the production sessionAliveProbe for
 // findRecoveryCandidate. Wraps tmux.HasSession; the indirection keeps
@@ -219,6 +250,34 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return fmt.Errorf("bootstrap ~/.fleet: %w", err)
 	}
+	// fleet#165 PR-D auto-reconciliation. Runs BEFORE tmux.Available
+	// and the coord-spawn lock so orphan tmux sessions surface as a
+	// one-time-per-dispatch nudge during the operator's normal
+	// workflow (no `fleet gc` invocation required to discover state).
+	//
+	// Orphan-agents AUTO-ARCHIVE is gated on opts.coordSpawn=false:
+	//
+	//   - For worker / regular dispatches (the common case), auto-
+	//     archive is safe — there's no recovery branch that wants a
+	//     dead record left on disk. A stale worker record otherwise
+	//     persists until manual `fleet rm`, polluting `fleet status`.
+	//
+	//   - For --coord-spawn dispatches, SKIP auto-archive. The
+	//     coord-spawn path has its own live-coord-veto + dead-coord-
+	//     recovery branch (further down in this function) that depends
+	//     on the dead record staying on disk so the successor can
+	//     inherit cwd / command / engine / DisableAutoResume. The
+	//     recovery branch explicitly DOES NOT archive even when
+	//     recovery succeeds (see "Local tmux probes cannot rule out a
+	//     live coord on a different tmux socket" comment block in the
+	//     recovery-bookkeeping section) — auto-archiving here would
+	//     undo that decision and break dead-coord recovery on every
+	//     coord-spawn against a dead lineage. The orphan-tmux surface
+	//     still runs in BOTH cases (informational only).
+	//
+	// Failure path is non-blocking: reconcile errors log to stderr +
+	// continue (TASK-PLAN §Risks). Healthy state emits zero output.
+	runDispatchReconcile(os.Stderr, opts.coordSpawn)
 	if err := tmux.Available(); err != nil {
 		return err
 	}
@@ -1027,4 +1086,58 @@ var sendInitialPrompt = func(session, prompt string) (submitted bool, err error)
 			session, werr)
 	}
 	return spawn.SendPromptKeysVerified(session, prompt)
+}
+
+// runDispatchReconcile fires the two reconcile passes documented on
+// dispatchReconcileFn. Errors are non-fatal — logged to stderr and
+// swallowed so the dispatch path can proceed to its normal failure
+// modes (tmux unavailable, lock contention, spawn error) without a
+// reconcile probe failure compounding into "dispatch refuses to run".
+//
+// Pass 1: Apply=true, Kinds=[orphan-agents] — silent on success
+// (per-action archive is unambiguous fleet-owned cleanup, not
+// operator-visible noise).
+//
+// Pass 2: Apply=false, Kinds=[orphan-tmux] — every surface action
+// prints one stderr line of the shape:
+//
+//	warning: orphan tmux session <name> has no agent record;
+//	  kill manually with `tmux kill-session -t <name>`
+//
+// Surface (don't auto-kill) per feedback_surface_dont_silo +
+// feedback_user_owns_tmux_config — fleet-named sessions outside the
+// current operator's record set may belong to a different workflow.
+//
+// stderr is io.Writer (not *os.File) so callers can redirect for
+// tests via the standard os.Stderr swap pattern.
+func runDispatchReconcile(stderr io.Writer) {
+	// Pass 1: orphan agent records → auto-archive.
+	if _, err := dispatchReconcileFn(gc.Options{
+		Apply:  true,
+		MaxAge: dispatchReconcileMaxAge,
+		Kinds:  []gc.Kind{gc.KindOrphanAgents},
+	}); err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: reconcile (orphan-agents) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
+			err)
+	}
+	// Pass 2: orphan tmux sessions → surface only, never kill.
+	report, err := dispatchReconcileFn(gc.Options{
+		Apply:  false,
+		MaxAge: dispatchReconcileMaxAge,
+		Kinds:  []gc.Kind{gc.KindOrphanTmux},
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr,
+			"warning: reconcile (orphan-tmux) probe failed: %v (continuing — dispatch is not gated on cleanup)\n",
+			err)
+	}
+	for _, a := range report.Actions {
+		if a.Kind != gc.KindOrphanTmux {
+			continue
+		}
+		_, _ = fmt.Fprintf(stderr,
+			"warning: orphan tmux session %s has no agent record; kill manually with `tmux kill-session -t %s`\n",
+			a.Target, a.Target)
+	}
 }
