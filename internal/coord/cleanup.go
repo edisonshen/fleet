@@ -44,6 +44,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/coordlock"
@@ -242,20 +243,104 @@ func archiveAgentRecord(id string) error {
 // its body equals agentID. Other-body markers (a different live coord
 // claimed the project after we wrote ours) are preserved. Missing
 // marker is a no-op.
+//
+// Concurrency contract (codex iter-4 [P1]): outside the coord-spawn
+// lock there are several marker WRITERS that this function races
+// against:
+//
+//   - cmd/fleet/handoff.go (3 sites): eager swap marker + rollback.
+//   - cmd/fleet/dispatch.go: spawn-time marker (inside coordlock).
+//   - internal/handoffop/{handoffop,atomic_coord_swap,replacement_
+//     cleanup}.go: drain-path marker writes.
+//   - internal/tui/keys.go: post-spawn marker (now lock-wrapped per
+//     iter-3, but historically not).
+//
+// Even though the caller (coord.Cleanup) holds the coord-spawn lock,
+// not every writer above honors it. A naive read-check-unlink can
+// still see the OLD body, get preempted, then unlink the NEW marker
+// a non-cooperative writer just dropped in.
+//
+// Fix: ATOMIC capture via rename. We rename the marker to a
+// process-unique side path (a single atomic syscall — no concurrent
+// writer can see the marker between our rename and their write because
+// the path no longer points at our renamed inode). Then we inspect the
+// captured body. If body == agentID we delete the side file (the
+// removal is now safe — we own that inode). If body != agentID we
+// rename it back so the marker is restored verbatim. Concurrent
+// writers using state.WriteCoordSpawnMarker (WriteAtomic → temp +
+// rename) create a fresh marker; we never touch theirs.
+//
+// Race walkthrough:
+//
+//	T0 cleanup rename(marker, side)         ← atomic capture
+//	T1 [writer in flight, e.g. handoff.go]
+//	   rename(temp.NNN, marker)              ← writes NEW marker
+//	   (cleanup's `side` has OLD content;
+//	    the path now has NEW content from writer.)
+//	T2 cleanup reads side, body == oldID    ← matches; safe to delete
+//	T3 cleanup unlink(side)                  ← deletes OLD content only;
+//	   NEW marker at the canonical path is intact.
+//
+// If T1 doesn't happen (no concurrent writer), cleanup's unlink-side
+// is observationally identical to unlink-marker.
+//
+// Idempotency: if the side file already exists from a crashed prior
+// Cleanup, we fail-open (treat as already-cleared) rather than
+// stomping on someone else's recovery state.
 func clearMarkerIfMatched(project, agentID string) error {
-	body := state.ReadCoordSpawnMarker(project)
-	if body == "" {
-		// Marker absent / unreadable / malformed → nothing to clear.
-		// Returning nil keeps Cleanup idempotent across double-fires.
+	markerPath, err := state.CoordSpawnMarkerPath(project)
+	if err != nil {
+		return fmt.Errorf("CoordSpawnMarkerPath: %w", err)
+	}
+	// Side path is process+PID+nanos-unique so two concurrent
+	// Cleanup calls (different agentIDs same project) don't collide.
+	sidePath := fmt.Sprintf("%s.clearing.%d.%d",
+		markerPath, os.Getpid(), time.Now().UnixNano())
+	// Atomic capture. ENOENT = marker already gone (idempotent).
+	if err := os.Rename(markerPath, sidePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("rename marker→side: %w", err)
+	}
+	// We own sidePath now. Read body via the captured file.
+	data, rerr := os.ReadFile(sidePath)
+	body := ""
+	if rerr == nil && len(data) > 0 {
+		// Match the same first-line whitespace-trimmed parse
+		// state.ReadCoordSpawnMarker performs.
+		body = trimFirstLine(string(data))
+	}
+	if body == "" || body == agentID {
+		// Matched (or unreadable, which collapses to the "best-effort
+		// clear" branch — leaving an unreadable file behind is worse
+		// than removing it). Unlink the captured side file. Live
+		// marker path is intact (concurrent writer may have written
+		// a fresh one).
+		if err := os.Remove(sidePath); err != nil {
+			return fmt.Errorf("remove side: %w", err)
+		}
 		return nil
 	}
-	if body != agentID {
-		// Different coord's marker. Per design: "Remove ONLY if its
-		// body equals <id>." Preserve it.
-		return nil
-	}
-	if err := state.RemoveCoordSpawnMarker(project); err != nil {
-		return fmt.Errorf("remove marker: %w", err)
+	// Body belongs to a different coord — restore the marker so the
+	// real coord's pointer is preserved.
+	if err := os.Rename(sidePath, markerPath); err != nil {
+		// Restoration failed. Best-effort cleanup of the side file so
+		// it doesn't accumulate in .locks/. The marker is lost in this
+		// pathological case, but we'd rather report than silo.
+		_ = os.Remove(sidePath)
+		return fmt.Errorf("restore non-matching marker: %w (side file removed; live marker lost)", err)
 	}
 	return nil
+}
+
+// trimFirstLine returns the first line of s with surrounding
+// whitespace stripped. Mirrors state.ReadCoordSpawnMarker's parse so
+// our match check sees the same body the production reader sees.
+func trimFirstLine(s string) string {
+	i := strings.IndexByte(s, '\n')
+	if i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }

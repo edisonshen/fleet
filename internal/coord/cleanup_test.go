@@ -349,6 +349,60 @@ func TestCleanup_MarkerStepHoldsSpawnLock(t *testing.T) {
 	}
 }
 
+// TestCleanup_MarkerAtomicCaptureRestoresWhenBodyChanges pins the
+// codex iter-4 [P1] fix: the atomic-rename capture in
+// clearMarkerIfMatched MUST preserve a marker whose body has been
+// rewritten by a non-cooperative concurrent writer. We simulate this
+// by pre-writing a side file with a DIFFERENT body before invoking
+// Cleanup — the rename → side captures the other-body marker, the
+// content check fails the match, and the marker is renamed back. End
+// state: marker exists with body == other (preserved verbatim).
+//
+// This is the test that catches a regression to the old non-atomic
+// "read then unlink" path: if the implementation reverts to
+// state.RemoveCoordSpawnMarker after a non-matching body, the marker
+// would be unlinked instead of restored.
+func TestCleanup_MarkerAtomicCaptureRestoresWhenBodyChanges(t *testing.T) {
+	helperFleetHome(t)
+	const (
+		agentID = "aaaa1111"
+		otherID = "ZZZZ9999"
+		project = "atomic-restore-test"
+		session = "fleet-aaaa1111"
+	)
+	writeAgentRecord(t, agentID, project, session)
+	// Marker body deliberately != agentID. clearMarkerIfMatched must
+	// rename-capture → see non-matching body → rename-back.
+	markerPath := writeMarker(t, project, otherID)
+
+	deps := Deps{KillTmux: func(string) error { return nil }}
+	if err := Cleanup(agentID, project, deps); err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+
+	data, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatalf("marker missing after non-match restore: %v", err)
+	}
+	got := strings.TrimSpace(string(data))
+	if got != otherID {
+		t.Errorf("marker body = %q, want %q (restored verbatim)", got, otherID)
+	}
+
+	// No leftover side files in the .locks/ dir (only the marker
+	// itself).
+	parent := filepath.Dir(markerPath)
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatalf("readdir %s: %v", parent, err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".clearing.") {
+			t.Errorf("leftover side file %s in %s — restore did not clean up its scratch path", e.Name(), parent)
+		}
+	}
+}
+
 // TestCleanup_TmuxKillErrorIsNonFatal pins the design's "best-effort,
 // non-fatal" tmux-kill contract: a returned error from the killer must
 // not abort the rest of the reap. Distinct from the panic test —
