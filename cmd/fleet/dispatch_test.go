@@ -976,8 +976,11 @@ func TestDispatch_SurfacesOrphanAgentRecord(t *testing.T) {
 	if !strings.Contains(body, "some-task") {
 		t.Errorf("stderr must include task_id for triage; got:\n%s", body)
 	}
-	if !strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
-		t.Errorf("stderr must include the manual cleanup one-liner; got:\n%s", body)
+	// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]):
+	// safer than the global gc command when a mixed orphans list
+	// contains coord records the operator wants to preserve.
+	if !strings.Contains(body, "fleet rm deadbeef") {
+		t.Errorf("stderr must include the per-record `fleet rm <id>` one-liner; got:\n%s", body)
 	}
 	// Stdout must not gain orphan noise (the dispatch happy path
 	// stays clean for scripted callers parsing stdout).
@@ -1301,12 +1304,20 @@ func TestSurfaceOrphanAgentsFromReport_EnrichesWithTaskAndProject(t *testing.T) 
 	body := stderr.String()
 	for _, want := range []string{
 		"11111111", "fix-bug", "p1",
-		"fleet gc --apply --kinds=orphan-agents",
+		// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+		"fleet rm 11111111",
+		// Multi-socket verification caveat (codex PR-D iter-5 [P2]).
 		"FLEET_TMUX_SOCKET",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("stderr must contain %q; got:\n%s", want, body)
 		}
+	}
+	// Worker-record hint must NOT recommend the global gc command —
+	// a mixed orphans list with a coord record would let the
+	// operator reap recovery state by accident.
+	if strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("worker-record hint must NOT name the destructive global gc command (codex PR-D iter-6 [P2]); got:\n%s", body)
 	}
 }
 
@@ -1380,8 +1391,9 @@ func TestSurfaceOrphanAgentsFromReport_BothSocketStates_AlwaysSurfaces(t *testin
 			if !strings.Contains(body, "22222222") {
 				t.Errorf("FLEET_TMUX_SOCKET=%q: stderr must surface candidate; got:\n%s", sock, body)
 			}
-			if !strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
-				t.Errorf("FLEET_TMUX_SOCKET=%q: stderr must include manual cleanup one-liner; got:\n%s", sock, body)
+			// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+			if !strings.Contains(body, "fleet rm 22222222") {
+				t.Errorf("FLEET_TMUX_SOCKET=%q: stderr must include per-record `fleet rm` one-liner; got:\n%s", sock, body)
 			}
 		})
 	}
@@ -1430,8 +1442,9 @@ func TestSurfaceOrphanAgentsFromReport_ListErrorFallsBackToBareID(t *testing.T) 
 	if !strings.Contains(body, "33333333") {
 		t.Errorf("stderr must surface candidate even when enrichment fails; got:\n%s", body)
 	}
-	if !strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
-		t.Errorf("stderr must include manual cleanup one-liner; got:\n%s", body)
+	// Per-record `fleet rm <id>` hint (codex PR-D iter-6 [P2]).
+	if !strings.Contains(body, "fleet rm 33333333") {
+		t.Errorf("stderr must include per-record `fleet rm <id>` one-liner; got:\n%s", body)
 	}
 }
 

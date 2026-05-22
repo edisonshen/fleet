@@ -1228,16 +1228,18 @@ func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
 // only here mirrors the orphan-tmux pass and the feedback_surface_
 // dont_silo.md guidance.
 //
-// Two warning shapes (codex review PR-D iter-3 [P2]):
+// Hint shapes (kept in sync with status.go's orphanCleanupHint per
+// codex review PR-D iter-6 [P2]):
 //
-//   - Coord records (TaskID prefix "coord-"): name the recovery-safe
-//     `fleet rm <id>` command, NOT the global `fleet gc --apply
-//     --kinds=orphan-agents` one — the global archive would also
-//     reap THIS coord record, disabling the dead-coord recovery
-//     branch for that project the next time --coord-spawn runs.
-//     shouldSkipArchiveForRecovery encodes the same invariant.
-//   - Worker records: name the global `fleet gc --apply` one-liner
-//     (matches the operator's existing cleanup muscle memory).
+//   - Coord records (TaskID prefix "coord-"): name `fleet rm <id>`
+//     plus an explicit "do NOT run `fleet gc --apply
+//     --kinds=orphan-agents`" warning. The global archive would
+//     also reap this coord record, disabling dead-coord recovery.
+//   - Worker records: name per-record `fleet rm <id>` (NOT the
+//     global gc command). A mixed orphans list with a worker row
+//     AND a coord row would otherwise let an operator follow the
+//     worker hint and reap the coord record too — codex iter-6
+//     [P2] caught that footgun.
 //
 // The helper enriches the warning with TaskID + Project (a useful
 // triage signal) by re-looking-up records via dispatchAgentListFn;
@@ -1282,7 +1284,7 @@ func surfaceOrphanAgentsFromReport(stderr io.Writer, report gc.Report) {
 			}
 		}
 		_, _ = fmt.Fprintf(stderr,
-			"warning: orphan agent record %s (task=%s, project=%s) — %s; archive manually with `fleet gc --apply --kinds=orphan-agents` from a shell where you know the FLEET_TMUX_SOCKET state (record does not persist spawn-time socket)\n",
-			a.Target, taskID, project, a.Reason)
+			"warning: orphan agent record %s (task=%s, project=%s) — %s; archive manually with `fleet rm %s` (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running — record does not persist spawn-time socket)\n",
+			a.Target, taskID, project, a.Reason, a.Target)
 	}
 }

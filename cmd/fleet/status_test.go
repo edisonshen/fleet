@@ -464,6 +464,10 @@ func stubStatusReconcile(t *testing.T, report gc.Report, err error) *gc.Options 
 // when reconcile returns a would-archive action, runStatus must print
 // it under "Orphans (operator action)" with the cleanup command. Exit
 // code is implicit — runStatus returning nil error.
+//
+// No record is seeded in FLEET_HOME so statusAgentListFn returns
+// empty; isCoordRecord(nil) is false; the worker-record hint shape
+// applies (`fleet rm <id>` per-record per codex PR-D iter-6 [P2]).
 func TestStatus_SurfacesOrphanAgentRecord(t *testing.T) {
 	stubEnsureFresh(t)
 	dir := t.TempDir()
@@ -485,10 +489,10 @@ func TestStatus_SurfacesOrphanAgentRecord(t *testing.T) {
 	if !strings.Contains(out, "deadbeef") {
 		t.Errorf("stdout should name the orphan agent ID; got:\n%s", out)
 	}
-	// The one-liner must point at the canonical cleanup command so
-	// the operator can copy-paste it.
-	if !strings.Contains(out, "fleet gc") {
-		t.Errorf("orphan-agents row should suggest `fleet gc`; got:\n%s", out)
+	// Per-record `fleet rm <id>` hint (worker-record shape; coord
+	// records get a different hint with a stronger warning).
+	if !strings.Contains(out, "fleet rm deadbeef") {
+		t.Errorf("orphan-agents row should suggest per-record `fleet rm <id>`; got:\n%s", out)
 	}
 }
 
@@ -570,22 +574,26 @@ func TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint(t *testing.T) {
 		t.Fatalf("runStatus: %v", err)
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "fleet gc --apply --kinds=orphan-agents") {
-		t.Errorf("worker orphan-agents row should still use global gc hint; got:\n%s", out)
+	// Codex review PR-D iter-6 [P2]: worker rows use per-record
+	// `fleet rm <id>` (NOT the global `fleet gc --apply
+	// --kinds=orphan-agents`). The bulk command would also reap
+	// coord records that appear in the same orphans table, defeating
+	// the coord-row preservation hint.
+	if !strings.Contains(out, "fleet rm ababcdcd") {
+		t.Errorf("worker orphan-agents row must use per-record `fleet rm <id>` (codex PR-D iter-6 [P2]); got:\n%s", out)
 	}
-	if strings.Contains(out, "fleet rm ababcdcd") {
-		t.Errorf("worker orphan-agents row must NOT use the coord-scoped `fleet rm` hint; got:\n%s", out)
+	if strings.Contains(out, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("worker orphan-agents row must NOT recommend the global gc command (it would reap adjacent coord records); got:\n%s", out)
 	}
 	if strings.Contains(out, "preserve for dead-coord recovery") {
 		t.Errorf("worker orphan-agents row must NOT show the coord-recovery rationale; got:\n%s", out)
 	}
-	// Codex review PR-D iter-5 [P2]: the worker-record hint must
-	// flag the multi-socket caveat so the operator doesn't blindly
-	// run `fleet gc --apply` from a shell with a different
-	// FLEET_TMUX_SOCKET than the agent's spawn socket (would archive
-	// a live agent silently).
-	if !strings.Contains(out, "check FLEET_TMUX_SOCKET first") {
-		t.Errorf("worker orphan-agents hint must include the multi-socket warning (codex PR-D iter-5 [P2]); got:\n%s", out)
+	// Multi-socket caveat preserved (codex PR-D iter-5 [P2]): even
+	// per-record `fleet rm` from a shell with a mismatched
+	// FLEET_TMUX_SOCKET could remove a record that points at a live
+	// agent on another socket. The hint mentions the verification.
+	if !strings.Contains(out, "FLEET_TMUX_SOCKET") {
+		t.Errorf("worker orphan-agents hint must reference FLEET_TMUX_SOCKET verification (codex PR-D iter-5 [P2]); got:\n%s", out)
 	}
 }
 
