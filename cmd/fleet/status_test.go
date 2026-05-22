@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/gc"
 )
 
@@ -488,6 +489,95 @@ func TestStatus_SurfacesOrphanAgentRecord(t *testing.T) {
 	// the operator can copy-paste it.
 	if !strings.Contains(out, "fleet gc") {
 		t.Errorf("orphan-agents row should suggest `fleet gc`; got:\n%s", out)
+	}
+}
+
+// stubStatusAgentList swaps statusAgentListFn for the test's
+// duration, returning a canned slice of records. Restores production
+// wiring via t.Cleanup.
+func stubStatusAgentList(t *testing.T, records []*agent.Record) {
+	t.Helper()
+	prev := statusAgentListFn
+	statusAgentListFn = func() ([]*agent.Record, error) { return records, nil }
+	t.Cleanup(func() { statusAgentListFn = prev })
+}
+
+// TestStatus_SurfacesOrphanCoordRecord_RecoverySafeHint pins the
+// codex review PR-D iter-4 [P2] fix: when `fleet status` surfaces an
+// orphan agent whose TaskID has prefix "coord-", the cleanup hint
+// MUST be the operator-scoped `fleet rm <id>` (with a "do NOT run
+// fleet gc --apply" nudge) — NOT the generic global archive command,
+// which would reap the coord record and break dead-coord recovery
+// for that project on the next --coord-spawn.
+//
+// Mirrors the dispatch-side guard in surfaceOrphanAgentsFromReport;
+// status and dispatch must agree on the hint shape because both
+// surface the same gc classifier output.
+func TestStatus_SurfacesOrphanCoordRecord_RecoverySafeHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	coordRec := &agent.Record{ID: "cdcdcdcd", TaskID: "coord-spark", Project: "spark"}
+	stubStatusAgentList(t, []*agent.Record{coordRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "cdcdcdcd", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-cdcdcdcd gone"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	// Must include the orphans section + the coord ID.
+	if !strings.Contains(out, "Orphans") || !strings.Contains(out, "cdcdcdcd") {
+		t.Errorf("stdout should surface the coord record in the orphans section; got:\n%s", out)
+	}
+	// Must include recovery-safe hint.
+	if !strings.Contains(out, "fleet rm cdcdcdcd") {
+		t.Errorf("orphan-agents coord row should suggest `fleet rm <id>` not the global archive; got:\n%s", out)
+	}
+	if !strings.Contains(out, "do NOT run `fleet gc --apply --kinds=orphan-agents`") {
+		t.Errorf("orphan-agents coord row must warn against the destructive global archive (codex PR-D iter-4 [P2]); got:\n%s", out)
+	}
+	if !strings.Contains(out, "preserve for dead-coord recovery") {
+		t.Errorf("orphan-agents coord row should explain the recovery preservation rationale; got:\n%s", out)
+	}
+}
+
+// TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint pins the
+// counter-case: a worker record (TaskID does NOT start with "coord-")
+// still gets the existing `fleet gc --apply --kinds=orphan-agents`
+// hint. This is the operator's cleanup muscle-memory path; the new
+// coord carve-out must not break it.
+func TestStatus_SurfacesOrphanWorkerRecord_GlobalGcHint(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	workerRec := &agent.Record{ID: "ababcdcd", TaskID: "fix-some-bug", Project: "p1"}
+	stubStatusAgentList(t, []*agent.Record{workerRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "ababcdcd", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-ababcdcd gone"},
+	}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("worker orphan-agents row should still use global gc hint; got:\n%s", out)
+	}
+	if strings.Contains(out, "fleet rm ababcdcd") {
+		t.Errorf("worker orphan-agents row must NOT use the coord-scoped `fleet rm` hint; got:\n%s", out)
+	}
+	if strings.Contains(out, "preserve for dead-coord recovery") {
+		t.Errorf("worker orphan-agents row must NOT show the coord-recovery rationale; got:\n%s", out)
 	}
 }
 

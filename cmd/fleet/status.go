@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -159,6 +160,14 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 	return nil
 }
 
+// statusAgentListFn is the production seam used by
+// emitOrphanReconcileSection to enrich orphan-agents rows with the
+// record's TaskID/Project so coord records (TaskID prefix coord-)
+// get the recovery-safe hint instead of the destructive global
+// archive command. Production wraps agent.List; tests override to
+// inject canned records without touching ~/.fleet/agents.
+var statusAgentListFn = func() ([]*agent.Record, error) { return agent.List() }
+
 // emitOrphanReconcileSection runs the dry-run reconcile pass at the
 // end of `fleet status` and renders any orphans under an explicit
 // "Orphans (operator action):" section with a per-action cleanup
@@ -171,9 +180,16 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 //
 //	Orphans (operator action):
 //	  orphan-agents   abcd1234       fleet gc --apply --kinds=orphan-agents
+//	  orphan-agents   coorddead      fleet rm coorddead  (preserve for recovery!)
 //	  orphan-tmux     fleet-deadbef  tmux kill-session -t fleet-deadbef
 //	  sockets         /tmp/...sock   fleet gc --apply --kinds=sockets
 //	  worktrees       /path/to/wt    fleet gc --apply --kinds=worktrees
+//
+// Coord records get a recovery-safe `fleet rm <id>` hint instead of
+// the global archive command (codex review PR-D iter-4 [P2] —
+// mirrors the dispatch-side surfaceOrphanAgentsFromReport guard;
+// without this, an operator following the status hint would archive
+// the coord record and break dead-coord recovery for that project).
 //
 // gc.Reconcile already returns r.Actions in a stable order (kind →
 // target), so no extra sorting needed here.
@@ -192,33 +208,76 @@ func emitOrphanReconcileSection(stdout, stderr io.Writer) {
 	if len(report.Actions) == 0 {
 		return
 	}
+	// Best-effort record enrichment for orphan-agents rows; failure
+	// is non-fatal (bare ID + generic hint fallback).
+	byID := map[string]*agent.Record{}
+	for _, a := range report.Actions {
+		if a.Kind == gc.KindOrphanAgents {
+			records, lerr := statusAgentListFn()
+			if lerr == nil {
+				for _, r := range records {
+					if r == nil {
+						continue
+					}
+					byID[r.ID] = r
+				}
+			}
+			break // lookup only once, regardless of how many rows
+		}
+	}
 	_, _ = fmt.Fprintln(stdout, "")
 	_, _ = fmt.Fprintln(stdout, "Orphans (operator action):")
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 	for _, a := range report.Actions {
-		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\n", a.Kind, a.Target, orphanCleanupHint(a))
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\t%s\n", a.Kind, a.Target, orphanCleanupHint(a, byID[a.Target]))
 	}
 	_ = tw.Flush()
+}
+
+// isCoordRecord is the package-local mirror of dispatch.go's
+// shouldSkipArchiveForRecovery — same invariant ("TaskID has prefix
+// coord-"), local for status.go so the rendering path can decide the
+// hint shape without a cross-file dependency. Kept in sync by the
+// shared CoordTaskIDPrefix constant.
+func isCoordRecord(r *agent.Record) bool {
+	if r == nil {
+		return false
+	}
+	return strings.HasPrefix(r.TaskID, CoordTaskIDPrefix)
 }
 
 // orphanCleanupHint returns the copy-paste cleanup command for one
 // orphan action. The hints are stable strings — pinned by tests so a
 // careless edit can't silently break operator muscle memory.
 //
-//	sockets       → fleet gc --apply --kinds=sockets
-//	orphan-agents → fleet gc --apply --kinds=orphan-agents
-//	orphan-tmux   → tmux kill-session -t <name>  (surface, NOT auto-kill)
-//	worktrees     → fleet gc --apply --kinds=worktrees
+//	sockets                       → fleet gc --apply --kinds=sockets
+//	orphan-agents (worker record) → fleet gc --apply --kinds=orphan-agents
+//	orphan-agents (coord record)  → fleet rm <id>  (recovery-safe; do NOT run
+//	                                fleet gc --apply --kinds=orphan-agents)
+//	orphan-tmux                   → tmux kill-session -t <name>  (surface, NOT auto-kill)
+//	worktrees                     → fleet gc --apply --kinds=worktrees
 //
 // orphan-tmux is the surface-don't-silo case: the cleanup hint names
 // the manual tmux command rather than `fleet gc --aggressive` so the
 // operator has to read + confirm before killing a session that might
 // belong to a different operator's workflow (feedback_user_owns_tmux_config).
-func orphanCleanupHint(a gc.Action) string {
+//
+// orphan-agents coord-record carve-out (codex review PR-D iter-4
+// [P2]): the global `fleet gc --apply --kinds=orphan-agents` would
+// also reap the coord record, breaking dead-coord recovery for the
+// project. The hint instead names the operator-scoped `fleet rm
+// <id>` plus a "preserve for recovery" tag so the operator triages
+// before destroying recovery state.
+func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 	switch a.Kind {
 	case gc.KindOrphanTmux:
 		return fmt.Sprintf("tmux kill-session -t %s", a.Target)
-	case gc.KindSockets, gc.KindOrphanAgents, gc.KindWorktrees:
+	case gc.KindOrphanAgents:
+		if isCoordRecord(rec) {
+			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
+		}
+		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
+	case gc.KindSockets, gc.KindWorktrees:
 		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
 	default:
 		return "(unknown — run `fleet gc` for details)"
