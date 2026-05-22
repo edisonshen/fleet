@@ -12,6 +12,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -1347,10 +1348,42 @@ func coordCwdForProject(records []*agent.Record, projectName string) string {
 	return ""
 }
 
-// writeCoordSpawnMarkerFn writes the coord-spawn marker file. var so
-// tests can stub the disk write. Production calls
-// state.WriteCoordSpawnMarker.
-var writeCoordSpawnMarkerFn = state.WriteCoordSpawnMarker
+// writeCoordSpawnMarkerFn writes the coord-spawn marker file under the
+// per-project coord-spawn NB-flock so a concurrent coord.Cleanup on an
+// older agent can't race our write (codex iter-3 [P1]: TUI marker write
+// happens AFTER `fleet dispatch` releases its own coordlock, so without
+// re-acquiring here the old coord's cleanup can interleave between our
+// read and our unlink — even though cleanup itself holds the lock for
+// its compare-and-remove step, the TUI write outside the lock reopens
+// the race window).
+//
+// On contention (extremely rare — another dispatch / drain is in flight
+// for the same project), we surface the error to the caller so the TUI
+// flash message stays accurate. The caller already handles a non-nil
+// werr by warning the operator that marker write failed (model.go:718).
+//
+// var so tests can stub the disk write (test helpers in
+// internal/tui/keys_test.go install a fake that records calls without
+// hitting FLEET_HOME or shelling out to flock).
+var writeCoordSpawnMarkerFn = writeCoordSpawnMarkerLocked
+
+// writeCoordSpawnMarkerLocked is the production implementation of
+// writeCoordSpawnMarkerFn: acquire coord-spawn lock, write marker,
+// release. The lock is the SAME one cmd/fleet/dispatch.go +
+// internal/handoffop + internal/coord/cleanup take for their own
+// marker-touching sections, so all four writers / clearers serialize
+// cleanly. Without this serialization, codex iter-3 [P1] showed the
+// race: cleanup acquires lock after dispatch released, reads old
+// marker body, TUI writes new id (outside lock), cleanup unlinks the
+// just-written new marker.
+func writeCoordSpawnMarkerLocked(projectName, agentID string) error {
+	release, err := coordlock.Acquire(projectName)
+	if err != nil {
+		return fmt.Errorf("writeCoordSpawnMarker: acquire coord-spawn lock: %w", err)
+	}
+	defer release()
+	return state.WriteCoordSpawnMarker(projectName, agentID)
+}
 
 // dispatchAgentIDPattern matches the first line of `fleet dispatch`
 // stdout: "agent <8-hex-id> spawned". We extract the ID so the
