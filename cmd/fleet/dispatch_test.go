@@ -1310,6 +1310,53 @@ func TestSurfaceOrphanAgentsFromReport_EnrichesWithTaskAndProject(t *testing.T) 
 	}
 }
 
+// TestSurfaceOrphanAgentsFromReport_CoordRecord_RecoverySafeHint pins
+// the codex review PR-D iter-3 [P2] fix: when a worker dispatch
+// surfaces a coord record (TaskID prefix "coord-"), the warning MUST
+// NOT name the global `fleet gc --apply --kinds=orphan-agents`
+// command — following that hint would reap this very coord record
+// and break the dead-coord recovery branch on the next --coord-spawn
+// for that project. The recovery-safe hint is `fleet rm <id>`
+// (operator-scoped to the specific record they're sure they want
+// gone), paired with an explicit "do NOT run fleet gc --apply..."
+// nudge so the operator can't follow the wrong remediation by
+// accident.
+func TestSurfaceOrphanAgentsFromReport_CoordRecord_RecoverySafeHint(t *testing.T) {
+	coordRec := &agent.Record{ID: "abababab", TaskID: "coord-spark", Project: "spark"}
+	stubDispatchAgentList(t, []*agent.Record{coordRec})
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "abababab", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-abababab gone"},
+	}}
+	var stderr bytes.Buffer
+	surfaceOrphanAgentsFromReport(&stderr, report)
+
+	body := stderr.String()
+	// Must surface the record + its identity (operator triage data).
+	for _, want := range []string{"abababab", "coord-spark", "spark"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stderr must include %q for triage; got:\n%s", want, body)
+		}
+	}
+	// Must include the recovery-safe one-liner (operator-scoped).
+	if !strings.Contains(body, "fleet rm abababab") {
+		t.Errorf("stderr must include recovery-safe `fleet rm <id>` hint; got:\n%s", body)
+	}
+	// Must explicitly warn against the destructive global cleanup
+	// command — without this, the operator's muscle memory could
+	// follow the worker-record hint and reap the coord record.
+	if !strings.Contains(body, "do NOT run `fleet gc --apply --kinds=orphan-agents`") {
+		t.Errorf("stderr must explicitly warn against `fleet gc --apply --kinds=orphan-agents` for coord records (codex PR-D iter-3 [P2]); got:\n%s", body)
+	}
+	// Must NOT advise running the global archive command for this
+	// record — the negative assertion paired with the explicit "do
+	// NOT" string above pins both directions.
+	if strings.Count(body, "fleet gc --apply --kinds=orphan-agents") > 1 {
+		t.Errorf("stderr must mention `fleet gc --apply...` AT MOST once (only in the do-NOT warning); got %d occurrences:\n%s",
+			strings.Count(body, "fleet gc --apply --kinds=orphan-agents"), body)
+	}
+}
+
 // TestSurfaceOrphanAgentsFromReport_BothSocketStates_AlwaysSurfaces
 // pins the surface-only contract under BOTH FLEET_TMUX_SOCKET states
 // (set + unset). The dispatch path NEVER auto-archives because

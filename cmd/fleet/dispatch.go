@@ -1228,11 +1228,24 @@ func runDispatchReconcile(stderr io.Writer, isCoordSpawn bool) {
 // only here mirrors the orphan-tmux pass and the feedback_surface_
 // dont_silo.md guidance.
 //
+// Two warning shapes (codex review PR-D iter-3 [P2]):
+//
+//   - Coord records (TaskID prefix "coord-"): name the recovery-safe
+//     `fleet rm <id>` command, NOT the global `fleet gc --apply
+//     --kinds=orphan-agents` one — the global archive would also
+//     reap THIS coord record, disabling the dead-coord recovery
+//     branch for that project the next time --coord-spawn runs.
+//     shouldSkipArchiveForRecovery encodes the same invariant.
+//   - Worker records: name the global `fleet gc --apply` one-liner
+//     (matches the operator's existing cleanup muscle memory).
+//
 // The helper enriches the warning with TaskID + Project (a useful
 // triage signal) by re-looking-up records via dispatchAgentListFn;
 // when the list fails or a record vanished between probe + lookup,
-// the line falls back to the bare ID. Empty report short-circuits
-// before the listing call.
+// the line falls back to the bare ID + worker-shaped command (the
+// recovery-safe hint requires knowing the task_id, which we don't
+// have without the record). Empty report short-circuits before the
+// listing call.
 func surfaceOrphanAgentsFromReport(stderr io.Writer, report gc.Report) {
 	if len(report.Actions) == 0 {
 		return
@@ -1251,9 +1264,16 @@ func surfaceOrphanAgentsFromReport(stderr io.Writer, report gc.Report) {
 		if a.Kind != gc.KindOrphanAgents {
 			continue
 		}
+		rec, ok := byID[a.Target]
+		if ok && shouldSkipArchiveForRecovery(rec) {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: orphan coord record %s (task=%s, project=%s) — %s; preserve for dead-coord recovery, or archive with `fleet rm %s` ONLY if you're sure no --coord-spawn against project %s will need it (do NOT run `fleet gc --apply --kinds=orphan-agents` — that reaps this record too)\n",
+				rec.ID, rec.TaskID, rec.Project, a.Reason, rec.ID, rec.Project)
+			continue
+		}
 		taskID := "?"
 		project := "?"
-		if rec, ok := byID[a.Target]; ok {
+		if ok {
 			if rec.TaskID != "" {
 				taskID = rec.TaskID
 			}
