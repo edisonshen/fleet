@@ -914,22 +914,44 @@ func stubDispatchReconcile(t *testing.T, reports []gc.Report, errs []error) *[]r
 }
 
 // TestDispatch_AutoArchivesOrphanAgentRecord pins the orphan-agents
-// auto-archive contract: runDispatch must invoke dispatchReconcileFn
-// with Apply=true + KindOrphanAgents BEFORE reaching tmux.Available.
-// The archive itself is silent (no stdout noise on the happy path —
-// reconciliation should not pollute the dispatch surface).
+// auto-archive wiring contract at the runDispatch level: the gc
+// classifier must run BEFORE reaching tmux.Available with
+// Kinds=[orphan-agents]. After codex review PR-D iter-1 [P1] the gc
+// pass is dry-run (Apply=false) and the dispatch layer applies the
+// per-record + FLEET_TMUX_SOCKET filters before calling
+// agent.Archive — see archiveOrphanAgentsFromReport for the actual
+// archive decision logic (and TestArchiveOrphanAgentsFromReport_*
+// for its regression tests).
+//
+// The archive itself remains silent on stdout (no operator-facing
+// noise on the dispatch happy path — reconciliation must not pollute
+// the dispatch surface).
 func TestDispatch_AutoArchivesOrphanAgentRecord(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
 	isolateTmuxSocket(t)
-	// Stub reconcile to RETURN one archived action so we can assert it
-	// fired BEFORE the tmux gate took over. Calls 0+1 are the two
-	// reconcile passes (orphan-agents apply, then orphan-tmux dry-run).
-	archivedReport := gc.Report{Actions: []gc.Action{
-		{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbArchived, Reason: "tmux session fleet-deadbeef gone"},
+	// Clear FLEET_TMUX_SOCKET that isolateTmuxSocket sets so the new
+	// multi-socket safety filter (codex review PR-D iter-1 [P1])
+	// doesn't shadow the happy-path archive assertion. The dispatch-
+	// layer archive is stubbed (dispatchAgentArchiveFn) so tmux
+	// isolation is moot for this test's actual mutations.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	// Stub reconcile to RETURN one would-archive action so we can
+	// assert it fired BEFORE the tmux gate took over. Calls 0+1 are
+	// the two reconcile passes (orphan-agents dry-run, then
+	// orphan-tmux dry-run).
+	wouldArchiveReport := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-deadbeef gone"},
 	}}
 	emptyReport := gc.Report{}
-	calls := stubDispatchReconcile(t, []gc.Report{archivedReport, emptyReport}, nil)
+	calls := stubDispatchReconcile(t, []gc.Report{wouldArchiveReport, emptyReport}, nil)
+	// Stub list/archive so the dispatch-layer filter has a real
+	// record to inspect; the worker record (no coord- prefix) should
+	// be archived.
+	stubDispatchAgentList(t, []*agent.Record{
+		{ID: "deadbeef", TaskID: "some-task", Project: "p1"},
+	})
+	archived := stubDispatchAgentArchive(t)
 
 	opts := &dispatchOpts{
 		taskID:  "some-task",
@@ -944,11 +966,15 @@ func TestDispatch_AutoArchivesOrphanAgentRecord(t *testing.T) {
 		t.Fatalf("expected dispatchReconcileFn to be called at least once; got 0 calls")
 	}
 	first := (*calls)[0]
-	if !first.opts.Apply {
-		t.Errorf("first reconcile call must have Apply=true (auto-archive); got Apply=%t", first.opts.Apply)
+	if first.opts.Apply {
+		t.Errorf("first reconcile call must have Apply=false (dispatch layer does the archive); got Apply=%t", first.opts.Apply)
 	}
 	if len(first.opts.Kinds) != 1 || first.opts.Kinds[0] != gc.KindOrphanAgents {
 		t.Errorf("first reconcile call must use Kinds=[orphan-agents] only; got %v", first.opts.Kinds)
+	}
+	// Dispatch-layer archive ran for the worker record.
+	if len(*archived) != 1 || (*archived)[0] != "deadbeef" {
+		t.Errorf("dispatch layer should have archived worker record deadbeef; got %v", *archived)
 	}
 	// Auto-archive is silent on stdout — the operator's dispatch flow
 	// should not see extra noise on the happy path.
@@ -1179,6 +1205,260 @@ func TestDispatchReconcileFn_DefaultsToGCReconcile(t *testing.T) {
 	}
 	if len(rep.Actions) != 0 {
 		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
+	}
+}
+
+// ----------------- codex review PR-D iter-1 [P1] regressions ---------
+//
+// Two dispatch-side filters protect the orphan-agents auto-archive
+// from silent data loss the gc.Reconcile classifier can't see:
+//
+//	1. FLEET_TMUX_SOCKET set → skip archive, surface to stderr.
+//	   Agent records do not persist their spawn-time socket; archiving
+//	   probed against a different server silently destroys live agents.
+//	2. TaskID prefix "coord-" → preserve for dead-coord recovery on
+//	   the next `fleet dispatch --coord-spawn` against that project.
+//
+// archiveOrphanAgentsFromReport implements both filters. These tests
+// pin the behavior at the helper level (the e2e runDispatch path is
+// hard to drive without a real tmux server).
+
+// stubDispatchAgentList swaps dispatchAgentListFn for the test's
+// duration, returning a canned slice of records. Restores production
+// wiring via t.Cleanup.
+func stubDispatchAgentList(t *testing.T, records []*agent.Record) {
+	t.Helper()
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) { return records, nil }
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+}
+
+// stubDispatchAgentArchive swaps dispatchAgentArchiveFn for the test's
+// duration. Records every (ID, TaskID) tuple the dispatch path tried
+// to archive so tests can assert exactly which records made it past
+// the filters. Returns a pointer to the captured slice.
+func stubDispatchAgentArchive(t *testing.T) *[]string {
+	t.Helper()
+	calls := []string{}
+	prev := dispatchAgentArchiveFn
+	dispatchAgentArchiveFn = func(r *agent.Record) error {
+		calls = append(calls, r.ID)
+		return nil
+	}
+	t.Cleanup(func() { dispatchAgentArchiveFn = prev })
+	return &calls
+}
+
+// TestShouldSkipArchiveForRecovery pins the per-record filter that
+// implements codex PR-D iter-1 [P1] finding #1: coord records must
+// outlive worker dispatches so the dead-coord recovery branch
+// (findRecoveryCandidate at dispatch.go:~659) can consume them on the
+// next --coord-spawn against that project.
+//
+// Cross-project covered: a worker dispatch against project A could
+// otherwise archive project B's dead coord record (the gc classifier
+// has no project scope when called from dispatch). The check is
+// "TaskID has prefix coord-" regardless of which project the record
+// belongs to.
+func TestShouldSkipArchiveForRecovery(t *testing.T) {
+	cases := []struct {
+		name string
+		rec  *agent.Record
+		want bool
+	}{
+		{
+			name: "coord-record-same-project-skipped",
+			rec:  &agent.Record{ID: "aaaa1111", TaskID: "coord-projects-fleet", Project: "projects-fleet"},
+			want: true,
+		},
+		{
+			name: "coord-record-other-project-skipped",
+			rec:  &agent.Record{ID: "bbbb2222", TaskID: "coord-rainier", Project: "rainier"},
+			want: true,
+		},
+		{
+			name: "worker-record-not-skipped",
+			rec:  &agent.Record{ID: "cccc3333", TaskID: "fix-some-bug-1234", Project: "projects-fleet"},
+			want: false,
+		},
+		{
+			name: "benign-coord-cache-warm-not-skipped",
+			rec:  &agent.Record{ID: "dddd4444", TaskID: "coord-cache-warm", Project: "ops"},
+			// "coord-cache-warm" starts with "coord-" so it IS skipped.
+			// This is intentional: false positives ("don't archive a
+			// few extra records") are cheaper than false negatives
+			// ("silently lose recovery state"). The operator can still
+			// archive via `fleet rm <id>` if they're sure recovery
+			// doesn't apply.
+			want: true,
+		},
+		{
+			name: "nil-record-skipped",
+			rec:  nil,
+			want: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldSkipArchiveForRecovery(tc.rec); got != tc.want {
+				t.Errorf("shouldSkipArchiveForRecovery(%v) = %t; want %t",
+					tc.rec, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestArchiveOrphanAgentsFromReport_PreservesCoordRecords is the
+// load-bearing regression for codex PR-D iter-1 [P1] finding #1.
+// Setup: dry-run report returns two would-archive actions, one for a
+// worker record and one for a coord record. After the dispatch-layer
+// filter, only the worker record should be archived; the coord
+// record stays on disk so the next --coord-spawn can recover it.
+func TestArchiveOrphanAgentsFromReport_PreservesCoordRecords(t *testing.T) {
+	// Ensure FLEET_TMUX_SOCKET is unset for this test so the
+	// multi-socket filter doesn't shadow the coord-recovery filter.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	workerRec := &agent.Record{ID: "11111111", TaskID: "fix-bug", Project: "p1"}
+	coordRec := &agent.Record{ID: "22222222", TaskID: "coord-p1", Project: "p1"}
+	stubDispatchAgentList(t, []*agent.Record{workerRec, coordRec})
+	archived := stubDispatchAgentArchive(t)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "11111111", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-11111111 gone"},
+		{Kind: gc.KindOrphanAgents, Target: "22222222", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-22222222 gone"},
+	}}
+	var stderr bytes.Buffer
+	archiveOrphanAgentsFromReport(&stderr, report)
+
+	if len(*archived) != 1 {
+		t.Fatalf("expected exactly 1 archive; got %d: %v", len(*archived), *archived)
+	}
+	if (*archived)[0] != "11111111" {
+		t.Errorf("expected worker record 11111111 to be archived; got %s", (*archived)[0])
+	}
+	// stderr must surface the coord-record preservation so the
+	// operator sees it (surface-don't-silo).
+	body := stderr.String()
+	if !strings.Contains(body, "22222222") {
+		t.Errorf("stderr must surface the preserved coord record ID; got:\n%s", body)
+	}
+	if !strings.Contains(body, "coord-p1") {
+		t.Errorf("stderr must include the coord task_id; got:\n%s", body)
+	}
+	if !strings.Contains(body, "fleet rm 22222222") {
+		t.Errorf("stderr must include the manual cleanup one-liner; got:\n%s", body)
+	}
+}
+
+// TestArchiveOrphanAgentsFromReport_SkipsAllWhenFleetTmuxSocketSet
+// is the regression for codex PR-D iter-1 [P1] finding #2. Setup:
+// FLEET_TMUX_SOCKET is set, so the dispatch-layer filter must skip
+// the auto-archive entirely (mirroring the warning `fleet gc --apply`
+// already ships). The records get surfaced to stderr; the operator
+// can review and run cleanup explicitly with the socket unset.
+func TestArchiveOrphanAgentsFromReport_SkipsAllWhenFleetTmuxSocketSet(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-other.sock")
+	workerRec := &agent.Record{ID: "33333333", TaskID: "fix-other-bug", Project: "p2"}
+	stubDispatchAgentList(t, []*agent.Record{workerRec})
+	archived := stubDispatchAgentArchive(t)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "33333333", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-33333333 gone"},
+	}}
+	var stderr bytes.Buffer
+	archiveOrphanAgentsFromReport(&stderr, report)
+
+	if len(*archived) != 0 {
+		t.Errorf("FLEET_TMUX_SOCKET set must short-circuit ALL archives; got %d: %v",
+			len(*archived), *archived)
+	}
+	body := stderr.String()
+	if !strings.Contains(body, "FLEET_TMUX_SOCKET") {
+		t.Errorf("stderr must surface the FLEET_TMUX_SOCKET reason; got:\n%s", body)
+	}
+	if !strings.Contains(body, "33333333") {
+		t.Errorf("stderr must name the would-archive candidate; got:\n%s", body)
+	}
+	if !strings.Contains(body, "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("stderr must include the manual cleanup one-liner so operator knows what to run; got:\n%s",
+			body)
+	}
+}
+
+// TestArchiveOrphanAgentsFromReport_ArchivesWorkerRecord_DefaultSocket
+// is the happy path: no FLEET_TMUX_SOCKET, no coord records, one
+// worker record. Should archive silently (no stderr noise on success).
+func TestArchiveOrphanAgentsFromReport_ArchivesWorkerRecord_DefaultSocket(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	workerRec := &agent.Record{ID: "44444444", TaskID: "fix-another-bug", Project: "p3"}
+	stubDispatchAgentList(t, []*agent.Record{workerRec})
+	archived := stubDispatchAgentArchive(t)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "44444444", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-44444444 gone"},
+	}}
+	var stderr bytes.Buffer
+	archiveOrphanAgentsFromReport(&stderr, report)
+
+	if len(*archived) != 1 || (*archived)[0] != "44444444" {
+		t.Errorf("expected worker record 44444444 to be archived; got %v", *archived)
+	}
+	// Silent on success — no stderr lines about archives.
+	if strings.Contains(stderr.String(), "warning:") {
+		t.Errorf("happy-path archive should be silent on stderr; got:\n%s",
+			stderr.String())
+	}
+}
+
+// TestArchiveOrphanAgentsFromReport_EmptyReport_NoSideEffects pins
+// the zero-orphan path: empty report short-circuits before agent.List
+// (avoids spurious filesystem reads when there's nothing to do).
+func TestArchiveOrphanAgentsFromReport_EmptyReport_NoSideEffects(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	// Spike list/archive to fail loudly if either gets called.
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) {
+		t.Fatal("dispatchAgentListFn must not be called on empty report")
+		return nil, nil
+	}
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+
+	var stderr bytes.Buffer
+	archiveOrphanAgentsFromReport(&stderr, gc.Report{})
+
+	if stderr.Len() != 0 {
+		t.Errorf("empty report should produce no stderr output; got:\n%s",
+			stderr.String())
+	}
+}
+
+// TestArchiveOrphanAgentsFromReport_ListError_FailsClosed pins the
+// fail-closed contract: if agent.List can't enumerate (permission,
+// mount failure), the auto-archive refuses to fire and surfaces the
+// error to stderr. Same shape as the --coord-spawn ListStrict guard.
+func TestArchiveOrphanAgentsFromReport_ListError_FailsClosed(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	prev := dispatchAgentListFn
+	dispatchAgentListFn = func() ([]*agent.Record, error) {
+		return nil, errors.New("permission denied")
+	}
+	t.Cleanup(func() { dispatchAgentListFn = prev })
+	archived := stubDispatchAgentArchive(t)
+
+	report := gc.Report{Actions: []gc.Action{
+		{Kind: gc.KindOrphanAgents, Target: "55555555", Verb: gc.VerbWouldArchive, Reason: "tmux session fleet-55555555 gone"},
+	}}
+	var stderr bytes.Buffer
+	archiveOrphanAgentsFromReport(&stderr, report)
+
+	if len(*archived) != 0 {
+		t.Errorf("list error must abort the archive (fail closed); got %d archives", len(*archived))
+	}
+	if !strings.Contains(stderr.String(), "permission denied") {
+		t.Errorf("stderr must surface the list error; got:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "fleet gc --apply --kinds=orphan-agents") {
+		t.Errorf("stderr must include the manual cleanup one-liner; got:\n%s", stderr.String())
 	}
 }
 
