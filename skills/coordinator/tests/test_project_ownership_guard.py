@@ -19,13 +19,16 @@ coord) corrupting the fleet project's lock content.
 Edge cases (per fleet#171 acceptance):
 
   1. Mismatch (agent.project=A, argv=B) → skipped + reason +
-     stderr diagnostic; lock file content NOT mutated.
+     stderr diagnostic + mismatch entry in `result.errors`; lock
+     file content NOT mutated.
   2. Match (agent.project=A, argv=A) → proceeds normally.
   3. Empty `coord_id` (no `FLEET_AGENT_ID`, manual operator invocation
      from a shell) → allow. Backwards-compat for diagnostic uses.
-  4. Missing agent record → warning in `result.errors`, allow.
-     Legacy pre-schema records must not block upgrades.
+  4. Missing agent record → warning written to stderr (NOT
+     result.errors — keeping that surface clean keeps the TUI from
+     alerting on every legacy/upgrade tick); allow.
   5. Empty `rec.project` field → allow. Same legacy reason.
+  6. Unparseable agent record → same as missing.
 
 Implementation note: the guard runs BEFORE `_try_lock`, so a
 mismatched call never opens the lock file at all. Tests assert this
@@ -216,12 +219,13 @@ def test_empty_agent_id_allows(
 
 
 def test_missing_record_warns_and_allows(
-    fleet_home: Path,
+    fleet_home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """coord_id provided but no agent record on disk. Legacy
     pre-schema records can be missing during upgrades; refusing
-    would brick the upgrade path. Expected: warning surfaced in
-    result.errors, tick proceeds (reason != mismatch)."""
+    would brick the upgrade path. Expected: warning written to
+    stderr (NOT result.errors — that surface drives TUI alerts),
+    tick proceeds (reason != mismatch)."""
     agent_id = "cccc3333"
     # Deliberately do NOT seed the agent record.
     _minimal_project(fleet_home, project="fleet")
@@ -237,23 +241,17 @@ def test_missing_record_warns_and_allows(
         f"missing record must NOT trigger ownership guard; got "
         f"reason={result.reason!r}"
     )
-    # Warning surfaced so the operator can investigate the missing
-    # record. Match on a phrase that calls out the missing record;
-    # the exact wording is implementation-defined but must mention
-    # the agent_id and indicate the record was missing/unreadable.
-    joined_errs = "\n".join(result.errors)
-    assert agent_id in joined_errs, (
-        f"warning must name the agent_id {agent_id!r}; "
-        f"got {result.errors!r}"
+    # Warning surfaced on stderr (NOT result.errors — leaving
+    # result.errors clean keeps the TUI from flagging every
+    # legacy/upgrade-path tick as a tick error).
+    captured = capsys.readouterr()
+    assert agent_id in captured.err, (
+        f"warning must name the agent_id {agent_id!r} on stderr; "
+        f"got err={captured.err!r}"
     )
-    # Look for any of the legacy-friendly markers we expect in the
-    # diagnostic.
-    assert any(
-        marker in joined_errs.lower()
-        for marker in ("missing", "unreadable", "no record", "no agent record")
-    ), (
-        f"warning must indicate the record was missing/unreadable; "
-        f"got {result.errors!r}"
+    assert "project-ownership guard" in captured.err, (
+        f"warning must label itself as the ownership guard; "
+        f"got err={captured.err!r}"
     )
 
 
@@ -293,11 +291,12 @@ def test_empty_record_project_allows(
 
 
 def test_unparseable_record_warns_and_allows(
-    fleet_home: Path,
+    fleet_home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Agent record exists but JSON is corrupt. Treat as missing —
     legacy data corruption (operator-edit, partial write, etc.)
-    shouldn't brick the coord."""
+    shouldn't brick the coord. Warning lands on stderr, result.errors
+    stays clean (same TUI-friendly rationale as the missing path)."""
     agent_id = "eeee5555"
     agents_dir = fleet_home / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -315,9 +314,12 @@ def test_unparseable_record_warns_and_allows(
         f"unparseable record must NOT trigger ownership guard; got "
         f"reason={result.reason!r}"
     )
-    # Warning surfaced.
-    joined_errs = "\n".join(result.errors)
-    assert agent_id in joined_errs, (
-        f"warning must name the agent_id {agent_id!r}; "
-        f"got {result.errors!r}"
+    captured = capsys.readouterr()
+    assert agent_id in captured.err, (
+        f"warning must name the agent_id {agent_id!r} on stderr; "
+        f"got err={captured.err!r}"
+    )
+    assert "project-ownership guard" in captured.err, (
+        f"warning must label itself as the ownership guard; "
+        f"got err={captured.err!r}"
     )
