@@ -153,6 +153,70 @@ def tick(
         now_unix = time.time()
     result = TickResult()
 
+    # 0. Project-ownership guard (fleet#171). The authoritative project
+    # owner for a coord agent is its agent record at
+    # ~/.fleet/agents/<id>.json — NOT cwd, NOT argv. If a caller hands
+    # us a project that doesn't match the agent record's `project`
+    # field, refuse before we touch the on-disk lock file. Without
+    # this, `python3 loop.py X` invoked from inside coord-for-Y's
+    # Claude session silently hijacks project X's coord lock and
+    # writes coord-for-Y's agent_id into it (observed live with agent
+    # 922e7c7d, projects-spark coord, hijacking fleet's lock).
+    #
+    # Edge cases:
+    #   - empty coord_id (operator-shell invocation, no agent context)
+    #     → allow. Backwards-compat for manual `loop.py X` diagnostics.
+    #   - missing or unparseable agent record → warn + allow. Legacy
+    #     pre-schema records must not block upgrades.
+    #   - empty rec.project field → allow. Same legacy reason.
+    #   - mismatch → populate skipped/reason/errors + stderr; return
+    #     BEFORE _try_lock. We deliberately do NOT sys.exit(2) — the
+    #     fleet-guard discipline pinned in loop.main is "always exit
+    #     0, surface via TickResult". Stderr write covers manual shell
+    #     invocations where the caller doesn't inspect TickResult.
+    if coord_id:
+        rec_path = home / "agents" / f"{coord_id}.json"
+        rec: dict | None = None
+        rec_error: str = ""
+        try:
+            with open(rec_path, "r", encoding="utf-8") as fh:
+                rec = json.load(fh)
+            if not isinstance(rec, dict):
+                rec = None
+                rec_error = "agent record is not a JSON object"
+        except FileNotFoundError:
+            rec_error = "no agent record on disk"
+        except (OSError, ValueError) as exc:
+            rec_error = f"agent record unreadable: {exc}"
+        if rec is not None:
+            rec_project = rec.get("project", "") or ""
+            if rec_project and rec_project != project:
+                import sys as _sys
+                msg = (
+                    f"coord agent {coord_id} owns project "
+                    f"{rec_project!r}, refusing to operate on "
+                    f"{project!r} (cwd or argv mismatch — investigate "
+                    f"spawn env / cwd / argv chain)"
+                )
+                _sys.stderr.write(msg + "\n")
+                result.errors.append(msg)
+                result.skipped = True
+                result.reason = "project-ownership-mismatch"
+                return result
+        elif rec_error:
+            # Warn to stderr so an operator running `loop.py X`
+            # manually sees it, but DO NOT push into result.errors —
+            # that surface is consumed by callers (TUI, `fleet
+            # status`) that treat any entry as a real tick error.
+            # Legacy/upgrade paths with missing records are common
+            # enough that polluting result.errors here would create
+            # permanent false alarms in the dashboard.
+            import sys as _sys
+            _sys.stderr.write(
+                f"project-ownership guard: agent {coord_id} — "
+                f"{rec_error}; allowing tick (legacy/upgrade path)\n"
+            )
+
     # 1. NB-flock coordinator.lock (PLAN §6 lock acquisition).
     project_dir = home / "projects" / project
     locks_dir = project_dir / ".locks"
