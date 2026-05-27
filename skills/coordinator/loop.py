@@ -249,6 +249,34 @@ def tick(
     cfg_path = project_dir / COORD_CONFIG_FILE
     configured_repo = coord_config.read_repo(cfg_path)
     if configured_repo:
+        # Distinguish "stale path" from "local-only repo" BEFORE
+        # interpreting empty git_remote_origin output (codex iter-5
+        # P2): a configured repo that no longer exists on disk also
+        # returns "" from `git remote get-url` (git -C <missing> fails
+        # quietly per git_remote_origin's contract). Treating that as
+        # local-only would let dispatches proceed against a nonexistent
+        # cwd and fail later with a confusing error. Refuse explicitly
+        # here so the operator knows to fix coord-config.json or
+        # re-spawn the coord.
+        if not os.path.isdir(configured_repo):
+            msg = (
+                f"coord-config.json::repo={configured_repo!r} for "
+                f"project {project!r} is not a directory (deleted, "
+                f"moved, or path typo) — refusing dispatch. Fix "
+                f"coord-config.json or re-spawn the coord from inside "
+                f"the correct checkout."
+            )
+            import sys as _sys
+            _sys.stderr.write(msg + "\n")
+            result.errors.append(msg)
+            result.skipped = True
+            result.reason = "coord-config-repo-missing"
+            result.raised += 1
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+            return result
         remote = coord_config.git_remote_origin(configured_repo)
         if not remote:
             # Local-only repo or no origin remote — we can't validate
@@ -258,6 +286,10 @@ def tick(
             # operator knows validation was skipped. The `repo` field
             # still pins where worktrees land, so the cwd-derived
             # worktree-base bug (issue #175) is still prevented.
+            #
+            # Note: directory-existence check above rules out the
+            # stale-path case, so empty origin here genuinely means
+            # "no `origin` remote configured" — not "directory gone."
             result.errors.append(
                 f"coord-config.json::repo={configured_repo!r} for "
                 f"project {project!r} has no `origin` remote — "

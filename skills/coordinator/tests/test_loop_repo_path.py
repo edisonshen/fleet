@@ -238,6 +238,29 @@ def test_validate_remote_accepts_single_token_project() -> None:
     )
 
 
+def test_validate_remote_accepts_hyphenated_parent_dir() -> None:
+    """Parent dirs with internal hyphens (`/src/my-org/my-project`)
+    yield tag `my-org-my-project`. Origin basename `my-project` must
+    still match.
+
+    review iter-5 (codex P2 finding): the iter-4 split-first-`-`-token
+    code yielded bare=`org-my-project`, which would refuse this
+    legitimate registration. The suffix-equality heuristic accepts it
+    correctly (tag endswith `-my-project`)."""
+    assert coord_config.remote_matches_project(
+        "git@github.com:src/my-project.git",
+        "my-org-my-project",
+    )
+
+
+def test_validate_remote_accepts_double_hyphenated_parent() -> None:
+    """More-than-2-segment tag (`a-b-c-d` from `/a-b/c-d`) still works."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/x/c-d.git",
+        "a-b-c-d",
+    )
+
+
 def test_validate_remote_empty_url_returns_false() -> None:
     """Empty remote URL → False. CALLER (loop.tick) must treat this as
     'cannot validate' (local-only repo path) rather than 'mismatch' —
@@ -508,6 +531,54 @@ def test_tick_local_only_repo_no_origin_warns_but_proceeds(
     assert any(
         "no `origin`" in e or "no origin" in e for e in result.errors
     ), f"expected local-only soft warning in errors; got {result.errors}"
+
+
+def test_tick_stale_repo_path_refuses_dispatch(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """coord-config.json::repo points at a path that no longer exists
+    (operator deleted/moved the checkout, or typo'd the path) →
+    refuse dispatch with `coord-config-repo-missing`, NOT silently
+    treat as local-only.
+
+    review iter-5 (codex P2 finding): `git remote get-url origin`
+    against a missing directory returns "" (per git_remote_origin's
+    swallow-on-failure contract), which iter-4 mapped to 'local-only
+    repo, proceed.' That let dispatches land against a nonexistent
+    cwd and fail later with an opaque error. Refuse explicitly so
+    the operator gets a clear coord-config error pointing at the
+    actual problem."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    stale_repo = tmp_path / "deleted-checkout"  # NOT created
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(stale_repo)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+
+    called = {"n": 0}
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        called["n"] += 1
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert called["n"] == 0, (
+        "stale-repo must short-circuit BEFORE _tick_locked runs"
+    )
+    assert result.skipped is True
+    assert result.reason == "coord-config-repo-missing", (
+        f"expected coord-config-repo-missing reason; got {result.reason!r}"
+    )
+    assert result.raised >= 1
+    assert any(
+        "not a directory" in e for e in result.errors
+    ), f"expected stale-path error; got {result.errors}"
 
 
 def test_tick_accepts_generic_parent_dir_tag(

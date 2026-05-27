@@ -137,37 +137,33 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
     """Heuristic: does the `origin` URL look like it belongs to `project`?
 
     Fleet project tags are `<parent-dir>-<repo-basename>` via
-    `internal/projects.TagForPath` (sanitized to the
-    state.ValidateProjectName allowlist). So `projects-rainier` came
-    from `~/projects/rainier`, `repos-my-project` came from
-    `/repos/my-project`, and the repo-basename half of the tag is
-    what should equal the github repo name. To recover it: strip the
-    FIRST `-`-delimited token (the parent dir), keep the rest, and
-    strict-equal against the URL basename (last segment after `/` or
-    `:`, with any trailing `.git` stripped). When the tag has no `-`
-    at all (e.g., a project registered with just a single-segment
-    path), match against the whole tag.
+    `internal/projects.TagForPath`. Both halves can themselves contain
+    `-` (sanitized parent `my-org`, sanitized base `my-project`), so
+    the tag `my-org-my-project` cannot be unambiguously inverted by
+    splitting on `-`. Rather than try, this function checks whether
+    the URL basename appears as the **suffix** of the project tag,
+    preceded by `-` (the parent/base boundary). If the tag has no
+    `-` at all (single-segment registration like just `fleet`),
+    match the whole tag against the URL basename.
 
     Examples (all True):
       ('https://github.com/edisonshen/rainier.git', 'projects-rainier')
       ('git@github.com:acme/my-project.git', 'repos-my-project')
+      ('git@github.com:src/my-project.git', 'my-org-my-project')
       ('https://github.com/edisonshen/fleet', 'projects-fleet')
       ('git@github.com:foo/rainier-app.git', 'projects-rainier-app')
 
-    Examples (all False — the iter-3 false-positive cases):
+    Examples (all False — iter-3 false-positive cases preserved):
       ('https://github.com/org/rainier-app.git', 'projects-rainier')
       ('git@github.com:foo/fleet-cli.git', 'projects-fleet')
       ('https://github.com/org/projects-rainier-app.git', 'projects-rainier')
 
-    Empty-origin edge case (review iter-4, codex finding): a
-    local-only checkout (`git init` with no `origin` remote) returns
-    "" from `git_remote_origin`. The CALLER (loop.tick) treats False
-    return here as "refuse dispatch — repo doesn't belong to project,"
-    which would break local-only repos registered via
-    `fleet project add /path/to/local-repo`. Caller must handle the
-    empty-origin path differently (skip validation + warn); this
-    function honestly says "I can't validate," and an empty needle
-    has never matched a real haystack.
+    Empty-origin edge case: a local-only checkout (`git init` with no
+    `origin` remote) returns "" from `git_remote_origin`. The CALLER
+    (loop.tick) treats False return here as "refuse dispatch" by
+    default, which would break local-only repos. loop.tick branches
+    on empty origin BEFORE calling this function — see
+    test_tick_local_only_repo_no_origin_warns_but_proceeds.
     """
     if not remote_url or not project:
         return False
@@ -183,13 +179,14 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
         tail = tail[: -len(".git")]
     if not tail:
         return False
-    # Recover the repo-basename half of the project tag by stripping
-    # the first `-` token (the parent-dir half from TagForPath). If
-    # there's no `-`, the whole tag IS the basename.
-    if "-" in project:
-        bare = project.split("-", 1)[1]
-    else:
-        bare = project
-    if not bare:
-        return False
-    return tail == bare
+    # If the project tag has no `-`, it was registered from a single-
+    # segment path (or sanitized down to one) — match whole-string.
+    # Otherwise: URL basename must appear as a hyphen-bounded suffix
+    # of the tag. This permits hyphenated parent dirs (`my-org/repo`
+    # → tag `my-org-repo`, basename `repo`) AND hyphenated bases
+    # (`projects/rainier-app` → tag `projects-rainier-app`, basename
+    # `rainier-app`), while still rejecting suffix lookalikes
+    # (basename `rainier-app` doesn't end the tag `projects-rainier`).
+    if "-" not in project:
+        return tail == project
+    return project.endswith("-" + tail)
