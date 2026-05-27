@@ -1823,3 +1823,126 @@ func TestRemoveCoordLockFile_Missing_NoError(t *testing.T) {
 		t.Fatalf("removeCoordLockFile on missing path returned error: %v", err)
 	}
 }
+
+// TestRemoveIfSameInode_InodeSwap_RefusesUnlink pins codex review iter-5
+// [P2]: after Flock succeeds, the unlink path MUST recheck that the
+// inode at `path` still equals the inode of our fd. Without this, two
+// overlapping `fleet gc --apply` passes + a concurrent coord-spawn can
+// leave the first pass holding an unlinked inode while a new dirent at
+// the same path points at a freshly created LIVE lock — os.Remove
+// would delete the live replacement and split-brain returns.
+//
+// Synchronously reproduce the swap by:
+//  1. Creating the original lock file at `path` → inode I1.
+//  2. Opening + flocking it ourselves (simulating the gc helper post-
+//     OpenFile + post-Flock state, holding I1).
+//  3. Unlinking `path` while we hold the fd (dirent gone, I1 still
+//     alive via our open fd).
+//  4. Creating a fresh file at `path` → inode I2.
+//  5. Calling removeIfSameInode(fd_I1, path) → must return the
+//     inode-swap error, leaving the I2 dirent intact.
+func TestRemoveIfSameInode_InodeSwap_RefusesUnlink(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("aabbccdd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	fd1, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open original: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Flock(int(fd1.Fd()), syscall.LOCK_UN)
+		_ = fd1.Close()
+	})
+	if err := syscall.Flock(int(fd1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock original: %v", err)
+	}
+	// Unlink the original dirent — fd1 still holds I1 alive.
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("unlink original: %v", err)
+	}
+	// Create a fresh dirent at the same path → new inode I2 (simulates
+	// a concurrent coord-spawn between our flock and our recheck).
+	if err := os.WriteFile(lockPath, []byte("11112222\n"), 0o644); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	// Capture I2's inode for the post-call assertion.
+	var pstBefore syscall.Stat_t
+	if err := syscall.Stat(lockPath, &pstBefore); err != nil {
+		t.Fatalf("stat replacement: %v", err)
+	}
+
+	rerr := removeIfSameInode(fd1, lockPath)
+	if rerr == nil {
+		t.Fatal("removeIfSameInode silently unlinked the replacement live lock — split-brain re-introduced")
+	}
+	if !strings.Contains(rerr.Error(), "different inode") && !strings.Contains(rerr.Error(), "replaced") {
+		t.Errorf("error %q does not explain the inode-swap refusal", rerr.Error())
+	}
+
+	// Replacement file must still exist on disk with its original inode.
+	var pstAfter syscall.Stat_t
+	if err := syscall.Stat(lockPath, &pstAfter); err != nil {
+		t.Errorf("replacement file disappeared after inode-swap refusal: %v", err)
+	} else if pstAfter.Ino != pstBefore.Ino {
+		t.Errorf("replacement inode changed: before=%d after=%d", pstBefore.Ino, pstAfter.Ino)
+	}
+}
+
+// TestRemoveIfSameInode_PathVanished_NoError confirms the safe-collapse
+// branch: if `path` is gone between our flock and recheck (e.g. an
+// earlier gc pass already won the race AND no spawn rebound the path),
+// removeIfSameInode returns nil. Our orphan inode reaps on close;
+// nothing to do.
+func TestRemoveIfSameInode_PathVanished_NoError(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("ababcdcd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	fd, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(fd.Fd()), syscall.LOCK_UN) })
+
+	// Path vanishes after our flock — no replacement.
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+
+	if err := removeIfSameInode(fd, lockPath); err != nil {
+		t.Errorf("removeIfSameInode returned error on safe-collapse path-vanished branch: %v", err)
+	}
+}
+
+// TestRemoveIfSameInode_SameInode_Unlinks confirms the happy path: the
+// fd inode equals the path inode → os.Remove fires + returns nil.
+func TestRemoveIfSameInode_SameInode_Unlinks(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("77778888\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	fd, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(fd.Fd()), syscall.LOCK_UN) })
+
+	if err := removeIfSameInode(fd, lockPath); err != nil {
+		t.Fatalf("removeIfSameInode: %v", err)
+	}
+	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+		t.Errorf("lock file still exists; stat=%v", statErr)
+	}
+}

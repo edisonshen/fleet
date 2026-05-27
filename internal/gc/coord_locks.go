@@ -357,43 +357,57 @@ func isCoordHolderShape(s string) bool {
 
 // removeCoordLockFile is the production RemoveCoordLock. Atomic
 // "no-held-lock" unlink — acquires LOCK_EX|LOCK_NB on the lock file
-// itself BEFORE the os.Remove, so a coord that spawned between our
-// liveness probe and this unlink cannot have its held flock unlinked
-// from under it.
+// itself BEFORE the os.Remove, then post-flock revalidates that the
+// inode under `path` is STILL the inode we locked. Both gates are
+// load-bearing for split-brain defense; either alone leaves a
+// realistic concurrent-coord-start race window open.
 //
-// Codex review iter-4 [P1]: the upstream classifier's liveness gates
-// (mismatch + dead-coord) read `LoadAgent` / `SessionAlive` and then
-// dispatch through this function. A concurrent coord-spawn between the
-// probe and `os.Remove(path)` would acquire LOCK_EX on the existing
-// inode, then we'd unlink it from underneath them — flock(2) is
-// inode-based, so the live coord keeps its lock on the unlinked inode
-// while a third coord can create + lock a fresh file. Same split-brain
-// the in-classifier gates already defend against for the pre-probe
-// case, but TOCTOU-deferred.
+// History:
+//   - Codex iter-4 [P1]: upstream classifier's liveness gates
+//     (mismatch + dead-coord) read `LoadAgent` / `SessionAlive` and
+//     dispatch here. A concurrent coord-spawn between the probe and
+//     `os.Remove(path)` would acquire LOCK_EX on the existing inode;
+//     `os.Remove` would unlink it from under the live coord
+//     (flock(2) is inode-based). Defense: take LOCK_EX|LOCK_NB
+//     ourselves before unlinking.
+//   - Codex iter-5 [P2]: even with the pre-flock acquired, an
+//     overlapping pair of gc passes can leave the first pass holding
+//     an unlinked inode while a new coord re-creates `path` at a
+//     different inode. The first pass's `os.Remove(path)` would then
+//     delete the replacement live lock. Defense: after Flock, stat
+//     fd and path; abort the unlink if the inodes diverge.
 //
-// Defense: open the file, attempt LOCK_EX|LOCK_NB. If acquisition
-// fails with EWOULDBLOCK, someone holds the flock RIGHT NOW (between
-// our probe and now) — refuse the unlink and bubble an error up so
-// the per-action Reason surfaces "remove failed: lock currently held"
-// and the classifier downgrades the Verb back to surface (see
-// appendCoordLockAction's --apply error branch).
+// Inode-swap walkthrough (codex iter-5 [P2]):
 //
-// We hold the flock ACROSS the os.Remove call. Any new openers after
-// os.Remove will create a new inode (the dirent is gone); their
-// LOCK_EX will succeed on the fresh inode — that's the intended
-// recovery shape, not a regression. The classifier's invariant is
-// "no live holder of the unlinked inode at the moment of unlink,"
-// which the held flock enforces.
+//	T0  GC1: OpenFile(path)       -> fd1 → inode I1 (no lock yet)
+//	T1  GC2: OpenFile(path)       -> fd2 → inode I1
+//	T2  GC2: Flock(LOCK_EX_NB)    -> succeeds; GC2 holds I1
+//	T3  GC2: os.Remove(path)      -> dirent gone; inode I1 alive
+//	                                 (fd1 still references it)
+//	T4  GC2: Flock(LOCK_UN); Close -> only fd1 keeps I1 alive
+//	T5  spawn: OpenFile(path, O_CREATE) -> inode I2, fresh dirent
+//	T6  spawn: Flock(LOCK_EX_NB)  -> succeeds on I2
+//	T7  GC1: Flock(LOCK_EX_NB)    -> succeeds on I1 (no one else
+//	                                 holds I1's flock anymore)
+//	T8  GC1: stat fd1 → inode I1; stat(path) → inode I2
+//	                                → MISMATCH; abort the os.Remove.
+//	T9  GC1: Flock(LOCK_UN); Close -> I1 reaped without unlinking I2.
 //
-// ENOENT-tolerant: a missing path collapses to nil (two operators
-// racing `fleet gc --apply` shouldn't see spurious errors).
+// Without the T8 inode-equality recheck, GC1 would have called
+// `os.Remove(path)` and deleted I2 — the live replacement lock that
+// the spawn at T5/T6 just created. Split-brain re-introduced.
+//
+// ENOENT-tolerant: a missing path at OpenFile or after the recheck
+// collapses to nil (two operators racing `fleet gc --apply` mustn't
+// see spurious errors).
 //
 // ASCII flow:
 //
-//	OpenFile(path, O_RDWR)        -> dirent → inode (existing)
-//	Flock(LOCK_EX | LOCK_NB)      -> EWOULDBLOCK if held: ABORT
-//	os.Remove(path)               -> dirent gone; inode pinned to us
-//	Flock(LOCK_UN); Close         -> inode reaped (no other openers)
+//	OpenFile(path, O_RDWR)                    -> dirent → inode (existing)
+//	Flock(LOCK_EX | LOCK_NB)                  -> EWOULDBLOCK if held: ABORT
+//	Fstat(fd) + Stat(path), compare ino+dev   -> mismatch: ABORT (no Remove)
+//	os.Remove(path)                           -> dirent gone; we own the inode
+//	Flock(LOCK_UN); Close                     -> inode reaped (no other openers)
 func removeCoordLockFile(path string) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
 	if err != nil {
@@ -409,10 +423,54 @@ func removeCoordLockFile(path string) error {
 		}
 		return fmt.Errorf("flock %s: %w", path, lerr)
 	}
-	rerr := os.Remove(path)
+	rerr := removeIfSameInode(f, path)
 	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	_ = f.Close()
-	if rerr != nil && !os.IsNotExist(rerr) {
+	return rerr
+}
+
+// removeIfSameInode performs the load-bearing post-flock inode-equality
+// recheck + os.Remove for removeCoordLockFile. Extracted so unit tests
+// can exercise the codex iter-5 [P2] swap-defense path synchronously
+// (constructing the rare "fd inode ≠ path inode" state from the test
+// is easy; constructing it inside removeCoordLockFile's internal
+// OpenFile would require a multi-goroutine race that's flaky).
+//
+// Caller MUST already hold LOCK_EX on f (the flock semantics make the
+// check meaningful — without the lock, this is just two stats in a row).
+// Caller is responsible for unlocking + closing f on return.
+//
+// Returns nil on:
+//   - successful unlink (the common case)
+//   - path vanished between flock and stat (safe-collapse — nothing to
+//     remove; the orphan inode we hold will reap on close)
+//   - os.Remove returning ENOENT (concurrent gc already won the race)
+//
+// Returns an error on:
+//   - fstat / stat IO error (other than ENOENT)
+//   - inode mismatch — path resolves to a DIFFERENT inode than the fd
+//     (someone unlinked our inode + a new spawn created a replacement
+//     before we could lock; unlinking now would delete the live
+//     replacement lock — split-brain re-introduced)
+//   - os.Remove error other than ENOENT.
+func removeIfSameInode(f *os.File, path string) error {
+	var fst, pst syscall.Stat_t
+	if ferr := syscall.Fstat(int(f.Fd()), &fst); ferr != nil {
+		return fmt.Errorf("fstat %s: %w", path, ferr)
+	}
+	if perr := syscall.Stat(path, &pst); perr != nil {
+		if errors.Is(perr, syscall.ENOENT) {
+			// Path vanished between our flock and stat — safe-collapse.
+			// We hold an orphan inode, but no dirent points at it (or
+			// any replacement). Nothing to remove.
+			return nil
+		}
+		return fmt.Errorf("stat %s: %w", path, perr)
+	}
+	if fst.Ino != pst.Ino || fst.Dev != pst.Dev {
+		return fmt.Errorf("coord lock %s was replaced by a different inode between open and lock — refusing to unlink (would delete a live replacement lock); re-run if you still see a stale lock", path)
+	}
+	if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
 		return rerr
 	}
 	return nil
