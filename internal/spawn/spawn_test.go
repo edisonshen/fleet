@@ -2,6 +2,7 @@ package spawn
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,12 @@ import (
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// jsonUnmarshalForTest defers to encoding/json. Kept as a tiny shim so
+// the import-block change above stays focused (issue #175 test helpers).
+func jsonUnmarshalForTest(b []byte, v any) error {
+	return json.Unmarshal(b, v)
+}
 
 func setupFleetHome(t *testing.T) string {
 	t.Helper()
@@ -1597,4 +1604,197 @@ func TestSpawn_ExecCommandRunsButPersistsCleanCommand(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
+// ---------- Issue #175: coord-config.json::repo write ----------
+//
+// On a coord-spawn, Spawn must also stamp the resolved repo path into
+// ~/.fleet/projects/<project>/coord-config.json::repo. loop.py reads
+// that field on every tick to decide where to run `git worktree add`,
+// avoiding the cwd-derived worktree-base bug (issue #175) where a coord
+// whose tmux session inherited the wrong shell cwd silently corrupted
+// cross-project dispatches.
+//
+// Detection: TaskID is "coord-<project>" AND Project is non-empty.
+// This is the existing CoordTaskIDPrefix convention from
+// cmd/fleet/dispatch.go (we duplicate the literal here to avoid a
+// cmd/fleet → internal/spawn import cycle).
+//
+// Idempotency: an existing non-empty `repo` field is preserved
+// (operator-set wins). Existing parallelism + other fields are merged
+// through. An existing empty `repo` field is treated as unset.
+
+// readCoordConfig parses the coord-config.json stamped by Spawn.
+// Mirrors the schema in skills/coordinator/coord_config.py.
+func readCoordConfig(t *testing.T, fleetHome, project string) map[string]any {
+	t.Helper()
+	path := filepath.Join(fleetHome, "projects", project, "coord-config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read coord-config.json: %v (path=%s)", err, path)
+	}
+	var data map[string]any
+	if err := jsonUnmarshalForTest(raw, &data); err != nil {
+		t.Fatalf("parse coord-config.json: %v (raw=%q)", err, string(raw))
+	}
+	return data
+}
+
+func TestSpawn_WritesCoordConfigRepo_OnFreshProject(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	gotRepo, _ := data["repo"].(string)
+	if gotRepo != myCwd {
+		t.Errorf("coord-config.json::repo: got %q want %q", gotRepo, myCwd)
+	}
+}
+
+func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Seed coord-config.json with parallelism but no repo.
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"parallelism": 3}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["parallelism"] != float64(3) {
+		t.Errorf("parallelism clobbered: got %v want 3 (json numeric)", data["parallelism"])
+	}
+	if data["repo"] != myCwd {
+		t.Errorf("repo: got %v want %q", data["repo"], myCwd)
+	}
+}
+
+func TestSpawn_PreservesExistingRepo(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Seed coord-config.json with an operator-set repo path.
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	preset := "/Users/op/projects/rainier-fork"
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+preset+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != preset {
+		t.Errorf("existing repo overwritten: got %v want %q", data["repo"], preset)
+	}
+}
+
+func TestSpawn_DoesNotWriteCoordConfigForWorkerSpawn(t *testing.T) {
+	// Worker spawn (TaskID is NOT the coord prefix) must NOT touch
+	// coord-config.json — that file is exclusively the coord's domain
+	// and stamping it from a worker would pin the wrong path (worker
+	// cwd may be a per-worker worktree, not the project repo).
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "auth-fix", // worker task slug, NOT coord prefix
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	cfgPath := filepath.Join(home, "projects", "projects-rainier", "coord-config.json")
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Errorf("worker spawn must NOT create coord-config.json; exists=%v err=%v", err == nil, err)
+	}
+}
+
+func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Set up a relative cwd: chdir to parent, pass basename as opts.Cwd.
+	abs := t.TempDir()
+	parent := filepath.Dir(abs)
+	rel := filepath.Base(abs)
+	origWd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origWd) })
+	if err := os.Chdir(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     rel,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	gotRepo, _ := data["repo"].(string)
+	if !filepath.IsAbs(gotRepo) {
+		t.Errorf("repo not absolutized: got %q", gotRepo)
+	}
+	// EvalSymlinks because macOS /var → /private/var via filepath.Abs.
+	got, _ := filepath.EvalSymlinks(gotRepo)
+	want, _ := filepath.EvalSymlinks(abs)
+	if got != want {
+		t.Errorf("repo absolutization wrong: got %q want %q", got, want)
+	}
 }
