@@ -39,7 +39,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -88,6 +87,12 @@ func reconcileCoordLocks(r *Report, opts Options, deps Deps) error {
 	if deps.ListCoordLocks == nil {
 		return errors.New("coord-locks: ListCoordLocks dep not wired")
 	}
+	if deps.LoadAgent == nil {
+		return errors.New("coord-locks: LoadAgent dep not wired")
+	}
+	if deps.SessionAlive == nil {
+		return errors.New("coord-locks: SessionAlive dep not wired")
+	}
 	locks, err := deps.ListCoordLocks()
 	if err != nil {
 		return err
@@ -108,7 +113,7 @@ func reconcileCoordLocks(r *Report, opts Options, deps Deps) error {
 			// flock alone is the load-bearing signal. Don't touch.
 			continue
 		}
-		rec, lerr := loadAgentRecord(deps, holder)
+		rec, lerr := deps.LoadAgent(holder)
 		if lerr != nil {
 			if errors.Is(lerr, state.ErrNotFound) {
 				appendCoordLockAction(r, opts, deps, l,
@@ -146,17 +151,6 @@ func reconcileCoordLocks(r *Report, opts Options, deps Deps) error {
 			fmt.Sprintf("stale tmux (session %s gone for agent %s)", rec.TmuxSession, holder))
 	}
 	return nil
-}
-
-// loadAgentRecord centralizes the LoadAgent dep call so the classifier
-// works with either an explicit per-ID dep (preferred for tests) or
-// falls back to the production agent.Load. Tests stub LoadAgent;
-// DefaultDeps wires it to agent.Load.
-func loadAgentRecord(deps Deps, id string) (*agent.Record, error) {
-	if deps.LoadAgent != nil {
-		return deps.LoadAgent(id)
-	}
-	return agent.Load(id)
 }
 
 // appendCoordLockAction builds the per-lock Action (default Verb=surface)
