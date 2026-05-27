@@ -827,6 +827,32 @@ func Spawn(opts Options) (*agent.Record, error) {
 		_ = tmux.Kill(session)
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
+
+	// fleet#175: on coord-spawn, stamp the resolved repo path into
+	// ~/.fleet/projects/<project>/coord-config.json::repo (idempotent).
+	// loop.py reads that field on every tick to decide where to run
+	// `git worktree add`, avoiding the cwd-derived worktree-base bug
+	// where a coord whose tmux session inherited the wrong shell cwd
+	// silently corrupted cross-project dispatches.
+	//
+	// Best-effort: a write failure here is logged to stderr but never
+	// fails the spawn. The worst case is the coord skill falls back
+	// to legacy cwd-derived behavior and emits a fallback warning into
+	// TickResult.errors — a breadcrumb the operator can see, not a
+	// silent corruption. Failing the spawn over a metadata file would
+	// be the inverse of helpful.
+	if isCoordSpawn(rec.TaskID, rec.Project) {
+		fhome := fleetHomeForSpawn()
+		if fhome != "" {
+			if werr := writeCoordConfigRepoIdempotent(fhome, rec.Project, cwd); werr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: write coord-config.json::repo for %s failed: %v "+
+						"(coord skill will fall back to cwd-derived worktree base)\n",
+					rec.Project, werr)
+			}
+		}
+	}
+
 	// NOTE: the handoff resume prompt is typed by the caller's retire
 	// path (handoffop.retireOldAgent / cmd/fleet/handoff.go step 11b)
 	// via SendInitialPrompt, NOT here. Keeping it out of Spawn means

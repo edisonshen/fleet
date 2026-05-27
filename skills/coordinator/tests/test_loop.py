@@ -2897,9 +2897,14 @@ def test_workers_delete_failure_does_not_abort_tick(
 
     # Tick must record the reconcile but NOT raise.
     assert result.reconciled == 1
-    assert result.errors == [], (
+    # fleet#175: tick now emits a fallback-warning into result.errors when
+    # coord-config.json::repo is missing. That breadcrumb is informational,
+    # not a hard error — filter it out before asserting the original
+    # "delete failure is best-effort" contract.
+    real_errors = [e for e in result.errors if "coord-config.json" not in e]
+    assert real_errors == [], (
         "delete failures should be best-effort, not bubble into errors[]: "
-        + repr(result.errors)
+        + repr(real_errors)
     )
     captured = capsys.readouterr()
     assert "workers delete failed" in captured.err
@@ -3062,8 +3067,11 @@ def test_sweep_failure_does_not_abort_tick(
             fleet_home=str(fleet_home),
         )
 
-    assert result.errors == [], (
-        "sweep failures must be best-effort; got: " + repr(result.errors)
+    # fleet#175: filter out the coord-config.json::repo-not-set fallback
+    # warning, which is informational (not a hard error).
+    real_errors = [e for e in result.errors if "coord-config.json" not in e]
+    assert real_errors == [], (
+        "sweep failures must be best-effort; got: " + repr(real_errors)
     )
     captured = capsys.readouterr()
     assert "workers delete failed" in captured.err

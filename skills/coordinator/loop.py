@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Iterable
 
 import conflict
+import coord_config
 import dispatch as dispatch_mod
 import parse
 import reaper as reaper_mod
@@ -227,6 +228,60 @@ def tick(
         result.skipped = True
         result.reason = "lock-busy"
         return result
+    # 1.5. Resolve worktree-base repo from coord-config.json (fleet#175).
+    #
+    # ASCII:
+    #
+    #   coord-config.json::repo set?
+    #     yes → git -C <repo> remote get-url origin
+    #             matches project (heuristic)?
+    #               yes → cwd = repo            ← use authoritative checkout
+    #               no  → skipped + raised++   ← refuse dispatch
+    #     no  → cwd = caller_cwd or os.getcwd()
+    #             record warning in result.errors so the operator
+    #             sees the legacy/upgrade breadcrumb in `fleet status`
+    #
+    # Why this lives between lock acquire and _tick_locked (rather than
+    # before the lock): the validation/refuse path must release the lock
+    # cleanly, and surfacing through the existing `finally: flock_un` is
+    # the simplest way to guarantee that. The cost of reading one JSON
+    # file under the lock is negligible compared to the rest of tick().
+    cfg_path = project_dir / COORD_CONFIG_FILE
+    configured_repo = coord_config.read_repo(cfg_path)
+    if configured_repo:
+        remote = coord_config.git_remote_origin(configured_repo)
+        if not coord_config.remote_matches_project(remote, project):
+            msg = (
+                f"coord-config.json::repo points at {configured_repo!r} "
+                f"(origin={remote!r}) but project is {project!r} — "
+                f"refusing dispatch. Fix coord-config.json or re-spawn "
+                f"the coord from inside the correct checkout."
+            )
+            import sys as _sys
+            _sys.stderr.write(msg + "\n")
+            result.errors.append(msg)
+            result.skipped = True
+            result.reason = "coord-config-repo-mismatch"
+            result.raised += 1
+            # Release the lock before returning (fleet#175: short-circuit
+            # path is still inside the lock-acquired branch).
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+            return result
+        cwd = configured_repo
+    else:
+        # No `repo` field in coord-config.json — fall through to legacy
+        # behavior, but warn into TickResult.errors so the operator sees
+        # the breadcrumb in `fleet status` and can run a follow-up spawn
+        # (or set the field manually).
+        result.errors.append(
+            f"coord-config.json::repo not set for {project!r}; "
+            f"falling back to caller cwd={cwd!r}. Re-spawn the coord "
+            f"from inside the project's git checkout, or set the field "
+            f"manually."
+        )
     # Load per-project parallelism config (cap>1 → worktree mode).
     # Caller-provided cap overrides only when it differs from
     # DEFAULT_CAP — that way tests can pin cap=2 explicitly while
