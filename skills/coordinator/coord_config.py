@@ -159,17 +159,13 @@ def write_repo_idempotent(config_path: Path | str, repo: str) -> None:
         # a clean one. This preserves the operator's intent (record the
         # repo) without inheriting garbage.
         data = {}
-    # Idempotency: preserve existing non-empty repo IFF the path
-    # still exists on disk. Stale paths get overwritten by the new
-    # `repo` value so respawn-as-recovery actually works (codex iter-8
-    # P2: without this, the iter-5 stale-path refuse-on-tick path
-    # would leave projects permanently blocked even after the operator
-    # follows the on-screen guidance to re-spawn).
-    existing_repo = data.get("repo")
-    if isinstance(existing_repo, str) and existing_repo.strip():
-        if os.path.isdir(existing_repo.strip()):
-            return
-        # Else: stale path → overwrite below.
+    # iter-9 (codex P1): always overwrite `repo` with the respawn
+    # cwd. See internal/spawn/coord_config.go for the full rationale —
+    # short version: respawning IS the operator's signal that the
+    # previous value was wrong. Preservation would trap projects
+    # without meta.json in the #175 wrong-repo state. Operators
+    # wanting a permanent pin use `fleet project add` to set
+    # meta.json::repo_path (which wins over coord-config in loop.tick).
     data["repo"] = repo
     # Atomic write: tmp + fsync + rename.
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(parent))

@@ -288,27 +288,38 @@ def test_write_preserves_existing_parallelism(tmp_path: Path) -> None:
     assert data == {"parallelism": 3, "repo": "/Users/op/projects/rainier"}
 
 
-def test_write_idempotent_preserves_existing_live_repo(tmp_path: Path) -> None:
-    """existing non-empty repo pointing at a live dir → NOT overwritten
-    (operator-set wins). iter-8 makes this contingent on the path
-    actually existing on disk."""
+def test_write_overwrites_existing_repo_with_respawn_cwd(tmp_path: Path) -> None:
+    """iter-9 (codex P1 resolution): respawn always overwrites the
+    `repo` field with the new cwd, even when the previous value
+    points at a live directory.
+
+    Rationale: for legacy / no-meta.json projects, coord-config.json::repo
+    is purely the spawn-time signal. Preserving an older live value
+    traps projects in the #175 wrong-repo state — operator can't fix it
+    by respawning from the correct checkout. Operators wanting a
+    permanent fork pin should use `fleet project add` to set
+    meta.json::repo_path (which wins over coord-config in loop.tick).
+    """
     cfg = tmp_path / "coord-config.json"
-    live = tmp_path / "operator-fork"
-    live.mkdir()
+    prev_live = tmp_path / "prev-checkout"
+    prev_live.mkdir()  # live, but operator's now respawning from elsewhere
     cfg.write_text(
-        json.dumps({"parallelism": 3, "repo": str(live)})
+        json.dumps({"parallelism": 3, "repo": str(prev_live)})
     )
-    other = tmp_path / "other-checkout"
-    other.mkdir()
-    coord_config.write_repo_idempotent(cfg, str(other))
+    new_cwd = tmp_path / "new-checkout"
+    new_cwd.mkdir()
+    coord_config.write_repo_idempotent(cfg, str(new_cwd))
     data = json.loads(cfg.read_text())
-    assert data["repo"] == str(live), "live operator-set repo must win"
+    assert data["repo"] == str(new_cwd), (
+        "respawn must overwrite even a live previous value"
+    )
+    # Sibling fields preserved:
+    assert data["parallelism"] == 3
 
 
 def test_write_overwrites_stale_existing_repo(tmp_path: Path) -> None:
-    """iter-8 (codex P2): existing repo pointing at a missing dir →
-    OVERWRITTEN by respawn. Without this, respawn-as-recovery (the
-    on-screen guidance from iter-5's stale-path refuse) is broken."""
+    """iter-9 still overwrites stale paths (this was the iter-8
+    contract; iter-9 generalizes it to all non-empty values)."""
     cfg = tmp_path / "coord-config.json"
     stale = tmp_path / "deleted-checkout"  # NOT created
     cfg.write_text(
@@ -318,10 +329,7 @@ def test_write_overwrites_stale_existing_repo(tmp_path: Path) -> None:
     new_repo.mkdir()
     coord_config.write_repo_idempotent(cfg, str(new_repo))
     data = json.loads(cfg.read_text())
-    assert data["repo"] == str(new_repo), (
-        "stale repo must be overwritten by respawn cwd"
-    )
-    # Sibling field preserved through overwrite:
+    assert data["repo"] == str(new_repo)
     assert data["parallelism"] == 3
 
 

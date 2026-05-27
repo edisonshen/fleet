@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // coordTaskIDPrefix matches cmd/fleet/dispatch.go's CoordTaskIDPrefix.
@@ -81,23 +80,23 @@ func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
 		return fmt.Errorf("read existing coord-config.json: %w", err)
 	}
 
-	// Idempotent: preserve existing non-empty repo IFF it still
-	// points at a live directory. Stale paths (deleted/moved
-	// checkout) get overwritten by the respawn cwd — without this,
-	// codex iter-5 P2 surfaces: an operator who hits the iter-5
-	// stale-path refuse path follows the on-screen guidance to
-	// "re-spawn the coord from inside the correct checkout," and
-	// the respawn correctly writes the new cwd here... except
-	// idempotency would silently preserve the stale value, leaving
-	// the project permanently refusing dispatch. Stat-checking the
-	// existing value lets respawn-as-recovery actually recover.
-	if existing, ok := data["repo"].(string); ok && strings.TrimSpace(existing) != "" {
-		if info, err := os.Stat(existing); err == nil && info.IsDir() {
-			return nil
-		}
-		// Stat failed or not-a-dir → overwrite with the live cwd
-		// (the respawn-as-recovery path).
-	}
+	// iter-9 (codex P1): always overwrite `repo` with the respawn
+	// cwd. The earlier "preserve existing non-empty" rule (iter-3..7)
+	// trapped legacy/non-meta.json projects in the #175 wrong-repo
+	// state — once any wrong cwd got stamped, respawn from the
+	// correct checkout couldn't fix it. iter-8 made the overwrite
+	// fire only for stale paths; iter-9 makes it unconditional,
+	// because a LIVE but wrong path is exactly the #175 scenario
+	// the on-screen guidance "re-spawn from the correct checkout"
+	// is supposed to recover.
+	//
+	// Operators wanting a permanent fork pin (the original
+	// preservation use case) should set meta.json::repo_path via
+	// `fleet project add <fork-path>`. meta.json wins over
+	// coord-config.json in loop.tick (iter-7), so the fork pin
+	// survives any number of respawns. coord-config.json::repo is
+	// purely the spawn-time signal; respawning IS the operator
+	// changing that signal.
 	data["repo"] = repo
 
 	// Atomic write: tmp + fsync + rename in the same directory.

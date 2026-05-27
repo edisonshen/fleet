@@ -1698,31 +1698,38 @@ func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
 	}
 }
 
-func TestSpawn_PreservesExistingLiveRepo(t *testing.T) {
-	// Idempotency: when an existing `repo` value still points at a
-	// live directory, respawn must NOT overwrite it. Operator may
-	// have explicitly set a fork checkout / out-of-tree path; respawn
-	// should preserve that choice.
+func TestSpawn_OverwritesExistingRepoWithRespawnCwd(t *testing.T) {
+	// iter-9 (codex P1 resolution): respawn always overwrites
+	// `coord-config.json::repo` with the new cwd, even when the
+	// previous value still points at a live directory. Rationale:
+	// for projects without meta.json, the only signal we have about
+	// where the operator INTENDS the worktree base is the cwd of
+	// the current spawn. Preserving an older live value would trap
+	// projects in the #175 wrong-repo state (operator can't fix it
+	// by respawning from the correct checkout).
+	//
+	// Operators wanting a permanent fork pin should use
+	// `fleet project add <fork-path>` — meta.json::repo_path wins
+	// over coord-config.json::repo in loop.tick (iter-7), so the
+	// fork pin survives any number of respawns.
 	requireTmux(t)
 	home := setupFleetHome(t)
 
-	// Seed coord-config.json with a REAL existing path (the iter-8
-	// change adds a Stat() check; preserve only applies to live dirs).
 	projDir := filepath.Join(home, "projects", "projects-rainier")
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(projDir, "coord-config.json")
-	preset := t.TempDir() // real, exists on disk
+	prevLiveRepo := t.TempDir() // a real, live directory
 	if err := os.WriteFile(
 		cfgPath,
-		[]byte(`{"parallelism": 2, "repo": "`+preset+`"}`+"\n"),
+		[]byte(`{"parallelism": 2, "repo": "`+prevLiveRepo+`"}`+"\n"),
 		0o644,
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	myCwd := t.TempDir()
+	myCwd := t.TempDir() // the NEW respawn cwd
 	rec, err := Spawn(Options{
 		TaskID:  "coord-projects-rainier",
 		Project: "projects-rainier",
@@ -1735,8 +1742,13 @@ func TestSpawn_PreservesExistingLiveRepo(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
 
 	data := readCoordConfig(t, home, "projects-rainier")
-	if data["repo"] != preset {
-		t.Errorf("existing live repo overwritten: got %v want %q", data["repo"], preset)
+	if data["repo"] != myCwd {
+		t.Errorf("respawn must overwrite existing repo: got %v want %q (old value %q was live but the respawn cwd is the operator's current intent)",
+			data["repo"], myCwd, prevLiveRepo)
+	}
+	// Sibling fields still preserved through overwrite:
+	if data["parallelism"] != float64(2) {
+		t.Errorf("parallelism clobbered during respawn overwrite: got %v want 2", data["parallelism"])
 	}
 }
 
