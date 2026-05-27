@@ -184,7 +184,7 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 // summary line. Format pinned by the design doc:
 //
 //	<kind>  <target>  verb=<v>  reason=<r>
-//	summary: N sockets, M agents, K tmux (surface only), L worktrees
+//	summary: N sockets, M agents, K tmux (surface only by default), L worktrees, P coord-locks
 //
 // dry-run / apply distinction is conveyed by the verb (would-* vs *),
 // not by a separate prefix.
