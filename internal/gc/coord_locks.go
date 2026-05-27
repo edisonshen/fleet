@@ -38,6 +38,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -354,12 +355,65 @@ func isCoordHolderShape(s string) bool {
 	return true
 }
 
-// removeCoordLockFile is the production RemoveCoordLock. Best-effort
-// unlink — ENOENT collapses to nil so two operators racing
-// `fleet gc --apply` don't see spurious errors.
+// removeCoordLockFile is the production RemoveCoordLock. Atomic
+// "no-held-lock" unlink — acquires LOCK_EX|LOCK_NB on the lock file
+// itself BEFORE the os.Remove, so a coord that spawned between our
+// liveness probe and this unlink cannot have its held flock unlinked
+// from under it.
+//
+// Codex review iter-4 [P1]: the upstream classifier's liveness gates
+// (mismatch + dead-coord) read `LoadAgent` / `SessionAlive` and then
+// dispatch through this function. A concurrent coord-spawn between the
+// probe and `os.Remove(path)` would acquire LOCK_EX on the existing
+// inode, then we'd unlink it from underneath them — flock(2) is
+// inode-based, so the live coord keeps its lock on the unlinked inode
+// while a third coord can create + lock a fresh file. Same split-brain
+// the in-classifier gates already defend against for the pre-probe
+// case, but TOCTOU-deferred.
+//
+// Defense: open the file, attempt LOCK_EX|LOCK_NB. If acquisition
+// fails with EWOULDBLOCK, someone holds the flock RIGHT NOW (between
+// our probe and now) — refuse the unlink and bubble an error up so
+// the per-action Reason surfaces "remove failed: lock currently held"
+// and the classifier downgrades the Verb back to surface (see
+// appendCoordLockAction's --apply error branch).
+//
+// We hold the flock ACROSS the os.Remove call. Any new openers after
+// os.Remove will create a new inode (the dirent is gone); their
+// LOCK_EX will succeed on the fresh inode — that's the intended
+// recovery shape, not a regression. The classifier's invariant is
+// "no live holder of the unlinked inode at the moment of unlink,"
+// which the held flock enforces.
+//
+// ENOENT-tolerant: a missing path collapses to nil (two operators
+// racing `fleet gc --apply` shouldn't see spurious errors).
+//
+// ASCII flow:
+//
+//	OpenFile(path, O_RDWR)        -> dirent → inode (existing)
+//	Flock(LOCK_EX | LOCK_NB)      -> EWOULDBLOCK if held: ABORT
+//	os.Remove(path)               -> dirent gone; inode pinned to us
+//	Flock(LOCK_UN); Close         -> inode reaped (no other openers)
 func removeCoordLockFile(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+	f, err := os.OpenFile(path, os.O_RDWR, 0o644)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	if lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lerr != nil {
+		_ = f.Close()
+		if errors.Is(lerr, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("coord lock %s is currently held by a live coord — refusing to unlink (would split-brain coord mutual-exclusion); kill the holder first then re-run", path)
+		}
+		return fmt.Errorf("flock %s: %w", path, lerr)
+	}
+	rerr := os.Remove(path)
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	_ = f.Close()
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return rerr
 	}
 	return nil
 }

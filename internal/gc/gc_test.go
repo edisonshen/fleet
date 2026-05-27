@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1744,5 +1745,81 @@ func TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped(t *testing.T) {
 	}
 	if _, ok := findAction(got, KindOrphanAgents, "legacy-record-aabb"); ok {
 		t.Fatalf("legacy empty-session record produced action: %+v", got.Actions)
+	}
+}
+
+// TestRemoveCoordLockFile_HeldByLiveCoord_RefusesUnlink pins codex
+// review iter-4 [P1]: the production unlink path MUST acquire
+// LOCK_EX|LOCK_NB on the coordinator.lock file BEFORE os.Remove. If
+// another process holds the flock (the realistic concurrent-start
+// race: a coord spawning between our liveness probe and this unlink),
+// the function must return an error instead of unlinking — flock(2)
+// is inode-based, so os.Remove on a held lock leaves the holder on
+// the unlinked inode while a new coord can create + flock a fresh
+// file → split-brain coord mutual-exclusion.
+//
+// The classifier's appendCoordLockAction surfaces this error as
+// "remove failed: ..." with Verb=surface, so --apply gracefully
+// degrades to surface on the realistic race window.
+func TestRemoveCoordLockFile_HeldByLiveCoord_RefusesUnlink(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("aabbccdd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	// Acquire LOCK_EX as a separate fd — simulates a live coord
+	// holding the flock at the moment removeCoordLockFile attempts
+	// the unlink.
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Flock(int(holder.Fd()), syscall.LOCK_UN)
+		_ = holder.Close()
+	})
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("holder Flock: %v", err)
+	}
+
+	rerr := removeCoordLockFile(lockPath)
+	if rerr == nil {
+		t.Fatal("removeCoordLockFile silently unlinked a held lock — split-brain risk")
+	}
+	if !strings.Contains(rerr.Error(), "currently held") && !strings.Contains(rerr.Error(), "split-brain") {
+		t.Errorf("error %q does not explain the live-holder refusal", rerr.Error())
+	}
+
+	// File must still exist on disk — the unlink was refused.
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Errorf("lock file disappeared even though removal was refused: %v", statErr)
+	}
+}
+
+// TestRemoveCoordLockFile_NotHeld_Unlinks confirms the happy path:
+// when no one holds the flock, removeCoordLockFile acquires it and
+// unlinks atomically.
+func TestRemoveCoordLockFile_NotHeld_Unlinks(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	if err := removeCoordLockFile(lockPath); err != nil {
+		t.Fatalf("removeCoordLockFile: %v", err)
+	}
+	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+		t.Errorf("lock file still exists after unlink; stat=%v", statErr)
+	}
+}
+
+// TestRemoveCoordLockFile_Missing_NoError confirms the ENOENT-tolerant
+// contract: two operators racing `fleet gc --apply` must not see
+// spurious errors when the second pass finds the file already gone.
+func TestRemoveCoordLockFile_Missing_NoError(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing-coordinator.lock")
+	if err := removeCoordLockFile(missing); err != nil {
+		t.Fatalf("removeCoordLockFile on missing path returned error: %v", err)
 	}
 }
