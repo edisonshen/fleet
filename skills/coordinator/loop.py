@@ -250,7 +250,23 @@ def tick(
     configured_repo = coord_config.read_repo(cfg_path)
     if configured_repo:
         remote = coord_config.git_remote_origin(configured_repo)
-        if not coord_config.remote_matches_project(remote, project):
+        if not remote:
+            # Local-only repo or no origin remote — we can't validate
+            # the project↔checkout mapping. Don't refuse dispatch (that
+            # would break `fleet project add /path/to/local-repo`); use
+            # the configured repo and surface a soft warning so the
+            # operator knows validation was skipped. The `repo` field
+            # still pins where worktrees land, so the cwd-derived
+            # worktree-base bug (issue #175) is still prevented.
+            result.errors.append(
+                f"coord-config.json::repo={configured_repo!r} for "
+                f"project {project!r} has no `origin` remote — "
+                f"skipping repo↔project validation. (Local-only "
+                f"checkouts are supported; set an origin remote to "
+                f"enable the sanity check.)"
+            )
+            cwd = configured_repo
+        elif not coord_config.remote_matches_project(remote, project):
             msg = (
                 f"coord-config.json::repo points at {configured_repo!r} "
                 f"(origin={remote!r}) but project is {project!r} — "
@@ -270,7 +286,8 @@ def tick(
             finally:
                 os.close(lock_fd)
             return result
-        cwd = configured_repo
+        else:
+            cwd = configured_repo
     else:
         # No `repo` field in coord-config.json — fall through to legacy
         # behavior, but warn into TickResult.errors so the operator sees

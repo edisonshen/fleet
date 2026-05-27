@@ -136,38 +136,42 @@ def git_remote_origin(repo_path: str) -> str:
 def remote_matches_project(remote_url: str, project: str) -> bool:
     """Heuristic: does the `origin` URL look like it belongs to `project`?
 
-    Strips the `projects-` prefix from the fleet-side project name
-    (a fleet bookkeeping convention; the github repo is named without
-    it) and checks that the **repo segment** of the URL (the basename
-    after the final `/` or `:`, with any trailing `.git` stripped)
-    equals the bare name exactly.
+    Fleet project tags are `<parent-dir>-<repo-basename>` via
+    `internal/projects.TagForPath` (sanitized to the
+    state.ValidateProjectName allowlist). So `projects-rainier` came
+    from `~/projects/rainier`, `repos-my-project` came from
+    `/repos/my-project`, and the repo-basename half of the tag is
+    what should equal the github repo name. To recover it: strip the
+    FIRST `-`-delimited token (the parent dir), keep the rest, and
+    strict-equal against the URL basename (last segment after `/` or
+    `:`, with any trailing `.git` stripped). When the tag has no `-`
+    at all (e.g., a project registered with just a single-segment
+    path), match against the whole tag.
 
-    Rationale for the strict segment-equality match (fleet#175 review
-    iter-3): a looser "delimited substring" match was rejected because
-    `-` and `_` as delimiters meant `projects-rainier` falsely matched
-    a remote like `github.com/org/rainier-app.git` (bare=`rainier`,
-    found as a `<slash>rainier<dash>` substring). False-positive
-    validation defeats the entire purpose of issue #175's safety check
-    — refuse dispatch when the configured repo does NOT belong to the
-    project. Better to demand the operator match the github repo name
-    than to silently pass a near-miss.
+    Examples (all True):
+      ('https://github.com/edisonshen/rainier.git', 'projects-rainier')
+      ('git@github.com:acme/my-project.git', 'repos-my-project')
+      ('https://github.com/edisonshen/fleet', 'projects-fleet')
+      ('git@github.com:foo/rainier-app.git', 'projects-rainier-app')
 
-    Fork / vanity-name edge case: operator points at
-    `~/projects/rainier-fork` whose origin is
-    `github.com/edisonshen/rainier-fork.git`. This returns False; the
-    operator either (a) renames the local checkout to match the github
-    repo name or (b) accepts the warning and re-spawns. Loose matching
-    here is the bug.
+    Examples (all False — the iter-3 false-positive cases):
+      ('https://github.com/org/rainier-app.git', 'projects-rainier')
+      ('git@github.com:foo/fleet-cli.git', 'projects-fleet')
+      ('https://github.com/org/projects-rainier-app.git', 'projects-rainier')
 
-    Empty inputs always return False — we never false-positive when
-    the data we'd validate against isn't there.
+    Empty-origin edge case (review iter-4, codex finding): a
+    local-only checkout (`git init` with no `origin` remote) returns
+    "" from `git_remote_origin`. The CALLER (loop.tick) treats False
+    return here as "refuse dispatch — repo doesn't belong to project,"
+    which would break local-only repos registered via
+    `fleet project add /path/to/local-repo`. Caller must handle the
+    empty-origin path differently (skip validation + warn); this
+    function honestly says "I can't validate," and an empty needle
+    has never matched a real haystack.
     """
     if not remote_url or not project:
         return False
-    bare = project.removeprefix("projects-")
-    if not bare:
-        return False
-    # Strip protocol + path prefix down to the repo basename. Two URL
+    # Strip protocol + path prefix down to the URL basename. Two URL
     # shapes are common:
     #   1. https://github.com/org/repo.git  → tail = "repo.git"
     #   2. git@github.com:org/repo.git      → after rsplit("/") = "repo.git"
@@ -177,4 +181,15 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
     tail = tail.rsplit(":", 1)[-1]
     if tail.endswith(".git"):
         tail = tail[: -len(".git")]
+    if not tail:
+        return False
+    # Recover the repo-basename half of the project tag by stripping
+    # the first `-` token (the parent-dir half from TagForPath). If
+    # there's no `-`, the whole tag IS the basename.
+    if "-" in project:
+        bare = project.split("-", 1)[1]
+    else:
+        bare = project
+    if not bare:
+        return False
     return tail == bare

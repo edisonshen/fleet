@@ -100,7 +100,12 @@ def test_validate_remote_mismatch() -> None:
 
 
 def test_validate_remote_empty_url() -> None:
-    """Empty remote URL → no match (don't false-positive on '')."""
+    """Empty remote URL → no match (don't false-positive on '').
+
+    NOTE: this returns False, but loop.tick's CALLER treats empty
+    origin as a 'cannot validate' soft path (local-only repo support),
+    NOT as a mismatch. The function itself stays honest about
+    empty input. See test_tick_local_only_repo_no_origin_warns_but_proceeds."""
     assert not coord_config.remote_matches_project("", "projects-rainier")
 
 
@@ -183,6 +188,61 @@ def test_validate_remote_accepts_scp_style_no_path() -> None:
         "git@example.com:fleet.git",
         "projects-fleet",
     )
+
+
+# ---------- review iter-4 (codex P1): generic TagForPath shape ----------
+#
+# Fleet project tags come from internal/projects.TagForPath, which
+# constructs `<parent>-<base>` for any path — NOT just `projects-<repo>`.
+# A `fleet project add /repos/my-project` yields tag `repos-my-project`;
+# the origin URL basename is `my-project`, so a strict `tag == basename`
+# match would reject the legitimate registration. The iter-3 heuristic
+# stripped only `projects-` prefix and broke this case. iter-4 strips
+# the first `-` token (the parent-dir half) generically, then matches
+# the repo-basename half.
+
+
+def test_validate_remote_accepts_repos_parent_dir_prefix() -> None:
+    """`repos-my-project` (from `fleet project add /repos/my-project`)
+    must match a `my-project.git` remote — TagForPath is generic,
+    not specific to `projects/`."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/acme/my-project.git",
+        "repos-my-project",
+    )
+
+
+def test_validate_remote_accepts_arbitrary_parent_dir_prefix() -> None:
+    """Any parent-dir prefix from TagForPath works (`work-foo`, etc.)."""
+    assert coord_config.remote_matches_project(
+        "git@github.com:user/foo.git",
+        "work-foo",
+    )
+
+
+def test_validate_remote_accepts_hyphenated_repo_name_under_parent() -> None:
+    """`projects-rainier-app` (project `rainier-app` under
+    `~/projects/`) must match `rainier-app.git`. The basename half
+    of the tag retains internal hyphens."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/edisonshen/rainier-app.git",
+        "projects-rainier-app",
+    )
+
+
+def test_validate_remote_accepts_single_token_project() -> None:
+    """A tag with no `-` at all (single-segment project) matches whole."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/edisonshen/fleet.git",
+        "fleet",
+    )
+
+
+def test_validate_remote_empty_url_returns_false() -> None:
+    """Empty remote URL → False. CALLER (loop.tick) must treat this as
+    'cannot validate' (local-only repo path) rather than 'mismatch' —
+    see test_tick_local_only_repo_no_origin_warns_but_proceeds below."""
+    assert not coord_config.remote_matches_project("", "projects-rainier")
 
 
 # ---------- coord_config.py: idempotent write ----------
@@ -394,3 +454,98 @@ def test_remote_match_heuristic_strips_projects_prefix(
     assert not coord_config.remote_matches_project(
         "https://github.com/edisonshen/fleet.git", "projects-rainier"
     )
+
+
+def test_tick_local_only_repo_no_origin_warns_but_proceeds(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """coord-config.json::repo set, but the checkout has NO `origin`
+    remote (local-only repo from `fleet project add /path/to/local`).
+    `git_remote_origin` returns "" — caller must NOT treat this as
+    mismatch (which would refuse dispatch). Instead: surface a soft
+    warning + proceed with the configured repo as cwd.
+
+    review iter-4 (codex P1 finding): the iter-3 strict-equality match
+    caused `git_remote_origin("") → ""` + `remote_matches_project("",
+    p) → False` to falsely trip the mismatch refuse-dispatch branch.
+    Local-only repos are a supported project shape; refusing them is
+    a regression."""
+    project = "local-only-repo"
+    home = _seed_fleet_home(tmp_path, project)
+    repo = tmp_path / "local-only-checkout"
+    repo.mkdir()
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(repo)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+    # Local-only repo: no origin → git_remote_origin returns "".
+    monkeypatch.setattr(
+        coord_config, "git_remote_origin",
+        lambda repo_path: "",
+    )
+
+    seen_cwd: list[str] = []
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        seen_cwd.append(args[4])
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path / "wrong-cwd"),
+        fleet_home=str(home),
+    )
+    # MUST NOT refuse dispatch:
+    assert result.skipped is False, (
+        f"local-only repo wrongly skipped: reason={result.reason!r}"
+    )
+    assert seen_cwd and seen_cwd[0] == str(repo), (
+        f"tick should still use configured repo as cwd; got {seen_cwd}"
+    )
+    # MUST surface a soft warning so the operator knows validation
+    # was skipped:
+    assert any(
+        "no `origin`" in e or "no origin" in e for e in result.errors
+    ), f"expected local-only soft warning in errors; got {result.errors}"
+
+
+def test_tick_accepts_generic_parent_dir_tag(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """`repos-my-project` tag (from `fleet project add /repos/my-project`)
+    must dispatch successfully when origin is `.../my-project.git`.
+
+    review iter-4 (codex P1 finding): the iter-3 heuristic stripped
+    only the literal `projects-` prefix, leaving non-`projects-` tags
+    broken. The generic strip-first-`-`-token approach handles every
+    TagForPath shape."""
+    project = "repos-my-project"
+    home = _seed_fleet_home(tmp_path, project)
+    repo = tmp_path / "my-project-checkout"
+    repo.mkdir()
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(repo)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        coord_config, "git_remote_origin",
+        lambda repo_path: "https://github.com/acme/my-project.git",
+    )
+
+    seen_cwd: list[str] = []
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        seen_cwd.append(args[4])
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path / "wrong-cwd"),
+        fleet_home=str(home),
+    )
+    assert result.skipped is False, (
+        f"generic parent-dir tag wrongly skipped: reason={result.reason!r}"
+    )
+    assert seen_cwd and seen_cwd[0] == str(repo)
