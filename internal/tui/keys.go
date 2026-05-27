@@ -426,34 +426,123 @@ func clampDashCursor(m Model) Model {
 	return m
 }
 
-// actionHandoff dispatches [h] to the agent at the dashboard cursor.
-// Tasks/projects/workers don't have handoff semantics — flash an
-// "doesn't apply" banner so the operator sees why nothing happened.
+// actionHandoff dispatches [h] for the row under the cursor.
+//
+// Inversion (2026-05-27): [h] is a PROJECT-LEVEL action. Coords are
+// 1-per-project, so the operator's mental model for "hand off this
+// agent's context" is "hand off this project's coord" — surfaced on
+// the left-panel project row where the project context lives. Pressing
+// [h] on a right-panel agent row used to be the only path and is now
+// REJECTED with a hint pointing back to the project row.
+//
+// Branches:
+//
+//	rowProject + project has a live coord (CoordID resolves to a record)
+//	  → run the same auto-red / precompact gate as the old agent path
+//	    (committed handoff journal forbids manual re-handoff) and shell
+//	    out via startHandoff(coord.ID).
+//
+//	rowProject + no live coord
+//	  → flash "no coord for project <name> — spawn one with [a]". [a]
+//	    on a project row is the auto-spawn path (issue #60), so it's
+//	    the right actionable next step.
+//
+//	rowAgent
+//	  → flash "[h] handoff applies to project rows (left panel) —
+//	    move cursor onto a project row". No shell-out. The agent's
+//	    coord-handoff is still reachable via [h] on its project row.
+//
+//	rowTask / rowWorker / rowSeparator / nil
+//	  → flash "[h] handoff applies to project rows" with no shell-out.
+//	    Old wording named v0.1 agents which is no longer accurate.
 func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 	row := m.selectedRow()
-	if row == nil || row.kind != rowAgent || row.agent == nil {
+	if row == nil {
 		m.flash = &flashMsg{
-			text:  "[h] handoff applies only to v0.1 agents — move cursor onto an agent row",
+			text:  "[h] handoff applies to project rows (left panel) — move cursor onto a project row",
 			isErr: true,
 		}
 		return m, nil, true
 	}
-	cur := row.agent
-	// Gate [h] only for COMMITTED handoff states (auto-red /
-	// precompact) — those have a queue journal on disk, so a manual
-	// handoff would race against the in-flight one. auto-yellow is
-	// NOT gated: the journal hasn't been written yet (only after
-	// MILESTONE), and [h] is the operator's escape hatch when the
-	// auto handoff stalls.
-	status := deriveStatus(cur, m.aliveByID)
+	switch row.kind {
+	case rowProject:
+		return m.actionHandoffProject(row.project)
+	case rowAgent:
+		m.flash = &flashMsg{
+			text:  "[h] handoff applies to project rows (left panel) — move cursor onto a project row",
+			isErr: true,
+		}
+		return m, nil, true
+	default:
+		m.flash = &flashMsg{
+			text:  "[h] handoff applies to project rows (left panel) — move cursor onto a project row",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+}
+
+// actionHandoffProject is the project-row branch of [h]. Resolves the
+// project's coord via ProjectRow.CoordID, applies the auto-red /
+// precompact gate, and shells out via startHandoff. When the project
+// has no live coord (CoordID empty OR matching record not loaded),
+// flashes the "spawn a coord" hint.
+//
+// The gate logic mirrors what used to live on the rowAgent branch:
+//
+//   - auto-red / precompact: handoff journal is already committed on
+//     disk, manual handoff would race the in-flight one. Suggest
+//     `fleet drain` as the operator's next step.
+//   - auto-yellow / live / asking / idle / blocked / review: gate
+//     allows; [h] is the operator's escape hatch.
+//
+// The two reasons CoordID resolves to no record:
+//
+//  1. CoordID == "" — the dashboard hasn't seen a coord lock body OR
+//     task_id fallback for this project. There may be a coord booting
+//     and the next refresh tick may bind it, but right now we have no
+//     identity to hand off.
+//  2. CoordID != "" but findRecordByID returns nil — race between
+//     dashboard refresh and agents refresh (same race that
+//     actionAttachProject's path-1 branch surfaces as "pending refresh").
+//
+// Both surface the same flash because the operator's recovery is the
+// same: either wait for the coord, or spawn one with [a].
+func (m Model) actionHandoffProject(p *ProjectRow) (Model, tea.Cmd, bool) {
+	if p == nil {
+		return m, nil, true
+	}
+	if p.CoordID == "" {
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("no coord for project %s — spawn one with [a]", p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	coord := findRecordByID(m.records, p.CoordID)
+	if coord == nil {
+		m.flash = &flashMsg{
+			text:  fmt.Sprintf("no coord for project %s — spawn one with [a]", p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	// Gate [h] only for COMMITTED handoff states (auto-red / precompact)
+	// — those have a queue journal on disk, so a manual handoff would
+	// race against the in-flight one. auto-yellow is NOT gated: the
+	// journal hasn't been written yet (only after MILESTONE), and [h]
+	// is the operator's escape hatch when the auto handoff stalls.
+	// Identical predicate to the previous rowAgent branch, just moved
+	// to the project-row path along with the rest of the keybind.
+	status := deriveStatus(coord, m.aliveByID)
 	if status == "auto-red" || status == "precompact" {
 		m.flash = &flashMsg{
-			text:  fmt.Sprintf("agent %s already has a handoff journal — `fleet drain` first", cur.ID),
+			text:  fmt.Sprintf("coord %s for project %s already has a handoff journal — `fleet drain` first", coord.ID, p.Name),
 			isErr: true,
 		}
 		return m, nil, true
 	}
-	return m, m.startHandoff(cur.ID), true
+	return m, m.startHandoff(coord.ID), true
 }
 
 // actionArchive dispatches [x] for the row under the cursor.
