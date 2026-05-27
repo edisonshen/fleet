@@ -1698,17 +1698,22 @@ func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
 	}
 }
 
-func TestSpawn_PreservesExistingRepo(t *testing.T) {
+func TestSpawn_PreservesExistingLiveRepo(t *testing.T) {
+	// Idempotency: when an existing `repo` value still points at a
+	// live directory, respawn must NOT overwrite it. Operator may
+	// have explicitly set a fork checkout / out-of-tree path; respawn
+	// should preserve that choice.
 	requireTmux(t)
 	home := setupFleetHome(t)
 
-	// Seed coord-config.json with an operator-set repo path.
+	// Seed coord-config.json with a REAL existing path (the iter-8
+	// change adds a Stat() check; preserve only applies to live dirs).
 	projDir := filepath.Join(home, "projects", "projects-rainier")
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(projDir, "coord-config.json")
-	preset := "/Users/op/projects/rainier-fork"
+	preset := t.TempDir() // real, exists on disk
 	if err := os.WriteFile(
 		cfgPath,
 		[]byte(`{"parallelism": 2, "repo": "`+preset+`"}`+"\n"),
@@ -1731,7 +1736,54 @@ func TestSpawn_PreservesExistingRepo(t *testing.T) {
 
 	data := readCoordConfig(t, home, "projects-rainier")
 	if data["repo"] != preset {
-		t.Errorf("existing repo overwritten: got %v want %q", data["repo"], preset)
+		t.Errorf("existing live repo overwritten: got %v want %q", data["repo"], preset)
+	}
+}
+
+func TestSpawn_OverwritesStaleRepoOnRespawn(t *testing.T) {
+	// iter-8 (codex P2 resolution): when an existing `repo` value
+	// points at a missing/deleted directory, respawn MUST overwrite
+	// it with the live cwd. Without this, the iter-5 stale-path
+	// refuse-on-tick path leaves projects permanently blocked even
+	// after the operator follows the on-screen guidance to re-spawn.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	// Stale path: directory was deleted/moved. Use a path inside the
+	// test's tempdir prefix that we explicitly do NOT mkdir.
+	staleRepo := filepath.Join(t.TempDir(), "deleted-checkout")
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+staleRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir() // the new live checkout
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != myCwd {
+		t.Errorf("stale repo not overwritten: got %v want %q (respawn-as-recovery broken)", data["repo"], myCwd)
+	}
+	// parallelism still preserved through the overwrite path:
+	if data["parallelism"] != float64(2) {
+		t.Errorf("parallelism clobbered during stale-repo overwrite: got %v want 2", data["parallelism"])
 	}
 }
 

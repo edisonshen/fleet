@@ -288,15 +288,41 @@ def test_write_preserves_existing_parallelism(tmp_path: Path) -> None:
     assert data == {"parallelism": 3, "repo": "/Users/op/projects/rainier"}
 
 
-def test_write_idempotent_preserves_existing_repo(tmp_path: Path) -> None:
-    """existing non-empty repo → NOT overwritten (operator-set wins)."""
+def test_write_idempotent_preserves_existing_live_repo(tmp_path: Path) -> None:
+    """existing non-empty repo pointing at a live dir → NOT overwritten
+    (operator-set wins). iter-8 makes this contingent on the path
+    actually existing on disk."""
     cfg = tmp_path / "coord-config.json"
+    live = tmp_path / "operator-fork"
+    live.mkdir()
     cfg.write_text(
-        '{"parallelism": 3, "repo": "/Users/op/projects/rainier-fork"}\n'
+        json.dumps({"parallelism": 3, "repo": str(live)})
     )
-    coord_config.write_repo_idempotent(cfg, "/Users/op/projects/rainier")
+    other = tmp_path / "other-checkout"
+    other.mkdir()
+    coord_config.write_repo_idempotent(cfg, str(other))
     data = json.loads(cfg.read_text())
-    assert data["repo"] == "/Users/op/projects/rainier-fork"
+    assert data["repo"] == str(live), "live operator-set repo must win"
+
+
+def test_write_overwrites_stale_existing_repo(tmp_path: Path) -> None:
+    """iter-8 (codex P2): existing repo pointing at a missing dir →
+    OVERWRITTEN by respawn. Without this, respawn-as-recovery (the
+    on-screen guidance from iter-5's stale-path refuse) is broken."""
+    cfg = tmp_path / "coord-config.json"
+    stale = tmp_path / "deleted-checkout"  # NOT created
+    cfg.write_text(
+        json.dumps({"parallelism": 3, "repo": str(stale)})
+    )
+    new_repo = tmp_path / "new-checkout"
+    new_repo.mkdir()
+    coord_config.write_repo_idempotent(cfg, str(new_repo))
+    data = json.loads(cfg.read_text())
+    assert data["repo"] == str(new_repo), (
+        "stale repo must be overwritten by respawn cwd"
+    )
+    # Sibling field preserved through overwrite:
+    assert data["parallelism"] == 3
 
 
 def test_write_overwrites_empty_repo(tmp_path: Path) -> None:

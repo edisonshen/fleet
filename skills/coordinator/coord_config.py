@@ -159,10 +159,17 @@ def write_repo_idempotent(config_path: Path | str, repo: str) -> None:
         # a clean one. This preserves the operator's intent (record the
         # repo) without inheriting garbage.
         data = {}
-    # Idempotency: preserve existing non-empty repo.
+    # Idempotency: preserve existing non-empty repo IFF the path
+    # still exists on disk. Stale paths get overwritten by the new
+    # `repo` value so respawn-as-recovery actually works (codex iter-8
+    # P2: without this, the iter-5 stale-path refuse-on-tick path
+    # would leave projects permanently blocked even after the operator
+    # follows the on-screen guidance to re-spawn).
     existing_repo = data.get("repo")
     if isinstance(existing_repo, str) and existing_repo.strip():
-        return
+        if os.path.isdir(existing_repo.strip()):
+            return
+        # Else: stale path → overwrite below.
     data["repo"] = repo
     # Atomic write: tmp + fsync + rename.
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=str(parent))

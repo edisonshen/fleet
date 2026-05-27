@@ -81,9 +81,22 @@ func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
 		return fmt.Errorf("read existing coord-config.json: %w", err)
 	}
 
-	// Idempotent: preserve non-empty operator-set repo.
+	// Idempotent: preserve existing non-empty repo IFF it still
+	// points at a live directory. Stale paths (deleted/moved
+	// checkout) get overwritten by the respawn cwd — without this,
+	// codex iter-5 P2 surfaces: an operator who hits the iter-5
+	// stale-path refuse path follows the on-screen guidance to
+	// "re-spawn the coord from inside the correct checkout," and
+	// the respawn correctly writes the new cwd here... except
+	// idempotency would silently preserve the stale value, leaving
+	// the project permanently refusing dispatch. Stat-checking the
+	// existing value lets respawn-as-recovery actually recover.
 	if existing, ok := data["repo"].(string); ok && strings.TrimSpace(existing) != "" {
-		return nil
+		if info, err := os.Stat(existing); err == nil && info.IsDir() {
+			return nil
+		}
+		// Stat failed or not-a-dir → overwrite with the live cwd
+		// (the respawn-as-recovery path).
 	}
 	data["repo"] = repo
 
