@@ -1863,18 +1863,13 @@ func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
 	}
 }
 
-func TestSpawn_HandoffDoesNotRestampCoordConfig(t *testing.T) {
-	// iter-17 (codex P2): on coord handoff/recovery (opts.OldRecord
-	// non-nil), Spawn must NOT write coord-config.json::repo. The
-	// handoff path inherits cwd from the outgoing record, which for
-	// a legacy coord could be the wrong path (the #175 bug). Restamping
-	// with the inherited bad path defeats the "re-spawn from the correct
-	// checkout" recovery the iter-9 unconditional-overwrite was meant
-	// to enable.
-	//
-	// Fresh spawn = operator typed `fleet dispatch --coord-spawn` from
-	// a chosen cwd; handoff = system-driven replacement that inherits
-	// (and could inherit a bad value).
+func TestSpawn_HandoffInheritedCwdSkipsCoordConfigStamp(t *testing.T) {
+	// iter-18: on coord handoff where Cwd is INHERITED (== OldRecord.Cwd),
+	// Spawn must NOT write coord-config.json::repo. The handoff
+	// inherits cwd from the outgoing record — that's system-driven
+	// inheritance, not operator-explicit. Restamping with the inherited
+	// value (which could be the wrong #175 cwd) blocks recovery via
+	// fresh-dispatch.
 	requireTmux(t)
 	home := setupFleetHome(t)
 
@@ -1894,22 +1889,22 @@ func TestSpawn_HandoffDoesNotRestampCoordConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Build an outgoing coord record (the handoff source).
+	inheritedCwd := t.TempDir()
 	old := agent.New("aaaa1111")
 	old.TaskID = "coord-projects-rainier"
 	old.Project = "projects-rainier"
 	old.Engine = "claude-code"
+	old.Cwd = inheritedCwd // pin inherited value
 	old.HandoffNumber = 1
 	prevPath := "/some/handoffs/aaaa0000-20260427-180000.md"
 	old.LastHandoffPath = &prevPath
 
 	docPath := "/some/handoffs/aaaa1111-20260427-184807.md"
-	handoffCwd := t.TempDir() // the handoff path's "inherited" cwd
 
 	rec, err := Spawn(Options{
 		OldRecord:  old,
 		NewDocPath: docPath,
-		Cwd:        handoffCwd, // would be the bad cwd in #175 scenario
+		Cwd:        inheritedCwd, // EQUALS OldRecord.Cwd → inheritance
 		Command:    []string{"sleep", "30"},
 	})
 	if err != nil {
@@ -1917,10 +1912,63 @@ func TestSpawn_HandoffDoesNotRestampCoordConfig(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
 
-	// coord-config.json::repo MUST be unchanged (sentinelRepo).
 	data := readCoordConfig(t, home, "projects-rainier")
 	if data["repo"] != sentinelRepo {
-		t.Errorf("handoff overwrote coord-config.json::repo: got %v want %q (handoff must skip the stamp; operator restamp lives in fresh-spawn only)",
+		t.Errorf("inherited-cwd handoff overwrote coord-config.json::repo: got %v want %q",
 			data["repo"], sentinelRepo)
+	}
+}
+
+func TestSpawn_RecoveryWithExplicitCwdRestampsCoordConfig(t *testing.T) {
+	// iter-18 (codex P2 fix): dead-coord recovery where operator
+	// passes a corrected --cwd (Spawn sees Cwd != OldRecord.Cwd)
+	// MUST restamp coord-config.json::repo. Without this, dead-coord
+	// recovery via `fleet dispatch --coord-spawn --cwd /correct`
+	// leaves the bad coord-config value, defeating the operator's
+	// explicit recovery action.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	badRepo := "/wrong/path/from/dead/coord"
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+badRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dead coord record with the bad cwd embedded:
+	dead := agent.New("aaaa1111")
+	dead.TaskID = "coord-projects-rainier"
+	dead.Project = "projects-rainier"
+	dead.Engine = "claude-code"
+	dead.Cwd = badRepo // matches the bad coord-config
+	dead.HandoffNumber = 1
+	prevPath := "/some/handoffs/aaaa0000-20260427-180000.md"
+	dead.LastHandoffPath = &prevPath
+
+	// Operator runs `fleet dispatch --coord-spawn --cwd /correct/path`:
+	correctCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		OldRecord:  dead,
+		NewDocPath: "/some/handoffs/aaaa1111-20260427-184807.md",
+		Cwd:        correctCwd, // DIFFERS from dead.Cwd → operator override
+		Command:    []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != correctCwd {
+		t.Errorf("recovery did not restamp coord-config.json::repo: got %v want %q (operator-supplied --cwd must override)",
+			data["repo"], correctCwd)
 	}
 }
