@@ -453,15 +453,31 @@ func taskStatusRawInFile(path, slug string) (status string, found bool, err erro
 
 // pidAliveOnDisk is the production PidAlive. Uses signal 0 — POSIX
 // "is the process there?" probe that doesn't actually deliver a signal.
-// Returns false on any error (process gone, permission denied on a
-// different user's pid, etc).
+//
+// Error handling (codex iter-4 [P2]):
+//   - nil err → process exists → alive
+//   - ESRCH (no such process) → dead
+//   - EPERM (process exists but we lack signal permission — different
+//     uid, sudo-crossed environment) → ALIVE. Other liveness checks in
+//     fleet (internal/workers.IsAlive, dispatch recovery) treat EPERM
+//     as alive; treating it as dead here would let
+//     `fleet gc --apply --kinds=worker-records` remove a live worker
+//     directory in shared/sudo environments.
+//   - any other error (rare; e.g., EINVAL on negative pid) → conservative
+//     fail-closed treat as alive so a transient probe quirk doesn't
+//     orphan a worker.
 func pidAliveOnDisk(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	if err := syscall.Kill(pid, 0); err != nil {
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, syscall.ESRCH) {
 		return false
 	}
+	// EPERM or any other non-ESRCH → conservative ALIVE.
 	return true
 }
 

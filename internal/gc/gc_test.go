@@ -2688,6 +2688,24 @@ func TestLoadWorkerStateOnDisk(t *testing.T) {
 	}
 }
 
+// TestPidAliveOnDisk_TreatsEPERMAsAlive pins the conservative-alive
+// behavior for permission-denied probe results (codex iter-4 [P2]).
+// In shared / sudo-crossed environments, kill(pid, 0) can return EPERM
+// for a process that DOES exist but belongs to a different uid.
+// Returning false would let `fleet gc --apply --kinds=worker-records`
+// remove a live worker directory. Mirrors internal/workers.IsAlive +
+// dispatch recovery's liveness contract.
+func TestPidAliveOnDisk_TreatsEPERMAsAlive(t *testing.T) {
+	// pid 1 (launchd / init) exists on every macOS+Linux system but
+	// cannot be signaled by a non-root caller → kill(1, 0) returns
+	// EPERM under the test process's normal uid. (When the test
+	// happens to run as root, kill(1, 0) returns nil — also alive.
+	// Either way the assertion holds.)
+	if !pidAliveOnDisk(1) {
+		t.Errorf("pidAliveOnDisk(1) reported dead — EPERM must collapse to alive (would let --apply remove a live worker dir in sudo-crossed environments)")
+	}
+}
+
 // TestLoadTaskStatusOnDisk_ArchivePresenceIsTerminal pins the
 // archive-is-dispositive invariant (codex iter-2 [P2] follow-up). The
 // `fleet tasks archive` flow (internal/tasks.go Archive) moves task
