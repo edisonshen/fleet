@@ -857,8 +857,16 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// fails the spawn. The worst case is the coord skill falls back
 	// to legacy cwd-derived behavior + emits a fallback warning.
 	if isCoordSpawn(rec.TaskID, rec.Project) {
+		// Operator-supplied cwd (vs system-inherited)?
+		// - OldRecord nil → fresh dispatch (operator chose cwd).
+		// - OldRecord.Cwd empty → legacy/upgraded record without cwd
+		//   info; treat any cwd as operator-supplied (iter-19 P2:
+		//   without this, legacy recovery never stamps).
+		// - OldRecord.Cwd non-empty + cwd differs → operator override.
+		// - OldRecord.Cwd non-empty + cwd matches → inheritance (skip).
 		operatorOverrideCwd := opts.OldRecord == nil ||
-			(opts.OldRecord.Cwd != "" && cwd != opts.OldRecord.Cwd)
+			opts.OldRecord.Cwd == "" ||
+			cwd != opts.OldRecord.Cwd
 		if operatorOverrideCwd {
 			fhome := fleetHomeForSpawn()
 			if fhome != "" {

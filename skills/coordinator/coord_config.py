@@ -20,20 +20,22 @@ Spawn (internal/spawn/spawn.go) writes this file on coord-spawn:
   - merge-safe: existing parallelism + future fields untouched
   - atomic: write to tmp + rename + fsync (no half-written files)
 
-loop.tick (skills/coordinator/loop.py) reads + validates (iter-11
-tiered authority):
+loop.tick (skills/coordinator/loop.py) reads + validates (iter-19
+final tiered authority):
 
   1. meta.json::repo_path (operator-set via `fleet project add`) is
      the AUTHORITATIVE source. When present, wins outright; URL
      heuristic bypassed. Custom-named clones / forks / vanity URLs
      all work — operator's explicit registration overrides
-     heuristic ambiguity.
+     heuristic ambiguity. Strict safety lives here: stale path →
+     refuse; divergence from coord-config → warn + override.
 
   2. coord-config.json::repo (set by Spawn from cwd at spawn-time)
      is the fallback for projects without meta.json. URL heuristic
-     is the ONLY safety check here, so mismatch REFUSES dispatch.
-     Custom-named operators bypass via `fleet project add` →
-     meta.json; #175 cross-project corruption is prevented.
+     is a SOFT SIGNAL — mismatch warns but doesn't refuse, because
+     the operator stamped this value explicitly at coord-spawn and
+     refusing on a fuzzy match would defeat their choice. Stale
+     path / non-git path → refuse (unambiguous errors).
 
   3. Caller cwd / os.getcwd() — legacy fallback (pre-#175 installs).
 
@@ -41,16 +43,23 @@ tiered authority):
     - meta.json::repo_path points at missing dir → meta-repo-missing
     - coord-config.json::repo points at missing dir →
       coord-config-repo-missing
-    - coord-config.json::repo + origin URL mismatches heuristic
-      (no meta.json) → coord-config-repo-mismatch (includes
-      `fleet project add` recovery hint in error message)
+    - coord-config.json::repo is not a git work tree →
+      coord-config-repo-not-git
 
   Warn-and-proceed paths (cwd set, dispatch continues):
     - meta.json present + differs from coord-config → use meta.json
-      + divergence warning
-    - coord-config present + no `origin` remote (local-only repo) →
-      soft warning, can't validate
+      + divergence warning (operator-authoritative override)
+    - coord-config present + no `origin` remote (local-only repo
+      with .git) → soft warning, can't heuristic-validate
+    - coord-config present + origin URL mismatches heuristic →
+      soft warning, recovery hint `fleet project add`
     - No repo at all → fall back to caller cwd + warning
+
+iter-history note: codex flipped 5+ times between refuse-on-mismatch
+and warn-on-mismatch for the no-meta.json branch. Both behaviors
+have real downsides. Iter-19 chose warn-but-proceed per
+feedback_coord_makes_engineering_calls — the meta.json tier is
+where strict safety lives; the coord-config tier is best-effort.
 """
 from __future__ import annotations
 

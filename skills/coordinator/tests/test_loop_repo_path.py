@@ -521,27 +521,29 @@ def test_tick_missing_repo_falls_back_with_warning(
     ), f"expected fallback warning in errors; got {result.errors}"
 
 
-def test_tick_remote_mismatch_no_meta_refuses_dispatch(
+def test_tick_remote_mismatch_no_meta_warns_but_proceeds(
     tmp_path: Path, monkeypatch,
 ) -> None:
     """coord-config.json::repo set, no meta.json, origin URL mismatches
-    project tag heuristic → REFUSE dispatch with
-    `coord-config-repo-mismatch`.
+    project tag heuristic → WARN in TickResult.errors but PROCEED.
 
-    iter-11 (codex P1 final resolution): the iter-6..iter-9
-    warn-but-proceed behavior allowed the #175 cross-project
-    corruption to fire silently for legacy projects (the exact class
-    of bug this PR is supposed to fix). The codex iter-2 concern
-    (custom-named clones get refused) is now handled by meta.json
-    (iter-7) — operators with `~/work/fleet-v2` should run
-    `fleet project add ~/work/fleet-v2` to register the path
-    authoritatively. meta.json wins over coord-config + bypasses
-    the heuristic; custom-name support lives in the authoritative
-    tier, not in the no-meta.json heuristic tier."""
+    iter-19 (codex contradiction final resolution): codex flipped
+    repeatedly between refuse-on-mismatch (P1: prevents #175
+    corruption) and warn-only (P1: refuse breaks legitimate custom
+    aliases and custom-named clones with no working recovery path).
+    Final engineering call: warn-but-proceed. The configured `repo`
+    field is the operator's stamped spawn-time value; refusing on a
+    fuzzy heuristic match defeats their explicit choice. Strict
+    safety lives at the meta.json tier — operators wanting refuse
+    register via `fleet project add` to write meta.json::repo_path.
+
+    Trade-off acknowledged: legacy/no-meta.json projects with a
+    truly-wrong coord-config.json::repo silently dispatch from the
+    wrong checkout. Recovery: the warning IS surfaced in
+    TickResult.errors; operator can detect via tick output and
+    register meta.json for the safety upgrade."""
     project = "projects-rainier"
     home = _seed_fleet_home(tmp_path, project)
-    # The #175 scenario: coord-spawn from /fleet/ for project rainier.
-    # No meta.json registered → heuristic is the only safety check.
     repo = tmp_path / "fleet-checkout"
     repo.mkdir()
     cfg = home / "projects" / project / "coord-config.json"
@@ -552,11 +554,11 @@ def test_tick_remote_mismatch_no_meta_refuses_dispatch(
         lambda repo_path: "git@github.com:edisonshen/fleet.git",
     )
 
-    called = {"n": 0}
+    seen_cwd: list[str] = []
     real_tick_locked = loop._tick_locked
 
     def spy(*args, **kwargs):
-        called["n"] += 1
+        seen_cwd.append(args[4])
         return real_tick_locked(*args, **kwargs)
 
     monkeypatch.setattr(loop, "_tick_locked", spy)
@@ -565,13 +567,16 @@ def test_tick_remote_mismatch_no_meta_refuses_dispatch(
         project, coord_id="", cwd=str(tmp_path),
         fleet_home=str(home),
     )
-    assert called["n"] == 0, (
-        "mismatch must short-circuit BEFORE _tick_locked runs"
+    # MUST proceed (configured repo is operator-stamped):
+    assert result.skipped is False, (
+        f"mismatch should warn + proceed; got skipped: {result.reason!r}"
     )
-    assert result.skipped is True
-    assert result.reason == "coord-config-repo-mismatch"
-    assert result.raised >= 1
-    # Recovery hint must be present in the error message:
+    assert seen_cwd and seen_cwd[0] == str(repo)
+    # MUST surface the heuristic-mismatch warning:
+    assert any(
+        "does not match" in e and project in e for e in result.errors
+    ), f"expected mismatch warning mentioning project; got {result.errors}"
+    # MUST include the recovery hint (`fleet project add`):
     assert any(
         "fleet project add" in e for e in result.errors
     ), f"expected `fleet project add` recovery hint; got {result.errors}"

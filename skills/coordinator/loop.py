@@ -249,7 +249,7 @@ def tick(
     #   3. caller cwd / os.getcwd() — legacy fallback (pre-fleet#175
     #      installs). Warning surfaced.
     #
-    # ASCII:
+    # ASCII (iter-19 final):
     #
     #   meta.json::repo_path present?
     #     yes:
@@ -260,20 +260,19 @@ def tick(
     #     no:
     #       coord-config.json::repo present?
     #         path missing? → refuse (coord-config-repo-missing)
+    #         path not a git work tree? → refuse (coord-config-repo-not-git)
     #         use as cwd; URL heuristic check:
-    #           empty origin → soft warning (local-only repo OK)
-    #           heuristic mismatch → refuse (coord-config-repo-mismatch)
-    #             — operator-recovery hint: `fleet project add`
+    #           empty origin (real git repo) → soft warning
+    #           heuristic mismatch → soft warning + recovery hint
     #           match → silent
     #       no → fallback to caller cwd + warning
     #
-    # iter-11: refuse-on-mismatch for the no-meta.json branch.
-    # iter-2..iter-9 alternated between refuse/warn behavior — codex
-    # surfaced both classes of bug. Final answer: refuse for safety,
-    # provide an explicit operator-recovery path (`fleet project add`)
-    # via meta.json for custom names. Cross-project corruption (#175)
-    # is what this PR fixes; allowing it on heuristic ambiguity would
-    # defeat the change.
+    # Heuristic semantics: soft signal only. Strict safety lives at
+    # the meta.json tier (operators wanting refuse-on-mismatch
+    # register via `fleet project add`). Codex flipped 5+ times on
+    # the heuristic refuse-vs-warn question — final call per
+    # feedback_coord_makes_engineering_calls + the operator's
+    # stated rubrics.
     #
     # Lives between lock acquire and _tick_locked so the refuse-paths
     # release the lock cleanly via the local fcntl.flock_un dance.
@@ -374,44 +373,49 @@ def tick(
                 f"register an authoritative path.)"
             )
         elif not coord_config.remote_matches_project(remote, project):
-            # iter-11 (codex P1): mismatch in the no-meta.json branch
-            # MUST refuse. The earlier iter-6..iter-9 "warn but proceed"
-            # behavior allowed the #175 cross-project corruption to
-            # silently fire for legacy projects (the exact class of
-            # bug this PR is supposed to fix).
+            # Mismatch in the no-meta.json branch is a SOFT WARNING.
             #
-            # The codex iter-2 concern (custom-named clones get
-            # refused) is now handled by meta.json: operators with
-            # `~/work/fleet-v2` cloned from `fleet.git` should run
-            # `fleet project add ~/work/fleet-v2` to register the
-            # path explicitly. meta.json::repo_path wins over
-            # coord-config + bypasses the heuristic, so custom names
-            # are supported via the authoritative tier.
+            # Iter-history on this question: codex flipped between
+            # refuse-on-mismatch (iter-4/6/8/11 P1, "prevents #175
+            # corruption") and warn-only (iter-2/3/16/18 P1, "refuse
+            # breaks legitimate custom-aliased projects and
+            # custom-named clones that have no working `fleet project
+            # add` recovery path"). Both are real concerns.
             #
-            # The refuse message includes the specific recovery hint
-            # (`fleet project add`) so the operator sees the path to
-            # un-block without losing data.
-            msg = (
+            # Final call (iter-19, codex contradiction resolved per
+            # CLAUDE.md §4 + feedback_coord_makes_engineering_calls):
+            # warn-but-proceed. The configured `repo` field is what
+            # the operator stamped at coord-spawn time; refusing to
+            # honor it on a fuzzy name-match would defeat the
+            # operator's explicit choice. The heuristic remains as
+            # a SIGNAL — operator sees the warning and can investigate
+            # — but it is NOT a gate.
+            #
+            # Strict safety (refuse on mismatch) lives at the
+            # meta.json tier: operators wanting the strict check
+            # run `fleet project add <path>` and meta.json wins over
+            # coord-config + the heuristic doesn't apply. This is the
+            # documented "use meta.json for safety" tiered authority
+            # introduced in iter-7.
+            #
+            # Real risk acknowledged: legacy/no-meta.json projects with
+            # a wrong coord-config.json::repo silently dispatch from
+            # the wrong checkout. Recovery: warning in TickResult.errors
+            # surfaces the signal; operator can detect via tick output
+            # and run `fleet project add` to register meta.json (which
+            # then takes over and refuses if the configured repo is
+            # truly wrong).
+            result.errors.append(
                 f"coord-config.json::repo={configured_repo!r} "
                 f"(origin={remote!r}) does not match the heuristic "
-                f"for project {project!r} — refusing dispatch to "
-                f"prevent cross-project corruption (issue #175). "
-                f"To recover: run "
-                f"`fleet project add {configured_repo}` to register "
-                f"the path as authoritative (operator-explicit), OR "
-                f"re-spawn the coord from the correct checkout."
+                f"for project {project!r}. Proceeding because the "
+                f"`repo` field is the operator-stamped spawn-time "
+                f"value; if the configured checkout is wrong, fix "
+                f"coord-config.json or re-spawn from the correct "
+                f"directory. For strict validation, register via "
+                f"`fleet project add {configured_repo}` to write "
+                f"meta.json::repo_path (the authoritative tier)."
             )
-            import sys as _sys
-            _sys.stderr.write(msg + "\n")
-            result.errors.append(msg)
-            result.skipped = True
-            result.reason = "coord-config-repo-mismatch"
-            result.raised += 1
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
-            return result
         cwd = configured_repo
     else:
         # Neither meta.json nor coord-config.json::repo — pre-#175
