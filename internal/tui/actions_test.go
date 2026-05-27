@@ -1990,6 +1990,39 @@ func TestHelpOverlay_AttachDescriptionMentionsProjects(t *testing.T) {
 	}
 }
 
+// TestHelpOverlay_HandoffDescriptionMentionsProjects pins the
+// 2026-05-27 [h] inversion: the [?] help overlay must describe [h] as
+// firing on PROJECT rows (for the project's coord), NOT "agents only".
+// Old text was "handoff (agents only)" and would silently mislead
+// operators after the inversion shipped (they'd press [h] on an agent
+// row, get the redirect flash, and have no idea where to go next).
+//
+// Parallel to TestHelpOverlay_AttachDescriptionMentionsProjects (issue
+// #60): help text must track keybind semantics.
+func TestHelpOverlay_HandoffDescriptionMentionsProjects(t *testing.T) {
+	out := renderHelpOverlay(120)
+	// Walk lines looking for the [h] row so we don't get a false pass
+	// from "projects" appearing elsewhere (e.g., the [a] row).
+	var hLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "h") && strings.Contains(line, "handoff") {
+			hLine = line
+			break
+		}
+	}
+	if hLine == "" {
+		t.Fatalf("no [h] handoff row in help overlay; got:\n%s", out)
+	}
+	if !strings.Contains(hLine, "project") {
+		t.Errorf("[h] help row should mention project (post-inversion); got %q", hLine)
+	}
+	// Old wording must be gone so a regression of the inversion is
+	// caught at test time.
+	if strings.Contains(hLine, "agents only") {
+		t.Errorf("[h] help row still says 'agents only' — inversion docs out of sync; got %q", hLine)
+	}
+}
+
 // TestCoordCwdForProject_ProjectMetaBeatsAgentRecordCwd pins fresh
 // coord spawns after PLAN-DOC/TASK-PLAN-DOC: worker records may point
 // at worktrees, so the registered project repo path must win.
