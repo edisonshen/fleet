@@ -104,6 +104,87 @@ def test_validate_remote_empty_url() -> None:
     assert not coord_config.remote_matches_project("", "projects-rainier")
 
 
+# ---------- coord_config.remote_matches_project: false-positive guards ----------
+#
+# review iter-3 regression suite: the original delimited-substring
+# heuristic false-positive-matched `projects-rainier` against any URL
+# whose repo segment merely *contained* `rainier` bordered by `-`/`_`/
+# `:`/`/` (e.g., `rainier-app.git`, `projects-rainier-app.git`). That
+# defeats issue #175's safety goal — the whole point of the remote
+# check is to refuse dispatch when the configured checkout doesn't
+# belong to the project. Pin the strict segment-equality behavior so
+# the looser heuristic can't slip back in via a future "be more
+# permissive" refactor.
+
+
+def test_validate_remote_rejects_suffix_repo() -> None:
+    """`projects-rainier` must NOT match a `rainier-app.git` remote.
+
+    Repro: operator stamps coord-config.json::repo with a checkout
+    whose origin points at a sibling repo sharing the prefix. The
+    original delimited-substring heuristic accepted this because
+    `-` was a valid right-delimiter; the strict segment match rejects
+    it (`tail=rainier-app` != `bare=rainier`).
+    """
+    assert not coord_config.remote_matches_project(
+        "https://github.com/org/rainier-app.git",
+        "projects-rainier",
+    )
+
+
+def test_validate_remote_rejects_prefix_repo() -> None:
+    """`projects-fleet` must NOT match a `fleet-cli.git` remote."""
+    assert not coord_config.remote_matches_project(
+        "git@github.com:foo/fleet-cli.git",
+        "projects-fleet",
+    )
+
+
+def test_validate_remote_rejects_projects_prefixed_lookalike() -> None:
+    """`projects-rainier` must NOT match `projects-rainier-app.git`."""
+    assert not coord_config.remote_matches_project(
+        "https://github.com/org/projects-rainier-app.git",
+        "projects-rainier",
+    )
+
+
+def test_validate_remote_rejects_nested_path_segment_with_match() -> None:
+    """`projects-fleet` must NOT match a URL with `fleet` as an
+    intermediate path component (e.g., `https://host/fleet/cli.git`)."""
+    # Only the BASENAME (after the final `/`) is compared. A repo named
+    # `cli` whose path happens to traverse `fleet/` is not a fleet repo.
+    assert not coord_config.remote_matches_project(
+        "https://github.com/foo/fleet/cli.git",
+        "projects-fleet",
+    )
+
+
+def test_validate_remote_rejects_underscore_suffix() -> None:
+    """Underscore-delimited suffixes (`rainier_app`) must NOT match."""
+    assert not coord_config.remote_matches_project(
+        "https://github.com/org/rainier_app.git",
+        "projects-rainier",
+    )
+
+
+def test_validate_remote_accepts_no_dot_git_suffix() -> None:
+    """Remotes without `.git` suffix (`https://host/org/fleet`) must
+    still match — `git remote get-url` returns whatever the operator
+    set, which may omit `.git`."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/edisonshen/fleet",
+        "projects-fleet",
+    )
+
+
+def test_validate_remote_accepts_scp_style_no_path() -> None:
+    """SCP-style `git@host:repo.git` (no nested org/) still parses."""
+    assert coord_config.remote_matches_project(
+        "git@example.com:fleet.git",
+        "projects-fleet",
+    )
+
+
 # ---------- coord_config.py: idempotent write ----------
 
 

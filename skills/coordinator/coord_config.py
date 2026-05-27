@@ -136,13 +136,28 @@ def git_remote_origin(repo_path: str) -> str:
 def remote_matches_project(remote_url: str, project: str) -> bool:
     """Heuristic: does the `origin` URL look like it belongs to `project`?
 
-    We strip the `projects-` prefix from the fleet-side project name
+    Strips the `projects-` prefix from the fleet-side project name
     (a fleet bookkeeping convention; the github repo is named without
-    it) and check the remote URL contains the bare name as a delimited
-    token — surrounded by `/`, `:`, `-`, `_`, or string boundary, AND
-    the immediately-following char must not be a letter/digit. The
-    delimiter check prevents `projects-fleet` from matching a URL
-    containing `fleetwood` etc.
+    it) and checks that the **repo segment** of the URL (the basename
+    after the final `/` or `:`, with any trailing `.git` stripped)
+    equals the bare name exactly.
+
+    Rationale for the strict segment-equality match (fleet#175 review
+    iter-3): a looser "delimited substring" match was rejected because
+    `-` and `_` as delimiters meant `projects-rainier` falsely matched
+    a remote like `github.com/org/rainier-app.git` (bare=`rainier`,
+    found as a `<slash>rainier<dash>` substring). False-positive
+    validation defeats the entire purpose of issue #175's safety check
+    — refuse dispatch when the configured repo does NOT belong to the
+    project. Better to demand the operator match the github repo name
+    than to silently pass a near-miss.
+
+    Fork / vanity-name edge case: operator points at
+    `~/projects/rainier-fork` whose origin is
+    `github.com/edisonshen/rainier-fork.git`. This returns False; the
+    operator either (a) renames the local checkout to match the github
+    repo name or (b) accepts the warning and re-spawns. Loose matching
+    here is the bug.
 
     Empty inputs always return False — we never false-positive when
     the data we'd validate against isn't there.
@@ -152,19 +167,14 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
     bare = project.removeprefix("projects-")
     if not bare:
         return False
-    # Trim a trailing `.git` so it doesn't poison the boundary check.
-    needle_url = remote_url
-    if needle_url.endswith(".git"):
-        needle_url = needle_url[: -len(".git")]
-    # Look for `<delim>bare<delim>` or `<delim>bare<end>`.
-    delims = "/:_-"
-    n = len(bare)
-    for i in range(len(needle_url) - n + 1):
-        if needle_url[i : i + n] != bare:
-            continue
-        before_ok = i == 0 or needle_url[i - 1] in delims
-        after_idx = i + n
-        after_ok = after_idx == len(needle_url) or needle_url[after_idx] in delims
-        if before_ok and after_ok:
-            return True
-    return False
+    # Strip protocol + path prefix down to the repo basename. Two URL
+    # shapes are common:
+    #   1. https://github.com/org/repo.git  → tail = "repo.git"
+    #   2. git@github.com:org/repo.git      → after rsplit("/") = "repo.git"
+    # The double rsplit handles SCP-style remotes with no nested path
+    # (`git@host:repo.git`) as well.
+    tail = remote_url.rsplit("/", 1)[-1]
+    tail = tail.rsplit(":", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[: -len(".git")]
+    return tail == bare
