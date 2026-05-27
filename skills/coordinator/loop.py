@@ -230,18 +230,21 @@ def tick(
         return result
     # 1.5. Resolve worktree-base repo (fleet#175).
     #
-    # Sources, in order of authority (iter-7):
+    # Sources, in order of authority:
     #
-    #   1. meta.json::repo_path — set by `fleet project add`. This is
-    #      the OPERATOR-AUTHORITATIVE registration. When present, it
-    #      wins outright.
+    #   1. meta.json::repo_path — set by `fleet project add`.
+    #      OPERATOR-AUTHORITATIVE. When present, wins outright;
+    #      URL heuristic is bypassed entirely. Custom-named clones,
+    #      forks, vanity URLs all work — operator's explicit
+    #      registration overrides any heuristic ambiguity.
     #
     #   2. coord-config.json::repo — set by Spawn from cwd at coord-
     #      spawn time. Authoritative for projects NOT registered via
-    #      `fleet project add` (legacy / direct-spawn flows). When
-    #      present without meta.json, used as cwd; URL heuristic
-    #      becomes a soft warning (can't distinguish custom-name from
-    #      wrong-repo without an authoritative source).
+    #      `fleet project add` (legacy / direct-spawn flows). URL
+    #      heuristic is the ONLY safety check here, so mismatch
+    #      REFUSES dispatch (custom-name operators register via
+    #      `fleet project add` to bypass; #175 corruption is
+    #      prevented).
     #
     #   3. caller cwd / os.getcwd() — legacy fallback (pre-fleet#175
     #      installs). Warning surfaced.
@@ -250,28 +253,27 @@ def tick(
     #
     #   meta.json::repo_path present?
     #     yes:
-    #       path missing on disk? → refuse (clear: meta.json points
-    #                                       at a stale checkout)
+    #       path missing on disk? → refuse (meta-repo-missing)
     #       differs from coord-config.json::repo? → use meta.json +
-    #                                                soft warning
+    #                                                divergence warning
     #       matches (or coord-config absent)? → use meta.json silently
     #     no:
     #       coord-config.json::repo present?
-    #         path missing? → refuse (stale path)
+    #         path missing? → refuse (coord-config-repo-missing)
     #         use as cwd; URL heuristic check:
-    #           empty origin → soft warning
-    #           heuristic mismatch → soft warning
+    #           empty origin → soft warning (local-only repo OK)
+    #           heuristic mismatch → refuse (coord-config-repo-mismatch)
+    #             — operator-recovery hint: `fleet project add`
     #           match → silent
     #       no → fallback to caller cwd + warning
     #
-    # Why meta.json wins over coord-config (iter-7, codex P1
-    # resolution): the URL heuristic can't disambiguate "operator
-    # cloned with a custom local name" (legit) from "coord spawned
-    # from wrong cwd" (the #175 bug). meta.json::repo_path is set
-    # explicitly by the operator via `fleet project add` — when
-    # present, it's the source of truth. coord-config.json::repo
-    # written by spawn from a buggy cwd is exactly the corruption
-    # #175 prevents; meta.json overrides that corruption.
+    # iter-11: refuse-on-mismatch for the no-meta.json branch.
+    # iter-2..iter-9 alternated between refuse/warn behavior — codex
+    # surfaced both classes of bug. Final answer: refuse for safety,
+    # provide an explicit operator-recovery path (`fleet project add`)
+    # via meta.json for custom names. Cross-project corruption (#175)
+    # is what this PR fixes; allowing it on heuristic ambiguity would
+    # defeat the change.
     #
     # Lives between lock acquire and _tick_locked so the refuse-paths
     # release the lock cleanly via the local fcntl.flock_un dance.
@@ -339,17 +341,44 @@ def tick(
                 f"register an authoritative path.)"
             )
         elif not coord_config.remote_matches_project(remote, project):
-            result.errors.append(
+            # iter-11 (codex P1): mismatch in the no-meta.json branch
+            # MUST refuse. The earlier iter-6..iter-9 "warn but proceed"
+            # behavior allowed the #175 cross-project corruption to
+            # silently fire for legacy projects (the exact class of
+            # bug this PR is supposed to fix).
+            #
+            # The codex iter-2 concern (custom-named clones get
+            # refused) is now handled by meta.json: operators with
+            # `~/work/fleet-v2` cloned from `fleet.git` should run
+            # `fleet project add ~/work/fleet-v2` to register the
+            # path explicitly. meta.json::repo_path wins over
+            # coord-config + bypasses the heuristic, so custom names
+            # are supported via the authoritative tier.
+            #
+            # The refuse message includes the specific recovery hint
+            # (`fleet project add`) so the operator sees the path to
+            # un-block without losing data.
+            msg = (
                 f"coord-config.json::repo={configured_repo!r} "
                 f"(origin={remote!r}) does not match the heuristic "
-                f"for project {project!r}. Proceeding because there "
-                f"is no meta.json::repo_path to authoritatively "
-                f"override; run `fleet project add {configured_repo}` "
-                f"to register the canonical path and remove this "
-                f"warning. If the configured checkout is wrong, fix "
-                f"coord-config.json or re-spawn from the correct "
-                f"directory."
+                f"for project {project!r} — refusing dispatch to "
+                f"prevent cross-project corruption (issue #175). "
+                f"To recover: run "
+                f"`fleet project add {configured_repo}` to register "
+                f"the path as authoritative (operator-explicit), OR "
+                f"re-spawn the coord from the correct checkout."
             )
+            import sys as _sys
+            _sys.stderr.write(msg + "\n")
+            result.errors.append(msg)
+            result.skipped = True
+            result.reason = "coord-config-repo-mismatch"
+            result.raised += 1
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+            return result
         cwd = configured_repo
     else:
         # Neither meta.json nor coord-config.json::repo — pre-#175

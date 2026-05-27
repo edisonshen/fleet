@@ -20,23 +20,20 @@ Spawn (internal/spawn/spawn.go) writes this file on coord-spawn:
   - merge-safe: existing parallelism + future fields untouched
   - atomic: write to tmp + rename + fsync (no half-written files)
 
-loop.tick (skills/coordinator/loop.py) reads + validates (iter-7,
+loop.tick (skills/coordinator/loop.py) reads + validates (iter-11
 tiered authority):
 
   1. meta.json::repo_path (operator-set via `fleet project add`) is
-     the AUTHORITATIVE source. When present, it wins outright over
-     coord-config.json::repo. This is the resolution for the codex
-     P1 contradiction (iter-2: heuristic refuse breaks legit
-     custom-name registrations; iter-4: heuristic warn-only allows
-     #175 wrong-repo dispatch). Operator-set repo_path is neither
-     a heuristic nor subject to the #175 spawn-time bug.
+     the AUTHORITATIVE source. When present, wins outright; URL
+     heuristic bypassed. Custom-named clones / forks / vanity URLs
+     all work — operator's explicit registration overrides
+     heuristic ambiguity.
 
   2. coord-config.json::repo (set by Spawn from cwd at spawn-time)
-     is the fallback for projects without meta.json. The URL
-     heuristic check stays as a SOFT WARNING (can't distinguish
-     custom-name from wrong-repo without authoritative source);
-     operator is nudged to run `fleet project add` to register an
-     authoritative path.
+     is the fallback for projects without meta.json. URL heuristic
+     is the ONLY safety check here, so mismatch REFUSES dispatch.
+     Custom-named operators bypass via `fleet project add` →
+     meta.json; #175 cross-project corruption is prevented.
 
   3. Caller cwd / os.getcwd() — legacy fallback (pre-#175 installs).
 
@@ -44,12 +41,15 @@ tiered authority):
     - meta.json::repo_path points at missing dir → meta-repo-missing
     - coord-config.json::repo points at missing dir →
       coord-config-repo-missing
+    - coord-config.json::repo + origin URL mismatches heuristic
+      (no meta.json) → coord-config-repo-mismatch (includes
+      `fleet project add` recovery hint in error message)
 
   Warn-and-proceed paths (cwd set, dispatch continues):
     - meta.json present + differs from coord-config → use meta.json
       + divergence warning
-    - coord-config present (no meta.json) + URL empty/mismatch →
-      soft warning
+    - coord-config present + no `origin` remote (local-only repo) →
+      soft warning, can't validate
     - No repo at all → fall back to caller cwd + warning
 """
 from __future__ import annotations
