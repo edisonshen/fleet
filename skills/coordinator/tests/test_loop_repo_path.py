@@ -238,25 +238,43 @@ def test_validate_remote_accepts_single_token_project() -> None:
     )
 
 
-def test_validate_remote_accepts_hyphenated_parent_dir() -> None:
-    """Parent dirs with internal hyphens (`/src/my-org/my-project`)
-    yield tag `my-org-my-project`. Origin basename `my-project` must
-    still match.
+def test_validate_remote_rejects_hyphenated_parent_dir_via_heuristic() -> None:
+    """Hyphenated parent dirs (`/src/my-org/my-project` → tag
+    `my-org-my-project`) do NOT pass the strict first-`-`-split
+    heuristic. iter-12 (codex P1 final resolution) accepts this
+    tradeoff because:
 
-    review iter-5 (codex P2 finding): the iter-4 split-first-`-`-token
-    code yielded bare=`org-my-project`, which would refuse this
-    legitimate registration. The suffix-equality heuristic accepts it
-    correctly (tag endswith `-my-project`)."""
-    assert coord_config.remote_matches_project(
+      - Allowing suffix-only matches lets `projects-rainier-app`
+        ↔ `app.git` pass silently (codex iter-9 P1) → #175
+        corruption for the legacy/no-meta.json path.
+
+      - Hyphenated-parent operators have an explicit escape hatch:
+        register the checkout via `fleet project add` to set
+        meta.json::repo_path. meta.json wins over coord-config +
+        bypasses this heuristic entirely (iter-7)."""
+    assert not coord_config.remote_matches_project(
         "git@github.com:src/my-project.git",
         "my-org-my-project",
     )
 
 
-def test_validate_remote_accepts_double_hyphenated_parent() -> None:
-    """More-than-2-segment tag (`a-b-c-d` from `/a-b/c-d`) still works."""
-    assert coord_config.remote_matches_project(
-        "https://github.com/x/c-d.git",
+def test_validate_remote_rejects_iter9_suffix_lookalike() -> None:
+    """iter-12 explicit regression: codex iter-9 P1. Project tag
+    `projects-rainier-app` must NOT match a remote whose basename is
+    just `app` (the trailing token), because that would mean a coord
+    misconfigured with `repo` pointing at a sibling `app/` checkout
+    silently dispatches workers there — exactly the cross-project
+    corruption #175 prevents."""
+    assert not coord_config.remote_matches_project(
+        "https://github.com/org/app.git",
+        "projects-rainier-app",
+    )
+
+
+def test_validate_remote_rejects_iter9_suffix_lookalike_short() -> None:
+    """Single-token suffix lookalike: tag=`a-b-c-d`, URL=`d`."""
+    assert not coord_config.remote_matches_project(
+        "https://github.com/x/d.git",
         "a-b-c-d",
     )
 

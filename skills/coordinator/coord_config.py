@@ -201,57 +201,62 @@ def git_remote_origin(repo_path: str) -> str:
 def remote_matches_project(remote_url: str, project: str) -> bool:
     """Heuristic: does the `origin` URL look like it belongs to `project`?
 
-    Fleet project tags are `<parent-dir>-<repo-basename>` via
-    `internal/projects.TagForPath`. Both halves can themselves contain
-    `-` (sanitized parent `my-org`, sanitized base `my-project`), so
-    the tag `my-org-my-project` cannot be unambiguously inverted by
-    splitting on `-`. Rather than try, this function checks whether
-    the URL basename appears as the **suffix** of the project tag,
-    preceded by `-` (the parent/base boundary). If the tag has no
-    `-` at all (single-segment registration like just `fleet`),
-    match the whole tag against the URL basename.
+    Fleet project tags from `internal/projects.TagForPath` are
+    `<parent>-<base>` where `<base>` is the repo basename. Both halves
+    can contain `-` (sanitized `my-org` parent, sanitized `my-project`
+    base), so a perfectly unambiguous inversion isn't possible. The
+    chosen heuristic: split on the FIRST `-` only, treating everything
+    after as the expected basename. When the tag has no `-` at all
+    (single-segment registration), match the whole tag.
+
+    Rationale (iter-12, codex P1 final resolution): two earlier
+    candidates were rejected.
+
+      - Strict suffix match (iter-5..11) — `project.endswith("-" + url)`.
+        Allowed `projects-rainier-app` ↔ `app.git` to pass silently,
+        defeating #175's safety guarantee for the legacy/no-meta.json
+        path (codex iter-9 P1).
+
+      - Try-all-segment splits (a permissive alternative) — accept any
+        `-`-split-point match. Same problem: ambiguous tags pass too
+        many spurious matches.
+
+    Strict first-`-` split rejects codex iter-9's bad case. The cost:
+    hyphenated-PARENT directories (`my-org/my-project` → tag
+    `my-org-my-project`, base=`my-project`, but iter-12 splits as
+    bare=`org-my-project`) won't match the heuristic. Those operators
+    register via `fleet project add` → meta.json::repo_path, which
+    wins over coord-config + bypasses the heuristic entirely (iter-7).
 
     Examples (all True):
       ('https://github.com/edisonshen/rainier.git', 'projects-rainier')
       ('git@github.com:acme/my-project.git', 'repos-my-project')
-      ('git@github.com:src/my-project.git', 'my-org-my-project')
       ('https://github.com/edisonshen/fleet', 'projects-fleet')
       ('git@github.com:foo/rainier-app.git', 'projects-rainier-app')
 
-    Examples (all False — iter-3 false-positive cases preserved):
+    Examples (all False):
       ('https://github.com/org/rainier-app.git', 'projects-rainier')
       ('git@github.com:foo/fleet-cli.git', 'projects-fleet')
       ('https://github.com/org/projects-rainier-app.git', 'projects-rainier')
+      ('https://github.com/org/app.git', 'projects-rainier-app')   # iter-9
+      ('git@github.com:src/my-project.git', 'my-org-my-project')   # use meta.json
 
-    Empty-origin edge case: a local-only checkout (`git init` with no
-    `origin` remote) returns "" from `git_remote_origin`. The CALLER
-    (loop.tick) treats False return here as "refuse dispatch" by
-    default, which would break local-only repos. loop.tick branches
-    on empty origin BEFORE calling this function — see
+    Empty-origin: returns False. CALLER (loop.tick) branches on empty
+    origin BEFORE calling this — see
     test_tick_local_only_repo_no_origin_warns_but_proceeds.
     """
     if not remote_url or not project:
         return False
-    # Strip protocol + path prefix down to the URL basename. Two URL
-    # shapes are common:
-    #   1. https://github.com/org/repo.git  → tail = "repo.git"
-    #   2. git@github.com:org/repo.git      → after rsplit("/") = "repo.git"
-    # The double rsplit handles SCP-style remotes with no nested path
-    # (`git@host:repo.git`) as well.
+    # Strip protocol + path prefix down to the URL basename.
     tail = remote_url.rsplit("/", 1)[-1]
     tail = tail.rsplit(":", 1)[-1]
     if tail.endswith(".git"):
         tail = tail[: -len(".git")]
     if not tail:
         return False
-    # If the project tag has no `-`, it was registered from a single-
-    # segment path (or sanitized down to one) — match whole-string.
-    # Otherwise: URL basename must appear as a hyphen-bounded suffix
-    # of the tag. This permits hyphenated parent dirs (`my-org/repo`
-    # → tag `my-org-repo`, basename `repo`) AND hyphenated bases
-    # (`projects/rainier-app` → tag `projects-rainier-app`, basename
-    # `rainier-app`), while still rejecting suffix lookalikes
-    # (basename `rainier-app` doesn't end the tag `projects-rainier`).
+    # If the project tag has no `-`, single-segment registration —
+    # match whole tag. Otherwise split off the first `-`-token (the
+    # parent half) and strict-equal match against the URL basename.
     if "-" not in project:
         return tail == project
-    return project.endswith("-" + tail)
+    return project.split("-", 1)[1] == tail
