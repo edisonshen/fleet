@@ -254,17 +254,24 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
         tail = tail[: -len(".git")]
     if not tail:
         return False
-    # Normalize case before comparison — TagForPath lowercases project
-    # tags (e.g., `Repos/MyProject` becomes `repos-myproject`), but
-    # `git remote get-url origin` returns the verbatim URL (likely
-    # `MyProject.git`). A strict-equal comparison would falsely reject
-    # the correct checkout. Lowercasing the URL basename matches the
-    # project-tag normalization (iter-13, codex P2).
+    # Normalize case — TagForPath lowercases project tags
+    # (`Repos/MyProject` becomes `repos-myproject`) but
+    # `git remote get-url origin` returns verbatim URLs. Lowercasing
+    # the URL basename matches the project-tag normalization
+    # (iter-13, codex P2).
     tail = tail.lower()
     project = project.lower()
-    # If the project tag has no `-`, single-segment registration —
-    # match whole tag. Otherwise split off the first `-`-token (the
-    # parent half) and strict-equal match against the URL basename.
+    # First: try strict whole-tag equality. Handles manually-named
+    # projects (`--project my-project` ↔ `my-project.git`) where the
+    # tag doesn't follow TagForPath's `<parent>-<base>` convention
+    # (iter-14, codex P2). Strictly more permissive than first-`-`
+    # split alone, and the new acceptance case is unambiguously
+    # legitimate (operator's chosen project name equals the URL
+    # basename verbatim).
+    if tail == project:
+        return True
+    # Second: TagForPath convention. Split off the first `-` (parent
+    # half) and strict-equal match the remainder against URL basename.
     if "-" not in project:
-        return tail == project
+        return False
     return project.split("-", 1)[1] == tail

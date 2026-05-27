@@ -298,6 +298,32 @@ def test_validate_remote_case_insensitive_mixed() -> None:
     )
 
 
+def test_validate_remote_accepts_manually_named_hyphenated_project() -> None:
+    """iter-14 (codex P2): a manually-named hyphenated project
+    (`--project my-project`) whose origin is `my-project.git` must
+    match. The TagForPath convention is `<parent>-<base>` but
+    operators using `fleet dispatch --project my-project` directly
+    bypass TagForPath; their project name equals the URL basename
+    verbatim. iter-12's first-`-`-split heuristic alone would have
+    refused this (bare=`project`, basename=`my-project`)."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/foo/my-project.git",
+        "my-project",
+    )
+
+
+def test_validate_remote_strict_equal_still_rejects_iter9_lookalike() -> None:
+    """iter-14 regression guard: adding the strict-equal pre-check
+    must NOT re-introduce iter-9's suffix-lookalike acceptance."""
+    # tag=`projects-rainier-app`, URL basename=`app`: strict-equal
+    # fails (app != projects-rainier-app), split fails (app !=
+    # rainier-app). Still rejected.
+    assert not coord_config.remote_matches_project(
+        "https://github.com/org/app.git",
+        "projects-rainier-app",
+    )
+
+
 def test_validate_remote_empty_url_returns_false() -> None:
     """Empty remote URL → False. CALLER (loop.tick) must treat this as
     'cannot validate' (local-only repo path) rather than 'mismatch' —
