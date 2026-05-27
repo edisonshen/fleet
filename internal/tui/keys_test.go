@@ -2,6 +2,8 @@ package tui
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/workers"
 )
 
 // keyMsg constructs a tea.KeyMsg matching what bubbletea emits for a
@@ -93,15 +96,104 @@ func (s *stubFleetCmd) install(t *testing.T) {
 }
 
 // -- [h] handoff --------------------------------------------------------
+//
+// Inversion contract (2026-05-27): [h] is a PROJECT-LEVEL action.
+// Pressing [h] on a project row with a live coord shells out to
+// `fleet handoff <coordID>`. Pressing [h] on an agent row REJECTS with
+// a hint pointing back to the project row. Task / worker / separator
+// rows preserve the existing "doesn't apply" flash with updated wording.
+//
+// Rationale: coords are 1-per-project, so the operator's mental model
+// for handoff is "hand off this project's coord," not "hand off this
+// loose-agent record." The left-panel project row is the natural
+// surface for that operation.
 
-func TestKey_HandoffShellsOutWithSelectedID(t *testing.T) {
+// projectRowModelWithCoord builds a Model whose dashboard carries a
+// single project row with the supplied CoordID, plus the supplied agent
+// records loaded into m.records. The cursor lands on the project row so
+// [h] dispatches from there. aliveByID is threaded so deriveStatus
+// produces the test-controlled handoff state.
+//
+// Mirrors projectRowModel but pins the coord via the dashboard snapshot
+// (CoordID-driven), which is the path the project-row [h] handler must
+// resolve through findRecordByID + deriveStatus.
+func projectRowModelWithCoord(t *testing.T, project, coordID string, records []*agent.Record, aliveByID map[string]bool) Model {
+	t.Helper()
+	m := New("test")
+	m.records = records
+	m.aliveByID = aliveByID
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: project, CoordID: coordID}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == project {
+			m.dashCursor = i
+			return m
+		}
+	}
+	t.Fatalf("no rowProject for %q in dashboardRows; got %+v", project, m.dashboardRows())
+	return m
+}
+
+func TestActionHandoff_OnProjectRow_WithLiveCoord_FiresHandoff(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from [h] on project row with live coord, got nil")
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 || len(stub.calls[0]) != 2 ||
+		stub.calls[0][0] != "handoff" || stub.calls[0][1] != "coord001" {
+		t.Errorf("expected ['handoff', 'coord001'], got %v", stub.calls)
+	}
+	if _, ok := updated.(Model); !ok {
+		t.Errorf("Update returned non-Model: %T", updated)
+	}
+}
+
+func TestActionHandoff_OnProjectRow_NoLiveCoord_Flashes(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// Pure-legacy project (no v0.2 dir) so unifiedProjects synthesizes a
+	// row without a CoordID. projectRowModel walks the synthetic path.
+	(&stubProjectTreeExists{missing: map[string]bool{"orphan": true}}).install(t)
+
+	// Tag at least one agent.Record with "orphan" so unifiedProjects
+	// creates the synthetic row, but DON'T set it as the coord (no
+	// task_id=coord-orphan + marker).
+	a := agent.New("loose001")
+	a.Project = "orphan"
+	a.TmuxSession = "fleet-loose001"
+	m := projectRowModel(t, "orphan", []*agent.Record{a}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on project row with no coord must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected no fleet invocations, got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "orphan") || !strings.Contains(mm.flash.text, "no coord") {
+		t.Errorf("flash should name the project and explain no coord; got %q", mm.flash.text)
+	}
+}
+
+func TestActionHandoff_OnAgentRow_RejectsWithHint(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
 	m := makeModelWithAgents(sampleAgent("agent01"), sampleAgent("agent02"))
-	// Locate agent02 by identity (issue #55: a synthetic project row
-	// from the shared Project tag now precedes the agent rows, so
-	// numeric index 1 no longer maps to "second agent").
+	// Move cursor onto an agent row.
 	for i, r := range m.dashboardRows() {
 		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "agent02" {
 			m.dashCursor = i
@@ -110,25 +202,203 @@ func TestKey_HandoffShellsOutWithSelectedID(t *testing.T) {
 	}
 
 	updated, cmd := m.Update(keyMsg("h"))
-	if cmd == nil {
-		t.Fatal("expected a tea.Cmd from [h], got nil")
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on agent row must NOT shell out (inverted); got cmd")
 	}
-	// Drain the cmd so the stub records the call.
-	_ = cmd()
-	if len(stub.calls) != 1 || len(stub.calls[0]) != 2 ||
-		stub.calls[0][0] != "handoff" || stub.calls[0][1] != "agent02" {
-		t.Errorf("expected ['handoff', 'agent02'], got %v", stub.calls)
+	if len(stub.calls) != 0 {
+		t.Errorf("expected no fleet invocations on agent row; got %v", stub.calls)
 	}
-	if _, ok := updated.(Model); !ok {
-		t.Errorf("Update returned non-Model: %T", updated)
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on agent-row [h], got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "project") {
+		t.Errorf("flash should redirect operator to project rows; got %q", mm.flash.text)
 	}
 }
 
-func TestKey_HandoffWithEmptyListIsNoop(t *testing.T) {
+func TestActionHandoff_OnTaskRow_FlashUnchanged(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	pdir := withFleetHome(t)
+	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+	// Expand "demo" so a task row exists; then walk the row list to it.
+	m.expanded = map[string]bool{"demo": true}
+	taskCursor := -1
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowTask {
+			taskCursor = i
+			break
+		}
+	}
+	if taskCursor < 0 {
+		t.Fatalf("no task row materialised; rows=%+v", m.dashboardRows())
+	}
+	m.dashCursor = taskCursor
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on task row must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls on task row; got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "project") {
+		t.Errorf("flash should point at project rows; got %q", mm.flash.text)
+	}
+}
+
+func TestActionHandoff_OnWorkerRow_FlashUnchanged(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)
 
-	m := makeModelWithAgents() // no agents
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = &Snapshot{
+		Workers: []*WorkerRow{{ID: "w0001", Project: "demo", Slug: "fix-bug"}},
+	}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowWorker {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on worker row must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls on worker row; got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "project") {
+		t.Errorf("flash should point at project rows; got %q", mm.flash.text)
+	}
+}
+
+func TestActionHandoff_OnSeparator_FlashUnchanged(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// Build a row list with two projects so an idle separator naturally
+	// appears (one active, one idle below the activity threshold).
+	pdir := withFleetHome(t)
+	// "active" project with a recent worker so it classifies active.
+	seedTasks(t, pdir, "active", TaskCounts{InProgress: 1})
+	seedWorker(t, pdir, "active", "wip-task", workers.State{
+		Phase:     workers.PhaseTDDGreen,
+		UpdatedAt: time.Now().UTC(),
+	})
+	// "stale" project with no fresh signals.
+	seedTasks(t, pdir, "stale", TaskCounts{Todo: 1})
+	dir := filepath.Join(pdir, "stale", "tasks.md")
+	// Push the tasks.md mtime way back so projectAddedAt returns an old
+	// value and the project classifies as IDLE.
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(dir, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	m := New("test")
+	m.width = 130
+	m.height = 30
+	m.dashboard = scanDashboard(time.Now())
+
+	sepIdx := -1
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowSeparator {
+			sepIdx = i
+			break
+		}
+	}
+	if sepIdx < 0 {
+		t.Skip("no separator materialised under current activity classifier — skip")
+	}
+	m.dashCursor = sepIdx
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on separator must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls on separator; got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on separator [h]; got %+v", mm.flash)
+	}
+}
+
+// TestActionHandoff_AutoRedGated_OnProjectCoord pins the moved gate:
+// the auto-red / precompact handoff-already-in-flight check that
+// previously lived on the agent-row path must move to the project-row
+// path so a coord with a committed handoff journal can't be re-handed
+// off via [h] on its project.
+func TestActionHandoff_AutoRedGated_OnProjectCoord(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	hoType := "auto-red"
+	coord.HandoffType = &hoType
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on project with auto-red coord must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash on auto-red gate, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "drain") {
+		t.Errorf("flash should mention `fleet drain`; got %q", mm.flash.text)
+	}
+}
+
+// TestActionHandoff_PrecompactGated_OnProjectCoord same as the auto-red
+// gate but for the precompact handoff state.
+func TestActionHandoff_PrecompactGated_OnProjectCoord(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	hoType := "precompact"
+	coord.HandoffType = &hoType
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	_, cmd := m.Update(keyMsg("h"))
+	if cmd != nil {
+		t.Errorf("[h] on project with precompact coord must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls; got %v", stub.calls)
+	}
+}
+
+func TestActionHandoff_OnEmptyList_Noop(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	m := makeModelWithAgents() // no agents, no projects
 	_, cmd := m.Update(keyMsg("h"))
 	if cmd != nil {
 		t.Errorf("expected nil cmd on [h] with empty list")
@@ -681,21 +951,23 @@ func TestKeyJK_MovesCursor(t *testing.T) {
 }
 
 // TestKey_RowTypeGatingForActions regresses the codex iter-1 fix in
-// 240a3b0, extended for issue #53 row-type discrimination: [h] only
-// applies to agent rows, [x] applies to agent (archive) or worker
-// (kill) rows. When the cursor lands on a project row, [h]/[x] flash
-// "doesn't apply" and do NOT shell out.
+// 240a3b0, extended for issue #53 row-type discrimination: [x] applies
+// to agent (archive) or worker (kill) rows. When the cursor lands on a
+// project row, [x] flashes "doesn't apply" and does NOT shell out.
 //
 // [a] is intentionally NOT covered here as of issue #60: [a] on a
 // project row now spawns / attaches a coord (see
-// TestKeyA_ProjectRow_SpawnsCoord and friends). The legacy "[a]
-// flashes on projects" assertion was removed when the keybind grew
-// project-row semantics.
+// TestKeyA_ProjectRow_SpawnsCoord and friends).
+//
+// [h] is intentionally NOT covered here as of the 2026-05-27 inversion:
+// [h] on a project row now FIRES handoff for the project's coord
+// (or flashes "no coord"). See TestActionHandoff_OnProjectRow_*.
+// The agent-row inversion is asserted by TestActionHandoff_OnAgentRow_RejectsWithHint.
 func TestKey_RowTypeGatingForActions(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "demo", TaskCounts{Todo: 1})
 
-	for _, key := range []string{"h", "x"} {
+	for _, key := range []string{"x"} {
 		stub := &stubFleetCmd{}
 		stub.install(t)
 
