@@ -155,8 +155,22 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		}
 
 		// 1. Mismatch — state.project disagrees with parent dir.
+		// Mismatch is detected BEFORE the live-PID guard so the operator
+		// SEES a cross-project record claiming a still-live PID — that's
+		// a real bug worth surfacing. The apply path, however, must NOT
+		// remove a live worker's dir: yanking state.json out from under a
+		// running subagent orphans its in-flight phase writes. Surface
+		// instead under --apply when the recorded PID is alive (codex
+		// iter-N: review-iter live-PID-mismatch gate).
 		if ws.Project != "" && ws.Project != info.Project {
 			reason := fmt.Sprintf("mismatch (worker dir=%s vs state.project=%s)", info.Project, ws.Project)
+			if ws.Pid > 0 && deps.PidAlive(ws.Pid) {
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: reason + fmt.Sprintf("; pid=%d still alive — refusing to remove; fix state.project field manually OR kill the worker first", ws.Pid),
+				})
+				continue
+			}
 			appendWorkerRecordAction(r, opts, deps, info, reason)
 			continue
 		}

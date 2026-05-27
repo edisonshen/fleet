@@ -2076,6 +2076,66 @@ func TestReconcile_WorkerRecords_Mismatch_ApplyRemoves(t *testing.T) {
 	}
 }
 
+// TestReconcile_WorkerRecords_Mismatch_LivePid_RefusesUnlink pins the
+// live-PID safety gate inside the mismatch apply path (review iter-1
+// follow-up). A cross-project record claiming a still-live PID is
+// surfaced regardless of liveness — the operator needs to see the bug
+// — but `--apply` must NOT remove the worker dir while the recorded
+// PID is alive. Yanking state.json out from under a running subagent
+// orphans its in-flight phase writes. Mirrors the live-PID guard at
+// step 2 of the classifier but applied INSIDE the mismatch branch
+// because mismatch is checked first.
+func TestReconcile_WorkerRecords_Mismatch_LivePid_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/live-mismatch-aaaa/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "live-mismatch-aaaa",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "live-mismatch-aaaa",
+			Project:   "projects-rainier", // mismatch
+			Pid:       12345,              // alive
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	deps.PidAlive = func(pid int) bool {
+		if pid != 12345 {
+			t.Fatalf("PidAlive pid=%d want 12345", pid)
+		}
+		return true
+	}
+	deps.RemoveWorkerRecord = func(string) error {
+		t.Fatal("RemoveWorkerRecord called on live-pid mismatch — would orphan running worker")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records mismatch surface; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("live-pid mismatch verb=%q, want %q (must surface, never apply)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "mismatch") {
+		t.Fatalf("reason=%q does not name mismatch mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "still alive") && !strings.Contains(a.Reason, "alive") {
+		t.Fatalf("reason=%q does not explain the live-pid refusal", a.Reason)
+	}
+}
+
 // TestReconcile_WorkerRecords_DeadPid_Surfaced: pid set + process dead +
 // updated_at older than 24h is the dead-pid failure mode.
 func TestReconcile_WorkerRecords_DeadPid_Surfaced(t *testing.T) {
