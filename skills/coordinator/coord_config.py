@@ -261,20 +261,36 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
     # (iter-13, codex P2).
     tail = tail.lower()
     project = project.lower()
-    # Two heuristics, in order:
+    # Two acceptance modes, in order:
     #
-    # 1. Whole-tag equality, ONLY for tags without `-`. Handles the
-    #    single-segment registration shape — `--project fleet` ↔
-    #    `fleet.git`. Tags WITH `-` are not strict-matched because
-    #    `projects-rainier` ↔ `projects-rainier.git` would falsely
-    #    accept a checkout that's a different (literally-named) repo
-    #    (codex iter-15 P2). Manually-named hyphenated projects
-    #    (`--project my-project`) bypass via `fleet project add` →
-    #    meta.json.
+    # 1. Whole-tag equality. Handles manually-named projects (
+    #    `--project my-project` ↔ `my-project.git`, codex iter-16 P1)
+    #    AND single-segment registrations (`--project fleet` ↔
+    #    `fleet.git`). The operator's explicit project name equals
+    #    the URL basename verbatim — unambiguously legitimate.
     #
-    # 2. TagForPath split convention. For tags WITH `-`, split off
-    #    the first `-` (parent half) and strict-equal match the
-    #    remainder against URL basename.
+    # 2. TagForPath split convention. For tags WITH `-`, also accept
+    #    when the trailing segment matches the URL basename.
+    #    `projects-rainier` ↔ `rainier.git` works via this branch.
+    #
+    # Known edge: this DOES allow `projects-rainier` ↔
+    # `projects-rainier.git` through mode 1 — a coord whose `--project
+    # projects-rainier` literally matches a github repo named
+    # `projects-rainier.git` (different from intended `rainier.git`)
+    # would pass validation. Codex iter-13/iter-15 surfaced this as
+    # P2; codex iter-16 surfaced the reverse (rejecting it blocks
+    # manually-named hyphenated projects with no working recovery
+    # path — `fleet project add` always uses TagForPath, so a custom
+    # tag like `my-project` can't be re-registered to itself).
+    #
+    # Final engineering call: accept the iter-13 edge case (extremely
+    # rare — requires a github repo to literally be named with the
+    # TagForPath-style prefix) in order to support the common
+    # iter-16 case (manually-named projects whose tag IS the github
+    # repo basename). Operators hitting the iter-13 case can manually
+    # edit coord-config.json or use a TagForPath-style tag instead.
+    if tail == project:
+        return True
     if "-" not in project:
-        return tail == project
+        return False
     return project.split("-", 1)[1] == tail

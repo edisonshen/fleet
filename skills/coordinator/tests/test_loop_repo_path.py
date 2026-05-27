@@ -298,31 +298,36 @@ def test_validate_remote_case_insensitive_mixed() -> None:
     )
 
 
-def test_validate_remote_rejects_manually_named_hyphenated_project() -> None:
-    """iter-15 (codex P2): a manually-named hyphenated project
-    (`--project my-project`) cannot be heuristically validated
-    without ambiguity. Operators using non-TagForPath tags should
-    register via `fleet project add` → meta.json::repo_path, which
-    bypasses this heuristic entirely.
+def test_validate_remote_accepts_manually_named_hyphenated_project() -> None:
+    """iter-16 (codex P1): a manually-named hyphenated project
+    (`--project my-project`) ↔ `my-project.git` MUST match. This is
+    a common pattern: operator runs `fleet dispatch --project
+    my-project` directly without `fleet project add` (which would
+    derive the tag from the path via TagForPath and produce
+    `repos-my-project` instead). Without strict-equal acceptance,
+    these operators have no recovery path — `fleet project add`
+    creates a different tag, and the heuristic refuses dispatch.
 
-    iter-14 added a strict-equal pre-check that accepted this case,
-    but codex iter-13 surfaced the cost: `projects-rainier` ↔
-    `projects-rainier.git` (different repo from the intended
-    `rainier.git`) would also pass strict-equal and silently dispatch
-    workers to the wrong checkout — the #175 corruption pattern."""
-    assert not coord_config.remote_matches_project(
+    Tradeoff (documented): strict-equal also accepts the edge case
+    `projects-rainier` ↔ `projects-rainier.git` — a github repo
+    literally named `projects-rainier` (different from intended
+    `rainier.git`) would pass. Extremely rare in practice; the
+    common manual-name case is worth the edge."""
+    assert coord_config.remote_matches_project(
         "https://github.com/foo/my-project.git",
         "my-project",
     )
 
 
-def test_validate_remote_rejects_iter13_strict_equal_lookalike() -> None:
-    """iter-15 explicit regression: codex iter-13 P2.
-    `projects-rainier` ↔ `projects-rainier.git` must NOT match — the
-    operator's project tag follows TagForPath convention, so the
-    expected basename is `rainier` (the part after the first `-`),
-    not the whole tag."""
-    assert not coord_config.remote_matches_project(
+def test_validate_remote_accepts_strict_equal_literal_repo_name() -> None:
+    """iter-16 documents the edge: `projects-rainier` tag matches a
+    repo also literally named `projects-rainier`. Accepting this
+    edge unlocks the much more common manual-name case (test above);
+    rejecting it would re-introduce codex iter-16's P1.
+
+    Operators hitting this edge can either edit coord-config.json
+    manually or rename their project to a TagForPath-style tag."""
+    assert coord_config.remote_matches_project(
         "https://github.com/org/projects-rainier.git",
         "projects-rainier",
     )
