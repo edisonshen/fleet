@@ -661,6 +661,9 @@ def test_tick_local_only_repo_no_origin_warns_but_proceeds(
     home = _seed_fleet_home(tmp_path, project)
     repo = tmp_path / "local-only-checkout"
     repo.mkdir()
+    # iter-17 (codex P1): the local-only-repo path requires a real
+    # `.git` marker to distinguish from "not a git repo at all."
+    (repo / ".git").mkdir()
     cfg = home / "projects" / project / "coord-config.json"
     cfg.write_text(json.dumps({"repo": str(repo)}) + "\n")
     _patch_bootstrap(monkeypatch)
@@ -695,6 +698,89 @@ def test_tick_local_only_repo_no_origin_warns_but_proceeds(
     assert any(
         "no `origin`" in e or "no origin" in e for e in result.errors
     ), f"expected local-only soft warning in errors; got {result.errors}"
+
+
+def test_tick_non_git_directory_refuses_dispatch(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """coord-config.json::repo points at a real directory that is NOT
+    a git work tree (no .git inside) — refuse with
+    `coord-config-repo-not-git`.
+
+    iter-17 (codex P1): without this check, $HOME or any non-git dir
+    would silently pass through the empty-origin branch (which was
+    designed for local-only git repos). A coord dispatched from a
+    non-git cwd could then spawn workers anywhere — defeating the
+    #175 safety guarantee."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    not_a_git_repo = tmp_path / "not-git"
+    not_a_git_repo.mkdir()
+    # NO .git inside — this is e.g. $HOME or /tmp.
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(not_a_git_repo)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+    # Real `git remote get-url origin` would fail because there's no
+    # `.git` to read; stub returns "" to simulate.
+    monkeypatch.setattr(
+        coord_config, "git_remote_origin",
+        lambda repo_path: "",
+    )
+
+    called = {"n": 0}
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        called["n"] += 1
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert called["n"] == 0, (
+        "non-git path must short-circuit BEFORE _tick_locked runs"
+    )
+    assert result.skipped is True
+    assert result.reason == "coord-config-repo-not-git", (
+        f"expected coord-config-repo-not-git reason; got {result.reason!r}"
+    )
+    assert result.raised >= 1
+    assert any(
+        "not a git work tree" in e for e in result.errors
+    ), f"expected non-git error; got {result.errors}"
+
+
+def test_tick_local_only_repo_with_git_pointer_file_accepted(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """`.git` as a FILE (not a dir) is a git-worktree pointer — must
+    also pass the iter-17 git-marker check."""
+    project = "local-only-repo"
+    home = _seed_fleet_home(tmp_path, project)
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    # Git worktrees use a `.git` FILE pointing at the main repo's
+    # worktrees/ subdir.
+    (worktree / ".git").write_text("gitdir: /some/path\n")
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(worktree)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        coord_config, "git_remote_origin",
+        lambda repo_path: "",
+    )
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert result.skipped is False, (
+        f"git worktree (with .git file pointer) wrongly refused: "
+        f"{result.reason!r}"
+    )
 
 
 def test_tick_stale_repo_path_refuses_dispatch(

@@ -332,6 +332,39 @@ def tick(
             )
         remote = coord_config.git_remote_origin(configured_repo)
         if not remote:
+            # No origin URL. Two possibilities:
+            #   (a) Real git repo with no `origin` remote (local-only,
+            #       legit project shape).
+            #   (b) NOT a git work tree at all (e.g., $HOME, /tmp,
+            #       arbitrary dir).
+            #
+            # iter-17 (codex P1): distinguish via the existence of
+            # `<repo>/.git` (regular repo dir, or worktree git
+            # pointer file). If neither exists, refuse — accepting
+            # an arbitrary non-git directory as cwd defeats the #175
+            # safety goal (coord dispatched from $HOME could spawn
+            # workers anywhere).
+            if not os.path.exists(os.path.join(configured_repo, ".git")):
+                msg = (
+                    f"coord-config.json::repo={configured_repo!r} for "
+                    f"project {project!r} is not a git work tree (no "
+                    f".git directory or worktree pointer found). "
+                    f"Refusing dispatch to prevent worker creation in "
+                    f"a non-git directory. Re-spawn the coord from "
+                    f"inside the project's git checkout."
+                )
+                import sys as _sys
+                _sys.stderr.write(msg + "\n")
+                result.errors.append(msg)
+                result.skipped = True
+                result.reason = "coord-config-repo-not-git"
+                result.raised += 1
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+                return result
+            # Real git repo with no origin — local-only is supported.
             result.errors.append(
                 f"coord-config.json::repo={configured_repo!r} for "
                 f"project {project!r} has no `origin` remote — "

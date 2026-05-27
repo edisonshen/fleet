@@ -1862,3 +1862,65 @@ func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
 		t.Errorf("repo absolutization wrong: got %q want %q", got, want)
 	}
 }
+
+func TestSpawn_HandoffDoesNotRestampCoordConfig(t *testing.T) {
+	// iter-17 (codex P2): on coord handoff/recovery (opts.OldRecord
+	// non-nil), Spawn must NOT write coord-config.json::repo. The
+	// handoff path inherits cwd from the outgoing record, which for
+	// a legacy coord could be the wrong path (the #175 bug). Restamping
+	// with the inherited bad path defeats the "re-spawn from the correct
+	// checkout" recovery the iter-9 unconditional-overwrite was meant
+	// to enable.
+	//
+	// Fresh spawn = operator typed `fleet dispatch --coord-spawn` from
+	// a chosen cwd; handoff = system-driven replacement that inherits
+	// (and could inherit a bad value).
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Seed coord-config.json with a sentinel value the handoff must
+	// NOT overwrite.
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	sentinelRepo := "/sentinel/operator/path"
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+sentinelRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build an outgoing coord record (the handoff source).
+	old := agent.New("aaaa1111")
+	old.TaskID = "coord-projects-rainier"
+	old.Project = "projects-rainier"
+	old.Engine = "claude-code"
+	old.HandoffNumber = 1
+	prevPath := "/some/handoffs/aaaa0000-20260427-180000.md"
+	old.LastHandoffPath = &prevPath
+
+	docPath := "/some/handoffs/aaaa1111-20260427-184807.md"
+	handoffCwd := t.TempDir() // the handoff path's "inherited" cwd
+
+	rec, err := Spawn(Options{
+		OldRecord:  old,
+		NewDocPath: docPath,
+		Cwd:        handoffCwd, // would be the bad cwd in #175 scenario
+		Command:    []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	// coord-config.json::repo MUST be unchanged (sentinelRepo).
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != sentinelRepo {
+		t.Errorf("handoff overwrote coord-config.json::repo: got %v want %q (handoff must skip the stamp; operator restamp lives in fresh-spawn only)",
+			data["repo"], sentinelRepo)
+	}
+}

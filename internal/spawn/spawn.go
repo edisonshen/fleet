@@ -828,20 +828,26 @@ func Spawn(opts Options) (*agent.Record, error) {
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
 
-	// fleet#175: on coord-spawn, stamp the resolved repo path into
-	// ~/.fleet/projects/<project>/coord-config.json::repo (idempotent).
-	// loop.py reads that field on every tick to decide where to run
+	// fleet#175: on FRESH coord-spawn, stamp the resolved repo path
+	// into ~/.fleet/projects/<project>/coord-config.json::repo. loop.py
+	// reads that field on every tick to decide where to run
 	// `git worktree add`, avoiding the cwd-derived worktree-base bug
 	// where a coord whose tmux session inherited the wrong shell cwd
 	// silently corrupted cross-project dispatches.
 	//
-	// Best-effort: a write failure here is logged to stderr but never
+	// iter-17 (codex P2): SKIP this on handoff/recovery paths
+	// (opts.OldRecord non-nil). Those paths inherit cwd from the
+	// outgoing record — for a legacy coord whose record already
+	// captured the wrong repo, restamping with the same bad path
+	// blocks the "re-spawn from the correct checkout" recovery the
+	// iter-9 unconditional-overwrite was supposed to enable. Fresh
+	// spawn = operator typed `fleet dispatch --coord-spawn` from a
+	// chosen cwd; handoff = system-driven replacement that inherits.
+	//
+	// Best-effort: a write failure is logged to stderr but never
 	// fails the spawn. The worst case is the coord skill falls back
-	// to legacy cwd-derived behavior and emits a fallback warning into
-	// TickResult.errors — a breadcrumb the operator can see, not a
-	// silent corruption. Failing the spawn over a metadata file would
-	// be the inverse of helpful.
-	if isCoordSpawn(rec.TaskID, rec.Project) {
+	// to legacy cwd-derived behavior + emits a fallback warning.
+	if isCoordSpawn(rec.TaskID, rec.Project) && opts.OldRecord == nil {
 		fhome := fleetHomeForSpawn()
 		if fhome != "" {
 			if werr := writeCoordConfigRepoIdempotent(fhome, rec.Project, cwd); werr != nil {
