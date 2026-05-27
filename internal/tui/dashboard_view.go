@@ -359,17 +359,166 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 // can highlight the right line: left column = projects + tasks; right
 // column = workers + agents (with a "v0.1 agents — N active"
 // sub-heading between worker rows and agent rows when both exist).
+//
+// fleet#177 Fix 2 — bounded right panel. When the terminal is short
+// (operator's 2026-05-27 screenshot: 30+ rows of accumulated worker
+// records + agents pushed the left projects list off-screen), the
+// right column caps at `usableRows - reservedLeft`, with workers +
+// agents splitting that budget 60/40. Overflow rolls into a
+// "K hidden — [↓/↑] scroll" footer; ↓/↑ on a right-column row adjusts
+// the matching scroll offset. The left column reserves >=50% of
+// usable rows (minProjectsRows floor: 6) so projects never get
+// pushed off-screen by right-column growth.
+//
+// Layout math (when m.height is set):
+//
+//	usableRows  = max(m.height - chrome, minBodyRows)   chrome = header+heading+footer
+//	leftRows    = max(minProjectsRows, usableRows/2)    reserve >= half for projects
+//	if projects fit in fewer rows, slack goes to right
+//	rightRows   = usableRows - leftRows
+//	workersRows = rightRows * 6 / 10                    60% workers
+//	agentsRows  = rightRows - workersRows               40% agents
+//	overflow per panel → "K hidden — [↓/↑] scroll" footer line
+//
+// When m.height is unset / zero (early render), we fall back to the
+// pre-#177 unbounded behavior so the first frame doesn't draw an
+// arbitrarily-truncated dashboard.
 func renderTwoColumnBody(m Model, leftW, rightW int) string {
-	leftLines, rightLines := buildBodyLines(m, leftW, rightW)
+	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
 
+	// Apply the bounded layout when we have a real terminal height.
+	// chromeRows accounts for the header strip + column heading + footer
+	// + a 1-row margin that keeps the bottom hint visible.
+	const (
+		minProjectsRows = 6
+		minRightRows    = 4
+		chromeRows      = 6 // header(1) + heading(1) + footer(2) + margin(2)
+		minBodyRows     = 8
+	)
+
+	usable := m.height - chromeRows
+	if m.height <= 0 || usable < minBodyRows {
+		// Unbounded fallback (early renders / pathological heights). No
+		// scroll trimming applied; layout matches the pre-#177 shape.
+		return renderTwoColumnUnbounded(leftLines, append(workerLines, agentLines...), leftW, rightW)
+	}
+
+	// Reserve at least half the usable rows for the LEFT column. Slack
+	// flows in both directions: if projects need fewer than half, the
+	// right column gets the extra. If right needs less than half (few
+	// workers + few agents), the left column gets the extra so the
+	// projects list isn't artificially cropped on a tall terminal.
+	leftRows := usable / 2
+	if leftRows < minProjectsRows {
+		leftRows = minProjectsRows
+	}
+	rightTotal := len(workerLines) + len(agentLines)
+	// Slack donation rules:
+	//   - left needs less than its share → donate to right
+	//   - right needs less than its share → donate to left (so long
+	//     left lists like an expanded project's task block aren't
+	//     cropped when the right column has plenty of headroom)
+	if len(leftLines) < leftRows {
+		leftRows = len(leftLines)
+	} else if rightTotal < usable-leftRows && len(leftLines) > leftRows {
+		// Right column has slack — grow left up to leftLines but never
+		// past usable - minRightRows.
+		want := len(leftLines)
+		ceiling := usable - minRightRows
+		if ceiling < leftRows {
+			ceiling = leftRows
+		}
+		if want > ceiling {
+			want = ceiling
+		}
+		leftRows = want
+	}
+	rightRows := usable - leftRows
+	if rightRows < minRightRows {
+		rightRows = minRightRows
+		leftRows = usable - rightRows
+	}
+
+	// Split rightRows 60/40 between workers + agents. The split is
+	// applied to the COMBINED panel including each sub-heading so a
+	// long workers panel doesn't starve the agents panel of its
+	// sub-header line.
+	workersRows := rightRows * 6 / 10
+	if workersRows < 1 {
+		workersRows = 1
+	}
+	agentsRows := rightRows - workersRows
+	if agentsRows < 1 && len(agentLines) > 0 {
+		agentsRows = 1
+		workersRows = rightRows - 1
+	}
+	// If one of the sub-panels has spare capacity, donate to the other.
+	if len(workerLines) < workersRows {
+		spare := workersRows - len(workerLines)
+		workersRows = len(workerLines)
+		agentsRows += spare
+	}
+	if len(agentLines) < agentsRows {
+		spare := agentsRows - len(agentLines)
+		agentsRows = len(agentLines)
+		workersRows += spare
+		if workersRows > len(workerLines) {
+			workersRows = len(workerLines)
+		}
+	}
+
+	// Apply per-panel scroll offset + overflow trim.
+	workerVisible := trimWithScroll(workerLines, workersRows, m.workersScrollOffset, "[↓/↑] scroll")
+	agentVisible := trimWithScroll(agentLines, agentsRows, m.agentsScrollOffset, "[↓/↑] scroll")
+
+	// The right column is workers panel stacked on top of the agents
+	// panel.
+	rightLines := append([]string{}, workerVisible...)
+	rightLines = append(rightLines, agentVisible...)
+
+	// maxRows is the bigger of left budget vs right budget — the
+	// column separator stays uniform across both columns.
+	maxRows := leftRows
+	if len(rightLines) > maxRows {
+		maxRows = len(rightLines)
+	}
+	if maxRows < minProjectsRows {
+		maxRows = minProjectsRows
+	}
+
+	sep := boxBorderStyle.Render("│")
+	var b strings.Builder
+	for i := 0; i < maxRows; i++ {
+		l := ""
+		r := ""
+		if i < len(leftLines) && i < leftRows {
+			l = leftLines[i]
+		}
+		if i < len(rightLines) {
+			r = rightLines[i]
+		}
+		l = padPlain(l, leftW)
+		r = padPlain(r, rightW)
+		b.WriteString(l)
+		b.WriteString(sep)
+		b.WriteString(r)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// renderTwoColumnUnbounded is the pre-#177 layout: no per-panel cap,
+// no scroll, no overflow footer. Used as the fallback when m.height is
+// unset or pathological so the first frame after spawn doesn't show
+// an arbitrarily-truncated dashboard.
+func renderTwoColumnUnbounded(leftLines, rightLines []string, leftW, rightW int) string {
 	maxRows := len(leftLines)
 	if len(rightLines) > maxRows {
 		maxRows = len(rightLines)
 	}
 	if maxRows < 6 {
-		maxRows = 6 // keep a minimum body height so the box doesn't collapse
+		maxRows = 6
 	}
-
 	sep := boxBorderStyle.Render("│")
 	var b strings.Builder
 	for i := 0; i < maxRows; i++ {
@@ -381,7 +530,6 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 		if i < len(rightLines) {
 			r = rightLines[i]
 		}
-		// Pad each side to its column width on plain-cell basis.
 		l = padPlain(l, leftW)
 		r = padPlain(r, rightW)
 		b.WriteString(l)
@@ -390,6 +538,56 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// trimWithScroll caps `lines` at `budget` rows starting at `offset`,
+// rendering a footer "<N> hidden — <hint>" line in the last slot when
+// there are more lines than fit. Harmonized with the existing agents
+// "K hidden — [c] view" footer shape so the operator's muscle memory
+// reads the same prefix on every overflow surface.
+//
+// Returns lines that always size to exactly `budget` (bottom-padded
+// with empty strings when input is shorter — the caller's stacking
+// stays well-defined).
+func trimWithScroll(lines []string, budget, offset int, hint string) []string {
+	if budget <= 0 {
+		return nil
+	}
+	if len(lines) <= budget {
+		out := make([]string, budget)
+		copy(out, lines)
+		return out
+	}
+	// Need a footer to surface overflow.
+	visible := budget - 1
+	if visible < 0 {
+		visible = 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	maxOff := len(lines) - visible
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if offset > maxOff {
+		offset = maxOff
+	}
+	end := offset + visible
+	if end > len(lines) {
+		end = len(lines)
+	}
+	hidden := len(lines) - visible
+	footer := fmt.Sprintf("  %d hidden — %s", hidden, hint)
+	out := make([]string, 0, budget)
+	out = append(out, lines[offset:end]...)
+	// If `visible` shrank below the slice length (shouldn't, but defensive),
+	// bottom-pad to `budget - 1` before appending the footer.
+	for len(out) < visible {
+		out = append(out, "")
+	}
+	out = append(out, columnHeadingStyle.Render(footer))
+	return out
 }
 
 // buildBodyLines is the per-column line builder. Iterates
@@ -401,16 +599,24 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 //	    └─ task lines (1 each)
 //	  next project …
 //
-//	right column:
+//	right column (split into workers + agents sub-panels for the
+//	bounded layout in renderTwoColumnBody):
 //	  worker block (2 lines + blank)
 //	  next worker …
+//	  ----------------- panel split ----------------
 //	  v0.1 agents — N active     <- sub-heading when records non-empty
 //	    agent block (2 lines + blank)
 //	    next agent …
 //
 // The cursor row is highlighted with a bold ▶ glyph in the left
 // margin (project/task) or replacing the leading dot (worker/agent).
-func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
+//
+// fleet#177 Fix 2: this function now returns THREE slices (left,
+// workers, agents) so renderTwoColumnBody can apply the bounded
+// 60/40 split + per-panel scroll independently. Callers that need
+// the legacy two-slice shape (e.g. existing tests) can recompose via
+// `append(workers, agents...)`.
+func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 	rows := m.dashboardRows()
 
 	// Left column: project + task rows.
@@ -571,13 +777,18 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 	// project in the list was expanded) gets it appended now.
 	flushFooter()
 
-	// Right column: worker rows, then a sub-header, then agent rows.
-	var right []string
+	// Right column: split into workers + agents sub-panels (fleet#177
+	// Fix 2) so the renderer can apply a 60/40 row budget + per-panel
+	// scroll independently. Workers come first; the agents sub-panel
+	// owns the sub-heading + (optional) right-column agent-idle
+	// separator.
+	var workers []string
+	var agents []string
 	hasWorkers, hasAgents := false, false
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		if row.kind == rowWorker {
-			right = append(right, workerBlockLines(row.worker, m.records, rightW, selected)...)
+			workers = append(workers, workerBlockLines(row.worker, m.records, rightW, selected)...)
 			hasWorkers = true
 		}
 	}
@@ -589,7 +800,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		if m.searchFilter != "" && m.dashboard != nil && len(m.dashboard.Workers) > 0 {
 			hint = fmt.Sprintf("  no workers match /%s — esc clears", m.searchFilter)
 		}
-		right = append(right, "", columnHeadingStyle.Render(hint))
+		workers = append(workers, "", columnHeadingStyle.Render(hint))
 	}
 	// Insert v0.1 agents sub-heading. The counter shows VISIBLE-LIVE
 	// agents — records that survived the filter AND whose derived
@@ -609,7 +820,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		// When the operator hasn't filtered, still show a sub-header
 		// for context (e.g. all agents dead → "v0.1 agents — 0
 		// active" tells the operator the section exists).
-		right = append(right, "",
+		agents = append(agents, "",
 			columnHeadingStyle.Render(fmt.Sprintf(
 				"  v0.1 agents — %d active", visibleAlive)))
 	}
@@ -617,7 +828,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowAgent:
-			right = append(right, agentBlockLines(row.agent, m.aliveByID, rightW, selected)...)
+			agents = append(agents, agentBlockLines(row.agent, m.aliveByID, rightW, selected)...)
 			hasAgents = true
 		case rowSeparator:
 			// dashboard-accumulation-f-4421 Sub-fix B: render the
@@ -625,12 +836,12 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string) {
 			// belong to the LEFT column and are already painted by the
 			// left-column loop above.
 			if row.separator != nil && row.separator.kind == separatorAgentIdle {
-				right = append(right, separatorBlockLine(row.separator, rightW, selected))
+				agents = append(agents, separatorBlockLine(row.separator, rightW, selected))
 			}
 		}
 	}
 	_ = hasAgents
-	return left, right
+	return left, workers, agents
 }
 
 // separatorBlockLine renders one "─── N idle ───" / "─── N hidden ───"

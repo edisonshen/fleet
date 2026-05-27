@@ -61,10 +61,20 @@ const (
 	// by default; --apply unlinks. Tracks fleet#172 — sweeps historical
 	// state from before PRs #173 (fleet#170) and #174 (fleet#171) closed
 	// the new-hijack window at spawn + tick time. See coord_locks.go.
+
+	// KindWorkerRecords (fleet#177) is the sixth classifier — sweeps
+	// stale `~/.fleet/projects/<p>/workers/<slug>/state.json` files.
+	// Four failure modes: mismatch (state.project disagrees with parent
+	// dir), dead-pid (pid set + process gone + old), stale-heartbeat
+	// (pid=0 + old), task-terminal (tasks.md says done|abandoned but
+	// worker dir survives). Surface-only by default; --apply removes
+	// the worker dir (NOT the worktree — KindWorktrees owns that).
+	// Live-PID guard + task-in-progress guard prevent live-worker harm.
+	// See worker_records.go.
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -198,6 +208,31 @@ type Deps struct {
 	// RemoveCoordLock unlinks the lock file under --apply. Production
 	// wiring is removeCoordLockFile (best-effort, ENOENT-tolerant).
 	RemoveCoordLock func(path string) error
+
+	// Worker-records (KindWorkerRecords).
+	// ListWorkerRecords enumerates every worker dir under
+	// ~/.fleet/projects/<p>/workers/<slug>/ containing a state.json.
+	// archive/ subtree is skipped. Production wiring is
+	// listWorkerRecordsOnDisk in worker_records.go.
+	ListWorkerRecords func() ([]WorkerRecordInfo, error)
+	// LoadWorkerState parses one state.json into the classifier's
+	// minimal projection (slug, project, pid, updated_at). Production
+	// wiring is loadWorkerStateOnDisk.
+	LoadWorkerState func(path string) (WorkerState, error)
+	// LoadTaskStatus returns the raw status string for a (project, slug)
+	// task from tasks.md (or tasks-archive.md). Returns "" with nil err
+	// when the slug is absent from both files. Production wiring is
+	// loadTaskStatusOnDisk.
+	LoadTaskStatus func(project, slug string) (string, error)
+	// PidAlive returns true iff the OS reports the pid as still
+	// running. Used by the live-PID guard to skip-reaping live workers.
+	// Production wiring is pidAliveOnDisk (signal-0 probe).
+	PidAlive func(pid int) bool
+	// RemoveWorkerRecord removes the worker DIR (state.json +
+	// output.log + scratch) under --apply. NEVER touches the worktree
+	// (separate path; KindWorktrees owns it). Production wiring is
+	// removeWorkerRecordDir.
+	RemoveWorkerRecord func(path string) error
 }
 
 // Action describes one planned-or-applied operation against a single
@@ -287,6 +322,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("coord-locks: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindWorkerRecords) {
+		if err := reconcileWorkerRecords(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("worker-records: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -312,6 +352,8 @@ func kindRank(k Kind) int {
 		return 3
 	case KindCoordLocks:
 		return 4
+	case KindWorkerRecords:
+		return 5
 	}
 	return 99
 }
@@ -650,6 +692,11 @@ func DefaultDeps() Deps {
 		ListCoordLocks:      listCoordLocksOnDisk,
 		LoadAgent:           agent.Load,
 		RemoveCoordLock:     removeCoordLockFile,
+		ListWorkerRecords:   listWorkerRecordsOnDisk,
+		LoadWorkerState:     loadWorkerStateOnDisk,
+		LoadTaskStatus:      loadTaskStatusOnDisk,
+		PidAlive:            pidAliveOnDisk,
+		RemoveWorkerRecord:  removeWorkerRecordDir,
 	}
 }
 

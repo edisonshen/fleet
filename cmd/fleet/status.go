@@ -301,12 +301,12 @@ func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
 		}
 		return fmt.Sprintf("fleet rm %s  (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running)", a.Target)
-	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks:
-		// coord-locks shares the global-gc hint shape (sockets +
-		// worktrees) because the unlink is project-scoped to the lock
-		// dir's parent project — no per-record FLEET_TMUX_SOCKET
-		// caveat applies. See cmd/fleet/gc.go's --kinds=coord-locks
-		// wiring (fleet#172).
+	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords:
+		// coord-locks + worker-records share the global-gc hint shape
+		// (sockets + worktrees) because the remove is project-scoped to
+		// the parent project's tree — no per-record FLEET_TMUX_SOCKET
+		// caveat applies. See cmd/fleet/gc.go's --kinds wiring
+		// (fleet#172 for coord-locks, fleet#177 for worker-records).
 		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
 	default:
 		return "(unknown — run `fleet gc` for details)"
