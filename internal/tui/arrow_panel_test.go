@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // Issue #83: Left/Right arrow keys jump cursor between PROJECTS and
@@ -200,5 +202,120 @@ func TestRenderHelpOverlay_DocsArrowPanelEntry(t *testing.T) {
 	}
 	if !strings.Contains(out, "PROJECTS") || !strings.Contains(out, "WORKERS") {
 		t.Errorf("help overlay missing panel labels (PROJECTS / WORKERS):\n%s", out)
+	}
+}
+
+// ----- fleet#177 right-panel scroll tests (Fix 2) -----
+
+// TestArrowKeys_ScrollWorkersPanel_DownIncrementsOffset: when the cursor
+// is on a worker row (right column focused) AND the right column has
+// overflow, ↓ increments the workers scroll offset. Boundary: capped
+// at maxScrollOffset so ↓ past the end doesn't underflow the slice.
+func TestArrowKeys_ScrollWorkersPanel_DownIncrementsOffset(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	// 30 workers to force overflow.
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	// Jump cursor to first worker row.
+	m.jumpToRightPanel()
+	if m.workersScrollOffset != 0 {
+		t.Fatalf("setup: workersScrollOffset=%d, want 0", m.workersScrollOffset)
+	}
+	// ↓ on right-column focus → scroll, not row movement.
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	if mm.workersScrollOffset == 0 {
+		t.Errorf("after ↓ on workers panel with overflow: workersScrollOffset=%d, want > 0", mm.workersScrollOffset)
+	}
+}
+
+// TestArrowKeys_ScrollWorkersPanel_UpClampsAtZero: ↑ on a panel whose
+// offset is already zero must clamp (not negative).
+func TestArrowKeys_ScrollWorkersPanel_UpClampsAtZero(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.jumpToRightPanel()
+	m.workersScrollOffset = 0
+	updated, _ := m.Update(keyMsg("up"))
+	mm := updated.(Model)
+	if mm.workersScrollOffset < 0 {
+		t.Errorf("after ↑ on workers panel offset=0: workersScrollOffset=%d, want clamped to 0", mm.workersScrollOffset)
+	}
+}
+
+// TestArrowKeys_LeftColumnUnaffectedByRightScroll: when the cursor is
+// on a LEFT-column row (project / task), ↓ moves the cursor normally
+// (j/k semantics) and does NOT touch workersScrollOffset.
+func TestArrowKeys_LeftColumnUnaffectedByRightScroll(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Active: true},
+			{Name: "demo", RepoSlug: "demo", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	// Place cursor on left column (project row).
+	m.jumpToLeftPanel()
+	startCursor := m.dashCursor
+	startOffset := m.workersScrollOffset
+
+	// ↓ on left-column focus → cursor moves, no scroll change.
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	if mm.dashCursor == startCursor {
+		t.Errorf("↓ on left column did not move cursor; dashCursor=%d (want > %d)", mm.dashCursor, startCursor)
+	}
+	if mm.workersScrollOffset != startOffset {
+		t.Errorf("↓ on left column touched right-panel scroll offset: workersScrollOffset=%d, want %d (unchanged)",
+			mm.workersScrollOffset, startOffset)
+	}
+}
+
+// TestRightPanelScrollOffsetResetsOnResize: a terminal resize event
+// must reset the right-panel offsets to 0 (the visible window changes,
+// and clamping after-the-fact is brittle).
+func TestRightPanelScrollOffsetResetsOnResize(t *testing.T) {
+	m := New("test")
+	m.workersScrollOffset = 5
+	m.agentsScrollOffset = 3
+
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 24})
+	mm := updated.(Model)
+	if mm.workersScrollOffset != 0 || mm.agentsScrollOffset != 0 {
+		t.Errorf("resize did not reset right-panel offsets: workers=%d, agents=%d (want 0,0)",
+			mm.workersScrollOffset, mm.agentsScrollOffset)
 	}
 }

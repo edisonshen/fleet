@@ -717,9 +717,9 @@ func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {
 }
 
 // TestStatus_ReconcilePassesAllKinds pins the call shape: status
-// surfaces ALL five kinds (sockets, orphan-agents, orphan-tmux,
-// worktrees, coord-locks), so the reconcile Options must opt into all
-// of them and run dry-run (Apply=false).
+// surfaces ALL six kinds (sockets, orphan-agents, orphan-tmux,
+// worktrees, coord-locks, worker-records), so the reconcile Options
+// must opt into all of them and run dry-run (Apply=false).
 func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	stubEnsureFresh(t)
 	dir := t.TempDir()
@@ -733,12 +733,13 @@ func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	if opts.Apply {
 		t.Errorf("status reconcile must be dry-run (Apply=false); got Apply=%t", opts.Apply)
 	}
-	// Must include all five kinds so the operator sees a complete
-	// picture of orphan state (fleet#172 added KindCoordLocks).
+	// Must include all six kinds so the operator sees a complete
+	// picture of orphan state (fleet#172 added KindCoordLocks;
+	// fleet#177 added KindWorkerRecords).
 	wantKinds := map[gc.Kind]bool{
 		gc.KindSockets: true, gc.KindOrphanAgents: true,
 		gc.KindOrphanTmux: true, gc.KindWorktrees: true,
-		gc.KindCoordLocks: true,
+		gc.KindCoordLocks: true, gc.KindWorkerRecords: true,
 	}
 	got := map[gc.Kind]bool{}
 	for _, k := range opts.Kinds {
@@ -748,6 +749,44 @@ func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 		if !got[k] {
 			t.Errorf("status reconcile missing kind %q; opts.Kinds=%v", k, opts.Kinds)
 		}
+	}
+}
+
+// TestStatus_SurfacesOrphanWorkerRecord_HintActionable: when a
+// worker-records orphan surfaces in `fleet status`, the hint column
+// must name the actionable `fleet gc --apply --kinds=worker-records`
+// command rather than fall through to the "(unknown — run `fleet gc`)"
+// default. Mirrors TestStatus_SurfacesOrphanCoordLock_HintActionable
+// for fleet#177.
+func TestStatus_SurfacesOrphanWorkerRecord_HintActionable(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{{
+		Kind:   gc.KindWorkerRecords,
+		Target: "/fake/projects/projects-fleet/workers/stale-aaaa/",
+		Verb:   gc.VerbSurface,
+		Reason: "stale-heartbeat (pid=0, last update 25h ago)",
+	}}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Orphans") {
+		t.Errorf("stdout should surface an Orphans section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "/fake/projects/projects-fleet/workers/stale-aaaa/") {
+		t.Errorf("stdout should name the orphan worker dir; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet gc --apply --kinds=worker-records") {
+		t.Errorf("orphan worker-records row must suggest the actionable gc command; got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown — run `fleet gc` for details") {
+		t.Errorf("orphan worker-records row hit the unknown-Kind fallback; got:\n%s", out)
 	}
 }
 

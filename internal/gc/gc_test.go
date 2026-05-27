@@ -83,11 +83,30 @@ func stubDeps(now time.Time) Deps {
 		RemoveCoordLock: func(string) error {
 			return errors.New("stubDeps: RemoveCoordLock should not run")
 		},
+		// Worker-records (KindWorkerRecords). Empty list by default;
+		// tests that exercise the classifier override these five.
+		ListWorkerRecords: func() ([]WorkerRecordInfo, error) { return nil, nil },
+		LoadWorkerState: func(string) (WorkerState, error) {
+			return WorkerState{}, nil
+		},
+		LoadTaskStatus: func(string, string) (string, error) {
+			// Default "in-progress" so absent overrides don't trigger
+			// the task-terminal branch on tests that don't care about it.
+			return "in-progress", nil
+		},
+		PidAlive: func(int) bool {
+			// Default: pretend any pid is alive unless overridden. The
+			// dead-pid + stale-heartbeat tests override this.
+			return true
+		},
+		RemoveWorkerRecord: func(string) error {
+			return errors.New("stubDeps: RemoveWorkerRecord should not run")
+		},
 	}
 }
 
 func defaultKinds() []Kind {
-	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks}
+	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords}
 }
 
 func findAction(r Report, kind Kind, target string) (Action, bool) {
@@ -1944,5 +1963,667 @@ func TestRemoveIfSameInode_SameInode_Unlinks(t *testing.T) {
 	}
 	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
 		t.Errorf("lock file still exists; stat=%v", statErr)
+	}
+}
+
+// ----- fleet#177 worker-records classifier tests -----
+//
+// KindWorkerRecords sweeps stale `~/.fleet/projects/<p>/workers/<slug>/state.json`
+// files across every project. Four failure modes:
+//
+//   - mismatch       — state.json's `project` field != parent-dir project name
+//                      (cross-project taint from before fleet#170/#171 closed
+//                      the new-write window)
+//   - dead-pid       — `pid` set + process gone + updated_at older than 24h
+//   - stale-heartbeat — `pid=0` + updated_at older than 24h
+//   - task-terminal  — task in tasks.md is done|abandoned but worker dir still
+//                      on disk
+//
+// Surface-only by default; --apply removes the worker directory (state.json +
+// output.log + scratch) via RemoveWorkerRecord. The worktree (separate path)
+// is NEVER touched — that's KindWorktrees' job.
+
+// TestReconcile_WorkerRecords_Mismatch_Surfaced pins the cross-project
+// taint case: state.json under projects-fleet/workers/<slug>/ but the
+// state.project field says "projects-rainier".
+func TestReconcile_WorkerRecords_Mismatch_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/etf-dashboard-publish-cr-31aa/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "etf-dashboard-publish-cr-31aa",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(p string) (WorkerState, error) {
+		if p != workerPath {
+			t.Fatalf("LoadWorkerState path=%q want %q", p, workerPath)
+		}
+		return WorkerState{
+			Slug:      "etf-dashboard-publish-cr-31aa",
+			Project:   "projects-rainier", // mismatch vs parent dir
+			Pid:       0,
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("mismatch verb=%q, want %q (default is surface-only)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "mismatch") {
+		t.Fatalf("reason=%q does not name mismatch mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "projects-rainier") {
+		t.Fatalf("reason=%q does not name the recorded project", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Mismatch_ApplyRemoves: --apply on the
+// mismatch branch upgrades the action to removed and calls
+// RemoveWorkerRecord with the worker dir path.
+func TestReconcile_WorkerRecords_Mismatch_ApplyRemoves(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/cross-taint-aaaa/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "cross-taint-aaaa",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "cross-taint-aaaa",
+			Project:   "projects-rainier",
+			Pid:       0,
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	var removed []string
+	deps.RemoveWorkerRecord = func(p string) error {
+		removed = append(removed, p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbRemoved {
+		t.Fatalf("apply verb=%q, want %q", a.Verb, VerbRemoved)
+	}
+	if len(removed) != 1 || removed[0] != workerPath {
+		t.Fatalf("removed=%v, want [%s]", removed, workerPath)
+	}
+}
+
+// TestReconcile_WorkerRecords_DeadPid_Surfaced: pid set + process dead +
+// updated_at older than 24h is the dead-pid failure mode.
+func TestReconcile_WorkerRecords_DeadPid_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/dead-pid-bbbb/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "dead-pid-bbbb",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "dead-pid-bbbb",
+			Project:   "projects-fleet",
+			Pid:       99999,
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	deps.PidAlive = func(pid int) bool {
+		if pid != 99999 {
+			t.Fatalf("PidAlive pid=%d want 99999", pid)
+		}
+		return false
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dead-pid verb=%q, want %q (surface only)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "dead-pid") {
+		t.Fatalf("reason=%q does not name dead-pid mode", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_LivePid_Unchanged pins the live-PID guard:
+// when the worker's pid is still alive, the classifier is a no-op even
+// if updated_at is ancient. Reaping a live worker would orphan the
+// running process.
+func TestReconcile_WorkerRecords_LivePid_Unchanged(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/live-cccc/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "live-cccc",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "live-cccc",
+			Project:   "projects-fleet",
+			Pid:       12345,
+			UpdatedAt: now.Add(-30 * 24 * time.Hour), // 30 days stale
+		}, nil
+	}
+	deps.PidAlive = func(int) bool { return true }
+	deps.RemoveWorkerRecord = func(string) error {
+		t.Fatal("RemoveWorkerRecord called on live-pid worker — would orphan running process")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindWorkerRecords, workerPath); ok {
+		t.Fatalf("live-pid worker produced an action; want no-op. got %+v", got.Actions)
+	}
+}
+
+// TestReconcile_WorkerRecords_StaleHeartbeat_Surfaced: pid=0 +
+// updated_at older than 24h (worker died before claiming the row OR was
+// never spawned at all).
+func TestReconcile_WorkerRecords_StaleHeartbeat_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/stale-dddd/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "stale-dddd",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "stale-dddd",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("stale-heartbeat verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "stale-heartbeat") {
+		t.Fatalf("reason=%q does not name stale-heartbeat mode", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_StaleHeartbeat_FreshSkipped: pid=0 but
+// updated_at is within the 24h window — worker is mid-spawn or
+// genuinely active without a pid (e.g., subagent dispatch overlap).
+// Must be left alone.
+func TestReconcile_WorkerRecords_StaleHeartbeat_FreshSkipped(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/fresh-eeee/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "fresh-eeee",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "fresh-eeee",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-30 * time.Minute), // way inside 24h window
+		}, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindWorkerRecords, workerPath); ok {
+		t.Fatalf("fresh stale-heartbeat candidate produced an action; want no-op. got %+v", got.Actions)
+	}
+}
+
+// TestReconcile_WorkerRecords_TaskTerminal_Surfaced: tasks.md says the
+// task is done; the worker dir is orphan post-archive.
+func TestReconcile_WorkerRecords_TaskTerminal_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/finished-ffff/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "finished-ffff",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "finished-ffff",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-2 * time.Hour), // fresh — not stale-heartbeat
+		}, nil
+	}
+	deps.LoadTaskStatus = func(project, slug string) (string, error) {
+		if project != "projects-fleet" || slug != "finished-ffff" {
+			t.Fatalf("LoadTaskStatus(%q,%q) wrong args", project, slug)
+		}
+		return "done", nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("task-terminal verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "task-terminal") {
+		t.Fatalf("reason=%q does not name task-terminal mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "done") {
+		t.Fatalf("reason=%q does not include the task status", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_TaskTerminal_Abandoned_Surfaced ensures the
+// classifier honors "abandoned" as a terminal status, not just "done".
+func TestReconcile_WorkerRecords_TaskTerminal_Abandoned_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/abandoned-gggg/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "abandoned-gggg",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "abandoned-gggg",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-2 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) {
+		return "abandoned", nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("task-terminal verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "abandoned") {
+		t.Fatalf("reason=%q does not include 'abandoned'", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_TaskInProgress_RefusesUnlink pins the
+// task-in-progress guard: even if the state.json looks orphan, when
+// tasks.md still says in-progress, the classifier MUST surface but
+// MUST NOT apply (coord reconcile owns that path).
+func TestReconcile_WorkerRecords_TaskInProgress_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/inprog-hhhh/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "inprog-hhhh",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "inprog-hhhh",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-25 * time.Hour), // looks stale-heartbeat
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) {
+		return "in-progress", nil
+	}
+	deps.RemoveWorkerRecord = func(string) error {
+		t.Fatal("RemoveWorkerRecord called for in-progress task — coord reconcile owns that path")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("in-progress task verb=%q, want %q (must never auto-remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "in-progress") && !strings.Contains(a.Reason, "coord reconcile") {
+		t.Fatalf("reason=%q does not explain the in-progress refusal", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_DryRun_NeverMutates pins the dry-run
+// invariant: dry-run produces would-* actions, never calls
+// RemoveWorkerRecord, regardless of the orphan mode.
+func TestReconcile_WorkerRecords_DryRun_NeverMutates(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/dryrun-iiii/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "dryrun-iiii",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "dryrun-iiii",
+			Project:   "projects-rainier", // mismatch
+			Pid:       0,
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	deps.RemoveWorkerRecord = func(string) error {
+		t.Fatal("RemoveWorkerRecord called in dry-run mode")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dry-run verb=%q, want %q", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_WorkerRecords_ParseError_SurfacedAsWarning: when
+// LoadWorkerState fails to parse the state.json (corrupt / partial
+// write / hand-edit), the classifier surfaces a warning rather than
+// silently skipping. surface-don't-silo.
+func TestReconcile_WorkerRecords_ParseError_SurfacedAsWarning(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/corrupt-jjjj/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "corrupt-jjjj",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{}, errors.New("unexpected end of JSON input")
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records parse-error action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parse-error verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "parse") {
+		t.Fatalf("reason=%q does not name parse failure", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Healthy_NoAction pins the no-noise contract:
+// a healthy worker (fresh updated_at, no mismatch, task in-progress)
+// produces zero actions.
+func TestReconcile_WorkerRecords_Healthy_NoAction(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "healthy-kkkk",
+			Path:    "/fake/projects/projects-fleet/workers/healthy-kkkk/",
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "healthy-kkkk",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-5 * time.Minute),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) {
+		return "in-progress", nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, a := range got.Actions {
+		if a.Kind == KindWorkerRecords {
+			t.Errorf("healthy worker produced action %+v; want zero", a)
+		}
+	}
+}
+
+// TestReconcile_WorkerRecords_MissingDep_Errors pins fail-fast: every
+// required Deps hook (ListWorkerRecords, LoadWorkerState, LoadTaskStatus,
+// PidAlive) must be wired. Missing any → error rather than silent skip.
+func TestReconcile_WorkerRecords_MissingDep_Errors(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListWorkerRecords = nil // nil out the required hook
+	_, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err == nil {
+		t.Fatal("Reconcile with missing ListWorkerRecords should error")
+	}
+	if !strings.Contains(err.Error(), "ListWorkerRecords") {
+		t.Errorf("error=%q does not name missing dep", err.Error())
+	}
+}
+
+// TestListWorkerRecordsOnDisk_ProductionLister exercises the production
+// `~/.fleet/projects/<p>/workers/<slug>/state.json` walker against a
+// fake home tree. Asserts:
+//   - state.json files under workers/<slug>/ are yielded
+//   - directories under workers/archive/ are skipped (archive subtree
+//     is fleet's own cold-storage and not a live worker)
+//   - non-state.json files (output.log, scratch/) are not yielded
+//   - parent-dir project name is plumbed into WorkerRecordInfo.Project
+func TestListWorkerRecordsOnDisk_ProductionLister(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+
+	// Build:
+	//   projects/projects-fleet/workers/live-slug-aaaa/state.json
+	//   projects/projects-fleet/workers/live-slug-aaaa/output.log     (skipped)
+	//   projects/projects-fleet/workers/archive/old-bbbb-20260101/state.json (skipped)
+	//   projects/projects-rainier/workers/cross-cccc/state.json
+	type seed struct {
+		path string
+		want bool
+	}
+	seeds := []seed{
+		{"projects/projects-fleet/workers/live-slug-aaaa/state.json", true},
+		{"projects/projects-fleet/workers/live-slug-aaaa/output.log", false},
+		{"projects/projects-fleet/workers/archive/old-bbbb-20260101/state.json", false},
+		{"projects/projects-rainier/workers/cross-cccc/state.json", true},
+	}
+	for _, s := range seeds {
+		full := filepath.Join(fleetHome, s.path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", full, err)
+		}
+		if err := os.WriteFile(full, []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write %s: %v", full, err)
+		}
+	}
+
+	got, err := listWorkerRecordsOnDisk()
+	if err != nil {
+		t.Fatalf("listWorkerRecordsOnDisk: %v", err)
+	}
+
+	// Build wantPaths for comparison.
+	wantPaths := map[string]string{}
+	for _, s := range seeds {
+		if !s.want {
+			continue
+		}
+		// Path is the worker DIR (parent of state.json), not the json itself.
+		full := filepath.Join(fleetHome, filepath.Dir(s.path))
+		// Derive project name from path: projects/<name>/workers/<slug>
+		parts := strings.Split(s.path, "/")
+		project := parts[1]
+		wantPaths[full] = project
+	}
+	if len(got) != len(wantPaths) {
+		t.Fatalf("listWorkerRecordsOnDisk returned %d entries, want %d. got=%+v", len(got), len(wantPaths), got)
+	}
+	for _, info := range got {
+		// Trim trailing separator for comparison since WorkerDir() returns
+		// trailing separator and our seed paths don't.
+		key := strings.TrimSuffix(info.Path, string(filepath.Separator))
+		wantProject, ok := wantPaths[key]
+		if !ok {
+			t.Errorf("unexpected entry path=%s slug=%s project=%s", info.Path, info.Slug, info.Project)
+			continue
+		}
+		if info.Project != wantProject {
+			t.Errorf("entry path=%s project=%q, want %q", info.Path, info.Project, wantProject)
+		}
+		if info.Slug == "" {
+			t.Errorf("entry path=%s has empty slug", info.Path)
+		}
+	}
+}
+
+// TestLoadWorkerStateOnDisk pins the production state.json parser:
+// must round-trip the four fields we care about (slug, project, pid,
+// updated_at) plus tolerate the extra phase/heartbeat fields the
+// coord skill writes.
+func TestLoadWorkerStateOnDisk(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	body := `{
+		"slug": "round-trip-llll",
+		"project": "projects-fleet",
+		"phase": "review-pending",
+		"phases_completed": ["starting", "branch"],
+		"pid": 4242,
+		"updated_at": "2026-05-27T00:00:00Z"
+	}`
+	if err := os.WriteFile(statePath, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	got, err := loadWorkerStateOnDisk(statePath)
+	if err != nil {
+		t.Fatalf("loadWorkerStateOnDisk: %v", err)
+	}
+	if got.Slug != "round-trip-llll" {
+		t.Errorf("Slug=%q, want round-trip-llll", got.Slug)
+	}
+	if got.Project != "projects-fleet" {
+		t.Errorf("Project=%q, want projects-fleet", got.Project)
+	}
+	if got.Pid != 4242 {
+		t.Errorf("Pid=%d, want 4242", got.Pid)
+	}
+	wantTime := time.Date(2026, 5, 27, 0, 0, 0, 0, time.UTC)
+	if !got.UpdatedAt.Equal(wantTime) {
+		t.Errorf("UpdatedAt=%v, want %v", got.UpdatedAt, wantTime)
 	}
 }

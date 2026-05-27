@@ -123,3 +123,168 @@ func TestBuildBodyLines_AgentIdleSeparatorRendersRightOnly(t *testing.T) {
 		t.Errorf("agent-idle separator '1 idle' missing from RIGHT column:\n%s", rightAll)
 	}
 }
+
+// ----- fleet#177 TUI right-panel bound tests (Fix 2) -----
+//
+// renderTwoColumnBody must reserve >=50% of usable vertical rows for the
+// LEFT projects column. When the right column (workers + agents) is
+// long, overflow rolls into a "K hidden — [↓/↑] scroll" footer instead
+// of pushing left-column rows off-screen. Arrow-key scroll inside the
+// focused right panel; left-column arrow nav untouched.
+
+// buildLargeWorkerSnapshot helper — synthesizes a snapshot with N
+// worker rows so tests can exercise overflow paths without needing real
+// fleet state on disk. The synthetic workers all live under one
+// project so the LEFT column is small (one project block, fixed).
+func buildLargeWorkerSnapshot(projectName string, workers int) *Snapshot {
+	snap := &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: projectName, RepoSlug: projectName, Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < workers; i++ {
+		snap.Workers = append(snap.Workers, &WorkerRow{
+			Project: projectName,
+			Slug:    "synth-worker-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	return snap
+}
+
+// TestRenderTwoColumnBody_BoundedRightPanel_LongWorkersList: 30 workers
+// on a 24-row terminal. The left projects column must still render its
+// full block (3 lines for the single project + 1 blank); the right
+// column shows the first K-1 workers + a footer line naming the
+// overflow + scroll hint.
+func TestRenderTwoColumnBody_BoundedRightPanel_LongWorkersList(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 24 // short terminal
+	m.dashboard = buildLargeWorkerSnapshot("fleet", 30)
+
+	body := renderTwoColumnBody(m, 90, 40)
+	// The body must include the project name (left column not pushed
+	// off-screen) AND the scroll hint footer (right column overflow).
+	if !strings.Contains(body, "fleet") {
+		t.Errorf("project name 'fleet' missing from rendered body — left column likely pushed off-screen:\n%s", body)
+	}
+	if !strings.Contains(body, "[↓/↑] scroll") {
+		t.Errorf("expected '[↓/↑] scroll' overflow hint in right column body; got:\n%s", body)
+	}
+	if !strings.Contains(body, "hidden") {
+		t.Errorf("expected 'hidden' count in scroll footer; got:\n%s", body)
+	}
+}
+
+// TestRenderTwoColumnBody_BoundedRightPanel_LongAgentsList: 30 agent
+// rows on a 24-row terminal. Same bounded-projects invariant.
+func TestRenderTwoColumnBody_BoundedRightPanel_LongAgentsList(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{
+			{Name: "fleet", RepoSlug: "fleet", Active: true},
+		},
+		LoadedAt: time.Now(),
+	}
+	// 30 agent records.
+	for i := 0; i < 30; i++ {
+		id := "aaaa" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))) + "00"
+		m.records = append(m.records, sampleAgent(id))
+	}
+
+	body := renderTwoColumnBody(m, 90, 40)
+	if !strings.Contains(body, "fleet") {
+		t.Errorf("project name 'fleet' missing — left column pushed off-screen:\n%s", body)
+	}
+	// Either the right-panel scroll hint OR the existing agents-only
+	// "[c] view" hint must fire; the new bound applies the unified
+	// scroll affordance.
+	if !strings.Contains(body, "[↓/↑] scroll") {
+		t.Errorf("expected '[↓/↑] scroll' overflow hint with 30 agents; got:\n%s", body)
+	}
+}
+
+// TestRenderTwoColumnBody_TallTerminal_NoScrollNeeded: 60-row terminal
+// with a comfortable 7 agents + 4 workers. No overflow → no footer
+// hint rendered.
+func TestRenderTwoColumnBody_TallTerminal_NoScrollNeeded(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 60
+	m.dashboard = buildLargeWorkerSnapshot("fleet", 4)
+	for i := 0; i < 7; i++ {
+		id := "bbbb" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))) + "00"
+		m.records = append(m.records, sampleAgent(id))
+	}
+
+	body := renderTwoColumnBody(m, 90, 40)
+	if strings.Contains(body, "[↓/↑] scroll") {
+		t.Errorf("tall terminal must NOT render scroll-hint footer; got:\n%s", body)
+	}
+}
+
+// TestRenderTwoColumnBody_ProjectsReservedHalf: the left projects
+// column reserves >= 50% of usable rows (minProjectsRows floor: 6).
+// Even with a packed right column the projects budget never falls
+// below the floor. This is the load-bearing invariant against the
+// operator's screenshot bug.
+func TestRenderTwoColumnBody_ProjectsReservedHalf(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 24
+
+	// 6 projects + many workers — when the budget is wrong, the right
+	// column eats all 24 rows and projects 5-6 disappear.
+	m.dashboard = &Snapshot{
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 6; i++ {
+		name := "proj-" + string(rune('a'+i))
+		m.dashboard.Projects = append(m.dashboard.Projects, &ProjectRow{
+			Name: name, RepoSlug: name, Active: true,
+		})
+	}
+	for i := 0; i < 50; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "proj-a",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+
+	body := renderTwoColumnBody(m, 90, 40)
+	// Every project name must be present in the rendered body — none
+	// pushed off-screen.
+	for i := 0; i < 6; i++ {
+		name := "proj-" + string(rune('a'+i))
+		if !strings.Contains(body, name) {
+			t.Errorf("project %q missing from body — left column truncated by right-column overflow:\n%s", name, body)
+		}
+	}
+}
+
+// TestRenderTwoColumnBody_ScrollHintHarmonized: the overflow hint must
+// match the "K hidden — <action>" shape used by the existing agents
+// "K hidden — [c] view" footer. Operator's muscle memory expects the
+// same prefix shape on both bounds.
+func TestRenderTwoColumnBody_ScrollHintHarmonized(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = buildLargeWorkerSnapshot("fleet", 30)
+
+	body := renderTwoColumnBody(m, 90, 40)
+	// Shape: "<N> hidden — [↓/↑] scroll" (mirrors agents footer).
+	if !strings.Contains(body, "hidden — [↓/↑] scroll") {
+		t.Errorf("scroll-hint footer not harmonized with existing 'K hidden — <action>' shape; got:\n%s", body)
+	}
+}
