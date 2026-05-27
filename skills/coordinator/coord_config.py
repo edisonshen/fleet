@@ -254,6 +254,14 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
         tail = tail[: -len(".git")]
     if not tail:
         return False
+    # Normalize case before comparison — TagForPath lowercases project
+    # tags (e.g., `Repos/MyProject` becomes `repos-myproject`), but
+    # `git remote get-url origin` returns the verbatim URL (likely
+    # `MyProject.git`). A strict-equal comparison would falsely reject
+    # the correct checkout. Lowercasing the URL basename matches the
+    # project-tag normalization (iter-13, codex P2).
+    tail = tail.lower()
+    project = project.lower()
     # If the project tag has no `-`, single-segment registration —
     # match whole tag. Otherwise split off the first `-`-token (the
     # parent half) and strict-equal match against the URL basename.

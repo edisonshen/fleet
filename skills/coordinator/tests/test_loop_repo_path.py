@@ -279,6 +279,25 @@ def test_validate_remote_rejects_iter9_suffix_lookalike_short() -> None:
     )
 
 
+def test_validate_remote_case_insensitive_match() -> None:
+    """iter-13 (codex P2): TagForPath lowercases tags, but
+    `git remote get-url` returns verbatim URLs. Compare
+    case-insensitively to accept `MyProject.git` against tag
+    `repos-myproject`."""
+    assert coord_config.remote_matches_project(
+        "https://github.com/acme/MyProject.git",
+        "repos-myproject",
+    )
+
+
+def test_validate_remote_case_insensitive_mixed() -> None:
+    """Case insensitivity applies both directions (defensive)."""
+    assert coord_config.remote_matches_project(
+        "git@github.com:edisonshen/RaInIeR.git",
+        "projects-rainier",
+    )
+
+
 def test_validate_remote_empty_url_returns_false() -> None:
     """Empty remote URL → False. CALLER (loop.tick) must treat this as
     'cannot validate' (local-only repo path) rather than 'mismatch' —
