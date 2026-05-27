@@ -33,6 +33,18 @@ func TestParseKindsCSV_Subset(t *testing.T) {
 	}
 }
 
+func TestParseKindsCSV_AcceptsCoordLocks(t *testing.T) {
+	// fleet#172: --kinds=coord-locks must parse cleanly. Empty-default
+	// (AllKinds) inclusion is covered by TestParseKindsCSV_Empty.
+	got, err := parseKindsCSV("coord-locks")
+	if err != nil {
+		t.Fatalf("parseKindsCSV: %v", err)
+	}
+	if len(got) != 1 || got[0] != gc.KindCoordLocks {
+		t.Fatalf("got %v, want [coord-locks]", got)
+	}
+}
+
 func TestParseKindsCSV_UnknownRejected(t *testing.T) {
 	if _, err := parseKindsCSV("sockets,foo"); err == nil {
 		t.Fatal("parseKindsCSV accepted unknown kind 'foo'")
@@ -59,6 +71,8 @@ func TestRenderReport_FormatPinned(t *testing.T) {
 			{Kind: gc.KindOrphanAgents, Target: "deadbeef", Verb: gc.VerbWouldArchive, Reason: "tmux gone"},
 			{Kind: gc.KindOrphanTmux, Target: "fleet-aaaaaaaa", Verb: gc.VerbSurface, Reason: "no agent record"},
 			{Kind: gc.KindWorktrees, Target: "/wt/old", Verb: gc.VerbWouldRemove, Reason: "task done"},
+			{Kind: gc.KindCoordLocks, Target: "/fake/projects/p/.locks/coordinator.lock",
+				Verb: gc.VerbSurface, Reason: "dead coord (agent record deadbeef missing)"},
 		}})
 	out := buf.String()
 	for _, want := range []string{
@@ -67,7 +81,8 @@ func TestRenderReport_FormatPinned(t *testing.T) {
 		"orphan-agents  deadbeef  verb=would-archive  reason=tmux gone",
 		"orphan-tmux  fleet-aaaaaaaa  verb=surface  reason=no agent record",
 		"worktrees  /wt/old  verb=would-remove  reason=task done",
-		"summary: 1 sockets, 1 agents, 1 tmux (surface only by default), 1 worktrees",
+		"coord-locks  /fake/projects/p/.locks/coordinator.lock  verb=surface  reason=dead coord (agent record deadbeef missing)",
+		"summary: 1 sockets, 1 agents, 1 tmux (surface only by default), 1 worktrees, 1 coord-locks",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("renderReport output missing %q\n--- got ---\n%s", want, out)
@@ -98,4 +113,55 @@ func TestGCCmd_RegisteredOnRoot(t *testing.T) {
 		}
 	}
 	t.Fatal("gc subcommand not registered on root")
+}
+
+// TestRunGC_CoordLocks_MultiSocketWarning pins codex review iter-2
+// [P2]: when FLEET_TMUX_SOCKET is set AND --apply AND coord-locks is
+// in the active kinds list, runGC must emit a stderr warning. The
+// classifier's SessionAlive probes use the current socket; a healthy
+// coord spawned against a different socket can look stale-tmux (or
+// dead-coord with no record) and the unlink path can remove its live
+// lock. Mirrors the existing orphan-agents warning shape.
+func TestRunGC_CoordLocks_MultiSocketWarning(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-other.sock")
+	t.Setenv("FLEET_HOME", t.TempDir()) // isolate from operator's real state
+	var stdout, stderr bytes.Buffer
+	err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    true,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "coord-locks",
+	})
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	se := stderr.String()
+	if !strings.Contains(se, "FLEET_TMUX_SOCKET=/tmp/fleet-other.sock") {
+		t.Errorf("stderr should name FLEET_TMUX_SOCKET; got:\n%s", se)
+	}
+	if !strings.Contains(se, "coord-locks") {
+		t.Errorf("stderr should name coord-locks; got:\n%s", se)
+	}
+	if !strings.Contains(se, "different socket") {
+		t.Errorf("stderr should explain cross-socket false-stale risk; got:\n%s", se)
+	}
+}
+
+// TestRunGC_CoordLocks_NoWarning_WhenSocketUnset is the negative
+// invariant: with FLEET_TMUX_SOCKET unset (default), runGC must NOT
+// emit the coord-locks warning even on --apply --kinds=coord-locks.
+func TestRunGC_CoordLocks_NoWarning_WhenSocketUnset(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	t.Setenv("FLEET_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    true,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "coord-locks",
+	})
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	if strings.Contains(stderr.String(), "FLEET_TMUX_SOCKET") {
+		t.Errorf("stderr should not mention FLEET_TMUX_SOCKET when unset; got:\n%s", stderr.String())
+	}
 }

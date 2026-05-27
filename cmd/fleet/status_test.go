@@ -656,6 +656,45 @@ func TestStatus_SurfacesOrphanTmuxSession_CustomSocketHint(t *testing.T) {
 	}
 }
 
+// TestStatus_SurfacesOrphanCoordLock_HintActionable pins the review
+// iter-1 fix: when a coord-locks orphan surfaces in `fleet status`, the
+// hint column must name the actionable `fleet gc --apply
+// --kinds=coord-locks` command rather than fall through to the generic
+// "(unknown — run `fleet gc` for details)" default. Enum & Value
+// Completeness: orphanCleanupHint() switch must cover every Kind in
+// gc.AllKinds.
+func TestStatus_SurfacesOrphanCoordLock_HintActionable(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{{
+		Kind:   gc.KindCoordLocks,
+		Target: "/fake/projects/alpha/.locks/coordinator.lock",
+		Verb:   gc.VerbSurface,
+		Reason: "dead coord (agent record deadbeef missing)",
+	}}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Orphans") {
+		t.Errorf("stdout should surface an Orphans section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "/fake/projects/alpha/.locks/coordinator.lock") {
+		t.Errorf("stdout should name the orphan coord lock; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet gc --apply --kinds=coord-locks") {
+		t.Errorf("orphan coord-locks row must suggest the actionable gc command (not the unknown-fallback); got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown — run `fleet gc` for details") {
+		t.Errorf("orphan coord-locks row hit the unknown-Kind fallback; got:\n%s", out)
+	}
+}
+
 // TestStatus_HealthyState_NoOrphanSection pins the no-noise contract:
 // empty reconcile report → no Orphans section in stdout.
 func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {
@@ -678,9 +717,9 @@ func TestStatus_HealthyState_NoOrphanSection(t *testing.T) {
 }
 
 // TestStatus_ReconcilePassesAllKinds pins the call shape: status
-// surfaces ALL four kinds (sockets, orphan-agents, orphan-tmux,
-// worktrees), so the reconcile Options must opt into all of them and
-// run dry-run (Apply=false).
+// surfaces ALL five kinds (sockets, orphan-agents, orphan-tmux,
+// worktrees, coord-locks), so the reconcile Options must opt into all
+// of them and run dry-run (Apply=false).
 func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	stubEnsureFresh(t)
 	dir := t.TempDir()
@@ -694,11 +733,12 @@ func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	if opts.Apply {
 		t.Errorf("status reconcile must be dry-run (Apply=false); got Apply=%t", opts.Apply)
 	}
-	// Must include all four kinds so the operator sees a complete
-	// picture of orphan state.
+	// Must include all five kinds so the operator sees a complete
+	// picture of orphan state (fleet#172 added KindCoordLocks).
 	wantKinds := map[gc.Kind]bool{
 		gc.KindSockets: true, gc.KindOrphanAgents: true,
 		gc.KindOrphanTmux: true, gc.KindWorktrees: true,
+		gc.KindCoordLocks: true,
 	}
 	got := map[gc.Kind]bool{}
 	for _, k := range opts.Kinds {

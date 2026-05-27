@@ -6,10 +6,12 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -67,11 +69,25 @@ func stubDeps(now time.Time) Deps {
 		IsTaskTerminal: func(string, string) (bool, error) {
 			return false, nil
 		},
+		// Coord-locks: empty list by default; tests that exercise the
+		// classifier override these three.
+		ListCoordLocks: func() ([]CoordLockInfo, error) { return nil, nil },
+		LoadAgent: func(string) (*agent.Record, error) {
+			// Default: behave as if the agent record exists with no
+			// project + no tmux session. Tests that exercise the
+			// classifier override this to return ErrNotFound (dead-coord),
+			// a record with a different project (mismatch), or a record
+			// with a tmux session (stale-tmux).
+			return &agent.Record{}, nil
+		},
+		RemoveCoordLock: func(string) error {
+			return errors.New("stubDeps: RemoveCoordLock should not run")
+		},
 	}
 }
 
 func defaultKinds() []Kind {
-	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees}
+	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks}
 }
 
 func findAction(r Report, kind Kind, target string) (Action, bool) {
@@ -1038,6 +1054,658 @@ func TestIsTaskTerminalOnDisk_IndentedSpoofIgnored(t *testing.T) {
 	}
 }
 
+// ----- fleet#172 coord-locks classifier tests -----
+
+// TestReconcile_CoordLocks_DeadCoord_Surfaced is the dead-coord failure
+// mode: the coordinator.lock body references an agent ID whose record
+// file under ~/.fleet/agents/<id>.json is missing. LoadAgent returns
+// state.ErrNotFound; the classifier must surface (default Verb=surface,
+// no unlink without --apply).
+func TestReconcile_CoordLocks_DeadCoord_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{
+			Path:     lockPath,
+			Project:  "alpha",
+			HolderID: "deadbeef",
+		}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		if id != "deadbeef" {
+			t.Fatalf("LoadAgent called with %q, want deadbeef", id)
+		}
+		return nil, state.ErrNotFound
+	}
+	// Holder coord is truly dead (its tmux session also gone) — the
+	// classic dead-coord case. codex iter-2 [P2]: the live-holder
+	// variant is covered separately by
+	// TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink.
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-deadbeef" {
+			return false, nil
+		}
+		return true, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dead-coord verb=%q, want %q (default is surface-only)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "dead coord") {
+		t.Fatalf("reason=%q does not name dead-coord mode", a.Reason)
+	}
+	if strings.Contains(a.Reason, "still alive") {
+		t.Fatalf("dead-holder reason should NOT mention live-refusal; got %q", a.Reason)
+	}
+}
+
+// TestReconcile_CoordLocks_DeadCoord_ApplyUnlinks: --apply upgrades
+// the action to would-remove → removed and actually unlinks the lock
+// file via RemoveCoordLock.
+func TestReconcile_CoordLocks_DeadCoord_ApplyUnlinks(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "11112222"}}, nil
+	}
+	deps.LoadAgent = func(string) (*agent.Record, error) { return nil, state.ErrNotFound }
+	// Holder coord is truly dead — tmux gone — so --apply may unlink
+	// safely. (Live-holder variant covered by the LiveHolder test
+	// below; codex iter-2 [P2] split-brain guard.)
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-11112222" {
+			return false, nil
+		}
+		return true, nil
+	}
+	var removed []string
+	deps.RemoveCoordLock = func(p string) error {
+		removed = append(removed, p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbRemoved {
+		t.Fatalf("apply verb=%q, want %q", a.Verb, VerbRemoved)
+	}
+	if len(removed) != 1 || removed[0] != lockPath {
+		t.Fatalf("removed=%v, want [%s]", removed, lockPath)
+	}
+}
+
+// TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink
+// pins codex review iter-2 [P2]: when LoadAgent returns ErrNotFound
+// (record file missing) but the fleet-<id> tmux session is STILL
+// ALIVE (e.g. operator-side `rm ~/.fleet/agents/<id>.json` while the
+// coord process is still running), the classifier must NOT unlink the
+// lock under --apply. flock(2) is inode-based; os.Remove of a held
+// coordinator.lock leaves the live coord pinned to the unlinked inode
+// while a new coord can create + flock a fresh file → split-brain
+// (same shape as the mismatch live-holder defense at line 131+).
+func TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "deadbeef"}}, nil
+	}
+	deps.LoadAgent = func(string) (*agent.Record, error) { return nil, state.ErrNotFound }
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-deadbeef" {
+			return true, nil // holder process still alive
+		}
+		return false, nil
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called for live-holder dead-coord — would split-brain coord mutual-exclusion (codex iter-2 [P2])")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("live-holder dead-coord verb=%q, want %q (must NEVER be would-remove/removed)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "dead coord") {
+		t.Fatalf("reason=%q does not name dead-coord mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "still alive") || !strings.Contains(a.Reason, "split-brain") {
+		t.Fatalf("reason=%q does not explain the live-holder refusal", a.Reason)
+	}
+}
+
+// TestReconcile_CoordLocks_Mismatch_Surfaced is the cross-project
+// hijack failure mode (the historical state PRs #173/#174 closed at
+// spawn + tick time but did NOT sweep): coordinator.lock under
+// project alpha holds an agent record whose record.Project="beta".
+// The classifier must flag mismatch (lock dir != record project).
+func TestReconcile_CoordLocks_Mismatch_Surfaced(t *testing.T) {
+	// Mismatch + holder DEAD: classic historical-sweep case. PRs #173/#174
+	// closed the new-hijack window at spawn + tick time; this sweeps
+	// state from before then. The hijacker coord whose record.Project
+	// disagrees with the lock dir has since died (tmux session gone),
+	// so the unlink is safe under --apply.
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "aabbccdd"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{
+			ID:          id,
+			Project:     "beta", // record claims a DIFFERENT project
+			TmuxSession: "fleet-" + id,
+		}, nil
+	}
+	// Holder is dead — SessionAlive returns alive=false. Mismatch
+	// branch surfaces with the standard mismatch reason.
+	deps.SessionAlive = func(string) (bool, error) {
+		return false, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("mismatch verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "mismatch") {
+		t.Fatalf("reason=%q does not name mismatch mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "alpha") || !strings.Contains(a.Reason, "beta") {
+		t.Fatalf("reason=%q does not name both alpha + beta", a.Reason)
+	}
+	if strings.Contains(a.Reason, "split-brain") {
+		t.Fatalf("dead-holder reason should NOT mention split-brain refusal; got %q", a.Reason)
+	}
+}
+
+// TestReconcile_CoordLocks_Mismatch_LiveHolder_SurfaceRefusesUnlink pins
+// codex review iter-1 [P1]: when the mismatch holder's tmux session is
+// STILL ALIVE, the classifier must NOT unlink the lock under --apply.
+// flock(2) is inode-based; os.Remove of a held coordinator.lock leaves
+// the live holder on the unlinked inode while a new coord can create +
+// flock a fresh file → split-brain (two coords own the same project's
+// mutual-exclusion gate). Surface only, regardless of --apply.
+func TestReconcile_CoordLocks_Mismatch_LiveHolder_SurfaceRefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "aabbccdd"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{
+			ID:          id,
+			Project:     "beta", // mismatch
+			TmuxSession: "fleet-" + id,
+		}, nil
+	}
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-aabbccdd" {
+			return true, nil // holder is ALIVE
+		}
+		return false, nil
+	}
+	// RemoveCoordLock must NEVER fire when the holder is live — verifies
+	// the split-brain defense end-to-end (no unlink under --apply).
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called for live-holder mismatch — would split-brain coord mutual-exclusion (codex iter-1 [P1])")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour, // <-- --apply on
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("live-holder mismatch verb=%q, want %q (must NEVER be would-remove/removed)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "mismatch") {
+		t.Fatalf("reason=%q does not name mismatch mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "alive") || !strings.Contains(a.Reason, "split-brain") {
+		t.Fatalf("reason=%q does not explain the live-holder refusal", a.Reason)
+	}
+}
+
+// TestReconcile_CoordLocks_Mismatch_ProbeError_SurfaceRefusesUnlink:
+// SessionAlive probe failure is ambiguous (transport / tmux server
+// missing). Treat as conservative-live and refuse to unlink — same
+// shape as the live-holder case. Mirrors reconcileOrphanAgents'
+// probe-error guard.
+func TestReconcile_CoordLocks_Mismatch_ProbeError_SurfaceRefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "aabbccdd"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{ID: id, Project: "beta", TmuxSession: "fleet-" + id}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) {
+		return false, errors.New("simulated tmux transport error")
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called on ambiguous probe error — must refuse to unlink (codex iter-1 [P1])")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("ambiguous-probe mismatch verb=%q, want %q", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_CoordLocks_Mismatch_EmptyTmux_SurfaceRefusesUnlink:
+// empty TmuxSession is unprobeable → conservative-treat-as-live so
+// --apply refuses to unlink. The mismatch is still SURFACED so the
+// operator knows something needs attention.
+func TestReconcile_CoordLocks_Mismatch_EmptyTmux_SurfaceRefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "aabbccdd"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{ID: id, Project: "beta", TmuxSession: ""}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) {
+		t.Fatal("SessionAlive must not be called when TmuxSession is empty")
+		return false, nil
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called on empty-TmuxSession mismatch — must refuse to unlink")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("empty-tmux mismatch verb=%q, want %q", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_CoordLocks_StaleTmux_Surfaced is the stale-tmux failure
+// mode: agent record exists and project matches, but the tmux session
+// the record names is gone (SessionAlive returns alive=false, err=nil).
+// The lock body is left behind without its session.
+func TestReconcile_CoordLocks_StaleTmux_Surfaced(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/gamma/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "gamma", HolderID: "55556666"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{
+			ID:          id,
+			Project:     "gamma",
+			TmuxSession: "fleet-" + id,
+		}, nil
+	}
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-55556666" {
+			return false, nil // session is gone
+		}
+		return true, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("stale-tmux verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "stale tmux") {
+		t.Fatalf("reason=%q does not name stale-tmux mode", a.Reason)
+	}
+}
+
+// TestReconcile_CoordLocks_HealthyCoord_Unchanged is the negative
+// invariant: a coord whose record loads cleanly, whose record.Project
+// matches the lock's parent dir, and whose tmux session is alive must
+// NOT be classified. The classifier is opt-in to misbehavior signals,
+// not opt-out from healthy coords.
+func TestReconcile_CoordLocks_HealthyCoord_Unchanged(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/delta/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "delta", HolderID: "77778888"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{
+			ID:          id,
+			Project:     "delta",
+			TmuxSession: "fleet-" + id,
+		}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) { return true, nil }
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindCoordLocks, lockPath); ok {
+		t.Fatalf("healthy coord flagged; got %+v", got.Actions)
+	}
+}
+
+// TestReconcile_CoordLocks_EmptyHolder_Skipped pins the legacy
+// zero-byte lock guard: a coordinator.lock with no holder body (a
+// pre-issue-#55 legacy lock, or torn body mid-write) must NOT be
+// classified. The kernel-side flock is the load-bearing signal; an
+// empty body is harmless and removing it could race a coord that's
+// mid-acquire-and-write.
+func TestReconcile_CoordLocks_EmptyHolder_Skipped(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{
+			{Path: "/fake/projects/eps/.locks/coordinator.lock", Project: "eps", HolderID: ""},
+			{Path: "/fake/projects/zet/.locks/coordinator.lock", Project: "zet", HolderID: "   "},
+		}, nil
+	}
+	deps.LoadAgent = func(string) (*agent.Record, error) {
+		t.Fatal("LoadAgent called for empty-holder lock; must be skipped pre-load")
+		return nil, nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	for _, a := range got.Actions {
+		if a.Kind == KindCoordLocks {
+			t.Fatalf("empty-holder lock flagged: %+v", a)
+		}
+	}
+}
+
+// TestReconcile_CoordLocks_LoadAgentTransientError_Preserved pins the
+// surface-don't-silo guard for transient errors. A non-ErrNotFound
+// LoadAgent error (parse failure, IO error) leaves the lock alone —
+// classifying a transient-fail record as dead-coord would unlink a
+// legitimate live coord's lock under --apply.
+func TestReconcile_CoordLocks_LoadAgentTransientError_Preserved(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/eta/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "eta", HolderID: "99990000"}}, nil
+	}
+	deps.LoadAgent = func(string) (*agent.Record, error) {
+		return nil, errors.New("simulated parse error")
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called on transient LoadAgent error; must be skipped")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindCoordLocks, lockPath); ok {
+		t.Fatalf("transient-error lock flagged: %+v", got.Actions)
+	}
+}
+
+// TestReconcile_CoordLocks_SessionAliveProbeError_Preserved is the
+// stale-tmux counterpart: if the tmux probe errors (transport failure),
+// the classifier must NOT flag stale. Mirrors reconcileOrphanAgents'
+// SessionAlive ambiguous-error guard.
+func TestReconcile_CoordLocks_SessionAliveProbeError_Preserved(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/theta/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "theta", HolderID: "ababcdcd"}}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		return &agent.Record{ID: id, Project: "theta", TmuxSession: "fleet-" + id}, nil
+	}
+	deps.SessionAlive = func(string) (bool, error) {
+		return false, errors.New("simulated tmux transport error")
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called on SessionAlive probe error; must be skipped")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindCoordLocks, lockPath); ok {
+		t.Fatalf("probe-error lock flagged: %+v", got.Actions)
+	}
+}
+
+// TestReconcile_CoordLocks_DryRun_NeverMutates: comprehensive negative
+// invariant. Even with three failure-mode lock files queued, Apply=false
+// must call RemoveCoordLock zero times.
+func TestReconcile_CoordLocks_DryRun_NeverMutates(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{
+			{Path: "/fake/projects/p1/.locks/coordinator.lock", Project: "p1", HolderID: "deadbeef"}, // dead
+			{Path: "/fake/projects/p2/.locks/coordinator.lock", Project: "p2", HolderID: "11112222"}, // mismatch
+			{Path: "/fake/projects/p3/.locks/coordinator.lock", Project: "p3", HolderID: "33334444"}, // stale tmux
+		}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		switch id {
+		case "deadbeef":
+			return nil, state.ErrNotFound
+		case "11112222":
+			return &agent.Record{ID: id, Project: "OTHER", TmuxSession: "fleet-" + id}, nil
+		case "33334444":
+			return &agent.Record{ID: id, Project: "p3", TmuxSession: "fleet-" + id}, nil
+		}
+		return nil, state.ErrNotFound
+	}
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-33334444" {
+			return false, nil
+		}
+		return true, nil
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called under dry-run")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// All three actions should be present, with verb=surface (dry-run).
+	count := 0
+	for _, a := range got.Actions {
+		if a.Kind != KindCoordLocks {
+			continue
+		}
+		count++
+		if a.Verb != VerbSurface {
+			t.Fatalf("dry-run coord-locks verb=%q, want %q (action=%+v)", a.Verb, VerbSurface, a)
+		}
+	}
+	if count != 3 {
+		t.Fatalf("dry-run coord-locks action count=%d, want 3; report=%+v", count, got.Actions)
+	}
+}
+
+// TestReconcile_CoordLocks_ProjectScope: --project filters the
+// classifier to the named project's lock only.
+func TestReconcile_CoordLocks_ProjectScope(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{
+			{Path: "/fake/projects/keep/.locks/coordinator.lock", Project: "keep", HolderID: "deadbeef"},
+			{Path: "/fake/projects/skip/.locks/coordinator.lock", Project: "skip", HolderID: "00001111"},
+		}, nil
+	}
+	deps.LoadAgent = func(id string) (*agent.Record, error) {
+		// Both would fire dead-coord absent the project scope.
+		return nil, state.ErrNotFound
+	}
+	got, err := Reconcile(Options{
+		Apply: false, Project: "keep", MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindCoordLocks, "/fake/projects/keep/.locks/coordinator.lock"); !ok {
+		t.Fatalf("missing in-scope action; got %+v", got.Actions)
+	}
+	if _, ok := findAction(got, KindCoordLocks, "/fake/projects/skip/.locks/coordinator.lock"); ok {
+		t.Fatalf("out-of-scope lock flagged; got %+v", got.Actions)
+	}
+}
+
+// TestListCoordLocksOnDisk_ProductionLister covers the on-disk parser
+// that DefaultDeps wires up: scan ~/.fleet/projects/<p>/.locks/coordinator.lock,
+// skip the reserved .locks sibling dir under projects/, parse holder
+// body's first line as 8-hex-char agent ID (anything else → empty).
+func TestListCoordLocksOnDisk_ProductionLister(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	mustMkdir := func(p string) {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+	mustWrite := func(p, content string) {
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	projects := filepath.Join(tmp, "projects")
+	mustMkdir(projects)
+	// alpha: well-formed lock body with 8-hex holder.
+	mustMkdir(filepath.Join(projects, "alpha", ".locks"))
+	mustWrite(filepath.Join(projects, "alpha", ".locks", "coordinator.lock"), "aabbccdd\n")
+	// beta: zero-byte lock (legacy / pre-issue-#55).
+	mustMkdir(filepath.Join(projects, "beta", ".locks"))
+	mustWrite(filepath.Join(projects, "beta", ".locks", "coordinator.lock"), "")
+	// gamma: garbage holder (not 8-hex).
+	mustMkdir(filepath.Join(projects, "gamma", ".locks"))
+	mustWrite(filepath.Join(projects, "gamma", ".locks", "coordinator.lock"), "not-an-id-here\n")
+	// delta: no .locks dir at all → skipped from output.
+	mustMkdir(filepath.Join(projects, "delta"))
+	// .locks: reserved sibling under projects/ — MUST be excluded.
+	mustMkdir(filepath.Join(projects, ".locks"))
+	mustWrite(filepath.Join(projects, ".locks", "coordinator.lock"), "11223344\n")
+
+	got, err := listCoordLocksOnDisk()
+	if err != nil {
+		t.Fatalf("listCoordLocksOnDisk: %v", err)
+	}
+	byProj := map[string]CoordLockInfo{}
+	for _, l := range got {
+		byProj[l.Project] = l
+	}
+	if _, ok := byProj[".locks"]; ok {
+		t.Fatalf("reserved .locks sibling included in output")
+	}
+	if _, ok := byProj["delta"]; ok {
+		t.Fatalf("project without .locks/coordinator.lock should be skipped")
+	}
+	if a, ok := byProj["alpha"]; !ok || a.HolderID != "aabbccdd" {
+		t.Fatalf("alpha holder=%v, want aabbccdd; got=%+v", a.HolderID, byProj)
+	}
+	if b, ok := byProj["beta"]; !ok || b.HolderID != "" {
+		t.Fatalf("beta should be present with empty holder; got=%+v", b)
+	}
+	if g, ok := byProj["gamma"]; !ok || g.HolderID != "" {
+		t.Fatalf("gamma holder=%v, want empty (garbage body)", g.HolderID)
+	}
+}
+
 // TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped pins the fix
 // for codex iter-3 [P1]: legacy / partially populated agent records
 // with empty TmuxSession would get `tmux has-session -t ""` probed,
@@ -1077,5 +1745,204 @@ func TestReconcile_OrphanAgents_EmptyTmuxSession_Skipped(t *testing.T) {
 	}
 	if _, ok := findAction(got, KindOrphanAgents, "legacy-record-aabb"); ok {
 		t.Fatalf("legacy empty-session record produced action: %+v", got.Actions)
+	}
+}
+
+// TestRemoveCoordLockFile_HeldByLiveCoord_RefusesUnlink pins codex
+// review iter-4 [P1]: the production unlink path MUST acquire
+// LOCK_EX|LOCK_NB on the coordinator.lock file BEFORE os.Remove. If
+// another process holds the flock (the realistic concurrent-start
+// race: a coord spawning between our liveness probe and this unlink),
+// the function must return an error instead of unlinking — flock(2)
+// is inode-based, so os.Remove on a held lock leaves the holder on
+// the unlinked inode while a new coord can create + flock a fresh
+// file → split-brain coord mutual-exclusion.
+//
+// The classifier's appendCoordLockAction surfaces this error as
+// "remove failed: ..." with Verb=surface, so --apply gracefully
+// degrades to surface on the realistic race window.
+func TestRemoveCoordLockFile_HeldByLiveCoord_RefusesUnlink(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("aabbccdd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	// Acquire LOCK_EX as a separate fd — simulates a live coord
+	// holding the flock at the moment removeCoordLockFile attempts
+	// the unlink.
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open holder: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Flock(int(holder.Fd()), syscall.LOCK_UN)
+		_ = holder.Close()
+	})
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("holder Flock: %v", err)
+	}
+
+	rerr := removeCoordLockFile(lockPath)
+	if rerr == nil {
+		t.Fatal("removeCoordLockFile silently unlinked a held lock — split-brain risk")
+	}
+	if !strings.Contains(rerr.Error(), "currently held") && !strings.Contains(rerr.Error(), "split-brain") {
+		t.Errorf("error %q does not explain the live-holder refusal", rerr.Error())
+	}
+
+	// File must still exist on disk — the unlink was refused.
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Errorf("lock file disappeared even though removal was refused: %v", statErr)
+	}
+}
+
+// TestRemoveCoordLockFile_NotHeld_Unlinks confirms the happy path:
+// when no one holds the flock, removeCoordLockFile acquires it and
+// unlinks atomically.
+func TestRemoveCoordLockFile_NotHeld_Unlinks(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	if err := removeCoordLockFile(lockPath); err != nil {
+		t.Fatalf("removeCoordLockFile: %v", err)
+	}
+	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+		t.Errorf("lock file still exists after unlink; stat=%v", statErr)
+	}
+}
+
+// TestRemoveCoordLockFile_Missing_NoError confirms the ENOENT-tolerant
+// contract: two operators racing `fleet gc --apply` must not see
+// spurious errors when the second pass finds the file already gone.
+func TestRemoveCoordLockFile_Missing_NoError(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing-coordinator.lock")
+	if err := removeCoordLockFile(missing); err != nil {
+		t.Fatalf("removeCoordLockFile on missing path returned error: %v", err)
+	}
+}
+
+// TestRemoveIfSameInode_InodeSwap_RefusesUnlink pins codex review iter-5
+// [P2]: after Flock succeeds, the unlink path MUST recheck that the
+// inode at `path` still equals the inode of our fd. Without this, two
+// overlapping `fleet gc --apply` passes + a concurrent coord-spawn can
+// leave the first pass holding an unlinked inode while a new dirent at
+// the same path points at a freshly created LIVE lock — os.Remove
+// would delete the live replacement and split-brain returns.
+//
+// Synchronously reproduce the swap by:
+//  1. Creating the original lock file at `path` → inode I1.
+//  2. Opening + flocking it ourselves (simulating the gc helper post-
+//     OpenFile + post-Flock state, holding I1).
+//  3. Unlinking `path` while we hold the fd (dirent gone, I1 still
+//     alive via our open fd).
+//  4. Creating a fresh file at `path` → inode I2.
+//  5. Calling removeIfSameInode(fd_I1, path) → must return the
+//     inode-swap error, leaving the I2 dirent intact.
+func TestRemoveIfSameInode_InodeSwap_RefusesUnlink(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("aabbccdd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	fd1, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open original: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Flock(int(fd1.Fd()), syscall.LOCK_UN)
+		_ = fd1.Close()
+	})
+	if err := syscall.Flock(int(fd1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock original: %v", err)
+	}
+	// Unlink the original dirent — fd1 still holds I1 alive.
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("unlink original: %v", err)
+	}
+	// Create a fresh dirent at the same path → new inode I2 (simulates
+	// a concurrent coord-spawn between our flock and our recheck).
+	if err := os.WriteFile(lockPath, []byte("11112222\n"), 0o644); err != nil {
+		t.Fatalf("create replacement: %v", err)
+	}
+	// Capture I2's inode for the post-call assertion.
+	var pstBefore syscall.Stat_t
+	if err := syscall.Stat(lockPath, &pstBefore); err != nil {
+		t.Fatalf("stat replacement: %v", err)
+	}
+
+	rerr := removeIfSameInode(fd1, lockPath)
+	if rerr == nil {
+		t.Fatal("removeIfSameInode silently unlinked the replacement live lock — split-brain re-introduced")
+	}
+	if !strings.Contains(rerr.Error(), "different inode") && !strings.Contains(rerr.Error(), "replaced") {
+		t.Errorf("error %q does not explain the inode-swap refusal", rerr.Error())
+	}
+
+	// Replacement file must still exist on disk with its original inode.
+	var pstAfter syscall.Stat_t
+	if err := syscall.Stat(lockPath, &pstAfter); err != nil {
+		t.Errorf("replacement file disappeared after inode-swap refusal: %v", err)
+	} else if pstAfter.Ino != pstBefore.Ino {
+		t.Errorf("replacement inode changed: before=%d after=%d", pstBefore.Ino, pstAfter.Ino)
+	}
+}
+
+// TestRemoveIfSameInode_PathVanished_NoError confirms the safe-collapse
+// branch: if `path` is gone between our flock and recheck (e.g. an
+// earlier gc pass already won the race AND no spawn rebound the path),
+// removeIfSameInode returns nil. Our orphan inode reaps on close;
+// nothing to do.
+func TestRemoveIfSameInode_PathVanished_NoError(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("ababcdcd\n"), 0o644); err != nil {
+		t.Fatalf("seed lock: %v", err)
+	}
+	fd, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(fd.Fd()), syscall.LOCK_UN) })
+
+	// Path vanishes after our flock — no replacement.
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatalf("unlink: %v", err)
+	}
+
+	if err := removeIfSameInode(fd, lockPath); err != nil {
+		t.Errorf("removeIfSameInode returned error on safe-collapse path-vanished branch: %v", err)
+	}
+}
+
+// TestRemoveIfSameInode_SameInode_Unlinks confirms the happy path: the
+// fd inode equals the path inode → os.Remove fires + returns nil.
+func TestRemoveIfSameInode_SameInode_Unlinks(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "coordinator.lock")
+	if err := os.WriteFile(lockPath, []byte("77778888\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	fd, err := os.OpenFile(lockPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	if err := syscall.Flock(int(fd.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(fd.Fd()), syscall.LOCK_UN) })
+
+	if err := removeIfSameInode(fd, lockPath); err != nil {
+		t.Fatalf("removeIfSameInode: %v", err)
+	}
+	if _, statErr := os.Stat(lockPath); !os.IsNotExist(statErr) {
+		t.Errorf("lock file still exists; stat=%v", statErr)
 	}
 }
