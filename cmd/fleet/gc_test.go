@@ -114,3 +114,54 @@ func TestGCCmd_RegisteredOnRoot(t *testing.T) {
 	}
 	t.Fatal("gc subcommand not registered on root")
 }
+
+// TestRunGC_CoordLocks_MultiSocketWarning pins codex review iter-2
+// [P2]: when FLEET_TMUX_SOCKET is set AND --apply AND coord-locks is
+// in the active kinds list, runGC must emit a stderr warning. The
+// classifier's SessionAlive probes use the current socket; a healthy
+// coord spawned against a different socket can look stale-tmux (or
+// dead-coord with no record) and the unlink path can remove its live
+// lock. Mirrors the existing orphan-agents warning shape.
+func TestRunGC_CoordLocks_MultiSocketWarning(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "/tmp/fleet-other.sock")
+	t.Setenv("FLEET_HOME", t.TempDir()) // isolate from operator's real state
+	var stdout, stderr bytes.Buffer
+	err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    true,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "coord-locks",
+	})
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	se := stderr.String()
+	if !strings.Contains(se, "FLEET_TMUX_SOCKET=/tmp/fleet-other.sock") {
+		t.Errorf("stderr should name FLEET_TMUX_SOCKET; got:\n%s", se)
+	}
+	if !strings.Contains(se, "coord-locks") {
+		t.Errorf("stderr should name coord-locks; got:\n%s", se)
+	}
+	if !strings.Contains(se, "different socket") {
+		t.Errorf("stderr should explain cross-socket false-stale risk; got:\n%s", se)
+	}
+}
+
+// TestRunGC_CoordLocks_NoWarning_WhenSocketUnset is the negative
+// invariant: with FLEET_TMUX_SOCKET unset (default), runGC must NOT
+// emit the coord-locks warning even on --apply --kinds=coord-locks.
+func TestRunGC_CoordLocks_NoWarning_WhenSocketUnset(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+	t.Setenv("FLEET_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	err := runGC(&stdout, &stderr, &gcFlags{
+		apply:    true,
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "coord-locks",
+	})
+	if err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	if strings.Contains(stderr.String(), "FLEET_TMUX_SOCKET") {
+		t.Errorf("stderr should not mention FLEET_TMUX_SOCKET when unset; got:\n%s", stderr.String())
+	}
+}

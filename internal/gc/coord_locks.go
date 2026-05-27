@@ -116,8 +116,41 @@ func reconcileCoordLocks(r *Report, opts Options, deps Deps) error {
 		rec, lerr := deps.LoadAgent(holder)
 		if lerr != nil {
 			if errors.Is(lerr, state.ErrNotFound) {
-				appendCoordLockAction(r, opts, deps, l,
-					fmt.Sprintf("dead coord (agent record %s missing)", holder))
+				// Liveness gate (codex review iter-2 [P2]): the record
+				// being gone does NOT prove the coord process is gone —
+				// an operator-side `rm ~/.fleet/agents/<id>.json` while
+				// the coord is still running leaves a live coord pinned
+				// to the inode flock with no record. Same split-brain
+				// risk as mismatch (see line 131+): if we unlink under
+				// --apply, the live coord remains on the unlinked inode
+				// and a new coord can create + flock a fresh file.
+				//
+				// Probe the conventional `fleet-<id>` tmux session: if
+				// alive, surface only (refuse to unlink). Empty-id
+				// shouldn't reach here (the holder="" guard above
+				// already skipped), but if SessionAlive is nil we treat
+				// as ambiguous and refuse (conservative-live).
+				reason := fmt.Sprintf("dead coord (agent record %s missing)", holder)
+				holderAlive := false
+				probeName := "fleet-" + holder
+				if deps.SessionAlive == nil {
+					holderAlive = true // unprobeable → conservative
+				} else {
+					ok, perr := deps.SessionAlive(probeName)
+					if perr != nil {
+						holderAlive = true // ambiguous → conservative
+					} else {
+						holderAlive = ok
+					}
+				}
+				if holderAlive {
+					r.Actions = append(r.Actions, Action{
+						Kind: KindCoordLocks, Target: l.Path, Verb: VerbSurface,
+						Reason: reason + "; but holder tmux session " + probeName + " still alive — refusing to unlink (would split-brain coord mutual-exclusion); investigate the missing record first",
+					})
+					continue
+				}
+				appendCoordLockAction(r, opts, deps, l, reason)
 				continue
 			}
 			// Transient / parse error — refuse to act on ambiguous state.

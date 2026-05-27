@@ -100,11 +100,18 @@ Exit codes:
 // list + summary; stderr = any classifier-level errors that didn't
 // abort the whole sweep.
 //
-// Multi-socket safety warning (codex iter-4 [P1]): when
-// FLEET_TMUX_SOCKET is set AND --apply AND orphan-agents is in the
-// active kinds list, print a stderr warning. The classifier probes
-// the CURRENT socket; agents spawned against a different socket may
-// look orphan and get archived. See reconcileOrphanAgents docstring.
+// Multi-socket safety warnings (codex iter-4 [P1] / codex review
+// iter-2 [P2]): when FLEET_TMUX_SOCKET is set AND --apply AND the
+// affected kind is in the active list, print a stderr warning. Both
+// orphan-agents and coord-locks probe SessionAlive on the CURRENT
+// socket; agents spawned against a different socket may look orphan
+// (orphan-agents path) or stale (coord-locks stale-tmux path). The
+// coord-locks split-brain defense (live-holder refusal) only triggers
+// when the probe returns alive=true — a cross-socket probe returns
+// alive=false and the lock gets unlinked. Same load-bearing constraint
+// the agent.Record schema would need to fix; out of scope here.
+// See reconcileOrphanAgents docstring + reconcileCoordLocks stale-tmux
+// branch for the full constraint discussion.
 func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 	kinds, err := parseKindsCSV(f.kindsCSV)
 	if err != nil {
@@ -118,6 +125,17 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 					"  was spawned against a different FLEET_TMUX_SOCKET, --apply may archive it\n"+
 					"  as orphan. Re-run with FLEET_TMUX_SOCKET unset (default) OR drop\n"+
 					"  --kinds=orphan-agents from this sweep to skip the agent-archive pass.\n",
+				sock)
+		}
+	}
+	if f.apply && hasKind(kinds, gc.KindCoordLocks) {
+		if sock := strings.TrimSpace(os.Getenv("FLEET_TMUX_SOCKET")); sock != "" {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: FLEET_TMUX_SOCKET=%s is set; coord-locks SessionAlive probes use THIS socket.\n"+
+					"  agent.Record does not persist its spawn-time socket. A healthy coord on a\n"+
+					"  different socket can look stale-tmux (or dead-coord with no record) and the\n"+
+					"  unlink path may remove its live lock. Re-run with FLEET_TMUX_SOCKET unset\n"+
+					"  (default) OR drop --kinds=coord-locks from this sweep.\n",
 				sock)
 		}
 	}

@@ -1077,6 +1077,16 @@ func TestReconcile_CoordLocks_DeadCoord_Surfaced(t *testing.T) {
 		}
 		return nil, state.ErrNotFound
 	}
+	// Holder coord is truly dead (its tmux session also gone) — the
+	// classic dead-coord case. codex iter-2 [P2]: the live-holder
+	// variant is covered separately by
+	// TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink.
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-deadbeef" {
+			return false, nil
+		}
+		return true, nil
+	}
 	got, err := Reconcile(Options{
 		Apply: false, MaxAge: 24 * time.Hour,
 		Kinds: []Kind{KindCoordLocks},
@@ -1094,6 +1104,9 @@ func TestReconcile_CoordLocks_DeadCoord_Surfaced(t *testing.T) {
 	if !strings.Contains(a.Reason, "dead coord") {
 		t.Fatalf("reason=%q does not name dead-coord mode", a.Reason)
 	}
+	if strings.Contains(a.Reason, "still alive") {
+		t.Fatalf("dead-holder reason should NOT mention live-refusal; got %q", a.Reason)
+	}
 }
 
 // TestReconcile_CoordLocks_DeadCoord_ApplyUnlinks: --apply upgrades
@@ -1107,6 +1120,15 @@ func TestReconcile_CoordLocks_DeadCoord_ApplyUnlinks(t *testing.T) {
 		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "11112222"}}, nil
 	}
 	deps.LoadAgent = func(string) (*agent.Record, error) { return nil, state.ErrNotFound }
+	// Holder coord is truly dead — tmux gone — so --apply may unlink
+	// safely. (Live-holder variant covered by the LiveHolder test
+	// below; codex iter-2 [P2] split-brain guard.)
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-11112222" {
+			return false, nil
+		}
+		return true, nil
+	}
 	var removed []string
 	deps.RemoveCoordLock = func(p string) error {
 		removed = append(removed, p)
@@ -1128,6 +1150,55 @@ func TestReconcile_CoordLocks_DeadCoord_ApplyUnlinks(t *testing.T) {
 	}
 	if len(removed) != 1 || removed[0] != lockPath {
 		t.Fatalf("removed=%v, want [%s]", removed, lockPath)
+	}
+}
+
+// TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink
+// pins codex review iter-2 [P2]: when LoadAgent returns ErrNotFound
+// (record file missing) but the fleet-<id> tmux session is STILL
+// ALIVE (e.g. operator-side `rm ~/.fleet/agents/<id>.json` while the
+// coord process is still running), the classifier must NOT unlink the
+// lock under --apply. flock(2) is inode-based; os.Remove of a held
+// coordinator.lock leaves the live coord pinned to the unlinked inode
+// while a new coord can create + flock a fresh file → split-brain
+// (same shape as the mismatch live-holder defense at line 131+).
+func TestReconcile_CoordLocks_DeadCoord_LiveHolder_SurfaceRefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	lockPath := "/fake/projects/alpha/.locks/coordinator.lock"
+	deps.ListCoordLocks = func() ([]CoordLockInfo, error) {
+		return []CoordLockInfo{{Path: lockPath, Project: "alpha", HolderID: "deadbeef"}}, nil
+	}
+	deps.LoadAgent = func(string) (*agent.Record, error) { return nil, state.ErrNotFound }
+	deps.SessionAlive = func(name string) (bool, error) {
+		if name == "fleet-deadbeef" {
+			return true, nil // holder process still alive
+		}
+		return false, nil
+	}
+	deps.RemoveCoordLock = func(string) error {
+		t.Fatal("RemoveCoordLock called for live-holder dead-coord — would split-brain coord mutual-exclusion (codex iter-2 [P2])")
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindCoordLocks},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindCoordLocks, lockPath)
+	if !ok {
+		t.Fatalf("missing coord-locks action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("live-holder dead-coord verb=%q, want %q (must NEVER be would-remove/removed)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "dead coord") {
+		t.Fatalf("reason=%q does not name dead-coord mode", a.Reason)
+	}
+	if !strings.Contains(a.Reason, "still alive") || !strings.Contains(a.Reason, "split-brain") {
+		t.Fatalf("reason=%q does not explain the live-holder refusal", a.Reason)
 	}
 }
 
