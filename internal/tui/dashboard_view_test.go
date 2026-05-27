@@ -112,9 +112,9 @@ func TestBuildBodyLines_AgentIdleSeparatorRendersRightOnly(t *testing.T) {
 		},
 	}
 
-	leftLines, rightLines := buildBodyLines(m, 90, 40)
+	leftLines, workerLines, agentLines := buildBodyLines(m, 90, 40)
 	leftAll := strings.Join(leftLines, "\n")
-	rightAll := strings.Join(rightLines, "\n")
+	rightAll := strings.Join(append(workerLines, agentLines...), "\n")
 
 	if strings.Contains(leftAll, "1 idle") {
 		t.Errorf("agent-idle separator '1 idle' leaked into LEFT column:\n%s", leftAll)
@@ -232,17 +232,20 @@ func TestRenderTwoColumnBody_TallTerminal_NoScrollNeeded(t *testing.T) {
 
 // TestRenderTwoColumnBody_ProjectsReservedHalf: the left projects
 // column reserves >= 50% of usable rows (minProjectsRows floor: 6).
-// Even with a packed right column the projects budget never falls
-// below the floor. This is the load-bearing invariant against the
-// operator's screenshot bug.
+// On a 60-row terminal this fits all 6 projects (each ~3-4 lines)
+// — the load-bearing invariant against the operator's screenshot bug
+// where 50+ workers pushed projects off-screen. The pre-#177 layout
+// would render the right column unbounded; the new bound keeps the
+// left half reserved regardless of right-column overflow.
 func TestRenderTwoColumnBody_ProjectsReservedHalf(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
 	m.width = 140
-	m.height = 24
+	m.height = 60
 
-	// 6 projects + many workers — when the budget is wrong, the right
-	// column eats all 24 rows and projects 5-6 disappear.
+	// 6 projects + 50 workers in one project. The unbounded right
+	// column would burn through the full body before the left finishes;
+	// the bounded layout caps it at 60/40 of the right budget.
 	m.dashboard = &Snapshot{
 		LoadedAt: time.Now(),
 	}
@@ -262,12 +265,20 @@ func TestRenderTwoColumnBody_ProjectsReservedHalf(t *testing.T) {
 
 	body := renderTwoColumnBody(m, 90, 40)
 	// Every project name must be present in the rendered body — none
-	// pushed off-screen.
+	// pushed off-screen by right-column overflow. projectDisplayName
+	// rewrites "proj-X" as "proj/X" (first hyphen → slash) so the
+	// assertion uses the display form.
 	for i := 0; i < 6; i++ {
-		name := "proj-" + string(rune('a'+i))
-		if !strings.Contains(body, name) {
-			t.Errorf("project %q missing from body — left column truncated by right-column overflow:\n%s", name, body)
+		want := "proj/" + string(rune('a'+i))
+		if !strings.Contains(body, want) {
+			t.Errorf("project %q missing from body — left column truncated by right-column overflow:\n%s", want, body)
 		}
+	}
+	// The right column must surface the workers overflow via the
+	// scroll-hint footer rather than rendering all 50 workers (which
+	// is what the operator's 2026-05-27 screenshot showed).
+	if !strings.Contains(body, "hidden — [↓/↑] scroll") {
+		t.Errorf("right column must surface workers overflow via scroll-hint footer; got:\n%s", body)
 	}
 }
 

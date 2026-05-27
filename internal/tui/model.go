@@ -166,6 +166,18 @@ type Model struct {
 	// dispatch on the row at this index. Wraps at boundaries.
 	dashCursor int
 
+	// workersScrollOffset / agentsScrollOffset are the vertical scroll
+	// positions for the right-column workers + agents panels (fleet#177
+	// Fix 2). renderTwoColumnBody caps each panel at a computed maxRows
+	// budget; lines beyond the budget are hidden and surfaced via a
+	// "K hidden — [↓/↑] scroll" footer. ↓/↑ on a right-column row
+	// adjusts the matching offset (clamped to [0, len(lines)-visible]).
+	// Reset to 0 on tea.WindowSizeMsg — the visible window changes and
+	// re-clamping after-the-fact is brittle. Left-column j/k/arrow nav
+	// is untouched.
+	workersScrollOffset int
+	agentsScrollOffset  int
+
 	// searchFilter is the current substring filter applied to
 	// dashboardRows(). Empty when no filter is active. Set via [/]
 	// search prompt; cleared via [esc] inside the prompt.
@@ -442,6 +454,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// fleet#177 Fix 2: a resize changes the visible-row budget for
+		// each right-column panel. Re-clamping the offsets after the
+		// fact is brittle (the buildBodyLines pass hasn't run yet), so
+		// reset both offsets to 0 — the operator scrolls back if they
+		// were mid-scroll.
+		m.workersScrollOffset = 0
+		m.agentsScrollOffset = 0
 		return m, nil
 
 	case tea.KeyMsg:
@@ -774,16 +793,75 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q":
 		return m, tea.Quit
-	case "j", "down":
+	case "j":
+		// j is row-nav across the unified row list. NEVER scrolls a
+		// right panel — the operator who wants vim-style nav keeps
+		// using j/k everywhere.
 		m.moveCursor(+1)
-	case "k", "up":
+	case "k":
 		m.moveCursor(-1)
+	case "down":
+		// fleet#177 Fix 2: arrow keys scroll the focused right panel.
+		// Cursor on a worker row → workersScrollOffset++; cursor on an
+		// agent or right-column separator row → agentsScrollOffset++.
+		// Cursor on a left-column row (project / task / left-column
+		// separator) → fall through to row-nav so the left column
+		// keeps its [↓/↑] behavior.
+		if !m.scrollRightPanel(+1) {
+			m.moveCursor(+1)
+		}
+	case "up":
+		if !m.scrollRightPanel(-1) {
+			m.moveCursor(-1)
+		}
 	case "left":
 		m.jumpToLeftPanel()
 	case "right":
 		m.jumpToRightPanel()
 	}
 	return m, nil
+}
+
+// scrollRightPanel adjusts the workers or agents scroll offset when the
+// cursor is on a right-column row. Returns true when a scroll was
+// applied (so the caller skips row-nav); false when the cursor is on
+// a LEFT-column row and the arrow should fall through to moveCursor.
+//
+// fleet#177 Fix 2 right-panel bound — see Model.workersScrollOffset
+// doc. Clamping happens in the renderer (trimWithScroll) — we
+// optimistically advance here; an over-scroll past the end snaps
+// back to the visible window on the next render.
+func (m *Model) scrollRightPanel(delta int) bool {
+	row := m.selectedRow()
+	if row == nil {
+		return false
+	}
+	switch row.kind {
+	case rowWorker:
+		m.workersScrollOffset += delta
+		if m.workersScrollOffset < 0 {
+			m.workersScrollOffset = 0
+		}
+		return true
+	case rowAgent:
+		m.agentsScrollOffset += delta
+		if m.agentsScrollOffset < 0 {
+			m.agentsScrollOffset = 0
+		}
+		return true
+	case rowSeparator:
+		// Right-column separator (separatorAgentIdle) is part of the
+		// agents panel; scroll it. Left-column separators fall through
+		// to moveCursor.
+		if row.separator != nil && row.separator.kind == separatorAgentIdle {
+			m.agentsScrollOffset += delta
+			if m.agentsScrollOffset < 0 {
+				m.agentsScrollOffset = 0
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // moveCursor advances dashCursor by delta across the unified row list
