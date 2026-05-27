@@ -368,3 +368,76 @@ func TestArrowKeys_ScrollMovesCursorToo(t *testing.T) {
 		}())
 	}
 }
+
+// TestArrowKeys_ScrollCursorStaysInPanel pins the kind-anchored cursor
+// (codex iter-3 [P2]): pressing ↑ on the FIRST worker row must NOT
+// walk the cursor into a left-column row (project / task). Without
+// this anchor, a single ↑ at the panel boundary silently moves to a
+// different column and subsequent actions target the wrong row.
+func TestArrowKeys_ScrollCursorStaysInPanel(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.jumpToRightPanel()
+	// Walk ↑ ten times from the FIRST worker — cursor must NEVER
+	// land on a non-worker row.
+	for i := 0; i < 10; i++ {
+		updated, _ := m.Update(keyMsg("up"))
+		m = updated.(Model)
+		row := m.selectedRow()
+		if row == nil {
+			t.Fatalf("iter %d: selectedRow returned nil", i)
+		}
+		if row.kind != rowWorker {
+			t.Errorf("iter %d: ↑ left cursor on kind=%v want rowWorker — would silently change panels", i, row.kind)
+		}
+	}
+}
+
+// TestArrowKeys_ScrollOffsetClampsAtMax pins the model-side upper
+// clamp (codex iter-3 [P2]): pressing ↓ many times past the visible
+// end must NOT leave workersScrollOffset growing unbounded. Without
+// the upper clamp, the next ↑ press just decrements the oversized
+// value and the panel appears stuck at the bottom for many keypresses.
+func TestArrowKeys_ScrollOffsetClampsAtMax(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	// 5 workers — small enough that the upper bound is tight (15 lines
+	// at 3 lines/row).
+	for i := 0; i < 5; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.jumpToRightPanel()
+	// Press ↓ 100 times — way past any reasonable line count.
+	for i := 0; i < 100; i++ {
+		updated, _ := m.Update(keyMsg("down"))
+		m = updated.(Model)
+	}
+	// Bound: 5 workers * 3 lines/row = 15. Stored offset must not
+	// exceed that.
+	const wantBound = 5 * 3
+	if m.workersScrollOffset > wantBound {
+		t.Errorf("100 × ↓ left workersScrollOffset=%d, want <= %d (upper clamp not enforced — panel will appear stuck on subsequent ↑)",
+			m.workersScrollOffset, wantBound)
+	}
+}

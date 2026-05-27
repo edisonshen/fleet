@@ -847,17 +847,11 @@ func (m *Model) scrollRightPanel(delta int) bool {
 	}
 	switch row.kind {
 	case rowWorker:
-		m.workersScrollOffset += delta
-		if m.workersScrollOffset < 0 {
-			m.workersScrollOffset = 0
-		}
+		m.workersScrollOffset = clampScrollOffset(m.workersScrollOffset+delta, m.panelMaxOffset(rowWorker))
 		m.moveCursorWithinKind(delta, rowWorker)
 		return true
 	case rowAgent:
-		m.agentsScrollOffset += delta
-		if m.agentsScrollOffset < 0 {
-			m.agentsScrollOffset = 0
-		}
+		m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
 		m.moveCursorWithinKind(delta, rowAgent)
 		return true
 	case rowSeparator:
@@ -865,10 +859,7 @@ func (m *Model) scrollRightPanel(delta int) bool {
 		// agents panel; scroll it. Left-column separators fall through
 		// to moveCursor.
 		if row.separator != nil && row.separator.kind == separatorAgentIdle {
-			m.agentsScrollOffset += delta
-			if m.agentsScrollOffset < 0 {
-				m.agentsScrollOffset = 0
-			}
+			m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
 			m.moveCursorWithinKind(delta, rowAgent)
 			return true
 		}
@@ -876,17 +867,73 @@ func (m *Model) scrollRightPanel(delta int) bool {
 	return false
 }
 
+// clampScrollOffset bounds the stored offset at [0, maxOff]. Without
+// the upper clamp (codex iter-3 [P2]), repeated ↓ past the visible
+// end leaves the model with an oversized offset; the renderer's
+// trimWithScroll then clamps for display only, but the next ↑ press
+// just decrements the oversized value — the panel appears stuck at
+// the bottom until many extra ↑ presses burn off the overshoot.
+func clampScrollOffset(want, maxOff int) int {
+	if want < 0 {
+		return 0
+	}
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if want > maxOff {
+		return maxOff
+	}
+	return want
+}
+
+// panelMaxOffset returns a conservative upper bound for the workers
+// or agents panel scroll offset based on the count of rows of the
+// matching kind. Each worker/agent row produces roughly 3 lines
+// (block header + status + blank) in buildBodyLines, so the bound is
+// 3 * rowCount. The renderer's trimWithScroll clamps tighter at
+// render time, but having a model-side bound prevents the
+// stuck-at-bottom UX bug after overscroll (codex iter-3 [P2]).
+func (m *Model) panelMaxOffset(kind rowKind) int {
+	const linesPerRow = 3
+	rows := m.dashboardRows()
+	count := 0
+	for _, r := range rows {
+		if r.kind == kind {
+			count++
+		}
+		if kind == rowAgent && r.kind == rowSeparator && r.separator != nil &&
+			r.separator.kind == separatorAgentIdle {
+			count++
+		}
+	}
+	bound := count * linesPerRow
+	if bound < 0 {
+		bound = 0
+	}
+	return bound
+}
+
 // moveCursorWithinKind advances dashCursor by delta but stays anchored
 // to rows of the target kind (rowWorker or rowAgent) on the right
-// column. Falls off the end of the kind-run → clamps to the last row
-// of that kind (no wrap into projects). Used by scrollRightPanel so
-// the cursor follows the scrolled panel rather than getting stranded
-// on a hidden row.
+// column. Falls off the end of the kind-run → clamps to the LAST row
+// of that kind it found (no wrap into projects, no crossover into the
+// other right-column panel). Used by scrollRightPanel so the cursor
+// follows the scrolled panel rather than getting stranded on a hidden
+// row.
 //
-// Implementation: walk the unified row list from the current cursor,
-// stepping ONE-AT-A-TIME by delta sign, counting only rows of the
-// matching kind (or right-column rowSeparator for rowAgent), until we
-// either accumulate |delta| matches or run out of matching rows.
+// Boundary behavior (codex iter-3 [P2]): when stepping in `step`
+// direction would land on a non-matching row (e.g., ↑ from first
+// worker into a left-column row, or ↓ from last worker into the agent
+// sub-heading), the cursor stays put rather than crossing the panel
+// boundary. Crossover would silently re-route subsequent actions
+// ([⏎] / [a]) to the wrong panel.
+//
+// Implementation: walk the unified row list from the current cursor
+// in delta-sign steps. Only commit pos when the candidate row is of
+// the matching kind; non-matching rows are SKIPPED past (so a few
+// non-matching rows between two workers don't strand the cursor) but
+// crossing a different RIGHT-column kind (e.g., from worker into
+// agent) ends the walk early.
 func (m *Model) moveCursorWithinKind(delta int, kind rowKind) {
 	rows := m.dashboardRows()
 	if len(rows) == 0 {
@@ -908,14 +955,38 @@ func (m *Model) moveCursorWithinKind(delta int, kind rowKind) {
 		}
 		return false
 	}
+	// Crossing into a DIFFERENT right-column kind ends the walk —
+	// don't silently change panels.
+	isOtherPanel := func(r dashRow) bool {
+		switch kind {
+		case rowWorker:
+			if r.kind == rowAgent {
+				return true
+			}
+			if r.kind == rowSeparator && r.separator != nil &&
+				r.separator.kind == separatorAgentIdle {
+				return true
+			}
+		case rowAgent:
+			if r.kind == rowWorker {
+				return true
+			}
+		}
+		return false
+	}
 	pos := m.dashCursor
+	scan := pos
 	for moved := 0; moved < delta; {
-		next := pos + step
+		next := scan + step
 		if next < 0 || next >= len(rows) {
 			break
 		}
-		pos = next
-		if matches(rows[pos]) {
+		if isOtherPanel(rows[next]) {
+			break
+		}
+		scan = next
+		if matches(rows[scan]) {
+			pos = scan
 			moved++
 		}
 	}
