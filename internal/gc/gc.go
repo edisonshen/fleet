@@ -53,10 +53,18 @@ const (
 	KindOrphanAgents Kind = "orphan-agents"
 	KindOrphanTmux   Kind = "orphan-tmux"
 	KindWorktrees    Kind = "worktrees"
+	// KindCoordLocks scans ~/.fleet/projects/<p>/.locks/coordinator.lock
+	// across every project and flags three failure modes: mismatch
+	// (lock body's agent record reports a different project than the
+	// lock's parent dir), dead-coord (record file missing), stale-tmux
+	// (record exists but the named tmux session is gone). Surface-only
+	// by default; --apply unlinks. Tracks fleet#172 — sweeps historical
+	// state from before PRs #173 (fleet#170) and #174 (fleet#171) closed
+	// the new-hijack window at spawn + tick time. See coord_locks.go.
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -176,6 +184,20 @@ type Deps struct {
 	ListWorktrees  func(project string) ([]WorktreeEntry, error)
 	RemoveWorktree func(path string) error
 	IsTaskTerminal func(project, slug string) (bool, error)
+
+	// Coord-locks (KindCoordLocks).
+	// ListCoordLocks enumerates every coordinator.lock file under
+	// ~/.fleet/projects/<p>/.locks/. Production wiring is
+	// listCoordLocksOnDisk in coord_locks.go.
+	ListCoordLocks func() ([]CoordLockInfo, error)
+	// LoadAgent loads a single agent record by ID. Used to look up
+	// the lock holder so the classifier can detect mismatch + stale.
+	// Returns state.ErrNotFound when the record file is missing — that's
+	// the dead-coord signal. Production wiring is agent.Load.
+	LoadAgent func(id string) (*agent.Record, error)
+	// RemoveCoordLock unlinks the lock file under --apply. Production
+	// wiring is removeCoordLockFile (best-effort, ENOENT-tolerant).
+	RemoveCoordLock func(path string) error
 }
 
 // Action describes one planned-or-applied operation against a single
@@ -260,6 +282,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("worktrees: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindCoordLocks) {
+		if err := reconcileCoordLocks(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("coord-locks: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -283,6 +310,8 @@ func kindRank(k Kind) int {
 		return 2
 	case KindWorktrees:
 		return 3
+	case KindCoordLocks:
+		return 4
 	}
 	return 99
 }
@@ -618,6 +647,9 @@ func DefaultDeps() Deps {
 		ListWorktrees:       listProjectWorktrees,
 		RemoveWorktree:      removeGitWorktree,
 		IsTaskTerminal:      isTaskTerminalOnDisk,
+		ListCoordLocks:      listCoordLocksOnDisk,
+		LoadAgent:           agent.Load,
+		RemoveCoordLock:     removeCoordLockFile,
 	}
 }
 

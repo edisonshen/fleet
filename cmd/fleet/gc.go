@@ -42,7 +42,7 @@ func newGCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "gc",
 		Short: "Reap orphan fleet-owned resources (sockets, agent records, tmux, worktrees)",
-		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165). Four kinds:
+		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165, #172). Five kinds:
 
   sockets        — /tmp/fleet-test-*.sock files older than --max-age
   orphan-agents  — ~/.fleet/agents/*.json records whose tmux session is gone
@@ -50,6 +50,12 @@ func newGCCmd() *cobra.Command {
                    (SURFACE only by default; --aggressive opts into kill)
   worktrees      — ~/.fleet/projects/*/worktrees/<slug> trees whose task
                    is done or abandoned
+  coord-locks    — ~/.fleet/projects/<p>/.locks/coordinator.lock files
+                   whose holder agent (a) loads with a DIFFERENT project
+                   than the lock dir (mismatch), (b) has no record file
+                   on disk (dead coord), or (c) names a tmux session
+                   that's gone (stale). SURFACE only by default; --apply
+                   unlinks the offending lock file (fleet#172)
 
 Default behavior is DRY-RUN — prints a planned action list and exits
 0 WITHOUT mutating. Pass --apply to actually remove / archive / kill.
@@ -67,7 +73,7 @@ Per-action output format:
   <kind>  <target>  verb=<v>  reason=<r>
 
 Trailing summary line:
-  summary: N sockets, M agents, K tmux (surface only), L worktrees
+  summary: N sockets, M agents, K tmux (surface only), L worktrees, P coord-locks
 
 Exit codes:
   0  — sweep ran (always; per-action failures surface in stderr lines)
@@ -83,7 +89,7 @@ Exit codes:
 	cmd.Flags().DurationVar(&f.maxAge, "max-age", gcDefaultMaxAge,
 		"age floor for socket sweep (Go duration; default 24h)")
 	cmd.Flags().StringVar(&f.kindsCSV, "kinds", "",
-		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees); empty = all")
+		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks); empty = all")
 	cmd.Flags().StringVar(&f.project, "project", "",
 		"scope worktree + agent enumeration to one project (default: all projects)")
 	return cmd
@@ -162,14 +168,14 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 		}
 		k := gc.Kind(p)
 		switch k {
-		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees:
+		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks:
 			out = append(out, k)
 		default:
-			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees)", p)
+			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks)", p)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees)")
+		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks)")
 	}
 	return out, nil
 }
@@ -190,7 +196,7 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 	_, _ = fmt.Fprintf(stdout, "fleet gc — mode=%s aggressive=%t max-age=%s\n",
 		mode, opts.Aggressive, opts.MaxAge)
 
-	var nSockets, nAgents, nTmux, nWorktrees int
+	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks int
 	for _, a := range r.Actions {
 		_, _ = fmt.Fprintf(stdout, "%s  %s  verb=%s  reason=%s\n",
 			a.Kind, a.Target, a.Verb, a.Reason)
@@ -203,9 +209,11 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 			nTmux++
 		case gc.KindWorktrees:
 			nWorktrees++
+		case gc.KindCoordLocks:
+			nCoordLocks++
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
-		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees\n",
-		nSockets, nAgents, nTmux, nWorktrees)
+		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks\n",
+		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks)
 }
