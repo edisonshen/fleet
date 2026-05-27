@@ -129,8 +129,44 @@ func reconcileCoordLocks(r *Report, opts Options, deps Deps) error {
 			continue
 		}
 		if rec.Project != "" && rec.Project != l.Project {
-			appendCoordLockAction(r, opts, deps, l,
-				fmt.Sprintf("mismatch (lock dir=%s vs record.project=%s)", l.Project, rec.Project))
+			// Liveness gate (codex review iter-1 [P1]): mismatch is
+			// determinative for surfacing, but NOT for unlinking under
+			// --apply when the holder's tmux session is still alive.
+			// flock(2)/fcntl(2) are inode-based; os.Remove of a held
+			// coordinator.lock leaves the live holder pinned to the
+			// unlinked inode while a new coord can create a fresh
+			// file + acquire a fresh flock → split-brain (two coords
+			// believe they own the same project's mutual-exclusion
+			// gate). Probe SessionAlive; refuse the unlink path when
+			// alive=true. Probe error / empty TmuxSession → treat as
+			// ambiguous and refuse (surface-don't-silo).
+			//
+			// Dry-run mirror (codex review iter-5 [P2] from sockets):
+			// the dry-run report must agree with what --apply will
+			// actually do, so apply the same liveness gate in both
+			// modes — never queue a would-remove the apply path
+			// would refuse.
+			reason := fmt.Sprintf("mismatch (lock dir=%s vs record.project=%s)", l.Project, rec.Project)
+			holderAlive := false
+			sess := strings.TrimSpace(rec.TmuxSession)
+			if sess == "" || deps.SessionAlive == nil {
+				holderAlive = true // unprobeable → conservative-treat-as-live
+			} else {
+				ok, perr := deps.SessionAlive(sess)
+				if perr != nil {
+					holderAlive = true // ambiguous probe → conservative
+				} else {
+					holderAlive = ok
+				}
+			}
+			if holderAlive {
+				r.Actions = append(r.Actions, Action{
+					Kind: KindCoordLocks, Target: l.Path, Verb: VerbSurface,
+					Reason: reason + "; holder tmux still alive — refusing to unlink (would split-brain coord mutual-exclusion); kill holder first then rerun",
+				})
+				continue
+			}
+			appendCoordLockAction(r, opts, deps, l, reason)
 			continue
 		}
 		if strings.TrimSpace(rec.TmuxSession) == "" {
