@@ -20,18 +20,37 @@ Spawn (internal/spawn/spawn.go) writes this file on coord-spawn:
   - merge-safe: existing parallelism + future fields untouched
   - atomic: write to tmp + rename + fsync (no half-written files)
 
-loop.tick (skills/coordinator/loop.py) reads + validates:
-  - missing field / file → fall back to caller cwd + warn in
-    TickResult.errors
-  - present field + path missing on disk → refuse + skip
-    (reason="coord-config-repo-missing")
-  - present field + remote mismatch → warn in TickResult.errors,
-    proceed (iter-6: heuristic can't distinguish custom-name from
-    actual-wrong-repo, so it must not block; the `repo` field is
-    authoritative)
-  - present field + no `origin` remote → warn in TickResult.errors,
-    proceed (local-only repos are supported)
-  - present field + remote matches → use as cwd for git worktree add
+loop.tick (skills/coordinator/loop.py) reads + validates (iter-7,
+tiered authority):
+
+  1. meta.json::repo_path (operator-set via `fleet project add`) is
+     the AUTHORITATIVE source. When present, it wins outright over
+     coord-config.json::repo. This is the resolution for the codex
+     P1 contradiction (iter-2: heuristic refuse breaks legit
+     custom-name registrations; iter-4: heuristic warn-only allows
+     #175 wrong-repo dispatch). Operator-set repo_path is neither
+     a heuristic nor subject to the #175 spawn-time bug.
+
+  2. coord-config.json::repo (set by Spawn from cwd at spawn-time)
+     is the fallback for projects without meta.json. The URL
+     heuristic check stays as a SOFT WARNING (can't distinguish
+     custom-name from wrong-repo without authoritative source);
+     operator is nudged to run `fleet project add` to register an
+     authoritative path.
+
+  3. Caller cwd / os.getcwd() — legacy fallback (pre-#175 installs).
+
+  Refuse-with-skip paths (return early after lock release):
+    - meta.json::repo_path points at missing dir → meta-repo-missing
+    - coord-config.json::repo points at missing dir →
+      coord-config-repo-missing
+
+  Warn-and-proceed paths (cwd set, dispatch continues):
+    - meta.json present + differs from coord-config → use meta.json
+      + divergence warning
+    - coord-config present (no meta.json) + URL empty/mismatch →
+      soft warning
+    - No repo at all → fall back to caller cwd + warning
 """
 from __future__ import annotations
 
@@ -40,6 +59,42 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+
+def read_project_repo_path(project_dir: Path | str) -> str | None:
+    """Return `repo_path` from ~/.fleet/projects/<p>/meta.json — the
+    operator-authoritative checkout path set by `fleet project add`.
+
+    Returns None when:
+      - meta.json doesn't exist (project pre-dates `fleet project add`,
+        or coord was spawned without prior `fleet project add`)
+      - meta.json unreadable / malformed JSON
+      - root is not an object
+      - `repo_path` field missing or non-string or whitespace-only
+
+    Callers (loop.tick) use this as the AUTHORITATIVE source for the
+    worktree-base cwd when present. Coord-config.json::repo is
+    secondary (written by Spawn from the cwd at spawn-time, which
+    can be wrong per issue #175). When meta.json::repo_path is
+    present AND it differs from coord-config.json::repo, the meta.json
+    value wins — the operator explicitly registered that path via
+    `fleet project add`.
+    """
+    path = Path(project_dir) / "meta.json"
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("repo_path")
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    if not stripped:
+        return None
+    return stripped
 
 
 def read_repo(config_path: Path | str) -> str | None:

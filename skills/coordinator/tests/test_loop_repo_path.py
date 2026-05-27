@@ -620,6 +620,197 @@ def test_tick_stale_repo_path_refuses_dispatch(
     ), f"expected stale-path error; got {result.errors}"
 
 
+def test_tick_meta_json_repo_path_wins_over_coord_config(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """meta.json::repo_path is operator-authoritative (set by
+    `fleet project add`); when present AND different from
+    coord-config.json::repo, meta.json wins outright + warning surfaces.
+
+    iter-7 (codex P1 resolution): the #175 bug is exactly "coord
+    spawned from wrong cwd → coord-config.json::repo points at the
+    wrong repo." meta.json::repo_path is set explicitly by
+    `fleet project add` and is NOT subject to that bug. When both
+    sources exist and disagree, meta.json is the source of truth.
+    The URL heuristic (which can't distinguish custom-name from
+    wrong-repo) is no longer load-bearing in this case."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    # meta.json points at the REAL rainier checkout.
+    correct_repo = tmp_path / "rainier-correct"
+    correct_repo.mkdir()
+    # coord-config.json::repo points at fleet (the #175 bug scenario).
+    wrong_spawn_repo = tmp_path / "fleet-checkout"
+    wrong_spawn_repo.mkdir()
+    proj_dir = home / "projects" / project
+    (proj_dir / "meta.json").write_text(
+        json.dumps({"schema": "v1", "repo_path": str(correct_repo)}) + "\n"
+    )
+    (proj_dir / "coord-config.json").write_text(
+        json.dumps({"repo": str(wrong_spawn_repo)}) + "\n"
+    )
+    _patch_bootstrap(monkeypatch)
+
+    seen_cwd: list[str] = []
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        seen_cwd.append(args[4])
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path / "wrong-cwd"),
+        fleet_home=str(home),
+    )
+    assert result.skipped is False, (
+        f"meta.json should win + proceed; got skipped: {result.reason!r}"
+    )
+    # MUST use meta.json's path, NOT coord-config's.
+    assert seen_cwd and seen_cwd[0] == str(correct_repo), (
+        f"meta.json::repo_path must win over coord-config.json::repo; "
+        f"got cwd={seen_cwd[0]!r}, want {str(correct_repo)!r}"
+    )
+    # Warning should announce the override:
+    assert any(
+        "meta.json" in e and "coord-config.json" in e
+        and "differs" in e for e in result.errors
+    ), f"expected meta-vs-coord-config divergence warning; got {result.errors}"
+
+
+def test_tick_meta_json_repo_path_used_silently_when_matches(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """When meta.json::repo_path == coord-config.json::repo, no
+    divergence warning fires (they agree)."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    repo = tmp_path / "rainier"
+    repo.mkdir()
+    proj_dir = home / "projects" / project
+    (proj_dir / "meta.json").write_text(
+        json.dumps({"schema": "v1", "repo_path": str(repo)}) + "\n"
+    )
+    (proj_dir / "coord-config.json").write_text(
+        json.dumps({"repo": str(repo)}) + "\n"
+    )
+    _patch_bootstrap(monkeypatch)
+
+    seen_cwd: list[str] = []
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        seen_cwd.append(args[4])
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert result.skipped is False
+    assert seen_cwd[0] == str(repo)
+    # No divergence warning, no missing-coord-config warning.
+    divergence_warnings = [
+        e for e in result.errors if "differs from meta.json" in e
+    ]
+    assert divergence_warnings == [], (
+        f"matching paths should not warn; got {divergence_warnings}"
+    )
+
+
+def test_tick_meta_json_repo_path_only_no_coord_config(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """meta.json::repo_path present + coord-config.json::repo absent →
+    meta.json wins silently (legacy projects + new `fleet project add`)."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    repo = tmp_path / "rainier"
+    repo.mkdir()
+    proj_dir = home / "projects" / project
+    (proj_dir / "meta.json").write_text(
+        json.dumps({"schema": "v1", "repo_path": str(repo)}) + "\n"
+    )
+    # No coord-config.json on disk.
+    _patch_bootstrap(monkeypatch)
+
+    seen_cwd: list[str] = []
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        seen_cwd.append(args[4])
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path / "wrong-cwd"),
+        fleet_home=str(home),
+    )
+    assert result.skipped is False
+    assert seen_cwd[0] == str(repo)
+
+
+def test_tick_meta_json_stale_path_refuses(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """meta.json::repo_path points at a missing directory → refuse with
+    meta-repo-missing reason. Symmetric to the coord-config stale-path
+    refuse from iter-5."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    stale_repo = tmp_path / "deleted"  # NOT created
+    proj_dir = home / "projects" / project
+    (proj_dir / "meta.json").write_text(
+        json.dumps({"schema": "v1", "repo_path": str(stale_repo)}) + "\n"
+    )
+    _patch_bootstrap(monkeypatch)
+
+    called = {"n": 0}
+    real_tick_locked = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        called["n"] += 1
+        return real_tick_locked(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert called["n"] == 0
+    assert result.skipped is True
+    assert result.reason == "meta-repo-missing"
+    assert result.raised >= 1
+
+
+def test_read_project_repo_path_returns_none_when_missing(
+    tmp_path: Path,
+) -> None:
+    """meta.json absent → None (fall through to coord-config path)."""
+    assert coord_config.read_project_repo_path(tmp_path) is None
+
+
+def test_read_project_repo_path_returns_none_when_field_missing(
+    tmp_path: Path,
+) -> None:
+    """meta.json without repo_path field → None."""
+    (tmp_path / "meta.json").write_text(json.dumps({"schema": "v1"}))
+    assert coord_config.read_project_repo_path(tmp_path) is None
+
+
+def test_read_project_repo_path_returns_stripped(tmp_path: Path) -> None:
+    """Valid repo_path → returned with whitespace stripped."""
+    (tmp_path / "meta.json").write_text(
+        json.dumps({"schema": "v1", "repo_path": "  /repos/foo  "})
+    )
+    assert coord_config.read_project_repo_path(tmp_path) == "/repos/foo"
+
+
 def test_tick_accepts_generic_parent_dir_tag(
     tmp_path: Path, monkeypatch,
 ) -> None:

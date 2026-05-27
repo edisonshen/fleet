@@ -3560,13 +3560,21 @@ def test_loop_skips_handoff_when_worker_pid_alive(
 
 def _write_non_git_meta(fleet_home: Path, project: str) -> None:
     """Seed a meta.json with is_git=false at the project root. Loop's
-    project_is_git lookup reads this file at dispatch time."""
+    project_is_git lookup reads this file at dispatch time.
+
+    fleet#175 iter-7: loop.tick now ALSO reads meta.json::repo_path as
+    the authoritative cwd source. The fake `/tmp/non-git-fake` placeholder
+    these tests used historically would trip the stale-path refuse
+    branch. Point repo_path at the project's own directory in
+    fleet_home — a real, existing path that satisfies the
+    os.path.isdir() guard without affecting any non-git assertions
+    these tests make."""
     proj_dir = fleet_home / "projects" / project
     proj_dir.mkdir(parents=True, exist_ok=True)
     (proj_dir / "meta.json").write_text(
         json.dumps({
             "schema": "v1",
-            "repo_path": "/tmp/non-git-fake",
+            "repo_path": str(proj_dir),
             "added_at": "2026-05-12T00:00:00Z",
             "is_git": False,
         }),
