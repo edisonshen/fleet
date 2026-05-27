@@ -298,29 +298,33 @@ def test_validate_remote_case_insensitive_mixed() -> None:
     )
 
 
-def test_validate_remote_accepts_manually_named_hyphenated_project() -> None:
-    """iter-14 (codex P2): a manually-named hyphenated project
-    (`--project my-project`) whose origin is `my-project.git` must
-    match. The TagForPath convention is `<parent>-<base>` but
-    operators using `fleet dispatch --project my-project` directly
-    bypass TagForPath; their project name equals the URL basename
-    verbatim. iter-12's first-`-`-split heuristic alone would have
-    refused this (bare=`project`, basename=`my-project`)."""
-    assert coord_config.remote_matches_project(
+def test_validate_remote_rejects_manually_named_hyphenated_project() -> None:
+    """iter-15 (codex P2): a manually-named hyphenated project
+    (`--project my-project`) cannot be heuristically validated
+    without ambiguity. Operators using non-TagForPath tags should
+    register via `fleet project add` → meta.json::repo_path, which
+    bypasses this heuristic entirely.
+
+    iter-14 added a strict-equal pre-check that accepted this case,
+    but codex iter-13 surfaced the cost: `projects-rainier` ↔
+    `projects-rainier.git` (different repo from the intended
+    `rainier.git`) would also pass strict-equal and silently dispatch
+    workers to the wrong checkout — the #175 corruption pattern."""
+    assert not coord_config.remote_matches_project(
         "https://github.com/foo/my-project.git",
         "my-project",
     )
 
 
-def test_validate_remote_strict_equal_still_rejects_iter9_lookalike() -> None:
-    """iter-14 regression guard: adding the strict-equal pre-check
-    must NOT re-introduce iter-9's suffix-lookalike acceptance."""
-    # tag=`projects-rainier-app`, URL basename=`app`: strict-equal
-    # fails (app != projects-rainier-app), split fails (app !=
-    # rainier-app). Still rejected.
+def test_validate_remote_rejects_iter13_strict_equal_lookalike() -> None:
+    """iter-15 explicit regression: codex iter-13 P2.
+    `projects-rainier` ↔ `projects-rainier.git` must NOT match — the
+    operator's project tag follows TagForPath convention, so the
+    expected basename is `rainier` (the part after the first `-`),
+    not the whole tag."""
     assert not coord_config.remote_matches_project(
-        "https://github.com/org/app.git",
-        "projects-rainier-app",
+        "https://github.com/org/projects-rainier.git",
+        "projects-rainier",
     )
 
 

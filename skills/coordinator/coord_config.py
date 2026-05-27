@@ -261,17 +261,20 @@ def remote_matches_project(remote_url: str, project: str) -> bool:
     # (iter-13, codex P2).
     tail = tail.lower()
     project = project.lower()
-    # First: try strict whole-tag equality. Handles manually-named
-    # projects (`--project my-project` ↔ `my-project.git`) where the
-    # tag doesn't follow TagForPath's `<parent>-<base>` convention
-    # (iter-14, codex P2). Strictly more permissive than first-`-`
-    # split alone, and the new acceptance case is unambiguously
-    # legitimate (operator's chosen project name equals the URL
-    # basename verbatim).
-    if tail == project:
-        return True
-    # Second: TagForPath convention. Split off the first `-` (parent
-    # half) and strict-equal match the remainder against URL basename.
+    # Two heuristics, in order:
+    #
+    # 1. Whole-tag equality, ONLY for tags without `-`. Handles the
+    #    single-segment registration shape — `--project fleet` ↔
+    #    `fleet.git`. Tags WITH `-` are not strict-matched because
+    #    `projects-rainier` ↔ `projects-rainier.git` would falsely
+    #    accept a checkout that's a different (literally-named) repo
+    #    (codex iter-15 P2). Manually-named hyphenated projects
+    #    (`--project my-project`) bypass via `fleet project add` →
+    #    meta.json.
+    #
+    # 2. TagForPath split convention. For tags WITH `-`, split off
+    #    the first `-` (parent half) and strict-equal match the
+    #    remainder against URL basename.
     if "-" not in project:
-        return False
+        return tail == project
     return project.split("-", 1)[1] == tail
