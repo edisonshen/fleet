@@ -230,22 +230,31 @@ def tick(
         return result
     # 1.5. Resolve worktree-base repo from coord-config.json (fleet#175).
     #
-    # ASCII:
+    # ASCII (post-iter-6):
     #
     #   coord-config.json::repo set?
-    #     yes → git -C <repo> remote get-url origin
-    #             matches project (heuristic)?
-    #               yes → cwd = repo            ← use authoritative checkout
-    #               no  → skipped + raised++   ← refuse dispatch
     #     no  → cwd = caller_cwd or os.getcwd()
-    #             record warning in result.errors so the operator
-    #             sees the legacy/upgrade breadcrumb in `fleet status`
+    #             record fallback warning (legacy/upgrade breadcrumb)
+    #     yes:
+    #       path exists on disk?
+    #         no  → skipped + raised++          ← stale-path refuse
+    #         yes → cwd = configured_repo
+    #               git -C <repo> remote get-url origin
+    #                 empty   → soft warning (local-only repo OK)
+    #                 mismatch → soft warning (custom-name OK)
+    #                 match   → silent
     #
     # Why this lives between lock acquire and _tick_locked (rather than
-    # before the lock): the validation/refuse path must release the lock
-    # cleanly, and surfacing through the existing `finally: flock_un` is
-    # the simplest way to guarantee that. The cost of reading one JSON
-    # file under the lock is negligible compared to the rest of tick().
+    # before the lock): the validation/refuse paths must release the
+    # lock cleanly, and surfacing through the existing `finally:
+    # flock_un` is the simplest way to guarantee that. The cost of
+    # reading one JSON file + one stat + one shell-out under the lock
+    # is negligible compared to the rest of tick().
+    #
+    # iter-6 (codex P1): mismatch is a soft warning, not refuse. The
+    # heuristic can't distinguish custom-name from actual-wrong-repo;
+    # the `repo` field is the authoritative pin (refusing on heuristic
+    # would break legit operator setups).
     cfg_path = project_dir / COORD_CONFIG_FILE
     configured_repo = coord_config.read_repo(cfg_path)
     if configured_repo:
@@ -278,18 +287,26 @@ def tick(
                 os.close(lock_fd)
             return result
         remote = coord_config.git_remote_origin(configured_repo)
+        # Sanity-check the remote URL against the project tag. This is
+        # a HEURISTIC advisory, NOT a gate. The authoritative pin for
+        # "where worker worktrees land" is the configured `repo`
+        # field; the remote check is belt-and-suspenders to catch
+        # gross misconfig (`coord-config.json::repo` accidentally
+        # pointing at the wrong project's checkout).
+        #
+        # iter-6 (codex P1): downgraded from refuse-dispatch to soft
+        # warning. The earlier "refuse if no name match" behavior
+        # broke legitimate registrations where the operator cloned
+        # into a custom-named directory (`~/work/fleet-v2` from
+        # `fleet.git`) — the heuristic can't tell custom-name from
+        # actual-wrong-repo, so it must not block. The warning still
+        # surfaces in TickResult.errors so operators see the signal
+        # without losing forward progress on legit setups.
         if not remote:
-            # Local-only repo or no origin remote — we can't validate
-            # the project↔checkout mapping. Don't refuse dispatch (that
-            # would break `fleet project add /path/to/local-repo`); use
-            # the configured repo and surface a soft warning so the
-            # operator knows validation was skipped. The `repo` field
-            # still pins where worktrees land, so the cwd-derived
-            # worktree-base bug (issue #175) is still prevented.
-            #
-            # Note: directory-existence check above rules out the
-            # stale-path case, so empty origin here genuinely means
-            # "no `origin` remote configured" — not "directory gone."
+            # No origin remote — local-only repo, OR a checkout where
+            # `git remote get-url origin` failed for environmental
+            # reasons (broken git index, permission glitch). Either
+            # way, can't validate; surface a soft warning + proceed.
             result.errors.append(
                 f"coord-config.json::repo={configured_repo!r} for "
                 f"project {project!r} has no `origin` remote — "
@@ -297,29 +314,23 @@ def tick(
                 f"checkouts are supported; set an origin remote to "
                 f"enable the sanity check.)"
             )
-            cwd = configured_repo
         elif not coord_config.remote_matches_project(remote, project):
-            msg = (
-                f"coord-config.json::repo points at {configured_repo!r} "
-                f"(origin={remote!r}) but project is {project!r} — "
-                f"refusing dispatch. Fix coord-config.json or re-spawn "
-                f"the coord from inside the correct checkout."
+            # Name doesn't match the heuristic. This MIGHT be a real
+            # misconfig (different repo entirely) OR an operator who
+            # cloned with a custom local name / fork / vanity URL.
+            # Surface as warning so the operator sees the signal, but
+            # don't refuse — the `repo` field is the authoritative
+            # pin and overriding the operator's explicit choice is
+            # worse than a soft nudge.
+            result.errors.append(
+                f"coord-config.json::repo={configured_repo!r} "
+                f"(origin={remote!r}) does not match the heuristic "
+                f"for project {project!r}. Proceeding because the "
+                f"`repo` field is authoritative; if the configured "
+                f"checkout is wrong, fix coord-config.json or "
+                f"re-spawn the coord from the correct directory."
             )
-            import sys as _sys
-            _sys.stderr.write(msg + "\n")
-            result.errors.append(msg)
-            result.skipped = True
-            result.reason = "coord-config-repo-mismatch"
-            result.raised += 1
-            # Release the lock before returning (fleet#175: short-circuit
-            # path is still inside the lock-acquired branch).
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
-            return result
-        else:
-            cwd = configured_repo
+        cwd = configured_repo
     else:
         # No `repo` field in coord-config.json — fall through to legacy
         # behavior, but warn into TickResult.errors so the operator sees

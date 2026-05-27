@@ -23,7 +23,14 @@ Spawn (internal/spawn/spawn.go) writes this file on coord-spawn:
 loop.tick (skills/coordinator/loop.py) reads + validates:
   - missing field / file → fall back to caller cwd + warn in
     TickResult.errors
-  - present field + remote mismatch → BLOCKED, no dispatch, raised++
+  - present field + path missing on disk → refuse + skip
+    (reason="coord-config-repo-missing")
+  - present field + remote mismatch → warn in TickResult.errors,
+    proceed (iter-6: heuristic can't distinguish custom-name from
+    actual-wrong-repo, so it must not block; the `repo` field is
+    authoritative)
+  - present field + no `origin` remote → warn in TickResult.errors,
+    proceed (local-only repos are supported)
   - present field + remote matches → use as cwd for git worktree add
 """
 from __future__ import annotations

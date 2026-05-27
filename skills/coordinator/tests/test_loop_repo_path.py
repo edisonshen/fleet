@@ -415,32 +415,42 @@ def test_tick_missing_repo_falls_back_with_warning(
     ), f"expected fallback warning in errors; got {result.errors}"
 
 
-def test_tick_remote_mismatch_refuses_dispatch(
+def test_tick_remote_mismatch_warns_but_proceeds(
     tmp_path: Path, monkeypatch,
 ) -> None:
     """coord-config.json::repo set, but `git remote get-url origin` doesn't
-    match the project name → skipped, error surfaced, raised++."""
+    match the project name → warn in TickResult.errors, but PROCEED
+    (the configured `repo` field is authoritative).
+
+    iter-6 (codex P1 finding): the earlier "refuse if mismatch"
+    behavior broke legitimate registrations where the operator
+    cloned into a custom-named directory (e.g., `~/work/fleet-v2`
+    cloned from `fleet.git`, or `fleet project add ~/forks/rainier-v3`
+    pointing at the rainier remote). The heuristic can't distinguish
+    custom-name from actual-wrong-repo, so it must not block. The
+    warning surfaces in errors[] so operators see the signal."""
     project = "projects-rainier"
     home = _seed_fleet_home(tmp_path, project)
-    repo = tmp_path / "fleet-checkout"  # WRONG repo for rainier
+    # Custom-named checkout: operator cloned rainier into "v3-checkout"
+    # for whatever reason; origin still points at the rainier remote.
+    # The heuristic-match would fail (basename "v3-checkout" vs tag
+    # "projects-rainier"), but operator's intent is clear.
+    repo = tmp_path / "v3-checkout"
     repo.mkdir()
     cfg = home / "projects" / project / "coord-config.json"
-    cfg.write_text(
-        json.dumps({"repo": str(repo)}) + "\n"
-    )
+    cfg.write_text(json.dumps({"repo": str(repo)}) + "\n")
     _patch_bootstrap(monkeypatch)
-    # Remote points at fleet, not rainier.
+    # Remote points at fleet, not rainier — would trip the heuristic.
     monkeypatch.setattr(
         coord_config, "git_remote_origin",
         lambda repo_path: "git@github.com:edisonshen/fleet.git",
     )
 
-    # If tick proceeded past the guard, _tick_locked would run.
-    called = {"n": 0}
+    seen_cwd: list[str] = []
     real_tick_locked = loop._tick_locked
 
     def spy(*args, **kwargs):
-        called["n"] += 1
+        seen_cwd.append(args[4])
         return real_tick_locked(*args, **kwargs)
 
     monkeypatch.setattr(loop, "_tick_locked", spy)
@@ -449,15 +459,44 @@ def test_tick_remote_mismatch_refuses_dispatch(
         project, coord_id="", cwd=str(tmp_path),
         fleet_home=str(home),
     )
-    assert called["n"] == 0, (
-        "remote-mismatch must short-circuit BEFORE _tick_locked runs"
+    # MUST proceed (configured repo is authoritative):
+    assert result.skipped is False, (
+        f"mismatch should warn + proceed; got skipped: {result.reason!r}"
     )
-    assert result.skipped is True
-    assert result.reason == "coord-config-repo-mismatch"
-    assert result.raised >= 1
+    assert seen_cwd and seen_cwd[0] == str(repo), (
+        f"configured repo must still be the cwd; got {seen_cwd}"
+    )
+    # MUST surface the heuristic-mismatch warning:
     assert any(
-        "remote" in e.lower() and project in e for e in result.errors
-    ), f"expected mismatch error mentioning project; got {result.errors}"
+        "does not match" in e and project in e for e in result.errors
+    ), f"expected mismatch warning mentioning project; got {result.errors}"
+
+
+def test_tick_remote_mismatch_does_not_set_skip_reason(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Regression guard: iter-6 contract change. result.reason must NOT
+    be set to the old `coord-config-repo-mismatch` value (that string
+    was specific to the refuse-dispatch path which no longer fires)."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    repo = tmp_path / "wrong-named-checkout"
+    repo.mkdir()
+    cfg = home / "projects" / project / "coord-config.json"
+    cfg.write_text(json.dumps({"repo": str(repo)}) + "\n")
+    _patch_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        coord_config, "git_remote_origin",
+        lambda repo_path: "git@github.com:edisonshen/fleet.git",
+    )
+
+    result = loop.tick(
+        project, coord_id="", cwd=str(tmp_path),
+        fleet_home=str(home),
+    )
+    assert result.reason != "coord-config-repo-mismatch", (
+        f"iter-6 dropped this skip reason; got {result.reason!r}"
+    )
 
 
 def test_remote_match_heuristic_strips_projects_prefix(
