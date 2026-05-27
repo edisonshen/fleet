@@ -166,6 +166,18 @@ type Model struct {
 	// dispatch on the row at this index. Wraps at boundaries.
 	dashCursor int
 
+	// workersScrollOffset / agentsScrollOffset are the vertical scroll
+	// positions for the right-column workers + agents panels (fleet#177
+	// Fix 2). renderTwoColumnBody caps each panel at a computed maxRows
+	// budget; lines beyond the budget are hidden and surfaced via a
+	// "K hidden — [↓/↑] scroll" footer. ↓/↑ on a right-column row
+	// adjusts the matching offset (clamped to [0, len(lines)-visible]).
+	// Reset to 0 on tea.WindowSizeMsg — the visible window changes and
+	// re-clamping after-the-fact is brittle. Left-column j/k/arrow nav
+	// is untouched.
+	workersScrollOffset int
+	agentsScrollOffset  int
+
 	// searchFilter is the current substring filter applied to
 	// dashboardRows(). Empty when no filter is active. Set via [/]
 	// search prompt; cleared via [esc] inside the prompt.
@@ -442,6 +454,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// fleet#177 Fix 2: a resize changes the visible-row budget for
+		// each right-column panel. Re-clamping the offsets after the
+		// fact is brittle (the buildBodyLines pass hasn't run yet), so
+		// reset both offsets to 0 — the operator scrolls back if they
+		// were mid-scroll.
+		m.workersScrollOffset = 0
+		m.agentsScrollOffset = 0
 		return m, nil
 
 	case tea.KeyMsg:
@@ -774,16 +793,204 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q":
 		return m, tea.Quit
-	case "j", "down":
+	case "j":
+		// j is row-nav across the unified row list. NEVER scrolls a
+		// right panel — the operator who wants vim-style nav keeps
+		// using j/k everywhere.
 		m.moveCursor(+1)
-	case "k", "up":
+	case "k":
 		m.moveCursor(-1)
+	case "down":
+		// fleet#177 Fix 2: arrow keys scroll the focused right panel.
+		// Cursor on a worker row → workersScrollOffset++; cursor on an
+		// agent or right-column separator row → agentsScrollOffset++.
+		// Cursor on a left-column row (project / task / left-column
+		// separator) → fall through to row-nav so the left column
+		// keeps its [↓/↑] behavior.
+		if !m.scrollRightPanel(+1) {
+			m.moveCursor(+1)
+		}
+	case "up":
+		if !m.scrollRightPanel(-1) {
+			m.moveCursor(-1)
+		}
 	case "left":
 		m.jumpToLeftPanel()
 	case "right":
 		m.jumpToRightPanel()
 	}
 	return m, nil
+}
+
+// scrollRightPanel adjusts the workers or agents scroll offset when the
+// cursor is on a right-column row. Returns true when a scroll was
+// applied (so the caller skips row-nav); false when the cursor is on
+// a LEFT-column row and the arrow should fall through to moveCursor.
+//
+// fleet#177 Fix 2 right-panel bound — see Model.workersScrollOffset
+// doc. Clamping happens in the renderer (trimWithScroll) — we
+// optimistically advance here; an over-scroll past the end snaps
+// back to the visible window on the next render.
+//
+// Cursor co-movement (codex iter-2 [P2] follow-up): scroll also
+// advances the cursor by the same delta within the unified row list,
+// clamped to the panel's row span. Without this, repeated ↓ keeps
+// the cursor pinned at the first visible row while content scrolls
+// past, so [⏎] / [a] / [r] / [c] target a row that's no longer
+// visible — the operator acts on a worker they can't see. Co-moving
+// the cursor keeps the selected marker on a visible row and actions
+// stay coherent with the screen.
+func (m *Model) scrollRightPanel(delta int) bool {
+	row := m.selectedRow()
+	if row == nil {
+		return false
+	}
+	switch row.kind {
+	case rowWorker:
+		m.workersScrollOffset = clampScrollOffset(m.workersScrollOffset+delta, m.panelMaxOffset(rowWorker))
+		m.moveCursorWithinKind(delta, rowWorker)
+		return true
+	case rowAgent:
+		m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
+		m.moveCursorWithinKind(delta, rowAgent)
+		return true
+	case rowSeparator:
+		// Right-column separator (separatorAgentIdle) is part of the
+		// agents panel; scroll it. Left-column separators fall through
+		// to moveCursor.
+		if row.separator != nil && row.separator.kind == separatorAgentIdle {
+			m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
+			m.moveCursorWithinKind(delta, rowAgent)
+			return true
+		}
+	}
+	return false
+}
+
+// clampScrollOffset bounds the stored offset at [0, maxOff]. Without
+// the upper clamp (codex iter-3 [P2]), repeated ↓ past the visible
+// end leaves the model with an oversized offset; the renderer's
+// trimWithScroll then clamps for display only, but the next ↑ press
+// just decrements the oversized value — the panel appears stuck at
+// the bottom until many extra ↑ presses burn off the overshoot.
+func clampScrollOffset(want, maxOff int) int {
+	if want < 0 {
+		return 0
+	}
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if want > maxOff {
+		return maxOff
+	}
+	return want
+}
+
+// panelMaxOffset returns a conservative upper bound for the workers
+// or agents panel scroll offset based on the count of rows of the
+// matching kind. Each worker/agent row produces roughly 3 lines
+// (block header + status + blank) in buildBodyLines, so the bound is
+// 3 * rowCount. The renderer's trimWithScroll clamps tighter at
+// render time, but having a model-side bound prevents the
+// stuck-at-bottom UX bug after overscroll (codex iter-3 [P2]).
+func (m *Model) panelMaxOffset(kind rowKind) int {
+	const linesPerRow = 3
+	rows := m.dashboardRows()
+	count := 0
+	for _, r := range rows {
+		if r.kind == kind {
+			count++
+		}
+		if kind == rowAgent && r.kind == rowSeparator && r.separator != nil &&
+			r.separator.kind == separatorAgentIdle {
+			count++
+		}
+	}
+	bound := count * linesPerRow
+	if bound < 0 {
+		bound = 0
+	}
+	return bound
+}
+
+// moveCursorWithinKind advances dashCursor by delta but stays anchored
+// to rows of the target kind (rowWorker or rowAgent) on the right
+// column. Falls off the end of the kind-run → clamps to the LAST row
+// of that kind it found (no wrap into projects, no crossover into the
+// other right-column panel). Used by scrollRightPanel so the cursor
+// follows the scrolled panel rather than getting stranded on a hidden
+// row.
+//
+// Boundary behavior (codex iter-3 [P2]): when stepping in `step`
+// direction would land on a non-matching row (e.g., ↑ from first
+// worker into a left-column row, or ↓ from last worker into the agent
+// sub-heading), the cursor stays put rather than crossing the panel
+// boundary. Crossover would silently re-route subsequent actions
+// ([⏎] / [a]) to the wrong panel.
+//
+// Implementation: walk the unified row list from the current cursor
+// in delta-sign steps. Only commit pos when the candidate row is of
+// the matching kind; non-matching rows are SKIPPED past (so a few
+// non-matching rows between two workers don't strand the cursor) but
+// crossing a different RIGHT-column kind (e.g., from worker into
+// agent) ends the walk early.
+func (m *Model) moveCursorWithinKind(delta int, kind rowKind) {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		return
+	}
+	step := 1
+	if delta < 0 {
+		step = -1
+		delta = -delta
+	}
+	matches := func(r dashRow) bool {
+		if r.kind == kind {
+			return true
+		}
+		// Agents panel includes the right-column separator (idle agents).
+		if kind == rowAgent && r.kind == rowSeparator && r.separator != nil &&
+			r.separator.kind == separatorAgentIdle {
+			return true
+		}
+		return false
+	}
+	// Crossing into a DIFFERENT right-column kind ends the walk —
+	// don't silently change panels.
+	isOtherPanel := func(r dashRow) bool {
+		switch kind {
+		case rowWorker:
+			if r.kind == rowAgent {
+				return true
+			}
+			if r.kind == rowSeparator && r.separator != nil &&
+				r.separator.kind == separatorAgentIdle {
+				return true
+			}
+		case rowAgent:
+			if r.kind == rowWorker {
+				return true
+			}
+		}
+		return false
+	}
+	pos := m.dashCursor
+	scan := pos
+	for moved := 0; moved < delta; {
+		next := scan + step
+		if next < 0 || next >= len(rows) {
+			break
+		}
+		if isOtherPanel(rows[next]) {
+			break
+		}
+		scan = next
+		if matches(rows[scan]) {
+			pos = scan
+			moved++
+		}
+	}
+	m.dashCursor = pos
 }
 
 // moveCursor advances dashCursor by delta across the unified row list
