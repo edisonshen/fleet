@@ -383,14 +383,18 @@ func loadTaskStatusOnDisk(project, slug string) (string, error) {
 	if status, found, ferr := taskStatusRawInFile(archivePath, slug); ferr != nil {
 		return "", ferr
 	} else if found {
-		// Archive = terminal by definition. If the archived row's
-		// status bullet is missing / non-terminal, the classifier treats
-		// the dir as task-terminal anyway because presence in the
-		// archive is dispositive (mirrors KindWorktrees logic).
-		if status == "" {
-			return "done", nil
-		}
-		return status, nil
+		// Archive = terminal by definition. The archived row's recorded
+		// status (in-progress / blocked / done / abandoned / missing
+		// bullet) is IGNORED — presence in tasks-archive.md is
+		// dispositive. Mirrors KindWorktrees: `fleet tasks archive` (per
+		// internal/tasks.go Archive) moves rows verbatim without forcing
+		// status=done, so an operator-forced archive of an `in-progress`
+		// task can leave the row with status=in-progress and a
+		// surviving worker dir. Returning the raw status here trips the
+		// task-in-progress guard and leaves the orphan unreapable
+		// (codex iter-2 [P2]).
+		_ = status // suppressed — see comment above
+		return "done", nil
 	}
 	// Slug not present in either file — treat as "no task entry"; the
 	// classifier interprets this as not-terminal so the worker dir is

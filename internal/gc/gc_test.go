@@ -2687,3 +2687,51 @@ func TestLoadWorkerStateOnDisk(t *testing.T) {
 		t.Errorf("UpdatedAt=%v, want %v", got.UpdatedAt, wantTime)
 	}
 }
+
+// TestLoadTaskStatusOnDisk_ArchivePresenceIsTerminal pins the
+// archive-is-dispositive invariant (codex iter-2 [P2] follow-up). The
+// `fleet tasks archive` flow (internal/tasks.go Archive) moves task
+// rows verbatim — it does NOT force status=done. An operator-forced
+// archive of an in-progress task leaves the row in tasks-archive.md
+// with status=in-progress. Returning that raw status from
+// loadTaskStatusOnDisk would trip the task-in-progress guard in
+// appendWorkerRecordWithTaskGuard and leave the orphan worker dir
+// unreapable forever. The contract: presence in tasks-archive.md is
+// dispositive — return "done" regardless of recorded status (mirrors
+// KindWorktrees / isTaskTerminalOnDisk).
+func TestLoadTaskStatusOnDisk_ArchivePresenceIsTerminal(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	// state.ProjectDir resolves to <CWD>/.fleet/projects/<name>/ when
+	// FLEET_HOME points elsewhere on some platforms; use the standard
+	// projects path under FLEET_HOME (mirrors listWorkerRecordsOnDisk).
+	projectsDir := filepath.Join(fleetHome, "projects", "projects-fleet")
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Archive a row with the WORST-CASE recorded status — in-progress
+	// (the exact case that previously trapped the orphan).
+	archiveBody := `## task: archived-inprog-slug
+- status: in-progress
+- priority: P1
+- worker_pid: 0
+
+Spec: archived but never marked done.
+`
+	archivePath := filepath.Join(projectsDir, "tasks-archive.md")
+	if err := os.WriteFile(archivePath, []byte(archiveBody), 0o644); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	// Sibling tasks.md exists but does NOT contain the slug — forces
+	// the lookup to fall through to the archive path.
+	if err := os.WriteFile(filepath.Join(projectsDir, "tasks.md"), []byte("# tasks\n"), 0o644); err != nil {
+		t.Fatalf("write tasks: %v", err)
+	}
+	got, err := loadTaskStatusOnDisk("projects-fleet", "archived-inprog-slug")
+	if err != nil {
+		t.Fatalf("loadTaskStatusOnDisk: %v", err)
+	}
+	if got != "done" {
+		t.Fatalf("archived in-progress row: status=%q, want %q (archive presence MUST be terminal — codex iter-2 P2)", got, "done")
+	}
+}

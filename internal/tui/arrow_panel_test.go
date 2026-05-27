@@ -319,3 +319,52 @@ func TestRightPanelScrollOffsetResetsOnResize(t *testing.T) {
 			mm.workersScrollOffset, mm.agentsScrollOffset)
 	}
 }
+
+// TestArrowKeys_ScrollMovesCursorToo pins cursor co-movement (codex
+// iter-2 [P2] follow-up): when ↓ scrolls the workers panel, the
+// cursor must also advance to the next worker row so [⏎]/[a]/etc
+// stay coherent with the visible row. Without this, repeated ↓
+// keeps the cursor pinned to the first worker while content scrolls
+// past, and actions target a row the operator can no longer see.
+func TestArrowKeys_ScrollMovesCursorToo(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.jumpToRightPanel()
+	startCursor := m.dashCursor
+	if startCursor < 0 {
+		t.Fatalf("jumpToRightPanel left cursor=%d", startCursor)
+	}
+
+	// ↓ on right-column should advance BOTH cursor and offset.
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	if mm.dashCursor == startCursor {
+		t.Errorf("↓ on workers panel did not advance dashCursor (was %d, still %d) — cursor will be stranded on scrolled content",
+			startCursor, mm.dashCursor)
+	}
+	if mm.workersScrollOffset == 0 {
+		t.Errorf("↓ on workers panel with overflow did not increment scroll offset; got 0")
+	}
+	// Cursor should still be on a worker row after the co-move.
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowWorker {
+		t.Errorf("after ↓ cursor landed on row kind=%v want rowWorker", func() interface{} {
+			if row == nil {
+				return "nil"
+			}
+			return row.kind
+		}())
+	}
+}

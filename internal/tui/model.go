@@ -831,6 +831,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // doc. Clamping happens in the renderer (trimWithScroll) — we
 // optimistically advance here; an over-scroll past the end snaps
 // back to the visible window on the next render.
+//
+// Cursor co-movement (codex iter-2 [P2] follow-up): scroll also
+// advances the cursor by the same delta within the unified row list,
+// clamped to the panel's row span. Without this, repeated ↓ keeps
+// the cursor pinned at the first visible row while content scrolls
+// past, so [⏎] / [a] / [r] / [c] target a row that's no longer
+// visible — the operator acts on a worker they can't see. Co-moving
+// the cursor keeps the selected marker on a visible row and actions
+// stay coherent with the screen.
 func (m *Model) scrollRightPanel(delta int) bool {
 	row := m.selectedRow()
 	if row == nil {
@@ -842,12 +851,14 @@ func (m *Model) scrollRightPanel(delta int) bool {
 		if m.workersScrollOffset < 0 {
 			m.workersScrollOffset = 0
 		}
+		m.moveCursorWithinKind(delta, rowWorker)
 		return true
 	case rowAgent:
 		m.agentsScrollOffset += delta
 		if m.agentsScrollOffset < 0 {
 			m.agentsScrollOffset = 0
 		}
+		m.moveCursorWithinKind(delta, rowAgent)
 		return true
 	case rowSeparator:
 		// Right-column separator (separatorAgentIdle) is part of the
@@ -858,10 +869,57 @@ func (m *Model) scrollRightPanel(delta int) bool {
 			if m.agentsScrollOffset < 0 {
 				m.agentsScrollOffset = 0
 			}
+			m.moveCursorWithinKind(delta, rowAgent)
 			return true
 		}
 	}
 	return false
+}
+
+// moveCursorWithinKind advances dashCursor by delta but stays anchored
+// to rows of the target kind (rowWorker or rowAgent) on the right
+// column. Falls off the end of the kind-run → clamps to the last row
+// of that kind (no wrap into projects). Used by scrollRightPanel so
+// the cursor follows the scrolled panel rather than getting stranded
+// on a hidden row.
+//
+// Implementation: walk the unified row list from the current cursor,
+// stepping ONE-AT-A-TIME by delta sign, counting only rows of the
+// matching kind (or right-column rowSeparator for rowAgent), until we
+// either accumulate |delta| matches or run out of matching rows.
+func (m *Model) moveCursorWithinKind(delta int, kind rowKind) {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		return
+	}
+	step := 1
+	if delta < 0 {
+		step = -1
+		delta = -delta
+	}
+	matches := func(r dashRow) bool {
+		if r.kind == kind {
+			return true
+		}
+		// Agents panel includes the right-column separator (idle agents).
+		if kind == rowAgent && r.kind == rowSeparator && r.separator != nil &&
+			r.separator.kind == separatorAgentIdle {
+			return true
+		}
+		return false
+	}
+	pos := m.dashCursor
+	for moved := 0; moved < delta; {
+		next := pos + step
+		if next < 0 || next >= len(rows) {
+			break
+		}
+		pos = next
+		if matches(rows[pos]) {
+			moved++
+		}
+	}
+	m.dashCursor = pos
 }
 
 // moveCursor advances dashCursor by delta across the unified row list
