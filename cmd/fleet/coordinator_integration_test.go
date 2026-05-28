@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -578,12 +579,54 @@ func listAllAgents(t *testing.T) []*agent.Record {
 // in its TickResult. Catches silent CLI failures (e.g., missing flag,
 // permission error inside the Python skill) that wouldn't otherwise
 // surface as a non-zero exit because tick() always returns 0 to match
-// fleet-guard discipline. The output is JSON; we look for the canonical
-// empty-errors marker rather than parsing the whole blob.
+// fleet-guard discipline.
+//
+// fleet#175 carve-out: tick() now emits an informational fallback
+// warning into result.errors when coord-config.json::repo is missing.
+// That breadcrumb is informational (the operator should re-spawn the
+// coord or set the field manually), NOT a hard error. The integration
+// tests don't seed coord-config.json so they'd see this warning on
+// every tick — filter it out at the assertion site rather than
+// mutating every test fixture.
+//
+// iter-10 (codex P2 resolution): parse the JSON output and check the
+// errors[] array directly instead of substring-matching against a
+// hard-coded badPrefix denylist. The denylist approach masked any
+// future error category not yet listed (e.g., a new `claims ...`
+// error class would slip through). Parsing is precise.
 func assertNoTickErrors(t *testing.T, tickOutput string) {
 	t.Helper()
-	if !strings.Contains(tickOutput, `"errors": []`) {
-		t.Errorf("loop.tick() reported errors:\n%s", tickOutput)
+	// Parse the JSON. tickOutput may contain leading garbage from the
+	// Python driver (e.g., stderr captured before the JSON line), so
+	// find the last `{...}` blob and parse that.
+	jsonStart := strings.LastIndex(tickOutput, "{")
+	jsonEnd := strings.LastIndex(tickOutput, "}")
+	if jsonStart < 0 || jsonEnd < jsonStart {
+		t.Errorf("assertNoTickErrors: no JSON blob in tick output:\n%s", tickOutput)
+		return
+	}
+	var parsed struct {
+		Errors []string `json:"errors"`
+	}
+	if err := json.Unmarshal([]byte(tickOutput[jsonStart:jsonEnd+1]), &parsed); err != nil {
+		t.Errorf("assertNoTickErrors: parse tick JSON: %v\n%s", err, tickOutput)
+		return
+	}
+	const fleet175Marker = "coord-config.json::repo not set for"
+	var realErrors []string
+	for _, e := range parsed.Errors {
+		// Tolerate ONLY the canonical fleet#175 fallback warning.
+		// Any other error entry — including future fleet#175 warnings
+		// in other shapes — fails the test, surfacing the new
+		// category for explicit triage.
+		if strings.Contains(e, fleet175Marker) {
+			continue
+		}
+		realErrors = append(realErrors, e)
+	}
+	if len(realErrors) > 0 {
+		t.Errorf("loop.tick() reported %d real error(s) beyond the fleet#175 fallback:\n%s\nfull output:\n%s",
+			len(realErrors), strings.Join(realErrors, "\n"), tickOutput)
 	}
 }
 

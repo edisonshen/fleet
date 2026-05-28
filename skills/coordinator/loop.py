@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Iterable
 
 import conflict
+import coord_config
 import dispatch as dispatch_mod
 import parse
 import reaper as reaper_mod
@@ -227,6 +228,205 @@ def tick(
         result.skipped = True
         result.reason = "lock-busy"
         return result
+    # 1.5. Resolve worktree-base repo (fleet#175).
+    #
+    # Sources, in order of authority:
+    #
+    #   1. meta.json::repo_path — set by `fleet project add`.
+    #      OPERATOR-AUTHORITATIVE. When present, wins outright;
+    #      URL heuristic is bypassed entirely. Custom-named clones,
+    #      forks, vanity URLs all work — operator's explicit
+    #      registration overrides any heuristic ambiguity.
+    #
+    #   2. coord-config.json::repo — set by Spawn from cwd at coord-
+    #      spawn time. Authoritative for projects NOT registered via
+    #      `fleet project add` (legacy / direct-spawn flows). URL
+    #      heuristic is the ONLY safety check here, so mismatch
+    #      REFUSES dispatch (custom-name operators register via
+    #      `fleet project add` to bypass; #175 corruption is
+    #      prevented).
+    #
+    #   3. caller cwd / os.getcwd() — legacy fallback (pre-fleet#175
+    #      installs). Warning surfaced.
+    #
+    # ASCII (iter-19 final):
+    #
+    #   meta.json::repo_path present?
+    #     yes:
+    #       path missing on disk? → refuse (meta-repo-missing)
+    #       differs from coord-config.json::repo? → use meta.json +
+    #                                                divergence warning
+    #       matches (or coord-config absent)? → use meta.json silently
+    #     no:
+    #       coord-config.json::repo present?
+    #         path missing? → refuse (coord-config-repo-missing)
+    #         path not a git work tree? → refuse (coord-config-repo-not-git)
+    #         use as cwd; URL heuristic check:
+    #           empty origin (real git repo) → soft warning
+    #           heuristic mismatch → soft warning + recovery hint
+    #           match → silent
+    #       no → fallback to caller cwd + warning
+    #
+    # Heuristic semantics: soft signal only. Strict safety lives at
+    # the meta.json tier (operators wanting refuse-on-mismatch
+    # register via `fleet project add`). Codex flipped 5+ times on
+    # the heuristic refuse-vs-warn question — final call per
+    # feedback_coord_makes_engineering_calls + the operator's
+    # stated rubrics.
+    #
+    # Lives between lock acquire and _tick_locked so the refuse-paths
+    # release the lock cleanly via the local fcntl.flock_un dance.
+    cfg_path = project_dir / COORD_CONFIG_FILE
+    configured_repo = coord_config.read_repo(cfg_path)
+    meta_repo = coord_config.read_project_repo_path(project_dir)
+
+    def _refuse_stale(source_name: str, repo_path: str, reason_code: str) -> "TickResult":
+        """Helper: refuse dispatch with a stale-path error message
+        and release the coord-spawn lock cleanly."""
+        msg = (
+            f"{source_name}={repo_path!r} for project {project!r} "
+            f"is not a directory (deleted, moved, or path typo) — "
+            f"refusing dispatch. Fix the source or re-spawn the coord "
+            f"from inside the correct checkout."
+        )
+        import sys as _sys
+        _sys.stderr.write(msg + "\n")
+        result.errors.append(msg)
+        result.skipped = True
+        result.reason = reason_code
+        result.raised += 1
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+        return result
+
+    if meta_repo:
+        # OPERATOR-AUTHORITATIVE source. meta.json wins over everything.
+        if not os.path.isdir(meta_repo):
+            return _refuse_stale(
+                "meta.json::repo_path", meta_repo, "meta-repo-missing",
+            )
+        # If coord-config.json::repo disagrees, the coord was likely
+        # spawned from the wrong cwd (the #175 bug). Surface a clear
+        # warning + override with meta.json's authoritative value.
+        if configured_repo and configured_repo != meta_repo:
+            result.errors.append(
+                f"coord-config.json::repo={configured_repo!r} differs "
+                f"from meta.json::repo_path={meta_repo!r} for project "
+                f"{project!r} — using meta.json (operator-authoritative "
+                f"via `fleet project add`). Re-spawn the coord from "
+                f"{meta_repo!r} to silence this warning."
+            )
+        cwd = meta_repo
+    elif configured_repo:
+        # No meta.json — fall back to spawn-time pin. URL heuristic
+        # becomes the only sanity check; soft warning on mismatch
+        # because we lack an authoritative source to override.
+        if not os.path.isdir(configured_repo):
+            return _refuse_stale(
+                "coord-config.json::repo",
+                configured_repo,
+                "coord-config-repo-missing",
+            )
+        remote = coord_config.git_remote_origin(configured_repo)
+        if not remote:
+            # No origin URL. Two possibilities:
+            #   (a) Real git repo with no `origin` remote (local-only,
+            #       legit project shape).
+            #   (b) NOT a git work tree at all (e.g., $HOME, /tmp,
+            #       arbitrary dir).
+            #
+            # iter-17 (codex P1): distinguish via the existence of
+            # `<repo>/.git` (regular repo dir, or worktree git
+            # pointer file). If neither exists, refuse — accepting
+            # an arbitrary non-git directory as cwd defeats the #175
+            # safety goal (coord dispatched from $HOME could spawn
+            # workers anywhere).
+            if not os.path.exists(os.path.join(configured_repo, ".git")):
+                msg = (
+                    f"coord-config.json::repo={configured_repo!r} for "
+                    f"project {project!r} is not a git work tree (no "
+                    f".git directory or worktree pointer found). "
+                    f"Refusing dispatch to prevent worker creation in "
+                    f"a non-git directory. Re-spawn the coord from "
+                    f"inside the project's git checkout."
+                )
+                import sys as _sys
+                _sys.stderr.write(msg + "\n")
+                result.errors.append(msg)
+                result.skipped = True
+                result.reason = "coord-config-repo-not-git"
+                result.raised += 1
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+                return result
+            # Real git repo with no origin — local-only is supported.
+            result.errors.append(
+                f"coord-config.json::repo={configured_repo!r} for "
+                f"project {project!r} has no `origin` remote — "
+                f"skipping repo↔project validation. (Local-only "
+                f"checkouts are supported; set an origin remote OR "
+                f"run `fleet project add {configured_repo}` to "
+                f"register an authoritative path.)"
+            )
+        elif not coord_config.remote_matches_project(remote, project):
+            # Mismatch in the no-meta.json branch is a SOFT WARNING.
+            #
+            # Iter-history on this question: codex flipped between
+            # refuse-on-mismatch (iter-4/6/8/11 P1, "prevents #175
+            # corruption") and warn-only (iter-2/3/16/18 P1, "refuse
+            # breaks legitimate custom-aliased projects and
+            # custom-named clones that have no working `fleet project
+            # add` recovery path"). Both are real concerns.
+            #
+            # Final call (iter-19, codex contradiction resolved per
+            # CLAUDE.md §4 + feedback_coord_makes_engineering_calls):
+            # warn-but-proceed. The configured `repo` field is what
+            # the operator stamped at coord-spawn time; refusing to
+            # honor it on a fuzzy name-match would defeat the
+            # operator's explicit choice. The heuristic remains as
+            # a SIGNAL — operator sees the warning and can investigate
+            # — but it is NOT a gate.
+            #
+            # Strict safety (refuse on mismatch) lives at the
+            # meta.json tier: operators wanting the strict check
+            # run `fleet project add <path>` and meta.json wins over
+            # coord-config + the heuristic doesn't apply. This is the
+            # documented "use meta.json for safety" tiered authority
+            # introduced in iter-7.
+            #
+            # Real risk acknowledged: legacy/no-meta.json projects with
+            # a wrong coord-config.json::repo silently dispatch from
+            # the wrong checkout. Recovery: warning in TickResult.errors
+            # surfaces the signal; operator can detect via tick output
+            # and run `fleet project add` to register meta.json (which
+            # then takes over and refuses if the configured repo is
+            # truly wrong).
+            result.errors.append(
+                f"coord-config.json::repo={configured_repo!r} "
+                f"(origin={remote!r}) does not match the heuristic "
+                f"for project {project!r}. Proceeding because the "
+                f"`repo` field is the operator-stamped spawn-time "
+                f"value; if the configured checkout is wrong, fix "
+                f"coord-config.json or re-spawn from the correct "
+                f"directory. For strict validation, register via "
+                f"`fleet project add {configured_repo}` to write "
+                f"meta.json::repo_path (the authoritative tier)."
+            )
+        cwd = configured_repo
+    else:
+        # Neither meta.json nor coord-config.json::repo — pre-#175
+        # install. Fall through to legacy caller-cwd behavior with a
+        # warning so the operator knows to re-spawn.
+        result.errors.append(
+            f"coord-config.json::repo not set for {project!r}; "
+            f"falling back to caller cwd={cwd!r}. Re-spawn the coord "
+            f"from inside the project's git checkout, or set the field "
+            f"manually."
+        )
     # Load per-project parallelism config (cap>1 → worktree mode).
     # Caller-provided cap overrides only when it differs from
     # DEFAULT_CAP — that way tests can pin cap=2 explicitly while

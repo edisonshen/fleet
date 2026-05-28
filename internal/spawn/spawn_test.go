@@ -2,6 +2,7 @@ package spawn
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,12 @@ import (
 	"github.com/edisonshen/fleet/internal/testutil/tmuxtest"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
+
+// jsonUnmarshalForTest defers to encoding/json. Kept as a tiny shim so
+// the import-block change above stays focused (issue #175 test helpers).
+func jsonUnmarshalForTest(b []byte, v any) error {
+	return json.Unmarshal(b, v)
+}
 
 func setupFleetHome(t *testing.T) string {
 	t.Helper()
@@ -1597,4 +1604,371 @@ func TestSpawn_ExecCommandRunsButPersistsCleanCommand(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Errorf("expected %q in pane within deadline:\n%s", want, string(lastOut))
+}
+
+// ---------- Issue #175: coord-config.json::repo write ----------
+//
+// On a coord-spawn, Spawn must also stamp the resolved repo path into
+// ~/.fleet/projects/<project>/coord-config.json::repo. loop.py reads
+// that field on every tick to decide where to run `git worktree add`,
+// avoiding the cwd-derived worktree-base bug (issue #175) where a coord
+// whose tmux session inherited the wrong shell cwd silently corrupted
+// cross-project dispatches.
+//
+// Detection: TaskID is "coord-<project>" AND Project is non-empty.
+// This is the existing CoordTaskIDPrefix convention from
+// cmd/fleet/dispatch.go (we duplicate the literal here to avoid a
+// cmd/fleet → internal/spawn import cycle).
+//
+// Idempotency: an existing non-empty `repo` field is preserved
+// (operator-set wins). Existing parallelism + other fields are merged
+// through. An existing empty `repo` field is treated as unset.
+
+// readCoordConfig parses the coord-config.json stamped by Spawn.
+// Mirrors the schema in skills/coordinator/coord_config.py.
+func readCoordConfig(t *testing.T, fleetHome, project string) map[string]any {
+	t.Helper()
+	path := filepath.Join(fleetHome, "projects", project, "coord-config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read coord-config.json: %v (path=%s)", err, path)
+	}
+	var data map[string]any
+	if err := jsonUnmarshalForTest(raw, &data); err != nil {
+		t.Fatalf("parse coord-config.json: %v (raw=%q)", err, string(raw))
+	}
+	return data
+}
+
+func TestSpawn_WritesCoordConfigRepo_OnFreshProject(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	gotRepo, _ := data["repo"].(string)
+	if gotRepo != myCwd {
+		t.Errorf("coord-config.json::repo: got %q want %q", gotRepo, myCwd)
+	}
+}
+
+func TestSpawn_WritesCoordConfigRepo_PreservesParallelism(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Seed coord-config.json with parallelism but no repo.
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"parallelism": 3}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["parallelism"] != float64(3) {
+		t.Errorf("parallelism clobbered: got %v want 3 (json numeric)", data["parallelism"])
+	}
+	if data["repo"] != myCwd {
+		t.Errorf("repo: got %v want %q", data["repo"], myCwd)
+	}
+}
+
+func TestSpawn_OverwritesExistingRepoWithRespawnCwd(t *testing.T) {
+	// iter-9 (codex P1 resolution): respawn always overwrites
+	// `coord-config.json::repo` with the new cwd, even when the
+	// previous value still points at a live directory. Rationale:
+	// for projects without meta.json, the only signal we have about
+	// where the operator INTENDS the worktree base is the cwd of
+	// the current spawn. Preserving an older live value would trap
+	// projects in the #175 wrong-repo state (operator can't fix it
+	// by respawning from the correct checkout).
+	//
+	// Operators wanting a permanent fork pin should use
+	// `fleet project add <fork-path>` — meta.json::repo_path wins
+	// over coord-config.json::repo in loop.tick (iter-7), so the
+	// fork pin survives any number of respawns.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	prevLiveRepo := t.TempDir() // a real, live directory
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+prevLiveRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir() // the NEW respawn cwd
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != myCwd {
+		t.Errorf("respawn must overwrite existing repo: got %v want %q (old value %q was live but the respawn cwd is the operator's current intent)",
+			data["repo"], myCwd, prevLiveRepo)
+	}
+	// Sibling fields still preserved through overwrite:
+	if data["parallelism"] != float64(2) {
+		t.Errorf("parallelism clobbered during respawn overwrite: got %v want 2", data["parallelism"])
+	}
+}
+
+func TestSpawn_OverwritesStaleRepoOnRespawn(t *testing.T) {
+	// iter-8 (codex P2 resolution): when an existing `repo` value
+	// points at a missing/deleted directory, respawn MUST overwrite
+	// it with the live cwd. Without this, the iter-5 stale-path
+	// refuse-on-tick path leaves projects permanently blocked even
+	// after the operator follows the on-screen guidance to re-spawn.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	// Stale path: directory was deleted/moved. Use a path inside the
+	// test's tempdir prefix that we explicitly do NOT mkdir.
+	staleRepo := filepath.Join(t.TempDir(), "deleted-checkout")
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+staleRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	myCwd := t.TempDir() // the new live checkout
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != myCwd {
+		t.Errorf("stale repo not overwritten: got %v want %q (respawn-as-recovery broken)", data["repo"], myCwd)
+	}
+	// parallelism still preserved through the overwrite path:
+	if data["parallelism"] != float64(2) {
+		t.Errorf("parallelism clobbered during stale-repo overwrite: got %v want 2", data["parallelism"])
+	}
+}
+
+func TestSpawn_DoesNotWriteCoordConfigForWorkerSpawn(t *testing.T) {
+	// Worker spawn (TaskID is NOT the coord prefix) must NOT touch
+	// coord-config.json — that file is exclusively the coord's domain
+	// and stamping it from a worker would pin the wrong path (worker
+	// cwd may be a per-worker worktree, not the project repo).
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	myCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		TaskID:  "auth-fix", // worker task slug, NOT coord prefix
+		Project: "projects-rainier",
+		Cwd:     myCwd,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	cfgPath := filepath.Join(home, "projects", "projects-rainier", "coord-config.json")
+	if _, err := os.Stat(cfgPath); !os.IsNotExist(err) {
+		t.Errorf("worker spawn must NOT create coord-config.json; exists=%v err=%v", err == nil, err)
+	}
+}
+
+func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Set up a relative cwd: chdir to parent, pass basename as opts.Cwd.
+	abs := t.TempDir()
+	parent := filepath.Dir(abs)
+	rel := filepath.Base(abs)
+	origWd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(origWd) })
+	if err := os.Chdir(parent); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := Spawn(Options{
+		TaskID:  "coord-projects-rainier",
+		Project: "projects-rainier",
+		Cwd:     rel,
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	gotRepo, _ := data["repo"].(string)
+	if !filepath.IsAbs(gotRepo) {
+		t.Errorf("repo not absolutized: got %q", gotRepo)
+	}
+	// EvalSymlinks because macOS /var → /private/var via filepath.Abs.
+	got, _ := filepath.EvalSymlinks(gotRepo)
+	want, _ := filepath.EvalSymlinks(abs)
+	if got != want {
+		t.Errorf("repo absolutization wrong: got %q want %q", got, want)
+	}
+}
+
+func TestSpawn_HandoffInheritedCwdSkipsCoordConfigStamp(t *testing.T) {
+	// iter-18: on coord handoff where Cwd is INHERITED (== OldRecord.Cwd),
+	// Spawn must NOT write coord-config.json::repo. The handoff
+	// inherits cwd from the outgoing record — that's system-driven
+	// inheritance, not operator-explicit. Restamping with the inherited
+	// value (which could be the wrong #175 cwd) blocks recovery via
+	// fresh-dispatch.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	// Seed coord-config.json with a sentinel value the handoff must
+	// NOT overwrite.
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	sentinelRepo := "/sentinel/operator/path"
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+sentinelRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	inheritedCwd := t.TempDir()
+	old := agent.New("aaaa1111")
+	old.TaskID = "coord-projects-rainier"
+	old.Project = "projects-rainier"
+	old.Engine = "claude-code"
+	old.Cwd = inheritedCwd // pin inherited value
+	old.HandoffNumber = 1
+	prevPath := "/some/handoffs/aaaa0000-20260427-180000.md"
+	old.LastHandoffPath = &prevPath
+
+	docPath := "/some/handoffs/aaaa1111-20260427-184807.md"
+
+	rec, err := Spawn(Options{
+		OldRecord:  old,
+		NewDocPath: docPath,
+		Cwd:        inheritedCwd, // EQUALS OldRecord.Cwd → inheritance
+		Command:    []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != sentinelRepo {
+		t.Errorf("inherited-cwd handoff overwrote coord-config.json::repo: got %v want %q",
+			data["repo"], sentinelRepo)
+	}
+}
+
+func TestSpawn_RecoveryWithExplicitCwdRestampsCoordConfig(t *testing.T) {
+	// iter-18 (codex P2 fix): dead-coord recovery where operator
+	// passes a corrected --cwd (Spawn sees Cwd != OldRecord.Cwd)
+	// MUST restamp coord-config.json::repo. Without this, dead-coord
+	// recovery via `fleet dispatch --coord-spawn --cwd /correct`
+	// leaves the bad coord-config value, defeating the operator's
+	// explicit recovery action.
+	requireTmux(t)
+	home := setupFleetHome(t)
+
+	projDir := filepath.Join(home, "projects", "projects-rainier")
+	if err := os.MkdirAll(projDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(projDir, "coord-config.json")
+	badRepo := "/wrong/path/from/dead/coord"
+	if err := os.WriteFile(
+		cfgPath,
+		[]byte(`{"parallelism": 2, "repo": "`+badRepo+`"}`+"\n"),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dead coord record with the bad cwd embedded:
+	dead := agent.New("aaaa1111")
+	dead.TaskID = "coord-projects-rainier"
+	dead.Project = "projects-rainier"
+	dead.Engine = "claude-code"
+	dead.Cwd = badRepo // matches the bad coord-config
+	dead.HandoffNumber = 1
+	prevPath := "/some/handoffs/aaaa0000-20260427-180000.md"
+	dead.LastHandoffPath = &prevPath
+
+	// Operator runs `fleet dispatch --coord-spawn --cwd /correct/path`:
+	correctCwd := t.TempDir()
+	rec, err := Spawn(Options{
+		OldRecord:  dead,
+		NewDocPath: "/some/handoffs/aaaa1111-20260427-184807.md",
+		Cwd:        correctCwd, // DIFFERS from dead.Cwd → operator override
+		Command:    []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+
+	data := readCoordConfig(t, home, "projects-rainier")
+	if data["repo"] != correctCwd {
+		t.Errorf("recovery did not restamp coord-config.json::repo: got %v want %q (operator-supplied --cwd must override)",
+			data["repo"], correctCwd)
+	}
 }

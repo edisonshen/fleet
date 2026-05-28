@@ -2897,9 +2897,14 @@ def test_workers_delete_failure_does_not_abort_tick(
 
     # Tick must record the reconcile but NOT raise.
     assert result.reconciled == 1
-    assert result.errors == [], (
+    # fleet#175: tick now emits a fallback-warning into result.errors when
+    # coord-config.json::repo is missing. That breadcrumb is informational,
+    # not a hard error — filter it out before asserting the original
+    # "delete failure is best-effort" contract.
+    real_errors = [e for e in result.errors if "coord-config.json" not in e]
+    assert real_errors == [], (
         "delete failures should be best-effort, not bubble into errors[]: "
-        + repr(result.errors)
+        + repr(real_errors)
     )
     captured = capsys.readouterr()
     assert "workers delete failed" in captured.err
@@ -3062,8 +3067,11 @@ def test_sweep_failure_does_not_abort_tick(
             fleet_home=str(fleet_home),
         )
 
-    assert result.errors == [], (
-        "sweep failures must be best-effort; got: " + repr(result.errors)
+    # fleet#175: filter out the coord-config.json::repo-not-set fallback
+    # warning, which is informational (not a hard error).
+    real_errors = [e for e in result.errors if "coord-config.json" not in e]
+    assert real_errors == [], (
+        "sweep failures must be best-effort; got: " + repr(real_errors)
     )
     captured = capsys.readouterr()
     assert "workers delete failed" in captured.err
@@ -3552,13 +3560,21 @@ def test_loop_skips_handoff_when_worker_pid_alive(
 
 def _write_non_git_meta(fleet_home: Path, project: str) -> None:
     """Seed a meta.json with is_git=false at the project root. Loop's
-    project_is_git lookup reads this file at dispatch time."""
+    project_is_git lookup reads this file at dispatch time.
+
+    fleet#175 iter-7: loop.tick now ALSO reads meta.json::repo_path as
+    the authoritative cwd source. The fake `/tmp/non-git-fake` placeholder
+    these tests used historically would trip the stale-path refuse
+    branch. Point repo_path at the project's own directory in
+    fleet_home — a real, existing path that satisfies the
+    os.path.isdir() guard without affecting any non-git assertions
+    these tests make."""
     proj_dir = fleet_home / "projects" / project
     proj_dir.mkdir(parents=True, exist_ok=True)
     (proj_dir / "meta.json").write_text(
         json.dumps({
             "schema": "v1",
-            "repo_path": "/tmp/non-git-fake",
+            "repo_path": str(proj_dir),
             "added_at": "2026-05-12T00:00:00Z",
             "is_git": False,
         }),
