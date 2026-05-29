@@ -840,6 +840,49 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // visible — the operator acts on a worker they can't see. Co-moving
 // the cursor keeps the selected marker on a visible row and actions
 // stay coherent with the screen.
+// Boundary fall-through (tui-nav-handoff-regressions Fix 1):
+// moveCursorWithinKind stops at the worker↔agent sub-panel edge
+// (isOtherPanel guard) rather than crossing. Net effect under #177:
+// ↓/↑ got TRAPPED inside each sub-panel — the operator on the last
+// worker pressed ↓ and nothing happened. The fix: detect the
+// "cursor pinned AND the adjacent row is the OTHER right-column panel"
+// case and return false so handleKey falls through to moveCursor,
+// which walks the unified row list and crosses the worker↔agent
+// boundary naturally (the same path j/k already use).
+//
+// Scoped to the worker↔agent boundary only. We deliberately do NOT
+// fall through at the OUTER edges of the right column:
+//
+//	↑ on the FIRST worker  → neighbor above is a LEFT-column project /
+//	  task row, NOT the other right-column panel → stay (return true).
+//	  Arrows must not silently jump out of the right column into the
+//	  left column (#177's TestArrowKeys_ScrollCursorStaysInPanel guards
+//	  this; ← is the explicit left-jump key).
+//	↓ on the LAST agent    → no neighbor below → moveCursor wrap handles
+//	  it, but only because there's no cross-panel neighbor to stay for;
+//	  see crossesToOtherRightPanel which returns false there so we fall
+//	  through to the existing wrap behavior.
+//
+// Why cursor progress, not scroll progress, gates "pinned":
+// panelMaxOffset is a count-based bound (3 × rowCount), so even a
+// NON-overflowing panel reports a positive max offset and
+// clampScrollOffset bumps the stored offset by delta. That phantom
+// bump means "scroll offset changed" is true at every boundary, so it
+// can't distinguish "still has content to scroll" from "at the edge".
+// Cursor movement is the honest signal: moveCursorWithinKind advances
+// the cursor iff another row of the same kind exists in the delta
+// direction. When it can't, we consult the adjacent row to decide
+// cross vs. stay, restoring the phantom offset bump on cross.
+//
+//	last worker, no more workers below, agent below → restore offset,
+//	  return false → moveCursor advances to first agent. ✓
+//	first agent, last worker above                  → restore offset,
+//	  return false → moveCursor steps back to last worker. ✓
+//	mid-panel, more rows of this kind ahead         → cursor advances
+//	  (offset rides it into view on overflow) → return true, stay. ✓
+//	first worker, project above (left column)       → cursor pinned but
+//	  no cross-panel neighbor → return true, stay (don't leave right
+//	  column via arrow). ✓
 func (m *Model) scrollRightPanel(delta int) bool {
 	row := m.selectedRow()
 	if row == nil {
@@ -847,22 +890,80 @@ func (m *Model) scrollRightPanel(delta int) bool {
 	}
 	switch row.kind {
 	case rowWorker:
-		m.workersScrollOffset = clampScrollOffset(m.workersScrollOffset+delta, m.panelMaxOffset(rowWorker))
-		m.moveCursorWithinKind(delta, rowWorker)
-		return true
+		return m.scrollOrCross(delta, rowWorker, &m.workersScrollOffset)
 	case rowAgent:
-		m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
-		m.moveCursorWithinKind(delta, rowAgent)
-		return true
+		return m.scrollOrCross(delta, rowAgent, &m.agentsScrollOffset)
 	case rowSeparator:
 		// Right-column separator (separatorAgentIdle) is part of the
 		// agents panel; scroll it. Left-column separators fall through
 		// to moveCursor.
 		if row.separator != nil && row.separator.kind == separatorAgentIdle {
-			m.agentsScrollOffset = clampScrollOffset(m.agentsScrollOffset+delta, m.panelMaxOffset(rowAgent))
-			m.moveCursorWithinKind(delta, rowAgent)
+			return m.scrollOrCross(delta, rowAgent, &m.agentsScrollOffset)
+		}
+	}
+	return false
+}
+
+// scrollOrCross advances the given panel's scroll offset + within-kind
+// cursor by delta. Returns true when the cursor made progress inside
+// the panel OR the cursor is pinned against a non-right-panel edge
+// (stay; caller skips moveCursor). Returns false ONLY when the cursor
+// is pinned at the worker↔agent boundary (adjacent row is the other
+// right-column panel) — in that case the phantom offset bump is
+// restored and the caller falls through to moveCursor to cross.
+func (m *Model) scrollOrCross(delta int, kind rowKind, offset *int) bool {
+	before := m.dashCursor
+	beforeOff := *offset
+	*offset = clampScrollOffset(*offset+delta, m.panelMaxOffset(kind))
+	m.moveCursorWithinKind(delta, kind)
+	if m.dashCursor != before {
+		// Cursor advanced within the panel — stay (scroll rode it into
+		// view on overflow).
+		return true
+	}
+	// Cursor pinned. Fall through to moveCursor when the immediate
+	// neighbor in the delta direction is the OTHER right-column panel
+	// (worker↔agent cross) OR there is no neighbor at all (we're at the
+	// absolute top/bottom of the unified list — let moveCursor wrap).
+	// Stay ONLY when the neighbor is an in-range LEFT-column row: arrows
+	// must not silently jump sideways out of the right column (← is the
+	// explicit left-jump key; #177 ScrollCursorStaysInPanel guards it).
+	if m.fallsThroughAtEdge(before, delta, kind) {
+		*offset = beforeOff // undo the phantom count-based bump
+		return false
+	}
+	return true
+}
+
+// fallsThroughAtEdge reports whether a pinned cursor at row index `pos`
+// stepping by `delta` (±1) should fall through to moveCursor. True when
+// the neighbor is the OTHER right-column sub-panel (worker↔agent cross)
+// or there is no neighbor (top/bottom of the list → moveCursor wraps).
+// False when the neighbor is an in-range LEFT-column row (project /
+// task / left separator) — staying keeps arrows from leaving the right
+// column sideways.
+func (m *Model) fallsThroughAtEdge(pos, delta int, fromKind rowKind) bool {
+	rows := m.dashboardRows()
+	next := pos
+	if delta > 0 {
+		next++
+	} else {
+		next--
+	}
+	if next < 0 || next >= len(rows) {
+		// No neighbor — absolute top/bottom. Let moveCursor wrap.
+		return true
+	}
+	nbr := rows[next]
+	switch fromKind {
+	case rowWorker:
+		if nbr.kind == rowAgent {
 			return true
 		}
+		return nbr.kind == rowSeparator && nbr.separator != nil &&
+			nbr.separator.kind == separatorAgentIdle
+	case rowAgent:
+		return nbr.kind == rowWorker
 	}
 	return false
 }

@@ -483,10 +483,18 @@ func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 }
 
 // actionHandoffProject is the project-row branch of [h]. Resolves the
-// project's coord via ProjectRow.CoordID, applies the auto-red /
+// project's coord via the shared resolveCoordRecord helper (CoordID
+// link first, then the records-scan fallback), applies the auto-red /
 // precompact gate, and shells out via startHandoff. When the project
-// has no live coord (CoordID empty OR matching record not loaded),
-// flashes the "spawn a coord" hint.
+// has no live coord by EITHER path, flashes the "spawn a coord" hint.
+//
+// tui-nav-handoff-regressions Fix 2: the previous version resolved the
+// coord ONLY via p.CoordID → findRecordByID. The dashboard's project→
+// coord link (CoordID) races the agents refresh, so a live-but-unlinked
+// coord made [h] flash "no coord" while the agents panel clearly showed
+// it (live repro 2026-05-28: projects-fengshen-site coord 129c9824).
+// resolveCoordRecord adds the same records-scan fallback that
+// actionAttachProject already used, so [h] finds the in-flight coord.
 //
 // The gate logic mirrors what used to live on the rowAgent branch:
 //
@@ -496,30 +504,15 @@ func (m Model) actionHandoff() (Model, tea.Cmd, bool) {
 //   - auto-yellow / live / asking / idle / blocked / review: gate
 //     allows; [h] is the operator's escape hatch.
 //
-// The two reasons CoordID resolves to no record:
-//
-//  1. CoordID == "" — the dashboard hasn't seen a coord lock body OR
-//     task_id fallback for this project. There may be a coord booting
-//     and the next refresh tick may bind it, but right now we have no
-//     identity to hand off.
-//  2. CoordID != "" but findRecordByID returns nil — race between
-//     dashboard refresh and agents refresh (same race that
-//     actionAttachProject's path-1 branch surfaces as "pending refresh").
-//
-// Both surface the same flash because the operator's recovery is the
-// same: either wait for the coord, or spawn one with [a].
+// "No coord" now means BOTH resolution paths missed: CoordID is empty
+// (or points at an unloaded record) AND no record carries the
+// coord-<project> task_id + marker + alive session. The operator's
+// recovery is the same: wait for the coord, or spawn one with [a].
 func (m Model) actionHandoffProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
-	if p.CoordID == "" {
-		m.flash = &flashMsg{
-			text:  fmt.Sprintf("no coord for project %s — spawn one with [a]", p.Name),
-			isErr: true,
-		}
-		return m, nil, true
-	}
-	coord := findRecordByID(m.records, p.CoordID)
+	coord := m.resolveCoordRecord(p)
 	if coord == nil {
 		m.flash = &flashMsg{
 			text:  fmt.Sprintf("no coord for project %s — spawn one with [a]", p.Name),
@@ -1124,13 +1117,19 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
-	// Path 1: fresh coord exists (lock body + freshness gate). Look up
-	// the record by ID; verify the session is alive before committing
-	// to attach. A coord whose tmux session died but whose lock body
-	// wasn't yet stale would get dispatched to a dead session otherwise
-	// — same UX bug as the agent-row branch's "no sessions" failure mode.
+	// Path 1: fresh coord exists (lock body + freshness gate). Resolve
+	// the record via the shared resolveCoordRecord helper (CoordID link
+	// first, then the records-scan fallback — tui-nav-handoff-regressions
+	// Fix 2) so attach benefits from the same fallback [h] now uses when
+	// CoordID points at an unloaded record. Verify the session is alive
+	// before committing to attach. A coord whose tmux session died but
+	// whose lock body wasn't yet stale would get dispatched to a dead
+	// session otherwise — same UX bug as the agent-row branch's "no
+	// sessions" failure mode. Downstream dead-session recovery + the
+	// "pending refresh" race flash are unchanged; only the lookup that
+	// produces `rec` swapped to the shared helper.
 	if p.CoordID != "" {
-		if rec := findRecordByID(m.records, p.CoordID); rec != nil && rec.TmuxSession != "" {
+		if rec := m.resolveCoordRecord(p); rec != nil && rec.TmuxSession != "" {
 			// Probe with sessionProbeOrAliveFn (codex review iter-6 P1):
 			// the bare sessionAliveFn returns false on transport errors
 			// (bad FLEET_TMUX_SOCKET, restarting tmux server, etc.),
@@ -1269,6 +1268,34 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	m.coordSpawnInFlight[p.Name] = true
 	cwd := coordCwdForProject(m.records, p.Name)
 	return m, m.startCoordSpawn(p.Name, cwd), true
+}
+
+// resolveCoordRecord finds the live coord record for a project row,
+// trying the dashboard-linked CoordID first, then the records scan that
+// actionAttachProject already relies on (findExistingCoordForProject:
+// an agent tagged task_id=coord-<project>, project matching, marker on
+// disk, alive tmux session). Read-only — no spawn, no dead-session
+// recovery; callers handle the not-found (nil) case.
+//
+// tui-nav-handoff-regressions Fix 2: shared by actionHandoffProject and
+// actionAttachProject's initial coord lookup so [h] and [a] resolve the
+// project's coord through the SAME chain. Previously only [a] had the
+// scan fallback, so [h] flashed "no coord" when the dashboard's
+// CoordID link hadn't published yet but a coord was demonstrably live
+// in the agents panel.
+func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
+	if p == nil {
+		return nil
+	}
+	if p.CoordID != "" {
+		if rec := findRecordByID(m.records, p.CoordID); rec != nil {
+			return rec
+		}
+	}
+	if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
+		return rec
+	}
+	return nil
 }
 
 // findRecordByID returns the first agent.Record with id, or nil.
