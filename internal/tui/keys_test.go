@@ -622,6 +622,49 @@ func TestResolveCoordRecord_CoordIDSet_RecordMissing_DoesNotScanStale(t *testing
 	}
 }
 
+// TestResolveCoordRecord_FallsBackToLockBody pins codex review iter-2
+// [P2]: empty CoordID + no spawn marker, but coordinator.lock names an
+// alive coord (prompt-delivery-recovery state). resolveCoordRecord must
+// reach the lock-body tier so [h] resolves the live coord instead of
+// flashing "no coord" — matching the SAME chain [a] uses (path 2.5).
+func TestResolveCoordRecord_FallsBackToLockBody(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// No marker → findExistingCoordForProject misses; the lock body
+	// rescues.
+	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+
+	coord := agent.New("lockbody1")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-lockbody1"
+
+	prev := findCoordByLockBody
+	findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
+		if projectName != "demo" {
+			return nil, false
+		}
+		for _, r := range records {
+			if r != nil && r.ID == "lockbody1" {
+				return r, true
+			}
+		}
+		return nil, false
+	}
+	t.Cleanup(func() { findCoordByLockBody = prev })
+
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	p := &ProjectRow{Name: "demo"} // CoordID empty
+
+	got := m.resolveCoordRecord(p)
+	if got == nil {
+		t.Fatal("resolveCoordRecord returned nil; want lock-body fallback to find the coord")
+	}
+	if got.ID != "lockbody1" {
+		t.Errorf("resolveCoordRecord returned %q; want lockbody1 (lock-body path)", got.ID)
+	}
+}
+
 // TestActionAttachProject_StillResolvesViaSharedHelper guards attach
 // against the helper swap: [a] on a project row whose CoordID is set
 // and whose record is loaded + alive still attaches to that coord's

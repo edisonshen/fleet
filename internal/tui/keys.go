@@ -1284,7 +1284,7 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 // CoordID link hadn't published yet but a coord was demonstrably live
 // in the agents panel.
 //
-// codex review iter-1 [P2]: the scan fallback fires ONLY when CoordID
+// codex review iter-1 [P2]: the scan fallbacks fire ONLY when CoordID
 // is empty. A non-empty CoordID is the dashboard's authoritative lock-
 // body link — when it's set but the matching record hasn't loaded yet
 // (the snapshot/agents refresh race), we must NOT fall through to the
@@ -1295,6 +1295,16 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 // Returning nil here preserves actionAttachProject's intentional
 // "pending refresh — try again" flash for the CoordID-set race; the
 // operator re-presses after the next tick binds the record.
+//
+// codex review iter-2 [P2]: when CoordID is empty, mirror BOTH of
+// actionAttachProject's read-only fallbacks in order — the marker scan
+// (findExistingCoordForProject, path 2) THEN the lock-body fallback
+// (findCoordByLockBody, path 2.5). Without the lock-body tier, the
+// prompt-delivery-recovery state (operator attached + manually typed
+// /coordinator, so coordinator.lock names an alive coord but no marker
+// was written) let [a] attach while [h] still flashed "no coord". The
+// design's G2 — "[h] resolves via the SAME chain [a] uses" — requires
+// the lock-body tier here too.
 func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 	if p == nil {
 		return nil
@@ -1306,6 +1316,9 @@ func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 		return findRecordByID(m.records, p.CoordID)
 	}
 	if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
+		return rec
+	}
+	if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
 		return rec
 	}
 	return nil

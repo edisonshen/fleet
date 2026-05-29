@@ -634,6 +634,70 @@ func Test_jk_UnaffectedByBoundaryFix(t *testing.T) {
 	}
 }
 
+// TestArrowDown_CrossToAgent_ResetsAgentsScrollOffset pins codex review
+// iter-2 [P2]: trimWithScroll does NOT auto-follow the cursor, so a
+// worker→agent cross must reset the DESTINATION (agents) panel offset to
+// keep the just-selected first-agent row visible. Setup: a previously
+// scrolled-away agents panel (agentsScrollOffset > 0), cursor on the
+// last worker, ↓ crosses to the first agent. Without the reset the
+// agents panel would still render from the old offset and the selected
+// agent would be off-screen — actions then target an unseen row.
+func TestArrowDown_CrossToAgent_ResetsAgentsScrollOffset(t *testing.T) {
+	m := rightPanelModel(t, 2,
+		sampleAgent("agent01"), sampleAgent("agent02"), sampleAgent("agent03"))
+	last := lastRowIndexOfKind(m, rowWorker)
+	if last < 0 {
+		t.Fatalf("no worker rows in fixture")
+	}
+	m.dashCursor = last
+	// Simulate the agents panel having been scrolled away earlier (e.g.
+	// operator scrolled agents down, then k'd back up into the workers).
+	m.agentsScrollOffset = 2
+
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowAgent {
+		t.Fatalf("↓ on last worker did not cross to an agent row; landed on %v", rowKindOf(row))
+	}
+	if mm.agentsScrollOffset != 0 {
+		t.Errorf("crossing into the agents panel left agentsScrollOffset=%d; want 0 "+
+			"(selected first-agent row would be hidden)", mm.agentsScrollOffset)
+	}
+}
+
+// TestArrowUp_CrossToWorker_ResetsWorkersScrollOffsetToBottom is the
+// symmetric guard: ↑ from the first agent crosses to the LAST worker, so
+// the workers panel offset must move to the bottom (not stay at a stale
+// top-scrolled value) to keep the last-worker row visible.
+func TestArrowUp_CrossToWorker_ResetsWorkersScrollOffsetToBottom(t *testing.T) {
+	m := rightPanelModel(t, 3,
+		sampleAgent("agent01"), sampleAgent("agent02"))
+	firstAgent := firstRowIndexOfKind(m, rowAgent)
+	if firstAgent < 0 {
+		t.Fatalf("no agent rows in fixture")
+	}
+	m.dashCursor = firstAgent
+	// Workers panel was scrolled to the top earlier; crossing up should
+	// move it to the bottom so the last worker is visible.
+	m.workersScrollOffset = 0
+
+	updated, _ := m.Update(keyMsg("up"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowWorker {
+		t.Fatalf("↑ on first agent did not cross to a worker; landed on %v", rowKindOf(row))
+	}
+	// The reset targets the count-based panel max; trimWithScroll
+	// re-clamps to the render-visible bottom. The contract under test is
+	// "non-zero / bottom-aligned", which equals panelMaxOffset(rowWorker).
+	if mm.workersScrollOffset != mm.panelMaxOffset(rowWorker) {
+		t.Errorf("crossing up into the workers panel left workersScrollOffset=%d; want %d "+
+			"(bottom-aligned so the last-worker row is visible)",
+			mm.workersScrollOffset, mm.panelMaxOffset(rowWorker))
+	}
+}
+
 // rowKindOf is a nil-safe helper for test error messages.
 func rowKindOf(r *dashRow) interface{} {
 	if r == nil {

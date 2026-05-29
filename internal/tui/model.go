@@ -929,9 +929,56 @@ func (m *Model) scrollOrCross(delta int, kind rowKind, offset *int) bool {
 	// explicit left-jump key; #177 ScrollCursorStaysInPanel guards it).
 	if m.fallsThroughAtEdge(before, delta, kind) {
 		*offset = beforeOff // undo the phantom count-based bump
+		m.alignDestPanelOnCross(delta, kind)
 		return false
 	}
 	return true
+}
+
+// alignDestPanelOnCross resets the DESTINATION right-panel's scroll
+// offset so the row moveCursor is about to land on stays visible after a
+// worker↔agent boundary cross (codex review iter-2 [P2]).
+//
+// trimWithScroll slices `lines[offset:end]` and does NOT auto-follow the
+// cursor — visibility depends entirely on the offset. scrollOrCross only
+// restored the SOURCE offset, so if the destination panel was previously
+// scrolled away (e.g. agentsScrollOffset > 0 from an earlier overflow
+// scroll, then k'd back into workers), crossing selects the first/last
+// destination row while the render still shows the old window — the
+// selected row is hidden and [⏎]/[a]/[h] target an off-screen agent.
+//
+//	↓ worker→agent: lands on the FIRST agent → agents panel to top
+//	  (offset 0). ✓
+//	↑ agent→worker: lands on the LAST worker → workers panel to bottom
+//	  (count-based max; trimWithScroll re-clamps to the render-visible
+//	  bottom, same contract the in-panel overflow scroll uses). ✓
+//
+// Only fires when `kind` is the source of a genuine worker↔agent cross.
+// The no-neighbor wrap case (↓ on last agent → moveCursor wraps to the
+// top of the unified list) resets BOTH offsets to 0 so a wrap onto a
+// right-column row is also visible.
+func (m *Model) alignDestPanelOnCross(delta int, kind rowKind) {
+	switch kind {
+	case rowWorker:
+		// ↓ from last worker → first agent. (↑ from a worker can't cross
+		// upward into agents; it either stays or wraps at index 0.)
+		if delta > 0 {
+			m.agentsScrollOffset = 0
+			return
+		}
+	case rowAgent:
+		// ↑ from first agent → last worker.
+		if delta < 0 {
+			m.workersScrollOffset = clampScrollOffset(
+				m.panelMaxOffset(rowWorker), m.panelMaxOffset(rowWorker))
+			return
+		}
+	}
+	// No-neighbor wrap (e.g. ↓ on the last agent): moveCursor wraps to
+	// the top of the unified list. Reset both panels to the top so a
+	// wrap that lands on a right-column row is visible.
+	m.workersScrollOffset = 0
+	m.agentsScrollOffset = 0
 }
 
 // fallsThroughAtEdge reports whether a pinned cursor at row index `pos`
