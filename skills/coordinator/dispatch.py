@@ -689,11 +689,6 @@ def build_finisher_prompt(
 
     proj_flag = f"--project {project}"
 
-    # When the worker ran in a pre-created worktree, push + `gh pr create`
-    # must run from that checkout (it holds the worker + reviewer commits;
-    # the main repo's HEAD is on a different branch). Prepend a cd step;
-    # in-place dispatch runs in the main repo and needs no cd
-    # (dispatch-reviewer-finish-9316).
     # Push step. When the worker ran in a pre-created worktree, the cd is
     # folded into step 1 (push + PR must run from the worktree, which
     # holds the worker + reviewer commits; the main repo HEAD is on a
