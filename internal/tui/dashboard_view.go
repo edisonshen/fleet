@@ -1740,6 +1740,7 @@ func renderDashboardFooterWithHidden(uptime time.Duration, usable int, searchFil
 		{"+", "add project"},
 		{"a", "attach"},
 		{"h", "handoff"},
+		{"r", "reset"},
 		{"x", "archive"},
 		{"/", "search"},
 		{"?", "help"},

@@ -24,6 +24,7 @@ var helpEntries = []helpEntry{
 	{"a", "attach coord (projects), tmux (agents), peek (workers/tasks)"},
 	{"c", "hide/unhide project (on a project row); toggle show-hidden mode (off-row)"},
 	{"h", "handoff (projects — fires for the project's coord)"},
+	{"r", "reset (projects — reaps tangled/dead-locked coord state, respawns one)"},
 	{"x", "archive (agents) — worker kill ships in v0.2.x"},
 	{"d", "dispatch a new agent (opens repo picker)"},
 	{"+", "register a cloned repo as a fleet project (no dispatch)"},

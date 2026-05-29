@@ -107,6 +107,18 @@ type Model struct {
 	// [x]. Empty slice on any non-dismiss flow.
 	dismissProjectDeadAgents []string
 
+	// resetProjectCandidate is the project name the operator pressed [r]
+	// on, awaiting y/esc in modeConfirmReset (dead-end-recovery-r-8559).
+	// Cleared when the prompt resolves either way.
+	resetProjectCandidate string
+	// resetCoordIDs is the snapshot of ALL coord agent-record IDs tagged
+	// with resetProjectCandidate at press time — every record whose
+	// task_id == coord-<project> AND project == <project>. Frozen here
+	// (like dismissProjectDeadAgents) so the confirm handler reaps the
+	// SAME records the prompt counted, immune to a refresh between press
+	// and confirm. Empty slice on any non-reset flow.
+	resetCoordIDs []string
+
 	// aliveByID is the cached tmux liveness snapshot from the most
 	// recent agentsMsg. Populated off the render path by
 	// loadAgentsCmd; deriveStatus reads from it. Nil/empty means no
@@ -561,6 +573,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		fl := formatRmFlash(msg.out, msg.err)
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: agent should be archived
+
+	case resetDoneMsg:
+		// [r] reset reap finished (dead-end-recovery-r-8559). On reap
+		// failure: surface the error, clear the in-flight gate, and do
+		// NOT respawn — a half-reaped project must not get a new coord
+		// racing the leftovers. The operator can re-press [r] once the
+		// underlying issue (e.g. a `fleet rm` that hit a busy lock) is
+		// resolved. On success: spawn ONE fresh coord and flash the
+		// reaped count.
+		if msg.err != nil {
+			if m.coordSpawnInFlight != nil {
+				delete(m.coordSpawnInFlight, msg.projectName)
+			}
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"reset of project %s failed after reaping %d coord record(s): %v\n%s — re-press [r] to retry",
+					msg.projectName, msg.reaped, msg.err, strings.TrimRight(msg.out, "\n")),
+				isErr: true,
+			}
+			return m, loadAgentsCmd()
+		}
+		// Reap succeeded — sessions/records gone, lock cleared. Spawn the
+		// replacement. EnsureProjectInitialized recreates the .locks/
+		// tree the gc sweep may have left bare so the fresh coord's
+		// first tick can re-acquire the flock. The coordSpawnInFlight
+		// gate was set at confirm time; startCoordSpawn's coordSpawnDone
+		// Msg clears it.
+		if _, ierr := state.EnsureProjectInitialized(msg.projectName); ierr != nil {
+			if m.coordSpawnInFlight != nil {
+				delete(m.coordSpawnInFlight, msg.projectName)
+			}
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"reset of project %s reaped %d coord record(s) + cleared lock, but respawn init failed: %v — press [a] on the row to retry",
+					msg.projectName, msg.reaped, ierr),
+				isErr: true,
+			}
+			return m, loadAgentsCmd()
+		}
+		cwd := coordCwdForProject(m.records, msg.projectName)
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"reset project %s — reaped %d coord record(s), cleared stale lock, spawning fresh coord",
+				msg.projectName, msg.reaped),
+		}
+		return m, tea.Batch(loadAgentsCmd(), m.startCoordSpawn(msg.projectName, cwd))
 
 	case addProjectDoneMsg:
 		// On error: re-open the picker (operator picks a different row)
@@ -1365,6 +1423,17 @@ func (m Model) renderFooter() string {
 		b.WriteString(promptStyle.Render(fmt.Sprintf(
 			"Dismiss legacy project %s? Archives %d dead agent record(s) — no live agents will be touched. [y/N]",
 			m.dismissProjectCandidate, count)))
+		b.WriteString("\n")
+	case modeConfirmReset:
+		// Reset is the most destructive project-row op: it reaps every
+		// coord record (kills tmux + archives) AND clears the stale lock,
+		// then respawns one fresh coord. Surface the coord-record count
+		// so the operator sees the blast radius before confirming
+		// (dead-end-recovery-r-8559).
+		count := len(m.resetCoordIDs)
+		b.WriteString(promptStyle.Render(fmt.Sprintf(
+			"Reset project %s? Reaps %d coord record(s) + clears stale coordinator.lock, then spawns ONE fresh coord. [y/N]",
+			m.resetProjectCandidate, count)))
 		b.WriteString("\n")
 	case modePromptTaskAdd:
 		b.WriteString(promptStyle.Render("task spec: " + m.promptBuf + "█"))

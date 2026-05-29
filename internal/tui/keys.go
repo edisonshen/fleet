@@ -76,6 +76,16 @@ const (
 	// advancing to the dispatch-prompt mode. Refer to the project-add
 	// CLI for the disk-mutation contract.
 	modeAddProject
+	// modeConfirmReset holds the y/N confirmation for the [r] reset path
+	// (dead-end-recovery-r-8559). Destructive: confirm reaps ALL of the
+	// project's coord sessions/records (`fleet rm <id>` per coord
+	// record), clears the stale coordinator.lock (`fleet gc
+	// --kinds=coord-locks --apply --project <name>`), then spawns ONE
+	// fresh coord. Distinct from modeConfirmArchive (single-agent) and
+	// modeConfirmDismissProject (legacy-v0.1 dead-record sweep, no
+	// respawn) because reset both reaps AND respawns — the recovery
+	// from a tangled/dead-locked project row.
+	modeConfirmReset
 )
 
 // flash is the banner surfaced under the table after a keybind action
@@ -103,6 +113,21 @@ type drainDoneMsg struct {
 type rmDoneMsg struct {
 	out string
 	err error
+}
+
+// resetDoneMsg is emitted after the [r] reset reap phase completes
+// (dead-end-recovery-r-8559). The reap runs as one tea.Cmd: fan
+// `fleet rm <id>` per coord record, then `fleet gc --kinds=coord-locks
+// --apply --project <name>` to clear the stale lock. projectName +
+// reaped (count of coord records archived) drive the success flash and
+// the follow-on fresh-coord spawn. err non-nil means the reap shell-out
+// failed; the handler surfaces it and does NOT respawn (a half-reaped
+// project shouldn't get a new coord racing the leftovers).
+type resetDoneMsg struct {
+	projectName string
+	reaped      int
+	out         string
+	err         error
 }
 
 // addProjectDoneMsg is emitted after the [+] picker's shell-out to
@@ -223,6 +248,8 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m.handleConfirmArchiveKey(key)
 	case modeConfirmDismissProject:
 		return m.handleConfirmDismissProjectKey(key)
+	case modeConfirmReset:
+		return m.handleConfirmResetKey(key)
 	case modePromptTaskAdd:
 		return m.handleTaskAddKey(key)
 	case modePromptSearch:
@@ -301,6 +328,8 @@ func (m Model) handleActionKey(key string) (Model, tea.Cmd, bool) {
 		return m.actionArchive()
 	case "a":
 		return m.actionAttach()
+	case "r":
+		return m.actionReset()
 	case "d":
 		// [d] enters the repo picker. discoverRepos runs synchronously;
 		// the cost is one Getwd + one ReadDir per project root, fine for
@@ -1201,15 +1230,59 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 			m.pendingAttach = rec.TmuxSession
 			return m, tea.Quit, true
 		}
-		// CoordID set but no matching record loaded yet (race: dashboard
-		// snapshot picked up the lock body before agentsMsg refreshed).
-		// codex review (P1): falling through to the spawn path here
-		// would launch a duplicate coord while a fresh one already
-		// holds the lock — the loadDashboardCmd / loadAgentsCmd race
-		// is normal under tea.Batch. Surface a retry hint so the
-		// operator can re-press [a] after the next refresh tick. The
-		// task_id fallback below is reachable only when CoordID is
-		// empty, so we don't accidentally route this case there.
+		// CoordID set but resolveCoordRecord returned nil. Two distinct
+		// causes, and they need OPPOSITE handling (dead-end-recovery
+		// -r-8559):
+		//
+		//   A. Transient snapshot-race — the dashboard picked up the
+		//      lock body before agentsMsg refreshed m.records, and the
+		//      holder is NOT archived. The record will appear next
+		//      tick. Keep the iter-1 P2 guard: flash "pending refresh"
+		//      and DO NOT scan (the scan keys off the marker and could
+		//      bind a different stale coord). The operator re-presses
+		//      [a] after the next refresh.
+		//
+		//   B. Terminally-stale link — the holder was archived (handoff
+		//      / crash reaped it) yet coordinator.lock still names it.
+		//      Re-pressing [a] would loop "pending refresh" FOREVER
+		//      because the record will NEVER load (it's gone). This is
+		//      the operator's hard dead-end (2026-05-28: projects-
+		//      fengshen-site coord 129c9824). Fall through to the SAME
+		//      scan fallbacks Path 2/2.5 use to resolve the LIVE
+		//      successor coord; if a successor is found, attach to it.
+		//      If no successor resolves either, surface the stale-lock
+		//      diagnosis with the concrete next step ([r] reset) rather
+		//      than the misleading "try again" flash.
+		if coordArchivedFn(p.CoordID) {
+			// Terminal stale: the linked holder is in the archive.
+			// Resolve the live successor via the read-only scan
+			// fallbacks (marker scan, then lock body). These are the
+			// same tiers actionAttachProject's empty-CoordID path uses;
+			// reaching them here is safe because the CoordID link is
+			// known-dead, so the iter-1 P2 "don't bind a stale coord"
+			// concern doesn't apply (the linked coord is already gone).
+			if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
+				m.pendingAttach = rec.TmuxSession
+				return m, tea.Quit, true
+			}
+			if rec, ok := findCoordByLockBody(m.records, p.Name); ok {
+				m.pendingAttach = rec.TmuxSession
+				return m, tea.Quit, true
+			}
+			// No live successor reachable. Surface the stale-lock
+			// diagnosis + the [r] reset escape hatch (feedback_surface
+			// _dont_silo: name the concrete next command, never loop a
+			// dead-end flash).
+			m.flash = &flashMsg{
+				text: fmt.Sprintf(
+					"coord %s for project %s is stale (archived holder still in coordinator.lock) — press [r] to reset and respawn",
+					p.CoordID, p.Name),
+				isErr: true,
+			}
+			return m, nil, true
+		}
+		// Transient race: holder not archived, record just not loaded
+		// yet. Keep the retry hint + the no-scan guard.
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
 				"coord %s for project %s pending refresh — try [a] again in a moment",
@@ -1270,6 +1343,181 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	return m, m.startCoordSpawn(p.Name, cwd), true
 }
 
+// actionReset dispatches [r] for the row under the cursor
+// (dead-end-recovery-r-8559). [r] is a PROJECT-LEVEL recovery key: it
+// reaps a tangled / dead-locked project's coord state and respawns one
+// clean coord. Only project rows apply; every other row kind (agent,
+// task, worker, separator, nil) flashes a "doesn't apply" hint pointing
+// at the project row.
+func (m Model) actionReset() (Model, tea.Cmd, bool) {
+	row := m.selectedRow()
+	if row == nil {
+		m.flash = &flashMsg{
+			text:  "[r] reset applies to project rows (left panel) — move cursor onto a project row",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+	switch row.kind {
+	case rowProject:
+		return m.actionResetProject(row.project)
+	default:
+		m.flash = &flashMsg{
+			text:  "[r] reset applies to project rows (left panel) — move cursor onto a project row",
+			isErr: true,
+		}
+		return m, nil, true
+	}
+}
+
+// actionResetProject is the project-row branch of [r]. It does NOT
+// mutate on press: it freezes the project name + the snapshot of ALL
+// coord-record IDs tagged with the project, then enters modeConfirmReset
+// for a y/N gate (destructive — reaps sessions/records AND clears the
+// lock). The reap + respawn fires only on confirm (handleConfirmResetKey).
+//
+// Freezing the coord IDs here (not at confirm time) makes the prompt
+// count authoritative: a refresh between press and confirm can't change
+// WHICH records [y] reaps.
+func (m Model) actionResetProject(p *ProjectRow) (Model, tea.Cmd, bool) {
+	if p == nil {
+		return m, nil, true
+	}
+	m.resetProjectCandidate = p.Name
+	m.resetCoordIDs = coordRecordIDsForProject(m.records, p.Name)
+	m.mode = modeConfirmReset
+	return m, nil, true
+}
+
+// coordRecordIDsForProject returns the IDs of every agent record that is
+// a coord for projectName by intent — task_id == coord-<project> AND
+// project == <project>. Unlike findExistingCoordForProject this does NOT
+// gate on marker presence or session liveness: reset must reap EVERY
+// coord record for the project (live, dead, duplicate, marker-less), so
+// the count is the full blast radius the operator confirms.
+func coordRecordIDsForProject(records []*agent.Record, projectName string) []string {
+	want := coordTaskID(projectName)
+	var ids []string
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.Project == projectName && r.TaskID == want {
+			ids = append(ids, r.ID)
+		}
+	}
+	return ids
+}
+
+// handleConfirmResetKey runs while modeConfirmReset is active
+// (dead-end-recovery-r-8559). Same y/N/esc swallow-rest contract as the
+// other confirm modes — j/k while the prompt is up must not move the
+// cursor.
+//
+// On confirm (y/Y): emit the reap tea.Cmd (startReset) which fans
+// `fleet rm <id>` per frozen coord ID, then clears the stale lock via
+// `fleet gc --kinds=coord-locks --apply --project <name>`. The fresh
+// coord spawn happens in the resetDoneMsg handler AFTER the reap
+// returns, so the new coord doesn't race the leftovers it's replacing.
+// We mark coordSpawnInFlight here so a stray [a] during the reap window
+// doesn't double-spawn.
+//
+// On cancel (esc/n/N): drop to nav, clear the frozen state, no mutation.
+func (m Model) handleConfirmResetKey(key string) (Model, tea.Cmd, bool) {
+	switch key {
+	case "y", "Y":
+		project := m.resetProjectCandidate
+		ids := m.resetCoordIDs
+		m.mode = modeNav
+		m.resetProjectCandidate = ""
+		m.resetCoordIDs = nil
+		if project == "" {
+			return m, nil, true
+		}
+		// Gate the follow-on respawn so a stray [a] during the reap
+		// window can't fire a competing dispatch.
+		if m.coordSpawnInFlight == nil {
+			m.coordSpawnInFlight = map[string]bool{}
+		}
+		m.coordSpawnInFlight[project] = true
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"resetting project %s — reaping %d coord record(s) + clearing stale lock, then respawning",
+				project, len(ids)),
+		}
+		return m, m.startReset(project, ids), true
+	case "esc", "n", "N":
+		m.mode = modeNav
+		m.resetProjectCandidate = ""
+		m.resetCoordIDs = nil
+		return m, nil, true
+	}
+	return m, nil, true
+}
+
+// startReset returns a tea.Cmd that runs the [r] reset reap as one
+// shell-out chain, then emits resetDoneMsg. Order matters:
+//
+//  1. `fleet rm <id>` for each frozen coord record — kills the
+//     duplicate fleet-<id> tmux session AND archives the record.
+//  2. `fleet gc --kinds=coord-locks --apply --project <name>` — clears
+//     the stale coordinator.lock (fleet owns its resources; we shell to
+//     gc rather than hand-rolling rm so the lock-classifier's split-
+//     brain defenses still run).
+//
+// The fresh-coord spawn is deliberately NOT here — it fires in the
+// resetDoneMsg handler so a reap failure aborts before a new coord is
+// born into a half-reaped project.
+//
+// All shell-outs go through runFleetCmd's serialized invocation; we
+// chain them inside one tea.Cmd closure so the whole reap is one
+// observable event boundary (a single resetDoneMsg), matching the
+// confirm-dismiss handler's "one confirm → one event" UX.
+func (m Model) startReset(project string, coordIDs []string) tea.Cmd {
+	return func() tea.Msg {
+		return resetReapFn(project, coordIDs)
+	}
+}
+
+// resetReapFn performs the [r] reset reap shell-out chain and returns
+// the resulting resetDoneMsg. var so tests stub it without forking
+// `fleet`. Production runs the rm-per-coord then gc-coord-locks chain;
+// the first non-zero exit aborts and surfaces (reaped left at the count
+// completed so the operator sees partial progress in the flash).
+var resetReapFn = func(project string, coordIDs []string) tea.Msg {
+	var out strings.Builder
+	for i, id := range coordIDs {
+		cmd := exec.Command(fleetBinary, "rm", id)
+		b, err := cmd.CombinedOutput()
+		out.Write(b)
+		if err != nil {
+			return resetDoneMsg{
+				projectName: project,
+				reaped:      i,
+				out:         out.String(),
+				err:         fmt.Errorf("rm %s: %w", id, err),
+			}
+		}
+	}
+	gc := exec.Command(fleetBinary, "gc",
+		"--kinds=coord-locks", "--apply", "--project", project)
+	b, err := gc.CombinedOutput()
+	out.Write(b)
+	if err != nil {
+		return resetDoneMsg{
+			projectName: project,
+			reaped:      len(coordIDs),
+			out:         out.String(),
+			err:         fmt.Errorf("gc coord-locks: %w", err),
+		}
+	}
+	return resetDoneMsg{
+		projectName: project,
+		reaped:      len(coordIDs),
+		out:         out.String(),
+	}
+}
+
 // resolveCoordRecord finds the live coord record for a project row,
 // trying the dashboard-linked CoordID first, then the records scan that
 // actionAttachProject already relies on (findExistingCoordForProject:
@@ -1322,6 +1570,31 @@ func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 		return rec
 	}
 	return nil
+}
+
+// coordArchivedFn reports whether an agent record was ARCHIVED — i.e.
+// ~/.fleet/agents/archive/<id>.json exists. A CoordID that resolves
+// neither to a live m.records entry NOR to a fresh on-disk record, but
+// IS present in the archive, is a TERMINALLY STALE link: the holder
+// handed off / crashed and got reaped, but the project's
+// coordinator.lock body still names it. This is the
+// dead-end-recovery-r-8559 root cause — a stale lock body strands the
+// operator on the project row while a live successor coord sits
+// unreachable. Distinguished from a transient snapshot-race (the record
+// simply hasn't loaded yet AND is not in the archive) so the iter-1 P2
+// "don't scan when CoordID set" guard still holds for the race.
+//
+// var so tests stub the archive presence without seeding archive dirs.
+var coordArchivedFn = func(id string) bool {
+	if id == "" {
+		return false
+	}
+	p, err := state.AgentArchivePath(id)
+	if err != nil {
+		return false
+	}
+	_, statErr := os.Stat(p)
+	return statErr == nil
 }
 
 // findRecordByID returns the first agent.Record with id, or nil.
