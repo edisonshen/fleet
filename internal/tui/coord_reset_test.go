@@ -492,7 +492,10 @@ func TestReapCoordIDsForProject_UnionsOnDiskCoords(t *testing.T) {
 	// missed missedCoord).
 	frozen := []string{frozenCoord.ID}
 
-	got := reapCoordIDsForProject(project, frozen)
+	got, err := reapCoordIDsForProject(project, frozen)
+	if err != nil {
+		t.Fatalf("reapCoordIDsForProject: %v", err)
+	}
 
 	// Must include BOTH demo coords, and NOT the other project's coord.
 	wantSet := map[string]bool{frozenCoord.ID: true, missedCoord.ID: true}
@@ -536,9 +539,39 @@ func TestReapCoordIDsForProject_EmptyFrozenStillReapsLive(t *testing.T) {
 		t.Fatalf("seed live coord: %v", err)
 	}
 
-	got := reapCoordIDsForProject(project, nil)
+	got, err := reapCoordIDsForProject(project, nil)
+	if err != nil {
+		t.Fatalf("reapCoordIDsForProject: %v", err)
+	}
 	if len(got) != 1 || got[0] != live.ID {
 		t.Fatalf("empty frozen set must still reap the live on-disk coord %s; got %v", live.ID, got)
+	}
+}
+
+// TestReapCoordIDsForProject_EnumErrorAborts is the codex iter-4 [P2]
+// regression: when agent.List() fails (agents dir unreadable), the reap
+// must NOT silently fall back to the frozen set — it returns an error so
+// resetReapFn aborts before clearing the lock + respawning. Proceeding on
+// an incomplete coord set in the exact race this guards could strand a
+// live coord alongside the replacement (split-brain).
+func TestReapCoordIDsForProject_EnumErrorAborts(t *testing.T) {
+	pdir := withFleetHome(t)
+	// Make the agents dir a FILE so os.ReadDir errors with ENOTDIR — a
+	// non-not-exist error agent.List() surfaces (List returns nil for a
+	// missing dir, so we force a real read error instead).
+	agentsPath := filepath.Join(filepath.Dir(pdir), "agents")
+	if err := os.WriteFile(agentsPath, []byte("not a dir"), 0o644); err != nil {
+		t.Fatalf("seed agents-as-file: %v", err)
+	}
+
+	got, err := reapCoordIDsForProject("demo", []string{"11110000"})
+	if err == nil {
+		t.Fatal("expected enumeration error when agents dir is unreadable; got nil")
+	}
+	// The frozen set is still returned (for diagnostics) but the error is
+	// the load-bearing signal the reap aborts on.
+	if len(got) != 1 || got[0] != "11110000" {
+		t.Errorf("frozen set should pass through on error; got %v", got)
 	}
 }
 

@@ -1400,8 +1400,22 @@ func (m Model) actionResetProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
+	// codex iter-4 [P2]: freeze the coord set from the SAME on-disk
+	// enumeration the reap uses (union of m.records + agent.List), not the
+	// in-memory snapshot alone. Otherwise the confirm prompt could show
+	// "Reaps 0" while the reap's on-disk union kills/archives additional
+	// records — an undercount of the destructive blast radius. Computing
+	// the freeze the same way the reap computes its set makes the prompt
+	// count authoritative (the reap re-unions at confirm time as a
+	// belt-and-suspenders for records that appear in the press→confirm gap,
+	// but the common-case count the operator sees now matches what runs).
 	m.resetProjectCandidate = p.Name
-	m.resetCoordIDs = coordRecordIDsForProject(m.records, p.Name)
+	// Freeze-time count is best-effort: ignore an enumeration error here
+	// (fall back to the in-memory set for the prompt). The reap re-runs
+	// reapCoordIDsForProject and is the authoritative gate — it aborts on
+	// a persistent enumeration error (codex iter-4 [P2]).
+	frozen, _ := reapCoordIDsForProject(p.Name, coordRecordIDsForProject(m.records, p.Name))
+	m.resetCoordIDs = frozen
 	m.mode = modeConfirmReset
 	return m, nil, true
 }
@@ -1510,13 +1524,20 @@ func (m Model) startReset(project string, coordIDs []string) tea.Cmd {
 // the project (agent.List → same coord-by-intent filter) and UNION with
 // the frozen IDs. The union (not replace) keeps every record the
 // operator's confirm prompt counted AND catches any the snapshot missed.
-// If the disk read fails we fall back to the frozen set rather than
-// abort — a partial reap that includes the confirmed records still beats
-// refusing recovery entirely (the operator can re-press [r]).
+//
+// codex iter-4 [P2]: a FAILED enumeration is NOT safe to swallow at reap
+// time. This function exists precisely for the race where the in-memory
+// snapshot can be empty / miss a live coord; if agent.List errors, the
+// frozen set may not be the true blast radius, and proceeding to clear
+// the lock + respawn could strand a live coord. So the reap aborts on a
+// non-nil error (resetReapFn turns it into a reset failure, no respawn).
+// Freeze-time callers (the confirm prompt count) treat the error as
+// best-effort — they ignore it because the reap re-runs this and is the
+// authoritative gate that will abort.
 //
 // Order is preserved deterministically: frozen IDs first (the order the
 // prompt counted), then any newly-discovered on-disk IDs appended.
-func reapCoordIDsForProject(project string, frozen []string) []string {
+func reapCoordIDsForProject(project string, frozen []string) ([]string, error) {
 	ids := append([]string(nil), frozen...)
 	seen := make(map[string]bool, len(frozen))
 	for _, id := range frozen {
@@ -1524,7 +1545,7 @@ func reapCoordIDsForProject(project string, frozen []string) []string {
 	}
 	records, err := agent.List()
 	if err != nil {
-		return ids // disk read failed: reap at least the confirmed set
+		return ids, fmt.Errorf("enumerate coord records for %s: %w", project, err)
 	}
 	for _, id := range coordRecordIDsForProject(records, project) {
 		if !seen[id] {
@@ -1532,7 +1553,7 @@ func reapCoordIDsForProject(project string, frozen []string) []string {
 			ids = append(ids, id)
 		}
 	}
-	return ids
+	return ids, nil
 }
 
 // resetReapFn performs the [r] reset reap shell-out chain and returns
@@ -1544,7 +1565,17 @@ func reapCoordIDsForProject(project string, frozen []string) []string {
 // aborts and surfaces (reaped left at the count completed so the
 // operator sees partial progress in the flash).
 var resetReapFn = func(project string, frozenIDs []string) tea.Msg {
-	coordIDs := reapCoordIDsForProject(project, frozenIDs)
+	coordIDs, enumErr := reapCoordIDsForProject(project, frozenIDs)
+	if enumErr != nil {
+		// codex iter-4 [P2]: can't trust the coord set — abort before any
+		// destructive op (no rm, no gc, no respawn). The operator re-presses
+		// [r] once the agents dir is readable again.
+		return resetDoneMsg{
+			projectName: project,
+			reaped:      0,
+			err:         fmt.Errorf("reset aborted — %w", enumErr),
+		}
+	}
 	var out strings.Builder
 	for i, id := range coordIDs {
 		cmd := exec.Command(fleetBinary, "rm", id)
