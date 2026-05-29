@@ -14,6 +14,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -1554,11 +1555,59 @@ var resetReapFn = func(project string, frozenIDs []string) tea.Msg {
 			err:         fmt.Errorf("gc coord-locks: %w", err),
 		}
 	}
+	// codex iter-2 [P1]: `fleet gc --kinds=coord-locks --apply` exits 0
+	// even when it REFUSES to unlink a lock (verb=surface) — e.g. the
+	// holder tmux is still alive, the SessionAlive probe was ambiguous,
+	// or the inode-swap defense aborted the remove. Treating any zero
+	// exit as "lock cleared" would let reset spawn a fresh coord while
+	// the stale lock + its old holder are still present → split-brain.
+	// Parse the per-action report: a coord-locks line whose verb is
+	// anything other than `removed` is a refusal → fail the reset (no
+	// respawn). No coord-locks line at all = there was nothing to clear
+	// (the lock was already gone), which is a legitimate success.
+	if refusal := coordLockRefusal(out.String()); refusal != "" {
+		return resetDoneMsg{
+			projectName: project,
+			reaped:      len(coordIDs),
+			out:         out.String(),
+			err:         fmt.Errorf("gc coord-locks refused to clear the stale lock: %s", refusal),
+		}
+	}
 	return resetDoneMsg{
 		projectName: project,
 		reaped:      len(coordIDs),
 		out:         out.String(),
 	}
+}
+
+// coordLockRefusal scans `fleet gc` output for a coord-locks action that
+// was NOT removed (codex iter-2 [P1]). Returns the reason text of the
+// first such refusal, or "" if every coord-locks line was removed (or
+// there were no coord-locks lines — nothing to clear). The per-action
+// line format is pinned by cmd/fleet/gc.go's renderReport:
+//
+//	coord-locks  <target>  verb=<v>  reason=<r>
+//
+// Under --apply the only success verb is `removed`; `surface` (live
+// holder / ambiguous probe / remove failed / inode-swap abort) and the
+// dry-run `would-remove` both mean the lock is STILL on disk.
+func coordLockRefusal(gcOutput string) string {
+	for _, line := range strings.Split(gcOutput, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, string(gc.KindCoordLocks)+"  ") {
+			continue
+		}
+		if strings.Contains(line, "verb="+string(gc.VerbRemoved)+"  ") ||
+			strings.HasSuffix(line, "verb="+string(gc.VerbRemoved)) {
+			continue // this lock was actually unlinked
+		}
+		// A coord-locks action that wasn't removed — surface the reason.
+		if i := strings.Index(line, "reason="); i >= 0 {
+			return strings.TrimSpace(line[i+len("reason="):])
+		}
+		return line
+	}
+	return ""
 }
 
 // resolveCoordRecord finds the live coord record for a project row,

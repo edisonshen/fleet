@@ -542,6 +542,73 @@ func TestReapCoordIDsForProject_EmptyFrozenStillReapsLive(t *testing.T) {
 	}
 }
 
+// TestCoordLockRefusal is the codex iter-2 [P1] regression: `fleet gc
+// --kinds=coord-locks --apply` exits 0 even when it REFUSES to unlink a
+// lock (verb=surface — live holder / ambiguous probe / inode-swap
+// abort). The reset must NOT treat that as a cleared lock, or it spawns
+// a fresh coord while the stale lock + old holder persist (split-brain).
+// coordLockRefusal parses the gc report and returns the refusal reason
+// (non-empty) when any coord-locks line was not `removed`.
+func TestCoordLockRefusal(t *testing.T) {
+	tests := []struct {
+		name       string
+		gcOutput   string
+		wantReason string // "" means "no refusal" (success)
+	}{
+		{
+			name: "removed-is-success",
+			gcOutput: "fleet gc — mode=apply aggressive=false max-age=24h0m0s\n" +
+				"coord-locks  /x/.locks/coordinator.lock  verb=removed  reason=stale tmux (session fleet-129c9824 gone for agent 129c9824)\n" +
+				"summary: 0 sockets, 0 agents, 0 tmux (surface only by default), 0 worktrees, 1 coord-locks, 0 worker-records\n",
+			wantReason: "",
+		},
+		{
+			name: "no-coord-locks-line-is-success",
+			gcOutput: "fleet gc — mode=apply aggressive=false max-age=24h0m0s\n" +
+				"summary: 0 sockets, 0 agents, 0 tmux (surface only by default), 0 worktrees, 0 coord-locks, 0 worker-records\n",
+			wantReason: "",
+		},
+		{
+			name: "surface-live-holder-is-refusal",
+			gcOutput: "fleet gc — mode=apply aggressive=false max-age=24h0m0s\n" +
+				"coord-locks  /x/.locks/coordinator.lock  verb=surface  reason=dead coord (agent record 129c9824 missing); but holder tmux session fleet-129c9824 still alive — refusing to unlink (would split-brain coord mutual-exclusion); investigate the missing record first\n" +
+				"summary: 0 sockets, 0 agents, 0 tmux (surface only by default), 0 worktrees, 1 coord-locks, 0 worker-records\n",
+			wantReason: "dead coord",
+		},
+		{
+			name: "remove-failed-surface-is-refusal",
+			gcOutput: "fleet gc — mode=apply aggressive=false max-age=24h0m0s\n" +
+				"coord-locks  /x/.locks/coordinator.lock  verb=surface  reason=stale tmux (session gone); remove failed: permission denied\n",
+			wantReason: "remove failed",
+		},
+		{
+			name:       "would-remove-means-not-removed-is-refusal",
+			gcOutput:   "coord-locks  /x/.locks/coordinator.lock  verb=would-remove  reason=stale tmux\n",
+			wantReason: "stale tmux",
+		},
+		{
+			name: "removed-one-surface-other-is-refusal",
+			gcOutput: "coord-locks  /a/.locks/coordinator.lock  verb=removed  reason=stale\n" +
+				"coord-locks  /b/.locks/coordinator.lock  verb=surface  reason=holder tmux still alive — refusing to unlink\n",
+			wantReason: "holder tmux still alive",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := coordLockRefusal(tc.gcOutput)
+			if tc.wantReason == "" {
+				if got != "" {
+					t.Errorf("coordLockRefusal = %q; want no refusal", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.wantReason) {
+				t.Errorf("coordLockRefusal = %q; want substring %q", got, tc.wantReason)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------
 // Architect-level integration test — the real integrated dashboard path
 // ---------------------------------------------------------------------
