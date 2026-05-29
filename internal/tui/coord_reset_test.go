@@ -462,6 +462,86 @@ func TestKeyR_NonProjectRow_Flashes(t *testing.T) {
 	}
 }
 
+// TestReapCoordIDsForProject_UnionsOnDiskCoords is the codex iter-1 [P1]
+// regression: [r] reset must reap the CURRENT on-disk coord set, not just
+// the in-memory snapshot frozen at press time. If [r] is pressed during
+// the dashboard/agents refresh race (or while a spawn is in flight),
+// m.records — and therefore the frozen IDs — can MISS a live coord. The
+// production reap re-reads on-disk state and UNIONs it so the missed coord
+// still gets reaped (otherwise: gc clears the lock, a replacement spawns,
+// and the missed coord stays alive → split-brain).
+func TestReapCoordIDsForProject_UnionsOnDiskCoords(t *testing.T) {
+	pdir := withFleetHome(t)
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(pdir), "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	const project = "demo"
+
+	// On-disk coord records for the project. The "missed" one is the live
+	// coord the press-time snapshot didn't have loaded yet.
+	frozenCoord := coordRecord("11110000", project)
+	missedCoord := coordRecord("22220000", project)
+	otherCoord := coordRecord("33330000", "otherproj") // different project
+	for _, r := range []*agent.Record{frozenCoord, missedCoord, otherCoord} {
+		if err := r.Write(); err != nil {
+			t.Fatalf("seed on-disk record %s: %v", r.ID, err)
+		}
+	}
+
+	// Frozen set captured at press time saw only frozenCoord (the race
+	// missed missedCoord).
+	frozen := []string{frozenCoord.ID}
+
+	got := reapCoordIDsForProject(project, frozen)
+
+	// Must include BOTH demo coords, and NOT the other project's coord.
+	wantSet := map[string]bool{frozenCoord.ID: true, missedCoord.ID: true}
+	if len(got) != len(wantSet) {
+		t.Fatalf("reap set = %v; want exactly the 2 demo coords (frozen+on-disk union)", got)
+	}
+	seen := map[string]bool{}
+	for _, id := range got {
+		if !wantSet[id] {
+			t.Errorf("reap set includes unexpected id %q (want only demo coords); got %v", id, got)
+		}
+		if seen[id] {
+			t.Errorf("reap set has duplicate id %q; got %v", id, got)
+		}
+		seen[id] = true
+	}
+	if !seen[missedCoord.ID] {
+		t.Errorf("reap set must include the on-disk coord missed by the snapshot (%s); got %v",
+			missedCoord.ID, got)
+	}
+	// Frozen ID must come first (deterministic order: prompt-counted set,
+	// then newly-discovered).
+	if got[0] != frozenCoord.ID {
+		t.Errorf("frozen IDs must lead the reap order; got[0]=%q want %q", got[0], frozenCoord.ID)
+	}
+}
+
+// TestReapCoordIDsForProject_EmptyFrozenStillReapsLive covers the
+// worst-case race: [r] pressed before ANY coord loaded into m.records, so
+// the frozen set is empty. The reap must still discover and reap the live
+// on-disk coord — an empty frozen set must NOT mean "reap nothing then
+// spawn a duplicate".
+func TestReapCoordIDsForProject_EmptyFrozenStillReapsLive(t *testing.T) {
+	pdir := withFleetHome(t)
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(pdir), "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	const project = "demo"
+	live := coordRecord("44440000", project)
+	if err := live.Write(); err != nil {
+		t.Fatalf("seed live coord: %v", err)
+	}
+
+	got := reapCoordIDsForProject(project, nil)
+	if len(got) != 1 || got[0] != live.ID {
+		t.Fatalf("empty frozen set must still reap the live on-disk coord %s; got %v", live.ID, got)
+	}
+}
+
 // ---------------------------------------------------------------------
 // Architect-level integration test — the real integrated dashboard path
 // ---------------------------------------------------------------------

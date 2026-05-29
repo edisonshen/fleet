@@ -1479,12 +1479,55 @@ func (m Model) startReset(project string, coordIDs []string) tea.Cmd {
 	}
 }
 
+// reapCoordIDsForProject is the authoritative coord-record set the
+// reap reaps (codex iter-1 [P1]: re-read on-disk state at reap time).
+// The frozen `coordIDs` (snapshotted at [r]-press from the in-memory
+// dashboard) can MISS a live coord when [r] is pressed during the
+// dashboard/agents refresh race, or while a coord spawn is still in
+// flight — m.records simply hasn't loaded it yet. Reaping only the
+// frozen set would leave that live coord's session/record alive while
+// gc clears the lock and we spawn a replacement: split-brain (two live
+// coords for one project).
+//
+// Fix: at reap time, re-enumerate the CURRENT on-disk coord records for
+// the project (agent.List → same coord-by-intent filter) and UNION with
+// the frozen IDs. The union (not replace) keeps every record the
+// operator's confirm prompt counted AND catches any the snapshot missed.
+// If the disk read fails we fall back to the frozen set rather than
+// abort — a partial reap that includes the confirmed records still beats
+// refusing recovery entirely (the operator can re-press [r]).
+//
+// Order is preserved deterministically: frozen IDs first (the order the
+// prompt counted), then any newly-discovered on-disk IDs appended.
+func reapCoordIDsForProject(project string, frozen []string) []string {
+	ids := append([]string(nil), frozen...)
+	seen := make(map[string]bool, len(frozen))
+	for _, id := range frozen {
+		seen[id] = true
+	}
+	records, err := agent.List()
+	if err != nil {
+		return ids // disk read failed: reap at least the confirmed set
+	}
+	for _, id := range coordRecordIDsForProject(records, project) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // resetReapFn performs the [r] reset reap shell-out chain and returns
 // the resulting resetDoneMsg. var so tests stub it without forking
-// `fleet`. Production runs the rm-per-coord then gc-coord-locks chain;
-// the first non-zero exit aborts and surfaces (reaped left at the count
-// completed so the operator sees partial progress in the flash).
-var resetReapFn = func(project string, coordIDs []string) tea.Msg {
+// `fleet`. Production re-reads the CURRENT on-disk coord set (union with
+// the frozen IDs — see reapCoordIDsForProject, codex iter-1 [P1]) so a
+// coord missed by the press-time snapshot still gets reaped, then runs
+// the rm-per-coord then gc-coord-locks chain; the first non-zero exit
+// aborts and surfaces (reaped left at the count completed so the
+// operator sees partial progress in the flash).
+var resetReapFn = func(project string, frozenIDs []string) tea.Msg {
+	coordIDs := reapCoordIDsForProject(project, frozenIDs)
 	var out strings.Builder
 	for i, id := range coordIDs {
 		cmd := exec.Command(fleetBinary, "rm", id)
