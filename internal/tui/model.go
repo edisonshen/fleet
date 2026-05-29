@@ -858,10 +858,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 //	  Arrows must not silently jump out of the right column into the
 //	  left column (#177's TestArrowKeys_ScrollCursorStaysInPanel guards
 //	  this; ← is the explicit left-jump key).
-//	↓ on the LAST agent    → no neighbor below → moveCursor wrap handles
-//	  it, but only because there's no cross-panel neighbor to stay for;
-//	  see crossesToOtherRightPanel which returns false there so we fall
-//	  through to the existing wrap behavior.
+//	↓ on the LAST agent    → no neighbor below (list end) → fall through
+//	  to moveCursor, which wraps to the top per existing behavior; see
+//	  fallsThroughAtEdge's no-neighbor branch.
 //
 // Why cursor progress, not scroll progress, gates "pinned":
 // panelMaxOffset is a count-based bound (3 × rowCount), so even a
