@@ -408,6 +408,211 @@ func TestActionHandoff_OnEmptyList_Noop(t *testing.T) {
 	}
 }
 
+// -- tui-nav-handoff-regressions Fix 2: shared coord resolution for [h] --
+//
+// Bug: [h] on a project row that demonstrably HAS a live coord flashed
+// "no coord" because actionHandoffProject resolved the coord ONLY via
+// p.CoordID (the dashboard's lock-body link), bailing when that link
+// hadn't published yet. actionAttachProject already had a richer chain
+// (CoordID → findExistingCoordForProject records scan). Fix: extract a
+// read-only resolveCoordRecord(p) helper and use it in BOTH handlers.
+
+// TestActionHandoffProject_CoordIDLinked_FiresHandoff: the happy path —
+// p.CoordID is set and the matching record is loaded → resolveCoordRecord
+// returns it via findRecordByID and [h] shells out to `fleet handoff`.
+func TestActionHandoffProject_CoordIDLinked_FiresHandoff(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	if cmd == nil {
+		t.Fatal("expected a tea.Cmd from [h] with linked CoordID, got nil")
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 || len(stub.calls[0]) != 2 ||
+		stub.calls[0][0] != "handoff" || stub.calls[0][1] != "coord001" {
+		t.Errorf("expected ['handoff','coord001'], got %v", stub.calls)
+	}
+	if _, ok := updated.(Model); !ok {
+		t.Errorf("Update returned non-Model: %T", updated)
+	}
+}
+
+// TestActionHandoffProject_CoordIDUnlinked_FallsBackToRecordsScan pins
+// THE live bug (2026-05-28): the project row's CoordID is empty (the
+// dashboard hasn't linked the lock body yet) but a real coord record
+// IS present in m.records — tagged task_id=coord-<project>, project
+// matching, alive session, marker on disk. [h] must resolve via the
+// records-scan fallback and fire the handoff, NOT flash "no coord".
+func TestActionHandoffProject_CoordIDUnlinked_FallsBackToRecordsScan(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Live coord, unlinked on the dashboard row (CoordID == "").
+	coord := agent.New("129c9824")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-129c9824"
+
+	m := projectRowModelWithCoord(t, "demo", "", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd == nil {
+		t.Fatalf("[h] with unlinked CoordID but live coord in records did NOT fire handoff; flash=%+v", mm.flash)
+	}
+	_ = cmd()
+	if len(stub.calls) != 1 || stub.calls[0][0] != "handoff" || stub.calls[0][1] != "129c9824" {
+		t.Errorf("expected ['handoff','129c9824'] via records-scan fallback, got %v", stub.calls)
+	}
+}
+
+// TestActionHandoffProject_GenuinelyNoCoord_Flashes: no CoordID AND no
+// matching coord record in the scan → the "no coord" flash is correct.
+func TestActionHandoffProject_GenuinelyNoCoord_Flashes(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	// Empty marker map → findExistingCoordForProject returns no match.
+	(&stubCoordSpawnMarker{markers: map[string]string{}}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// A loose agent tagged with the project but NOT the coord (regular
+	// task_id, no marker) — synthesizes the row but isn't a coord.
+	loose := agent.New("loose001")
+	loose.Project = "demo"
+	loose.TaskID = "regular-task"
+	loose.TmuxSession = "fleet-loose001"
+
+	m := projectRowModelWithCoord(t, "demo", "", []*agent.Record{loose}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] with genuinely no coord must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls, got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("expected error flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "demo") || !strings.Contains(mm.flash.text, "no coord") {
+		t.Errorf("flash should name the project and explain no coord; got %q", mm.flash.text)
+	}
+}
+
+// TestActionHandoffProject_AutoRedGated: a coord resolved via the
+// fallback that's in auto-red (committed handoff journal) is still
+// gated — [h] flashes "drain first" rather than racing the in-flight
+// handoff. Confirms the gate runs on the resolved record regardless of
+// which resolution path found it.
+func TestActionHandoffProject_AutoRedGated(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := agent.New("129c9824")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-129c9824"
+	hoType := "auto-red"
+	coord.HandoffType = &hoType
+
+	m := projectRowModelWithCoord(t, "demo", "", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Errorf("[h] on auto-red coord (resolved via fallback) must NOT shell out; got cmd")
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("expected zero fleet calls, got %v", stub.calls)
+	}
+	if mm.flash == nil || !mm.flash.isErr || !strings.Contains(mm.flash.text, "drain") {
+		t.Fatalf("expected auto-red drain-first flash, got %+v", mm.flash)
+	}
+}
+
+// TestResolveCoordRecord_PrefersCoordID: when p.CoordID resolves to a
+// loaded record, resolveCoordRecord returns it WITHOUT consulting the
+// records scan (the dashboard's lock-body link is authoritative).
+func TestResolveCoordRecord_PrefersCoordID(t *testing.T) {
+	// No marker stub installed — if resolveCoordRecord wrongly fell
+	// through to the scan, findExistingCoordForProject would return nil
+	// (no marker) and the test would catch the mis-route.
+	linked := sampleAgent("linked01")
+	linked.Project = "demo"
+
+	m := New("test")
+	m.records = []*agent.Record{linked}
+	p := &ProjectRow{Name: "demo", CoordID: "linked01"}
+
+	got := m.resolveCoordRecord(p)
+	if got == nil {
+		t.Fatal("resolveCoordRecord returned nil for a linked CoordID")
+	}
+	if got.ID != "linked01" {
+		t.Errorf("resolveCoordRecord returned %q; want linked01 (CoordID path)", got.ID)
+	}
+}
+
+// TestResolveCoordRecord_FallsBackToScan: empty CoordID → the helper
+// falls back to findExistingCoordForProject and returns the in-flight
+// coord record.
+func TestResolveCoordRecord_FallsBackToScan(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "129c9824"}}).install(t)
+
+	coord := agent.New("129c9824")
+	coord.Project = "demo"
+	coord.TaskID = "coord-demo"
+	coord.TmuxSession = "fleet-129c9824"
+
+	m := New("test")
+	m.records = []*agent.Record{coord}
+	p := &ProjectRow{Name: "demo"} // CoordID empty
+
+	got := m.resolveCoordRecord(p)
+	if got == nil {
+		t.Fatal("resolveCoordRecord returned nil; want scan fallback to find the coord")
+	}
+	if got.ID != "129c9824" {
+		t.Errorf("resolveCoordRecord returned %q; want 129c9824 (scan path)", got.ID)
+	}
+}
+
+// TestActionAttachProject_StillResolvesViaSharedHelper guards attach
+// against the helper swap: [a] on a project row whose CoordID is set
+// and whose record is loaded + alive still attaches to that coord's
+// tmux session (path 1 behavior preserved through resolveCoordRecord).
+func TestActionAttachProject_StillResolvesViaSharedHelper(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	(&stubProjectTreeExists{}).install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-coord001" {
+		t.Errorf("pendingAttach = %q; want fleet-coord001 (attach via shared helper)", mm.pendingAttach)
+	}
+	if cmd == nil {
+		t.Error("expected tea.Quit cmd from attach to a live coord")
+	}
+}
+
 // -- [a] attach ---------------------------------------------------------
 
 // stubSessionAlive replaces sessionAliveFn (used by [a] attach) so

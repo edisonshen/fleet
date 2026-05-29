@@ -6,6 +6,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // Issue #83: Left/Right arrow keys jump cursor between PROJECTS and
@@ -403,6 +405,241 @@ func TestArrowKeys_ScrollCursorStaysInPanel(t *testing.T) {
 			t.Errorf("iter %d: ↑ left cursor on kind=%v want rowWorker — would silently change panels", i, row.kind)
 		}
 	}
+}
+
+// ----- tui-nav-handoff-regressions Fix 1: arrow boundary crossing -----
+//
+// Bug: ↓/↑ can't cross from the workers panel into the agents panel.
+// The #177 scrollRightPanel kept returning true at the worker→agent
+// boundary so handleKey never fell through to moveCursor, which is the
+// helper that crosses panels. Fix: scrollRightPanel detects the
+// no-progress case (cursor unchanged) at the panel boundary and returns
+// false so the arrow falls through to moveCursor.
+//
+// rightPanelModel builds a NON-overflowing right column (a handful of
+// workers + agents) with a tall terminal so trimWithScroll never hides
+// rows — the boundary-crossing path is the one under test, not the
+// overflow-scroll path.
+
+// rightPanelModel seeds a dashboard with the given number of workers
+// (project "fleet", phase review-pending) plus the given agent records,
+// on a tall+wide terminal so neither right-column panel overflows.
+func rightPanelModel(t *testing.T, workerCount int, agents ...*agent.Record) Model {
+	t.Helper()
+	m := New("test")
+	m.width = 160
+	m.height = 60 // tall enough that a small right column never overflows
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < workerCount; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.records = agents
+	return m
+}
+
+// lastRowIndexOfKind returns the index of the LAST dashboardRows() row
+// of kind k, or -1 if none.
+func lastRowIndexOfKind(m Model, k rowKind) int {
+	idx := -1
+	for i, r := range m.dashboardRows() {
+		if r.kind == k {
+			idx = i
+		}
+	}
+	return idx
+}
+
+// firstRowIndexOfKind returns the index of the FIRST dashboardRows()
+// row of kind k, or -1 if none.
+func firstRowIndexOfKind(m Model, k rowKind) int {
+	for i, r := range m.dashboardRows() {
+		if r.kind == k {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestArrowDown_LastWorker_CrossesToFirstAgent: with non-overflowing
+// panels, cursor on the last worker row, ↓ crosses into the first agent
+// row instead of dead-ending in the workers panel.
+func TestArrowDown_LastWorker_CrossesToFirstAgent(t *testing.T) {
+	m := rightPanelModel(t, 2, sampleAgent("agent01"), sampleAgent("agent02"))
+	last := lastRowIndexOfKind(m, rowWorker)
+	if last < 0 {
+		t.Fatalf("no worker rows in fixture; rows=%d", len(m.dashboardRows()))
+	}
+	m.dashCursor = last
+
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowAgent {
+		t.Fatalf("↓ on last worker did not cross to an agent row; landed on %v (dashCursor=%d)",
+			rowKindOf(row), mm.dashCursor)
+	}
+	// Should be the FIRST agent (immediately after the last worker).
+	if firstAgent := firstRowIndexOfKind(mm, rowAgent); mm.dashCursor != firstAgent {
+		t.Errorf("↓ crossed to dashCursor=%d; want first agent row at %d", mm.dashCursor, firstAgent)
+	}
+}
+
+// TestArrowUp_FirstAgent_CrossesToLastWorker is the symmetric case:
+// cursor on the first agent row, ↑ crosses back into the last worker
+// row instead of dead-ending in the agents panel.
+func TestArrowUp_FirstAgent_CrossesToLastWorker(t *testing.T) {
+	m := rightPanelModel(t, 2, sampleAgent("agent01"), sampleAgent("agent02"))
+	firstAgent := firstRowIndexOfKind(m, rowAgent)
+	if firstAgent < 0 {
+		t.Fatalf("no agent rows in fixture; rows=%d", len(m.dashboardRows()))
+	}
+	m.dashCursor = firstAgent
+
+	updated, _ := m.Update(keyMsg("up"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowWorker {
+		t.Fatalf("↑ on first agent did not cross to a worker row; landed on %v (dashCursor=%d)",
+			rowKindOf(row), mm.dashCursor)
+	}
+	if lastWorker := lastRowIndexOfKind(mm, rowWorker); mm.dashCursor != lastWorker {
+		t.Errorf("↑ crossed to dashCursor=%d; want last worker row at %d", mm.dashCursor, lastWorker)
+	}
+}
+
+// TestArrowDown_OverflowWorkerPanel_ScrollsStaysInPanel regresses the
+// #177 behavior: when the worker panel overflows and the cursor is
+// mid-panel, ↓ scrolls the panel AND advances the cursor but does NOT
+// cross into the agents panel. The boundary fall-through must only fire
+// when there is genuinely no next worker row.
+func TestArrowDown_OverflowWorkerPanel_ScrollsStaysInPanel(t *testing.T) {
+	m := New("test")
+	m.width = 140
+	m.height = 24 // short → 30 workers overflow
+	m.dashboard = &Snapshot{
+		Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet", Active: true}},
+		LoadedAt: time.Now(),
+	}
+	for i := 0; i < 30; i++ {
+		m.dashboard.Workers = append(m.dashboard.Workers, &WorkerRow{
+			Project: "fleet",
+			Slug:    "synth-" + string(rune('a'+(i%26))) + string(rune('a'+((i/26)%26))),
+			Phase:   "review-pending",
+		})
+	}
+	m.records = append(m.records, sampleAgent("agent01"))
+	m.jumpToRightPanel() // first worker
+	startOffset := m.workersScrollOffset
+
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowWorker {
+		t.Fatalf("↓ mid-overflow-panel left cursor on %v; want rowWorker (must NOT cross)",
+			rowKindOf(row))
+	}
+	if mm.workersScrollOffset <= startOffset {
+		t.Errorf("↓ on overflowing worker panel did not advance scroll offset (was %d, now %d)",
+			startOffset, mm.workersScrollOffset)
+	}
+}
+
+// TestArrowDown_LastAgent_WrapsToTop: cursor on the last agent row, ↓
+// falls through to moveCursor which wraps to the top of the unified row
+// list (existing wrap behavior, now reachable because the boundary
+// fall-through fires).
+func TestArrowDown_LastAgent_WrapsToTop(t *testing.T) {
+	m := rightPanelModel(t, 1, sampleAgent("agent01"), sampleAgent("agent02"))
+	last := lastRowIndexOfKind(m, rowAgent)
+	if last < 0 {
+		t.Fatalf("no agent rows in fixture")
+	}
+	m.dashCursor = last
+
+	updated, _ := m.Update(keyMsg("down"))
+	mm := updated.(Model)
+	if mm.dashCursor != 0 {
+		t.Errorf("↓ on last agent did not wrap to top; dashCursor=%d want 0", mm.dashCursor)
+	}
+}
+
+// TestArrowNav_FullTopToBottom_TraversesAllRightRows: from the first
+// worker, repeated ↓ visits every worker then every agent without
+// getting stuck at the worker→agent boundary.
+func TestArrowNav_FullTopToBottom_TraversesAllRightRows(t *testing.T) {
+	m := rightPanelModel(t, 3, sampleAgent("agent01"), sampleAgent("agent02"))
+	firstWorker := firstRowIndexOfKind(m, rowWorker)
+	if firstWorker < 0 {
+		t.Fatalf("no worker rows in fixture")
+	}
+	m.dashCursor = firstWorker
+
+	// Collect the kinds visited over enough ↓ presses to reach the last
+	// agent. Workers (3) + agents (2) = 5 right-column rows; 4 presses
+	// walk from first worker to last agent.
+	wantWorkers := 0
+	for _, r := range m.dashboardRows() {
+		if r.kind == rowWorker {
+			wantWorkers++
+		}
+	}
+	sawAgent := false
+	for i := 0; i < wantWorkers+1; i++ {
+		row := m.selectedRow()
+		if row != nil && row.kind == rowAgent {
+			sawAgent = true
+			break
+		}
+		updated, _ := m.Update(keyMsg("down"))
+		m = updated.(Model)
+	}
+	if !sawAgent {
+		t.Errorf("walking ↓ from the first worker never reached an agent row — stuck at the boundary")
+	}
+}
+
+// Test_jk_UnaffectedByBoundaryFix regresses the j/k contract: j/k call
+// moveCursor directly and ALREADY cross panels freely; the Fix 1 change
+// to scrollRightPanel must not touch that path. j on the last worker
+// lands on the first agent (same as the fixed ↓), and j never scrolls.
+func Test_jk_UnaffectedByBoundaryFix(t *testing.T) {
+	m := rightPanelModel(t, 2, sampleAgent("agent01"), sampleAgent("agent02"))
+	last := lastRowIndexOfKind(m, rowWorker)
+	m.dashCursor = last
+	startOffset := m.workersScrollOffset
+
+	updated, _ := m.Update(keyMsg("j"))
+	mm := updated.(Model)
+	row := mm.selectedRow()
+	if row == nil || row.kind != rowAgent {
+		t.Fatalf("j on last worker did not cross to agent; landed on %v", rowKindOf(row))
+	}
+	if mm.workersScrollOffset != startOffset {
+		t.Errorf("j touched workersScrollOffset (%d → %d); j must NEVER scroll a panel",
+			startOffset, mm.workersScrollOffset)
+	}
+	// k from the first agent crosses back to the last worker.
+	updated, _ = mm.Update(keyMsg("k"))
+	mm2 := updated.(Model)
+	row = mm2.selectedRow()
+	if row == nil || row.kind != rowWorker {
+		t.Errorf("k on first agent did not cross back to worker; landed on %v", rowKindOf(row))
+	}
+}
+
+// rowKindOf is a nil-safe helper for test error messages.
+func rowKindOf(r *dashRow) interface{} {
+	if r == nil {
+		return "nil"
+	}
+	return r.kind
 }
 
 // TestArrowKeys_ScrollOffsetClampsAtMax pins the model-side upper
