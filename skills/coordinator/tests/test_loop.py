@@ -770,6 +770,124 @@ def test_terminal_release_skipped_when_no_agent_id_known(
     )
 
 
+# ---------- worktree-aware reviewer/finisher dispatch (dispatch-reviewer-finish-9316) ----------
+
+
+def _seed_worktree(fleet_home: Path, project: str, slug: str) -> Path:
+    """Create the on-disk worktree directory the coord would have made
+    for a cap>1 worker (`<fleet_home>/projects/<project>/worktrees/<slug>`)
+    with a `.git` file so the loop's worktree detection recognizes it as
+    a real git worktree."""
+    wt = fleet_home / "projects" / project / "worktrees" / slug
+    wt.mkdir(parents=True, exist_ok=True)
+    # A linked worktree has a `.git` FILE (not dir) pointing back at the
+    # main repo's .git/worktrees/<slug>.
+    (wt / ".git").write_text("gitdir: /repo/.git/worktrees/" + slug + "\n",
+                             encoding="utf-8")
+    return wt
+
+
+def test_handoff_reviewer_prompt_cds_into_worktree(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Regression for dispatch-reviewer-finish-9316: a worker that ran in
+    a pre-created worktree leaves its branch checked out THERE. The
+    reviewer dispatch must cd into that worktree, NOT `git checkout
+    <branch>` in the main repo (which fatals "branch already used by
+    worktree"). This test FAILS on the parent commit, where the loop
+    passes no worktree and build_reviewer_prompt emits `git checkout`.
+    """
+    wt = _seed_worktree(fleet_home, "fleet", "wtreview-aaaa")
+    _write_tasks(project_dir, [
+        _make_task("wtreview-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "wtreview-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("eeee0001")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    inbox = fleet_home / "inbox" / "eeee0001.md"
+    assert inbox.exists(), "reviewer prompt was not written to inbox"
+    body = inbox.read_text()
+    assert f"cd {wt}" in body, (
+        f"reviewer prompt must cd into the worktree; body=\n{body}"
+    )
+    assert "git checkout worker/wtreview-aaaa" not in body, (
+        "reviewer prompt must NOT bare-checkout the branch for a worktree task"
+    )
+
+
+def test_handoff_finisher_prompt_cds_into_worktree(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """Regression for dispatch-reviewer-finish-9316: the finisher dispatch
+    for a worktree-created task must cd into the worktree before push/PR.
+    FAILS on the parent commit (no worktree passed → no cd step)."""
+    wt = _seed_worktree(fleet_home, "fleet", "wtfin-aaaa")
+    _write_tasks(project_dir, [
+        _make_task("wtfin-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "wtfin-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-done"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("ffff0001")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    inbox = fleet_home / "inbox" / "ffff0001.md"
+    assert inbox.exists(), "finisher prompt was not written to inbox"
+    body = inbox.read_text()
+    assert f"cd {wt}" in body, (
+        f"finisher prompt must cd into the worktree; body=\n{body}"
+    )
+    assert body.index(f"cd {wt}") < body.index("git push"), (
+        "cd into worktree must precede git push"
+    )
+
+
+def test_handoff_reviewer_prompt_no_worktree_keeps_checkout(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """In-place (cap=1, no worktree on disk) dispatch keeps the original
+    `git checkout <branch>` step. Guards against regressing the
+    single-worker path."""
+    _write_tasks(project_dir, [
+        _make_task("inplace-aaaa", status="in-progress", worker_pid=0),
+    ])
+    workers_dir = project_dir / "workers" / "inplace-aaaa"
+    workers_dir.mkdir(parents=True, exist_ok=True)
+    (workers_dir / "state.json").write_text(
+        json.dumps({"phase": "review-pending"}), encoding="utf-8",
+    )
+    dispatch_subprocess.append("dddd0001")
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    inbox = fleet_home / "inbox" / "dddd0001.md"
+    assert inbox.exists()
+    body = inbox.read_text()
+    assert "git checkout worker/inplace-aaaa" in body
+    assert "cd /" not in body
+
+
 # ---------- acquire-prompt failure handling (codex iter-4 [P1]) ----------
 
 

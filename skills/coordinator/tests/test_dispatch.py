@@ -511,6 +511,65 @@ def test_build_reviewer_prompt_reads_engine_from_env(monkeypatch) -> None:
     assert "coord engine = codex" in out.lower()
 
 
+# ---------- worktree-aware reviewer/finisher (dispatch-reviewer-finish-9316) ----------
+
+
+def test_build_reviewer_prompt_worktree_cds_instead_of_checkout() -> None:
+    """Regression for dispatch-reviewer-finish-9316: when the worker ran
+    in a pre-created worktree, the branch is checked out THERE. A bare
+    `git checkout <branch>` in the main repo fatals "branch already used
+    by worktree". The reviewer must instead `cd` into the worktree and
+    verify the branch with `git rev-parse --abbrev-ref HEAD`."""
+    t = _make_task()
+    wt = "/Users/x/.fleet/projects/fleet/worktrees/fix-thing-aaaa"
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", branch="worker/fix-thing-aaaa", worktree=wt,
+    )
+    assert f"cd {wt}" in out
+    assert "git rev-parse --abbrev-ref HEAD" in out
+    # The fatal bare-checkout step-1 must NOT appear.
+    assert "git checkout worker/fix-thing-aaaa" not in out
+
+
+def test_build_reviewer_prompt_no_worktree_keeps_checkout() -> None:
+    """In-place (cap=1, no worktree) dispatch must keep the original
+    `git checkout <branch>` step — worktree-mode is the override, not
+    the new default. Byte-for-byte behavior guard for the non-worktree
+    path."""
+    t = _make_task()
+    out = dispatch.build_reviewer_prompt(
+        t, project="fleet", branch="worker/fix-thing-aaaa",
+    )
+    assert "git checkout worker/fix-thing-aaaa" in out
+    assert "cd /" not in out
+
+
+def test_build_finisher_prompt_worktree_cds_before_push() -> None:
+    """Regression for dispatch-reviewer-finish-9316: the finisher must
+    `cd` into the worker's worktree before `git push` / `gh pr create`,
+    otherwise it operates on the main repo's checkout (wrong branch /
+    no worker commits visible to gh from the wrong cwd)."""
+    t = _make_task()
+    wt = "/Users/x/.fleet/projects/fleet/worktrees/fix-thing-aaaa"
+    out = dispatch.build_finisher_prompt(
+        t, project="fleet", branch="worker/fix-thing-aaaa", worktree=wt,
+    )
+    assert f"cd {wt}" in out
+    # The cd step must come before the push instruction.
+    assert out.index(f"cd {wt}") < out.index("git push")
+
+
+def test_build_finisher_prompt_no_worktree_omits_cd() -> None:
+    """In-place finisher dispatch must NOT emit a `cd` into a worktree —
+    it runs in the main repo's checkout as before."""
+    t = _make_task()
+    out = dispatch.build_finisher_prompt(
+        t, project="fleet", branch="worker/fix-thing-aaaa",
+    )
+    assert "cd /" not in out
+    assert "git push" in out
+
+
 # ---------- build_finisher_prompt (reviewer-subagent-arch) ----------
 
 
