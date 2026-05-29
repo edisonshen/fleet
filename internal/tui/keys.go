@@ -1384,6 +1384,22 @@ func (m Model) actionResetProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
+	// codex iter-3 [P2]: refuse to arm reset while a coord spawn for this
+	// project is still in flight ([a]/[+] dispatch goroutine running, its
+	// coordSpawnDoneMsg not yet handled). The dispatch hasn't written the
+	// new coord's record/marker yet, so m.records would freeze a snapshot
+	// that MISSES it; reaping that snapshot then respawning would
+	// duplicate the just-spawned coord. Make the operator wait for the
+	// spawn to settle (the flash names the next step — surface-don't-silo).
+	if m.coordSpawnInFlight[p.Name] {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord spawn for project %s is in flight — wait for it to settle, then press [r] (resetting now could duplicate the spawning coord)",
+				p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
 	m.resetProjectCandidate = p.Name
 	m.resetCoordIDs = coordRecordIDsForProject(m.records, p.Name)
 	m.mode = modeConfirmReset
@@ -1573,11 +1589,56 @@ var resetReapFn = func(project string, frozenIDs []string) tea.Msg {
 			err:         fmt.Errorf("gc coord-locks refused to clear the stale lock: %s", refusal),
 		}
 	}
+	// codex iter-3 [P2]: the line-parse above catches an EXPLICIT refusal
+	// (verb=surface), but gc can also emit NO coord-locks action at all
+	// for an existing lock it couldn't classify — an unreadable / parse-
+	// failing holder record, a malformed/torn body, or an ambiguous probe
+	// all fall through to "skip" with no action line, yet the lock file is
+	// STILL on disk. Treating that as success would respawn over a lock
+	// the reset never proved gone. Backstop with a direct stat.
+	if lerr := coordLockStillPresent(project); lerr != nil {
+		return resetDoneMsg{
+			projectName: project,
+			reaped:      len(coordIDs),
+			out:         out.String(),
+			err:         lerr,
+		}
+	}
 	return resetDoneMsg{
 		projectName: project,
 		reaped:      len(coordIDs),
 		out:         out.String(),
 	}
+}
+
+// coordLockStillPresent is the codex iter-3 [P2] post-gc backstop: after
+// the reset reap archived every coord record for the project and gc ran
+// (without an explicit refusal), the project's coordinator.lock MUST be
+// gone for the "clear the stale lock" guarantee to hold. A surviving
+// file means gc couldn't classify it (unreadable holder record, torn
+// body, ambiguous probe → no action line) — the reset did NOT clear it,
+// so we fail closed (no respawn). Respawn hasn't run yet, so nothing
+// should be legitimately recreating the lock between reap and this stat.
+//
+// Returns nil when the lock is absent (success) or the path can't be
+// resolved (can't make a claim → don't block recovery on a path error,
+// the line-parse refusal already covered the classifiable cases). A stat
+// error other than not-exist is itself ambiguous → fail closed.
+func coordLockStillPresent(project string) error {
+	lp, perr := state.CoordinatorLockPath(project)
+	if perr != nil {
+		return nil
+	}
+	_, serr := os.Stat(lp)
+	if serr == nil {
+		return fmt.Errorf(
+			"coordinator.lock still present at %s after gc (gc could not classify it — likely an unreadable holder record or torn lock body); reset did not clear it",
+			lp)
+	}
+	if !os.IsNotExist(serr) {
+		return fmt.Errorf("stat coordinator.lock for %s after gc: %w", project, serr)
+	}
+	return nil
 }
 
 // coordLockRefusal scans `fleet gc` output for a coord-locks action that
