@@ -591,6 +591,37 @@ func TestResolveCoordRecord_FallsBackToScan(t *testing.T) {
 	}
 }
 
+// TestResolveCoordRecord_CoordIDSet_RecordMissing_DoesNotScanStale pins
+// codex review iter-1 [P2]: when p.CoordID is set (authoritative lock-
+// body link) but the matching record hasn't loaded yet, resolveCoordRecord
+// must return nil — NOT fall through to the marker scan, which keys off
+// coordSpawnMarkerFn and could resolve a DIFFERENT, stale coord-<project>
+// record (e.g., an old session still alive mid-handoff while the new
+// coord already holds the lock). Routing [a]/[h] to that stale coord
+// would attach / hand off the wrong owner. The caller surfaces the
+// "pending refresh" race flash instead.
+func TestResolveCoordRecord_CoordIDSet_RecordMissing_DoesNotScanStale(t *testing.T) {
+	(&stubSessionAlive{}).install(t)
+	// On-disk marker points at a STALE coord (old session, still alive),
+	// distinct from the authoritative p.CoordID below.
+	(&stubCoordSpawnMarker{markers: map[string]string{"demo": "stale999"}}).install(t)
+
+	stale := agent.New("stale999")
+	stale.Project = "demo"
+	stale.TaskID = "coord-demo"
+	stale.TmuxSession = "fleet-stale999"
+
+	m := New("test")
+	m.records = []*agent.Record{stale} // the NEW coord (CoordID) isn't loaded yet
+	p := &ProjectRow{Name: "demo", CoordID: "new111"}
+
+	got := m.resolveCoordRecord(p)
+	if got != nil {
+		t.Fatalf("resolveCoordRecord returned %q for a set-but-unloaded CoordID; want nil "+
+			"(must NOT route to the stale marker-scanned coord)", got.ID)
+	}
+}
+
 // TestActionAttachProject_StillResolvesViaSharedHelper guards attach
 // against the helper swap: [a] on a project row whose CoordID is set
 // and whose record is loaded + alive still attaches to that coord's

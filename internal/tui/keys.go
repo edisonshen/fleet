@@ -1283,14 +1283,27 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 // scan fallback, so [h] flashed "no coord" when the dashboard's
 // CoordID link hadn't published yet but a coord was demonstrably live
 // in the agents panel.
+//
+// codex review iter-1 [P2]: the scan fallback fires ONLY when CoordID
+// is empty. A non-empty CoordID is the dashboard's authoritative lock-
+// body link — when it's set but the matching record hasn't loaded yet
+// (the snapshot/agents refresh race), we must NOT fall through to the
+// marker scan, which keys off coordSpawnMarkerFn and can resolve a
+// DIFFERENT, stale coord-<project> record (e.g., an old session still
+// alive mid-handoff while the new coord already holds the lock). Routing
+// [a]/[h] to that stale coord would hand off / attach the wrong owner.
+// Returning nil here preserves actionAttachProject's intentional
+// "pending refresh — try again" flash for the CoordID-set race; the
+// operator re-presses after the next tick binds the record.
 func (m Model) resolveCoordRecord(p *ProjectRow) *agent.Record {
 	if p == nil {
 		return nil
 	}
 	if p.CoordID != "" {
-		if rec := findRecordByID(m.records, p.CoordID); rec != nil {
-			return rec
-		}
+		// Authoritative link set: resolve by ID only. Do NOT scan —
+		// the scan keys off the on-disk marker, which can lag behind a
+		// fresh CoordID and surface a stale coord.
+		return findRecordByID(m.records, p.CoordID)
 	}
 	if rec, ok := findExistingCoordForProject(m.records, p.Name); ok {
 		return rec
