@@ -4198,6 +4198,32 @@ def _dispatch_ready(
     return actions
 
 
+def _worktree_path_if_present(
+    fleet_home: str, project: str, slug: str,
+) -> str:
+    """Return the worker's worktree path iff it's a real git worktree on
+    disk, else "".
+
+    Mirrors Go's state.WorktreePath layout
+    (`<fleet_home>/projects/<project>/worktrees/<slug>`). A linked git
+    worktree has a `.git` FILE (a gitdir pointer), not a directory — we
+    check for that so a stale empty dir (or a non-worktree drop-in)
+    doesn't get mistaken for a real checkout. Deriving the path directly
+    (instead of shelling to `fleet workers worktree-path`) keeps the
+    handoff hot path subprocess-free and trivially testable; the layout
+    is a stable contract pinned by state.WorktreePath + its test.
+
+    dispatch-reviewer-finish-9316: the reviewer/finisher use this to
+    decide between `cd <worktree>` and `git checkout <branch>`.
+    """
+    if not fleet_home or not project or not slug:
+        return ""
+    wt = os.path.join(fleet_home, "projects", project, "worktrees", slug)
+    if os.path.exists(os.path.join(wt, ".git")):
+        return wt
+    return ""
+
+
 def _dispatch_review_handoffs(
     *,
     tasks: list[parse.Task],
@@ -4283,15 +4309,26 @@ def _dispatch_review_handoffs(
             continue
 
         branch = t.branch or f"worker/{t.slug}"
+        # dispatch-reviewer-finish-9316: if the worker ran in a pre-
+        # created worktree (cap>1 dispatch), the branch is checked out
+        # THERE. The reviewer/finisher must cd into that worktree rather
+        # than `git checkout <branch>` in the main repo (which fatals
+        # "branch already used by worktree"). Worktrees live until the
+        # task reaches a terminal state, so they're still on disk during
+        # the review-pending → review-done handoff window. Empty string
+        # (in-place dispatch) keeps the original git-checkout behavior.
+        worktree = _worktree_path_if_present(fleet_home, project, t.slug)
         try:
             if phase == "review-pending":
                 prompt = dispatch_mod.build_reviewer_prompt(
-                    t, project=project, branch=branch, is_git=is_git,
+                    t, project=project, branch=branch,
+                    worktree=worktree or None, is_git=is_git,
                 )
                 description = f"fleet reviewer {t.slug}"
             else:
                 prompt = dispatch_mod.build_finisher_prompt(
-                    t, project=project, branch=branch, is_git=is_git,
+                    t, project=project, branch=branch,
+                    worktree=worktree or None, is_git=is_git,
                 )
                 description = f"fleet finisher {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:

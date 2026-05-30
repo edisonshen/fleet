@@ -370,6 +370,7 @@ def build_reviewer_prompt(
     *,
     branch: str | None = None,
     workers_dir: str | None = None,
+    worktree: str | None = None,
     is_git: bool = True,
     coord_engine: str | None = None,
 ) -> str:
@@ -409,6 +410,16 @@ def build_reviewer_prompt(
                   /review + codex against the worker diff — but a
                   banner up top documents the diversity setup so the
                   reviewer subagent understands the role split.
+    worktree:     absolute path to the worker's pre-created git worktree
+                  (cap > 1 mode), or None for in-place (cap=1) dispatch.
+                  When set, step 1 becomes `cd <worktree>` +
+                  `git rev-parse --abbrev-ref HEAD` verify instead of
+                  `git checkout {branch}`. The worker ran in this
+                  worktree, so the branch is already checked out THERE —
+                  a bare `git checkout {branch}` in the main repo fatals
+                  "branch already used by worktree" and the review never
+                  runs (dispatch-reviewer-finish-9316). Ignored in
+                  non-git mode (no branches to check out).
     """
     if branch is None:
         branch = f"worker/{task.slug}"
@@ -483,11 +494,29 @@ def build_reviewer_prompt(
     lines.append("## Required workflow")
     lines.append("")
 
-    if is_git:
-        lines.extend([
+    # Step 1 differs by mode (dispatch-reviewer-finish-9316): when the
+    # worker ran in a pre-created worktree, the branch is checked out
+    # THERE. `git checkout {branch}` in the main repo would fatal
+    # "branch already used by worktree" — so cd into the worktree and
+    # verify instead. In-place dispatch keeps the original checkout.
+    if worktree:
+        step1_lines = [
+            f"1. `cd {worktree}` — the worker ran in this pre-created worktree, so",
+            f"   branch {branch} is already checked out there with the worker's",
+            "   commits. Do NOT `git checkout` in the main repo (it fatals \"branch",
+            "   already used by worktree\"). Verify with",
+            f"   `git rev-parse --abbrev-ref HEAD` (must equal {branch}); you append",
+            "   review fixes on top from inside the worktree.",
+        ]
+    else:
+        step1_lines = [
             f"1. `git checkout {branch}` — make sure you're on the worker's branch.",
             "   The worker's commits are already there; you append review fixes on",
             "   top.",
+        ]
+    if is_git:
+        lines.extend([
+            *step1_lines,
             "",
             f"2. /review iteration loop (gstack skill, MANDATORY — never skippable):",
             "   - Invoke `/review` via the Skill tool (literal name `review`).",
@@ -622,6 +651,7 @@ def build_finisher_prompt(
     *,
     branch: str | None = None,
     workers_dir: str | None = None,
+    worktree: str | None = None,
     is_git: bool = True,
 ) -> str:
     """Assemble the finisher subagent's first-turn prompt.
@@ -643,6 +673,14 @@ def build_finisher_prompt(
     on push or PR creation flips phase=blocked with the failure as
     --reason. Re-dispatching a failed finisher is the operator's call
     (or a future autosystem; v0 leaves it manual).
+
+    worktree: absolute path to the worker's pre-created git worktree
+              (cap > 1 mode), or None for in-place (cap=1) dispatch.
+              When set, the prompt opens with a `cd <worktree>` step so
+              push + `gh pr create` run from the checkout that holds the
+              worker + reviewer commits — the main repo's HEAD is on a
+              different branch (dispatch-reviewer-finish-9316). Ignored
+              in non-git mode.
     """
     if branch is None:
         branch = f"worker/{task.slug}"
@@ -650,6 +688,33 @@ def build_finisher_prompt(
         workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
 
     proj_flag = f"--project {project}"
+
+    # Push step. When the worker ran in a pre-created worktree, the cd is
+    # folded into step 1 (push + PR must run from the worktree, which
+    # holds the worker + reviewer commits; the main repo HEAD is on a
+    # different branch). Folding it into step 1 keeps the downstream
+    # step numbers (2..5) byte-identical to the in-place path
+    # (dispatch-reviewer-finish-9316).
+    if worktree:
+        push_step = [
+            f"1. `cd {worktree}` — the worker ran in this pre-created worktree;",
+            f"   branch {branch} (worker + reviewer commits) is checked out THERE,",
+            "   so push + PR must run from inside it, NOT the main repo (whose",
+            "   HEAD is on a different branch). Then:",
+            f"   `git push -u origin {branch}` — fresh push. If origin already has",
+            "   a stale prior attempt's tip, use `git push --force-with-lease",
+            f"   origin {branch}` (your branch is the only writer; --force-with-",
+            "   lease is safe). Never plain `--force`.",
+            "",
+        ]
+    else:
+        push_step = [
+            f"1. `git push -u origin {branch}` — fresh push. If origin already has",
+            "   a stale prior attempt's tip, use `git push --force-with-lease",
+            f"   origin {branch}` (your branch is the only writer; --force-with-",
+            "   lease is safe). Never plain `--force`.",
+            "",
+        ]
 
     if is_git:
         lines: list[str] = [
@@ -669,11 +734,7 @@ def build_finisher_prompt(
             "",
             "## Required workflow",
             "",
-            f"1. `git push -u origin {branch}` — fresh push. If origin already has",
-            "   a stale prior attempt's tip, use `git push --force-with-lease",
-            f"   origin {branch}` (your branch is the only writer; --force-with-",
-            "   lease is safe). Never plain `--force`.",
-            "",
+            *push_step,
             "2. Read state.json to extract reviewer counts for the PR body:",
             f"   - `cat {workers_dir}/state.json | jq -r '.review_claude_rounds, .review_codex_rounds, .review_codex_status, .review_codex_skip_reason'`",
             "",
