@@ -103,13 +103,15 @@ func TestFooter_OmitsNavAndPanelChips(t *testing.T) {
 // stays wired (and [n] stays in the help overlay) but the footer no
 // longer advertises it.
 //
-// Canonical: ⏎ open · + add project · a attach · h handoff · x archive ·
-// / search · ? help · q quit. Eight chips total — the count is
-// invariant; only the second slot changed.
+// Canonical: ⏎ open · + add project · a attach · h handoff · r reset ·
+// x archive · / search · ? help · q quit. Nine chips total post the
+// [r] reset chip (dead-end-recovery-r-8559); reset is a headline
+// recovery affordance and earns a footer slot between handoff and
+// archive.
 func TestFooter_DocumentsCoreKeysOnly(t *testing.T) {
 	out := renderDashboardFooter(0, 200, "")
-	for _, want := range []string{"⏎", "+", "a", "h", "x", "/", "?", "q",
-		"open", "add project", "attach", "handoff", "archive", "search", "help", "quit"} {
+	for _, want := range []string{"⏎", "+", "a", "h", "r", "x", "/", "?", "q",
+		"open", "add project", "attach", "handoff", "reset", "archive", "search", "help", "quit"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("footer missing required chip %q, got:\n%s", want, out)
 		}
@@ -159,14 +161,20 @@ func TestHelpOverlay_DocumentsArrowsAndJKAndLeftRight(t *testing.T) {
 // pushes the legend over the 100-col budget. 110 is still well
 // within the "common split pane" envelope on a 13-inch laptop and
 // preserves the regression intent (no silent wrap at common widths).
+//
+// Anchor bumped again to a 112-column terminal (usable=111) post the
+// [r] reset chip (dead-end-recovery-r-8559): reset is a headline
+// recovery affordance and earns a footer slot, adding "[r] reset "
+// (11 cells incl. separator). 112 stays inside the common split-pane
+// envelope and keeps the no-silent-wrap intent intact.
 func TestFooter_FitsCommonSplitPaneWidth(t *testing.T) {
-	const splitPaneWidth = 109 // m.width=110 → usable = m.width - 1
+	const splitPaneWidth = 111 // m.width=112 → usable = m.width - 1
 	out := renderDashboardFooter(0, splitPaneWidth, "")
 	// renderDashboardFooter pads with spaces to reach `usable`; if the
 	// content alone exceeds that budget, gap collapses to 1 and the
 	// rendered string overruns. Width should be exactly splitPaneWidth.
 	if got := lipgloss.Width(out); got > splitPaneWidth {
-		t.Errorf("footer rendered %d cells wide; must fit in %d (110-col terminal)",
+		t.Errorf("footer rendered %d cells wide; must fit in %d (112-col terminal)",
 			got, splitPaneWidth)
 	}
 }
