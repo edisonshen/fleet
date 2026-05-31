@@ -307,6 +307,51 @@ func TestJumpToLeftPanel_AlignsScroll(t *testing.T) {
 	}
 }
 
+// TestDashboardRefresh_AlignsLeftScroll is the regression for the codex
+// [P2] data-refresh path: a dashboardMsg that relocates the cursor via
+// refreshCursor (selected project vanished → reset to row 0) must also
+// align the left scroll. Otherwise the renderer keeps slicing at the old
+// bottom offset while actions target the row-0 project the user can't see.
+func TestDashboardRefresh_AlignsLeftScroll(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+	// Select a deep project and scroll the left pane to the bottom.
+	rows := m.dashboardRows()
+	last := 0
+	for i := range rows {
+		if rows[i].kind == rowProject {
+			last = i
+		}
+	}
+	m.dashCursor = last
+	m.projectsScrollOffset = m.panelMaxOffset(rowProject)
+	if m.projectsScrollOffset == 0 {
+		t.Fatalf("expected nonzero offset")
+	}
+
+	// Refresh with a snapshot that no longer contains the selected
+	// project → refreshCursor resets dashCursor to 0.
+	newSnap := buildManyProjectsSnapshot(3)
+	updated, _ := m.Update(dashboardMsg{snap: newSnap})
+	m2 := updated.(Model)
+	if m2.dashCursor != 0 {
+		t.Logf("cursor after refresh = %d (refreshCursor reset path)", m2.dashCursor)
+	}
+	// With only 3 projects the list now fits → offset must be 0 and the
+	// first project visible. (Also guards the broader invariant: after a
+	// refresh the selected row is on-screen.)
+	if m2.projectsScrollOffset != 0 {
+		t.Errorf("refresh to a fitting list must reset projectsScrollOffset to 0; got %d", m2.projectsScrollOffset)
+	}
+	frame := renderTwoColumnBody(m2, 90, 40)
+	if !strings.Contains(frame, projectDisplayWant(0)) {
+		t.Errorf("after refresh the row-0 project must be visible:\n%s", frame)
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).

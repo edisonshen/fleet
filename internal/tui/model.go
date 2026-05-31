@@ -520,6 +520,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.groupKeysByID = msg.groupKeys
 		m.records = sortRecordsBy(msg.records, msg.groupKeys)
 		m.refreshCursor(prevID)
+		// A background refresh can relocate the cursor (identity moved or
+		// vanished → row 0) while projectsScrollOffset still points at the
+		// old window; align so the relocated project isn't off-screen
+		// (codex review [P2]). KeyMsg covers nav; this covers data refresh.
+		m.alignLeftScrollToCursor()
 		return m, nil
 
 	case tickMsg:
@@ -562,6 +567,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshCursor(prevID)
+		// Same as agentsMsg: a snapshot refresh can move the cursor while
+		// the left scroll is stale — align so actions don't target an
+		// off-screen project (codex review [P2]).
+		m.alignLeftScrollToCursor()
 		return m, nil
 
 	case queueEventMsg:
