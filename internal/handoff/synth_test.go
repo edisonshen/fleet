@@ -612,6 +612,42 @@ func TestSynthesizeRecovery_MalformedCheckpointFallsThrough(t *testing.T) {
 	}
 }
 
+// TestSynthesizeRecovery_RejectsForeignCoordCheckpoint pins the
+// coord-generation guard: a checkpoint whose frontmatter coord_id
+// belongs to a PRIOR coord (A) must NOT be lifted into a recovery for a
+// DIFFERENT coord (B) — even on the empty-lastHandoffPath path where the
+// timestamp guard is skipped. Without the guard, B would resurrect A's
+// stale Active Subagents / Open PRs. The fix falls back to the live
+// state.json walk instead.
+func TestSynthesizeRecovery_RejectsForeignCoordCheckpoint(t *testing.T) {
+	pdir := withFleetHomeSynth(t)
+	now := time.Now().UTC()
+
+	// Live state.json reflects B's actual (current) lane.
+	seedCoordState(t, pdir, "myproj", map[string]string{
+		"fix-current-9999": "b0b0b0b0",
+	})
+	seedWorkerState(t, pdir, "myproj", "fix-current-9999", "tdd-green", "")
+
+	// Checkpoint on disk was written by coord A (coord_id "deadbeef"),
+	// fresh timestamp, carrying A's now-stale lane.
+	staleRow := `- task="fix-staleA-0000" branch="worker/fix-staleA-0000" phase="push" status="in-progress" pr_url="" agent_id="deadbeef" subagent_id=""`
+	seedCheckpoint(t, pdir, "myproj", now, []string{staleRow}, nil, nil)
+
+	// Recover coord B ("b0b0b0b0"), no handoff baseline → empty path.
+	doc, err := SynthesizeRecoveryWithLastHandoff("b0b0b0b0", "myproj", "", now)
+	if err != nil {
+		t.Fatalf("SynthesizeRecoveryWithLastHandoff: %v", err)
+	}
+	if len(doc.ActiveSubagents) != 1 {
+		t.Fatalf("ActiveSubagents: got %d want 1 (state.json fallback)", len(doc.ActiveSubagents))
+	}
+	if doc.ActiveSubagents[0].TaskID != "fix-current-9999" {
+		t.Errorf("task: got %q want fix-current-9999 (foreign checkpoint must be rejected)",
+			doc.ActiveSubagents[0].TaskID)
+	}
+}
+
 // TestSynthesizeRecovery_LegacyWrapperUnchanged pins that the legacy
 // SynthesizeRecovery entry point still works (it delegates to the new
 // signature with an empty lastHandoffPath). No checkpoint present, so

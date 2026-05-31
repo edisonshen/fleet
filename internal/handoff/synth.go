@@ -128,7 +128,7 @@ func SynthesizeRecoveryWithLastHandoff(
 	// between clean handoffs is thus bounded by the checkpoint interval
 	// rather than the (potentially hours-long) gap between fleet-guard's
 	// context-pct triggers.
-	if cp, ok := loadCheckpointIfFresher(pdir, lastHandoffPath); ok {
+	if cp, ok := loadCheckpointIfFresher(pdir, agentID, lastHandoffPath); ok {
 		doc.ActiveSubagents = cp.activeSubagents
 		doc.OpenPRs = cp.openPRs
 		// Recent decisions surface in the NextSteps body as a free-form
@@ -304,6 +304,7 @@ func readWorkerStateForSynth(workersDir, slug string) (ActiveSubagent, bool) {
 // PRs (`- #N title — head — url` bullets), and Recent decisions
 // (free-form bullet text).
 type checkpointDoc struct {
+	coordID         string
 	updatedAt       time.Time
 	activeSubagents []ActiveSubagent
 	openPRs         []OpenPR
@@ -321,13 +322,17 @@ type checkpointDoc struct {
 //     coord's first N-tick boundary),
 //   - the checkpoint's frontmatter is malformed (refuse to lift from a
 //     half-written / schema-drifted doc),
+//   - the checkpoint belongs to a DIFFERENT coord generation (its
+//     frontmatter coord_id is set and != the recovering agentID — a
+//     fresh coord that died before writing its own checkpoint must not
+//     inherit the previous coord's stale Active Subagents / Open PRs),
 //   - the checkpoint pre-dates the last handoff (the handoff doc is
 //     fresher, and the successor's handoff_resume.py re-reads state from
 //     it anyway; shadowing with older data would regress).
 //
 // Best-effort: any I/O error returns ok=false; the caller falls through
 // to the state.json walk, which is the safe default.
-func loadCheckpointIfFresher(pdir, lastHandoffPath string) (*checkpointDoc, bool) {
+func loadCheckpointIfFresher(pdir, agentID, lastHandoffPath string) (*checkpointDoc, bool) {
 	path := filepath.Join(pdir, "coord-checkpoint.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -335,6 +340,17 @@ func loadCheckpointIfFresher(pdir, lastHandoffPath string) (*checkpointDoc, bool
 	}
 	cp, ok := parseCheckpoint(data)
 	if !ok {
+		return nil, false
+	}
+	// Coord-generation guard: a checkpoint stamped with a coord_id that
+	// isn't the coord we're recovering belongs to a prior generation
+	// (coord A wrote it, handed off to B, B died before its own first
+	// N-tick checkpoint). Lifting A's state into B's recovery would
+	// resurrect workers/PRs B never owned. Reject so the caller falls
+	// back to the live state.json walk. An empty coord_id (legacy /
+	// pre-schema checkpoint) can't be attributed, so it's left to the
+	// timestamp guard rather than rejected outright.
+	if cp.coordID != "" && agentID != "" && cp.coordID != agentID {
 		return nil, false
 	}
 	// Empty path → checkpoint always wins (no handoff baseline to
@@ -434,7 +450,7 @@ func parseCheckpoint(data []byte) (*checkpointDoc, bool) {
 	}
 
 	sections := splitCheckpointH3Sections(rest)
-	cp := &checkpointDoc{updatedAt: updated.UTC()}
+	cp := &checkpointDoc{coordID: parsed["coord_id"], updatedAt: updated.UTC()}
 	if raw, ok := sections["Active Subagents"]; ok {
 		cp.activeSubagents = parseCheckpointActiveSubagents(raw)
 	}
