@@ -777,13 +777,10 @@ func buildBodyLinesCore(m Model, leftW, rightW int) ([]string, []string, []strin
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowProject:
-			leftLineStart[i] = len(left)
 			// A new project row terminates any pending footer for the
-			// previous project — write it before opening this project.
-			// flushFooter writes the PREVIOUS project's footer; the start
-			// index above is recorded before it so it points at this
-			// project's header. Re-record after flush to skip the donated
-			// footer lines.
+			// previous project — flush it FIRST, then record this project's
+			// line start so it points at this header (not at the donated
+			// footer lines of the previous project).
 			flushFooter()
 			leftLineStart[i] = len(left)
 			if projectHasExpandedRowsBelow(i, row.project.Name) {
