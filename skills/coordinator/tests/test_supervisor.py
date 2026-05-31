@@ -799,6 +799,94 @@ def test_supervisor_exits_when_stdout_broken(fleet_home: Path) -> None:
     assert res.iterations == 0
 
 
+class _StreamBrokenAfterN:
+    """A log stream that buffers the first N writes, then raises
+    BrokenPipeError. Lets the loop reach a specific emit() deeper in the
+    loop body (e.g. the operator-inbox-exit emit) before the pipe breaks.
+    """
+
+    def __init__(self, ok_writes: int) -> None:
+        self.ok_writes = ok_writes
+        self.writes = 0
+
+    def write(self, _s: str) -> int:
+        self.writes += 1
+        if self.writes > self.ok_writes:
+            raise BrokenPipeError(32, "Broken pipe")
+        return len(_s)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_supervisor_inbox_emit_broken_pipe_propagates(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 regression: the operator-inbox-exit
+    emit() lives inside a `try/except OSError` that guards direct.stat().
+    BrokenPipeError is an OSError subclass, so a bare `except OSError`
+    there would SWALLOW the broken pipe and keep the loop spinning to the
+    cap — defeating the fast broken-stdout exit on this path. The fix
+    re-raises BrokenPipeError so the outer handler sets
+    exit_reason="stdout-broken" immediately.
+
+    Setup: a forced wake (force_tick_check → True) with a coord inbox file
+    whose mtime is past the baseline, so the loop enters the inbox-exit
+    branch and calls emit(). The stream allows the loop-start banner write
+    (write #1) then breaks on the inbox emit (write #2). On the parent fix
+    (before this regression fix) exit_reason would be "operator-inbox-
+    message" and the loop would NOT bail on the broken pipe.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    coord_id = "cccccc01"
+    inbox = fleet_home / "inbox" / f"{coord_id}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("operator: please check on this\n")
+    # mtime well past the baseline so the inbox-exit branch is taken.
+    import os as _os
+    _os.utime(inbox, (1_000_000.0, 1_000_000.0))
+
+    broken = _StreamBrokenAfterN(ok_writes=1)  # banner OK, inbox emit breaks
+    seq = iter([[probe]] * 100)
+    fake_now = {"t": 0.0}
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(poll_interval_s=30, poll_max_s=3600,
+                 supervisor_max_s=0, stuck_check_every=0),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=lambda s: fake_now.__setitem__("t", fake_now["t"] + s),
+        now_fn=lambda: fake_now["t"],
+        refresh_probes=lambda: next(seq, []),
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id=coord_id,
+        direct_inbox_session_baseline=0.0,
+        log_stream=broken,
+    )
+    assert res.exit_reason == "stdout-broken", (
+        f"inbox-emit broken pipe must propagate to stdout-broken, "
+        f"got {res.exit_reason!r}"
+    )
+    # The inbox emit is the SECOND write (banner = #1). With the fix it
+    # propagates immediately, so the stream sees exactly 2 writes and the
+    # loop bails on its first iteration. Without the fix the bare
+    # `except OSError: pass` swallows the broken inbox emit and the loop
+    # keeps spinning — more writes, more iterations — before some later
+    # unguarded emit finally propagates. Pin both so the test fails on the
+    # parent (swallow) behaviour, not just on the final exit_reason.
+    assert broken.writes == 2, (
+        f"loop must bail on the broken inbox emit (write #2), not swallow "
+        f"and keep writing; saw {broken.writes} writes"
+    )
+    assert res.iterations == 1
+
+
 def test_supervisor_respects_supervisor_max_s_cap(fleet_home: Path) -> None:
     """Defect #2: FLEET_COORD_SUPERVISOR_MAX_S caps the loop tighter than
     poll_max_s so a wedged loop can never hold the lock for the full 4h

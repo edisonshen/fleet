@@ -1236,6 +1236,17 @@ def run_supervisor(
                             stream=log_stream,
                         )
                         break
+                except BrokenPipeError:
+                    # loop-supervisor-sigpipe-5263: BrokenPipeError is a
+                    # subclass of OSError. This try/except guards the
+                    # direct.stat() probe, but the emit() above writes to
+                    # log_stream — if that pipe is broken, emit() re-raises
+                    # BrokenPipeError and a bare `except OSError` here would
+                    # SWALLOW it, defeating the fast broken-stdout exit on
+                    # this path (the loop would spin to the supervisor cap
+                    # instead of bailing now). Re-raise so the outer handler
+                    # sets exit_reason="stdout-broken" and releases the lock.
+                    raise
                 except OSError:
                     pass
 
@@ -1381,6 +1392,12 @@ def run_supervisor(
                     last_periodic_reconcile_unix = now_clock
                     try:
                         periodic_full_reconcile()
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: never let the
+                        # fail-soft `except Exception` swallow a broken
+                        # pipe — it must reach the outer handler so the
+                        # loop bails and releases the lock.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         res.errors.append(f"periodic-reconcile: {exc}")
                 if run_stuck:
@@ -1409,6 +1426,11 @@ def run_supervisor(
                         res.nudges_sent += stuck_summary.nudges
                         res.escalations += stuck_summary.escalations
                         res.blocks += stuck_summary.blocks
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: propagate broken
+                        # pipe past the fail-soft handler to the outer
+                        # except so the loop exits + releases the lock.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         res.errors.append(f"stuck-check: {exc}")
                         stuck_summary = _StuckPassResult()
@@ -1443,6 +1465,11 @@ def run_supervisor(
                             log_stream=log_stream,
                         )
                         res.idle_archives += archived
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: propagate broken
+                        # pipe past the fail-soft handler to the outer
+                        # except so the loop exits + releases the lock.
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         res.errors.append(f"idle-archive: {exc}")
                 try:
