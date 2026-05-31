@@ -887,11 +887,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// (e.g. nothing to scroll), fall through to row-nav so j/k-style
 		// wrapping still works.
 		if !m.scrollRightPanel(+1) && !m.scrollLeftPanel(+1) {
+			// Fallback row-nav (e.g. wrap from the last agent back to the
+			// first project). Align the left scroll if we landed on a
+			// left-column row — otherwise a wrap onto a project hidden
+			// behind a nonzero offset would be off-screen (codex [P2]).
 			m.moveCursor(+1)
+			m.alignLeftScrollToCursor()
 		}
 	case "up":
 		if !m.scrollRightPanel(-1) && !m.scrollLeftPanel(-1) {
 			m.moveCursor(-1)
+			m.alignLeftScrollToCursor()
 		}
 	case "left":
 		m.jumpToLeftPanel()

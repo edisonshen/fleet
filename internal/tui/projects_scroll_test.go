@@ -6,6 +6,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/edisonshen/fleet/internal/agent"
 )
 
 // buildManyProjectsSnapshot returns a snapshot with `n` distinct projects
@@ -228,6 +230,43 @@ func TestJK_KeepsSelectedRowVisible(t *testing.T) {
 	}
 	if !advanced {
 		t.Errorf("walking j through 12 projects must advance projectsScrollOffset past 0")
+	}
+}
+
+// TestArrowWrap_FromRightPaneAlignsLeftScroll is the regression for the
+// codex [P2] on the arrow fallback path: after the left pane is scrolled
+// to a nonzero offset, ↓ on the last right-column row falls through to
+// moveCursor and WRAPS to the first project. Without alignment the left
+// pane stays scrolled and the wrapped-to project is off-screen. The fix
+// aligns the offset on the fallback move so the selected project shows.
+func TestArrowWrap_FromRightPaneAlignsLeftScroll(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+	m.records = []*agent.Record{sampleAgent("agent01")}
+	// Pre-scroll the left pane so a wrap onto project 0 would be hidden.
+	m.projectsScrollOffset = m.panelMaxOffset(rowProject)
+	if m.projectsScrollOffset == 0 {
+		t.Fatalf("expected a nonzero max offset to exercise the wrap")
+	}
+
+	// Park the cursor on the LAST dashboard row (the trailing right-column
+	// row); ↓ from there wraps to index 0 (first project).
+	rows := m.dashboardRows()
+	m.dashCursor = len(rows) - 1
+
+	updated, _ := m.Update(keyMsg("down"))
+	m2 := updated.(Model)
+	if m2.dashCursor != 0 {
+		t.Fatalf("↓ on the last row must wrap to row 0; got cursor=%d", m2.dashCursor)
+	}
+	frame := renderTwoColumnBody(m2, 90, 40)
+	want := projectDisplayName(m.dashboard.Projects[0].Name)
+	if !strings.Contains(frame, want) {
+		t.Errorf("after wrap to project 0 the left scroll must align so %q is visible (offset=%d):\n%s",
+			want, m2.projectsScrollOffset, frame)
 	}
 }
 
