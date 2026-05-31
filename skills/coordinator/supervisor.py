@@ -1203,6 +1203,20 @@ def run_supervisor(
                     last_change_ts=last_change_ts,
                     now_unix=now_fn(),
                 )
+            # loop-supervisor-sigpipe-5263 (codex iter-1 [P2]): clamp the
+            # sleep to the remaining cap budget. compute_next_sleep_s can
+            # return a long interval (e.g. poll_interval_s=3600s in legacy
+            # mode); without clamping the loop would sleep the full
+            # interval and only re-check the cap on the NEXT iteration,
+            # holding coordinator.lock past effective_max_s and defeating
+            # the lock-hold bound this task adds. Clamp so the loop wakes
+            # exactly at the cap and exits via the top-of-loop check.
+            if effective_max_s > 0:
+                remaining = effective_max_s - (now_fn() - started_at)
+                if remaining <= 0:
+                    sleep_s = 0
+                elif sleep_s > remaining:
+                    sleep_s = remaining
             if sleep_s > 0:
                 sleep_fn(sleep_s)
             poll_count += 1

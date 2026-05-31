@@ -936,6 +936,45 @@ def test_supervisor_max_s_zero_disables_cap(fleet_home: Path) -> None:
     assert res.exit_reason == "max-duration"
 
 
+def test_supervisor_sleep_clamped_to_remaining_cap(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 (codex iter-1 [P2]): a long poll
+    interval must not let the loop sleep PAST the cap while holding
+    coordinator.lock. With poll_interval_s=3600 (legacy single-rate, so
+    compute_next_sleep_s returns 3600) and supervisor_max_s=1800, an
+    unclamped loop would sleep the full 3600s and hold the lock for an
+    hour — double the bound. The clamp caps each sleep at the remaining
+    budget, so no recorded sleep exceeds the cap and the loop exits at it.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    sleeps: list[float] = []
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(
+            poll_interval_s=3600,   # >> cap; legacy single-rate cadence
+            poll_base_interval_s=0,  # disable adaptive → returns poll_interval_s
+            poll_max_s=14400,
+            supervisor_max_s=1800,
+            stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+        sleep_calls=sleeps,
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # No single sleep may exceed the cap (unclamped it would be 3600 > 1800).
+    assert sleeps, "loop should have slept at least once"
+    assert max(sleeps) <= 1800, (
+        f"sleep must be clamped to the remaining cap budget; "
+        f"saw max sleep {max(sleeps)}s > cap 1800s"
+    )
+
+
 # ---------- agent_id mapping ----------
 
 
