@@ -395,6 +395,72 @@ func TestLastProject_TrailingLinesReachable(t *testing.T) {
 	}
 }
 
+// TestTallBlock_IntraBlockScrollReachesTail is the regression for the
+// codex [P2] tall-single-block gap: on a very short terminal a single
+// project block (header + counts + coord-id + blank) is taller than the
+// visible window, so the central align can't show header and footer at
+// once. Pressing [↓] while pinned on that block must scroll WITHIN it to
+// reveal the coord-id/status tail, not dead-end. Mirrors the operator's
+// "footer says N hidden but the lines are unreachable" case.
+func TestTallBlock_IntraBlockScrollReachesTail(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 14 // usable=8 → leftRows=4 → visible=3; a coord-id block is 5 lines
+	snap := &Snapshot{LoadedAt: time.Now()}
+	for i := 0; i < 6; i++ {
+		name := "proj-a" + string(rune('a'+i))
+		snap.Projects = append(snap.Projects, &ProjectRow{
+			Name: name, RepoSlug: "repo-a" + string(rune('a'+i)), Active: true,
+			CoordID: "coord01", // forces the extra footer line → 5-line block
+		})
+	}
+	m.dashboard = snap
+	// Cursor on the LAST project so moveCursorWithinLeft can't advance and
+	// the intra-block scroll path is exercised.
+	rows := m.dashboardRows()
+	last := 0
+	for i := range rows {
+		if rows[i].kind == rowProject {
+			last = i
+		}
+	}
+	m.dashCursor = last
+	m.alignLeftScrollToCursor()
+	startOff := m.projectsScrollOffset
+
+	// The block's tail (coord-id line) must NOT be visible at the initial
+	// (header-anchored) offset, proving the block overflows the window.
+	if strings.Contains(renderTwoColumnBody(m, 90, 40), "coord01") {
+		t.Skip("coord-id already visible — terminal not short enough to exercise the tall-block path")
+	}
+
+	// Pressing [↓] must scroll WITHIN the last block (cursor stays pinned
+	// on it, offset advances toward the tail), not wrap away. After the
+	// intra-block scroll the coord-id tail must be on screen.
+	updated, _ := m.Update(keyMsg("down"))
+	m2 := updated.(Model)
+	if m2.dashCursor != last {
+		t.Fatalf("intra-block scroll must keep the cursor on the last project (row %d); wrapped to %d", last, m2.dashCursor)
+	}
+	if m2.projectsScrollOffset <= startOff {
+		t.Fatalf("intra-block [↓] must advance the offset within the tall block; stayed at %d", m2.projectsScrollOffset)
+	}
+	// Keep pressing until the tail shows (bounded by block height).
+	cur := tea.Model(m2)
+	reached := strings.Contains(renderTwoColumnBody(m2, 90, 40), "coord01")
+	for i := 0; i < 4 && !reached; i++ {
+		cur, _ = cur.(Model).Update(keyMsg("down"))
+		if cur.(Model).dashCursor != last {
+			break // scrolled to block bottom then wrapped — stop
+		}
+		reached = strings.Contains(renderTwoColumnBody(cur.(Model), 90, 40), "coord01")
+	}
+	if !reached {
+		t.Errorf("intra-block [↓] must reveal the tall block's coord-id tail; stayed hidden")
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).

@@ -1052,19 +1052,78 @@ func (m *Model) scrollLeftPanel(delta int) bool {
 	beforeCursor := m.dashCursor
 	m.moveCursorWithinLeft(delta)
 	// The window alignment runs centrally in Update (KeyMsg case) after
-	// handleKey, so we do NOT align here — that avoids a second
-	// buildBodyLinesCore (and its tmux/marker side effects) per keypress
-	// (codex review [P2]). The central align anchors the cursor's WHOLE
-	// block (header + trailing footer/status) into view, so the last
-	// project's trailing lines are already revealed when the cursor lands
-	// on it — no separate trailing-scroll step is needed here.
-	//
-	// Return value: cursor advanced within the left column → true (arrow
-	// scrolled in place); pinned at the first/last left row → false so
-	// handleKey falls through to moveCursor's wrap (no dead-end).
-	if m.dashCursor == beforeCursor {
+	// handleKey, so we do NOT align here on the common path — that avoids a
+	// second buildBodyLinesCore (and its tmux/marker side effects) per
+	// keypress (codex review [P2]). The central align anchors the cursor's
+	// block into view, so a normal cursor advance is enough.
+	if m.dashCursor != beforeCursor {
+		return true // cursor advanced within the left column → scrolled
+	}
+	// Cursor is pinned at the first/last left-column row. If the cursor's
+	// block is TALLER than the window (a single project whose
+	// header+tasks+footer exceed leftRows-1), there are still hidden lines
+	// the central align can't reveal (it can't show header and footer at
+	// once). Walk the offset WITHIN the block so [↓/↑] reaches those lines
+	// instead of dead-ending (codex review [P2]). Returns true iff the
+	// offset moved.
+	return m.scrollWithinTallBlock(delta)
+}
+
+// scrollWithinTallBlock advances projectsScrollOffset by delta when the
+// selected left-column block is taller than the visible window and the
+// offset can still move inside the block's [start, blockEnd-visible]
+// scroll range. Returns true when the offset moved (caller stays put),
+// false otherwise (caller falls through to moveCursor's wrap). Builds the
+// body once; only reached on the pinned-cursor edge, not the common path.
+func (m *Model) scrollWithinTallBlock(delta int) bool {
+	leftW, rightW := splitColumns(usableWidth(m.width))
+	leftLines, workerLines, agentLines, lineStart := buildBodyLinesCore(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
+	if !ok {
 		return false
 	}
+	maxOff := leftMaxOffsetFor(len(leftLines), leftRows)
+	if maxOff == 0 || m.dashCursor < 0 || m.dashCursor >= len(lineStart) {
+		return false
+	}
+	start := lineStart[m.dashCursor]
+	if start < 0 {
+		return false
+	}
+	blockEnd := len(leftLines)
+	for j := m.dashCursor + 1; j < len(lineStart); j++ {
+		if lineStart[j] >= 0 {
+			blockEnd = lineStart[j]
+			break
+		}
+	}
+	visible := leftRows - 1
+	if visible < 1 {
+		visible = 1
+	}
+	if blockEnd-start <= visible {
+		// Block fits the window — nothing hidden inside it; let the caller
+		// wrap.
+		return false
+	}
+	// Intra-block scroll range: [start, blockEnd-visible], also clamped to
+	// the panel's overall max offset.
+	lo := start
+	hi := blockEnd - visible
+	if hi > maxOff {
+		hi = maxOff
+	}
+	want := m.projectsScrollOffset + delta
+	if want < lo {
+		want = lo
+	}
+	if want > hi {
+		want = hi
+	}
+	if want == m.projectsScrollOffset {
+		return false // already at the block's top/bottom edge → wrap
+	}
+	m.projectsScrollOffset = want
 	return true
 }
 
@@ -1123,16 +1182,32 @@ func (m *Model) alignLeftScrollToCursor() {
 		visible = 1
 	}
 	off := m.projectsScrollOffset
-	// Anchor bottom first (reveal trailing lines), then top (keep the
-	// header visible). When the block is taller than the window, the top
-	// anchor wins so the cursor row's header stays on screen.
-	if blockEnd > off+visible {
-		off = blockEnd - visible // scroll down so the block END is the last line
-	}
-	if start < off {
-		off = start // row is above the window → make it the top line
-	} else if start >= off+visible {
-		off = start - visible + 1 // row is below → make it the bottom line
+	blockHeight := blockEnd - start
+	switch {
+	case blockHeight > visible:
+		// Block is TALLER than the window — it can't fit whole. Don't
+		// force a header/footer anchor: keep the offset wherever it is as
+		// long as the window still overlaps the block, so scrollLeftPanel's
+		// intra-block scroll can walk through the hidden tail (codex [P2]).
+		// Only re-anchor when the window shows NONE of the block: clamp the
+		// offset into the block's scroll range [start, blockEnd-visible].
+		if off < start {
+			off = start
+		} else if off > blockEnd-visible {
+			off = blockEnd - visible
+		}
+	default:
+		// Block fits — bottom-anchor to reveal the trailing footer/status
+		// lines, then top-anchor so the header stays on screen (the block
+		// fits, so both hold simultaneously).
+		if blockEnd > off+visible {
+			off = blockEnd - visible
+		}
+		if start < off {
+			off = start
+		} else if start >= off+visible {
+			off = start - visible + 1
+		}
 	}
 	m.projectsScrollOffset = clampScrollOffset(off, maxOff)
 }
