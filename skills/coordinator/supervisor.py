@@ -1219,6 +1219,21 @@ def run_supervisor(
                     sleep_s = remaining
             if sleep_s > 0:
                 sleep_fn(sleep_s)
+            # loop-supervisor-sigpipe-5263 (codex iter-3 [P2]): re-check
+            # the cap IMMEDIATELY after the (clamped) sleep. The clamp wakes
+            # us exactly at the budget, but without this short-circuit the
+            # loop would still run the full poll body (refresh_probes,
+            # reconcile, stuck-check, idle-archive) before the top-of-loop
+            # check — holding coordinator.lock past supervisor_max_s when a
+            # poll body is slow. Break here so the cap is a true ceiling on
+            # lock-hold, not "cap + one poll body".
+            if effective_max_s > 0 and now_fn() - started_at >= effective_max_s:
+                res.exit_reason = max_exit_reason
+                emit(
+                    "[coord] supervisor loop exiting: max duration reached",
+                    stream=log_stream,
+                )
+                break
             poll_count += 1
             res.iterations += 1
 

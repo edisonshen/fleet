@@ -975,6 +975,59 @@ def test_supervisor_sleep_clamped_to_remaining_cap(fleet_home: Path) -> None:
     )
 
 
+def test_supervisor_no_poll_body_after_cap_consuming_sleep(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 (codex iter-3 [P2]): when a clamped
+    sleep consumes the entire remaining cap budget, the loop must break
+    immediately after the sleep — NOT run a full poll body (refresh_probes
+    / reconcile / stuck-check / idle-archive) and only re-check the cap at
+    the top of the next iteration. Otherwise the lock is held for
+    `cap + one poll body`, overrunning supervisor_max_s.
+
+    With poll_interval_s == supervisor_max_s == 1800, iteration 1 clamps
+    the sleep to the full 1800s, wakes exactly at the cap, and must bail.
+    The cap is enforced via a no-op probe counter: refresh_probes must
+    only be called once (the pre-loop priming read), never again inside
+    the loop body.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    refresh_calls = {"n": 0}
+    fake_now = {"t": 0.0}
+
+    def counting_refresh():
+        refresh_calls["n"] += 1
+        return [probe]
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(
+            poll_interval_s=1800, poll_base_interval_s=0,
+            poll_max_s=14400, supervisor_max_s=1800, stuck_check_every=0,
+        ),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=lambda s: fake_now.__setitem__("t", fake_now["t"] + s),
+        now_fn=lambda: fake_now["t"],
+        refresh_probes=counting_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        log_stream=io.StringIO(),
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # Pre-loop priming read is call #1. The loop body's refresh_probes
+    # (inside the iteration) must NEVER run because we break right after
+    # the cap-consuming sleep. Without the post-sleep check it would be 2+.
+    assert refresh_calls["n"] == 1, (
+        f"loop ran a poll body after the cap was hit; refresh_probes "
+        f"called {refresh_calls['n']}x (expected 1 = priming read only)"
+    )
+    assert res.iterations == 0
+
+
 # ---------- agent_id mapping ----------
 
 
