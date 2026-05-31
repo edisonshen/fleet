@@ -461,6 +461,51 @@ func TestTallBlock_IntraBlockScrollReachesTail(t *testing.T) {
 	}
 }
 
+// TestTallBlocks_MiddleTailsReachableWalkingDown is the regression for the
+// codex [P2] middle-block gap: when every project block is taller than the
+// window, walking ↓ must reveal EACH block's coord-id/status tail (scroll
+// within the block before advancing to the next row), not skip the tails
+// of non-final projects. Each project carries a distinct coord id so we
+// can assert every tail appeared in some frame.
+func TestTallBlocks_MiddleTailsReachableWalkingDown(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 14 // visible=3; a coord-id block is 5 lines → every block overflows
+	snap := &Snapshot{LoadedAt: time.Now()}
+	const n = 5
+	for i := 0; i < n; i++ {
+		snap.Projects = append(snap.Projects, &ProjectRow{
+			Name:     "proj-a" + string(rune('a'+i)),
+			RepoSlug: "repo-a" + string(rune('a'+i)),
+			Active:   true,
+			CoordID:  "cid" + string(rune('0'+i)),
+		})
+	}
+	m.dashboard = snap
+	m.dashCursor = 0
+	m.alignLeftScrollToCursor()
+
+	seen := map[string]bool{}
+	cur := tea.Model(m)
+	// Walk ↓ generously (block height * n * 2) so every tail gets a frame.
+	for k := 0; k < n*10; k++ {
+		frame := renderTwoColumnBody(cur.(Model), 90, 40)
+		for i := 0; i < n; i++ {
+			if strings.Contains(frame, "cid"+string(rune('0'+i))) {
+				seen["cid"+string(rune('0'+i))] = true
+			}
+		}
+		cur, _ = cur.(Model).Update(keyMsg("down"))
+	}
+	for i := 0; i < n; i++ {
+		id := "cid" + string(rune('0'+i))
+		if !seen[id] {
+			t.Errorf("walking ↓ must reveal block %d's coord-id tail %q; it was skipped", i, id)
+		}
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).

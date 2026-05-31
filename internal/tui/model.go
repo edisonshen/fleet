@@ -1049,32 +1049,43 @@ func (m *Model) scrollLeftPanel(delta int) bool {
 	if !isLeftColumnRow(row) {
 		return false
 	}
+	// Try an INTRA-block scroll FIRST: when the selected block is taller
+	// than the window and still has hidden lines in the delta direction,
+	// consume the arrow scrolling those into view before moving the cursor
+	// to the next row. Without this, ↓ through a list of tall blocks skips
+	// each block's hidden footer/status tail (codex review [P2] — applies
+	// to MIDDLE blocks, not just the pinned first/last).
+	if m.scrollWithinTallBlock(delta) {
+		return true
+	}
+	// Block fully shown (or fits) — advance the cursor to the next left
+	// row. The window alignment runs centrally in Update (KeyMsg case)
+	// after handleKey, so we don't align here on the common path (avoids a
+	// second buildBodyLinesCore + its tmux/marker side effects per
+	// keypress). The central align anchors the new cursor's block into
+	// view.
 	beforeCursor := m.dashCursor
 	m.moveCursorWithinLeft(delta)
-	// The window alignment runs centrally in Update (KeyMsg case) after
-	// handleKey, so we do NOT align here on the common path — that avoids a
-	// second buildBodyLinesCore (and its tmux/marker side effects) per
-	// keypress (codex review [P2]). The central align anchors the cursor's
-	// block into view, so a normal cursor advance is enough.
 	if m.dashCursor != beforeCursor {
 		return true // cursor advanced within the left column → scrolled
 	}
-	// Cursor is pinned at the first/last left-column row. If the cursor's
-	// block is TALLER than the window (a single project whose
-	// header+tasks+footer exceed leftRows-1), there are still hidden lines
-	// the central align can't reveal (it can't show header and footer at
-	// once). Walk the offset WITHIN the block so [↓/↑] reaches those lines
-	// instead of dead-ending (codex review [P2]). Returns true iff the
-	// offset moved.
-	return m.scrollWithinTallBlock(delta)
+	// Cursor pinned at the first/last left row AND no intra-block lines to
+	// reveal — let handleKey fall through to moveCursor's wrap (no
+	// dead-end).
+	return false
 }
 
 // scrollWithinTallBlock advances projectsScrollOffset by delta when the
-// selected left-column block is taller than the visible window and the
-// offset can still move inside the block's [start, blockEnd-visible]
-// scroll range. Returns true when the offset moved (caller stays put),
-// false otherwise (caller falls through to moveCursor's wrap). Builds the
-// body once; only reached on the pinned-cursor edge, not the common path.
+// SELECTED left-column block is taller than the visible window and still
+// has hidden lines in the delta direction (below for ↓, above for ↑).
+// Returns true when the offset moved (caller consumes the arrow), false
+// when the block fits or its visible edge is already at the delta-side
+// boundary (caller advances the cursor / wraps). Builds the body once.
+//
+//	window = [off, off+visible)
+//	block  = [start, blockEnd)
+//	↓ (delta>0): hidden tail when blockEnd > off+visible → bump off up
+//	↑ (delta<0): hidden head when start   < off          → bump off down
 func (m *Model) scrollWithinTallBlock(delta int) bool {
 	leftW, rightW := splitColumns(usableWidth(m.width))
 	leftLines, workerLines, agentLines, lineStart := buildBodyLinesCore(*m, leftW, rightW)
@@ -1102,26 +1113,35 @@ func (m *Model) scrollWithinTallBlock(delta int) bool {
 		visible = 1
 	}
 	if blockEnd-start <= visible {
-		// Block fits the window — nothing hidden inside it; let the caller
-		// wrap.
+		// Block fits the window — nothing hidden inside it.
 		return false
 	}
-	// Intra-block scroll range: [start, blockEnd-visible], also clamped to
-	// the panel's overall max offset.
-	lo := start
-	hi := blockEnd - visible
+	off := m.projectsScrollOffset
+	var want int
+	if delta > 0 {
+		if blockEnd <= off+visible {
+			return false // tail already fully visible → advance cursor
+		}
+		want = off + delta
+	} else {
+		if start >= off {
+			return false // head already fully visible → advance cursor
+		}
+		want = off + delta
+	}
+	// Clamp to the block's scroll range and the panel max.
+	lo, hi := start, blockEnd-visible
 	if hi > maxOff {
 		hi = maxOff
 	}
-	want := m.projectsScrollOffset + delta
 	if want < lo {
 		want = lo
 	}
 	if want > hi {
 		want = hi
 	}
-	if want == m.projectsScrollOffset {
-		return false // already at the block's top/bottom edge → wrap
+	if want == off {
+		return false
 	}
 	m.projectsScrollOffset = want
 	return true
