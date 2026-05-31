@@ -104,8 +104,10 @@ behavior, or `fleet skills sync --force` to convert back to a pinned copy.
 
 `fleet skills status` reports each skill's shape and **flags a copy that
 has diverged from the repo** (a merged fix the running coord can't see),
-exiting non-zero so CI/scripts catch the drift. A coord also warns to
-stderr at startup if its skill dir is a stale copy.
+exiting non-zero so CI/scripts catch the drift — it is the reliable drift
+gate today. A coord launched through the `fleet coord-run` supervisor also
+warns to stderr at startup; the default dispatch wrapper does not yet route
+through that supervisor, so run `fleet skills status` to be sure.
 
 Runtime deps: `tmux` (brew pulls it transitively) and the
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI.

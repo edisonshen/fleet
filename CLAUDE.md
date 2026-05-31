@@ -40,7 +40,7 @@ fleet skills status          # show shape (symlink/copy) + flag a copy diverged 
 fleet skills sync            # re-copy embedded bytes (copy mode; --force converts a symlink back)
 ```
 
-Policy: **symlink for repo developers (the maintainer default), copy for brew/binary-only installs.** Symlink follows the checkout's working tree — keep the linked checkout on `main` for stable coord behavior. `fleet skills status` exits non-zero on a stale copy, and a coord warns to stderr at startup if its skill dir is a stale copy diverged from the repo.
+Policy: **symlink for repo developers (the maintainer default), copy for brew/binary-only installs.** Symlink follows the checkout's working tree — keep the linked checkout on `main` for stable coord behavior. `fleet skills link` (no flags) replaces an existing copy in place; re-pointing an existing symlink to a different checkout needs `--force`. `fleet skills status` exits non-zero on a stale copy — it is the reliable drift gate. A coord launched via `fleet coord-run` also warns to stderr at startup, but the default dispatch wrapper does not yet route through that supervisor, so use `fleet skills status` to catch drift.
 
 ## Engineering preferences
 

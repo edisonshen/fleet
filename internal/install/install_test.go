@@ -85,27 +85,70 @@ func TestLink_LiveEditGoesThrough(t *testing.T) {
 	}
 }
 
-func TestLink_RefusesExistingCopyWithoutForce(t *testing.T) {
+// TestLink_ReplacesExistingCopyWithoutForce is the headline UX path: a
+// developer who ran `fleet init` first has a COPY on disk; `fleet skills
+// link` (no flags) must convert it to a live symlink, not error out. A copy
+// is regenerable embedded bytes, so replacing it needs no --force.
+func TestLink_ReplacesExistingCopyWithoutForce(t *testing.T) {
 	claudeHome := t.TempDir()
 	repo := t.TempDir()
 	repoSkill := filepath.Join(repo, "skills", "coordinator")
 	if err := os.MkdirAll(repoSkill, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// pre-existing copy
+	// pre-existing copy with a stale file in it (proves the dir is removed).
 	dst := SkillDir(claudeHome, "coordinator")
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := Link(io.Discard, claudeHome, "coordinator", repoSkill, false); err == nil {
-		t.Fatal("expected error replacing existing copy without --force")
+	if err := os.WriteFile(filepath.Join(dst, "SKILL.md"), []byte("stale copy"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if err := Link(io.Discard, claudeHome, "coordinator", repoSkill, true); err != nil {
-		t.Fatalf("Link with force: %v", err)
+	if err := Link(io.Discard, claudeHome, "coordinator", repoSkill, false); err != nil {
+		t.Fatalf("Link over a copy without --force should succeed, got %v", err)
 	}
 	shape, _, _ := classify(dst)
 	if shape != ShapeSymlink {
-		t.Errorf("after force link shape=%v want symlink", shape)
+		t.Errorf("after link shape=%v want symlink (copy not converted)", shape)
+	}
+}
+
+// TestLink_RefusesExistingSymlinkWithoutForce: an existing symlink to a
+// DIFFERENT checkout is deliberate operator state — never re-point it
+// silently. --force opts into the re-point.
+func TestLink_RefusesExistingSymlinkWithoutForce(t *testing.T) {
+	claudeHome := t.TempDir()
+	repoA := t.TempDir()
+	repoB := t.TempDir()
+	skillA := filepath.Join(repoA, "skills", "coordinator")
+	skillB := filepath.Join(repoB, "skills", "coordinator")
+	for _, d := range []string{skillA, skillB} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Link to checkout A first.
+	if err := Link(io.Discard, claudeHome, "coordinator", skillA, false); err != nil {
+		t.Fatal(err)
+	}
+	// Re-pointing to B without --force must error (don't clobber the link).
+	if err := Link(io.Discard, claudeHome, "coordinator", skillB, false); err == nil {
+		t.Fatal("expected error re-pointing an existing symlink without --force")
+	}
+	// The original link to A must be intact (not removed by the failed call).
+	gotTarget, _ := os.Readlink(SkillDir(claudeHome, "coordinator"))
+	wantA, _ := filepath.Abs(skillA)
+	if gotTarget != wantA {
+		t.Errorf("symlink re-pointed despite error: target=%q want %q", gotTarget, wantA)
+	}
+	// With --force it re-points to B.
+	if err := Link(io.Discard, claudeHome, "coordinator", skillB, true); err != nil {
+		t.Fatalf("Link --force re-point: %v", err)
+	}
+	gotTarget, _ = os.Readlink(SkillDir(claudeHome, "coordinator"))
+	wantB, _ := filepath.Abs(skillB)
+	if gotTarget != wantB {
+		t.Errorf("after force re-point target=%q want %q", gotTarget, wantB)
 	}
 }
 

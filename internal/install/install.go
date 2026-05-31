@@ -132,9 +132,20 @@ func IsSymlink(claudeHome, name string) bool {
 // Link points claudeHome/skills/<name> at repoSkillDir via a symlink.
 //
 // repoSkillDir must be an existing directory holding the skill's source
-// (e.g. <repo>/skills/coordinator). force replaces an existing entry of
-// any shape (copy or stale symlink); without force an existing entry is an
-// error so a hand-tended install isn't silently blown away.
+// (e.g. <repo>/skills/coordinator).
+//
+// Replacement policy (this is the headline upgrade path — `fleet skills
+// link` with no flags must Just Work on the common stale-copy machine):
+//   - COPY → replaced automatically. A copy is regenerable embedded bytes,
+//     not operator-authored state, so converting it to a live symlink is
+//     exactly what the documented no-flag command promises. Requiring
+//     --force here would make `fleet skills link` fail on every machine
+//     that ran `fleet init` first (the normal case) — defeating the point.
+//   - SYMLINK pointing ELSEWHERE → requires force. An existing symlink is a
+//     deliberate operator choice (maybe a second checkout); silently
+//     re-pointing it would blow away that intent (surface-dont-silo). force
+//     opts into the re-point.
+//   - SYMLINK already pointing at abs → no-op skip (idempotent).
 //
 // The replacement is NOT atomic across the unlink+symlink window — a crash
 // between the two leaves the skill missing, which autoinit / `fleet init`
@@ -162,13 +173,23 @@ func Link(stdout io.Writer, claudeHome, name, repoSkillDir string, force bool) e
 	case shape == ShapeSymlink && target == abs:
 		_, _ = fmt.Fprintf(stdout, "skip (already linked): %s -> %s\n", dst, abs)
 		return nil
-	case shape != ShapeMissing && !force:
+	case shape == ShapeSymlink && !force:
+		// An existing symlink to a DIFFERENT checkout is deliberate operator
+		// state; never silently re-point it (surface-dont-silo).
 		return fmt.Errorf(
-			"link %s: %s already exists as %s; pass --force to replace (existing target: %q)",
-			name, dst, shape, target)
-	case shape != ShapeMissing:
+			"link %s: %s already symlinked to %q; pass --force to re-point",
+			name, dst, target)
+	case shape == ShapeSymlink:
+		// force-replacing a symlink: remove just the link (RemoveAll on a
+		// symlink unlinks it, never recurses into the target's repo dir).
+		if rmErr := os.Remove(dst); rmErr != nil {
+			return fmt.Errorf("link %s: remove existing symlink: %w", name, rmErr)
+		}
+	case shape == ShapeCopy:
+		// A copy is regenerable embedded bytes — replace it with the live
+		// link without requiring --force (this is the documented upgrade).
 		if rmErr := os.RemoveAll(dst); rmErr != nil {
-			return fmt.Errorf("link %s: remove existing %s: %w", name, dst, rmErr)
+			return fmt.Errorf("link %s: remove existing copy: %w", name, rmErr)
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
