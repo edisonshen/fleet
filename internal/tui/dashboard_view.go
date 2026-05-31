@@ -401,7 +401,16 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 //	usable   = height - chrome
 //	leftRows = clamp(usable/2 with slack donation in both directions)
 //	rightRows= usable - leftRows  (floored at minRightRows)
-func (m Model) bodyRowBudget(leftW, rightW int) (leftRows, rightRows int, ok bool) {
+//
+// PURE: takes the already-built line COUNTS (leftLen / workerLen /
+// agentLen) rather than rebuilding the body. buildBodyLines reaches
+// projectFooterLines, which probes tmux and can REMOVE a stale
+// coord-spawn marker — a real side effect. Rebuilding here (the old shape)
+// duplicated that I/O on every bounded render and again on every
+// key-driven scroll alignment, and risked budgeting against different
+// marker state than the rendered lines (codex review [P2]). Callers build
+// once and thread the counts in.
+func (m Model) bodyRowBudget(leftLen, workerLen, agentLen int) (leftRows, rightRows int, ok bool) {
 	const (
 		minProjectsRows = 6
 		minRightRows    = 4
@@ -412,7 +421,6 @@ func (m Model) bodyRowBudget(leftW, rightW int) (leftRows, rightRows int, ok boo
 	if m.height <= 0 || usable < minBodyRows {
 		return 0, 0, false
 	}
-	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
 
 	// Reserve at least half the usable rows for the LEFT column. Slack
 	// flows in both directions: if projects need fewer than half, the
@@ -423,11 +431,11 @@ func (m Model) bodyRowBudget(leftW, rightW int) (leftRows, rightRows int, ok boo
 	if leftRows < minProjectsRows {
 		leftRows = minProjectsRows
 	}
-	rightTotal := len(workerLines) + len(agentLines)
-	if len(leftLines) < leftRows {
-		leftRows = len(leftLines)
-	} else if rightTotal < usable-leftRows && len(leftLines) > leftRows {
-		want := len(leftLines)
+	rightTotal := workerLen + agentLen
+	if leftLen < leftRows {
+		leftRows = leftLen
+	} else if rightTotal < usable-leftRows && leftLen > leftRows {
+		want := leftLen
 		ceiling := usable - minRightRows
 		if ceiling < leftRows {
 			ceiling = leftRows
@@ -449,9 +457,11 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
 
 	// bodyRowBudget owns the chrome math + left/right row split (single
-	// source of truth shared with leftPanelMaxOffset). ok=false means the
+	// source of truth shared with leftPanelMaxOffset). Threaded the
+	// already-built line counts in so the budget calc is pure (no rebuild
+	// → no duplicated tmux/marker side effects). ok=false means the
 	// unbounded fallback applies (early render / pathological height).
-	leftRows, rightRows, ok := m.bodyRowBudget(leftW, rightW)
+	leftRows, rightRows, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
 	if !ok {
 		// Unbounded fallback (early renders / pathological heights). No
 		// scroll trimming applied; layout matches the pre-#177 shape.

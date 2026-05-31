@@ -1050,12 +1050,15 @@ func (m *Model) scrollLeftPanel(delta int) bool {
 		return false
 	}
 	beforeCursor := m.dashCursor
-	beforeOff := m.projectsScrollOffset
 	m.moveCursorWithinLeft(delta)
-	m.alignLeftScrollToCursor()
-	if m.dashCursor == beforeCursor && m.projectsScrollOffset == beforeOff {
-		// Pinned at the first/last left row with nowhere to scroll — let
-		// moveCursor handle the wrap so arrows don't dead-end.
+	// The window alignment runs centrally in Update (KeyMsg case) after
+	// handleKey, so we do NOT call alignLeftScrollToCursor here — that
+	// avoids a second buildBodyLinesCore (and its tmux/marker side
+	// effects) per keypress (codex review [P2]). We only decide the
+	// return value: cursor advanced within the left column → true (arrow
+	// scrolled in place); pinned at the first/last left row → false so
+	// handleKey falls through to moveCursor's wrap (no dead-end).
+	if m.dashCursor == beforeCursor {
 		return false
 	}
 	return true
@@ -1075,16 +1078,19 @@ func (m *Model) scrollLeftPanel(delta int) bool {
 // left column fits (maxOff==0): there is no scrolling to align.
 func (m *Model) alignLeftScrollToCursor() {
 	leftW, rightW := splitColumns(usableWidth(m.width))
-	leftRows, _, ok := m.bodyRowBudget(leftW, rightW)
+	// Build the body ONCE (buildBodyLinesCore has tmux/marker side effects
+	// via projectFooterLines — do not rebuild for the budget or the max
+	// offset; thread the counts instead). codex review [P2].
+	leftLines, workerLines, agentLines, lineStart := buildBodyLinesCore(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
 	if !ok {
 		return
 	}
-	maxOff := m.leftPanelMaxOffset()
+	maxOff := leftMaxOffsetFor(len(leftLines), leftRows)
 	if maxOff == 0 {
 		m.projectsScrollOffset = 0
 		return
 	}
-	_, _, _, lineStart := buildBodyLinesCore(*m, leftW, rightW)
 	if m.dashCursor < 0 || m.dashCursor >= len(lineStart) {
 		return
 	}
@@ -1317,22 +1323,28 @@ func (m *Model) panelMaxOffset(kind rowKind) int {
 // scroll) or on the unbounded-fallback render path.
 func (m *Model) leftPanelMaxOffset() int {
 	leftW, rightW := splitColumns(usableWidth(m.width))
-	leftRows, _, ok := m.bodyRowBudget(leftW, rightW)
+	leftLines, workerLines, agentLines := buildBodyLines(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
 	if !ok {
 		return 0
 	}
-	leftLines, _, _ := buildBodyLines(*m, leftW, rightW)
-	if len(leftLines) <= leftRows {
+	return leftMaxOffsetFor(len(leftLines), leftRows)
+}
+
+// leftMaxOffsetFor is the pure scroll-ceiling math shared by
+// leftPanelMaxOffset and alignLeftScrollToCursor: total left lines minus
+// the visible content window. trimWithScroll reserves one row for the
+// overflow footer, so the effective window is leftRows-1. Zero when the
+// column fits.
+func leftMaxOffsetFor(leftLen, leftRows int) int {
+	if leftLen <= leftRows {
 		return 0
 	}
-	// trimWithScroll reserves one row for the footer when overflowing, so
-	// the effective visible content rows is leftRows-1. The max offset is
-	// the count of lines that can't fit that window.
 	visible := leftRows - 1
 	if visible < 0 {
 		visible = 0
 	}
-	off := len(leftLines) - visible
+	off := leftLen - visible
 	if off < 0 {
 		off = 0
 	}
