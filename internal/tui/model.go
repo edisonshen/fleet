@@ -1052,10 +1052,14 @@ func (m *Model) scrollLeftPanel(delta int) bool {
 	beforeCursor := m.dashCursor
 	m.moveCursorWithinLeft(delta)
 	// The window alignment runs centrally in Update (KeyMsg case) after
-	// handleKey, so we do NOT call alignLeftScrollToCursor here — that
-	// avoids a second buildBodyLinesCore (and its tmux/marker side
-	// effects) per keypress (codex review [P2]). We only decide the
-	// return value: cursor advanced within the left column → true (arrow
+	// handleKey, so we do NOT align here — that avoids a second
+	// buildBodyLinesCore (and its tmux/marker side effects) per keypress
+	// (codex review [P2]). The central align anchors the cursor's WHOLE
+	// block (header + trailing footer/status) into view, so the last
+	// project's trailing lines are already revealed when the cursor lands
+	// on it — no separate trailing-scroll step is needed here.
+	//
+	// Return value: cursor advanced within the left column → true (arrow
 	// scrolled in place); pinned at the first/last left row → false so
 	// handleKey falls through to moveCursor's wrap (no dead-end).
 	if m.dashCursor == beforeCursor {
@@ -1099,6 +1103,19 @@ func (m *Model) alignLeftScrollToCursor() {
 		// Cursor is not on a left-column row — nothing to align.
 		return
 	}
+	// blockEnd is the first rendered line AFTER the cursor's block: the
+	// next left-column row's start, or the end of the left lines for the
+	// last block. The whole [start, blockEnd) span is what the operator
+	// wants on screen (header + footer/status), so we anchor on the END
+	// when the block extends below the window — that reveals the last
+	// project's trailing lines instead of stranding them (codex [P2]).
+	blockEnd := len(leftLines)
+	for j := m.dashCursor + 1; j < len(lineStart); j++ {
+		if lineStart[j] >= 0 {
+			blockEnd = lineStart[j]
+			break
+		}
+	}
 	// trimWithScroll reserves one row for the overflow footer, so the
 	// visible content window is leftRows-1 lines.
 	visible := leftRows - 1
@@ -1106,6 +1123,12 @@ func (m *Model) alignLeftScrollToCursor() {
 		visible = 1
 	}
 	off := m.projectsScrollOffset
+	// Anchor bottom first (reveal trailing lines), then top (keep the
+	// header visible). When the block is taller than the window, the top
+	// anchor wins so the cursor row's header stays on screen.
+	if blockEnd > off+visible {
+		off = blockEnd - visible // scroll down so the block END is the last line
+	}
 	if start < off {
 		off = start // row is above the window → make it the top line
 	} else if start >= off+visible {

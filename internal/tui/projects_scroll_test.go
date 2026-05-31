@@ -352,6 +352,49 @@ func TestDashboardRefresh_AlignsLeftScroll(t *testing.T) {
 	}
 }
 
+// TestLastProject_TrailingLinesReachable is the regression for the codex
+// [P2] trailing-lines gap: when the left pane overflows and the cursor is
+// on the FINAL project, the offset must anchor to the block's end (==
+// maxOff) so the project's footer/status lines are on screen, not
+// stranded below a start-anchored window. Walking ↓ to the last project
+// must drive the offset all the way to leftMaxOffsetFor.
+func TestLastProject_TrailingLinesReachable(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+
+	maxOff := m.panelMaxOffset(rowProject)
+	if maxOff == 0 {
+		t.Fatalf("expected an overflowing list")
+	}
+
+	// Walk ↓ until the cursor reaches the last project row.
+	rows := m.dashboardRows()
+	lastProject := 0
+	for i := range rows {
+		if rows[i].kind == rowProject {
+			lastProject = i
+		}
+	}
+	cur := tea.Model(m)
+	for i := 0; i < len(rows)+2; i++ {
+		if cur.(Model).dashCursor == lastProject {
+			break
+		}
+		cur, _ = cur.(Model).Update(keyMsg("down"))
+	}
+	m2 := cur.(Model)
+	if m2.dashCursor != lastProject {
+		t.Fatalf("failed to walk to the last project row (cursor=%d want=%d)", m2.dashCursor, lastProject)
+	}
+	if m2.projectsScrollOffset != maxOff {
+		t.Errorf("cursor on the last project must anchor offset to maxOff=%d so trailing lines show; got %d",
+			maxOff, m2.projectsScrollOffset)
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).
