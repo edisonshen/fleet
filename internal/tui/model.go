@@ -490,7 +490,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		updated, cmd := m.handleKey(msg)
+		// Central left-scroll alignment: ANY key that teleports the cursor
+		// onto a left-column row (search [/]+esc resetting to row 0, [←]
+		// jumpToLeftPanel, vim j/k, arrow fallback wrap, ...) must keep the
+		// selected project inside the projects-scroll window, or actions
+		// target an off-screen row. Doing it here once covers every path
+		// instead of chasing each cursor-reset site (codex review [P2],
+		// iters 1-4). No-op when the cursor is on a right-column row or the
+		// list fits (alignLeftScrollToCursor guards both).
+		if um, ok := updated.(Model); ok {
+			um.alignLeftScrollToCursor()
+			return um, cmd
+		}
+		return updated, cmd
 
 	case agentsMsg:
 		// Capture the cursor's row identity BEFORE swapping records
@@ -867,17 +880,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "j":
 		// j is row-nav across the unified row list. NEVER scrolls a
-		// right panel — the operator who wants vim-style nav keeps
-		// using j/k everywhere. But when j lands the cursor on a
-		// left-column row that the projects-scroll trim has hidden, the
-		// offset must follow so [⏎]/[a] don't target an off-screen
-		// project (codex review [P2] — j/k bypassed the arrow-key
-		// alignment in scrollLeftPanel).
+		// right panel — the operator who wants vim-style nav keeps using
+		// j/k everywhere. The central alignment in Update (KeyMsg case)
+		// keeps the projects-scroll window following the cursor so a j/k
+		// move onto a hidden project isn't off-screen (codex review [P2]).
 		m.moveCursor(+1)
-		m.alignLeftScrollToCursor()
 	case "k":
 		m.moveCursor(-1)
-		m.alignLeftScrollToCursor()
 	case "down":
 		// fleet#177 Fix 2: arrow keys scroll the focused right panel.
 		// Cursor on a worker row → workersScrollOffset++; cursor on an
@@ -888,16 +897,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// wrapping still works.
 		if !m.scrollRightPanel(+1) && !m.scrollLeftPanel(+1) {
 			// Fallback row-nav (e.g. wrap from the last agent back to the
-			// first project). Align the left scroll if we landed on a
-			// left-column row — otherwise a wrap onto a project hidden
-			// behind a nonzero offset would be off-screen (codex [P2]).
+			// first project). The central alignment in Update keeps a wrap
+			// onto a hidden project visible (codex [P2]).
 			m.moveCursor(+1)
-			m.alignLeftScrollToCursor()
 		}
 	case "up":
 		if !m.scrollRightPanel(-1) && !m.scrollLeftPanel(-1) {
 			m.moveCursor(-1)
-			m.alignLeftScrollToCursor()
 		}
 	case "left":
 		m.jumpToLeftPanel()

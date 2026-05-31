@@ -270,6 +270,43 @@ func TestArrowWrap_FromRightPaneAlignsLeftScroll(t *testing.T) {
 	}
 }
 
+// TestJumpToLeftPanel_AlignsScroll is the regression for the codex [P2]
+// teleport class: [←] jumpToLeftPanel snaps dashCursor to the first
+// project WITHOUT going through scrollLeftPanel. With the left pane
+// scrolled to the bottom, the first project would be off-screen unless
+// the central alignment in Update resets/aligns the offset. Covers the
+// general "cursor teleport without scroll-path" family (search-esc reset,
+// jump-to-top, etc.).
+func TestJumpToLeftPanel_AlignsScroll(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+	m.records = []*agent.Record{sampleAgent("agent01")}
+	// Park cursor on the trailing right-column row and scroll left to max.
+	rows := m.dashboardRows()
+	m.dashCursor = len(rows) - 1
+	m.projectsScrollOffset = m.panelMaxOffset(rowProject)
+	if m.projectsScrollOffset == 0 {
+		t.Fatalf("expected nonzero offset to exercise the jump")
+	}
+
+	// [←] jumps to the first project; central align must reveal it.
+	updated, _ := m.Update(keyMsg("left"))
+	m2 := updated.(Model)
+	sel := m2.selectedRow()
+	if sel == nil || sel.kind != rowProject {
+		t.Fatalf("[←] must land on a project row; got %+v", sel)
+	}
+	frame := renderTwoColumnBody(m2, 90, 40)
+	want := projectDisplayName(sel.project.Name)
+	if !strings.Contains(frame, want) {
+		t.Errorf("[←] to project %q must align the left scroll so it is visible (offset=%d):\n%s",
+			want, m2.projectsScrollOffset, frame)
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).
