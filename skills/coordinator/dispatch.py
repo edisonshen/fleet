@@ -37,6 +37,7 @@ import secrets
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import parse
 
@@ -1004,6 +1005,306 @@ def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = N
             pass
         raise
     return target
+
+
+# ----------------------------------------------------------------------
+# Rolling coord checkpoint
+# ----------------------------------------------------------------------
+#
+# The coord writes ~/.fleet/projects/<p>/coord-checkpoint.md every N
+# ticks (N = FLEET_COORD_CHECKPOINT_EVERY, default 5). The checkpoint
+# bounds the recovery window between fleet-guard's 50%/70% context
+# handoffs: a coord that dies mid-handoff is resumable from the most
+# recent checkpoint (~2.5min stale on defaults) rather than the last
+# handoff doc (potentially hours stale).
+#
+# Schema is markdown + YAML-ish frontmatter so internal/handoff/synth.go
+# can read a few key:value pairs without a full YAML parser. The four
+# body sections match the handoff doc shape verbatim (Active Subagents
+# uses the same 7-field key="value" rows as handoff.go's
+# renderActiveSubagents) so synth.go lifts the rows into a synthetic
+# handoff doc without translating.
+#
+# The writer reuses the same tmp + fsync + os.replace atomic-publish
+# dance as write_worker_inbox above — a torn write would corrupt the
+# recovery path that needs the file most.
+#
+#   tick loop ──every N ticks──▶ write_coord_checkpoint()
+#                                      │ tmp+fsync+os.replace
+#                                      ▼
+#                          coord-checkpoint.md
+#                                      │ coord dies; successor dispatch
+#                                      ▼
+#       synth.go SynthesizeRecoveryWithLastHandoff() prefers it if newer
+#
+# Env knobs:
+#   FLEET_COORD_CHECKPOINT_EVERY      (int >= 0, default 5; 0 disables)
+#   FLEET_COORD_CHECKPOINT_DECISIONS  (int >= 0, default 10)
+
+_CHECKPOINT_DEFAULT_EVERY = 5
+_CHECKPOINT_DEFAULT_DECISIONS = 10
+
+# Body placeholders — kept byte-identical with handoff.go's
+# ActiveSubagentsNonePlaceholder / OpenPRsNonePlaceholder and the
+# seedCheckpoint fixture in internal/handoff/synth_test.go. synth.go
+# slices the section bodies by these literal strings.
+_CHECKPOINT_ACTIVE_PLACEHOLDER = "_(none)_"
+_CHECKPOINT_OPEN_PRS_PLACEHOLDER = "_(no open PRs)_"
+_CHECKPOINT_DECISIONS_PLACEHOLDER = "_(no recent decisions)_"
+_CHECKPOINT_DRAFTED_PLACEHOLDER = "_(empty — populated in Phase 2)_"
+
+
+def resolve_checkpoint_every() -> int:
+    """Read FLEET_COORD_CHECKPOINT_EVERY; default 5 on unset / invalid.
+
+    Accepts non-negative ints. Negative values (operator misconfig) and
+    non-int strings fall back to the default rather than silently
+    flipping to "checkpoint every tick" (which would amplify the
+    misconfig into disk pressure). 0 is valid: it disables checkpointing
+    entirely (see should_checkpoint).
+    """
+    raw = os.environ.get("FLEET_COORD_CHECKPOINT_EVERY")
+    if raw is None:
+        return _CHECKPOINT_DEFAULT_EVERY
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _CHECKPOINT_DEFAULT_EVERY
+    if n < 0:
+        return _CHECKPOINT_DEFAULT_EVERY
+    return n
+
+
+def resolve_checkpoint_decisions() -> int:
+    """Read FLEET_COORD_CHECKPOINT_DECISIONS; default 10 on unset/invalid.
+
+    Caps the recent_decisions buffer so a long-running coord doesn't
+    grow the checkpoint past readable size.
+    """
+    raw = os.environ.get("FLEET_COORD_CHECKPOINT_DECISIONS")
+    if raw is None:
+        return _CHECKPOINT_DEFAULT_DECISIONS
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return _CHECKPOINT_DEFAULT_DECISIONS
+    if n < 0:
+        return _CHECKPOINT_DEFAULT_DECISIONS
+    return n
+
+
+def should_checkpoint(tick_count: int, every: int) -> bool:
+    """Return True when this tick should write a checkpoint.
+
+    Gate: tick_count > 0 AND every > 0 AND tick_count % every == 0.
+
+    tick_count=0 is the pre-first-tick state — no checkpoint until the
+    coord has actually run a tick. every=0 disables checkpointing
+    entirely (operator override via FLEET_COORD_CHECKPOINT_EVERY=0).
+    """
+    if tick_count <= 0:
+        return False
+    if every <= 0:
+        return False
+    return tick_count % every == 0
+
+
+def record_checkpoint_decision(state: dict, line: str) -> None:
+    """Append `line` to state["recent_decisions"], capped to the
+    FLEET_COORD_CHECKPOINT_DECISIONS limit. Mutates `state` in place.
+
+    Tolerates a state dict that has never carried a recent_decisions key
+    (fresh coord first tick) or one whose value is corrupt (non-list).
+    Blank / whitespace-only entries are dropped; embedded newlines are
+    flattened to spaces so the bullet-per-line markdown contract holds.
+    """
+    if line is None:
+        return
+    flat = str(line).replace("\r", "\n").replace("\n", " ").strip()
+    if not flat:
+        return
+    cap = resolve_checkpoint_decisions()
+    raw = state.get("recent_decisions")
+    if not isinstance(raw, list):
+        raw = []
+    raw.append(flat)
+    if cap > 0 and len(raw) > cap:
+        raw = raw[-cap:]
+    state["recent_decisions"] = raw
+
+
+def write_coord_checkpoint(
+    *,
+    project_dir,
+    coord_id: str,
+    project: str,
+    state: dict,
+    active_subagents: list[dict],
+    open_prs: list[dict],
+    now: datetime | None = None,
+) -> str:
+    """Atomically publish coord-checkpoint.md under project_dir.
+
+    Returns the absolute path written (project_dir/coord-checkpoint.md).
+
+    state: the coord-state.json dict. tick_count + recent_decisions are
+        read out for the frontmatter + Recent decisions section.
+    active_subagents: list of dicts with keys task, branch, phase,
+        status, pr_url, agent_id, subagent_id. Rendered with the same
+        7-field key="value" shape as handoff.go's renderActiveSubagents
+        so synth.go copies the lines verbatim.
+    open_prs: list of dicts with keys number, title, head, url. Rendered
+        as `- #N title — head — url` bullets, matching handoff.go.
+    now: override timestamp for deterministic tests; defaults to UTC now.
+
+    Atomic write: tmp + fsync + os.replace in the same directory as the
+    target (mirrors write_worker_inbox). A crash mid-write leaves the
+    prior coord-checkpoint.md (if any) intact and no stray .tmp.* litter.
+    """
+    target_dir = os.fspath(project_dir)
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, "coord-checkpoint.md")
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    # RFC3339 with Z (UTC) suffix — match the handoff doc style so the
+    # synth.go time.Parse(time.RFC3339, ...) accepts it.
+    updated_at = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    raw_tick = state.get("tick_count", 0)
+    try:
+        tick_count = int(raw_tick)
+    except (TypeError, ValueError):
+        tick_count = 0
+
+    raw_decisions = state.get("recent_decisions")
+    if isinstance(raw_decisions, list):
+        decisions = [str(d) for d in raw_decisions if isinstance(d, str) and d.strip()]
+    else:
+        decisions = []
+
+    body = _render_checkpoint(
+        coord_id=coord_id,
+        project=project,
+        updated_at=updated_at,
+        tick_count=tick_count,
+        active_subagents=active_subagents,
+        open_prs=open_prs,
+        decisions=decisions,
+    )
+
+    fd, tmp = tempfile.mkstemp(prefix="coord-checkpoint.md.tmp.", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    return target
+
+
+def _render_checkpoint(
+    *,
+    coord_id: str,
+    project: str,
+    updated_at: str,
+    tick_count: int,
+    active_subagents: list[dict],
+    open_prs: list[dict],
+    decisions: list[str],
+) -> str:
+    parts: list[str] = []
+    parts.append("---\n")
+    parts.append("schema: v1\n")
+    parts.append(f'coord_id: "{coord_id}"\n')
+    parts.append(f'project: "{project}"\n')
+    parts.append(f'updated_at: "{updated_at}"\n')
+    parts.append(f"tick_count: {tick_count}\n")
+    parts.append("---\n\n")
+
+    parts.append("### Active Subagents\n")
+    parts.append(_render_checkpoint_active(active_subagents))
+    parts.append("\n\n")
+
+    parts.append("### Open PRs\n")
+    parts.append(_render_checkpoint_open_prs(open_prs))
+    parts.append("\n\n")
+
+    parts.append("### Recent decisions\n")
+    parts.append(_render_checkpoint_decisions(decisions))
+    parts.append("\n\n")
+
+    parts.append("### Drafted but unfiled tasks\n")
+    parts.append(_CHECKPOINT_DRAFTED_PLACEHOLDER + "\n")
+
+    return "".join(parts)
+
+
+def _render_checkpoint_active(subs: list[dict]) -> str:
+    if not subs:
+        return _CHECKPOINT_ACTIVE_PLACEHOLDER
+    lines: list[str] = []
+    for s in subs:
+        # Mirrors handoff.go:renderActiveSubagents — 7 fields, each value
+        # Go-strconv.Quote-escaped so synth.go's strconv.Unquote round-
+        # trips it.
+        line = (
+            f'- task="{_checkpoint_q(s.get("task"))}" '
+            f'branch="{_checkpoint_q(s.get("branch"))}" '
+            f'phase="{_checkpoint_q(s.get("phase"))}" '
+            f'status="{_checkpoint_q(s.get("status"))}" '
+            f'pr_url="{_checkpoint_q(s.get("pr_url"))}" '
+            f'agent_id="{_checkpoint_q(s.get("agent_id"))}" '
+            f'subagent_id="{_checkpoint_q(s.get("subagent_id"))}"'
+        )
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_checkpoint_open_prs(prs: list[dict]) -> str:
+    if not prs:
+        return _CHECKPOINT_OPEN_PRS_PLACEHOLDER
+    lines: list[str] = []
+    for p in prs:
+        number = p.get("number", 0)
+        title = _checkpoint_flatten(p.get("title"))
+        head = _checkpoint_flatten(p.get("head"))
+        url = _checkpoint_flatten(p.get("url"))
+        lines.append(f"- #{number} {title} — {head} — {url}")
+    return "\n".join(lines)
+
+
+def _render_checkpoint_decisions(decisions: list[str]) -> str:
+    if not decisions:
+        return _CHECKPOINT_DECISIONS_PLACEHOLDER
+    return "\n".join(f"- {d}" for d in decisions)
+
+
+def _checkpoint_q(v) -> str:
+    """Escape a value for a `key="..."` field, matching Go strconv.Quote
+    precedence (backslash first, then double-quote). None / non-string
+    falls back to "" so the field renders as `key=""`.
+    """
+    if v is None:
+        return ""
+    s = str(v)
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", "\\n")
+    s = s.replace("\r", "\\r")
+    return s
+
+
+def _checkpoint_flatten(v) -> str:
+    if v is None:
+        return ""
+    return str(v).replace("\n", " ").replace("\r", " ")
 
 
 class AcquirePromptError(RuntimeError):
