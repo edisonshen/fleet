@@ -1002,31 +1002,83 @@ func isLeftColumnRow(r *dashRow) bool {
 //
 // Mirrors the #177 right-panel arrow-scroll contract but without the
 // worker↔agent cross-panel complexity: the left column is a single panel.
-// We bump the offset and co-move the cursor by the same delta within the
-// left-column rows so the selected marker rides the scroll into view
-// (parity with scrollOrCross's cursor co-movement). Clamping to
-// panelMaxOffset(rowProject) prevents the stuck-at-bottom overscroll bug
-// (#177 clampScrollOffset rationale).
+//
+// The selected row moves by ONE left-column row per press; the scroll
+// offset is then aligned to that row's RENDERED line position so the
+// block stays inside the visible window. Aligning (rather than bumping
+// the offset by a fixed delta) is the fix for the codex [P2] desync: a
+// project block is multiple rendered lines, so a 1-line offset bump fell
+// out of step with a 1-row cursor move and the selected block drifted
+// off-screen after a few presses. Clamping to panelMaxOffset(rowProject)
+// prevents the stuck-at-bottom overscroll bug (#177 clampScrollOffset
+// rationale).
+//
+// Returns false (→ caller falls through to moveCursor's wrap) only when
+// the cursor is pinned at the first/last left-column row AND the offset
+// can't move — i.e. the true top/bottom edge. Otherwise returns true so
+// the arrow scrolls in place.
 func (m *Model) scrollLeftPanel(delta int) bool {
 	row := m.selectedRow()
 	if !isLeftColumnRow(row) {
 		return false
 	}
-	before := m.projectsScrollOffset
-	m.projectsScrollOffset = clampScrollOffset(
-		m.projectsScrollOffset+delta, m.panelMaxOffset(rowProject))
-	if m.projectsScrollOffset == before {
-		// At the edge (top with ↑, or bottom with ↓) — let moveCursor
-		// handle the wrap so arrows don't dead-end.
+	beforeCursor := m.dashCursor
+	beforeOff := m.projectsScrollOffset
+	m.moveCursorWithinLeft(delta)
+	m.alignLeftScrollToCursor()
+	if m.dashCursor == beforeCursor && m.projectsScrollOffset == beforeOff {
+		// Pinned at the first/last left row with nowhere to scroll — let
+		// moveCursor handle the wrap so arrows don't dead-end.
 		return false
 	}
-	// Co-move the cursor within the left column so [⏎]/[a]/[c] keep
-	// targeting a visible row. moveCursorWithinLeft walks left-column
-	// rows only; if it can't advance (no more left rows in the delta
-	// direction) the cursor stays put — the scroll alone still surfaced
-	// the off-screen rows via the bounded window.
-	m.moveCursorWithinLeft(delta)
 	return true
+}
+
+// alignLeftScrollToCursor sets projectsScrollOffset so the selected
+// left-column row's rendered block sits inside the visible window
+// [offset, offset+visible). It reads the per-row line spans from
+// buildBodyLinesCore (the same accounting the renderer uses) so the
+// offset can never disagree with what trimWithScroll actually shows.
+//
+//	cursor line above window  → scroll up so the row is the top line
+//	cursor line below window  → scroll down so the row is the bottom line
+//	cursor line inside window → leave the offset untouched (no jitter)
+//
+// No-op on the unbounded-fallback render path (ok=false) or when the
+// left column fits (maxOff==0): there is no scrolling to align.
+func (m *Model) alignLeftScrollToCursor() {
+	leftW, rightW := splitColumns(usableWidth(m.width))
+	leftRows, _, ok := m.bodyRowBudget(leftW, rightW)
+	if !ok {
+		return
+	}
+	maxOff := m.leftPanelMaxOffset()
+	if maxOff == 0 {
+		m.projectsScrollOffset = 0
+		return
+	}
+	_, _, _, lineStart := buildBodyLinesCore(*m, leftW, rightW)
+	if m.dashCursor < 0 || m.dashCursor >= len(lineStart) {
+		return
+	}
+	start := lineStart[m.dashCursor]
+	if start < 0 {
+		// Cursor is not on a left-column row — nothing to align.
+		return
+	}
+	// trimWithScroll reserves one row for the overflow footer, so the
+	// visible content window is leftRows-1 lines.
+	visible := leftRows - 1
+	if visible < 1 {
+		visible = 1
+	}
+	off := m.projectsScrollOffset
+	if start < off {
+		off = start // row is above the window → make it the top line
+	} else if start >= off+visible {
+		off = start - visible + 1 // row is below → make it the bottom line
+	}
+	m.projectsScrollOffset = clampScrollOffset(off, maxOff)
 }
 
 // moveCursorWithinLeft advances dashCursor by delta but stays anchored to

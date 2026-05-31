@@ -650,6 +650,16 @@ func trimWithScroll(lines []string, budget, offset int, hint string) []string {
 // the legacy two-slice shape (e.g. existing tests) can recompose via
 // `append(workers, agents...)`.
 func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
+	left, workers, agents, _ := buildBodyLinesCore(m, leftW, rightW)
+	return left, workers, agents
+}
+
+// buildBodyLinesCore is buildBodyLines plus the per-row left-line start
+// index (leftLineStart[i] = rendered left-line index where row i begins,
+// -1 for non-left rows). scrollLeftPanel uses the spans to keep the
+// selected row inside the visible window; buildBodyLines wraps it for the
+// callers that don't need the spans.
+func buildBodyLinesCore(m Model, leftW, rightW int) ([]string, []string, []string, []int) {
 	rows := m.dashboardRows()
 
 	// Left column: project + task rows.
@@ -743,13 +753,29 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 		}
 		return false
 	}
+	// leftLineStart[i] records the rendered left-line index where row i's
+	// block begins (-1 for rows that don't render in the left column).
+	// scrollLeftPanel uses it to align projectsScrollOffset to the selected
+	// row's actual line position — without it the offset (1 line per ↓) and
+	// the cursor (1 project block ≈ many lines per ↓) desynchronize and the
+	// selected row drifts off-screen (codex review [P2]).
+	leftLineStart := make([]int, len(rows))
+	for i := range leftLineStart {
+		leftLineStart[i] = -1
+	}
 	for i, row := range rows {
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowProject:
+			leftLineStart[i] = len(left)
 			// A new project row terminates any pending footer for the
 			// previous project — write it before opening this project.
+			// flushFooter writes the PREVIOUS project's footer; the start
+			// index above is recorded before it so it points at this
+			// project's header. Re-record after flush to skip the donated
+			// footer lines.
 			flushFooter()
+			leftLineStart[i] = len(left)
 			if projectHasExpandedRowsBelow(i, row.project.Name) {
 				header, prefix := projectHeaderLines(row.project, leftW, selected)
 				if insideHiddenGroup {
@@ -769,6 +795,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 				left = append(left, lines...)
 			}
 		case rowTask:
+			leftLineStart[i] = len(left)
 			line := taskBlockLine(row.task, leftW, selected)
 			if insideHiddenGroup {
 				line = hiddenProjectStyle.Render(line)
@@ -788,6 +815,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 			// before. Idle/hidden separators sit between projects, so
 			// they DO close any pending footer.
 			if row.separator != nil && row.separator.kind == separatorHistory {
+				leftLineStart[i] = len(left)
 				left = append(left, separatorBlockLine(row.separator, leftW, selected))
 				// No trailing blank — history separator is followed by
 				// either the expanded history rows or the project's
@@ -795,6 +823,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 				continue
 			}
 			flushFooter()
+			leftLineStart[i] = len(left)
 			left = append(left, separatorBlockLine(row.separator, leftW, selected))
 			// Empty trailing line keeps spacing consistent with the
 			// project blocks (which end with "" for visual rhythm).
@@ -874,7 +903,7 @@ func buildBodyLines(m Model, leftW, rightW int) ([]string, []string, []string) {
 		}
 	}
 	_ = hasAgents
-	return left, workers, agents
+	return left, workers, agents, leftLineStart
 }
 
 // separatorBlockLine renders one "─── N idle ───" / "─── N hidden ───"

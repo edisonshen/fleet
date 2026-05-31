@@ -117,10 +117,13 @@ func TestRenderTwoColumnBody_LeftPanel_NoFooterWhenFits(t *testing.T) {
 	}
 }
 
-// TestArrowDown_ScrollsLeftProjectsPanel: pressing ↓ while the cursor is
-// on a left-column (project) row advances projectsScrollOffset so the
-// operator can reach the off-screen projects. Mirrors the #177 right-panel
-// arrow-scroll contract on the left column.
+// TestArrowDown_ScrollsLeftProjectsPanel: walking ↓ through the left
+// column eventually advances projectsScrollOffset so the operator reaches
+// the off-screen projects, and ↑ brings it back. The offset is aligned to
+// the cursor's rendered line (not bumped a fixed amount per press), so the
+// FIRST ↓ near the top may leave the offset at 0 — the invariant is that
+// it advances by the time the cursor walks past the visible window, and
+// the selected row never goes negative.
 func TestArrowDown_ScrollsLeftProjectsPanel(t *testing.T) {
 	withFleetHome(t)
 	m := New("test")
@@ -132,21 +135,63 @@ func TestArrowDown_ScrollsLeftProjectsPanel(t *testing.T) {
 		t.Fatalf("expected cursor on a project row to start; got %+v", got)
 	}
 
-	before := m.projectsScrollOffset
-	updated, _ := m.Update(keyMsg("down"))
-	m2 := updated.(Model)
-	if m2.projectsScrollOffset <= before {
-		t.Errorf("↓ on a project row must advance projectsScrollOffset; before=%d after=%d", before, m2.projectsScrollOffset)
+	// Walk ↓ across every project; the offset must strictly advance past 0
+	// somewhere along the way (the bottom projects don't fit at offset 0).
+	cur := tea.Model(m)
+	maxSeen := 0
+	for i := 0; i < 11; i++ {
+		cur, _ = cur.(Model).Update(keyMsg("down"))
+		if off := cur.(Model).projectsScrollOffset; off > maxSeen {
+			maxSeen = off
+		}
 	}
+	if maxSeen == 0 {
+		t.Errorf("walking ↓ through 12 projects must advance projectsScrollOffset past 0; stayed 0")
+	}
+	mDown := cur.(Model)
 
-	// ↑ must bring it back down (clamped at 0, never negative).
-	updated2, _ := m2.Update(keyMsg("up"))
-	m3 := updated2.(Model)
-	if m3.projectsScrollOffset < 0 {
-		t.Errorf("projectsScrollOffset must never go negative; got %d", m3.projectsScrollOffset)
+	// ↑ must reduce the offset back toward 0 and never go negative.
+	cur2 := tea.Model(mDown)
+	for i := 0; i < 11; i++ {
+		cur2, _ = cur2.(Model).Update(keyMsg("up"))
+		if off := cur2.(Model).projectsScrollOffset; off < 0 {
+			t.Fatalf("projectsScrollOffset must never go negative; got %d", off)
+		}
 	}
-	if m3.projectsScrollOffset >= m2.projectsScrollOffset {
-		t.Errorf("↑ must reduce projectsScrollOffset; before=%d after=%d", m2.projectsScrollOffset, m3.projectsScrollOffset)
+	if cur2.(Model).projectsScrollOffset >= mDown.projectsScrollOffset {
+		t.Errorf("walking ↑ must reduce projectsScrollOffset; down=%d up=%d",
+			mDown.projectsScrollOffset, cur2.(Model).projectsScrollOffset)
+	}
+}
+
+// TestArrowDown_KeepsSelectedRowVisible is the regression for the codex
+// [P2] desync: as the cursor walks ↓ through an overflowing left column,
+// the selected project must stay inside the rendered window at every step
+// (the scroll offset is aligned to the cursor's line, not bumped a fixed
+// amount). On the pre-fix code the offset advanced one line per press
+// while the cursor advanced one multi-line block, so the selected row
+// drifted off-screen and [⏎]/[a] targeted an invisible project.
+func TestArrowDown_KeepsSelectedRowVisible(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+
+	cur := tea.Model(m)
+	for i := 0; i < 11; i++ {
+		cur, _ = cur.(Model).Update(keyMsg("down"))
+		mm := cur.(Model)
+		sel := mm.selectedRow()
+		if sel == nil || sel.project == nil {
+			continue
+		}
+		want := projectDisplayName(sel.project.Name)
+		frame := renderTwoColumnBody(mm, 90, 40)
+		if !strings.Contains(frame, want) {
+			t.Fatalf("after %d ↓ presses the selected project %q is off-screen (offset=%d):\n%s",
+				i+1, want, mm.projectsScrollOffset, frame)
+		}
 	}
 }
 
