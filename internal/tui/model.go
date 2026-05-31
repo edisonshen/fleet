@@ -868,10 +868,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "j":
 		// j is row-nav across the unified row list. NEVER scrolls a
 		// right panel — the operator who wants vim-style nav keeps
-		// using j/k everywhere.
+		// using j/k everywhere. But when j lands the cursor on a
+		// left-column row that the projects-scroll trim has hidden, the
+		// offset must follow so [⏎]/[a] don't target an off-screen
+		// project (codex review [P2] — j/k bypassed the arrow-key
+		// alignment in scrollLeftPanel).
 		m.moveCursor(+1)
+		m.alignLeftScrollToCursor()
 	case "k":
 		m.moveCursor(-1)
+		m.alignLeftScrollToCursor()
 	case "down":
 		// fleet#177 Fix 2: arrow keys scroll the focused right panel.
 		// Cursor on a worker row → workersScrollOffset++; cursor on an

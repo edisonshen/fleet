@@ -195,6 +195,42 @@ func TestArrowDown_KeepsSelectedRowVisible(t *testing.T) {
 	}
 }
 
+// TestJK_KeepsSelectedRowVisible is the regression for the codex [P2] on
+// the vim-nav path: j/k call moveCursor directly (not scrollLeftPanel), so
+// without an explicit alignment they leave the cursor on an off-screen
+// project while the render stays at offset 0. Each j press must keep the
+// selected project inside the rendered window.
+func TestJK_KeepsSelectedRowVisible(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+
+	cur := tea.Model(m)
+	advanced := false
+	for i := 0; i < 11; i++ {
+		cur, _ = cur.(Model).Update(keyMsg("j"))
+		mm := cur.(Model)
+		if mm.projectsScrollOffset > 0 {
+			advanced = true
+		}
+		sel := mm.selectedRow()
+		if sel == nil || sel.project == nil {
+			continue
+		}
+		want := projectDisplayName(sel.project.Name)
+		frame := renderTwoColumnBody(mm, 90, 40)
+		if !strings.Contains(frame, want) {
+			t.Fatalf("after %d j presses the selected project %q is off-screen (offset=%d):\n%s",
+				i+1, want, mm.projectsScrollOffset, frame)
+		}
+	}
+	if !advanced {
+		t.Errorf("walking j through 12 projects must advance projectsScrollOffset past 0")
+	}
+}
+
 // TestWindowResize_ResetsProjectsScrollOffset: the visible window changes
 // on resize, so the stored left-panel offset resets to 0 (parity with the
 // workers/agents offset reset in #177).
