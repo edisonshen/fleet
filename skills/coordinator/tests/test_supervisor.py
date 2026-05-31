@@ -115,6 +115,10 @@ def _cfg(**overrides) -> supervisor.SupervisorConfig:
         poll_interval_s=30, stuck_check_every=10,
         stuck_threshold_s=180, stuck_polls=3, nudge_cooldown_s=120,
         poll_max_s=14400,
+        # supervisor-loop wall-clock cap. 0 here disables the extra cap
+        # so legacy tests fall back to poll_max_s governance; tests that
+        # exercise the cap override explicitly.
+        supervisor_max_s=0,
         # Legacy single-rate driver. Tests that exercise the invariant-4
         # adaptive cadence override these explicitly.
         poll_base_interval_s=0, poll_backoff_interval_s=0,
@@ -744,6 +748,106 @@ def test_supervisor_emits_summary_lines_to_stdout(fleet_home: Path) -> None:
     assert "supervisor loop exiting" in output
 
 
+# ---------- sigpipe / wedge guards (loop-supervisor-sigpipe-5263) ----------
+
+
+class _BrokenStream:
+    """A log stream whose write() raises BrokenPipeError, simulating a
+    closed stdout (e.g. `python3 loop.py X | head -40` after head exits).
+    flush() is a no-op so the failure surfaces only on write."""
+
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, _s: str) -> int:
+        self.writes += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:  # pragma: no cover - never reached
+        pass
+
+
+def test_supervisor_exits_when_stdout_broken(fleet_home: Path) -> None:
+    """Defect #1: when the log/dispatch stream is a broken pipe, the
+    supervisor must NOT swallow-and-keep-polling (the wedge). It exits
+    promptly with a distinct reason so the caller can release the lock
+    and let the next tick retry, instead of spinning until poll_max_s.
+
+    Regression: on the parent commit emit() swallows the BrokenPipeError
+    and the loop polls until max-duration (60s budget / 30s polls => 2
+    iterations here). The fix breaks on the FIRST broken write, so the
+    loop never reaches the second poll.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    broken = _BrokenStream()
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(poll_interval_s=30, poll_max_s=60, stuck_check_every=0),
+        fleet_home_=fleet_home,
+        log=broken,
+    )
+    assert res.exit_reason == "stdout-broken"
+    # The first emit (loop-start banner) is the broken write; the loop
+    # must bail before completing a single poll iteration.
+    assert res.iterations == 0
+
+
+def test_supervisor_respects_supervisor_max_s_cap(fleet_home: Path) -> None:
+    """Defect #2: FLEET_COORD_SUPERVISOR_MAX_S caps the loop tighter than
+    poll_max_s so a wedged loop can never hold the lock for the full 4h
+    poll_max budget. With supervisor_max_s=60 < poll_max_s=14400, the
+    loop exits at the supervisor cap.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(
+            poll_interval_s=30, poll_max_s=14400,
+            supervisor_max_s=60, stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # 60s cap, 30s polls => at most 2 iters before exit.
+    assert res.iterations <= 2
+
+
+def test_supervisor_max_s_zero_disables_cap(fleet_home: Path) -> None:
+    """supervisor_max_s=0 falls back to poll_max_s only (no extra cap)."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,
+        cfg=_cfg(
+            poll_interval_s=30, poll_max_s=60,
+            supervisor_max_s=0, stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+    )
+    # With the supervisor cap disabled, poll_max_s governs.
+    assert res.exit_reason == "max-duration"
+
+
 # ---------- agent_id mapping ----------
 
 
@@ -892,6 +996,7 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     monkeypatch.setenv("FLEET_COORD_STUCK_POLLS", "1")
     monkeypatch.setenv("FLEET_COORD_NUDGE_COOLDOWN_S", "7")
     monkeypatch.setenv("FLEET_COORD_POLL_MAX_S", "60")
+    monkeypatch.setenv("FLEET_COORD_SUPERVISOR_MAX_S", "45")
     cfg = supervisor.SupervisorConfig.from_env()
     assert cfg.poll_interval_s == 5
     assert cfg.stuck_check_every == 2
@@ -899,6 +1004,17 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     assert cfg.stuck_polls == 1
     assert cfg.nudge_cooldown_s == 7
     assert cfg.poll_max_s == 60
+    assert cfg.supervisor_max_s == 45
+
+
+def test_supervisor_max_s_defaults_to_30_min(monkeypatch) -> None:
+    """FLEET_COORD_SUPERVISOR_MAX_S unset → 30-min default so a wedged
+    supervisor loop can never hold coordinator.lock for the full 4h
+    poll_max_s budget."""
+    monkeypatch.delenv("FLEET_COORD_SUPERVISOR_MAX_S", raising=False)
+    assert supervisor.env_supervisor_max_s() == 1800
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.supervisor_max_s == 1800
 
 
 # ---------- codex iter-2 P1/P2 regressions ----------

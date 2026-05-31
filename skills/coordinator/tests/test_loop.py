@@ -2652,6 +2652,56 @@ def test_main_writes_json_summary_on_run(
     assert any(ln.strip() == "END_DISPATCH" for ln in lines)
 
 
+# ---------- broken-stdout on DISPATCH emit (loop-supervisor-sigpipe-5263) ----------
+
+
+class _BrokenStdout:
+    """stdout whose write() raises BrokenPipeError, simulating
+    `python3 loop.py X | head -40` after head closes the read end."""
+
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, _s):
+        self.writes += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):  # pragma: no cover - not reached
+        pass
+
+    def close(self):
+        pass
+
+
+def test_main_exits_nonzero_when_dispatch_emit_broken_pipe(
+    monkeypatch, capsys,
+) -> None:
+    """Defect #1: a DISPATCH-block print that hits BrokenPipeError must
+    NOT be swallowed. main() surfaces the failure to stderr and returns
+    non-zero so the caller knows the dispatch never reached the coord
+    (the lock is already released by tick()'s finally before main()
+    prints). On the parent commit the unguarded print() raises
+    BrokenPipeError out of main(), which the supervisor invocation
+    swallowed and kept polling — the wedge.
+    """
+    fake = loop.TickResult()
+    fake.dispatched = 1
+    fake.dispatch_instructions = ["DISPATCH: ready-aaaa\nEND_DISPATCH"]
+    monkeypatch.setattr(loop, "tick", lambda *a, **kw: fake)
+    monkeypatch.setenv("FLEET_PROJECT", "fleet")
+
+    broken = _BrokenStdout()
+    monkeypatch.setattr(loop.sys, "stdout", broken)
+
+    rc = loop.main([])
+    assert rc != 0, "main() must return non-zero on broken DISPATCH emit"
+    # Real attempt to write the block was made before bailing.
+    assert broken.writes >= 1
+    # Diagnostic surfaced to stderr (captured stderr; stdout is broken).
+    err = capsys.readouterr().err
+    assert "broken" in err.lower() or "pipe" in err.lower()
+
+
 # ---------- coord_id published into coordinator.lock body (issue #55) ----------
 
 
@@ -2727,6 +2777,57 @@ def test_try_lock_returns_none_when_already_held(tmp_path: Path) -> None:
     finally:
         fcntl.flock(fd1, fcntl.LOCK_UN)
         os.close(fd1)
+
+
+def test_wedged_tick_releases_lock_so_next_tick_recovers(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess,
+) -> None:
+    """loop-supervisor-sigpipe-5263 integration: while a prior tick holds
+    coordinator.lock (the wedge), every subsequent tick is lock-busy and
+    does NOT dispatch. Once that holder releases the lock — which is
+    exactly what the supervisor's max-duration / broken-stdout exit does
+    via _tick_locked's finally — the next tick acquires the lock and
+    dispatches the ready task. This is the recovery the incident lacked:
+    a wedged tick must not be able to block the project forever, and a
+    fresh tick must be able to pick up cleanly the moment the lock frees.
+    """
+    _write_tasks(project_dir, [_make_task("ready-cccc", status="ready")])
+    lock_path = project_dir / ".locks" / "coordinator.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Phase 1: a prior tick is wedged, holding the lock (alive PID, so
+    # flock is NOT auto-released by the kernel — the incident shape).
+    held_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        busy = loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+        assert busy.skipped is True
+        assert busy.reason == "lock-busy"
+        assert busy.dispatched == 0
+    finally:
+        # Phase 2: the wedged holder hits its cap / broken-pipe exit and
+        # releases the lock (mirrors _tick_locked's finally: LOCK_UN +
+        # close). No manual kill required — the code frees it on its own.
+        fcntl.flock(held_fd, fcntl.LOCK_UN)
+        os.close(held_fd)
+
+    # Phase 3: a fresh tick now acquires the freed lock and dispatches
+    # the still-ready task — full recovery, no operator intervention.
+    dispatch_subprocess.append("dddddd03")
+    recovered = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    assert recovered.skipped is False
+    assert recovered.reason == ""
+    assert recovered.dispatched == 1
+    # Lock body is re-stamped with the recovering coord's id and is free
+    # again afterwards (LOCK_UN in tick()'s finally).
+    assert lock_path.read_bytes() == b"cccccc01\n"
 
 
 def test_tick_publishes_coord_id_in_lock_body(
