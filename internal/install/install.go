@@ -37,6 +37,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -264,6 +265,17 @@ func walkCopy(stdout io.Writer, fsys fs.FS, dst string, force bool) error {
 		}
 		if err := state.WriteAtomic(target, data); err != nil {
 			return fmt.Errorf("write %s: %w", target, err)
+		}
+		// .py/.sh get the exec bit so the hook runner can invoke them via
+		// shebang. WriteAtomic lands files 0644; without this, a
+		// `fleet skills sync` (or sync --force converting a symlink back to
+		// a copy) would leave fleet-guard/main.py non-executable, breaking
+		// the documented shebang invocation path. Mirrors init.go's
+		// installSkillFilesFS chmod.
+		if strings.HasSuffix(path, ".py") || strings.HasSuffix(path, ".sh") {
+			if err := os.Chmod(target, 0o755); err != nil {
+				return fmt.Errorf("chmod %s: %w", target, err)
+			}
 		}
 		_, _ = fmt.Fprintf(stdout, "wrote: %s\n", target)
 		return nil

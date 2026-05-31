@@ -186,6 +186,41 @@ func TestCopyFromFS_WritesFiles(t *testing.T) {
 	}
 }
 
+// TestCopyFromFS_SetsExecBitOnScripts guards the parity bug codex caught:
+// the copy path must chmod .py/.sh to 0755 (like init.go's
+// installSkillFilesFS) so a `fleet skills sync`-refreshed main.py stays
+// executable for the shebang invocation path.
+func TestCopyFromFS_SetsExecBitOnScripts(t *testing.T) {
+	claudeHome := t.TempDir()
+	fsys := fakeFS(map[string]string{
+		"main.py":   "print('x')",
+		"hook.sh":   "echo x",
+		"SKILL.md":  "# coord",
+		"notes.txt": "plain",
+	})
+	if err := CopyFromFS(io.Discard, claudeHome, "coordinator", fsys, false); err != nil {
+		t.Fatalf("CopyFromFS: %v", err)
+	}
+	dst := SkillDir(claudeHome, "coordinator")
+	for _, f := range []string{"main.py", "hook.sh"} {
+		fi, err := os.Stat(filepath.Join(dst, f))
+		if err != nil {
+			t.Fatalf("stat %s: %v", f, err)
+		}
+		if fi.Mode().Perm()&0o111 == 0 {
+			t.Errorf("%s not executable: mode=%o", f, fi.Mode().Perm())
+		}
+	}
+	// Non-script files stay non-executable.
+	fi, err := os.Stat(filepath.Join(dst, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o111 != 0 {
+		t.Errorf("SKILL.md unexpectedly executable: mode=%o", fi.Mode().Perm())
+	}
+}
+
 func TestCopyFromFS_SkipsSymlinkWithoutForce(t *testing.T) {
 	claudeHome := t.TempDir()
 	repo := t.TempDir()
