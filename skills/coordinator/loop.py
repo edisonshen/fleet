@@ -4842,9 +4842,13 @@ def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     """Skill entry point. Reads project from FLEET_PROJECT env or argv.
 
-    Always exits 0 — failures are recorded in the result and surfaced
-    to the operator via the agent's blocked_reason; the hook itself
-    must not block the agent's turn (matches fleet-guard discipline).
+    Exits 0 on the normal path — failures are recorded in the result and
+    surfaced to the operator via the agent's blocked_reason; the hook
+    itself must not block the agent's turn (matches fleet-guard
+    discipline). The ONE exception (loop-supervisor-sigpipe-5263) is a
+    broken stdout while emitting the DISPATCH block: that returns 2 so the
+    harness re-ticks, because a swallowed broken pipe would silently drop
+    the dispatch instead of delivering it to the coord.
     """
     argv = list(argv) if argv is not None else []
     project = os.environ.get("FLEET_PROJECT", "")
