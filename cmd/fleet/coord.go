@@ -43,11 +43,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
+	fleet "github.com/edisonshen/fleet"
 	"github.com/edisonshen/fleet/internal/coord"
+	"github.com/edisonshen/fleet/internal/install"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -165,6 +168,17 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 // (cancel-the-cmd, not the process directly — that gives the child a
 // moment to flush before the kernel reaps it).
 func notifyCoordRun(opts coordRunOpts, stdout, stderr io.Writer) error {
+	// Surface-dont-silo: a coord running on a stale skill COPY is exactly
+	// how a merged P0 fix gets silently neutered (#182). Shout to stderr
+	// with a remediation command BEFORE the child starts — best-effort, it
+	// never blocks the spawn. Resolves ~/.claude itself; on resolution
+	// failure WarnIfStale's Status call simply finds nothing and stays
+	// quiet.
+	if home, herr := os.UserHomeDir(); herr == nil {
+		_ = install.WarnIfStale(stderr,
+			filepath.Join(home, ".claude"), fleet.SkillFS())
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer cancel()

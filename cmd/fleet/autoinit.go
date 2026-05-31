@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	fleet "github.com/edisonshen/fleet"
+	"github.com/edisonshen/fleet/internal/install"
 )
 
 // maybeAutoInit installs the bundled skills silently if any embedded
@@ -67,6 +68,15 @@ func maybeAutoInit(stdout io.Writer, claudeHomeOverride string) {
 // coordinator must trigger autoinit so the new skill lands.
 func allSkillsFullyInstalled(claudeHome string) bool {
 	for name, fsys := range fleet.SkillFS() {
+		// A symlinked skill dir is an explicit operator choice to run the
+		// repo checkout live (`fleet skills link`). Its files legitimately
+		// differ from the binary's embedded bytes whenever the checkout is
+		// ahead of the last build — treating that as "not installed" would
+		// make autoinit clobber the live link with a stale copy and silently
+		// undo the operator's link. Symlink present → considered installed.
+		if install.IsSymlink(claudeHome, name) {
+			continue
+		}
 		skillRoot := filepath.Join(claudeHome, "skills", name)
 		if !skillFilesPresentFS(fsys, skillRoot) {
 			return false

@@ -27,6 +27,21 @@ Implementation order (parallel-safe):
 5. **Week 6 — Dogfood.** Use Fleet to build Fleet for one full week.
 6. **Week 7 — Launch.** Show HN + tweet.
 
+## Skill install: symlink when developing on Fleet
+
+The coordinator/fleet-guard skills are embedded in the binary and `fleet init` copies them to `~/.claude/skills/<name>/`. A **copy** is a frozen snapshot: a merged skill fix is invisible to a running coord until the binary is rebuilt and `fleet skills sync` is re-run. This once silently neutered a merged P0 (#182).
+
+When working on Fleet itself, install the skills as a **symlink** so merged fixes go live on the next coord spawn:
+
+```sh
+fleet skills link            # symlink ~/.claude/skills/<name> -> <repo>/skills/<name> (auto-detect checkout)
+fleet skills link --from <repo>   # point at a checkout explicitly
+fleet skills status          # show shape (symlink/copy) + flag a copy diverged from the repo
+fleet skills sync            # re-copy embedded bytes (copy mode; --force converts a symlink back)
+```
+
+Policy: **symlink for repo developers (the maintainer default), copy for brew/binary-only installs.** Symlink follows the checkout's working tree — keep the linked checkout on `main` for stable coord behavior. `fleet skills status` exits non-zero on a stale copy, and a coord warns to stderr at startup if its skill dir is a stale copy diverged from the repo.
+
 ## Engineering preferences
 
 - Boring tech by default (bubbletea, cobra, fsnotify, GoReleaser — already in design). Innovation tokens go to agent-health-as-primitive only.
