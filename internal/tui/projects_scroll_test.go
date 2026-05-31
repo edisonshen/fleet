@@ -74,6 +74,27 @@ func TestRenderTwoColumnBody_LeftPanelBounded_LongProjectsList(t *testing.T) {
 	}
 }
 
+// TestRenderTwoColumnBody_LeftPanel_OverflowSurfacesFooter is the
+// behavior-only regression (no reference to the new field) that fails on
+// the PARENT commit: with more projects than fit, the parent renderer
+// silently dropped the overflow with no affordance, so the body contained
+// neither the off-screen project names nor a "N hidden" footer. The fix
+// surfaces a footer (and the names become reachable via scroll — covered
+// by the LongProjectsList test). This one stays green-on-parent-impossible
+// purely from public render output.
+func TestRenderTwoColumnBody_LeftPanel_OverflowSurfacesFooter(t *testing.T) {
+	withFleetHome(t)
+	m := New("test")
+	m.width = 140
+	m.height = 20
+	m.dashboard = buildManyProjectsSnapshot(12)
+
+	body := renderTwoColumnBody(m, 90, 40)
+	if !strings.Contains(body, "hidden — [↓/↑] scroll") {
+		t.Errorf("left column silently truncates without a scroll affordance (surface-dont-silo violation); got:\n%s", body)
+	}
+}
+
 // TestRenderTwoColumnBody_LeftPanel_NoFooterWhenFits: the left-panel
 // footer must NOT appear when all projects fit the budget (clean look at
 // the common case — no false overflow chrome on a tall terminal).

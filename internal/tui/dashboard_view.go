@@ -41,17 +41,7 @@ import (
 // active". The cursor lives in dashboardRows() (model.go) and walks
 // every row regardless of column.
 func renderDashboard(m Model) string {
-	w := m.width
-	if w <= 0 {
-		w = 110
-	}
-	// 1-cell right margin matches the v0.1 layout's anti-wrap rule.
-	// Anything wider triggers phantom-newline wrap on some terminals.
-	usable := w - 1
-	if usable < 60 {
-		usable = 60
-	}
-
+	usable := usableWidth(m.width)
 	leftW, rightW := splitColumns(usable)
 
 	var b strings.Builder
@@ -61,6 +51,22 @@ func renderDashboard(m Model) string {
 	b.WriteString("\n")
 	b.WriteString(renderTwoColumnBody(m, leftW, rightW))
 	return b.String()
+}
+
+// usableWidth converts a terminal width into the dashboard's usable
+// content width: fall back to 110 when unset, subtract a 1-cell right
+// margin (the v0.1 anti-wrap rule — wider triggers phantom-newline wrap
+// on some terminals), and floor at 60. Shared by renderDashboard and the
+// model-side leftPanelMaxOffset so both agree on the column geometry.
+func usableWidth(w int) int {
+	if w <= 0 {
+		w = 110
+	}
+	usable := w - 1
+	if usable < 60 {
+		usable = 60
+	}
+	return usable
 }
 
 // splitColumns returns (leftWidth, rightWidth) summing to usable.
@@ -383,46 +389,44 @@ func renderColumnHeadings(m Model, leftW, rightW int) string {
 // When m.height is unset / zero (early render), we fall back to the
 // pre-#177 unbounded behavior so the first frame doesn't draw an
 // arbitrarily-truncated dashboard.
-func renderTwoColumnBody(m Model, leftW, rightW int) string {
-	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
-
-	// Apply the bounded layout when we have a real terminal height.
-	// chromeRows accounts for the header strip + column heading + footer
-	// + a 1-row margin that keeps the bottom hint visible.
+// bodyRowBudget computes the LEFT / RIGHT row budgets for the bounded
+// two-column layout. Extracted from renderTwoColumnBody so
+// leftPanelMaxOffset can compute the exact left scroll ceiling from the
+// SAME numbers the renderer uses (no drift). ok=false signals the
+// unbounded fallback (m.height unset or below minBodyRows) — callers
+// should not apply scroll trimming in that case.
+//
+// Layout math (see renderTwoColumnBody doc for the full rationale):
+//
+//	usable   = height - chrome
+//	leftRows = clamp(usable/2 with slack donation in both directions)
+//	rightRows= usable - leftRows  (floored at minRightRows)
+func (m Model) bodyRowBudget(leftW, rightW int) (leftRows, rightRows int, ok bool) {
 	const (
 		minProjectsRows = 6
 		minRightRows    = 4
 		chromeRows      = 6 // header(1) + heading(1) + footer(2) + margin(2)
 		minBodyRows     = 8
 	)
-
 	usable := m.height - chromeRows
 	if m.height <= 0 || usable < minBodyRows {
-		// Unbounded fallback (early renders / pathological heights). No
-		// scroll trimming applied; layout matches the pre-#177 shape.
-		return renderTwoColumnUnbounded(leftLines, append(workerLines, agentLines...), leftW, rightW)
+		return 0, 0, false
 	}
+	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
 
 	// Reserve at least half the usable rows for the LEFT column. Slack
 	// flows in both directions: if projects need fewer than half, the
 	// right column gets the extra. If right needs less than half (few
 	// workers + few agents), the left column gets the extra so the
 	// projects list isn't artificially cropped on a tall terminal.
-	leftRows := usable / 2
+	leftRows = usable / 2
 	if leftRows < minProjectsRows {
 		leftRows = minProjectsRows
 	}
 	rightTotal := len(workerLines) + len(agentLines)
-	// Slack donation rules:
-	//   - left needs less than its share → donate to right
-	//   - right needs less than its share → donate to left (so long
-	//     left lists like an expanded project's task block aren't
-	//     cropped when the right column has plenty of headroom)
 	if len(leftLines) < leftRows {
 		leftRows = len(leftLines)
 	} else if rightTotal < usable-leftRows && len(leftLines) > leftRows {
-		// Right column has slack — grow left up to leftLines but never
-		// past usable - minRightRows.
 		want := len(leftLines)
 		ceiling := usable - minRightRows
 		if ceiling < leftRows {
@@ -433,11 +437,27 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 		}
 		leftRows = want
 	}
-	rightRows := usable - leftRows
+	rightRows = usable - leftRows
 	if rightRows < minRightRows {
 		rightRows = minRightRows
 		leftRows = usable - rightRows
 	}
+	return leftRows, rightRows, true
+}
+
+func renderTwoColumnBody(m Model, leftW, rightW int) string {
+	leftLines, workerLines, agentLines := buildBodyLines(m, leftW, rightW)
+
+	// bodyRowBudget owns the chrome math + left/right row split (single
+	// source of truth shared with leftPanelMaxOffset). ok=false means the
+	// unbounded fallback applies (early render / pathological height).
+	leftRows, rightRows, ok := m.bodyRowBudget(leftW, rightW)
+	if !ok {
+		// Unbounded fallback (early renders / pathological heights). No
+		// scroll trimming applied; layout matches the pre-#177 shape.
+		return renderTwoColumnUnbounded(leftLines, append(workerLines, agentLines...), leftW, rightW)
+	}
+	const minProjectsRows = 6
 
 	// Split rightRows 60/40 between workers + agents. The split is
 	// applied to the COMBINED panel including each sub-heading so a
@@ -468,6 +488,16 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 	}
 
 	// Apply per-panel scroll offset + overflow trim.
+	//
+	// tui-project-list-truncat: the LEFT PROJECTS column now gets the SAME
+	// bound + scroll treatment as the #177 right panels. Before this, the
+	// left column was sliced raw at leftRows (`if i < leftRows`) with no
+	// footer — projects past the budget vanished silently (operator's
+	// 2026-05-29 "8 projects · 5 groups rendered" bug). trimWithScroll
+	// caps at leftRows, surfaces a "K hidden — [↓/↑] scroll" footer on
+	// overflow, and pages via projectsScrollOffset (↓/↑ on a left-column
+	// row; see scrollLeftPanel in model.go).
+	leftVisible := trimWithScroll(leftLines, leftRows, m.projectsScrollOffset, "[↓/↑] scroll")
 	workerVisible := trimWithScroll(workerLines, workersRows, m.workersScrollOffset, "[↓/↑] scroll")
 	agentVisible := trimWithScroll(agentLines, agentsRows, m.agentsScrollOffset, "[↓/↑] scroll")
 
@@ -478,7 +508,10 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 
 	// maxRows is the bigger of left budget vs right budget — the
 	// column separator stays uniform across both columns.
-	maxRows := leftRows
+	maxRows := len(leftVisible)
+	if maxRows < leftRows {
+		maxRows = leftRows
+	}
 	if len(rightLines) > maxRows {
 		maxRows = len(rightLines)
 	}
@@ -491,8 +524,8 @@ func renderTwoColumnBody(m Model, leftW, rightW int) string {
 	for i := 0; i < maxRows; i++ {
 		l := ""
 		r := ""
-		if i < len(leftLines) && i < leftRows {
-			l = leftLines[i]
+		if i < len(leftVisible) {
+			l = leftVisible[i]
 		}
 		if i < len(rightLines) {
 			r = rightLines[i]
