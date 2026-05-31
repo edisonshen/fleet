@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -4860,9 +4861,35 @@ def main(argv: Iterable[str] | None = None) -> int:
     # "Worker dispatch protocol". Blocks are separated by a blank
     # line so the parser (Claude reasoning over the stdout) can pick
     # them out of multi-block ticks.
-    for block in result.dispatch_instructions:
-        print(block)
-        print()
+    #
+    # loop-supervisor-sigpipe-5263: emitting a DISPATCH block is the
+    # WHOLE POINT of the tick — if stdout is closed (e.g. the tick was
+    # piped through `head -40` which closed the read end), the block
+    # never reaches the coord and there is no way to communicate it.
+    # Do NOT swallow the BrokenPipeError and pretend the dispatch
+    # happened: surface it on stderr and exit non-zero so the operator
+    # / harness sees the failure and re-ticks. The coordinator.lock is
+    # already released by tick()'s finally before we reach this print
+    # loop, so a non-zero exit here doesn't strand the lock.
+    try:
+        for block in result.dispatch_instructions:
+            print(block, file=sys.stdout)
+            print(file=sys.stdout)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        # Avoid a second BrokenPipeError on interpreter shutdown flush.
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.stderr.write(
+            f"coordinator: failed to emit DISPATCH block "
+            f"({len(result.dispatch_instructions)} pending) to a closed "
+            f"stdout (broken pipe: {exc}); the dispatch did NOT reach the "
+            f"coord. Re-run the tick with full output captured (never "
+            f"`| head`). Exiting non-zero so the harness re-ticks.\n"
+        )
+        return 2
     print(json.dumps({
         "skipped": result.skipped,
         "reason": result.reason,
@@ -4877,5 +4904,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main(sys.argv[1:]))
