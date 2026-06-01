@@ -6,12 +6,58 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-30
+
+Resource lifecycle is now Fleet's job, not the operator's. A new
+`fleet gc` subcommand classifies and reaps everything Fleet creates —
+orphan sockets, abandoned agent records, stray tmux sessions, unreaped
+worktrees, stale coord locks, and dead worker records — and `fleet
+status` / `fleet dispatch` surface those orphans inline so leaks never
+accumulate silently. The remote-control listener gains an
+operator-managed lifecycle with per-project markers and
+project-suffixed session names so coords and handoff successors are
+distinguishable across projects. Coordinators refuse cross-project
+ticks, derive worktree base from the project repo, and emit
+worktree-aware reviewer/finisher prompts. The TUI fixes a wave of
+navigation regressions: right-panel scroll bounding, `[h]` handoff
+inverted to project rows, arrow boundary crossing, and dead-end
+recovery on coord rows with an `[r]` reset.
+
+### Added
+
+- `fleet gc` subcommand for orphan cleanup, with classifiers for
+  leaked sockets, orphan agent records, orphan tmux sessions,
+  unreaped worktrees, coord locks, and worker records (fleet#165
+  PR-A #166, fleet#172 #176, #177). Each classifier identifies and
+  safely reaps resources Fleet created but never cleaned up.
+- `coord.Cleanup` primitive plus a `fleet coord-run` wrapper that
+  funnels coord teardown through a single reaping path on both happy
+  and failure exits (fleet#165 PR-C #168).
+- Reconciliation surfaces orphans inline in `fleet status` and
+  `fleet dispatch` so leaked resources are visible at every command
+  invocation, not just on an explicit gc run (fleet#165 PR-D #169).
+- `FLEET_MAX_SESSIONS` spawn-time cap with a `fleet status` banner
+  backstop to guard against runaway session creation (#149).
+- `FLEET_PROJECT` injected into the spawned tmux environment so
+  coords and workers can resolve their owning project without
+  re-deriving it (fleet#170 #173).
+- Coordinators refuse to tick when the agent record owns a different
+  project, preventing cross-project task mutation (fleet#171 #174).
+- Operator-managed remote-control listener lifecycle (v0.12 #159),
+  with coord-spawn auto-writing the `rc-enabled` marker (#163) and
+  an atomic non-blocking flock spawn gate plus handoffop drain
+  backfill (#164).
+- Worker poll loop and reaper enforcing lifecycle invariants 4 and 5
+  (#154).
+- Dispatch Delivery controller vertical slice with a
+  `coord_prompt_inbox` migration that closes a 30-file leak (#156).
+
 ### Changed
 
 - Remote-control session names now carry the project name so coords
-  and handoff successors are distinguishable on operator's phone /
+  and handoff successors are distinguishable on the operator's phone /
   claude.ai instead of showing as identical `fleet-coord-<8hex>`
-  entries across projects.
+  entries across projects (#155).
   - **Coord side:** suffix-extension `fleet-coord-<id>-<project>`.
     The coord daemon's `--remote-control-session-name-prefix` stays
     the broad `fleet-coord` literal (one daemon for all coords on
@@ -32,6 +78,37 @@ follows [SemVer](https://semver.org/).
   - Empty-project fallback returns the legacy shapes
     (`fleet-coord-<id>` / `fleet-handoff-<id>`) for safety on
     records without a project field.
+- TUI `[h]` handoff inverted to act on project rows rather than
+  individual agent rows (#178).
+- TUI right-panel is now scroll-bounded so long content can't run off
+  the viewport (#177).
+- The coordinator skill now requires plan docs before dispatch (#158).
+
+### Fixed
+
+- Coord and spawn derive the worktree base from the project repo
+  rather than the current working directory, so worktrees land in the
+  right place regardless of where a command runs (Issue #175 #179).
+- Reviewer and finisher dispatch prompts are now worktree-aware, so
+  subagents operate in the correct worktree instead of the coord's
+  checkout (#182).
+- TUI coord-row dead-end recovery with an `[r]` reset, so a stuck
+  coord row is no longer a navigation dead-end (#181).
+- TUI arrow-key boundary crossing and `[h]` coord resolution fixes
+  (P0 regressions from #177/#178) (#180).
+- Orphan tmux leak plugged at the handoff/maintenance boundary, with a
+  `prune-orphan-tmux` sweeper and codex-review follow-ups (#146, #148).
+- Test isolation gaps closed: `FLEET_TMUX_SOCKET` isolation plus
+  socket-file reaping (#150), a runtime tmux sink guard with
+  function-scoped test-isolation lint (#152), and a
+  `/tmp/fleet-test-*.sock` `TestMain` sweeper with a zero-leak CI gate
+  (fleet#165 PR-B #167).
+- Atomic coord-swap helper hardened across 18 codex iterations (#151).
+- `waitForPaneStable` deadline-check race closed (#160).
+- Reconcile recovers stuck PRs via branch lookup, with an apply-order
+  fix (#162).
+- Remote-control listener-spawn gated under
+  `FLEET_RC_BOOTSTRAP_DISABLED` on both the Go and Python sides (#157).
 
 ## [0.10.0] - 2026-05-14
 
@@ -864,7 +941,9 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/edisonshen/fleet/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/edisonshen/fleet/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/edisonshen/fleet/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/edisonshen/fleet/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/edisonshen/fleet/compare/v0.8.1...v0.8.2
