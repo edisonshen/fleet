@@ -69,6 +69,46 @@ fleet init
 `fleet init` installs the bundled `fleet-guard` and `coordinator`
 skills under `~/.claude/skills/` and seeds `~/.fleet/standards.md`.
 
+### Skill install shape: copy vs symlink
+
+A bundled skill can sit on disk two ways:
+
+| Shape     | Source              | When a merged skill fix goes live                 | Best for                     |
+|-----------|---------------------|---------------------------------------------------|------------------------------|
+| **copy**  | embedded binary bytes | after rebuilding the binary **and** re-running `fleet skills sync` | brew / binary-only installs  |
+| **symlink** | the repo checkout's `skills/<name>/` | immediately, on the next coord spawn              | developing **on** Fleet      |
+
+`fleet init` and `fleet skills sync` install **copies** — self-contained,
+the only safe option when there is no repo checkout (brew). The cost: a
+merged skill fix is invisible to a running coord until you rebuild the
+binary and re-`sync`. This gap once silently neutered a merged P0
+(`#182`): the install was a frozen hand-copied snapshot, so the fix never
+reached the running coord.
+
+If you are **developing on Fleet** (you have the repo checked out), use a
+symlink so fixes go live the moment they land in your checkout:
+
+```sh
+fleet skills link            # symlink ~/.claude/skills/<name> -> <repo>/skills/<name>
+                             # (auto-detects the checkout from registered projects)
+fleet skills link --from ~/projects/fleet   # or point at a checkout explicitly
+```
+
+**Recommendation:** symlink for anyone working on the Fleet repo itself
+(this is the default for the maintainer); copy for everyone else.
+
+**Symlink tradeoff:** the linked skill follows your checkout's working
+tree. If the checkout sits on a feature branch, the coord runs that
+branch's skill code. Keep the linked checkout on `main` for stable
+behavior, or `fleet skills sync --force` to convert back to a pinned copy.
+
+`fleet skills status` reports each skill's shape and **flags a copy that
+has diverged from the repo** (a merged fix the running coord can't see),
+exiting non-zero so CI/scripts catch the drift — it is the reliable drift
+gate today. A coord launched through the `fleet coord-run` supervisor also
+warns to stderr at startup; the default dispatch wrapper does not yet route
+through that supervisor, so run `fleet skills status` to be sure.
+
 Runtime deps: `tmux` (brew pulls it transitively) and the
 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI.
 

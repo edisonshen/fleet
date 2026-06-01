@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	fleet "github.com/edisonshen/fleet"
+	"github.com/edisonshen/fleet/internal/install"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -79,6 +80,17 @@ func runInit(stdout io.Writer, force bool, claudeHomeOverride string) error {
 	// map entry in SkillFS().
 	skills := fleet.SkillFS()
 	for _, name := range skillInstallOrder(skills) {
+		// A symlinked skill dir means the operator ran `fleet skills link`
+		// to follow a repo checkout live. Writing the embedded copy here
+		// would follow the symlink and OVERWRITE the operator's repo files
+		// with stale embedded bytes — corrupting their checkout. Leave the
+		// link intact; `fleet skills sync --force` is the explicit opt-out
+		// for converting back to a copy.
+		if install.IsSymlink(claudeHome, name) {
+			_, _ = fmt.Fprintf(stdout, "skip (symlinked, live): %s\n",
+				filepath.Join(claudeHome, "skills", name))
+			continue
+		}
 		skillRoot := filepath.Join(claudeHome, "skills", name)
 		if err := installSkillFilesFS(stdout, skills[name], skillRoot, force); err != nil {
 			return fmt.Errorf("install %s: %w", name, err)
