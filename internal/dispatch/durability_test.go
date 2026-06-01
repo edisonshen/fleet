@@ -387,6 +387,76 @@ func TestResetForRelaunch_Atomic(t *testing.T) {
 	}
 }
 
+// TestResetForRelaunch_ReArmsReleasedClaim is the codex iter-4 [P2]
+// regression: when reset-for-relaunch runs on a journal whose
+// coord_prompt_inbox claim was already RELEASED, it must re-arm the claim
+// to live (pointing at the rewritten inbox) and reset recl_state — else
+// the freshly-written inbox leaks (next release sees claim already
+// released) and recl_state wrongly reads complete while the dispatch is
+// live.
+func TestResetForRelaunch_ReArmsReleasedClaim(t *testing.T) {
+	home := withFleetHome(t)
+	pinNow(t, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	id := acquirePendingFixture(t, "50000001")
+
+	// Drive a full lifecycle: launch + ack + release (terminal). The
+	// release marks the claim ClaimReleased and recl_state complete.
+	if _, err := MarkLaunchAttempted(id, 0); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := MarkAcked(id); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if _, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{DispatchID: id, HostID: "h"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	jReleased, _ := LoadJournal(id)
+	if idx := jReleased.findClaim(KindCoordPromptInbox); idx < 0 || jReleased.Claims[idx].State != ClaimReleased {
+		t.Fatalf("precondition: claim not released")
+	}
+
+	// Reset-for-relaunch re-arms it.
+	res, err := ResetForRelaunch(id, strings.NewReader("RELAUNCH BODY"))
+	if err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	if res.Outcome != ResetDone {
+		t.Fatalf("reset outcome = %q, want reset", res.Outcome)
+	}
+	j, _ := LoadJournal(id)
+	idx := j.findClaim(KindCoordPromptInbox)
+	if idx < 0 || j.Claims[idx].State != ClaimLive {
+		t.Fatalf("claim not re-armed to live after reset (state=%v)",
+			func() ClaimState {
+				if idx < 0 {
+					return "MISSING"
+				}
+				return j.Claims[idx].State
+			}())
+	}
+	if j.ReclState != ReclPending {
+		t.Fatalf("recl_state = %q, want pending after reset (was complete)", j.ReclState)
+	}
+	// The new inbox exists and the claim points at it; a subsequent
+	// terminal release must now reclaim (unlink) the rewritten inbox.
+	if _, rerr := readInboxFile(t, home, id); rerr != nil {
+		t.Fatalf("relaunch inbox missing: %v", rerr)
+	}
+	// Drive to terminal + release again; the inbox must be reclaimed.
+	if _, err := MarkLaunchAttempted(id, res.Generation); err != nil {
+		t.Fatalf("mark (relaunch): %v", err)
+	}
+	if err := MarkAcked(id); err != nil {
+		t.Fatalf("ack (relaunch): %v", err)
+	}
+	if _, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{DispatchID: id, HostID: "h"}); err != nil {
+		t.Fatalf("release (relaunch): %v", err)
+	}
+	if _, rerr := readInboxFile(t, home, id); rerr == nil {
+		t.Fatalf("relaunch inbox NOT reclaimed by terminal release (leak)")
+	}
+}
+
 // TestRelease_NoClobberLaunchStates pins the ReleaseCoordPromptInbox
 // fix: releasing must not downgrade ExecBlocked, and an un-acked
 // ExecLaunchAttempted resolves to ExecFailed (launch unconfirmed), not

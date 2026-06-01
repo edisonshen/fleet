@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -266,6 +267,33 @@ func ResetForRelaunch(id DispatchID, content io.Reader) (ResetForRelaunchResult,
 		if werr := state.WriteAtomic(inboxPath, body); werr != nil {
 			return fmt.Errorf("rewrite relaunch inbox %s: %w", inboxPath, werr)
 		}
+		// Codex iter-4 [P2]: re-arm the coord_prompt_inbox claim. A
+		// relaunch often runs on a journal whose claim was already
+		// RELEASED (the prior dispatch terminated and reclaimed its
+		// inbox). We just rewrote ~/.fleet/inbox/<id>.md (Write 1), so a
+		// claim left at `released` would (a) leak that fresh inbox — the
+		// next terminal release sees the claim already released and never
+		// reclaims the file — and (b) report recl_state=complete while a
+		// live dispatch is active. Flip the claim back to `live` (pointing
+		// at the rewritten inbox, ReleasedAt cleared) and reset recl_state
+		// so the next terminal release reclaims the new inbox.
+		if idx := j.findClaim(KindCoordPromptInbox); idx >= 0 {
+			var dc DeliveryClaim
+			if uerr := json.Unmarshal(j.Claims[idx].Data, &dc); uerr == nil {
+				dc.Path = inboxPath
+				dc.ReleasedAt = nil
+				dc.CreatedAt = nowFunc().UTC()
+				if data, merr := json.Marshal(dc); merr == nil {
+					j.Claims[idx] = ClaimInline{
+						Class: ClassDelivery,
+						Kind:  KindCoordPromptInbox,
+						State: ClaimLive,
+						Data:  data,
+					}
+				}
+			}
+		}
+		j.ReclState = ReclPending
 		// Write 2 (LAST under the lock): reset to a fresh ExecPending
 		// lifecycle. Bump the generation so any stale block carrying the
 		// old gen predicate-fails, and zero the replay cap so the fresh

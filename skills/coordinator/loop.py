@@ -4254,24 +4254,30 @@ def _replay_pending_dispatches(
         freshness.
       - ExecAcked / live worker / terminal → leave alone.
 
-    Replay keys ONLY on journal state + project ownership — never on task
-    status, worker_agent_ids, pending_acquire, or state.json freshness
-    (the replay-predicate invariant). A phantom's bootstrapped state.json
-    is fake liveness; the journal is the only trustworthy signal.
+    Replay keys on journal state + project ownership + DISPATCH IDENTITY:
+    a pending journal is re-emitted only when worker_agent_ids[slug] equals
+    this journal's agent_id — i.e. this journal IS the task's current,
+    applied dispatch. Codex iter-2/iter-4 [P1]: keying on journal state
+    alone (the original rev6 invariant) double-launches across the
+    acquire-before-apply crash window — an orphaned ExecPending journal A
+    (whose coord crashed before persisting state) gets replayed while the
+    still-`ready` task is freshly dispatched as agent B. The identity
+    predicate ties replay to the dispatch the task actually adopted, so an
+    orphan (worker_agent_ids[slug] != A) is never replayed; it's left for
+    the cap / sweeper. The phantom case still works: a lost-stdout block's
+    journal IS the adopted dispatch (worker_agent_ids[slug] == A, task
+    in-progress), so it re-emits.
     """
     actions: list[_ReplayAction] = []
-    # Codex iter-2 [P1]: ids still mid-application are owned by the normal
-    # `_dispatch_ready` / pending_acquire retry path, NOT replay. When a
-    # tick acquires the journal (→ ExecPending) but _apply_dispatch fails
-    # or crashes before status=in-progress + state bootstrap land, the
-    # slug stays `ready` and pending_acquire_agent_ids holds the retry
-    # handle. If replay emitted for that ExecPending journal it would
-    # launch a worker with NO applied task state AND clear the
-    # pending-acquire entry — letting the same ready task dispatch again
-    # (double-launch + orphaned launch). Replay is for the PHANTOM where
-    # the dispatch was already applied (pending_acquire cleared) but the
-    # block never reached the coord. So skip any id the pending_acquire
-    # map still owns; the normal retry re-applies it idempotently.
+    # Identity maps for the replay predicate. worker_agent_ids[slug] is the
+    # agent_id the task ADOPTED (persisted by _apply_dispatch /
+    # _apply_dispatch_handoff before coord-state is saved). pending_acquire
+    # holds ids that are mid-application (acquired, not yet applied) — those
+    # are the normal retry path's, never replay's.
+    try:
+        adopted_agent_ids = supervisor_mod.load_agent_id_map(coord_state)
+    except Exception:  # noqa: BLE001
+        adopted_agent_ids = {}
     try:
         pending_acquire_ids = set(
             supervisor_mod.load_pending_acquire_agent_id_map(coord_state).values()
@@ -4281,10 +4287,20 @@ def _replay_pending_dispatches(
     for agent_id, slug, j in _iter_project_journals(home, project):
         state = j.get("exec_state", "")
         if state == "pending":
+            # Codex iter-4 [P1]: only replay the journal the task currently
+            # owns. An orphaned pending journal (coord crashed after
+            # acquire but before persisting state, so the task was
+            # re-dispatched under a DIFFERENT agent_id) must NOT be
+            # replayed — that's the cross-id double-launch the per-id CAS
+            # cannot catch. Mid-application ids (in pending_acquire, not
+            # yet adopted) are the normal retry's; skip them too.
             if agent_id in pending_acquire_ids:
-                # Mid-application — the normal _dispatch_ready retry owns
-                # this id this tick. Do NOT replay (would double-launch a
-                # task whose state was never applied).
+                continue
+            if adopted_agent_ids.get(slug) != agent_id:
+                # This journal is not the task's adopted dispatch (orphan
+                # from a crash, or a stale prior id). Leave it — replay
+                # would launch a worker the task never adopted, racing the
+                # real dispatch. The cap path / sweeper reaps the orphan.
                 continue
             res = dispatch_mod.reserve_replay(
                 agent_id, cap=_REPLAY_CAP,

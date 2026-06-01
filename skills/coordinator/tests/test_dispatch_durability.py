@@ -82,14 +82,42 @@ def _journal(home: Path, agent_id: str) -> dict:
     )
 
 
+def _adopt_all(home: Path) -> dict:
+    """Build a coord_state that ADOPTS every on-disk dispatch journal:
+    worker_agent_ids[slug] = agent_id for each journal. Models the normal
+    "the dispatch was applied" state — replay's identity predicate
+    (codex iter-4) re-emits a pending journal only when the task adopted
+    THAT agent_id. The phantom tests (broken-stdout) are exactly this
+    case: the dispatch was applied (adopted), the block was just lost."""
+    import json as _json
+    agents: dict[str, str] = {}
+    ddir = home / "dispatches"
+    if ddir.is_dir():
+        for p in sorted(ddir.iterdir()):
+            if not p.name.endswith(".json") or p.name.endswith(".json.lock"):
+                continue
+            aid = p.name[: -len(".json")]
+            try:
+                j = _json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            owner = j.get("owner", "")
+            if isinstance(owner, str) and owner.startswith("project/myproj/slug/"):
+                agents[owner[len("project/myproj/slug/"):]] = aid
+    return {"worker_agent_ids": agents}
+
+
 def _replay(home: Path, fleet_bin: str, *, now_unix: float | None = None,
             coord_state: dict | None = None):
+    # Default to the adopted-all coord_state so phantom tests (block lost
+    # after the dispatch was applied) re-emit; tests exercising orphans /
+    # mid-application / handoffs pass an explicit coord_state.
     return loop._replay_pending_dispatches(
         project="myproj",
         home=home,
         fleet_bin=fleet_bin,
         fleet_home=str(home),
-        coord_state=coord_state if coord_state is not None else {},
+        coord_state=coord_state if coord_state is not None else _adopt_all(home),
         now_unix=now_unix if now_unix is not None else time.time(),
     )
 
@@ -325,6 +353,27 @@ def test_replay_skips_mid_application_pending(
     assert [a for a in actions if a.dispatch_instruction] == []
     # And the cap was NOT consumed (replay never touched the journal).
     assert _journal(home, "aae00222").get("replay_emit_attempts", 0) == 0
+
+
+def test_replay_skips_orphaned_pending_not_adopted(
+    fleet_bin: str, home: Path,
+) -> None:
+    """Codex iter-4 [P1]: a pending journal the task did NOT adopt (coord
+    crashed after acquire but before persisting state; the still-ready
+    task was re-dispatched under a DIFFERENT agent_id) must NOT be
+    replayed — replaying journal A while agent B owns the task is a
+    cross-id double-launch the per-id CAS cannot stop. Replay re-emits
+    only the journal whose agent_id == worker_agent_ids[slug]."""
+    _acquire(fleet_bin, home, "aae0a001", "fix-foo")  # orphaned journal A
+    # The task adopted a DIFFERENT dispatch (agent B) on re-dispatch.
+    actions = _replay(
+        home, fleet_bin,
+        coord_state={"worker_agent_ids": {"fix-foo": "bbbb0002"}},
+    )
+    assert [a for a in actions if a.dispatch_instruction] == [], \
+        "orphaned pending journal wrongly replayed (cross-id double-launch)"
+    # Orphan's cap untouched — left for the cap/sweeper, not relaunched.
+    assert _journal(home, "aae0a001").get("replay_emit_attempts", 0) == 0
 
 
 # ---------------------------------------------------------------------------
