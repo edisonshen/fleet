@@ -139,16 +139,25 @@ type Model struct {
 	// would draw on top of bubbletea's state.
 	pendingAttach string
 
-	// coordSpawnInFlight tracks projects whose [a] dispatch goroutine
-	// has been launched but coordSpawnDoneMsg hasn't returned yet.
-	// During this window the marker file isn't written and the agent
-	// record isn't on disk — without this gate, a second [a] press
-	// would launch a second `fleet dispatch coord-<project>` and we'd
-	// have two competing coord agents (issue #63 codex iter-3 P2
-	// follow-up). Map key is project name; value is irrelevant
-	// (presence == in-flight). Cleared when coordSpawnDoneMsg arrives
-	// or when the err branch fires.
-	coordSpawnInFlight map[string]bool
+	// coordOpInFlight tracks projects whose coord-lifecycle op (a SPAWN
+	// via [a]/[+]/[r], or a HANDOFF via [h]) has been kicked off but its
+	// completion message hasn't returned yet. During this window the
+	// dispatch/handoff goroutine is running and no fresh marker / agent
+	// record exists on disk — without this gate, a second [a] OR [h]
+	// press would launch a competing coord and we'd end with N coords
+	// for one project (the 2026-05-28 fengshen-site triple-coord repro;
+	// design: docs/DESIGN-tui-coord-row-lifecycle.md D1).
+	//
+	// Map key is project name; value is the op kind: coordOpSpawn or
+	// coordOpHandoff (drives the visible in-flight status token — D2).
+	// Presence (any value) means "a lifecycle op is in flight; refuse
+	// to start another." Cleared when the matching done message arrives
+	// (coordSpawnDoneMsg / handoffDoneMsg) or when an err branch fires.
+	//
+	// Renamed from coordSpawnInFlight map[string]bool (PR2 of the
+	// coord-row-lifecycle fix): [h] previously never set the guard, so
+	// a handoff successor-spawn was invisible to the dedup machinery.
+	coordOpInFlight map[string]string
 
 	// projectAddCoordSpawn marks the [+]-hotkey-initiated coord spawns
 	// so the coordSpawnDoneMsg handler can format a recovery-oriented
@@ -307,6 +316,81 @@ type Model struct {
 	// shape but is a separate field so toggling the LEFT and RIGHT
 	// idle groups stays independent.
 	agentIdleExpanded bool
+}
+
+// coordOp* are the kinds of coord-lifecycle op tracked by
+// coordOpInFlight (PR2 of the coord-row-lifecycle fix). Both gate new
+// spawns/handoffs identically; the value only drives which status token
+// the project row renders ("creating…" vs "handing off…").
+const (
+	coordOpSpawn   = "spawn"
+	coordOpHandoff = "handoff"
+)
+
+// coordOpVerb maps an op kind to a noun for the "already in flight"
+// flash ("coord spawn …" / "coord handoff …"). Unknown values fall back
+// to the literal op string so a future op kind degrades gracefully.
+func coordOpVerb(op string) string {
+	switch op {
+	case coordOpSpawn:
+		return "spawn"
+	case coordOpHandoff:
+		return "handoff"
+	default:
+		return op
+	}
+}
+
+// coordOpToken maps an op kind to the project-row status token shown
+// while the op is in flight (design D2 — visible feedback that stops the
+// double-tap at the source). Returns "" for an unknown/empty op so the
+// renderer falls through to its normal coord-status logic.
+func coordOpToken(op string) string {
+	switch op {
+	case coordOpSpawn:
+		return "creating…"
+	case coordOpHandoff:
+		return "handing off…"
+	default:
+		return ""
+	}
+}
+
+// opInFlight reports whether ANY coord-lifecycle op (spawn or handoff)
+// is currently in flight for the project. Both [a] and [h] check this
+// before creating a new agent so neither can stack a duplicate coord on
+// top of the other's in-flight op (the unified guard — design D1).
+func (m Model) opInFlight(project string) bool {
+	_, ok := m.coordOpInFlight[project]
+	return ok
+}
+
+// inFlightOp returns the kind of op in flight for the project (coordOp
+// Spawn / coordOpHandoff) and whether one is in flight at all. The
+// project-row renderer uses the kind to pick the status token.
+func (m Model) inFlightOp(project string) (string, bool) {
+	op, ok := m.coordOpInFlight[project]
+	return op, ok
+}
+
+// setOpInFlight marks a coord-lifecycle op (op = coordOpSpawn |
+// coordOpHandoff) in flight for the project, lazily allocating the map.
+// Pointer receiver: mutates the caller's Model in place so the guard
+// survives the value-receiver action methods that thread Model by value.
+func (m *Model) setOpInFlight(project, op string) {
+	if m.coordOpInFlight == nil {
+		m.coordOpInFlight = map[string]string{}
+	}
+	m.coordOpInFlight[project] = op
+}
+
+// clearOpInFlight removes the in-flight marker for the project (called
+// from the done-message handlers regardless of success/error). Safe on a
+// nil map.
+func (m *Model) clearOpInFlight(project string) {
+	if m.coordOpInFlight != nil {
+		delete(m.coordOpInFlight, project)
+	}
 }
 
 // detailView is the inline detail panel shown by [⏎] open. The kind
@@ -596,6 +680,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, loadAgentsCmd()
 
 	case handoffDoneMsg:
+		// Clear the in-flight guard set by actionHandoffProject — the
+		// handoff shell-out is done (success OR error), so [a]/[h] for
+		// this project may proceed again. projectName is "" for the
+		// agent-row [h] path (no project guard was set there); delete on
+		// "" is a harmless no-op (PR2: unified coord-op guard).
+		m.clearOpInFlight(msg.projectName)
 		fl := formatHandoffFlash(msg.out, msg.err)
 		m.flash = &fl
 		return m, loadAgentsCmd() // refresh: agent should be archived
@@ -619,9 +709,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// resolved. On success: spawn ONE fresh coord and flash the
 		// reaped count.
 		if msg.err != nil {
-			if m.coordSpawnInFlight != nil {
-				delete(m.coordSpawnInFlight, msg.projectName)
-			}
+			m.clearOpInFlight(msg.projectName)
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"reset of project %s failed after reaping %d coord record(s): %v\n%s — re-press [r] to retry",
@@ -633,13 +721,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Reap succeeded — sessions/records gone, lock cleared. Spawn the
 		// replacement. EnsureProjectInitialized recreates the .locks/
 		// tree the gc sweep may have left bare so the fresh coord's
-		// first tick can re-acquire the flock. The coordSpawnInFlight
+		// first tick can re-acquire the flock. The coordOpInFlight
 		// gate was set at confirm time; startCoordSpawn's coordSpawnDone
 		// Msg clears it.
 		if _, ierr := state.EnsureProjectInitialized(msg.projectName); ierr != nil {
-			if m.coordSpawnInFlight != nil {
-				delete(m.coordSpawnInFlight, msg.projectName)
-			}
+			m.clearOpInFlight(msg.projectName)
 			m.flash = &flashMsg{
 				text: fmt.Sprintf(
 					"reset of project %s reaped %d coord record(s) + cleared lock, but respawn init failed: %v — press [a] on the row to retry",
@@ -702,7 +788,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//   addProjectDoneMsg(success)
 		//     → projects.TagForPath(path)
 		//     → state.EnsureProjectInitialized(tag)
-		//     → mark coordSpawnInFlight[tag] + projectAddCoordSpawn[tag]
+		//     → setOpInFlight(tag, spawn) + mark projectAddCoordSpawn[tag]
 		//     → tea.Batch(loadDashboardCmd, startCoordSpawn(tag, path))
 		//     → coordSpawnDoneMsg lands → existing handler sets
 		//       pendingAttach + tea.Quit (success) OR flashes the
@@ -718,20 +804,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, loadDashboardCmd()
 		}
-		if m.coordSpawnInFlight != nil && m.coordSpawnInFlight[tag] {
-			// Rare: a coord spawn for the same tag is already in flight
-			// (e.g. operator pressed [a] on a synthetic row before [+]
-			// completed). Skip the second dispatch; the existing spawn
-			// will surface via its own coordSpawnDoneMsg.
+		if m.opInFlight(tag) {
+			// Rare: a coord lifecycle op for the same tag is already in
+			// flight (e.g. operator pressed [a] on a synthetic row before
+			// [+] completed). Skip the second dispatch; the existing op
+			// will surface via its own done message.
 			return m, loadDashboardCmd()
-		}
-		if m.coordSpawnInFlight == nil {
-			m.coordSpawnInFlight = map[string]bool{}
 		}
 		if m.projectAddCoordSpawn == nil {
 			m.projectAddCoordSpawn = map[string]bool{}
 		}
-		m.coordSpawnInFlight[tag] = true
+		m.setOpInFlight(tag, coordOpSpawn)
 		m.projectAddCoordSpawn[tag] = true
 		return m, tea.Batch(loadDashboardCmd(), m.startCoordSpawn(tag, msg.path))
 
@@ -739,9 +822,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear in-flight gate — regardless of success/error, this
 		// dispatch attempt is done. Subsequent [a] presses go through
 		// the full lookup path again (find existing → spawn).
-		if m.coordSpawnInFlight != nil {
-			delete(m.coordSpawnInFlight, msg.projectName)
-		}
+		m.clearOpInFlight(msg.projectName)
 		// Capture (and clear) the [+]-initiated flag so the err branch
 		// below can format the project-added-but-spawn-failed recovery
 		// hint. Either branch resets the flag — the operator's next

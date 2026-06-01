@@ -1619,7 +1619,7 @@ func TestKeyA_ProjectRow_DeadCoord_InFlightGuardBlocksDoubleSpawn(t *testing.T) 
 	}
 	// Simulate a prior [a] press that already triggered a recovery
 	// dispatch (in-flight; coordSpawnDoneMsg hasn't arrived yet).
-	m.coordSpawnInFlight = map[string]bool{"demo": true}
+	m.coordOpInFlight = map[string]string{"demo": coordOpSpawn}
 	for i, r := range m.dashboardRows() {
 		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
 			m.dashCursor = i
@@ -2351,8 +2351,8 @@ func TestKeyA_ProjectRow_InFlightSpawn_RejectsDuplicate(t *testing.T) {
 		t.Fatal("first [a] should produce a spawn cmd")
 	}
 	mm := updated.(Model)
-	if !mm.coordSpawnInFlight["demo"] {
-		t.Fatal("after first [a], coordSpawnInFlight[demo] should be true")
+	if !mm.opInFlight("demo") {
+		t.Fatal("after first [a], coordOpInFlight[demo] should be set")
 	}
 	// Second [a] WITHOUT draining the first cmd. Should be rejected.
 	beforeCalls := len(stub.calls)
@@ -2381,7 +2381,7 @@ func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 	(&stubWriteCoordSpawnMarker{}).install(t)
 
 	m := New("test")
-	m.coordSpawnInFlight = map[string]bool{"demo": true}
+	m.coordOpInFlight = map[string]string{"demo": coordOpSpawn}
 
 	updated, _ := m.Update(coordSpawnDoneMsg{
 		projectName: "demo",
@@ -2389,8 +2389,8 @@ func TestModel_CoordSpawnDoneMsg_ClearsInFlight(t *testing.T) {
 		session:     "fleet-abcd1234",
 	})
 	mm := updated.(Model)
-	if mm.coordSpawnInFlight["demo"] {
-		t.Error("coordSpawnInFlight[demo] should be cleared after coordSpawnDoneMsg")
+	if mm.opInFlight("demo") {
+		t.Error("coordOpInFlight[demo] should be cleared after coordSpawnDoneMsg")
 	}
 }
 

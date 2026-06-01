@@ -188,6 +188,243 @@ func TestActionHandoff_OnProjectRow_NoLiveCoord_Flashes(t *testing.T) {
 	}
 }
 
+// -- PR2: unified coord-op in-flight guard ([h] dedup + visible feedback) --
+//
+// docs/DESIGN-tui-coord-row-lifecycle.md D1/D2. The 2026-05-28 repro:
+// operator pressed [h] (no in-flight guard, no visible feedback), saw
+// nothing happen, double-tapped [a] → 3 coords for one project. These
+// tests pin that [h] now arms the SAME guard [a] uses, both keys refuse
+// to start a second lifecycle op while one is in flight, the done
+// messages clear the guard, and the project row renders a visible token.
+
+// TestActionHandoff_ArmsInFlightGuard pins D1: a successful [h] on a
+// project row sets coordOpInFlight[project]=handoff so a follow-on [a]/[h]
+// is gated. This is the gap that let the handoff successor-spawn go
+// invisible to the dedup machinery.
+func TestActionHandoff_ArmsInFlightGuard(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd == nil {
+		t.Fatal("expected handoff cmd from [h] on live coord")
+	}
+	op, ok := mm.inFlightOp("demo")
+	if !ok {
+		t.Fatal("after [h], coordOpInFlight[demo] must be set (D1 unified guard)")
+	}
+	if op != coordOpHandoff {
+		t.Errorf("in-flight op = %q; want %q", op, coordOpHandoff)
+	}
+}
+
+// TestActionHandoff_SecondHandoffWhileInFlight_NoOp pins D1: a second [h]
+// while a handoff is already in flight must NOT fire a second `fleet
+// handoff` shell-out; it flashes instead.
+func TestActionHandoff_SecondHandoffWhileInFlight_NoOp(t *testing.T) {
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	// First [h] arms the guard and fires the shell-out.
+	updated, cmd := m.Update(keyMsg("h"))
+	mm := updated.(Model)
+	if cmd == nil {
+		t.Fatal("first [h] should produce a handoff cmd")
+	}
+	_ = cmd() // drain the first handoff shell-out
+	if len(stub.calls) != 1 {
+		t.Fatalf("first [h] should shell out once; got %d", len(stub.calls))
+	}
+
+	// Second [h] WITHOUT the handoffDoneMsg arriving. Must be rejected.
+	updated2, cmd2 := mm.Update(keyMsg("h"))
+	mm2 := updated2.(Model)
+	if cmd2 != nil {
+		t.Error("second [h] during in-flight handoff must NOT produce a cmd")
+	}
+	if mm2.flash == nil || !mm2.flash.isErr {
+		t.Fatalf("second [h] should flash an error; got %+v", mm2.flash)
+	}
+	if !strings.Contains(mm2.flash.text, "in flight") {
+		t.Errorf("flash should mention 'in flight'; got %q", mm2.flash.text)
+	}
+	if len(stub.calls) != 1 {
+		t.Errorf("second [h] must NOT shell out; got %d calls", len(stub.calls))
+	}
+}
+
+// TestActionAttach_RefusesWhileHandoffInFlight pins D1: [a] (spawn path)
+// refuses to spawn while a HANDOFF is in flight for the project. Without
+// this, [h]'s successor-spawn + an [a] would race two coords — the exact
+// triple-coord the operator hit.
+func TestActionAttach_RefusesWhileHandoffInFlight(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Project row with NO resolvable coord (empty CoordID, no records) so
+	// [a] would normally fall to the Path-3 fresh-spawn. The handoff guard
+	// must intercept before that.
+	m := New("test")
+	m.coordOpInFlight = map[string]string{"demo": coordOpHandoff}
+	m.dashboard = &Snapshot{Projects: []*ProjectRow{{Name: "demo"}}}
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowProject && r.project != nil && r.project.Name == "demo" {
+			m.dashCursor = i
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Error("[a] must NOT spawn while a handoff is in flight")
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] during in-flight handoff should flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "handoff") {
+		t.Errorf("flash should name the in-flight handoff; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] must NOT shell out while handoff in flight; got %v", stub.calls)
+	}
+}
+
+// TestUpdate_HandoffDoneClearsInFlightGuard pins D1: handoffDoneMsg
+// clears the guard (success path) so a subsequent [a]/[h] proceeds.
+func TestUpdate_HandoffDoneClearsInFlightGuard(t *testing.T) {
+	m := makeModelWithAgents()
+	m.coordOpInFlight = map[string]string{"demo": coordOpHandoff}
+
+	updated, _ := m.Update(handoffDoneMsg{projectName: "demo", out: "handed off"})
+	mm := updated.(Model)
+	if mm.opInFlight("demo") {
+		t.Error("coordOpInFlight[demo] must be cleared after handoffDoneMsg")
+	}
+}
+
+// TestUpdate_HandoffDoneFailureClearsInFlightGuard pins D1: the guard
+// clears even when the handoff shell-out errored, so the operator can
+// retry [h]/[a] rather than being stuck behind a stale guard.
+func TestUpdate_HandoffDoneFailureClearsInFlightGuard(t *testing.T) {
+	m := makeModelWithAgents()
+	m.coordOpInFlight = map[string]string{"demo": coordOpHandoff}
+
+	updated, _ := m.Update(handoffDoneMsg{
+		projectName: "demo",
+		out:         "boom",
+		err:         errors.New("exit 1"),
+	})
+	mm := updated.(Model)
+	if mm.opInFlight("demo") {
+		t.Error("coordOpInFlight[demo] must be cleared even on handoff failure")
+	}
+}
+
+// TestProjectRow_RendersInFlightToken pins D2: while an op is in flight,
+// the project row renders the visible "creating…" / "handing off…" token
+// — the feedback whose absence caused the double-tap. Cleared (token
+// gone) once no op is in flight.
+func TestProjectRow_RendersInFlightToken(t *testing.T) {
+	cases := []struct {
+		op    string
+		token string
+	}{
+		{coordOpSpawn, "creating…"},
+		{coordOpHandoff, "handing off…"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			p := &ProjectRow{Name: "demo"}
+			ctx := coordSpawnCtx{
+				now:        time.Now(),
+				opInFlight: map[string]string{"demo": tc.op},
+			}
+			lines := projectFooterLines(p, 80, "  ", ctx)
+			joined := strings.Join(lines, "\n")
+			if !strings.Contains(joined, tc.token) {
+				t.Errorf("project footer should render %q while %s in flight; got:\n%s",
+					tc.token, tc.op, joined)
+			}
+		})
+	}
+
+	// No op in flight → no token (normal status path).
+	p := &ProjectRow{Name: "demo"}
+	ctx := coordSpawnCtx{now: time.Now()}
+	joined := strings.Join(projectFooterLines(p, 80, "  ", ctx), "\n")
+	if strings.Contains(joined, "creating…") || strings.Contains(joined, "handing off…") {
+		t.Errorf("no token expected when no op in flight; got:\n%s", joined)
+	}
+}
+
+// TestIntegration_HandoffThenDoubleAttach_OnlyOneOp is the architect-level
+// regression for the 2026-05-28 triple-coord (feedback_e2e_tests_for_all
+// _cases): simulate the EXACT operator sequence — [h] then [a] then [a] —
+// through the real Update path and assert only ONE coord-lifecycle op
+// shells out. Pre-PR2, [h] set no guard, so both [a] presses spawned →
+// 3 coords. Fails-on-parent: without the unified guard, the two [a]
+// presses each fire a dispatch.
+func TestIntegration_HandoffThenDoubleAttach_OnlyOneOp(t *testing.T) {
+	withFleetHome(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+	// coord001's tmux session is DEAD: [a] Path 1 would normally take the
+	// dead-session RECOVERY spawn (a real `fleet dispatch` shell-out).
+	// This mirrors the operator's repro where the project had a stale
+	// coord — so [a] is a SPAWN, not a harmless attach, and the missing
+	// [h] guard is observable. The unified guard set by [h] must block
+	// BOTH [a] presses from spawning a successor on top of the in-flight
+	// handoff.
+	(&stubSessionAlive{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-coord001": true}}).install(t)
+
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	coord.TaskID = coordTaskID("demo")
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+
+	// [h] — fire the handoff (spawns a successor coord under the hood).
+	updated, cmd := m.Update(keyMsg("h"))
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("[h] should fire a handoff cmd")
+	}
+	_ = cmd() // drain the handoff shell-out (one call)
+
+	// Double-tap [a] WHILE the handoff is in flight (handoffDoneMsg has
+	// NOT arrived). Both presses must be refused by the unified guard.
+	for i := 0; i < 2; i++ {
+		updated, cmd = m.Update(keyMsg("a"))
+		m = updated.(Model)
+		if cmd != nil {
+			// Drain in case a buggy build produced a spawn cmd, so the
+			// call is captured and the count assertion below catches it.
+			_ = cmd()
+		}
+	}
+
+	// Exactly ONE lifecycle shell-out total: the [h] handoff. Neither [a]
+	// may have added a recovery dispatch. Pre-PR2 (no [h] guard) the
+	// first [a] spawns → 2+ calls; this assertion is the fails-on-parent.
+	if len(stub.calls) != 1 {
+		t.Fatalf("expected exactly ONE coord-lifecycle shell-out (the handoff); got %d: %v",
+			len(stub.calls), stub.calls)
+	}
+	if stub.calls[0][0] != "handoff" {
+		t.Errorf("the one call should be the handoff; got %v", stub.calls[0])
+	}
+}
+
 func TestActionHandoff_OnAgentRow_RejectsWithHint(t *testing.T) {
 	stub := &stubFleetCmd{}
 	stub.install(t)

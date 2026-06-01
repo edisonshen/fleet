@@ -52,6 +52,17 @@ type coordSpawnCtx struct {
 	tickFrame    int
 	spawnTimeout time.Duration
 	records      []*agent.Record
+
+	// opInFlight is m.coordOpInFlight: project name → op kind
+	// (coordOpSpawn / coordOpHandoff) for a coord-lifecycle op that the
+	// TUI has kicked off but whose done message hasn't returned yet
+	// (PR2 — design D2). When the current row's project has an entry,
+	// projectFooterLines renders a "creating…" / "handing off…" status
+	// token so the operator sees in-flight feedback BEFORE any marker /
+	// agent record exists on disk — the fix that stops the double-tap
+	// into a duplicate coord at the source. Nil/absent → no token; the
+	// normal marker-driven coord-status logic runs unchanged.
+	opInFlight map[string]string
 }
 
 // coordSpawnState enumerates the indicator states the project row can
