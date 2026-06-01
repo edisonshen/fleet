@@ -291,7 +291,18 @@ func writeRecoveryHandoffDoc(deadRec *agent.Record, ts time.Time) (string, error
 	if deadRec == nil {
 		return "", fmt.Errorf("writeRecoveryHandoffDoc: nil deadRec")
 	}
-	doc, err := handoff.SynthesizeRecovery(deadRec.ID, deadRec.Project, ts)
+	// Prefer the rolling coord-checkpoint.md (written every N ticks by
+	// the coord skill) over the last clean handoff doc when it's fresher
+	// — bounds the recovery window to the checkpoint interval instead of
+	// the (potentially hours-long) gap between fleet-guard handoffs.
+	// LastHandoffPath is nil for a coord that died before ever handing
+	// off; "" then means "no handoff baseline" and any checkpoint wins.
+	var lastHandoff string
+	if deadRec.LastHandoffPath != nil {
+		lastHandoff = *deadRec.LastHandoffPath
+	}
+	doc, err := handoff.SynthesizeRecoveryWithLastHandoff(
+		deadRec.ID, deadRec.Project, lastHandoff, ts)
 	if err != nil {
 		return "", fmt.Errorf("synthesize recovery doc: %w", err)
 	}
