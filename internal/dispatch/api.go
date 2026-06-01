@@ -48,6 +48,32 @@ func AcquireCoordPromptInbox(opts AcquireCoordPromptInboxOptions) (AcquireResult
 	if err := validateAcquireOptions(opts); err != nil {
 		return AcquireResult{}, err
 	}
+	// dispatch-durability (fleet#184): acquire is a create/load → mutate
+	// → SaveJournal RMW (it sets ExecPending on a fresh journal and the
+	// controller flips the claim allocating → live), so it MUST hold the
+	// per-id flock like every other journal writer. Otherwise an acquire
+	// (or an idempotent re-acquire) racing a mark-launch-attempted /
+	// reset-for-relaunch on the same id in a separate `fleet` process
+	// could clobber the flock-guarded write via WriteAtomic's
+	// unconditional os.Rename. The stdin Content reader is consumed
+	// inside the controller; reading it under the lock is bounded (a
+	// few-KB prompt), matching the reset-for-relaunch "stdin is already a
+	// short prompt" assumption.
+	var res AcquireResult
+	lockErr := withJournalLock(opts.DispatchID, func() error {
+		r, e := acquireCoordPromptInboxLocked(opts)
+		res = r
+		return e
+	})
+	if lockErr != nil {
+		return AcquireResult{}, lockErr
+	}
+	return res, nil
+}
+
+// acquireCoordPromptInboxLocked is the body of AcquireCoordPromptInbox,
+// run while the per-id flock is held by the withJournalLock wrapper.
+func acquireCoordPromptInboxLocked(opts AcquireCoordPromptInboxOptions) (AcquireResult, error) {
 	path, err := CoordPromptInboxPath(opts.DispatchID)
 	if err != nil {
 		return AcquireResult{}, err
@@ -142,6 +168,40 @@ func ReleaseCoordPromptInbox(opts ReleaseCoordPromptInboxOptions) (ReleaseResult
 	if opts.DispatchID == "" {
 		return ReleaseResult{}, errors.New("dispatch_id required")
 	}
+	// dispatch-durability (fleet#184): release is a read → mutate
+	// exec_state → SaveJournal RMW, so it MUST hold the per-id flock —
+	// exactly like mark-launch-attempted / reserve-replay / reset-for-
+	// relaunch. Without it, a release running in one `fleet` process
+	// (loop.py reaper / residual-crash repair, during a tick) can
+	// interleave with a mark-launch-attempted running in another `fleet`
+	// process (the coord agent, between tick turns, across the agent-turn
+	// boundary that coordinator.lock does NOT serialize) and clobber the
+	// flock-guarded launch flip via the unconditional os.Rename in
+	// WriteAtomic — the rev4 lost-update the flock exists to close. Load
+	// the journal INSIDE the lock so we mutate fresh state.
+	var res ReleaseResult
+	lockErr := withJournalLock(opts.DispatchID, func() error {
+		r, e := releaseCoordPromptInboxLocked(opts)
+		res = r
+		return e
+	})
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrJournalContention) {
+			// Surface contention to the caller as an error; the Python
+			// release helper logs it and the next tick / sweeper retries.
+			return ReleaseResult{}, lockErr
+		}
+		return ReleaseResult{}, lockErr
+	}
+	return res, nil
+}
+
+// releaseCoordPromptInboxLocked is the body of ReleaseCoordPromptInbox,
+// run while the per-id flock is held by the withJournalLock wrapper.
+// The internal controller SaveJournal calls execute under the held
+// flock (SaveJournal does not re-acquire it), so the whole read →
+// mutate → write sequence is one critical section.
+func releaseCoordPromptInboxLocked(opts ReleaseCoordPromptInboxOptions) (ReleaseResult, error) {
 	j, err := LoadJournal(opts.DispatchID)
 	if err != nil {
 		if errors.Is(err, ErrJournalNotFound) {

@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,11 @@ import (
 	"testing"
 	"time"
 )
+
+// errorsIsContention reports whether err wraps ErrJournalContention.
+func errorsIsContention(err error) bool {
+	return errors.Is(err, ErrJournalContention)
+}
 
 // readInboxFile reads the coord_prompt_inbox file for id under the test
 // FLEET_HOME.
@@ -204,6 +210,72 @@ func TestConcurrentWriters_NoLostUpdate(t *testing.T) {
 	if j.ReplayEmitAttempts != n {
 		t.Fatalf("replay_emit_attempts = %d, want %d — a lost update clobbered a counter increment",
 			j.ReplayEmitAttempts, n)
+	}
+}
+
+// TestAcquireReleaseTakeFlock pins that acquire and release route
+// through withJournalLock — a release that interleaves with a
+// flock-guarded mark-launch-attempted must NOT clobber the launch flip
+// (the rev4 lost-update reopened by a lock-free SaveJournal). We hold
+// the journal flock from another goroutine and assert release blocks on
+// it (returns contention under a tiny deadline) rather than barging in
+// lock-free.
+func TestAcquireReleaseTakeFlock(t *testing.T) {
+	withFleetHome(t)
+	pinNow(t, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	id := acquirePendingFixture(t, "40000001")
+
+	// Hold the per-id flock so a concurrent release cannot acquire it.
+	restoreDeadline := setJournalLockDeadline(1 * time.Millisecond)
+	defer restoreDeadline()
+	held := make(chan struct{})
+	release := make(chan struct{})
+	go func() {
+		_ = withJournalLock(id, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+
+	// Release must contend on the flock (proving it takes the lock) — a
+	// lock-free release would succeed here and clobber whatever the lock
+	// holder is mid-writing.
+	_, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{DispatchID: id, HostID: "h"})
+	close(release)
+	if err == nil {
+		t.Fatalf("release succeeded while the journal flock was held — release is NOT taking the flock (lost-update race)")
+	}
+	if !errorsIsContention(err) {
+		t.Fatalf("release error = %v, want journal-lock contention", err)
+	}
+}
+
+// TestReleaseNoClobberOfConcurrentLaunch is the lost-update regression:
+// a mark-launch-attempted (flock-guarded) and a release run back-to-back
+// on the same id; the release must operate on the launch_attempted state
+// it observes under the lock and resolve to ExecFailed (un-acked launch),
+// never silently revert to a stale ExecPending/ExecDone from a lock-free
+// read. (Serialization is enforced by the flock; this asserts the
+// post-condition that proves no update was lost.)
+func TestReleaseNoClobberOfConcurrentLaunch(t *testing.T) {
+	withFleetHome(t)
+	pinNow(t, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
+	id := acquirePendingFixture(t, "41000001")
+
+	if out, err := MarkLaunchAttempted(id, 0); err != nil || out != LaunchAttemptOK {
+		t.Fatalf("mark: out=%q err=%v", out, err)
+	}
+	// Release now: it must read launch_attempted UNDER the flock and
+	// resolve to ExecFailed (launch unconfirmed) — not clobber it to a
+	// stale ExecDone from a pre-flip read.
+	if _, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{DispatchID: id, HostID: "h"}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	j, _ := LoadJournal(id)
+	if j.ExecState != ExecFailed {
+		t.Fatalf("released launch_attempted = %q, want failed (launch flip must not be lost)", j.ExecState)
 	}
 }
 

@@ -4280,9 +4280,11 @@ def _replay_pending_dispatches(
             # not_pending / absent: a concurrent writer changed state
             # between our read + the reserve; nothing to do this tick.
         elif state == "launch_attempted":
-            acked = j.get("exec_state") == "acked"  # always False here
-            if acked:
-                continue
+            # state is "launch_attempted" here by construction; an "acked"
+            # entry would have taken neither this branch nor the pending
+            # one (replay leaves acked/terminal alone). Residual-crash
+            # repair only fires when the launch flip landed but no ack
+            # ever followed.
             if _has_live_registered_subagent(coord_state, slug):
                 # Registered (just late) — registration-repair territory,
                 # not a phantom. Leave for the normal supervisor path.
