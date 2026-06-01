@@ -80,8 +80,10 @@ func TestAcquireAndDeliver_Happy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadJournal: %v", err)
 	}
-	if j.ExecState != ExecInFlight {
-		t.Errorf("exec_state = %q; want in_flight", j.ExecState)
+	// dispatch-durability #184: acquire leaves ExecPending (not
+	// ExecInFlight) — the coord flips it to launch_attempted at launch.
+	if j.ExecState != ExecPending {
+		t.Errorf("exec_state = %q; want pending", j.ExecState)
 	}
 	if len(j.Claims) != 1 || j.Claims[0].State != ClaimLive {
 		t.Errorf("claims = %+v; want one live claim", j.Claims)

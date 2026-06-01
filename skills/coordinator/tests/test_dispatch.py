@@ -267,12 +267,26 @@ def test_format_dispatch_instruction_shape() -> None:
     assert lines[0] == "DISPATCH: ready-aaaa"
     # Block fields must appear in order with exact spacing.
     assert lines[1] == "  agent_id: abcdef01"
-    assert lines[2] == "  description: fleet worker ready-aaaa"
-    assert lines[3] == "  prompt_file: /tmp/inbox/abcdef01.md"
-    assert lines[4] == "  run_in_background: true"
-    assert lines[5] == "  subagent_type: general-purpose"
-    assert lines[6] == "END_DISPATCH"
-    assert len(lines) == 7
+    # dispatch-durability (#184): the launch token follows agent_id.
+    assert lines[2] == "  generation: 0"
+    assert lines[3] == "  description: fleet worker ready-aaaa"
+    assert lines[4] == "  prompt_file: /tmp/inbox/abcdef01.md"
+    assert lines[5] == "  run_in_background: true"
+    assert lines[6] == "  subagent_type: general-purpose"
+    assert lines[7] == "END_DISPATCH"
+    assert len(lines) == 8
+
+
+def test_format_dispatch_instruction_carries_generation() -> None:
+    """#184: a non-zero generation is stamped so the coord's
+    mark-launch-attempted gate validates against the right lifecycle."""
+    out = dispatch.format_dispatch_instruction(
+        agent_id="abcdef01",
+        slug="ready-aaaa",
+        prompt_file="/tmp/inbox/abcdef01.md",
+        generation=3,
+    )
+    assert "  generation: 3" in out
 
 
 def test_format_dispatch_instruction_custom_description() -> None:

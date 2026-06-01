@@ -924,6 +924,7 @@ def format_dispatch_instruction(
     slug: str,
     prompt_file: str,
     description: str | None = None,
+    generation: int = 0,
 ) -> str:
     """Render the DISPATCH block the coord agent (Claude) will act on.
 
@@ -937,11 +938,20 @@ def format_dispatch_instruction(
 
         DISPATCH: <slug>
           agent_id: <8hex>
+          generation: <int>
           description: <short>
           prompt_file: <abs path>
           run_in_background: true
           subagent_type: general-purpose
         END_DISPATCH
+
+    `generation` is the launch token (dispatch-durability #184). Before
+    invoking the Agent the coord runs `fleet claims mark-launch-attempted
+    <agent_id> <generation>`; the flip lands only if the on-disk journal
+    is still at this generation — a stale re-emitted block (older
+    lifecycle) carries an old gen and predicate-fails, so it cannot
+    double-launch a later lifecycle. See SKILL.md "Worker dispatch
+    protocol" step 2.
 
     description defaults to "fleet worker <slug>". prompt_file is
     the path the coord must Read; the body is then passed verbatim
@@ -964,6 +974,7 @@ def format_dispatch_instruction(
     return "\n".join([
         f"DISPATCH: {slug}",
         f"  agent_id: {agent_id}",
+        f"  generation: {int(generation)}",
         f"  description: {desc}",
         f"  prompt_file: {prompt_file}",
         "  run_in_background: true",
@@ -1561,6 +1572,173 @@ def release_coord_prompt_inbox(
     # Pass through whatever outcome the CLI emitted, even unknown ones —
     # the caller's `outcome in {...}` check is the routing decision.
     return response
+
+
+# ============================================================
+# dispatch-durability (#184) launch-state helpers
+# ============================================================
+#
+# Python shells out to `fleet claims <subcmd>` — the journal is Go-owned
+# (only Go takes the per-id flock; a Python tmp+rename would race the Go
+# writers). These helpers parse the JSON envelope and return the
+# `outcome` (+ `generation` where present). They never write the journal
+# directly. See durability.go for the underlying state machine.
+
+
+def mark_launch_attempted(
+    agent_id: str,
+    generation: int,
+    *,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> str:
+    """Run `fleet claims mark-launch-attempted <id> <gen>` — the tri-state
+    CAS the coord runs IMMEDIATELY before invoking the host Agent.
+
+    Returns the outcome string the coord MUST branch on:
+      - "ok"             → flip landed; LAUNCH the Agent.
+      - "predicate_fail" → not pending / stale gen; SKIP, do NOT launch.
+      - "contention"     → flock deadline; TRANSIENT; retry SAME block
+                           next tick; NEVER treat as skip.
+      - "error"          → unexpected (binary missing / bad input); the
+                           coord logs + retries next tick (fail-safe:
+                           treated like contention by the caller, NOT a
+                           skip).
+    """
+    out = _run_claims_simple(
+        [fleet_bin, "claims", "mark-launch-attempted", agent_id, str(generation)],
+        fleet_home=fleet_home, timeout_s=timeout_s,
+    )
+    return out.get("outcome", "error")
+
+
+def mark_acked(
+    agent_id: str,
+    *,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> str:
+    """Run `fleet claims mark-acked <id>` — best-effort flip
+    launch_attempted → acked. Returns the outcome ("acked" / "contention"
+    / "error"). Never raises; a failed ack just leaves the entry at
+    launch_attempted (residual-crash repair handles a never-acked
+    launch)."""
+    out = _run_claims_simple(
+        [fleet_bin, "claims", "mark-acked", agent_id],
+        fleet_home=fleet_home, timeout_s=timeout_s,
+    )
+    return out.get("outcome", "error")
+
+
+def reserve_replay(
+    agent_id: str,
+    *,
+    cap: int = 5,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict:
+    """Run `fleet claims reserve-replay <id> --cap N` — the tick-entry
+    replay primitive. Increments the durable replay counter under the
+    flock BEFORE the block reaches output.
+
+    Returns a dict {"outcome": ..., "generation": int|None}:
+      - "reserved"    → re-emit the block stamped with `generation`.
+      - "capped"      → cap hit; journal flipped to ExecBlocked (caller
+                        escalates off-channel).
+      - "not_pending" → not ExecPending; do NOT replay.
+      - "absent"      → no journal; nothing to replay.
+      - "contention"  → flock deadline; retry next tick.
+      - "error"       → unexpected; caller logs + skips this id this tick.
+    """
+    out = _run_claims_simple(
+        [fleet_bin, "claims", "reserve-replay", agent_id, "--cap", str(cap)],
+        fleet_home=fleet_home, timeout_s=timeout_s,
+    )
+    return {
+        "outcome": out.get("outcome", "error"),
+        "generation": out.get("generation"),
+    }
+
+
+def reset_for_relaunch(
+    agent_id: str,
+    prompt: str,
+    *,
+    fleet_bin: str = "fleet",
+    fleet_home: str | None = None,
+    timeout_s: float = 10.0,
+) -> dict:
+    """Run `fleet claims reset-for-relaunch <id>` with the new prompt
+    piped on stdin — re-arm an EXISTING dispatch (handoff_resume).
+
+    Under one flock the Go side rewrites the inbox + resets the entry to
+    a fresh ExecPending with a bumped generation. Returns
+    {"outcome": ..., "generation": int|None, "path": str}:
+      - "reset"      → entry re-armed; emit the resume block stamped with
+                       the NEW `generation`.
+      - "absent"     → no journal; caller should acquire fresh instead.
+      - "contention" → flock deadline; retry next tick.
+      - "error"      → unexpected.
+    """
+    out = _run_claims_input(
+        [fleet_bin, "claims", "reset-for-relaunch", agent_id],
+        prompt, fleet_home=fleet_home, timeout_s=timeout_s,
+    )
+    return {
+        "outcome": out.get("outcome", "error"),
+        "generation": out.get("generation"),
+        "path": out.get("path", ""),
+    }
+
+
+def _run_claims_simple(
+    cmd: list[str],
+    *,
+    fleet_home: str | None,
+    timeout_s: float,
+) -> dict:
+    """Run a `fleet claims` subcommand (no stdin) and return the parsed
+    JSON envelope. On any subprocess failure return {"outcome": "error"}
+    — these helpers are best-effort; the coord retries on the next tick.
+    """
+    env = os.environ.copy()
+    if fleet_home:
+        env["FLEET_HOME"] = fleet_home
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s,
+            check=False, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {"outcome": "error"}
+    parsed = _parse_claims_response(proc.stdout)
+    return parsed or {"outcome": "error"}
+
+
+def _run_claims_input(
+    cmd: list[str],
+    stdin_body: str,
+    *,
+    fleet_home: str | None,
+    timeout_s: float,
+) -> dict:
+    """Like _run_claims_simple but pipes stdin_body on stdin (for
+    reset-for-relaunch, which reads the new prompt from stdin)."""
+    env = os.environ.copy()
+    if fleet_home:
+        env["FLEET_HOME"] = fleet_home
+    try:
+        proc = subprocess.run(
+            cmd, input=stdin_body, capture_output=True, text=True,
+            timeout=timeout_s, check=False, env=env,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {"outcome": "error"}
+    parsed = _parse_claims_response(proc.stdout)
+    return parsed or {"outcome": "error"}
 
 
 def _parse_claims_response(stdout: str) -> dict:

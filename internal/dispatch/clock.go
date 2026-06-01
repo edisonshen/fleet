@@ -15,3 +15,12 @@ func setNow(t time.Time) func() {
 	nowFunc = func() time.Time { return t }
 	return func() { nowFunc = prev }
 }
+
+// setJournalLockDeadline overrides journalLockDeadline for a test and
+// returns a restore func. Used by the contention test (#184) to force a
+// deterministic flock timeout.
+func setJournalLockDeadline(d time.Duration) func() {
+	prev := journalLockDeadline
+	journalLockDeadline = d
+	return func() { journalLockDeadline = prev }
+}

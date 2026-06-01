@@ -64,7 +64,17 @@ func AcquireCoordPromptInbox(opts AcquireCoordPromptInboxOptions) (AcquireResult
 				opts.TmuxSocket,
 				nowFunc(),
 			)
-			j.ExecState = ExecInFlight
+			// dispatch-durability (fleet#184): acquire leaves the entry
+			// at ExecPending — it is the COORD that durably flips
+			// pending → launch_attempted (via `fleet claims
+			// mark-launch-attempted`) IMMEDIATELY before invoking the
+			// host Agent. Setting ExecInFlight here (pre-#184) was
+			// premature: it implied a launch that had not happened, so
+			// replay could not distinguish "recorded but never launched"
+			// (safe to re-emit) from "launched". newJournal already
+			// defaults ExecState=ExecPending; the explicit set documents
+			// the contract.
+			j.ExecState = ExecPending
 			if err := SaveJournal(j); err != nil {
 				return AcquireResult{}, err
 			}
@@ -142,11 +152,33 @@ func ReleaseCoordPromptInbox(opts ReleaseCoordPromptInboxOptions) (ReleaseResult
 	}
 	// Mark exec_state terminal on release if not already — the PR1
 	// migration calls release at the dispatch's terminal transition
-	// (loop.py reaper / supervisor). PR1 keeps the flip conservative:
-	// only mark done if currently in_flight/pending. PR3 layers richer
-	// terminal-cause tracking on top.
+	// (loop.py reaper / supervisor).
+	//
+	// dispatch-durability (fleet#184): the pre-#184 code force-flipped
+	// ANY non-terminal state to ExecDone. That would CLOBBER the new
+	// launch states:
+	//   - ExecLaunchAttempted, un-acked: the coord flipped it to
+	//     launch_attempted but no register_subagent ack ever landed.
+	//     Forcing ExecDone would falsely record success and erase the
+	//     "launch unconfirmed" signal the residual-crash repair relies
+	//     on. Resolve to ExecFailed instead.
+	//   - ExecBlocked / ExecFailed are already terminal (IsTerminal
+	//     covers them) — never downgrade.
+	//   - ExecAcked (live worker finished) and ExecPending / ExecInFlight
+	//     (legacy) → ExecDone, the normal completion.
 	if !j.ExecState.IsTerminal() {
-		j.ExecState = ExecDone
+		switch j.ExecState {
+		case ExecLaunchAttempted:
+			// Launch attempted but never acked → unconfirmed. Don't
+			// pretend it completed cleanly.
+			j.ExecState = ExecFailed
+			if j.BlockedReason == "" {
+				j.BlockedReason = "released_launch_unconfirmed"
+			}
+		default:
+			// pending / in_flight (legacy) / acked → done.
+			j.ExecState = ExecDone
+		}
 	}
 	controller := NewCoordPromptInboxController()
 	status, existing, err := controller.Inspect(j, KindCoordPromptInbox)

@@ -355,28 +355,66 @@ def build_resume_dispatches(
             )
             continue
         # Build the resume prompt: WIP-aware preamble + original inbox
-        # body. Write it to the SAME inbox path so the agent_id stays
-        # stable across handoff (tasks.md notes don't need re-stitching).
+        # body. We re-use the SAME agent_id so tasks.md notes stay
+        # coherent across handoff.
         original_body = inbox_path.read_text(encoding="utf-8")
         resume_body = (
             _RESUME_PREAMBLE_TEMPLATE.format(wip_path=str(wip_path))
             + original_body
         )
-        try:
-            dispatch_mod.write_worker_inbox(
-                e.agent_id, resume_body, fleet_home=str(fleet_home_p),
-            )
-        except (ValueError, OSError) as exc:
+        # dispatch-durability (#184): re-arm the EXISTING dispatch journal
+        # via `fleet claims reset-for-relaunch` instead of a bare
+        # write_worker_inbox. The original journal entry is ExecAcked /
+        # terminal from the FIRST dispatch; a blind mark-launch-attempted
+        # would predicate-fail (not pending) and the resume would never
+        # launch. reset-for-relaunch reads the new prompt on stdin, then
+        # under one flock rewrites the inbox AND resets the entry to a
+        # fresh ExecPending with a BUMPED generation — so this resume block
+        # carries the new gen, enters the universal launch gate, and any
+        # stale older-gen block predicate-fails (no double-launch).
+        reset = dispatch_mod.reset_for_relaunch(
+            e.agent_id, resume_body, fleet_home=str(fleet_home_p),
+        )
+        outcome = reset.get("outcome")
+        if outcome == "reset":
+            generation = int(reset.get("generation") or 0)
+        elif outcome == "contention":
+            # TRANSIENT: the journal flock was busy. Do NOT re-emit a block
+            # we couldn't re-arm (a stale-gen block would predicate-fail at
+            # the coord and waste the launch). Skip; the next successor tick
+            # retries the reset cleanly.
             skipped.append(
-                f"task {e.task_id}: inbox rewrite failed: {exc}; skip",
+                f"task {e.task_id}: reset-for-relaunch contention; "
+                "skip (retry next tick)",
             )
             continue
+        else:
+            # absent (no journal for this id — pre-#184 dispatch or reaped)
+            # or error (binary missing / unexpected): the journal was NOT
+            # mutated, so fall back to a direct inbox write with gen 0. The
+            # coord's mark-launch-attempted gate stays safe either way — if
+            # a journal does exist at a higher gen, the gen-0 block simply
+            # predicate-fails (no double-launch); if none exists, the launch
+            # proceeds. This preserves the legacy resume path for journals
+            # the durability machinery doesn't own.
+            try:
+                dispatch_mod.write_worker_inbox(
+                    e.agent_id, resume_body, fleet_home=str(fleet_home_p),
+                )
+            except (ValueError, OSError) as exc:
+                skipped.append(
+                    f"task {e.task_id}: inbox rewrite failed "
+                    f"(reset outcome={outcome!r}): {exc}; skip",
+                )
+                continue
+            generation = 0
         try:
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=e.agent_id,
                 slug=e.task_id,
                 prompt_file=str(inbox_path),
                 description=f"fleet worker {e.task_id} (resume)",
+                generation=generation,
             )
         except ValueError as exc:
             skipped.append(

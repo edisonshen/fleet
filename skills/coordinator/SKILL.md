@@ -177,6 +177,7 @@ Block shape:
 ```text
 DISPATCH: <slug>
   agent_id: <8hex>
+  generation: <int>
   description: <short>
   prompt_file: <abs path>
   run_in_background: true
@@ -185,21 +186,49 @@ END_DISPATCH
 ```
 
 For each block:
-1. Read `prompt_file`.
-2. Invoke the Agent tool once. Use `description`, full prompt body,
+1. Read `prompt_file`. Note the block's `agent_id` and `generation` (the
+   launch token).
+2. **Durably record the launch attempt BEFORE invoking the Agent** — the
+   tri-state CAS that closes the broken-stdout phantom (dispatch-durability
+   #184). Run:
+
+   ```bash
+   fleet claims mark-launch-attempted <agent_id> <generation>
+   ```
+
+   Parse the JSON `outcome` field and branch on ALL THREE results — do NOT
+   collapse them to "nonzero → skip" (that silently drops a launch):
+   - **`ok`** (exit 0) → the journal flipped `pending → launch_attempted`;
+     **proceed to step 3 and launch the Agent.**
+   - **`predicate_fail`** (exit 20) → the entry is not pending, or the
+     generation is stale (another tick/path already owns this launch, or
+     this is a stale re-emitted block) → **SKIP this block; do NOT launch.**
+   - **`contention`** (exit 21) → the per-id flock could not be taken in
+     time. **TRANSIENT** → **do NOT launch, do NOT mark it done; the next
+     tick re-emits the same block. NEVER treat contention as a skip.**
+3. Invoke the Agent tool ONCE. Use `description`, full prompt body,
    `subagent_type=general-purpose`, and `run_in_background=true`.
-3. Capture the returned `subagent_id`.
-4. Best-effort register it:
+4. Capture the returned `subagent_id` and best-effort register it (this
+   also flips the journal `launch_attempted → acked`):
 
 ```bash
 python3 /path/to/skills/coordinator/register_subagent.py \
   --project <project> <slug> <subagent_id>
 ```
 
-One Agent call per DISPATCH block. If a tick emits N blocks, make N Agent calls
-before doing anything else. Skip registration only if no `subagent_id` is
-available or the brief register call hits lock contention; the worker still
-runs.
+One Agent call per DISPATCH block whose `mark-launch-attempted` returned
+`ok`. If a tick emits N blocks, run the step-2 gate then the Agent call for
+each before doing anything else. Skip registration only if no `subagent_id`
+is available or the brief register call hits lock contention; the worker
+still runs (the residual-crash repair handles a never-acked launch, and
+replay never re-emits `launch_attempted`, so a missed ack can't
+double-launch).
+
+**Replayed blocks** (description ends `(replay)`) are re-emissions of a
+dispatch that was recorded but whose launch block never reached the coord
+(the broken-stdout incident). Treat them identically — the `generation`
+token + `mark-launch-attempted` gate guarantee at-most-once launch even if
+a stale block and a replay block both arrive.
 
 - `FLEET_AGENT_ID` — coord's 8-hex ID. Without it the skill exits silently (fleet-guard discipline).
 - `FLEET_HOME` — defaults to `~/.fleet/`. Override for sandboxed tests.

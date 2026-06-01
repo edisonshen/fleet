@@ -169,10 +169,37 @@ def register(
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_path = locks_dir / "coordinator.lock"
 
+    fleet_agent_id = ""
     with _take_coord_lock(lock_path):
         cs = _read_coord_state(state_path)
         supervisor_mod.remember_subagent_id(cs, slug, subagent_id)
         _write_coord_state(state_path, cs)
+        # dispatch-durability (#184): capture the Fleet 8-hex agent_id for
+        # this slug while we hold the lock + have coord-state loaded, so
+        # we can flip the dispatch journal launch_attempted → acked AFTER
+        # releasing the coord lock (the journal mark-acked takes the
+        # SEPARATE per-id flock — never nest the two locks).
+        fleet_agent_id = supervisor_mod.load_agent_id_map(cs).get(slug, "")
+
+    # Journal ack is best-effort + OUTSIDE the coord lock (separate flock).
+    # A failed/contended ack just leaves the entry at launch_attempted;
+    # the residual-crash repair (loop.py) handles a never-acked launch, and
+    # replay never re-emits launch_attempted, so a missed ack can't cause a
+    # double-launch — it only delays the "acked" breadcrumb.
+    _mark_dispatch_acked(fleet_agent_id, home)
+
+
+def _mark_dispatch_acked(fleet_agent_id: str, home: Path) -> None:
+    """Best-effort flip the dispatch journal to ExecAcked for the given
+    Fleet agent_id via `fleet claims mark-acked`. No-op on empty id or any
+    failure (never raises — registration must not fail on an ack hiccup)."""
+    if not fleet_agent_id:
+        return
+    try:
+        import dispatch as dispatch_mod  # local sibling import
+        dispatch_mod.mark_acked(fleet_agent_id, fleet_home=str(home))
+    except Exception:  # noqa: BLE001 — best-effort; ack is non-load-bearing
+        pass
 
 
 def clear(
