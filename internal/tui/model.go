@@ -190,6 +190,19 @@ type Model struct {
 	workersScrollOffset int
 	agentsScrollOffset  int
 
+	// projectsScrollOffset is the vertical scroll position for the LEFT
+	// PROJECTS column (tui-project-list-truncat). renderTwoColumnBody caps
+	// the left column at leftRows; before this fix, lines beyond leftRows
+	// were SILENTLY dropped — the operator's 2026-05-29 screenshot showed
+	// "8 projects" in the header but only ~5 project groups rendered, with
+	// a [+]-added project ("spark") never visible (violates
+	// surface-dont-silo). Now the left column reuses trimWithScroll like
+	// the #177 right panels: overflow surfaces a "K hidden — [↓/↑] scroll"
+	// footer and ↓/↑ on a left-column row pages through. Reset to 0 on
+	// tea.WindowSizeMsg (visible window changes; re-clamping after the fact
+	// is brittle).
+	projectsScrollOffset int
+
 	// searchFilter is the current substring filter applied to
 	// dashboardRows(). Empty when no filter is active. Set via [/]
 	// search prompt; cleared via [esc] inside the prompt.
@@ -473,10 +486,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// were mid-scroll.
 		m.workersScrollOffset = 0
 		m.agentsScrollOffset = 0
+		m.projectsScrollOffset = 0
 		return m, nil
 
 	case tea.KeyMsg:
-		return m.handleKey(msg)
+		updated, cmd := m.handleKey(msg)
+		// Central left-scroll alignment: ANY key that teleports the cursor
+		// onto a left-column row (search [/]+esc resetting to row 0, [←]
+		// jumpToLeftPanel, vim j/k, arrow fallback wrap, ...) must keep the
+		// selected project inside the projects-scroll window, or actions
+		// target an off-screen row. Doing it here once covers every path
+		// instead of chasing each cursor-reset site (codex review [P2],
+		// iters 1-4). No-op when the cursor is on a right-column row or the
+		// list fits (alignLeftScrollToCursor guards both).
+		if um, ok := updated.(Model); ok {
+			um.alignLeftScrollToCursor()
+			return um, cmd
+		}
+		return updated, cmd
 
 	case agentsMsg:
 		// Capture the cursor's row identity BEFORE swapping records
@@ -493,6 +520,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.groupKeysByID = msg.groupKeys
 		m.records = sortRecordsBy(msg.records, msg.groupKeys)
 		m.refreshCursor(prevID)
+		// A background refresh can relocate the cursor (identity moved or
+		// vanished → row 0) while projectsScrollOffset still points at the
+		// old window; align so the relocated project isn't off-screen
+		// (codex review [P2]). KeyMsg covers nav; this covers data refresh.
+		m.alignLeftScrollToCursor()
 		return m, nil
 
 	case tickMsg:
@@ -535,6 +567,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		m.refreshCursor(prevID)
+		// Same as agentsMsg: a snapshot refresh can move the cursor while
+		// the left scroll is stale — align so actions don't target an
+		// off-screen project (codex review [P2]).
+		m.alignLeftScrollToCursor()
 		return m, nil
 
 	case queueEventMsg:
@@ -853,8 +889,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	case "j":
 		// j is row-nav across the unified row list. NEVER scrolls a
-		// right panel — the operator who wants vim-style nav keeps
-		// using j/k everywhere.
+		// right panel — the operator who wants vim-style nav keeps using
+		// j/k everywhere. The central alignment in Update (KeyMsg case)
+		// keeps the projects-scroll window following the cursor so a j/k
+		// move onto a hidden project isn't off-screen (codex review [P2]).
 		m.moveCursor(+1)
 	case "k":
 		m.moveCursor(-1)
@@ -862,14 +900,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// fleet#177 Fix 2: arrow keys scroll the focused right panel.
 		// Cursor on a worker row → workersScrollOffset++; cursor on an
 		// agent or right-column separator row → agentsScrollOffset++.
-		// Cursor on a left-column row (project / task / left-column
-		// separator) → fall through to row-nav so the left column
-		// keeps its [↓/↑] behavior.
-		if !m.scrollRightPanel(+1) {
+		// Cursor on a left-column row → scroll the LEFT projects panel
+		// (tui-project-list-truncat). When neither panel consumes the key
+		// (e.g. nothing to scroll), fall through to row-nav so j/k-style
+		// wrapping still works.
+		if !m.scrollRightPanel(+1) && !m.scrollLeftPanel(+1) {
+			// Fallback row-nav (e.g. wrap from the last agent back to the
+			// first project). The central alignment in Update keeps a wrap
+			// onto a hidden project visible (codex [P2]).
 			m.moveCursor(+1)
 		}
 	case "up":
-		if !m.scrollRightPanel(-1) {
+		if !m.scrollRightPanel(-1) && !m.scrollLeftPanel(-1) {
 			m.moveCursor(-1)
 		}
 	case "left":
@@ -959,6 +1001,267 @@ func (m *Model) scrollRightPanel(delta int) bool {
 		}
 	}
 	return false
+}
+
+// isLeftColumnRow reports whether a dashRow renders in the LEFT PROJECTS
+// column. Projects + tasks always do; separators do UNLESS they are the
+// right-column agent-idle group (which lives in the agents sub-panel).
+func isLeftColumnRow(r *dashRow) bool {
+	if r == nil {
+		return false
+	}
+	switch r.kind {
+	case rowProject, rowTask:
+		return true
+	case rowSeparator:
+		return r.separator == nil || r.separator.kind != separatorAgentIdle
+	}
+	return false
+}
+
+// scrollLeftPanel pages the LEFT PROJECTS column by delta when the cursor
+// is on a left-column row AND the panel has somewhere to scroll in that
+// direction (tui-project-list-truncat). Returns true when the offset
+// actually moved (caller skips moveCursor so the arrow scrolls in place);
+// false otherwise so handleKey falls through to moveCursor — that keeps
+// the wrap-at-boundary j/k behavior intact at the top/bottom edges and on
+// a non-overflowing list (no scroll → normal cursor nav).
+//
+// Mirrors the #177 right-panel arrow-scroll contract but without the
+// worker↔agent cross-panel complexity: the left column is a single panel.
+//
+// The selected row moves by ONE left-column row per press; the scroll
+// offset is then aligned to that row's RENDERED line position so the
+// block stays inside the visible window. Aligning (rather than bumping
+// the offset by a fixed delta) is the fix for the codex [P2] desync: a
+// project block is multiple rendered lines, so a 1-line offset bump fell
+// out of step with a 1-row cursor move and the selected block drifted
+// off-screen after a few presses. Clamping to panelMaxOffset(rowProject)
+// prevents the stuck-at-bottom overscroll bug (#177 clampScrollOffset
+// rationale).
+//
+// Returns false (→ caller falls through to moveCursor's wrap) only when
+// the cursor is pinned at the first/last left-column row AND the offset
+// can't move — i.e. the true top/bottom edge. Otherwise returns true so
+// the arrow scrolls in place.
+func (m *Model) scrollLeftPanel(delta int) bool {
+	row := m.selectedRow()
+	if !isLeftColumnRow(row) {
+		return false
+	}
+	// Try an INTRA-block scroll FIRST: when the selected block is taller
+	// than the window and still has hidden lines in the delta direction,
+	// consume the arrow scrolling those into view before moving the cursor
+	// to the next row. Without this, ↓ through a list of tall blocks skips
+	// each block's hidden footer/status tail (codex review [P2] — applies
+	// to MIDDLE blocks, not just the pinned first/last).
+	if m.scrollWithinTallBlock(delta) {
+		return true
+	}
+	// Block fully shown (or fits) — advance the cursor to the next left
+	// row. The window alignment runs centrally in Update (KeyMsg case)
+	// after handleKey, so we don't align here on the common path (avoids a
+	// second buildBodyLinesCore + its tmux/marker side effects per
+	// keypress). The central align anchors the new cursor's block into
+	// view.
+	beforeCursor := m.dashCursor
+	m.moveCursorWithinLeft(delta)
+	if m.dashCursor != beforeCursor {
+		return true // cursor advanced within the left column → scrolled
+	}
+	// Cursor pinned at the first/last left row AND no intra-block lines to
+	// reveal — let handleKey fall through to moveCursor's wrap (no
+	// dead-end).
+	return false
+}
+
+// scrollWithinTallBlock advances projectsScrollOffset by delta when the
+// SELECTED left-column block is taller than the visible window and still
+// has hidden lines in the delta direction (below for ↓, above for ↑).
+// Returns true when the offset moved (caller consumes the arrow), false
+// when the block fits or its visible edge is already at the delta-side
+// boundary (caller advances the cursor / wraps). Builds the body once.
+//
+//	window = [off, off+visible)
+//	block  = [start, blockEnd)
+//	↓ (delta>0): hidden tail when blockEnd > off+visible → bump off up
+//	↑ (delta<0): hidden head when start   < off          → bump off down
+func (m *Model) scrollWithinTallBlock(delta int) bool {
+	leftW, rightW := splitColumns(usableWidth(m.width))
+	leftLines, workerLines, agentLines, lineStart := buildBodyLinesCore(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
+	if !ok {
+		return false
+	}
+	maxOff := leftMaxOffsetFor(len(leftLines), leftRows)
+	if maxOff == 0 || m.dashCursor < 0 || m.dashCursor >= len(lineStart) {
+		return false
+	}
+	start := lineStart[m.dashCursor]
+	if start < 0 {
+		return false
+	}
+	blockEnd := len(leftLines)
+	for j := m.dashCursor + 1; j < len(lineStart); j++ {
+		if lineStart[j] >= 0 {
+			blockEnd = lineStart[j]
+			break
+		}
+	}
+	visible := leftRows - 1
+	if visible < 1 {
+		visible = 1
+	}
+	if blockEnd-start <= visible {
+		// Block fits the window — nothing hidden inside it.
+		return false
+	}
+	off := m.projectsScrollOffset
+	var want int
+	if delta > 0 {
+		if blockEnd <= off+visible {
+			return false // tail already fully visible → advance cursor
+		}
+		want = off + delta
+	} else {
+		if start >= off {
+			return false // head already fully visible → advance cursor
+		}
+		want = off + delta
+	}
+	// Clamp to the block's scroll range and the panel max.
+	lo, hi := start, blockEnd-visible
+	if hi > maxOff {
+		hi = maxOff
+	}
+	if want < lo {
+		want = lo
+	}
+	if want > hi {
+		want = hi
+	}
+	if want == off {
+		return false
+	}
+	m.projectsScrollOffset = want
+	return true
+}
+
+// alignLeftScrollToCursor sets projectsScrollOffset so the selected
+// left-column row's rendered block sits inside the visible window
+// [offset, offset+visible). It reads the per-row line spans from
+// buildBodyLinesCore (the same accounting the renderer uses) so the
+// offset can never disagree with what trimWithScroll actually shows.
+//
+//	cursor line above window  → scroll up so the row is the top line
+//	cursor line below window  → scroll down so the row is the bottom line
+//	cursor line inside window → leave the offset untouched (no jitter)
+//
+// No-op on the unbounded-fallback render path (ok=false) or when the
+// left column fits (maxOff==0): there is no scrolling to align.
+func (m *Model) alignLeftScrollToCursor() {
+	leftW, rightW := splitColumns(usableWidth(m.width))
+	// Build the body ONCE (buildBodyLinesCore has tmux/marker side effects
+	// via projectFooterLines — do not rebuild for the budget or the max
+	// offset; thread the counts instead). codex review [P2].
+	leftLines, workerLines, agentLines, lineStart := buildBodyLinesCore(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
+	if !ok {
+		return
+	}
+	maxOff := leftMaxOffsetFor(len(leftLines), leftRows)
+	if maxOff == 0 {
+		m.projectsScrollOffset = 0
+		return
+	}
+	if m.dashCursor < 0 || m.dashCursor >= len(lineStart) {
+		return
+	}
+	start := lineStart[m.dashCursor]
+	if start < 0 {
+		// Cursor is not on a left-column row — nothing to align.
+		return
+	}
+	// blockEnd is the first rendered line AFTER the cursor's block: the
+	// next left-column row's start, or the end of the left lines for the
+	// last block. The whole [start, blockEnd) span is what the operator
+	// wants on screen (header + footer/status), so we anchor on the END
+	// when the block extends below the window — that reveals the last
+	// project's trailing lines instead of stranding them (codex [P2]).
+	blockEnd := len(leftLines)
+	for j := m.dashCursor + 1; j < len(lineStart); j++ {
+		if lineStart[j] >= 0 {
+			blockEnd = lineStart[j]
+			break
+		}
+	}
+	// trimWithScroll reserves one row for the overflow footer, so the
+	// visible content window is leftRows-1 lines.
+	visible := leftRows - 1
+	if visible < 1 {
+		visible = 1
+	}
+	off := m.projectsScrollOffset
+	blockHeight := blockEnd - start
+	switch {
+	case blockHeight > visible:
+		// Block is TALLER than the window — it can't fit whole. Don't
+		// force a header/footer anchor: keep the offset wherever it is as
+		// long as the window still overlaps the block, so scrollLeftPanel's
+		// intra-block scroll can walk through the hidden tail (codex [P2]).
+		// Only re-anchor when the window shows NONE of the block: clamp the
+		// offset into the block's scroll range [start, blockEnd-visible].
+		if off < start {
+			off = start
+		} else if off > blockEnd-visible {
+			off = blockEnd - visible
+		}
+	default:
+		// Block fits — bottom-anchor to reveal the trailing footer/status
+		// lines, then top-anchor so the header stays on screen (the block
+		// fits, so both hold simultaneously).
+		if blockEnd > off+visible {
+			off = blockEnd - visible
+		}
+		if start < off {
+			off = start
+		} else if start >= off+visible {
+			off = start - visible + 1
+		}
+	}
+	m.projectsScrollOffset = clampScrollOffset(off, maxOff)
+}
+
+// moveCursorWithinLeft advances dashCursor by delta but stays anchored to
+// LEFT-column rows (project / task / left separator). Skips past any
+// right-column rows interleaved in the unified list and stops at the
+// first/last left row rather than wrapping. Companion to scrollLeftPanel
+// so the cursor follows a scrolled left panel (parity with
+// moveCursorWithinKind for the right panels).
+func (m *Model) moveCursorWithinLeft(delta int) {
+	rows := m.dashboardRows()
+	if len(rows) == 0 {
+		return
+	}
+	step := 1
+	if delta < 0 {
+		step = -1
+		delta = -delta
+	}
+	pos := m.dashCursor
+	scan := pos
+	for moved := 0; moved < delta; {
+		next := scan + step
+		if next < 0 || next >= len(rows) {
+			break
+		}
+		scan = next
+		if isLeftColumnRow(&rows[scan]) {
+			pos = scan
+			moved++
+		}
+	}
+	m.dashCursor = pos
 }
 
 // scrollOrCross advances the given panel's scroll offset + within-kind
@@ -1099,6 +1402,18 @@ func clampScrollOffset(want, maxOff int) int {
 // render time, but having a model-side bound prevents the
 // stuck-at-bottom UX bug after overscroll (codex iter-3 [P2]).
 func (m *Model) panelMaxOffset(kind rowKind) int {
+	// LEFT PROJECTS column (tui-project-list-truncat): the panel is the
+	// whole projects+tasks column, whose block heights vary
+	// (collapsed project ≈ 5 lines, +1 per expanded task). A flat
+	// 3×rowCount estimate would under-bound and strand the bottom
+	// projects below a scroll ceiling. Instead, compute the EXACT bound
+	// from the rendered left-line count minus the visible budget — the
+	// same numbers renderTwoColumnBody uses — so ↓ can always reach the
+	// last project. trimWithScroll re-clamps at render time; this bound
+	// just stops the offset from over/under-shooting.
+	if kind == rowProject {
+		return m.leftPanelMaxOffset()
+	}
 	const linesPerRow = 3
 	rows := m.dashboardRows()
 	count := 0
@@ -1116,6 +1431,42 @@ func (m *Model) panelMaxOffset(kind rowKind) int {
 		bound = 0
 	}
 	return bound
+}
+
+// leftPanelMaxOffset returns the exact scroll ceiling for the LEFT
+// PROJECTS column: total rendered left lines minus the visible left-row
+// budget. Mirrors renderTwoColumnBody's width + leftRows math (via the
+// shared bodyRowBudget) so the bound agrees with what the renderer
+// actually shows. Zero when the left column fits (no overflow → no
+// scroll) or on the unbounded-fallback render path.
+func (m *Model) leftPanelMaxOffset() int {
+	leftW, rightW := splitColumns(usableWidth(m.width))
+	leftLines, workerLines, agentLines := buildBodyLines(*m, leftW, rightW)
+	leftRows, _, ok := m.bodyRowBudget(len(leftLines), len(workerLines), len(agentLines))
+	if !ok {
+		return 0
+	}
+	return leftMaxOffsetFor(len(leftLines), leftRows)
+}
+
+// leftMaxOffsetFor is the pure scroll-ceiling math shared by
+// leftPanelMaxOffset and alignLeftScrollToCursor: total left lines minus
+// the visible content window. trimWithScroll reserves one row for the
+// overflow footer, so the effective window is leftRows-1. Zero when the
+// column fits.
+func leftMaxOffsetFor(leftLen, leftRows int) int {
+	if leftLen <= leftRows {
+		return 0
+	}
+	visible := leftRows - 1
+	if visible < 0 {
+		visible = 0
+	}
+	off := leftLen - visible
+	if off < 0 {
+		off = 0
+	}
+	return off
 }
 
 // moveCursorWithinKind advances dashCursor by delta but stays anchored
