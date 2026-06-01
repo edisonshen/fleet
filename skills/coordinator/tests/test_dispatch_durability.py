@@ -154,19 +154,31 @@ def test_case_b_launch_attempted_durable(fleet_bin: str, home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_case_g_registered_subagent_not_repaired(fleet_bin: str, home: Path) -> None:
+def test_case_g_live_worker_not_repaired(fleet_bin: str, home: Path) -> None:
+    """A live worker (worker-authored state.json advanced AFTER this
+    dispatch's launch_attempted_at) is left alone, even past grace and
+    even with no journal ack.
+
+    Codex iter-3 [P1]: liveness is gated on the worker's OWN fresh
+    state.json, NOT a slug-keyed subagent_id (which can be a stale
+    prior-stage mapping in a reviewer/finisher handoff). So the live
+    signal here is a fresh worker state write, not coord_state."""
     _acquire(fleet_bin, home, "aa900001", "fix-foo")
     dispatch_mod.mark_launch_attempted(
         "aa900001", 0, fleet_bin=fleet_bin, fleet_home=str(home))
-    # coord_state records a subagent_id for this slug (registered, just no
-    # journal ack yet) — and the launch is well past the grace window.
-    coord_state = {"worker_subagent_ids": {"fix-foo": "sub-abc"}}
+    # Worker is genuinely running: phase past the bootstrap, updated_at
+    # after the launch flip.
+    wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
+    wdir.mkdir(parents=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "tdd-green", "updated_at": "2099-01-01T00:00:00Z"}),
+        encoding="utf-8")
     actions = _replay(
         home, fleet_bin,
         now_unix=time.time() + 10_000,  # far past grace
-        coord_state=coord_state,
+        coord_state={},
     )
-    # No replay, no repair: a registered subagent is alive → leave it.
+    # No replay, no repair: a live worker → leave it.
     assert [a for a in actions if a.dispatch_instruction] == []
     assert [a for a in actions if a.raise_msg] == []
     assert _journal(home, "aa900001")["exec_state"] == "launch_attempted"
@@ -238,12 +250,15 @@ def test_residual_crash_repair_left_alone_for_live_worker(
     _acquire(fleet_bin, home, "aae00111", "fix-foo")
     dispatch_mod.mark_launch_attempted(
         "aae00111", 0, fleet_bin=fleet_bin, fleet_home=str(home))
-    # Seed a worker-authored state.json (phase advanced past the
-    # "starting" bootstrap → a real running worker).
+    # Seed a worker-authored state.json: phase advanced past the
+    # "starting" bootstrap AND updated_at is AFTER this dispatch's
+    # launch_attempted_at (codex iter-3: the write must belong to THIS
+    # launch, not a stale prior stage).
     wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
     wdir.mkdir(parents=True)
     (wdir / "state.json").write_text(
-        json.dumps({"phase": "tdd-green", "updated_at": ""}), encoding="utf-8")
+        json.dumps({"phase": "tdd-green", "updated_at": "2099-01-01T00:00:00Z"}),
+        encoding="utf-8")
 
     actions = _replay(
         home, fleet_bin,
@@ -256,6 +271,41 @@ def test_residual_crash_repair_left_alone_for_live_worker(
     assert [a for a in actions if a.dispatch_instruction] == []
     # Journal is NOT torn down — still launch_attempted (not released).
     assert _journal(home, "aae00111")["exec_state"] == "launch_attempted"
+
+
+def test_residual_crash_repair_handoff_stale_priorstage_state(
+    fleet_bin: str, home: Path,
+) -> None:
+    """Codex iter-3 [P1]: a reviewer/finisher handoff mints a NEW agent_id
+    but reuses the slug. The PRIOR stage already left a review-pending /
+    review-done state.json (and a prior subagent_id in coord_state) BEFORE
+    the new launch flip. A handoff that crashes after mark-launch-attempted
+    but before the Agent invoke must still be detected as a phantom —
+    the stale prior-stage state predates this journal's launch_attempted_at
+    and must NOT count as live, and the slug-keyed prior subagent_id must
+    NOT suppress repair."""
+    _acquire(fleet_bin, home, "aae00333", "fix-foo")
+    dispatch_mod.mark_launch_attempted(
+        "aae00333", 0, fleet_bin=fleet_bin, fleet_home=str(home))
+    # Prior-stage state.json: a review phase, but written BEFORE the new
+    # launch flip (timestamp in the past relative to launch_attempted_at).
+    wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
+    wdir.mkdir(parents=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "review-pending", "updated_at": "2000-01-01T00:00:00Z"}),
+        encoding="utf-8")
+
+    actions = _replay(
+        home, fleet_bin,
+        now_unix=time.time() + 10_000,  # past grace
+        # Stale prior-stage subagent mapping for the slug.
+        coord_state={"worker_subagent_ids": {"fix-foo": "sub-prior"}},
+    )
+    # Phantom detected → escalated (raise), NOT treated as live.
+    raises = [a for a in actions if a.raise_msg]
+    assert len(raises) == 1, "handoff phantom with stale prior-stage state not escalated"
+    assert [a for a in actions if a.dispatch_instruction] == []
+    assert _journal(home, "aae00333")["exec_state"] == "launch_attempted"
 
 
 def test_replay_skips_mid_application_pending(

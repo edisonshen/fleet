@@ -2363,23 +2363,44 @@ _WORKER_AUTHORED_PHASES = frozenset({
 
 def _worker_launch_looks_live(
     project: str, slug: str, *, home: Path | None = None,
+    since_unix: float | None = None,
 ) -> bool:
     """True if workers/<slug>/state.json shows a WORKER-authored progress
-    phase — evidence the Agent genuinely launched and is running, even
-    though register_subagent (best-effort) may not have recorded a
-    subagent_id.
+    phase whose update landed AFTER `since_unix` — evidence the Agent for
+    THIS dispatch genuinely launched and is running, even though
+    register_subagent (best-effort) may not have recorded a subagent_id.
 
-    Conservative on purpose: only a phase the bootstrap never writes
-    ("starting") counts. The dispatch bootstrap sets phase="starting"
-    with a fresh updated_at, so a phantom that crashed right after
-    _apply_dispatch would read "starting" + fresh — which we deliberately
-    do NOT treat as live (that's the phantom the repair targets). A real
-    worker advances to branch/tdd-*/review-* etc., which only the worker
-    process writes. Missing/unreadable state → not live."""
+    Conservative on purpose:
+      - Only a phase the bootstrap never writes counts (the dispatch
+        bootstrap sets phase="starting"; a real worker advances to
+        branch/tdd-*/review-* etc.). A phantom that crashed right after
+        _apply_dispatch reads "starting" → not live.
+      - Codex iter-3 [P1]: when `since_unix` is given (this journal's
+        launch_attempted_at), the worker's state.json `updated_at` MUST
+        be strictly newer. A reviewer/finisher handoff reuses the slug
+        but mints a new agent_id; the prior stage already left a
+        review-pending / review-done state.json BEFORE the new launch
+        flip. Requiring updated_at > launch_attempted_at excludes that
+        stale prior-stage state so a handoff that crashed before the
+        Agent invoke is correctly seen as a phantom (escalated), not
+        mistaken for the still-present prior subagent.
+
+    Missing/unreadable state, or a bootstrap/prior phase, or a stale
+    timestamp → not live."""
     st = _read_worker_state(project, slug, home=home)
     if st is None:
         return False
-    return st.get("phase", "") in _WORKER_AUTHORED_PHASES
+    if st.get("phase", "") not in _WORKER_AUTHORED_PHASES:
+        return False
+    if since_unix is None:
+        return True
+    updated = _parse_iso_utc(st.get("updated_at", ""))
+    if updated is None:
+        # No usable worker timestamp → can't prove the write is for THIS
+        # dispatch; treat as not-live (the phantom path escalates, which
+        # is safe — it never auto-releases).
+        return False
+    return updated > since_unix
 
 
 def _worker_state_fresh(
@@ -4188,37 +4209,6 @@ def _iter_project_journals(
     return out
 
 
-def _has_live_registered_subagent(coord_state: dict, slug: str) -> bool:
-    """True ONLY if coord_state records a subagent_id for this slug — the
-    register_subagent ack breadcrumb, written by the coord AFTER the Agent
-    tool returns a subagent_id (i.e. the launch genuinely happened). Used
-    by residual-crash repair to avoid flipping a launch that DID register
-    (just late) to blocked.
-
-    Codex iter-1 [P1]: this MUST NOT key on the worker agent_id map.
-    `remember_agent_id` runs in _apply_dispatch BEFORE the DISPATCH block
-    is emitted and BEFORE the Agent tool is ever invoked, so the agent_id
-    map is populated for the EXACT phantom this repair targets — a
-    dispatch that crashed after mark-launch-attempted but before/at the
-    Agent call. Keying on agent_id would treat every such phantom as
-    "registered" and suppress repair forever, leaving the journal stuck at
-    launch_attempted with an in-progress task and no worker. The
-    subagent_id map is the only post-launch signal.
-
-    NOTE: this is a registration breadcrumb, not a liveness probe; the
-    repair predicate ALSO requires elapsed > LAUNCH_ACK_GRACE, so a slug
-    with a stale breadcrumb from a prior dispatch won't suppress repair
-    of a genuinely-dead relaunch (the journal generation + launch time
-    are the authoritative signals)."""
-    try:
-        sub = supervisor_mod.load_subagent_id_map(coord_state)
-        if slug in sub and sub.get(slug):
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    return False
-
-
 def _parse_iso_utc(s: str) -> float | None:
     """Parse a Go RFC3339/ISO-8601 UTC timestamp to epoch seconds, or
     None. Go writes e.g. "2026-06-01T12:00:00Z"."""
@@ -4347,10 +4337,6 @@ def _replay_pending_dispatches(
             # one (replay leaves acked/terminal alone). Residual-crash
             # repair only fires when the launch flip landed but no ack
             # ever followed.
-            if _has_live_registered_subagent(coord_state, slug):
-                # Registered (just late) — registration-repair territory,
-                # not a phantom. Leave for the normal supervisor path.
-                continue
             attempted_at = _parse_iso_utc(j.get("launch_attempted_at", ""))
             if attempted_at is None:
                 # No timestamp — can't time-gate; be conservative and
@@ -4363,12 +4349,24 @@ def _replay_pending_dispatches(
             # contention while the worker still runs. So "launch_attempted
             # + no subagent_id + past grace" does NOT prove a phantom; a
             # healthy worker that just skipped registration looks
-            # identical. If the worker's OWN state.json shows it is
-            # publishing progress (a worker-authored phase advance, not
-            # the dispatch bootstrap), treat it as a live unregistered
-            # worker and leave it for the normal worker-state liveness
-            # path — do NOT escalate or tear down its inbox.
-            if _worker_launch_looks_live(project, slug, home=home):
+            # identical. Gate on the worker's OWN state.json.
+            #
+            # Codex iter-3 [P1]: the liveness signal MUST be tied to THIS
+            # dispatch, not the slug. A reviewer/finisher handoff mints a
+            # NEW agent_id but reuses the slug, and coord_state still holds
+            # the PRIOR stage's subagent_id while state.json still reads
+            # the prior phase (review-pending / review-done). A slug-keyed
+            # subagent check or a phase-only check would treat that
+            # prior-stage state as proof THIS launch is live and skip
+            # repair forever. So we (a) dropped the slug-keyed subagent
+            # check entirely, and (b) require the worker's state.json to
+            # have advanced AFTER this journal's launch_attempted_at — a
+            # prior-stage write predates the new launch flip and does NOT
+            # count. Only a fresh-after-launch worker write means a live
+            # (just-unregistered) worker for THIS dispatch.
+            if _worker_launch_looks_live(
+                project, slug, home=home, since_unix=attempted_at,
+            ):
                 continue
             # Genuinely no live worker after grace → likely crashed
             # between the launch flip and the Agent invoke. ESCALATE
