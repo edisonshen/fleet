@@ -192,9 +192,12 @@ def test_residual_crash_repair(fleet_bin: str, home: Path) -> None:
     raises = [a for a in actions if a.raise_msg]
     assert len(raises) == 1
     assert "never acked" in raises[0].raise_msg
-    # Journal is terminal (released → failed for an un-acked launch).
-    j = _journal(home, "aad00001")
-    assert j["exec_state"] in ("failed", "blocked")
+    # Codex iter-2 [P1]: repair ESCALATES off-channel but does NOT
+    # destructively release — a live-but-unregistered worker looks
+    # identical to a phantom, so tearing down the inbox/journal would
+    # risk killing a healthy worker. The journal stays launch_attempted
+    # (replay never re-emits it → no double-launch); the operator decides.
+    assert _journal(home, "aad00001")["exec_state"] == "launch_attempted"
 
 
 def test_residual_crash_repair_agent_id_breadcrumb_not_suppressing(
@@ -219,7 +222,59 @@ def test_residual_crash_repair_agent_id_breadcrumb_not_suppressing(
     raises = [a for a in actions if a.raise_msg]
     assert len(raises) == 1, "phantom with only agent_id breadcrumb must be repaired"
     assert "never acked" in raises[0].raise_msg
-    assert _journal(home, "aae00cab")["exec_state"] in ("failed", "blocked")
+    # Escalate-only (codex iter-2): journal left at launch_attempted, not released.
+    assert _journal(home, "aae00cab")["exec_state"] == "launch_attempted"
+
+
+def test_residual_crash_repair_left_alone_for_live_worker(
+    fleet_bin: str, home: Path,
+) -> None:
+    """Codex iter-2 [P1]: register_subagent is best-effort and may be
+    SKIPPED while the worker runs. A launch_attempted entry past grace
+    with NO subagent_id but a worker-authored state.json phase is a LIVE
+    unregistered worker, NOT a phantom — it must be left alone (no
+    escalation, no release/teardown of its inbox). Only a true phantom
+    (no worker progress) is escalated."""
+    _acquire(fleet_bin, home, "aae00111", "fix-foo")
+    dispatch_mod.mark_launch_attempted(
+        "aae00111", 0, fleet_bin=fleet_bin, fleet_home=str(home))
+    # Seed a worker-authored state.json (phase advanced past the
+    # "starting" bootstrap → a real running worker).
+    wdir = home / "projects" / "myproj" / "workers" / "fix-foo"
+    wdir.mkdir(parents=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "tdd-green", "updated_at": ""}), encoding="utf-8")
+
+    actions = _replay(
+        home, fleet_bin,
+        now_unix=time.time() + 10_000,  # well past grace
+        coord_state={},                  # no subagent registration
+    )
+    # No escalation, no redispatch — the live worker is left for the
+    # normal worker-state liveness path.
+    assert [a for a in actions if a.raise_msg] == [], "live worker wrongly escalated"
+    assert [a for a in actions if a.dispatch_instruction] == []
+    # Journal is NOT torn down — still launch_attempted (not released).
+    assert _journal(home, "aae00111")["exec_state"] == "launch_attempted"
+
+
+def test_replay_skips_mid_application_pending(
+    fleet_bin: str, home: Path,
+) -> None:
+    """Codex iter-2 [P1]: a journal acquired (ExecPending) but not yet
+    applied (slug still in pending_acquire_agent_ids) is owned by the
+    normal _dispatch_ready retry, NOT replay. Replaying it would launch a
+    worker with no applied task state AND clear the pending-acquire
+    handle. Replay must skip ids the pending_acquire map still owns."""
+    _acquire(fleet_bin, home, "aae00222", "fix-foo")
+    actions = _replay(
+        home, fleet_bin,
+        coord_state={"pending_acquire_agent_ids": {"fix-foo": "aae00222"}},
+    )
+    # No replay block emitted — the normal retry owns this id.
+    assert [a for a in actions if a.dispatch_instruction] == []
+    # And the cap was NOT consumed (replay never touched the journal).
+    assert _journal(home, "aae00222").get("replay_emit_attempts", 0) == 0
 
 
 # ---------------------------------------------------------------------------

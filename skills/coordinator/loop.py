@@ -2349,6 +2349,39 @@ def _read_worker_state(
         return None
 
 
+# Phases that prove a WORKER (not the dispatch bootstrap) authored the
+# state.json. _apply_dispatch bootstraps phase="starting" BEFORE the
+# Agent runs; any phase past that is a worker-authored advance. Used by
+# residual-crash repair to tell a live-but-unregistered worker (skipped
+# best-effort register_subagent) apart from a true phantom that crashed
+# before the Agent invoke.
+_WORKER_AUTHORED_PHASES = frozenset({
+    "branch", "tdd-red", "tdd-green", "tdd-refactor", "review-pending",
+    "review-claude", "review-codex", "review-done", "push", "done",
+})
+
+
+def _worker_launch_looks_live(
+    project: str, slug: str, *, home: Path | None = None,
+) -> bool:
+    """True if workers/<slug>/state.json shows a WORKER-authored progress
+    phase — evidence the Agent genuinely launched and is running, even
+    though register_subagent (best-effort) may not have recorded a
+    subagent_id.
+
+    Conservative on purpose: only a phase the bootstrap never writes
+    ("starting") counts. The dispatch bootstrap sets phase="starting"
+    with a fresh updated_at, so a phantom that crashed right after
+    _apply_dispatch would read "starting" + fresh — which we deliberately
+    do NOT treat as live (that's the phantom the repair targets). A real
+    worker advances to branch/tdd-*/review-* etc., which only the worker
+    process writes. Missing/unreadable state → not live."""
+    st = _read_worker_state(project, slug, home=home)
+    if st is None:
+        return False
+    return st.get("phase", "") in _WORKER_AUTHORED_PHASES
+
+
 def _worker_state_fresh(
     project: str, slug: str, *, home: Path | None = None,
 ) -> bool:
@@ -4237,9 +4270,32 @@ def _replay_pending_dispatches(
     is fake liveness; the journal is the only trustworthy signal.
     """
     actions: list[_ReplayAction] = []
+    # Codex iter-2 [P1]: ids still mid-application are owned by the normal
+    # `_dispatch_ready` / pending_acquire retry path, NOT replay. When a
+    # tick acquires the journal (→ ExecPending) but _apply_dispatch fails
+    # or crashes before status=in-progress + state bootstrap land, the
+    # slug stays `ready` and pending_acquire_agent_ids holds the retry
+    # handle. If replay emitted for that ExecPending journal it would
+    # launch a worker with NO applied task state AND clear the
+    # pending-acquire entry — letting the same ready task dispatch again
+    # (double-launch + orphaned launch). Replay is for the PHANTOM where
+    # the dispatch was already applied (pending_acquire cleared) but the
+    # block never reached the coord. So skip any id the pending_acquire
+    # map still owns; the normal retry re-applies it idempotently.
+    try:
+        pending_acquire_ids = set(
+            supervisor_mod.load_pending_acquire_agent_id_map(coord_state).values()
+        )
+    except Exception:  # noqa: BLE001
+        pending_acquire_ids = set()
     for agent_id, slug, j in _iter_project_journals(home, project):
         state = j.get("exec_state", "")
         if state == "pending":
+            if agent_id in pending_acquire_ids:
+                # Mid-application — the normal _dispatch_ready retry owns
+                # this id this tick. Do NOT replay (would double-launch a
+                # task whose state was never applied).
+                continue
             res = dispatch_mod.reserve_replay(
                 agent_id, cap=_REPLAY_CAP,
                 fleet_bin=fleet_bin, fleet_home=fleet_home,
@@ -4302,23 +4358,37 @@ def _replay_pending_dispatches(
                 continue
             if now_unix - attempted_at <= _LAUNCH_ACK_GRACE_S:
                 continue  # still inside the grace window
-            # Residual-crash repair: launch flip landed, no ack, no live
-            # subagent, past grace → silent phantom. Flip to BLOCKED via
-            # release (un-acked launch_attempted → failed/blocked) and
-            # escalate off-channel. We use the Go release path so the
-            # journal mutation is flock-serialized.
-            rel = dispatch_mod.release_coord_prompt_inbox(
-                agent_id, fleet_bin=fleet_bin, fleet_home=fleet_home,
-            )
+            # Codex iter-2 [P1]: register_subagent is best-effort — the
+            # protocol explicitly allows it to be SKIPPED on lock
+            # contention while the worker still runs. So "launch_attempted
+            # + no subagent_id + past grace" does NOT prove a phantom; a
+            # healthy worker that just skipped registration looks
+            # identical. If the worker's OWN state.json shows it is
+            # publishing progress (a worker-authored phase advance, not
+            # the dispatch bootstrap), treat it as a live unregistered
+            # worker and leave it for the normal worker-state liveness
+            # path — do NOT escalate or tear down its inbox.
+            if _worker_launch_looks_live(project, slug, home=home):
+                continue
+            # Genuinely no live worker after grace → likely crashed
+            # between the launch flip and the Agent invoke. ESCALATE
+            # off-channel ONLY (surface-dont-silo). We do NOT release /
+            # mark the journal failed here: a destructive release could
+            # tear down the inbox of a worker we merely failed to observe,
+            # and the worker's own terminal transition (or the operator)
+            # will release it. Replay never re-emits launch_attempted, so
+            # leaving it non-terminal cannot double-launch. To avoid
+            # re-escalating every tick, the escalation is advisory; the
+            # operator re-dispatches or the worker self-completes.
             actions.append(_ReplayAction(
                 agent_id=agent_id, slug=slug,
                 raise_msg=(
                     f"dispatch {slug or agent_id} (agent {agent_id}) flipped to "
-                    f"launch_attempted but never acked and has no live subagent "
+                    f"launch_attempted but never acked and shows no live worker "
                     f"after {_LAUNCH_ACK_GRACE_S}s — likely crashed between the "
-                    f"launch flip and the Agent invoke. Resolved to "
-                    f"{rel.get('outcome', '?')}; NOT auto-replayed (would "
-                    "double-launch). Re-dispatch manually if the task is "
+                    f"launch flip and the Agent invoke. NOT auto-replayed (would "
+                    "double-launch) and NOT auto-released (a live-but-unregistered "
+                    "worker looks identical). Re-dispatch manually if the task is "
                     "still needed."
                 ),
             ))
