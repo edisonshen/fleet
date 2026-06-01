@@ -197,6 +197,31 @@ def test_residual_crash_repair(fleet_bin: str, home: Path) -> None:
     assert j["exec_state"] in ("failed", "blocked")
 
 
+def test_residual_crash_repair_agent_id_breadcrumb_not_suppressing(
+    fleet_bin: str, home: Path,
+) -> None:
+    """Codex iter-1 [P1]: a phantom that crashed after mark-launch-attempted
+    but before the Agent call has its worker_agent_ids breadcrumb ALREADY
+    set (remember_agent_id runs in _apply_dispatch before the DISPATCH
+    block is even emitted). The residual-crash repair MUST still fire — it
+    keys only on the post-launch subagent_id, never on the pre-launch
+    agent_id. Without the fix the journal sits at launch_attempted forever.
+    """
+    _acquire(fleet_bin, home, "aae00cab", "fix-foo")
+    dispatch_mod.mark_launch_attempted(
+        "aae00cab", 0, fleet_bin=fleet_bin, fleet_home=str(home))
+    actions = _replay(
+        home, fleet_bin,
+        now_unix=time.time() + 10_000,  # past grace
+        # agent_id breadcrumb present (pre-launch), but NO subagent_id ack.
+        coord_state={"worker_agent_ids": {"fix-foo": "aae00cab"}},
+    )
+    raises = [a for a in actions if a.raise_msg]
+    assert len(raises) == 1, "phantom with only agent_id breadcrumb must be repaired"
+    assert "never acked" in raises[0].raise_msg
+    assert _journal(home, "aae00cab")["exec_state"] in ("failed", "blocked")
+
+
 # ---------------------------------------------------------------------------
 # Case (e) — replay cap persists + ExecBlocked, no infinite re-emit.
 # ---------------------------------------------------------------------------

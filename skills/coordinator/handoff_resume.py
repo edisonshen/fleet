@@ -279,6 +279,7 @@ def build_resume_dispatches(
     *,
     wip_dir: str | os.PathLike,
     fleet_home: str | os.PathLike,
+    project: str | None = None,
 ) -> tuple[list[str], list[str]]:
     """Build DISPATCH blocks the coord agent can act on to re-spawn
     each Active Subagent whose WIP file exists AND whose status/pr_url
@@ -316,6 +317,11 @@ def build_resume_dispatches(
     """
     wip_dir_p = Path(wip_dir)
     fleet_home_p = Path(fleet_home)
+    # Owner string for the replay project-ownership filter (loop.py
+    # _iter_project_journals). The resume acquire below records it on a
+    # freshly-created journal; defaults to FLEET_PROJECT so the re-armed
+    # entry is owned by the coord's project rather than orphaned.
+    resume_project = project or os.environ.get("FLEET_PROJECT", "") or "unknown"
     blocks: list[str] = []
     skipped: list[str] = []
     for e in entries:
@@ -388,15 +394,36 @@ def build_resume_dispatches(
                 "skip (retry next tick)",
             )
             continue
+        elif outcome == "absent":
+            # No journal for this id (pre-#184 dispatch, or the journal was
+            # reaped). Codex iter-1 [P2]: a bare write_worker_inbox + gen-0
+            # block would be SKIPPED by the coord — the new protocol always
+            # runs `mark-launch-attempted` first, and the Go side returns
+            # predicate_fail for an absent journal, so the resume would
+            # never launch. Acquire a FRESH journal instead: that creates
+            # the entry at ExecPending generation 0 AND writes the resume
+            # inbox under the flock, so the gen-0 resume block passes the
+            # launch gate. This re-arms legacy/no-journal resumes the
+            # durability machinery didn't previously own.
+            try:
+                dispatch_mod.acquire_coord_prompt_inbox(
+                    e.agent_id, resume_body,
+                    owner=f"project/{resume_project}/slug/{e.task_id}",
+                    fleet_home=str(fleet_home_p),
+                )
+            except dispatch_mod.AcquirePromptError as exc:
+                skipped.append(
+                    f"task {e.task_id}: resume acquire failed "
+                    f"(reset outcome=absent): {exc.message}; skip",
+                )
+                continue
+            generation = 0
         else:
-            # absent (no journal for this id — pre-#184 dispatch or reaped)
-            # or error (binary missing / unexpected): the journal was NOT
-            # mutated, so fall back to a direct inbox write with gen 0. The
-            # coord's mark-launch-attempted gate stays safe either way — if
-            # a journal does exist at a higher gen, the gen-0 block simply
-            # predicate-fails (no double-launch); if none exists, the launch
-            # proceeds. This preserves the legacy resume path for journals
-            # the durability machinery doesn't own.
+            # error (binary missing / unexpected): the journal was NOT
+            # mutated and we cannot re-arm it via the Go path. Best-effort
+            # direct inbox write with gen 0 — if a journal does exist at a
+            # higher gen the gen-0 block predicate-fails (no double-launch);
+            # this just preserves the inbox body for a manual re-dispatch.
             try:
                 dispatch_mod.write_worker_inbox(
                     e.agent_id, resume_body, fleet_home=str(fleet_home_p),
@@ -461,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
     ) or os.path.expanduser("~/.fleet/subagent-wip")
     blocks, skipped = build_resume_dispatches(
         entries, wip_dir=wip_dir, fleet_home=fleet_home,
+        project=os.environ.get("FLEET_PROJECT", "") or None,
     )
     for line in skipped:
         print(f"# {line}", file=sys.stderr)

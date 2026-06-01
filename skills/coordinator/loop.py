@@ -4156,9 +4156,21 @@ def _iter_project_journals(
 
 
 def _has_live_registered_subagent(coord_state: dict, slug: str) -> bool:
-    """True if coord_state records a subagent_id OR a worker agent_id for
-    this slug — used by residual-crash repair to avoid flipping a launch
-    that DID register (just late) to blocked.
+    """True ONLY if coord_state records a subagent_id for this slug — the
+    register_subagent ack breadcrumb, written by the coord AFTER the Agent
+    tool returns a subagent_id (i.e. the launch genuinely happened). Used
+    by residual-crash repair to avoid flipping a launch that DID register
+    (just late) to blocked.
+
+    Codex iter-1 [P1]: this MUST NOT key on the worker agent_id map.
+    `remember_agent_id` runs in _apply_dispatch BEFORE the DISPATCH block
+    is emitted and BEFORE the Agent tool is ever invoked, so the agent_id
+    map is populated for the EXACT phantom this repair targets — a
+    dispatch that crashed after mark-launch-attempted but before/at the
+    Agent call. Keying on agent_id would treat every such phantom as
+    "registered" and suppress repair forever, leaving the journal stuck at
+    launch_attempted with an in-progress task and no worker. The
+    subagent_id map is the only post-launch signal.
 
     NOTE: this is a registration breadcrumb, not a liveness probe; the
     repair predicate ALSO requires elapsed > LAUNCH_ACK_GRACE, so a slug
@@ -4168,12 +4180,6 @@ def _has_live_registered_subagent(coord_state: dict, slug: str) -> bool:
     try:
         sub = supervisor_mod.load_subagent_id_map(coord_state)
         if slug in sub and sub.get(slug):
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        agents = supervisor_mod.load_agent_id_map(coord_state)
-        if slug in agents and agents.get(slug):
             return True
     except Exception:  # noqa: BLE001
         pass
