@@ -215,30 +215,27 @@ func releaseCoordPromptInboxLocked(opts ReleaseCoordPromptInboxOptions) (Release
 	// (loop.py reaper / supervisor).
 	//
 	// dispatch-durability (fleet#184): the pre-#184 code force-flipped
-	// ANY non-terminal state to ExecDone. That would CLOBBER the new
-	// launch states:
-	//   - ExecLaunchAttempted, un-acked: the coord flipped it to
-	//     launch_attempted but no register_subagent ack ever landed.
-	//     Forcing ExecDone would falsely record success and erase the
-	//     "launch unconfirmed" signal the residual-crash repair relies
-	//     on. Resolve to ExecFailed instead.
+	// ANY non-terminal state to ExecDone. The launch states need care:
 	//   - ExecBlocked / ExecFailed are already terminal (IsTerminal
 	//     covers them) — never downgrade.
 	//   - ExecAcked (live worker finished) and ExecPending / ExecInFlight
 	//     (legacy) → ExecDone, the normal completion.
+	//   - ExecLaunchAttempted → ExecDone.
+	//
+	// Codex iter-5 [P2]: an un-acked ExecLaunchAttempted at RELEASE time
+	// does NOT mean a failed launch. register_subagent is best-effort
+	// (skipped on lock contention) while the worker runs to completion,
+	// and release is driven by the worker's OWN terminal transition
+	// (loop.py reaper / supervisor on phase=done). So a missing ack is a
+	// missing BREADCRUMB, not a failure — recording ExecFailed would
+	// corrupt the lifecycle of a worker that completed fine. The phantom
+	// "launched-but-never-ran" case is handled separately by the
+	// residual-crash repair (loop.py), which ESCALATES off-channel and
+	// deliberately does NOT call release (a live-but-unregistered worker
+	// is indistinguishable), so a launch_attempted journal only reaches
+	// THIS release via a real worker's terminal signal → ExecDone.
 	if !j.ExecState.IsTerminal() {
-		switch j.ExecState {
-		case ExecLaunchAttempted:
-			// Launch attempted but never acked → unconfirmed. Don't
-			// pretend it completed cleanly.
-			j.ExecState = ExecFailed
-			if j.BlockedReason == "" {
-				j.BlockedReason = "released_launch_unconfirmed"
-			}
-		default:
-			// pending / in_flight (legacy) / acked → done.
-			j.ExecState = ExecDone
-		}
+		j.ExecState = ExecDone
 	}
 	controller := NewCoordPromptInboxController()
 	status, existing, err := controller.Inspect(j, KindCoordPromptInbox)

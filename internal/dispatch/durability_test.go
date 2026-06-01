@@ -255,10 +255,12 @@ func TestAcquireReleaseTakeFlock(t *testing.T) {
 // TestReleaseNoClobberOfConcurrentLaunch is the lost-update regression:
 // a mark-launch-attempted (flock-guarded) and a release run back-to-back
 // on the same id; the release must operate on the launch_attempted state
-// it observes under the lock and resolve to ExecFailed (un-acked launch),
-// never silently revert to a stale ExecPending/ExecDone from a lock-free
-// read. (Serialization is enforced by the flock; this asserts the
-// post-condition that proves no update was lost.)
+// it observes UNDER the lock, never silently revert to a stale
+// pre-flip read. Codex iter-5 [P2]: release of an un-acked
+// launch_attempted resolves to ExecDone (the worker's terminal signal
+// drove the release; a missing best-effort ack is not a failure). The
+// no-clobber proof is that LaunchAttemptedAt survives the release — a
+// lost update from a stale ExecPending read would not carry it.
 func TestReleaseNoClobberOfConcurrentLaunch(t *testing.T) {
 	withFleetHome(t)
 	pinNow(t, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
@@ -267,15 +269,15 @@ func TestReleaseNoClobberOfConcurrentLaunch(t *testing.T) {
 	if out, err := MarkLaunchAttempted(id, 0); err != nil || out != LaunchAttemptOK {
 		t.Fatalf("mark: out=%q err=%v", out, err)
 	}
-	// Release now: it must read launch_attempted UNDER the flock and
-	// resolve to ExecFailed (launch unconfirmed) — not clobber it to a
-	// stale ExecDone from a pre-flip read.
 	if _, err := ReleaseCoordPromptInbox(ReleaseCoordPromptInboxOptions{DispatchID: id, HostID: "h"}); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	j, _ := LoadJournal(id)
-	if j.ExecState != ExecFailed {
-		t.Fatalf("released launch_attempted = %q, want failed (launch flip must not be lost)", j.ExecState)
+	if j.ExecState != ExecDone {
+		t.Fatalf("released launch_attempted = %q, want done (worker-terminal release)", j.ExecState)
+	}
+	if j.LaunchAttemptedAt.IsZero() {
+		t.Fatalf("LaunchAttemptedAt cleared — release clobbered the flock-guarded flip (lost update)")
 	}
 }
 
@@ -458,14 +460,16 @@ func TestResetForRelaunch_ReArmsReleasedClaim(t *testing.T) {
 }
 
 // TestRelease_NoClobberLaunchStates pins the ReleaseCoordPromptInbox
-// fix: releasing must not downgrade ExecBlocked, and an un-acked
-// ExecLaunchAttempted resolves to ExecFailed (launch unconfirmed), not
-// ExecDone.
+// fix: releasing must not downgrade ExecBlocked. Codex iter-5 [P2]: an
+// un-acked ExecLaunchAttempted resolves to ExecDone (not ExecFailed) —
+// release is the worker's terminal signal and a missing best-effort ack
+// is not a failure.
 func TestRelease_NoClobberLaunchStates(t *testing.T) {
 	withFleetHome(t)
 	pinNow(t, time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC))
 
-	// (1) un-acked launch_attempted → release → ExecFailed.
+	// (1) un-acked launch_attempted → release → ExecDone (worker-terminal
+	// release; missing ack is a breadcrumb, not a failure).
 	id1 := acquirePendingFixture(t, "10000001")
 	if _, err := MarkLaunchAttempted(id1, 0); err != nil {
 		t.Fatalf("mark: %v", err)
@@ -474,8 +478,8 @@ func TestRelease_NoClobberLaunchStates(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 	j1, _ := LoadJournal(id1)
-	if j1.ExecState != ExecFailed {
-		t.Fatalf("released un-acked launch_attempted = %q, want failed (not done — launch unconfirmed)", j1.ExecState)
+	if j1.ExecState != ExecDone {
+		t.Fatalf("released un-acked launch_attempted = %q, want done (worker-terminal release)", j1.ExecState)
 	}
 
 	// (2) acked → release → ExecDone (normal completion).
