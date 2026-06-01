@@ -1174,6 +1174,28 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
+	// Path 0: unified in-flight gate (PR2 — design D1; codex review iter
+	// run-2 [P2]). Check BEFORE any attach/spawn branch. The lower paths
+	// resolve a coord record first, so an in-flight HANDOFF used to be
+	// bypassed on the live-coord attach path: pressing [h] (old coord
+	// still alive — the `fleet handoff` shell-out is async) then [a]
+	// would hit Path 1, see the old session alive, set pendingAttach +
+	// tea.Quit, and exit INTO the coord that's mid-handoff — before the
+	// old Path-2.6 guard ran. That contradicted the guard's documented
+	// contract ("refuse [a] while an op is in flight"). Hoisting the
+	// check here makes [a] refuse uniformly for BOTH spawn and handoff
+	// ops: the operator already sees the "handing off…" / "creating…"
+	// D2 token, so the flash names why and the next step. Single guard,
+	// single source of truth — the lower-path duplicates are removed.
+	if op, ok := m.inFlightOp(p.Name); ok {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord %s for project %s is in flight — wait a moment then re-press [a]",
+				coordOpVerb(op), p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
 	// Path 1: fresh coord exists (lock body + freshness gate). Resolve
 	// the record via the shared resolveCoordRecord helper (CoordID link
 	// first, then the records-scan fallback — tui-nav-handoff-regressions
@@ -1216,23 +1238,9 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 					}
 					return m, nil, true
 				}
-				// Unified in-flight guard (PR2 — design D1). The lower
-				// fresh-spawn path 2.6 below has the same check; we
-				// honor it here too so an operator's double-tap on
-				// [a] before the first coordSpawnDoneMsg arrives
-				// doesn't fire a second recovery dispatch against the
-				// same project state. opInFlight also covers an
-				// in-flight HANDOFF, so [a] refuses to resume while [h]
-				// is spawning a successor (the dedup the operator hit).
-				if op, ok := m.inFlightOp(p.Name); ok {
-					m.flash = &flashMsg{
-						text: fmt.Sprintf(
-							"coord %s for project %s already in flight — wait for it to finish",
-							coordOpVerb(op), p.Name),
-						isErr: true,
-					}
-					return m, nil, true
-				}
+				// In-flight ops are already refused at Path 0 (top of
+				// this func), so reaching here means no spawn/handoff is
+				// in flight — safe to arm the recovery spawn's guard.
 				m.setOpInFlight(p.Name, coordOpSpawn)
 				// Pass the DEAD COORD's own cwd, not the project's
 				// first-record cwd (codex review iter-11 P2). The
@@ -1339,22 +1347,9 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		m.pendingAttach = rec.TmuxSession
 		return m, tea.Quit, true
 	}
-	// Path 2.6: unified in-flight gate (PR2 — design D1). coordOpInFlight
-	// tracks projects whose spawn OR handoff op has launched but its done
-	// message hasn't arrived yet. During this window the agent record +
-	// marker don't exist on disk, so paths 1/2/2.5 would all miss and
-	// we'd duplicate-spawn. Refusing here while a HANDOFF is in flight is
-	// the core fix: it stops [a] from stacking a coord on the successor
-	// that [h] is already spawning.
-	if op, ok := m.inFlightOp(p.Name); ok {
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"coord %s for project %s is in flight — wait a moment then re-press [a]",
-				coordOpVerb(op), p.Name),
-			isErr: true,
-		}
-		return m, nil, true
-	}
+	// In-flight ops (spawn OR handoff) are refused at Path 0 (top of this
+	// func), so reaching Path 3 means none is in flight — the agent
+	// record + marker simply don't exist yet, so a fresh spawn is correct.
 	// Path 3: no coord. Pre-init the project tree (so the skill's first
 	// tick can write coord-state.json and acquire the flock), then spawn.
 	if _, err := state.EnsureProjectInitialized(p.Name); err != nil {

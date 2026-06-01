@@ -299,6 +299,49 @@ func TestActionAttach_RefusesWhileHandoffInFlight(t *testing.T) {
 	}
 }
 
+// TestActionAttach_RefusesWhileHandoffInFlight_LiveCoord pins the codex
+// review run-2 [P2] fix: when a HANDOFF is in flight AND the project's
+// coord is still ALIVE, [a] must refuse — it must NOT attach (set
+// pendingAttach + tea.Quit) to the old coord that's mid-handoff. Before
+// the Path-0 hoist, the in-flight guard ran AFTER the live-coord attach
+// path, so [h] then [a] quit into the dying coord and bypassed the
+// guard entirely. This is the exact gap that made the unified guard's
+// "refuse [a] during handoff" contract a lie on the live-attach path.
+// Fails-on-(this-PR-before-the-hoist): pendingAttach would be set + cmd
+// would be tea.Quit.
+func TestActionAttach_RefusesWhileHandoffInFlight_LiveCoord(t *testing.T) {
+	withFleetHome(t)
+	(&stubSessionAlive{}).install(t) // coord session is ALIVE
+	(&stubProjectTreeExists{}).install(t)
+	stub := &stubFleetCmd{}
+	stub.install(t)
+
+	// Live coord resolvable via CoordID → Path 1 would normally attach.
+	coord := sampleAgent("coord001")
+	coord.Project = "demo"
+	m := projectRowModelWithCoord(t, "demo", "coord001", []*agent.Record{coord}, nil)
+	// A handoff is in flight for the project (armed by a prior [h]).
+	m.coordOpInFlight = map[string]string{"demo": coordOpHandoff}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if cmd != nil {
+		t.Error("[a] must NOT attach (tea.Quit) into a coord mid-handoff")
+	}
+	if mm.pendingAttach != "" {
+		t.Errorf("pendingAttach must stay empty during in-flight handoff; got %q", mm.pendingAttach)
+	}
+	if mm.flash == nil || !mm.flash.isErr {
+		t.Fatalf("[a] during in-flight handoff (live coord) should flash; got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "handoff") {
+		t.Errorf("flash should name the in-flight handoff; got %q", mm.flash.text)
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("[a] must NOT shell out while handoff in flight; got %v", stub.calls)
+	}
+}
+
 // TestUpdate_HandoffDoneClearsInFlightGuard pins D1: handoffDoneMsg
 // clears the guard (success path) so a subsequent [a]/[h] proceeds.
 func TestUpdate_HandoffDoneClearsInFlightGuard(t *testing.T) {
