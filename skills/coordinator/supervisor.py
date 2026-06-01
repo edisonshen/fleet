@@ -1144,8 +1144,17 @@ def run_supervisor(
         last_change_ts[p.slug] = started_at
 
     if not has_active_workers(probes):
-        res.exit_reason = "no-active-workers"
-        emit("[coord] supervisor loop exiting: no active workers", stream=log_stream)
+        # loop-supervisor-sigpipe-5263 (codex iter-6 [P3]): this early
+        # exit's emit() sits BEFORE the main broken-pipe try-block, but
+        # emit() now re-raises BrokenPipeError. If stdout is already
+        # closed when there are no active workers, an unguarded emit here
+        # would propagate out of run_supervisor instead of returning a
+        # clean result. Guard it the same way the main loop does.
+        try:
+            emit("[coord] supervisor loop exiting: no active workers", stream=log_stream)
+            res.exit_reason = "no-active-workers"
+        except BrokenPipeError:
+            res.exit_reason = "stdout-broken"
         return res
 
     # loop-supervisor-sigpipe-5263: wrap the entire poll loop so a

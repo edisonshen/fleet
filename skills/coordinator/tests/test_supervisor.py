@@ -799,6 +799,25 @@ def test_supervisor_exits_when_stdout_broken(fleet_home: Path) -> None:
     assert res.iterations == 0
 
 
+def test_supervisor_no_active_workers_stdout_broken(fleet_home: Path) -> None:
+    """Codex iter-6 [P3]: the no-active-workers early-exit emit() sits
+    BEFORE the main broken-pipe try-block. emit() now re-raises
+    BrokenPipeError, so an unguarded emit there would propagate out of
+    run_supervisor when stdout is already closed and there are no active
+    workers. The guard must catch it and return exit_reason=stdout-broken
+    instead of raising."""
+    broken = _BrokenStream()
+    res = _drive_loop(
+        probes_seq=[[]],  # no active workers on the initial probe
+        cfg=_cfg(poll_interval_s=30, poll_max_s=60, stuck_check_every=0),
+        fleet_home_=fleet_home,
+        log=broken,
+    )
+    # Must return cleanly, not raise.
+    assert res.exit_reason == "stdout-broken"
+    assert res.iterations == 0
+
+
 class _StreamBrokenAfterN:
     """A log stream that buffers the first N writes, then raises
     BrokenPipeError. Lets the loop reach a specific emit() deeper in the

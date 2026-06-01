@@ -2223,6 +2223,37 @@ def _record_review_handoff_dispatched(
     state["review_handoffs_dispatched"] = raw
 
 
+_PHANTOM_ESCALATED_KEY = "phantom_launch_escalated"
+
+
+def _phantom_already_escalated(state: dict, agent_id: str, generation: int) -> bool:
+    """True if the residual-crash escalation already fired for this
+    (agent_id, generation) phantom. Codex iter-6 [P2]: without a durable
+    breadcrumb the repair re-raises the same operator escalation every
+    tick. Keyed by generation so a reset-for-relaunch (which bumps gen)
+    gets a fresh escalation if the relaunch also phantoms."""
+    raw = state.get(_PHANTOM_ESCALATED_KEY)
+    if not isinstance(raw, list):
+        return False
+    return f"{agent_id}:{generation}" in raw
+
+
+def _record_phantom_escalated(state: dict, agent_id: str, generation: int) -> None:
+    """Persist that the residual-crash escalation fired for this
+    (agent_id, generation). Mutates coord_state in place; tick() saves it.
+    Bounded: capped to the most recent 200 entries so a long-lived coord
+    can't grow the list without limit."""
+    raw = state.get(_PHANTOM_ESCALATED_KEY)
+    if not isinstance(raw, list):
+        raw = []
+    key = f"{agent_id}:{generation}"
+    if key not in raw:
+        raw.append(key)
+    if len(raw) > 200:
+        raw = raw[-200:]
+    state[_PHANTOM_ESCALATED_KEY] = raw
+
+
 def _clear_review_handoff_state(state: dict, slug: str) -> None:
     """Drop ALL review-handoff entries for the given slug.
 
@@ -4391,9 +4422,19 @@ def _replay_pending_dispatches(
             # tear down the inbox of a worker we merely failed to observe,
             # and the worker's own terminal transition (or the operator)
             # will release it. Replay never re-emits launch_attempted, so
-            # leaving it non-terminal cannot double-launch. To avoid
-            # re-escalating every tick, the escalation is advisory; the
-            # operator re-dispatches or the worker self-completes.
+            # leaving it non-terminal cannot double-launch.
+            #
+            # Codex iter-6 [P2]: escalate ONCE per (agent_id, generation).
+            # The journal stays launch_attempted (we deliberately don't
+            # mutate it), so without a durable breadcrumb this branch would
+            # re-raise the same operator escalation every tick forever.
+            # Record the escalation in coord_state (persisted by tick());
+            # a reset-for-relaunch bumps the generation, so a relaunch that
+            # also phantoms gets a fresh escalation.
+            generation = int(j.get("generation") or 0)
+            if _phantom_already_escalated(coord_state, agent_id, generation):
+                continue
+            _record_phantom_escalated(coord_state, agent_id, generation)
             actions.append(_ReplayAction(
                 agent_id=agent_id, slug=slug,
                 raise_msg=(

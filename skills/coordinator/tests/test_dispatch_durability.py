@@ -240,6 +240,24 @@ def test_residual_crash_repair(fleet_bin: str, home: Path) -> None:
     assert _journal(home, "aad00001")["exec_state"] == "launch_attempted"
 
 
+def test_residual_crash_repair_escalates_once(fleet_bin: str, home: Path) -> None:
+    """Codex iter-6 [P2]: the escalation persists a breadcrumb in
+    coord_state so it fires ONCE per (agent_id, generation), not every
+    tick. The journal is deliberately left launch_attempted, so without
+    the breadcrumb the same operator escalation would re-raise forever."""
+    _acquire(fleet_bin, home, "aad000e1", "fix-foo")
+    dispatch_mod.mark_launch_attempted(
+        "aad000e1", 0, fleet_bin=fleet_bin, fleet_home=str(home))
+    cs: dict = {}  # SAME coord_state across both ticks (persistence)
+    far = time.time() + 10_000
+    first = _replay(home, fleet_bin, now_unix=far, coord_state=cs)
+    assert len([a for a in first if a.raise_msg]) == 1, "first tick must escalate"
+    # Second tick over the SAME (unchanged) journal + coord_state: the
+    # breadcrumb suppresses a duplicate escalation.
+    second = _replay(home, fleet_bin, now_unix=far, coord_state=cs)
+    assert [a for a in second if a.raise_msg] == [], "escalation re-fired (no breadcrumb)"
+
+
 def test_residual_crash_repair_agent_id_breadcrumb_not_suppressing(
     fleet_bin: str, home: Path,
 ) -> None:
