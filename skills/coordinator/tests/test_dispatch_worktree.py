@@ -215,6 +215,34 @@ def test_fetch_remote_refuses_empty() -> None:
     assert m.call_count == 0
 
 
+def test_ref_exists_true_when_rev_parse_succeeds() -> None:
+    """ref_exists verifies the base resolves to a commit before we hand
+    it to `git worktree add` (codex [P2] guard)."""
+    with patch.object(
+        worktree_mod.subprocess, "run", return_value=_ok(stdout="deadbeef\n"),
+    ) as m:
+        assert worktree_mod.ref_exists("/repo", "origin/main") is True
+    args = m.call_args[0][0]
+    assert args == [
+        "git", "-C", "/repo", "rev-parse", "--verify", "--quiet",
+        "origin/main^{commit}",
+    ]
+
+
+def test_ref_exists_false_when_ref_absent() -> None:
+    """Missing origin/<default> (no remote / never fetched) → False so
+    the caller falls back to local HEAD instead of a fatal base."""
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("", returncode=1)):
+        assert worktree_mod.ref_exists("/repo", "origin/main") is False
+
+
+def test_ref_exists_false_on_subprocess_exception_and_empty() -> None:
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        assert worktree_mod.ref_exists("/repo", "origin/main") is False
+    assert worktree_mod.ref_exists("", "origin/main") is False
+    assert worktree_mod.ref_exists("/repo", "") is False
+
+
 def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
     """Coord crash mid-tick can leave the wt on disk + registered; resume
     must succeed. We verify the path is registered via `git worktree
@@ -534,6 +562,8 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
         # origin/HEAD → default branch "main" (coord-worktree-stale fix).
         ("git", "-C", repo, "symbolic-ref"): _ok(stdout="origin/main\n"),
         ("git", "-C", repo, "fetch"): _ok(),
+        # ref_exists guard: origin/main resolves → use it as base.
+        ("git", "-C", repo, "rev-parse", "--verify"): _ok(stdout="deadbeef\n"),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -929,3 +959,76 @@ def test_real_git_branch_off_local_head_misses_dependency(_stale_clone, tmp_path
         "expected stale tree to miss the dependency — if this file "
         "exists the fixture is not modeling origin-ahead-of-local"
     )
+
+
+# ---------- REAL-GIT integration: no-origin-ref fallback (codex [P2]) ----------
+#
+# A repo with NO `origin` remote (or one whose origin/<default> was never
+# fetched) has no origin/<default> object. Forcing base="origin/<default>"
+# would make `git worktree add` fatal "invalid reference", skipping the
+# dispatch FOREVER — a regression vs the old base="" (local HEAD) path.
+# The ref_exists guard must fall back to local HEAD so dispatch proceeds.
+
+
+def test_ref_exists_false_for_unfetched_origin_real_git(tmp_path):
+    """A freshly-init repo with no remote has no origin/main object →
+    ref_exists returns False (drives the local-HEAD fallback)."""
+    if not shutil.which("git"):
+        pytest.skip("git not on PATH")
+    repo = str(tmp_path / "lonely")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, env=_GIT_ENV)
+    (tmp_path / "lonely" / "f.txt").write_text("x\n")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-q", "-m", "c1")
+    # No origin remote at all → origin/main can't resolve.
+    assert worktree_mod.ref_exists(repo, "origin/main") is False
+    # Local HEAD obviously resolves.
+    assert worktree_mod.ref_exists(repo, "HEAD") is True
+
+
+def test_real_git_dispatch_falls_back_to_local_head_without_origin(tmp_path):
+    """fails-on-parent: a real cap=2 dispatch against a repo with NO
+    origin remote must still create the worker worktree (off local HEAD).
+    Pre-fix (force base=origin/main) → `git worktree add` fatals and the
+    dispatch is skipped; this guards the codex [P2] regression."""
+    if not shutil.which("git"):
+        pytest.skip("git not on PATH")
+    repo = str(tmp_path / "noremote")
+    subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True, env=_GIT_ENV)
+    (tmp_path / "noremote" / "base.txt").write_text("base\n")
+    _git(repo, "add", "base.txt")
+    _git(repo, "commit", "-q", "-m", "c1 base")
+
+    t = _ready_task("alpha-1234")
+    wt_path = str(tmp_path / "wt" / "alpha-1234")
+
+    # Real git for worktree ops; only stub the fleet CLI (worktree-path)
+    # and the dispatch helpers. The router records calls and shells real
+    # git for git argv (so resolve_default_branch / fetch / ref_exists /
+    # worktree add all hit the actual repo).
+    real_run = subprocess.run
+
+    def _router(cmd, *args, **kwargs):
+        if cmd[:3] == ["/usr/local/bin/fleet", "workers", "worktree-path"]:
+            return _ok(stdout=wt_path + "\n")
+        if cmd[:1] == ["git"]:
+            return real_run(*([cmd] + list(args)), **kwargs)
+        emu = _maybe_claims_emulator(cmd, kwargs)
+        if emu is not None:
+            return emu
+        return _ok()
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_router):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd=repo, cap=2,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    assert len(actions) == 1, f"expected one action, got: {actions}"
+    assert actions[0].error == "", f"dispatch wedged: {actions[0].error}"
+    assert actions[0].worktree == wt_path
+    # The worktree was really created off local HEAD (base.txt present).
+    assert os.path.exists(os.path.join(wt_path, "base.txt"))

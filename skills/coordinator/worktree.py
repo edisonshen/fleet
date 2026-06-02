@@ -166,6 +166,41 @@ def fetch_remote(
     return WorktreeResult(error=f"fetch_remote: git fetch {remote} {branch}: {stderr}")
 
 
+def ref_exists(
+    repo: str,
+    ref: str,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Return True iff <ref> resolves to an object in <repo>.
+
+    `git -C <repo> rev-parse --verify --quiet <ref>^{commit}` — exit 0
+    means the ref names a commit we can branch from. Used to GUARD the
+    base passed to `git worktree add`: a non-git project, a repo with no
+    `origin` remote, or one whose `origin/<default>` ref was never
+    fetched (offline first run) has NO `origin/<default>` object. Passing
+    that as base makes `git worktree add` fatal with `invalid reference`,
+    which would skip the dispatch entirely (codex [P2]). The caller falls
+    back to the local-HEAD base (base="") when this returns False, so
+    cap>1 dispatch still proceeds — just off local HEAD, the pre-fix
+    behavior, rather than wedging the task forever.
+
+    Never raises — a missing git binary / timeout / empty input is a
+    conservative False (caller falls back to local HEAD).
+    """
+    if not repo or not ref:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+             f"{ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def create_worktree(
     repo: str,
     wt_path: str,

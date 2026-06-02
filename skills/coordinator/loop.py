@@ -4755,13 +4755,32 @@ def _dispatch_ready(
             # fetch is best-effort: on failure we log and still branch off
             # whatever origin/<default> exists locally (better a possibly
             # stale base than wedging all of cap on a network blip).
+            #
+            # BUT origin/<default> only works as a base if that ref EXISTS
+            # locally. A repo with no `origin` remote, or one whose
+            # origin/<default> was never fetched (offline first run),
+            # has no such object — `git worktree add ... origin/<default>`
+            # would fatal "invalid reference" and skip the dispatch
+            # forever (codex [P2]). So we verify the ref resolves; if it
+            # doesn't, fall back to base="" (local HEAD), the pre-fix
+            # behavior — cap>1 dispatch still proceeds, just off a
+            # possibly-stale local tip instead of wedging the task.
             default_branch = worktree_mod.resolve_default_branch(cwd)
-            base_ref = f"origin/{default_branch}"
+            origin_base = f"origin/{default_branch}"
             fetch_res = worktree_mod.fetch_remote(cwd, default_branch)
             if fetch_res.error:
                 print(
-                    f"coord: {fetch_res.error}; branching {t.slug} off "
-                    f"possibly-stale {base_ref}",
+                    f"coord: {fetch_res.error}; will branch {t.slug} off "
+                    f"{origin_base} if it exists, else local HEAD",
+                    file=sys.stderr,
+                )
+            if worktree_mod.ref_exists(cwd, origin_base):
+                base_ref = origin_base
+            else:
+                base_ref = ""  # local HEAD — origin/<default> unavailable
+                print(
+                    f"coord: {origin_base} not present in {cwd}; branching "
+                    f"{t.slug} off local HEAD (no fresh origin base)",
                     file=sys.stderr,
                 )
             wt_result = worktree_mod.create_worktree(
