@@ -1128,6 +1128,13 @@ def _tick_locked(
                 state=checkpoint_state,
                 home=home,
             )
+            # Codex iter-7 [P1]: clear the durable "checkpoint due" latch
+            # ONLY after a successful publish, and persist the clear so a
+            # later tick doesn't needlessly retry. A failed write (caught
+            # below) leaves the latch set → next tick retries.
+            if checkpoint_state.get("checkpoint_due"):
+                checkpoint_state["checkpoint_due"] = False
+                _save_coord_state(state_path, checkpoint_state)
         except Exception as exc:  # noqa: BLE001 — checkpoint must never fail a tick
             result.errors.append(f"rolling checkpoint: {exc}")
 
@@ -1477,6 +1484,10 @@ def _run_supervisor(
                     project=project, project_dir=project_dir,
                     coord_id=coord_id, state=cs, home=home,
                 )
+                # Codex iter-7 [P1]: clear the due-latch only after a
+                # successful publish (cs is persisted below). A failed
+                # write leaves it set → retried next heartbeat / tick.
+                cs["checkpoint_due"] = False
         except Exception as exc:  # noqa: BLE001 — never wedge the heartbeat
             result.errors.append(f"supervisor rolling checkpoint: {exc}")
         _save_coord_state(state_path, cs)
@@ -2660,6 +2671,16 @@ def _bump_tick_counter(state: dict) -> bool:
     file write to the end of the tick (after the supervisor loop, which
     can dispatch new workers mid-tick). Tolerates a corrupt / non-int /
     negative counter by resetting to 0 before the +1 bump.
+
+    Codex iter-7 [P1]: a "checkpoint due" latch (state["checkpoint_due"])
+    survives the bump→heartbeat→deferred-write window. When an interval
+    tick lands we set the latch BEFORE the heartbeat persists it; the
+    write clears it only on success (_write_rolling_checkpoint_file).
+    If the write fails / the coord crashes in that window, the latch
+    stays True on disk, so the NEXT tick retries the write even though
+    the modulo no longer matches. Without the latch the missed checkpoint
+    would never be retried and a stale coord-checkpoint.md could shadow
+    synth.go's coord-state walk, dropping workers dispatched that tick.
     """
     raw_tick = state.get("tick_count", 0)
     try:
@@ -2672,7 +2693,15 @@ def _bump_tick_counter(state: dict) -> bool:
     state["tick_count"] = tick_count
 
     every = dispatch_mod.resolve_checkpoint_every()
-    return dispatch_mod.should_checkpoint(tick_count, every)
+    due_now = dispatch_mod.should_checkpoint(tick_count, every)
+    # A latch left over from a prior tick whose write never completed.
+    pending = bool(state.get("checkpoint_due"))
+    if due_now:
+        # Latch it durably so a crash before the deferred write retries
+        # next tick. Only meaningful when checkpointing is enabled
+        # (should_checkpoint already returns False for every<=0).
+        state["checkpoint_due"] = True
+    return due_now or pending
 
 
 def _write_rolling_checkpoint_file(

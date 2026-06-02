@@ -4465,3 +4465,62 @@ def test_supervisor_heartbeat_writes_rolling_checkpoint(
     body = cp.read_text(encoding="utf-8")
     assert 'task="sup-jjjj"' in body
     assert 'agent_id="abcd000b"' in body
+
+
+def test_bump_tick_counter_latches_due_and_retries(monkeypatch) -> None:
+    """Codex iter-7 P1: a "checkpoint due" latch survives a missed write.
+    On the interval tick the latch is set; if the write never completes,
+    the NEXT tick (modulo no longer matching) must still return True so
+    the missed checkpoint is retried — otherwise a stale coord-checkpoint
+    shadows synth.go's state walk."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    # Interval tick: 4 → 5, due, latch set.
+    state = {"tick_count": 4}
+    assert loop._bump_tick_counter(state) is True
+    assert state["checkpoint_due"] is True
+
+    # Simulate a crash before the write cleared the latch: tick_count was
+    # persisted (5) but checkpoint_due is still True on disk.
+    state = {"tick_count": 5, "checkpoint_due": True}
+    # 6 % 5 != 0 (not due now) but the latch forces a retry.
+    assert loop._bump_tick_counter(state) is True
+
+    # A clean state with no latch on an off-interval tick does NOT write.
+    state = {"tick_count": 5, "checkpoint_due": False}
+    assert loop._bump_tick_counter(state) is False
+
+
+def test_tick_retries_missed_checkpoint_via_latch(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-7 P1 (integration): a coord that crashed with the latch
+    set (tick_count past the modulo) writes the checkpoint on the very
+    next tick and clears the latch."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    _write_tasks(project_dir, [
+        _make_task("retry-qqqq", status="in-progress", worker_pid=0),
+    ])
+    # On-disk state from the crashed tick: counter moved past the modulo,
+    # latch still set (write never completed).
+    _seed_coord_state(project_dir, agent_id_map={"retry-qqqq": "abcd000f"})
+    sp = project_dir / "coord-state.json"
+    s = json.loads(sp.read_text())
+    s["tick_count"] = 5  # next bump → 6, 6 % 5 != 0 (not due by modulo)
+    s["checkpoint_due"] = True
+    sp.write_text(json.dumps(s), encoding="utf-8")
+
+    cp = _checkpoint_path(project_dir)
+    assert not cp.exists()
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # The latch forced the missed checkpoint to be written this tick.
+    assert cp.exists(), "latch must force a retry of the missed checkpoint"
+    assert 'task="retry-qqqq"' in cp.read_text(encoding="utf-8")
+    # And the latch is cleared after the successful publish.
+    final = json.loads(sp.read_text())
+    assert final.get("checkpoint_due") is False
