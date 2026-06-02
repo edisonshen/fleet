@@ -4465,4 +4465,3 @@ def test_supervisor_heartbeat_writes_rolling_checkpoint(
     body = cp.read_text(encoding="utf-8")
     assert 'task="sup-jjjj"' in body
     assert 'agent_id="abcd000b"' in body
-
