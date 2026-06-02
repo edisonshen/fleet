@@ -4288,3 +4288,84 @@ def test_tick_checkpoint_written_after_supervisor(
     assert 'task="sup-iiii"' in body
     assert 'status="in-progress"' in body
 
+
+def test_write_rolling_checkpoint_skips_on_corrupt_tasks(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-3 P2: a corrupt/unparseable tasks.md at checkpoint-write
+    time must NOT overwrite the prior checkpoint with an empty one — an
+    empty checkpoint would, because synth.go prefers a fresher checkpoint
+    over the state walk, make a later crash treat every live worker as
+    absent. The write raises (caller fail-soft-logs); the prior checkpoint
+    survives intact."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # A pre-existing good checkpoint that must NOT be clobbered.
+    prior = _checkpoint_path(project_dir)
+    prior.write_text("PRIOR GOOD CHECKPOINT\n", encoding="utf-8")
+    # Corrupt tasks.md so parse.read raises (not merely missing → empty).
+    (project_dir / "tasks.md").write_text(
+        "## task: broken\nstatus: not-a-valid-status\n", encoding="utf-8",
+    )
+    state = {"tick_count": 0}
+
+    # _bump_tick_counter says "write" (every=1), but the file write raises.
+    assert loop._bump_tick_counter(state) is True
+    with pytest.raises(Exception):
+        loop._write_rolling_checkpoint_file(
+            project="fleet", project_dir=project_dir,
+            coord_id="cccccc01", state=state, home=fleet_home,
+        )
+
+    # Prior checkpoint is untouched — recovery still has real data.
+    assert prior.read_text(encoding="utf-8") == "PRIOR GOOD CHECKPOINT\n"
+
+
+def test_supervisor_heartbeat_writes_rolling_checkpoint(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-3 P1: during a long supervisor session the checkpoint
+    must refresh from the supervisor's periodic heartbeat, not only after
+    the supervisor exits. Drive a real tick with the supervisor enabled,
+    patch run_supervisor to invoke the write_state hook it was handed, and
+    assert the hook published a checkpoint reflecting the live worker."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "5")
+    # A live in-flight worker so _run_supervisor proceeds to the inner
+    # supervisor loop (it returns early when nothing is in-flight). A
+    # worker-authored state.json + live pid keep it past reconcile.
+    _write_tasks(project_dir, [
+        _make_task("sup-jjjj", status="in-progress", worker_pid=4321),
+    ])
+    _seed_coord_state(project_dir, agent_id_map={"sup-jjjj": "abcd000b"})
+    wdir = project_dir / "workers" / "sup-jjjj"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    cp = _checkpoint_path(project_dir)
+
+    def _fake_inner_supervisor(*, write_state, **kwargs):
+        # Remove the post-supervisor checkpoint so we prove the HEARTBEAT
+        # hook (not the end-of-tick write) published one mid-session.
+        if cp.exists():
+            cp.unlink()
+        # The supervisor's periodic heartbeat fires write_state.
+        write_state()
+        return loop.supervisor_mod.SupervisorResult()
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        monkeypatch.setattr(
+            loop.supervisor_mod, "run_supervisor", _fake_inner_supervisor,
+        )
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert cp.exists(), "supervisor heartbeat must publish a checkpoint"
+    body = cp.read_text(encoding="utf-8")
+    assert 'task="sup-jjjj"' in body
+    assert 'agent_id="abcd000b"' in body
+

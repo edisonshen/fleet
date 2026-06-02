@@ -1462,6 +1462,23 @@ def _run_supervisor(
         # Heartbeat publish. Re-load → no-op-write so any concurrent
         # supervisor stuck-check write isn't clobbered.
         cs = _load_coord_state(state_path)
+        # Codex iter-3 [P1]: also drive the rolling checkpoint from the
+        # supervisor's periodic heartbeat. The supervisor can hold the
+        # lock for hours (poll loop, default 4h max) and dispatch workers
+        # mid-session; without this the checkpoint would only refresh at
+        # the top of the next top-level tick — i.e. never, during a long
+        # session — defeating the bounded-staleness guarantee. Bump the
+        # counter (persisted in the same cs write below) and, at interval,
+        # write coord-checkpoint.md reflecting the current on-disk state.
+        # Fail-soft: a checkpoint failure must not wedge the heartbeat.
+        try:
+            if _bump_tick_counter(cs):
+                _write_rolling_checkpoint_file(
+                    project=project, project_dir=project_dir,
+                    coord_id=coord_id, state=cs, home=home,
+                )
+        except Exception as exc:  # noqa: BLE001 — never wedge the heartbeat
+            result.errors.append(f"supervisor rolling checkpoint: {exc}")
         _save_coord_state(state_path, cs)
 
     # Invariant 4 force-tick: short-circuit the next sleep when there's
@@ -2698,14 +2715,17 @@ def _write_rolling_checkpoint_file(
     """
     # Re-read tasks.md from disk so a task dispatched THIS tick (flipped
     # to in-progress by _apply_dispatch / the supervisor AFTER the
-    # caller's snapshot) lands in the checkpoint. Empty list on a parse
-    # error — better an empty (honest) checkpoint than one rendered from a
-    # stale snapshot. The call-site try/except already fail-soft-wraps us.
+    # caller's snapshot) lands in the checkpoint.
+    #
+    # Codex iter-3 [P2]: on a parse error we RAISE rather than write an
+    # empty checkpoint. An empty coord-checkpoint.md would, because
+    # synth.go prefers a fresher checkpoint over the coord-state walk,
+    # make a later crash treat every live worker / PR shepherd as absent.
+    # Failing soft here means the call-site try/except logs the error and
+    # leaves the PREVIOUS checkpoint (and the state walk) intact — strictly
+    # safer than overwriting good recovery data with nothing.
     tasks_path = project_dir / "tasks.md"
-    try:
-        tasks = parse.read(str(tasks_path)).tasks
-    except Exception:  # noqa: BLE001 — empty beats a stale snapshot
-        tasks = []
+    tasks = parse.read(str(tasks_path)).tasks
 
     agent_ids = supervisor_mod.load_agent_id_map(state)
     subagent_ids = supervisor_mod.load_subagent_id_map(state)
