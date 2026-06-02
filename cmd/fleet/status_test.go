@@ -733,13 +733,15 @@ func TestStatus_ReconcilePassesAllKinds(t *testing.T) {
 	if opts.Apply {
 		t.Errorf("status reconcile must be dry-run (Apply=false); got Apply=%t", opts.Apply)
 	}
-	// Must include all six kinds so the operator sees a complete
+	// Must include all seven kinds so the operator sees a complete
 	// picture of orphan state (fleet#172 added KindCoordLocks;
-	// fleet#177 added KindWorkerRecords).
+	// fleet#177 added KindWorkerRecords; invalid-project-dir-guar-d636
+	// added KindInvalidProjects).
 	wantKinds := map[gc.Kind]bool{
 		gc.KindSockets: true, gc.KindOrphanAgents: true,
 		gc.KindOrphanTmux: true, gc.KindWorktrees: true,
 		gc.KindCoordLocks: true, gc.KindWorkerRecords: true,
+		gc.KindInvalidProjects: true,
 	}
 	got := map[gc.Kind]bool{}
 	for _, k := range opts.Kinds {
@@ -787,6 +789,40 @@ func TestStatus_SurfacesOrphanWorkerRecord_HintActionable(t *testing.T) {
 	}
 	if strings.Contains(out, "unknown — run `fleet gc` for details") {
 		t.Errorf("orphan worker-records row hit the unknown-Kind fallback; got:\n%s", out)
+	}
+}
+
+// TestStatus_SurfacesInvalidProject_HintActionable regresses codex iter-9
+// [P2]: status runs gc.AllKinds (now incl. KindInvalidProjects), so an
+// invalid-projects orphan must render the actionable
+// `fleet gc --apply --kinds=invalid-projects` hint, not the unknown-Kind
+// fallback. Mirrors the coord-locks / worker-records hint tests.
+func TestStatus_SurfacesInvalidProject_HintActionable(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	report := gc.Report{Actions: []gc.Action{{
+		Kind:   gc.KindInvalidProjects,
+		Target: "/fake/projects/--project",
+		Verb:   gc.VerbWouldRemove,
+		Reason: "invalid project name \"--project\" (CLI flag-misparse) + no tasks.md",
+	}}}
+	stubStatusReconcile(t, report, nil)
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "/fake/projects/--project") {
+		t.Errorf("stdout should name the orphan invalid-project dir; got:\n%s", out)
+	}
+	if !strings.Contains(out, "fleet gc --apply --kinds=invalid-projects") {
+		t.Errorf("orphan invalid-projects row must suggest the actionable gc command; got:\n%s", out)
+	}
+	if strings.Contains(out, "unknown — run `fleet gc` for details") {
+		t.Errorf("orphan invalid-projects row hit the unknown-Kind fallback; got:\n%s", out)
 	}
 }
 
