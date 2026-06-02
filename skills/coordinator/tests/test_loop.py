@@ -4111,6 +4111,11 @@ def test_write_rolling_checkpoint_falls_back_to_worker_state_pr_url(
     assert "https://github.com/owner/repo/pull/77" in body
     assert 'pr_url="https://github.com/owner/repo/pull/77"' in body
     assert "_(no open PRs)_" not in body
+    # Codex iter-8 [P2]: the fallback-PR row is stamped in-review so
+    # handoff_resume treats it shepherd-only (no worker re-dispatch
+    # against the already-open PR), not in-progress.
+    assert 'status="in-review"' in body
+    assert 'status="in-progress"' not in body
 
 
 def test_write_rolling_checkpoint_includes_coord_state_only_worker(
@@ -4488,6 +4493,18 @@ def test_bump_tick_counter_latches_due_and_retries(monkeypatch) -> None:
     # A clean state with no latch on an off-interval tick does NOT write.
     state = {"tick_count": 5, "checkpoint_due": False}
     assert loop._bump_tick_counter(state) is False
+
+
+def test_bump_tick_counter_disabled_clears_stale_latch(monkeypatch) -> None:
+    """Codex iter-8 P2: FLEET_COORD_CHECKPOINT_EVERY=0 is the kill switch.
+    A stale checkpoint_due latch (from before the operator disabled it)
+    must NOT keep forcing writes — the latch is cleared and no write is
+    requested."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "0")
+    state = {"tick_count": 7, "checkpoint_due": True}
+    assert loop._bump_tick_counter(state) is False
+    assert state["checkpoint_due"] is False  # latch cleared
+    assert state["tick_count"] == 8  # counter still advances (liveness)
 
 
 def test_tick_retries_missed_checkpoint_via_latch(

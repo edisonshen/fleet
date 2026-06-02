@@ -2693,13 +2693,22 @@ def _bump_tick_counter(state: dict) -> bool:
     state["tick_count"] = tick_count
 
     every = dispatch_mod.resolve_checkpoint_every()
+    # Codex iter-8 [P2]: honor the disable kill-switch even with a stale
+    # latch. FLEET_COORD_CHECKPOINT_EVERY=0 means "no checkpoints"; a
+    # leftover checkpoint_due from before the operator disabled it must
+    # NOT keep forcing (failing) writes every tick. Clear the latch and
+    # bail when disabled.
+    if every <= 0:
+        if state.get("checkpoint_due"):
+            state["checkpoint_due"] = False
+        return False
+
     due_now = dispatch_mod.should_checkpoint(tick_count, every)
     # A latch left over from a prior tick whose write never completed.
     pending = bool(state.get("checkpoint_due"))
     if due_now:
         # Latch it durably so a crash before the deferred write retries
-        # next tick. Only meaningful when checkpointing is enabled
-        # (should_checkpoint already returns False for every<=0).
+        # next tick.
         state["checkpoint_due"] = True
     return due_now or pending
 
@@ -2803,6 +2812,16 @@ def _write_rolling_checkpoint_file(
         task_pr = t.pr_url if t is not None else ""
         state_pr = st.get("pr_url", "") if isinstance(st.get("pr_url"), str) else ""
         pr_url = task_pr or state_pr
+        # Codex iter-8 [P2]: if the PR url came from the worker-state
+        # FALLBACK (tasks.md not stamped yet → task_pr empty, state_pr
+        # set) the task is effectively in-review — a PR is open. Stamp the
+        # row status as in-review so handoff_resume treats it shepherd-only
+        # (in _NON_REDISPATCH_STATUSES) rather than re-dispatching a worker
+        # against an already-open PR. tasks.md's own status (once stamped)
+        # always wins; we only synthesize in-review for the unstamped
+        # window where status would otherwise be in-progress + pr_url set.
+        if not task_pr and state_pr and status in ("", "in-progress"):
+            status = "in-review"
         active_subagents.append({
             "task": slug,
             "branch": branch,
