@@ -3936,3 +3936,200 @@ def test_loop_non_git_phase_done_reconciles_to_done(
     # The success note mentions non-git so the operator sees the mode.
     success_notes = [c for c in note_calls if "non-git" in (c[-1] if c else "")]
     assert success_notes, f"expected non-git success note: {note_calls!r}"
+
+
+# ----------------------------------------------------------------------
+# Rolling coord checkpoint wiring (#187 writer × loop.py tick)
+# ----------------------------------------------------------------------
+#
+# #187 shipped the writers (should_checkpoint / write_coord_checkpoint /
+# record_checkpoint_decision) in dispatch.py but loop.py never called
+# them. These tests pin the wiring in _tick_locked: the tick bumps a
+# persisted tick_count and, every N ticks, publishes coord-checkpoint.md
+# with the synth.go-compatible schema. The fails-on-parent guard is the
+# whole point — on the pre-wiring loop.py no checkpoint file is ever
+# written, so test_tick_writes_checkpoint_at_interval fails there.
+
+
+def _checkpoint_path(project_dir: Path) -> Path:
+    return project_dir / "coord-checkpoint.md"
+
+
+def test_write_rolling_checkpoint_bumps_counter_off_interval(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: _write_rolling_checkpoint always bumps tick_count, but on an
+    off-interval tick it writes NO file and returns None."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 3}
+
+    written = loop._write_rolling_checkpoint(
+        tasks=[], project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert written is None  # 4 % 5 != 0
+    assert state["tick_count"] == 4  # counter still advanced
+    assert not _checkpoint_path(project_dir).exists()
+
+
+def test_write_rolling_checkpoint_writes_at_interval(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: on the Nth tick the helper writes coord-checkpoint.md with
+    the in-progress task as an Active Subagents row + its PR."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {
+        "tick_count": 4,
+        "worker_agent_ids": {"feat-aaaa": "abcd0001"},
+        "recent_decisions": ["dispatched feat-aaaa"],
+    }
+    tasks = [
+        _make_task(
+            "feat-aaaa", status="in-progress", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/9",
+        ),
+        _make_task("idle-bbbb", status="ready"),  # not in-progress → excluded
+    ]
+    # Worker phase comes from workers/<slug>/state.json.
+    wdir = project_dir / "workers" / "feat-aaaa"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "push"}), encoding="utf-8",
+    )
+
+    written = loop._write_rolling_checkpoint(
+        tasks=tasks, project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert state["tick_count"] == 5
+    assert written == str(_checkpoint_path(project_dir))
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Frontmatter schema synth.go reads.
+    assert "schema: v1" in body
+    assert 'coord_id: "cccccc01"' in body
+    assert 'project: "fleet"' in body
+    assert "tick_count: 5" in body
+    # Active Subagents row carries the in-progress task, its phase, the
+    # agent_id from coord-state, and its PR — and excludes the ready task.
+    assert 'task="feat-aaaa"' in body
+    assert 'phase="push"' in body
+    assert 'agent_id="abcd0001"' in body
+    assert "idle-bbbb" not in body
+    # Open PRs section lists the task's PR.
+    assert "https://github.com/owner/repo/pull/9" in body
+    # Recent decisions ride along from coord-state.
+    assert "dispatched feat-aaaa" in body
+
+
+def test_write_rolling_checkpoint_disabled_when_every_zero(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: FLEET_COORD_CHECKPOINT_EVERY=0 disables checkpointing — the
+    counter still advances (liveness) but no file is ever written."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "0")
+    state = {"tick_count": 0}
+
+    for _ in range(6):
+        assert loop._write_rolling_checkpoint(
+            tasks=[], project="fleet", project_dir=project_dir,
+            coord_id="cccccc01", state=state, home=fleet_home,
+        ) is None
+
+    assert state["tick_count"] == 6
+    assert not _checkpoint_path(project_dir).exists()
+
+
+def test_write_rolling_checkpoint_tolerates_corrupt_counter(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: a non-int / negative tick_count (corrupt state) resets to 0
+    before the bump rather than crashing the tick."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    for bad in ("garbage", -7, None):
+        state = {"tick_count": bad}
+        loop._write_rolling_checkpoint(
+            tasks=[], project="fleet", project_dir=project_dir,
+            coord_id="cccccc01", state=state, home=fleet_home,
+        )
+        assert state["tick_count"] == 1
+
+
+def test_tick_writes_checkpoint_at_interval(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Integration + fails-on-parent: driving loop.tick N times persists
+    the tick_count across ticks (in coord-state.json) and publishes
+    coord-checkpoint.md on the Nth tick. The pre-wiring loop.py never
+    calls the writer, so this test fails there — the whole point of the
+    task.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "3")
+    # An in-progress task so the checkpoint carries a real Active row.
+    _write_tasks(project_dir, [
+        _make_task(
+            "live-cccc", status="in-progress", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/3",
+        ),
+    ])
+    _seed_coord_state(project_dir, agent_id_map={"live-cccc": "deadbeef"})
+
+    cp = _checkpoint_path(project_dir)
+
+    # Tick 1 + 2: counter advances, no checkpoint yet.
+    for expected_tick in (1, 2):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+        state = json.loads((project_dir / "coord-state.json").read_text())
+        assert state["tick_count"] == expected_tick
+        assert not cp.exists(), f"no checkpoint expected at tick {expected_tick}"
+
+    # Tick 3: interval hit → checkpoint published with the live task.
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state["tick_count"] == 3
+    assert cp.exists(), "coord-checkpoint.md must exist after the Nth tick"
+    body = cp.read_text(encoding="utf-8")
+    assert "schema: v1" in body
+    assert "tick_count: 3" in body
+    assert 'task="live-cccc"' in body
+    assert 'agent_id="deadbeef"' in body
+    assert "https://github.com/owner/repo/pull/3" in body
+
+
+def test_tick_checkpoint_schema_matches_synth_fixture(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Integration: the checkpoint a real tick writes is byte-shaped like
+    the seedCheckpoint fixture in internal/handoff/synth_test.go so
+    synth.go lifts the rows verbatim. Pins the section headers + the
+    placeholders for an empty (no in-progress) lane.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # No in-progress tasks → every section should render its placeholder.
+    _write_tasks(project_dir, [_make_task("idle-dddd", status="ready")])
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    assert body.startswith("---\n")
+    assert "### Active Subagents\n" in body
+    assert "### Open PRs\n" in body
+    assert "### Recent decisions\n" in body
+    assert "### Drafted but unfiled tasks\n" in body
+    # Placeholders are byte-identical with synth.go's literals.
+    assert "_(none)_" in body
+    assert "_(no open PRs)_" in body
+    assert "_(no recent decisions)_" in body
+

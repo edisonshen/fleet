@@ -1042,13 +1042,39 @@ def _tick_locked(
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"subagent audit: {exc}")
 
+    # 5.9. Rolling coord checkpoint (#187). Bump the per-coord tick
+    # counter (persisted in coord-state.json) and, every N ticks, publish
+    # coord-checkpoint.md so a successor coord can resume from a recent
+    # snapshot rather than the (potentially hours-stale) last handoff doc.
+    # synth.go prefers the checkpoint when it's newer than the handoff.
+    #
+    #   tick_count++ ──should_checkpoint(N)──▶ write_coord_checkpoint()
+    #
+    # The counter lives in `state` so it rides the same heartbeat
+    # _save_coord_state below — no second write. dispatch.py owns the
+    # writer + the gate; loop.py only supplies the live tick payload
+    # (in-flight subagents + their open PRs). Fail-soft: a checkpoint
+    # write must never wedge a tick.
+    try:
+        _write_rolling_checkpoint(
+            tasks=f.tasks,
+            project=project,
+            project_dir=project_dir,
+            coord_id=coord_id,
+            state=state,
+            home=home,
+        )
+    except Exception as exc:  # noqa: BLE001 — checkpoint must never fail a tick
+        result.errors.append(f"rolling checkpoint: {exc}")
+
     # Heartbeat: rewrite coord-state.json on EVERY tick, even when nothing
     # was drained or dispatched. The Variant A dashboard reads this file's
     # mtime as the per-tick liveness signal — gating the write on
     # last_seen (issue #50) made dispatch-only ticks invisible to the TUI
     # and surfaced as `○ idle · auto-stopped` while the coord was actually
     # working. tmp+rename is cheap and idempotent on identical state, so
-    # the unconditional refresh is correct.
+    # the unconditional refresh is correct. The tick_count bumped just
+    # above (rolling checkpoint) is persisted here in the same write.
     _save_coord_state(state_path, state)
 
     # Auto-archive when tasks.md grows past the threshold. Runs at end
@@ -2588,6 +2614,92 @@ def _read_worker_state(
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _write_rolling_checkpoint(
+    *,
+    tasks: list[parse.Task],
+    project: str,
+    project_dir: Path,
+    coord_id: str,
+    state: dict,
+    home: Path,
+) -> str | None:
+    """Bump the per-coord tick counter and, every N ticks, publish
+    coord-checkpoint.md (the rolling recovery snapshot, #187).
+
+    Mutates `state["tick_count"]` in place (the caller's heartbeat
+    _save_coord_state persists it). Returns the checkpoint path when a
+    file was written, else None (off-interval or checkpointing disabled).
+
+    Payload derivation — the checkpoint mirrors a handoff doc's two
+    live-work sections so synth.go lifts the rows verbatim:
+      - active_subagents: every in-progress task, enriched with the
+        worker phase (workers/<slug>/state.json) and the slug→id maps
+        from coord_state.
+      - open_prs: the subset of those tasks that carry a pr_url.
+    Recent decisions ride along from state["recent_decisions"]
+    (populated by record_checkpoint_decision at dispatch sites).
+
+    dispatch.py owns should_checkpoint + write_coord_checkpoint + the
+    env knobs; this helper is the loop.py-side glue.
+    """
+    raw_tick = state.get("tick_count", 0)
+    try:
+        tick_count = int(raw_tick)
+    except (TypeError, ValueError):
+        tick_count = 0
+    if tick_count < 0:
+        tick_count = 0
+    tick_count += 1
+    state["tick_count"] = tick_count
+
+    every = dispatch_mod.resolve_checkpoint_every()
+    if not dispatch_mod.should_checkpoint(tick_count, every):
+        return None
+
+    agent_ids = supervisor_mod.load_agent_id_map(state)
+    subagent_ids = supervisor_mod.load_subagent_id_map(state)
+
+    active_subagents: list[dict] = []
+    open_prs: list[dict] = []
+    pr_seq = 0
+    for t in tasks:
+        if t.status != "in-progress":
+            continue
+        st = _read_worker_state(project, t.slug, home=home)
+        phase = (st or {}).get("phase", "") if isinstance(st, dict) else ""
+        branch = t.branch or f"worker/{t.slug}"
+        active_subagents.append({
+            "task": t.slug,
+            "branch": branch,
+            "phase": phase,
+            "status": t.status,
+            "pr_url": t.pr_url,
+            "agent_id": agent_ids.get(t.slug, ""),
+            "subagent_id": subagent_ids.get(t.slug, ""),
+        })
+        if t.pr_url:
+            # We only know the URL + head branch from tasks.md; number
+            # is unknown here (the PR monitor owns gh state), so render a
+            # 0 placeholder. synth.go reads head/url; the bullet is for
+            # the human-readable recovery doc, not gh reconciliation.
+            pr_seq += 1
+            open_prs.append({
+                "number": pr_seq,
+                "title": t.slug,
+                "head": branch,
+                "url": t.pr_url,
+            })
+
+    return dispatch_mod.write_coord_checkpoint(
+        project_dir=project_dir,
+        coord_id=coord_id,
+        project=project,
+        state=state,
+        active_subagents=active_subagents,
+        open_prs=open_prs,
+    )
 
 
 # Phases that prove a WORKER (not the dispatch bootstrap) authored the
