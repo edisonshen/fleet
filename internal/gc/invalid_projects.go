@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -221,21 +222,31 @@ func projectHasTasksNow(path string) (bool, error) {
 }
 
 // quarantineProjectDir atomically renames a malformed project dir to a
-// sibling ".<name>.gc-quarantine" path before deletion (codex iter-2 [P1]
+// UNIQUE dot-prefixed sibling before deletion (codex iter-2/iter-3 [P1]
 // TOCTOU close). Same-parent rename is atomic on a single filesystem, so
 // after this returns no live writer using the canonical projects/<name>
 // path can mutate the tree we're about to inspect+delete. The "." prefix
 // keeps the quarantine out of listProjectDirsRaw / the dashboard scan (both
 // skip dot-prefixed entries) so a half-finished reap can't resurface as a
-// phantom project. Returns the quarantined path.
+// phantom project.
+//
+// The path is made unique with pid+nanotime so two concurrent
+// `fleet gc --apply` runs can't collide on a deterministic name (iter-3
+// [P1.1]). We NEVER blindly RemoveAll a pre-existing quarantine: a leftover
+// from a failed restore may still hold a real tasks.md, and deleting it as
+// "stale" would be exactly the data loss the quarantine exists to prevent
+// (iter-3 [P1.2]). Instead we fail closed if the unique target already
+// exists (effectively never, but checked) and leave any orphaned quarantine
+// for a future surfacing pass / the operator.
 func quarantineProjectDir(path string) (string, error) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
-	qpath := filepath.Join(dir, "."+base+".gc-quarantine")
-	// Clear any stale quarantine from a prior aborted run so the rename
-	// can't fail with "destination exists".
-	if err := os.RemoveAll(qpath); err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("clear stale quarantine %s: %w", qpath, err)
+	qpath := filepath.Join(dir,
+		fmt.Sprintf(".%s.gc-quarantine.%d.%d", base, os.Getpid(), time.Now().UnixNano()))
+	if _, err := os.Lstat(qpath); err == nil {
+		return "", fmt.Errorf("quarantine path %s already exists — refusing to overwrite", qpath)
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat quarantine path %s: %w", qpath, err)
 	}
 	if err := os.Rename(path, qpath); err != nil {
 		return "", err

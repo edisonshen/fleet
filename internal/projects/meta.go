@@ -213,9 +213,24 @@ func sanitizeTag(s string) string {
 	for strings.Contains(out, "--") {
 		out = strings.ReplaceAll(out, "--", "-")
 	}
-	out = strings.Trim(out, "-.")
-	if out == "" || out == "." || out == ".." {
+	out = strings.Trim(out, "-._")
+	// ValidateProjectName now rejects leading-hyphen + punctuation-only
+	// names (invalid-project-dir-guar-d636). Keep the producer in lockstep:
+	// a path that sanitizes to punctuation-only (e.g. "_", "_._") or empty
+	// must fall back to "fleet", not emit a tag the validator would reject.
+	if !hasAlnum(out) {
 		return "fleet"
 	}
 	return out
+}
+
+// hasAlnum reports whether s contains at least one lowercase letter or
+// digit — the minimum ValidateProjectName requires.
+func hasAlnum(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			return true
+		}
+	}
+	return false
 }

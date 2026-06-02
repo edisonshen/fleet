@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // TestMeta_RoundTrip pins the basic Read/Write contract: a Meta
@@ -121,6 +123,28 @@ func TestMeta_RejectsInvalidProjectName(t *testing.T) {
 	err := Write("Foo/Bar", Meta{Schema: "v1", RepoPath: "/x", AddedAt: time.Now().UTC()})
 	if err == nil {
 		t.Fatal("expected validation error on bad project name, got nil")
+	}
+}
+
+// TestSanitizeTag_ProducerValidatorContract regresses codex iter-3 [P2]:
+// ValidateProjectName now rejects leading-hyphen + punctuation-only names,
+// so the sanitizeTag producer must never emit one. A path that sanitizes to
+// punctuation-only ("_", "_._") or leading-hyphen must fall back to "fleet",
+// not a tag the validator would reject. EVERY sanitizeTag output must pass
+// ValidateProjectName, or `fleet project add` would refuse a tag it itself
+// generated for an otherwise-valid path.
+func TestSanitizeTag_ProducerValidatorContract(t *testing.T) {
+	for _, in := range []string{
+		"_", "_._", "...", "---", "-x", "--project",
+		"@@@", "  ", "/", "ok-name", "Foo_Bar", "123",
+		"-leading", "trailing-", ".dotfile", "a.b.c",
+	} {
+		t.Run(in, func(t *testing.T) {
+			got := sanitizeTag(in)
+			if err := state.ValidateProjectName(got); err != nil {
+				t.Errorf("sanitizeTag(%q)=%q but ValidateProjectName rejects it: %v", in, got, err)
+			}
+		})
 	}
 }
 

@@ -2934,6 +2934,17 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	if _, serr := os.Stat(real); serr != nil {
 		t.Fatalf("apply must NOT touch the real project; stat err=%v", serr)
 	}
+	// No leftover quarantine dir (codex iter-3 [P1]): a successful reap
+	// renames then deletes, leaving only the real project behind.
+	ents, rerr := os.ReadDir(pdir)
+	if rerr != nil {
+		t.Fatalf("ReadDir(%s): %v", pdir, rerr)
+	}
+	for _, e := range ents {
+		if strings.Contains(e.Name(), "gc-quarantine") {
+			t.Errorf("leftover quarantine dir after successful reap: %s", e.Name())
+		}
+	}
 }
 
 // TestReconcile_InvalidProjects_TOCTOU_TasksAppearedNotRemoved regresses
