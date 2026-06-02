@@ -4074,6 +4074,45 @@ def test_write_rolling_checkpoint_includes_in_review_pr(
     assert "_(no open PRs)_" not in body
 
 
+def test_write_rolling_checkpoint_falls_back_to_worker_state_pr_url(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-4 P1: when the worker has opened a PR (recorded in
+    workers/<slug>/state.json) but tasks.md isn't stamped yet, the
+    checkpoint must still capture the PR — synth.go's state walk reads
+    pr_url from worker state, so a checkpoint that only read tasks.md would
+    (because synth prefers the fresher checkpoint) strand the shepherd."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"unstamped-llll": "abcd000c"}}
+    # tasks.md: in-progress, pr_url NOT yet stamped (empty).
+    _write_tasks(project_dir, [
+        _make_task("unstamped-llll", status="in-progress", worker_pid=0,
+                   pr_url=""),
+    ])
+    # worker state.json: the worker already opened a PR.
+    wdir = project_dir / "workers" / "unstamped-llll"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({
+            "phase": "push",
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }),
+        encoding="utf-8",
+    )
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Worker-state PR URL appears in BOTH the active row and Open PRs.
+    assert "https://github.com/owner/repo/pull/77" in body
+    assert 'pr_url="https://github.com/owner/repo/pull/77"' in body
+    assert "_(no open PRs)_" not in body
+
+
 def test_write_rolling_checkpoint_rereads_tasks_after_dispatch(
     fleet_home: Path, project_dir: Path, monkeypatch,
 ) -> None:

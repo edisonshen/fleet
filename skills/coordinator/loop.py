@@ -2737,30 +2737,40 @@ def _write_rolling_checkpoint_file(
         if t.status not in ("in-progress", "in-review"):
             continue
         st = _read_worker_state(project, t.slug, home=home)
-        phase = (st or {}).get("phase", "") if isinstance(st, dict) else ""
+        st = st if isinstance(st, dict) else {}
+        phase = st.get("phase", "")
         branch = t.branch or f"worker/{t.slug}"
+        # Codex iter-4 [P1]: prefer tasks.md's pr_url (authoritative once
+        # the reconcile stamps it) but fall back to workers/<slug>/
+        # state.json's pr_url for the window where the worker has opened a
+        # PR but tasks.md isn't stamped yet. synth.go's state walk reads
+        # pr_url from worker state, so a checkpoint that only read tasks.md
+        # would — because synth prefers the fresher checkpoint — lose the
+        # PR and strand its shepherd after a crash in that window.
+        pr_url = t.pr_url or (
+            st.get("pr_url", "") if isinstance(st.get("pr_url"), str) else ""
+        )
         active_subagents.append({
             "task": t.slug,
             "branch": branch,
             "phase": phase,
             "status": t.status,
-            "pr_url": t.pr_url,
+            "pr_url": pr_url,
             "agent_id": agent_ids.get(t.slug, ""),
             "subagent_id": subagent_ids.get(t.slug, ""),
         })
-        if t.pr_url:
-            # We only know the URL + head branch from tasks.md; the real
-            # gh PR number is unknown here (the PR monitor owns gh state).
-            # Render a 1-based ordinal instead so the bullet stays well-
-            # formed for synth.go's `- #<n> ...` parser — synth lifts
-            # head/url for recovery, the ordinal is just for the human-
-            # readable doc, not gh reconciliation.
+        if pr_url:
+            # We only know the URL + head branch here; the real gh PR
+            # number is unknown (the PR monitor owns gh state). Render a
+            # 1-based ordinal so the bullet stays well-formed for synth.go's
+            # `- #<n> ...` parser — synth lifts head/url for recovery, the
+            # ordinal is just for the human-readable doc, not gh reconcile.
             pr_seq += 1
             open_prs.append({
                 "number": pr_seq,
                 "title": t.slug,
                 "head": branch,
-                "url": t.pr_url,
+                "url": pr_url,
             })
 
     return dispatch_mod.write_coord_checkpoint(
