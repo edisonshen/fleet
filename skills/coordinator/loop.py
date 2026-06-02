@@ -2212,15 +2212,42 @@ def _read_coord_spawn_marker(project_dir: Path) -> str:
     return first.strip()
 
 
-def _agent_record_exists(home: Path, agent_id: str) -> bool:
-    """True iff ~/.fleet/agents/<id>.json exists and parses as a dict."""
-    if not agent_id:
+def _holder_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
+    """True iff ~/.fleet/agents/<id>.json names THIS project's coord.
+
+    A bare "the record parses" check is NOT enough to justify a
+    self-exit (codex review [P2]): the lock body could name a same-
+    project WORKER that hijacked coordinator.lock (the fleet#171
+    hijack the project-ownership guard exists to catch), or a stale
+    body naming a live agent that belongs to a DIFFERENT project.
+    Either case must NOT make a legitimate coord kill itself.
+
+    So we require the holder's record to be genuinely this project's
+    coord on TWO axes:
+
+      - ``project`` field == this project (excludes cross-project
+        agents whose ID leaked into the body), and
+      - ``task_id`` == ``coord-<project>`` (the canonical coord task
+        id — see internal/tui/keys.go:coordTaskID,
+        internal/handoff/synth.go). A worker's task_id is its feature
+        task, never ``coord-<project>``, so this excludes a hijacking
+        worker.
+
+    Both must hold; a record missing either field (legacy / partial)
+    fails closed -> caller skips rather than self-exits.
+    """
+    if not agent_id or not project:
         return False
     try:
         with open(home / "agents" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
-            return isinstance(json.load(fh), dict)
+            rec = json.load(fh)
     except (OSError, ValueError):
         return False
+    if not isinstance(rec, dict):
+        return False
+    if (rec.get("project") or "") != project:
+        return False
+    return (rec.get("task_id") or "") == f"coord-{project}"
 
 
 def _classify_lock_busy(
@@ -2251,9 +2278,11 @@ def _classify_lock_busy(
          successor coord (mid-handoff). Never self-exit; the stale
          holder is the one to be reaped (by the swap / `fleet gc`).
          Skip.
-      5. holder's agent record missing OR holder's tmux session dead
-         -> the holder crashed; this is a normal takeover, the next
-         tick will acquire the lock. Skip.
+      5. holder's record is not THIS project's coord (missing record,
+         project mismatch, or task_id != coord-<project> — e.g. a
+         same-project worker that hijacked the lock, or a cross-project
+         agent ID in the body) OR holder's tmux session is dead -> not
+         a legitimate live coord to defer to. Skip. (codex review [P2])
 
     Only when NONE of the above fire is the session a true duplicate.
     """
@@ -2266,8 +2295,10 @@ def _classify_lock_busy(
         return "skip", ""
     if _read_coord_spawn_marker(project_dir) == coord_id:
         return "skip", ""
-    # The holder must be a genuinely live coord, not a stale lock body.
-    if not _agent_record_exists(home, holder):
+    # The holder must be a genuinely live coord FOR THIS PROJECT, not a
+    # stale lock body, a hijacking same-project worker, or a cross-
+    # project agent whose ID leaked into the body (codex review [P2]).
+    if not _holder_is_project_coord(home, holder, project_dir.name):
         return "skip", ""
     holder_session = supervisor_mod.session_name_for_agent(holder)
     if not supervisor_mod.tmux_session_alive(holder_session):

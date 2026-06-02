@@ -48,13 +48,24 @@ import supervisor as supervisor_mod
 # ---------- helpers ----------
 
 
-def _seed_agent_record(home: Path, agent_id: str, project: str = "fleet") -> None:
+def _seed_agent_record(
+    home: Path,
+    agent_id: str,
+    project: str = "fleet",
+    *,
+    task_id: str | None = None,
+) -> None:
+    """Seed ~/.fleet/agents/<id>.json. By default the record is THIS
+    project's coord (task_id == coord-<project>), matching the live
+    record shape (role=executor, task_id=coord-<project>). Pass an
+    explicit ``task_id`` to seed a NON-coord record (e.g. a worker) so
+    tests can exercise the holder-is-not-a-coord skip path."""
     agents_dir = home / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     (agents_dir / f"{agent_id}.json").write_text(json.dumps({
         "id": agent_id,
         "project": project,
-        "kind": "coord",
+        "task_id": task_id if task_id is not None else f"coord-{project}",
     }))
 
 
@@ -326,6 +337,72 @@ def test_holder_without_agent_record_does_not_self_exit(
     )
 
     assert result.self_exit is False
+    assert result.reason == "lock-busy"
+
+
+def test_holder_is_same_project_worker_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex review [P2]: the lock body names a LIVE same-project agent
+    whose task_id is a feature task, not coord-<project> (a worker that
+    hijacked coordinator.lock — the fleet#171 scenario). It is NOT a
+    legitimate coord to defer to, so we must skip, never self-exit."""
+    me = "aaaa0021"
+    worker = "bbbb0022"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    # Holder is a WORKER: same project, but task_id is a feature task.
+    _seed_agent_record(
+        fleet_home, worker, project="fleet", task_id="some-feature-task-1234",
+    )
+    held_lock(pdir, worker)
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "a same-project worker holding the lock must not trigger self-exit"
+    )
+    assert result.reason == "lock-busy"
+
+
+def test_holder_is_cross_project_coord_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex review [P2]: the lock body names a LIVE coord that belongs
+    to a DIFFERENT project (stale/leaked body). Its project field does
+    not match ours, so it is not a legitimate holder for THIS project's
+    lock — skip, never self-exit."""
+    me = "aaaa0023"
+    other = "bbbb0024"
+    pdir = _minimal_project(fleet_home)
+    _seed_agent_record(fleet_home, me)
+    # Holder is a coord, but for a DIFFERENT project.
+    _seed_agent_record(
+        fleet_home, other, project="rainier", task_id="coord-rainier",
+    )
+    held_lock(pdir, other)
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "a cross-project coord in the lock body must not trigger self-exit"
+    )
     assert result.reason == "lock-busy"
 
 
