@@ -2751,22 +2751,36 @@ def _write_rolling_checkpoint_file(
     dispatch.py owns write_coord_checkpoint + the env knobs; this helper
     is the loop.py-side glue.
     """
+    agent_ids = supervisor_mod.load_agent_id_map(state)
+    subagent_ids = supervisor_mod.load_subagent_id_map(state)
+
     # Re-read tasks.md from disk so a task dispatched THIS tick (flipped
     # to in-progress by _apply_dispatch / the supervisor AFTER the
     # caller's snapshot) lands in the checkpoint.
     #
-    # Codex iter-3 [P2]: on a parse error we RAISE rather than write an
-    # empty checkpoint. An empty coord-checkpoint.md would, because
-    # synth.go prefers a fresher checkpoint over the coord-state walk,
-    # make a later crash treat every live worker / PR shepherd as absent.
-    # Failing soft here means the call-site try/except logs the error and
-    # leaves the PREVIOUS checkpoint (and the state walk) intact — strictly
-    # safer than overwriting good recovery data with nothing.
+    # On a parse error (corrupt tasks.md) we have two recovery-safe moves,
+    # chosen by whether coord-state still tracks any worker:
+    #   - worker_agent_ids NON-EMPTY (codex iter-9 [P2]): fall back to an
+    #     empty task list and build a coord-state-only snapshot from
+    #     worker_agent_ids + worker state.json (iter-5) — the same data
+    #     synth.go's state walk recovers, just without the tasks.md
+    #     status/pr_url overlay. Fresher than a possibly-stale prior
+    #     checkpoint, and never empty.
+    #   - worker_agent_ids EMPTY (codex iter-3 [P2]): RAISE so the
+    #     call-site logs + leaves the PREVIOUS checkpoint intact. Writing
+    #     an empty checkpoint here would, because synth.go prefers a
+    #     fresher checkpoint, hide any worker the prior checkpoint still
+    #     records. Nothing to snapshot + don't clobber good recovery data.
+    # tasks.md corruption is rare (atomic tmp+rename → readers see a whole
+    # old-or-new file), so the missing overlay is an acceptable degradation.
     tasks_path = project_dir / "tasks.md"
-    tasks = parse.read(str(tasks_path)).tasks
+    try:
+        tasks = parse.read(str(tasks_path)).tasks
+    except Exception:  # noqa: BLE001
+        if not agent_ids:
+            raise  # nothing to snapshot; preserve the prior checkpoint
+        tasks = []
 
-    agent_ids = supervisor_mod.load_agent_id_map(state)
-    subagent_ids = supervisor_mod.load_subagent_id_map(state)
     tasks_by_slug = {t.slug: t for t in tasks}
 
     # Codex iter-5 [P1]: drive the active rows from worker_agent_ids (the

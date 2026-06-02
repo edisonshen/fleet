@@ -4395,11 +4395,11 @@ def test_write_rolling_checkpoint_skips_on_corrupt_tasks(
     fleet_home: Path, project_dir: Path, monkeypatch,
 ) -> None:
     """Codex iter-3 P2: a corrupt/unparseable tasks.md at checkpoint-write
-    time must NOT overwrite the prior checkpoint with an empty one — an
-    empty checkpoint would, because synth.go prefers a fresher checkpoint
-    over the state walk, make a later crash treat every live worker as
-    absent. The write raises (caller fail-soft-logs); the prior checkpoint
-    survives intact."""
+    time, WITH no workers tracked in coord-state, must NOT overwrite the
+    prior checkpoint with an empty one — an empty checkpoint would, because
+    synth.go prefers a fresher checkpoint over the state walk, make a later
+    crash treat every live worker as absent. The write raises (caller
+    fail-soft-logs); the prior checkpoint survives intact."""
     monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
     # A pre-existing good checkpoint that must NOT be clobbered.
     prior = _checkpoint_path(project_dir)
@@ -4408,7 +4408,7 @@ def test_write_rolling_checkpoint_skips_on_corrupt_tasks(
     (project_dir / "tasks.md").write_text(
         "## task: broken\nstatus: not-a-valid-status\n", encoding="utf-8",
     )
-    state = {"tick_count": 0}
+    state = {"tick_count": 0}  # no worker_agent_ids → nothing to snapshot
 
     # _bump_tick_counter says "write" (every=1), but the file write raises.
     assert loop._bump_tick_counter(state) is True
@@ -4420,6 +4420,43 @@ def test_write_rolling_checkpoint_skips_on_corrupt_tasks(
 
     # Prior checkpoint is untouched — recovery still has real data.
     assert prior.read_text(encoding="utf-8") == "PRIOR GOOD CHECKPOINT\n"
+
+
+def test_write_rolling_checkpoint_corrupt_tasks_writes_coord_state_snapshot(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-9 P2: when tasks.md is corrupt BUT coord-state still
+    tracks workers, write a coord-state-only snapshot (rows from
+    worker_agent_ids + worker state.json) rather than leaving a possibly-
+    stale prior checkpoint that could shadow current coord-state. The
+    snapshot is fresh + non-empty; it just lacks the tasks.md overlay."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    prior = _checkpoint_path(project_dir)
+    prior.write_text("STALE PRIOR CHECKPOINT\n", encoding="utf-8")
+    (project_dir / "tasks.md").write_text(
+        "## task: broken\nstatus: not-a-valid-status\n", encoding="utf-8",
+    )
+    state = {"tick_count": 0, "worker_agent_ids": {"live-rrrr": "abcd0010"}}
+    wdir = project_dir / "workers" / "live-rrrr"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    assert loop._bump_tick_counter(state) is True
+    written = loop._write_rolling_checkpoint_file(
+        project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert written == str(prior)
+    body = prior.read_text(encoding="utf-8")
+    # The stale prior is replaced by a fresh coord-state snapshot that
+    # captures the tracked worker (from worker_agent_ids, no tasks.md).
+    assert "STALE PRIOR CHECKPOINT" not in body
+    assert 'task="live-rrrr"' in body
+    assert 'agent_id="abcd0010"' in body
+    assert 'phase="implement"' in body
 
 
 def test_supervisor_heartbeat_writes_rolling_checkpoint(
