@@ -2729,17 +2729,41 @@ def _write_rolling_checkpoint_file(
 
     agent_ids = supervisor_mod.load_agent_id_map(state)
     subagent_ids = supervisor_mod.load_subagent_id_map(state)
+    tasks_by_slug = {t.slug: t for t in tasks}
+
+    # Codex iter-5 [P1]: drive the active rows from worker_agent_ids (the
+    # SAME source synth.go's state walk uses), then overlay tasks.md
+    # metadata. tasks.md alone is not the source of truth: a slug can live
+    # in coord-state.json's worker_agent_ids while absent from tasks.md
+    # (coord remembered the agent_id but crashed before stamping the task,
+    # or tasks.md is missing/partial). synth's walk would still recover
+    # such a worker from worker_agent_ids + worker state.json; a checkpoint
+    # built from tasks.md only would drop it, and because synth prefers the
+    # fresher checkpoint, recovery would lose that in-flight worker.
+    #
+    # Union = worker_agent_ids slugs (the recovery driver) ∪ active
+    # tasks.md slugs (covers a task flipped to in-progress THIS tick before
+    # its agent_id is remembered). Sorted for deterministic doc output.
+    candidate_slugs = set(agent_ids)
+    for t in tasks:
+        if t.status in ("in-progress", "in-review"):
+            candidate_slugs.add(t.slug)
 
     active_subagents: list[dict] = []
     open_prs: list[dict] = []
     pr_seq = 0
-    for t in tasks:
-        if t.status not in ("in-progress", "in-review"):
-            continue
-        st = _read_worker_state(project, t.slug, home=home)
+    for slug in sorted(candidate_slugs):
+        t = tasks_by_slug.get(slug)
+        # Mirror synth.go's state walk: skip a worker_agent_ids slug whose
+        # worker dir is gone AND which isn't an active tasks.md row — it's
+        # archived / hand-deleted / never existed, not recoverable.
+        st = _read_worker_state(project, slug, home=home)
         st = st if isinstance(st, dict) else {}
+        if not st and (t is None or t.status not in ("in-progress", "in-review")):
+            continue
         phase = st.get("phase", "")
-        branch = t.branch or f"worker/{t.slug}"
+        status = t.status if t is not None else ""
+        branch = (t.branch if t is not None and t.branch else f"worker/{slug}")
         # Codex iter-4 [P1]: prefer tasks.md's pr_url (authoritative once
         # the reconcile stamps it) but fall back to workers/<slug>/
         # state.json's pr_url for the window where the worker has opened a
@@ -2747,17 +2771,17 @@ def _write_rolling_checkpoint_file(
         # pr_url from worker state, so a checkpoint that only read tasks.md
         # would — because synth prefers the fresher checkpoint — lose the
         # PR and strand its shepherd after a crash in that window.
-        pr_url = t.pr_url or (
-            st.get("pr_url", "") if isinstance(st.get("pr_url"), str) else ""
-        )
+        task_pr = t.pr_url if t is not None else ""
+        state_pr = st.get("pr_url", "") if isinstance(st.get("pr_url"), str) else ""
+        pr_url = task_pr or state_pr
         active_subagents.append({
-            "task": t.slug,
+            "task": slug,
             "branch": branch,
             "phase": phase,
-            "status": t.status,
+            "status": status,
             "pr_url": pr_url,
-            "agent_id": agent_ids.get(t.slug, ""),
-            "subagent_id": subagent_ids.get(t.slug, ""),
+            "agent_id": agent_ids.get(slug, ""),
+            "subagent_id": subagent_ids.get(slug, ""),
         })
         if pr_url:
             # We only know the URL + head branch here; the real gh PR
@@ -2768,7 +2792,7 @@ def _write_rolling_checkpoint_file(
             pr_seq += 1
             open_prs.append({
                 "number": pr_seq,
-                "title": t.slug,
+                "title": slug,
                 "head": branch,
                 "url": pr_url,
             })

@@ -4113,6 +4113,64 @@ def test_write_rolling_checkpoint_falls_back_to_worker_state_pr_url(
     assert "_(no open PRs)_" not in body
 
 
+def test_write_rolling_checkpoint_includes_coord_state_only_worker(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-5 P1: a slug present in coord-state.json's
+    worker_agent_ids but ABSENT from tasks.md (coord remembered the
+    agent_id then crashed before stamping the task, or tasks.md is
+    partial) must still land in the checkpoint — synth.go's state walk
+    drives off worker_agent_ids, so a checkpoint built from tasks.md alone
+    would drop the worker and, because synth prefers the fresher
+    checkpoint, lose it on recovery."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"ghost-mmmm": "abcd000d"}}
+    # tasks.md exists but does NOT contain ghost-mmmm.
+    _write_tasks(project_dir, [_make_task("other-nnnn", status="ready")])
+    # The worker has a live state.json (so it's recoverable, not archived).
+    wdir = project_dir / "workers" / "ghost-mmmm"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # The coord-state-only worker is captured (driven off worker_agent_ids).
+    assert 'task="ghost-mmmm"' in body
+    assert 'agent_id="abcd000d"' in body
+    assert 'phase="implement"' in body
+
+
+def test_write_rolling_checkpoint_skips_archived_coord_state_worker(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-5 P1 (mirror synth): a worker_agent_ids slug whose worker
+    dir is GONE (archived / hand-deleted) and which is not an active
+    tasks.md row is skipped — same as synth.go's state walk, which skips a
+    slug when readWorkerStateForSynth returns ok=false."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"archived-oooo": "abcd000e"}}
+    _write_tasks(project_dir, [_make_task("live-pppp", status="ready")])
+    # No workers/archived-oooo/state.json on disk → not recoverable.
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # The archived worker is NOT resurrected into the checkpoint.
+    assert "archived-oooo" not in body
+    assert "_(none)_" in body
+
+
 def test_write_rolling_checkpoint_rereads_tasks_after_dispatch(
     fleet_home: Path, project_dir: Path, monkeypatch,
 ) -> None:
