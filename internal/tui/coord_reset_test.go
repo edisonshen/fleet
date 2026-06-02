@@ -293,8 +293,8 @@ func TestKeyR_Confirm_Y_ReapsAndRespawns(t *testing.T) {
 	if mm.mode != modeNav {
 		t.Errorf("mode after y = %v; want modeNav", mm.mode)
 	}
-	if !mm.coordSpawnInFlight["demo"] {
-		t.Errorf("coordSpawnInFlight[demo] must be set to gate stray [a] during reap")
+	if !mm.opInFlight("demo") {
+		t.Errorf("coordOpInFlight[demo] must be set to gate stray [a] during reap")
 	}
 	if cmd == nil {
 		t.Fatal("y must produce the reap cmd; got nil")
@@ -365,8 +365,8 @@ func TestKeyR_Confirm_Esc_Cancels(t *testing.T) {
 				t.Errorf("frozen reset state not cleared after %s: %q %v",
 					key, mm.resetProjectCandidate, mm.resetCoordIDs)
 			}
-			if mm.coordSpawnInFlight["demo"] {
-				t.Errorf("%s must NOT set coordSpawnInFlight", key)
+			if mm.opInFlight("demo") {
+				t.Errorf("%s must NOT set coordOpInFlight", key)
 			}
 			if len(reap.calls) != 0 {
 				t.Errorf("%s must not reap; got %v", key, reap.calls)
@@ -407,7 +407,7 @@ func TestKeyR_ReapFailure_NoRespawn(t *testing.T) {
 	if !strings.Contains(mm.flash.text, "re-press [r]") {
 		t.Errorf("error flash should point at retry; got %q", mm.flash.text)
 	}
-	if mm.coordSpawnInFlight["demo"] {
+	if mm.opInFlight("demo") {
 		t.Errorf("in-flight gate must be cleared on reap failure")
 	}
 	if len(spawn.calls) != 0 {
@@ -655,7 +655,7 @@ func TestKeyR_InFlightSpawn_RefusesArm(t *testing.T) {
 
 	c1 := coordRecord("129c9824", "demo")
 	m := projectRowResetModel(t, "demo", []*agent.Record{c1})
-	m.coordSpawnInFlight = map[string]bool{"demo": true}
+	m.coordOpInFlight = map[string]string{"demo": coordOpSpawn}
 
 	updated, cmd := m.Update(keyMsg("r"))
 	mm := updated.(Model)

@@ -695,6 +695,10 @@ func buildBodyLinesCore(m Model, leftW, rightW int) ([]string, []string, []strin
 		// Loaded once via loadAgentsCmd; nil on cold start (Path B no-ops
 		// until the first agent load completes, Path A still fires).
 		records: m.records,
+		// PR2 D2: thread the in-flight op map so each project row can
+		// render "creating…" / "handing off…" while its spawn/handoff
+		// goroutine runs (visible feedback that stops the double-tap).
+		opInFlight: m.coordOpInFlight,
 	}
 	// Activity-grouping helper — when a project block follows the
 	// hidden separator AND that separator is expanded, render the
@@ -1164,6 +1168,23 @@ func projectFooterLines(p *ProjectRow, w int, prefix string, ctx coordSpawnCtx) 
 			gap = 1
 		}
 		countsLine = countsLine + strings.Repeat(" ", gap) + status
+	}
+
+	// PR2 D2 — in-flight op token. When the TUI has kicked off a coord
+	// SPAWN ([a]/[+]/[r]) or HANDOFF ([h]) for this project but the done
+	// message hasn't returned, render a visible "⠋ creating…" /
+	// "⠋ handing off…" line. This fires BEFORE any coord-spawn marker
+	// exists on disk (the goroutine is still shelling out), so it's the
+	// earliest possible feedback — exactly what was missing when the
+	// operator pressed [h], saw nothing, and double-tapped [a] into a
+	// triple-coord. Highest priority: short-circuit the marker-driven
+	// status below so the two indicators don't fight. Uses the spinner
+	// glyph + tickFrame already threaded for the spawning line so the
+	// motion reads as "work happening."
+	if token := coordOpToken(ctx.opInFlight[p.Name]); token != "" {
+		glyph := string(coordSpawnSpinnerGlyph(ctx.tickFrame))
+		line := prefix + dimStyle.Render(glyph+" "+token)
+		return []string{countsLine, line, ""}
 	}
 
 	// Optional coord-id line (issue #55). Rendered only when the

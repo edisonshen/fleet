@@ -100,8 +100,14 @@ type flashMsg struct {
 // the shelled-out command returns. Carries combined stdout+stderr so
 // the banner can show the operator what happened.
 type handoffDoneMsg struct {
-	out string
-	err error
+	// projectName is the project whose coord was handed off, set by the
+	// project-row [h] path so the Update handler can clear the
+	// coordOpInFlight guard (PR2 of the coord-row-lifecycle fix). Empty
+	// for the agent-row [h] path, which never sets a project guard;
+	// clearOpInFlight("") is a no-op there.
+	projectName string
+	out         string
+	err         error
 }
 type dispatchDoneMsg struct {
 	out string
@@ -542,6 +548,22 @@ func (m Model) actionHandoffProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
+	// Unified in-flight guard (PR2 — design D1). [h] spawns a SUCCESSOR
+	// coord via `fleet handoff`, so it must respect the SAME guard [a]
+	// uses: if a spawn OR a handoff is already in flight for this
+	// project, refuse and flash rather than firing a second lifecycle op
+	// that would stack a duplicate coord. This is the gap that caused the
+	// 2026-05-28 fengshen-site triple-coord: [h] set no guard, so the
+	// follow-on [a] happily spawned on top of the in-flight handoff.
+	if op, ok := m.inFlightOp(p.Name); ok {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord %s for project %s already in flight — wait for it to finish before [h]",
+				coordOpVerb(op), p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
 	coord := m.resolveCoordRecord(p)
 	if coord == nil {
 		m.flash = &flashMsg{
@@ -565,7 +587,12 @@ func (m Model) actionHandoffProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
-	return m, m.startHandoff(coord.ID), true
+	// Arm the unified guard BEFORE shelling out (D1). handoffDoneMsg
+	// clears it (success or error). While set, the project row renders
+	// the "handing off…" token (D2) so the operator sees feedback and
+	// doesn't re-press into a duplicate spawn.
+	m.setOpInFlight(p.Name, coordOpHandoff)
+	return m, m.startHandoff(p.Name, coord.ID), true
 }
 
 // actionArchive dispatches [x] for the row under the cursor.
@@ -1147,6 +1174,28 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
+	// Path 0: unified in-flight gate (PR2 — design D1; codex review iter
+	// run-2 [P2]). Check BEFORE any attach/spawn branch. The lower paths
+	// resolve a coord record first, so an in-flight HANDOFF used to be
+	// bypassed on the live-coord attach path: pressing [h] (old coord
+	// still alive — the `fleet handoff` shell-out is async) then [a]
+	// would hit Path 1, see the old session alive, set pendingAttach +
+	// tea.Quit, and exit INTO the coord that's mid-handoff — before the
+	// old Path-2.6 guard ran. That contradicted the guard's documented
+	// contract ("refuse [a] while an op is in flight"). Hoisting the
+	// check here makes [a] refuse uniformly for BOTH spawn and handoff
+	// ops: the operator already sees the "handing off…" / "creating…"
+	// D2 token, so the flash names why and the next step. Single guard,
+	// single source of truth — the lower-path duplicates are removed.
+	if op, ok := m.inFlightOp(p.Name); ok {
+		m.flash = &flashMsg{
+			text: fmt.Sprintf(
+				"coord %s for project %s is in flight — wait a moment then re-press [a]",
+				coordOpVerb(op), p.Name),
+			isErr: true,
+		}
+		return m, nil, true
+	}
 	// Path 1: fresh coord exists (lock body + freshness gate). Resolve
 	// the record via the shared resolveCoordRecord helper (CoordID link
 	// first, then the records-scan fallback — tui-nav-handoff-regressions
@@ -1189,25 +1238,10 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 					}
 					return m, nil, true
 				}
-				// In-flight guard (codex review iter-6 P2): the lower
-				// fresh-spawn path 2.6 below has the same check; we
-				// honor it here too so an operator's double-tap on
-				// [a] before the first coordSpawnDoneMsg arrives
-				// doesn't fire a second recovery dispatch against the
-				// same project state.
-				if m.coordSpawnInFlight[p.Name] {
-					m.flash = &flashMsg{
-						text: fmt.Sprintf(
-							"coord resume for project %s already in flight — wait for it to finish",
-							p.Name),
-						isErr: true,
-					}
-					return m, nil, true
-				}
-				if m.coordSpawnInFlight == nil {
-					m.coordSpawnInFlight = map[string]bool{}
-				}
-				m.coordSpawnInFlight[p.Name] = true
+				// In-flight ops are already refused at Path 0 (top of
+				// this func), so reaching here means no spawn/handoff is
+				// in flight — safe to arm the recovery spawn's guard.
+				m.setOpInFlight(p.Name, coordOpSpawn)
 				// Pass the DEAD COORD's own cwd, not the project's
 				// first-record cwd (codex review iter-11 P2). The
 				// dispatch CLI's recovery path falls back to the dead
@@ -1313,20 +1347,9 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		m.pendingAttach = rec.TmuxSession
 		return m, tea.Quit, true
 	}
-	// Path 2.6: in-flight gate. coordSpawnInFlight tracks projects
-	// whose dispatch goroutine has launched but coordSpawnDoneMsg
-	// hasn't arrived yet. During this window the agent record + marker
-	// don't exist on disk, so paths 1/2/2.5 would all miss and
-	// we'd duplicate-spawn (codex iter-3 P2 follow-up).
-	if m.coordSpawnInFlight[p.Name] {
-		m.flash = &flashMsg{
-			text: fmt.Sprintf(
-				"coord spawn for project %s is in flight — wait a moment then re-press [a]",
-				p.Name),
-			isErr: true,
-		}
-		return m, nil, true
-	}
+	// In-flight ops (spawn OR handoff) are refused at Path 0 (top of this
+	// func), so reaching Path 3 means none is in flight — the agent
+	// record + marker simply don't exist yet, so a fresh spawn is correct.
 	// Path 3: no coord. Pre-init the project tree (so the skill's first
 	// tick can write coord-state.json and acquire the flock), then spawn.
 	if _, err := state.EnsureProjectInitialized(p.Name); err != nil {
@@ -1336,10 +1359,7 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
-	if m.coordSpawnInFlight == nil {
-		m.coordSpawnInFlight = map[string]bool{}
-	}
-	m.coordSpawnInFlight[p.Name] = true
+	m.setOpInFlight(p.Name, coordOpSpawn)
 	cwd := coordCwdForProject(m.records, p.Name)
 	return m, m.startCoordSpawn(p.Name, cwd), true
 }
@@ -1384,18 +1404,19 @@ func (m Model) actionResetProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 	if p == nil {
 		return m, nil, true
 	}
-	// codex iter-3 [P2]: refuse to arm reset while a coord spawn for this
-	// project is still in flight ([a]/[+] dispatch goroutine running, its
-	// coordSpawnDoneMsg not yet handled). The dispatch hasn't written the
-	// new coord's record/marker yet, so m.records would freeze a snapshot
-	// that MISSES it; reaping that snapshot then respawning would
-	// duplicate the just-spawned coord. Make the operator wait for the
-	// spawn to settle (the flash names the next step — surface-don't-silo).
-	if m.coordSpawnInFlight[p.Name] {
+	// codex iter-3 [P2] + PR2 D1: refuse to arm reset while a coord
+	// lifecycle op for this project is still in flight (an [a]/[+]/[r]
+	// spawn OR an [h] handoff goroutine running, its done message not yet
+	// handled). The op hasn't written the new coord's record/marker yet,
+	// so m.records would freeze a snapshot that MISSES it; reaping that
+	// snapshot then respawning would duplicate the in-flight coord. Make
+	// the operator wait for the op to settle (the flash names the next
+	// step — surface-don't-silo).
+	if op, ok := m.inFlightOp(p.Name); ok {
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
-				"coord spawn for project %s is in flight — wait for it to settle, then press [r] (resetting now could duplicate the spawning coord)",
-				p.Name),
+				"coord %s for project %s is in flight — wait for it to settle, then press [r] (resetting now could duplicate the in-flight coord)",
+				coordOpVerb(op), p.Name),
 			isErr: true,
 		}
 		return m, nil, true
@@ -1450,7 +1471,7 @@ func coordRecordIDsForProject(records []*agent.Record, projectName string) []str
 // `fleet gc --kinds=coord-locks --apply --project <name>`. The fresh
 // coord spawn happens in the resetDoneMsg handler AFTER the reap
 // returns, so the new coord doesn't race the leftovers it's replacing.
-// We mark coordSpawnInFlight here so a stray [a] during the reap window
+// We mark coordOpInFlight here so a stray [a]/[h] during the reap window
 // doesn't double-spawn.
 //
 // On cancel (esc/n/N): drop to nav, clear the frozen state, no mutation.
@@ -1465,12 +1486,9 @@ func (m Model) handleConfirmResetKey(key string) (Model, tea.Cmd, bool) {
 		if project == "" {
 			return m, nil, true
 		}
-		// Gate the follow-on respawn so a stray [a] during the reap
-		// window can't fire a competing dispatch.
-		if m.coordSpawnInFlight == nil {
-			m.coordSpawnInFlight = map[string]bool{}
-		}
-		m.coordSpawnInFlight[project] = true
+		// Gate the follow-on respawn so a stray [a] (or [h]) during the
+		// reap window can't fire a competing dispatch.
+		m.setOpInFlight(project, coordOpSpawn)
 		m.flash = &flashMsg{
 			text: fmt.Sprintf(
 				"resetting project %s — reaping %d coord record(s) + clearing stale lock, then respawning",
@@ -2495,10 +2513,13 @@ func (m Model) handlePromptKey(key string) (Model, tea.Cmd, bool) {
 }
 
 // startHandoff returns a tea.Cmd that runs `fleet handoff <id>` and
-// emits handoffDoneMsg on completion.
-func (m Model) startHandoff(id string) tea.Cmd {
+// emits handoffDoneMsg on completion. project is threaded into the done
+// message so the Update handler clears the coordOpInFlight guard set by
+// actionHandoffProject (PR2). Pass "" for paths that don't arm the
+// project-level guard.
+func (m Model) startHandoff(project, id string) tea.Cmd {
 	return runFleetCmd([]string{"handoff", id}, func(out string, err error) tea.Msg {
-		return handoffDoneMsg{out: out, err: err}
+		return handoffDoneMsg{projectName: project, out: out, err: err}
 	})
 }
 
