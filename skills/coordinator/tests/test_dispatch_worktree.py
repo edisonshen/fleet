@@ -263,31 +263,68 @@ def test_current_branch_empty_on_detached_head_or_error() -> None:
     assert worktree_mod.current_branch("") == ""
 
 
-def test_resolve_worker_base_prefers_current_branch_upstream() -> None:
-    """codex [P1]: on a checked-out branch with an upstream, the worker
-    branches off origin/<that branch> — NOT the remote default. Fetches
-    the current branch so it's fresh."""
-    # current_branch → "integration"; ref_exists(origin/integration) → True.
+def test_upstream_ref_returns_configured_upstream() -> None:
+    """upstream_ref reads the branch's ACTUAL @{upstream}, which may be
+    differently-named than the local branch (codex [P2])."""
+    with patch.object(
+        worktree_mod.subprocess, "run", return_value=_ok(stdout="origin/main\n"),
+    ) as m:
+        assert worktree_mod.upstream_ref("/repo", "integration") == "origin/main"
+    args = m.call_args[0][0]
+    assert args == [
+        "git", "-C", "/repo", "rev-parse", "--abbrev-ref",
+        "--symbolic-full-name", "integration@{upstream}",
+    ]
+
+
+def test_upstream_ref_empty_when_no_upstream() -> None:
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("", returncode=128)):
+        assert worktree_mod.upstream_ref("/repo", "local-only") == ""
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        assert worktree_mod.upstream_ref("/repo", "x") == ""
+    assert worktree_mod.upstream_ref("", "x") == ""
+
+
+def test_resolve_worker_base_uses_configured_upstream_same_name() -> None:
+    """On a checked-out branch whose upstream is origin/<same name>, the
+    worker branches off that fresh upstream — NOT the remote default."""
     runs = [
-        _ok(stdout="integration\n"),   # symbolic-ref HEAD
-        _ok(stdout="deadbeef\n"),      # rev-parse origin/integration^{commit}
+        _ok(stdout="integration\n"),     # current_branch
+        _ok(stdout="origin/integration\n"),  # upstream_ref
     ]
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         wb = worktree_mod.resolve_worker_base("/repo")
     assert wb.base == "origin/integration"
+    assert wb.fetch_remote == "origin"
     assert wb.fetch_branch == "integration"
 
 
-def test_resolve_worker_base_local_only_branch_uses_local_head() -> None:
-    """A purely-local stacked branch (no origin/<cb>) → base="" (local
-    HEAD) so the operator's commits aren't dropped; no fetch attempted."""
+def test_resolve_worker_base_honors_differently_named_upstream() -> None:
+    """codex [P2]: `git checkout -b integration --track origin/main` tracks
+    origin/MAIN. resolve_worker_base must fetch + base off the CONFIGURED
+    upstream (origin/main), not the bogus origin/integration."""
     runs = [
-        _ok(stdout="stacked-local\n"),   # symbolic-ref HEAD
-        _err("", returncode=1),          # rev-parse origin/stacked-local → absent
+        _ok(stdout="integration\n"),   # current_branch
+        _ok(stdout="origin/main\n"),   # upstream_ref → differently named
+    ]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        wb = worktree_mod.resolve_worker_base("/repo")
+    assert wb.base == "origin/main"
+    assert wb.fetch_remote == "origin"
+    assert wb.fetch_branch == "main"
+
+
+def test_resolve_worker_base_local_only_branch_uses_local_head() -> None:
+    """A purely-local stacked branch (no upstream) → base="" (local HEAD)
+    so the operator's commits aren't dropped; no fetch attempted."""
+    runs = [
+        _ok(stdout="stacked-local\n"),   # current_branch
+        _err("", returncode=128),        # upstream_ref → no upstream
     ]
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         wb = worktree_mod.resolve_worker_base("/repo")
     assert wb.base == ""
+    assert wb.fetch_remote == ""
     assert wb.fetch_branch == ""
 
 
@@ -295,13 +332,22 @@ def test_resolve_worker_base_detached_head_falls_back_to_default() -> None:
     """Detached HEAD has no current branch → fall back to the remote
     default branch (resolve_default_branch)."""
     runs = [
-        _err("", returncode=1),          # symbolic-ref HEAD → detached
-        _ok(stdout="origin/master\n"),   # symbolic-ref refs/remotes/origin/HEAD
+        _err("", returncode=1),          # current_branch → detached
+        _ok(stdout="origin/master\n"),   # resolve_default_branch: origin/HEAD
     ]
     with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
         wb = worktree_mod.resolve_worker_base("/repo")
     assert wb.base == "origin/master"
+    assert wb.fetch_remote == "origin"
     assert wb.fetch_branch == "master"
+
+
+def test_split_remote_ref() -> None:
+    assert worktree_mod._split_remote_ref("origin/main") == ("origin", "main")
+    assert worktree_mod._split_remote_ref("origin/feat/x") == ("origin", "feat/x")
+    assert worktree_mod._split_remote_ref("upstream/dev") == ("upstream", "dev")
+    assert worktree_mod._split_remote_ref("bare") == ("origin", "bare")
+    assert worktree_mod._split_remote_ref("") == ("", "")
 
 
 def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
@@ -624,6 +670,10 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
         # honor the coord's branch, not the remote default).
         ("git", "-C", repo, "symbolic-ref", "--short", "-q", "HEAD"):
             _ok(stdout="main\n"),
+        # configured upstream of `main` → origin/main (codex [P2] — read
+        # the real @{upstream}, don't assume origin/<current>).
+        ("git", "-C", repo, "rev-parse", "--abbrev-ref",
+         "--symbolic-full-name"): _ok(stdout="origin/main\n"),
         ("git", "-C", repo, "fetch"): _ok(),
         # ref_exists guard: origin/main resolves → use it as base.
         ("git", "-C", repo, "rev-parse", "--verify"): _ok(stdout="deadbeef\n"),
@@ -1169,4 +1219,58 @@ def test_real_git_dispatch_honors_stacked_integration_branch(tmp_path):
     assert os.path.exists(os.path.join(wt_path, "integration.txt")), (
         "worker tree missing integration branch's own commit — it was "
         "wrongly based on origin/main instead of origin/integration"
+    )
+
+
+def test_real_git_dispatch_honors_differently_named_upstream(tmp_path):
+    """fails-on-parent (vs assuming origin/<current>): the coord is on a
+    LOCAL branch `work` that tracks origin/main (different name). When
+    origin/main advances, the worker must fetch + branch off origin/main
+    (the real @{upstream}) — not the nonexistent origin/work, which the
+    origin/<current> assumption would miss, dropping it to stale local
+    HEAD (codex [P2])."""
+    if not shutil.which("git"):
+        pytest.skip("git not on PATH")
+    origin = str(tmp_path / "origin.git")
+    seed = str(tmp_path / "seed")
+    subprocess.run(["git", "init", "-q", "-b", "main", seed], check=True, env=_GIT_ENV)
+    (tmp_path / "seed" / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-q", "-m", "c1 base")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True, env=_GIT_ENV)
+    _git(seed, "remote", "add", "origin", origin)
+    _git(seed, "push", "-q", "origin", "main")
+
+    clone = str(tmp_path / "clone")
+    subprocess.run(["git", "clone", "-q", origin, clone], check=True, env=_GIT_ENV)
+    # Local branch `work` tracking origin/main (DIFFERENT name).
+    _git(clone, "checkout", "-q", "-b", "work", "--track", "origin/main")
+    local_c1 = _git(clone, "rev-parse", "HEAD")
+    assert worktree_mod.upstream_ref(clone, "work") == "origin/main"
+
+    # origin/main advances with a dependency; clone's local `work` is stale.
+    (tmp_path / "seed" / "dep.txt").write_text("merged dependency on main\n")
+    _git(seed, "add", "dep.txt")
+    _git(seed, "commit", "-q", "-m", "c2 dep on main")
+    _git(seed, "push", "-q", "origin", "main")
+    assert _git(clone, "rev-parse", "HEAD") == local_c1
+    assert not os.path.exists(os.path.join(clone, "dep.txt"))
+
+    t = _ready_task("alpha-1234")
+    wt_path = str(tmp_path / "wt" / "alpha-1234")
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd=clone, cap=2,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
+    # The dependency from the REAL upstream (origin/main) is present — proves
+    # we read @{upstream} rather than assuming origin/work (which doesn't exist).
+    assert os.path.exists(os.path.join(wt_path, "dep.txt")), (
+        "worker tree missing the dependency from origin/main — the "
+        "differently-named upstream was not resolved (stale local HEAD)"
     )

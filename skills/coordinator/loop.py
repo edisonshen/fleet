@@ -4763,7 +4763,9 @@ def _dispatch_ready(
             # ref beats wedging all of cap on a network blip).
             wb = worktree_mod.resolve_worker_base(cwd)
             if wb.fetch_branch:
-                fetch_res = worktree_mod.fetch_remote(cwd, wb.fetch_branch)
+                fetch_res = worktree_mod.fetch_remote(
+                    cwd, wb.fetch_branch, remote=wb.fetch_remote or "origin",
+                )
                 if fetch_res.error:
                     print(
                         f"coord: {fetch_res.error}; will branch {t.slug} off "
