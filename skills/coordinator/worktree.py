@@ -201,6 +201,105 @@ def ref_exists(
     return proc.returncode == 0
 
 
+def current_branch(
+    repo: str,
+    *,
+    timeout_s: float = 10.0,
+) -> str:
+    """Return <repo>'s currently checked-out branch name, or "" if the
+    repo is in detached-HEAD state / not a git repo.
+
+    `git -C <repo> symbolic-ref --short -q HEAD` prints the branch name
+    on a normal checkout and exits non-zero (empty) when HEAD is
+    detached. The coord's checkout branch is operator-authoritative: the
+    operator chooses the integration branch by checking it out before
+    spawning the coord, so workers must branch off ITS upstream, not the
+    remote default. Never raises.
+    """
+    if not repo:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "symbolic-ref", "--short", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+@dataclass
+class WorkerBase:
+    """Resolved base for a worker worktree + the branch to fetch first.
+
+    base is what `git worktree add` branches off (passed as create_worktree's
+    `base=`); "" means local HEAD. fetch_branch is the branch name to
+    `git fetch origin <fetch_branch>` before resolving base ("" = skip
+    fetch, e.g. detached HEAD with no resolvable default).
+    """
+
+    base: str = ""
+    fetch_branch: str = ""
+
+
+def resolve_worker_base(
+    repo: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 10.0,
+) -> WorkerBase:
+    """Pick the base ref a worker worktree should branch from.
+
+    The goal is two-fold and the two pulls are in tension:
+      (a) workers must see commits a dependency PR JUST merged to the
+          remote (the stale-local-HEAD bug this PR fixes), AND
+      (b) workers must honor the coord's deliberately checked-out branch
+          (operator may sit on a stacked/integration branch ahead of the
+          remote default — branching off origin/<default> would DROP that
+          branch's commits; codex [P1]).
+
+    Resolution (first hit wins):
+      1. The coord is on branch <cb> with a remote-tracking ref
+         origin/<cb>. → fetch <cb>, base = "origin/<cb>". Fresh upstream
+         of the operator's OWN branch: satisfies (a) AND (b).
+      2. The coord is on branch <cb> with NO origin/<cb> (a purely-local
+         stacked branch the operator built and hasn't pushed). → base =
+         "" (local HEAD). Honors (b); there's no remote to refresh from.
+         fetch_branch stays "" — fetching <cb> would fail (no upstream).
+      3. Detached HEAD / no current branch → fall back to the remote
+         default branch (resolve_default_branch), fetch it, base =
+         "origin/<default>" if it exists else "" (local HEAD).
+
+    Pure resolution: this does NOT fetch or create anything. The caller
+    fetches WorkerBase.fetch_branch (best-effort), then verifies/creates.
+
+    ASCII — the decision the caller drives off this:
+
+        coord checkout HEAD ──► current_branch?
+              │ detached                  │ branch <cb>
+              ▼                            ▼
+        default branch <d>         origin/<cb> exists?
+        origin/<d> exists?          │ yes        │ no
+          y → origin/<d>            ▼            ▼
+          n → "" (HEAD)        origin/<cb>     "" (local HEAD)
+                               (fetch <cb>)    (no fetch)
+    """
+    cb = current_branch(repo, timeout_s=timeout_s)
+    if cb:
+        remote_ref = f"{remote}/{cb}"
+        if ref_exists(repo, remote_ref, timeout_s=timeout_s):
+            return WorkerBase(base=remote_ref, fetch_branch=cb)
+        # On a local-only branch (no upstream): branch off local HEAD so
+        # the operator's commits aren't dropped. No fetch — there's no
+        # origin/<cb> to refresh, and fetching would just error.
+        return WorkerBase(base="", fetch_branch="")
+    # Detached HEAD: best we can do is the remote default branch.
+    default_branch = resolve_default_branch(repo, remote=remote, timeout_s=timeout_s)
+    return WorkerBase(base=f"{remote}/{default_branch}", fetch_branch=default_branch)
+
+
 def create_worktree(
     repo: str,
     wt_path: str,

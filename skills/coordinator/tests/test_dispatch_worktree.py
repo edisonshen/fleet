@@ -243,6 +243,67 @@ def test_ref_exists_false_on_subprocess_exception_and_empty() -> None:
     assert worktree_mod.ref_exists("/repo", "") is False
 
 
+# ---------- worktree.py: current_branch + resolve_worker_base ----------
+
+
+def test_current_branch_returns_name() -> None:
+    with patch.object(
+        worktree_mod.subprocess, "run", return_value=_ok(stdout="feat/x\n"),
+    ) as m:
+        assert worktree_mod.current_branch("/repo") == "feat/x"
+    args = m.call_args[0][0]
+    assert args == ["git", "-C", "/repo", "symbolic-ref", "--short", "-q", "HEAD"]
+
+
+def test_current_branch_empty_on_detached_head_or_error() -> None:
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("", returncode=1)):
+        assert worktree_mod.current_branch("/repo") == ""
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        assert worktree_mod.current_branch("/repo") == ""
+    assert worktree_mod.current_branch("") == ""
+
+
+def test_resolve_worker_base_prefers_current_branch_upstream() -> None:
+    """codex [P1]: on a checked-out branch with an upstream, the worker
+    branches off origin/<that branch> — NOT the remote default. Fetches
+    the current branch so it's fresh."""
+    # current_branch → "integration"; ref_exists(origin/integration) → True.
+    runs = [
+        _ok(stdout="integration\n"),   # symbolic-ref HEAD
+        _ok(stdout="deadbeef\n"),      # rev-parse origin/integration^{commit}
+    ]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        wb = worktree_mod.resolve_worker_base("/repo")
+    assert wb.base == "origin/integration"
+    assert wb.fetch_branch == "integration"
+
+
+def test_resolve_worker_base_local_only_branch_uses_local_head() -> None:
+    """A purely-local stacked branch (no origin/<cb>) → base="" (local
+    HEAD) so the operator's commits aren't dropped; no fetch attempted."""
+    runs = [
+        _ok(stdout="stacked-local\n"),   # symbolic-ref HEAD
+        _err("", returncode=1),          # rev-parse origin/stacked-local → absent
+    ]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        wb = worktree_mod.resolve_worker_base("/repo")
+    assert wb.base == ""
+    assert wb.fetch_branch == ""
+
+
+def test_resolve_worker_base_detached_head_falls_back_to_default() -> None:
+    """Detached HEAD has no current branch → fall back to the remote
+    default branch (resolve_default_branch)."""
+    runs = [
+        _err("", returncode=1),          # symbolic-ref HEAD → detached
+        _ok(stdout="origin/master\n"),   # symbolic-ref refs/remotes/origin/HEAD
+    ]
+    with patch.object(worktree_mod.subprocess, "run", side_effect=lambda *a, **k: runs.pop(0)):
+        wb = worktree_mod.resolve_worker_base("/repo")
+    assert wb.base == "origin/master"
+    assert wb.fetch_branch == "master"
+
+
 def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
     """Coord crash mid-tick can leave the wt on disk + registered; resume
     must succeed. We verify the path is registered via `git worktree
@@ -559,8 +620,10 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_path + "\n"),
-        # origin/HEAD → default branch "main" (coord-worktree-stale fix).
-        ("git", "-C", repo, "symbolic-ref"): _ok(stdout="origin/main\n"),
+        # current_branch: coord is checked out on `main` (codex [P1] —
+        # honor the coord's branch, not the remote default).
+        ("git", "-C", repo, "symbolic-ref", "--short", "-q", "HEAD"):
+            _ok(stdout="main\n"),
         ("git", "-C", repo, "fetch"): _ok(),
         # ref_exists guard: origin/main resolves → use it as base.
         ("git", "-C", repo, "rev-parse", "--verify"): _ok(stdout="deadbeef\n"),
@@ -1003,24 +1066,11 @@ def test_real_git_dispatch_falls_back_to_local_head_without_origin(tmp_path):
     wt_path = str(tmp_path / "wt" / "alpha-1234")
 
     # Real git for worktree ops; only stub the fleet CLI (worktree-path)
-    # and the dispatch helpers. The router records calls and shells real
-    # git for git argv (so resolve_default_branch / fetch / ref_exists /
-    # worktree add all hit the actual repo).
-    real_run = subprocess.run
-
-    def _router(cmd, *args, **kwargs):
-        if cmd[:3] == ["/usr/local/bin/fleet", "workers", "worktree-path"]:
-            return _ok(stdout=wt_path + "\n")
-        if cmd[:1] == ["git"]:
-            return real_run(*([cmd] + list(args)), **kwargs)
-        emu = _maybe_claims_emulator(cmd, kwargs)
-        if emu is not None:
-            return emu
-        return _ok()
-
+    # and the dispatch helpers (shared _git_router shells real git so
+    # current_branch / fetch / ref_exists / worktree add hit the repo).
     with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
          patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
-         patch.object(dispatch_mod.subprocess, "run", side_effect=_router):
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(repo, wt_path)):
         actions = loop._dispatch_ready(
             tasks=[t], project="proj", cwd=repo, cap=2,
             fleet_bin="/usr/local/bin/fleet",
@@ -1032,3 +1082,91 @@ def test_real_git_dispatch_falls_back_to_local_head_without_origin(tmp_path):
     assert actions[0].worktree == wt_path
     # The worktree was really created off local HEAD (base.txt present).
     assert os.path.exists(os.path.join(wt_path, "base.txt"))
+
+
+# ---------- REAL-GIT integration: honor the coord's checked-out branch (codex [P1]) ----------
+#
+# The operator can deliberately check the coord out on a stacked/integration
+# branch ahead of origin/<default>. The worker must branch off THAT branch's
+# fresh upstream (origin/<integration>), not origin/<default> — otherwise it
+# drops the integration branch's commits. We also prove freshness: a dependency
+# that merged to origin/<integration> after the clone's last pull must appear.
+
+
+def _git_router(repo, wt_path):
+    """Router that shells real git but stubs the fleet worktree-path CLI."""
+    real_run = subprocess.run
+
+    def _router(cmd, *args, **kwargs):
+        if cmd[:3] == ["/usr/local/bin/fleet", "workers", "worktree-path"]:
+            return _ok(stdout=wt_path + "\n")
+        if cmd[:1] == ["git"]:
+            return real_run(*([cmd] + list(args)), **kwargs)
+        emu = _maybe_claims_emulator(cmd, kwargs)
+        if emu is not None:
+            return emu
+        return _ok()
+    return _router
+
+
+def test_real_git_dispatch_honors_stacked_integration_branch(tmp_path):
+    """fails-on-parent (vs the origin/<default>-forcing variant): the coord
+    is checked out on `integration` (ahead of origin/main). The worker tree
+    must contain (a) the integration branch's own commit AND (b) a dependency
+    merged to origin/integration after the clone's last pull — while NOT
+    being based on origin/main."""
+    if not shutil.which("git"):
+        pytest.skip("git not on PATH")
+    origin = str(tmp_path / "origin.git")
+    seed = str(tmp_path / "seed")
+    subprocess.run(["git", "init", "-q", "-b", "main", seed], check=True, env=_GIT_ENV)
+    (tmp_path / "seed" / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-q", "-m", "c1 main base")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True, env=_GIT_ENV)
+    _git(seed, "remote", "add", "origin", origin)
+    _git(seed, "push", "-q", "origin", "main")
+    # Operator builds an integration branch with its own commit, pushes it.
+    _git(seed, "checkout", "-q", "-b", "integration")
+    (tmp_path / "seed" / "integration.txt").write_text("integration-only work\n")
+    _git(seed, "add", "integration.txt")
+    _git(seed, "commit", "-q", "-m", "c2 integration feature")
+    _git(seed, "push", "-q", "origin", "integration")
+
+    # Clone, check out integration tracking origin/integration.
+    clone = str(tmp_path / "clone")
+    subprocess.run(["git", "clone", "-q", origin, clone], check=True, env=_GIT_ENV)
+    _git(clone, "checkout", "-q", "-b", "integration", "origin/integration")
+    int_c2 = _git(clone, "rev-parse", "HEAD")
+
+    # origin/integration advances with a dependency commit; clone is stale.
+    (tmp_path / "seed" / "dep.txt").write_text("merged dependency on integration\n")
+    _git(seed, "add", "dep.txt")
+    _git(seed, "commit", "-q", "-m", "c3 dep on integration")
+    _git(seed, "push", "-q", "origin", "integration")
+    # Clone's local integration still at c2 (pre-dep), no dep.txt yet.
+    assert _git(clone, "rev-parse", "HEAD") == int_c2
+    assert not os.path.exists(os.path.join(clone, "dep.txt"))
+
+    t = _ready_task("alpha-1234")
+    wt_path = str(tmp_path / "wt" / "alpha-1234")
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd=clone, cap=2,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
+    # (b) Fresh: the dependency merged to origin/integration is present.
+    assert os.path.exists(os.path.join(wt_path, "dep.txt")), (
+        "worker tree missing the fresh dependency from origin/integration"
+    )
+    # (a) Honors the integration branch: its own commit's file is present.
+    # (If the worker were based on origin/main this would be absent.)
+    assert os.path.exists(os.path.join(wt_path, "integration.txt")), (
+        "worker tree missing integration branch's own commit — it was "
+        "wrongly based on origin/main instead of origin/integration"
+    )
