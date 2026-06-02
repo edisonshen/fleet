@@ -4133,3 +4133,38 @@ def test_tick_checkpoint_schema_matches_synth_fixture(
     assert "_(no open PRs)_" in body
     assert "_(no recent decisions)_" in body
 
+
+def test_tick_checkpoint_write_failure_does_not_wedge_tick(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Fail-soft: a raising write_coord_checkpoint must NOT propagate out
+    of the tick. The breadcrumb lands in result.errors, the heartbeat
+    save still runs, and tick_count still persists — so the next tick
+    advances the counter normally instead of re-failing at the same
+    modulo value forever. Guards the try/except at the loop.py call site,
+    which the happy-path tests never exercise.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    _write_tasks(project_dir, [_make_task("idle-eeee", status="ready")])
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated checkpoint write fault")
+
+    monkeypatch.setattr(loop.dispatch_mod, "write_coord_checkpoint", _boom)
+
+    # The tick must complete (no exception escapes) ...
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # ... record the failure as a breadcrumb (operator-visible) ...
+    assert any("rolling checkpoint" in e for e in result.errors), result.errors
+    # ... NOT write a (partial) checkpoint file ...
+    assert not _checkpoint_path(project_dir).exists()
+    # ... and STILL persist the bumped counter via the heartbeat save, so
+    # the next tick advances to 2 rather than retrying 1 forever.
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state["tick_count"] == 1
+

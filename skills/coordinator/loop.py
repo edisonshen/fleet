@@ -2680,10 +2680,12 @@ def _write_rolling_checkpoint(
             "subagent_id": subagent_ids.get(t.slug, ""),
         })
         if t.pr_url:
-            # We only know the URL + head branch from tasks.md; number
-            # is unknown here (the PR monitor owns gh state), so render a
-            # 0 placeholder. synth.go reads head/url; the bullet is for
-            # the human-readable recovery doc, not gh reconciliation.
+            # We only know the URL + head branch from tasks.md; the real
+            # gh PR number is unknown here (the PR monitor owns gh state).
+            # Render a 1-based ordinal instead so the bullet stays well-
+            # formed for synth.go's `- #<n> ...` parser — synth lifts
+            # head/url for recovery, the ordinal is just for the human-
+            # readable doc, not gh reconciliation.
             pr_seq += 1
             open_prs.append({
                 "number": pr_seq,
