@@ -2947,6 +2947,36 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestIsQuarantineDir regresses codex iter-6 [P2]: the quarantine match
+// must be the exact fleet shape (dot-prefixed + marker + pid.nano), NOT a
+// loose Contains — or a legit project literally named "foo.gc-quarantine.1.2"
+// (no leading dot) would be misclassified as fleet cruft and deleted.
+func TestIsQuarantineDir(t *testing.T) {
+	match := []string{
+		".--project.gc-quarantine.1234.5678",
+		".-weird.gc-quarantine.1.999999999",
+		".a.gc-quarantine.0.0",
+	}
+	for _, n := range match {
+		if !isQuarantineDir(n) {
+			t.Errorf("isQuarantineDir(%q)=false, want true", n)
+		}
+	}
+	noMatch := []string{
+		"foo.gc-quarantine.1.2",      // no leading dot — a real project name
+		".foo.gc-quarantine",         // missing pid.nano suffix
+		".foo.gc-quarantine.1",       // only one numeric run
+		".foo.gc-quarantine.a.b",     // non-numeric suffix
+		"fleet", ".locks", ".hidden", // ordinary entries
+		"my.gc-quarantine.project", // marker present but not the suffix shape, no dot
+	}
+	for _, n := range noMatch {
+		if isQuarantineDir(n) {
+			t.Errorf("isQuarantineDir(%q)=true, want false", n)
+		}
+	}
+}
+
 // TestReconcile_InvalidProjects_StrandedQuarantineReaped regresses codex
 // iter-5 [P2]: a leftover ".<base>.gc-quarantine..." dir from a failed
 // restore is dot-prefixed, but fleet must still be able to reap its own

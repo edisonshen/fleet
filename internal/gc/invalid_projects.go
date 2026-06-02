@@ -29,7 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
@@ -63,7 +63,7 @@ func reconcileInvalidProjects(r *Report, opts Options, deps Deps) error {
 		// ValidateProjectName (dots + alnum are allowed). Treat it like a
 		// malformed dir so the same tasks.md-guarded reap applies (codex
 		// iter-5 [P2]).
-		isQuarantine := strings.Contains(d.Name, quarantineMarker)
+		isQuarantine := isQuarantineDir(d.Name)
 		if !isQuarantine && valid(d.Name) {
 			continue // real project — leave alone
 		}
@@ -181,6 +181,25 @@ func applyInvalidProjectReap(act *Action, deps Deps, d ProjectDirInfo) {
 // (feedback_fleet_owns_its_resources). codex iter-5 [P2].
 const quarantineMarker = ".gc-quarantine."
 
+// quarantineRe matches ONLY the exact shape quarantineProjectDir emits:
+//
+//	.<base>.gc-quarantine.<pid>.<nano>
+//
+// Anchored, leading-dot-required, with the marker followed by two integer
+// runs (pid + UnixNano). A legit project literally named "foo.gc-quarantine.1.2"
+// is NOT dot-prefixed, so it never matches — avoiding the overmatch where
+// Contains(name, marker) would misclassify a real project as fleet cruft
+// and delete it (codex iter-6 [P2]).
+var quarantineRe = regexp.MustCompile(`^\..+\.gc-quarantine\.\d+\.\d+$`)
+
+// isQuarantineDir reports whether name is one of fleet's own leftover
+// quarantine dirs (created by quarantineProjectDir). Used to (a) re-surface
+// stranded quarantines past the dot-prefix skip and (b) treat them as
+// always-reapable in the classifier.
+func isQuarantineDir(name string) bool {
+	return quarantineRe.MatchString(name)
+}
+
 // listProjectDirsRaw enumerates EVERY ~/.fleet/projects/<name>/ entry
 // (including malformed names ListProjects hides) plus whether each holds
 // a tasks.md. The reserved ".locks" control dir and OTHER dot-prefixed
@@ -214,7 +233,7 @@ func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 		if name == ".locks" {
 			continue
 		}
-		if len(name) > 0 && name[0] == '.' && !strings.Contains(name, quarantineMarker) {
+		if len(name) > 0 && name[0] == '.' && !isQuarantineDir(name) {
 			continue
 		}
 		path := filepath.Join(pdir, name)
@@ -273,7 +292,7 @@ func quarantineProjectDir(path string) (string, error) {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
 	qpath := filepath.Join(dir,
-		fmt.Sprintf(".%s.gc-quarantine.%d.%d", base, os.Getpid(), time.Now().UnixNano()))
+		fmt.Sprintf(".%s%s%d.%d", base, quarantineMarker, os.Getpid(), time.Now().UnixNano()))
 	if _, err := os.Lstat(qpath); err == nil {
 		return "", fmt.Errorf("quarantine path %s already exists — refusing to overwrite", qpath)
 	} else if !os.IsNotExist(err) {
