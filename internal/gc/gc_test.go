@@ -2947,6 +2947,41 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestReconcile_InvalidProjects_TasksStatErrSurfacesInBoth regresses codex
+// iter-7 [P2]: a non-ENOENT tasks.md stat error during listing makes
+// presence unknown. Dry-run must surface (not would-remove) so it agrees
+// with apply, which also fails closed. Destructive classifiers must not
+// advertise a removal the apply path will refuse.
+func TestReconcile_InvalidProjects_TasksStatErrSurfacesInBoth(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	bogus := "/fake/projects/--project"
+	for _, apply := range []bool{false, true} {
+		t.Run(map[bool]string{false: "dry-run", true: "apply"}[apply], func(t *testing.T) {
+			deps := stubDeps(now)
+			deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+				return []ProjectDirInfo{{
+					Name: "--project", Path: bogus, HasTasks: false,
+					TasksStatErr: errors.New("permission denied"),
+				}}, nil
+			}
+			got, err := Reconcile(Options{
+				Apply: apply, MaxAge: 24 * time.Hour,
+				Kinds: []Kind{KindInvalidProjects},
+			}, deps)
+			if err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			a, ok := findAction(got, KindInvalidProjects, bogus)
+			if !ok {
+				t.Fatalf("missing action; got %+v", got.Actions)
+			}
+			if a.Verb != VerbSurface {
+				t.Fatalf("apply=%v verb=%q, want %q (stat-err must surface in both modes)", apply, a.Verb, VerbSurface)
+			}
+		})
+	}
+}
+
 // TestIsQuarantineDir regresses codex iter-6 [P2]: the quarantine match
 // must be the exact fleet shape (dot-prefixed + marker + pid.nano), NOT a
 // loose Contains — or a legit project literally named "foo.gc-quarantine.1.2"

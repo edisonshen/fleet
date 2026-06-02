@@ -278,11 +278,16 @@ type Deps struct {
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
 // invalid-projects classifier. HasTasks gates the conservative reap
-// (a malformed name WITH a tasks.md is surfaced-only).
+// (a malformed name WITH a tasks.md is surfaced-only). TasksStatErr carries
+// a non-ENOENT stat error from the listing pass so DRY-RUN surfaces the
+// ambiguity instead of advertising would-remove — keeping dry-run honest
+// about what apply will actually do (apply rechecks and fails closed too,
+// codex iter-7 [P2]).
 type ProjectDirInfo struct {
-	Name     string
-	Path     string
-	HasTasks bool
+	Name         string
+	Path         string
+	HasTasks     bool
+	TasksStatErr error
 }
 
 // Action describes one planned-or-applied operation against a single

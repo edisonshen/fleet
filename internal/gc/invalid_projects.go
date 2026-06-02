@@ -67,6 +67,17 @@ func reconcileInvalidProjects(r *Report, opts Options, deps Deps) error {
 		if !isQuarantine && valid(d.Name) {
 			continue // real project — leave alone
 		}
+		if d.TasksStatErr != nil {
+			// tasks.md presence is unknown (non-ENOENT stat error during
+			// listing). DRY-RUN must surface this — not advertise
+			// would-remove — so it agrees with apply, which also fails
+			// closed on an ambiguous stat (codex iter-7 [P2]).
+			r.Actions = append(r.Actions, Action{
+				Kind: KindInvalidProjects, Target: d.Path, Verb: VerbSurface,
+				Reason: fmt.Sprintf("invalid project name %q but tasks.md stat failed (%v) — refusing to auto-remove; resolve then re-run `fleet gc --kinds invalid-projects`", d.Name, d.TasksStatErr),
+			})
+			continue
+		}
 		if d.HasTasks {
 			// Conservative: a malformed name (or stranded quarantine) with
 			// a task list might hold real state the operator wants to
@@ -190,7 +201,12 @@ const quarantineMarker = ".gc-quarantine."
 // is NOT dot-prefixed, so it never matches — avoiding the overmatch where
 // Contains(name, marker) would misclassify a real project as fleet cruft
 // and delete it (codex iter-6 [P2]).
-var quarantineRe = regexp.MustCompile(`^\..+\.gc-quarantine\.\d+\.\d+$`)
+// (?s) lets "." match newlines: a malformed dir name can legitimately
+// contain a "\n" (ValidateProjectName rejects it, but the dir exists on
+// disk and quarantineProjectDir embeds the base verbatim). Without (?s) a
+// stranded newline-named quarantine would never re-match and would silo
+// forever (codex iter-7 [P2]).
+var quarantineRe = regexp.MustCompile(`(?s)^\..+\.gc-quarantine\.\d+\.\d+$`)
 
 // isQuarantineDir reports whether name is one of fleet's own leftover
 // quarantine dirs (created by quarantineProjectDir). Used to (a) re-surface
@@ -238,10 +254,15 @@ func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 		}
 		path := filepath.Join(pdir, name)
 		hasTasks := false
+		var tasksStatErr error
 		if _, serr := os.Stat(filepath.Join(path, "tasks.md")); serr == nil {
 			hasTasks = true
+		} else if !os.IsNotExist(serr) {
+			// Non-ENOENT (permission, I/O): tasks.md presence is unknown.
+			// Carry it so dry-run surfaces instead of advertising removal.
+			tasksStatErr = serr
 		}
-		out = append(out, ProjectDirInfo{Name: name, Path: path, HasTasks: hasTasks})
+		out = append(out, ProjectDirInfo{Name: name, Path: path, HasTasks: hasTasks, TasksStatErr: tasksStatErr})
 	}
 	return out, nil
 }
