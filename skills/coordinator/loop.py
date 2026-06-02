@@ -1042,30 +1042,26 @@ def _tick_locked(
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"subagent audit: {exc}")
 
-    # 5.9. Rolling coord checkpoint (#187). Bump the per-coord tick
-    # counter (persisted in coord-state.json) and, every N ticks, publish
-    # coord-checkpoint.md so a successor coord can resume from a recent
-    # snapshot rather than the (potentially hours-stale) last handoff doc.
-    # synth.go prefers the checkpoint when it's newer than the handoff.
+    # 5.9. Rolling coord checkpoint (#187), part 1 — bump the counter.
+    # We bump the per-coord tick counter HERE (so it rides the heartbeat
+    # _save_coord_state below in a single write) but DEFER the actual
+    # coord-checkpoint.md file write to the END of the tick, after the
+    # supervisor loop. Rationale: the supervisor can reconcile + dispatch
+    # NEW workers mid-tick (_maybe_dispatch_after_reconcile); writing the
+    # checkpoint before the supervisor would snapshot a pre-supervisor
+    # view, and because synth.go prefers a fresher checkpoint over the
+    # coord-state walk, a crash after a supervisor dispatch would strand
+    # that worker. Bumping here + writing last keeps the counter durable
+    # while the file reflects the final post-supervisor state.
     #
-    #   tick_count++ ──should_checkpoint(N)──▶ write_coord_checkpoint()
+    #   tick_count++  ─heartbeat persist─▶ … supervisor … ─▶ checkpoint write
     #
-    # The counter lives in `state` so it rides the same heartbeat
-    # _save_coord_state below — no second write. dispatch.py owns the
-    # writer + the gate; loop.py only supplies the live tick payload
-    # (in-flight subagents + their open PRs). Fail-soft: a checkpoint
-    # write must never wedge a tick.
+    # Fail-soft: neither the bump nor the (deferred) write may wedge a tick.
+    should_write_checkpoint = False
     try:
-        _write_rolling_checkpoint(
-            tasks=f.tasks,
-            project=project,
-            project_dir=project_dir,
-            coord_id=coord_id,
-            state=state,
-            home=home,
-        )
-    except Exception as exc:  # noqa: BLE001 — checkpoint must never fail a tick
-        result.errors.append(f"rolling checkpoint: {exc}")
+        should_write_checkpoint = _bump_tick_counter(state)
+    except Exception as exc:  # noqa: BLE001 — counter bump must never fail a tick
+        result.errors.append(f"rolling checkpoint counter: {exc}")
 
     # Heartbeat: rewrite coord-state.json on EVERY tick, even when nothing
     # was drained or dispatched. The Variant A dashboard reads this file's
@@ -1113,6 +1109,28 @@ def _tick_locked(
             result=result,
             emitted_this_tick=emitted_this_tick,
         )
+
+    # 5.9. Rolling coord checkpoint (#187), part 2 — write the file LAST.
+    # Runs after the supervisor so the checkpoint reflects any workers the
+    # supervisor dispatched mid-tick (see part-1 comment above). The
+    # counter was already bumped + persisted by the heartbeat; this is the
+    # pure file write, gated on the interval decision from part 1. We
+    # re-load coord-state from disk so the payload's slug→agent_id maps +
+    # recent_decisions include the supervisor's own state mutations.
+    # Fail-soft: a checkpoint write must never wedge a tick.
+    if should_write_checkpoint:
+        try:
+            checkpoint_state = _load_coord_state(state_path)
+            _write_rolling_checkpoint_file(
+                project=project,
+                project_dir=project_dir,
+                coord_id=coord_id,
+                state=checkpoint_state,
+                home=home,
+            )
+        except Exception as exc:  # noqa: BLE001 — checkpoint must never fail a tick
+            result.errors.append(f"rolling checkpoint: {exc}")
+
     return result
 
 
@@ -2616,26 +2634,49 @@ def _read_worker_state(
         return None
 
 
-def _write_rolling_checkpoint(
+def _bump_tick_counter(state: dict) -> bool:
+    """Bump state["tick_count"] (mutated in place) and return True when
+    this tick should publish a rolling checkpoint (#187).
+
+    Split from the file write so the caller can persist the bumped counter
+    via the heartbeat _save_coord_state, then DEFER the actual checkpoint
+    file write to the end of the tick (after the supervisor loop, which
+    can dispatch new workers mid-tick). Tolerates a corrupt / non-int /
+    negative counter by resetting to 0 before the +1 bump.
+    """
+    raw_tick = state.get("tick_count", 0)
+    try:
+        tick_count = int(raw_tick)
+    except (TypeError, ValueError):
+        tick_count = 0
+    if tick_count < 0:
+        tick_count = 0
+    tick_count += 1
+    state["tick_count"] = tick_count
+
+    every = dispatch_mod.resolve_checkpoint_every()
+    return dispatch_mod.should_checkpoint(tick_count, every)
+
+
+def _write_rolling_checkpoint_file(
     *,
-    tasks: list[parse.Task],
     project: str,
     project_dir: Path,
     coord_id: str,
     state: dict,
     home: Path,
 ) -> str | None:
-    """Bump the per-coord tick counter and, every N ticks, publish
-    coord-checkpoint.md (the rolling recovery snapshot, #187).
+    """Publish coord-checkpoint.md (the rolling recovery snapshot, #187).
 
-    Mutates `state["tick_count"]` in place (the caller's heartbeat
-    _save_coord_state persists it). Returns the checkpoint path when a
-    file was written, else None (off-interval or checkpointing disabled).
+    Caller is responsible for the counter bump + interval gate (see
+    _bump_tick_counter) and for invoking this only on a checkpoint tick.
+    Returns the checkpoint path written.
 
-    `tasks` is only used as a fallback snapshot — when the on-interval
-    branch fires we RE-READ tasks.md from disk (see below) so we capture
-    the post-_apply_dispatch state, not the pre-dispatch snapshot the
-    caller holds.
+    Always RE-READS tasks.md from disk so the snapshot reflects every
+    mutation that landed this tick — including workers the supervisor
+    dispatched after the heartbeat — not a pre-dispatch / pre-supervisor
+    view. (A crash after a supervisor dispatch must not leave a fresher-
+    but-stale checkpoint that shadows synth.go's coord-state walk.)
 
     Payload derivation — the checkpoint mirrors a handoff doc's two
     live-work sections so synth.go lifts the rows verbatim:
@@ -2652,35 +2693,19 @@ def _write_rolling_checkpoint(
     Recent decisions ride along from state["recent_decisions"]
     (populated by record_checkpoint_decision at dispatch sites).
 
-    dispatch.py owns should_checkpoint + write_coord_checkpoint + the
-    env knobs; this helper is the loop.py-side glue.
+    dispatch.py owns write_coord_checkpoint + the env knobs; this helper
+    is the loop.py-side glue.
     """
-    raw_tick = state.get("tick_count", 0)
-    try:
-        tick_count = int(raw_tick)
-    except (TypeError, ValueError):
-        tick_count = 0
-    if tick_count < 0:
-        tick_count = 0
-    tick_count += 1
-    state["tick_count"] = tick_count
-
-    every = dispatch_mod.resolve_checkpoint_every()
-    if not dispatch_mod.should_checkpoint(tick_count, every):
-        return None
-
     # Re-read tasks.md from disk so a task dispatched THIS tick (flipped
-    # to in-progress by _apply_dispatch AFTER the caller's `f` snapshot
-    # was taken) lands in the checkpoint. Without this the snapshot is
-    # stale and a freshly-launched worker renders as _(none)_ — and since
-    # synth.go prefers the fresher checkpoint, recovery would omit that
-    # worker. Fall back to the caller's snapshot on a parse error (the
-    # call-site try/except already fail-soft-wraps the whole helper).
+    # to in-progress by _apply_dispatch / the supervisor AFTER the
+    # caller's snapshot) lands in the checkpoint. Empty list on a parse
+    # error — better an empty (honest) checkpoint than one rendered from a
+    # stale snapshot. The call-site try/except already fail-soft-wraps us.
     tasks_path = project_dir / "tasks.md"
     try:
         tasks = parse.read(str(tasks_path)).tasks
-    except Exception:  # noqa: BLE001 — stale snapshot beats no checkpoint
-        pass
+    except Exception:  # noqa: BLE001 — empty beats a stale snapshot
+        tasks = []
 
     agent_ids = supervisor_mod.load_agent_id_map(state)
     subagent_ids = supervisor_mod.load_subagent_id_map(state)
