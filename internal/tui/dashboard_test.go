@@ -543,6 +543,82 @@ func TestScanDashboard_SkipsLocksDir(t *testing.T) {
 	}
 }
 
+// TestScanDashboard_SkipsMalformedProjectDir regresses
+// invalid-project-dir-guar-d636: a "--project" dir (CLI flag-misparse)
+// must NOT render as a project row, must NOT inflate the count, and —
+// because "--project" sorts before letters — must NOT hijack the title.
+// The malformed name is surfaced via Snapshot.SkippedMalformed (loader
+// emits a stderr hint), not silently dropped.
+func TestScanDashboard_SkipsMalformedProjectDir(t *testing.T) {
+	pdir := withFleetHome(t)
+	// A real project + the bogus "--project" dir sitting alongside it,
+	// shaped like the operator's screenshot: .locks + coord-state.json,
+	// NO tasks.md.
+	seedTasks(t, pdir, "fleet", TaskCounts{Todo: 1})
+	bogus := filepath.Join(pdir, "--project")
+	if err := os.MkdirAll(filepath.Join(bogus, ".locks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bogus, "coord-state.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := scanDashboard(time.Now())
+	for _, p := range snap.Projects {
+		if p.Name == "--project" {
+			t.Errorf("malformed --project dir must not render as a project row: %+v", p)
+		}
+	}
+	if len(snap.Projects) != 1 || snap.Projects[0].Name != "fleet" {
+		t.Fatalf("expected exactly the valid 'fleet' project; got %d projects %+v",
+			len(snap.Projects), snap.Projects)
+	}
+	// Surfaced, not silently dropped.
+	found := false
+	for _, n := range snap.SkippedMalformed {
+		if n == "--project" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("--project must be reported in SkippedMalformed; got %v", snap.SkippedMalformed)
+	}
+}
+
+// TestUnifiedProjects_SkipsMalformedAgentTag regresses the second
+// enumeration source: a loose agent record tagged project="--project"
+// must not synthesize a row that re-hijacks the title via the
+// agent-record path (invalid-project-dir-guar-d636).
+func TestUnifiedProjects_SkipsMalformedAgentTag(t *testing.T) {
+	// Isolate FLEET_HOME so hiddenProjectsSet() reads an empty hidden
+	// list (not the operator's real ~/.fleet) — otherwise the synthetic
+	// loop's hidden filter is non-deterministic across machines.
+	t.Setenv("FLEET_HOME", t.TempDir())
+	m := Model{
+		dashboard: &Snapshot{Projects: []*ProjectRow{{Name: "fleet", RepoSlug: "fleet"}}},
+		records: []*agent.Record{
+			{ID: "aaaa1111", Project: "--project"},
+			{ID: "bbbb2222", Project: "rainier"},
+		},
+	}
+	got := m.unifiedProjects()
+	for _, p := range got {
+		if p.Name == "--project" {
+			t.Errorf("agent tag '--project' must not synthesize a project row: %+v", p)
+		}
+	}
+	// The valid synthetic 'rainier' tag should still appear.
+	haveRainier := false
+	for _, p := range got {
+		if p.Name == "rainier" {
+			haveRainier = true
+		}
+	}
+	if !haveRainier {
+		t.Errorf("valid synthetic project 'rainier' should still appear; got %+v", got)
+	}
+}
+
 func TestScanDashboard_AttentionProjectsSortedFirst(t *testing.T) {
 	pdir := withFleetHome(t)
 	seedTasks(t, pdir, "alpha", TaskCounts{Todo: 1})

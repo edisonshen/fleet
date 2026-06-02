@@ -167,6 +167,42 @@ func TestTasksAdd_PositionalSlug(t *testing.T) {
 	}
 }
 
+// TestTasksList_RejectsFlagMisparseProject is the CLI-boundary integration
+// test for invalid-project-dir-guar-d636. It drives the assembled root
+// command (`fleet tasks list --project=<misparse>`) — the same surface the
+// operator hits — and asserts that (a) the command errors and (b) NO
+// ~/.fleet/projects/<misparse>/ directory is left behind. Before the fix,
+// `--project=--project` / `--project=-x` slipped past ValidateProjectName
+// (hyphen is an allowed interior char) and a bogus project dir polluted the
+// dashboard. Architect-level e2e per feedback_e2e_tests_for_all_cases:
+// unit coverage on ValidateProjectName alone wouldn't catch a future call
+// site that bypasses it.
+func TestTasksList_RejectsFlagMisparseProject(t *testing.T) {
+	for _, bad := range []string{"--project", "-x", "--", "-_-"} {
+		t.Run(bad, func(t *testing.T) {
+			fleetHome := t.TempDir()
+			t.Setenv("FLEET_HOME", fleetHome)
+			if _, err := state.Bootstrap(); err != nil {
+				t.Fatalf("Bootstrap: %v", err)
+			}
+			root := newRootCmd()
+			root.SetArgs([]string{"tasks", "list", "--project=" + bad})
+			root.SetOut(&bytes.Buffer{})
+			root.SetErr(&bytes.Buffer{})
+			if err := root.Execute(); err == nil {
+				t.Fatalf("`tasks list --project=%q` must error; got nil", bad)
+			}
+			// The malformed dir must NOT have been created anywhere under
+			// projects/. ProjectDir/EnsureProjectInitialized must refuse
+			// before any MkdirAll.
+			leaked := filepath.Join(fleetHome, "projects", bad)
+			if _, err := os.Stat(leaked); err == nil {
+				t.Errorf("malformed project dir leaked on disk: %s", leaked)
+			}
+		})
+	}
+}
+
 // TestTasksList_Filters list with --status filter narrows rows.
 func TestTasksList_Filters(t *testing.T) {
 	_, project := setupTasksHome(t)

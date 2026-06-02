@@ -21,10 +21,12 @@ package tui
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -140,6 +142,13 @@ type Snapshot struct {
 	CIRuns   int       // count of in-progress CI / PR check runs (best effort)
 	LoadedAt time.Time // wall time the snapshot was assembled
 	Err      error     // best-effort: collection errors don't block render
+	// SkippedMalformed lists ~/.fleet/projects/<name>/ dir names that
+	// failed state.ValidateProjectName and were excluded from Projects /
+	// the header count (e.g. a "--project" dir from a CLI flag-misparse,
+	// invalid-project-dir-guar-d636). Surfaced — not silently dropped —
+	// per feedback_surface_dont_silo: the loader emits a one-line stderr
+	// diagnostic (deduped per process) pointing at `fleet gc`.
+	SkippedMalformed []string
 }
 
 // dashboardMsg carries a refreshed Snapshot from the loader goroutine.
@@ -153,7 +162,43 @@ type dashboardMsg struct {
 func loadDashboardCmd() tea.Cmd {
 	return func() tea.Msg {
 		snap := scanDashboard(time.Now())
+		surfaceMalformedProjects(snap.SkippedMalformed)
 		return dashboardMsg{snap: snap}
+	}
+}
+
+// malformedProjectsReported dedupes the stderr diagnostic per process —
+// scanDashboard runs every tick (1s poll + fsnotify), so without the
+// dedupe a single "--project" dir would spew a line every second.
+var (
+	malformedProjectsReported   = map[string]bool{}
+	malformedProjectsReportedMu sync.Mutex
+)
+
+// surfaceMalformedProjects emits a one-line stderr diagnostic per unique
+// malformed project dir name (invalid-project-dir-guar-d636). Surface,
+// don't silo: the operator gets a concrete `fleet gc --apply` next-step
+// hint instead of a silently-vanished dir. The TUI runs in the alternate
+// screen, so the line lands on the operator's terminal scrollback after
+// exit (matching the projects/ watcher warning in tui.go).
+func surfaceMalformedProjects(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	malformedProjectsReportedMu.Lock()
+	defer malformedProjectsReportedMu.Unlock()
+	for _, n := range names {
+		if malformedProjectsReported[n] {
+			continue
+		}
+		malformedProjectsReported[n] = true
+		// %q quotes + escapes the name: a malformed dir name can contain
+		// newlines or terminal escape sequences, and printing it raw would
+		// let it forge warning lines or emit control output on the
+		// operator's terminal (codex iter-1 [P2]).
+		fmt.Fprintf(os.Stderr,
+			"warning: skipping malformed project dir ~/.fleet/projects/%q (invalid name — likely a `--project` CLI flag-misparse). Reap it with `fleet gc --kinds invalid-projects --apply`.\n",
+			n)
 	}
 }
 
@@ -192,6 +237,17 @@ func scanDashboard(now time.Time) *Snapshot {
 		// dirs (state.Bootstrap creates it) but isn't a project.
 		name := e.Name()
 		if name == ".locks" || strings.HasPrefix(name, ".") {
+			continue
+		}
+		// Skip malformed project dirs (invalid-project-dir-guar-d636).
+		// A "--project" dir from a CLI flag-misparse (or any name that
+		// fails ValidateProjectName) must not render in the project list
+		// or inflate the header count — and because "--project" sorts
+		// before letters it would otherwise hijack the dashboard title.
+		// Surfaced via SkippedMalformed (loader emits a stderr hint),
+		// never silently included (feedback_surface_dont_silo).
+		if err := state.ValidateProjectName(name); err != nil {
+			snap.SkippedMalformed = append(snap.SkippedMalformed, name)
 			continue
 		}
 		row, wrows := scanProject(projDir, name, now)
