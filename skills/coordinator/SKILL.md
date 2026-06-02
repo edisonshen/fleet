@@ -325,7 +325,13 @@ directly and notes the diff summary.
 ## Failure Modes
 
 - Parse error: skip tick and report parse error.
-- Lock busy: skip tick, no mutation.
+- Lock busy: skip tick, no mutation. EXCEPTION (coord-self-exit-when-it-6014):
+  if a *different live* coord holds `coordinator.lock` AND the `coord-spawn-marker`
+  does not name this session (i.e. we are not the project's intended/successor
+  coord), this session is a duplicate that would otherwise idle forever. It emits a
+  stderr diagnostic and `main()` runs `tmux kill-session -t fleet-<coord_id>` to tear
+  down its own session, self-healing to one coord. The lock holder and the intended
+  successor coord (marker names them) never self-exit.
 - Prompt too large: leave task ready/todo and report error.
 - Worker died without PR: requeue and note.
 - CI red: requeue/fix-subagent path.

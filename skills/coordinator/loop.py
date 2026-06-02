@@ -108,6 +108,14 @@ class TickResult:
     skipped=True with reason="lock-busy" means another tick is in
     flight; the coord exits cleanly. Counters are zero when skipped.
 
+    self_exit=True (reason="duplicate-coord-self-exit") means this
+    coord lost the coordinator.lock to a DIFFERENT live coord and is
+    NOT the project's intended coord (per the coord-spawn-marker) — it
+    is a duplicate session that would otherwise idle forever holding a
+    tmux session and doing no work (coord-self-exit-when-it-6014). The
+    tick stays side-effect-free; main() reads this flag and tears down
+    THIS coord's own tmux session so the duplicate self-heals to one.
+
     dispatch_instructions carries the rendered DISPATCH blocks (issue
     #84 Phase A) that the coord agent (Claude) is expected to act on
     by invoking the Agent tool once per block on its NEXT assistant
@@ -117,6 +125,11 @@ class TickResult:
 
     skipped: bool = False
     reason: str = ""
+    # coord-self-exit-when-it-6014: set True when the lock-busy branch
+    # detects THIS session is a duplicate coord (a different live coord
+    # holds the lock + we are not the project's intended coord). main()
+    # acts on it by killing this coord's own tmux session.
+    self_exit: bool = False
     parsed_tasks: int = 0
     reconciled: int = 0
     drained: int = 0
@@ -226,8 +239,38 @@ def tick(
     lock_path = locks_dir / "coordinator.lock"
     lock_fd = _try_lock(lock_path, holder_id=coord_id)
     if lock_fd is None:
+        # coord-self-exit-when-it-6014: the lock is held by SOMEONE.
+        # The historical behavior was "skip the tick, exit cleanly" —
+        # but the *claude session* lived on idle forever, leaving a
+        # zombie coord that holds a tmux session and does no work. That
+        # is why [h]/[a] mishaps leave multiple live coords instead of
+        # self-healing to one.
+        #
+        # Decide whether THIS session is a genuine duplicate that
+        # should tear itself down. We must be conservative — the lock
+        # HOLDER must never self-exit, and a mid-handoff / intended
+        # successor coord must never self-exit either.
+        #
+        #   lock body holder == ""            -> can't prove duplicate; skip only
+        #   holder == coord_id                -> our own stale flock;   skip only
+        #   spawn-marker == coord_id          -> WE are the intended    skip only
+        #                                        coord (mid-handoff /
+        #                                        successor); never exit
+        #   holder != me AND holder is LIVE   -> DUPLICATE: self-exit
+        #   holder dead / stale               -> normal takeover;       skip only
         result.skipped = True
         result.reason = "lock-busy"
+        decision, diag = _classify_lock_busy(
+            lock_path, project_dir, coord_id, home,
+        )
+        if decision == "duplicate":
+            result.self_exit = True
+            result.reason = "duplicate-coord-self-exit"
+            # surface_dont_silo: a self-exit must never be silent. The
+            # operator (and any shell-invoked `loop.py`) sees exactly
+            # why this session is going away and how to confirm.
+            sys.stderr.write(diag + "\n")
+            result.errors.append(diag)
         return result
     # 1.5. Resolve worktree-base repo (fleet#175).
     #
@@ -2119,6 +2162,173 @@ def _try_lock(path: Path, *, holder_id: str = "") -> int | None:
         except OSError:
             pass
     return fd
+
+
+# 8-hex agent-id shape. Mirrors internal/tui/dashboard.go:isAgentIDShape
+# so the Python coord and the Go dashboard agree on what counts as a
+# valid lock-body / marker holder. Anything else (legacy zero-byte
+# lock, hand-edit, garbage) is treated as "no holder".
+_AGENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _read_lock_holder(lock_path: Path) -> str:
+    """Return the agent ID written into coordinator.lock's body, or "".
+
+    The Python coord skill writes ``<coord_id>\\n`` into the lock body
+    after acquiring LOCK_EX (`_try_lock`). We read the first line and
+    validate the 8-hex shape; anything else returns "" so callers fall
+    through to the "no provable holder" path. Mirrors the Go reader at
+    internal/tui/dashboard.go:readCoordHolder.
+
+    NOTE: flock(2) does not truncate the body on release, so a stale
+    body can name a dead coord. The liveness probe in
+    `_classify_lock_busy` is the load-bearing freshness gate.
+    """
+    try:
+        with open(lock_path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return ""
+    s = first.strip()
+    return s if _AGENT_ID_RE.match(s) else ""
+
+
+def _read_coord_spawn_marker(project_dir: Path) -> str:
+    """Return the agent ID in the project's coord-spawn-marker, or "".
+
+    The marker (``.locks/coord-spawn-marker``) names the project's
+    INTENDED coord — the TUI/CLI writes it on every fresh coord spawn
+    (state.WriteCoordSpawnMarker). When the marker names US, this
+    session is the legitimate / successor coord and must never
+    self-exit even while a stale predecessor still holds the flock for
+    one more tick. Mirrors state.ReadCoordSpawnMarker.
+    """
+    marker_path = project_dir / ".locks" / "coord-spawn-marker"
+    try:
+        with open(marker_path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return ""
+    return first.strip()
+
+
+def _agent_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
+    """True iff ~/.fleet/agents/<id>.json names THIS project's coord.
+
+    Applied to BOTH the lock holder and the current session: a bare
+    "the record parses" check is NOT enough to justify a self-exit
+    (codex review [P2]). For the HOLDER, the lock body could name a
+    same-project WORKER that hijacked coordinator.lock (the fleet#171
+    hijack the project-ownership guard exists to catch), or a stale
+    body naming a live agent that belongs to a DIFFERENT project — in
+    neither case is the holder a legitimate coord to defer to. For the
+    CURRENT session, a worker that accidentally runs `loop.py` must not
+    be classified a duplicate coord and killed. So both the deferred-to
+    holder and the self-exiting session must clear this check.
+
+    We require the record to be genuinely this project's coord on TWO
+    axes:
+
+      - ``project`` field == this project (excludes cross-project
+        agents whose ID leaked into the body), and
+      - ``task_id`` == ``coord-<project>`` (the canonical coord task
+        id — see internal/tui/keys.go:coordTaskID,
+        internal/handoff/synth.go). A worker's task_id is its feature
+        task, never ``coord-<project>``, so this excludes a hijacking
+        worker.
+
+    Both must hold; a record missing either field (legacy / partial)
+    fails closed -> caller skips rather than self-exits.
+    """
+    if not agent_id or not project:
+        return False
+    try:
+        with open(home / "agents" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(rec, dict):
+        return False
+    if (rec.get("project") or "") != project:
+        return False
+    return (rec.get("task_id") or "") == f"coord-{project}"
+
+
+def _classify_lock_busy(
+    lock_path: Path,
+    project_dir: Path,
+    coord_id: str,
+    home: Path,
+) -> tuple[str, str]:
+    """Decide what a coord that LOST the coordinator.lock should do.
+
+    Returns ``(decision, diagnostic)`` where decision is:
+
+      - "duplicate" — a DIFFERENT, LIVE coord holds the lock and this
+        session is not the project's intended coord. Caller self-exits.
+      - "skip"      — every conservative gate failed; just skip the
+        tick (historical behavior). diagnostic is "".
+
+    Conservatism (any one fires -> "skip"):
+
+      1. No coord_id  -> can't reason about identity (manual shell
+         invocation). Skip.
+      2. THIS session is not itself this project's coord (its own
+         record is missing / project-mismatched / task_id !=
+         coord-<project>) -> a worker that accidentally ran loop.py
+         must never self-exit and kill its own worker session. Skip.
+         (codex review [P2], round 2)
+      3. Lock body has no valid holder ID -> can't prove a duplicate.
+         Skip. (legacy zero-byte lock, hand-edit, race before the
+         holder published its body.)
+      4. holder == coord_id -> our own stale flock from a prior tick
+         that hasn't been reaped yet. Not a duplicate. Skip.
+      5. spawn-marker == coord_id -> WE are the project's intended /
+         successor coord (mid-handoff). Never self-exit; the stale
+         holder is the one to be reaped (by the swap / `fleet gc`).
+         Skip.
+      6. holder's record is not THIS project's coord (missing record,
+         project mismatch, or task_id != coord-<project> — e.g. a
+         same-project worker that hijacked the lock, or a cross-project
+         agent ID in the body) OR holder's tmux session is dead -> not
+         a legitimate live coord to defer to. Skip. (codex review [P2])
+
+    Only when NONE of the above fire is the session a true duplicate.
+    """
+    if not coord_id:
+        return "skip", ""
+    # THIS session must itself be this project's coord before we would
+    # ever tear it down (codex review [P2], round 2). A WORKER that
+    # accidentally runs `loop.py <project>` (or whose FLEET_AGENT_ID is
+    # set) while the real coord holds the lock would otherwise be
+    # classified "duplicate" and have main() kill `fleet-<worker_id>`,
+    # destroying unrelated worker work. Self-exit is a coord-only
+    # self-heal; non-coords just skip the tick.
+    if not _agent_is_project_coord(home, coord_id, project_dir.name):
+        return "skip", ""
+    holder = _read_lock_holder(lock_path)
+    if not holder:
+        return "skip", ""
+    if holder == coord_id:
+        return "skip", ""
+    if _read_coord_spawn_marker(project_dir) == coord_id:
+        return "skip", ""
+    # The holder must be a genuinely live coord FOR THIS PROJECT, not a
+    # stale lock body, a hijacking same-project worker, or a cross-
+    # project agent whose ID leaked into the body (codex review [P2]).
+    if not _agent_is_project_coord(home, holder, project_dir.name):
+        return "skip", ""
+    holder_session = supervisor_mod.session_name_for_agent(holder)
+    if not supervisor_mod.tmux_session_alive(holder_session):
+        return "skip", ""
+    diag = (
+        f"[coord] coordinator.lock for {project_dir.name!r} is held by a "
+        f"different LIVE coord {holder} (tmux {holder_session}); this "
+        f"session {coord_id} is a duplicate doing no work — exiting to "
+        f"self-heal to one coord. If this is wrong, run `fleet status` "
+        f"to inspect the coords for this project."
+    )
+    return "duplicate", diag
 
 
 def _resolve_home(fleet_home: str | None) -> Path:
@@ -5305,6 +5515,30 @@ def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
 # ---------- entry point for SKILL.md invocation ----------
 
 
+# coord-self-exit-when-it-6014: injectable so tests can assert the
+# self-exit path WITHOUT killing any real tmux session. Production
+# implementation runs `tmux kill-session -t fleet-<coord_id>`, which
+# tears down THIS coord's own session (the python tick runs inside it
+# as a Stop-hook child; killing the session reaps the claude process
+# cleanly — no kill -9). Returns True iff the kill command ran exit 0.
+def _kill_own_tmux_session(coord_id: str) -> bool:
+    session = supervisor_mod.session_name_for_agent(coord_id)
+    if not session:
+        return False
+    try:
+        proc = subprocess.run(
+            ["tmux", "kill-session", "-t", session],
+            capture_output=True, text=True, timeout=5.0, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return proc.returncode == 0
+
+
+# Test seam: overridable so the self-exit test never shells out to tmux.
+_kill_own_session_fn = _kill_own_tmux_session
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     """Skill entry point. Reads project from FLEET_PROJECT env or argv.
 
@@ -5324,6 +5558,42 @@ def main(argv: Iterable[str] | None = None) -> int:
         print("coordinator: no project set (FLEET_PROJECT or argv[0])")
         return 0
     result = tick(project)
+    # coord-self-exit-when-it-6014: a duplicate coord (a different live
+    # coord holds coordinator.lock + we are not the intended coord) must
+    # not idle as a zombie. tick() already emitted the stderr diagnostic
+    # (surface_dont_silo) and skipped all work, so there are no DISPATCH
+    # blocks. Print the JSON summary so the reason is captured in the
+    # tick log, then kill THIS session's own tmux session — the python
+    # tick runs inside `fleet-<coord_id>` as a Stop-hook child, so the
+    # kill reaps the claude process cleanly (no kill -9, no orphan).
+    #
+    # We kill AFTER printing so an operator tailing the tick output sees
+    # the reason before the session disappears. The lock was never
+    # acquired (lock-busy branch), so there is nothing to release.
+    if result.self_exit:
+        coord_id = os.environ.get("FLEET_AGENT_ID", "")
+        print(json.dumps({
+            "skipped": result.skipped,
+            "reason": result.reason,
+            "self_exit": True,
+            "parsed": result.parsed_tasks,
+            "reconciled": result.reconciled,
+            "drained": result.drained,
+            "dispatched": result.dispatched,
+            "raised": result.raised,
+            "errors": result.errors,
+        }))
+        sys.stdout.flush()
+        if coord_id and not _kill_own_session_fn(coord_id):
+            sys.stderr.write(
+                f"coordinator: self-exit requested for duplicate coord "
+                f"{coord_id} but `tmux kill-session -t "
+                f"{supervisor_mod.session_name_for_agent(coord_id)}` did "
+                f"not succeed; this session may persist. Run `fleet gc` "
+                f"or kill the duplicate manually after confirming the "
+                f"holder is the live coord.\n"
+            )
+        return 0
     # Issue #84 Phase A: emit DISPATCH blocks BEFORE the JSON summary
     # so the coord agent (Claude) sees them as parseable plain text in
     # the tick output. Each block tells Claude to invoke the Agent
