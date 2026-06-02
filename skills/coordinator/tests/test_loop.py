@@ -3984,13 +3984,15 @@ def test_write_rolling_checkpoint_writes_at_interval(
         "worker_agent_ids": {"feat-aaaa": "abcd0001"},
         "recent_decisions": ["dispatched feat-aaaa"],
     }
-    tasks = [
+    # The helper re-reads tasks.md from disk (not the passed snapshot),
+    # so seed it on disk.
+    _write_tasks(project_dir, [
         _make_task(
             "feat-aaaa", status="in-progress", worker_pid=0,
             pr_url="https://github.com/owner/repo/pull/9",
         ),
-        _make_task("idle-bbbb", status="ready"),  # not in-progress → excluded
-    ]
+        _make_task("idle-bbbb", status="ready"),  # not active → excluded
+    ])
     # Worker phase comes from workers/<slug>/state.json.
     wdir = project_dir / "workers" / "feat-aaaa"
     wdir.mkdir(parents=True, exist_ok=True)
@@ -3999,7 +4001,7 @@ def test_write_rolling_checkpoint_writes_at_interval(
     )
 
     written = loop._write_rolling_checkpoint(
-        tasks=tasks, project="fleet", project_dir=project_dir,
+        tasks=[], project="fleet", project_dir=project_dir,
         coord_id="cccccc01", state=state, home=fleet_home,
     )
 
@@ -4021,6 +4023,67 @@ def test_write_rolling_checkpoint_writes_at_interval(
     assert "https://github.com/owner/repo/pull/9" in body
     # Recent decisions ride along from coord-state.
     assert "dispatched feat-aaaa" in body
+
+
+def test_write_rolling_checkpoint_includes_in_review_pr(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex P1: a task that opened a PR and moved to in-review must stay
+    in the checkpoint — both as an Active Subagents row (so the successor
+    re-spawns its shepherd) and in Open PRs (so PR monitoring resumes).
+    Dropping it would, because synth.go prefers the fresher checkpoint
+    over the state walk, strand the open-review PR after a coord crash."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"rev-ffff": "abcd0009"}}
+    _write_tasks(project_dir, [
+        _make_task(
+            "rev-ffff", status="in-review", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/42",
+        ),
+    ])
+
+    written = loop._write_rolling_checkpoint(
+        tasks=[], project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    assert 'task="rev-ffff"' in body
+    assert 'status="in-review"' in body
+    assert 'agent_id="abcd0009"' in body
+    # The in-review PR rides into Open PRs (not just the active row).
+    assert "https://github.com/owner/repo/pull/42" in body
+    assert "_(no open PRs)_" not in body
+
+
+def test_write_rolling_checkpoint_rereads_tasks_after_dispatch(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex P1: the helper must re-read tasks.md from disk, not trust the
+    caller's pre-_apply_dispatch snapshot. Here disk shows an in-progress
+    worker (dispatched this tick) while the passed `tasks` is the stale
+    pre-dispatch view (status=ready) — the checkpoint must reflect disk."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"fresh-gggg": "abcd000a"}}
+    # Disk: the post-dispatch truth (worker just launched → in-progress).
+    _write_tasks(project_dir, [
+        _make_task("fresh-gggg", status="in-progress", worker_pid=0),
+    ])
+    # Stale caller snapshot: the same task still looked ready pre-dispatch.
+    stale = [_make_task("fresh-gggg", status="ready")]
+
+    written = loop._write_rolling_checkpoint(
+        tasks=stale, project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Disk wins: the freshly-dispatched worker appears despite the stale arg.
+    assert 'task="fresh-gggg"' in body
+    assert 'status="in-progress"' in body
+    assert "_(none)_" not in body
 
 
 def test_write_rolling_checkpoint_disabled_when_every_zero(

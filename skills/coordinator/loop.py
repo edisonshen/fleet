@@ -2632,11 +2632,22 @@ def _write_rolling_checkpoint(
     _save_coord_state persists it). Returns the checkpoint path when a
     file was written, else None (off-interval or checkpointing disabled).
 
+    `tasks` is only used as a fallback snapshot — when the on-interval
+    branch fires we RE-READ tasks.md from disk (see below) so we capture
+    the post-_apply_dispatch state, not the pre-dispatch snapshot the
+    caller holds.
+
     Payload derivation — the checkpoint mirrors a handoff doc's two
     live-work sections so synth.go lifts the rows verbatim:
-      - active_subagents: every in-progress task, enriched with the
-        worker phase (workers/<slug>/state.json) and the slug→id maps
-        from coord_state.
+      - active_subagents: every ACTIVE task — both `in-progress` (worker
+        running, may not have a PR yet) and `in-review` (PR open, shepherd
+        running) — enriched with the worker phase (workers/<slug>/
+        state.json) and the slug→id maps from coord_state. This mirrors
+        the handoff recovery contract (handoff.go: pr_url + in-review →
+        re-spawn shepherd; empty pr_url + in-progress → re-dispatch). A
+        checkpoint that dropped in-review tasks would, because synth.go
+        prefers a fresher checkpoint over the state walk, strand every
+        open-review PR's monitor after a coord crash.
       - open_prs: the subset of those tasks that carry a pr_url.
     Recent decisions ride along from state["recent_decisions"]
     (populated by record_checkpoint_decision at dispatch sites).
@@ -2658,6 +2669,19 @@ def _write_rolling_checkpoint(
     if not dispatch_mod.should_checkpoint(tick_count, every):
         return None
 
+    # Re-read tasks.md from disk so a task dispatched THIS tick (flipped
+    # to in-progress by _apply_dispatch AFTER the caller's `f` snapshot
+    # was taken) lands in the checkpoint. Without this the snapshot is
+    # stale and a freshly-launched worker renders as _(none)_ — and since
+    # synth.go prefers the fresher checkpoint, recovery would omit that
+    # worker. Fall back to the caller's snapshot on a parse error (the
+    # call-site try/except already fail-soft-wraps the whole helper).
+    tasks_path = project_dir / "tasks.md"
+    try:
+        tasks = parse.read(str(tasks_path)).tasks
+    except Exception:  # noqa: BLE001 — stale snapshot beats no checkpoint
+        pass
+
     agent_ids = supervisor_mod.load_agent_id_map(state)
     subagent_ids = supervisor_mod.load_subagent_id_map(state)
 
@@ -2665,7 +2689,7 @@ def _write_rolling_checkpoint(
     open_prs: list[dict] = []
     pr_seq = 0
     for t in tasks:
-        if t.status != "in-progress":
+        if t.status not in ("in-progress", "in-review"):
             continue
         st = _read_worker_state(project, t.slug, home=home)
         phase = (st or {}).get("phase", "") if isinstance(st, dict) else ""
