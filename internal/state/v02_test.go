@@ -165,6 +165,23 @@ func TestValidateProjectName_RejectsReserved(t *testing.T) {
 	}
 }
 
+func TestValidateProjectName_RejectsFlagMisparse(t *testing.T) {
+	// Regression for invalid-project-dir-guar-d636: a `--project` flag
+	// misparse (e.g. `fleet tasks list --project=--project` or
+	// `--project=-x`) captured a flag-shaped token as the project NAME.
+	// Hyphen IS an allowed interior char, so the old loop accepted these
+	// and a bogus ~/.fleet/projects/--project/ dir polluted the dashboard
+	// (title "FLEET /--project", inflated count). Leading "-" and
+	// punctuation-only names are now rejected at this single chokepoint.
+	for _, in := range []string{"--project", "-x", "-", "--", "-foo", "_._", "._", "...", "-_-"} {
+		t.Run(in, func(t *testing.T) {
+			if err := ValidateProjectName(in); err == nil {
+				t.Errorf("ValidateProjectName(%q) returned nil err; want rejection (flag-misparse / punctuation-only)", in)
+			}
+		})
+	}
+}
+
 func TestValidateProjectName_RejectsUppercase(t *testing.T) {
 	// macOS/APFS case-insensitive default would alias "Foo" and
 	// "foo" onto the same projects/<name>/ tree → silent state

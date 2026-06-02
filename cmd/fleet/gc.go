@@ -65,6 +65,12 @@ func newGCCmd() *cobra.Command {
                    SURFACE only by default; --apply removes the worker
                    dir (state.json + output.log + scratch). Worktree
                    is NEVER touched — KindWorktrees owns that (fleet#177)
+  invalid-projects — ~/.fleet/projects/<name>/ dirs whose name fails
+                   validation (e.g. a "--project" dir from a CLI flag-
+                   misparse) AND that hold no tasks.md. SURFACE only by
+                   default; --apply rm -rf's the dir. A malformed name
+                   WITH a tasks.md is surfaced but never auto-removed
+                   (invalid-project-dir-guar-d636)
 
 Default behavior is DRY-RUN — prints a planned action list and exits
 0 WITHOUT mutating. Pass --apply to actually remove / archive / kill.
@@ -98,7 +104,7 @@ Exit codes:
 	cmd.Flags().DurationVar(&f.maxAge, "max-age", gcDefaultMaxAge,
 		"age floor for socket sweep (Go duration; default 24h)")
 	cmd.Flags().StringVar(&f.kindsCSV, "kinds", "",
-		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records); empty = all")
+		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects); empty = all")
 	cmd.Flags().StringVar(&f.project, "project", "",
 		"scope worktree + agent enumeration to one project (default: all projects)")
 	return cmd
@@ -195,14 +201,14 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 		}
 		k := gc.Kind(p)
 		switch k {
-		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords:
+		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects:
 			out = append(out, k)
 		default:
-			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records)", p)
+			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)", p)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records)")
+		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)")
 	}
 	return out, nil
 }
@@ -223,7 +229,7 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 	_, _ = fmt.Fprintf(stdout, "fleet gc — mode=%s aggressive=%t max-age=%s\n",
 		mode, opts.Aggressive, opts.MaxAge)
 
-	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords int
+	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects int
 	for _, a := range r.Actions {
 		_, _ = fmt.Fprintf(stdout, "%s  %s  verb=%s  reason=%s\n",
 			a.Kind, a.Target, a.Verb, a.Reason)
@@ -240,9 +246,11 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 			nCoordLocks++
 		case gc.KindWorkerRecords:
 			nWorkerRecords++
+		case gc.KindInvalidProjects:
+			nInvalidProjects++
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
-		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records\n",
-		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords)
+		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects\n",
+		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects)
 }

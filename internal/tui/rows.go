@@ -177,6 +177,15 @@ func (m Model) unifiedProjectsFiltered(hiddenSet map[string]bool) []*ProjectRow 
 		if seen[r.Project] {
 			continue
 		}
+		// Skip malformed project tags from agent records too
+		// (invalid-project-dir-guar-d636). A record tagged
+		// project="--project" (CLI flag-misparse) must not synthesize a
+		// row that re-hijacks the title / inflates the count via the
+		// agent-record source, even though scanDashboard already filters
+		// the on-disk dir.
+		if err := state.ValidateProjectName(r.Project); err != nil {
+			continue
+		}
 		if hiddenSet[r.Project] {
 			// Drop hidden project from the synthetic-from-agent source.
 			continue

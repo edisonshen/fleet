@@ -71,10 +71,19 @@ const (
 	// the worker dir (NOT the worktree — KindWorktrees owns that).
 	// Live-PID guard + task-in-progress guard prevent live-worker harm.
 	// See worker_records.go.
+
+	// KindInvalidProjects (invalid-project-dir-guar-d636) is the seventh
+	// classifier — sweeps malformed ~/.fleet/projects/<name>/ dirs whose
+	// name fails state.ValidateProjectName (e.g. a "--project" dir born
+	// from a CLI flag-misparse). Reap gate is conservative: name invalid
+	// AND no tasks.md (a malformed name that somehow accreted a task list
+	// is surfaced-only, never auto-removed — the operator may have real
+	// state to migrate). SURFACE by default; --apply rm -rf's the dir.
+	// See invalid_projects.go.
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -233,6 +242,30 @@ type Deps struct {
 	// (separate path; KindWorktrees owns it). Production wiring is
 	// removeWorkerRecordDir.
 	RemoveWorkerRecord func(path string) error
+
+	// Invalid-projects (KindInvalidProjects).
+	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
+	// (unlike ListProjects, which already filters out invalid names) plus
+	// whether that dir contains a tasks.md. The classifier needs the raw
+	// list so it can SEE the malformed names ListProjects hides.
+	// Production wiring is listProjectDirsRaw.
+	ListProjectDirs func() ([]ProjectDirInfo, error)
+	// ValidProjectName reports whether a project dir name is valid (nil
+	// err from state.ValidateProjectName). Injectable for tests; default
+	// wiring is the real validator.
+	ValidProjectName func(name string) bool
+	// RemoveProjectDir rm -rf's a malformed project dir under --apply.
+	// Production wiring is removeProjectDirTree (ENOENT-tolerant).
+	RemoveProjectDir func(path string) error
+}
+
+// ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
+// invalid-projects classifier. HasTasks gates the conservative reap
+// (a malformed name WITH a tasks.md is surfaced-only).
+type ProjectDirInfo struct {
+	Name     string
+	Path     string
+	HasTasks bool
 }
 
 // Action describes one planned-or-applied operation against a single
@@ -327,6 +360,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("worker-records: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindInvalidProjects) {
+		if err := reconcileInvalidProjects(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("invalid-projects: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -354,6 +392,8 @@ func kindRank(k Kind) int {
 		return 4
 	case KindWorkerRecords:
 		return 5
+	case KindInvalidProjects:
+		return 6
 	}
 	return 99
 }
@@ -697,6 +737,9 @@ func DefaultDeps() Deps {
 		LoadTaskStatus:      loadTaskStatusOnDisk,
 		PidAlive:            pidAliveOnDisk,
 		RemoveWorkerRecord:  removeWorkerRecordDir,
+		ListProjectDirs:     listProjectDirsRaw,
+		ValidProjectName:    func(name string) bool { return state.ValidateProjectName(name) == nil },
+		RemoveProjectDir:    removeProjectDirTree,
 	}
 }
 

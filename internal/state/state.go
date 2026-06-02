@@ -265,16 +265,38 @@ func ValidateProjectName(name string) error {
 	if name == ".locks" {
 		return fmt.Errorf("project name %q reserved (collides with projects/.locks/)", name)
 	}
+	// Reject names that start with "-": a CLI flag-misparse (e.g.
+	// `fleet tasks list --project=--project` or `--project=-x`) can
+	// capture a flag-shaped token as the project NAME. ValidateProjectName
+	// is the single chokepoint every --project surface (dispatch, tasks,
+	// project, tui actions) funnels through, so rejecting the leading "-"
+	// here closes the hole everywhere. A literal `--project` directory
+	// otherwise sorts before letters and hijacks the dashboard title /
+	// project count (the bug this guard fixes). No legitimate project
+	// name begins with a hyphen.
+	if strings.HasPrefix(name, "-") {
+		return fmt.Errorf("project name %q must not start with %q (looks like a CLI flag — likely a `--project` flag-misparse)", name, "-")
+	}
+	hasAlnum := false
 	for _, c := range name {
 		switch {
 		case c >= 'a' && c <= 'z':
+			hasAlnum = true
 		case c >= '0' && c <= '9':
+			hasAlnum = true
 		case c == '-' || c == '_' || c == '.':
 		case c >= 'A' && c <= 'Z':
 			return fmt.Errorf("project name %q contains uppercase %q (lowercase-only — case-insensitive filesystems alias case variants)", name, c)
 		default:
 			return fmt.Errorf("project name %q contains invalid character %q (allowed: lowercase letters, digits, _, -, .)", name, c)
 		}
+	}
+	// Punctuation-only names ("--", "-_-", "..." would already be caught
+	// by the leading-"-" / reserved guards above, but "_._" / "._" slip
+	// through the per-char loop) carry no identity and alias confusingly
+	// on disk. Require at least one alphanumeric rune.
+	if !hasAlnum {
+		return fmt.Errorf("project name %q has no alphanumeric character (allowed: lowercase letters, digits, _, -, .)", name)
 	}
 	return nil
 }

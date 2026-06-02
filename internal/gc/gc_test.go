@@ -102,6 +102,13 @@ func stubDeps(now time.Time) Deps {
 		RemoveWorkerRecord: func(string) error {
 			return errors.New("stubDeps: RemoveWorkerRecord should not run")
 		},
+		// Invalid-projects (KindInvalidProjects). Empty list by default;
+		// the classifier tests override ListProjectDirs / RemoveProjectDir.
+		ListProjectDirs:  func() ([]ProjectDirInfo, error) { return nil, nil },
+		ValidProjectName: func(name string) bool { return state.ValidateProjectName(name) == nil },
+		RemoveProjectDir: func(string) error {
+			return errors.New("stubDeps: RemoveProjectDir should not run")
+		},
 	}
 }
 
@@ -2751,5 +2758,171 @@ Spec: archived but never marked done.
 	}
 	if got != "done" {
 		t.Fatalf("archived in-progress row: status=%q, want %q (archive presence MUST be terminal — codex iter-2 P2)", got, "done")
+	}
+}
+
+// ----- invalid-project-dir-guar-d636 invalid-projects classifier tests -----
+
+// TestReconcile_InvalidProjects_DryRunSurfaces: a malformed dir name
+// ("--project") with NO tasks.md is reported with would-remove in
+// dry-run and the remover is never called.
+func TestReconcile_InvalidProjects_DryRunSurfaces(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{
+			{Name: "--project", Path: bogus, HasTasks: false},
+			{Name: "fleet", Path: "/fake/projects/fleet", HasTasks: true},
+		}, nil
+	}
+	// RemoveProjectDir must NOT run in dry-run (stubDeps default errors).
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action for %q; got %+v", bogus, got.Actions)
+	}
+	if a.Verb != VerbWouldRemove {
+		t.Fatalf("dry-run verb=%q, want %q", a.Verb, VerbWouldRemove)
+	}
+	// The valid project must NOT be flagged.
+	if _, ok := findAction(got, KindInvalidProjects, "/fake/projects/fleet"); ok {
+		t.Errorf("valid project 'fleet' must not be flagged")
+	}
+}
+
+// TestReconcile_InvalidProjects_ApplyRemoves: --apply calls the remover
+// and reports verb=removed.
+func TestReconcile_InvalidProjects_ApplyRemoves(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "--project", Path: bogus, HasTasks: false}}, nil
+	}
+	var removed []string
+	deps.RemoveProjectDir = func(p string) error { removed = append(removed, p); return nil }
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbRemoved {
+		t.Fatalf("apply verb=%q, want %q", a.Verb, VerbRemoved)
+	}
+	if len(removed) != 1 || removed[0] != bogus {
+		t.Fatalf("RemoveProjectDir called with %v, want [%q]", removed, bogus)
+	}
+}
+
+// TestReconcile_InvalidProjects_WithTasksSurfacedNotRemoved: a malformed
+// name that DOES hold a tasks.md is surfaced (Verb=surface) but never
+// auto-removed — surface-don't-silo (the operator may have state).
+func TestReconcile_InvalidProjects_WithTasksSurfacedNotRemoved(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/-weird"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "-weird", Path: bogus, HasTasks: true}}, nil
+	}
+	// RemoveProjectDir must NOT run even under --apply (stub errors).
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("with-tasks verb=%q, want %q (surface-only)", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_InvalidProjects_EndToEnd is the architect-level
+// integration test (feedback_e2e_tests_for_all_cases): it builds a real
+// FLEET_HOME with a "--project" dir (mirroring the operator's screenshot:
+// .locks + coord-state.json, NO tasks.md) plus a real "fleet" project,
+// wires DefaultDeps (the production on-disk hooks), and asserts dry-run
+// surfaces the bogus dir while --apply removes it from disk and leaves
+// the real project untouched. Catches a future regression where the
+// on-disk lister or remover diverges from the classifier contract.
+func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	pdir := filepath.Join(home, "projects")
+	// Bogus "--project" dir: .locks + coord-state.json, NO tasks.md.
+	bogus := filepath.Join(pdir, "--project")
+	if err := os.MkdirAll(filepath.Join(bogus, ".locks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bogus, "coord-state.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Real project with a tasks.md.
+	real := filepath.Join(pdir, "fleet")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "tasks.md"), []byte("# tasks\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC) }
+	kinds := []Kind{KindInvalidProjects}
+
+	// Dry-run: surfaces would-remove, dir still on disk.
+	dry, err := Reconcile(Options{Apply: false, MaxAge: 24 * time.Hour, Kinds: kinds}, deps)
+	if err != nil {
+		t.Fatalf("dry Reconcile: %v", err)
+	}
+	a, ok := findAction(dry, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("dry-run missing action for %q; got %+v", bogus, dry.Actions)
+	}
+	if a.Verb != VerbWouldRemove {
+		t.Fatalf("dry verb=%q want %q", a.Verb, VerbWouldRemove)
+	}
+	if _, serr := os.Stat(bogus); serr != nil {
+		t.Fatalf("dry-run must NOT remove the dir; stat err=%v", serr)
+	}
+	// The real project must NOT be flagged.
+	if _, ok := findAction(dry, KindInvalidProjects, real); ok {
+		t.Errorf("real 'fleet' project must not be flagged")
+	}
+
+	// Apply: removes the bogus dir, real project survives.
+	app, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: kinds}, deps)
+	if err != nil {
+		t.Fatalf("apply Reconcile: %v", err)
+	}
+	a2, ok := findAction(app, KindInvalidProjects, bogus)
+	if !ok || a2.Verb != VerbRemoved {
+		t.Fatalf("apply action for %q = %+v (ok=%v); want verb=%q", bogus, a2, ok, VerbRemoved)
+	}
+	if _, serr := os.Stat(bogus); !os.IsNotExist(serr) {
+		t.Fatalf("apply must remove the bogus dir; stat err=%v", serr)
+	}
+	if _, serr := os.Stat(real); serr != nil {
+		t.Fatalf("apply must NOT touch the real project; stat err=%v", serr)
 	}
 }
