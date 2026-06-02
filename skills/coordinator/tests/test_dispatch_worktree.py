@@ -17,6 +17,7 @@ per module under test) so the wrong mock can't mask a regression.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from unittest.mock import patch, MagicMock
 
@@ -132,6 +133,86 @@ def test_create_worktree_passes_base_when_provided(tmp_path) -> None:
         worktree_mod.create_worktree(repo, wt, "worker/alpha-1234", base="main")
     args = m.call_args[0][0]
     assert args[-1] == "main"
+
+
+def test_create_worktree_base_is_last_arg_not_dash_b_target(tmp_path) -> None:
+    """Coord-worktree-stale fix: base must be appended AFTER `-b <branch>`
+    so git creates `worker/<slug>` starting at <base>, not the local
+    HEAD. argv order matters: `worktree add <wt> -b <branch> <base>`."""
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m:
+        worktree_mod.create_worktree(
+            repo, wt, "worker/alpha-1234", base="origin/main",
+        )
+    args = m.call_args[0][0]
+    assert args == [
+        "git", "-C", repo, "worktree", "add", wt, "-b",
+        "worker/alpha-1234", "origin/main",
+    ]
+
+
+# ---------- worktree.py: default-branch resolution + fetch ----------
+
+
+def test_resolve_default_branch_strips_remote_prefix() -> None:
+    """`git symbolic-ref --short refs/remotes/origin/HEAD` returns
+    `origin/<branch>`; we strip the `origin/` to get the bare name."""
+    with patch.object(
+        worktree_mod.subprocess, "run", return_value=_ok(stdout="origin/main\n"),
+    ) as m:
+        assert worktree_mod.resolve_default_branch("/repo") == "main"
+    args = m.call_args[0][0]
+    assert args == [
+        "git", "-C", "/repo", "symbolic-ref", "--short",
+        "refs/remotes/origin/HEAD",
+    ]
+
+
+def test_resolve_default_branch_handles_non_main_default() -> None:
+    with patch.object(
+        worktree_mod.subprocess, "run",
+        return_value=_ok(stdout="origin/master\n"),
+    ):
+        assert worktree_mod.resolve_default_branch("/repo") == "master"
+
+
+def test_resolve_default_branch_falls_back_to_main_on_error() -> None:
+    """Unset origin/HEAD (bare clone, never set) or a git error → "main"
+    so dispatch still proceeds with a sane base."""
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("fatal: ref not a symbolic ref\n")):
+        assert worktree_mod.resolve_default_branch("/repo") == "main"
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        assert worktree_mod.resolve_default_branch("/repo") == "main"
+    assert worktree_mod.resolve_default_branch("") == "main"
+
+
+def test_fetch_remote_invokes_git_fetch_with_argv() -> None:
+    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m:
+        res = worktree_mod.fetch_remote("/repo", "main")
+    assert res.error == ""
+    args = m.call_args[0][0]
+    assert args == ["git", "-C", "/repo", "fetch", "origin", "main"]
+
+
+def test_fetch_remote_surfaces_error_non_fatally() -> None:
+    """Offline / no-remote fetch returns an error string the caller logs;
+    it does NOT raise (caller proceeds with the existing origin ref)."""
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("fatal: could not read from remote\n")):
+        res = worktree_mod.fetch_remote("/repo", "main")
+    assert res.path == ""
+    assert "could not read from remote" in res.error
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        res = worktree_mod.fetch_remote("/repo", "main")
+    assert "fetch_remote:" in res.error
+
+
+def test_fetch_remote_refuses_empty() -> None:
+    with patch.object(worktree_mod.subprocess, "run") as m:
+        res = worktree_mod.fetch_remote("", "main")
+    assert "empty repo/branch" in res.error
+    assert m.call_count == 0
 
 
 def test_create_worktree_idempotent_on_already_exists_when_registered(tmp_path) -> None:
@@ -450,6 +531,9 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     routes = {
         ("/usr/local/bin/fleet", "workers", "worktree-path"):
             _ok(stdout=wt_path + "\n"),
+        # origin/HEAD → default branch "main" (coord-worktree-stale fix).
+        ("git", "-C", repo, "symbolic-ref"): _ok(stdout="origin/main\n"),
+        ("git", "-C", repo, "fetch"): _ok(),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -471,12 +555,18 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
     assert actions[0].worktree == wt_path
     assert actions[0].branch == "worker/alpha-1234"
 
-    # `git worktree add` ran with the expected argv.
+    # Coord-worktree-stale fix: the worker branches off the FRESH
+    # origin/main tip, not local HEAD. We must (1) fetch origin main and
+    # (2) pass base="origin/main" to `git worktree add` so a just-merged
+    # dependency PR is present in the worker's tree.
     git_calls = [c for c in calls if c[:1] == ["git"]]
+    assert ["git", "-C", repo, "fetch", "origin", "main"] in git_calls, \
+        f"expected origin fetch before worktree add; saw: {git_calls}"
     assert any(
-        c == ["git", "-C", repo, "worktree", "add", wt_path, "-b", "worker/alpha-1234"]
+        c == ["git", "-C", repo, "worktree", "add", wt_path, "-b",
+              "worker/alpha-1234", "origin/main"]
         for c in git_calls
-    ), f"expected `git worktree add` call missing; saw: {git_calls}"
+    ), f"expected `git worktree add ... origin/main` call missing; saw: {git_calls}"
 
     # Issue #84 Phase A: no `fleet dispatch` shell-out. The DISPATCH
     # block is the spawn signal; agent_id is minted in-process.
@@ -727,3 +817,115 @@ def test_apply_reconcile_in_review_keeps_worktree(tmp_path) -> None:
     for call in m_wt.call_args_list:
         cmd = call[0][0]
         assert "remove" not in cmd, f"unexpected remove: {cmd}"
+
+
+# ---------- REAL-GIT integration: stale-base regression ----------
+#
+# coord-worktree-stale-bas-b40b. The mocked tests above pin argv shape;
+# this drives a REAL git repo to prove the integrated behavior: when a
+# dependency PR has merged to origin/<default> AFTER the coord's last
+# pull (origin ahead of local HEAD), a dispatched worker's worktree must
+# contain the dependency's merged file. With the fix (fetch + base=
+# origin/<default>) it does; the pre-fix code (branch off local HEAD)
+# leaves the file ABSENT — fails-on-parent.
+
+
+_GIT_ENV = {
+    **os.environ,
+    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+}
+
+
+def _git(repo: str, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", repo, *args],
+        capture_output=True, text=True, env=_GIT_ENV, check=True,
+    )
+    return proc.stdout.strip()
+
+
+@pytest.fixture
+def _stale_clone(tmp_path):
+    """Build: a bare origin with two commits on main, and a clone whose
+    local main is pinned to the FIRST commit (stale — origin advanced
+    after the clone's last fetch). The second commit adds dep.txt, the
+    "merged dependency" file the worker must see.
+
+    Returns (clone_path, origin_default_branch).
+    """
+    git = shutil.which("git")
+    if not git:
+        pytest.skip("git not on PATH")
+
+    origin = str(tmp_path / "origin.git")
+    seed = str(tmp_path / "seed")
+    # Seed working repo → push two commits to a bare origin.
+    subprocess.run(["git", "init", "-q", "-b", "main", seed], check=True, env=_GIT_ENV)
+    (tmp_path / "seed" / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-q", "-m", "c1 base")
+    c1 = _git(seed, "rev-parse", "HEAD")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True, env=_GIT_ENV)
+    _git(seed, "remote", "add", "origin", origin)
+    _git(seed, "push", "-q", "origin", "main")
+
+    # Clone (its local main now points at c1). Set origin/HEAD so
+    # resolve_default_branch finds "main".
+    clone = str(tmp_path / "clone")
+    subprocess.run(["git", "clone", "-q", origin, clone], check=True, env=_GIT_ENV)
+    _git(clone, "remote", "set-head", "origin", "main")
+
+    # Origin advances: add the dependency file via the seed repo, push.
+    (tmp_path / "seed" / "dep.txt").write_text("merged dependency code\n")
+    _git(seed, "add", "dep.txt")
+    _git(seed, "commit", "-q", "-m", "c2 add dependency")
+    _git(seed, "push", "-q", "origin", "main")
+
+    # Sanity: clone's LOCAL main is still at c1 (stale, pre-merge); it
+    # has NOT fetched the dependency commit. This is the bug's premise.
+    assert _git(clone, "rev-parse", "HEAD") == c1
+    assert not os.path.exists(os.path.join(clone, "dep.txt"))
+    return clone, "main"
+
+
+def test_real_git_worker_worktree_contains_merged_dependency(_stale_clone, tmp_path):
+    """fails-on-parent: with the fix, the worker worktree branches off the
+    freshly-fetched origin/main and CONTAINS dep.txt. The pre-fix code
+    branched off the clone's stale local HEAD (c1) → dep.txt absent."""
+    clone, default = _stale_clone
+    assert worktree_mod.resolve_default_branch(clone) == default
+
+    # The exact sequence the dispatch path runs: fetch origin <default>,
+    # then create the worktree off origin/<default>.
+    fetch_res = worktree_mod.fetch_remote(clone, default)
+    assert fetch_res.error == "", fetch_res.error
+
+    wt = str(tmp_path / "wt" / "alpha-1234")
+    res = worktree_mod.create_worktree(
+        clone, wt, "worker/alpha-1234", base=f"origin/{default}",
+    )
+    assert res.error == "", res.error
+
+    # The dependency's merged file is present in the worker's tree.
+    dep = os.path.join(wt, "dep.txt")
+    assert os.path.exists(dep), (
+        "worker worktree is missing the merged dependency file — it "
+        "branched off stale local HEAD instead of origin/main"
+    )
+    assert open(dep).read() == "merged dependency code\n"
+
+
+def test_real_git_branch_off_local_head_misses_dependency(_stale_clone, tmp_path):
+    """Pins the BUG: branching the worktree off the clone's local HEAD
+    (no base, no fetch — old behavior) yields a tree WITHOUT dep.txt.
+    Guards against a regression that drops the fetch+base wiring."""
+    clone, _default = _stale_clone
+    wt = str(tmp_path / "wt-stale" / "alpha-1234")
+    # Old behavior: base="" → branch off local HEAD (c1, stale).
+    res = worktree_mod.create_worktree(clone, wt, "stale/alpha-1234")
+    assert res.error == "", res.error
+    assert not os.path.exists(os.path.join(wt, "dep.txt")), (
+        "expected stale tree to miss the dependency — if this file "
+        "exists the fixture is not modeling origin-ahead-of-local"
+    )

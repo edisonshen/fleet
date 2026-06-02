@@ -84,6 +84,88 @@ def compute_worktree_path(
     return out.rstrip(os.sep)
 
 
+def resolve_default_branch(
+    repo: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 10.0,
+) -> str:
+    """Resolve <repo>'s default branch name (e.g. "main", "master").
+
+    Strategy (first hit wins):
+      1. `git -C <repo> symbolic-ref --short refs/remotes/<remote>/HEAD`
+         → e.g. "origin/main"; strip the "<remote>/" prefix. This is the
+         remote's published default, recorded at clone time. It is the
+         authoritative answer and is what we branch workers off of.
+      2. Fallback to "main" when symbolic-ref is unset / errors. A bare
+         clone or a repo whose origin/HEAD was never set won't have the
+         ref; "main" is the modern default and matches fleet's own repo.
+
+    Returns the branch NAME only (no remote prefix). Never raises — a
+    detached / non-git / no-remote repo falls through to "main", which
+    the caller then qualifies as "<remote>/main" for the fetch + base.
+    """
+    if not repo:
+        return "main"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "symbolic-ref", "--short",
+             f"refs/remotes/{remote}/HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "main"
+    if proc.returncode != 0:
+        return "main"
+    out = (proc.stdout or "").strip()
+    # symbolic-ref --short returns "<remote>/<branch>"; strip the remote.
+    prefix = f"{remote}/"
+    if out.startswith(prefix):
+        out = out[len(prefix):]
+    return out or "main"
+
+
+def fetch_remote(
+    repo: str,
+    branch: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 60.0,
+) -> WorktreeResult:
+    """`git -C <repo> fetch <remote> <branch>` — refresh the remote ref.
+
+    Why: a worker worktree branched off the coord's LOCAL HEAD inherits
+    whatever the coord last pulled. When a dependency PR merges to
+    origin/<branch> AFTER the coord's last fetch, local <branch> is
+    stale and the worker's tree is missing the dependency's code. We
+    fetch the remote ref immediately before `git worktree add` so the
+    worktree can branch off the fresh origin/<branch> tip.
+
+    Returns WorktreeResult with empty error on success. On failure
+    (offline, no remote, bad branch) the caller treats it as non-fatal:
+    it logs and proceeds to branch off the (possibly stale) origin ref
+    that already exists locally — better a stale base than no dispatch.
+    A missing remote is the common non-git-server case; we don't want
+    to wedge all of cap on a transient network blip.
+
+    Best-effort by contract. Empty repo/branch is a refusing no-op so a
+    caller bug can't shell `git fetch origin ''`.
+    """
+    if not repo or not branch:
+        return WorktreeResult(error="fetch_remote: empty repo/branch")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "fetch", remote, branch],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return WorktreeResult(error=f"fetch_remote: {exc}")
+    if proc.returncode == 0:
+        return WorktreeResult(path=repo)
+    stderr = (proc.stderr or proc.stdout or "").strip()
+    return WorktreeResult(error=f"fetch_remote: git fetch {remote} {branch}: {stderr}")
+
+
 def create_worktree(
     repo: str,
     wt_path: str,

@@ -4678,10 +4678,13 @@ def _dispatch_ready(
 
     Worktree-mode (cap > 1): each dispatched worker gets its own git
     worktree under ~/.fleet/projects/<p>/worktrees/<slug>/, branched
-    `worker/<slug>` off the repo's current HEAD. Worker's cwd is the
-    worktree path (NOT the main repo). A failed worktree create
-    aborts that one dispatch — the loop continues with the next
-    candidate so a stale on-disk worktree doesn't block all of cap.
+    `worker/<slug>` off the FRESH origin/<default-branch> tip (we fetch
+    origin/<default> first), NOT off the coord's local HEAD — so a
+    dependency PR that just merged to origin is present in the worker's
+    tree even if the coord never pulled. Worker's cwd is the worktree
+    path (NOT the main repo). A failed worktree create aborts that one
+    dispatch — the loop continues with the next candidate so a stale
+    on-disk worktree doesn't block all of cap.
 
     Single-worker mode (cap == 1): unchanged from v0.2.0 — every
     worker uses the project's main repo as its cwd, no worktree, no
@@ -4737,8 +4740,32 @@ def _dispatch_ready(
                     error=f"worktree-path resolution failed for {t.slug}",
                 ))
                 continue
+            # Branch the worker off the FRESH origin/<default> tip, not the
+            # coord's local HEAD. A dependency PR that merged to
+            # origin/<default> after the coord's last pull leaves local
+            # <default> stale; branching off local HEAD would hand the
+            # worker a tree missing the dependency's merged code (the exact
+            # depends_on-defeating bug this fixes). Resolve the remote
+            # default branch, fetch it, then pass base="origin/<default>".
+            #
+            #   coord local main (stale) ──┐
+            #                              ├─ git worktree add -b worker/<s>
+            #   origin/main (fresh, +dep) ─┘   base=origin/main  ◄── we use this
+            #
+            # fetch is best-effort: on failure we log and still branch off
+            # whatever origin/<default> exists locally (better a possibly
+            # stale base than wedging all of cap on a network blip).
+            default_branch = worktree_mod.resolve_default_branch(cwd)
+            base_ref = f"origin/{default_branch}"
+            fetch_res = worktree_mod.fetch_remote(cwd, default_branch)
+            if fetch_res.error:
+                print(
+                    f"coord: {fetch_res.error}; branching {t.slug} off "
+                    f"possibly-stale {base_ref}",
+                    file=sys.stderr,
+                )
             wt_result = worktree_mod.create_worktree(
-                cwd, wt_path, worker_branch,
+                cwd, wt_path, worker_branch, base=base_ref,
             )
             if wt_result.error:
                 actions.append(_DispatchAction(
