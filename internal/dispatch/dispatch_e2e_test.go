@@ -55,7 +55,9 @@ func TestE2E_CoordPromptInbox_FullCycle(t *testing.T) {
 		t.Fatalf("Outcome = %q; want acquired", acq.Outcome)
 	}
 
-	// Inbox file present, journal present + ExecInFlight.
+	// Inbox file present, journal present + ExecPending (dispatch-
+	// durability #184: acquire no longer flips to ExecInFlight; the
+	// coord durably flips pending → launch_attempted before launch).
 	if _, err := os.Stat(acq.Path); err != nil {
 		t.Fatalf("inbox missing post-acquire: %v", err)
 	}
@@ -63,8 +65,8 @@ func TestE2E_CoordPromptInbox_FullCycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadJournal post-acquire: %v", err)
 	}
-	if j.ExecState != ExecInFlight {
-		t.Errorf("exec_state = %q post-acquire; want in_flight", j.ExecState)
+	if j.ExecState != ExecPending {
+		t.Errorf("exec_state = %q post-acquire; want pending", j.ExecState)
 	}
 	if j.ReclState != ReclPending {
 		t.Errorf("recl_state = %q post-acquire; want pending", j.ReclState)

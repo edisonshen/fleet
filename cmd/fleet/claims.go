@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/spf13/cobra"
 
@@ -58,7 +59,30 @@ type claimsResponse struct {
 	Kind       string `json:"kind,omitempty"`
 	Path       string `json:"path,omitempty"`
 	Error      string `json:"error,omitempty"`
+	// Generation is the journal's launch token. Emitted by the
+	// dispatch-durability (#184) subcommands so loop.py can stamp the
+	// re-emitted DISPATCH block with the gen the journal currently holds
+	// (reserve-replay / reset-for-relaunch return the NEW gen). A pointer
+	// so omitempty drops it from the legacy acquire/release/inspect
+	// envelopes that don't carry a generation.
+	Generation *int `json:"generation,omitempty"`
 }
+
+// dispatch-durability (#184) subcommand outcome strings. The Python
+// coord (loop.py / register_subagent / handoff_resume) branches on the
+// `outcome` JSON field; exit codes are a secondary signal (the tri-state
+// for mark-launch-attempted gets distinct non-zero codes so a shell
+// caller can branch without parsing JSON).
+const (
+	outcomeLaunchOK         = "ok"             // pending → launch_attempted flipped
+	outcomePredicateFail    = "predicate_fail" // not pending / gen mismatch → skip
+	outcomeContention       = "contention"     // flock deadline → TRANSIENT, retry
+	outcomeAcked            = "acked"          // launch_attempted → acked
+	outcomeReplayReserved   = "reserved"       // replay emission reserved
+	outcomeReplayCapped     = "capped"         // cap hit → journal ExecBlocked
+	outcomeReplayNotPending = "not_pending"    // not ExecPending → no replay
+	outcomeReset            = "reset"          // entry reset to fresh ExecPending
+)
 
 // claimsExitCode maps outcome strings to the stable exit code table.
 // Any outcome not in this table exits 1 (caller error).
@@ -67,7 +91,15 @@ func claimsExitCode(outcome string) int {
 	case dispatch.OutcomeAcquired,
 		dispatch.OutcomeAlreadyAcquired,
 		dispatch.OutcomeReleased,
-		dispatch.OutcomeAlreadyReleased:
+		dispatch.OutcomeAlreadyReleased,
+		// #184 success-shaped outcomes (no stderr noise; loop.py reads
+		// stdout JSON). "capped" and "reset" are durable successes —
+		// the journal mutation landed — so they exit 0.
+		outcomeLaunchOK,
+		outcomeAcked,
+		outcomeReplayReserved,
+		outcomeReplayCapped,
+		outcomeReset:
 		return 0
 	case dispatch.OutcomeNotOwned:
 		return 10
@@ -75,6 +107,15 @@ func claimsExitCode(outcome string) int {
 		return 11
 	case dispatch.OutcomeContested:
 		return 12
+	// #184 non-error, non-success outcomes: distinct codes so a shell
+	// caller can branch on $? without JSON parsing. The coord protocol
+	// (SKILL.md) keys on the JSON `outcome` field.
+	case outcomePredicateFail:
+		return 20
+	case outcomeContention:
+		return 21
+	case outcomeReplayNotPending:
+		return 22
 	default:
 		return 1
 	}
@@ -90,6 +131,11 @@ func newClaimsCmd() *cobra.Command {
 	cmd.AddCommand(newClaimsAcquirePromptCmd())
 	cmd.AddCommand(newClaimsReleaseCmd())
 	cmd.AddCommand(newClaimsInspectCmd())
+	// dispatch-durability (#184) launch-state subcommands.
+	cmd.AddCommand(newClaimsMarkLaunchAttemptedCmd())
+	cmd.AddCommand(newClaimsMarkAckedCmd())
+	cmd.AddCommand(newClaimsReserveReplayCmd())
+	cmd.AddCommand(newClaimsResetForRelaunchCmd())
 	return cmd
 }
 
@@ -331,4 +377,222 @@ func claimsOutcomeFromErr(err error) string {
 		return e.outcome
 	}
 	return ""
+}
+
+// ============================================================
+// dispatch-durability (#184) launch-state subcommands
+// ============================================================
+
+// newClaimsMarkLaunchAttemptedCmd implements `fleet claims
+// mark-launch-attempted <id> <gen>` — the tri-state CAS the coord runs
+// IMMEDIATELY before invoking the host Agent (SKILL.md "Worker dispatch
+// protocol" step 2). Three distinct outcomes the coord MUST branch on:
+//
+//	ok             (exit 0)  → flip landed; LAUNCH the Agent.
+//	predicate_fail (exit 20) → not pending / stale gen; another path owns
+//	                           this launch; SKIP, do NOT launch.
+//	contention     (exit 21) → flock deadline; TRANSIENT; retry the SAME
+//	                           block next tick; NEVER treat as skip.
+func newClaimsMarkLaunchAttemptedCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "mark-launch-attempted <dispatch-id> <generation>",
+		Short:  "Flip pending → launch_attempted iff gen matches (tri-state CAS)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(2),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runClaimsMarkLaunchAttempted(c.OutOrStdout(), args[0], args[1])
+		},
+	}
+	return cmd
+}
+
+func runClaimsMarkLaunchAttempted(stdout io.Writer, dispatchID, genStr string) error {
+	if _, err := state.Bootstrap(); err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("bootstrap ~/.fleet: %w", err))
+	}
+	id, err := dispatch.NewDispatchID(dispatchID)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	gen, err := strconv.Atoi(genStr)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("invalid generation %q: %w", genStr, err))
+	}
+	outcome, err := dispatch.MarkLaunchAttempted(id, gen)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	var outStr string
+	switch outcome {
+	case dispatch.LaunchAttemptOK:
+		outStr = outcomeLaunchOK
+	case dispatch.LaunchAttemptPredicateFail:
+		outStr = outcomePredicateFail
+	case dispatch.LaunchAttemptContention:
+		outStr = outcomeContention
+	default:
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("unexpected launch-attempt outcome %q", outcome))
+	}
+	return emitOutcome(stdout, claimsResponse{
+		Outcome:    outStr,
+		DispatchID: id.String(),
+		Kind:       dispatch.KindCoordPromptInbox,
+	})
+}
+
+// newClaimsMarkAckedCmd implements `fleet claims mark-acked <id>` —
+// register_subagent flips launch_attempted → acked (best-effort).
+func newClaimsMarkAckedCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "mark-acked <dispatch-id>",
+		Short:  "Flip launch_attempted → acked (best-effort, idempotent)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runClaimsMarkAcked(c.OutOrStdout(), args[0])
+		},
+	}
+	return cmd
+}
+
+func runClaimsMarkAcked(stdout io.Writer, dispatchID string) error {
+	if _, err := state.Bootstrap(); err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("bootstrap ~/.fleet: %w", err))
+	}
+	id, err := dispatch.NewDispatchID(dispatchID)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	if err := dispatch.MarkAcked(id); err != nil {
+		if errors.Is(err, dispatch.ErrJournalContention) {
+			// Best-effort: contention is non-fatal for ack (the chip just
+			// stays empty); surface it as a distinct outcome so the coord
+			// can log + move on without treating it as an error.
+			return emitOutcome(stdout, claimsResponse{
+				Outcome:    outcomeContention,
+				DispatchID: id.String(),
+				Kind:       dispatch.KindCoordPromptInbox,
+			})
+		}
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	return emitOutcome(stdout, claimsResponse{
+		Outcome:    outcomeAcked,
+		DispatchID: id.String(),
+		Kind:       dispatch.KindCoordPromptInbox,
+	})
+}
+
+// newClaimsReserveReplayCmd implements `fleet claims reserve-replay <id>
+// [--cap N]` — the tick-entry replay primitive. Increments the durable
+// replay counter under the flock BEFORE the block reaches tick output;
+// returns the launch token (generation) to stamp on the re-emitted block.
+func newClaimsReserveReplayCmd() *cobra.Command {
+	var cap int
+	cmd := &cobra.Command{
+		Use:    "reserve-replay <dispatch-id>",
+		Short:  "Reserve a replay emission (increment cap, return launch gen)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runClaimsReserveReplay(c.OutOrStdout(), args[0], cap)
+		},
+	}
+	cmd.Flags().IntVar(&cap, "cap", 5,
+		"total-per-dispatch replay cap; at/over cap the journal flips to ExecBlocked")
+	return cmd
+}
+
+func runClaimsReserveReplay(stdout io.Writer, dispatchID string, cap int) error {
+	if _, err := state.Bootstrap(); err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("bootstrap ~/.fleet: %w", err))
+	}
+	id, err := dispatch.NewDispatchID(dispatchID)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	if cap < 1 {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("invalid --cap %d: must be >= 1", cap))
+	}
+	res, err := dispatch.ReserveReplay(id, cap)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	resp := claimsResponse{DispatchID: id.String(), Kind: dispatch.KindCoordPromptInbox}
+	switch res.Outcome {
+	case dispatch.ReplayReserved:
+		resp.Outcome = outcomeReplayReserved
+		g := res.Generation
+		resp.Generation = &g
+	case dispatch.ReplayCapped:
+		resp.Outcome = outcomeReplayCapped
+	case dispatch.ReplayNotPending:
+		resp.Outcome = outcomeReplayNotPending
+	case dispatch.ReplayAbsent:
+		resp.Outcome = dispatch.OutcomeAbsent
+	case dispatch.ReplayContention:
+		resp.Outcome = outcomeContention
+	default:
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("unexpected reserve-replay outcome %q", res.Outcome))
+	}
+	return emitOutcome(stdout, resp)
+}
+
+// newClaimsResetForRelaunchCmd implements `fleet claims
+// reset-for-relaunch <id>` — handoff_resume.py re-arms an existing
+// dispatch. Reads the new prompt on stdin, then under one flock rewrites
+// the inbox + resets the entry to a fresh ExecPending with a bumped
+// generation. Returns the NEW gen for the resume DISPATCH block.
+func newClaimsResetForRelaunchCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:    "reset-for-relaunch <dispatch-id>",
+		Short:  "Rewrite inbox (stdin) + reset entry to fresh ExecPending (gen-bumped)",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(c *cobra.Command, args []string) error {
+			return runClaimsResetForRelaunch(c.OutOrStdout(), c.InOrStdin(), args[0])
+		},
+	}
+	return cmd
+}
+
+func runClaimsResetForRelaunch(stdout io.Writer, stdin io.Reader, dispatchID string) error {
+	if _, err := state.Bootstrap(); err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("bootstrap ~/.fleet: %w", err))
+	}
+	id, err := dispatch.NewDispatchID(dispatchID)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	res, err := dispatch.ResetForRelaunch(id, stdin)
+	if err != nil {
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox, err)
+	}
+	resp := claimsResponse{
+		DispatchID: id.String(),
+		Kind:       dispatch.KindCoordPromptInbox,
+		Path:       res.Path,
+	}
+	switch res.Outcome {
+	case dispatch.ResetDone:
+		resp.Outcome = outcomeReset
+		g := res.Generation
+		resp.Generation = &g
+	case dispatch.ResetAbsent:
+		resp.Outcome = dispatch.OutcomeAbsent
+	case dispatch.ResetContention:
+		resp.Outcome = outcomeContention
+	default:
+		return emitErrorAndFail(stdout, dispatchID, dispatch.KindCoordPromptInbox,
+			fmt.Errorf("unexpected reset-for-relaunch outcome %q", res.Outcome))
+	}
+	return emitOutcome(stdout, resp)
 }

@@ -40,15 +40,42 @@ const SchemaVersion = "v1"
 
 // ExecState is the dispatch's execution lifecycle stage.
 //
-//	pending → in_flight → { done | blocked | failed }
+// Dispatch-durability (fleet#184) reshaped the live launch path:
+//
+//	pending → launch_attempted → acked → { done | blocked | failed }
+//
+// in_flight is RETIRED from the live path (acquire no longer sets it)
+// but is still PARSED as a legacy alias for on-disk entries written by
+// the pre-#184 binary — see ExecInFlight's doc.
 type ExecState string
 
 const (
-	ExecPending  ExecState = "pending"
+	ExecPending ExecState = "pending"
+	// ExecInFlight is RETIRED from the live path as of fleet#184.
+	// Pre-#184 acquire flipped a fresh journal to in_flight at
+	// inbox-write time, which was premature (the coord had not yet
+	// launched the Agent). Acquire now leaves the entry at ExecPending
+	// and it is the COORD that durably flips pending → launch_attempted
+	// immediately before invoking the Agent tool. The constant stays so
+	// old on-disk journals parse without error; nothing in the live
+	// path WRITES it anymore. Treated as non-terminal (same as before).
 	ExecInFlight ExecState = "in_flight"
-	ExecDone     ExecState = "done"
-	ExecBlocked  ExecState = "blocked"
-	ExecFailed   ExecState = "failed"
+	// ExecLaunchAttempted is set by the coord (via `fleet claims
+	// mark-launch-attempted`) under the per-journal flock, IMMEDIATELY
+	// before it invokes the host Agent tool. This is the durable
+	// "launch was attempted" record that makes replay safe: replay
+	// re-emits ONLY ExecPending entries (coord never flipped them ⇒
+	// never launched), and NEVER ExecLaunchAttempted (the double-launch
+	// trap — a launched-but-unacked worker frequently has no ack because
+	// register_subagent is best-effort).
+	ExecLaunchAttempted ExecState = "launch_attempted"
+	// ExecAcked is set when register_subagent succeeds (best-effort; may
+	// be skipped on lock contention). A live, acked worker is left
+	// alone by replay.
+	ExecAcked   ExecState = "acked"
+	ExecDone    ExecState = "done"
+	ExecBlocked ExecState = "blocked"
+	ExecFailed  ExecState = "failed"
 )
 
 // IsTerminal reports whether this ExecState is one of the terminal
@@ -192,6 +219,38 @@ type Journal struct {
 	ReclState     ReclState     `json:"recl_state"`
 	BlockedReason string        `json:"blocked_reason,omitempty"`
 	Claims        []ClaimInline `json:"claims"`
+
+	// --- dispatch-durability (fleet#184) ---
+
+	// Generation is bumped under the per-journal flock on every
+	// lifecycle reset (acquire of a fresh journal starts at 0;
+	// reset-for-relaunch bumps it). It is an audit/version field AND
+	// the launch token: a DISPATCH block carries the generation it was
+	// emitted for, and `mark-launch-attempted <id> <gen>` flips
+	// pending → launch_attempted ONLY if the on-disk generation still
+	// equals the token. A stale re-emitted block (from a tick that read
+	// an older lifecycle) carries an old gen → predicate-fail → cannot
+	// consume a later lifecycle's launch. NOT the concurrency primitive
+	// (the flock is) — see store.go withJournalLock.
+	Generation int `json:"generation"`
+
+	// LaunchAttemptedAt records when the coord durably flipped
+	// pending → launch_attempted. Residual-crash repair fires on
+	// (launch_attempted && !acked && no-live-subagent && now-this >
+	// LAUNCH_ACK_GRACE) → ExecBlocked + off-channel escalation.
+	LaunchAttemptedAt time.Time `json:"launch_attempted_at,omitempty"`
+
+	// ReplayEmitAttempts counts RESERVED replay emissions (not
+	// deliveries). reserve-replay increments it under the flock BEFORE
+	// the block is added to tick output, so a broken-pipe print still
+	// advances the cap — no infinite re-emit across coord restarts. The
+	// cap is total-per-dispatch, not per-coord-process.
+	ReplayEmitAttempts int `json:"replay_emit_attempts,omitempty"`
+
+	// LastReplayAt / LastReplayError are debug breadcrumbs for the
+	// replay path (last reserved emission + last recorded error).
+	LastReplayAt    time.Time `json:"last_replay_at,omitempty"`
+	LastReplayError string    `json:"last_replay_error,omitempty"`
 }
 
 // ClaimInline is the on-disk envelope for any claim, regardless of

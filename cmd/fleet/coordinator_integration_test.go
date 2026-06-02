@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -334,6 +335,44 @@ print(json.dumps({
 		t.Logf("loop.tick stderr (informational): %s", errb.String())
 	}
 	return out.String()
+}
+
+// markLaunched simulates the coord's "Worker dispatch protocol" step 2
+// (dispatch-durability #184): for every dispatch journal currently at
+// ExecPending, flip it to launch_attempted via `fleet claims
+// mark-launch-attempted <id> <gen>`. The real coord does this between
+// ticks immediately before invoking the Agent; integration tests that
+// drive ticks directly must replicate it, otherwise the journals stay
+// ExecPending and the tick-entry replay reconcile re-emits them (a
+// faithful behavior, but it inflates the `dispatched` count the
+// pre-#184 single-launch tests assert on).
+func (env *integrationEnv) markLaunched(t *testing.T) {
+	t.Helper()
+	dispDir := filepath.Join(env.fleetHome, "dispatches")
+	entries, err := os.ReadDir(dispDir)
+	if err != nil {
+		return // no journals yet
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".json.lock") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".json")
+		raw, rerr := os.ReadFile(filepath.Join(dispDir, name))
+		if rerr != nil {
+			continue
+		}
+		var j struct {
+			ExecState  string `json:"exec_state"`
+			Generation int    `json:"generation"`
+		}
+		if json.Unmarshal(raw, &j) != nil || j.ExecState != "pending" {
+			continue
+		}
+		env.runFleet(t, "claims", "mark-launch-attempted", id,
+			strconv.Itoa(j.Generation))
+	}
 }
 
 // plantCoord seeds an agent record + live tmux session standing in for
@@ -1050,6 +1089,12 @@ func TestCoordParallelDispatch_SkipsOverlappingTasks(t *testing.T) {
 		t.Fatalf("first tick did not dispatch exactly 2 (expected A+C, B skipped): %s", out1)
 	}
 	assertNoTickErrors(t, out1)
+
+	// dispatch-durability (#184): simulate the coord flipping the
+	// dispatched workers' journals to launch_attempted (protocol step 2)
+	// so the tick-#2 replay reconcile doesn't re-emit A/C (which would
+	// inflate the dispatch count this conflict test asserts on).
+	env.markLaunched(t)
 
 	taskA := env.readTask(t, slugA)
 	taskB := env.readTask(t, slugB)

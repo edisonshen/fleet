@@ -140,6 +140,22 @@ def env_poll_max_s() -> int:
     return _env_int("FLEET_COORD_POLL_MAX_S", 14400)
 
 
+def env_supervisor_max_s() -> int:
+    """Tighter wall-clock cap on a SINGLE supervisor loop invocation
+    (loop-supervisor-sigpipe-5263). The supervisor holds
+    coordinator.lock for its whole duration, so a wedged loop blocks
+    every other tick for the project. poll_max_s defaults to 4h — far
+    too long to hold the lock if the loop wedges. This cap (default
+    30 min) bounds how long one tick can ever hold the lock; the
+    harness re-ticks after the loop exits and frees the lock.
+
+    0 disables the extra cap (poll_max_s alone governs) — matches the
+    supervisor's zero-disables convention. The effective cap is
+    min(poll_max_s, supervisor_max_s) when both are > 0.
+    """
+    return _env_int("FLEET_COORD_SUPERVISOR_MAX_S", 1800)
+
+
 def env_idle_ttl_h() -> int:
     """Hours of inactivity before an idle agent record is auto-archived
     via `fleet rm <id>` (dashboard-accumulation-f-4421 Sub-fix C).
@@ -226,6 +242,13 @@ class SupervisorConfig:
     stuck_polls: int = 3                # 0 → fire recovery on first stuck pass
     nudge_cooldown_s: int = 120
     poll_max_s: int = 14400             # hard wall-clock cap
+    # loop-supervisor-sigpipe-5263: tighter per-invocation cap so a
+    # wedged loop can never hold coordinator.lock for the full
+    # poll_max_s. 0 → disabled (poll_max_s governs alone). When > 0 the
+    # effective cap is min(poll_max_s, supervisor_max_s). Defaulted to 0
+    # on the dataclass so explicit-construction call sites (tests) opt
+    # in deliberately; from_env() supplies the production 30-min default.
+    supervisor_max_s: int = 0
     # Invariant-4 adaptive cadence (DESIGN-subagent-lifecycle.md §4).
     #   poll_base_interval_s     — per-probe poll cadence default (5 s).
     #   poll_backoff_interval_s  — dilated cadence after stability (30 s).
@@ -246,6 +269,7 @@ class SupervisorConfig:
             stuck_polls=env_stuck_polls(),
             nudge_cooldown_s=env_nudge_cooldown_s(),
             poll_max_s=env_poll_max_s(),
+            supervisor_max_s=env_supervisor_max_s(),
             poll_base_interval_s=env_poll_base_interval_s(),
             poll_backoff_interval_s=env_poll_backoff_interval_s(),
             poll_stability_window_s=env_poll_stability_window_s(),
@@ -430,16 +454,30 @@ def emit(line: str, *, stream=None) -> None:
     """Print a structured log line. Defaults to stdout; tests inject a
     StringIO. Newline appended if missing. The supervisor prefixes
     every line with `[coord]` so operators tail-grepping the coord's
-    tmux pane can isolate supervisor output from worker output."""
+    tmux pane can isolate supervisor output from worker output.
+
+    loop-supervisor-sigpipe-5263: BrokenPipeError is NOT swallowed. A
+    broken pipe means the read end is gone (e.g. the tick was piped
+    through `head` which closed after N lines) — the supervisor has no
+    way to communicate, including emitting the DISPATCH block that is
+    the whole point of the loop. Re-raise so run_supervisor exits the
+    loop and the caller releases coordinator.lock instead of spinning
+    until poll_max_s while holding the lock (the observed wedge). Other
+    OSErrors (transient write faults, a momentarily-full pane) are still
+    swallowed — they don't imply the channel is permanently dead."""
     out = stream if stream is not None else sys.stdout
     if not line.endswith("\n"):
         line = line + "\n"
     try:
         out.write(line)
         out.flush()
+    except BrokenPipeError:
+        # Read end is gone for good — propagate so the loop bails and
+        # the lock is released for the next tick.
+        raise
     except OSError:
-        # Closed pipe (operator detached the tmux pane mid-emit).
-        # Swallow — supervisor must not crash on log failure.
+        # Non-pipe write fault (detached pane mid-emit, transient).
+        # Swallow — supervisor must not crash on a one-off log failure.
         pass
 
 
@@ -1046,6 +1084,28 @@ def run_supervisor(
         return res
 
     started_at = now_fn()
+    # loop-supervisor-sigpipe-5263: a single supervisor invocation holds
+    # coordinator.lock for its whole duration, so it must NEVER outlive
+    # the tighter of the two wall-clock caps. supervisor_max_s (default
+    # 30 min via from_env) bounds lock-hold; poll_max_s (4h) is the
+    # legacy outer bound. Both 0-disable independently; the effective
+    # cap is the smallest positive value.
+    effective_max_s = cfg.poll_max_s
+    if cfg.supervisor_max_s > 0:
+        if effective_max_s > 0:
+            effective_max_s = min(effective_max_s, cfg.supervisor_max_s)
+        else:
+            effective_max_s = cfg.supervisor_max_s
+    # Distinct exit_reason when the supervisor-specific cap is the
+    # binding one, so operators can tell "tick capped to bound lock
+    # hold" apart from "hit the 4h outer ceiling".
+    max_exit_reason = (
+        "supervisor-max-duration"
+        if (cfg.supervisor_max_s > 0
+            and (cfg.poll_max_s <= 0
+                 or cfg.supervisor_max_s <= cfg.poll_max_s))
+        else "max-duration"
+    )
     # Codex iter-11 [P1] + iter-21 [P3]: snapshot the direct-inbox
     # mtime at session start so the "operator wrote to inbox → exit"
     # gate fires only when the file actually changes during
@@ -1084,300 +1144,393 @@ def run_supervisor(
         last_change_ts[p.slug] = started_at
 
     if not has_active_workers(probes):
-        res.exit_reason = "no-active-workers"
-        emit("[coord] supervisor loop exiting: no active workers", stream=log_stream)
+        # loop-supervisor-sigpipe-5263 (codex iter-6 [P3]): this early
+        # exit's emit() sits BEFORE the main broken-pipe try-block, but
+        # emit() now re-raises BrokenPipeError. If stdout is already
+        # closed when there are no active workers, an unguarded emit here
+        # would propagate out of run_supervisor instead of returning a
+        # clean result. Guard it the same way the main loop does.
+        try:
+            emit("[coord] supervisor loop exiting: no active workers", stream=log_stream)
+            res.exit_reason = "no-active-workers"
+        except BrokenPipeError:
+            res.exit_reason = "stdout-broken"
         return res
 
-    emit(
-        f"[coord] supervisor loop starting: {len(probes)} active workers, "
-        f"poll={cfg.poll_interval_s}s base={cfg.poll_base_interval_s}s "
-        f"backoff={cfg.poll_backoff_interval_s}s "
-        f"stuck_every={cfg.stuck_check_every} "
-        f"threshold={cfg.stuck_threshold_s}s",
-        stream=log_stream,
-    )
+    # loop-supervisor-sigpipe-5263: wrap the entire poll loop so a
+    # BrokenPipeError raised by emit() (read end of stdout closed, e.g.
+    # the tick was piped through `head`) unwinds the loop instead of
+    # being swallowed and spun on. We exit with a distinct reason; the
+    # caller (loop._tick_locked) releases coordinator.lock in its
+    # finally, so the next tick can recover rather than the loop pinning
+    # the lock until poll_max_s while writing into a dead pipe.
+    try:
+        emit(
+            f"[coord] supervisor loop starting: {len(probes)} active workers, "
+            f"poll={cfg.poll_interval_s}s base={cfg.poll_base_interval_s}s "
+            f"backoff={cfg.poll_backoff_interval_s}s "
+            f"stuck_every={cfg.stuck_check_every} "
+            f"threshold={cfg.stuck_threshold_s}s",
+            stream=log_stream,
+        )
 
-    while True:
-        if now_fn() - started_at >= cfg.poll_max_s:
-            res.exit_reason = "max-duration"
-            emit("[coord] supervisor loop exiting: max duration reached", stream=log_stream)
-            break
+        while True:
+            if effective_max_s > 0 and now_fn() - started_at >= effective_max_s:
+                res.exit_reason = max_exit_reason
+                emit(
+                    "[coord] supervisor loop exiting: max duration reached",
+                    stream=log_stream,
+                )
+                break
 
-        # Invariant 4: compute the next sleep adaptively. Probes still
-        # in their stability window force base cadence; otherwise back
-        # off. force_tick_check is the inbox/queue event surface — if
-        # an event is queued we sleep 0 (effectively "skip the wait")
-        # and call force_tick_dispatch so a NEW_TASK / drain event
-        # actually drains + dispatches under cap (codex iter-3 [P2]).
-        forced = False
-        if force_tick_check is not None:
-            try:
-                forced = bool(force_tick_check())
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"force_tick_check: {exc}")
-                forced = False
-        if forced:
-            # Codex iter-19 [P2]: enforce a small floor on consecutive
-            # forced wakes so a chronic force-tick condition (e.g.,
-            # tasks.md parse error preventing watermark advance)
-            # doesn't peg the supervisor at 0-second polls. The
-            # 100-ms floor is large enough to keep CPU usage sane
-            # but small enough that genuine fast-wake handling still
-            # responds quickly.
-            sleep_s = 0.1
-        else:
-            sleep_s = compute_next_sleep_s(
-                cfg=cfg,
-                probes=probes,
-                last_change_ts=last_change_ts,
-                now_unix=now_fn(),
-            )
-        if sleep_s > 0:
-            sleep_fn(sleep_s)
-        poll_count += 1
-        res.iterations += 1
+            # Invariant 4: compute the next sleep adaptively. Probes still
+            # in their stability window force base cadence; otherwise back
+            # off. force_tick_check is the inbox/queue event surface — if
+            # an event is queued we sleep 0 (effectively "skip the wait")
+            # and call force_tick_dispatch so a NEW_TASK / drain event
+            # actually drains + dispatches under cap (codex iter-3 [P2]).
+            forced = False
+            if force_tick_check is not None:
+                try:
+                    forced = bool(force_tick_check())
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"force_tick_check: {exc}")
+                    forced = False
+            if forced:
+                # Codex iter-19 [P2]: enforce a small floor on consecutive
+                # forced wakes so a chronic force-tick condition (e.g.,
+                # tasks.md parse error preventing watermark advance)
+                # doesn't peg the supervisor at 0-second polls. The
+                # 100-ms floor is large enough to keep CPU usage sane
+                # but small enough that genuine fast-wake handling still
+                # responds quickly.
+                sleep_s = 0.1
+            else:
+                sleep_s = compute_next_sleep_s(
+                    cfg=cfg,
+                    probes=probes,
+                    last_change_ts=last_change_ts,
+                    now_unix=now_fn(),
+                )
+            # loop-supervisor-sigpipe-5263 (codex iter-1 [P2]): clamp the
+            # sleep to the remaining cap budget. compute_next_sleep_s can
+            # return a long interval (e.g. poll_interval_s=3600s in legacy
+            # mode); without clamping the loop would sleep the full
+            # interval and only re-check the cap on the NEXT iteration,
+            # holding coordinator.lock past effective_max_s and defeating
+            # the lock-hold bound this task adds. Clamp so the loop wakes
+            # exactly at the cap and exits via the top-of-loop check.
+            if effective_max_s > 0:
+                remaining = effective_max_s - (now_fn() - started_at)
+                if remaining <= 0:
+                    sleep_s = 0
+                elif sleep_s > remaining:
+                    sleep_s = remaining
+            if sleep_s > 0:
+                sleep_fn(sleep_s)
+            # loop-supervisor-sigpipe-5263 (codex iter-3 [P2]): re-check
+            # the cap IMMEDIATELY after the (clamped) sleep. The clamp wakes
+            # us exactly at the budget, but without this short-circuit the
+            # loop would still run the full poll body (refresh_probes,
+            # reconcile, stuck-check, idle-archive) before the top-of-loop
+            # check — holding coordinator.lock past supervisor_max_s when a
+            # poll body is slow. Break here so the cap is a true ceiling on
+            # lock-hold, not "cap + one poll body".
+            if effective_max_s > 0 and now_fn() - started_at >= effective_max_s:
+                res.exit_reason = max_exit_reason
+                emit(
+                    "[coord] supervisor loop exiting: max duration reached",
+                    stream=log_stream,
+                )
+                break
+            poll_count += 1
+            res.iterations += 1
 
-        # Codex iter-10 [P2]: when the operator wrote to the direct
-        # coord inbox (~/.fleet/inbox/<coord>.md), exit the supervisor
-        # so the next Claude-agent turn fires fleet-guard's
-        # SessionStart hook and surfaces the message. The coord skill
-        # itself doesn't consume that inbox surface (fleet-guard
-        # does), so staying in the supervisor would silence operator
-        # messages indefinitely.
-        #
-        # Codex iter-11 [P1]: gate on mtime ADVANCE relative to the
-        # supervisor's start-of-session snapshot, not just file
-        # existence. A pre-existing inbox file (stale operator message,
-        # or a [STUCK] line dropped by emit_stuck_alert itself) would
-        # otherwise terminate the supervisor on every forced wake —
-        # including archive-driven NEW_TASK / TASK_DONE_PR wakes that
-        # have nothing to do with operator messages.
-        if forced and coord_id:
-            direct = home / "inbox" / f"{coord_id}.md"
-            try:
-                cur_mtime = direct.stat().st_mtime
-                if cur_mtime > direct_inbox_session_baseline:
-                    res.exit_reason = "operator-inbox-message"
-                    emit(
-                        f"[coord] supervisor loop exiting: operator wrote "
-                        f"to inbox {direct.name} (fleet-guard will deliver "
-                        "on next turn)",
-                        stream=log_stream,
-                    )
-                    break
-            except OSError:
-                pass
+            # Codex iter-10 [P2]: when the operator wrote to the direct
+            # coord inbox (~/.fleet/inbox/<coord>.md), exit the supervisor
+            # so the next Claude-agent turn fires fleet-guard's
+            # SessionStart hook and surfaces the message. The coord skill
+            # itself doesn't consume that inbox surface (fleet-guard
+            # does), so staying in the supervisor would silence operator
+            # messages indefinitely.
+            #
+            # Codex iter-11 [P1]: gate on mtime ADVANCE relative to the
+            # supervisor's start-of-session snapshot, not just file
+            # existence. A pre-existing inbox file (stale operator message,
+            # or a [STUCK] line dropped by emit_stuck_alert itself) would
+            # otherwise terminate the supervisor on every forced wake —
+            # including archive-driven NEW_TASK / TASK_DONE_PR wakes that
+            # have nothing to do with operator messages.
+            if forced and coord_id:
+                direct = home / "inbox" / f"{coord_id}.md"
+                try:
+                    cur_mtime = direct.stat().st_mtime
+                    if cur_mtime > direct_inbox_session_baseline:
+                        res.exit_reason = "operator-inbox-message"
+                        emit(
+                            f"[coord] supervisor loop exiting: operator wrote "
+                            f"to inbox {direct.name} (fleet-guard will deliver "
+                            "on next turn)",
+                            stream=log_stream,
+                        )
+                        break
+                except BrokenPipeError:
+                    # loop-supervisor-sigpipe-5263: BrokenPipeError is a
+                    # subclass of OSError. This try/except guards the
+                    # direct.stat() probe, but the emit() above writes to
+                    # log_stream — if that pipe is broken, emit() re-raises
+                    # BrokenPipeError and a bare `except OSError` here would
+                    # SWALLOW it, defeating the fast broken-stdout exit on
+                    # this path (the loop would spin to the supervisor cap
+                    # instead of bailing now). Re-raise so the outer handler
+                    # sets exit_reason="stdout-broken" and releases the lock.
+                    raise
+                except OSError:
+                    pass
 
-        # On forced wake, run the dispatch hook so a NEW_TASK arriving
-        # mid-supervisor session is picked up under spare cap. Pre-sleep
-        # tick order: the iteration body below still runs (reconcile +
-        # reaper + stuck-check), so this is purely an additional
-        # dispatch surface for the forced path.
-        if forced and force_tick_dispatch is not None:
-            try:
-                force_tick_dispatch()
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"force_tick_dispatch: {exc}")
+            # On forced wake, run the dispatch hook so a NEW_TASK arriving
+            # mid-supervisor session is picked up under spare cap. Pre-sleep
+            # tick order: the iteration body below still runs (reconcile +
+            # reaper + stuck-check), so this is purely an additional
+            # dispatch surface for the forced path.
+            if forced and force_tick_dispatch is not None:
+                try:
+                    force_tick_dispatch()
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"force_tick_dispatch: {exc}")
 
-        # Re-read probes every iteration so a finished worker (whose
-        # task transitioned to done/blocked between polls) drops out.
-        # Cheap: parse.read on tasks.md is microseconds.
-        probes = refresh_probes()
-        if not has_active_workers(probes):
-            res.exit_reason = "all-terminal"
-            emit("[coord] supervisor loop exiting: all workers terminal", stream=log_stream)
-            break
+            # Re-read probes every iteration so a finished worker (whose
+            # task transitioned to done/blocked between polls) drops out.
+            # Cheap: parse.read on tasks.md is microseconds.
+            probes = refresh_probes()
+            if not has_active_workers(probes):
+                res.exit_reason = "all-terminal"
+                emit("[coord] supervisor loop exiting: all workers terminal", stream=log_stream)
+                break
 
-        # Track newly-appeared probes so they get baselined; drop
-        # mtimes for slugs that left the in-flight set.
-        cur_slugs = {p.slug for p in probes}
-        for slug in list(last_mtimes.keys()):
-            if slug not in cur_slugs:
-                del last_mtimes[slug]
-        for slug in list(last_change_ts.keys()):
-            if slug not in cur_slugs:
-                del last_change_ts[slug]
-        for p in probes:
-            last_mtimes.setdefault(p.slug, safe_mtime(p.state_path))
-            last_change_ts.setdefault(p.slug, now_fn())
+            # Track newly-appeared probes so they get baselined; drop
+            # mtimes for slugs that left the in-flight set.
+            cur_slugs = {p.slug for p in probes}
+            for slug in list(last_mtimes.keys()):
+                if slug not in cur_slugs:
+                    del last_mtimes[slug]
+            for slug in list(last_change_ts.keys()):
+                if slug not in cur_slugs:
+                    del last_change_ts[slug]
+            for p in probes:
+                last_mtimes.setdefault(p.slug, safe_mtime(p.state_path))
+                last_change_ts.setdefault(p.slug, now_fn())
 
-        # Mtime change detection — cheap stat, no API calls. Computed
-        # FIRST so the change list is fixed before either the reaper or
-        # the reconcile pass mutates state.json (the reaper writes
-        # nothing to state.json; the reconcile path may delete the
-        # worker dir, which would flip mtime AFTER reconcile fired —
-        # we don't want that to count as a "changed" tick).
-        changed: list[WorkerProbe] = []
-        for p in probes:
-            cur = safe_mtime(p.state_path)
-            prev = last_mtimes.get(p.slug, 0.0)
-            if cur > prev:
-                changed.append(p)
-                last_mtimes[p.slug] = cur
-                last_change_ts[p.slug] = now_fn()
-
-        # Invariant 5 (reaper) — runs BEFORE reconcile_one (codex iter-1
-        # [P1]). A worker whose state.json mtime just advanced to
-        # phase=done MUST get its /exit + kill-cycle started before
-        # reconcile flips the task status and forgets the agent_id
-        # mapping. Otherwise reconcile clears worker_agent_ids and the
-        # subsequent reaper pass has no tmux session to address — the
-        # tmux session leaks as an orphan (the exact failure shape
-        # invariant 5 exists to prevent). Hook owns its own state
-        # persistence; failures are non-fatal.
-        #
-        # Codex iter-3 [P2]: reaper_hook may return a list of slugs
-        # whose kill cycle COMPLETED this iteration. Those slugs need
-        # an immediate reconcile pass — their state.json mtime probably
-        # hasn't moved (the worker exited cleanly and state.json was
-        # stable for several polls), so without an explicit re-add to
-        # `changed` the status flip would wait for the periodic full
-        # reconcile (5+ minutes default). For cap=1 projects this
-        # blocks the next dispatch.
-        reaped_now: list[str] = []
-        if reaper_hook is not None:
-            try:
-                ret = reaper_hook(probes)
-                if isinstance(ret, list):
-                    reaped_now = [str(s) for s in ret if isinstance(s, str)]
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"reaper_hook: {exc}")
-        # Add the just-reaped slugs to `changed` so reconcile re-runs
-        # against them this iteration (their lane is now clear, the
-        # deferred status flip can proceed).
-        if reaped_now:
-            slug_to_probe = {p.slug: p for p in probes}
-            for slug in reaped_now:
-                p = slug_to_probe.get(slug)
-                if p is None:
-                    continue
-                if p not in changed:
+            # Mtime change detection — cheap stat, no API calls. Computed
+            # FIRST so the change list is fixed before either the reaper or
+            # the reconcile pass mutates state.json (the reaper writes
+            # nothing to state.json; the reconcile path may delete the
+            # worker dir, which would flip mtime AFTER reconcile fired —
+            # we don't want that to count as a "changed" tick).
+            changed: list[WorkerProbe] = []
+            for p in probes:
+                cur = safe_mtime(p.state_path)
+                prev = last_mtimes.get(p.slug, 0.0)
+                if cur > prev:
                     changed.append(p)
+                    last_mtimes[p.slug] = cur
+                    last_change_ts[p.slug] = now_fn()
 
-        if changed:
-            for p in changed:
+            # Invariant 5 (reaper) — runs BEFORE reconcile_one (codex iter-1
+            # [P1]). A worker whose state.json mtime just advanced to
+            # phase=done MUST get its /exit + kill-cycle started before
+            # reconcile flips the task status and forgets the agent_id
+            # mapping. Otherwise reconcile clears worker_agent_ids and the
+            # subsequent reaper pass has no tmux session to address — the
+            # tmux session leaks as an orphan (the exact failure shape
+            # invariant 5 exists to prevent). Hook owns its own state
+            # persistence; failures are non-fatal.
+            #
+            # Codex iter-3 [P2]: reaper_hook may return a list of slugs
+            # whose kill cycle COMPLETED this iteration. Those slugs need
+            # an immediate reconcile pass — their state.json mtime probably
+            # hasn't moved (the worker exited cleanly and state.json was
+            # stable for several polls), so without an explicit re-add to
+            # `changed` the status flip would wait for the periodic full
+            # reconcile (5+ minutes default). For cap=1 projects this
+            # blocks the next dispatch.
+            reaped_now: list[str] = []
+            if reaper_hook is not None:
                 try:
-                    reconcile_one(p)
-                    res.reconcile_calls += 1
-                except Exception as exc:  # noqa: BLE001 — fail-soft
-                    res.errors.append(f"reconcile {p.slug}: {exc}")
-            try:
-                write_state()
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"write_state after reconcile: {exc}")
+                    ret = reaper_hook(probes)
+                    if isinstance(ret, list):
+                        reaped_now = [str(s) for s in ret if isinstance(s, str)]
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"reaper_hook: {exc}")
+            # Add the just-reaped slugs to `changed` so reconcile re-runs
+            # against them this iteration (their lane is now clear, the
+            # deferred status flip can proceed).
+            if reaped_now:
+                slug_to_probe = {p.slug: p for p in probes}
+                for slug in reaped_now:
+                    p = slug_to_probe.get(slug)
+                    if p is None:
+                        continue
+                    if p not in changed:
+                        changed.append(p)
 
-        # Periodic full reconcile + sparse stuck-check. Decoupled
-        # cadences: periodic_full_reconcile runs at every
-        # `stuck_check_every` poll (or fallback _PERIODIC_RECONCILE_FALLBACK
-        # when stuck_check_every=0 disables the ladder); stuck-check
-        # ladder runs only when stuck_check_every > 0. codex iter-2 [P2]:
-        # without the decoupling, an operator who set stuck_check_every=0
-        # to disable the recovery ladder ALSO killed the in-review PR/CI
-        # sweep — leaving merged-but-not-reconciled tasks frozen in
-        # in-review until the supervisor exited.
-        reconcile_cadence = (
-            cfg.stuck_check_every if cfg.stuck_check_every > 0
-            else _PERIODIC_RECONCILE_FALLBACK_EVERY
-        )
-        # Codex iter-6 [P2] + iter-8 [P2]: cadence by WALL-CLOCK time
-        # for BOTH drivers. Adaptive mode varies per-iteration sleep
-        # (5/30 s); legacy mode is now perturbed by forced-wake zero-
-        # sleep iterations (the codex iter-8 [P2] finding). Using
-        # elapsed seconds against the operator-facing target
-        # (poll_interval_s × stuck_check_every) gives "every 5 min by
-        # default" semantics in every mode and shields the recovery
-        # ladder from inbox/archive event bursts.
-        stuck_target_s = float(cfg.poll_interval_s * cfg.stuck_check_every)
-        periodic_target_s = float(cfg.poll_interval_s * reconcile_cadence)
-        now_clock = now_fn()
-        run_periodic = (
-            periodic_full_reconcile is not None
-            and reconcile_cadence > 0
-            and periodic_target_s > 0
-            and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
-        )
-        run_stuck = (
-            cfg.stuck_check_every > 0
-            and stuck_target_s > 0
-            and (now_clock - last_stuck_check_unix) >= stuck_target_s
-        )
-        if run_periodic or run_stuck:
-            # Periodic full reconcile FIRST. Running before stuck-check
-            # means a worker that just transitioned to in-review (and
-            # would otherwise be stuck-flagged on the next pass) drops
-            # out of the live-worker probe set BEFORE we evaluate it.
-            if run_periodic:
-                last_periodic_reconcile_unix = now_clock
+            if changed:
+                for p in changed:
+                    try:
+                        reconcile_one(p)
+                        res.reconcile_calls += 1
+                    except Exception as exc:  # noqa: BLE001 — fail-soft
+                        res.errors.append(f"reconcile {p.slug}: {exc}")
                 try:
-                    periodic_full_reconcile()
+                    write_state()
                 except Exception as exc:  # noqa: BLE001
-                    res.errors.append(f"periodic-reconcile: {exc}")
-            if run_stuck:
-                last_stuck_check_unix = now_clock
-                res.stuck_check_passes += 1
-                # Codex iter-12 [P1] + iter-18 [P1]: capture the
-                # per-write mtimes of every [STUCK] alert this pass
-                # emits, so we can swallow ONLY our own writes when
-                # bumping direct_inbox_session_baseline. An operator
-                # write that races our alert in the same pass would
-                # have a DIFFERENT mtime — using that as baseline
-                # would silence the operator message.
-                stuck_alert_mtimes: list[float] = []
+                    res.errors.append(f"write_state after reconcile: {exc}")
+
+            # Periodic full reconcile + sparse stuck-check. Decoupled
+            # cadences: periodic_full_reconcile runs at every
+            # `stuck_check_every` poll (or fallback _PERIODIC_RECONCILE_FALLBACK
+            # when stuck_check_every=0 disables the ladder); stuck-check
+            # ladder runs only when stuck_check_every > 0. codex iter-2 [P2]:
+            # without the decoupling, an operator who set stuck_check_every=0
+            # to disable the recovery ladder ALSO killed the in-review PR/CI
+            # sweep — leaving merged-but-not-reconciled tasks frozen in
+            # in-review until the supervisor exited.
+            reconcile_cadence = (
+                cfg.stuck_check_every if cfg.stuck_check_every > 0
+                else _PERIODIC_RECONCILE_FALLBACK_EVERY
+            )
+            # Codex iter-6 [P2] + iter-8 [P2]: cadence by WALL-CLOCK time
+            # for BOTH drivers. Adaptive mode varies per-iteration sleep
+            # (5/30 s); legacy mode is now perturbed by forced-wake zero-
+            # sleep iterations (the codex iter-8 [P2] finding). Using
+            # elapsed seconds against the operator-facing target
+            # (poll_interval_s × stuck_check_every) gives "every 5 min by
+            # default" semantics in every mode and shields the recovery
+            # ladder from inbox/archive event bursts.
+            stuck_target_s = float(cfg.poll_interval_s * cfg.stuck_check_every)
+            periodic_target_s = float(cfg.poll_interval_s * reconcile_cadence)
+            now_clock = now_fn()
+            run_periodic = (
+                periodic_full_reconcile is not None
+                and reconcile_cadence > 0
+                and periodic_target_s > 0
+                and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
+            )
+            run_stuck = (
+                cfg.stuck_check_every > 0
+                and stuck_target_s > 0
+                and (now_clock - last_stuck_check_unix) >= stuck_target_s
+            )
+            if run_periodic or run_stuck:
+                # Periodic full reconcile FIRST. Running before stuck-check
+                # means a worker that just transitioned to in-review (and
+                # would otherwise be stuck-flagged on the next pass) drops
+                # out of the live-worker probe set BEFORE we evaluate it.
+                if run_periodic:
+                    last_periodic_reconcile_unix = now_clock
+                    try:
+                        periodic_full_reconcile()
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: never let the
+                        # fail-soft `except Exception` swallow a broken
+                        # pipe — it must reach the outer handler so the
+                        # loop bails and releases the lock.
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        res.errors.append(f"periodic-reconcile: {exc}")
+                if run_stuck:
+                    last_stuck_check_unix = now_clock
+                    res.stuck_check_passes += 1
+                    # Codex iter-12 [P1] + iter-18 [P1]: capture the
+                    # per-write mtimes of every [STUCK] alert this pass
+                    # emits, so we can swallow ONLY our own writes when
+                    # bumping direct_inbox_session_baseline. An operator
+                    # write that races our alert in the same pass would
+                    # have a DIFFERENT mtime — using that as baseline
+                    # would silence the operator message.
+                    stuck_alert_mtimes: list[float] = []
+                    try:
+                        stuck_summary = _run_stuck_check_pass(
+                            probes=probes,
+                            project=project,
+                            home=home,
+                            fleet_bin=fleet_bin,
+                            cfg=cfg,
+                            now_unix=now_fn(),
+                            coord_id=coord_id,
+                            log_stream=log_stream,
+                            stuck_alert_mtimes=stuck_alert_mtimes,
+                        )
+                        res.nudges_sent += stuck_summary.nudges
+                        res.escalations += stuck_summary.escalations
+                        res.blocks += stuck_summary.blocks
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: propagate broken
+                        # pipe past the fail-soft handler to the outer
+                        # except so the loop exits + releases the lock.
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        res.errors.append(f"stuck-check: {exc}")
+                        stuck_summary = _StuckPassResult()
+                    # Codex iter-12 [P1]: if the stuck-check pass wrote
+                    # to the coord inbox (a [STUCK] alert), advance the
+                    # session baseline so the next forced wake doesn't
+                    # treat the alert as an operator message.
+                    #
+                    # Codex iter-18 [P1]: advance the baseline ONLY to
+                    # the highest mtime we recorded immediately after our
+                    # OWN writes. An operator write that races our pass
+                    # has a different (typically later) mtime — it stays
+                    # > baseline and triggers the operator-inbox-exit on
+                    # the next forced wake. Without per-write capture,
+                    # taking the file's final mtime would baseline-over
+                    # any concurrent operator write and silence the
+                    # operator message for the rest of the session.
+                    if coord_id and stuck_alert_mtimes:
+                        new_baseline = max(stuck_alert_mtimes)
+                        if new_baseline > direct_inbox_session_baseline:
+                            direct_inbox_session_baseline = new_baseline
+                    # dashboard-accumulation-f-4421 Sub-fix C: agent
+                    # auto-archive runs alongside the stuck-check pass at the
+                    # same cadence. Best-effort; failures log to stderr and
+                    # never abort the supervisor.
+                    try:
+                        archived = _run_idle_agent_archive_pass(
+                            project=project,
+                            home=home,
+                            fleet_bin=fleet_bin,
+                            now_unix=now_fn(),
+                            log_stream=log_stream,
+                        )
+                        res.idle_archives += archived
+                    except BrokenPipeError:
+                        # loop-supervisor-sigpipe-5263: propagate broken
+                        # pipe past the fail-soft handler to the outer
+                        # except so the loop exits + releases the lock.
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        res.errors.append(f"idle-archive: {exc}")
                 try:
-                    stuck_summary = _run_stuck_check_pass(
-                        probes=probes,
-                        project=project,
-                        home=home,
-                        fleet_bin=fleet_bin,
-                        cfg=cfg,
-                        now_unix=now_fn(),
-                        coord_id=coord_id,
-                        log_stream=log_stream,
-                        stuck_alert_mtimes=stuck_alert_mtimes,
-                    )
-                    res.nudges_sent += stuck_summary.nudges
-                    res.escalations += stuck_summary.escalations
-                    res.blocks += stuck_summary.blocks
+                    write_state()
                 except Exception as exc:  # noqa: BLE001
-                    res.errors.append(f"stuck-check: {exc}")
-                    stuck_summary = _StuckPassResult()
-                # Codex iter-12 [P1]: if the stuck-check pass wrote
-                # to the coord inbox (a [STUCK] alert), advance the
-                # session baseline so the next forced wake doesn't
-                # treat the alert as an operator message.
-                #
-                # Codex iter-18 [P1]: advance the baseline ONLY to
-                # the highest mtime we recorded immediately after our
-                # OWN writes. An operator write that races our pass
-                # has a different (typically later) mtime — it stays
-                # > baseline and triggers the operator-inbox-exit on
-                # the next forced wake. Without per-write capture,
-                # taking the file's final mtime would baseline-over
-                # any concurrent operator write and silence the
-                # operator message for the rest of the session.
-                if coord_id and stuck_alert_mtimes:
-                    new_baseline = max(stuck_alert_mtimes)
-                    if new_baseline > direct_inbox_session_baseline:
-                        direct_inbox_session_baseline = new_baseline
-                # dashboard-accumulation-f-4421 Sub-fix C: agent
-                # auto-archive runs alongside the stuck-check pass at the
-                # same cadence. Best-effort; failures log to stderr and
-                # never abort the supervisor.
-                try:
-                    archived = _run_idle_agent_archive_pass(
-                        project=project,
-                        home=home,
-                        fleet_bin=fleet_bin,
-                        now_unix=now_fn(),
-                        log_stream=log_stream,
-                    )
-                    res.idle_archives += archived
-                except Exception as exc:  # noqa: BLE001
-                    res.errors.append(f"idle-archive: {exc}")
-            try:
-                write_state()
-            except Exception as exc:  # noqa: BLE001
-                res.errors.append(f"write_state after stuck-check: {exc}")
+                    res.errors.append(f"write_state after stuck-check: {exc}")
+    except BrokenPipeError:
+        # Read end of stdout is gone (broken pipe). We cannot emit the
+        # DISPATCH block or any further log line, so there is no point
+        # continuing to poll — that's exactly the wedge this task fixes.
+        # Record the reason and fall through to return so the caller
+        # releases coordinator.lock; the harness re-ticks with a fresh
+        # (hopefully un-piped) stdout. Best-effort stderr note in case
+        # stderr is still open.
+        res.exit_reason = "stdout-broken"
+        try:
+            sys.stderr.write(
+                "[coord] supervisor loop exiting: stdout broken "
+                "(pipe closed) — releasing lock for the next tick\n"
+            )
+            sys.stderr.flush()
+        except OSError:
+            pass
 
     return res
 

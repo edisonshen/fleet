@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -815,6 +816,54 @@ def _tick_locked(
                 f"coord-state save on parse-error path failed: {save_exc}"
             )
         return result
+
+    # 5.0. dispatch-durability (#184) — tick-entry REPLAY reconcile.
+    # Re-emit DISPATCH blocks for journal entries recorded ExecPending
+    # (coord wrote inbox+journal but the launch block never reached the
+    # coord — the broken-stdout phantom), and residual-crash-repair any
+    # ExecLaunchAttempted that never acked. Runs BEFORE new dispatch so a
+    # replayed launch claims the at-most-one-block-per-id-per-tick slot.
+    #
+    # `emitted_this_tick` is the ONE shared at-most-one-block-per-id set
+    # across ALL emitters — replay + _dispatch_ready + the primary/
+    # supervisor handoff emitters. The flock CAS (mark-launch-attempted
+    # <gen>) is the final backstop, but the shared set avoids emitting two
+    # blocks for one id in the first place. Keyed by agent_id.
+    emitted_this_tick: set[str] = set()
+    try:
+        replays = _replay_pending_dispatches(
+            project=project,
+            home=home,
+            fleet_bin=fleet_bin,
+            fleet_home=str(home),
+            coord_state=state,
+            now_unix=now_unix,
+        )
+    except Exception as exc:  # noqa: BLE001 — replay must never wedge a tick
+        replays = []
+        result.errors.append(f"replay reconcile: {exc}")
+    for rp in replays:
+        if rp.raise_msg:
+            # Off-channel escalation (NOT the stdout DISPATCH stream): the
+            # whole point of replay is that stdout may be broken. Goes to
+            # stderr + the tick errors list + raised counter.
+            sys.stderr.write(f"coordinator: {rp.raise_msg}\n")
+            result.errors.append(rp.raise_msg)
+            result.raised += 1
+            continue
+        if rp.error:
+            result.errors.append(f"replay {rp.slug or rp.agent_id}: {rp.error}")
+            continue
+        if rp.dispatch_instruction and rp.agent_id not in emitted_this_tick:
+            result.dispatch_instructions.append(rp.dispatch_instruction)
+            emitted_this_tick.add(rp.agent_id)
+            result.dispatched += 1
+            # A replayed id owns its slot this tick — drop any
+            # pending_acquire entry so _dispatch_ready doesn't also emit
+            # for the same slug (one owner per id per tick).
+            if rp.slug:
+                supervisor_mod.forget_pending_acquire_agent_id(state, rp.slug)
+
     # 5a. Review handoffs (reviewer-subagent-arch). Detect in-flight
     # tasks whose state.json reports phase=review-pending (→ dispatch
     # reviewer) or phase=review-done (→ dispatch finisher) and emit
@@ -857,9 +906,18 @@ def _tick_locked(
                 supervisor_mod.forget_pending_acquire_agent_id(
                     state, action.slug,
                 )
-            if action.dispatch_instruction:
+            # #184: at-most-one-block-per-id-per-tick across replay +
+            # handoff + dispatch (a handoff-apply failure can leave an
+            # ExecPending handoff id that BOTH replay and this path would
+            # emit). Skip if replay already emitted this id this tick.
+            if (
+                action.dispatch_instruction
+                and action.agent_id not in emitted_this_tick
+            ):
                 result.dispatch_instructions.append(action.dispatch_instruction)
-            result.dispatched += 1
+                if action.agent_id:
+                    emitted_this_tick.add(action.agent_id)
+                result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"handoff apply {action.slug}: {exc}")
     dispatched = _dispatch_ready(
@@ -915,9 +973,17 @@ def _tick_locked(
             # state.json bootstrap MUST land on disk before the
             # coord spawns the subagent, so a worker that races to
             # `fleet workers update` finds an in-progress task.
-            if action.dispatch_instruction:
+            #
+            # #184: at-most-one-block-per-id-per-tick — skip if replay (or
+            # the handoff path) already emitted a block for this id.
+            if (
+                action.dispatch_instruction
+                and action.agent_id not in emitted_this_tick
+            ):
                 result.dispatch_instructions.append(action.dispatch_instruction)
-            result.dispatched += 1
+                if action.agent_id:
+                    emitted_this_tick.add(action.agent_id)
+                result.dispatched += 1
         except Exception as exc:
             result.errors.append(f"dispatch {action.slug}: {exc}")
 
@@ -976,6 +1042,7 @@ def _tick_locked(
             state_path=state_path,
             coord_id=coord_id,
             result=result,
+            emitted_this_tick=emitted_this_tick,
         )
     return result
 
@@ -993,6 +1060,7 @@ def _run_supervisor(
     state_path: Path,
     coord_id: str,
     result: TickResult,
+    emitted_this_tick: set[str] | None = None,
 ) -> None:
     """Drive the supervisor loop. Hooks defined here so the supervisor
     module stays free of loop.py's mutation surface.
@@ -1002,7 +1070,15 @@ def _run_supervisor(
     on each reconcile-on-mtime-change call from disk. The loop is the
     only writer of supervisor.* + worker_agent_ids inside this skill
     (besides the initial dispatch path).
+
+    `emitted_this_tick` (#184) is the SAME at-most-one-block-per-id set
+    seeded by the primary phase's replay reconcile; the supervisor's own
+    handoff/dispatch emitters respect + extend it so a block already
+    emitted by replay (or the primary phase) is never re-emitted in a
+    supervisor reconcile pass within the same tick.
     """
+    if emitted_this_tick is None:
+        emitted_this_tick = set()
     # Build initial probes from tasks.md.
     try:
         initial = parse.read(str(tasks_path))
@@ -1198,8 +1274,14 @@ def _run_supervisor(
                     supervisor_mod.forget_pending_acquire_agent_id(
                         cs, action.slug,
                     )
-                if action.dispatch_instruction:
+                # #184: shared at-most-one-block-per-id-per-tick.
+                if (
+                    action.dispatch_instruction
+                    and action.agent_id not in emitted_this_tick
+                ):
                     result.dispatch_instructions.append(action.dispatch_instruction)
+                    if action.agent_id:
+                        emitted_this_tick.add(action.agent_id)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(
                     f"supervisor handoff apply {action.slug}: {exc}"
@@ -1244,8 +1326,15 @@ def _run_supervisor(
                 # the inbox file but never surface the spawn
                 # instruction — task would sit in-progress with no
                 # actual worker.
-                if action.dispatch_instruction:
+                #
+                # #184: shared at-most-one-block-per-id-per-tick.
+                if (
+                    action.dispatch_instruction
+                    and action.agent_id not in emitted_this_tick
+                ):
                     result.dispatch_instructions.append(action.dispatch_instruction)
+                    if action.agent_id:
+                        emitted_this_tick.add(action.agent_id)
             except Exception as exc:  # noqa: BLE001
                 result.errors.append(f"supervisor dispatch {action.slug}: {exc}")
         _save_coord_state(state_path, cs)
@@ -2134,6 +2223,37 @@ def _record_review_handoff_dispatched(
     state["review_handoffs_dispatched"] = raw
 
 
+_PHANTOM_ESCALATED_KEY = "phantom_launch_escalated"
+
+
+def _phantom_already_escalated(state: dict, agent_id: str, generation: int) -> bool:
+    """True if the residual-crash escalation already fired for this
+    (agent_id, generation) phantom. Codex iter-6 [P2]: without a durable
+    breadcrumb the repair re-raises the same operator escalation every
+    tick. Keyed by generation so a reset-for-relaunch (which bumps gen)
+    gets a fresh escalation if the relaunch also phantoms."""
+    raw = state.get(_PHANTOM_ESCALATED_KEY)
+    if not isinstance(raw, list):
+        return False
+    return f"{agent_id}:{generation}" in raw
+
+
+def _record_phantom_escalated(state: dict, agent_id: str, generation: int) -> None:
+    """Persist that the residual-crash escalation fired for this
+    (agent_id, generation). Mutates coord_state in place; tick() saves it.
+    Bounded: capped to the most recent 200 entries so a long-lived coord
+    can't grow the list without limit."""
+    raw = state.get(_PHANTOM_ESCALATED_KEY)
+    if not isinstance(raw, list):
+        raw = []
+    key = f"{agent_id}:{generation}"
+    if key not in raw:
+        raw.append(key)
+    if len(raw) > 200:
+        raw = raw[-200:]
+    state[_PHANTOM_ESCALATED_KEY] = raw
+
+
 def _clear_review_handoff_state(state: dict, slug: str) -> None:
     """Drop ALL review-handoff entries for the given slug.
 
@@ -2210,6 +2330,32 @@ def _is_worker_alive(t: parse.Task, project: str, home: Path | None = None) -> b
 # wait that would block the queue forever.
 _WORKER_STATE_FRESH_S = 15 * 60
 
+# 8-hex agent_id shape (matches dispatch.py:_AGENT_ID_FULL_RE + the Go
+# DispatchID regex). Used to filter dispatch-journal filenames in the
+# replay reconcile.
+_AGENT_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+# dispatch-durability (#184) tunables.
+#
+# REPLAY_CAP — total-per-dispatch replay-emission budget. Once a
+# dispatch's reserve count reaches this, the journal flips to ExecBlocked
+# (durable, off-channel escalation) instead of re-emitting forever. The
+# count is durable IN the journal, so it survives coord restarts (a
+# broken-stdout incident that recurs N times across restarts hits the cap
+# and stops, rather than looping).
+_REPLAY_CAP = 5
+
+# LAUNCH_ACK_GRACE_S — how long an ExecLaunchAttempted entry may sit
+# un-acked with no live subagent before residual-crash repair flips it to
+# ExecBlocked. A crash AFTER mark-launch-attempted but BEFORE the Agent
+# tool invocation (or a launch that died instantly) leaves a silent
+# phantom that bootstrapped state.json reads "alive" for 15 min — so we
+# can't trust state.json freshness; we repair on (launch_attempted + no
+# ack + no live registered subagent + elapsed > grace). 2 ticks of slack
+# (~the supervisor poll cadence) avoids false-positives on a coord that's
+# mid-launch when the next tick fires.
+_LAUNCH_ACK_GRACE_S = 90
+
 
 def _read_worker_state(
     project: str, slug: str, *, home: Path | None = None,
@@ -2232,6 +2378,60 @@ def _read_worker_state(
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+# Phases that prove a WORKER (not the dispatch bootstrap) authored the
+# state.json. _apply_dispatch bootstraps phase="starting" BEFORE the
+# Agent runs; any phase past that is a worker-authored advance. Used by
+# residual-crash repair to tell a live-but-unregistered worker (skipped
+# best-effort register_subagent) apart from a true phantom that crashed
+# before the Agent invoke.
+_WORKER_AUTHORED_PHASES = frozenset({
+    "branch", "tdd-red", "tdd-green", "tdd-refactor", "review-pending",
+    "review-claude", "review-codex", "review-done", "push", "done",
+})
+
+
+def _worker_launch_looks_live(
+    project: str, slug: str, *, home: Path | None = None,
+    since_unix: float | None = None,
+) -> bool:
+    """True if workers/<slug>/state.json shows a WORKER-authored progress
+    phase whose update landed AFTER `since_unix` — evidence the Agent for
+    THIS dispatch genuinely launched and is running, even though
+    register_subagent (best-effort) may not have recorded a subagent_id.
+
+    Conservative on purpose:
+      - Only a phase the bootstrap never writes counts (the dispatch
+        bootstrap sets phase="starting"; a real worker advances to
+        branch/tdd-*/review-* etc.). A phantom that crashed right after
+        _apply_dispatch reads "starting" → not live.
+      - Codex iter-3 [P1]: when `since_unix` is given (this journal's
+        launch_attempted_at), the worker's state.json `updated_at` MUST
+        be strictly newer. A reviewer/finisher handoff reuses the slug
+        but mints a new agent_id; the prior stage already left a
+        review-pending / review-done state.json BEFORE the new launch
+        flip. Requiring updated_at > launch_attempted_at excludes that
+        stale prior-stage state so a handoff that crashed before the
+        Agent invoke is correctly seen as a phantom (escalated), not
+        mistaken for the still-present prior subagent.
+
+    Missing/unreadable state, or a bootstrap/prior phase, or a stale
+    timestamp → not live."""
+    st = _read_worker_state(project, slug, home=home)
+    if st is None:
+        return False
+    if st.get("phase", "") not in _WORKER_AUTHORED_PHASES:
+        return False
+    if since_unix is None:
+        return True
+    updated = _parse_iso_utc(st.get("updated_at", ""))
+    if updated is None:
+        # No usable worker timestamp → can't prove the write is for THIS
+        # dispatch; treat as not-live (the phantom path escalates, which
+        # is safe — it never auto-releases).
+        return False
+    return updated > since_unix
 
 
 def _worker_state_fresh(
@@ -3984,6 +4184,273 @@ class _DispatchAction:
     error: str = ""
 
 
+@dataclass
+class _ReplayAction:
+    """A replay decision for one dispatch journal entry (#184).
+
+    Mirrors _DispatchAction's emit shape but is produced by the
+    tick-entry replay reconcile, NOT a fresh dispatch. agent_id +
+    dispatch_instruction populated on a successful reserve; error/raise
+    carry escalations (cap reached, residual-crash repair).
+    """
+    agent_id: str
+    slug: str = ""
+    dispatch_instruction: str = ""
+    error: str = ""       # transient/log-only (contention, parse)
+    raise_msg: str = ""   # off-channel escalation (capped / phantom repair)
+
+
+def _iter_project_journals(
+    home: Path, project: str,
+) -> "list[tuple[str, str, dict]]":
+    """Yield (agent_id, slug, journal_dict) for every dispatch journal
+    owned by `project`.
+
+    Ownership is read from the journal's `owner` field
+    (`project/<project>/slug/<slug>`) — NEVER from cwd, tasks.md, or
+    coord_state (the replay-predicate invariant: key only on journal
+    state + project ownership). A journal whose owner doesn't match this
+    project is skipped (strict coord scope).
+    """
+    out: list[tuple[str, str, dict]] = []
+    disp_dir = home / "dispatches"
+    try:
+        entries = sorted(disp_dir.iterdir())
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return out
+    owner_prefix = f"project/{project}/"
+    for p in entries:
+        if not p.name.endswith(".json") or p.name.endswith(".json.lock"):
+            continue
+        agent_id = p.name[: -len(".json")]
+        if not _AGENT_ID_RE.fullmatch(agent_id):
+            continue
+        try:
+            j = json.loads(p.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(j, dict):
+            continue
+        owner = j.get("owner", "")
+        if not isinstance(owner, str) or not owner.startswith(owner_prefix):
+            continue
+        slug = owner[len(owner_prefix):]
+        slug = slug[len("slug/"):] if slug.startswith("slug/") else slug
+        out.append((agent_id, slug, j))
+    return out
+
+
+def _parse_iso_utc(s: str) -> float | None:
+    """Parse a Go RFC3339/ISO-8601 UTC timestamp to epoch seconds, or
+    None. Go writes e.g. "2026-06-01T12:00:00Z"."""
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        # Python's fromisoformat handles the trailing 'Z' from 3.11+.
+        from datetime import datetime, timezone
+        t = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        dt = datetime.fromisoformat(t)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _replay_pending_dispatches(
+    *,
+    project: str,
+    home: Path,
+    fleet_bin: str,
+    fleet_home: str,
+    coord_state: dict,
+    now_unix: float,
+) -> list[_ReplayAction]:
+    """Tick-entry replay reconcile (dispatch-durability #184).
+
+    For every dispatch journal owned by this project:
+
+      - ExecPending → reserve-replay (durable cap++); if reserved, re-emit
+        the SAME DISPATCH block (same agent_id + inbox) stamped with the
+        journal's CURRENT generation so the coord's mark-launch-attempted
+        gate validates it against this lifecycle. If the cap is reached,
+        the Go side flips the entry to ExecBlocked; we raise an
+        off-channel escalation (NOT stdout — a broken stdout is exactly
+        why replay exists).
+      - ExecLaunchAttempted, un-acked, no live registered subagent, past
+        LAUNCH_ACK_GRACE → residual-crash repair: a crash after the launch
+        flip but before the Agent invoke (a silent phantom). Flip to
+        ExecBlocked + escalate. NEVER blind-replay launch_attempted (the
+        double-launch trap) and NEVER trust bootstrapped state.json
+        freshness.
+      - ExecAcked / live worker / terminal → leave alone.
+
+    Replay keys on journal state + project ownership + DISPATCH IDENTITY:
+    a pending journal is re-emitted only when worker_agent_ids[slug] equals
+    this journal's agent_id — i.e. this journal IS the task's current,
+    applied dispatch. Codex iter-2/iter-4 [P1]: keying on journal state
+    alone (the original rev6 invariant) double-launches across the
+    acquire-before-apply crash window — an orphaned ExecPending journal A
+    (whose coord crashed before persisting state) gets replayed while the
+    still-`ready` task is freshly dispatched as agent B. The identity
+    predicate ties replay to the dispatch the task actually adopted, so an
+    orphan (worker_agent_ids[slug] != A) is never replayed; it's left for
+    the cap / sweeper. The phantom case still works: a lost-stdout block's
+    journal IS the adopted dispatch (worker_agent_ids[slug] == A, task
+    in-progress), so it re-emits.
+    """
+    actions: list[_ReplayAction] = []
+    # Identity maps for the replay predicate. worker_agent_ids[slug] is the
+    # agent_id the task ADOPTED (persisted by _apply_dispatch /
+    # _apply_dispatch_handoff before coord-state is saved). pending_acquire
+    # holds ids that are mid-application (acquired, not yet applied) — those
+    # are the normal retry path's, never replay's.
+    try:
+        adopted_agent_ids = supervisor_mod.load_agent_id_map(coord_state)
+    except Exception:  # noqa: BLE001
+        adopted_agent_ids = {}
+    try:
+        pending_acquire_ids = set(
+            supervisor_mod.load_pending_acquire_agent_id_map(coord_state).values()
+        )
+    except Exception:  # noqa: BLE001
+        pending_acquire_ids = set()
+    for agent_id, slug, j in _iter_project_journals(home, project):
+        state = j.get("exec_state", "")
+        if state == "pending":
+            # Codex iter-4 [P1]: only replay the journal the task currently
+            # owns. An orphaned pending journal (coord crashed after
+            # acquire but before persisting state, so the task was
+            # re-dispatched under a DIFFERENT agent_id) must NOT be
+            # replayed — that's the cross-id double-launch the per-id CAS
+            # cannot catch. Mid-application ids (in pending_acquire, not
+            # yet adopted) are the normal retry's; skip them too.
+            if agent_id in pending_acquire_ids:
+                continue
+            if adopted_agent_ids.get(slug) != agent_id:
+                # This journal is not the task's adopted dispatch (orphan
+                # from a crash, or a stale prior id). Leave it — replay
+                # would launch a worker the task never adopted, racing the
+                # real dispatch. The cap path / sweeper reaps the orphan.
+                continue
+            res = dispatch_mod.reserve_replay(
+                agent_id, cap=_REPLAY_CAP,
+                fleet_bin=fleet_bin, fleet_home=fleet_home,
+            )
+            outcome = res.get("outcome")
+            if outcome == "reserved":
+                inbox = str(home / "inbox" / f"{agent_id}.md")
+                try:
+                    block = dispatch_mod.format_dispatch_instruction(
+                        agent_id=agent_id, slug=slug or agent_id,
+                        prompt_file=inbox,
+                        description=f"fleet worker {slug or agent_id} (replay)",
+                        generation=int(res.get("generation") or 0),
+                    )
+                except ValueError as exc:
+                    actions.append(_ReplayAction(
+                        agent_id=agent_id, slug=slug,
+                        error=f"replay format failed: {exc}",
+                    ))
+                    continue
+                actions.append(_ReplayAction(
+                    agent_id=agent_id, slug=slug,
+                    dispatch_instruction=block,
+                ))
+            elif outcome == "capped":
+                # Durable BLOCKED — surface off-channel (NOT stdout; a
+                # broken stdout is why replay exists). surface-dont-silo.
+                actions.append(_ReplayAction(
+                    agent_id=agent_id, slug=slug,
+                    raise_msg=(
+                        f"dispatch {slug or agent_id} (agent {agent_id}) "
+                        f"undelivered after {_REPLAY_CAP} replay attempts; "
+                        "marked BLOCKED. stdout to the coord is likely broken "
+                        "— re-run the tick with full output captured "
+                        "(never `| head`)."
+                    ),
+                ))
+            elif outcome in ("contention", "error"):
+                # Transient — retry next tick; log-only.
+                actions.append(_ReplayAction(
+                    agent_id=agent_id, slug=slug,
+                    error=f"replay reserve outcome={outcome!r}; retry next tick",
+                ))
+            # not_pending / absent: a concurrent writer changed state
+            # between our read + the reserve; nothing to do this tick.
+        elif state == "launch_attempted":
+            # state is "launch_attempted" here by construction; an "acked"
+            # entry would have taken neither this branch nor the pending
+            # one (replay leaves acked/terminal alone). Residual-crash
+            # repair only fires when the launch flip landed but no ack
+            # ever followed.
+            attempted_at = _parse_iso_utc(j.get("launch_attempted_at", ""))
+            if attempted_at is None:
+                # No timestamp — can't time-gate; be conservative and
+                # leave it (avoid flipping a launch we can't reason about).
+                continue
+            if now_unix - attempted_at <= _LAUNCH_ACK_GRACE_S:
+                continue  # still inside the grace window
+            # Codex iter-2 [P1]: register_subagent is best-effort — the
+            # protocol explicitly allows it to be SKIPPED on lock
+            # contention while the worker still runs. So "launch_attempted
+            # + no subagent_id + past grace" does NOT prove a phantom; a
+            # healthy worker that just skipped registration looks
+            # identical. Gate on the worker's OWN state.json.
+            #
+            # Codex iter-3 [P1]: the liveness signal MUST be tied to THIS
+            # dispatch, not the slug. A reviewer/finisher handoff mints a
+            # NEW agent_id but reuses the slug, and coord_state still holds
+            # the PRIOR stage's subagent_id while state.json still reads
+            # the prior phase (review-pending / review-done). A slug-keyed
+            # subagent check or a phase-only check would treat that
+            # prior-stage state as proof THIS launch is live and skip
+            # repair forever. So we (a) dropped the slug-keyed subagent
+            # check entirely, and (b) require the worker's state.json to
+            # have advanced AFTER this journal's launch_attempted_at — a
+            # prior-stage write predates the new launch flip and does NOT
+            # count. Only a fresh-after-launch worker write means a live
+            # (just-unregistered) worker for THIS dispatch.
+            if _worker_launch_looks_live(
+                project, slug, home=home, since_unix=attempted_at,
+            ):
+                continue
+            # Genuinely no live worker after grace → likely crashed
+            # between the launch flip and the Agent invoke. ESCALATE
+            # off-channel ONLY (surface-dont-silo). We do NOT release /
+            # mark the journal failed here: a destructive release could
+            # tear down the inbox of a worker we merely failed to observe,
+            # and the worker's own terminal transition (or the operator)
+            # will release it. Replay never re-emits launch_attempted, so
+            # leaving it non-terminal cannot double-launch.
+            #
+            # Codex iter-6 [P2]: escalate ONCE per (agent_id, generation).
+            # The journal stays launch_attempted (we deliberately don't
+            # mutate it), so without a durable breadcrumb this branch would
+            # re-raise the same operator escalation every tick forever.
+            # Record the escalation in coord_state (persisted by tick());
+            # a reset-for-relaunch bumps the generation, so a relaunch that
+            # also phantoms gets a fresh escalation.
+            generation = int(j.get("generation") or 0)
+            if _phantom_already_escalated(coord_state, agent_id, generation):
+                continue
+            _record_phantom_escalated(coord_state, agent_id, generation)
+            actions.append(_ReplayAction(
+                agent_id=agent_id, slug=slug,
+                raise_msg=(
+                    f"dispatch {slug or agent_id} (agent {agent_id}) flipped to "
+                    f"launch_attempted but never acked and shows no live worker "
+                    f"after {_LAUNCH_ACK_GRACE_S}s — likely crashed between the "
+                    f"launch flip and the Agent invoke. NOT auto-replayed (would "
+                    "double-launch) and NOT auto-released (a live-but-unregistered "
+                    "worker looks identical). Re-dispatch manually if the task is "
+                    "still needed."
+                ),
+            ))
+        # other states: leave alone.
+    return actions
+
+
 def _dispatch_ready(
     *,
     tasks: list[parse.Task],
@@ -4841,9 +5308,13 @@ def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
 def main(argv: Iterable[str] | None = None) -> int:
     """Skill entry point. Reads project from FLEET_PROJECT env or argv.
 
-    Always exits 0 — failures are recorded in the result and surfaced
-    to the operator via the agent's blocked_reason; the hook itself
-    must not block the agent's turn (matches fleet-guard discipline).
+    Exits 0 on the normal path — failures are recorded in the result and
+    surfaced to the operator via the agent's blocked_reason; the hook
+    itself must not block the agent's turn (matches fleet-guard
+    discipline). The ONE exception (loop-supervisor-sigpipe-5263) is a
+    broken stdout while emitting the DISPATCH block: that returns 2 so the
+    harness re-ticks, because a swallowed broken pipe would silently drop
+    the dispatch instead of delivering it to the coord.
     """
     argv = list(argv) if argv is not None else []
     project = os.environ.get("FLEET_PROJECT", "")
@@ -4860,9 +5331,35 @@ def main(argv: Iterable[str] | None = None) -> int:
     # "Worker dispatch protocol". Blocks are separated by a blank
     # line so the parser (Claude reasoning over the stdout) can pick
     # them out of multi-block ticks.
-    for block in result.dispatch_instructions:
-        print(block)
-        print()
+    #
+    # loop-supervisor-sigpipe-5263: emitting a DISPATCH block is the
+    # WHOLE POINT of the tick — if stdout is closed (e.g. the tick was
+    # piped through `head -40` which closed the read end), the block
+    # never reaches the coord and there is no way to communicate it.
+    # Do NOT swallow the BrokenPipeError and pretend the dispatch
+    # happened: surface it on stderr and exit non-zero so the operator
+    # / harness sees the failure and re-ticks. The coordinator.lock is
+    # already released by tick()'s finally before we reach this print
+    # loop, so a non-zero exit here doesn't strand the lock.
+    try:
+        for block in result.dispatch_instructions:
+            print(block, file=sys.stdout)
+            print(file=sys.stdout)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        # Avoid a second BrokenPipeError on interpreter shutdown flush.
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+        sys.stderr.write(
+            f"coordinator: failed to emit DISPATCH block "
+            f"({len(result.dispatch_instructions)} pending) to a closed "
+            f"stdout (broken pipe: {exc}); the dispatch did NOT reach the "
+            f"coord. Re-run the tick with full output captured (never "
+            f"`| head`). Exiting non-zero so the harness re-ticks.\n"
+        )
+        return 2
     print(json.dumps({
         "skipped": result.skipped,
         "reason": result.reason,
@@ -4877,5 +5374,4 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main(sys.argv[1:]))

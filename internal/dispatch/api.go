@@ -48,6 +48,32 @@ func AcquireCoordPromptInbox(opts AcquireCoordPromptInboxOptions) (AcquireResult
 	if err := validateAcquireOptions(opts); err != nil {
 		return AcquireResult{}, err
 	}
+	// dispatch-durability (fleet#184): acquire is a create/load → mutate
+	// → SaveJournal RMW (it sets ExecPending on a fresh journal and the
+	// controller flips the claim allocating → live), so it MUST hold the
+	// per-id flock like every other journal writer. Otherwise an acquire
+	// (or an idempotent re-acquire) racing a mark-launch-attempted /
+	// reset-for-relaunch on the same id in a separate `fleet` process
+	// could clobber the flock-guarded write via WriteAtomic's
+	// unconditional os.Rename. The stdin Content reader is consumed
+	// inside the controller; reading it under the lock is bounded (a
+	// few-KB prompt), matching the reset-for-relaunch "stdin is already a
+	// short prompt" assumption.
+	var res AcquireResult
+	lockErr := withJournalLock(opts.DispatchID, func() error {
+		r, e := acquireCoordPromptInboxLocked(opts)
+		res = r
+		return e
+	})
+	if lockErr != nil {
+		return AcquireResult{}, lockErr
+	}
+	return res, nil
+}
+
+// acquireCoordPromptInboxLocked is the body of AcquireCoordPromptInbox,
+// run while the per-id flock is held by the withJournalLock wrapper.
+func acquireCoordPromptInboxLocked(opts AcquireCoordPromptInboxOptions) (AcquireResult, error) {
 	path, err := CoordPromptInboxPath(opts.DispatchID)
 	if err != nil {
 		return AcquireResult{}, err
@@ -64,7 +90,17 @@ func AcquireCoordPromptInbox(opts AcquireCoordPromptInboxOptions) (AcquireResult
 				opts.TmuxSocket,
 				nowFunc(),
 			)
-			j.ExecState = ExecInFlight
+			// dispatch-durability (fleet#184): acquire leaves the entry
+			// at ExecPending — it is the COORD that durably flips
+			// pending → launch_attempted (via `fleet claims
+			// mark-launch-attempted`) IMMEDIATELY before invoking the
+			// host Agent. Setting ExecInFlight here (pre-#184) was
+			// premature: it implied a launch that had not happened, so
+			// replay could not distinguish "recorded but never launched"
+			// (safe to re-emit) from "launched". newJournal already
+			// defaults ExecState=ExecPending; the explicit set documents
+			// the contract.
+			j.ExecState = ExecPending
 			if err := SaveJournal(j); err != nil {
 				return AcquireResult{}, err
 			}
@@ -132,6 +168,40 @@ func ReleaseCoordPromptInbox(opts ReleaseCoordPromptInboxOptions) (ReleaseResult
 	if opts.DispatchID == "" {
 		return ReleaseResult{}, errors.New("dispatch_id required")
 	}
+	// dispatch-durability (fleet#184): release is a read → mutate
+	// exec_state → SaveJournal RMW, so it MUST hold the per-id flock —
+	// exactly like mark-launch-attempted / reserve-replay / reset-for-
+	// relaunch. Without it, a release running in one `fleet` process
+	// (loop.py reaper / residual-crash repair, during a tick) can
+	// interleave with a mark-launch-attempted running in another `fleet`
+	// process (the coord agent, between tick turns, across the agent-turn
+	// boundary that coordinator.lock does NOT serialize) and clobber the
+	// flock-guarded launch flip via the unconditional os.Rename in
+	// WriteAtomic — the rev4 lost-update the flock exists to close. Load
+	// the journal INSIDE the lock so we mutate fresh state.
+	var res ReleaseResult
+	lockErr := withJournalLock(opts.DispatchID, func() error {
+		r, e := releaseCoordPromptInboxLocked(opts)
+		res = r
+		return e
+	})
+	if lockErr != nil {
+		if errors.Is(lockErr, ErrJournalContention) {
+			// Surface contention to the caller as an error; the Python
+			// release helper logs it and the next tick / sweeper retries.
+			return ReleaseResult{}, lockErr
+		}
+		return ReleaseResult{}, lockErr
+	}
+	return res, nil
+}
+
+// releaseCoordPromptInboxLocked is the body of ReleaseCoordPromptInbox,
+// run while the per-id flock is held by the withJournalLock wrapper.
+// The internal controller SaveJournal calls execute under the held
+// flock (SaveJournal does not re-acquire it), so the whole read →
+// mutate → write sequence is one critical section.
+func releaseCoordPromptInboxLocked(opts ReleaseCoordPromptInboxOptions) (ReleaseResult, error) {
 	j, err := LoadJournal(opts.DispatchID)
 	if err != nil {
 		if errors.Is(err, ErrJournalNotFound) {
@@ -142,9 +212,28 @@ func ReleaseCoordPromptInbox(opts ReleaseCoordPromptInboxOptions) (ReleaseResult
 	}
 	// Mark exec_state terminal on release if not already — the PR1
 	// migration calls release at the dispatch's terminal transition
-	// (loop.py reaper / supervisor). PR1 keeps the flip conservative:
-	// only mark done if currently in_flight/pending. PR3 layers richer
-	// terminal-cause tracking on top.
+	// (loop.py reaper / supervisor).
+	//
+	// dispatch-durability (fleet#184): the pre-#184 code force-flipped
+	// ANY non-terminal state to ExecDone. The launch states need care:
+	//   - ExecBlocked / ExecFailed are already terminal (IsTerminal
+	//     covers them) — never downgrade.
+	//   - ExecAcked (live worker finished) and ExecPending / ExecInFlight
+	//     (legacy) → ExecDone, the normal completion.
+	//   - ExecLaunchAttempted → ExecDone.
+	//
+	// Codex iter-5 [P2]: an un-acked ExecLaunchAttempted at RELEASE time
+	// does NOT mean a failed launch. register_subagent is best-effort
+	// (skipped on lock contention) while the worker runs to completion,
+	// and release is driven by the worker's OWN terminal transition
+	// (loop.py reaper / supervisor on phase=done). So a missing ack is a
+	// missing BREADCRUMB, not a failure — recording ExecFailed would
+	// corrupt the lifecycle of a worker that completed fine. The phantom
+	// "launched-but-never-ran" case is handled separately by the
+	// residual-crash repair (loop.py), which ESCALATES off-channel and
+	// deliberately does NOT call release (a live-but-unregistered worker
+	// is indistinguishable), so a launch_attempted journal only reaches
+	// THIS release via a real worker's terminal signal → ExecDone.
 	if !j.ExecState.IsTerminal() {
 		j.ExecState = ExecDone
 	}

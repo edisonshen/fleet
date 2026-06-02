@@ -10,11 +10,86 @@ Covers:
 """
 from __future__ import annotations
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
+import dispatch as dispatch_mod
 import handoff_resume
+
+
+@pytest.fixture(scope="session")
+def built_fleet_bin(tmp_path_factory) -> str:
+    """Build the real `fleet` binary from THIS worktree so the #184
+    reset-for-relaunch / acquire flock path is exercised against the
+    current code (not whatever older `fleet` is on PATH). Skips if Go is
+    unavailable."""
+    if shutil.which("go") is None:
+        pytest.skip("go toolchain not available")
+    repo_root = Path(__file__).resolve().parents[3]
+    out_dir = tmp_path_factory.mktemp("fleet-bin")
+    binary = out_dir / "fleet"
+    proc = subprocess.run(
+        ["go", "build", "-o", str(binary), "./cmd/fleet"],
+        cwd=str(repo_root), capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        pytest.skip(f"fleet build failed: {proc.stderr}")
+    return str(binary)
+
+
+def test_resume_absent_journal_acquires_gen0_passes_gate(
+    built_fleet_bin: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex iter-1 [P2]: a resume for an id with NO dispatch journal
+    (pre-#184 / reaped) must ACQUIRE a fresh journal (gen 0) so the gen-0
+    resume block passes the coord's mark-launch-attempted gate. A bare
+    write_worker_inbox would leave the journal absent and the gate would
+    predicate-fail, silently dropping the resume."""
+    fleet_home = tmp_path / "fleet-home"
+    wip_dir = tmp_path / "wip"
+    (fleet_home / "inbox").mkdir(parents=True)
+    (fleet_home / "dispatches").mkdir(parents=True)
+    wip_dir.mkdir()
+    inbox = fleet_home / "inbox" / "abcd1234.md"
+    inbox.write_text("You are a Fleet worker for task: fix-foo\n", encoding="utf-8")
+    (wip_dir / "fix-foo.md").write_text("## Phase 1\n- landed\n", encoding="utf-8")
+
+    # Point dispatch_mod's default `fleet` at the freshly-built binary by
+    # threading it through the env the helper copies (FLEET_HOME) and the
+    # PATH so the bare-string "fleet" resolves to our build.
+    bin_dir = str(Path(built_fleet_bin).parent)
+    monkeypatch.setenv("PATH", bin_dir + ":" + __import__("os").environ["PATH"])
+    monkeypatch.setenv("FLEET_PROJECT", "myproj")
+
+    entries = [
+        handoff_resume.ResumeEntry(
+            task_id="fix-foo", branch="worker/fix-foo", phase="tdd-green",
+            agent_id="abcd1234", subagent_id="",
+        )
+    ]
+    blocks, skipped = handoff_resume.build_resume_dispatches(
+        entries, wip_dir=wip_dir, fleet_home=fleet_home, project="myproj",
+    )
+    assert skipped == [], skipped
+    assert len(blocks) == 1
+    assert "generation: 0" in blocks[0]
+
+    # The journal must now EXIST at gen 0, ExecPending — so a gen-0
+    # mark-launch-attempted (the coord's step 2) returns ok, not the
+    # predicate_fail that an absent journal would yield.
+    journal_path = fleet_home / "dispatches" / "abcd1234.json"
+    assert journal_path.exists(), "absent resume did not acquire a journal"
+    j = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert j["exec_state"] == "pending"
+    assert j["generation"] == 0
+    out = dispatch_mod.mark_launch_attempted(
+        "abcd1234", 0, fleet_bin=built_fleet_bin, fleet_home=str(fleet_home),
+    )
+    assert out == "ok", f"gen-0 launch gate must accept the acquired journal, got {out}"
 
 
 def _seed_handoff(

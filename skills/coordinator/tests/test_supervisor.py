@@ -115,6 +115,10 @@ def _cfg(**overrides) -> supervisor.SupervisorConfig:
         poll_interval_s=30, stuck_check_every=10,
         stuck_threshold_s=180, stuck_polls=3, nudge_cooldown_s=120,
         poll_max_s=14400,
+        # supervisor-loop wall-clock cap. 0 here disables the extra cap
+        # so legacy tests fall back to poll_max_s governance; tests that
+        # exercise the cap override explicitly.
+        supervisor_max_s=0,
         # Legacy single-rate driver. Tests that exercise the invariant-4
         # adaptive cadence override these explicitly.
         poll_base_interval_s=0, poll_backoff_interval_s=0,
@@ -744,6 +748,305 @@ def test_supervisor_emits_summary_lines_to_stdout(fleet_home: Path) -> None:
     assert "supervisor loop exiting" in output
 
 
+# ---------- sigpipe / wedge guards (loop-supervisor-sigpipe-5263) ----------
+
+
+class _BrokenStream:
+    """A log stream whose write() raises BrokenPipeError, simulating a
+    closed stdout (e.g. `python3 loop.py X | head -40` after head exits).
+    flush() is a no-op so the failure surfaces only on write."""
+
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, _s: str) -> int:
+        self.writes += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:  # pragma: no cover - never reached
+        pass
+
+
+def test_supervisor_exits_when_stdout_broken(fleet_home: Path) -> None:
+    """Defect #1: when the log/dispatch stream is a broken pipe, the
+    supervisor must NOT swallow-and-keep-polling (the wedge). It exits
+    promptly with a distinct reason so the caller can release the lock
+    and let the next tick retry, instead of spinning until poll_max_s.
+
+    Regression: on the parent commit emit() swallows the BrokenPipeError
+    and the loop polls until max-duration (60s budget / 30s polls => 2
+    iterations here). The fix breaks on the FIRST broken write, so the
+    loop never reaches the second poll.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    broken = _BrokenStream()
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(poll_interval_s=30, poll_max_s=60, stuck_check_every=0),
+        fleet_home_=fleet_home,
+        log=broken,
+    )
+    assert res.exit_reason == "stdout-broken"
+    # The first emit (loop-start banner) is the broken write; the loop
+    # must bail before completing a single poll iteration.
+    assert res.iterations == 0
+
+
+def test_supervisor_no_active_workers_stdout_broken(fleet_home: Path) -> None:
+    """Codex iter-6 [P3]: the no-active-workers early-exit emit() sits
+    BEFORE the main broken-pipe try-block. emit() now re-raises
+    BrokenPipeError, so an unguarded emit there would propagate out of
+    run_supervisor when stdout is already closed and there are no active
+    workers. The guard must catch it and return exit_reason=stdout-broken
+    instead of raising."""
+    broken = _BrokenStream()
+    res = _drive_loop(
+        probes_seq=[[]],  # no active workers on the initial probe
+        cfg=_cfg(poll_interval_s=30, poll_max_s=60, stuck_check_every=0),
+        fleet_home_=fleet_home,
+        log=broken,
+    )
+    # Must return cleanly, not raise.
+    assert res.exit_reason == "stdout-broken"
+    assert res.iterations == 0
+
+
+class _StreamBrokenAfterN:
+    """A log stream that buffers the first N writes, then raises
+    BrokenPipeError. Lets the loop reach a specific emit() deeper in the
+    loop body (e.g. the operator-inbox-exit emit) before the pipe breaks.
+    """
+
+    def __init__(self, ok_writes: int) -> None:
+        self.ok_writes = ok_writes
+        self.writes = 0
+
+    def write(self, _s: str) -> int:
+        self.writes += 1
+        if self.writes > self.ok_writes:
+            raise BrokenPipeError(32, "Broken pipe")
+        return len(_s)
+
+    def flush(self) -> None:
+        pass
+
+
+def test_supervisor_inbox_emit_broken_pipe_propagates(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 regression: the operator-inbox-exit
+    emit() lives inside a `try/except OSError` that guards direct.stat().
+    BrokenPipeError is an OSError subclass, so a bare `except OSError`
+    there would SWALLOW the broken pipe and keep the loop spinning to the
+    cap — defeating the fast broken-stdout exit on this path. The fix
+    re-raises BrokenPipeError so the outer handler sets
+    exit_reason="stdout-broken" immediately.
+
+    Setup: a forced wake (force_tick_check → True) with a coord inbox file
+    whose mtime is past the baseline, so the loop enters the inbox-exit
+    branch and calls emit(). The stream allows the loop-start banner write
+    (write #1) then breaks on the inbox emit (write #2). On the parent fix
+    (before this regression fix) exit_reason would be "operator-inbox-
+    message" and the loop would NOT bail on the broken pipe.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    coord_id = "cccccc01"
+    inbox = fleet_home / "inbox" / f"{coord_id}.md"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text("operator: please check on this\n")
+    # mtime well past the baseline so the inbox-exit branch is taken.
+    import os as _os
+    _os.utime(inbox, (1_000_000.0, 1_000_000.0))
+
+    broken = _StreamBrokenAfterN(ok_writes=1)  # banner OK, inbox emit breaks
+    seq = iter([[probe]] * 100)
+    fake_now = {"t": 0.0}
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(poll_interval_s=30, poll_max_s=3600,
+                 supervisor_max_s=0, stuck_check_every=0),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=lambda s: fake_now.__setitem__("t", fake_now["t"] + s),
+        now_fn=lambda: fake_now["t"],
+        refresh_probes=lambda: next(seq, []),
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        force_tick_check=lambda: True,
+        coord_id=coord_id,
+        direct_inbox_session_baseline=0.0,
+        log_stream=broken,
+    )
+    assert res.exit_reason == "stdout-broken", (
+        f"inbox-emit broken pipe must propagate to stdout-broken, "
+        f"got {res.exit_reason!r}"
+    )
+    # The inbox emit is the SECOND write (banner = #1). With the fix it
+    # propagates immediately, so the stream sees exactly 2 writes and the
+    # loop bails on its first iteration. Without the fix the bare
+    # `except OSError: pass` swallows the broken inbox emit and the loop
+    # keeps spinning — more writes, more iterations — before some later
+    # unguarded emit finally propagates. Pin both so the test fails on the
+    # parent (swallow) behaviour, not just on the final exit_reason.
+    assert broken.writes == 2, (
+        f"loop must bail on the broken inbox emit (write #2), not swallow "
+        f"and keep writing; saw {broken.writes} writes"
+    )
+    assert res.iterations == 1
+
+
+def test_supervisor_respects_supervisor_max_s_cap(fleet_home: Path) -> None:
+    """Defect #2: FLEET_COORD_SUPERVISOR_MAX_S caps the loop tighter than
+    poll_max_s so a wedged loop can never hold the lock for the full 4h
+    poll_max budget. With supervisor_max_s=60 < poll_max_s=14400, the
+    loop exits at the supervisor cap.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(
+            poll_interval_s=30, poll_max_s=14400,
+            supervisor_max_s=60, stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # 60s cap, 30s polls => at most 2 iters before exit.
+    assert res.iterations <= 2
+
+
+def test_supervisor_max_s_zero_disables_cap(fleet_home: Path) -> None:
+    """supervisor_max_s=0 falls back to poll_max_s only (no extra cap)."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,
+        cfg=_cfg(
+            poll_interval_s=30, poll_max_s=60,
+            supervisor_max_s=0, stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+    )
+    # With the supervisor cap disabled, poll_max_s governs.
+    assert res.exit_reason == "max-duration"
+
+
+def test_supervisor_sleep_clamped_to_remaining_cap(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 (codex iter-1 [P2]): a long poll
+    interval must not let the loop sleep PAST the cap while holding
+    coordinator.lock. With poll_interval_s=3600 (legacy single-rate, so
+    compute_next_sleep_s returns 3600) and supervisor_max_s=1800, an
+    unclamped loop would sleep the full 3600s and hold the lock for an
+    hour — double the bound. The clamp caps each sleep at the remaining
+    budget, so no recorded sleep exceeds the cap and the loop exits at it.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    sleeps: list[float] = []
+    res = _drive_loop(
+        probes_seq=[[probe]] * 100,  # never goes terminal
+        cfg=_cfg(
+            poll_interval_s=3600,   # >> cap; legacy single-rate cadence
+            poll_base_interval_s=0,  # disable adaptive → returns poll_interval_s
+            poll_max_s=14400,
+            supervisor_max_s=1800,
+            stuck_check_every=0,
+        ),
+        fleet_home_=fleet_home,
+        sleep_calls=sleeps,
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # No single sleep may exceed the cap (unclamped it would be 3600 > 1800).
+    assert sleeps, "loop should have slept at least once"
+    assert max(sleeps) <= 1800, (
+        f"sleep must be clamped to the remaining cap budget; "
+        f"saw max sleep {max(sleeps)}s > cap 1800s"
+    )
+
+
+def test_supervisor_no_poll_body_after_cap_consuming_sleep(fleet_home: Path) -> None:
+    """loop-supervisor-sigpipe-5263 (codex iter-3 [P2]): when a clamped
+    sleep consumes the entire remaining cap budget, the loop must break
+    immediately after the sleep — NOT run a full poll body (refresh_probes
+    / reconcile / stuck-check / idle-archive) and only re-check the cap at
+    the top of the next iteration. Otherwise the lock is held for
+    `cap + one poll body`, overrunning supervisor_max_s.
+
+    With poll_interval_s == supervisor_max_s == 1800, iteration 1 clamps
+    the sleep to the full 1800s, wakes exactly at the cap, and must bail.
+    The cap is enforced via a no-op probe counter: refresh_probes must
+    only be called once (the pre-loop priming read), never again inside
+    the loop body.
+    """
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path,
+        agent_id="aaaaaaaa", tmux_session="fleet-aaaaaaaa",
+    )
+    refresh_calls = {"n": 0}
+    fake_now = {"t": 0.0}
+
+    def counting_refresh():
+        refresh_calls["n"] += 1
+        return [probe]
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(
+            poll_interval_s=1800, poll_base_interval_s=0,
+            poll_max_s=14400, supervisor_max_s=1800, stuck_check_every=0,
+        ),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=lambda s: fake_now.__setitem__("t", fake_now["t"] + s),
+        now_fn=lambda: fake_now["t"],
+        refresh_probes=counting_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        log_stream=io.StringIO(),
+    )
+    assert res.exit_reason == "supervisor-max-duration"
+    # Pre-loop priming read is call #1. The loop body's refresh_probes
+    # (inside the iteration) must NEVER run because we break right after
+    # the cap-consuming sleep. Without the post-sleep check it would be 2+.
+    assert refresh_calls["n"] == 1, (
+        f"loop ran a poll body after the cap was hit; refresh_probes "
+        f"called {refresh_calls['n']}x (expected 1 = priming read only)"
+    )
+    assert res.iterations == 0
+
+
 # ---------- agent_id mapping ----------
 
 
@@ -892,6 +1195,7 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     monkeypatch.setenv("FLEET_COORD_STUCK_POLLS", "1")
     monkeypatch.setenv("FLEET_COORD_NUDGE_COOLDOWN_S", "7")
     monkeypatch.setenv("FLEET_COORD_POLL_MAX_S", "60")
+    monkeypatch.setenv("FLEET_COORD_SUPERVISOR_MAX_S", "45")
     cfg = supervisor.SupervisorConfig.from_env()
     assert cfg.poll_interval_s == 5
     assert cfg.stuck_check_every == 2
@@ -899,6 +1203,17 @@ def test_supervisor_config_from_env(monkeypatch) -> None:
     assert cfg.stuck_polls == 1
     assert cfg.nudge_cooldown_s == 7
     assert cfg.poll_max_s == 60
+    assert cfg.supervisor_max_s == 45
+
+
+def test_supervisor_max_s_defaults_to_30_min(monkeypatch) -> None:
+    """FLEET_COORD_SUPERVISOR_MAX_S unset → 30-min default so a wedged
+    supervisor loop can never hold coordinator.lock for the full 4h
+    poll_max_s budget."""
+    monkeypatch.delenv("FLEET_COORD_SUPERVISOR_MAX_S", raising=False)
+    assert supervisor.env_supervisor_max_s() == 1800
+    cfg = supervisor.SupervisorConfig.from_env()
+    assert cfg.supervisor_max_s == 1800
 
 
 # ---------- codex iter-2 P1/P2 regressions ----------
