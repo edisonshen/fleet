@@ -179,7 +179,14 @@ func applyInvalidProjectReap(act *Action, deps Deps, d ProjectDirInfo) {
 	}
 
 	if rerr := deps.RemoveProjectDir(qpath); rerr != nil {
-		act.Reason = fmt.Sprintf("remove failed: %v", rerr)
+		// Remove failed AFTER the dir was renamed to qpath: the original
+		// path no longer exists, so a bare "remove failed" with the
+		// original Target would misdirect recovery. Surface the actual
+		// quarantine path so the operator can finish the cleanup
+		// (surface-don't-silo, codex iter-8 [P2]). It also re-matches
+		// isQuarantineDir, so a later `fleet gc` reaps it automatically.
+		act.Verb = VerbSurface
+		act.Reason = fmt.Sprintf("invalid project name %q — quarantined to %q but remove failed (%v); reap it with `fleet gc --kinds invalid-projects --apply` or `rm -rf` manually", d.Name, qpath, rerr)
 		return
 	}
 	act.Verb = VerbRemoved
@@ -246,6 +253,16 @@ func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 		name := e.Name()
 		// Reserved control dir + dot-prefixed entries are never projects,
 		// EXCEPT fleet's own leftover quarantine dirs (reap fleet's cruft).
+		//
+		// INTENTIONAL SCOPE (codex iter-8 [P2], judged not-a-bug): dot-
+		// prefixed names like "...", "._" pass through here as hidden, NOT
+		// surfaced as malformed. This bug is specifically about the
+		// "--project" flag-misparse, which is NOT dot-prefixed; matching the
+		// long-standing .locks / dashboard convention that dot-dirs are
+		// hidden control entries keeps the classifier from spamming the
+		// operator with every stray dotfile. fleet never creates a dot-
+		// prefixed project, so a hidden dot-dir is operator-hand-made and
+		// theirs to manage — except quarantine cruft, which fleet owns.
 		if name == ".locks" {
 			continue
 		}

@@ -2947,6 +2947,41 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestReconcile_InvalidProjects_RemoveFailureSurfacesQuarantinePath
+// regresses codex iter-8 [P2]: when RemoveProjectDir fails AFTER the dir
+// was renamed to the quarantine path, the action must surface the QUARANTINE
+// path (not the now-gone original) so recovery isn't misdirected, and the
+// verb must flip to surface (not stay would-remove).
+func TestReconcile_InvalidProjects_RemoveFailureSurfacesQuarantinePath(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	qpath := "/fake/projects/.--project.gc-quarantine.7.7"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "--project", Path: bogus, HasTasks: false}}, nil
+	}
+	deps.QuarantineProjectDir = func(string) (string, error) { return qpath, nil }
+	deps.ProjectHasTasks = func(string) (bool, error) { return false, nil }
+	deps.RemoveProjectDir = func(string) error { return errors.New("disk full") }
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("remove-failure verb=%q, want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, qpath) {
+		t.Fatalf("remove-failure reason must name the quarantine path %q; got %q", qpath, a.Reason)
+	}
+}
+
 // TestReconcile_InvalidProjects_TasksStatErrSurfacesInBoth regresses codex
 // iter-7 [P2]: a non-ENOENT tasks.md stat error during listing makes
 // presence unknown. Dry-run must surface (not would-remove) so it agrees
