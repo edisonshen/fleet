@@ -265,6 +265,15 @@ type Deps struct {
 	// on present==true OR a non-ENOENT statErr. Production wiring is
 	// projectHasTasksNow. (codex iter-1 [P1])
 	ProjectHasTasks func(path string) (bool, error)
+	// QuarantineProjectDir atomically renames a malformed project dir to a
+	// dot-prefixed sibling before deletion, so the post-quarantine tasks.md
+	// recheck is authoritative (no live writer can reach the renamed tree).
+	// Returns the quarantined path. Production wiring is quarantineProjectDir.
+	// (codex iter-2 [P1] — full TOCTOU close.)
+	QuarantineProjectDir func(path string) (string, error)
+	// RestoreProjectDir renames a quarantined dir back when the recheck
+	// found tasks.md (un-quarantine). Production wiring is restoreProjectDir.
+	RestoreProjectDir func(quarantined, original string) error
 }
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
@@ -721,34 +730,36 @@ func humanDuration(d time.Duration) string {
 // real call for each hook."
 func DefaultDeps() Deps {
 	return Deps{
-		Now:                 time.Now,
-		ListSockets:         func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
-		RemoveSocket:        removeSocketFile,
-		SocketLive:          socketLiveOnDisk,
-		ListAgents:          agent.List,
-		ListAgentsStrict:    agent.ListStrict,
-		ArchiveAgent:        func(r *agent.Record) error { return r.Archive() },
-		SessionAlive:        tmux.SessionAlive,
-		AgentDirSane:        agentDirSane,
-		ListSessions:        tmux.ListSessionsWithCreated,
-		KillSession:         tmux.Kill,
-		OrphanTmuxFreshness: orphanTmuxFreshness,
-		ListProjects:        listProjectsOnDisk,
-		ListWorktrees:       listProjectWorktrees,
-		RemoveWorktree:      removeGitWorktree,
-		IsTaskTerminal:      isTaskTerminalOnDisk,
-		ListCoordLocks:      listCoordLocksOnDisk,
-		LoadAgent:           agent.Load,
-		RemoveCoordLock:     removeCoordLockFile,
-		ListWorkerRecords:   listWorkerRecordsOnDisk,
-		LoadWorkerState:     loadWorkerStateOnDisk,
-		LoadTaskStatus:      loadTaskStatusOnDisk,
-		PidAlive:            pidAliveOnDisk,
-		RemoveWorkerRecord:  removeWorkerRecordDir,
-		ListProjectDirs:     listProjectDirsRaw,
-		ValidProjectName:    func(name string) bool { return state.ValidateProjectName(name) == nil },
-		RemoveProjectDir:    removeProjectDirTree,
-		ProjectHasTasks:     projectHasTasksNow,
+		Now:                  time.Now,
+		ListSockets:          func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		RemoveSocket:         removeSocketFile,
+		SocketLive:           socketLiveOnDisk,
+		ListAgents:           agent.List,
+		ListAgentsStrict:     agent.ListStrict,
+		ArchiveAgent:         func(r *agent.Record) error { return r.Archive() },
+		SessionAlive:         tmux.SessionAlive,
+		AgentDirSane:         agentDirSane,
+		ListSessions:         tmux.ListSessionsWithCreated,
+		KillSession:          tmux.Kill,
+		OrphanTmuxFreshness:  orphanTmuxFreshness,
+		ListProjects:         listProjectsOnDisk,
+		ListWorktrees:        listProjectWorktrees,
+		RemoveWorktree:       removeGitWorktree,
+		IsTaskTerminal:       isTaskTerminalOnDisk,
+		ListCoordLocks:       listCoordLocksOnDisk,
+		LoadAgent:            agent.Load,
+		RemoveCoordLock:      removeCoordLockFile,
+		ListWorkerRecords:    listWorkerRecordsOnDisk,
+		LoadWorkerState:      loadWorkerStateOnDisk,
+		LoadTaskStatus:       loadTaskStatusOnDisk,
+		PidAlive:             pidAliveOnDisk,
+		RemoveWorkerRecord:   removeWorkerRecordDir,
+		ListProjectDirs:      listProjectDirsRaw,
+		ValidProjectName:     func(name string) bool { return state.ValidateProjectName(name) == nil },
+		RemoveProjectDir:     removeProjectDirTree,
+		ProjectHasTasks:      projectHasTasksNow,
+		QuarantineProjectDir: quarantineProjectDir,
+		RestoreProjectDir:    restoreProjectDir,
 	}
 }
 

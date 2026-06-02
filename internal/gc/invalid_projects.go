@@ -74,32 +74,88 @@ func reconcileInvalidProjects(r *Report, opts Options, deps Deps) error {
 			Reason: fmt.Sprintf("invalid project name %q (CLI flag-misparse / hand-edit) + no tasks.md", d.Name),
 		}
 		if opts.Apply {
-			// TOCTOU guard (codex iter-1 [P1]): HasTasks was sampled during
-			// ListProjectDirs; a concurrent coord/migration can write
-			// tasks.md before we rm -rf. Re-stat immediately before the
-			// destructive op and FAIL CLOSED — surface instead of deleting
-			// on a freshly-appeared tasks.md OR any non-ENOENT stat error.
-			// Data safety beats reaping one cruft dir this run.
-			if hasTasks, terr := projectHasTasksRecheck(deps, d.Path); terr != nil {
-				act.Verb = VerbSurface
-				act.Reason = fmt.Sprintf("invalid project name %q but tasks.md stat failed (%v) — refusing to auto-remove; re-run `fleet gc --kinds invalid-projects` after resolving", d.Name, terr)
-				r.Actions = append(r.Actions, act)
-				continue
-			} else if hasTasks {
-				act.Verb = VerbSurface
-				act.Reason = fmt.Sprintf("invalid project name %q but tasks.md appeared since scan — refusing to auto-remove (concurrent write?); migrate or `rm -rf` manually after review", d.Name)
-				r.Actions = append(r.Actions, act)
-				continue
-			}
-			if rerr := deps.RemoveProjectDir(d.Path); rerr != nil {
-				act.Reason = fmt.Sprintf("remove failed: %v", rerr)
-			} else {
-				act.Verb = VerbRemoved
-			}
+			applyInvalidProjectReap(&act, deps, d)
 		}
 		r.Actions = append(r.Actions, act)
 	}
 	return nil
+}
+
+// applyInvalidProjectReap performs the destructive removal under --apply,
+// closing the TOCTOU data-loss window codex flagged (iter-1/iter-2 [P1]).
+//
+// A plain "re-stat tasks.md, then rm -rf" still races: a coord/migration
+// can write tasks.md AFTER the stat but BEFORE the RemoveAll, and the new
+// task list is destroyed. The fix is to make the gate atomic against the
+// LIVE path by quarantining first:
+//
+//	rename(dir → dir.gc-quarantine)   ← atomic; live writers now miss
+//	  │                                 the tree (they hit the old path,
+//	  │                                 which no longer exists / is recreated
+//	  │                                 fresh — never our quarantined tree)
+//	  ▼
+//	stat(quarantine/tasks.md)
+//	  ├─ present / stat-err → rename back (restore) + surface, never delete
+//	  └─ absent            → RemoveAll(quarantine)
+//
+// Once renamed, nothing using the canonical projects/<name> path can add a
+// tasks.md into the tree we're about to delete, so the post-quarantine
+// stat is authoritative. Fail closed on any quarantine/stat/restore error.
+func applyInvalidProjectReap(act *Action, deps Deps, d ProjectDirInfo) {
+	// Pre-quarantine fast path: if tasks.md is already visible, surface
+	// without even touching the dir (cheap, common no-op).
+	if hasTasks, terr := projectHasTasksRecheck(deps, d.Path); terr != nil {
+		act.Verb = VerbSurface
+		act.Reason = fmt.Sprintf("invalid project name %q but tasks.md stat failed (%v) — refusing to auto-remove; re-run `fleet gc --kinds invalid-projects` after resolving", d.Name, terr)
+		return
+	} else if hasTasks {
+		act.Verb = VerbSurface
+		act.Reason = fmt.Sprintf("invalid project name %q but tasks.md present — refusing to auto-remove; migrate or `rm -rf` manually after review", d.Name)
+		return
+	}
+
+	quarantine := deps.QuarantineProjectDir
+	if quarantine == nil {
+		quarantine = quarantineProjectDir
+	}
+	restore := deps.RestoreProjectDir
+	if restore == nil {
+		restore = restoreProjectDir
+	}
+
+	qpath, qerr := quarantine(d.Path)
+	if qerr != nil {
+		act.Verb = VerbSurface
+		act.Reason = fmt.Sprintf("invalid project name %q — quarantine rename failed (%v); refusing to auto-remove", d.Name, qerr)
+		return
+	}
+
+	// Authoritative re-stat on the quarantined tree: no live writer can
+	// reach it anymore, so this result is stable through the delete.
+	if hasTasks, terr := projectHasTasksRecheck(deps, qpath); terr != nil || hasTasks {
+		// tasks.md raced in (or stat ambiguous) — un-quarantine and surface.
+		reason := "tasks.md appeared during reap (concurrent write?)"
+		if terr != nil {
+			reason = fmt.Sprintf("tasks.md stat failed (%v)", terr)
+		}
+		if rerr := restore(qpath, d.Path); rerr != nil {
+			// Restore failed: the dir is stranded at the quarantine path.
+			// Surface loudly with the exact path so the operator recovers
+			// it (surface-don't-silo) rather than silently losing state.
+			act.Verb = VerbSurface
+			act.Reason = fmt.Sprintf("invalid project name %q — %s; auto-remove aborted but RESTORE FAILED (%v); recover state from %q manually", d.Name, reason, rerr, qpath)
+			return
+		}
+		act.Verb = VerbSurface
+		act.Reason = fmt.Sprintf("invalid project name %q but %s — refusing to auto-remove; migrate or `rm -rf` manually after review", d.Name, reason)
+		return
+	}
+
+	if rerr := deps.RemoveProjectDir(qpath); rerr != nil {
+		act.Reason = fmt.Sprintf("remove failed: %v", rerr)
+		return
+	}
+	act.Verb = VerbRemoved
 }
 
 // listProjectDirsRaw enumerates EVERY ~/.fleet/projects/<name>/ entry
@@ -162,6 +218,43 @@ func projectHasTasksNow(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
+}
+
+// quarantineProjectDir atomically renames a malformed project dir to a
+// sibling ".<name>.gc-quarantine" path before deletion (codex iter-2 [P1]
+// TOCTOU close). Same-parent rename is atomic on a single filesystem, so
+// after this returns no live writer using the canonical projects/<name>
+// path can mutate the tree we're about to inspect+delete. The "." prefix
+// keeps the quarantine out of listProjectDirsRaw / the dashboard scan (both
+// skip dot-prefixed entries) so a half-finished reap can't resurface as a
+// phantom project. Returns the quarantined path.
+func quarantineProjectDir(path string) (string, error) {
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	qpath := filepath.Join(dir, "."+base+".gc-quarantine")
+	// Clear any stale quarantine from a prior aborted run so the rename
+	// can't fail with "destination exists".
+	if err := os.RemoveAll(qpath); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("clear stale quarantine %s: %w", qpath, err)
+	}
+	if err := os.Rename(path, qpath); err != nil {
+		return "", err
+	}
+	return qpath, nil
+}
+
+// restoreProjectDir renames a quarantined dir back to its original path
+// when the post-quarantine recheck found tasks.md (un-quarantine). If the
+// original path was recreated in the meantime (concurrent writer), the
+// rename would clobber it, so we refuse and leave the dir quarantined for
+// the operator to merge by hand (the caller surfaces the quarantine path).
+func restoreProjectDir(quarantined, original string) error {
+	if _, err := os.Lstat(original); err == nil {
+		return fmt.Errorf("original path %s reappeared — leaving quarantined to avoid clobber", original)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat %s: %w", original, err)
+	}
+	return os.Rename(quarantined, original)
 }
 
 // removeProjectDirTree rm -rf's a malformed project dir under --apply.

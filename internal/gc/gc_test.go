@@ -112,6 +112,12 @@ func stubDeps(now time.Time) Deps {
 		// Default recheck: tasks.md absent (safe to remove). The TOCTOU
 		// test overrides this to simulate a racing concurrent write.
 		ProjectHasTasks: func(string) (bool, error) { return false, nil },
+		// Identity quarantine for in-memory tests (no real FS): the reap
+		// flow renames before delete; stub it as a pass-through so the
+		// classifier's verb/remover assertions don't need a temp dir. The
+		// EndToEnd test uses DefaultDeps (real rename) instead.
+		QuarantineProjectDir: func(p string) (string, error) { return p, nil },
+		RestoreProjectDir:    func(string, string) error { return nil },
 	}
 }
 
@@ -2959,6 +2965,57 @@ func TestReconcile_InvalidProjects_TOCTOU_TasksAppearedNotRemoved(t *testing.T) 
 	}
 	if a.Verb != VerbSurface {
 		t.Fatalf("TOCTOU verb=%q, want %q (must fail closed, not remove)", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_InvalidProjects_TOCTOU_PostQuarantineRace regresses codex
+// iter-2 [P1]: the residual window where tasks.md appears AFTER the first
+// recheck but BEFORE rm -rf. The fix quarantines (renames) first, then
+// re-stats the quarantined tree. Here the pre-quarantine stat sees no
+// tasks.md (path=d.Path → false) but the post-quarantine stat does
+// (path=quarantined → true), so the classifier must un-quarantine
+// (restore called) and surface — never remove.
+func TestReconcile_InvalidProjects_TOCTOU_PostQuarantineRace(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	qpath := "/fake/projects/.--project.gc-quarantine"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "--project", Path: bogus, HasTasks: false}}, nil
+	}
+	deps.QuarantineProjectDir = func(p string) (string, error) {
+		if p != bogus {
+			t.Errorf("quarantine called with %q, want %q", p, bogus)
+		}
+		return qpath, nil
+	}
+	// tasks.md is absent on the live path but present once quarantined
+	// (the race: a writer landed tasks.md right after the first stat).
+	deps.ProjectHasTasks = func(p string) (bool, error) {
+		return p == qpath, nil
+	}
+	var restored [][2]string
+	deps.RestoreProjectDir = func(q, o string) error {
+		restored = append(restored, [2]string{q, o})
+		return nil
+	}
+	// RemoveProjectDir must NOT run (stubDeps default errors).
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("post-quarantine race verb=%q, want %q (must restore + surface)", a.Verb, VerbSurface)
+	}
+	if len(restored) != 1 || restored[0] != [2]string{qpath, bogus} {
+		t.Fatalf("RestoreProjectDir calls=%v, want one [%q %q]", restored, qpath, bogus)
 	}
 }
 
