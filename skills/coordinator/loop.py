@@ -2212,18 +2212,22 @@ def _read_coord_spawn_marker(project_dir: Path) -> str:
     return first.strip()
 
 
-def _holder_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
+def _agent_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
     """True iff ~/.fleet/agents/<id>.json names THIS project's coord.
 
-    A bare "the record parses" check is NOT enough to justify a
-    self-exit (codex review [P2]): the lock body could name a same-
-    project WORKER that hijacked coordinator.lock (the fleet#171
+    Applied to BOTH the lock holder and the current session: a bare
+    "the record parses" check is NOT enough to justify a self-exit
+    (codex review [P2]). For the HOLDER, the lock body could name a
+    same-project WORKER that hijacked coordinator.lock (the fleet#171
     hijack the project-ownership guard exists to catch), or a stale
-    body naming a live agent that belongs to a DIFFERENT project.
-    Either case must NOT make a legitimate coord kill itself.
+    body naming a live agent that belongs to a DIFFERENT project — in
+    neither case is the holder a legitimate coord to defer to. For the
+    CURRENT session, a worker that accidentally runs `loop.py` must not
+    be classified a duplicate coord and killed. So both the deferred-to
+    holder and the self-exiting session must clear this check.
 
-    So we require the holder's record to be genuinely this project's
-    coord on TWO axes:
+    We require the record to be genuinely this project's coord on TWO
+    axes:
 
       - ``project`` field == this project (excludes cross-project
         agents whose ID leaked into the body), and
@@ -2269,16 +2273,21 @@ def _classify_lock_busy(
 
       1. No coord_id  -> can't reason about identity (manual shell
          invocation). Skip.
-      2. Lock body has no valid holder ID -> can't prove a duplicate.
+      2. THIS session is not itself this project's coord (its own
+         record is missing / project-mismatched / task_id !=
+         coord-<project>) -> a worker that accidentally ran loop.py
+         must never self-exit and kill its own worker session. Skip.
+         (codex review [P2], round 2)
+      3. Lock body has no valid holder ID -> can't prove a duplicate.
          Skip. (legacy zero-byte lock, hand-edit, race before the
          holder published its body.)
-      3. holder == coord_id -> our own stale flock from a prior tick
+      4. holder == coord_id -> our own stale flock from a prior tick
          that hasn't been reaped yet. Not a duplicate. Skip.
-      4. spawn-marker == coord_id -> WE are the project's intended /
+      5. spawn-marker == coord_id -> WE are the project's intended /
          successor coord (mid-handoff). Never self-exit; the stale
          holder is the one to be reaped (by the swap / `fleet gc`).
          Skip.
-      5. holder's record is not THIS project's coord (missing record,
+      6. holder's record is not THIS project's coord (missing record,
          project mismatch, or task_id != coord-<project> — e.g. a
          same-project worker that hijacked the lock, or a cross-project
          agent ID in the body) OR holder's tmux session is dead -> not
@@ -2287,6 +2296,15 @@ def _classify_lock_busy(
     Only when NONE of the above fire is the session a true duplicate.
     """
     if not coord_id:
+        return "skip", ""
+    # THIS session must itself be this project's coord before we would
+    # ever tear it down (codex review [P2], round 2). A WORKER that
+    # accidentally runs `loop.py <project>` (or whose FLEET_AGENT_ID is
+    # set) while the real coord holds the lock would otherwise be
+    # classified "duplicate" and have main() kill `fleet-<worker_id>`,
+    # destroying unrelated worker work. Self-exit is a coord-only
+    # self-heal; non-coords just skip the tick.
+    if not _agent_is_project_coord(home, coord_id, project_dir.name):
         return "skip", ""
     holder = _read_lock_holder(lock_path)
     if not holder:
@@ -2298,7 +2316,7 @@ def _classify_lock_busy(
     # The holder must be a genuinely live coord FOR THIS PROJECT, not a
     # stale lock body, a hijacking same-project worker, or a cross-
     # project agent whose ID leaked into the body (codex review [P2]).
-    if not _holder_is_project_coord(home, holder, project_dir.name):
+    if not _agent_is_project_coord(home, holder, project_dir.name):
         return "skip", ""
     holder_session = supervisor_mod.session_name_for_agent(holder)
     if not supervisor_mod.tmux_session_alive(holder_session):

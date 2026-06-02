@@ -340,6 +340,42 @@ def test_holder_without_agent_record_does_not_self_exit(
     assert result.reason == "lock-busy"
 
 
+def test_self_is_worker_does_not_self_exit(
+    fleet_home: Path,
+    held_lock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex review [P2] round 2: THIS session is a same-project WORKER
+    (task_id is a feature task, not coord-<project>) that accidentally
+    ran loop.py while the real coord holds the lock. It must NOT be
+    classified a duplicate coord and have its worker session killed —
+    just skip the tick."""
+    me_worker = "aaaa0031"
+    real_coord = "bbbb0032"
+    pdir = _minimal_project(fleet_home)
+    # THIS session is a worker: same project, feature task_id.
+    _seed_agent_record(
+        fleet_home, me_worker, project="fleet", task_id="feature-task-9999",
+    )
+    # The lock is held by the genuine project coord.
+    _seed_agent_record(fleet_home, real_coord)
+    held_lock(pdir, real_coord)
+    _write_marker(pdir, real_coord)
+    monkeypatch.setattr(
+        supervisor_mod, "tmux_session_alive", lambda session, **kw: True,
+    )
+
+    result = loop.tick(
+        project="fleet", coord_id=me_worker, cwd="/tmp/x",
+        fleet_home=str(fleet_home),
+    )
+
+    assert result.self_exit is False, (
+        "a worker that ran loop.py must never self-exit (would kill worker work)"
+    )
+    assert result.reason == "lock-busy"
+
+
 def test_holder_is_same_project_worker_does_not_self_exit(
     fleet_home: Path,
     held_lock,
