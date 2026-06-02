@@ -201,6 +201,38 @@ def ref_exists(
     return proc.returncode == 0
 
 
+def is_ancestor(
+    repo: str,
+    ancestor: str,
+    descendant: str,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Return True iff <ancestor> is an ancestor of (or equal to)
+    <descendant> in <repo>'s commit graph.
+
+    `git -C <repo> merge-base --is-ancestor <ancestor> <descendant>`
+    (exit 0 = yes, 1 = no). Used to decide whether branching a worker off
+    a fresh remote ref would DROP the coord's local commits: if local
+    HEAD is an ancestor of the fetched upstream, the upstream is a strict
+    superset (local adds nothing) and is safe to use as the base; if NOT
+    (local ahead/diverged), we must branch off local HEAD to preserve the
+    operator's un-pushed commits (codex [P1]). Never raises — any
+    error / missing ref returns False (conservative: keep local HEAD).
+    """
+    if not repo or not ancestor or not descendant:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor",
+             ancestor, descendant],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def current_branch(
     repo: str,
     *,

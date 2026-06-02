@@ -4740,27 +4740,29 @@ def _dispatch_ready(
                     error=f"worktree-path resolution failed for {t.slug}",
                 ))
                 continue
-            # Pick the worker's base ref. Two pulls are in tension:
+            # Pick the worker's base ref. Several pulls are in tension:
             #   (a) the worker must see commits a dependency PR JUST merged
-            #       to the remote (the stale-local-HEAD bug this PR fixes), and
-            #   (b) the worker must honor the coord's deliberately checked-out
-            #       branch — the operator may sit on a stacked/integration
-            #       branch ahead of origin/<default>; branching off the remote
-            #       default would DROP that branch's commits (codex [P1]).
-            # resolve_worker_base reconciles both: it prefers the FRESH
-            # upstream of the coord's CURRENT branch (origin/<current>), which
-            # satisfies (a)+(b); falls back to local HEAD for a purely-local
-            # stacked branch with no upstream (honors (b)); and falls back to
-            # origin/<default> only when HEAD is detached.
+            #       to the remote (the stale-local-HEAD bug this PR fixes),
+            #   (b) honor the coord's deliberately checked-out branch — not
+            #       the remote default (codex [P1] #1),
+            #   (c) honor a DIFFERENTLY-named configured upstream, not an
+            #       assumed origin/<current> (codex [P2]), and
+            #   (d) NEVER drop the operator's local commits that are ahead
+            #       of / diverged from that upstream (codex [P1] #2).
             #
-            #   coord on `integration` (local, +ops) ──┐
-            #   origin/integration (fresh, +dep) ──────┼─ base=origin/integration
-            #                                          │   (fetch integration first)
-            #   origin/main (irrelevant here) ─────────┘
+            # resolve_worker_base picks the candidate base: the coord's
+            # branch's CONFIGURED upstream (@{upstream}); local HEAD when
+            # there's no upstream; the remote default when HEAD is detached.
+            # We then fetch that upstream (best-effort) and apply the
+            # ancestry gate below.
             #
-            # fetch is best-effort: on failure we log and branch off whatever
-            # the chosen base already resolves to locally (a possibly-stale
-            # ref beats wedging all of cap on a network blip).
+            #   local HEAD ⊆ fresh upstream?   (merge-base --is-ancestor)
+            #     yes → base = upstream    (local adds nothing; take freshness)  (a)
+            #     no  → base = "" / HEAD   (local ahead/diverged; preserve it)   (d)
+            #
+            # fetch is best-effort: on failure the upstream ref is whatever
+            # already resolves locally (a possibly-stale ref beats wedging
+            # all of cap on a network blip).
             wb = worktree_mod.resolve_worker_base(cwd)
             if wb.fetch_branch:
                 fetch_res = worktree_mod.fetch_remote(
@@ -4772,21 +4774,28 @@ def _dispatch_ready(
                         f"{wb.base or 'local HEAD'} at its current local tip",
                         file=sys.stderr,
                     )
-            # Verify the chosen base resolves to a commit. A remote ref that
-            # never landed locally (no origin remote, offline first run)
-            # would make `git worktree add` fatal "invalid reference" and
-            # skip the dispatch forever (codex [P2]); fall back to local
-            # HEAD so cap>1 dispatch still proceeds.
+            base_ref = ""  # default: local HEAD
+            # Use the fresh upstream as base ONLY when it (1) resolves to a
+            # commit — a remote ref that never landed locally would make
+            # `git worktree add` fatal "invalid reference" (codex [P2]) —
+            # AND (2) local HEAD is an ancestor of it, i.e. the upstream is
+            # a strict superset of local so we lose no local commits (codex
+            # [P1] #2). Otherwise fall back to local HEAD.
             if wb.base and worktree_mod.ref_exists(cwd, wb.base):
-                base_ref = wb.base
-            else:
-                base_ref = ""  # local HEAD
-                if wb.base:
+                if worktree_mod.is_ancestor(cwd, "HEAD", wb.base):
+                    base_ref = wb.base
+                else:
                     print(
-                        f"coord: {wb.base} not present in {cwd}; branching "
-                        f"{t.slug} off local HEAD (no fresh remote base)",
+                        f"coord: local HEAD has commits ahead of {wb.base}; "
+                        f"branching {t.slug} off local HEAD to preserve them",
                         file=sys.stderr,
                     )
+            elif wb.base:
+                print(
+                    f"coord: {wb.base} not present in {cwd}; branching "
+                    f"{t.slug} off local HEAD (no fresh remote base)",
+                    file=sys.stderr,
+                )
             wt_result = worktree_mod.create_worktree(
                 cwd, wt_path, worker_branch, base=base_ref,
             )

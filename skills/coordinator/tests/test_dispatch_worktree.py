@@ -243,6 +243,23 @@ def test_ref_exists_false_on_subprocess_exception_and_empty() -> None:
     assert worktree_mod.ref_exists("/repo", "") is False
 
 
+def test_is_ancestor_true_argv_and_false_paths() -> None:
+    """is_ancestor gates upstream-as-base: True only when local HEAD is
+    contained in the upstream (codex [P1] #2)."""
+    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m:
+        assert worktree_mod.is_ancestor("/repo", "HEAD", "origin/main") is True
+    args = m.call_args[0][0]
+    assert args == [
+        "git", "-C", "/repo", "merge-base", "--is-ancestor", "HEAD", "origin/main",
+    ]
+    with patch.object(worktree_mod.subprocess, "run", return_value=_err("", returncode=1)):
+        assert worktree_mod.is_ancestor("/repo", "HEAD", "origin/main") is False
+    with patch.object(worktree_mod.subprocess, "run", side_effect=FileNotFoundError("no git")):
+        assert worktree_mod.is_ancestor("/repo", "HEAD", "origin/main") is False
+    assert worktree_mod.is_ancestor("/repo", "", "origin/main") is False
+    assert worktree_mod.is_ancestor("/repo", "HEAD", "") is False
+
+
 # ---------- worktree.py: current_branch + resolve_worker_base ----------
 
 
@@ -677,6 +694,9 @@ def test_dispatch_ready_cap2_creates_worktree_and_passes_cwd(tmp_path) -> None:
         ("git", "-C", repo, "fetch"): _ok(),
         # ref_exists guard: origin/main resolves → use it as base.
         ("git", "-C", repo, "rev-parse", "--verify"): _ok(stdout="deadbeef\n"),
+        # ancestry gate: local HEAD is an ancestor of origin/main (local
+        # adds nothing) → safe to use upstream as base (codex [P1] #2).
+        ("git", "-C", repo, "merge-base", "--is-ancestor"): _ok(),
         ("git", "-C", repo, "worktree", "add"): _ok(),
     }
     calls: list = []
@@ -1273,4 +1293,49 @@ def test_real_git_dispatch_honors_differently_named_upstream(tmp_path):
     assert os.path.exists(os.path.join(wt_path, "dep.txt")), (
         "worker tree missing the dependency from origin/main — the "
         "differently-named upstream was not resolved (stale local HEAD)"
+    )
+
+
+def test_real_git_dispatch_preserves_local_commits_ahead_of_upstream(tmp_path):
+    """fails-on-parent (vs always-use-upstream): the coord's branch has an
+    upstream BUT local commits AHEAD of it (operator's un-pushed work). The
+    worker must branch off local HEAD so those commits survive — the
+    ancestry gate must NOT swap in the upstream (codex [P1] #2)."""
+    if not shutil.which("git"):
+        pytest.skip("git not on PATH")
+    origin = str(tmp_path / "origin.git")
+    seed = str(tmp_path / "seed")
+    subprocess.run(["git", "init", "-q", "-b", "main", seed], check=True, env=_GIT_ENV)
+    (tmp_path / "seed" / "base.txt").write_text("base\n")
+    _git(seed, "add", "base.txt")
+    _git(seed, "commit", "-q", "-m", "c1 base")
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", origin], check=True, env=_GIT_ENV)
+    _git(seed, "remote", "add", "origin", origin)
+    _git(seed, "push", "-q", "origin", "main")
+
+    clone = str(tmp_path / "clone")
+    subprocess.run(["git", "clone", "-q", origin, clone], check=True, env=_GIT_ENV)
+    # Operator makes a LOCAL commit on main, ahead of origin/main, un-pushed.
+    (tmp_path / "clone" / "local_wip.txt").write_text("operator local work\n")
+    _git(clone, "add", "local_wip.txt")
+    _git(clone, "commit", "-q", "-m", "local wip ahead of upstream")
+    # Sanity: local HEAD is NOT an ancestor of origin/main (it's ahead).
+    assert worktree_mod.is_ancestor(clone, "HEAD", "origin/main") is False
+
+    t = _ready_task("alpha-1234")
+    wt_path = str(tmp_path / "wt" / "alpha-1234")
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_git_router(clone, wt_path)):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd=clone, cap=2,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+        )
+
+    assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
+    # The operator's local-only commit survives in the worker tree.
+    assert os.path.exists(os.path.join(wt_path, "local_wip.txt")), (
+        "worker tree dropped the operator's local commit — it was wrongly "
+        "based on origin/main instead of local HEAD"
     )
