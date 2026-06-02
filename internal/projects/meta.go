@@ -213,11 +213,18 @@ func sanitizeTag(s string) string {
 	for strings.Contains(out, "--") {
 		out = strings.ReplaceAll(out, "--", "-")
 	}
-	out = strings.Trim(out, "-._")
-	// ValidateProjectName now rejects leading-hyphen + punctuation-only
-	// names (invalid-project-dir-guar-d636). Keep the producer in lockstep:
-	// a path that sanitizes to punctuation-only (e.g. "_", "_._") or empty
+	// Trim only "-" and "." at the edges (NOT "_"): underscores are valid
+	// interior AND edge chars in ValidateProjectName, so trimming a
+	// trailing "_" would alias e.g. "repos-foo_" onto "repos-foo" — a
+	// different project (codex iter-4 [P2]). Leading "-" must go because
+	// the validator rejects it; "." because "." / ".." are reserved.
+	out = strings.Trim(out, "-.")
+	// ValidateProjectName rejects leading-hyphen + punctuation-only names
+	// (invalid-project-dir-guar-d636). Keep the producer in lockstep: a
+	// path that sanitizes to punctuation-only (e.g. "_", "_._") or empty
 	// must fall back to "fleet", not emit a tag the validator would reject.
+	// The !hasAlnum check (not edge-trimming "_") does the punctuation-only
+	// fallback so valid underscore-bearing tags are preserved verbatim.
 	if !hasAlnum(out) {
 		return "fleet"
 	}

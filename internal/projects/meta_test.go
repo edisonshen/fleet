@@ -146,6 +146,23 @@ func TestSanitizeTag_ProducerValidatorContract(t *testing.T) {
 			}
 		})
 	}
+
+	// Underscores are valid edge + interior chars; the punctuation-only
+	// fallback must NOT trim a trailing/leading "_" off an otherwise-valid
+	// tag, or distinct repos alias onto one project (codex iter-4 [P2]).
+	preserve := map[string]string{
+		"repos-foo_": "repos-foo_",
+		"_foo":       "_foo",
+		"a_b":        "a_b",
+		"foo.bar":    "foo.bar",
+	}
+	for in, want := range preserve {
+		t.Run("preserve/"+in, func(t *testing.T) {
+			if got := sanitizeTag(in); got != want {
+				t.Errorf("sanitizeTag(%q)=%q, want %q (underscore-bearing tags must survive)", in, got, want)
+			}
+		})
+	}
 }
 
 // TestMeta_LegacyFileWithoutIsGit_ParsesAsTrue: a meta.json written by
