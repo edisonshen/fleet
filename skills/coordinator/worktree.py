@@ -84,6 +84,305 @@ def compute_worktree_path(
     return out.rstrip(os.sep)
 
 
+def resolve_default_branch(
+    repo: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 10.0,
+) -> str:
+    """Resolve <repo>'s default branch name (e.g. "main", "master").
+
+    Strategy (first hit wins):
+      1. `git -C <repo> symbolic-ref --short refs/remotes/<remote>/HEAD`
+         → e.g. "origin/main"; strip the "<remote>/" prefix. This is the
+         remote's published default, recorded at clone time. It is the
+         authoritative answer and is what we branch workers off of.
+      2. Fallback to "main" when symbolic-ref is unset / errors. A bare
+         clone or a repo whose origin/HEAD was never set won't have the
+         ref; "main" is the modern default and matches fleet's own repo.
+
+    Returns the branch NAME only (no remote prefix). Never raises — a
+    detached / non-git / no-remote repo falls through to "main", which
+    the caller then qualifies as "<remote>/main" for the fetch + base.
+    """
+    if not repo:
+        return "main"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "symbolic-ref", "--short",
+             f"refs/remotes/{remote}/HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return "main"
+    if proc.returncode != 0:
+        return "main"
+    out = (proc.stdout or "").strip()
+    # symbolic-ref --short returns "<remote>/<branch>"; strip the remote.
+    prefix = f"{remote}/"
+    if out.startswith(prefix):
+        out = out[len(prefix):]
+    return out or "main"
+
+
+def fetch_remote(
+    repo: str,
+    branch: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 60.0,
+) -> WorktreeResult:
+    """`git -C <repo> fetch <remote> <branch>` — refresh the remote ref.
+
+    Why: a worker worktree branched off the coord's LOCAL HEAD inherits
+    whatever the coord last pulled. When a dependency PR merges to
+    origin/<branch> AFTER the coord's last fetch, local <branch> is
+    stale and the worker's tree is missing the dependency's code. We
+    fetch the remote ref immediately before `git worktree add` so the
+    worktree can branch off the fresh origin/<branch> tip.
+
+    Returns WorktreeResult with empty error on success. On failure
+    (offline, no remote, bad branch) the caller treats it as non-fatal:
+    it logs and proceeds to branch off the (possibly stale) origin ref
+    that already exists locally — better a stale base than no dispatch.
+    A missing remote is the common non-git-server case; we don't want
+    to wedge all of cap on a transient network blip.
+
+    Best-effort by contract. Empty repo/branch is a refusing no-op so a
+    caller bug can't shell `git fetch origin ''`.
+    """
+    if not repo or not branch:
+        return WorktreeResult(error="fetch_remote: empty repo/branch")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "fetch", remote, branch],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return WorktreeResult(error=f"fetch_remote: {exc}")
+    if proc.returncode == 0:
+        return WorktreeResult(path=repo)
+    stderr = (proc.stderr or proc.stdout or "").strip()
+    return WorktreeResult(error=f"fetch_remote: git fetch {remote} {branch}: {stderr}")
+
+
+def ref_exists(
+    repo: str,
+    ref: str,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Return True iff <ref> resolves to an object in <repo>.
+
+    `git -C <repo> rev-parse --verify --quiet <ref>^{commit}` — exit 0
+    means the ref names a commit we can branch from. Used to GUARD the
+    base passed to `git worktree add`: a non-git project, a repo with no
+    `origin` remote, or one whose `origin/<default>` ref was never
+    fetched (offline first run) has NO `origin/<default>` object. Passing
+    that as base makes `git worktree add` fatal with `invalid reference`,
+    which would skip the dispatch entirely (codex [P2]). The caller falls
+    back to the local-HEAD base (base="") when this returns False, so
+    cap>1 dispatch still proceeds — just off local HEAD, the pre-fix
+    behavior, rather than wedging the task forever.
+
+    Never raises — a missing git binary / timeout / empty input is a
+    conservative False (caller falls back to local HEAD).
+    """
+    if not repo or not ref:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+             f"{ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def is_ancestor(
+    repo: str,
+    ancestor: str,
+    descendant: str,
+    *,
+    timeout_s: float = 10.0,
+) -> bool:
+    """Return True iff <ancestor> is an ancestor of (or equal to)
+    <descendant> in <repo>'s commit graph.
+
+    `git -C <repo> merge-base --is-ancestor <ancestor> <descendant>`
+    (exit 0 = yes, 1 = no). Used to decide whether branching a worker off
+    a fresh remote ref would DROP the coord's local commits: if local
+    HEAD is an ancestor of the fetched upstream, the upstream is a strict
+    superset (local adds nothing) and is safe to use as the base; if NOT
+    (local ahead/diverged), we must branch off local HEAD to preserve the
+    operator's un-pushed commits (codex [P1]). Never raises — any
+    error / missing ref returns False (conservative: keep local HEAD).
+    """
+    if not repo or not ancestor or not descendant:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor",
+             ancestor, descendant],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def current_branch(
+    repo: str,
+    *,
+    timeout_s: float = 10.0,
+) -> str:
+    """Return <repo>'s currently checked-out branch name, or "" if the
+    repo is in detached-HEAD state / not a git repo.
+
+    `git -C <repo> symbolic-ref --short -q HEAD` prints the branch name
+    on a normal checkout and exits non-zero (empty) when HEAD is
+    detached. The coord's checkout branch is operator-authoritative: the
+    operator chooses the integration branch by checking it out before
+    spawning the coord, so workers must branch off ITS upstream, not the
+    remote default. Never raises.
+    """
+    if not repo:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "symbolic-ref", "--short", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def upstream_ref(
+    repo: str,
+    branch: str = "HEAD",
+    *,
+    timeout_s: float = 10.0,
+) -> str:
+    """Return <branch>'s CONFIGURED upstream remote-tracking ref, e.g.
+    "origin/main", or "" when no upstream is set / on error.
+
+    `git -C <repo> rev-parse --abbrev-ref --symbolic-full-name <branch>@{u}`.
+    Unlike assuming "<remote>/<branch>", this reads the branch's ACTUAL
+    `branch.<name>.merge`/`.remote` config — so a local branch tracking a
+    DIFFERENTLY-NAMED upstream (`git checkout -b integration --track
+    origin/main`) resolves to the real "origin/main", not the bogus
+    "origin/integration" (codex [P2]). Never raises.
+    """
+    if not repo or not branch:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--abbrev-ref",
+             "--symbolic-full-name", f"{branch}@{{upstream}}"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+@dataclass
+class WorkerBase:
+    """Resolved base for a worker worktree + the branch to fetch first.
+
+    base is what `git worktree add` branches off (passed as create_worktree's
+    `base=`); "" means local HEAD. fetch_remote/fetch_branch name the
+    `git fetch <fetch_remote> <fetch_branch>` to run before resolving base
+    (both "" = skip fetch, e.g. a local-only branch with no upstream).
+    """
+
+    base: str = ""
+    fetch_remote: str = ""
+    fetch_branch: str = ""
+
+
+def _split_remote_ref(ref: str, default_remote: str = "origin") -> tuple[str, str]:
+    """Split "origin/main" → ("origin", "main"); "origin/feat/x" →
+    ("origin", "feat/x"). A ref with no "/" is treated as a bare branch
+    on default_remote. Returns ("", "") for empty input."""
+    if not ref:
+        return ("", "")
+    parts = ref.split("/", 1)
+    if len(parts) == 2:
+        return (parts[0], parts[1])
+    return (default_remote, parts[0])
+
+
+def resolve_worker_base(
+    repo: str,
+    *,
+    remote: str = "origin",
+    timeout_s: float = 10.0,
+) -> WorkerBase:
+    """Pick the base ref a worker worktree should branch from.
+
+    The goal is two-fold and the two pulls are in tension:
+      (a) workers must see commits a dependency PR JUST merged to the
+          remote (the stale-local-HEAD bug this PR fixes), AND
+      (b) workers must honor the coord's deliberately checked-out branch
+          (operator may sit on a stacked/integration branch ahead of the
+          remote default — branching off origin/<default> would DROP that
+          branch's commits; codex [P1]).
+
+    Resolution (first hit wins):
+      1. The coord is on branch <cb> with a CONFIGURED upstream
+         <remote>/<up> (read via `@{upstream}`, NOT assumed to be
+         origin/<cb> — codex [P2]: a branch can track a differently-named
+         upstream). → fetch <up> from <remote>, base = "<remote>/<up>".
+         Fresh upstream of the operator's OWN branch: satisfies (a)+(b).
+      2. The coord is on branch <cb> with NO upstream (a purely-local
+         stacked branch the operator built and hasn't pushed). → base =
+         "" (local HEAD). Honors (b); there's no remote to refresh from.
+      3. Detached HEAD / no current branch → fall back to the remote
+         default branch (resolve_default_branch), fetch it, base =
+         "<remote>/<default>" (caller verifies + falls back to HEAD).
+
+    Pure resolution: this does NOT fetch or create anything. The caller
+    fetches WorkerBase.fetch_{remote,branch} (best-effort), then
+    verifies WorkerBase.base via ref_exists and creates.
+
+    ASCII — the decision the caller drives off this:
+
+        coord checkout HEAD ──► current_branch?
+              │ detached                  │ branch <cb>
+              ▼                            ▼
+        default branch <d>         configured upstream @{u}?
+        fetch <d>                   │ <r>/<up>    │ none
+        base=<remote>/<d>           ▼             ▼
+        (caller verifies)      <r>/<up>        "" (local HEAD)
+                               (fetch <r> <up>) (no fetch)
+    """
+    cb = current_branch(repo, timeout_s=timeout_s)
+    if cb:
+        up = upstream_ref(repo, cb, timeout_s=timeout_s)
+        if up:
+            up_remote, up_branch = _split_remote_ref(up, default_remote=remote)
+            return WorkerBase(
+                base=up, fetch_remote=up_remote, fetch_branch=up_branch,
+            )
+        # Local-only branch (no upstream): branch off local HEAD so the
+        # operator's commits aren't dropped. No fetch — nothing to refresh.
+        return WorkerBase(base="", fetch_remote="", fetch_branch="")
+    # Detached HEAD: best we can do is the remote default branch.
+    default_branch = resolve_default_branch(repo, remote=remote, timeout_s=timeout_s)
+    return WorkerBase(
+        base=f"{remote}/{default_branch}", fetch_remote=remote,
+        fetch_branch=default_branch,
+    )
+
+
 def create_worktree(
     repo: str,
     wt_path: str,
