@@ -74,6 +74,23 @@ func reconcileInvalidProjects(r *Report, opts Options, deps Deps) error {
 			Reason: fmt.Sprintf("invalid project name %q (CLI flag-misparse / hand-edit) + no tasks.md", d.Name),
 		}
 		if opts.Apply {
+			// TOCTOU guard (codex iter-1 [P1]): HasTasks was sampled during
+			// ListProjectDirs; a concurrent coord/migration can write
+			// tasks.md before we rm -rf. Re-stat immediately before the
+			// destructive op and FAIL CLOSED — surface instead of deleting
+			// on a freshly-appeared tasks.md OR any non-ENOENT stat error.
+			// Data safety beats reaping one cruft dir this run.
+			if hasTasks, terr := projectHasTasksRecheck(deps, d.Path); terr != nil {
+				act.Verb = VerbSurface
+				act.Reason = fmt.Sprintf("invalid project name %q but tasks.md stat failed (%v) — refusing to auto-remove; re-run `fleet gc --kinds invalid-projects` after resolving", d.Name, terr)
+				r.Actions = append(r.Actions, act)
+				continue
+			} else if hasTasks {
+				act.Verb = VerbSurface
+				act.Reason = fmt.Sprintf("invalid project name %q but tasks.md appeared since scan — refusing to auto-remove (concurrent write?); migrate or `rm -rf` manually after review", d.Name)
+				r.Actions = append(r.Actions, act)
+				continue
+			}
 			if rerr := deps.RemoveProjectDir(d.Path); rerr != nil {
 				act.Reason = fmt.Sprintf("remove failed: %v", rerr)
 			} else {
@@ -120,6 +137,31 @@ func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 		out = append(out, ProjectDirInfo{Name: name, Path: path, HasTasks: hasTasks})
 	}
 	return out, nil
+}
+
+// projectHasTasksRecheck re-stats <path>/tasks.md right before the
+// destructive remove (codex iter-1 [P1] TOCTOU guard). Uses the injected
+// dep when present so tests can simulate a tasks.md racing in; falls back
+// to the production stat otherwise.
+func projectHasTasksRecheck(deps Deps, path string) (bool, error) {
+	if deps.ProjectHasTasks != nil {
+		return deps.ProjectHasTasks(path)
+	}
+	return projectHasTasksNow(path)
+}
+
+// projectHasTasksNow reports whether <path>/tasks.md exists. A missing
+// file (ENOENT) is the safe-to-remove case (false, nil); any OTHER stat
+// error is returned so the caller fails closed rather than guessing.
+func projectHasTasksNow(path string) (bool, error) {
+	_, err := os.Stat(filepath.Join(path, "tasks.md"))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // removeProjectDirTree rm -rf's a malformed project dir under --apply.

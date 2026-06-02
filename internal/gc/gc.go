@@ -257,6 +257,14 @@ type Deps struct {
 	// RemoveProjectDir rm -rf's a malformed project dir under --apply.
 	// Production wiring is removeProjectDirTree (ENOENT-tolerant).
 	RemoveProjectDir func(path string) error
+	// ProjectHasTasks re-stats <path>/tasks.md immediately before the
+	// destructive RemoveProjectDir, closing the TOCTOU window between the
+	// ListProjectDirs scan (which set HasTasks) and the actual rm -rf: a
+	// concurrent coord/migration can write tasks.md in that gap. Returns
+	// (present, statErr). The classifier FAILS CLOSED — refuses to remove
+	// on present==true OR a non-ENOENT statErr. Production wiring is
+	// projectHasTasksNow. (codex iter-1 [P1])
+	ProjectHasTasks func(path string) (bool, error)
 }
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
@@ -740,6 +748,7 @@ func DefaultDeps() Deps {
 		ListProjectDirs:     listProjectDirsRaw,
 		ValidProjectName:    func(name string) bool { return state.ValidateProjectName(name) == nil },
 		RemoveProjectDir:    removeProjectDirTree,
+		ProjectHasTasks:     projectHasTasksNow,
 	}
 }
 

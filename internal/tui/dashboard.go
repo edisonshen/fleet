@@ -192,8 +192,12 @@ func surfaceMalformedProjects(names []string) {
 			continue
 		}
 		malformedProjectsReported[n] = true
+		// %q quotes + escapes the name: a malformed dir name can contain
+		// newlines or terminal escape sequences, and printing it raw would
+		// let it forge warning lines or emit control output on the
+		// operator's terminal (codex iter-1 [P2]).
 		fmt.Fprintf(os.Stderr,
-			"warning: skipping malformed project dir ~/.fleet/projects/%s (invalid name — likely a `--project` CLI flag-misparse). Reap it with `fleet gc --kinds invalid-projects --apply`.\n",
+			"warning: skipping malformed project dir ~/.fleet/projects/%q (invalid name — likely a `--project` CLI flag-misparse). Reap it with `fleet gc --kinds invalid-projects --apply`.\n",
 			n)
 	}
 }

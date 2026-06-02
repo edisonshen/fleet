@@ -109,6 +109,9 @@ func stubDeps(now time.Time) Deps {
 		RemoveProjectDir: func(string) error {
 			return errors.New("stubDeps: RemoveProjectDir should not run")
 		},
+		// Default recheck: tasks.md absent (safe to remove). The TOCTOU
+		// test overrides this to simulate a racing concurrent write.
+		ProjectHasTasks: func(string) (bool, error) { return false, nil },
 	}
 }
 
@@ -2924,5 +2927,66 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	}
 	if _, serr := os.Stat(real); serr != nil {
 		t.Fatalf("apply must NOT touch the real project; stat err=%v", serr)
+	}
+}
+
+// TestReconcile_InvalidProjects_TOCTOU_TasksAppearedNotRemoved regresses
+// codex iter-1 [P1]: HasTasks is sampled during ListProjectDirs, but a
+// concurrent coord/migration can write tasks.md before the rm -rf. The
+// classifier must re-stat right before deletion and FAIL CLOSED — surface,
+// never remove — when tasks.md raced in. Here HasTasks=false (scan-time)
+// but ProjectHasTasks=true (recheck-time) simulates the race.
+func TestReconcile_InvalidProjects_TOCTOU_TasksAppearedNotRemoved(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "--project", Path: bogus, HasTasks: false}}, nil
+	}
+	// tasks.md raced in between scan and delete.
+	deps.ProjectHasTasks = func(string) (bool, error) { return true, nil }
+	// RemoveProjectDir must NOT run (stubDeps default errors).
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("TOCTOU verb=%q, want %q (must fail closed, not remove)", a.Verb, VerbSurface)
+	}
+}
+
+// TestReconcile_InvalidProjects_TOCTOU_StatErrorFailsClosed: a non-ENOENT
+// stat error during the pre-delete recheck must also fail closed (surface,
+// not remove) — codex iter-1 [P1]. We never rm -rf on an ambiguous stat.
+func TestReconcile_InvalidProjects_TOCTOU_StatErrorFailsClosed(t *testing.T) {
+	now := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	bogus := "/fake/projects/--project"
+	deps.ListProjectDirs = func() ([]ProjectDirInfo, error) {
+		return []ProjectDirInfo{{Name: "--project", Path: bogus, HasTasks: false}}, nil
+	}
+	deps.ProjectHasTasks = func(string) (bool, error) {
+		return false, errors.New("permission denied")
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindInvalidProjects},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindInvalidProjects, bogus)
+	if !ok {
+		t.Fatalf("missing invalid-projects action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("stat-error verb=%q, want %q (must fail closed)", a.Verb, VerbSurface)
 	}
 }
