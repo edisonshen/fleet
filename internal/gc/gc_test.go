@@ -2947,6 +2947,55 @@ func TestReconcile_InvalidProjects_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestReconcile_InvalidProjects_StrandedQuarantineReaped regresses codex
+// iter-5 [P2]: a leftover ".<base>.gc-quarantine..." dir from a failed
+// restore is dot-prefixed, but fleet must still be able to reap its own
+// cruft (feedback_fleet_owns_its_resources). An EMPTY stranded quarantine
+// (no tasks.md) is reaped; one that still HOLDS a tasks.md is surfaced,
+// never auto-deleted.
+func TestReconcile_InvalidProjects_StrandedQuarantineReaped(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("FLEET_HOME", home)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("Bootstrap: %v", err)
+	}
+	pdir := filepath.Join(home, "projects")
+	// Empty stranded quarantine (no tasks.md) — must be reaped.
+	emptyQ := filepath.Join(pdir, ".--project.gc-quarantine.1234.5678")
+	if err := os.MkdirAll(filepath.Join(emptyQ, ".locks"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Stranded quarantine WITH tasks.md — must be surfaced, not deleted.
+	tasksQ := filepath.Join(pdir, ".-weird.gc-quarantine.4321.8765")
+	if err := os.MkdirAll(tasksQ, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tasksQ, "tasks.md"), []byte("# tasks\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deps := DefaultDeps()
+	deps.Now = func() time.Time { return time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC) }
+	app, err := Reconcile(Options{Apply: true, MaxAge: 24 * time.Hour, Kinds: []Kind{KindInvalidProjects}}, deps)
+	if err != nil {
+		t.Fatalf("apply Reconcile: %v", err)
+	}
+	// Empty quarantine reaped.
+	if ae, ok := findAction(app, KindInvalidProjects, emptyQ); !ok || ae.Verb != VerbRemoved {
+		t.Fatalf("empty stranded quarantine action=%+v (ok=%v); want verb=%q", ae, ok, VerbRemoved)
+	}
+	if _, serr := os.Stat(emptyQ); !os.IsNotExist(serr) {
+		t.Fatalf("empty stranded quarantine must be removed; stat err=%v", serr)
+	}
+	// tasks.md quarantine surfaced + still on disk.
+	if at, ok := findAction(app, KindInvalidProjects, tasksQ); !ok || at.Verb != VerbSurface {
+		t.Fatalf("tasks-bearing stranded quarantine action=%+v (ok=%v); want verb=%q", at, ok, VerbSurface)
+	}
+	if _, serr := os.Stat(tasksQ); serr != nil {
+		t.Fatalf("tasks-bearing stranded quarantine must survive; stat err=%v", serr)
+	}
+}
+
 // TestReconcile_InvalidProjects_TOCTOU_TasksAppearedNotRemoved regresses
 // codex iter-1 [P1]: HasTasks is sampled during ListProjectDirs, but a
 // concurrent coord/migration can write tasks.md before the rm -rf. The

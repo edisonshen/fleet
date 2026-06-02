@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/edisonshen/fleet/internal/state"
@@ -57,22 +58,36 @@ func reconcileInvalidProjects(r *Report, opts Options, deps Deps) error {
 		valid = func(name string) bool { return state.ValidateProjectName(name) == nil }
 	}
 	for _, d := range dirs {
-		if valid(d.Name) {
+		// A leftover quarantine dir is fleet's own cruft and is always
+		// reapable, even though its dotted name happens to pass
+		// ValidateProjectName (dots + alnum are allowed). Treat it like a
+		// malformed dir so the same tasks.md-guarded reap applies (codex
+		// iter-5 [P2]).
+		isQuarantine := strings.Contains(d.Name, quarantineMarker)
+		if !isQuarantine && valid(d.Name) {
 			continue // real project — leave alone
 		}
 		if d.HasTasks {
-			// Conservative: a malformed name with a task list might hold
-			// real state the operator wants to migrate. Surface, don't
-			// auto-delete (feedback_surface_dont_silo).
+			// Conservative: a malformed name (or stranded quarantine) with
+			// a task list might hold real state the operator wants to
+			// migrate. Surface, don't auto-delete (feedback_surface_dont_silo).
+			reason := fmt.Sprintf("invalid project name %q but tasks.md present — refusing to auto-remove; migrate or `rm -rf` manually after review", d.Name)
+			if isQuarantine {
+				reason = fmt.Sprintf("stranded gc quarantine %q still holds tasks.md (failed restore?) — refusing to auto-remove; recover state then `rm -rf` manually", d.Name)
+			}
 			r.Actions = append(r.Actions, Action{
 				Kind: KindInvalidProjects, Target: d.Path, Verb: VerbSurface,
-				Reason: fmt.Sprintf("invalid project name %q but tasks.md present — refusing to auto-remove; migrate or `rm -rf` manually after review", d.Name),
+				Reason: reason,
 			})
 			continue
 		}
+		reason := fmt.Sprintf("invalid project name %q (CLI flag-misparse / hand-edit) + no tasks.md", d.Name)
+		if isQuarantine {
+			reason = fmt.Sprintf("stranded gc quarantine %q + no tasks.md — reaping fleet's own leftover", d.Name)
+		}
 		act := Action{
 			Kind: KindInvalidProjects, Target: d.Path, Verb: VerbWouldRemove,
-			Reason: fmt.Sprintf("invalid project name %q (CLI flag-misparse / hand-edit) + no tasks.md", d.Name),
+			Reason: reason,
 		}
 		if opts.Apply {
 			applyInvalidProjectReap(&act, deps, d)
@@ -159,10 +174,22 @@ func applyInvalidProjectReap(act *Action, deps Deps, d ProjectDirInfo) {
 	act.Verb = VerbRemoved
 }
 
+// quarantineMarker tags the dot-prefixed sibling dirs quarantineProjectDir
+// creates. listProjectDirsRaw deliberately re-surfaces these (despite the
+// dot prefix) so a stranded quarantine from a failed restore is reapable by
+// fleet itself — fleet owns the lifecycle of everything it creates
+// (feedback_fleet_owns_its_resources). codex iter-5 [P2].
+const quarantineMarker = ".gc-quarantine."
+
 // listProjectDirsRaw enumerates EVERY ~/.fleet/projects/<name>/ entry
 // (including malformed names ListProjects hides) plus whether each holds
-// a tasks.md. The reserved ".locks" control dir and dot-prefixed entries
-// are skipped — they're not projects and not the classifier's concern.
+// a tasks.md. The reserved ".locks" control dir and OTHER dot-prefixed
+// entries are skipped — they're not projects and not the classifier's
+// concern. The ONE dot-prefixed exception is fleet's own leftover
+// `.<base>.gc-quarantine.<pid>.<nano>` dirs: those are cruft fleet created
+// and must reap (a name starting with "." fails ValidateProjectName, so the
+// classifier treats them as malformed — reaped if empty, surfaced if they
+// still hold a tasks.md from a failed restore).
 func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 	root, err := state.Root()
 	if err != nil {
@@ -182,8 +209,12 @@ func listProjectDirsRaw() ([]ProjectDirInfo, error) {
 			continue
 		}
 		name := e.Name()
-		// Reserved control dir + dot-prefixed entries are never projects.
-		if name == ".locks" || (len(name) > 0 && name[0] == '.') {
+		// Reserved control dir + dot-prefixed entries are never projects,
+		// EXCEPT fleet's own leftover quarantine dirs (reap fleet's cruft).
+		if name == ".locks" {
+			continue
+		}
+		if len(name) > 0 && name[0] == '.' && !strings.Contains(name, quarantineMarker) {
 			continue
 		}
 		path := filepath.Join(pdir, name)
