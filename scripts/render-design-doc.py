@@ -132,7 +132,7 @@ HTML_TEMPLATE = """<!doctype html>
     padding: 56px 32px 112px;
   }}
   body > header,
-  body > main,
+  body > section,
   body > footer {{ grid-column: 2; }}
   header {{
     border-bottom: 1px solid var(--border);
@@ -152,14 +152,14 @@ HTML_TEMPLATE = """<!doctype html>
     margin: 0 0 12px;
     max-width: 18ch;
   }}
-  main h2 {{
+  h2 {{
     font-size: 1.42rem;
     line-height: 1.22;
     margin: 72px 0 18px;
     font-weight: 680;
     padding-top: 2px;
   }}
-  main > h2:first-child {{ margin-top: 0; }}
+  section:first-of-type h2 {{ margin-top: 0; }}
   h3 {{
     font-size: 1.08rem;
     line-height: 1.34;
@@ -179,7 +179,7 @@ HTML_TEMPLATE = """<!doctype html>
     font-weight: 650;
     color: var(--muted);
   }}
-  .anchor {{
+  .heading-anchor {{
     opacity: 0;
     border-bottom: 0;
     color: var(--subtle);
@@ -188,17 +188,17 @@ HTML_TEMPLATE = """<!doctype html>
     text-decoration: none;
     transition: opacity 140ms ease, color 140ms ease;
   }}
-  :is(h1, h2, h3, h4, h5, h6):hover .anchor,
-  .anchor:focus {{
+  :is(h1, h2, h3, h4, h5, h6):hover .heading-anchor,
+  .heading-anchor:focus {{
     opacity: 1;
     color: var(--accent);
   }}
-  .doc-meta {{
+  .meta {{
     color: var(--muted);
     font-size: 0.86rem;
     line-height: 1.55;
   }}
-  .doc-meta code {{ font-size: 0.92em; }}
+  .meta code {{ font-size: 0.92em; }}
   p, li {{ margin: 0 0 12px; }}
   p {{ max-width: 72ch; }}
   ul, ol {{ padding-left: 24px; }}
@@ -303,7 +303,7 @@ HTML_TEMPLATE = """<!doctype html>
     line-height: 1.45;
     box-shadow: var(--shadow);
   }}
-  nav.toc .toctitle {{
+  nav.toc strong {{
     display: block;
     margin: 0 0 10px;
     font-size: 0.74rem;
@@ -312,8 +312,7 @@ HTML_TEMPLATE = """<!doctype html>
     color: var(--muted);
     font-weight: 650;
   }}
-  nav.toc ul {{ list-style: none; padding-left: 0; margin: 0; }}
-  nav.toc ul ul {{ padding-left: 14px; }}
+  nav.toc ol {{ padding-left: 19px; margin: 0; }}
   nav.toc li {{ margin: 5px 0; padding-left: 2px; }}
   nav.toc a {{
     color: var(--fg);
@@ -383,7 +382,7 @@ HTML_TEMPLATE = """<!doctype html>
     body {{ display: block; max-width: 820px; padding: 40px 24px 88px; }}
     header {{ margin-bottom: 24px; }}
     h1 {{ max-width: none; }}
-    main h2 {{ margin-top: 56px; }}
+    h2 {{ margin-top: 56px; }}
     nav.toc {{ position: static; max-height: none; margin: 0 0 44px; }}
   }}
   @media (max-width: 720px) {{
@@ -412,9 +411,9 @@ HTML_TEMPLATE = """<!doctype html>
     body {{ display: block; max-width: none; padding: 0; font-size: 11pt; line-height: 1.5; }}
     nav.toc {{ position: static; box-shadow: none; margin: 0 0 24pt; page-break-after: avoid; max-height: none; }}
     h1 {{ font-size: 28pt; max-width: none; }}
-    main h2 {{ font-size: 16pt; margin-top: 28pt; page-break-after: avoid; }}
+    h2 {{ font-size: 16pt; margin-top: 28pt; page-break-after: avoid; }}
     h3, h4 {{ page-break-after: avoid; }}
-    .anchor {{ display: none; }}
+    .heading-anchor {{ display: none; }}
     a {{ color: inherit; border-bottom: 0; text-decoration: underline; }}
     pre, table, blockquote, .qbox, .layer {{ break-inside: avoid; box-shadow: none; }}
     table {{ font-size: 9pt; }}
@@ -425,19 +424,17 @@ HTML_TEMPLATE = """<!doctype html>
 <body>
 <header>
   <h1>{title}</h1>
-  <div class="doc-meta">
+  <div class="meta">
     <strong>Source:</strong> <code>{source_path}</code> &middot;
     <strong>Rendered:</strong> {rendered_at} &middot;
     agents read the <code>.md</code>, humans read the <code>.html</code>.
   </div>
 </header>
 <nav class="toc" aria-label="Contents">
-  <span class="toctitle">Contents</span>
+  <strong>Contents</strong>
   {toc}
 </nav>
-<main>
 {body}
-</main>
 <footer>
   <p>Rendered from <code>{source_path}</code> by <code>scripts/render-design-doc.py</code> in hub style. The <code>.md</code> is the source of truth; regenerate this file after editing it.</p>
 </footer>
@@ -486,11 +483,19 @@ class HubTreeprocessor(Treeprocessor):
         return root
 
     def _number_sections(self, root):
-        """Prefix top-level h2 headings with an incrementing ordinal.
+        """Prefix top-level h2 headings with an ordinal and renumber their id.
 
-        `## Problem` -> "1. Problem". Headings that already begin with a
-        number (`## 3. Foo`, `## 4.2 Bar`) are left untouched so docs that
-        number their own sections aren't double-numbered.
+        `## Problem` -> "1. Problem" with id `1-problem`, matching the
+        operator's hub exemplar (DESIGN-docs-publisher.html uses
+        `<section id="1-problem">` / `<h2 id="1-problem">`). The toc extension
+        (higher priority) has already assigned a plain slug id (`problem`) and
+        appended a `.heading-anchor` permalink child whose href points at
+        `#problem`; we prefix the ordinal to both the id and the href so the
+        anchor still resolves.
+
+        Headings that already begin with a number (`## 3. Foo`, `## 4.2 Bar`)
+        keep their slug id and are not re-prefixed, so self-numbered docs
+        aren't double-numbered.
         """
         n = 0
         for el in list(root):
@@ -500,10 +505,16 @@ class HubTreeprocessor(Treeprocessor):
             if _ALREADY_NUMBERED_RE.match(text):
                 continue
             n += 1
-            # The toc extension has already appended the permalink anchor as a
-            # child element, so the heading's leading prose lives in el.text.
-            prefix = f"{n}. "
-            el.text = prefix + (el.text or "")
+            slug = el.get("id") or ""
+            new_id = f"{n}-{slug}" if slug else str(n)
+            el.set("id", new_id)
+            # The toc extension appended the permalink anchor as the last child;
+            # repoint its href at the renumbered id.
+            for child in el:
+                if child.get("href") == f"#{slug}":
+                    child.set("href", f"#{new_id}")
+            # Leading prose lives in el.text (toc moved the anchor into a child).
+            el.text = f"{n}. " + (el.text or "")
 
 
 class HubExtension(Extension):
@@ -588,6 +599,66 @@ def wrap_qboxes(body_html: str) -> str:
     return "".join(out)
 
 
+_H2_OPEN_RE = re.compile(r'<h2\b[^>]*\bid="([^"]*)"[^>]*>', re.IGNORECASE)
+
+
+def wrap_sections(body_html: str) -> str:
+    """Wrap each top-level ``<h2 id=...>`` and its content in ``<section>``.
+
+    Reproduces the hub exemplar skeleton (DESIGN-docs-publisher.html), where
+    every numbered ``##`` heading lives inside ``<section id="N-slug">`` so the
+    CSS grid (``body > section {{ grid-column: 2 }}``) and sticky-TOC layout
+    apply. Any preamble before the first ``<h2>`` is wrapped in an
+    ``<section id="overview">`` to keep it in the content column.
+    """
+    matches = list(_H2_OPEN_RE.finditer(body_html))
+    if not matches:
+        # No headings: keep everything in one section so the grid still applies.
+        inner = body_html.strip()
+        return f'<section id="overview">\n{inner}\n</section>\n' if inner else ""
+
+    out: list[str] = []
+    preamble = body_html[: matches[0].start()].strip()
+    if preamble:
+        out.append(f'<section id="overview">\n{preamble}\n</section>\n')
+
+    for idx, m in enumerate(matches):
+        sec_id = m.group(1)
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(body_html)
+        chunk = body_html[m.start():end].strip()
+        out.append(f'<section id="{sec_id}">\n{chunk}\n</section>\n')
+    return "".join(out)
+
+
+def build_toc(body_html: str) -> str:
+    """Build the hub TOC ``<ol>`` from top-level ``<h2 id=...>`` headings.
+
+    Mirrors the exemplar's flat ``nav.toc ol`` of numbered sections (one entry
+    per ``##``), not python-markdown's nested ``<ul>``. Link text is the
+    heading's visible text with the permalink ``¶`` stripped.
+    """
+    items: list[str] = []
+    for m in _H2_OPEN_RE.finditer(body_html):
+        sec_id = m.group(1)
+        # Heading text runs from the end of the open tag to its </h2>.
+        tail = body_html[m.end():]
+        close = tail.lower().find("</h2>")
+        inner = tail[:close] if close != -1 else tail
+        # Drop the permalink anchor, then strip remaining tags + entities.
+        inner = re.sub(
+            r'<a\b[^>]*class="heading-anchor"[^>]*>.*?</a>', "", inner,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        text = re.sub(r"<[^>]+>", "", inner).strip()
+        text = html.unescape(text)
+        items.append(
+            f'<li><a href="#{html.escape(sec_id)}">{html.escape(text)}</a></li>'
+        )
+    if not items:
+        return ""
+    return "<ol>\n  " + "\n  ".join(items) + "\n</ol>"
+
+
 # --- Conversion --------------------------------------------------------------
 
 def extract_title(md_text: str) -> str:
@@ -617,7 +688,7 @@ def render_markdown(md_text: str) -> tuple[str, str]:
         extension_configs={
             "toc": {
                 "permalink": "¶",   # ¶
-                "permalink_class": "anchor",
+                "permalink_class": "heading-anchor",
                 "permalink_title": "Permalink to this section",
                 "toc_depth": "2-4",
             },
@@ -627,7 +698,11 @@ def render_markdown(md_text: str) -> tuple[str, str]:
     body_html = md.convert(md_text)
     body_html = wrap_diagrams(body_html)
     body_html = wrap_qboxes(body_html)
-    toc_html = md.toc
+    # Build the hub TOC from the (now numbered) top-level headings BEFORE
+    # wrapping sections — wrap_sections only reflows markup, not ids, but
+    # building first keeps the two passes independent.
+    toc_html = build_toc(body_html)
+    body_html = wrap_sections(body_html)
     return body_html, toc_html
 
 

@@ -117,6 +117,13 @@ def test_sticky_toc_and_dark_light(rdd):
     # Sticky TOC container.
     assert 'nav class="toc"' in html
     assert "position: sticky" in html
+    # Hub exemplar TOC shape: <strong>Contents</strong> + a flat <ol> of
+    # top-level sections (not python-markdown's nested <ul>).
+    assert "<strong>Contents</strong>" in html
+    assert "nav.toc ol" in html        # CSS targets an ordered list
+    assert re.search(r'<nav class="toc"[^>]*>\s*<strong>Contents</strong>\s*<ol>',
+                     html)
+    assert '<li><a href="#1-problem">1. Problem</a></li>' in html
     # Dark/light via prefers-color-scheme + color-scheme hint.
     assert "prefers-color-scheme: dark" in html
     assert "color-scheme: light dark" in html
@@ -127,9 +134,14 @@ def test_sections_numbered_and_anchored(rdd):
     # Top-level sections auto-numbered.
     assert re.search(r"<h2[^>]*>\s*1\.\s*Problem", body)
     assert re.search(r"<h2[^>]*>\s*2\.\s*Mental model", body)
-    # Anchored: every heading carries an id + a hover ¶ permalink anchor.
-    assert re.search(r'<h2 id="problem"', body)
-    assert 'class="anchor"' in body
+    # Anchored, hub exemplar style: id is the numbered slug `N-slug`, and the
+    # permalink anchor uses class "heading-anchor" with ¶ pointing at it.
+    assert re.search(r'<h2 id="1-problem"', body)
+    assert 'class="heading-anchor"' in body
+    assert 'href="#1-problem"' in body
+    # Each top-level section is wrapped in <section id="N-slug"> (exemplar).
+    assert '<section id="1-problem">' in body
+    assert '<section id="2-mental-model">' in body
 
 
 def test_decision_box_renders(rdd):
