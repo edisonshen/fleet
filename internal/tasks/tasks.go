@@ -364,6 +364,8 @@ func Archive(project string, slugs []string) error {
 				existing.PRURL = t.PRURL
 				existing.Branch = t.Branch
 				existing.Updated = t.Updated
+				existing.DispatchGeneration = t.DispatchGeneration
+				existing.Parked = t.Parked
 				existing.DependsOn = t.DependsOn
 				existing.SpawnedBy = t.SpawnedBy
 				existing.Spec = t.Spec

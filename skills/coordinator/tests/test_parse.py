@@ -315,8 +315,10 @@ def test_absent_keys_are_legacy_defaults() -> None:
 
 def test_rejects_bad_dispatch_generation() -> None:
     """Non-numeric / negative dispatch_generation surfaces a ParseError,
-    not a silent 0."""
-    for bad in ("abc", "-1", "1.5"):
+    not a silent 0. Also covers Go/Python lockstep: forms Python int()
+    would accept but Go strconv.Atoi rejects (underscores, Unicode
+    digits, signs) must be refused (codex iter-1 P2)."""
+    for bad in ("abc", "-1", "1.5", "1_000", "+5", "５"):
         src = (
             "---\nschema: v1\n---\n\n"
             "## task: badgen-1234\n\n"

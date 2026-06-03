@@ -474,18 +474,16 @@ def _set_kv(t: Task, k: str, v: str, lineno: int, raw: str) -> None:
         if v in ("", "null"):
             t.dispatch_generation = 0
             return
-        try:
-            n = int(v)
-        except ValueError:
+        # Match Go strconv.Atoi exactly: ASCII decimal digits only (no
+        # underscores, no Unicode digits, no leading/trailing whitespace —
+        # the value is already stripped). Python int() is laxer (accepts
+        # "1_000" and Unicode digits), which would drift the Go/Python
+        # parser lockstep. Reject anything Go would. (codex iter-1 P2)
+        if not v.isascii() or not v.isdigit():
             raise ParseError(
                 lineno, 1, raw, f"invalid dispatch_generation: {v}",
-            ) from None
-        if n < 0:
-            raise ParseError(
-                lineno, 1, raw,
-                f"dispatch_generation must be non-negative: {v}",
             )
-        t.dispatch_generation = n
+        t.dispatch_generation = int(v)
     elif k == "parked":
         # Durable dirty-worktree park marker (DESIGN §4.2). Empty /
         # "null" → not parked. Non-required; old rows parse fine.

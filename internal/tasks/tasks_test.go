@@ -897,7 +897,9 @@ func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
 		PRURL:  "https://example.com/pr/42",
 		Branch: "feat/edits", Notes: "extra context from operator",
 		Spec: "edited spec", Acceptance: "edited acceptance",
-		DependsOn: []string{"beta-5678"},
+		DependsOn:          []string{"beta-5678"},
+		DispatchGeneration: 5,
+		Parked:             "2026-05-06T11:30:00Z dirty: leftover",
 	}
 	if err := Write(filepath.Join(dir, "tasks.md"), &File{
 		Schema: 1, Tasks: []*Task{edited},
@@ -951,6 +953,14 @@ func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
 	}
 	if len(got.DependsOn) != 1 || got.DependsOn[0] != "beta-5678" {
 		t.Errorf("DependsOn = %v; want [beta-5678]", got.DependsOn)
+	}
+	// New coord-lifecycle fields (DESIGN PR1) must also survive the
+	// retry-refresh, not be dropped to zero (codex iter-1 P2).
+	if got.DispatchGeneration != 5 {
+		t.Errorf("DispatchGeneration = %d; want 5 (operator edit lost)", got.DispatchGeneration)
+	}
+	if got.Parked != "2026-05-06T11:30:00Z dirty: leftover" {
+		t.Errorf("Parked = %q; want the operator-edited park marker", got.Parked)
 	}
 	// Created must be immutable identity — unchanged.
 	if !got.Created.Equal(created) {
