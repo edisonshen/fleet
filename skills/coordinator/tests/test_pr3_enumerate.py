@@ -660,11 +660,12 @@ class TestPartialApplyWedgeRecovery:
             {"slug": slug, "phase": "starting", "dispatch_generation": gen},
         )
 
-    def test_wedge_requeued_when_replay_cannot_recover(
+    def test_wedge_requeued_when_worker_never_launched(
         self, tmp_path: Path,
     ) -> None:
         # Partial-apply: authority gen 2, only a stale gen-1 state on disk,
-        # id in pending_acquire (replay SKIPS it), journal pending.
+        # id in pending_acquire (replay SKIPS it), journal PENDING (worker
+        # never launched). Safe to requeue.
         slug = "wedge-aaaa"
         agent_id = "abcd1234"
         self._stale_state(tmp_path, slug, gen=1)
@@ -685,6 +686,28 @@ class TestPartialApplyWedgeRecovery:
         assert a.clear_worker is True
         assert a.delete_worker_dir is True
 
+    def test_launch_attempted_journal_NOT_requeued(
+        self, tmp_path: Path,
+    ) -> None:
+        # A worker that DID launch (journal launch_attempted) must NOT be
+        # requeued even though its id is in pending_acquire — requeuing a
+        # launched worker is the #184 double-dispatch trap. Replay's
+        # residual-crash repair / the live worker owns recovery.
+        slug = "launched-xxxx"
+        agent_id = "1eaf0001"
+        self._stale_state(tmp_path, slug, gen=1)
+        self._journal(tmp_path, agent_id, slug, "launch_attempted")
+        coord_state = {
+            "worker_agent_ids": {slug: agent_id},
+            "pending_acquire_agent_ids": {slug: agent_id},
+        }
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path, coord_state=coord_state,
+            )
+        assert actions == [], "a launched worker must not be requeued"
+
     def test_prior_stale_state_still_fences_after_recovery(
         self, tmp_path: Path,
     ) -> None:
@@ -704,7 +727,7 @@ class TestPartialApplyWedgeRecovery:
 
     def test_replay_recoverable_slug_not_requeued(self, tmp_path: Path) -> None:
         # A `stale` slug whose adopted PENDING journal is NOT in
-        # pending_acquire IS replay-recoverable → reconcile must short-
+        # pending_acquire IS replay-eligible → reconcile must short-
         # circuit (NO requeue) so we don't double-dispatch the #184 trap.
         slug = "live-bbbb"
         agent_id = "beef0001"
@@ -736,20 +759,29 @@ class TestPartialApplyWedgeRecovery:
             )
         assert actions == []
 
-    def test_replay_can_recover_predicate(self, tmp_path: Path) -> None:
+    def test_wedge_recoverable_predicate(self, tmp_path: Path) -> None:
         slug = "pred-dddd"
         agent_id = "cafe0001"
         self._journal(tmp_path, agent_id, slug, "pending")
-        # adopted + pending journal + NOT pending_acquire → recoverable.
-        assert loop._replay_can_recover(
+        # id in pending_acquire + pending journal → WEDGE (worker never
+        # launched), safe to requeue.
+        assert loop._dispatch_wedge_recoverable(
+            slug, "p", tmp_path,
+            {"worker_agent_ids": {slug: agent_id},
+             "pending_acquire_agent_ids": {slug: agent_id}},
+        ) is True
+        # id NOT in pending_acquire (replay-eligible / applied) → NOT a
+        # wedge; replay owns it.
+        assert loop._dispatch_wedge_recoverable(
             slug, "p", tmp_path,
             {"worker_agent_ids": {slug: agent_id}},
-        ) is True
-        # same but id in pending_acquire → NOT recoverable (replay skips).
-        assert loop._replay_can_recover(
+        ) is False
+        # no adopted id → not a wedge.
+        assert loop._dispatch_wedge_recoverable(slug, "p", tmp_path, {}) is False
+        # launched (journal launch_attempted) → not requeue-safe.
+        self._journal(tmp_path, agent_id, slug, "launch_attempted")
+        assert loop._dispatch_wedge_recoverable(
             slug, "p", tmp_path,
             {"worker_agent_ids": {slug: agent_id},
              "pending_acquire_agent_ids": {slug: agent_id}},
         ) is False
-        # no adopted id → NOT recoverable.
-        assert loop._replay_can_recover(slug, "p", tmp_path, {}) is False

@@ -3551,21 +3551,35 @@ def _audit_archived_subagents(
     return flagged_now
 
 
-def _replay_can_recover(
+def _dispatch_wedge_recoverable(
     slug: str,
     project: str,
     home: Path | None,
     coord_state: dict | None,
 ) -> bool:
-    """True iff the dispatch-journal replay (_replay_pending_dispatches)
-    will re-emit a DISPATCH for `slug` on a subsequent tick.
+    """True iff `slug` is a dispatch PARTIAL-APPLY WEDGE safe to requeue.
 
-    Replay re-emits ONLY when the slug's adopted journal is `pending`,
-    `adopted_agent_ids[slug] == agent_id`, AND the id is NOT in
-    pending_acquire (a mid-application id is the dispatch RETRY's, not
-    replay's — replay skips it, see _replay_pending_dispatches). This
-    helper mirrors that predicate so reconcile can tell whether a stale/
-    missing in-progress slug has a live recovery owner or is WEDGED.
+    The wedge: _apply_dispatch crashed AFTER the status=in-progress +
+    dispatch_generation commit but BEFORE the state.json bootstrap. The
+    DISPATCH block is collected by the caller only AFTER _apply_dispatch
+    RETURNS (loop.py ~1041), so the worker was NEVER launched — the
+    adopted journal is therefore still `pending` (never launch_attempted /
+    acked). And the id is still in pending_acquire (forget runs only after
+    _apply_dispatch succeeds), so the journal REPLAY skips it
+    (_replay_pending_dispatches) and the dispatch-retry path never fires
+    (it only picks status=ready). Nobody recovers → wedged in-progress.
+
+    Requeue is SAFE only under ALL of:
+      - the slug has an adopted agent_id,
+      - that id is in pending_acquire (replay will NOT re-emit it),
+      - its journal exists AND is `pending` (the worker was never launched
+        — a launch_attempted / acked journal means a worker DID launch, so
+        requeuing would double-dispatch; defer to replay's residual-crash
+        repair / the live worker's own terminal write instead).
+
+    A False result (no adopted id, not pending_acquire, journal absent /
+    non-pending) means reconcile must NOT requeue — replay or a live
+    worker owns recovery. Conservative: any ambiguity → False (no requeue).
     """
     if coord_state is None or home is None:
         return False
@@ -3582,15 +3596,19 @@ def _replay_can_recover(
         )
     except Exception:  # noqa: BLE001
         pending = set()
-    if agent_id in pending:
-        # Mid-application id: replay SKIPS it (the dispatch-retry path
-        # owns it, but the retry only fires for status=ready — a wedged
-        # in-progress slug is never re-picked). NOT replay-recoverable.
+    if agent_id not in pending:
+        # NOT a partial-apply wedge: a replay-eligible (applied) id, or an
+        # untracked id. Replay / the live worker owns recovery — never
+        # requeue (that is the #184 double-dispatch trap).
         return False
-    # Find the journal for this adopted id and confirm it is pending.
+    # The id is mid-application. Confirm the journal is `pending` (worker
+    # never launched). A launch_attempted / acked / terminal journal means
+    # a worker DID launch — do NOT requeue.
     for jid, jslug, j in _iter_project_journals(home, project):
         if jid == agent_id and jslug == slug:
             return j.get("exec_state", "") == "pending"
+    # No journal for the adopted id: cannot prove the worker never
+    # launched → fail safe (no requeue).
     return False
 
 
@@ -3669,11 +3687,15 @@ def _reconcile_inflight(
             # in pending_acquire (forget runs only AFTER _apply_dispatch
             # returns), and replay SKIPS pending_acquire ids — so NOBODY
             # re-emits and the task is WEDGED in-progress forever (codex
-            # [P1]). Detect the unrecoverable wedge (no replay owner) and
-            # requeue to `todo` so the next dispatch re-picks it (gen
-            # increments → the prior stale state still fences `stale`,
-            # monotonic, no reuse). Only fires when coord_state is wired.
-            if coord_state is not None and not _replay_can_recover(
+            # [P1]). _dispatch_wedge_recoverable proves the worker was
+            # NEVER launched (adopted id in pending_acquire + its journal
+            # still `pending`); only THEN is requeue-to-`todo` safe (a
+            # launch_attempted / live worker is left to replay's
+            # residual-crash repair, never requeued — that is the #184
+            # double-dispatch trap). The next dispatch increments the gen
+            # → the prior stale state still fences `stale` (monotonic, no
+            # reuse). Inert unless coord_state is wired.
+            if _dispatch_wedge_recoverable(
                 t.slug, project, home, coord_state,
             ):
                 print(
