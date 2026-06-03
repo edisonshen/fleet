@@ -180,6 +180,33 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 			continue
 		}
 
+		// 2b. PARKED guard (D2, DESIGN §4.2) — checked BEFORE every
+		// removal branch (dead-pid, stale-heartbeat, task-terminal). A
+		// dirty-parked row keeps its worker dir ON PURPOSE: it holds the
+		// recovery context the coord protects (a dirty leaked worktree the
+		// operator must inspect/commit/discard). A parked `done` row is
+		// ALSO stale-heartbeat (pid=0, old) by construction — the worker
+		// exited long ago — so a parked check placed only in the
+		// task-terminal branch would be unreachable: the stale-heartbeat
+		// branch (#4) removes the dir first under --apply. So the guard
+		// lives here, ahead of all three, and surfaces (don't silo) the
+		// path without removing. Unwired dep / probe error → treat as
+		// not-parked (back-compat); a non-empty parked value protects.
+		if deps.LoadTaskParked != nil {
+			if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: fmt.Sprintf(
+						"row is PARKED (%s) — coord kept the worker dir for "+
+							"dirty-worktree recovery; surface only, refusing to "+
+							"remove. Resolve the park (commit/discard the worktree, "+
+							"clear `parked`) first",
+						parked),
+				})
+				continue
+			}
+		}
+
 		age := now.Sub(ws.UpdatedAt)
 
 		// 3. Dead-pid — pid set, process gone, old.
@@ -203,32 +230,10 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 			continue
 		}
 		if status == "done" || status == "abandoned" {
-			// D2 (DESIGN §4.2): a dirty-parked terminal row keeps its
-			// worker dir ON PURPOSE — it holds the recovery context the
-			// coord protects (a dirty leaked worktree the operator must
-			// inspect/commit/discard). A manual/global `fleet gc
-			// --kinds=worker-records --apply` MUST NOT erase it. Surface
-			// (don't silo) but never auto-remove a parked row's dir.
-			// Same projection seam as R7: the classifier reads the task
-			// row's `parked` field. Unwired dep / probe error → treat as
-			// not-parked (back-compat); a non-empty parked value protects.
-			if deps.LoadTaskParked != nil {
-				if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
-					r.Actions = append(r.Actions, Action{
-						Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
-						Reason: fmt.Sprintf(
-							"task-terminal (status=%s) but row is PARKED (%s) — "+
-								"coord kept the worker dir for dirty-worktree recovery; "+
-								"surface only, refusing to remove. Resolve the park "+
-								"(commit/discard the worktree, clear `parked`) first",
-							status, parked),
-					})
-					continue
-				}
-			}
 			reason := fmt.Sprintf("task-terminal (task status=%s, worker dir orphan post-archive)", status)
 			// task-terminal IS a confirmed terminal state — apply is
-			// safe without the task-in-progress guard.
+			// safe without the task-in-progress guard. (The parked
+			// recovery-context guard ran earlier at #2b.)
 			appendWorkerRecordAction(r, opts, deps, info, reason)
 			continue
 		}

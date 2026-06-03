@@ -2467,6 +2467,104 @@ func TestReconcile_WorkerRecords_TaskTerminal_Parked_RefusesUnlink(t *testing.T)
 	}
 }
 
+// TestReconcile_WorkerRecords_Parked_StaleHeartbeat_RefusesUnlink is the
+// codex-iter-1 [P1] regression: a parked row is ALSO stale-heartbeat by
+// construction (pid=0 + old updated_at — the worker exited long before
+// it was parked). The parked guard MUST run BEFORE the stale-heartbeat
+// removal branch, else `--apply` removes the dirty recovery context the
+// patch is meant to preserve. (The original guard sat in the
+// task-terminal branch #5, which is unreachable for this case — #4 fires
+// first.)
+func TestReconcile_WorkerRecords_Parked_StaleHeartbeat_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkstale-rrrr/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "parkstale-rrrr",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:    "parkstale-rrrr",
+			Project: "projects-fleet",
+			Pid:     0,
+			// 48h old → squarely in the stale-heartbeat (#4) window.
+			UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-06-01T00:00:00Z dirty worktree", nil
+	}
+	// stubDeps wires RemoveWorkerRecord to error if called — so if the
+	// stale-heartbeat branch wrongly removed the dir under --apply, the
+	// verb would flip back to surface WITH a "remove failed" reason. The
+	// assertions below pin VerbSurface + the PARKED reason (proving the
+	// remover was never invoked).
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked+stale verb=%q, want %q (must not remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("reason=%q must name the parked guard (not stale-heartbeat removal)", a.Reason)
+	}
+	if strings.Contains(a.Reason, "remove failed") {
+		t.Fatalf("reason=%q shows a remove was attempted — parked guard ran too late", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Parked_DeadPid_RefusesUnlink: same guard,
+// the dead-pid branch (#3). A parked row whose recorded pid is gone +
+// old must surface, never remove.
+func TestReconcile_WorkerRecords_Parked_DeadPid_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkdead-ssss/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet", Slug: "parkdead-ssss", Path: workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug: "parkdead-ssss", Project: "projects-fleet",
+			Pid: 999999, UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.PidAlive = func(int) bool { return false } // pid gone → dead-pid branch
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-06-01T00:00:00Z dirty worktree", nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface || !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("parked+dead-pid verb=%q reason=%q, want surface+PARKED", a.Verb, a.Reason)
+	}
+}
+
 // TestReconcile_WorkerRecords_TaskTerminal_NilParkedDep is the
 // back-compat path: an older Deps with no LoadTaskParked wiring behaves
 // as if no row is parked (the task-terminal branch still applies).
