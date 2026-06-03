@@ -22,6 +22,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // gcDefaultMaxAge is the floor for socket / generic age gates when the
@@ -160,6 +161,24 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 		MaxAge:     f.maxAge,
 		Kinds:      kinds,
 		Project:    f.project,
+	}
+	// DESIGN-coord-worktree-lifecycle § Concurrency: hold the project-
+	// scoped worktree-GC flock across the whole scan → re-check → remove
+	// window so a coord-invoked run (every-N-ticks) and an operator-
+	// invoked run can't race the same removal. Only relevant when the
+	// worktrees kind is enabled AND a project is scoped — a host-wide
+	// sweep (no --project) is the operator's per-project reclaim and the
+	// coord always passes --project (coord-scope strict). Best-effort:
+	// a lock-acquire failure surfaces as a warning but does NOT abort the
+	// sweep (the other classifiers must still run).
+	if hasKind(kinds, gc.KindWorktrees) && strings.TrimSpace(f.project) != "" {
+		if release, lerr := state.LockProjectWorktreeGC(f.project); lerr != nil {
+			_, _ = fmt.Fprintf(stderr,
+				"warning: could not take worktree-gc lock for %q: %v (proceeding unlocked)\n",
+				f.project, lerr)
+		} else {
+			defer release()
+		}
 	}
 	deps := gc.DefaultDeps()
 	report, rerr := gc.Reconcile(opts, deps)

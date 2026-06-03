@@ -90,6 +90,81 @@ def project_is_git(project: str, *, fleet_home: str | None = None) -> bool:
     return bool(val)
 
 
+def worktree_preflight_ok(
+    computed_path: str,
+    expected_branch: str,
+    *,
+    timeout_s: float = 15.0,
+) -> tuple[bool, str]:
+    """DESIGN §4.2 dispatch-side preflight, keyed on the COMPUTED path.
+
+    Before `git worktree add`, a `status=ready` task whose persisted
+    `worktree=` is EMPTY can still have a LEAKED tree on disk at the
+    deterministic `worker/<slug>` path (a prior attempt's dirty-parked or
+    branch-mismatch tree that was kept). create_worktree treats a
+    registered path collision as success WITHOUT a cleanliness/branch
+    check, so dispatching would silently hand the worker that stale tree.
+
+    This preflight refuses dispatch when a tree at computed_path is
+    WRONG-BRANCH or DIRTY:
+
+      (ok=True,  "")        — no tree at computed_path (fresh dispatch),
+                              OR a tree that is on expected_branch AND
+                              clean (a resumable idempotent-create tree).
+      (ok=False, "<why>")   — a tree exists at computed_path that is on a
+                              different branch, has a detached/unknown
+                              HEAD, is dirty, or whose cleanliness can't
+                              be determined. Caller REFUSES dispatch +
+                              surfaces the reason.
+
+    Keyed on the COMPUTED path (not the persisted worktree=, which is ""
+    on a leaked-dir row). Pure read — never mutates. Never raises.
+    """
+    if not computed_path or not expected_branch:
+        # Nothing to check (non-git / no path resolved) — let the normal
+        # create path proceed; it has its own collision handling.
+        return (True, "")
+    if not os.path.exists(computed_path):
+        return (True, "")
+    # A tree is present. Verify branch identity first.
+    try:
+        proc = subprocess.run(
+            ["git", "-C", computed_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return (False, f"preflight: branch probe failed at {computed_path}: {exc}")
+    if proc.returncode != 0:
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        return (False, f"preflight: not a git worktree at {computed_path}: {stderr}")
+    actual_branch = (proc.stdout or "").strip()
+    if actual_branch != expected_branch:
+        return (
+            False,
+            f"preflight: tree at {computed_path} is on branch "
+            f"{actual_branch!r} != expected {expected_branch!r} — refusing "
+            f"dispatch (a prior attempt's tree was left behind; resolve it)",
+        )
+    # Right branch — now require it to be clean.
+    try:
+        sproc = subprocess.run(
+            ["git", "-C", computed_path, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return (False, f"preflight: status probe failed at {computed_path}: {exc}")
+    if sproc.returncode != 0:
+        stderr = (sproc.stderr or sproc.stdout or "").strip()
+        return (False, f"preflight: status --porcelain failed at {computed_path}: {stderr}")
+    if (sproc.stdout or "").strip():
+        return (
+            False,
+            f"preflight: tree at {computed_path} ({expected_branch}) has "
+            f"uncommitted changes — refusing dispatch (resolve / commit first)",
+        )
+    return (True, "")
+
+
 def build_worker_prompt(
     task: parse.Task,
     project: str,

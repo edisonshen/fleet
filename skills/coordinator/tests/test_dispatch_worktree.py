@@ -492,19 +492,50 @@ def test_remove_worktree_refuses_empty_path(tmp_path) -> None:
     assert "refuse unsafe path" in res.error
 
 
-def test_remove_worktree_invokes_git_with_force(tmp_path) -> None:
+def test_remove_worktree_default_force_false_dirty_guarded(tmp_path) -> None:
+    # DESIGN §4.1: force=False is now the DEFAULT. A clean tree (porcelain
+    # returns empty) is removed WITHOUT --force, after a dirty-guard probe.
     repo = str(tmp_path / "repo")
     os.makedirs(repo)
     wt = str(tmp_path / ".fleet" / "projects" / "proj" / "worktrees" / "alpha-1234")
     os.makedirs(wt)
-    fake = _ok()
-    with patch.object(worktree_mod.subprocess, "run", return_value=fake) as m:
+
+    def fake_run(cmd, **kw):
+        if "status" in cmd and "--porcelain" in cmd:
+            return _ok("")  # clean
+        return _ok()
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=fake_run) as m:
         res = worktree_mod.remove_worktree(repo, wt)
+    assert res.outcome == worktree_mod.OUTCOME_REMOVED
     assert res.error == ""
-    # Two calls: `worktree remove --force` then `worktree prune`.
     calls = [c[0][0] for c in m.call_args_list]
-    assert ["git", "-C", repo, "worktree", "remove", "--force", wt] in calls
+    # Dirty-guard probe ran; remove ran WITHOUT --force; prune ran.
+    assert ["git", "-C", wt, "status", "--porcelain"] in calls
+    assert ["git", "-C", repo, "worktree", "remove", wt] in calls
+    assert ["git", "-C", repo, "worktree", "remove", "--force", wt] not in calls
     assert ["git", "-C", repo, "worktree", "prune"] in calls
+
+
+def test_remove_worktree_dirty_parks_not_removed(tmp_path) -> None:
+    # FAILS-ON-PARENT: parent force=True would delete this. New default
+    # parks a dirty tree (porcelain non-empty) and never calls remove.
+    repo = str(tmp_path / "repo")
+    os.makedirs(repo)
+    wt = str(tmp_path / ".fleet" / "projects" / "proj" / "worktrees" / "alpha-1234")
+    os.makedirs(wt)
+
+    def fake_run(cmd, **kw):
+        if "status" in cmd and "--porcelain" in cmd:
+            return _ok(" M file.py\n")  # DIRTY
+        if cmd[3:5] == ["worktree", "remove"]:
+            raise AssertionError("dirty tree must NOT be removed")
+        return _ok()
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=fake_run):
+        res = worktree_mod.remove_worktree(repo, wt)
+    assert res.outcome == worktree_mod.OUTCOME_DIRTY_PARKED
+    assert res.error != ""
 
 
 def test_remove_worktree_no_force_when_force_false(tmp_path) -> None:
@@ -906,23 +937,35 @@ def test_apply_sentinel_done_pr_removes_worktree_in_cap2_mode(tmp_path) -> None:
     )
     action = loop._SentinelAction(
         slug="alpha-1234", kind="task_done_pr",
-        payload="https://github.com/x/y/pull/1",
+        payload="https://github.com/x/y/pull/1", dispatch_generation=0,
     )
-    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m_wt, \
+
+    def fake_run(cmd, **kw):
+        # Branch-identity probe → expected branch; clean porcelain.
+        if "rev-parse" in cmd and "--abbrev-ref" in cmd:
+            return _ok("worker/alpha-1234\n")
+        if "status" in cmd and "--porcelain" in cmd:
+            return _ok("")
+        return _ok()
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=fake_run) as m_wt, \
          patch.object(loop, "_run_fleet") as m_fleet:
         loop._apply_sentinel(
             action, "proj", "fleet",
-            repo=repo, tasks_by_slug={t.slug: t},
+            repo=repo, tasks_by_slug={t.slug: t}, full_tasks_by_slug={t.slug: t},
         )
-    # `git worktree remove --force <wt>` ran.
+    # DESIGN §4.1: `git worktree remove <wt>` ran WITHOUT --force.
     git_calls = [c[0][0] for c in m_wt.call_args_list]
-    assert any("remove" in c and "--force" in c for c in git_calls), git_calls
+    assert any(c[3:5] == ["worktree", "remove"] and "--force" not in c for c in git_calls), git_calls
+    assert not any("--force" in c for c in git_calls), git_calls
     # tasks.md mutations happened in the right order.
     fleet_calls = [c[0][0] for c in m_fleet.call_args_list]
     assert any("pr_url=https://github.com/x/y/pull/1" in " ".join(c) for c in fleet_calls)
     assert any("status=in-review" in " ".join(c) for c in fleet_calls)
     # Worktree field cleared after remove so re-dispatch starts fresh.
     assert any("worktree=" in c[-1] and c[-1].endswith("worktree=") for c in fleet_calls)
+    # Clean reap → NOT parked.
+    assert not any("parked=" in " ".join(c) for c in fleet_calls)
 
 
 def test_apply_sentinel_cap1_does_not_remove_worktree(tmp_path) -> None:
@@ -947,19 +990,29 @@ def test_apply_reconcile_done_removes_worktree_in_cap2_mode(tmp_path) -> None:
     os.makedirs(wt_path)
     t = parse.Task(
         slug="alpha-1234", status="in-review", priority="P1",
-        worktree=wt_path,
+        worktree=wt_path, branch="worker/alpha-1234",
     )
     action = loop._ReconcileAction(
         slug="alpha-1234", new_status="done", clear_worker=True,
     )
-    with patch.object(worktree_mod.subprocess, "run", return_value=_ok()) as m_wt, \
+
+    def fake_run(cmd, **kw):
+        if "rev-parse" in cmd and "--abbrev-ref" in cmd:
+            return _ok("worker/alpha-1234\n")
+        if "status" in cmd and "--porcelain" in cmd:
+            return _ok("")
+        return _ok()
+
+    with patch.object(worktree_mod.subprocess, "run", side_effect=fake_run) as m_wt, \
          patch.object(loop, "_run_fleet"):
         loop._apply_reconcile(
             action, "proj", "fleet",
             repo=repo, tasks_by_slug={t.slug: t},
         )
     git_calls = [c[0][0] for c in m_wt.call_args_list]
-    assert any("remove" in c and wt_path in c for c in git_calls), git_calls
+    # DESIGN §4.1: removed WITHOUT --force (clean + branch-corroborated).
+    assert any(c[3:5] == ["worktree", "remove"] and wt_path in c for c in git_calls), git_calls
+    assert not any("--force" in c for c in git_calls), git_calls
 
 
 def test_apply_reconcile_in_review_keeps_worktree(tmp_path) -> None:

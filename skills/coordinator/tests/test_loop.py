@@ -2303,22 +2303,25 @@ def test_apply_dispatch_orders_status_branch_state_pid_note(
         slug="ready-aaaa", agent_id="abcdef01", branch="worker/ready-aaaa",
     )
     loop._apply_dispatch(action, "fleet-proj", "fleet")
-    # Five calls in order: status, branch, workers update bootstrap,
-    # worker_pid, note.
-    assert len(fleet_run_recorder) == 5
+    # Six calls in order: status, branch, parked-clear (DESIGN §4.2 codex
+    # [P2]), workers update bootstrap, worker_pid, note.
+    assert len(fleet_run_recorder) == 6
     assert "status=in-progress" in fleet_run_recorder[0]
     assert fleet_run_recorder[1][1:3] == ["tasks", "set"]
     assert "branch=" in fleet_run_recorder[1][-1]
-    assert fleet_run_recorder[2][1:3] == ["workers", "update"]
-    assert "--phase" in fleet_run_recorder[2]
-    assert "starting" in fleet_run_recorder[2]
-    assert fleet_run_recorder[3][1:3] == ["tasks", "set"]
-    assert fleet_run_recorder[3][-1].startswith("worker_pid=")
+    # parked-clear lands after branch, before the state.json bootstrap.
+    assert fleet_run_recorder[2][1:3] == ["tasks", "set"]
+    assert fleet_run_recorder[2][-1] == "parked="
+    assert fleet_run_recorder[3][1:3] == ["workers", "update"]
+    assert "--phase" in fleet_run_recorder[3]
+    assert "starting" in fleet_run_recorder[3]
+    assert fleet_run_recorder[4][1:3] == ["tasks", "set"]
+    assert fleet_run_recorder[4][-1].startswith("worker_pid=")
     # The PID written must be the live coord's PID — non-zero, not
     # the agent_id's hex value, not 0. Tested via parse-back.
-    pid_str = fleet_run_recorder[3][-1].split("=", 1)[1]
+    pid_str = fleet_run_recorder[4][-1].split("=", 1)[1]
     assert int(pid_str) > 0, f"worker_pid must be live PID, got {pid_str!r}"
-    assert fleet_run_recorder[4][1:3] == ["tasks", "note"]
+    assert fleet_run_recorder[5][1:3] == ["tasks", "note"]
     # Every call carries --project to defeat cwd-default drift.
     for call in fleet_run_recorder:
         assert "--project" in call, f"missing --project in {call}"

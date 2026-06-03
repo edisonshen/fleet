@@ -3565,3 +3565,87 @@ func TestReconcile_InvalidProjects_TOCTOU_StatErrorFailsClosed(t *testing.T) {
 		t.Fatalf("stat-error verb=%q, want %q (must fail closed)", a.Verb, VerbSurface)
 	}
 }
+
+// TestLoadTaskParkedOnDisk_ConsultsArchive is the codex round-3 [P2]
+// regression: auto-archive can move a dirty-parked `done` row from
+// tasks.md to tasks-archive.md (tasks.Archive preserves the `parked`
+// field). loadTaskParkedOnDisk MUST consult the archive so worker-records
+// GC still sees the park and keeps the recovery dir.
+func TestLoadTaskParkedOnDisk_ConsultsArchive(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// live row: a different (non-parked) task. The parked row lives ONLY
+	// in the archive (post auto-archive).
+	tasksMD := `## task: live-slug-aaaa
+- status: in-progress
+- priority: P1
+`
+	archiveMD := `## task: parked-done-bbbb
+- status: done
+- priority: P2
+- parked: 2026-06-03T00:00:00Z dirty worktree
+`
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tasksMD), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pdir, "tasks-archive.md"), []byte(archiveMD), 0o644); err != nil {
+		t.Fatalf("write tasks-archive.md: %v", err)
+	}
+	// Parked row only in the archive → must be seen.
+	got, err := loadTaskParkedOnDisk("alpha", "parked-done-bbbb")
+	if err != nil {
+		t.Fatalf("loadTaskParkedOnDisk: %v", err)
+	}
+	if got == "" {
+		t.Fatalf("archived parked row must be reported as parked; got empty")
+	}
+	// A non-parked, non-archived slug → empty.
+	got2, err := loadTaskParkedOnDisk("alpha", "live-slug-aaaa")
+	if err != nil {
+		t.Fatalf("loadTaskParkedOnDisk live: %v", err)
+	}
+	if got2 != "" {
+		t.Fatalf("non-parked live row must be empty; got %q", got2)
+	}
+}
+
+// TestLoadTaskParkedOnDisk_LiveRowWins is the codex round-4 [P2]
+// regression: in the brief tasks.md+archive coexistence window, a LIVE
+// row whose parked field was CLEARED (park resolved) must win over a
+// stale archived parked value for the same slug — otherwise GC keeps a
+// worker dir the live source-of-truth says is reapable.
+func TestLoadTaskParkedOnDisk_LiveRowWins(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	pdir := filepath.Join(tmp, "projects", "alpha")
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tasksMD := `## task: dup-slug-aaaa
+- status: done
+- priority: P1
+- parked: null
+`
+	archiveMD := `## task: dup-slug-aaaa
+- status: done
+- priority: P1
+- parked: 2026-06-03T00:00:00Z dirty worktree
+`
+	if err := os.WriteFile(filepath.Join(pdir, "tasks.md"), []byte(tasksMD), 0o644); err != nil {
+		t.Fatalf("write tasks.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(pdir, "tasks-archive.md"), []byte(archiveMD), 0o644); err != nil {
+		t.Fatalf("write tasks-archive.md: %v", err)
+	}
+	got, err := loadTaskParkedOnDisk("alpha", "dup-slug-aaaa")
+	if err != nil {
+		t.Fatalf("loadTaskParkedOnDisk: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("live row (cleared parked) must win over archived park; got %q", got)
+	}
+}
