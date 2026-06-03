@@ -133,6 +133,15 @@ type State struct {
 	ReviewCodexStatus     ReviewStatus `json:"review_codex_status,omitempty"`
 	ReviewCodexRounds     int          `json:"review_codex_rounds,omitempty"`
 	ReviewCodexSkipReason string       `json:"review_codex_skip_reason,omitempty"`
+
+	// DispatchGeneration is the coord-owned per-slug fence token
+	// (DESIGN-coord-worktree-lifecycle §1/§2.2) stamped at the dispatch
+	// that authored this state. The chokepoint reader
+	// (read_current_worker_state) compares it against the task row's
+	// authoritative dispatch_generation: a PRIOR-generation state is a
+	// stale prior attempt's leftover (short-circuit, never mutate),
+	// the current generation is the live attempt. Absent / legacy = 0.
+	DispatchGeneration int `json:"dispatch_generation,omitempty"`
 }
 
 // Errors.
@@ -147,6 +156,13 @@ var (
 	ErrCodexSkipNeedsReason = errors.New("review_codex_status=skipped requires review_codex_skip_reason in {rate-limited, unavailable, no-git}")
 	ErrInvalidSlug          = errors.New("invalid worker slug")
 	ErrPreconditionLive     = errors.New("cannot archive live worker")
+	// ErrStaleGeneration fires when a `fleet workers update
+	// --dispatch-generation n` carries a generation that does NOT match
+	// the task row's authoritative dispatch_generation — a stale prior
+	// attempt's worker trying to clobber the current attempt's state
+	// (DESIGN §2.2 CAS). The write is rejected (incl. when state.json is
+	// absent: a stale worker must not bootstrap/poison it) and surfaced.
+	ErrStaleGeneration = errors.New("stale dispatch_generation: write rejected by worker-state CAS")
 	// ErrPhasePushNonGit fires when a worker on a non-git project tries
 	// to transition through phase=push. Non-git projects skip push
 	// entirely (review-done → done); a phase=push write is a contract
@@ -382,6 +398,99 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 	if mutate == nil {
 		return fmt.Errorf("%w: nil mutate fn", ErrInvalidState)
 	}
+	return withUpdateLock(project, slug, func() error {
+		cur, err := loadOrBootstrapForUpdate(project, slug)
+		if err != nil {
+			return err
+		}
+		mutate(cur)
+		return writeStateLocked(project, slug, cur)
+	})
+}
+
+// UpdateStateGen is the generation-CAS'd writer (DESIGN §2.2). EVERY
+// state-mutating `fleet workers update` routes through it carrying the
+// generation `n` stamped into its dispatch prompt; `taskGen` is the
+// AUTHORITY — the task row's current dispatch_generation read by the
+// caller under the same logical dispatch. The whole compare→repair→write
+// runs under the per-worker lock so the decision is atomic:
+//
+//	n != taskGen                       → ErrStaleGeneration (reject + surface),
+//	                                     EVEN when state.json is absent (a stale
+//	                                     worker must not bootstrap/poison it; a
+//	                                     missing file is bootstrapped ONLY by the
+//	                                     current generation).
+//	absent, n == taskGen               → bootstrap FRESH (stamp gen), apply mutate.
+//	present, on-disk gen < taskGen,    → REPLACE with FRESH state (empty
+//	  n == taskGen                       pr_url/review/phases + new started_at),
+//	                                     NOT a field-merge — so an old PR can't
+//	                                     leak into the branch→PR fallback. Then
+//	                                     stamp gen + apply mutate.
+//	present, on-disk gen == taskGen    → apply mutate normally.
+//
+// Authority is the TASK ROW's dispatch_generation, never the on-disk
+// state alone: bootstrapping on a missing-file compare would let a stale
+// worker recreate an absent file (then reject the current worker because
+// the stale gen is now "on disk"). The task row is the durable CAS
+// authority.
+func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) error {
+	if mutate == nil {
+		return fmt.Errorf("%w: nil mutate fn", ErrInvalidState)
+	}
+	return withUpdateLock(project, slug, func() error {
+		// A stale writer is rejected first — before any read/bootstrap —
+		// so it can neither clobber a present file nor bootstrap an
+		// absent one.
+		if n != taskGen {
+			return fmt.Errorf(
+				"%w: write gen=%d, task-row authority gen=%d, slug=%q",
+				ErrStaleGeneration, n, taskGen, slug,
+			)
+		}
+		cur, err := ReadState(project, slug)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		// Codex iter-1 [P1]: REJECT when the on-disk gen is HIGHER than the
+		// authority this writer read. The CAS authority (taskRowDispatch-
+		// Generation) is read OUTSIDE this lock, so it can be stale: a
+		// worker reads taskGen=N just before the coord bumps the row to
+		// N+1 AND the current attempt bootstraps state.json at N+1. This
+		// writer then arrives with n==taskGen==N (its own gate passes) but
+		// the on-disk file is already at N+1 — the live current attempt.
+		// Merging it (the old code) would DOWNGRADE the file to N and
+		// clobber live state. A higher on-disk gen means "a newer attempt
+		// already wrote here": reject this writer as stale, never merge.
+		if cur != nil && cur.DispatchGeneration > taskGen {
+			return fmt.Errorf(
+				"%w: write gen=%d, on-disk gen=%d already newer, slug=%q",
+				ErrStaleGeneration, n, cur.DispatchGeneration, slug,
+			)
+		}
+		if cur == nil || cur.DispatchGeneration < taskGen {
+			// Absent, OR a prior-generation file the current attempt is
+			// repairing. Either way: brand-new state, never a merge of
+			// the stale object's fields.
+			cur = &State{
+				Slug:      slug,
+				Project:   project,
+				Phase:     PhaseStarting,
+				StartedAt: time.Now().UTC(),
+			}
+		}
+		// At this point cur.DispatchGeneration == taskGen (the > case was
+		// rejected, the < / absent case was replaced fresh). The stamp is
+		// a consistency reassertion.
+		cur.DispatchGeneration = taskGen
+		mutate(cur)
+		return writeStateLocked(project, slug, cur)
+	})
+}
+
+// withUpdateLock takes the per-worker in-process mutex + flock and runs
+// fn under both, ensuring the worker dir exists first. Shared by
+// UpdateState + UpdateStateGen so their lock discipline can't drift.
+func withUpdateLock(project, slug string, fn func() error) error {
 	// In-process mutex first (cheap, no fs op).
 	key := project + "/" + slug
 	muIface, _ := updateMu.LoadOrStore(key, &sync.Mutex{})
@@ -402,13 +511,18 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir worker dir: %w", err)
 	}
+	return fn()
+}
 
+// loadOrBootstrapForUpdate reads the current state or returns a minimal
+// bootstrapped one (the non-CAS path; UpdateStateGen owns its own
+// generation-aware bootstrap). Caller must hold the worker lock.
+func loadOrBootstrapForUpdate(project, slug string) (*State, error) {
 	cur, err := ReadState(project, slug)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return err
+		return nil, err
 	}
 	if cur == nil {
-		// Bootstrap a minimal state for first-time writers.
 		cur = &State{
 			Slug:      slug,
 			Project:   project,
@@ -416,8 +530,7 @@ func UpdateState(project, slug string, mutate func(*State)) error {
 			StartedAt: time.Now().UTC(),
 		}
 	}
-	mutate(cur)
-	return writeStateLocked(project, slug, cur)
+	return cur, nil
 }
 
 // acquireWorkerLock returns an exclusive flock on the per-worker lock

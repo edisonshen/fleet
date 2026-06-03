@@ -100,6 +100,7 @@ def build_worker_prompt(
     workers_dir: str | None = None,
     worktree_pre_created: bool = False,
     is_git: bool = True,
+    dispatch_generation: int = 0,
 ) -> str:
     """Assemble the worker's first-turn prompt.
 
@@ -175,6 +176,15 @@ def build_worker_prompt(
     # heartbeats into a phantom ~/.fleet/projects/<wrong>/workers/...
     # tree the coordinator never reads).
     proj_flag = f"--project {project}"
+    # Fold the coord-owned per-slug fence token (DESIGN §2.2) into the
+    # shared flag string so EVERY `fleet workers update` the worker runs
+    # carries --dispatch-generation <gen> and is CAS'd against the task
+    # row. A stale prior attempt that wakes and runs these commands is
+    # rejected; the current attempt's gen matches the task-row authority
+    # _apply_dispatch persisted. gen==0 (legacy / un-migrated dispatch)
+    # omits the flag, keeping the ungated path.
+    if int(dispatch_generation) > 0:
+        proj_flag = f"{proj_flag} --dispatch-generation {int(dispatch_generation)}"
     # Step 1 differs by mode: cap=1 the worker creates the branch
     # itself; cap>1 the coord already ran `git worktree add -b <branch>`
     # so the worker's cwd is already the worktree on the right branch.
@@ -374,6 +384,7 @@ def build_reviewer_prompt(
     worktree: str | None = None,
     is_git: bool = True,
     coord_engine: str | None = None,
+    dispatch_generation: int = 0,
 ) -> str:
     """Assemble the reviewer subagent's first-turn prompt.
 
@@ -430,6 +441,12 @@ def build_reviewer_prompt(
         coord_engine = os.environ.get("FLEET_ENGINE", "") or ENGINE_CLAUDE_CODE
 
     proj_flag = f"--project {project}"
+    # Handoffs INHERIT the dispatching attempt's gen (DESIGN §3) — no
+    # increment. Fold it into the shared flag so the reviewer's
+    # `fleet workers update --phase review-done` write is CAS'd under
+    # the SAME generation as the worker that handed off.
+    if int(dispatch_generation) > 0:
+        proj_flag = f"{proj_flag} --dispatch-generation {int(dispatch_generation)}"
     base_branch = "main"  # finisher opens the PR against main; reviewer doesn't push.
 
     # Header + role intro. Non-git differs only in the "what handoff
@@ -654,6 +671,7 @@ def build_finisher_prompt(
     workers_dir: str | None = None,
     worktree: str | None = None,
     is_git: bool = True,
+    dispatch_generation: int = 0,
 ) -> str:
     """Assemble the finisher subagent's first-turn prompt.
 
@@ -689,6 +707,11 @@ def build_finisher_prompt(
         workers_dir = f"~/.fleet/projects/{project}/workers/{task.slug}"
 
     proj_flag = f"--project {project}"
+    # Handoffs INHERIT the dispatching attempt's gen (DESIGN §3) — no
+    # increment. The finisher's `fleet workers update --phase done` is
+    # CAS'd under the same generation as the worker + reviewer.
+    if int(dispatch_generation) > 0:
+        proj_flag = f"{proj_flag} --dispatch-generation {int(dispatch_generation)}"
 
     # Push step. When the worker ran in a pre-created worktree, the cd is
     # folded into step 1 (push + PR must run from the worktree, which

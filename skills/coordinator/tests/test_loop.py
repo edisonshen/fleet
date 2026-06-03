@@ -28,6 +28,7 @@ import pytest
 import dispatch
 import loop
 import parse
+import supervisor
 
 
 # ---------- helpers ----------
@@ -45,6 +46,7 @@ def _make_task(
     *, worker_pid: int = 0, pr_url: str = "", spec: str = "spec",
     acceptance: str = "acc", notes: str = "",
     depends_on: list[str] | None = None,
+    dispatch_generation: int = 0,
 ) -> parse.Task:
     return parse.Task(
         slug=slug, status=status, priority=priority,
@@ -54,6 +56,7 @@ def _make_task(
         spawned_by="user",
         depends_on=list(depends_on) if depends_on else [],
         spec=spec, acceptance=acceptance, notes=notes,
+        dispatch_generation=dispatch_generation,
     )
 
 
@@ -951,10 +954,17 @@ def test_acquire_failure_persists_pending_agent_id_for_retry(
     coord_state = json.loads(
         (project_dir / "coord-state.json").read_text(encoding="utf-8")
     )
-    pending = coord_state.get("pending_acquire_agent_ids", {})
+    # Pending entry persists as the {agent_id, dispatch_generation,
+    # dispatch_kind} record (DESIGN §3). Extract the agent_id via the
+    # shape-tolerant supervisor accessor.
+    pending = supervisor.load_pending_acquire_agent_id_map(coord_state)
     assert pending.get("retry-aaaa") == "baaaaad1", (
         f"pending agent_id not persisted: pending={pending!r}"
     )
+    rec = supervisor.load_pending_acquire_record_map(coord_state).get("retry-aaaa")
+    assert rec == {
+        "agent_id": "baaaaad1", "dispatch_generation": 1, "dispatch_kind": "worker",
+    }, f"pending record shape: {rec!r}"
 
 
 def test_acquire_retry_reuses_pending_agent_id(
@@ -1093,7 +1103,7 @@ def test_apply_failure_after_acquire_success_persists_pending(
     )
 
     state = json.loads((project_dir / "coord-state.json").read_text())
-    pending = state.get("pending_acquire_agent_ids", {})
+    pending = supervisor.load_pending_acquire_agent_id_map(state)
     assert pending.get("acq-ok-apply-fail") == "a1b2c3d4", (
         "acquire-success + apply-fail must leave pending entry for retry; "
         f"pending={pending!r}"
@@ -1872,7 +1882,7 @@ def test_apply_dispatch_failure_preserves_pending_acquire(
     # CRITICAL: the pending-acquire entry MUST still be there so the
     # next tick can retry with the same agent_id.
     state_after = json.loads(state_path.read_text())
-    pending = state_after.get("pending_acquire_agent_ids", {})
+    pending = supervisor.load_pending_acquire_agent_id_map(state_after)
     assert pending.get("apply-fail-aa") == "abadcafe", (
         f"apply failure must preserve pending agent_id for retry; "
         f"pending={pending!r}"

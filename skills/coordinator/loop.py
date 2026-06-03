@@ -2662,6 +2662,71 @@ def _read_worker_state(
         return None
 
 
+# The chokepoint reader's tri-state outcomes (DESIGN
+# DESIGN-coord-worktree-lifecycle §2.1). Strings (not an Enum) so they
+# round-trip cleanly through tick summaries / surfaced diagnostics and
+# stay trivially comparable in tests.
+WORKER_STATE_CURRENT = "current"
+WORKER_STATE_STALE = "stale"
+WORKER_STATE_MISSING = "missing"
+
+
+def read_current_worker_state(
+    project: str,
+    slug: str,
+    dispatch_generation: int,
+    *,
+    home: Path | None = None,
+) -> tuple[str, dict | None]:
+    """The chokepoint reader (DESIGN §2.1): classify workers/<slug>/
+    state.json against the slug's AUTHORITATIVE task-row
+    dispatch_generation, returning (classification, state-or-None).
+
+        s = load state.json
+        if s is absent:                           -> missing
+        if s.dispatch_generation == authority:    -> current
+        else (PRIOR generation):                  -> stale
+
+    The load-bearing distinction is ``stale`` != ``missing``:
+
+      - ``current`` — state present, generation matches the task-row
+        authority. The caller proceeds as normal (the live attempt).
+      - ``stale``  — state present but stamped with a PRIOR generation.
+        It is a previous attempt's inert leftover. The caller MUST
+        short-circuit for this slug this tick: NO status mutation, NO
+        clear_worker, NO worktree removal, NO nudge/escalate/block —
+        only surface. (Treating a prior-generation state as ``missing``
+        was the recurring bug: the died-without-PR branch then removed
+        the CURRENT attempt's worktree + worker dir.)
+      - ``missing`` — no state file at all (a genuinely absent state, no
+        live attempt). ONLY ``missing`` keeps the existing "worker died
+        without PR" semantics.
+
+    A state with NO ``dispatch_generation`` key reads as 0 (legacy /
+    pre-migration). When the authority is also 0 (the slug was never
+    re-dispatched under the new epoch), legacy state compares
+    ``current``; once the slug is re-dispatched (authority >= 1) the
+    legacy 0 compares ``stale`` and is fenced out — fail-safe, matching
+    the §3 tokenless-legacy rule.
+
+    Returns the raw state dict alongside the classification so callers
+    that act on ``current`` don't re-read the file (one read per gate).
+    """
+    st = _read_worker_state(project, slug, home=home)
+    if st is None:
+        return (WORKER_STATE_MISSING, None)
+    try:
+        state_gen = int(st.get("dispatch_generation", 0) or 0)
+    except (TypeError, ValueError):
+        # A non-int generation on disk is corrupt; treat as legacy 0 so
+        # it fences out the moment the slug is re-dispatched (authority
+        # >= 1) rather than ever masquerading as the current attempt.
+        state_gen = 0
+    if state_gen == dispatch_generation:
+        return (WORKER_STATE_CURRENT, st)
+    return (WORKER_STATE_STALE, st)
+
+
 def _bump_tick_counter(state: dict) -> bool:
     """Bump state["tick_count"] (mutated in place) and return True when
     this tick should publish a rolling checkpoint (#187).
@@ -4670,6 +4735,16 @@ class _DispatchAction:
                               # task status / bootstrap state.json
                               # (worker only; reviewer/finisher reuse
                               # the existing slot).
+    dispatch_generation: int = 0  # coord-owned per-slug fence token
+                                  # (DESIGN §1/§3) stamped into this
+                                  # dispatch's prompt + persisted to the
+                                  # task row in _apply_dispatch's
+                                  # pre-launch status=in-progress commit.
+                                  # A genuine (re-)dispatch increments
+                                  # t.dispatch_generation by 1; a pending-
+                                  # acquire retry reuses the recorded gen;
+                                  # a handoff inherits the slug's current
+                                  # gen (no increment).
     error: str = ""
 
 
@@ -5086,6 +5161,73 @@ def _dispatch_ready(
             worker_cwd = wt_result.path
             worker_worktree = wt_result.path
 
+        # Epoch (DESIGN §1/§3): compute the dispatch_generation BEFORE
+        # building the prompt so the gen the worker is told to write is
+        # the SAME value _apply_dispatch persists to the task row. A
+        # pending-acquire retry REUSES its recorded gen + agent_id (the
+        # task row + already-acquired prompt are unchanged; re-
+        # incrementing would skew the task row to N+1 while the prompt
+        # still says N, wedging every CAS'd `fleet workers update`). The
+        # reuse is gated on a FULL {agent_id, gen, kind} match — a stale
+        # wrong-kind pending entry (e.g. a reviewer/finisher acquire that
+        # errored on the same slug) is forgotten + a fresh worker
+        # dispatch is minted (never reused), so acquire_coord_prompt_inbox
+        # writes a fresh worker prompt instead of returning already_
+        # acquired on a reviewer prompt. A genuine (re-)dispatch
+        # increments t.dispatch_generation by exactly 1.
+        pending_rec = None
+        if coord_state is not None:
+            pending_rec = supervisor_mod.load_pending_acquire_record_map(
+                coord_state,
+            ).get(t.slug)
+        pending_kind = pending_rec.get("dispatch_kind") if pending_rec else None
+        next_gen = int(t.dispatch_generation) + 1
+        # Codex iter-2 [P2]: a worker pending record is reusable ONLY when
+        # its recorded gen is consistent with THIS slug's current task row.
+        # A worker record was minted as (prior_task_gen + 1). On a clean
+        # retry the task row is unchanged so recorded_gen == next_gen
+        # (acquire/apply never persisted the bump). If a partial apply DID
+        # persist the bump before failing, the row now equals recorded_gen.
+        # Any OTHER value means the slug was reset/re-dispatched out from
+        # under this record (the row advanced again) — reusing it would
+        # write a STALE gen back via _apply_dispatch + reuse an old prompt
+        # under an old CAS token, defeating the fence. Forget + mint fresh.
+        pending_gen = (
+            int(pending_rec["dispatch_generation"]) if pending_rec else None
+        )
+        worker_gen_consistent = pending_gen in (
+            next_gen, int(t.dispatch_generation),
+        )
+        if pending_rec is not None and pending_kind == "worker" and worker_gen_consistent:
+            # A verified worker retry: reuse BOTH agent_id and the
+            # recorded gen (the task row + already-acquired prompt are
+            # unchanged; re-incrementing would skew them).
+            agent_id = pending_rec["agent_id"]
+            dispatch_generation = int(pending_rec["dispatch_generation"])
+        elif pending_rec is not None and pending_kind == "":
+            # Legacy bare-string pending entry (pre-migration, kind
+            # unknown). Back-compat: reuse the agent_id as a worker retry
+            # AND keep its gen 0 (ungated) so the half-written legacy
+            # prompt — which carries no --dispatch-generation — still
+            # matches if acquire returns already_acquired. A fresh gen
+            # would mint >=1 and skew the unchanged legacy prompt.
+            agent_id = pending_rec["agent_id"]
+            dispatch_generation = 0
+        else:
+            if pending_rec is not None and coord_state is not None:
+                # Not reusable: a POSITIVE wrong-kind entry (a reviewer/
+                # finisher acquire that errored on this slug), OR a
+                # worker-kind entry whose recorded gen is inconsistent with
+                # the current task row (the slug was reset/re-dispatched
+                # out from under it). Either way, drop it so we don't reuse
+                # it via already_acquired with the wrong prompt / a stale
+                # CAS token. The orphaned journal/inbox is reclaimed by the
+                # existing replay/sweeper machinery, same as any orphan.
+                supervisor_mod.forget_pending_acquire_agent_id(
+                    coord_state, t.slug,
+                )
+            agent_id = dispatch_mod.mint_agent_id()
+            dispatch_generation = next_gen
         try:
             prompt = dispatch_mod.build_worker_prompt(
                 t, project=project,
@@ -5094,6 +5236,7 @@ def _dispatch_ready(
                 branch=worker_branch,
                 worktree_pre_created=bool(worker_worktree),
                 is_git=is_git,
+                dispatch_generation=dispatch_generation,
             )
         except dispatch_mod.PromptTooLargeError as exc:
             actions.append(_DispatchAction(slug=t.slug, error=str(exc)))
@@ -5129,11 +5272,8 @@ def _dispatch_ready(
         #   - acquire failed half-way (pending set by except branch)
         #   - acquire OK but apply failed (pending set after success)
         # The next-tick retry reuses the same id either way.
-        pending_map = (
-            supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
-            if coord_state is not None else {}
-        )
-        agent_id = pending_map.get(t.slug) or dispatch_mod.mint_agent_id()
+        # (agent_id + dispatch_generation resolved above from the
+        # pending record, or freshly minted/incremented.)
         try:
             inbox_path = dispatch_mod.acquire_coord_prompt_inbox(
                 agent_id, prompt,
@@ -5151,10 +5291,13 @@ def _dispatch_ready(
             # Codex iter-4 [P1]: also persist the agent_id as a
             # pending-acquire entry so the NEXT tick reuses it. This
             # is the key to hitting AcquireCoordPromptInbox's recovery
-            # branch for half-written journals.
+            # branch for half-written journals. The record carries the
+            # gen + kind so the retry REUSES this gen (DESIGN §3) and
+            # proves it's a worker (not a handoff) retry.
             if coord_state is not None:
-                supervisor_mod.remember_pending_acquire_agent_id(
+                supervisor_mod.remember_pending_acquire_record(
                     coord_state, t.slug, agent_id,
+                    dispatch_generation, "worker",
                 )
             # agent_id="" on the error action so callers can't
             # mistakenly treat the failed dispatch as successful (see
@@ -5168,8 +5311,9 @@ def _dispatch_ready(
             continue
         except Exception as exc:  # noqa: BLE001
             if coord_state is not None:
-                supervisor_mod.remember_pending_acquire_agent_id(
+                supervisor_mod.remember_pending_acquire_record(
                     coord_state, t.slug, agent_id,
+                    dispatch_generation, "worker",
                 )
             actions.append(_DispatchAction(
                 slug=t.slug,
@@ -5189,8 +5333,9 @@ def _dispatch_ready(
         # clears the entry and pending becomes empty again, so a
         # SUBSEQUENT dispatch after terminal forget mints fresh.
         if coord_state is not None:
-            supervisor_mod.remember_pending_acquire_agent_id(
+            supervisor_mod.remember_pending_acquire_record(
                 coord_state, t.slug, agent_id,
+                dispatch_generation, "worker",
             )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
@@ -5207,6 +5352,7 @@ def _dispatch_ready(
             slug=t.slug, agent_id=agent_id, branch=worker_branch,
             worktree=worker_worktree,
             dispatch_instruction=instruction,
+            dispatch_generation=dispatch_generation,
         ))
         active += 1
         in_flight_after_dispatch.append(t)
@@ -5307,8 +5453,21 @@ def _dispatch_review_handoffs(
         # which is exactly the case we want to detect here.
         if t.worker_pid > 0 and _pid_alive(t.worker_pid):
             continue
-        st = _read_worker_state(project, t.slug, home=home)
-        if st is None:
+        # R8 chokepoint (DESIGN §2.1/§3): route the handoff-trigger read
+        # through the generation-aware reader. A STALE `review-pending` /
+        # `review-done` from a PRIOR attempt must NOT double-dispatch a
+        # reviewer/finisher onto the re-dispatched slug — that spawned
+        # subagent would be an accepted CURRENT-gen writer (e.g. a
+        # spurious phase=done), losing the live attempt's work + reaping
+        # its clean tree. `stale` short-circuits (no release, no pending-
+        # acquire mutation, no DISPATCH emit); `missing` falls to the
+        # existing handoff no-op; only `current` proceeds. This is the
+        # one reader PR2 wires (it's part of the epoch surface); the full
+        # R1-R7 reconcile/reaper routing is PR3.
+        cls, st = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if cls != WORKER_STATE_CURRENT or st is None:
             continue
         phase = st.get("phase", "")
         if phase not in ("review-pending", "review-done"):
@@ -5333,17 +5492,25 @@ def _dispatch_review_handoffs(
         # the review-pending → review-done handoff window. Empty string
         # (in-place dispatch) keeps the original git-checkout behavior.
         worktree = _worktree_path_if_present(fleet_home, project, t.slug)
+        # A handoff INHERITS the slug's current dispatch_generation
+        # (DESIGN §3) — no increment. The reviewer/finisher write under
+        # the SAME gen as the worker that handed off, so their CAS'd
+        # `fleet workers update` lands against the unchanged task-row
+        # authority.
+        handoff_generation = int(t.dispatch_generation)
         try:
             if phase == "review-pending":
                 prompt = dispatch_mod.build_reviewer_prompt(
                     t, project=project, branch=branch,
                     worktree=worktree or None, is_git=is_git,
+                    dispatch_generation=handoff_generation,
                 )
                 description = f"fleet reviewer {t.slug}"
             else:
                 prompt = dispatch_mod.build_finisher_prompt(
                     t, project=project, branch=branch,
                     worktree=worktree or None, is_git=is_git,
+                    dispatch_generation=handoff_generation,
                 )
                 description = f"fleet finisher {t.slug}"
         except dispatch_mod.PromptTooLargeError as exc:
@@ -5359,15 +5526,49 @@ def _dispatch_review_handoffs(
         # on EVERY acquire-success (cleared on apply-success), so it
         # also catches the apply-failed-mid-chain scenario. A retry
         # here that finds a pending entry MUST reuse it.
-        pending_handoff_map = (
-            supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
-            if coord_state is not None else {}
-        )
         # Pending-acquire entries from _dispatch_ready and from
-        # _dispatch_review_handoffs share the same keyspace (slug);
-        # this is correct because at any given time only ONE
-        # acquire-prompt is in-flight per slug.
-        agent_id = pending_handoff_map.get(t.slug) or dispatch_mod.mint_agent_id()
+        # _dispatch_review_handoffs share the same keyspace (slug). A
+        # retry may reuse the prior tick's agent_id ONLY on a full
+        # {dispatch_generation, dispatch_kind} match (DESIGN §3):
+        # because handoffs inherit the slug's gen, a worker retry and a
+        # reviewer/finisher retry on the same slug carry the SAME gen, so
+        # gen equality alone can't tell them apart. A wrong-kind pending
+        # entry (e.g. a leftover worker-kind acquire) must NOT be reused
+        # via already_acquired — that would hand the reviewer/finisher
+        # the worker's prompt. Kind mismatch → forget the stale entry +
+        # mint fresh (a fresh acquire writes the correct prompt).
+        this_kind = "reviewer" if phase == "review-pending" else "finisher"
+        pending_handoff_rec = None
+        if coord_state is not None:
+            pending_handoff_rec = supervisor_mod.load_pending_acquire_record_map(
+                coord_state,
+            ).get(t.slug)
+        pending_handoff_kind = (
+            pending_handoff_rec.get("dispatch_kind") if pending_handoff_rec else None
+        )
+        # Reuse on a verified same-kind+same-gen match, OR a legacy
+        # bare-string entry (kind unknown → back-compat: trust it as this
+        # stage's retry). A POSITIVE different-kind entry (e.g. a leftover
+        # worker-kind acquire) is NOT reused — that would hand this
+        # reviewer/finisher the worker's prompt via already_acquired.
+        reuse_handoff = pending_handoff_rec is not None and (
+            pending_handoff_kind == ""
+            or (
+                pending_handoff_kind == this_kind
+                and int(pending_handoff_rec.get("dispatch_generation", -1))
+                == handoff_generation
+            )
+        )
+        if reuse_handoff:
+            agent_id = pending_handoff_rec["agent_id"]
+            reusing_pending = True
+        else:
+            if pending_handoff_rec is not None and coord_state is not None:
+                supervisor_mod.forget_pending_acquire_agent_id(
+                    coord_state, t.slug,
+                )
+            agent_id = dispatch_mod.mint_agent_id()
+            reusing_pending = False
         # PR1 dispatch-lifecycle: release the PRIOR dispatch's
         # coord_prompt_inbox claim BEFORE acquiring the next one. The
         # worker/reviewer that just emitted phase=review-pending or
@@ -5384,7 +5585,7 @@ def _dispatch_review_handoffs(
         # Skip the release when we're reusing a pending agent_id —
         # the prior worker's agent_id is the one we're recovering, so
         # releasing it would conflict with the acquire that follows.
-        if coord_state is not None and t.slug not in pending_handoff_map:
+        if coord_state is not None and not reusing_pending:
             prior_agent_id = supervisor_mod.load_agent_id_map(
                 coord_state,
             ).get(t.slug, "")
@@ -5426,8 +5627,9 @@ def _dispatch_review_handoffs(
             )
         except dispatch_mod.AcquirePromptError as exc:
             if coord_state is not None:
-                supervisor_mod.remember_pending_acquire_agent_id(
+                supervisor_mod.remember_pending_acquire_record(
                     coord_state, t.slug, agent_id,
+                    handoff_generation, this_kind,
                 )
             actions.append(_DispatchAction(
                 slug=t.slug,
@@ -5438,8 +5640,9 @@ def _dispatch_review_handoffs(
             continue
         except Exception as exc:  # noqa: BLE001
             if coord_state is not None:
-                supervisor_mod.remember_pending_acquire_agent_id(
+                supervisor_mod.remember_pending_acquire_record(
                     coord_state, t.slug, agent_id,
+                    handoff_generation, this_kind,
                 )
             actions.append(_DispatchAction(
                 slug=t.slug,
@@ -5449,11 +5652,13 @@ def _dispatch_review_handoffs(
         # Acquire succeeded. Codex iter-8 [P1]: persist pending entry
         # now so a subsequent handoff-apply failure leaves an
         # explicit retry breadcrumb (the next tick reuses this id
-        # via load_pending_acquire_agent_id_map). The caller clears
-        # this entry after _apply_dispatch_handoff lands.
+        # via the pending-acquire record on a full gen+kind match).
+        # The caller clears this entry after _apply_dispatch_handoff
+        # lands.
         if coord_state is not None:
-            supervisor_mod.remember_pending_acquire_agent_id(
+            supervisor_mod.remember_pending_acquire_record(
                 coord_state, t.slug, agent_id,
+                handoff_generation, this_kind,
             )
         try:
             instruction = dispatch_mod.format_dispatch_instruction(
@@ -5473,6 +5678,7 @@ def _dispatch_review_handoffs(
             slug=t.slug, agent_id=agent_id, branch=branch,
             dispatch_instruction=instruction,
             handoff_phase=phase,
+            dispatch_generation=handoff_generation,
         ))
     return actions
 
@@ -5646,7 +5852,25 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     #     renders it).
     #  5. note last (informational; missing it is a graceful
     #     degradation, not state corruption).
+    # DESIGN §3 dispatch ordering: the dispatch_generation persist is
+    # FOLDED INTO the same pre-launch status=in-progress commit (steps
+    # 1+2), strictly before the state.json bootstrap (step 3) and before
+    # the DISPATCH block is collected by the caller (step 5). Two
+    # invariants ride on this:
+    #   - the task row's dispatch_generation is the durable CAS authority
+    #     (DESIGN §2.2); once it lands, every stale worker's CAS'd
+    #     `fleet workers update` is rejected.
+    #   - it must NOT be possible to emit a launchable DISPATCH while the
+    #     slug is still status=ready — the status flip is first, and the
+    #     caller collects the block only after this function returns.
+    # gen<=0 (legacy un-migrated dispatch) skips the set, leaving the
+    # task-row default (0) intact.
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
+    if action.dispatch_generation > 0:
+        _run_fleet([
+            fleet_bin, "tasks", "set", "--project", project, action.slug,
+            f"dispatch_generation={action.dispatch_generation}",
+        ])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
     if action.worktree:
@@ -5654,7 +5878,21 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
         # up on terminal transition (done/abandoned). Single-worker
         # mode leaves this empty so existing behavior is unchanged.
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worktree={action.worktree}"])
-    _run_fleet([fleet_bin, "workers", "update", "--project", project, action.slug, "--phase", "starting"])
+    # Bootstrap state.json stamped with the SAME generation just
+    # persisted to the task row (step 3). Passing --dispatch-generation
+    # routes the bootstrap through the writer CAS: the task-row authority
+    # equals action.dispatch_generation (we just set it), so the CAS
+    # accepts + stamps the file — and the chokepoint reader classifies it
+    # `current`. Without the stamp the bootstrapped file would read as a
+    # legacy gen-0 state and be fenced `stale` the moment the slug's
+    # authority is >= 1. gen<=0 (legacy) keeps the ungated bootstrap.
+    starting_update = [
+        fleet_bin, "workers", "update", "--project", project, action.slug,
+        "--phase", "starting",
+    ]
+    if action.dispatch_generation > 0:
+        starting_update += ["--dispatch-generation", str(action.dispatch_generation)]
+    _run_fleet(starting_update)
     _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worker_pid={os.getpid()}"])
     _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"dispatched as agent {action.agent_id}"])
 
