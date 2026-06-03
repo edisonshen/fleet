@@ -264,6 +264,49 @@ def test_cli_contract(rdd, tmp_path):
     assert "Hub" not in out.name and out.name == "DESIGN-cli.html"
 
 
+def test_leading_h1_not_duplicated_in_body(rdd):
+    """codex P2: the source ``# Title`` goes in the header, not also the body.
+
+    extract_title() lifts the first ``# Title`` into the page <header>; the
+    body must NOT also carry an <h1> (the hub exemplar shows the title once).
+    """
+    md = "# My Design Doc\n\n## Problem\nBody text.\n"
+    title = rdd.extract_title(md)
+    assert title == "My Design Doc"
+    body, _toc = rdd.render_markdown(md)
+    assert "<h1" not in body.lower()
+    # The full page shows the title once in the header <h1> (plus once in the
+    # non-visible <head><title>) — never a second visible <h1> in the body.
+    page = rdd.HTML_TEMPLATE.format(
+        title=title, toc=_toc, body=body, source_path="f.md", rendered_at="x"
+    )
+    assert page.lower().count("<h1") == 1
+    assert "<title>My Design Doc</title>" in page
+    # A deeper h1 in body would be unusual, but a non-leading one is untouched:
+    body2, _ = rdd.render_markdown("## First\nx\n\n# Stray\ny\n")
+    assert "Stray" in body2
+
+
+def test_mixed_numbering_stays_monotonic(rdd):
+    """codex P2: a self-numbered h2 advances the counter, no duplicate ordinals.
+
+    `## 1. Background` then `## Problem` must render 1. then 2. (not 1. twice),
+    in both the headings and the TOC.
+    """
+    md = "# Doc\n\n## 1. Background\nb\n\n## Problem\np\n\n## Approach\na\n"
+    body, toc = rdd.render_markdown(md)
+    # Self-numbered heading kept as-is (slug id, no re-prefix), counter = 1.
+    assert re.search(r"<h2[^>]*>\s*1\.\s*Background", body)
+    # Next auto-numbered section continues at 2, not 1.
+    assert re.search(r'<h2 id="2-problem"[^>]*>\s*2\.\s*Problem', body)
+    assert re.search(r'<h2 id="3-approach"[^>]*>\s*3\.\s*Approach', body)
+    # No duplicate "1." sections.
+    assert len(re.findall(r"<h2[^>]*>\s*1\.\s", body)) == 1
+    # TOC mirrors monotonic numbering.
+    assert "2. Problem" in toc
+    assert "3. Approach" in toc
+
+
 def test_rejects_non_md(rdd, tmp_path):
     bad = tmp_path / "notes.txt"
     bad.write_text("hi", encoding="utf-8")

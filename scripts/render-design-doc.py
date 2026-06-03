@@ -464,7 +464,9 @@ _DIAGRAM_GLYPHS = set(
 _QHEADING_RE = re.compile(r"^Q\d+\b")
 
 # Heading text that already starts with its own ordinal ("3.", "4.2", "12 —").
-_ALREADY_NUMBERED_RE = re.compile(r"^\d+(\.\d+)*\s*[.)\s—:-]")
+# `ordinal` captures the leading top-level number so the counter can advance
+# past self-numbered sections and keep auto-numbering monotonic.
+_ALREADY_NUMBERED_RE = re.compile(r"^(?P<ordinal>\d+)(\.\d+)*\s*[.)\s—:-]")
 
 
 class HubTreeprocessor(Treeprocessor):
@@ -495,14 +497,20 @@ class HubTreeprocessor(Treeprocessor):
 
         Headings that already begin with a number (`## 3. Foo`, `## 4.2 Bar`)
         keep their slug id and are not re-prefixed, so self-numbered docs
-        aren't double-numbered.
+        aren't double-numbered. The running counter advances to the heading's
+        own leading ordinal so a mixed doc (`## 1. Background` then `## Problem`)
+        numbers monotonically (1, 2, ...) instead of emitting a duplicate `1.`.
         """
         n = 0
         for el in list(root):
             if el.tag != "h2":
                 continue
             text = "".join(el.itertext()).strip()
-            if _ALREADY_NUMBERED_RE.match(text):
+            m = _ALREADY_NUMBERED_RE.match(text)
+            if m:
+                # Advance the counter past the heading's own top-level ordinal
+                # so subsequent auto-numbered sections stay monotonic.
+                n = max(n, int(m.group("ordinal")))
                 continue
             n += 1
             slug = el.get("id") or ""
@@ -597,6 +605,22 @@ def wrap_qboxes(body_html: str) -> str:
             i += 1
     out.append(body_html[last:])
     return "".join(out)
+
+
+_LEADING_H1_RE = re.compile(r"\s*<h1\b[^>]*>.*?</h1>\s*", re.IGNORECASE | re.DOTALL)
+
+
+def strip_leading_h1(body_html: str) -> str:
+    """Drop the source doc's leading ``<h1>`` from the rendered body.
+
+    ``extract_title()`` already lifts the first ``# Title`` into the page
+    ``<header>``; leaving the same ``<h1>`` in the body would render the title
+    twice (and ``wrap_sections`` would bury it in an ``overview`` section). The
+    hub exemplar (DESIGN-docs-publisher.html) carries the title only in the
+    header, so strip the first ``<h1>`` if the body opens with one. Headings
+    deeper in the doc are untouched.
+    """
+    return _LEADING_H1_RE.sub("", body_html, count=1) if body_html.lstrip().lower().startswith("<h1") else body_html
 
 
 _H2_OPEN_RE = re.compile(r'<h2\b[^>]*\bid="([^"]*)"[^>]*>', re.IGNORECASE)
@@ -696,6 +720,7 @@ def render_markdown(md_text: str) -> tuple[str, str]:
         output_format="html5",
     )
     body_html = md.convert(md_text)
+    body_html = strip_leading_h1(body_html)
     body_html = wrap_diagrams(body_html)
     body_html = wrap_qboxes(body_html)
     # Build the hub TOC from the (now numbered) top-level headings BEFORE
