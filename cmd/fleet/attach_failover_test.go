@@ -18,8 +18,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -578,9 +576,3 @@ func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 		t.Errorf("err must mention dispatch + cause: %q", err.Error())
 	}
 }
-
-// --- helper: silence unused-import linter for io ---
-var _ = io.Discard
-
-// helper to keep imports tidy when adding more tests
-var _ = fmt.Sprintf
