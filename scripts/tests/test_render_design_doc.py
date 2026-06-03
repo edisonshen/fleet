@@ -4,8 +4,13 @@ These assert the operator's "hub" aesthetic structural markers appear in the
 generated HTML (sticky-TOC card, auto-numbered/anchored sections, embedded
 <style>, decision boxes, diagram cards), that the output is fully
 self-contained (no external <script src=>/<link href=...cdn...>/CDN fonts),
-and that the script renders the real fleet DESIGN-*.md docs without error —
-including the large docs/DESIGN-coord-worktree-lifecycle.md.
+and that the script renders a large doc without error via the file path.
+
+Smoke tests use a SYNTHETIC fixture, never the repo's live docs/DESIGN-*.md:
+those are actively-edited design docs whose content must not be committed as
+test fixtures here (a stale snapshot would collide with the doc's ongoing
+rewrite on merge). A skip-if-present test opportunistically renders a real doc
+when one exists in the local checkout, but never commits it.
 
 The script's filename has a hyphen, so it cannot be imported as a normal
 module; we load it from source via importlib.
@@ -159,32 +164,78 @@ def test_decision_and_change_log_sections_render(rdd):
     assert "Change log" in toc
 
 
-@pytest.mark.parametrize(
-    "doc",
-    ["DESIGN-dispatch-durability.md", "DESIGN-coord-worktree-lifecycle.md"],
-)
-def test_smoke_render_real_docs(rdd, tmp_path, doc):
-    """Render the real (large) fleet DESIGN docs without error, in hub style."""
-    src = DOCS / doc
-    if not src.exists():
-        pytest.skip(f"{doc} not present on this branch")
-    # Copy into a tmp dir so we don't write .html into the repo during tests
-    # (fleet owns its resources: tmp_path is auto-reaped by pytest).
-    work = tmp_path / doc
-    work.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+# A self-contained "large doc" fixture for the file-path smoke test. We never
+# render the repo's real docs/DESIGN-*.md here: those are live, actively-edited
+# design docs whose content must not be committed as test fixtures (a stale
+# snapshot would collide with the doc's ongoing rewrite on merge). Instead we
+# synthesize a substantial multi-section doc on the fly so the smoke test still
+# exercises render() on a big input through the file path.
+def _make_large_fixture_md(sections: int = 60) -> str:
+    parts = ["# Large Synthetic Design Doc", ""]
+    for i in range(sections):
+        parts.append(f"## Section {chr(ord('A') + (i % 26))}{i}")
+        parts.append("")
+        parts.append(
+            "A paragraph of body prose explaining this section in enough "
+            "detail to make the rendered output substantial. " * 4
+        )
+        parts.append("")
+        parts.append("```")
+        parts.append(" a ──▶ b ──▶ c")
+        parts.append(" ▲           │")
+        parts.append(" └─── loop ◄─┘")
+        parts.append("```")
+        parts.append("")
+        parts.append("| Col | Val |")
+        parts.append("|-----|-----|")
+        parts.append(f"| row | {i} |")
+        parts.append("")
+    return "\n".join(parts)
+
+
+def test_smoke_render_large_synthetic_doc(rdd, tmp_path):
+    """Render a large SYNTHETIC doc through the file path without error.
+
+    Uses a generated fixture (not the repo's live docs/DESIGN-*.md) so this
+    tooling test never carries a real design doc's content as a committed
+    snapshot.
+    """
+    work = tmp_path / "DESIGN-synthetic-large.md"
+    work.write_text(_make_large_fixture_md(), encoding="utf-8")
     out = rdd.render(work)
     assert out.exists()
     html = out.read_text(encoding="utf-8")
-    # Hub markers present on the real doc.
+    # Hub markers present.
     assert 'nav class="toc"' in html
     assert "position: sticky" in html
     assert re.search(r"<h2[^>]*>\s*1\.\s", html)        # first section numbered
     assert "<style>" in html
     assert "<script" not in html.lower()
     assert not re.search(r"<link\b", html, re.IGNORECASE)
-    # The big doc must be substantial (sanity: it didn't truncate).
-    if doc == "DESIGN-coord-worktree-lifecycle.md":
-        assert len(html) > 50_000
+    # Substantial (sanity: it didn't truncate).
+    assert len(html) > 50_000
+
+
+def test_smoke_render_real_docs_if_present(rdd, tmp_path):
+    """If a real docs/DESIGN-*.md happens to be present locally, render it.
+
+    Skip-if-absent and NEVER committed here: this only opportunistically
+    exercises the renderer against whatever real docs exist in the developer's
+    checkout. CI and a clean tooling branch have none of these files, so this
+    is a no-op skip there — the synthetic test above is the load-bearing one.
+    """
+    candidates = sorted(DOCS.glob("DESIGN-*.md")) if DOCS.exists() else []
+    if not candidates:
+        pytest.skip("no real DESIGN-*.md present (expected on a tooling branch)")
+    src = candidates[0]
+    work = tmp_path / src.name
+    work.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    out = rdd.render(work)
+    assert out.exists()
+    html = out.read_text(encoding="utf-8")
+    assert 'nav class="toc"' in html
+    assert "<style>" in html
+    assert "<script" not in html.lower()
 
 
 def test_cli_contract(rdd, tmp_path):
