@@ -486,3 +486,270 @@ class TestD1ParkedSweepGuard:
             )
         assert swept == 1
         mdwd.assert_called_once()
+
+
+# ======================================================================
+# P1 #1 — the legacy 0->1 re-dispatch fence collision (codex [P1]).
+#
+# A LEGACY slug (pre-epoch attempt, gen 0, tokenless sentinels) being
+# re-dispatched lands at gen 1 (_dispatch_ready: next_gen = 0 + 1) —
+# colliding with a genuine FIRST epoch dispatch (also gen 1). A stale
+# tokenless prior-attempt sentinel then passes _sentinel_corroborates's
+# `authority <= 1` trust window and reaps the LIVE re-dispatched tree.
+#
+# Fix: every requeue floors dispatch_generation to >= 1, so the next
+# dispatch ALWAYS reaches gen >= 2. Then a tokenless prior-attempt
+# sentinel against the re-dispatched authority (>= 2) is fenced
+# skipped_stale — while the legitimate first-attempt (gen 1, NEVER
+# requeued) tokenless sentinel still applies.
+# ======================================================================
+
+
+class TestRedispatchGenerationFloor:
+    def _floor_calls(self, task, *, home=None):
+        calls: list[list[str]] = []
+        with patch.object(
+            loop, "_run_fleet",
+            side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd)),
+        ):
+            loop._floor_dispatch_generation_for_requeue(
+                task.slug, "p", "fleet",
+                full_tasks_by_slug={task.slug: task},
+                home=home,
+            )
+        return calls
+
+    def test_legacy_gen0_requeue_floors_to_one(self) -> None:
+        # A legacy gen-0 slug requeued → floored to dispatch_generation=1
+        # so the NEXT dispatch reaches gen 2 (>= 2 fences the tokenless
+        # prior-attempt sentinel).
+        t = _make_task("leg-floor", status="todo", dispatch_generation=0)
+        calls = self._floor_calls(t)
+        joined = [" ".join(c) for c in calls]
+        assert any("dispatch_generation=1" in j for j in joined), joined
+
+    def test_epoch_gen1_requeue_is_idempotent_no_write(self) -> None:
+        # An already-epoch-dispatched slug (gen 1) requeued → NO write
+        # (re-dispatch already reaches gen 2 from current+1).
+        t = _make_task("epoch-floor", status="todo", dispatch_generation=1)
+        calls = self._floor_calls(t)
+        assert calls == [], "gen>=1 already fences; no redundant CLI write"
+
+    def test_worker_failed_sentinel_floors_legacy_gen(self) -> None:
+        # WORKER_FAILED requeues the slug; a legacy gen-0 row must be
+        # floored to 1 inside the apply so the re-dispatch reaches >= 2.
+        action = loop._SentinelAction(
+            slug="wf-floor", kind="worker_failed",
+            payload="crashed", dispatch_generation=None,  # tokenless legacy
+        )
+        t = _make_task("wf-floor", status="in-progress", dispatch_generation=0)
+        calls: list[list[str]] = []
+        with patch.object(
+            loop, "_run_fleet",
+            side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd)),
+        ), patch.object(loop, "_maybe_remove_worktree"), \
+             patch.object(loop, "_maybe_delete_worker_dir"):
+            outcome = loop._apply_sentinel(
+                action, "p", "fleet",
+                tasks_by_slug={t.slug: t}, full_tasks_by_slug={t.slug: t},
+            )
+        assert outcome == loop.SENTINEL_APPLIED  # gen0 tokenless = first attempt
+        joined = [" ".join(c) for c in calls]
+        assert any("dispatch_generation=1" in j for j in joined), joined
+
+    def test_reconcile_todo_floors_legacy_gen(self, tmp_path: Path) -> None:
+        # _apply_reconcile on a todo requeue floors a legacy gen-0 slug.
+        action = loop._ReconcileAction(
+            slug="rc-floor", new_status="todo", clear_worker=True,
+            delete_worker_dir=True, note="worker died without PR",
+        )
+        t = _make_task("rc-floor", status="in-progress", dispatch_generation=0)
+        calls: list[list[str]] = []
+        with patch.object(
+            loop, "_run_fleet",
+            side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd)),
+        ), patch.object(loop, "_maybe_remove_worktree"), \
+             patch.object(loop, "_maybe_delete_worker_dir"):
+            loop._apply_reconcile(
+                action, "p", "fleet",
+                full_tasks_by_slug={t.slug: t}, home=tmp_path,
+            )
+        joined = [" ".join(c) for c in calls]
+        assert any("dispatch_generation=1" in j for j in joined), joined
+
+    def test_stale_tokenless_after_redispatch_authority2_skipped(self) -> None:
+        # End-to-end of the fix's purpose: after the floor+increment the
+        # re-dispatched authority is >= 2, so a stale tokenless prior-
+        # attempt TASK_DONE_PR is fenced (NO reap of the live tree) — even
+        # with an identical worker/<slug> branch.
+        action = loop._SentinelAction(
+            slug="e2e-redisp", kind="task_done_pr",
+            payload="https://x/pr/STALE", dispatch_generation=None,
+        )
+        t = _make_task(
+            "e2e-redisp", status="in-progress", dispatch_generation=2,
+            branch="worker/e2e-redisp",
+        )
+        calls: list[list[str]] = []
+        with patch.object(
+            loop, "_run_fleet",
+            side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd)),
+        ), patch.object(loop, "_maybe_remove_worktree") as mrw, \
+             patch.object(loop, "_maybe_delete_worker_dir") as mdwd:
+            outcome = loop._apply_sentinel(
+                action, "p", "fleet",
+                tasks_by_slug={t.slug: t}, full_tasks_by_slug={t.slug: t},
+            )
+        assert outcome == loop.SENTINEL_SKIPPED_STALE
+        assert calls == []
+        mrw.assert_not_called()
+        mdwd.assert_not_called()
+
+    def test_first_attempt_tokenless_gen1_still_applies(self) -> None:
+        # Preserve codex iter-3: a genuine first-attempt (gen 1, never
+        # requeued, so never floored ABOVE 1) tokenless sentinel still
+        # applies — the floor reserves gen 1 for exactly this case.
+        action = loop._SentinelAction(
+            slug="e2e-first", kind="task_done_pr",
+            payload="https://x/pr/first", dispatch_generation=None,
+        )
+        t = _make_task(
+            "e2e-first", status="in-progress", dispatch_generation=1,
+            branch="worker/e2e-first",
+        )
+        with patch.object(loop, "_run_fleet"), \
+             patch.object(loop, "_maybe_remove_worktree") as mrw, \
+             patch.object(loop, "_maybe_delete_worker_dir"):
+            outcome = loop._apply_sentinel(
+                action, "p", "fleet",
+                tasks_by_slug={t.slug: t}, full_tasks_by_slug={t.slug: t},
+            )
+        assert outcome == loop.SENTINEL_APPLIED
+        mrw.assert_called_once()
+
+
+# ======================================================================
+# P1 #2 — dispatch partial-apply WEDGE recovery (codex [P1]).
+#
+# _apply_dispatch crashes after the status=in-progress + dispatch_
+# generation commit but BEFORE the state.json bootstrap. The id is still
+# in pending_acquire (forget runs only after _apply_dispatch returns), so
+# the journal replay SKIPS the slug — and reconcile previously short-
+# circuited on `stale`, deferring to a replay that never fires. The task
+# wedged in-progress forever. Reconcile now detects "no replay owner" and
+# requeues to todo (gen preserved; the next dispatch increments so the
+# prior attempt's state stays `stale`, monotonic, no reuse).
+# ======================================================================
+
+
+class TestPartialApplyWedgeRecovery:
+    def _journal(self, home: Path, agent_id: str, slug: str, state: str) -> None:
+        d = home / "dispatches"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{agent_id}.json").write_text(
+            json.dumps({
+                "owner": f"project/p/slug/{slug}",
+                "exec_state": state,
+            }),
+            encoding="utf-8",
+        )
+
+    def _stale_state(self, home: Path, slug: str, gen: int) -> None:
+        _write_worker_state(
+            home, "p", slug,
+            {"slug": slug, "phase": "starting", "dispatch_generation": gen},
+        )
+
+    def test_wedge_requeued_when_replay_cannot_recover(
+        self, tmp_path: Path,
+    ) -> None:
+        # Partial-apply: authority gen 2, only a stale gen-1 state on disk,
+        # id in pending_acquire (replay SKIPS it), journal pending.
+        slug = "wedge-aaaa"
+        agent_id = "abcd1234"
+        self._stale_state(tmp_path, slug, gen=1)
+        self._journal(tmp_path, agent_id, slug, "pending")
+        coord_state = {
+            "worker_agent_ids": {slug: agent_id},
+            "pending_acquire_agent_ids": {slug: agent_id},
+        }
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path, coord_state=coord_state,
+            )
+        # NOT wedged: recovered to a re-dispatchable status.
+        assert len(actions) == 1
+        a = actions[0]
+        assert a.new_status == "todo"
+        assert a.clear_worker is True
+        assert a.delete_worker_dir is True
+
+    def test_prior_stale_state_still_fences_after_recovery(
+        self, tmp_path: Path,
+    ) -> None:
+        # After recovery the task row keeps gen 2; the NEXT dispatch
+        # increments to gen 3 (the floor is for legacy gen-0 only — gen 2
+        # already reaches 3 via current+1). A prior-attempt stale state
+        # (gen 1 or 2) then classifies `stale`, NOT `current`, against the
+        # new authority — proving no generation REUSE re-validates it.
+        slug = "wedge-fence"
+        # state on disk is gen 2 (the wedged attempt's authority); the
+        # NEXT dispatch will be gen 3.
+        self._stale_state(tmp_path, slug, gen=2)
+        cls, _st = loop.read_current_worker_state(
+            "p", slug, 3, home=tmp_path,
+        )
+        assert cls == loop.WORKER_STATE_STALE
+
+    def test_replay_recoverable_slug_not_requeued(self, tmp_path: Path) -> None:
+        # A `stale` slug whose adopted PENDING journal is NOT in
+        # pending_acquire IS replay-recoverable → reconcile must short-
+        # circuit (NO requeue) so we don't double-dispatch the #184 trap.
+        slug = "live-bbbb"
+        agent_id = "beef0001"
+        self._stale_state(tmp_path, slug, gen=1)
+        self._journal(tmp_path, agent_id, slug, "pending")
+        coord_state = {
+            "worker_agent_ids": {slug: agent_id},
+            # NOT in pending_acquire → replay WILL re-emit.
+        }
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path, coord_state=coord_state,
+            )
+        assert actions == [], "replay owns recovery; reconcile must not requeue"
+
+    def test_no_coord_state_preserves_legacy_shortcircuit(
+        self, tmp_path: Path,
+    ) -> None:
+        # Legacy callers / tests that pass no coord_state keep the
+        # pre-fix behavior: a stale in-progress slug short-circuits (no
+        # requeue) and defers to replay.
+        slug = "legacy-cccc"
+        self._stale_state(tmp_path, slug, gen=1)
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path,  # no coord_state
+            )
+        assert actions == []
+
+    def test_replay_can_recover_predicate(self, tmp_path: Path) -> None:
+        slug = "pred-dddd"
+        agent_id = "cafe0001"
+        self._journal(tmp_path, agent_id, slug, "pending")
+        # adopted + pending journal + NOT pending_acquire → recoverable.
+        assert loop._replay_can_recover(
+            slug, "p", tmp_path,
+            {"worker_agent_ids": {slug: agent_id}},
+        ) is True
+        # same but id in pending_acquire → NOT recoverable (replay skips).
+        assert loop._replay_can_recover(
+            slug, "p", tmp_path,
+            {"worker_agent_ids": {slug: agent_id},
+             "pending_acquire_agent_ids": {slug: agent_id}},
+        ) is False
+        # no adopted id → NOT recoverable.
+        assert loop._replay_can_recover(slug, "p", tmp_path, {}) is False

@@ -615,7 +615,9 @@ def _tick_locked(
     # reaper lane is still open (kill_directive sent, grace not yet
     # expired) defers its status flip — _apply_reconcile is suppressed
     # for that action this tick.
-    reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
+    reconciled = _reconcile_inflight(
+        f.tasks, project, fleet_bin, home=home, coord_state=state,
+    )
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
     reconcile_repo = cwd if cap > 1 else ""
     reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
@@ -1247,10 +1249,10 @@ def _run_supervisor(
         scoped = [t for t in f3.tasks if t.slug in set(slugs)]
         if not scoped:
             return False
-        actions = _reconcile_inflight(
-            scoped, project, fleet_bin, home=home,
-        )
         cs = _load_coord_state(state_path)
+        actions = _reconcile_inflight(
+            scoped, project, fleet_bin, home=home, coord_state=cs,
+        )
         slot_freed = False
         full_map = {t.slug: t for t in f3.tasks}
         for action in actions:
@@ -3549,18 +3551,72 @@ def _audit_archived_subagents(
     return flagged_now
 
 
+def _replay_can_recover(
+    slug: str,
+    project: str,
+    home: Path | None,
+    coord_state: dict | None,
+) -> bool:
+    """True iff the dispatch-journal replay (_replay_pending_dispatches)
+    will re-emit a DISPATCH for `slug` on a subsequent tick.
+
+    Replay re-emits ONLY when the slug's adopted journal is `pending`,
+    `adopted_agent_ids[slug] == agent_id`, AND the id is NOT in
+    pending_acquire (a mid-application id is the dispatch RETRY's, not
+    replay's — replay skips it, see _replay_pending_dispatches). This
+    helper mirrors that predicate so reconcile can tell whether a stale/
+    missing in-progress slug has a live recovery owner or is WEDGED.
+    """
+    if coord_state is None or home is None:
+        return False
+    try:
+        adopted = supervisor_mod.load_agent_id_map(coord_state)
+    except Exception:  # noqa: BLE001
+        return False
+    agent_id = adopted.get(slug, "")
+    if not agent_id:
+        return False
+    try:
+        pending = set(
+            supervisor_mod.load_pending_acquire_agent_id_map(coord_state).values()
+        )
+    except Exception:  # noqa: BLE001
+        pending = set()
+    if agent_id in pending:
+        # Mid-application id: replay SKIPS it (the dispatch-retry path
+        # owns it, but the retry only fires for status=ready — a wedged
+        # in-progress slug is never re-picked). NOT replay-recoverable.
+        return False
+    # Find the journal for this adopted id and confirm it is pending.
+    for jid, jslug, j in _iter_project_journals(home, project):
+        if jid == agent_id and jslug == slug:
+            return j.get("exec_state", "") == "pending"
+    return False
+
+
 def _reconcile_inflight(
     tasks: list[parse.Task],
     project: str,
     fleet_bin: str,
     *,
     home: Path | None = None,
+    coord_state: dict | None = None,
 ) -> list[_ReconcileAction]:
     """For each in-flight task, check the worker is alive; otherwise
     decide the next status from state.json's terminal phase, then
     pr_url + CI.
 
     Returns a list of _ReconcileAction; caller applies via the fleet CLI.
+
+    `coord_state` (optional) enables partial-apply WEDGE recovery: an
+    in-progress slug whose state.json is stale/missing, has no live
+    worker, AND is NOT replay-recoverable (no pending journal the replay
+    would re-emit) is requeued to `todo` instead of being left wedged
+    forever (codex [P1] — _apply_dispatch can crash after the
+    status=in-progress + dispatch_generation commit but before the
+    state.json bootstrap; replay SKIPS such a slug because its id sits in
+    pending_acquire). When coord_state is None (legacy callers / tests)
+    the recovery is inert and behavior is unchanged.
     """
     actions: list[_ReconcileAction] = []
     # One project-mode lookup per reconcile pass. Non-git projects'
@@ -3598,15 +3654,44 @@ def _reconcile_inflight(
             # codex iter-4 [P1]: a `stale` state on an in-progress task can
             # be either (a) a prior attempt's leftover while the current
             # attempt is mid-relaunch, or (b) a dispatch partial-apply (gen
-            # bump landed, `starting` bootstrap didn't). In BOTH cases the
-            # correct owner of re-launch is the #184 dispatch journal
-            # replay (_replay_pending_dispatches re-emits the DISPATCH when
-            # worker_agent_ids[slug] is the adopted journal id + the task
-            # is in-progress), which makes the worker write a
-            # current-generation state. Reconcile must NOT requeue here:
-            # requeuing an in-progress task with an adopted journal is the
-            # exact double-dispatch trap #184 closed. So we short-circuit
-            # (no mutation) and surface; replay owns recovery.
+            # bump landed, `starting` bootstrap didn't). The correct owner
+            # of re-launch is NORMALLY the #184 dispatch journal replay
+            # (_replay_pending_dispatches re-emits the DISPATCH when
+            # worker_agent_ids[slug] is the adopted PENDING journal id),
+            # which makes the worker write a current-generation state.
+            # Reconcile must NOT blindly requeue an in-progress task with a
+            # live adopted journal — that is the double-dispatch trap #184
+            # closed.
+            #
+            # BUT replay does NOT cover every partial-apply: when
+            # _apply_dispatch crashes after the status=in-progress + gen
+            # commit but before the state.json bootstrap, the id is still
+            # in pending_acquire (forget runs only AFTER _apply_dispatch
+            # returns), and replay SKIPS pending_acquire ids — so NOBODY
+            # re-emits and the task is WEDGED in-progress forever (codex
+            # [P1]). Detect the unrecoverable wedge (no replay owner) and
+            # requeue to `todo` so the next dispatch re-picks it (gen
+            # increments → the prior stale state still fences `stale`,
+            # monotonic, no reuse). Only fires when coord_state is wired.
+            if coord_state is not None and not _replay_can_recover(
+                t.slug, project, home, coord_state,
+            ):
+                print(
+                    f"coord: reconcile RECOVERING wedged {t.slug} — stale "
+                    f"worker state (authority={int(t.dispatch_generation)}) "
+                    f"with no replay owner (dispatch partial-apply); "
+                    f"requeue to todo. The next dispatch increments the "
+                    f"generation so the prior attempt's state stays stale.",
+                    file=sys.stderr,
+                )
+                actions.append(_ReconcileAction(
+                    slug=t.slug, new_status="todo", clear_worker=True,
+                    note="dispatch partial-apply wedge — requeued (no PR)",
+                    raised_to_user=True,
+                    raise_text=f"{t.slug} recovered from dispatch wedge",
+                    delete_worker_dir=True,
+                ))
+                continue
             print(
                 f"coord: reconcile skipped {t.slug} — stale worker state "
                 f"(prior dispatch_generation, authority="
@@ -4241,6 +4326,27 @@ def _apply_reconcile(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
+    # DESIGN §1/§3 re-dispatch fence floor. A requeue to `todo` makes the
+    # slug re-dispatch-eligible; the NEXT dispatch increments
+    # dispatch_generation by 1 (loop.py _dispatch_ready: next_gen =
+    # current + 1). A LEGACY slug whose first (pre-epoch) attempt ran
+    # tokenless carries gen 0, so its re-dispatch would land at gen 1 —
+    # COLLIDING with a genuine first epoch dispatch (also gen 1). A stale
+    # tokenless TASK_DONE_PR/WORKER_FAILED from that pre-epoch attempt
+    # then corroborates as legacy-trusted at authority 1 and reaps the
+    # re-dispatched LIVE tree (codex [P1]). Reserve gen 1 EXCLUSIVELY for
+    # the first-ever epoch dispatch by flooring the generation to >= 1 on
+    # every requeue: a re-dispatch is then ALWAYS gen >= 2, so
+    # _sentinel_corroborates can safely keep its `authority <= 1 => trust`
+    # rule (preserving the first-attempt tokenless path) while fencing a
+    # genuinely re-dispatched slug at >= 2.
+    if action.new_status == "todo":
+        _floor_dispatch_generation_for_requeue(
+            action.slug, project, fleet_bin,
+            full_tasks_by_slug=full_tasks_by_slug,
+            tasks_by_slug=tasks_by_slug,
+            home=home,
+        )
     if action.clear_worker:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
@@ -4487,6 +4593,50 @@ def _task_row_dispatch_generation(
     return None
 
 
+def _floor_dispatch_generation_for_requeue(
+    slug: str,
+    project: str,
+    fleet_bin: str,
+    *,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+    home: Path | None = None,
+) -> None:
+    """Ensure a requeued (re-dispatch-eligible) slug carries
+    dispatch_generation >= 1 so the NEXT dispatch lands at gen >= 2.
+
+    DESIGN §1/§3 re-dispatch fence: gen 1 is reserved for the FIRST epoch
+    dispatch of a never-dispatched slug. A LEGACY slug (pre-epoch attempt,
+    gen 0, tokenless sentinels) being re-dispatched would otherwise also
+    land at gen 1 (_dispatch_ready: next_gen = 0 + 1), colliding with a
+    true first dispatch and letting a stale tokenless prior-attempt
+    sentinel pass _sentinel_corroborates's `authority <= 1` trust window
+    and reap the LIVE re-dispatched tree. Flooring the gen to 1 on requeue
+    makes every re-dispatch reach >= 2, closing the collision.
+
+    Idempotent: a slug already at gen >= 1 is left untouched (no CLI
+    write). gen<=0 (or unreadable) is floored to 1.
+    """
+    current = _task_row_dispatch_generation(
+        project, slug, home=home,
+        tasks_by_slug=tasks_by_slug,
+        full_tasks_by_slug=full_tasks_by_slug,
+    )
+    if current is not None and current >= 1:
+        return
+    try:
+        _run_fleet([
+            fleet_bin, "tasks", "set", "--project", project, slug,
+            "dispatch_generation=1",
+        ])
+    except Exception as exc:  # noqa: BLE001
+        import sys
+        print(
+            f"coord: dispatch_generation floor failed for {slug}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def _sentinel_corroborates(
     action: _SentinelAction, authority: int | None,
 ) -> bool:
@@ -4621,6 +4771,17 @@ def _apply_sentinel(
     elif action.kind == "worker_failed":
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
+        # DESIGN §1/§3 re-dispatch fence floor (see
+        # _floor_dispatch_generation_for_requeue): WORKER_FAILED requeues
+        # the slug, so the next dispatch must reach gen >= 2 to fence any
+        # stale tokenless prior-attempt sentinel out at _sentinel_
+        # corroborates. Floor a legacy gen-0 slug to 1 here too.
+        _floor_dispatch_generation_for_requeue(
+            action.slug, project, fleet_bin,
+            full_tasks_by_slug=full_tasks_by_slug,
+            tasks_by_slug=tasks_by_slug,
+            home=home,
+        )
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
