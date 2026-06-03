@@ -35,6 +35,22 @@ var sessionAliveFn = tmux.HasSession
 // stub without forking tmux.
 var sessionProbeFn = tmux.SessionAlive
 
+// chainResolveFn is the chain-following resolver used by the
+// rowAgent [a] handler (handoff-identity-cont-3f1d Piece 2). Var
+// so tests can stub without touching the filesystem. Production
+// delegates to agent.ResolveChain which walks live → archive
+// successor pointers with a cycle guard.
+var chainResolveFn = agent.ResolveChain
+
+// pluralizeHops emits "" for hops==1 and "s" otherwise so the
+// "rotated through N hop(s)" message reads naturally.
+func pluralizeHops(hops int) string {
+	if hops == 1 {
+		return ""
+	}
+	return "s"
+}
+
 // Action keybinds added in Week 4b+4c. Layered onto the existing
 // navigation set (j/k/g/G/q) without touching them.
 //
@@ -756,6 +772,30 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 			return m, nil, true
 		}
 		cur := row.agent
+		// Chain-following resolver (handoff-identity-cont-3f1d Piece 2)
+		// — call agent.ResolveChain on the row id BEFORE the dead-session
+		// pre-flight. The common case (live row) returns hops=0 with the
+		// same record and the rest of the handler is unchanged. The
+		// race-window case (row was just archived as a handoff while
+		// rendered) walks pred → succ and attaches to the live tail, so
+		// the operator doesn't dead-end on a moments-stale row. Errors
+		// from the resolver fall back to the existing live-record-only
+		// flow so this enhancement never makes the existing UX worse.
+		if tail, hops, rerr := chainResolveFn(cur.ID); rerr == nil && hops > 0 && tail != nil {
+			session := tail.TmuxSession
+			if session == "" {
+				session = "fleet-" + tail.ID
+			}
+			if sessionAliveFn(session) {
+				m.flash = &flashMsg{
+					text: fmt.Sprintf(
+						"agent %s handed off → %s (rotated through %d hop%s) — attaching to live tail",
+						cur.ID, tail.ID, hops, pluralizeHops(hops)),
+				}
+				m.pendingAttach = session
+				return m, tea.Quit, true
+			}
+		}
 		// Pre-flight liveness check (same behavior as v0.1 [a] flow):
 		// tmux's `attach -t <session>` on a dead session prints "no
 		// sessions" and the operator drops back to their shell with
@@ -2547,6 +2587,49 @@ func (m Model) startDispatch(task string) tea.Cmd {
 	return runFleetCmd(args, func(out string, err error) tea.Msg {
 		return dispatchDoneMsg{out: out, err: err}
 	})
+}
+
+// parseRotationFromHandoff extracts (predecessor, successor) ids from
+// the first matching line of `fleet handoff` stdout. The handoff CLI
+// always emits "agent <pred> handed off → <succ>" as its primary
+// success line (cmd/fleet/handoff.go runHandoff step ~1110, and the
+// crash-recovery branch ~320). When the line is present, the TUI
+// pins a brief rotation flash on the predecessor row so the operator
+// sees the chain transition before the natural agents refresh moves
+// the cursor.
+//
+// Returns ("", "") when the line shape doesn't match — the
+// rotation flash is then skipped (the surfaced flash banner still
+// shows the operator the raw output).
+func parseRotationFromHandoff(out string) (pred, succ string) {
+	// Walk line-by-line so subsequent informational lines (task /
+	// project / tmux / handoff / number) don't get matched.
+	for _, line := range strings.Split(out, "\n") {
+		// Match: "agent <pred> handed off → <succ>" (allow extra
+		// trailing text e.g. "(cleaned stale queue file)").
+		const prefix = "agent "
+		const middle = " handed off → "
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		mid := strings.Index(line, middle)
+		if mid < len(prefix) {
+			continue
+		}
+		predID := strings.TrimSpace(line[len(prefix):mid])
+		rest := strings.TrimSpace(line[mid+len(middle):])
+		// Successor id is up to the first whitespace (rest may carry
+		// a parenthetical suffix). Empty after trim → bail.
+		succID := rest
+		if sp := strings.IndexAny(rest, " \t"); sp > 0 {
+			succID = rest[:sp]
+		}
+		if predID == "" || succID == "" {
+			continue
+		}
+		return predID, succID
+	}
+	return "", ""
 }
 
 // formatHandoffFlash converts a handoffDoneMsg into a banner string.

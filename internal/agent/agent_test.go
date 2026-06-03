@@ -142,7 +142,7 @@ func TestRecord_JSONShape(t *testing.T) {
 	// Verify a few load-bearing fields are present in the JSON.
 	s := string(data)
 	for _, want := range []string{
-		`"schema_version": 1`,
+		`"schema_version": 2`,
 		`"engine": "claude-code"`,
 		`"role": "executor"`,
 		`"mode": "execute"`,

@@ -186,6 +186,72 @@ func TestHandoff_HappyPath(t *testing.T) {
 	}
 }
 
+// TestHandoff_WritesChainPointer pins the v2 schema chain-pointer
+// write on the happy-path handoff (handoff-identity-cont-3f1d).
+// Predecessor archive must carry successor_id + archived_cause=handoff;
+// live successor record must carry predecessor_id. Together these
+// are what `fleet attach <predecessor>` walks via agent.ResolveChain.
+func TestHandoff_WritesChainPointer(t *testing.T) {
+	requireTmux(t)
+	tmp := setupFleetHome(t)
+
+	old := seedAgent(t)
+	t.Cleanup(func() { _ = tmux.Kill(old.TmuxSession) })
+
+	out := &bytes.Buffer{}
+	if err := runHandoff(&handoffOpts{
+		oldID:       old.ID,
+		command:     []string{"sleep", "60"},
+		graceMillis: 0,
+	}, out, out); err != nil {
+		t.Fatalf("handoff: %v\n%s", err, out.String())
+	}
+
+	live, err := agent.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(live) != 1 {
+		t.Fatalf("expected exactly 1 live after handoff; got %d", len(live))
+	}
+	newRec := live[0]
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+
+	// Predecessor archive carries successor_id + cause=handoff.
+	arc, err := agent.LoadArchive(old.ID)
+	if err != nil {
+		t.Fatalf("LoadArchive predecessor: %v", err)
+	}
+	if arc.SuccessorID != newRec.ID {
+		t.Errorf("archive[%s].SuccessorID: got %q want %q", old.ID, arc.SuccessorID, newRec.ID)
+	}
+	if arc.ArchivedCause != agent.ArchivedCauseHandoff {
+		t.Errorf("archive[%s].ArchivedCause: got %q want %q",
+			old.ID, arc.ArchivedCause, agent.ArchivedCauseHandoff)
+	}
+
+	// Live successor carries predecessor_id pointing back.
+	if newRec.PredecessorID != old.ID {
+		t.Errorf("live successor PredecessorID: got %q want %q", newRec.PredecessorID, old.ID)
+	}
+
+	// Resolver round-trip: ResolveChain(old.ID) lands on newRec with hops=1.
+	tail, hops, rerr := agent.ResolveChain(old.ID)
+	if rerr != nil {
+		t.Fatalf("ResolveChain(%s): %v", old.ID, rerr)
+	}
+	if tail.ID != newRec.ID {
+		t.Errorf("ResolveChain tail: got %q want %q", tail.ID, newRec.ID)
+	}
+	if hops != 1 {
+		t.Errorf("ResolveChain hops: got %d want 1", hops)
+	}
+
+	// Silence the unused-tmp linter — kept in scope so future
+	// assertions can reach the on-disk paths directly.
+	_ = tmp
+}
+
 func TestHandoff_ChainGrowsAcrossSequentialHandoffs(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
