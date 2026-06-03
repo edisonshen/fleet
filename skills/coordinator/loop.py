@@ -85,15 +85,29 @@ def _audit_freshness_seconds() -> int:
 
 # Sentinel grammar (ENG §5.3). Worker reports use these to communicate
 # state changes back to the coord through the inbox archive.
+#
+# DESIGN-coord-worktree-lifecycle §3 (sentinel-path readers S1-S5): a
+# STATE-MUTATING sentinel (task_done_pr, worker_failed, blocked_question)
+# carries the worker's dispatch_generation token so the coord can
+# corroborate it against the slug's current task-row authority and skip
+# ALL terminal side effects on a stale (prior-attempt) sentinel. The
+# token is an OPTIONAL `gen=<n>` clause placed immediately after the slug
+# (additive: a pre-migration worker that omits it parses as gen 0, the
+# tokenless-legacy path). A pure `new_task` wake carries no state
+# mutation and stays token-free. The clause sits BEFORE the payload so
+# the greedy `.+`/`\S+` payload captures can't swallow it.
 _SENTINEL_PATTERNS = {
     "task_done_pr": re.compile(
-        r"^TASK_DONE_PR\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<url>\S+)\s*$",
+        r"^TASK_DONE_PR\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<url>\S+)\s*$",
     ),
     "blocked_question": re.compile(
-        r"^BLOCKED_QUESTION\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<text>.+)$",
+        r"^BLOCKED_QUESTION\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<text>.+)$",
     ),
     "worker_failed": re.compile(
-        r"^WORKER_FAILED\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<reason>.+)$",
+        r"^WORKER_FAILED\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<reason>.+)$",
     ),
     "new_task": re.compile(
         r"^NEW_TASK\s*=?\s*(?P<slug>[a-z0-9._-]+)\s*$",
@@ -601,7 +615,9 @@ def _tick_locked(
     # reaper lane is still open (kill_directive sent, grace not yet
     # expired) defers its status flip — _apply_reconcile is suppressed
     # for that action this tick.
-    reconciled = _reconcile_inflight(f.tasks, project, fleet_bin, home=home)
+    reconciled = _reconcile_inflight(
+        f.tasks, project, fleet_bin, home=home, coord_state=state,
+    )
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
     reconcile_repo = cwd if cap > 1 else ""
     reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
@@ -761,13 +777,18 @@ def _tick_locked(
             deferred_actions.append(action)
             continue
         try:
-            _apply_sentinel(
+            sentinel_outcome = _apply_sentinel(
                 action, project, fleet_bin,
                 repo=sentinel_repo,
                 tasks_by_slug=sentinel_tasks_by_slug,
                 home=home,
                 full_tasks_by_slug=tasks_by_slug,
             )
+            # DESIGN §3 S4: a STALE sentinel performed NO terminal side
+            # effects — consume it (no release/forget/handoff-clear, no
+            # re-defer). Only `applied` drives the in-flight teardown.
+            if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                continue
             result.drained += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -1228,10 +1249,10 @@ def _run_supervisor(
         scoped = [t for t in f3.tasks if t.slug in set(slugs)]
         if not scoped:
             return False
-        actions = _reconcile_inflight(
-            scoped, project, fleet_bin, home=home,
-        )
         cs = _load_coord_state(state_path)
+        actions = _reconcile_inflight(
+            scoped, project, fleet_bin, home=home, coord_state=cs,
+        )
         slot_freed = False
         full_map = {t.slug: t for t in f3.tasks}
         for action in actions:
@@ -1660,13 +1681,19 @@ def _run_supervisor(
                 still_deferred.append(action)
                 continue
             try:
-                _apply_sentinel(
+                sentinel_outcome = _apply_sentinel(
                     action, project, fleet_bin,
                     repo=sentinel_repo,
                     tasks_by_slug=sentinel_tbs,
                     home=home,
                     full_tasks_by_slug=tbs,
                 )
+                # DESIGN §3 S4: a STALE deferred-replay sentinel did NO
+                # terminal side effect — consume it (drop from the queue,
+                # no release/forget/handoff-clear). Not re-deferred: a
+                # stale sentinel never becomes current.
+                if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                    continue
                 # Codex iter-23 [P2]: same blocked_question carve-out
                 # as the non-replay drain — blocked workers stay alive,
                 # so we must preserve the agent_id mapping. Only the
@@ -1829,13 +1856,17 @@ def _run_supervisor(
                 deferred_actions.append(action)
                 continue
             try:
-                _apply_sentinel(
+                sentinel_outcome = _apply_sentinel(
                     action, project, fleet_bin,
                     repo=sentinel_repo,
                     tasks_by_slug=sentinel_tasks_by_slug,
                     home=home,
                     full_tasks_by_slug=tasks_by_slug,
                 )
+                # DESIGN §3 S4: STALE sentinel → consume, no teardown,
+                # no re-defer (a stale sentinel never becomes current).
+                if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                    continue
                 # Codex iter-22 [P1]: blocked workers stay ALIVE so
                 # the operator can answer the BLOCKED_QUESTION. We
                 # must NOT forget the agent_id mapping in that case —
@@ -1958,7 +1989,27 @@ def _build_reap_inputs(
         tmux_session = (
             supervisor_mod.session_name_for_agent(agent_id) if agent_id else ""
         )
-        worker_state = _read_worker_state(project, t.slug, home=home)
+        # R5 chokepoint (DESIGN §2.1/§3): the reaper judges this slug's
+        # worker_state (judge_completion) and may kill/reap on a
+        # terminal phase. A STALE state (prior dispatch_generation) must
+        # NOT drive a reap of the CURRENT attempt — skip the task
+        # entirely from the reap input set so a stale `phase=done`/
+        # `phase=failed` never reaps/kills the live worker. `current`
+        # passes its state through; `missing` passes None (the reaper
+        # judges PENDING — can't judge yet — a benign no-op).
+        rcls, rstate = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if rcls == WORKER_STATE_STALE:
+            import sys
+            print(
+                f"coord: reaper skipped {t.slug} — stale worker state "
+                f"(prior dispatch_generation, authority="
+                f"{int(t.dispatch_generation)}); not reaping, surfacing",
+                file=sys.stderr,
+            )
+            continue
+        worker_state = rstate
         pid = 0
         if worker_state is not None:
             raw_pid = worker_state.get("pid", 0) or worker_state.get("worker_pid", 0)
@@ -2051,12 +2102,26 @@ def _load_deferred_sentinels(coord_state: dict) -> list["_SentinelAction"]:
             "task_done_pr", "blocked_question", "worker_failed", "new_task",
         ):
             continue
+        # DESIGN §3 S5: round-trip the dispatch_generation token so a
+        # deferred→replayed sentinel corroborates on replay (neither
+        # fail-open removal nor fail-closed leak). Absent / null in the
+        # persisted entry → None (tokenless-legacy).
+        raw_gen = entry.get("dispatch_generation", None)
+        gen: int | None
+        if raw_gen is None:
+            gen = None
+        else:
+            try:
+                gen = int(raw_gen)
+            except (TypeError, ValueError):
+                gen = None
         out.append(_SentinelAction(
             slug=slug, kind=kind,
             payload=str(entry.get("payload", "") or ""),
             raised_to_user=bool(entry.get("raised_to_user", False)),
             raise_text=str(entry.get("raise_text", "") or ""),
             source_file=str(entry.get("source_file", "") or ""),
+            dispatch_generation=gen,
         ))
     return out
 
@@ -2092,6 +2157,9 @@ def _save_deferred_sentinels(
             "raised_to_user": a.raised_to_user,
             "raise_text": a.raise_text,
             "source_file": a.source_file,
+            # DESIGN §3 S5: persist the generation token (None for a
+            # tokenless-legacy sentinel) so replay corroborates correctly.
+            "dispatch_generation": a.dispatch_generation,
         }
         for a in actions
     ]
@@ -2669,6 +2737,15 @@ def _read_worker_state(
 WORKER_STATE_CURRENT = "current"
 WORKER_STATE_STALE = "stale"
 WORKER_STATE_MISSING = "missing"
+
+# _apply_sentinel outcomes (DESIGN §3 sentinel-path readers S4). The
+# caller gates release/forget/handoff-clear on `applied`; `skipped_stale`
+# performs NONE of those (consumed, deliberate no-op); `error` re-queues
+# (the watermark already advanced past the only durable record of the
+# transition, so a returned `error` must not silently consume it).
+SENTINEL_APPLIED = "applied"
+SENTINEL_SKIPPED_STALE = "skipped_stale"
+SENTINEL_ERROR = "error"
 
 
 def read_current_worker_state(
@@ -3474,18 +3551,114 @@ def _audit_archived_subagents(
     return flagged_now
 
 
+def _dispatch_wedge_recoverable(
+    slug: str,
+    project: str,
+    home: Path | None,
+    coord_state: dict | None,
+) -> bool:
+    """True iff `slug` is a dispatch PARTIAL-APPLY WEDGE safe to requeue.
+
+    The wedge: _apply_dispatch crashed AFTER the status=in-progress +
+    dispatch_generation commit but BEFORE the state.json bootstrap. The
+    DISPATCH block is collected by the caller only AFTER _apply_dispatch
+    RETURNS (loop.py ~1041), so the worker was NEVER launched — the
+    adopted journal is therefore still `pending` (never launch_attempted /
+    acked). And the id is still in pending_acquire (forget runs only after
+    _apply_dispatch succeeds), so the journal REPLAY skips it
+    (_replay_pending_dispatches) and the dispatch-retry path never fires
+    (it only picks status=ready). Nobody recovers → wedged in-progress.
+
+    Requeue is SAFE under EITHER recovery path, both of which prove the
+    worker was NEVER launched (so requeue cannot double-dispatch):
+
+    (A) Same-process wedge (coord-state still in memory):
+      - the slug has an adopted agent_id,
+      - that id is in pending_acquire (replay will NOT re-emit it),
+      - its journal exists AND is `pending`.
+
+    (B) Cross-restart wedge (coord crashed BEFORE the coord-state
+        heartbeat saved, so worker_agent_ids/pending_acquire are EMPTY
+        after restart — codex review-iter [P1]): the durable journal
+        (written by acquire_coord_prompt_inbox BEFORE _apply_dispatch) is
+        an ORPHAN `pending` for this slug with NO coord-state entry. Replay
+        ALSO skips it (its identity predicate needs adopted_agent_ids[slug]
+        == agent_id, which is empty), so reconcile is the ONLY recovery.
+      - the slug has NO adopted agent_id (coord-state lost),
+      - exactly one journal owned by this slug is `pending` (never
+        launched), none in a launched/terminal state.
+
+    A launch_attempted / acked / terminal journal means a worker DID
+    launch → NOT requeue (defer to replay's residual-crash repair / the
+    live worker). Conservative: any ambiguity → False (no requeue).
+    """
+    if coord_state is None or home is None:
+        return False
+    try:
+        adopted = supervisor_mod.load_agent_id_map(coord_state)
+    except Exception:  # noqa: BLE001
+        adopted = {}
+    agent_id = adopted.get(slug, "")
+    if agent_id:
+        # Path (A): same-process wedge — the id must be mid-application
+        # (in pending_acquire, so replay skips it) with a `pending`
+        # journal (worker never launched).
+        try:
+            pending = set(
+                supervisor_mod.load_pending_acquire_agent_id_map(
+                    coord_state,
+                ).values()
+            )
+        except Exception:  # noqa: BLE001
+            pending = set()
+        if agent_id not in pending:
+            # Replay-eligible (applied) id → replay owns it; never requeue
+            # (the #184 double-dispatch trap).
+            return False
+        for jid, jslug, j in _iter_project_journals(home, project):
+            if jid == agent_id and jslug == slug:
+                return j.get("exec_state", "") == "pending"
+        # No journal for the adopted id → can't prove un-launched → safe-no.
+        return False
+    # Path (B): cross-restart wedge — no adopted id. Look for an orphan
+    # pending journal owned by this slug. If ANY journal for this slug is
+    # in a launched/terminal state, a worker DID launch → do NOT requeue.
+    slug_journals = [
+        (jid, j) for jid, jslug, j in _iter_project_journals(home, project)
+        if jslug == slug
+    ]
+    if not slug_journals:
+        return False
+    states = {j.get("exec_state", "") for _jid, j in slug_journals}
+    # Every journal for this slug must be `pending` (never launched). A
+    # mix containing launch_attempted/acked/terminal means a launch
+    # happened — fail safe.
+    return states == {"pending"}
+
+
 def _reconcile_inflight(
     tasks: list[parse.Task],
     project: str,
     fleet_bin: str,
     *,
     home: Path | None = None,
+    coord_state: dict | None = None,
 ) -> list[_ReconcileAction]:
     """For each in-flight task, check the worker is alive; otherwise
     decide the next status from state.json's terminal phase, then
     pr_url + CI.
 
     Returns a list of _ReconcileAction; caller applies via the fleet CLI.
+
+    `coord_state` (optional) enables partial-apply WEDGE recovery: an
+    in-progress slug whose state.json is stale/missing, has no live
+    worker, AND is NOT replay-recoverable (no pending journal the replay
+    would re-emit) is requeued to `todo` instead of being left wedged
+    forever (codex [P1] — _apply_dispatch can crash after the
+    status=in-progress + dispatch_generation commit but before the
+    state.json bootstrap; replay SKIPS such a slug because its id sits in
+    pending_acquire). When coord_state is None (legacy callers / tests)
+    the recovery is inert and behavior is unchanged.
     """
     actions: list[_ReconcileAction] = []
     # One project-mode lookup per reconcile pass. Non-git projects'
@@ -3496,6 +3669,83 @@ def _reconcile_inflight(
     is_git = dispatch_mod.project_is_git(project, fleet_home=fleet_home_str)
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
+            continue
+        # R1-R4 chokepoint (DESIGN §2.1/§3): classify the on-disk state
+        # against the slug's AUTHORITATIVE task-row dispatch_generation
+        # FIRST — BEFORE the liveness check (R1) and the decision tree
+        # (R2 terminal-state, R3 mid-phase, R4 died-without-PR — the
+        # highest-severity case). Generation must gate liveness too:
+        # codex iter-2 [P1] — a re-dispatched slug whose PRIOR attempt
+        # left a stale state.json with a fresh non-terminal phase (or no
+        # updated_at) makes `_is_worker_alive` return True off the stale
+        # file. If the current attempt hasn't bootstrapped its own state
+        # yet, that stale file would otherwise suppress reconcile FOREVER
+        # (the live attempt never re-evaluated). So `stale` short-circuits
+        # the WHOLE per-task pass (no liveness trust, no mutation, no
+        # clear_worker / delete_worker_dir / worktree removal) and
+        # surfaces; the current attempt is reconciled on a later tick once
+        # it writes a current-generation state. `current`/`missing` fall
+        # through to the liveness check + the existing tree (`missing`
+        # keeps died-without-PR semantics; `current` reads the live
+        # attempt's terminal/mid-phase signals below).
+        recon_cls, _ = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if recon_cls == WORKER_STATE_STALE:
+            import sys
+            # codex iter-4 [P1]: a `stale` state on an in-progress task can
+            # be either (a) a prior attempt's leftover while the current
+            # attempt is mid-relaunch, or (b) a dispatch partial-apply (gen
+            # bump landed, `starting` bootstrap didn't). The correct owner
+            # of re-launch is NORMALLY the #184 dispatch journal replay
+            # (_replay_pending_dispatches re-emits the DISPATCH when
+            # worker_agent_ids[slug] is the adopted PENDING journal id),
+            # which makes the worker write a current-generation state.
+            # Reconcile must NOT blindly requeue an in-progress task with a
+            # live adopted journal — that is the double-dispatch trap #184
+            # closed.
+            #
+            # BUT replay does NOT cover every partial-apply: when
+            # _apply_dispatch crashes after the status=in-progress + gen
+            # commit but before the state.json bootstrap, the id is still
+            # in pending_acquire (forget runs only AFTER _apply_dispatch
+            # returns), and replay SKIPS pending_acquire ids — so NOBODY
+            # re-emits and the task is WEDGED in-progress forever (codex
+            # [P1]). _dispatch_wedge_recoverable proves the worker was
+            # NEVER launched (adopted id in pending_acquire + its journal
+            # still `pending`); only THEN is requeue-to-`todo` safe (a
+            # launch_attempted / live worker is left to replay's
+            # residual-crash repair, never requeued — that is the #184
+            # double-dispatch trap). The next dispatch increments the gen
+            # → the prior stale state still fences `stale` (monotonic, no
+            # reuse). Inert unless coord_state is wired.
+            if _dispatch_wedge_recoverable(
+                t.slug, project, home, coord_state,
+            ):
+                print(
+                    f"coord: reconcile RECOVERING wedged {t.slug} — stale "
+                    f"worker state (authority={int(t.dispatch_generation)}) "
+                    f"with no replay owner (dispatch partial-apply); "
+                    f"requeue to todo. The next dispatch increments the "
+                    f"generation so the prior attempt's state stays stale.",
+                    file=sys.stderr,
+                )
+                actions.append(_ReconcileAction(
+                    slug=t.slug, new_status="todo", clear_worker=True,
+                    note="dispatch partial-apply wedge — requeued (no PR)",
+                    raised_to_user=True,
+                    raise_text=f"{t.slug} recovered from dispatch wedge",
+                    delete_worker_dir=True,
+                ))
+                continue
+            print(
+                f"coord: reconcile skipped {t.slug} — stale worker state "
+                f"(prior dispatch_generation, authority="
+                f"{int(t.dispatch_generation)}); no mutation. Re-launch (if "
+                f"the current attempt's bootstrap was lost) is owned by the "
+                f"dispatch-journal replay, not reconcile.",
+                file=sys.stderr,
+            )
             continue
         if _is_worker_alive(t, project, home=home):
             continue
@@ -4120,6 +4370,37 @@ def _apply_reconcile(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "pr_url="])
     if action.set_pr_url:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
+    # DESIGN §1/§3 re-dispatch fence floor. A requeue to `todo` makes the
+    # slug re-dispatch-eligible; the NEXT dispatch increments
+    # dispatch_generation by 1 (loop.py _dispatch_ready: next_gen =
+    # current + 1). A LEGACY slug whose first (pre-epoch) attempt ran
+    # tokenless carries gen 0, so its re-dispatch would land at gen 1 —
+    # COLLIDING with a genuine first epoch dispatch (also gen 1). A stale
+    # tokenless TASK_DONE_PR/WORKER_FAILED from that pre-epoch attempt
+    # then corroborates as legacy-trusted at authority 1 and reaps the
+    # re-dispatched LIVE tree (codex [P1]). Reserve gen 1 EXCLUSIVELY for
+    # the first-ever epoch dispatch by flooring the generation to >= 1 on
+    # every requeue: a re-dispatch is then ALWAYS gen >= 2, so
+    # _sentinel_corroborates can safely keep its `authority <= 1 => trust`
+    # rule (preserving the first-attempt tokenless path) while fencing a
+    # genuinely re-dispatched slug at >= 2.
+    #
+    # ORDER + REQUIRED (codex iter-3 [P1]): the floor is committed BEFORE
+    # the status=todo flip and RAISES on failure (not best-effort). If the
+    # status flipped first and the coord then crashed (or the floor write
+    # failed silently), the row would be a re-dispatchable `todo` still at
+    # gen 0 → the next dispatch lands at gen 1 where a stale tokenless
+    # prior-attempt sentinel is still trusted and reaps the live retry.
+    # Committing the floor first makes it a precondition: a floor failure
+    # leaves the row in its prior (non-todo) status — never an unfloored
+    # re-dispatchable todo. (Idempotent: gen>=1 → no write.)
+    if action.new_status == "todo":
+        _floor_dispatch_generation_for_requeue(
+            action.slug, project, fleet_bin,
+            full_tasks_by_slug=full_tasks_by_slug,
+            tasks_by_slug=tasks_by_slug,
+            home=home,
+        )
     if action.new_status:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     if action.clear_worker:
@@ -4196,6 +4477,15 @@ class _SentinelAction:
     # so callers that defer (e.g., reaper-lane gate) can roll the
     # watermark back to before this file rather than losing the event.
     source_file: str = ""
+    # DESIGN §3 (sentinel-path readers S1-S5): the dispatch_generation
+    # token the worker stamped into a state-mutating sentinel (gen=<n>),
+    # or None for a TOKENLESS pre-migration sentinel. The apply path
+    # corroborates this against the slug's current task-row authority;
+    # mismatch → skipped_stale (no terminal side effects). new_task is
+    # never state-mutating so it stays None. Persisted through the
+    # deferred-sentinel queue (S5) so a deferred→replayed sentinel
+    # corroborates correctly on replay.
+    dispatch_generation: int | None = None
     # delete_worker_dir is set in _apply_sentinel based on `kind`
     # (task_done_pr / worker_failed → True; blocked_question /
     # new_task → False). It's not part of the parsed sentinel grammar
@@ -4287,23 +4577,159 @@ def _parse_sentinel(line: str) -> _SentinelAction | None:
         if not m:
             continue
         slug = m.group("slug")
+        # DESIGN §3: extract the optional gen=<n> token (state-mutating
+        # sentinels only; new_task has no group). None = tokenless
+        # pre-migration sentinel → the tokenless-legacy corroboration
+        # path in _apply_sentinel.
+        gen: int | None = None
+        if "gen" in m.groupdict() and m.group("gen") is not None:
+            try:
+                gen = int(m.group("gen"))
+            except (TypeError, ValueError):
+                gen = None
         if kind == "task_done_pr":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("url"),
+                dispatch_generation=gen,
             )
         if kind == "blocked_question":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("text"),
                 raised_to_user=True,
                 raise_text=f"{slug} blocked: {m.group('text')}",
+                dispatch_generation=gen,
             )
         if kind == "worker_failed":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("reason"),
+                dispatch_generation=gen,
             )
         if kind == "new_task":
             return _SentinelAction(slug=slug, kind=kind)
     return None
+
+
+def _task_row_dispatch_generation(
+    project: str,
+    slug: str,
+    *,
+    home: Path | None = None,
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
+) -> int | None:
+    """Read the slug's AUTHORITATIVE task-row dispatch_generation (the
+    sentinel CAS authority, DESIGN §3). Prefers an in-memory pre-mutation
+    snapshot (full_tasks_by_slug, then tasks_by_slug); falls back to
+    re-reading tasks.md from disk.
+
+    Returns the int generation, or None when the slug is absent / the
+    read fails — the caller fails CLOSED (treats a tokenless sentinel as
+    legacy-trusted only when the authority is genuinely 0/absent).
+    """
+    for lookup in (full_tasks_by_slug, tasks_by_slug):
+        if lookup is not None:
+            tk = lookup.get(slug)
+            if tk is not None:
+                try:
+                    return int(tk.dispatch_generation)
+                except (TypeError, ValueError):
+                    return 0
+    fleet_home = home if home is not None else _resolve_home(None)
+    tasks_path = fleet_home / "projects" / project / "tasks.md"
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:  # noqa: BLE001
+        return None
+    for t in f.tasks:
+        if t.slug == slug:
+            try:
+                return int(t.dispatch_generation)
+            except (TypeError, ValueError):
+                return 0
+    return None
+
+
+def _floor_dispatch_generation_for_requeue(
+    slug: str,
+    project: str,
+    fleet_bin: str,
+    *,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+    home: Path | None = None,
+) -> None:
+    """Ensure a requeued (re-dispatch-eligible) slug carries
+    dispatch_generation >= 1 so the NEXT dispatch lands at gen >= 2.
+
+    DESIGN §1/§3 re-dispatch fence: gen 1 is reserved for the FIRST epoch
+    dispatch of a never-dispatched slug. A LEGACY slug (pre-epoch attempt,
+    gen 0, tokenless sentinels) being re-dispatched would otherwise also
+    land at gen 1 (_dispatch_ready: next_gen = 0 + 1), colliding with a
+    true first dispatch and letting a stale tokenless prior-attempt
+    sentinel pass _sentinel_corroborates's `authority <= 1` trust window
+    and reap the LIVE re-dispatched tree. Flooring the gen to 1 on requeue
+    makes every re-dispatch reach >= 2, closing the collision.
+
+    Idempotent: a slug already at gen >= 1 is left untouched (no CLI
+    write). gen<=0 (or unreadable) is floored to 1.
+
+    RAISES on a failed floor write (codex iter-3 [P1]): the caller commits
+    this BEFORE flipping status=todo and must treat a floor failure as a
+    hard precondition — letting the requeue proceed at gen 0 would land the
+    next dispatch at gen 1 where a stale tokenless prior-attempt sentinel
+    is still trusted and reaps the live retry. Propagating the error keeps
+    the row in its prior (non-todo) status so the next tick retries the
+    whole transition atomically.
+    """
+    current = _task_row_dispatch_generation(
+        project, slug, home=home,
+        tasks_by_slug=tasks_by_slug,
+        full_tasks_by_slug=full_tasks_by_slug,
+    )
+    if current is not None and current >= 1:
+        return
+    # No try/except: a failure must propagate so the caller does NOT flip
+    # the row to a re-dispatchable todo at the unfloored gen.
+    _run_fleet([
+        fleet_bin, "tasks", "set", "--project", project, slug,
+        "dispatch_generation=1",
+    ])
+
+
+def _sentinel_corroborates(
+    action: _SentinelAction, authority: int | None,
+) -> bool:
+    """DESIGN §3 sentinel generation corroboration. Returns True when the
+    sentinel's stamped generation matches the slug's current task-row
+    authority (so its terminal side effects may apply), False when it is
+    a STALE prior-attempt sentinel that must be skipped.
+
+      - Sentinel carries a token (action.dispatch_generation is not None):
+        corroborate by integer equality. Mismatch → stale.
+      - Tokenless legacy sentinel (None): legacy-trusted while the slug
+        has NOT been RE-dispatched. "Not re-dispatched" means the slug is
+        still on its FIRST attempt: authority is absent/unknown, 0 (legacy
+        / un-migrated), OR 1 (the first dispatch under the epoch sets
+        gen 1 — §1). Only a GENUINE re-dispatch advances the authority to
+        >= 2 (each re-dispatch increments by 1), so ONLY authority >= 2
+        fences a tokenless sentinel out as STALE. This is the rollout
+        path: current emitters (the coord agent following SKILL.md) do
+        NOT yet stamp `gen=` on every sentinel, so a first-attempt task's
+        tokenless TASK_DONE_PR / WORKER_FAILED must still apply — codex
+        iter-3 [P1]. The fail-safe still holds: a re-dispatched slug
+        (gen >= 2) never reaps its live tree on a tokenless prior-attempt
+        sentinel. The window closes as emitters adopt `gen=`.
+    """
+    token = action.dispatch_generation
+    if token is None:
+        # Tokenless-legacy: trusted on the FIRST attempt (authority
+        # absent/0/1); fenced once genuinely re-dispatched (>= 2).
+        return authority is None or authority <= 1
+    # Tokened: strict integer corroboration. A None/absent authority
+    # means the task row is gone or unreadable — fail closed (skip).
+    if authority is None:
+        return False
+    return int(token) == int(authority)
 
 
 def _apply_sentinel(
@@ -4315,8 +4741,9 @@ def _apply_sentinel(
     tasks_by_slug: dict[str, parse.Task] | None = None,
     home: Path | None = None,
     full_tasks_by_slug: dict[str, parse.Task] | None = None,
-) -> None:
-    """Apply a parsed sentinel via the fleet CLI.
+) -> str:
+    """Apply a parsed sentinel via the fleet CLI. Returns one of
+    SENTINEL_APPLIED / SENTINEL_SKIPPED_STALE / SENTINEL_ERROR.
 
     `--project <project>` is threaded into every mutation so a coord
     whose cwd resolves to a different sanitized name than its project
@@ -4330,7 +4757,35 @@ def _apply_sentinel(
     the PR is open). WORKER_FAILED also clears the worktree because the
     next dispatch creates a fresh one. Both are best-effort — failures
     log to stderr but don't roll back the tasks.md mutation.
+
+    DESIGN §3 (S1-S3): a STATE-MUTATING sentinel (task_done_pr,
+    worker_failed, blocked_question) is corroborated against the slug's
+    current task-row dispatch_generation. A stale (prior-attempt)
+    sentinel — even with an IDENTICAL worker/<slug> branch + deterministic
+    path — is SKIPPED: NONE of its terminal side effects run (status
+    mutation, pr_url, worktree removal, worker-dir delete) — only
+    surface. The caller (S4) gates release/forget/handoff-clear on the
+    returned APPLIED outcome. new_task carries no state mutation and is
+    never gated.
     """
+    # DESIGN §3 (S1/S2/S3): corroborate state-mutating sentinels against
+    # the slug's current dispatch_generation before ANY side effect.
+    if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
+        authority = _task_row_dispatch_generation(
+            project, action.slug, home=home,
+            tasks_by_slug=tasks_by_slug,
+            full_tasks_by_slug=full_tasks_by_slug,
+        )
+        if not _sentinel_corroborates(action, authority):
+            import sys
+            print(
+                f"coord: sentinel {action.kind} {action.slug} SKIPPED — "
+                f"stale dispatch_generation (sentinel="
+                f"{action.dispatch_generation}, authority={authority}); "
+                f"all terminal side effects skipped, surfacing",
+                file=sys.stderr,
+            )
+            return SENTINEL_SKIPPED_STALE
     if action.kind == "task_done_pr":
         # Order matters for issue #101: pr_url onto tasks.md FIRST,
         # then status flip, then worker dir delete. The PR URL must
@@ -4364,13 +4819,31 @@ def _apply_sentinel(
                     f"coord: subagent archive write failed for {action.slug}: {exc}",
                     file=sys.stderr,
                 )
+        return SENTINEL_APPLIED
     elif action.kind == "blocked_question":
         # Lifecycle Waiting — operator may un-block the task; KEEP
         # the worker dir (its blocked_reason is still useful context).
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=blocked"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"BLOCKED_QUESTION: {action.payload}"])
+        return SENTINEL_APPLIED
     elif action.kind == "worker_failed":
+        # DESIGN §1/§3 re-dispatch fence floor (see
+        # _floor_dispatch_generation_for_requeue): WORKER_FAILED requeues
+        # the slug, so the next dispatch must reach gen >= 2 to fence any
+        # stale tokenless prior-attempt sentinel out at _sentinel_
+        # corroborates. Floor a legacy gen-0 slug to 1 here too. ORDER +
+        # REQUIRED (codex iter-3 [P1]): commit the floor BEFORE status=todo
+        # and let it RAISE on failure — an unfloored todo at gen 0
+        # redispatches to gen 1 where a stale tokenless sentinel is still
+        # trusted. A floor failure leaves the row in-progress (the prior
+        # status) so the next drain retries atomically.
+        _floor_dispatch_generation_for_requeue(
+            action.slug, project, fleet_bin,
+            full_tasks_by_slug=full_tasks_by_slug,
+            tasks_by_slug=tasks_by_slug,
+            home=home,
+        )
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         if action.payload:
@@ -4378,11 +4851,14 @@ def _apply_sentinel(
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
         # Worker reached TerminalFailure — rm-rf workers/<slug>/.
         _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+        return SENTINEL_APPLIED
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
         # was the wake; dispatch_ready in the same tick will pick up
-        # the new task if it's ready.
-        return
+        # the new task if it's ready. Token-free → always "applied"
+        # (a benign no-op the caller consumes).
+        return SENTINEL_APPLIED
+    return SENTINEL_APPLIED
 
 
 def _maybe_delete_worker_dir(slug: str, fleet_bin: str, project: str) -> None:
@@ -4469,6 +4945,16 @@ def _sweep_done_worker_dirs(
     swept = 0
     for t in tasks:
         if t.status != "done":
+            continue
+        # D1 (DESIGN §4.2): a dirty-parked `done` row keeps its worker
+        # dir on purpose — it holds the recovery context the operator
+        # needs to inspect/commit/discard the leaked dirty worktree.
+        # This every-tick sweep must NOT erase it. Skip any worker dir
+        # whose task row is `parked`; the field is cleared on resolve
+        # (status leaves blocked / explicit `fleet tasks set parked=`)
+        # and the next sweep re-arms. (The claim-release wire below is
+        # also skipped — a parked row is still mid-lifecycle.)
+        if getattr(t, "parked", ""):
             continue
         # Codex iter-6 [P2]: even if the worker dir is already gone
         # (sweep already ran on a prior tick), the slug may still have
@@ -5204,13 +5690,26 @@ def _dispatch_ready(
             # unchanged; re-incrementing would skew them).
             agent_id = pending_rec["agent_id"]
             dispatch_generation = int(pending_rec["dispatch_generation"])
-        elif pending_rec is not None and pending_kind == "":
+        elif (
+            pending_rec is not None and pending_kind == ""
+            and int(t.dispatch_generation) == 0
+        ):
             # Legacy bare-string pending entry (pre-migration, kind
-            # unknown). Back-compat: reuse the agent_id as a worker retry
-            # AND keep its gen 0 (ungated) so the half-written legacy
-            # prompt — which carries no --dispatch-generation — still
-            # matches if acquire returns already_acquired. A fresh gen
-            # would mint >=1 and skew the unchanged legacy prompt.
+            # unknown) AND the task row authority is still 0. Back-compat:
+            # reuse the agent_id as a worker retry AND keep its gen 0
+            # (ungated) so the half-written legacy prompt — which carries
+            # no --dispatch-generation — still matches if acquire returns
+            # already_acquired.
+            #
+            # codex iter-5 [P2]: reuse ONLY while the row is gen 0. Once the
+            # row has advanced (floored to 1 on a requeue, or bumped by a
+            # re-dispatch — both more common now that the fence floor
+            # exists), reusing the legacy gen-0 prompt would have
+            # _apply_dispatch skip the generation persist and run
+            # `fleet workers update` WITHOUT --dispatch-generation, which
+            # the gen>0 CAS now REJECTS — wedging the slug forever. So a
+            # legacy entry on a gen>0 row falls through to the forget+mint
+            # branch below (fresh gen-stamped prompt).
             agent_id = pending_rec["agent_id"]
             dispatch_generation = 0
         else:
@@ -5547,12 +6046,21 @@ def _dispatch_review_handoffs(
             pending_handoff_rec.get("dispatch_kind") if pending_handoff_rec else None
         )
         # Reuse on a verified same-kind+same-gen match, OR a legacy
-        # bare-string entry (kind unknown → back-compat: trust it as this
-        # stage's retry). A POSITIVE different-kind entry (e.g. a leftover
-        # worker-kind acquire) is NOT reused — that would hand this
-        # reviewer/finisher the worker's prompt via already_acquired.
+        # bare-string entry (kind unknown → back-compat) BUT ONLY while the
+        # handoff generation is still 0. A POSITIVE different-kind entry
+        # (e.g. a leftover worker-kind acquire) is NOT reused — that would
+        # hand this reviewer/finisher the worker's prompt via
+        # already_acquired.
+        #
+        # codex iter-5 [P2]: a legacy bare-string entry must NOT be reused
+        # on a gen>0 handoff. Its already-acquired prompt carries no
+        # --dispatch-generation, so the handoff subagent would run ungated
+        # `fleet workers update` commands that the gen>0 CAS now REJECTS —
+        # wedging the review/finish transition (and it could replay the
+        # wrong stage's old prompt). A legacy entry on a gen>0 row falls
+        # through to forget+mint a fresh gen-stamped prompt below.
         reuse_handoff = pending_handoff_rec is not None and (
-            pending_handoff_kind == ""
+            (pending_handoff_kind == "" and handoff_generation == 0)
             or (
                 pending_handoff_kind == this_kind
                 and int(pending_handoff_rec.get("dispatch_generation", -1))
@@ -5865,12 +6373,28 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     #     caller collects the block only after this function returns.
     # gen<=0 (legacy un-migrated dispatch) skips the set, leaving the
     # task-row default (0) intact.
-    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
+    #
+    # ORDER (codex iter-2 [P1]): persist dispatch_generation BEFORE the
+    # status=in-progress flip. `fleet tasks set` is one key=value per call
+    # (ExactArgs(2)) — not atomic across two fields. If status flipped
+    # FIRST and the gen set then crashed/failed, the row would be
+    # in-progress at the OLD (prior) generation; a redispatch with a stale
+    # state.json would read that prior attempt as `current` and let stale
+    # terminal/PR data drive reconcile. By committing the gen FIRST, a
+    # crash between the two leaves the row still `status=ready` at the new
+    # gen — re-dispatchable, never in-progress-under-old-gen. No launchable
+    # DISPATCH can be emitted mid-apply: the caller collects the block only
+    # AFTER this function returns (loop.py ~1041), so the brief `ready`
+    # window cannot double-dispatch. The duplicate-dispatch guard (slug
+    # leaves the ready set before any launchable block) still holds because
+    # both writes + the block-collection are one synchronous tick under the
+    # coord lock.
     if action.dispatch_generation > 0:
         _run_fleet([
             fleet_bin, "tasks", "set", "--project", project, action.slug,
             f"dispatch_generation={action.dispatch_generation}",
         ])
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
     if action.worktree:

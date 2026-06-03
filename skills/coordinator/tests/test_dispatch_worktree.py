@@ -1339,3 +1339,76 @@ def test_real_git_dispatch_preserves_local_commits_ahead_of_upstream(tmp_path):
         "worker tree dropped the operator's local commit — it was wrongly "
         "based on origin/main instead of local HEAD"
     )
+
+
+# ---------- codex iter-5 [P2]: legacy pending-acquire reuse across gens ----------
+
+
+def _legacy_pending_coord_state(slug: str, agent_id: str) -> dict:
+    """A pre-migration bare-STRING pending-acquire entry (no dispatch_kind /
+    dispatch_generation record shape) for `slug`."""
+    return {"pending_acquire_agent_ids": {slug: agent_id}}
+
+
+def test_dispatch_ready_legacy_pending_NOT_reused_on_gen_gt0(tmp_path) -> None:
+    """codex iter-5 [P2]: a legacy bare-string pending-acquire entry must
+    NOT be reused once the task row authority is gen>0 (e.g. floored to 1
+    on a prior requeue). Reusing the legacy gen-0 prompt would have
+    _apply_dispatch skip the generation persist + run an ungated
+    `fleet workers update` that the gen>0 CAS rejects, wedging the slug.
+    The legacy entry must be FORGOTTEN and a fresh id minted."""
+    t = _ready_task("legdisp-aaaa")
+    t.dispatch_generation = 1  # row already advanced past legacy 0
+    legacy_id = "0ff10001"
+    coord_state = _legacy_pending_coord_state("legdisp-aaaa", legacy_id)
+
+    def _runner(cmd, *args, **kwargs):
+        emu = _maybe_claims_emulator(cmd, kwargs)
+        return emu if emu is not None else _ok()
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# S"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_runner):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd="/repo", cap=1,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+            coord_state=coord_state,
+        )
+
+    assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
+    # The fresh dispatch reaches gen 2 (next_gen = 1 + 1), NOT the legacy
+    # gen 0, and does NOT reuse the legacy id.
+    assert actions[0].dispatch_generation == 2, actions[0].dispatch_generation
+    assert actions[0].agent_id != legacy_id, "legacy gen-0 id wrongly reused on gen>0 row"
+    # The legacy pending entry was forgotten.
+    remaining = loop.supervisor_mod.load_pending_acquire_agent_id_map(coord_state)
+    assert remaining.get("legdisp-aaaa") in (None, actions[0].agent_id), remaining
+
+
+def test_dispatch_ready_legacy_pending_reused_on_gen0(tmp_path) -> None:
+    """The legacy reuse path STILL applies while the row is gen 0 (true
+    pre-migration first attempt): reuse the legacy id + keep gen 0 so the
+    already-acquired ungated prompt still matches."""
+    t = _ready_task("legdisp-bbbb")
+    t.dispatch_generation = 0
+    legacy_id = "0ff10002"
+    coord_state = _legacy_pending_coord_state("legdisp-bbbb", legacy_id)
+
+    def _runner(cmd, *args, **kwargs):
+        emu = _maybe_claims_emulator(cmd, kwargs)
+        return emu if emu is not None else _ok()
+
+    with patch.object(dispatch_mod, "fetch_standards", return_value="# S"), \
+         patch.object(dispatch_mod, "fetch_learnings", return_value=""), \
+         patch.object(dispatch_mod.subprocess, "run", side_effect=_runner):
+        actions = loop._dispatch_ready(
+            tasks=[t], project="proj", cwd="/repo", cap=1,
+            fleet_bin="/usr/local/bin/fleet",
+            fleet_home=str(tmp_path),
+            coord_state=coord_state,
+        )
+
+    assert len(actions) == 1 and actions[0].error == "", f"actions: {actions}"
+    assert actions[0].dispatch_generation == 0, "legacy gen-0 reuse must keep gen 0"
+    assert actions[0].agent_id == legacy_id, "legacy id should be reused on a gen-0 row"

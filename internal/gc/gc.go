@@ -233,6 +233,16 @@ type Deps struct {
 	// when the slug is absent from both files. Production wiring is
 	// loadTaskStatusOnDisk.
 	LoadTaskStatus func(project, slug string) (string, error)
+	// LoadTaskParked returns the raw `parked` field for a (project, slug)
+	// task from tasks.md (DESIGN-coord-worktree-lifecycle §4.2). Empty
+	// string = not parked. A non-empty value means the coord
+	// intentionally KEPT the worker dir to preserve dirty-worktree
+	// recovery context — D2: this classifier must NOT auto-remove it
+	// (surface only). Returns "" with nil err when the slug is absent or
+	// the field is unset. nil-tolerant: when unwired the classifier
+	// behaves as if no row is parked (back-compat for older Deps). Wiring
+	// is loadTaskParkedOnDisk.
+	LoadTaskParked func(project, slug string) (string, error)
 	// PidAlive returns true iff the OS reports the pid as still
 	// running. Used by the live-PID guard to skip-reaping live workers.
 	// Production wiring is pidAliveOnDisk (signal-0 probe).
@@ -757,6 +767,7 @@ func DefaultDeps() Deps {
 		ListWorkerRecords:    listWorkerRecordsOnDisk,
 		LoadWorkerState:      loadWorkerStateOnDisk,
 		LoadTaskStatus:       loadTaskStatusOnDisk,
+		LoadTaskParked:       loadTaskParkedOnDisk,
 		PidAlive:             pidAliveOnDisk,
 		RemoveWorkerRecord:   removeWorkerRecordDir,
 		ListProjectDirs:      listProjectDirsRaw,

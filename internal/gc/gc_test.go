@@ -94,6 +94,11 @@ func stubDeps(now time.Time) Deps {
 			// the task-terminal branch on tests that don't care about it.
 			return "in-progress", nil
 		},
+		LoadTaskParked: func(string, string) (string, error) {
+			// Default: not parked (D2). The parked-protect test overrides
+			// this to a non-empty value to exercise the guard.
+			return "", nil
+		},
 		PidAlive: func(int) bool {
 			// Default: pretend any pid is alive unless overridden. The
 			// dead-pid + stale-heartbeat tests override this.
@@ -2092,6 +2097,57 @@ func TestReconcile_WorkerRecords_Mismatch_ApplyRemoves(t *testing.T) {
 	}
 }
 
+// TestReconcile_WorkerRecords_Parked_Mismatch_RefusesRemove pins the
+// review-iter [P2] fix: the PARKED guard runs BEFORE the project-mismatch
+// removal branch. A dirty-parked row whose state.json ALSO carries a
+// project mismatch + dead/no PID would otherwise be removed by the
+// mismatch branch under --apply, erasing the dirty-worktree recovery
+// context the park exists to protect. The parked guard must win.
+func TestReconcile_WorkerRecords_Parked_Mismatch_RefusesRemove(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parked-mismatch-aaaa/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "parked-mismatch-aaaa",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "parked-mismatch-aaaa",
+			Project:   "projects-rainier", // mismatch vs parent dir
+			Pid:       0,                  // dead/no pid → mismatch branch removes
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-05-27T00:00:00Z dirty worktree", nil
+	}
+	deps.RemoveWorkerRecord = func(p string) error {
+		t.Fatalf("RemoveWorkerRecord(%q) called on a PARKED row — the parked guard must run BEFORE the mismatch removal branch ([P2])", p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked+mismatch verb=%q, want %q (surface, never remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("reason=%q does not name PARKED protection", a.Reason)
+	}
+}
+
 // TestReconcile_WorkerRecords_Mismatch_LivePid_RefusesUnlink pins the
 // live-PID safety gate inside the mismatch apply path (review iter-1
 // follow-up). A cross-project record claiming a still-live PID is
@@ -2403,6 +2459,248 @@ func TestReconcile_WorkerRecords_TaskTerminal_Abandoned_Surfaced(t *testing.T) {
 	}
 	if !strings.Contains(a.Reason, "abandoned") {
 		t.Fatalf("reason=%q does not include 'abandoned'", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_TaskTerminal_Parked_RefusesUnlink is D2
+// (DESIGN-coord-worktree-lifecycle §4.2): a task-terminal `done` row that
+// the coord PARKED (kept the worker dir to preserve dirty-worktree
+// recovery context) must NOT be auto-removed by `fleet gc
+// --kinds=worker-records --apply`. The classifier surfaces but refuses
+// the unlink — even under --apply.
+func TestReconcile_WorkerRecords_TaskTerminal_Parked_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parked-pppp/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "parked-pppp",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "parked-pppp",
+			Project:   "projects-fleet",
+			Pid:       0,
+			UpdatedAt: now.Add(-2 * time.Hour), // fresh — not stale-heartbeat
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) {
+		return "done", nil
+	}
+	deps.LoadTaskParked = func(project, slug string) (string, error) {
+		if project != "projects-fleet" || slug != "parked-pppp" {
+			t.Fatalf("LoadTaskParked(%q,%q) wrong args", project, slug)
+		}
+		return "2026-06-03T00:00:00Z dirty worktree", nil
+	}
+	// RemoveWorkerRecord must NEVER fire on a parked row — stubDeps wires
+	// it to error if called, so an --apply that wrongly removed it would
+	// also surface a remove error; the assertion below pins VerbSurface.
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked task-terminal verb=%q, want %q (must not remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("reason=%q does not name the parked guard", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Parked_StaleHeartbeat_RefusesUnlink is the
+// codex-iter-1 [P1] regression: a parked row is ALSO stale-heartbeat by
+// construction (pid=0 + old updated_at — the worker exited long before
+// it was parked). The parked guard MUST run BEFORE the stale-heartbeat
+// removal branch, else `--apply` removes the dirty recovery context the
+// patch is meant to preserve. (The original guard sat in the
+// task-terminal branch #5, which is unreachable for this case — #4 fires
+// first.)
+func TestReconcile_WorkerRecords_Parked_StaleHeartbeat_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkstale-rrrr/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "parkstale-rrrr",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:    "parkstale-rrrr",
+			Project: "projects-fleet",
+			Pid:     0,
+			// 48h old → squarely in the stale-heartbeat (#4) window.
+			UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-06-01T00:00:00Z dirty worktree", nil
+	}
+	// stubDeps wires RemoveWorkerRecord to error if called — so if the
+	// stale-heartbeat branch wrongly removed the dir under --apply, the
+	// verb would flip back to surface WITH a "remove failed" reason. The
+	// assertions below pin VerbSurface + the PARKED reason (proving the
+	// remover was never invoked).
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked+stale verb=%q, want %q (must not remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("reason=%q must name the parked guard (not stale-heartbeat removal)", a.Reason)
+	}
+	if strings.Contains(a.Reason, "remove failed") {
+		t.Fatalf("reason=%q shows a remove was attempted — parked guard ran too late", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Parked_DeadPid_RefusesUnlink: same guard,
+// the dead-pid branch (#3). A parked row whose recorded pid is gone +
+// old must surface, never remove.
+func TestReconcile_WorkerRecords_Parked_DeadPid_RefusesUnlink(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkdead-ssss/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet", Slug: "parkdead-ssss", Path: workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug: "parkdead-ssss", Project: "projects-fleet",
+			Pid: 999999, UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.PidAlive = func(int) bool { return false } // pid gone → dead-pid branch
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-06-01T00:00:00Z dirty worktree", nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface || !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("parked+dead-pid verb=%q reason=%q, want surface+PARKED", a.Verb, a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_Parked_ProbeError_FailsClosed pins the
+// codex review-iter [P2]: when LoadTaskParked returns an ERROR (tasks.md
+// momentarily unreadable), the classifier must NOT fall through to the
+// removal branches — under --apply that could rm-rf a dirty-worktree
+// recovery dir the parked marker protects. It must surface + skip (fail
+// closed), even when the row is otherwise a removable task-terminal/stale
+// candidate.
+func TestReconcile_WorkerRecords_Parked_ProbeError_FailsClosed(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkerr-tttt/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet", Slug: "parkerr-tttt", Path: workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		// stale-heartbeat candidate (pid=0, old) — would normally remove.
+		return WorkerState{
+			Slug: "parkerr-tttt", Project: "projects-fleet",
+			Pid: 0, UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "", errors.New("tasks.md unreadable")
+	}
+	deps.RemoveWorkerRecord = func(p string) error {
+		t.Fatalf("RemoveWorkerRecord(%q) called despite a parked-probe ERROR — must fail closed ([P2])", p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked-probe-error verb=%q, want %q (fail closed)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "probe failed") {
+		t.Fatalf("reason=%q does not name the fail-closed probe error", a.Reason)
+	}
+}
+
+// TestReconcile_WorkerRecords_TaskTerminal_NilParkedDep is the
+// back-compat path: an older Deps with no LoadTaskParked wiring behaves
+// as if no row is parked (the task-terminal branch still applies).
+func TestReconcile_WorkerRecords_TaskTerminal_NilParkedDep(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	deps.LoadTaskParked = nil // simulate pre-D2 Deps
+	workerPath := "/fake/projects/projects-fleet/workers/nilpark-qqqq/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "nilpark-qqqq",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug: "nilpark-qqqq", Project: "projects-fleet", Pid: 0,
+			UpdatedAt: now.Add(-2 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	got, err := Reconcile(Options{
+		Apply: false, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if !strings.Contains(a.Reason, "task-terminal") {
+		t.Fatalf("reason=%q should be the normal task-terminal action", a.Reason)
 	}
 }
 
@@ -2767,6 +3065,66 @@ Spec: archived but never marked done.
 	}
 	if got != "done" {
 		t.Fatalf("archived in-progress row: status=%q, want %q (archive presence MUST be terminal — codex iter-2 P2)", got, "done")
+	}
+}
+
+// TestLoadTaskParkedOnDisk pins the D2 production parser: it reads the
+// `- parked:` field for a live row, returns "" for an unset / "null"
+// field, and returns "" for an absent slug.
+func TestLoadTaskParkedOnDisk(t *testing.T) {
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	projectsDir := filepath.Join(fleetHome, "projects", "projects-fleet")
+	if err := os.MkdirAll(projectsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	body := `# tasks
+
+## task: parked-row
+- status: done
+- priority: P1
+- worker_pid: 0
+- dispatch_generation: 2
+- parked: 2026-06-03T00:00:00Z dirty worktree
+
+Spec: parked.
+
+## task: clean-row
+- status: done
+- priority: P1
+- worker_pid: 0
+- dispatch_generation: 1
+
+Spec: not parked.
+
+## task: null-row
+- status: done
+- priority: P1
+- worker_pid: 0
+- parked: null
+
+Spec: explicit null.
+`
+	if err := os.WriteFile(filepath.Join(projectsDir, "tasks.md"), []byte(body), 0o644); err != nil {
+		t.Fatalf("write tasks: %v", err)
+	}
+	cases := []struct {
+		slug string
+		want string
+	}{
+		{"parked-row", "2026-06-03T00:00:00Z dirty worktree"},
+		{"clean-row", ""},
+		{"null-row", ""},
+		{"absent-row", ""},
+	}
+	for _, c := range cases {
+		got, err := loadTaskParkedOnDisk("projects-fleet", c.slug)
+		if err != nil {
+			t.Fatalf("loadTaskParkedOnDisk(%q): %v", c.slug, err)
+		}
+		if got != c.want {
+			t.Errorf("loadTaskParkedOnDisk(%q)=%q, want %q", c.slug, got, c.want)
+		}
 	}
 }
 

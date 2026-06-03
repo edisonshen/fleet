@@ -308,13 +308,23 @@ Do not write `tasks.md` directly. Use Fleet CLI mutations only.
 Inbox archive lines:
 
 ```text
-TASK_DONE_PR=<slug> <pr-url>
-BLOCKED_QUESTION=<slug> <one-line text>
-WORKER_FAILED=<slug> <reason>
+TASK_DONE_PR=<slug> [gen=<n>] <pr-url>
+BLOCKED_QUESTION=<slug> [gen=<n>] <one-line text>
+WORKER_FAILED=<slug> [gen=<n>] <reason>
 NEW_TASK=<slug>
 ```
 
 Slug mismatch means ignore and log. A sentinel mutates only its own slug.
+
+State-mutating sentinels (TASK_DONE_PR / BLOCKED_QUESTION / WORKER_FAILED) SHOULD
+carry the dispatch generation as `gen=<n>` immediately after the slug, where `<n>`
+is the worker's `--dispatch-generation` value (the coord-owned per-slug fence
+token). The coord corroborates `gen` against the slug's current task-row
+`dispatch_generation` and SKIPS all terminal side effects on a mismatch — so a
+stale prior-attempt sentinel can never reap a re-dispatched slug's live worktree
+(DESIGN-coord-worktree-lifecycle §3). A sentinel that omits `gen=` is treated as a
+pre-migration tokenless signal: trusted only while the slug has not been
+re-dispatched. `NEW_TASK` is a wake-only sentinel and carries no token.
 
 ## Non-git Projects
 

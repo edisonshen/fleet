@@ -252,10 +252,16 @@ def test_gen_inconsistent_worker_record_is_forgotten(fleet_home: Path) -> None:
 def test_apply_dispatch_persists_generation_with_in_progress_flip(
     fleet_home: Path,
 ) -> None:
-    # _apply_dispatch must persist dispatch_generation in the SAME
-    # pre-launch commit as status=in-progress, BEFORE the state.json
-    # bootstrap — and the status flip is the FIRST mutation (so no
-    # launchable DISPATCH is emitted while the slug is still ready).
+    # _apply_dispatch persists dispatch_generation in the pre-launch
+    # commit, BEFORE state.json bootstrap. codex iter-2 [P1]: the gen set
+    # must come BEFORE the status=in-progress flip — `fleet tasks set` is
+    # one field per call (not atomic across two), so a crash between them
+    # must NOT leave the row in-progress at the OLD generation (which would
+    # let a stale prior state read `current`). Committing gen first leaves
+    # any crash window at status=ready under the NEW gen (re-dispatchable),
+    # never in-progress-under-old-gen. No launchable DISPATCH is emitted
+    # mid-apply (the caller collects the block only after this returns), so
+    # the brief ready window cannot double-dispatch.
     calls: list[list[str]] = []
     with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd))):
         loop._apply_dispatch(
@@ -277,9 +283,9 @@ def test_apply_dispatch_persists_generation_with_in_progress_flip(
     i_bootstrap = idx(
         lambda c: c[1:3] == ["workers", "update"] and "starting" in c,
     )
-    assert i_status == 0, "status=in-progress must be the FIRST mutation"
-    assert i_gen > i_status, "dispatch_generation persisted in the pre-launch commit"
-    assert i_bootstrap > i_gen, "state.json bootstrap comes AFTER the gen persist"
+    assert i_gen == 0, "dispatch_generation must be the FIRST mutation (before status)"
+    assert i_status > i_gen, "status=in-progress comes AFTER the gen commit (atomicity-safe order)"
+    assert i_bootstrap > i_status, "state.json bootstrap comes AFTER the pre-launch commit"
     # The bootstrap state write carries --dispatch-generation so the
     # bootstrapped state.json reads `current` (not legacy-0 / stale).
     assert "--dispatch-generation" in calls[i_bootstrap]
@@ -332,6 +338,48 @@ def test_handoff_reader_dispatches_on_current(fleet_home: Path) -> None:
     # The reviewer prompt INHERITS the slug's current gen (no increment).
     assert actions[0].dispatch_generation == 2
     assert rb.call_args.kwargs["dispatch_generation"] == 2
+
+
+def test_handoff_legacy_pending_NOT_reused_on_gen_gt0(fleet_home: Path) -> None:
+    # codex iter-5 [P2]: a legacy bare-string pending-acquire entry must
+    # NOT be reused on a gen>0 handoff. Its already-acquired prompt has no
+    # --dispatch-generation, so the handoff subagent would run ungated
+    # `fleet workers update` (rejected by the gen>0 CAS) → wedge. A legacy
+    # entry on a gen>0 row must be forgotten + a fresh id minted.
+    task = _make_task("ho-leg", status="in-progress", dispatch_generation=2)
+    _write_worker_state(
+        fleet_home, "fleet", "ho-leg",
+        {"slug": "ho-leg", "phase": "review-pending", "dispatch_generation": 2},
+    )
+    legacy_id = "0ff1aaaa"
+    coord_state = {"pending_acquire_agent_ids": {"ho-leg": legacy_id}}
+    forgotten: list[str] = []
+    real_forget = loop.supervisor_mod.forget_pending_acquire_agent_id
+
+    def _spy_forget(cs, slug):
+        forgotten.append(slug)
+        return real_forget(cs, slug)
+
+    with patch.object(dispatch, "project_is_git", return_value=True), \
+         patch.object(dispatch, "build_reviewer_prompt", return_value="reviewer prompt"), \
+         patch.object(dispatch, "mint_agent_id", return_value="cccccccc"), \
+         patch.object(
+             loop.supervisor_mod, "forget_pending_acquire_agent_id",
+             side_effect=_spy_forget,
+         ), \
+         patch.object(
+             dispatch, "acquire_coord_prompt_inbox",
+             return_value=str(fleet_home / "inbox" / "cccccccc.md"),
+         ), \
+         patch.object(dispatch, "format_dispatch_instruction", return_value="DISPATCH ..."):
+        actions = loop._dispatch_review_handoffs(
+            tasks=[task], project="fleet", fleet_bin="fleet",
+            fleet_home=str(fleet_home), home=fleet_home, coord_state=coord_state,
+        )
+    assert len(actions) == 1 and not actions[0].error
+    # The legacy entry was forgotten + a FRESH id minted (not the legacy id).
+    assert "ho-leg" in forgotten, "legacy gen>0 pending entry must be forgotten"
+    assert actions[0].agent_id == "cccccccc", "must mint fresh, not reuse legacy id"
 
 
 def test_no_launchable_dispatch_emitted_while_ready(fleet_home: Path) -> None:

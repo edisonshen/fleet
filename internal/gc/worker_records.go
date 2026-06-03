@@ -162,6 +162,48 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		// running subagent orphans its in-flight phase writes. Surface
 		// instead under --apply when the recorded PID is alive (codex
 		// iter-N: review-iter live-PID-mismatch gate).
+		//
+		// PARKED guard runs FIRST (review-iter [P2]): the mismatch branch
+		// below removes a dir for a dead/no-PID worker, so a parked row
+		// whose state.json ALSO has a project mismatch would be removed
+		// before the parked check if that check sat after this branch —
+		// erasing the dirty-worktree recovery context the park protects.
+		// So the PARKED guard precedes ALL removal branches (mismatch,
+		// dead-pid, stale-heartbeat, task-terminal). The live-PID guard
+		// below (#2) still wins because a live worker is never touched
+		// regardless of parked state.
+		if deps.LoadTaskParked != nil {
+			parked, perr := deps.LoadTaskParked(info.Project, info.Slug)
+			if perr != nil {
+				// FAIL CLOSED (codex review-iter [P2]): a parked-read error
+				// (e.g. tasks.md momentarily unreadable) must NOT fall
+				// through to the removal branches — under --apply that
+				// could rm-rf a dirty-worktree recovery dir the `parked`
+				// marker exists to protect. Surface + skip; the next run
+				// re-evaluates once the read succeeds.
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: fmt.Sprintf(
+						"parked-state probe failed (%v) — cannot prove the row "+
+							"is not PARKED; refusing to remove (fail closed). "+
+							"Retry once tasks.md is readable", perr),
+				})
+				continue
+			}
+			if parked != "" {
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: fmt.Sprintf(
+						"row is PARKED (%s) — coord kept the worker dir for "+
+							"dirty-worktree recovery; surface only, refusing to "+
+							"remove. Resolve the park (commit/discard the worktree, "+
+							"clear `parked`) first",
+						parked),
+				})
+				continue
+			}
+		}
+
 		if ws.Project != "" && ws.Project != info.Project {
 			reason := fmt.Sprintf("mismatch (worker dir=%s vs state.project=%s)", info.Project, ws.Project)
 			if ws.Pid > 0 && deps.PidAlive(ws.Pid) {
@@ -205,7 +247,8 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		if status == "done" || status == "abandoned" {
 			reason := fmt.Sprintf("task-terminal (task status=%s, worker dir orphan post-archive)", status)
 			// task-terminal IS a confirmed terminal state — apply is
-			// safe without the task-in-progress guard.
+			// safe without the task-in-progress guard. (The parked
+			// recovery-context guard ran earlier at #2b.)
 			appendWorkerRecordAction(r, opts, deps, info, reason)
 			continue
 		}
@@ -400,6 +443,82 @@ func loadTaskStatusOnDisk(project, slug string) (string, error) {
 	// classifier interprets this as not-terminal so the worker dir is
 	// kept (surface-don't-silo; could be a partial workflow).
 	return "", nil
+}
+
+// loadTaskParkedOnDisk is the production LoadTaskParked
+// (DESIGN-coord-worktree-lifecycle §4.2 / D2). Reads tasks.md for the
+// given (project, slug) and returns the raw `- parked:` field value.
+// Returns "" with nil err when the slug is absent or the field is unset.
+//
+// Only tasks.md is consulted (NOT tasks-archive.md): the parked-protect
+// invariant matters for LIVE rows the coord is mid-lifecycle on. An
+// archived row is terminal-by-definition and its worker dir is a normal
+// reap target.
+func loadTaskParkedOnDisk(project, slug string) (string, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	tasksPath := filepath.Join(filepath.Clean(dir), "tasks.md")
+	val, _, ferr := taskFieldRawInFile(tasksPath, slug, "- parked:")
+	if ferr != nil {
+		return "", ferr
+	}
+	// "null" is the explicit unset sentinel the Python parser emits.
+	if val == "null" {
+		return "", nil
+	}
+	return val, nil
+}
+
+// taskFieldRawInFile returns the raw value of an arbitrary
+// `<fieldPrefix>` bullet (e.g. "- parked:" / "- status:") under the
+// given slug's `## task:` heading. Shares the SAME fence-aware,
+// column-0-anchored grammar as taskStatusRawInFile — factored out so the
+// parked lookup doesn't duplicate the fence walk. found reports whether
+// the slug heading exists at all (vs. the field merely being unset).
+func taskFieldRawInFile(path, slug, fieldPrefix string) (value string, found bool, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read %s: %w", path, rerr)
+	}
+	wantHeader := "## task: " + slug
+	lines := strings.Split(string(data), "\n")
+	inFence := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if line != wantHeader {
+			continue
+		}
+		innerFence := false
+		for j := i + 1; j < len(lines); j++ {
+			lj := lines[j]
+			if strings.HasPrefix(lj, "```") {
+				innerFence = !innerFence
+				continue
+			}
+			if innerFence {
+				continue
+			}
+			if strings.HasPrefix(lj, "## ") {
+				break
+			}
+			if strings.HasPrefix(lj, fieldPrefix) {
+				return strings.TrimSpace(strings.TrimPrefix(lj, fieldPrefix)), true, nil
+			}
+		}
+		return "", true, nil
+	}
+	return "", false, nil
 }
 
 // taskStatusRawInFile is a thin variant of taskStatusInFile that returns
