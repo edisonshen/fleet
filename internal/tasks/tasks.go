@@ -922,12 +922,9 @@ func setKV(t *Task, k, v string, lineNum int, raw string) error {
 			t.DispatchGeneration = 0
 			return nil
 		}
-		n, err := strconv.Atoi(v)
+		n, err := ParseDispatchGeneration(v)
 		if err != nil {
-			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid dispatch_generation: " + v}
-		}
-		if n < 0 {
-			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "dispatch_generation must be non-negative: " + v}
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: err.Error()}
 		}
 		t.DispatchGeneration = n
 	case "parked":
@@ -962,6 +959,35 @@ func parseTime(v string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, v)
+}
+
+// ParseDispatchGeneration parses the dispatch_generation bullet value
+// under a deliberately tight grammar: bare ASCII decimal digits only
+// ([0-9]+), non-negative, bounded by int32 max. The bound keeps the
+// Go and Python parsers (parse.py) in exact lockstep — strconv.Atoi
+// would accept a leading '+' sign and platform-dependent 64-bit
+// overflow that the Python mirror (isascii()+isdigit()) does not, and
+// a fence token never needs values past a few thousand. Empty / "null"
+// are handled by callers (legacy → 0). (codex iter-2 P2)
+func ParseDispatchGeneration(v string) (int, error) {
+	if v == "" {
+		return 0, fmt.Errorf("invalid dispatch_generation: empty")
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, fmt.Errorf("invalid dispatch_generation: %s", v)
+		}
+	}
+	// Bound to int32 max so a pathological digit string can't overflow
+	// or diverge across the two parsers.
+	if len(v) > 10 {
+		return 0, fmt.Errorf("dispatch_generation too large: %s", v)
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n > 1<<31-1 {
+		return 0, fmt.Errorf("dispatch_generation too large: %s", v)
+	}
+	return n, nil
 }
 
 // parseDeps parses a JSON-array literal of slugs: `[]`, `[a]`, `[a, b]`.

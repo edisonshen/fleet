@@ -1021,18 +1021,16 @@ func setTaskField(t *tasks.Task, key, value string) error {
 	case "dispatch_generation":
 		// Coord-owned per-slug fence token (DESIGN §1). Settable here for
 		// testing/manual use; the coord increments it on dispatch in a
-		// later PR. Empty / "null" / "0" → 0. strconv.Atoi rejects
-		// trailing garbage, matching the parser exactly.
-		if value == "" || value == "null" || value == "0" {
+		// later PR. Empty / "null" → 0. Routes through the same tight
+		// [0-9]+ grammar the parser uses so CLI and on-disk validation
+		// stay identical (and in lockstep with parse.py).
+		if value == "" || value == "null" {
 			t.DispatchGeneration = 0
 			return nil
 		}
-		n, err := strconv.Atoi(value)
+		n, err := tasks.ParseDispatchGeneration(value)
 		if err != nil {
-			return fmt.Errorf("dispatch_generation: %w", err)
-		}
-		if n < 0 {
-			return fmt.Errorf("dispatch_generation: must be non-negative, got %d", n)
+			return fmt.Errorf("tasks set: %w", err)
 		}
 		t.DispatchGeneration = n
 	case "parked":

@@ -1315,6 +1315,31 @@ func TestSchema_RejectsBadDispatchGeneration(t *testing.T) {
 	}
 }
 
+// TestParseDispatchGeneration exercises the shared [0-9]+ grammar used
+// by both the on-disk parser and `fleet tasks set`, kept in lockstep
+// with parse.py's mirror (codex iter-2 P2).
+func TestParseDispatchGeneration(t *testing.T) {
+	okCases := map[string]int{"0": 0, "1": 1, "42": 42, "2147483647": 1<<31 - 1}
+	for in, want := range okCases {
+		got, err := ParseDispatchGeneration(in)
+		if err != nil {
+			t.Errorf("ParseDispatchGeneration(%q) err=%v; want %d", in, err, want)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseDispatchGeneration(%q)=%d; want %d", in, got, want)
+		}
+	}
+	// Rejected: signs, decimals, non-digits, underscores, overflow.
+	// These mirror exactly what parse.py's isascii()+isdigit()+bound
+	// refuses, so a hand-edited row parses the same in both paths.
+	for _, bad := range []string{"", "abc", "-1", "+5", "1.5", "1_000", "9999999999", "12345678901", "0x10"} {
+		if _, err := ParseDispatchGeneration(bad); err == nil {
+			t.Errorf("ParseDispatchGeneration(%q) accepted; want error", bad)
+		}
+	}
+}
+
 // helpers -----------------------------------------------------------
 
 func slugList(ts []*Task) []string {
