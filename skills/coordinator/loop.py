@@ -4370,8 +4370,6 @@ def _apply_reconcile(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "pr_url="])
     if action.set_pr_url:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.set_pr_url}"])
-    if action.new_status:
-        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     # DESIGN §1/§3 re-dispatch fence floor. A requeue to `todo` makes the
     # slug re-dispatch-eligible; the NEXT dispatch increments
     # dispatch_generation by 1 (loop.py _dispatch_ready: next_gen =
@@ -4386,6 +4384,16 @@ def _apply_reconcile(
     # _sentinel_corroborates can safely keep its `authority <= 1 => trust`
     # rule (preserving the first-attempt tokenless path) while fencing a
     # genuinely re-dispatched slug at >= 2.
+    #
+    # ORDER + REQUIRED (codex iter-3 [P1]): the floor is committed BEFORE
+    # the status=todo flip and RAISES on failure (not best-effort). If the
+    # status flipped first and the coord then crashed (or the floor write
+    # failed silently), the row would be a re-dispatchable `todo` still at
+    # gen 0 → the next dispatch lands at gen 1 where a stale tokenless
+    # prior-attempt sentinel is still trusted and reaps the live retry.
+    # Committing the floor first makes it a precondition: a floor failure
+    # leaves the row in its prior (non-todo) status — never an unfloored
+    # re-dispatchable todo. (Idempotent: gen>=1 → no write.)
     if action.new_status == "todo":
         _floor_dispatch_generation_for_requeue(
             action.slug, project, fleet_bin,
@@ -4393,6 +4401,8 @@ def _apply_reconcile(
             tasks_by_slug=tasks_by_slug,
             home=home,
         )
+    if action.new_status:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"status={action.new_status}"])
     if action.clear_worker:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
@@ -4662,6 +4672,14 @@ def _floor_dispatch_generation_for_requeue(
 
     Idempotent: a slug already at gen >= 1 is left untouched (no CLI
     write). gen<=0 (or unreadable) is floored to 1.
+
+    RAISES on a failed floor write (codex iter-3 [P1]): the caller commits
+    this BEFORE flipping status=todo and must treat a floor failure as a
+    hard precondition — letting the requeue proceed at gen 0 would land the
+    next dispatch at gen 1 where a stale tokenless prior-attempt sentinel
+    is still trusted and reaps the live retry. Propagating the error keeps
+    the row in its prior (non-todo) status so the next tick retries the
+    whole transition atomically.
     """
     current = _task_row_dispatch_generation(
         project, slug, home=home,
@@ -4670,17 +4688,12 @@ def _floor_dispatch_generation_for_requeue(
     )
     if current is not None and current >= 1:
         return
-    try:
-        _run_fleet([
-            fleet_bin, "tasks", "set", "--project", project, slug,
-            "dispatch_generation=1",
-        ])
-    except Exception as exc:  # noqa: BLE001
-        import sys
-        print(
-            f"coord: dispatch_generation floor failed for {slug}: {exc}",
-            file=sys.stderr,
-        )
+    # No try/except: a failure must propagate so the caller does NOT flip
+    # the row to a re-dispatchable todo at the unfloored gen.
+    _run_fleet([
+        fleet_bin, "tasks", "set", "--project", project, slug,
+        "dispatch_generation=1",
+    ])
 
 
 def _sentinel_corroborates(
@@ -4815,19 +4828,24 @@ def _apply_sentinel(
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"BLOCKED_QUESTION: {action.payload}"])
         return SENTINEL_APPLIED
     elif action.kind == "worker_failed":
-        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
-        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         # DESIGN §1/§3 re-dispatch fence floor (see
         # _floor_dispatch_generation_for_requeue): WORKER_FAILED requeues
         # the slug, so the next dispatch must reach gen >= 2 to fence any
         # stale tokenless prior-attempt sentinel out at _sentinel_
-        # corroborates. Floor a legacy gen-0 slug to 1 here too.
+        # corroborates. Floor a legacy gen-0 slug to 1 here too. ORDER +
+        # REQUIRED (codex iter-3 [P1]): commit the floor BEFORE status=todo
+        # and let it RAISE on failure — an unfloored todo at gen 0
+        # redispatches to gen 1 where a stale tokenless sentinel is still
+        # trusted. A floor failure leaves the row in-progress (the prior
+        # status) so the next drain retries atomically.
         _floor_dispatch_generation_for_requeue(
             action.slug, project, fleet_bin,
             full_tasks_by_slug=full_tasks_by_slug,
             tasks_by_slug=tasks_by_slug,
             home=home,
         )
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)

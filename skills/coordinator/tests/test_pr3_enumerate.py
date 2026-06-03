@@ -556,6 +556,35 @@ class TestRedispatchGenerationFloor:
         assert outcome == loop.SENTINEL_APPLIED  # gen0 tokenless = first attempt
         joined = [" ".join(c) for c in calls]
         assert any("dispatch_generation=1" in j for j in joined), joined
+        # codex iter-3 [P1]: the floor lands BEFORE the status=todo flip.
+        gen_i = next(i for i, j in enumerate(joined) if "dispatch_generation=1" in j)
+        status_i = next(i for i, j in enumerate(joined) if "status=todo" in j)
+        assert gen_i < status_i, "floor must commit before status=todo"
+
+    def test_worker_failed_floor_failure_aborts_requeue(self) -> None:
+        # codex iter-3 [P1]: a floor write FAILURE must propagate (not be
+        # swallowed), so the status=todo flip never runs — leaving the row
+        # in-progress for an atomic retry rather than an unfloored todo.
+        action = loop._SentinelAction(
+            slug="wf-fail", kind="worker_failed",
+            payload="crashed", dispatch_generation=None,
+        )
+        t = _make_task("wf-fail", status="in-progress", dispatch_generation=0)
+
+        def boom(cmd, timeout_s=30.0):
+            if cmd[1:3] == ["tasks", "set"] and "dispatch_generation=1" in cmd:
+                raise RuntimeError("floor write failed")
+            if cmd[1:3] == ["tasks", "set"] and "status=todo" in cmd:
+                raise AssertionError("status=todo flipped despite floor failure")
+
+        with patch.object(loop, "_run_fleet", side_effect=boom), \
+             patch.object(loop, "_maybe_remove_worktree"), \
+             patch.object(loop, "_maybe_delete_worker_dir"):
+            with __import__("pytest").raises(RuntimeError, match="floor write failed"):
+                loop._apply_sentinel(
+                    action, "p", "fleet",
+                    tasks_by_slug={t.slug: t}, full_tasks_by_slug={t.slug: t},
+                )
 
     def test_reconcile_todo_floors_legacy_gen(self, tmp_path: Path) -> None:
         # _apply_reconcile on a todo requeue floors a legacy gen-0 slug.
@@ -576,6 +605,10 @@ class TestRedispatchGenerationFloor:
             )
         joined = [" ".join(c) for c in calls]
         assert any("dispatch_generation=1" in j for j in joined), joined
+        # codex iter-3 [P1]: floor commits BEFORE the status=todo flip.
+        gen_i = next(i for i, j in enumerate(joined) if "dispatch_generation=1" in j)
+        status_i = next(i for i, j in enumerate(joined) if "status=todo" in j)
+        assert gen_i < status_i, "floor must commit before status=todo"
 
     def test_stale_tokenless_after_redispatch_authority2_skipped(self) -> None:
         # End-to-end of the fix's purpose: after the floor+increment the
