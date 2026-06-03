@@ -1903,27 +1903,11 @@ func coordTaskID(projectName string) string {
 // the matching agent's tmux session being alive, which catches the
 // "coord crashed but lock body remains" case.
 var findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	root, err := state.Root()
-	if err != nil {
-		return nil, false
-	}
-	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
-	if holderID == "" {
-		return nil, false
-	}
-	for _, r := range records {
-		if r == nil || r.ID != holderID {
-			continue
-		}
-		if r.TmuxSession == "" {
-			continue
-		}
-		if !sessionProbeOrAliveFn(r.TmuxSession) {
-			continue
-		}
-		return r, true
-	}
-	return nil, false
+	// Delegate to the shared resolver (attach-failover-59db
+	// refactor). The TUI variant requires no marker gate, no
+	// freshness gate — just "the lock body's id, with a live
+	// tmux session." That's exactly projectlookup's contract.
+	return projectlookup.FindCoordByLockBody(records, projectName)
 }
 
 // findExistingCoordForProject searches records for an alive agent
@@ -1957,6 +1941,15 @@ var findCoordByLockBody = func(records []*agent.Record, projectName string) (*ag
 // Tristate liveness (codex iter-6 P2): use sessionProbeOrAliveFn so a
 // tmux transport error (bad FLEET_TMUX_SOCKET, restarting server)
 // doesn't drop a live coord and force a duplicate spawn.
+//
+// Relationship to projectlookup.FindLiveCoord (attach-failover-59db):
+// the shared helper is the DEDUP-AGNOSTIC version — it accepts ANY
+// live coord for the project (the right call for Tier 3 failover,
+// where the operator's intent is "land me in some live coord, any
+// one"). This TUI-local helper layers the marker gate on top: a coord
+// whose initial prompt failed is INTENTIONALLY excluded from
+// idempotency dedup so a second [a] respawns rather than dropping
+// into a bare Claude shell.
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	want := coordTaskID(projectName)
 	wantID := coordSpawnMarkerFn(projectName)
