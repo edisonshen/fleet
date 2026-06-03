@@ -1042,13 +1042,35 @@ def _tick_locked(
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"subagent audit: {exc}")
 
+    # 5.9. Rolling coord checkpoint (#187), part 1 — bump the counter.
+    # We bump the per-coord tick counter HERE (so it rides the heartbeat
+    # _save_coord_state below in a single write) but DEFER the actual
+    # coord-checkpoint.md file write to the END of the tick, after the
+    # supervisor loop. Rationale: the supervisor can reconcile + dispatch
+    # NEW workers mid-tick (_maybe_dispatch_after_reconcile); writing the
+    # checkpoint before the supervisor would snapshot a pre-supervisor
+    # view, and because synth.go prefers a fresher checkpoint over the
+    # coord-state walk, a crash after a supervisor dispatch would strand
+    # that worker. Bumping here + writing last keeps the counter durable
+    # while the file reflects the final post-supervisor state.
+    #
+    #   tick_count++  ─heartbeat persist─▶ … supervisor … ─▶ checkpoint write
+    #
+    # Fail-soft: neither the bump nor the (deferred) write may wedge a tick.
+    should_write_checkpoint = False
+    try:
+        should_write_checkpoint = _bump_tick_counter(state)
+    except Exception as exc:  # noqa: BLE001 — counter bump must never fail a tick
+        result.errors.append(f"rolling checkpoint counter: {exc}")
+
     # Heartbeat: rewrite coord-state.json on EVERY tick, even when nothing
     # was drained or dispatched. The Variant A dashboard reads this file's
     # mtime as the per-tick liveness signal — gating the write on
     # last_seen (issue #50) made dispatch-only ticks invisible to the TUI
     # and surfaced as `○ idle · auto-stopped` while the coord was actually
     # working. tmp+rename is cheap and idempotent on identical state, so
-    # the unconditional refresh is correct.
+    # the unconditional refresh is correct. The tick_count bumped just
+    # above (rolling checkpoint) is persisted here in the same write.
     _save_coord_state(state_path, state)
 
     # Auto-archive when tasks.md grows past the threshold. Runs at end
@@ -1087,6 +1109,35 @@ def _tick_locked(
             result=result,
             emitted_this_tick=emitted_this_tick,
         )
+
+    # 5.9. Rolling coord checkpoint (#187), part 2 — write the file LAST.
+    # Runs after the supervisor so the checkpoint reflects any workers the
+    # supervisor dispatched mid-tick (see part-1 comment above). The
+    # counter was already bumped + persisted by the heartbeat; this is the
+    # pure file write, gated on the interval decision from part 1. We
+    # re-load coord-state from disk so the payload's slug→agent_id maps +
+    # recent_decisions include the supervisor's own state mutations.
+    # Fail-soft: a checkpoint write must never wedge a tick.
+    if should_write_checkpoint:
+        try:
+            checkpoint_state = _load_coord_state(state_path)
+            _write_rolling_checkpoint_file(
+                project=project,
+                project_dir=project_dir,
+                coord_id=coord_id,
+                state=checkpoint_state,
+                home=home,
+            )
+            # Codex iter-7 [P1]: clear the durable "checkpoint due" latch
+            # ONLY after a successful publish, and persist the clear so a
+            # later tick doesn't needlessly retry. A failed write (caught
+            # below) leaves the latch set → next tick retries.
+            if checkpoint_state.get("checkpoint_due"):
+                checkpoint_state["checkpoint_due"] = False
+                _save_coord_state(state_path, checkpoint_state)
+        except Exception as exc:  # noqa: BLE001 — checkpoint must never fail a tick
+            result.errors.append(f"rolling checkpoint: {exc}")
+
     return result
 
 
@@ -1418,6 +1469,27 @@ def _run_supervisor(
         # Heartbeat publish. Re-load → no-op-write so any concurrent
         # supervisor stuck-check write isn't clobbered.
         cs = _load_coord_state(state_path)
+        # Codex iter-3 [P1]: also drive the rolling checkpoint from the
+        # supervisor's periodic heartbeat. The supervisor can hold the
+        # lock for hours (poll loop, default 4h max) and dispatch workers
+        # mid-session; without this the checkpoint would only refresh at
+        # the top of the next top-level tick — i.e. never, during a long
+        # session — defeating the bounded-staleness guarantee. Bump the
+        # counter (persisted in the same cs write below) and, at interval,
+        # write coord-checkpoint.md reflecting the current on-disk state.
+        # Fail-soft: a checkpoint failure must not wedge the heartbeat.
+        try:
+            if _bump_tick_counter(cs):
+                _write_rolling_checkpoint_file(
+                    project=project, project_dir=project_dir,
+                    coord_id=coord_id, state=cs, home=home,
+                )
+                # Codex iter-7 [P1]: clear the due-latch only after a
+                # successful publish (cs is persisted below). A failed
+                # write leaves it set → retried next heartbeat / tick.
+                cs["checkpoint_due"] = False
+        except Exception as exc:  # noqa: BLE001 — never wedge the heartbeat
+            result.errors.append(f"supervisor rolling checkpoint: {exc}")
         _save_coord_state(state_path, cs)
 
     # Invariant 4 force-tick: short-circuit the next sleep when there's
@@ -2588,6 +2660,213 @@ def _read_worker_state(
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def _bump_tick_counter(state: dict) -> bool:
+    """Bump state["tick_count"] (mutated in place) and return True when
+    this tick should publish a rolling checkpoint (#187).
+
+    Split from the file write so the caller can persist the bumped counter
+    via the heartbeat _save_coord_state, then DEFER the actual checkpoint
+    file write to the end of the tick (after the supervisor loop, which
+    can dispatch new workers mid-tick). Tolerates a corrupt / non-int /
+    negative counter by resetting to 0 before the +1 bump.
+
+    Codex iter-7 [P1]: a "checkpoint due" latch (state["checkpoint_due"])
+    survives the bump→heartbeat→deferred-write window. When an interval
+    tick lands we set the latch BEFORE the heartbeat persists it; the
+    write clears it only on success (_write_rolling_checkpoint_file).
+    If the write fails / the coord crashes in that window, the latch
+    stays True on disk, so the NEXT tick retries the write even though
+    the modulo no longer matches. Without the latch the missed checkpoint
+    would never be retried and a stale coord-checkpoint.md could shadow
+    synth.go's coord-state walk, dropping workers dispatched that tick.
+    """
+    raw_tick = state.get("tick_count", 0)
+    try:
+        tick_count = int(raw_tick)
+    except (TypeError, ValueError):
+        tick_count = 0
+    if tick_count < 0:
+        tick_count = 0
+    tick_count += 1
+    state["tick_count"] = tick_count
+
+    every = dispatch_mod.resolve_checkpoint_every()
+    # Codex iter-8 [P2]: honor the disable kill-switch even with a stale
+    # latch. FLEET_COORD_CHECKPOINT_EVERY=0 means "no checkpoints"; a
+    # leftover checkpoint_due from before the operator disabled it must
+    # NOT keep forcing (failing) writes every tick. Clear the latch and
+    # bail when disabled.
+    if every <= 0:
+        if state.get("checkpoint_due"):
+            state["checkpoint_due"] = False
+        return False
+
+    due_now = dispatch_mod.should_checkpoint(tick_count, every)
+    # A latch left over from a prior tick whose write never completed.
+    pending = bool(state.get("checkpoint_due"))
+    if due_now:
+        # Latch it durably so a crash before the deferred write retries
+        # next tick.
+        state["checkpoint_due"] = True
+    return due_now or pending
+
+
+def _write_rolling_checkpoint_file(
+    *,
+    project: str,
+    project_dir: Path,
+    coord_id: str,
+    state: dict,
+    home: Path,
+) -> str | None:
+    """Publish coord-checkpoint.md (the rolling recovery snapshot, #187).
+
+    Caller is responsible for the counter bump + interval gate (see
+    _bump_tick_counter) and for invoking this only on a checkpoint tick.
+    Returns the checkpoint path written.
+
+    Always RE-READS tasks.md from disk so the snapshot reflects every
+    mutation that landed this tick — including workers the supervisor
+    dispatched after the heartbeat — not a pre-dispatch / pre-supervisor
+    view. (A crash after a supervisor dispatch must not leave a fresher-
+    but-stale checkpoint that shadows synth.go's coord-state walk.)
+
+    Payload derivation — the checkpoint mirrors a handoff doc's two
+    live-work sections so synth.go lifts the rows verbatim:
+      - active_subagents: every ACTIVE task — both `in-progress` (worker
+        running, may not have a PR yet) and `in-review` (PR open, shepherd
+        running) — enriched with the worker phase (workers/<slug>/
+        state.json) and the slug→id maps from coord_state. This mirrors
+        the handoff recovery contract (handoff.go: pr_url + in-review →
+        re-spawn shepherd; empty pr_url + in-progress → re-dispatch). A
+        checkpoint that dropped in-review tasks would, because synth.go
+        prefers a fresher checkpoint over the state walk, strand every
+        open-review PR's monitor after a coord crash.
+      - open_prs: the subset of those tasks that carry a pr_url.
+    Recent decisions ride along from state["recent_decisions"]
+    (populated by record_checkpoint_decision at dispatch sites).
+
+    dispatch.py owns write_coord_checkpoint + the env knobs; this helper
+    is the loop.py-side glue.
+    """
+    agent_ids = supervisor_mod.load_agent_id_map(state)
+    subagent_ids = supervisor_mod.load_subagent_id_map(state)
+
+    # Re-read tasks.md from disk so a task dispatched THIS tick (flipped
+    # to in-progress by _apply_dispatch / the supervisor AFTER the
+    # caller's snapshot) lands in the checkpoint.
+    #
+    # On a parse error (corrupt tasks.md) we have two recovery-safe moves,
+    # chosen by whether coord-state still tracks any worker:
+    #   - worker_agent_ids NON-EMPTY (codex iter-9 [P2]): fall back to an
+    #     empty task list and build a coord-state-only snapshot from
+    #     worker_agent_ids + worker state.json (iter-5) — the same data
+    #     synth.go's state walk recovers, just without the tasks.md
+    #     status/pr_url overlay. Fresher than a possibly-stale prior
+    #     checkpoint, and never empty.
+    #   - worker_agent_ids EMPTY (codex iter-3 [P2]): RAISE so the
+    #     call-site logs + leaves the PREVIOUS checkpoint intact. Writing
+    #     an empty checkpoint here would, because synth.go prefers a
+    #     fresher checkpoint, hide any worker the prior checkpoint still
+    #     records. Nothing to snapshot + don't clobber good recovery data.
+    # tasks.md corruption is rare (atomic tmp+rename → readers see a whole
+    # old-or-new file), so the missing overlay is an acceptable degradation.
+    tasks_path = project_dir / "tasks.md"
+    try:
+        tasks = parse.read(str(tasks_path)).tasks
+    except Exception:  # noqa: BLE001
+        if not agent_ids:
+            raise  # nothing to snapshot; preserve the prior checkpoint
+        tasks = []
+
+    tasks_by_slug = {t.slug: t for t in tasks}
+
+    # Codex iter-5 [P1]: drive the active rows from worker_agent_ids (the
+    # SAME source synth.go's state walk uses), then overlay tasks.md
+    # metadata. tasks.md alone is not the source of truth: a slug can live
+    # in coord-state.json's worker_agent_ids while absent from tasks.md
+    # (coord remembered the agent_id but crashed before stamping the task,
+    # or tasks.md is missing/partial). synth's walk would still recover
+    # such a worker from worker_agent_ids + worker state.json; a checkpoint
+    # built from tasks.md only would drop it, and because synth prefers the
+    # fresher checkpoint, recovery would lose that in-flight worker.
+    #
+    # Union = worker_agent_ids slugs (the recovery driver) ∪ active
+    # tasks.md slugs (covers a task flipped to in-progress THIS tick before
+    # its agent_id is remembered). Sorted for deterministic doc output.
+    candidate_slugs = set(agent_ids)
+    for t in tasks:
+        if t.status in ("in-progress", "in-review"):
+            candidate_slugs.add(t.slug)
+
+    active_subagents: list[dict] = []
+    open_prs: list[dict] = []
+    pr_seq = 0
+    for slug in sorted(candidate_slugs):
+        t = tasks_by_slug.get(slug)
+        # Mirror synth.go's state walk: skip a worker_agent_ids slug whose
+        # worker dir is gone AND which isn't an active tasks.md row — it's
+        # archived / hand-deleted / never existed, not recoverable.
+        st = _read_worker_state(project, slug, home=home)
+        st = st if isinstance(st, dict) else {}
+        if not st and (t is None or t.status not in ("in-progress", "in-review")):
+            continue
+        phase = st.get("phase", "")
+        status = t.status if t is not None else ""
+        branch = (t.branch if t is not None and t.branch else f"worker/{slug}")
+        # Codex iter-4 [P1]: prefer tasks.md's pr_url (authoritative once
+        # the reconcile stamps it) but fall back to workers/<slug>/
+        # state.json's pr_url for the window where the worker has opened a
+        # PR but tasks.md isn't stamped yet. synth.go's state walk reads
+        # pr_url from worker state, so a checkpoint that only read tasks.md
+        # would — because synth prefers the fresher checkpoint — lose the
+        # PR and strand its shepherd after a crash in that window.
+        task_pr = t.pr_url if t is not None else ""
+        state_pr = st.get("pr_url", "") if isinstance(st.get("pr_url"), str) else ""
+        pr_url = task_pr or state_pr
+        # Codex iter-8 [P2]: if the PR url came from the worker-state
+        # FALLBACK (tasks.md not stamped yet → task_pr empty, state_pr
+        # set) the task is effectively in-review — a PR is open. Stamp the
+        # row status as in-review so handoff_resume treats it shepherd-only
+        # (in _NON_REDISPATCH_STATUSES) rather than re-dispatching a worker
+        # against an already-open PR. tasks.md's own status (once stamped)
+        # always wins; we only synthesize in-review for the unstamped
+        # window where status would otherwise be in-progress + pr_url set.
+        if not task_pr and state_pr and status in ("", "in-progress"):
+            status = "in-review"
+        active_subagents.append({
+            "task": slug,
+            "branch": branch,
+            "phase": phase,
+            "status": status,
+            "pr_url": pr_url,
+            "agent_id": agent_ids.get(slug, ""),
+            "subagent_id": subagent_ids.get(slug, ""),
+        })
+        if pr_url:
+            # We only know the URL + head branch here; the real gh PR
+            # number is unknown (the PR monitor owns gh state). Render a
+            # 1-based ordinal so the bullet stays well-formed for synth.go's
+            # `- #<n> ...` parser — synth lifts head/url for recovery, the
+            # ordinal is just for the human-readable doc, not gh reconcile.
+            pr_seq += 1
+            open_prs.append({
+                "number": pr_seq,
+                "title": slug,
+                "head": branch,
+                "url": pr_url,
+            })
+
+    return dispatch_mod.write_coord_checkpoint(
+        project_dir=project_dir,
+        coord_id=coord_id,
+        project=project,
+        state=state,
+        active_subagents=active_subagents,
+        open_prs=open_prs,
+    )
 
 
 # Phases that prove a WORKER (not the dispatch bootstrap) authored the

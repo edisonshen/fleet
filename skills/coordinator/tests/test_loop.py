@@ -3936,3 +3936,645 @@ def test_loop_non_git_phase_done_reconciles_to_done(
     # The success note mentions non-git so the operator sees the mode.
     success_notes = [c for c in note_calls if "non-git" in (c[-1] if c else "")]
     assert success_notes, f"expected non-git success note: {note_calls!r}"
+
+
+# ----------------------------------------------------------------------
+# Rolling coord checkpoint wiring (#187 writer × loop.py tick)
+# ----------------------------------------------------------------------
+#
+# #187 shipped the writers (should_checkpoint / write_coord_checkpoint /
+# record_checkpoint_decision) in dispatch.py but loop.py never called
+# them. These tests pin the wiring in _tick_locked: the tick bumps a
+# persisted tick_count and, every N ticks, publishes coord-checkpoint.md
+# with the synth.go-compatible schema. The fails-on-parent guard is the
+# whole point — on the pre-wiring loop.py no checkpoint file is ever
+# written, so test_tick_writes_checkpoint_at_interval fails there.
+
+
+def _checkpoint_path(project_dir: Path) -> Path:
+    return project_dir / "coord-checkpoint.md"
+
+
+def _bump_then_maybe_write(
+    *, project_dir: Path, coord_id: str, state: dict, home: Path,
+    project: str = "fleet",
+) -> str | None:
+    """Replays the loop.py contract: bump the counter, then write the
+    checkpoint file iff this tick is on-interval. Returns the written path
+    or None (off-interval / disabled). Mirrors _tick_locked's split-phase
+    wiring (counter bump before heartbeat; file write deferred to end)."""
+    should_write = loop._bump_tick_counter(state)
+    if not should_write:
+        return None
+    return loop._write_rolling_checkpoint_file(
+        project=project, project_dir=project_dir,
+        coord_id=coord_id, state=state, home=home,
+    )
+
+
+def test_write_rolling_checkpoint_bumps_counter_off_interval(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: the counter bump always advances tick_count, but on an
+    off-interval tick it writes NO file and returns None."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 3}
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is None  # 4 % 5 != 0
+    assert state["tick_count"] == 4  # counter still advanced
+    assert not _checkpoint_path(project_dir).exists()
+
+
+def test_write_rolling_checkpoint_writes_at_interval(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: on the Nth tick the helper writes coord-checkpoint.md with
+    the in-progress task as an Active Subagents row + its PR."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {
+        "tick_count": 4,
+        "worker_agent_ids": {"feat-aaaa": "abcd0001"},
+        "recent_decisions": ["dispatched feat-aaaa"],
+    }
+    # The helper re-reads tasks.md from disk (not the passed snapshot),
+    # so seed it on disk.
+    _write_tasks(project_dir, [
+        _make_task(
+            "feat-aaaa", status="in-progress", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/9",
+        ),
+        _make_task("idle-bbbb", status="ready"),  # not active → excluded
+    ])
+    # Worker phase comes from workers/<slug>/state.json.
+    wdir = project_dir / "workers" / "feat-aaaa"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "push"}), encoding="utf-8",
+    )
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert state["tick_count"] == 5
+    assert written == str(_checkpoint_path(project_dir))
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Frontmatter schema synth.go reads.
+    assert "schema: v1" in body
+    assert 'coord_id: "cccccc01"' in body
+    assert 'project: "fleet"' in body
+    assert "tick_count: 5" in body
+    # Active Subagents row carries the in-progress task, its phase, the
+    # agent_id from coord-state, and its PR — and excludes the ready task.
+    assert 'task="feat-aaaa"' in body
+    assert 'phase="push"' in body
+    assert 'agent_id="abcd0001"' in body
+    assert "idle-bbbb" not in body
+    # Open PRs section lists the task's PR.
+    assert "https://github.com/owner/repo/pull/9" in body
+    # Recent decisions ride along from coord-state.
+    assert "dispatched feat-aaaa" in body
+
+
+def test_write_rolling_checkpoint_includes_in_review_pr(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex P1: a task that opened a PR and moved to in-review must stay
+    in the checkpoint — both as an Active Subagents row (so the successor
+    re-spawns its shepherd) and in Open PRs (so PR monitoring resumes).
+    Dropping it would, because synth.go prefers the fresher checkpoint
+    over the state walk, strand the open-review PR after a coord crash."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"rev-ffff": "abcd0009"}}
+    _write_tasks(project_dir, [
+        _make_task(
+            "rev-ffff", status="in-review", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/42",
+        ),
+    ])
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    assert 'task="rev-ffff"' in body
+    assert 'status="in-review"' in body
+    assert 'agent_id="abcd0009"' in body
+    # The in-review PR rides into Open PRs (not just the active row).
+    assert "https://github.com/owner/repo/pull/42" in body
+    assert "_(no open PRs)_" not in body
+
+
+def test_write_rolling_checkpoint_falls_back_to_worker_state_pr_url(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-4 P1: when the worker has opened a PR (recorded in
+    workers/<slug>/state.json) but tasks.md isn't stamped yet, the
+    checkpoint must still capture the PR — synth.go's state walk reads
+    pr_url from worker state, so a checkpoint that only read tasks.md would
+    (because synth prefers the fresher checkpoint) strand the shepherd."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"unstamped-llll": "abcd000c"}}
+    # tasks.md: in-progress, pr_url NOT yet stamped (empty).
+    _write_tasks(project_dir, [
+        _make_task("unstamped-llll", status="in-progress", worker_pid=0,
+                   pr_url=""),
+    ])
+    # worker state.json: the worker already opened a PR.
+    wdir = project_dir / "workers" / "unstamped-llll"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({
+            "phase": "push",
+            "pr_url": "https://github.com/owner/repo/pull/77",
+        }),
+        encoding="utf-8",
+    )
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Worker-state PR URL appears in BOTH the active row and Open PRs.
+    assert "https://github.com/owner/repo/pull/77" in body
+    assert 'pr_url="https://github.com/owner/repo/pull/77"' in body
+    assert "_(no open PRs)_" not in body
+    # Codex iter-8 [P2]: the fallback-PR row is stamped in-review so
+    # handoff_resume treats it shepherd-only (no worker re-dispatch
+    # against the already-open PR), not in-progress.
+    assert 'status="in-review"' in body
+    assert 'status="in-progress"' not in body
+
+
+def test_write_rolling_checkpoint_includes_coord_state_only_worker(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-5 P1: a slug present in coord-state.json's
+    worker_agent_ids but ABSENT from tasks.md (coord remembered the
+    agent_id then crashed before stamping the task, or tasks.md is
+    partial) must still land in the checkpoint — synth.go's state walk
+    drives off worker_agent_ids, so a checkpoint built from tasks.md alone
+    would drop the worker and, because synth prefers the fresher
+    checkpoint, lose it on recovery."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"ghost-mmmm": "abcd000d"}}
+    # tasks.md exists but does NOT contain ghost-mmmm.
+    _write_tasks(project_dir, [_make_task("other-nnnn", status="ready")])
+    # The worker has a live state.json (so it's recoverable, not archived).
+    wdir = project_dir / "workers" / "ghost-mmmm"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # The coord-state-only worker is captured (driven off worker_agent_ids).
+    assert 'task="ghost-mmmm"' in body
+    assert 'agent_id="abcd000d"' in body
+    assert 'phase="implement"' in body
+
+
+def test_write_rolling_checkpoint_skips_archived_coord_state_worker(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-5 P1 (mirror synth): a worker_agent_ids slug whose worker
+    dir is GONE (archived / hand-deleted) and which is not an active
+    tasks.md row is skipped — same as synth.go's state walk, which skips a
+    slug when readWorkerStateForSynth returns ok=false."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"archived-oooo": "abcd000e"}}
+    _write_tasks(project_dir, [_make_task("live-pppp", status="ready")])
+    # No workers/archived-oooo/state.json on disk → not recoverable.
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # The archived worker is NOT resurrected into the checkpoint.
+    assert "archived-oooo" not in body
+    assert "_(none)_" in body
+
+
+def test_write_rolling_checkpoint_rereads_tasks_after_dispatch(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex P1: the file write must read tasks.md from disk so a worker
+    dispatched THIS tick (by _apply_dispatch or the supervisor, after the
+    heartbeat) lands in the checkpoint. Disk shows in-progress; the
+    checkpoint must reflect it."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    state = {"tick_count": 4, "worker_agent_ids": {"fresh-gggg": "abcd000a"}}
+    # Disk: the post-dispatch truth (worker just launched → in-progress).
+    _write_tasks(project_dir, [
+        _make_task("fresh-gggg", status="in-progress", worker_pid=0),
+    ])
+
+    written = _bump_then_maybe_write(
+        project_dir=project_dir, coord_id="cccccc01",
+        state=state, home=fleet_home,
+    )
+
+    assert written is not None
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # Disk read: the freshly-dispatched worker appears in the checkpoint.
+    assert 'task="fresh-gggg"' in body
+    assert 'status="in-progress"' in body
+    assert "_(none)_" not in body
+
+
+def test_write_rolling_checkpoint_disabled_when_every_zero(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: FLEET_COORD_CHECKPOINT_EVERY=0 disables checkpointing — the
+    counter still advances (liveness) but no file is ever written."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "0")
+    state = {"tick_count": 0}
+
+    for _ in range(6):
+        assert _bump_then_maybe_write(
+            project_dir=project_dir, coord_id="cccccc01",
+            state=state, home=fleet_home,
+        ) is None
+
+    assert state["tick_count"] == 6
+    assert not _checkpoint_path(project_dir).exists()
+
+
+def test_write_rolling_checkpoint_tolerates_corrupt_counter(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Unit: a non-int / negative tick_count (corrupt state) resets to 0
+    before the bump rather than crashing the tick."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    for bad in ("garbage", -7, None):
+        state = {"tick_count": bad}
+        _bump_then_maybe_write(
+            project_dir=project_dir, coord_id="cccccc01",
+            state=state, home=fleet_home,
+        )
+        assert state["tick_count"] == 1
+
+
+def test_tick_writes_checkpoint_at_interval(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Integration + fails-on-parent: driving loop.tick N times persists
+    the tick_count across ticks (in coord-state.json) and publishes
+    coord-checkpoint.md on the Nth tick. The pre-wiring loop.py never
+    calls the writer, so this test fails there — the whole point of the
+    task.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "3")
+    # An in-progress task so the checkpoint carries a real Active row.
+    _write_tasks(project_dir, [
+        _make_task(
+            "live-cccc", status="in-progress", worker_pid=0,
+            pr_url="https://github.com/owner/repo/pull/3",
+        ),
+    ])
+    _seed_coord_state(project_dir, agent_id_map={"live-cccc": "deadbeef"})
+
+    cp = _checkpoint_path(project_dir)
+
+    # Tick 1 + 2: counter advances, no checkpoint yet.
+    for expected_tick in (1, 2):
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+        state = json.loads((project_dir / "coord-state.json").read_text())
+        assert state["tick_count"] == expected_tick
+        assert not cp.exists(), f"no checkpoint expected at tick {expected_tick}"
+
+    # Tick 3: interval hit → checkpoint published with the live task.
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state["tick_count"] == 3
+    assert cp.exists(), "coord-checkpoint.md must exist after the Nth tick"
+    body = cp.read_text(encoding="utf-8")
+    assert "schema: v1" in body
+    assert "tick_count: 3" in body
+    assert 'task="live-cccc"' in body
+    assert 'agent_id="deadbeef"' in body
+    assert "https://github.com/owner/repo/pull/3" in body
+
+
+def test_tick_checkpoint_schema_matches_synth_fixture(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Integration: the checkpoint a real tick writes is byte-shaped like
+    the seedCheckpoint fixture in internal/handoff/synth_test.go so
+    synth.go lifts the rows verbatim. Pins the section headers + the
+    placeholders for an empty (no in-progress) lane.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # No in-progress tasks → every section should render its placeholder.
+    _write_tasks(project_dir, [_make_task("idle-dddd", status="ready")])
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    assert body.startswith("---\n")
+    assert "### Active Subagents\n" in body
+    assert "### Open PRs\n" in body
+    assert "### Recent decisions\n" in body
+    assert "### Drafted but unfiled tasks\n" in body
+    # Placeholders are byte-identical with synth.go's literals.
+    assert "_(none)_" in body
+    assert "_(no open PRs)_" in body
+    assert "_(no recent decisions)_" in body
+
+
+def test_tick_checkpoint_write_failure_does_not_wedge_tick(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Fail-soft: a raising write_coord_checkpoint must NOT propagate out
+    of the tick. The breadcrumb lands in result.errors, the heartbeat
+    save still runs, and tick_count still persists — so the next tick
+    advances the counter normally instead of re-failing at the same
+    modulo value forever. Guards the try/except at the loop.py call site,
+    which the happy-path tests never exercise.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    _write_tasks(project_dir, [_make_task("idle-eeee", status="ready")])
+
+    def _boom(**kwargs):
+        raise RuntimeError("simulated checkpoint write fault")
+
+    monkeypatch.setattr(loop.dispatch_mod, "write_coord_checkpoint", _boom)
+
+    # The tick must complete (no exception escapes) ...
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # ... record the failure as a breadcrumb (operator-visible) ...
+    assert any("rolling checkpoint" in e for e in result.errors), result.errors
+    # ... NOT write a (partial) checkpoint file ...
+    assert not _checkpoint_path(project_dir).exists()
+    # ... and STILL persist the bumped counter via the heartbeat save, so
+    # the next tick advances to 2 rather than retrying 1 forever.
+    state = json.loads((project_dir / "coord-state.json").read_text())
+    assert state["tick_count"] == 1
+
+
+def test_tick_checkpoint_written_after_supervisor(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-2 P1: the checkpoint must be written AFTER the supervisor
+    loop, so a worker the supervisor dispatches mid-tick lands in the
+    recovery snapshot. If the checkpoint were written before the
+    supervisor, a crash after a supervisor dispatch would leave a fresher-
+    but-stale checkpoint that synth.go prefers over the coord-state walk,
+    stranding the worker. Patch _run_supervisor to mutate tasks.md (the
+    way a real supervisor dispatch would) and assert the post-supervisor
+    task appears in the checkpoint.
+    """
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # conftest pins poll_interval=0 (supervisor off); enable it so the
+    # _run_supervisor branch runs and our patched mutation fires.
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "5")
+    # Pre-supervisor disk state: nothing active.
+    _write_tasks(project_dir, [_make_task("idle-hhhh", status="ready")])
+
+    def _fake_supervisor(**kwargs):
+        # Simulate a supervisor mid-tick dispatch: a new worker flips to
+        # in-progress on disk AFTER the heartbeat already ran.
+        _write_tasks(project_dir, [
+            _make_task("sup-iiii", status="in-progress", worker_pid=0),
+            _make_task("idle-hhhh", status="ready"),
+        ])
+
+    monkeypatch.setattr(loop, "_run_supervisor", _fake_supervisor)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    body = _checkpoint_path(project_dir).read_text(encoding="utf-8")
+    # The supervisor-dispatched worker is captured because the checkpoint
+    # write runs last and re-reads tasks.md from disk.
+    assert 'task="sup-iiii"' in body
+    assert 'status="in-progress"' in body
+
+
+def test_write_rolling_checkpoint_skips_on_corrupt_tasks(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-3 P2: a corrupt/unparseable tasks.md at checkpoint-write
+    time, WITH no workers tracked in coord-state, must NOT overwrite the
+    prior checkpoint with an empty one — an empty checkpoint would, because
+    synth.go prefers a fresher checkpoint over the state walk, make a later
+    crash treat every live worker as absent. The write raises (caller
+    fail-soft-logs); the prior checkpoint survives intact."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    # A pre-existing good checkpoint that must NOT be clobbered.
+    prior = _checkpoint_path(project_dir)
+    prior.write_text("PRIOR GOOD CHECKPOINT\n", encoding="utf-8")
+    # Corrupt tasks.md so parse.read raises (not merely missing → empty).
+    (project_dir / "tasks.md").write_text(
+        "## task: broken\nstatus: not-a-valid-status\n", encoding="utf-8",
+    )
+    state = {"tick_count": 0}  # no worker_agent_ids → nothing to snapshot
+
+    # _bump_tick_counter says "write" (every=1), but the file write raises.
+    assert loop._bump_tick_counter(state) is True
+    with pytest.raises(Exception):
+        loop._write_rolling_checkpoint_file(
+            project="fleet", project_dir=project_dir,
+            coord_id="cccccc01", state=state, home=fleet_home,
+        )
+
+    # Prior checkpoint is untouched — recovery still has real data.
+    assert prior.read_text(encoding="utf-8") == "PRIOR GOOD CHECKPOINT\n"
+
+
+def test_write_rolling_checkpoint_corrupt_tasks_writes_coord_state_snapshot(
+    fleet_home: Path, project_dir: Path, monkeypatch,
+) -> None:
+    """Codex iter-9 P2: when tasks.md is corrupt BUT coord-state still
+    tracks workers, write a coord-state-only snapshot (rows from
+    worker_agent_ids + worker state.json) rather than leaving a possibly-
+    stale prior checkpoint that could shadow current coord-state. The
+    snapshot is fresh + non-empty; it just lacks the tasks.md overlay."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    prior = _checkpoint_path(project_dir)
+    prior.write_text("STALE PRIOR CHECKPOINT\n", encoding="utf-8")
+    (project_dir / "tasks.md").write_text(
+        "## task: broken\nstatus: not-a-valid-status\n", encoding="utf-8",
+    )
+    state = {"tick_count": 0, "worker_agent_ids": {"live-rrrr": "abcd0010"}}
+    wdir = project_dir / "workers" / "live-rrrr"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    assert loop._bump_tick_counter(state) is True
+    written = loop._write_rolling_checkpoint_file(
+        project="fleet", project_dir=project_dir,
+        coord_id="cccccc01", state=state, home=fleet_home,
+    )
+
+    assert written == str(prior)
+    body = prior.read_text(encoding="utf-8")
+    # The stale prior is replaced by a fresh coord-state snapshot that
+    # captures the tracked worker (from worker_agent_ids, no tasks.md).
+    assert "STALE PRIOR CHECKPOINT" not in body
+    assert 'task="live-rrrr"' in body
+    assert 'agent_id="abcd0010"' in body
+    assert 'phase="implement"' in body
+
+
+def test_supervisor_heartbeat_writes_rolling_checkpoint(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-3 P1: during a long supervisor session the checkpoint
+    must refresh from the supervisor's periodic heartbeat, not only after
+    the supervisor exits. Drive a real tick with the supervisor enabled,
+    patch run_supervisor to invoke the write_state hook it was handed, and
+    assert the hook published a checkpoint reflecting the live worker."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "1")
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "5")
+    # A live in-flight worker so _run_supervisor proceeds to the inner
+    # supervisor loop (it returns early when nothing is in-flight). A
+    # worker-authored state.json + live pid keep it past reconcile.
+    _write_tasks(project_dir, [
+        _make_task("sup-jjjj", status="in-progress", worker_pid=4321),
+    ])
+    _seed_coord_state(project_dir, agent_id_map={"sup-jjjj": "abcd000b"})
+    wdir = project_dir / "workers" / "sup-jjjj"
+    wdir.mkdir(parents=True, exist_ok=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "implement"}), encoding="utf-8",
+    )
+
+    cp = _checkpoint_path(project_dir)
+
+    def _fake_inner_supervisor(*, write_state, **kwargs):
+        # Remove the post-supervisor checkpoint so we prove the HEARTBEAT
+        # hook (not the end-of-tick write) published one mid-session.
+        if cp.exists():
+            cp.unlink()
+        # The supervisor's periodic heartbeat fires write_state.
+        write_state()
+        return loop.supervisor_mod.SupervisorResult()
+
+    with patch.object(loop, "_pid_alive", return_value=True):
+        monkeypatch.setattr(
+            loop.supervisor_mod, "run_supervisor", _fake_inner_supervisor,
+        )
+        loop.tick(
+            "fleet", coord_id="cccccc01", cwd="/repo",
+            fleet_home=str(fleet_home),
+        )
+
+    assert cp.exists(), "supervisor heartbeat must publish a checkpoint"
+    body = cp.read_text(encoding="utf-8")
+    assert 'task="sup-jjjj"' in body
+    assert 'agent_id="abcd000b"' in body
+
+
+def test_bump_tick_counter_latches_due_and_retries(monkeypatch) -> None:
+    """Codex iter-7 P1: a "checkpoint due" latch survives a missed write.
+    On the interval tick the latch is set; if the write never completes,
+    the NEXT tick (modulo no longer matching) must still return True so
+    the missed checkpoint is retried — otherwise a stale coord-checkpoint
+    shadows synth.go's state walk."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    # Interval tick: 4 → 5, due, latch set.
+    state = {"tick_count": 4}
+    assert loop._bump_tick_counter(state) is True
+    assert state["checkpoint_due"] is True
+
+    # Simulate a crash before the write cleared the latch: tick_count was
+    # persisted (5) but checkpoint_due is still True on disk.
+    state = {"tick_count": 5, "checkpoint_due": True}
+    # 6 % 5 != 0 (not due now) but the latch forces a retry.
+    assert loop._bump_tick_counter(state) is True
+
+    # A clean state with no latch on an off-interval tick does NOT write.
+    state = {"tick_count": 5, "checkpoint_due": False}
+    assert loop._bump_tick_counter(state) is False
+
+
+def test_bump_tick_counter_disabled_clears_stale_latch(monkeypatch) -> None:
+    """Codex iter-8 P2: FLEET_COORD_CHECKPOINT_EVERY=0 is the kill switch.
+    A stale checkpoint_due latch (from before the operator disabled it)
+    must NOT keep forcing writes — the latch is cleared and no write is
+    requested."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "0")
+    state = {"tick_count": 7, "checkpoint_due": True}
+    assert loop._bump_tick_counter(state) is False
+    assert state["checkpoint_due"] is False  # latch cleared
+    assert state["tick_count"] == 8  # counter still advances (liveness)
+
+
+def test_tick_retries_missed_checkpoint_via_latch(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Codex iter-7 P1 (integration): a coord that crashed with the latch
+    set (tick_count past the modulo) writes the checkpoint on the very
+    next tick and clears the latch."""
+    monkeypatch.setenv("FLEET_COORD_CHECKPOINT_EVERY", "5")
+    _write_tasks(project_dir, [
+        _make_task("retry-qqqq", status="in-progress", worker_pid=0),
+    ])
+    # On-disk state from the crashed tick: counter moved past the modulo,
+    # latch still set (write never completed).
+    _seed_coord_state(project_dir, agent_id_map={"retry-qqqq": "abcd000f"})
+    sp = project_dir / "coord-state.json"
+    s = json.loads(sp.read_text())
+    s["tick_count"] = 5  # next bump → 6, 6 % 5 != 0 (not due by modulo)
+    s["checkpoint_due"] = True
+    sp.write_text(json.dumps(s), encoding="utf-8")
+
+    cp = _checkpoint_path(project_dir)
+    assert not cp.exists()
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # The latch forced the missed checkpoint to be written this tick.
+    assert cp.exists(), "latch must force a retry of the missed checkpoint"
+    assert 'task="retry-qqqq"' in cp.read_text(encoding="utf-8")
+    # And the latch is cleared after the successful publish.
+    final = json.loads(sp.read_text())
+    assert final.get("checkpoint_due") is False
