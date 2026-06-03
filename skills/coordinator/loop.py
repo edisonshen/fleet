@@ -5690,13 +5690,26 @@ def _dispatch_ready(
             # unchanged; re-incrementing would skew them).
             agent_id = pending_rec["agent_id"]
             dispatch_generation = int(pending_rec["dispatch_generation"])
-        elif pending_rec is not None and pending_kind == "":
+        elif (
+            pending_rec is not None and pending_kind == ""
+            and int(t.dispatch_generation) == 0
+        ):
             # Legacy bare-string pending entry (pre-migration, kind
-            # unknown). Back-compat: reuse the agent_id as a worker retry
-            # AND keep its gen 0 (ungated) so the half-written legacy
-            # prompt — which carries no --dispatch-generation — still
-            # matches if acquire returns already_acquired. A fresh gen
-            # would mint >=1 and skew the unchanged legacy prompt.
+            # unknown) AND the task row authority is still 0. Back-compat:
+            # reuse the agent_id as a worker retry AND keep its gen 0
+            # (ungated) so the half-written legacy prompt — which carries
+            # no --dispatch-generation — still matches if acquire returns
+            # already_acquired.
+            #
+            # codex iter-5 [P2]: reuse ONLY while the row is gen 0. Once the
+            # row has advanced (floored to 1 on a requeue, or bumped by a
+            # re-dispatch — both more common now that the fence floor
+            # exists), reusing the legacy gen-0 prompt would have
+            # _apply_dispatch skip the generation persist and run
+            # `fleet workers update` WITHOUT --dispatch-generation, which
+            # the gen>0 CAS now REJECTS — wedging the slug forever. So a
+            # legacy entry on a gen>0 row falls through to the forget+mint
+            # branch below (fresh gen-stamped prompt).
             agent_id = pending_rec["agent_id"]
             dispatch_generation = 0
         else:
@@ -6033,12 +6046,21 @@ def _dispatch_review_handoffs(
             pending_handoff_rec.get("dispatch_kind") if pending_handoff_rec else None
         )
         # Reuse on a verified same-kind+same-gen match, OR a legacy
-        # bare-string entry (kind unknown → back-compat: trust it as this
-        # stage's retry). A POSITIVE different-kind entry (e.g. a leftover
-        # worker-kind acquire) is NOT reused — that would hand this
-        # reviewer/finisher the worker's prompt via already_acquired.
+        # bare-string entry (kind unknown → back-compat) BUT ONLY while the
+        # handoff generation is still 0. A POSITIVE different-kind entry
+        # (e.g. a leftover worker-kind acquire) is NOT reused — that would
+        # hand this reviewer/finisher the worker's prompt via
+        # already_acquired.
+        #
+        # codex iter-5 [P2]: a legacy bare-string entry must NOT be reused
+        # on a gen>0 handoff. Its already-acquired prompt carries no
+        # --dispatch-generation, so the handoff subagent would run ungated
+        # `fleet workers update` commands that the gen>0 CAS now REJECTS —
+        # wedging the review/finish transition (and it could replay the
+        # wrong stage's old prompt). A legacy entry on a gen>0 row falls
+        # through to forget+mint a fresh gen-stamped prompt below.
         reuse_handoff = pending_handoff_rec is not None and (
-            pending_handoff_kind == ""
+            (pending_handoff_kind == "" and handoff_generation == 0)
             or (
                 pending_handoff_kind == this_kind
                 and int(pending_handoff_rec.get("dispatch_generation", -1))

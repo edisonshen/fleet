@@ -340,6 +340,48 @@ def test_handoff_reader_dispatches_on_current(fleet_home: Path) -> None:
     assert rb.call_args.kwargs["dispatch_generation"] == 2
 
 
+def test_handoff_legacy_pending_NOT_reused_on_gen_gt0(fleet_home: Path) -> None:
+    # codex iter-5 [P2]: a legacy bare-string pending-acquire entry must
+    # NOT be reused on a gen>0 handoff. Its already-acquired prompt has no
+    # --dispatch-generation, so the handoff subagent would run ungated
+    # `fleet workers update` (rejected by the gen>0 CAS) → wedge. A legacy
+    # entry on a gen>0 row must be forgotten + a fresh id minted.
+    task = _make_task("ho-leg", status="in-progress", dispatch_generation=2)
+    _write_worker_state(
+        fleet_home, "fleet", "ho-leg",
+        {"slug": "ho-leg", "phase": "review-pending", "dispatch_generation": 2},
+    )
+    legacy_id = "0ff1aaaa"
+    coord_state = {"pending_acquire_agent_ids": {"ho-leg": legacy_id}}
+    forgotten: list[str] = []
+    real_forget = loop.supervisor_mod.forget_pending_acquire_agent_id
+
+    def _spy_forget(cs, slug):
+        forgotten.append(slug)
+        return real_forget(cs, slug)
+
+    with patch.object(dispatch, "project_is_git", return_value=True), \
+         patch.object(dispatch, "build_reviewer_prompt", return_value="reviewer prompt"), \
+         patch.object(dispatch, "mint_agent_id", return_value="cccccccc"), \
+         patch.object(
+             loop.supervisor_mod, "forget_pending_acquire_agent_id",
+             side_effect=_spy_forget,
+         ), \
+         patch.object(
+             dispatch, "acquire_coord_prompt_inbox",
+             return_value=str(fleet_home / "inbox" / "cccccccc.md"),
+         ), \
+         patch.object(dispatch, "format_dispatch_instruction", return_value="DISPATCH ..."):
+        actions = loop._dispatch_review_handoffs(
+            tasks=[task], project="fleet", fleet_bin="fleet",
+            fleet_home=str(fleet_home), home=fleet_home, coord_state=coord_state,
+        )
+    assert len(actions) == 1 and not actions[0].error
+    # The legacy entry was forgotten + a FRESH id minted (not the legacy id).
+    assert "ho-leg" in forgotten, "legacy gen>0 pending entry must be forgotten"
+    assert actions[0].agent_id == "cccccccc", "must mint fresh, not reuse legacy id"
+
+
 def test_no_launchable_dispatch_emitted_while_ready(fleet_home: Path) -> None:
     # Structural invariant: _dispatch_ready does NOT itself flip the task
     # row (it only PROPOSES actions); the status=in-progress flip happens
