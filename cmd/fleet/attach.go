@@ -17,6 +17,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/projectlookup"
+	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -407,7 +408,7 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		_, _ = fmt.Fprintf(opts.Stderr,
 			"%s: reaped stale %s; spawned %s for %s; attaching\n",
 			token, staleID, newID, project)
-		return attachFnVar(tmux.SessionName(newID))
+		return attachSpawnedSession(token, project, newID, opts)
 	}
 	// Path D: no coord at all → spawn fresh.
 	newID, derr := coordSpawnFnVar(project)
@@ -419,7 +420,30 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	_, _ = fmt.Fprintf(opts.Stderr,
 		"%s: no coord for %s; spawned %s; attaching\n",
 		token, project, newID)
-	return attachFnVar(tmux.SessionName(newID))
+	return attachSpawnedSession(token, project, newID, opts)
+}
+
+// attachSpawnedSession probes the freshly-spawned session before exec'ing
+// tmux.Attach and surfaces a SystemError when the spawn returned exit 0
+// but the session is DEFINITIVELY dead. dispatch treats some failure modes
+// (initial-prompt delivery hiccup, fast crash before first tmux paint) as
+// warnings on stdout — exit 0 alone doesn't guarantee an attachable
+// session. Without this gate, Tier 3 would exec into nothing and dead-end
+// the operator on tmux's own "no sessions" line, violating the never-exit
+// invariant. Codex review iter-2 P2.
+//
+// Transport errors from the probe stay conservative (proceed with attach)
+// — a flaky tmux socket shouldn't force a re-spawn loop when the real
+// session may well be live. Same discipline as runAttachFailover's Tier
+// 1/2 stale-live-record gate (codex review iter-1 P1).
+func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
+	session := tmux.SessionName(newID)
+	if alive, probeErr := sessionProbeFnVar(session); probeErr == nil && !alive {
+		return newSystemError(70, fmt.Sprintf(
+			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach <token> --project %s` (or `fleet dispatch --coord-spawn --project %s`) to retry; check ~/.fleet/agents/%s.json for clues",
+			project, session, project, project, newID))
+	}
+	return attachFnVar(session)
 }
 
 // derivSource identifies which step in the derivation pipeline picked
@@ -620,7 +644,23 @@ func shellCoordSpawn(project string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("locate self binary: %w", err)
 	}
-	cmd := exec.Command(self, "dispatch", "--coord-spawn", "--project", project)
+	args := []string{"dispatch", "--coord-spawn", "--project", project}
+	// Codex review iter-2 P1: pass --cwd <repo_path> when meta.json
+	// registers one. Without this, dispatch falls back to the attach
+	// process's cwd — which is almost certainly NOT the project's repo
+	// when the operator runs `fleet attach --project <p>` from another
+	// directory. The recovered coord would then run git/test/worktree
+	// commands against the wrong checkout.
+	//
+	// meta.json is optional (some legacy projects predate it); on absence
+	// or read failure, fall back to the existing behavior (no --cwd, let
+	// dispatch resolve). Don't fail the spawn for a missing meta — the
+	// invariant "never exit" still holds; the coord just lands in the
+	// caller's cwd as it did before this fix.
+	if meta, mErr := projects.Read(project); mErr == nil && meta.RepoPath != "" {
+		args = append(args, "--cwd", meta.RepoPath)
+	}
+	cmd := exec.Command(self, args...)
 	cmd.Env = os.Environ()
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -607,6 +607,51 @@ func TestSystemFailure_TmuxMissing_ReturnsSystemErr(t *testing.T) {
 	}
 }
 
+// TestSystemFailure_SpawnSessionDead — codex review iter-2 P2. dispatch
+// exits 0 but the newly-spawned tmux session is DEFINITIVELY dead (the
+// coord process crashed before the first tmux paint, or initial-prompt
+// delivery failed and the wrapper exited). Tier 3 must surface a
+// SystemError with the retry next-step command rather than exec'ing into
+// nothing and stranding the operator on tmux's "no sessions" error.
+func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	// Replace the dispatch stub: returns an ID but does NOT register
+	// fleet-<id> in aliveSessions → probe returns (false, nil).
+	coordSpawnFnVar = func(project string) (string, error) {
+		s.dispatched = append(s.dispatched, project)
+		r := agent.New("ghostxxx")
+		r.Project = project
+		r.TaskID = projectlookup.CoordTaskID(project)
+		r.TmuxSession = "fleet-ghostxxx"
+		if err := r.Write(); err != nil {
+			return "", err
+		}
+		// Intentionally do NOT add fleet-ghostxxx to aliveSessions.
+		return "ghostxxx", nil
+	}
+	s.addProjectDir(t, "projects-fleet")
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("expected SystemError when spawn session is dead")
+	}
+	if !strings.Contains(err.Error(), "session") || !strings.Contains(err.Error(), "ghostxxx") {
+		t.Errorf("err must name the dead session: %q", err.Error())
+	}
+	// Must surface a concrete retry command (surface-don't-silo).
+	if !strings.Contains(err.Error(), "re-run") {
+		t.Errorf("err must surface next-step retry command: %q", err.Error())
+	}
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(spawn session dead): got %d want 70", ec)
+	}
+	// Attach must NOT have been called — we'd otherwise have exec'd
+	// into a dead session, defeating the gate.
+	if s.attachCalls != 0 {
+		t.Errorf("attach must not be called when spawn session is dead; got %d calls", s.attachCalls)
+	}
+}
+
 func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
