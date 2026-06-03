@@ -2616,6 +2616,56 @@ func TestReconcile_WorkerRecords_Parked_DeadPid_RefusesUnlink(t *testing.T) {
 	}
 }
 
+// TestReconcile_WorkerRecords_Parked_ProbeError_FailsClosed pins the
+// codex review-iter [P2]: when LoadTaskParked returns an ERROR (tasks.md
+// momentarily unreadable), the classifier must NOT fall through to the
+// removal branches — under --apply that could rm-rf a dirty-worktree
+// recovery dir the parked marker protects. It must surface + skip (fail
+// closed), even when the row is otherwise a removable task-terminal/stale
+// candidate.
+func TestReconcile_WorkerRecords_Parked_ProbeError_FailsClosed(t *testing.T) {
+	now := time.Date(2026, 6, 3, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parkerr-tttt/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet", Slug: "parkerr-tttt", Path: workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		// stale-heartbeat candidate (pid=0, old) — would normally remove.
+		return WorkerState{
+			Slug: "parkerr-tttt", Project: "projects-fleet",
+			Pid: 0, UpdatedAt: now.Add(-48 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskStatus = func(string, string) (string, error) { return "done", nil }
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "", errors.New("tasks.md unreadable")
+	}
+	deps.RemoveWorkerRecord = func(p string) error {
+		t.Fatalf("RemoveWorkerRecord(%q) called despite a parked-probe ERROR — must fail closed ([P2])", p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked-probe-error verb=%q, want %q (fail closed)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "probe failed") {
+		t.Fatalf("reason=%q does not name the fail-closed probe error", a.Reason)
+	}
+}
+
 // TestReconcile_WorkerRecords_TaskTerminal_NilParkedDep is the
 // back-compat path: an older Deps with no LoadTaskParked wiring behaves
 // as if no row is parked (the task-terminal branch still applies).

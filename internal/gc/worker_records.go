@@ -173,7 +173,24 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		// below (#2) still wins because a live worker is never touched
 		// regardless of parked state.
 		if deps.LoadTaskParked != nil {
-			if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
+			parked, perr := deps.LoadTaskParked(info.Project, info.Slug)
+			if perr != nil {
+				// FAIL CLOSED (codex review-iter [P2]): a parked-read error
+				// (e.g. tasks.md momentarily unreadable) must NOT fall
+				// through to the removal branches — under --apply that
+				// could rm-rf a dirty-worktree recovery dir the `parked`
+				// marker exists to protect. Surface + skip; the next run
+				// re-evaluates once the read succeeds.
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: fmt.Sprintf(
+						"parked-state probe failed (%v) — cannot prove the row "+
+							"is not PARKED; refusing to remove (fail closed). "+
+							"Retry once tasks.md is readable", perr),
+				})
+				continue
+			}
+			if parked != "" {
 				r.Actions = append(r.Actions, Action{
 					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
 					Reason: fmt.Sprintf(
