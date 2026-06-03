@@ -420,6 +420,43 @@ class TestWorktreeCleanupContext:
         assert set(tbs.keys()) == {"a", "b"}
 
 
+class TestSweepDoneDirtyGuard:
+    """codex round-4 [P2]: the done-dir sweep must NOT erase a worker dir
+    whose `done` task still has a dirty worktree on disk (the operator-
+    manual-`done` window, before the every-N-ticks Go backstop sees it)."""
+
+    def test_sweep_keeps_dir_when_worktree_dirty(self, tmp_path):
+        home = tmp_path
+        wdir = home / "projects" / "p" / "workers" / "manual-aaaa"
+        wdir.mkdir(parents=True)
+        (wdir / "state.json").write_text("{}", encoding="utf-8")
+        wt = home / "projects" / "p" / "worktrees" / "manual-aaaa"
+        wt.mkdir(parents=True)
+        t = _task("manual-aaaa", status="done", worktree=str(wt), branch="worker/manual-aaaa")
+        deleted = {"called": False}
+        with patch.object(worktree_mod, "worktree_is_dirty", return_value=(True, "")), \
+             patch.object(loop, "_maybe_delete_worker_dir",
+                          side_effect=lambda *a, **k: deleted.__setitem__("called", True)):
+            swept = loop._sweep_done_worker_dirs([t], "p", "fleet", home=home)
+        assert deleted["called"] is False, "dirty done worktree → worker dir KEPT"
+        assert swept == 0
+
+    def test_sweep_deletes_dir_when_worktree_clean(self, tmp_path):
+        home = tmp_path
+        wdir = home / "projects" / "p" / "workers" / "clean-bbbb"
+        wdir.mkdir(parents=True)
+        (wdir / "state.json").write_text("{}", encoding="utf-8")
+        wt = home / "projects" / "p" / "worktrees" / "clean-bbbb"
+        wt.mkdir(parents=True)
+        t = _task("clean-bbbb", status="done", worktree=str(wt), branch="worker/clean-bbbb")
+        deleted = {"called": False}
+        with patch.object(worktree_mod, "worktree_is_dirty", return_value=(False, "")), \
+             patch.object(loop, "_maybe_delete_worker_dir",
+                          side_effect=lambda *a, **k: deleted.__setitem__("called", True)):
+            loop._sweep_done_worker_dirs([t], "p", "fleet", home=home)
+        assert deleted["called"] is True, "clean done worktree → worker dir swept"
+
+
 class TestDispatchClearsParked:
     """codex [P2]: (re-)dispatch must clear a resolved `parked` marker so
     the next completion's worker-dir sweep / Go GC don't hard-keep it."""

@@ -5069,6 +5069,28 @@ def _sweep_done_worker_dirs(
         # also skipped — a parked row is still mid-lifecycle.)
         if getattr(t, "parked", ""):
             continue
+        # DESIGN §4.2 ordering belt (codex [P2]): a `done` transition that
+        # bypassed reconcile/sentinel (e.g. operator `fleet tasks set
+        # status=done`) never ran the §4.2 park logic, so `parked` is empty
+        # even when the worktree is still on disk AND dirty. This sweep runs
+        # EARLIER in the tick than the every-N-ticks Go worktree-gc backstop,
+        # so without this guard it would erase the recovery context before
+        # the backstop ever sees the dirty tree. Skip the delete when the
+        # row still carries a worktree= that exists on disk and is dirty —
+        # the operator inspects/commits/discards it first. Only probes git
+        # for `done` rows that still have an unreaped worktree= (rare).
+        wt = getattr(t, "worktree", "")
+        if wt and os.path.exists(wt):
+            dirty, derr = worktree_mod.worktree_is_dirty(wt)
+            if dirty or derr:
+                import sys
+                print(
+                    f"coord: sweep keeping worker dir for done task {t.slug} — "
+                    f"worktree {wt} is dirty/undeterminable "
+                    f"({'dirty' if dirty else derr}); resolve it first",
+                    file=sys.stderr,
+                )
+                continue
         # Codex iter-6 [P2]: even if the worker dir is already gone
         # (sweep already ran on a prior tick), the slug may still have
         # a live coord_prompt_inbox claim from when it was in-progress.

@@ -484,11 +484,16 @@ func loadTaskParkedOnDisk(project, slug string) (string, error) {
 	if ferr != nil {
 		return "", ferr
 	}
-	if v := normalizeParked(val); found && v != "" {
-		return v, nil
+	// The LIVE row is the source of truth (codex [P2]): if the slug is
+	// present in tasks.md, its parked value WINS — even when empty/cleared
+	// (a resolved park). Only when the slug is ABSENT from tasks.md (it was
+	// auto-archived) do we fall back to the archive, where a preserved
+	// parked field still protects the worker dir. This avoids a stale
+	// archived park (from the brief tasks.md+archive coexistence window)
+	// overriding a live row that says the park was resolved.
+	if found {
+		return normalizeParked(val), nil
 	}
-	// Not parked in (or not present in) tasks.md → check the archive. A
-	// non-empty parked there still protects the worker dir.
 	archivePath := filepath.Join(filepath.Clean(dir), "tasks-archive.md")
 	aval, _, aerr := taskFieldRawInFile(archivePath, slug, "- parked:")
 	if aerr != nil {
