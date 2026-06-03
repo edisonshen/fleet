@@ -110,6 +110,18 @@ type Task struct {
 	Updated    time.Time
 	StartedAt  time.Time // First time status flipped to in-progress; sticky.
 	FinishedAt time.Time // Most recent flip into done/abandoned; cleared on reopen.
+	// DispatchGeneration is the coord-owned per-slug fence token
+	// (DESIGN-coord-worktree-lifecycle §1). Absent / legacy rows read as
+	// 0; the coord increments by 1 on every genuine (re-)dispatch.
+	// Additive in this PR: parsed + rendered only; no writer sets it yet
+	// beyond `fleet tasks set`.
+	DispatchGeneration int
+	// Parked is a durable "leave this worktree/worker-dir alone" marker
+	// (DESIGN §4.2): a free-form `<UTC ts + reason>` string set when a
+	// dirty worktree is parked, cleared on resolve. Empty = not parked.
+	// Additive in this PR: parsed + rendered only; no writer sets it yet
+	// beyond `fleet tasks set`.
+	Parked     string
 	DependsOn  []string
 	SpawnedBy  string
 	Spec       string
@@ -352,6 +364,8 @@ func Archive(project string, slugs []string) error {
 				existing.PRURL = t.PRURL
 				existing.Branch = t.Branch
 				existing.Updated = t.Updated
+				existing.DispatchGeneration = t.DispatchGeneration
+				existing.Parked = t.Parked
 				existing.DependsOn = t.DependsOn
 				existing.SpawnedBy = t.SpawnedBy
 				existing.Spec = t.Spec
@@ -901,6 +915,22 @@ func setKV(t *Task, k, v string, lineNum int, raw string) error {
 			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid finished_at: " + err.Error()}
 		}
 		t.FinishedAt = ts
+	case "dispatch_generation":
+		// Coord-owned per-slug fence token (DESIGN §1). Empty / "null" /
+		// absent → 0 (legacy). Non-required; old rows parse fine.
+		if v == "" || v == "null" {
+			t.DispatchGeneration = 0
+			return nil
+		}
+		n, err := ParseDispatchGeneration(v)
+		if err != nil {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: err.Error()}
+		}
+		t.DispatchGeneration = n
+	case "parked":
+		// Durable dirty-worktree park marker (DESIGN §4.2). Empty / "null"
+		// → not parked. Non-required; old rows parse fine.
+		t.Parked = nullToEmpty(v)
 	case "depends_on":
 		deps, err := parseDeps(v)
 		if err != nil {
@@ -929,6 +959,35 @@ func parseTime(v string) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Parse(time.RFC3339, v)
+}
+
+// ParseDispatchGeneration parses the dispatch_generation bullet value
+// under a deliberately tight grammar: bare ASCII decimal digits only
+// ([0-9]+), non-negative, bounded by int32 max. The bound keeps the
+// Go and Python parsers (parse.py) in exact lockstep — strconv.Atoi
+// would accept a leading '+' sign and platform-dependent 64-bit
+// overflow that the Python mirror (isascii()+isdigit()) does not, and
+// a fence token never needs values past a few thousand. Empty / "null"
+// are handled by callers (legacy → 0). (codex iter-2 P2)
+func ParseDispatchGeneration(v string) (int, error) {
+	if v == "" {
+		return 0, fmt.Errorf("invalid dispatch_generation: empty")
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, fmt.Errorf("invalid dispatch_generation: %s", v)
+		}
+	}
+	// Bound to int32 max so a pathological digit string can't overflow
+	// or diverge across the two parsers.
+	if len(v) > 10 {
+		return 0, fmt.Errorf("dispatch_generation too large: %s", v)
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n > 1<<31-1 {
+		return 0, fmt.Errorf("dispatch_generation too large: %s", v)
+	}
+	return n, nil
 }
 
 // parseDeps parses a JSON-array literal of slugs: `[]`, `[a]`, `[a, b]`.
@@ -1033,6 +1092,11 @@ func renderTask(b *strings.Builder, t *Task) error {
 	// shape — see optionalLifecycleBullets comment.
 	writeOptional(b, "started_at", formatTime(t.StartedAt))
 	writeOptional(b, "finished_at", formatTime(t.FinishedAt))
+	// Coord-lifecycle fields (DESIGN-coord-worktree-lifecycle §1/§4.2).
+	// dispatch_generation is ALWAYS emitted (like worker_pid) so re-saved
+	// old rows pick up the new shape; parked is optional (like worktree).
+	fmt.Fprintf(b, "- dispatch_generation: %d\n", t.DispatchGeneration)
+	writeOptional(b, "parked", t.Parked)
 	fmt.Fprintf(b, "- depends_on: %s\n", formatDeps(t.DependsOn))
 	writeOptional(b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')

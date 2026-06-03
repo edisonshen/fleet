@@ -105,6 +105,15 @@ class Task:
     # the authoritative state machine.
     started_at: _dt.datetime | None = None
     finished_at: _dt.datetime | None = None
+    # Coord-owned per-slug fence token (DESIGN-coord-worktree-lifecycle
+    # §1). Absent / legacy = 0; coord increments by 1 on every genuine
+    # (re-)dispatch. Additive in PR1: parsed + rendered only, no writer
+    # sets it yet beyond `fleet tasks set`.
+    dispatch_generation: int = 0
+    # Durable dirty-worktree park marker (DESIGN §4.2): a free-form
+    # `<UTC ts + reason>` string set when a dirty worktree is parked,
+    # cleared on resolve. Empty == not parked. Additive in PR1.
+    parked: str = ""
     depends_on: list[str] = field(default_factory=list)
     spawned_by: str = ""
     spec: str = ""
@@ -459,6 +468,30 @@ def _set_kv(t: Task, k: str, v: str, lineno: int, raw: str) -> None:
         t.started_at = _parse_time(v, lineno, raw, "started_at")
     elif k == "finished_at":
         t.finished_at = _parse_time(v, lineno, raw, "finished_at")
+    elif k == "dispatch_generation":
+        # Coord-owned per-slug fence token (DESIGN §1). Empty / "null" /
+        # absent → 0 (legacy). Non-required; old rows parse fine.
+        if v in ("", "null"):
+            t.dispatch_generation = 0
+            return
+        # Tight grammar identical to Go tasks.ParseDispatchGeneration:
+        # bare ASCII decimal digits only ([0-9]+), non-negative, bounded
+        # by int32 max. Python int() is laxer (accepts "1_000", Unicode
+        # digits, '+5', and unbounded precision), all of which would
+        # drift the Go/Python parser lockstep. (codex iter-2 P2)
+        if not v.isascii() or not v.isdigit():
+            raise ParseError(
+                lineno, 1, raw, f"invalid dispatch_generation: {v}",
+            )
+        if len(v) > 10 or int(v) > 2**31 - 1:
+            raise ParseError(
+                lineno, 1, raw, f"dispatch_generation too large: {v}",
+            )
+        t.dispatch_generation = int(v)
+    elif k == "parked":
+        # Durable dirty-worktree park marker (DESIGN §4.2). Empty /
+        # "null" → not parked. Non-required; old rows parse fine.
+        t.parked = "" if v == "null" else v
     elif k == "depends_on":
         t.depends_on = _parse_deps(v, lineno, raw)
     elif k == "spawned_by":
@@ -579,6 +612,10 @@ def _render_task(t: Task) -> str:
     # rows pick up the new shape. Matches Go's renderTask order.
     parts.append(_optional("started_at", _format_time(t.started_at)))
     parts.append(_optional("finished_at", _format_time(t.finished_at)))
+    # Coord-lifecycle fields (DESIGN §1/§4.2). dispatch_generation is
+    # ALWAYS emitted (like worker_pid); parked is optional (like worktree).
+    parts.append(f"- dispatch_generation: {t.dispatch_generation}\n")
+    parts.append(_optional("parked", t.parked))
     parts.append(f"- depends_on: {_format_deps(t.depends_on)}\n")
     parts.append(_optional("spawned_by", t.spawned_by))
     parts.append("\n")

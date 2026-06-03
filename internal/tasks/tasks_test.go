@@ -897,7 +897,9 @@ func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
 		PRURL:  "https://example.com/pr/42",
 		Branch: "feat/edits", Notes: "extra context from operator",
 		Spec: "edited spec", Acceptance: "edited acceptance",
-		DependsOn: []string{"beta-5678"},
+		DependsOn:          []string{"beta-5678"},
+		DispatchGeneration: 5,
+		Parked:             "2026-05-06T11:30:00Z dirty: leftover",
 	}
 	if err := Write(filepath.Join(dir, "tasks.md"), &File{
 		Schema: 1, Tasks: []*Task{edited},
@@ -951,6 +953,14 @@ func TestArchive_RetryPreservesOperatorEdits(t *testing.T) {
 	}
 	if len(got.DependsOn) != 1 || got.DependsOn[0] != "beta-5678" {
 		t.Errorf("DependsOn = %v; want [beta-5678]", got.DependsOn)
+	}
+	// New coord-lifecycle fields (DESIGN PR1) must also survive the
+	// retry-refresh, not be dropped to zero (codex iter-1 P2).
+	if got.DispatchGeneration != 5 {
+		t.Errorf("DispatchGeneration = %d; want 5 (operator edit lost)", got.DispatchGeneration)
+	}
+	if got.Parked != "2026-05-06T11:30:00Z dirty: leftover" {
+		t.Errorf("Parked = %q; want the operator-edited park marker", got.Parked)
 	}
 	// Created must be immutable identity — unchanged.
 	if !got.Created.Equal(created) {
@@ -1161,6 +1171,172 @@ func TestLifecycle_RejectsBadStartedAt(t *testing.T) {
 	}
 	if !strings.Contains(pe.Msg, "started_at") {
 		t.Errorf("Msg=%q; want substring 'started_at'", pe.Msg)
+	}
+}
+
+// ---- DESIGN-coord-worktree-lifecycle PR1: schema rollout (T8) ----
+
+// TestSchema_DispatchGenerationParkedRoundTrip exercises the two new
+// coord-lifecycle fields end-to-end: set on a Task, Write, Read back,
+// and assert both survive. dispatch_generation is the per-slug fence
+// token (§1); parked is the durable dirty-worktree marker (§4.2).
+func TestSchema_DispatchGenerationParkedRoundTrip(t *testing.T) {
+	now := time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC)
+	tk := &Task{
+		Slug: "schema-1234", Status: StatusInProgress, Priority: PriorityP1,
+		Created: now, Updated: now,
+		DispatchGeneration: 3,
+		Parked:             "2026-06-03T10:00:00Z dirty: uncommitted edits",
+		SpawnedBy:          "user", Spec: "s", Acceptance: "a", Notes: "",
+	}
+	f := &File{Schema: 1}
+	if err := f.Add(tk); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	tmp := filepath.Join(t.TempDir(), "schema.md")
+	if err := Write(tmp, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(got.Tasks))
+	}
+	if got.Tasks[0].DispatchGeneration != 3 {
+		t.Errorf("DispatchGeneration=%d; want 3", got.Tasks[0].DispatchGeneration)
+	}
+	if got.Tasks[0].Parked != tk.Parked {
+		t.Errorf("Parked=%q; want %q", got.Tasks[0].Parked, tk.Parked)
+	}
+}
+
+// TestSchema_BothKeysParseCleanly verifies a hand-written task block
+// carrying BOTH new bullets parses without error (T8: before any
+// writer runs). The on-disk canonical position is after finished_at,
+// before depends_on.
+func TestSchema_BothKeysParseCleanly(t *testing.T) {
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: both-1234\n\n" +
+		"- status: in-progress\n- priority: P0\n- worker_pid: 0\n" +
+		"- worktree: /wt/both\n- pr_url:\n- branch: worker/both-1234\n" +
+		"- created: 2026-06-03T10:00:00Z\n- updated: 2026-06-03T10:00:00Z\n" +
+		"- started_at:\n- finished_at:\n" +
+		"- dispatch_generation: 7\n" +
+		"- parked: 2026-06-03T10:00:00Z dirty\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "both.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read both-keys file: %v", err)
+	}
+	if len(f.Tasks) != 1 {
+		t.Fatalf("Tasks=%d; want 1", len(f.Tasks))
+	}
+	if f.Tasks[0].DispatchGeneration != 7 {
+		t.Errorf("DispatchGeneration=%d; want 7", f.Tasks[0].DispatchGeneration)
+	}
+	if f.Tasks[0].Parked != "2026-06-03T10:00:00Z dirty" {
+		t.Errorf("Parked=%q; want the dirty marker", f.Tasks[0].Parked)
+	}
+}
+
+// TestSchema_AbsentKeysAreLegacyDefaults verifies a legacy row lacking
+// both new bullets parses to gen 0 / not-parked, and a re-Write emits
+// the canonical bullets (dispatch_generation always, parked empty).
+func TestSchema_AbsentKeysAreLegacyDefaults(t *testing.T) {
+	src := "---\nschema: v1\n---\n\n" +
+		"## task: legacy-1234\n\n" +
+		"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+		"- worktree:\n- pr_url:\n- branch:\n" +
+		"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+		"- depends_on: []\n- spawned_by: user\n\n" +
+		"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+	tmp := filepath.Join(t.TempDir(), "legacy.md")
+	if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	f, err := Read(tmp)
+	if err != nil {
+		t.Fatalf("Read legacy: %v", err)
+	}
+	if f.Tasks[0].DispatchGeneration != 0 {
+		t.Errorf("DispatchGeneration=%d; want 0 (legacy)", f.Tasks[0].DispatchGeneration)
+	}
+	if f.Tasks[0].Parked != "" {
+		t.Errorf("Parked=%q; want empty (legacy)", f.Tasks[0].Parked)
+	}
+	out := filepath.Join(t.TempDir(), "out.md")
+	if err := Write(out, f); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	// Canonical position: after finished_at, before depends_on.
+	want := "- finished_at:\n- dispatch_generation: 0\n- parked:\n- depends_on: []\n"
+	if !strings.Contains(string(got), want) {
+		t.Errorf("re-saved file missing canonical new bullets:\n--- got ---\n%s\n--- want substring ---\n%s", got, want)
+	}
+}
+
+// TestSchema_RejectsBadDispatchGeneration — non-numeric / negative
+// dispatch_generation surfaces a ParseError, not a silent 0.
+func TestSchema_RejectsBadDispatchGeneration(t *testing.T) {
+	for _, bad := range []string{"abc", "-1", "1.5"} {
+		src := "---\nschema: v1\n---\n\n" +
+			"## task: badgen-1234\n\n" +
+			"- status: todo\n- priority: P1\n- worker_pid: 0\n" +
+			"- worktree:\n- pr_url:\n- branch:\n" +
+			"- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n" +
+			"- dispatch_generation: " + bad + "\n" +
+			"- depends_on: []\n- spawned_by: user\n\n" +
+			"### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+		tmp := filepath.Join(t.TempDir(), "badgen.md")
+		if err := os.WriteFile(tmp, []byte(src), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, err := Read(tmp)
+		if err == nil {
+			t.Fatalf("Read accepted bad dispatch_generation %q; want ParseError", bad)
+		}
+		var pe *ParseError
+		if !errors.As(err, &pe) {
+			t.Errorf("%q: got %T %v; want *ParseError", bad, err, err)
+		} else if !strings.Contains(pe.Msg, "dispatch_generation") {
+			t.Errorf("%q: Msg=%q; want substring 'dispatch_generation'", bad, pe.Msg)
+		}
+	}
+}
+
+// TestParseDispatchGeneration exercises the shared [0-9]+ grammar used
+// by both the on-disk parser and `fleet tasks set`, kept in lockstep
+// with parse.py's mirror (codex iter-2 P2).
+func TestParseDispatchGeneration(t *testing.T) {
+	okCases := map[string]int{"0": 0, "1": 1, "42": 42, "2147483647": 1<<31 - 1}
+	for in, want := range okCases {
+		got, err := ParseDispatchGeneration(in)
+		if err != nil {
+			t.Errorf("ParseDispatchGeneration(%q) err=%v; want %d", in, err, want)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseDispatchGeneration(%q)=%d; want %d", in, got, want)
+		}
+	}
+	// Rejected: signs, decimals, non-digits, underscores, overflow.
+	// These mirror exactly what parse.py's isascii()+isdigit()+bound
+	// refuses, so a hand-edited row parses the same in both paths.
+	for _, bad := range []string{"", "abc", "-1", "+5", "1.5", "1_000", "9999999999", "12345678901", "0x10"} {
+		if _, err := ParseDispatchGeneration(bad); err == nil {
+			t.Errorf("ParseDispatchGeneration(%q) accepted; want error", bad)
+		}
 	}
 }
 

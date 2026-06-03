@@ -14,6 +14,8 @@ schema: v1
 - updated: 2026-05-06T11:30:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 

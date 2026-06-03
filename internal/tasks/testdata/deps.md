@@ -14,6 +14,8 @@ schema: v1
 - updated: 2026-05-01T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -40,6 +42,8 @@ Foundation done.
 - updated: 2026-05-02T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: [foundation-aaaa]
 - spawned_by: user
 
@@ -66,6 +70,8 @@ Middle done.
 - updated: 2026-05-03T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: [foundation-aaaa, middle-bbbb]
 - spawned_by: user
 
