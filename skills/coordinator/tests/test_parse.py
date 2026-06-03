@@ -12,12 +12,18 @@ on Write so the round-trip drifts on purpose — exercised separately).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 from pathlib import Path
 
 import pytest
 
 import parse
+
+
+def _DT(*args: int) -> _dt.datetime:
+    """UTC datetime helper for task timestamps in tests."""
+    return _dt.datetime(*args, tzinfo=_dt.timezone.utc)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -233,3 +239,94 @@ def test_writes_atomic(tmp_path) -> None:
     # No leftover .tmp files in the parent directory.
     leftovers = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
     assert leftovers == []
+
+
+# ---- DESIGN-coord-worktree-lifecycle PR1 (T8): new task-row fields ----
+
+
+def test_dispatch_generation_parked_round_trip() -> None:
+    """dispatch_generation (int) + parked (str) set on a Task survive a
+    render → parse round-trip. The two new coord-lifecycle fields
+    (DESIGN §1 / §4.2)."""
+    f = parse.File(schema=1)
+    t = parse.Task(
+        slug="schema-1234",
+        status="in-progress",
+        priority="P1",
+        created=_DT(2026, 6, 3, 10, 0, 0),
+        updated=_DT(2026, 6, 3, 10, 0, 0),
+        dispatch_generation=3,
+        parked="2026-06-03T10:00:00Z dirty: uncommitted edits",
+        spawned_by="user",
+        spec="s",
+        acceptance="a",
+    )
+    f.tasks.append(t)
+    rendered = parse.render(f)
+    back = parse.parse(rendered)
+    assert len(back.tasks) == 1
+    assert back.tasks[0].dispatch_generation == 3
+    assert back.tasks[0].parked == t.parked
+
+
+def test_both_keys_parse_cleanly() -> None:
+    """A hand-written task block carrying BOTH new bullets parses without
+    error (T8: before any writer runs). Canonical position is after
+    finished_at, before depends_on."""
+    src = (
+        "---\nschema: v1\n---\n\n"
+        "## task: both-1234\n\n"
+        "- status: in-progress\n- priority: P0\n- worker_pid: 0\n"
+        "- worktree: /wt/both\n- pr_url:\n- branch: worker/both-1234\n"
+        "- created: 2026-06-03T10:00:00Z\n- updated: 2026-06-03T10:00:00Z\n"
+        "- started_at:\n- finished_at:\n"
+        "- dispatch_generation: 7\n"
+        "- parked: 2026-06-03T10:00:00Z dirty\n"
+        "- depends_on: []\n- spawned_by: user\n\n"
+        "### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+    ).encode("utf-8")
+    f = parse.parse(src)
+    assert len(f.tasks) == 1
+    assert f.tasks[0].dispatch_generation == 7
+    assert f.tasks[0].parked == "2026-06-03T10:00:00Z dirty"
+
+
+def test_absent_keys_are_legacy_defaults() -> None:
+    """A legacy row lacking both bullets parses to gen 0 / not-parked,
+    and a re-render emits the canonical bullets in position."""
+    src = (
+        "---\nschema: v1\n---\n\n"
+        "## task: legacy-1234\n\n"
+        "- status: todo\n- priority: P1\n- worker_pid: 0\n"
+        "- worktree:\n- pr_url:\n- branch:\n"
+        "- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n"
+        "- depends_on: []\n- spawned_by: user\n\n"
+        "### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+    ).encode("utf-8")
+    f = parse.parse(src)
+    assert f.tasks[0].dispatch_generation == 0
+    assert f.tasks[0].parked == ""
+    rendered = parse.render(f)
+    assert (
+        "- finished_at:\n- dispatch_generation: 0\n- parked:\n- depends_on: []\n"
+        in rendered
+    )
+
+
+def test_rejects_bad_dispatch_generation() -> None:
+    """Non-numeric / negative dispatch_generation surfaces a ParseError,
+    not a silent 0."""
+    for bad in ("abc", "-1", "1.5"):
+        src = (
+            "---\nschema: v1\n---\n\n"
+            "## task: badgen-1234\n\n"
+            "- status: todo\n- priority: P1\n- worker_pid: 0\n"
+            "- worktree:\n- pr_url:\n- branch:\n"
+            "- created: 2026-05-06T10:00:00Z\n- updated: 2026-05-06T10:00:00Z\n"
+            f"- dispatch_generation: {bad}\n"
+            "- depends_on: []\n- spawned_by: user\n\n"
+            "### Spec\n\nA.\n\n### Acceptance\n\nA.\n\n### Notes\n\n"
+        ).encode("utf-8")
+        with pytest.raises(parse.ParseError) as exc_info:
+            parse.parse(src)
+        assert "dispatch_generation" in exc_info.value.msg

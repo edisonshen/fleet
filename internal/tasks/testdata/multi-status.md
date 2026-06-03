@@ -14,6 +14,8 @@ schema: v1
 - updated: 2026-05-01T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -40,6 +42,8 @@ Alpha done.
 - updated: 2026-05-02T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -66,6 +70,8 @@ Beta done.
 - updated: 2026-05-03T11:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -92,6 +98,8 @@ Gamma done.
 - updated: 2026-05-04T12:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -118,6 +126,8 @@ Delta done.
 - updated: 2026-05-05T13:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -144,6 +154,8 @@ Epsilon done.
 - updated: 2026-05-06T10:30:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -170,6 +182,8 @@ Zeta done.
 - updated: 2026-05-06T11:30:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 

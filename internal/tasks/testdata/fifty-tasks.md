@@ -14,6 +14,8 @@ schema: v1
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -40,6 +42,8 @@ Bulk task 0 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -66,6 +70,8 @@ Bulk task 1 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -92,6 +98,8 @@ Bulk task 2 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -118,6 +126,8 @@ Bulk task 3 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -144,6 +154,8 @@ Bulk task 4 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -170,6 +182,8 @@ Bulk task 5 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -196,6 +210,8 @@ Bulk task 6 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -222,6 +238,8 @@ Bulk task 7 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -248,6 +266,8 @@ Bulk task 8 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -274,6 +294,8 @@ Bulk task 9 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -300,6 +322,8 @@ Bulk task 10 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -326,6 +350,8 @@ Bulk task 11 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -352,6 +378,8 @@ Bulk task 12 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -378,6 +406,8 @@ Bulk task 13 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -404,6 +434,8 @@ Bulk task 14 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -430,6 +462,8 @@ Bulk task 15 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -456,6 +490,8 @@ Bulk task 16 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -482,6 +518,8 @@ Bulk task 17 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -508,6 +546,8 @@ Bulk task 18 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -534,6 +574,8 @@ Bulk task 19 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -560,6 +602,8 @@ Bulk task 20 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -586,6 +630,8 @@ Bulk task 21 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -612,6 +658,8 @@ Bulk task 22 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -638,6 +686,8 @@ Bulk task 23 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -664,6 +714,8 @@ Bulk task 24 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -690,6 +742,8 @@ Bulk task 25 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -716,6 +770,8 @@ Bulk task 26 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -742,6 +798,8 @@ Bulk task 27 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -768,6 +826,8 @@ Bulk task 28 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -794,6 +854,8 @@ Bulk task 29 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -820,6 +882,8 @@ Bulk task 30 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -846,6 +910,8 @@ Bulk task 31 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -872,6 +938,8 @@ Bulk task 32 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -898,6 +966,8 @@ Bulk task 33 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -924,6 +994,8 @@ Bulk task 34 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -950,6 +1022,8 @@ Bulk task 35 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -976,6 +1050,8 @@ Bulk task 36 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1002,6 +1078,8 @@ Bulk task 37 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1028,6 +1106,8 @@ Bulk task 38 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1054,6 +1134,8 @@ Bulk task 39 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1080,6 +1162,8 @@ Bulk task 40 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1106,6 +1190,8 @@ Bulk task 41 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1132,6 +1218,8 @@ Bulk task 42 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1158,6 +1246,8 @@ Bulk task 43 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1184,6 +1274,8 @@ Bulk task 44 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1210,6 +1302,8 @@ Bulk task 45 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1236,6 +1330,8 @@ Bulk task 46 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1262,6 +1358,8 @@ Bulk task 47 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 
@@ -1288,6 +1386,8 @@ Bulk task 48 acceptance.
 - updated: 2026-05-06T10:00:00Z
 - started_at:
 - finished_at:
+- dispatch_generation: 0
+- parked:
 - depends_on: []
 - spawned_by: user
 

@@ -595,6 +595,94 @@ func TestTasksSet_RejectsNonNumericPID(t *testing.T) {
 	}
 }
 
+// ---- DESIGN-coord-worktree-lifecycle PR1 (T8): tasks set round-trip ----
+
+// TestTasksSet_DispatchGenerationParked exercises `fleet tasks set
+// <slug> dispatch_generation=` and `parked=` round-trip through the
+// CLI: set, read back, clear.
+func TestTasksSet_DispatchGenerationParked(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "wtlc-set", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+
+	// Defaults: gen 0, not parked.
+	if row := listTaskRow(t, project, slug); row.DispatchGeneration != 0 || row.Parked != "" {
+		t.Fatalf("defaults: gen=%d parked=%q; want 0 / empty", row.DispatchGeneration, row.Parked)
+	}
+
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "dispatch_generation=4", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set dispatch_generation: %v", err)
+	}
+	parkVal := "2026-06-03T10:00:00Z dirty: uncommitted edits"
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "parked="+parkVal, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set parked: %v", err)
+	}
+	row := listTaskRow(t, project, slug)
+	if row.DispatchGeneration != 4 {
+		t.Errorf("DispatchGeneration=%d; want 4", row.DispatchGeneration)
+	}
+	if row.Parked != parkVal {
+		t.Errorf("Parked=%q; want %q", row.Parked, parkVal)
+	}
+
+	// Clearing parked with the empty value resets it.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "parked=", &bytes.Buffer{}); err != nil {
+		t.Fatalf("clear parked: %v", err)
+	}
+	if row := listTaskRow(t, project, slug); row.Parked != "" {
+		t.Errorf("Parked=%q after clear; want empty", row.Parked)
+	}
+	// Resetting generation to 0 works too.
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "dispatch_generation=0", &bytes.Buffer{}); err != nil {
+		t.Fatalf("reset dispatch_generation: %v", err)
+	}
+	if row := listTaskRow(t, project, slug); row.DispatchGeneration != 0 {
+		t.Errorf("DispatchGeneration=%d after reset; want 0", row.DispatchGeneration)
+	}
+}
+
+// TestTasksSet_RejectsBadDispatchGeneration — non-numeric / negative
+// dispatch_generation is rejected (matching the parser).
+func TestTasksSet_RejectsBadDispatchGeneration(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "wtlc-badgen", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	for _, bad := range []string{"123abc", "-5", "1.5"} {
+		if err := runTasksSet(&tasksSetOpts{project: project}, slug, "dispatch_generation="+bad, &bytes.Buffer{}); err == nil {
+			t.Errorf("set dispatch_generation=%q accepted; want error", bad)
+		}
+	}
+}
+
+// TestTasksSet_RejectsMultilineParked — parked is a scalar bullet; a
+// newline would corrupt the row on round-trip.
+func TestTasksSet_RejectsMultilineParked(t *testing.T) {
+	_, project := setupTasksHome(t)
+	addOut := &bytes.Buffer{}
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "wtlc-parkml", priority: "P1",
+		spec: "x", spawnedBy: "user", status: "todo",
+	}, "", addOut); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	slug := strings.Fields(addOut.String())[1]
+	if err := runTasksSet(&tasksSetOpts{project: project}, slug, "parked=line1\nline2", &bytes.Buffer{}); err == nil {
+		t.Error("set parked with newline accepted; want error")
+	}
+}
+
 // TestTasksAdd_RejectsArchivedSlug — codex iter-4 P2: explicit --slug
 // matching an archived slug must fail. Otherwise re-archive later
 // returns ErrDuplicateSlug and the task lifecycle gets stuck.

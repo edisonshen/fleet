@@ -110,6 +110,18 @@ type Task struct {
 	Updated    time.Time
 	StartedAt  time.Time // First time status flipped to in-progress; sticky.
 	FinishedAt time.Time // Most recent flip into done/abandoned; cleared on reopen.
+	// DispatchGeneration is the coord-owned per-slug fence token
+	// (DESIGN-coord-worktree-lifecycle §1). Absent / legacy rows read as
+	// 0; the coord increments by 1 on every genuine (re-)dispatch.
+	// Additive in this PR: parsed + rendered only; no writer sets it yet
+	// beyond `fleet tasks set`.
+	DispatchGeneration int
+	// Parked is a durable "leave this worktree/worker-dir alone" marker
+	// (DESIGN §4.2): a free-form `<UTC ts + reason>` string set when a
+	// dirty worktree is parked, cleared on resolve. Empty = not parked.
+	// Additive in this PR: parsed + rendered only; no writer sets it yet
+	// beyond `fleet tasks set`.
+	Parked     string
 	DependsOn  []string
 	SpawnedBy  string
 	Spec       string
@@ -901,6 +913,25 @@ func setKV(t *Task, k, v string, lineNum int, raw string) error {
 			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid finished_at: " + err.Error()}
 		}
 		t.FinishedAt = ts
+	case "dispatch_generation":
+		// Coord-owned per-slug fence token (DESIGN §1). Empty / "null" /
+		// absent → 0 (legacy). Non-required; old rows parse fine.
+		if v == "" || v == "null" {
+			t.DispatchGeneration = 0
+			return nil
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "invalid dispatch_generation: " + v}
+		}
+		if n < 0 {
+			return &ParseError{Line: lineNum, Col: 1, Raw: raw, Msg: "dispatch_generation must be non-negative: " + v}
+		}
+		t.DispatchGeneration = n
+	case "parked":
+		// Durable dirty-worktree park marker (DESIGN §4.2). Empty / "null"
+		// → not parked. Non-required; old rows parse fine.
+		t.Parked = nullToEmpty(v)
 	case "depends_on":
 		deps, err := parseDeps(v)
 		if err != nil {
@@ -1033,6 +1064,11 @@ func renderTask(b *strings.Builder, t *Task) error {
 	// shape — see optionalLifecycleBullets comment.
 	writeOptional(b, "started_at", formatTime(t.StartedAt))
 	writeOptional(b, "finished_at", formatTime(t.FinishedAt))
+	// Coord-lifecycle fields (DESIGN-coord-worktree-lifecycle §1/§4.2).
+	// dispatch_generation is ALWAYS emitted (like worker_pid) so re-saved
+	// old rows pick up the new shape; parked is optional (like worktree).
+	fmt.Fprintf(b, "- dispatch_generation: %d\n", t.DispatchGeneration)
+	writeOptional(b, "parked", t.Parked)
 	fmt.Fprintf(b, "- depends_on: %s\n", formatDeps(t.DependsOn))
 	writeOptional(b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')

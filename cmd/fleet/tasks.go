@@ -706,19 +706,28 @@ func writeTaskListRows(stdout io.Writer, rows []*tasks.Task) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "SLUG\tSTATUS\tPRIORITY\tAGE\tWORKER_PID")
+	// GEN = dispatch_generation (coord fence token, DESIGN §1); PARKED =
+	// the durable dirty-worktree park marker (§4.2), shown as the truncated
+	// reason or "-" when unset.
+	_, _ = fmt.Fprintln(tw, "SLUG\tSTATUS\tPRIORITY\tAGE\tWORKER_PID\tGEN\tPARKED")
 	now := time.Now().UTC()
 	for _, t := range rows {
 		pid := "-"
 		if t.WorkerPID > 0 {
 			pid = fmt.Sprintf("%d", t.WorkerPID)
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+		parked := "-"
+		if t.Parked != "" {
+			parked = t.Parked
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
 			t.Slug,
 			t.Status,
 			t.Priority,
 			humanAge(now.Sub(t.Created)),
 			pid,
+			t.DispatchGeneration,
+			parked,
 		)
 	}
 	return tw.Flush()
@@ -787,6 +796,10 @@ func renderTaskMarkdown(w io.Writer, t *tasks.Task) error {
 	writeOptionalBullet(&b, "updated", formatTimeRFC3339(t.Updated))
 	writeOptionalBullet(&b, "started_at", formatTimeRFC3339(t.StartedAt))
 	writeOptionalBullet(&b, "finished_at", formatTimeRFC3339(t.FinishedAt))
+	// Keep byte-equal to internal/tasks.renderTask: dispatch_generation
+	// always emitted, parked optional.
+	fmt.Fprintf(&b, "- dispatch_generation: %d\n", t.DispatchGeneration)
+	writeOptionalBullet(&b, "parked", t.Parked)
 	fmt.Fprintf(&b, "- depends_on: %s\n", formatDepsList(t.DependsOn))
 	writeOptionalBullet(&b, "spawned_by", t.SpawnedBy)
 	b.WriteByte('\n')
@@ -845,7 +858,8 @@ func newTasksSetCmd() *cobra.Command {
 on-disk grammar:
 
   status, priority, worker_pid, worktree, pr_url, branch,
-  depends_on (comma-separated), spawned_by
+  dispatch_generation (int), parked, depends_on (comma-separated),
+  spawned_by
 
 Examples:
   fleet tasks set <slug> status=in-progress
@@ -1004,6 +1018,30 @@ func setTaskField(t *tasks.Task, key, value string) error {
 			return err
 		}
 		t.Branch = nullOrValue(value)
+	case "dispatch_generation":
+		// Coord-owned per-slug fence token (DESIGN §1). Settable here for
+		// testing/manual use; the coord increments it on dispatch in a
+		// later PR. Empty / "null" / "0" → 0. strconv.Atoi rejects
+		// trailing garbage, matching the parser exactly.
+		if value == "" || value == "null" || value == "0" {
+			t.DispatchGeneration = 0
+			return nil
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("dispatch_generation: %w", err)
+		}
+		if n < 0 {
+			return fmt.Errorf("dispatch_generation: must be non-negative, got %d", n)
+		}
+		t.DispatchGeneration = n
+	case "parked":
+		// Durable dirty-worktree park marker (DESIGN §4.2). Free-form
+		// scalar; "null" / "" clears it. Settable here for manual use.
+		if err := validateScalarBullet(key, value); err != nil {
+			return err
+		}
+		t.Parked = nullOrValue(value)
 	case "depends_on":
 		deps := parseDependsOn(value)
 		if err := validateDependencySlugs(deps); err != nil {
@@ -1018,7 +1056,7 @@ func setTaskField(t *tasks.Task, key, value string) error {
 	case "created", "updated":
 		return fmt.Errorf("tasks set: %s is not settable (parser owns created; updated bumps automatically)", key)
 	default:
-		return fmt.Errorf("tasks set: unknown key %q (allowed: status, priority, worker_pid, worktree, pr_url, branch, depends_on, spawned_by)", key)
+		return fmt.Errorf("tasks set: unknown key %q (allowed: status, priority, worker_pid, worktree, pr_url, branch, dispatch_generation, parked, depends_on, spawned_by)", key)
 	}
 	// Round-trip the file through the writer to catch invalid enum
 	// values (Status / Priority) at the same point Add would. We can't
