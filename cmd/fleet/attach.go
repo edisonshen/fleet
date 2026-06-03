@@ -695,18 +695,31 @@ var (
 // --coord-spawn`. Extracted so unit tests can pin the shape without
 // shelling out — the dispatch CLI requires the task-id positional
 // (cobra.ExactArgs(1)) and a missing --cwd lands the recovered coord
-// in the wrong checkout. Codex review iter-2 P1 + iter-4 P1.
+// in the wrong checkout. Codex review iter-2 P1 + iter-4 P1 + iter-6 P1.
 //
 // Shape: `dispatch coord-<project> --coord-spawn --project <project>
-// [--cwd <repo_path>]`. The --cwd suffix only appears when meta.json
-// registers a repo_path; legacy projects without meta.json fall back to
-// dispatch's caller-cwd resolution.
+// --prompt <coord-bootstrap-prompt> --engine claude-code
+// [--cwd <repo_path>]`.
+//
+//   - --prompt forces /coordinator into the fresh agent's first paint;
+//     without it the operator lands in a bare Claude that never claims
+//     the project (codex iter-6 P1).
+//   - --engine claude-code matches the TUI [a] auto-spawn discipline:
+//     the coordinator skill's DISPATCH blocks only a claude-code session
+//     can consume. Without the explicit stamp, an operator in
+//     `fleet -codex attach ...` would propagate FLEET_ENGINE=codex into
+//     dispatch, which today rejects coord-spawn with a different engine.
+//   - --cwd suffix only appears when meta.json registers a repo_path;
+//     legacy projects without meta.json fall back to dispatch's
+//     caller-cwd resolution.
 func buildCoordSpawnArgs(project string) []string {
 	args := []string{
 		"dispatch",
 		projectlookup.CoordTaskID(project),
 		"--coord-spawn",
 		"--project", project,
+		"--prompt", projectlookup.CoordSpawnPrompt(project),
+		"--engine", "claude-code",
 	}
 	if meta, mErr := projects.Read(project); mErr == nil && meta.RepoPath != "" {
 		args = append(args, "--cwd", meta.RepoPath)

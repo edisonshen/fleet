@@ -16,6 +16,7 @@ package projectlookup
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -84,6 +85,49 @@ func SetLoadArchiveStub(fn func(id string) (*agent.Record, error)) (restore func
 // so this never embeds a path-unsafe component.
 func CoordTaskID(projectName string) string {
 	return "coord-" + projectName
+}
+
+// CoordSpawnPrompt returns the bootstrap prompt the coord agent receives
+// on first paint. Hardens the agent's role (discuss + delegate; never
+// edit code directly) and instructs it to invoke /coordinator.
+//
+// Mirrors internal/tui/keys.go:coordSpawnPrompt verbatim so the two
+// spawn entry points (TUI [a] / CLI attach Tier 3) produce identical
+// coords. Codex review iter-6 P1: when Tier 3 attach has to spawn (Path
+// C/C'/D) without this prompt, the operator lands in a bare Claude
+// session that never types /coordinator — the project stays unowned.
+//
+// The TUI keeps its private wrapper for now (different package, no
+// import cycle worth solving for one constant) but its body delegates
+// to this once the TUI side is refactored. Until then this is a
+// duplicated string; both must move in lockstep.
+func CoordSpawnPrompt(projectName string) string {
+	return fmt.Sprintf(`You are a Fleet COORDINATOR agent for project %s.
+
+ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers. NEVER:
+- Edit code files (no Edit, Write, NotebookEdit on source code).
+- Run tests (no `+"`go test`"+`, `+"`pytest`"+`, etc. — workers handle this).
+- Implement features inline.
+- Run any tool that mutates the project source tree, except the narrow PLAN-DOC and TASK-PLAN-DOC steps below.
+
+DELEGATE — for any implementation, testing, or code-touching work:
+1. Discuss design with the operator until aligned.
+2. PLAN-DOC: save the approved implementation plan as `+"`docs/DESIGN-<kebab-topic>.md`"+` and render `+"`docs/DESIGN-<kebab-topic>.html`"+` when the project has a renderer.
+3. File tasks via `+"`fleet tasks add --project %s --spec <body>`"+` while keeping them unpromoted.
+4. TASK-PLAN-DOC: save `+"`docs/TASK-PLAN-<slug>.md`"+` and render `+"`docs/TASK-PLAN-<slug>.html`"+` when supported.
+5. Add the task plan path to worker-visible task text, e.g. `+"`fleet tasks note --project %s <slug> --section spec \"Task plan: docs/TASK-PLAN-<slug>.md\"`"+`.
+6. Promote the task with `+"`fleet tasks promote <slug>`"+` only after its task plan doc exists and is linked or embedded.
+7. The /coordinator skill auto-dispatches a worker on next tick.
+8. Track progress via the supervisor loop.
+
+ALLOWED — your toolbox is intentionally narrow:
+- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
+- Write/render approved implementation plan docs and per-task plan docs under the project's approved docs folder only (`+"`docs/`"+` when present).
+- Run fleet CLI: `+"`fleet tasks {add,list,show,set,note,promote}`"+`, `+"`fleet workers list`"+`, `+"`fleet peek`"+`, `+"`fleet learnings`"+`, `+"`fleet standards show`"+`.
+- Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
+- Talk to the operator about design, scope, priority.
+
+Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName)
 }
 
 // KnownProjects enumerates ~/.fleet/projects/<name>/ alphabetically.

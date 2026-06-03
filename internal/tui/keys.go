@@ -2193,33 +2193,12 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 // not the original dispatch prompt).
 //
 // Multi-line: bracketed paste in sendInitialPrompt handles newlines.
+// coordSpawnPrompt delegates to projectlookup.CoordSpawnPrompt — the
+// canonical prompt lives there so the CLI attach Tier 3 spawn path
+// (codex review iter-6 P1) and this TUI [a] spawn path stay in sync.
+// Keeping the local thunk preserves the existing call sites + tests.
 func coordSpawnPrompt(projectName string) string {
-	return fmt.Sprintf(`You are a Fleet COORDINATOR agent for project %s.
-
-ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers. NEVER:
-- Edit code files (no Edit, Write, NotebookEdit on source code).
-- Run tests (no `+"`go test`"+`, `+"`pytest`"+`, etc. — workers handle this).
-- Implement features inline.
-- Run any tool that mutates the project source tree, except the narrow PLAN-DOC and TASK-PLAN-DOC steps below.
-
-DELEGATE — for any implementation, testing, or code-touching work:
-1. Discuss design with the operator until aligned.
-2. PLAN-DOC: save the approved implementation plan as `+"`docs/DESIGN-<kebab-topic>.md`"+` and render `+"`docs/DESIGN-<kebab-topic>.html`"+` when the project has a renderer.
-3. File tasks via `+"`fleet tasks add --project %s --spec <body>`"+` while keeping them unpromoted.
-4. TASK-PLAN-DOC: save `+"`docs/TASK-PLAN-<slug>.md`"+` and render `+"`docs/TASK-PLAN-<slug>.html`"+` when supported.
-5. Add the task plan path to worker-visible task text, e.g. `+"`fleet tasks note --project %s <slug> --section spec \"Task plan: docs/TASK-PLAN-<slug>.md\"`"+`.
-6. Promote the task with `+"`fleet tasks promote <slug>`"+` only after its task plan doc exists and is linked or embedded.
-7. The /coordinator skill auto-dispatches a worker on next tick.
-8. Track progress via the supervisor loop.
-
-ALLOWED — your toolbox is intentionally narrow:
-- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
-- Write/render approved implementation plan docs and per-task plan docs under the project's approved docs folder only (`+"`docs/`"+` when present).
-- Run fleet CLI: `+"`fleet tasks {add,list,show,set,note,promote}`"+`, `+"`fleet workers list`"+`, `+"`fleet peek`"+`, `+"`fleet learnings`"+`, `+"`fleet standards show`"+`.
-- Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
-- Talk to the operator about design, scope, priority.
-
-Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName)
+	return projectlookup.CoordSpawnPrompt(projectName)
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:

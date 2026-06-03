@@ -385,17 +385,23 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("FLEET_HOME", tmp)
+	// Codex iter-6 P1: the spawned coord MUST receive the bootstrap
+	// prompt (so /coordinator runs) AND be forced to engine claude-code
+	// (so DISPATCH blocks work). The full argv shape is asserted below.
+	wantPrompt := projectlookup.CoordSpawnPrompt("projects-fleet")
 	// No meta.json: argv should be dispatch <task-id> --coord-spawn
-	// --project <p> (no --cwd suffix).
+	// --project <p> --prompt <p> --engine claude-code (no --cwd suffix).
 	got := buildCoordSpawnArgs("projects-fleet")
 	want := []string{
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
+		"--prompt", wantPrompt,
+		"--engine", "claude-code",
 	}
 	if !stringSlicesEqual(got, want) {
 		t.Errorf("buildCoordSpawnArgs(no meta): got %v want %v", got, want)
 	}
-	// With meta.json: --cwd <repo_path> appended.
+	// With meta.json: --cwd <repo_path> appended after the prompt/engine.
 	if err := os.MkdirAll(filepath.Join(tmp, "projects", "projects-fleet"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -407,10 +413,22 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	want = []string{
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
+		"--prompt", wantPrompt,
+		"--engine", "claude-code",
 		"--cwd", "/repos/projects-fleet",
 	}
 	if !stringSlicesEqual(got, want) {
 		t.Errorf("buildCoordSpawnArgs(with meta): got %v want %v", got, want)
+	}
+	// Sanity-check the prompt content — it MUST contain "/coordinator"
+	// (the operator-visible cue that the agent will run the supervisor
+	// loop) and the project name (so the agent knows which tasks.md to
+	// own). Codex iter-6 P1.
+	if !strings.Contains(wantPrompt, "/coordinator") {
+		t.Errorf("CoordSpawnPrompt missing /coordinator invocation: %q", wantPrompt)
+	}
+	if !strings.Contains(wantPrompt, "projects-fleet") {
+		t.Errorf("CoordSpawnPrompt missing project name: %q", wantPrompt)
 	}
 }
 
