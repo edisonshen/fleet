@@ -26,7 +26,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install pytest
-        run: python3 -m pip install --upgrade pip pytest
+        # markdown: required by scripts/render-design-doc.py and its tests
+        # (scripts/tests/). Tests skip gracefully if it's missing, but CI
+        # installs it so the hub-style render path is actually exercised.
+        run: python3 -m pip install --upgrade pip pytest markdown
 
       - name: Build
         run: go build ./...
@@ -66,7 +69,7 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: Python tests
-        run: python3 -m pytest skills/ -q
+        run: python3 -m pytest skills/ scripts/ -q
 
       - name: Assert no /tmp/fleet-test-* leak
         # fleet#165 PR-B gate. The test-suite Sweep (internal/testutil)
