@@ -3572,22 +3572,24 @@ def _reconcile_inflight(
     for t in tasks:
         if t.status not in ("in-progress", "in-review"):
             continue
-        if _is_worker_alive(t, project, home=home):
-            continue
-        # R1-R4 chokepoint (DESIGN §2.1/§3): the worker is gone, but
-        # BEFORE the reconcile decision tree reads state.json (alive
-        # fall-through R1, terminal-state R2, mid-phase R3, the
-        # died-without-PR fall-through R4 — the highest-severity case),
-        # classify the on-disk state against the slug's AUTHORITATIVE
-        # task-row dispatch_generation. A STALE state is a PRIOR
-        # attempt's inert leftover: it must drive NO mutation — no
-        # status flip, no clear_worker, no delete_worker_dir, no
-        # worktree removal. Treating it as `missing` was the recurring
-        # bug (the died-without-PR branch then removed the CURRENT
-        # attempt's worktree + worker dir). `stale` short-circuits +
-        # surfaces; `current`/`missing` fall through to the existing
-        # tree (`missing` keeps died-without-PR semantics; `current`
-        # reads the live attempt's terminal/mid-phase signals below).
+        # R1-R4 chokepoint (DESIGN §2.1/§3): classify the on-disk state
+        # against the slug's AUTHORITATIVE task-row dispatch_generation
+        # FIRST — BEFORE the liveness check (R1) and the decision tree
+        # (R2 terminal-state, R3 mid-phase, R4 died-without-PR — the
+        # highest-severity case). Generation must gate liveness too:
+        # codex iter-2 [P1] — a re-dispatched slug whose PRIOR attempt
+        # left a stale state.json with a fresh non-terminal phase (or no
+        # updated_at) makes `_is_worker_alive` return True off the stale
+        # file. If the current attempt hasn't bootstrapped its own state
+        # yet, that stale file would otherwise suppress reconcile FOREVER
+        # (the live attempt never re-evaluated). So `stale` short-circuits
+        # the WHOLE per-task pass (no liveness trust, no mutation, no
+        # clear_worker / delete_worker_dir / worktree removal) and
+        # surfaces; the current attempt is reconciled on a later tick once
+        # it writes a current-generation state. `current`/`missing` fall
+        # through to the liveness check + the existing tree (`missing`
+        # keeps died-without-PR semantics; `current` reads the live
+        # attempt's terminal/mid-phase signals below).
         recon_cls, _ = read_current_worker_state(
             project, t.slug, int(t.dispatch_generation), home=home,
         )
@@ -3599,6 +3601,8 @@ def _reconcile_inflight(
                 f"{int(t.dispatch_generation)}); no mutation, surfacing",
                 file=sys.stderr,
             )
+            continue
+        if _is_worker_alive(t, project, home=home):
             continue
         # Worker is gone. Before falling through to pr_url + CI, check
         # whether state.json reports a terminal phase. v0.2 workers

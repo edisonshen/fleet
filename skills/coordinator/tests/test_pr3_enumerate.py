@@ -128,6 +128,29 @@ class TestR1toR4ReconcileStale:
         assert actions[0].new_status == "in-review"
         assert actions[0].set_pr_url == "https://example.com/pr/123"
 
+    def test_stale_fresh_nonterminal_state_does_not_mask_as_alive(self, tmp_path: Path) -> None:
+        # codex iter-2 [P1]: a re-dispatched slug whose PRIOR attempt left
+        # a FRESH non-terminal state.json (phase=tdd-green, recent
+        # updated_at) would make _is_worker_alive return True off the
+        # stale file. The generation gate must run BEFORE liveness so the
+        # stale file does not suppress reconcile forever. Expected: ZERO
+        # actions (short-circuited as stale + surfaced) — NOT silently
+        # "alive" (which would also be zero actions but for the wrong
+        # reason); we assert the surfacing stderr to disambiguate.
+        import datetime as dt2
+        fresh = dt2.datetime.now(dt2.timezone.utc).isoformat()
+        _write_worker_state(
+            tmp_path, "p", "mask-eeee",
+            {"slug": "mask-eeee", "phase": "tdd-green",
+             "dispatch_generation": 1, "updated_at": fresh},
+        )
+        # worker_pid 0 → liveness relies on state freshness; the stale
+        # fresh state would otherwise read alive.
+        t = _make_task("mask-eeee", status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", side_effect=AssertionError("liveness consulted before gen gate")):
+            actions = loop._reconcile_inflight([t], "p", "fleet", home=tmp_path)
+        assert actions == [], "stale state must short-circuit before liveness"
+
     def test_missing_state_keeps_died_without_pr(self, tmp_path: Path) -> None:
         # No state file at all → MISSING → existing died-without-PR
         # semantics still apply (status=todo + clear_worker).
