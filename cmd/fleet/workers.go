@@ -673,19 +673,34 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		}
 	}
 
-	// Writer CAS (DESIGN §2.2): when --dispatch-generation is set, route
-	// through UpdateStateGen, reading the task row's authoritative
-	// dispatch_generation under the same logical dispatch. A stale write
-	// is CAS-rejected (incl. when state.json is absent) and surfaced. The
-	// flag is OMITTED by legacy / pre-migration workers, which keep the
-	// ungated UpdateState so they don't fail open.
+	// Writer CAS (DESIGN §2.2). Read the task row's authoritative
+	// dispatch_generation ONCE (under the same logical dispatch).
+	//
+	//   --dispatch-generation set  → route through UpdateStateGen, a CAS
+	//     that rejects a stale write incl. when state.json is absent.
+	//   --dispatch-generation OMITTED → allowed ONLY while the authority
+	//     is 0 (a genuinely un-migrated / legacy slug). Codex iter-3 [P1]:
+	//     once the slug has been (re-)dispatched under the epoch (authority
+	//     > 0), an ungated UpdateState would let a stale/pre-upgrade worker
+	//     load the CURRENT gen>0 state.json, mutate it, and write it back
+	//     with the gen PRESERVED — so the chokepoint reader would classify
+	//     the stale write `current`, defeating the fence. Reject it with a
+	//     clear next step instead of failing open.
+	taskGen, gerr := taskRowDispatchGeneration(project, slug)
+	if gerr != nil {
+		return gerr
+	}
 	var updateErr error
 	if opts.dispatchGenerationSet {
-		taskGen, gerr := taskRowDispatchGeneration(project, slug)
-		if gerr != nil {
-			return gerr
-		}
 		updateErr = workers.UpdateStateGen(project, slug, opts.dispatchGeneration, taskGen, mutate)
+	} else if taskGen > 0 {
+		return fmt.Errorf(
+			"worker %q has dispatch_generation=%d on its task row; "+
+				"`fleet workers update` must pass --dispatch-generation %d "+
+				"(the ungated path is rejected once a slug is dispatched under "+
+				"the epoch — a stale/legacy worker must not clobber current state)",
+			slug, taskGen, taskGen,
+		)
 	} else {
 		updateErr = workers.UpdateState(project, slug, mutate)
 	}

@@ -1926,6 +1926,7 @@ def _run_stuck_check_pass(
                 if _mark_worker_blocked(
                     project=project, slug=p.slug, fleet_bin=fleet_bin,
                     reason="stuck-idle: persistent inactivity after escalation",
+                    home=home,
                 ):
                     out.blocks += 1
                     emit(
@@ -2003,22 +2004,63 @@ def _escalate_to_operator(
 
 def _mark_worker_blocked(
     *, project: str, slug: str, fleet_bin: str, reason: str,
+    home: Path | None = None,
 ) -> bool:
-    """`fleet workers update --phase blocked --reason ...`. Returns
-    True on success, False on subprocess failure."""
+    """`fleet workers update --phase blocked --reason ...` (W3, the
+    coordinator-authored stuck-worker block). Returns True on success,
+    False on subprocess failure.
+
+    Codex iter-3 [P1]: this coord-authored write is NOT exempt from the
+    generation CAS (DESIGN §2.2). Once a slug is dispatched under the
+    epoch (task-row dispatch_generation > 0), the ungated `fleet workers
+    update` path is rejected — so this W3 write MUST carry
+    --dispatch-generation <current>. We read the slug's current task-row
+    gen and pass it; gen 0 (legacy / un-migrated) keeps the ungated call.
+    """
+    gen = _task_row_dispatch_generation(project, slug, home=home)
+    cmd = [
+        fleet_bin, "workers", "update",
+        "--project", project, slug,
+        "--phase", "blocked",
+        "--reason", reason,
+    ]
+    if gen > 0:
+        cmd += ["--dispatch-generation", str(gen)]
     try:
         subprocess.run(
-            [
-                fleet_bin, "workers", "update",
-                "--project", project, slug,
-                "--phase", "blocked",
-                "--reason", reason,
-            ],
-            capture_output=True, text=True, timeout=30.0, check=True,
+            cmd, capture_output=True, text=True, timeout=30.0, check=True,
         )
     except (subprocess.SubprocessError, OSError):
         return False
     return True
+
+
+def _task_row_dispatch_generation(
+    project: str, slug: str, *, home: Path | None = None,
+) -> int:
+    """Read the slug's current task-row dispatch_generation (the CAS
+    authority, DESIGN §2.2). Returns 0 on any read/parse error or when
+    the slug is absent — i.e. fail to the ungated/legacy authority, so a
+    coord write never wedges on a transient tasks.md read fault (the
+    worst case is a single ungated write on a slug that genuinely has
+    gen 0)."""
+    import os as _os
+
+    import parse as _parse
+    if home is None:
+        home = Path(_os.environ.get("FLEET_HOME") or _os.path.expanduser("~/.fleet"))
+    tasks_path = home / "projects" / project / "tasks.md"
+    try:
+        f = _parse.read(str(tasks_path))
+    except Exception:  # noqa: BLE001
+        return 0
+    for t in f.tasks:
+        if t.slug == slug:
+            try:
+                return int(t.dispatch_generation)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _fmt_ts(unix: float) -> str:

@@ -733,10 +733,34 @@ func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
 		t.Errorf("phase = %q, want tdd-green", st.Phase)
 	}
 
-	// Omitting the flag keeps the ungated legacy path (no CAS).
-	if err := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
+	// Codex iter-3 [P1]: once a slug's task row has gen > 0, an UNGATED
+	// update (no --dispatch-generation) is REJECTED — a stale/legacy
+	// worker must not bypass the fence by loading + rewriting the current
+	// state.json with the gen preserved.
+	ungatedErr := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
 		project: project, phase: "tdd-refactor",
+	}, &bytes.Buffer{})
+	if ungatedErr == nil || !strings.Contains(ungatedErr.Error(), "must pass --dispatch-generation") {
+		t.Fatalf("ungated update on a gen>0 slug must be rejected, got %v", ungatedErr)
+	}
+}
+
+// TestWorkersUpdate_UngatedAllowedWhenAuthorityZero confirms the legacy
+// path stays open for genuinely un-migrated slugs: a task row at gen 0
+// (or no task row) accepts an ungated `fleet workers update` so
+// pre-epoch workers don't fail open (codex iter-3 [P1] back-compat).
+func TestWorkersUpdate_UngatedAllowedWhenAuthorityZero(t *testing.T) {
+	_, project := setupTasksHome(t)
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "legacy-zzzz", priority: "P1",
+		spec: "x", status: "ready",
+	}, "legacy-zzzz", &bytes.Buffer{}); err != nil {
+		t.Fatalf("add task: %v", err)
+	}
+	// Task row gen defaults to 0; an ungated update is allowed.
+	if err := runWorkersUpdate("legacy-zzzz", &workersUpdateOpts{
+		project: project, phase: "tdd-red",
 	}, &bytes.Buffer{}); err != nil {
-		t.Fatalf("ungated update should succeed: %v", err)
+		t.Fatalf("ungated update on a gen-0 slug should succeed: %v", err)
 	}
 }
