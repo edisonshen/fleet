@@ -255,6 +255,19 @@ func main() {
 			// sentinel. Skill consumers parse stdout, not stderr.
 			os.Exit(rcExitCode(outcome))
 		}
+		// fleet attach (Tier 3 PROJECT RECOVERY, attach-failover-59db)
+		// owns its exit codes via ExitCodeFor: 64 (UsageError — non-tty +
+		// no derivation), 70/127 (SystemError — tmux missing, dispatch
+		// failed, FS broken), 1 otherwise. Detect via the typed errors
+		// the attach RunE returns; on a hit, skip the generic "error:"
+		// stderr print (the RunE already wrote the diagnostic — printing
+		// here again would double-surface it) and exit with the mapped
+		// code. Codex review iter-1 P2.
+		var attachUsage *UsageError
+		var attachSystem *SystemError
+		if errors.As(err, &attachUsage) || errors.As(err, &attachSystem) {
+			os.Exit(ExitCodeFor(err))
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

@@ -540,6 +540,46 @@ func TestF16_CwdWinsWhenNothingElse(t *testing.T) {
 	}
 }
 
+// --- F19 (codex review iter-1 P1): stale live record → Tier 3 ---
+//
+// Token resolves to a live agent.Record on disk (Tier 1 hits), but its
+// tmux session is DEFINITIVELY dead (probe returns alive=false). Before
+// the fix, runAttachFailover called tmux.Attach immediately, which
+// returns ErrNoSession and the operator dead-ended. The never-exit
+// guarantee requires Tier 3 PROJECT RECOVERY to take over.
+
+func TestF19_StaleLiveRecord_FailsOverToProjectRecovery(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Stale live record: agent.Record on disk, but no entry in
+	// aliveSessions → session probe returns (false, nil) → definitively
+	// dead. The record is tagged with project so Tier 3 can derive.
+	r := agent.New("staleabc")
+	r.Project = "projects-fleet"
+	r.TaskID = projectlookup.CoordTaskID("projects-fleet")
+	r.TmuxSession = "fleet-staleabc"
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	// Live successor coord for the same project — Tier 3 attaches here.
+	s.addLiveCoord(t, "projects-fleet", "xxxxxxxx")
+	stderr, err := s.run(t, "staleabc", AttachOpts{})
+	if err != nil {
+		t.Fatalf("F19: expected no error (must fail over, not dead-end), got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "live record present but tmux session") {
+		t.Errorf("F19 stderr missing stale-live-record failover line: %q", got)
+	}
+	if !strings.Contains(got, "staleabc: attached to current coord xxxxxxxx for projects-fleet") {
+		t.Errorf("F19 stderr missing Tier-3 attached line: %q", got)
+	}
+	if s.attachedTo != "fleet-xxxxxxxx" {
+		t.Errorf("F19: attached to %q want fleet-xxxxxxxx (live successor)", s.attachedTo)
+	}
+}
+
 // --- system failure tests: tmux missing, dispatch failed ---
 
 func TestSystemFailure_TmuxMissing_ReturnsSystemErr(t *testing.T) {
@@ -559,6 +599,12 @@ func TestSystemFailure_TmuxMissing_ReturnsSystemErr(t *testing.T) {
 	if !strings.Contains(err.Error(), "install") && !strings.Contains(err.Error(), "PATH") {
 		t.Errorf("err must surface next-step (install/PATH); got %q", err.Error())
 	}
+	// Codex review iter-1 P2: SystemError must map to its embedded exit
+	// code (127 for tmux-missing) so main() exits with the documented
+	// 127. Without the ExitCodeFor wiring this regressed to exit 1.
+	if ec := ExitCodeFor(err); ec != 127 {
+		t.Errorf("ExitCodeFor(tmux missing): got %d want 127", ec)
+	}
 }
 
 func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
@@ -574,5 +620,10 @@ func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "dispatch") || !strings.Contains(err.Error(), "disk full") {
 		t.Errorf("err must mention dispatch + cause: %q", err.Error())
+	}
+	// Codex review iter-1 P2: dispatch failure maps to 70 (sysexits
+	// EX_SOFTWARE) per ExitCodeFor's default for SystemError.
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(dispatch failed): got %d want 70", ec)
 	}
 }

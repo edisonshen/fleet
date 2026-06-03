@@ -71,10 +71,14 @@ Exit codes:
 			}
 			err := runAttachFailover(args[0], opts)
 			if err != nil {
-				// Map UsageError -> cobra silent-error so cobra does
-				// not double-print; main() inspects ExitCodeFor().
+				// Map typed errors (UsageError + SystemError) to cobra's
+				// silent-error path so cobra doesn't print its generic
+				// "Error: ..." line on top of the diagnostic our RunE
+				// already wrote. main() inspects ExitCodeFor for the
+				// exit code (64 / 70 / 127). Codex review iter-1 P2.
 				var ue *UsageError
-				if errors.As(err, &ue) {
+				var se *SystemError
+				if errors.As(err, &ue) || errors.As(err, &se) {
 					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), err.Error())
 					cmd.SilenceErrors = true
 					cmd.SilenceUsage = true
@@ -173,6 +177,31 @@ func runAttachFailover(token string, opts AttachOpts) error {
 			return newSystemError(127, fmt.Sprintf(
 				"tmux not available: %v — install tmux (https://github.com/tmux/tmux) and ensure it is on PATH",
 				err))
+		}
+		// Stale-live-record gate (codex review iter-1 P1): a live record
+		// on disk with a dead tmux session must NOT dead-end on
+		// `tmux.Attach` — that's the exact "never-exit" failure mode
+		// Tier 3 exists to recover from. Probe the session; on a
+		// DEFINITIVE dead (probe returns alive=false with no error),
+		// surface a tier-2-style line and fall through to project
+		// recovery. Transport errors (ambiguous) stay conservative and
+		// proceed with attach — tmux's own error surfaces if it really
+		// is dead, but a hiccup doesn't cost a needless respawn.
+		if alive, probeErr := sessionProbeFnVar(session); probeErr == nil && !alive {
+			_, _ = fmt.Fprintf(opts.Stderr,
+				"%s: live record present but tmux session %s is gone; failing over to project recovery\n",
+				token, session)
+			// Carry the stale record's project tag into Tier 3 (when the
+			// flag is empty) so derivation doesn't dead-end on "unknown
+			// token" just because the live record never made it into the
+			// archive yet. The flag takes precedence when the operator
+			// passed --project explicitly — same precedence as the
+			// archive-record branch in deriveProject.
+			recovery := opts
+			if recovery.Project == "" && rec.Project != "" {
+				recovery.Project = rec.Project
+			}
+			return tier3ProjectRecovery(token, errors.New("stale live record"), recovery)
 		}
 		if hops > 0 {
 			hopWord := "hops"

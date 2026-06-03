@@ -48,9 +48,17 @@ func installFakeAttach(t *testing.T) *fakeAttach {
 	attachFnVar = fa.Attach
 	prevAvail := tmuxAvailableFnVar
 	tmuxAvailableFnVar = func() error { return nil }
+	// Tier 1 / Tier 2 happy-path tests assume the resolved session is
+	// alive — without this stub the post-codex-iter-1 stale-live-record
+	// gate would probe the real tmux for a fake "fleet-liveeeee" session,
+	// see "definitively dead", and fail over into Tier 3 (which is the
+	// wrong code path for these tests). Codex review iter-1 P1.
+	prevProbe := sessionProbeFnVar
+	sessionProbeFnVar = func(string) (bool, error) { return true, nil }
 	t.Cleanup(func() {
 		attachFnVar = prev
 		tmuxAvailableFnVar = prevAvail
+		sessionProbeFnVar = prevProbe
 	})
 	return fa
 }
