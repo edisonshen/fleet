@@ -25,10 +25,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Model name -> context-window size in tokens.
+# Mirrors skills/fleet-guard/health.py:CONTEXT_LIMITS — keep byte-consistent
+# (test_health.py::TestContextLimitsParity asserts the two are identical).
 # Update as Anthropic ships new model IDs. Unknown models do NOT silently
 # fall back to a guessed limit — see the model-resolution block below for
 # why null + context_limit_known=False is preferable to a wrong percentage.
 CONTEXT_LIMITS = {
+    "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
     "claude-opus-4-5":     200_000,
@@ -36,6 +39,49 @@ CONTEXT_LIMITS = {
     "claude-sonnet-4-5":   200_000,
     "claude-haiku-4-5":    200_000,
 }
+
+
+# A "[1m]" bracket marker denotes the 1M-context variant regardless of the
+# base model's default limit — see skills/fleet-guard/health.py for the full
+# rationale (codex P2, 2026-06-03).
+ONE_M_BRACKET_TOKENS = 1_000_000
+
+
+def _normalize_model(raw):
+    """Reduce a model id to its CONTEXT_LIMITS lookup key.
+
+    Mirrors skills/fleet-guard/health.py:_normalize_model. Strips a trailing
+    bracket variant ("claude-opus-4-8[1m]" -> "claude-opus-4-8") and a trailing
+    -YYYYMMDD date pin. Only strips recognized decorations; otherwise-unknown
+    ids stay unknown (no family/prefix guessing).
+    """
+    if not raw:
+        return raw
+    s = raw
+    bracket = s.find("[")
+    if bracket >= 0:
+        s = s[:bracket]
+    if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
+        s = s[:-9]
+    return s
+
+
+def _resolve_limit(raw):
+    """Resolve a model id to its context-window size, or None when unknown.
+    Mirrors skills/fleet-guard/health.py:_resolve_limit: exact hit -> "[1m]"
+    variant means 1M -> stripped base lookup -> None.
+    """
+    if not raw:
+        return None
+    exact = CONTEXT_LIMITS.get(raw)
+    if exact is not None:
+        return exact
+    open_b = raw.find("[")
+    if open_b >= 0:
+        close_b = raw.find("]", open_b)
+        if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
+            return ONE_M_BRACKET_TOKENS
+    return CONTEXT_LIMITS.get(_normalize_model(raw))
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
 PAYLOAD_DIR = SPIKE_DIR / "payloads"
@@ -183,10 +229,12 @@ def main() -> int:
     # plausible-looking but wrong percentages that poison Q3 (accuracy). The
     # fire still counts for Q1 (we have tokens), but pct stays null until
     # the model is added to CONTEXT_LIMITS.
-    known = record["model"] in CONTEXT_LIMITS
+    # Resolve via the shared policy (exact -> "[1m]"=1M -> stripped base).
+    # Mirrors health.py:read_context_pct.
+    limit = _resolve_limit(record["model"])
+    known = limit is not None
     record["context_limit_known"] = known
     if known:
-        limit = CONTEXT_LIMITS[record["model"]]
         record["context_limit"] = limit
         record["computed_pct"] = round(total * 100.0 / limit, 2)
     else:

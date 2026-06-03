@@ -23,10 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Mirrors spike/stop-hook.py:CONTEXT_LIMITS. Keep in sync. Future operator-
-# overridable via ~/.fleet/config.yaml:context_limits (TODOS F11) — not yet
-# wired. Unknown models leave context_pct=None rather than guess a limit.
+# Mirrors spike/stop-hook.py:CONTEXT_LIMITS. Keep in sync (byte-consistent) —
+# tests/test_health.py::TestContextLimitsParity asserts the two tables are
+# identical so they can't drift again. Future operator-overridable via
+# ~/.fleet/config.yaml:context_limits (TODOS F11) — not yet wired. Unknown
+# models (after normalization) leave context_pct=None rather than guess a
+# limit; a wrong limit produces a plausible-looking but wrong percentage that
+# would fire (or suppress) the 50/70 handoff at the wrong moment.
 CONTEXT_LIMITS: dict[str, int] = {
+    "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
     "claude-opus-4-5":     200_000,
@@ -34,6 +39,72 @@ CONTEXT_LIMITS: dict[str, int] = {
     "claude-sonnet-4-5":   200_000,
     "claude-haiku-4-5":    200_000,
 }
+
+
+# A "[1m]" bracket marker is Anthropic's 1M-context variant tag (e.g.
+# "claude-opus-4-8[1m]"). It denotes a 1,000,000-token window regardless of the
+# base model's default limit, so it must NOT be stripped down to the base
+# entry — doing so would compute a 1M context against a 200k base limit and
+# fire the red handoff far too early (codex P2, 2026-06-03).
+ONE_M_BRACKET_TOKENS = 1_000_000
+
+
+def _normalize_model(raw: str) -> str:
+    """Reduce a transcript model id to its CONTEXT_LIMITS lookup key by
+    stripping decorations the table doesn't carry:
+      - a trailing bracket variant, e.g. "claude-opus-4-8[1m]" -> "claude-opus-4-8"
+      - a trailing date pin, e.g. "claude-opus-4-8-20260601" -> "claude-opus-4-8"
+
+    This is the lookup-KEY reducer only; it does NOT decide the limit. The
+    "[1m]" variant maps to a 1M limit in _resolve_limit BEFORE this strip is
+    consulted, so a bracketed 1M tag never inherits a smaller base limit. We
+    only strip recognized decorations; an otherwise-unknown id (after
+    stripping) stays unknown — no family/prefix guessing.
+
+        "claude-opus-4-8[1m]"        -> "claude-opus-4-8"
+        "claude-opus-4-8-20260601"   -> "claude-opus-4-8"
+        "claude-opus-4-8"            -> "claude-opus-4-8"  (unchanged)
+        "claude-future-99"           -> "claude-future-99" (unchanged -> unknown)
+    """
+    if not raw:
+        return raw
+    s = raw
+    bracket = s.find("[")
+    if bracket >= 0:
+        s = s[:bracket]
+    # Strip a trailing -YYYYMMDD date pin (exactly 8 digits after a hyphen).
+    if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
+        s = s[:-9]
+    return s
+
+
+def _resolve_limit(raw: str | None) -> int | None:
+    """Resolve a transcript model id to its context-window size, or None when
+    unknown. Resolution policy (shared with spike/stop-hook.py):
+
+      1. Exact table hit on the raw id wins (covers any future id we add
+         verbatim, including a decorated one).
+      2. A "[1m]" bracket tag denotes the 1M-context variant -> 1,000,000,
+         regardless of the base model's default limit. Checked BEFORE the
+         base-strip so e.g. "claude-sonnet-4-6[1m]" does NOT collapse to the
+         200k sonnet entry.
+      3. Otherwise, look up the decoration-stripped form (date pin, non-[1m]
+         bracket) against the table.
+      4. No match -> None (unknown stays unknown; never guess a limit).
+    """
+    if not raw:
+        return None
+    exact = CONTEXT_LIMITS.get(raw)
+    if exact is not None:
+        return exact
+    # Match the bracket token EXACTLY against "1m" (case-insensitive) — a
+    # substring check would mis-classify e.g. "[v1m]" or "[not-1m]" as 1M.
+    open_b = raw.find("[")
+    if open_b >= 0:
+        close_b = raw.find("]", open_b)
+        if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
+            return ONE_M_BRACKET_TOKENS
+    return CONTEXT_LIMITS.get(_normalize_model(raw))
 
 # Schema version for ~/.fleet/agents/<id>.json. Mirrors
 # internal/agent.SchemaVersion. Bumped only when the on-disk shape changes
@@ -122,9 +193,14 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
     total = in_t + cr_t + cc_t
 
     model = last_model or None
-    if model not in CONTEXT_LIMITS:
+    if model is None:
+        return (None, None)
+    # Return the RAW model id either way so an unknown model still surfaces its
+    # real name for diagnostics / a future config-driven table entry.
+    limit = _resolve_limit(model)
+    if limit is None:
         return (None, model)
-    pct = round(total * 100.0 / CONTEXT_LIMITS[model], 2)
+    pct = round(total * 100.0 / limit, 2)
     return (pct, model)
 
 
