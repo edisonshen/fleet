@@ -23,10 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Mirrors spike/stop-hook.py:CONTEXT_LIMITS. Keep in sync. Future operator-
-# overridable via ~/.fleet/config.yaml:context_limits (TODOS F11) — not yet
-# wired. Unknown models leave context_pct=None rather than guess a limit.
+# Mirrors spike/stop-hook.py:CONTEXT_LIMITS. Keep in sync (byte-consistent) —
+# tests/test_health.py::TestContextLimitsParity asserts the two tables are
+# identical so they can't drift again. Future operator-overridable via
+# ~/.fleet/config.yaml:context_limits (TODOS F11) — not yet wired. Unknown
+# models (after normalization) leave context_pct=None rather than guess a
+# limit; a wrong limit produces a plausible-looking but wrong percentage that
+# would fire (or suppress) the 50/70 handoff at the wrong moment.
 CONTEXT_LIMITS: dict[str, int] = {
+    "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
     "claude-opus-4-5":     200_000,
@@ -34,6 +39,39 @@ CONTEXT_LIMITS: dict[str, int] = {
     "claude-sonnet-4-5":   200_000,
     "claude-haiku-4-5":    200_000,
 }
+
+
+def _normalize_model(raw: str) -> str:
+    """Reduce a transcript model id to its CONTEXT_LIMITS lookup key.
+
+    Claude Code reports the model on each assistant turn with optional
+    decorations the table doesn't carry:
+      - a trailing bracket variant, e.g. "claude-opus-4-8[1m]" (the 1M-context
+        variant marker) -> strip "[...]".
+      - a trailing date pin, e.g. "claude-opus-4-8-20260601" -> strip a
+        "-YYYYMMDD" suffix.
+
+    Resolution order in read_context_pct is exact-first-then-normalized: the
+    raw id is tried verbatim against the table, then this normalized form. We
+    only strip decorations we recognize; an otherwise-unknown id (after
+    stripping) stays unknown so the table comment's intent holds — no family
+    or prefix guessing.
+
+        "claude-opus-4-8[1m]"        -> "claude-opus-4-8"
+        "claude-opus-4-8-20260601"   -> "claude-opus-4-8"
+        "claude-opus-4-8"            -> "claude-opus-4-8"  (unchanged)
+        "claude-future-99"           -> "claude-future-99" (unchanged -> unknown)
+    """
+    if not raw:
+        return raw
+    s = raw
+    bracket = s.find("[")
+    if bracket >= 0:
+        s = s[:bracket]
+    # Strip a trailing -YYYYMMDD date pin (exactly 8 digits after a hyphen).
+    if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
+        s = s[:-9]
+    return s
 
 # Schema version for ~/.fleet/agents/<id>.json. Mirrors
 # internal/agent.SchemaVersion. Bumped only when the on-disk shape changes
@@ -122,9 +160,16 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
     total = in_t + cr_t + cc_t
 
     model = last_model or None
-    if model not in CONTEXT_LIMITS:
+    if model is None:
+        return (None, None)
+    # Exact-first-then-normalized lookup: try the raw id verbatim, then the
+    # decoration-stripped form (e.g. "claude-opus-4-8[1m]" -> "claude-opus-4-8").
+    # Return the RAW model id either way so an unknown model still surfaces its
+    # real name for diagnostics / a future config-driven table entry.
+    limit = CONTEXT_LIMITS.get(model) or CONTEXT_LIMITS.get(_normalize_model(model))
+    if limit is None:
         return (None, model)
-    pct = round(total * 100.0 / CONTEXT_LIMITS[model], 2)
+    pct = round(total * 100.0 / limit, 2)
     return (pct, model)
 
 

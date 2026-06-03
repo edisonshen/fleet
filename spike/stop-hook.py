@@ -25,10 +25,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Model name -> context-window size in tokens.
+# Mirrors skills/fleet-guard/health.py:CONTEXT_LIMITS — keep byte-consistent
+# (test_health.py::TestContextLimitsParity asserts the two are identical).
 # Update as Anthropic ships new model IDs. Unknown models do NOT silently
 # fall back to a guessed limit — see the model-resolution block below for
 # why null + context_limit_known=False is preferable to a wrong percentage.
 CONTEXT_LIMITS = {
+    "claude-opus-4-8":   1_000_000,
     "claude-opus-4-7":   1_000_000,
     "claude-opus-4-6":     200_000,
     "claude-opus-4-5":     200_000,
@@ -36,6 +39,25 @@ CONTEXT_LIMITS = {
     "claude-sonnet-4-5":   200_000,
     "claude-haiku-4-5":    200_000,
 }
+
+
+def _normalize_model(raw: str) -> str:
+    """Reduce a model id to its CONTEXT_LIMITS lookup key.
+
+    Mirrors skills/fleet-guard/health.py:_normalize_model. Strips a trailing
+    bracket variant ("claude-opus-4-8[1m]" -> "claude-opus-4-8") and a trailing
+    -YYYYMMDD date pin. Only strips recognized decorations; otherwise-unknown
+    ids stay unknown (no family/prefix guessing).
+    """
+    if not raw:
+        return raw
+    s = raw
+    bracket = s.find("[")
+    if bracket >= 0:
+        s = s[:bracket]
+    if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
+        s = s[:-9]
+    return s
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
 PAYLOAD_DIR = SPIKE_DIR / "payloads"
@@ -183,10 +205,13 @@ def main() -> int:
     # plausible-looking but wrong percentages that poison Q3 (accuracy). The
     # fire still counts for Q1 (we have tokens), but pct stays null until
     # the model is added to CONTEXT_LIMITS.
-    known = record["model"] in CONTEXT_LIMITS
+    # Exact-first-then-normalized lookup (e.g. "claude-opus-4-8[1m]" ->
+    # "claude-opus-4-8"). Mirrors health.py:read_context_pct.
+    limit = CONTEXT_LIMITS.get(record["model"]) or \
+        CONTEXT_LIMITS.get(_normalize_model(record["model"]))
+    known = limit is not None
     record["context_limit_known"] = known
     if known:
-        limit = CONTEXT_LIMITS[record["model"]]
         record["context_limit"] = limit
         record["computed_pct"] = round(total * 100.0 / limit, 2)
     else:

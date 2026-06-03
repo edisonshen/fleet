@@ -10,6 +10,7 @@ FLEET_HOME is redirected to a tmp_path for every test via the autouse fixture.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from datetime import datetime, timezone
@@ -18,6 +19,20 @@ from pathlib import Path
 import pytest
 
 import health
+
+
+def _load_stop_hook():
+    """Load spike/stop-hook.py as a module despite its hyphenated filename
+    (not importable via `import`). Used by the table-parity test so the two
+    CONTEXT_LIMITS tables can't drift again."""
+    # tests/ -> fleet-guard/ -> skills/ -> repo root -> spike/stop-hook.py
+    repo_root = Path(__file__).resolve().parents[3]
+    hook_path = repo_root / "spike" / "stop-hook.py"
+    spec = importlib.util.spec_from_file_location("spike_stop_hook", hook_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(autouse=True)
@@ -215,6 +230,128 @@ class TestReadContextPct:
         pct, model = health.read_context_pct({"transcript_path": str(path)})
         assert pct == 25.0
         assert model == "claude-sonnet-4-6"
+
+
+# -- opus-4-8 1M-context regression (fleet-guard-model-limit-db14) -----------
+
+class TestOpus48HandoffFires:
+    """REGRESSION (fleet-guard-model-limit-db14, P0): before the fix,
+    CONTEXT_LIMITS topped out at claude-opus-4-7 and the live model id is
+    "claude-opus-4-8[1m]" (1M context). read_context_pct returned None ->
+    threshold(None)="unknown" -> the 50/70 auto-handoff NEVER fired and the
+    agent ran to 100% into native auto-compact. These tests prove the proactive
+    handoff would now fire on opus-4-8."""
+
+    def _write_transcript(self, tmp_path: Path, model: str, ctx_tokens: int) -> str:
+        path = tmp_path / "t.jsonl"
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": model,
+                "usage": {
+                    "input_tokens": ctx_tokens,
+                    # output excluded from context_pct — set high to prove it.
+                    "output_tokens": 500_000,
+                },
+            },
+        }) + "\n", encoding="utf-8")
+        return str(path)
+
+    def test_opus_4_8_bracket_variant_over_70_is_red(self, tmp_path: Path) -> None:
+        # 750k / 1_000_000 = 75% -> RED. The bracketed [1m] variant must
+        # resolve to the 1M limit, not fall through to unknown.
+        tp = self._write_transcript(tmp_path, "claude-opus-4-8[1m]", 750_000)
+        pct, model = health.read_context_pct({"transcript_path": tp})
+        assert pct == 75.0
+        assert model == "claude-opus-4-8[1m]"  # raw id surfaced verbatim
+        assert health.threshold(pct) == "red"
+
+    def test_opus_4_8_bracket_variant_over_50_is_yellow(self, tmp_path: Path) -> None:
+        # 600k / 1_000_000 = 60% -> YELLOW.
+        tp = self._write_transcript(tmp_path, "claude-opus-4-8[1m]", 600_000)
+        pct, _ = health.read_context_pct({"transcript_path": tp})
+        assert pct == 60.0
+        assert health.threshold(pct) == "yellow"
+
+    def test_opus_4_8_plain_resolves_to_1m(self, tmp_path: Path) -> None:
+        # The un-decorated id is in the table directly; 200k -> 20% green.
+        tp = self._write_transcript(tmp_path, "claude-opus-4-8", 200_000)
+        pct, model = health.read_context_pct({"transcript_path": tp})
+        assert pct == 20.0
+        assert model == "claude-opus-4-8"
+        assert health.threshold(pct) == "green"
+
+
+# -- _normalize_model --------------------------------------------------------
+
+class TestNormalizeModel:
+    @pytest.mark.parametrize("raw,expected", [
+        ("claude-opus-4-8", "claude-opus-4-8"),
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("claude-opus-4-8-20260601", "claude-opus-4-8"),
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("claude-sonnet-4-6-20251101", "claude-sonnet-4-6"),
+        ("", ""),
+    ])
+    def test_strips_known_decorations(self, raw: str, expected: str) -> None:
+        assert health._normalize_model(raw) == expected
+
+    def test_unknown_model_passes_through_unchanged(self) -> None:
+        # No family/prefix guessing — an unknown id (after stripping) stays
+        # unknown so the table comment's intent holds.
+        assert health._normalize_model("claude-future-99") == "claude-future-99"
+
+    def test_dated_and_bracketed_variants_resolve_to_1m_limit(
+        self, tmp_path: Path,
+    ) -> None:
+        """All opus-4-8 decorations resolve to the 1M limit; a genuinely
+        unknown model still returns (None, model)."""
+        for variant in ("claude-opus-4-8",
+                        "claude-opus-4-8[1m]",
+                        "claude-opus-4-8-20260601"):
+            path = tmp_path / "t.jsonl"
+            path.write_text(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "model": variant,
+                    "usage": {"input_tokens": 500_000},
+                },
+            }) + "\n", encoding="utf-8")
+            pct, model = health.read_context_pct({"transcript_path": str(path)})
+            assert pct == 50.0, f"{variant} did not resolve to 1M limit"
+            assert model == variant
+
+        # Genuinely unknown -> None, raw id preserved.
+        path = tmp_path / "unknown.jsonl"
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-future-99",
+                "usage": {"input_tokens": 500_000},
+            },
+        }) + "\n", encoding="utf-8")
+        pct, model = health.read_context_pct({"transcript_path": str(path)})
+        assert pct is None
+        assert model == "claude-future-99"
+
+
+# -- CONTEXT_LIMITS table parity ---------------------------------------------
+
+class TestContextLimitsParity:
+    """The CONTEXT_LIMITS table is duplicated in health.py and
+    spike/stop-hook.py (the skill and the spike must compute the same pct
+    against the same transcript). Assert they are identical so a future edit
+    to one without the other re-introduces the stale-table bug class
+    (fleet-guard-model-limit-db14)."""
+
+    def test_tables_are_identical(self) -> None:
+        stop_hook = _load_stop_hook()
+        assert health.CONTEXT_LIMITS == stop_hook.CONTEXT_LIMITS
+
+    def test_opus_4_8_present_in_both(self) -> None:
+        stop_hook = _load_stop_hook()
+        assert health.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
+        assert stop_hook.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
 
 
 # -- update_record -----------------------------------------------------------
