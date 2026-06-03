@@ -6333,12 +6333,28 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
     #     caller collects the block only after this function returns.
     # gen<=0 (legacy un-migrated dispatch) skips the set, leaving the
     # task-row default (0) intact.
-    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
+    #
+    # ORDER (codex iter-2 [P1]): persist dispatch_generation BEFORE the
+    # status=in-progress flip. `fleet tasks set` is one key=value per call
+    # (ExactArgs(2)) — not atomic across two fields. If status flipped
+    # FIRST and the gen set then crashed/failed, the row would be
+    # in-progress at the OLD (prior) generation; a redispatch with a stale
+    # state.json would read that prior attempt as `current` and let stale
+    # terminal/PR data drive reconcile. By committing the gen FIRST, a
+    # crash between the two leaves the row still `status=ready` at the new
+    # gen — re-dispatchable, never in-progress-under-old-gen. No launchable
+    # DISPATCH can be emitted mid-apply: the caller collects the block only
+    # AFTER this function returns (loop.py ~1041), so the brief `ready`
+    # window cannot double-dispatch. The duplicate-dispatch guard (slug
+    # leaves the ready set before any launchable block) still holds because
+    # both writes + the block-collection are one synchronous tick under the
+    # coord lock.
     if action.dispatch_generation > 0:
         _run_fleet([
             fleet_bin, "tasks", "set", "--project", project, action.slug,
             f"dispatch_generation={action.dispatch_generation}",
         ])
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-progress"])
     if action.branch:
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"branch={action.branch}"])
     if action.worktree:

@@ -252,10 +252,16 @@ def test_gen_inconsistent_worker_record_is_forgotten(fleet_home: Path) -> None:
 def test_apply_dispatch_persists_generation_with_in_progress_flip(
     fleet_home: Path,
 ) -> None:
-    # _apply_dispatch must persist dispatch_generation in the SAME
-    # pre-launch commit as status=in-progress, BEFORE the state.json
-    # bootstrap — and the status flip is the FIRST mutation (so no
-    # launchable DISPATCH is emitted while the slug is still ready).
+    # _apply_dispatch persists dispatch_generation in the pre-launch
+    # commit, BEFORE state.json bootstrap. codex iter-2 [P1]: the gen set
+    # must come BEFORE the status=in-progress flip — `fleet tasks set` is
+    # one field per call (not atomic across two), so a crash between them
+    # must NOT leave the row in-progress at the OLD generation (which would
+    # let a stale prior state read `current`). Committing gen first leaves
+    # any crash window at status=ready under the NEW gen (re-dispatchable),
+    # never in-progress-under-old-gen. No launchable DISPATCH is emitted
+    # mid-apply (the caller collects the block only after this returns), so
+    # the brief ready window cannot double-dispatch.
     calls: list[list[str]] = []
     with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: calls.append(list(cmd))):
         loop._apply_dispatch(
@@ -277,9 +283,9 @@ def test_apply_dispatch_persists_generation_with_in_progress_flip(
     i_bootstrap = idx(
         lambda c: c[1:3] == ["workers", "update"] and "starting" in c,
     )
-    assert i_status == 0, "status=in-progress must be the FIRST mutation"
-    assert i_gen > i_status, "dispatch_generation persisted in the pre-launch commit"
-    assert i_bootstrap > i_gen, "state.json bootstrap comes AFTER the gen persist"
+    assert i_gen == 0, "dispatch_generation must be the FIRST mutation (before status)"
+    assert i_status > i_gen, "status=in-progress comes AFTER the gen commit (atomicity-safe order)"
+    assert i_bootstrap > i_status, "state.json bootstrap comes AFTER the pre-launch commit"
     # The bootstrap state write carries --dispatch-generation so the
     # bootstrapped state.json reads `current` (not legacy-0 / stale).
     assert "--dispatch-generation" in calls[i_bootstrap]

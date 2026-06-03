@@ -798,6 +798,41 @@ class TestPartialApplyWedgeRecovery:
             )
         assert actions == []
 
+    def test_gen_committed_before_status_so_crash_leaves_ready(self) -> None:
+        # codex iter-2 [P1]: dispatch_generation must be persisted BEFORE
+        # status=in-progress. `fleet tasks set` is one field per call, so a
+        # crash between the two must NOT strand the row in-progress at the
+        # OLD gen (which would let a stale prior state read `current`).
+        # Simulate a crash AFTER the gen set but BEFORE the status flip:
+        # the only mutation that landed is the gen set; status is still
+        # ready. Assert the gen set is the one that landed (not status).
+        calls: list[list[str]] = []
+
+        def boom(cmd, timeout_s=30.0):
+            calls.append(list(cmd))
+            if cmd[1:3] == ["tasks", "set"] and "status=in-progress" in cmd:
+                raise RuntimeError("simulated coord crash before status flip")
+
+        with patch.object(loop, "_run_fleet", side_effect=boom):
+            try:
+                loop._apply_dispatch(
+                    loop._DispatchAction(
+                        slug="crash-zzzz", agent_id="aaaaaaaa",
+                        branch="worker/crash-zzzz",
+                        dispatch_instruction="DISPATCH ...",
+                        dispatch_generation=3,
+                    ),
+                    "fleet", "fleet",
+                )
+            except RuntimeError:
+                pass
+        joined = [" ".join(c) for c in calls]
+        # The gen set landed (it ran first); the status flip is what raised.
+        assert any("dispatch_generation=3" in j for j in joined)
+        gen_i = next(i for i, j in enumerate(joined) if "dispatch_generation=3" in j)
+        status_i = next(i for i, j in enumerate(joined) if "status=in-progress" in j)
+        assert gen_i < status_i, "gen must commit before status (crash-safe order)"
+
     def test_wedge_recoverable_predicate(self, tmp_path: Path) -> None:
         slug = "pred-dddd"
         agent_id = "cafe0001"
