@@ -41,21 +41,25 @@ CONTEXT_LIMITS: dict[str, int] = {
 }
 
 
+# A "[1m]" bracket marker is Anthropic's 1M-context variant tag (e.g.
+# "claude-opus-4-8[1m]"). It denotes a 1,000,000-token window regardless of the
+# base model's default limit, so it must NOT be stripped down to the base
+# entry — doing so would compute a 1M context against a 200k base limit and
+# fire the red handoff far too early (codex P2, 2026-06-03).
+ONE_M_BRACKET_TOKENS = 1_000_000
+
+
 def _normalize_model(raw: str) -> str:
-    """Reduce a transcript model id to its CONTEXT_LIMITS lookup key.
+    """Reduce a transcript model id to its CONTEXT_LIMITS lookup key by
+    stripping decorations the table doesn't carry:
+      - a trailing bracket variant, e.g. "claude-opus-4-8[1m]" -> "claude-opus-4-8"
+      - a trailing date pin, e.g. "claude-opus-4-8-20260601" -> "claude-opus-4-8"
 
-    Claude Code reports the model on each assistant turn with optional
-    decorations the table doesn't carry:
-      - a trailing bracket variant, e.g. "claude-opus-4-8[1m]" (the 1M-context
-        variant marker) -> strip "[...]".
-      - a trailing date pin, e.g. "claude-opus-4-8-20260601" -> strip a
-        "-YYYYMMDD" suffix.
-
-    Resolution order in read_context_pct is exact-first-then-normalized: the
-    raw id is tried verbatim against the table, then this normalized form. We
-    only strip decorations we recognize; an otherwise-unknown id (after
-    stripping) stays unknown so the table comment's intent holds — no family
-    or prefix guessing.
+    This is the lookup-KEY reducer only; it does NOT decide the limit. The
+    "[1m]" variant maps to a 1M limit in _resolve_limit BEFORE this strip is
+    consulted, so a bracketed 1M tag never inherits a smaller base limit. We
+    only strip recognized decorations; an otherwise-unknown id (after
+    stripping) stays unknown — no family/prefix guessing.
 
         "claude-opus-4-8[1m]"        -> "claude-opus-4-8"
         "claude-opus-4-8-20260601"   -> "claude-opus-4-8"
@@ -72,6 +76,31 @@ def _normalize_model(raw: str) -> str:
     if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
         s = s[:-9]
     return s
+
+
+def _resolve_limit(raw: str | None) -> int | None:
+    """Resolve a transcript model id to its context-window size, or None when
+    unknown. Resolution policy (shared with spike/stop-hook.py):
+
+      1. Exact table hit on the raw id wins (covers any future id we add
+         verbatim, including a decorated one).
+      2. A "[1m]" bracket tag denotes the 1M-context variant -> 1,000,000,
+         regardless of the base model's default limit. Checked BEFORE the
+         base-strip so e.g. "claude-sonnet-4-6[1m]" does NOT collapse to the
+         200k sonnet entry.
+      3. Otherwise, look up the decoration-stripped form (date pin, non-[1m]
+         bracket) against the table.
+      4. No match -> None (unknown stays unknown; never guess a limit).
+    """
+    if not raw:
+        return None
+    exact = CONTEXT_LIMITS.get(raw)
+    if exact is not None:
+        return exact
+    bracket = raw.find("[")
+    if bracket >= 0 and "1m" in raw[bracket:].lower():
+        return ONE_M_BRACKET_TOKENS
+    return CONTEXT_LIMITS.get(_normalize_model(raw))
 
 # Schema version for ~/.fleet/agents/<id>.json. Mirrors
 # internal/agent.SchemaVersion. Bumped only when the on-disk shape changes
@@ -162,11 +191,9 @@ def read_context_pct(payload: dict[str, Any]) -> tuple[float | None, str | None]
     model = last_model or None
     if model is None:
         return (None, None)
-    # Exact-first-then-normalized lookup: try the raw id verbatim, then the
-    # decoration-stripped form (e.g. "claude-opus-4-8[1m]" -> "claude-opus-4-8").
     # Return the RAW model id either way so an unknown model still surfaces its
     # real name for diagnostics / a future config-driven table entry.
-    limit = CONTEXT_LIMITS.get(model) or CONTEXT_LIMITS.get(_normalize_model(model))
+    limit = _resolve_limit(model)
     if limit is None:
         return (None, model)
     pct = round(total * 100.0 / limit, 2)

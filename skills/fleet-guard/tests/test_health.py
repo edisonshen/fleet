@@ -335,6 +335,74 @@ class TestNormalizeModel:
         assert model == "claude-future-99"
 
 
+# -- _resolve_limit ([1m] bracket = 1M regardless of base) -------------------
+
+class TestResolveLimit:
+    """codex P2 regression (2026-06-03): a "[1m]" bracket tag denotes the
+    1M-context variant and must resolve to 1,000,000 even when the base model's
+    table entry is 200k. Naively stripping "[1m]" and looking up the base would
+    make a 500k context look like 250% and fire the red handoff far too early.
+    """
+
+    def test_exact_table_hit(self) -> None:
+        assert health._resolve_limit("claude-opus-4-8") == 1_000_000
+        assert health._resolve_limit("claude-sonnet-4-6") == 200_000
+
+    def test_one_m_bracket_on_200k_base_resolves_to_1m(self) -> None:
+        # claude-sonnet-4-6 base is 200k; the [1m] variant is 1M, NOT 200k.
+        assert health._resolve_limit("claude-sonnet-4-6[1m]") == 1_000_000
+
+    def test_one_m_bracket_on_1m_base_resolves_to_1m(self) -> None:
+        assert health._resolve_limit("claude-opus-4-8[1m]") == 1_000_000
+
+    def test_non_1m_bracket_strips_to_base(self) -> None:
+        # A non-[1m] bracket decoration falls back to the stripped base limit.
+        assert health._resolve_limit("claude-sonnet-4-6[beta]") == 200_000
+
+    def test_dated_variant_strips_to_base(self) -> None:
+        assert health._resolve_limit("claude-sonnet-4-6-20251101") == 200_000
+
+    def test_unknown_returns_none(self) -> None:
+        assert health._resolve_limit("claude-future-99") is None
+        assert health._resolve_limit("claude-future-99[1m]") == 1_000_000  # [1m] tag wins
+        assert health._resolve_limit("") is None
+        assert health._resolve_limit(None) is None
+
+    def test_sonnet_1m_over_70_fires_red(self, tmp_path: Path) -> None:
+        """End-to-end through read_context_pct: a 750k context on
+        claude-sonnet-4-6[1m] is 75% of 1M -> red. Under the buggy strip it
+        would be 375% of 200k (still red but for the wrong reason); the
+        meaningful assertion is the EXACT pct, proving the 1M denominator."""
+        path = tmp_path / "t.jsonl"
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6[1m]",
+                "usage": {"input_tokens": 750_000},
+            },
+        }) + "\n", encoding="utf-8")
+        pct, model = health.read_context_pct({"transcript_path": str(path)})
+        assert pct == 75.0  # 750k / 1M, NOT 750k / 200k = 375.0
+        assert model == "claude-sonnet-4-6[1m]"
+        assert health.threshold(pct) == "red"
+
+    def test_sonnet_1m_under_50_is_green(self, tmp_path: Path) -> None:
+        """The bug's user-visible symptom: a [1m]-base-200k model at 40% of 1M
+        (400k tokens) must read green, not the 200% the strip-to-base bug
+        would produce (which would spuriously trigger handoff)."""
+        path = tmp_path / "t.jsonl"
+        path.write_text(json.dumps({
+            "type": "assistant",
+            "message": {
+                "model": "claude-sonnet-4-6[1m]",
+                "usage": {"input_tokens": 400_000},
+            },
+        }) + "\n", encoding="utf-8")
+        pct, _ = health.read_context_pct({"transcript_path": str(path)})
+        assert pct == 40.0
+        assert health.threshold(pct) == "green"
+
+
 # -- CONTEXT_LIMITS table parity ---------------------------------------------
 
 class TestContextLimitsParity:
@@ -352,6 +420,22 @@ class TestContextLimitsParity:
         stop_hook = _load_stop_hook()
         assert health.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
         assert stop_hook.CONTEXT_LIMITS.get("claude-opus-4-8") == 1_000_000
+
+    def test_resolve_limit_agrees_across_modules(self) -> None:
+        """The shared resolution policy (_resolve_limit) must produce the same
+        limit in both modules for representative ids, including the [1m] tag and
+        dated/unknown variants."""
+        stop_hook = _load_stop_hook()
+        for mid in ("claude-opus-4-8",
+                    "claude-opus-4-8[1m]",
+                    "claude-opus-4-8-20260601",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-4-6[1m]",
+                    "claude-sonnet-4-6[beta]",
+                    "claude-future-99",
+                    "claude-future-99[1m]",
+                    ""):
+            assert health._resolve_limit(mid) == stop_hook._resolve_limit(mid), mid
 
 
 # -- update_record -----------------------------------------------------------

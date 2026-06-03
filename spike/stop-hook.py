@@ -41,7 +41,13 @@ CONTEXT_LIMITS = {
 }
 
 
-def _normalize_model(raw: str) -> str:
+# A "[1m]" bracket marker denotes the 1M-context variant regardless of the
+# base model's default limit — see skills/fleet-guard/health.py for the full
+# rationale (codex P2, 2026-06-03).
+ONE_M_BRACKET_TOKENS = 1_000_000
+
+
+def _normalize_model(raw):
     """Reduce a model id to its CONTEXT_LIMITS lookup key.
 
     Mirrors skills/fleet-guard/health.py:_normalize_model. Strips a trailing
@@ -58,6 +64,22 @@ def _normalize_model(raw: str) -> str:
     if len(s) > 9 and s[-9] == "-" and s[-8:].isdigit():
         s = s[:-9]
     return s
+
+
+def _resolve_limit(raw):
+    """Resolve a model id to its context-window size, or None when unknown.
+    Mirrors skills/fleet-guard/health.py:_resolve_limit: exact hit -> "[1m]"
+    variant means 1M -> stripped base lookup -> None.
+    """
+    if not raw:
+        return None
+    exact = CONTEXT_LIMITS.get(raw)
+    if exact is not None:
+        return exact
+    bracket = raw.find("[")
+    if bracket >= 0 and "1m" in raw[bracket:].lower():
+        return ONE_M_BRACKET_TOKENS
+    return CONTEXT_LIMITS.get(_normalize_model(raw))
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
 PAYLOAD_DIR = SPIKE_DIR / "payloads"
@@ -205,10 +227,9 @@ def main() -> int:
     # plausible-looking but wrong percentages that poison Q3 (accuracy). The
     # fire still counts for Q1 (we have tokens), but pct stays null until
     # the model is added to CONTEXT_LIMITS.
-    # Exact-first-then-normalized lookup (e.g. "claude-opus-4-8[1m]" ->
-    # "claude-opus-4-8"). Mirrors health.py:read_context_pct.
-    limit = CONTEXT_LIMITS.get(record["model"]) or \
-        CONTEXT_LIMITS.get(_normalize_model(record["model"]))
+    # Resolve via the shared policy (exact -> "[1m]"=1M -> stripped base).
+    # Mirrors health.py:read_context_pct.
+    limit = _resolve_limit(record["model"])
     known = limit is not None
     record["context_limit_known"] = known
     if known:
