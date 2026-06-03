@@ -3569,47 +3569,71 @@ def _dispatch_wedge_recoverable(
     (_replay_pending_dispatches) and the dispatch-retry path never fires
     (it only picks status=ready). Nobody recovers → wedged in-progress.
 
-    Requeue is SAFE only under ALL of:
+    Requeue is SAFE under EITHER recovery path, both of which prove the
+    worker was NEVER launched (so requeue cannot double-dispatch):
+
+    (A) Same-process wedge (coord-state still in memory):
       - the slug has an adopted agent_id,
       - that id is in pending_acquire (replay will NOT re-emit it),
-      - its journal exists AND is `pending` (the worker was never launched
-        — a launch_attempted / acked journal means a worker DID launch, so
-        requeuing would double-dispatch; defer to replay's residual-crash
-        repair / the live worker's own terminal write instead).
+      - its journal exists AND is `pending`.
 
-    A False result (no adopted id, not pending_acquire, journal absent /
-    non-pending) means reconcile must NOT requeue — replay or a live
-    worker owns recovery. Conservative: any ambiguity → False (no requeue).
+    (B) Cross-restart wedge (coord crashed BEFORE the coord-state
+        heartbeat saved, so worker_agent_ids/pending_acquire are EMPTY
+        after restart — codex review-iter [P1]): the durable journal
+        (written by acquire_coord_prompt_inbox BEFORE _apply_dispatch) is
+        an ORPHAN `pending` for this slug with NO coord-state entry. Replay
+        ALSO skips it (its identity predicate needs adopted_agent_ids[slug]
+        == agent_id, which is empty), so reconcile is the ONLY recovery.
+      - the slug has NO adopted agent_id (coord-state lost),
+      - exactly one journal owned by this slug is `pending` (never
+        launched), none in a launched/terminal state.
+
+    A launch_attempted / acked / terminal journal means a worker DID
+    launch → NOT requeue (defer to replay's residual-crash repair / the
+    live worker). Conservative: any ambiguity → False (no requeue).
     """
     if coord_state is None or home is None:
         return False
     try:
         adopted = supervisor_mod.load_agent_id_map(coord_state)
     except Exception:  # noqa: BLE001
-        return False
+        adopted = {}
     agent_id = adopted.get(slug, "")
-    if not agent_id:
+    if agent_id:
+        # Path (A): same-process wedge — the id must be mid-application
+        # (in pending_acquire, so replay skips it) with a `pending`
+        # journal (worker never launched).
+        try:
+            pending = set(
+                supervisor_mod.load_pending_acquire_agent_id_map(
+                    coord_state,
+                ).values()
+            )
+        except Exception:  # noqa: BLE001
+            pending = set()
+        if agent_id not in pending:
+            # Replay-eligible (applied) id → replay owns it; never requeue
+            # (the #184 double-dispatch trap).
+            return False
+        for jid, jslug, j in _iter_project_journals(home, project):
+            if jid == agent_id and jslug == slug:
+                return j.get("exec_state", "") == "pending"
+        # No journal for the adopted id → can't prove un-launched → safe-no.
         return False
-    try:
-        pending = set(
-            supervisor_mod.load_pending_acquire_agent_id_map(coord_state).values()
-        )
-    except Exception:  # noqa: BLE001
-        pending = set()
-    if agent_id not in pending:
-        # NOT a partial-apply wedge: a replay-eligible (applied) id, or an
-        # untracked id. Replay / the live worker owns recovery — never
-        # requeue (that is the #184 double-dispatch trap).
+    # Path (B): cross-restart wedge — no adopted id. Look for an orphan
+    # pending journal owned by this slug. If ANY journal for this slug is
+    # in a launched/terminal state, a worker DID launch → do NOT requeue.
+    slug_journals = [
+        (jid, j) for jid, jslug, j in _iter_project_journals(home, project)
+        if jslug == slug
+    ]
+    if not slug_journals:
         return False
-    # The id is mid-application. Confirm the journal is `pending` (worker
-    # never launched). A launch_attempted / acked / terminal journal means
-    # a worker DID launch — do NOT requeue.
-    for jid, jslug, j in _iter_project_journals(home, project):
-        if jid == agent_id and jslug == slug:
-            return j.get("exec_state", "") == "pending"
-    # No journal for the adopted id: cannot prove the worker never
-    # launched → fail safe (no requeue).
-    return False
+    states = {j.get("exec_state", "") for _jid, j in slug_journals}
+    # Every journal for this slug must be `pending` (never launched). A
+    # mix containing launch_attempted/acked/terminal means a launch
+    # happened — fail safe.
+    return states == {"pending"}
 
 
 def _reconcile_inflight(

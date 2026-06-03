@@ -2097,6 +2097,57 @@ func TestReconcile_WorkerRecords_Mismatch_ApplyRemoves(t *testing.T) {
 	}
 }
 
+// TestReconcile_WorkerRecords_Parked_Mismatch_RefusesRemove pins the
+// review-iter [P2] fix: the PARKED guard runs BEFORE the project-mismatch
+// removal branch. A dirty-parked row whose state.json ALSO carries a
+// project mismatch + dead/no PID would otherwise be removed by the
+// mismatch branch under --apply, erasing the dirty-worktree recovery
+// context the park exists to protect. The parked guard must win.
+func TestReconcile_WorkerRecords_Parked_Mismatch_RefusesRemove(t *testing.T) {
+	now := time.Date(2026, 5, 27, 12, 0, 0, 0, time.UTC)
+	deps := stubDeps(now)
+	workerPath := "/fake/projects/projects-fleet/workers/parked-mismatch-aaaa/"
+	deps.ListWorkerRecords = func() ([]WorkerRecordInfo, error) {
+		return []WorkerRecordInfo{{
+			Project: "projects-fleet",
+			Slug:    "parked-mismatch-aaaa",
+			Path:    workerPath,
+		}}, nil
+	}
+	deps.LoadWorkerState = func(string) (WorkerState, error) {
+		return WorkerState{
+			Slug:      "parked-mismatch-aaaa",
+			Project:   "projects-rainier", // mismatch vs parent dir
+			Pid:       0,                  // dead/no pid → mismatch branch removes
+			UpdatedAt: now.Add(-25 * time.Hour),
+		}, nil
+	}
+	deps.LoadTaskParked = func(string, string) (string, error) {
+		return "2026-05-27T00:00:00Z dirty worktree", nil
+	}
+	deps.RemoveWorkerRecord = func(p string) error {
+		t.Fatalf("RemoveWorkerRecord(%q) called on a PARKED row — the parked guard must run BEFORE the mismatch removal branch ([P2])", p)
+		return nil
+	}
+	got, err := Reconcile(Options{
+		Apply: true, MaxAge: 24 * time.Hour,
+		Kinds: []Kind{KindWorkerRecords},
+	}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindWorkerRecords, workerPath)
+	if !ok {
+		t.Fatalf("missing worker-records action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("parked+mismatch verb=%q, want %q (surface, never remove)", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "PARKED") {
+		t.Fatalf("reason=%q does not name PARKED protection", a.Reason)
+	}
+}
+
 // TestReconcile_WorkerRecords_Mismatch_LivePid_RefusesUnlink pins the
 // live-PID safety gate inside the mismatch apply path (review iter-1
 // follow-up). A cross-project record claiming a still-live PID is

@@ -162,6 +162,31 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		// running subagent orphans its in-flight phase writes. Surface
 		// instead under --apply when the recorded PID is alive (codex
 		// iter-N: review-iter live-PID-mismatch gate).
+		//
+		// PARKED guard runs FIRST (review-iter [P2]): the mismatch branch
+		// below removes a dir for a dead/no-PID worker, so a parked row
+		// whose state.json ALSO has a project mismatch would be removed
+		// before the parked check if that check sat after this branch —
+		// erasing the dirty-worktree recovery context the park protects.
+		// So the PARKED guard precedes ALL removal branches (mismatch,
+		// dead-pid, stale-heartbeat, task-terminal). The live-PID guard
+		// below (#2) still wins because a live worker is never touched
+		// regardless of parked state.
+		if deps.LoadTaskParked != nil {
+			if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
+				r.Actions = append(r.Actions, Action{
+					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+					Reason: fmt.Sprintf(
+						"row is PARKED (%s) — coord kept the worker dir for "+
+							"dirty-worktree recovery; surface only, refusing to "+
+							"remove. Resolve the park (commit/discard the worktree, "+
+							"clear `parked`) first",
+						parked),
+				})
+				continue
+			}
+		}
+
 		if ws.Project != "" && ws.Project != info.Project {
 			reason := fmt.Sprintf("mismatch (worker dir=%s vs state.project=%s)", info.Project, ws.Project)
 			if ws.Pid > 0 && deps.PidAlive(ws.Pid) {
@@ -178,33 +203,6 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 		// 2. Live-PID guard — never touch a live worker.
 		if ws.Pid > 0 && deps.PidAlive(ws.Pid) {
 			continue
-		}
-
-		// 2b. PARKED guard (D2, DESIGN §4.2) — checked BEFORE every
-		// removal branch (dead-pid, stale-heartbeat, task-terminal). A
-		// dirty-parked row keeps its worker dir ON PURPOSE: it holds the
-		// recovery context the coord protects (a dirty leaked worktree the
-		// operator must inspect/commit/discard). A parked `done` row is
-		// ALSO stale-heartbeat (pid=0, old) by construction — the worker
-		// exited long ago — so a parked check placed only in the
-		// task-terminal branch would be unreachable: the stale-heartbeat
-		// branch (#4) removes the dir first under --apply. So the guard
-		// lives here, ahead of all three, and surfaces (don't silo) the
-		// path without removing. Unwired dep / probe error → treat as
-		// not-parked (back-compat); a non-empty parked value protects.
-		if deps.LoadTaskParked != nil {
-			if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
-				r.Actions = append(r.Actions, Action{
-					Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
-					Reason: fmt.Sprintf(
-						"row is PARKED (%s) — coord kept the worker dir for "+
-							"dirty-worktree recovery; surface only, refusing to "+
-							"remove. Resolve the park (commit/discard the worktree, "+
-							"clear `parked`) first",
-						parked),
-				})
-				continue
-			}
 		}
 
 		age := now.Sub(ws.UpdatedAt)

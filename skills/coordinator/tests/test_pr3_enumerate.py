@@ -686,6 +686,45 @@ class TestPartialApplyWedgeRecovery:
         assert a.clear_worker is True
         assert a.delete_worker_dir is True
 
+    def test_cross_restart_orphan_pending_journal_requeued(
+        self, tmp_path: Path,
+    ) -> None:
+        # review-iter [P1]: coord crashed BEFORE saving coord-state, so
+        # worker_agent_ids/pending_acquire are EMPTY after restart. The
+        # durable orphan PENDING journal (worker never launched) for the
+        # slug is the only evidence — replay also skips it (no adopted id).
+        # Reconcile must still recover the wedge.
+        slug = "restart-yyyy"
+        agent_id = "deed0001"
+        self._stale_state(tmp_path, slug, gen=1)
+        self._journal(tmp_path, agent_id, slug, "pending")
+        coord_state: dict = {}  # coord-state LOST on the crash
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path, coord_state=coord_state,
+            )
+        assert len(actions) == 1
+        assert actions[0].new_status == "todo"
+        assert actions[0].clear_worker is True
+
+    def test_cross_restart_launched_journal_NOT_requeued(
+        self, tmp_path: Path,
+    ) -> None:
+        # Cross-restart, but the orphan journal is launch_attempted — a
+        # worker DID launch before the crash. Requeuing would double-
+        # dispatch. Must NOT requeue.
+        slug = "restart-launched"
+        agent_id = "deed0002"
+        self._stale_state(tmp_path, slug, gen=1)
+        self._journal(tmp_path, agent_id, slug, "launch_attempted")
+        t = _make_task(slug, status="in-progress", dispatch_generation=2)
+        with patch.object(loop, "_is_worker_alive", return_value=False):
+            actions = loop._reconcile_inflight(
+                [t], "p", "fleet", home=tmp_path, coord_state={},
+            )
+        assert actions == [], "launched worker (no coord-state) must not requeue"
+
     def test_launch_attempted_journal_NOT_requeued(
         self, tmp_path: Path,
     ) -> None:
@@ -776,12 +815,15 @@ class TestPartialApplyWedgeRecovery:
             slug, "p", tmp_path,
             {"worker_agent_ids": {slug: agent_id}},
         ) is False
-        # no adopted id → not a wedge.
-        assert loop._dispatch_wedge_recoverable(slug, "p", tmp_path, {}) is False
-        # launched (journal launch_attempted) → not requeue-safe.
+        # no adopted id BUT orphan pending journal (cross-restart, path B)
+        # → wedge (worker never launched), requeue-safe.
+        assert loop._dispatch_wedge_recoverable(slug, "p", tmp_path, {}) is True
+        # launched (journal launch_attempted) → not requeue-safe (both A+B).
         self._journal(tmp_path, agent_id, slug, "launch_attempted")
         assert loop._dispatch_wedge_recoverable(
             slug, "p", tmp_path,
             {"worker_agent_ids": {slug: agent_id},
              "pending_acquire_agent_ids": {slug: agent_id}},
         ) is False
+        # cross-restart with launched journal → also not requeue-safe.
+        assert loop._dispatch_wedge_recoverable(slug, "p", tmp_path, {}) is False
