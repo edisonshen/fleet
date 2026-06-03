@@ -634,6 +634,20 @@ def forget_agent_id(
         forget_pending_acquire_agent_id(coord_state, slug)
 
 
+def _pending_acquire_agent_id(v: object) -> str:
+    """Extract the agent_id from a pending-acquire value, tolerating
+    BOTH the legacy bare-string shape and the new
+    ``{agent_id, dispatch_generation, dispatch_kind}`` record shape
+    (DESIGN §3). Returns "" when the value is malformed / not an
+    agent_id."""
+    if isinstance(v, str):
+        return v if _is_agent_id(v) else ""
+    if isinstance(v, dict):
+        aid = v.get("agent_id", "")
+        return aid if isinstance(aid, str) and _is_agent_id(aid) else ""
+    return ""
+
+
 def load_pending_acquire_agent_id_map(coord_state: dict) -> dict[str, str]:
     """Return the slug → pending-acquire agent_id map.
 
@@ -644,14 +658,68 @@ def load_pending_acquire_agent_id_map(coord_state: dict) -> dict[str, str]:
     so AcquireCoordPromptInbox's recovery branch (live-claim-with-
     missing-file) can complete the half-written acquire instead of
     orphaning a journal.
+
+    Tolerates both the legacy bare-string value and the new
+    ``{agent_id, dispatch_generation, dispatch_kind}`` record
+    (load_pending_acquire_record_map exposes the full record).
     """
     raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
     if not isinstance(raw, dict):
         return {}
     out: dict[str, str] = {}
     for k, v in raw.items():
-        if isinstance(k, str) and isinstance(v, str) and _is_agent_id(v):
-            out[k] = v
+        if not isinstance(k, str):
+            continue
+        aid = _pending_acquire_agent_id(v)
+        if aid:
+            out[k] = aid
+    return out
+
+
+def load_pending_acquire_record_map(coord_state: dict) -> dict[str, dict]:
+    """Return the slug → ``{agent_id, dispatch_generation,
+    dispatch_kind}`` pending-acquire record map (DESIGN §3).
+
+    A dispatch retry uses the full record to PROVE prompt ↔ task-row
+    generation match: a retry reuses the recorded generation (never
+    re-increments — re-incrementing would skew the task row to gen N+1
+    while the already-acquired prompt still tells the worker to write
+    gen N, wedging every CAS'd update), and reuses ONLY when the
+    dispatch_kind matches too (a worker retry and a reviewer/finisher
+    retry on the same slug carry the same inherited generation, so
+    generation equality alone can't tell them apart — a kind mismatch
+    must release+rewrite, never blind-reuse the wrong prompt).
+
+    A legacy bare-string entry surfaces as
+    ``{agent_id, dispatch_generation: 0, dispatch_kind: ""}`` so the
+    retry treats it as a kind/gen mismatch and rewrites — fail-safe.
+    """
+    raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        aid = _pending_acquire_agent_id(v)
+        if not aid:
+            continue
+        if isinstance(v, dict):
+            try:
+                gen = int(v.get("dispatch_generation", 0) or 0)
+            except (TypeError, ValueError):
+                gen = 0
+            kind = v.get("dispatch_kind", "")
+            kind = kind if isinstance(kind, str) else ""
+        else:
+            # Legacy bare-string: unknown gen/kind → 0/"" so the retry
+            # rewrites rather than trusting an unverifiable record.
+            gen, kind = 0, ""
+        out[k] = {
+            "agent_id": aid,
+            "dispatch_generation": gen,
+            "dispatch_kind": kind,
+        }
     return out
 
 
@@ -659,13 +727,41 @@ def remember_pending_acquire_agent_id(
     coord_state: dict, slug: str, agent_id: str,
 ) -> None:
     """Persist a slug → pending-acquire agent_id so the next tick
-    retries with the same id and can hit the recovery path."""
+    retries with the same id and can hit the recovery path.
+
+    Back-compat shim: writes the bare-string shape. New call sites use
+    remember_pending_acquire_record to also persist the generation +
+    kind needed for the §3 retry proof."""
     if not slug or not _is_agent_id(agent_id):
         return
     raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
     if not isinstance(raw, dict):
         raw = {}
     raw[slug] = agent_id
+    coord_state[_PENDING_ACQUIRE_IDS_KEY] = raw
+
+
+def remember_pending_acquire_record(
+    coord_state: dict,
+    slug: str,
+    agent_id: str,
+    dispatch_generation: int,
+    dispatch_kind: str,
+) -> None:
+    """Persist the full ``{agent_id, dispatch_generation,
+    dispatch_kind}`` pending-acquire record (DESIGN §3) so a retry can
+    PROVE the prompt ↔ task-row generation+kind match before reusing
+    the already-acquired claim."""
+    if not slug or not _is_agent_id(agent_id):
+        return
+    raw = coord_state.get(_PENDING_ACQUIRE_IDS_KEY, {})
+    if not isinstance(raw, dict):
+        raw = {}
+    raw[slug] = {
+        "agent_id": agent_id,
+        "dispatch_generation": int(dispatch_generation),
+        "dispatch_kind": dispatch_kind or "",
+    }
     coord_state[_PENDING_ACQUIRE_IDS_KEY] = raw
 
 

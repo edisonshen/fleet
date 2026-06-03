@@ -366,6 +366,16 @@ type workersUpdateOpts struct {
 	reviewCodexStatusSet     bool
 	reviewCodexRoundsSet     bool
 	reviewCodexSkipReasonSet bool
+
+	// dispatchGeneration is the coord-owned per-slug fence token
+	// (DESIGN §1/§2.2) stamped into this dispatch's worker prompt. When
+	// set, the update routes through workers.UpdateStateGen, a CAS that
+	// rejects the write when it doesn't match the task row's
+	// authoritative dispatch_generation (a stale prior attempt). When
+	// the flag is absent (legacy / non-worker callers), the update keeps
+	// the ungated path so pre-migration workers don't fail open.
+	dispatchGeneration    int
+	dispatchGenerationSet bool
 }
 
 // allowedCodexSkipReasonsCLI is the CLI-side mirror of the
@@ -440,6 +450,7 @@ explicitly when the caller is a wrapper script.`,
 			opts.reviewCodexStatusSet = cmd.Flags().Changed("review-codex-status")
 			opts.reviewCodexRoundsSet = cmd.Flags().Changed("review-codex-rounds")
 			opts.reviewCodexSkipReasonSet = cmd.Flags().Changed("review-codex-skip-reason")
+			opts.dispatchGenerationSet = cmd.Flags().Changed("dispatch-generation")
 			return runWorkersUpdate(args[0], opts, cmd.OutOrStdout())
 		},
 	}
@@ -460,8 +471,35 @@ explicitly when the caller is a wrapper script.`,
 		"reviewer subagent: rounds of codex review run before terminal status (0..N)")
 	cmd.Flags().StringVar(&opts.reviewCodexSkipReason, "review-codex-skip-reason", "",
 		"reviewer subagent: skip reason — required when --review-codex-status=skipped (allowlist: rate-limited, unavailable, no-git)")
+	cmd.Flags().IntVar(&opts.dispatchGeneration, "dispatch-generation", 0,
+		"coord-owned per-slug fence token (DESIGN §2.2). When set, the update is a CAS against the task row's dispatch_generation: a stale generation is rejected. Omit on legacy/non-worker callers.")
 	_ = cmd.MarkFlagRequired("phase")
 	return cmd
+}
+
+// taskRowDispatchGeneration reads the AUTHORITATIVE dispatch_generation
+// for slug from the project's tasks.md (DESIGN §2.2: the task row is the
+// durable CAS authority, never the on-disk state alone). A slug absent
+// from live tasks.md (never tracked, or archived terminal) resolves to 0
+// — the legacy/untracked authority — so a gen-0 (pre-migration) writer is
+// accepted and a current-gen writer against a vanished row is CAS-
+// rejected + surfaced (fail-safe). A genuine read error (corrupt/too-new
+// tasks.md) is propagated so the CAS fails closed rather than silently
+// defaulting to 0 and accepting a stale write.
+func taskRowDispatchGeneration(project, slug string) (int, error) {
+	f, _, err := readTasks(project)
+	if err != nil {
+		return 0, fmt.Errorf("read task row for CAS authority: %w", err)
+	}
+	t, err := f.Get(slug)
+	if err != nil {
+		// Slug not present in live tasks.md → authority 0 (legacy /
+		// untracked). f.Get returns a not-found error; treat it as 0,
+		// NOT a hard failure (a worker can outlive its task row's
+		// archival).
+		return 0, nil
+	}
+	return t.DispatchGeneration, nil
 }
 
 func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) error {
@@ -518,7 +556,7 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 		return errors.New("--review-codex-skip-reason set without --review-codex-status=skipped")
 	}
 
-	updateErr := workers.UpdateState(project, slug, func(s *workers.State) {
+	mutate := func(s *workers.State) {
 		// Record phase transition: append the previous phase to the
 		// completed list so workers.list / peek can show "5/9 phases
 		// done" without losing history. Skip the append on the very
@@ -633,7 +671,24 @@ func runWorkersUpdate(slug string, opts *workersUpdateOpts, stdout io.Writer) er
 				s.Exit = &ec
 			}
 		}
-	})
+	}
+
+	// Writer CAS (DESIGN §2.2): when --dispatch-generation is set, route
+	// through UpdateStateGen, reading the task row's authoritative
+	// dispatch_generation under the same logical dispatch. A stale write
+	// is CAS-rejected (incl. when state.json is absent) and surfaced. The
+	// flag is OMITTED by legacy / pre-migration workers, which keep the
+	// ungated UpdateState so they don't fail open.
+	var updateErr error
+	if opts.dispatchGenerationSet {
+		taskGen, gerr := taskRowDispatchGeneration(project, slug)
+		if gerr != nil {
+			return gerr
+		}
+		updateErr = workers.UpdateStateGen(project, slug, opts.dispatchGeneration, taskGen, mutate)
+	} else {
+		updateErr = workers.UpdateState(project, slug, mutate)
+	}
 	if updateErr != nil {
 		return fmt.Errorf("workers update: %w", updateErr)
 	}

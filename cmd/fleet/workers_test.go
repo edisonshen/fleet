@@ -676,3 +676,67 @@ func sanitizeCLISlug(s string) string {
 	}
 	return string(out)
 }
+
+// TestWorkersUpdate_DispatchGenerationCAS is the CLI half of T2: the
+// `fleet workers update --dispatch-generation` path reads the
+// AUTHORITATIVE dispatch_generation from the task row and CAS-rejects a
+// stale write (this covers W1 worker self-report AND W3 coord-authored
+// writes, which share this CLI). A matching gen succeeds + stamps the
+// state.
+func TestWorkersUpdate_DispatchGenerationCAS(t *testing.T) {
+	_, project := setupTasksHome(t)
+	// Seed a task row, then advance its authoritative gen to 2 (a
+	// re-dispatched slug).
+	if err := runTasksAdd(&tasksAddOpts{
+		project: project, slug: "gen-cas-aaaa", priority: "P1",
+		spec: "x", status: "ready",
+	}, "gen-cas-aaaa", &bytes.Buffer{}); err != nil {
+		t.Fatalf("add task: %v", err)
+	}
+	if err := runTasksSet(&tasksSetOpts{project: project},
+		"gen-cas-aaaa", "dispatch_generation=2", &bytes.Buffer{}); err != nil {
+		t.Fatalf("set dispatch_generation: %v", err)
+	}
+
+	// A stale gen-1 worker self-report is CAS-rejected.
+	staleErr := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
+		project:               project,
+		phase:                 "tdd-green",
+		dispatchGeneration:    1,
+		dispatchGenerationSet: true,
+	}, &bytes.Buffer{})
+	if staleErr == nil || !strings.Contains(staleErr.Error(), "stale dispatch_generation") {
+		t.Fatalf("stale gen should be CAS-rejected, got %v", staleErr)
+	}
+	// The rejected write did not bootstrap state.json.
+	if _, err := workers.ReadState(project, "gen-cas-aaaa"); err == nil {
+		t.Fatalf("stale write bootstrapped state.json (should not)")
+	}
+
+	// A matching gen-2 write succeeds and stamps the gen.
+	if err := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
+		project:               project,
+		phase:                 "tdd-green",
+		dispatchGeneration:    2,
+		dispatchGenerationSet: true,
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("matching gen should succeed: %v", err)
+	}
+	st, err := workers.ReadState(project, "gen-cas-aaaa")
+	if err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if st.DispatchGeneration != 2 {
+		t.Errorf("stamped gen = %d, want 2", st.DispatchGeneration)
+	}
+	if st.Phase != workers.PhaseTDDGreen {
+		t.Errorf("phase = %q, want tdd-green", st.Phase)
+	}
+
+	// Omitting the flag keeps the ungated legacy path (no CAS).
+	if err := runWorkersUpdate("gen-cas-aaaa", &workersUpdateOpts{
+		project: project, phase: "tdd-refactor",
+	}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("ungated update should succeed: %v", err)
+	}
+}

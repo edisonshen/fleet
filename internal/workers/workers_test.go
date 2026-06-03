@@ -1331,3 +1331,130 @@ func TestWorkers_CodexSkipReasonNoGitAccepted(t *testing.T) {
 		t.Errorf("WriteState with codex skip reason no-git: %v", err)
 	}
 }
+
+// TestUpdateStateGen_CAS is T2 (DESIGN §2.2): the generation-CAS'd
+// writer rejects a stale generation (incl. when state.json is absent),
+// accepts a matching one, and repairs a prior-generation file with a
+// FRESH replacement — never a field-merge — so an old PR can't leak.
+func TestUpdateStateGen_CAS(t *testing.T) {
+	// 1. Stale write against a re-dispatched slug is REJECTED even when
+	//    the file is ABSENT (a stale worker may not bootstrap/poison it).
+	t.Run("stale rejected when file absent", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("FLEET_HOME", tmp)
+		// task-row authority = 2; a stale gen-1 worker writes.
+		err := UpdateStateGen("p", "absent-aaaa", 1, 2, func(s *State) {
+			s.Phase = PhaseDone
+			s.PRURL = "https://example.com/pr/1"
+		})
+		if !errors.Is(err, ErrStaleGeneration) {
+			t.Fatalf("want ErrStaleGeneration, got %v", err)
+		}
+		// The file must NOT have been bootstrapped by the rejected write.
+		if _, rerr := ReadState("p", "absent-aaaa"); !errors.Is(rerr, ErrNotFound) {
+			t.Fatalf("stale write bootstrapped an absent file: ReadState err=%v", rerr)
+		}
+	})
+
+	// 2. Matching generation bootstraps a fresh file + applies the update.
+	t.Run("matching generation succeeds", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("FLEET_HOME", tmp)
+		if err := UpdateStateGen("p", "match-bbbb", 1, 1, func(s *State) {
+			s.Phase = PhaseBranch
+		}); err != nil {
+			t.Fatalf("matching gen should succeed: %v", err)
+		}
+		got, err := ReadState("p", "match-bbbb")
+		if err != nil {
+			t.Fatalf("ReadState: %v", err)
+		}
+		if got.DispatchGeneration != 1 {
+			t.Errorf("stamped gen = %d, want 1", got.DispatchGeneration)
+		}
+		if got.Phase != PhaseBranch {
+			t.Errorf("phase = %q, want branch", got.Phase)
+		}
+	})
+
+	// 3. Stale write against an EXISTING current-gen file is rejected and
+	//    does NOT clobber the live state.
+	t.Run("stale rejected against present file", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("FLEET_HOME", tmp)
+		// Live current attempt (gen 3) wrote in-progress + no PR.
+		if err := UpdateStateGen("p", "live-cccc", 3, 3, func(s *State) {
+			s.Phase = PhaseTDDGreen
+		}); err != nil {
+			t.Fatalf("seed live state: %v", err)
+		}
+		// A stale gen-2 worker tries to clobber it with phase=done.
+		err := UpdateStateGen("p", "live-cccc", 2, 3, func(s *State) {
+			s.Phase = PhaseDone
+			s.PRURL = "https://example.com/pr/stale"
+		})
+		if !errors.Is(err, ErrStaleGeneration) {
+			t.Fatalf("want ErrStaleGeneration, got %v", err)
+		}
+		got, _ := ReadState("p", "live-cccc")
+		if got.Phase != PhaseTDDGreen || got.PRURL != "" {
+			t.Errorf("stale write clobbered live state: phase=%q pr=%q", got.Phase, got.PRURL)
+		}
+		if got.DispatchGeneration != 3 {
+			t.Errorf("gen = %d, want 3 (unchanged)", got.DispatchGeneration)
+		}
+	})
+
+	// 4. Repair: the current generation overwriting a PRIOR-generation
+	//    file is a FRESH replacement — empty pr_url/review/phases + new
+	//    started_at — never a field-merge (so an old PR can't leak into
+	//    the branch→PR fallback).
+	t.Run("repair is fresh replacement not merge", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("FLEET_HOME", tmp)
+		// Prior attempt (gen 1) left a terminal state with a PR + review
+		// status + completed phases on disk.
+		if err := UpdateStateGen("p", "repair-dddd", 1, 1, func(s *State) {
+			s.Phase = PhaseReviewDone
+			s.PhasesCompleted = []Phase{PhaseBranch, PhaseTDDGreen}
+			s.ReviewClaudeStatus = ReviewStatusPassed
+			s.ReviewCodexStatus = ReviewStatusPassed
+		}); err != nil {
+			t.Fatalf("seed prior-gen state: %v", err)
+		}
+		oldStarted := func() time.Time {
+			s, _ := ReadState("p", "repair-dddd")
+			return s.StartedAt
+		}()
+		// Re-dispatch bumps the authority to 2; the current worker's
+		// bootstrap write (gen 2) repairs the gen-1 file.
+		if err := UpdateStateGen("p", "repair-dddd", 2, 2, func(s *State) {
+			s.Phase = PhaseStarting
+		}); err != nil {
+			t.Fatalf("repair write should succeed: %v", err)
+		}
+		got, err := ReadState("p", "repair-dddd")
+		if err != nil {
+			t.Fatalf("ReadState: %v", err)
+		}
+		if got.DispatchGeneration != 2 {
+			t.Errorf("gen = %d, want 2", got.DispatchGeneration)
+		}
+		if got.PRURL != "" {
+			t.Errorf("repair leaked old pr_url %q (must be fresh)", got.PRURL)
+		}
+		if got.ReviewClaudeStatus != "" || got.ReviewCodexStatus != "" {
+			t.Errorf("repair leaked old review status: claude=%q codex=%q",
+				got.ReviewClaudeStatus, got.ReviewCodexStatus)
+		}
+		if len(got.PhasesCompleted) != 0 {
+			t.Errorf("repair leaked completed phases: %v", got.PhasesCompleted)
+		}
+		if !got.StartedAt.After(oldStarted) && !got.StartedAt.Equal(oldStarted) {
+			// started_at is reset to a fresh now(); it must not be older
+			// than the prior attempt's (a merge would keep the old one,
+			// but a fresh one is >= old).
+			t.Errorf("repair started_at %v older than prior %v", got.StartedAt, oldStarted)
+		}
+	})
+}
