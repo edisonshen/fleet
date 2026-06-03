@@ -214,6 +214,41 @@ def test_pending_acquire_retry_reuses_generation_and_records_kind(
     }
 
 
+def test_gen_inconsistent_worker_record_is_forgotten(fleet_home: Path) -> None:
+    # Codex iter-2 [P2]: a worker-kind pending record whose recorded gen
+    # is inconsistent with the current task row (the slug was reset/re-
+    # dispatched out from under it) must NOT be reused — reusing would
+    # write a stale gen back + reuse an old prompt under an old CAS token.
+    # Forget it + mint fresh at next_gen.
+    coord_state: dict = {}
+    # Record gen 2; but the task row has advanced to gen 7 (re-dispatched
+    # twice since), so the record is stale. next_gen would be 8.
+    supervisor.remember_pending_acquire_record(
+        coord_state, "skew-eeee", "deadc0de", 2, "worker",
+    )
+    with patch.object(dispatch, "fetch_standards", return_value="# Standards"), \
+         patch.object(dispatch, "fetch_learnings", return_value=""), \
+         patch.object(dispatch, "project_is_git", return_value=True), \
+         patch.object(dispatch, "mint_agent_id", return_value="ffffffff"), \
+         patch.object(
+             dispatch, "acquire_coord_prompt_inbox",
+             return_value=str(fleet_home / "inbox" / "ffffffff.md"),
+         ) as acq, \
+         patch.object(dispatch, "format_dispatch_instruction", return_value="DISPATCH ..."):
+        actions = loop._dispatch_ready(
+            tasks=[_make_task("skew-eeee", dispatch_generation=7)],
+            project="fleet", cwd="/repo", cap=1,
+            fleet_bin="fleet", fleet_home=str(fleet_home),
+            coord_state=coord_state,
+        )
+    assert len(actions) == 1 and not actions[0].error
+    # Stale record discarded → fresh mint + next_gen (8), NOT the recorded
+    # agent/gen.
+    assert actions[0].agent_id == "ffffffff"
+    assert actions[0].dispatch_generation == 8
+    assert acq.call_args.args[0] == "ffffffff"
+
+
 def test_apply_dispatch_persists_generation_with_in_progress_flip(
     fleet_home: Path,
 ) -> None:

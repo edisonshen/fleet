@@ -5181,7 +5181,24 @@ def _dispatch_ready(
                 coord_state,
             ).get(t.slug)
         pending_kind = pending_rec.get("dispatch_kind") if pending_rec else None
-        if pending_rec is not None and pending_kind == "worker":
+        next_gen = int(t.dispatch_generation) + 1
+        # Codex iter-2 [P2]: a worker pending record is reusable ONLY when
+        # its recorded gen is consistent with THIS slug's current task row.
+        # A worker record was minted as (prior_task_gen + 1). On a clean
+        # retry the task row is unchanged so recorded_gen == next_gen
+        # (acquire/apply never persisted the bump). If a partial apply DID
+        # persist the bump before failing, the row now equals recorded_gen.
+        # Any OTHER value means the slug was reset/re-dispatched out from
+        # under this record (the row advanced again) — reusing it would
+        # write a STALE gen back via _apply_dispatch + reuse an old prompt
+        # under an old CAS token, defeating the fence. Forget + mint fresh.
+        pending_gen = (
+            int(pending_rec["dispatch_generation"]) if pending_rec else None
+        )
+        worker_gen_consistent = pending_gen in (
+            next_gen, int(t.dispatch_generation),
+        )
+        if pending_rec is not None and pending_kind == "worker" and worker_gen_consistent:
             # A verified worker retry: reuse BOTH agent_id and the
             # recorded gen (the task row + already-acquired prompt are
             # unchanged; re-incrementing would skew them).
@@ -5198,16 +5215,19 @@ def _dispatch_ready(
             dispatch_generation = 0
         else:
             if pending_rec is not None and coord_state is not None:
-                # POSITIVE wrong-kind entry (a reviewer/finisher acquire
-                # that errored on this slug). Drop it so we don't reuse it
-                # via already_acquired with the wrong prompt. The orphaned
-                # journal/inbox is reclaimed by the existing replay/sweeper
-                # machinery, same as any orphan.
+                # Not reusable: a POSITIVE wrong-kind entry (a reviewer/
+                # finisher acquire that errored on this slug), OR a
+                # worker-kind entry whose recorded gen is inconsistent with
+                # the current task row (the slug was reset/re-dispatched
+                # out from under it). Either way, drop it so we don't reuse
+                # it via already_acquired with the wrong prompt / a stale
+                # CAS token. The orphaned journal/inbox is reclaimed by the
+                # existing replay/sweeper machinery, same as any orphan.
                 supervisor_mod.forget_pending_acquire_agent_id(
                     coord_state, t.slug,
                 )
             agent_id = dispatch_mod.mint_agent_id()
-            dispatch_generation = int(t.dispatch_generation) + 1
+            dispatch_generation = next_gen
         try:
             prompt = dispatch_mod.build_worker_prompt(
                 t, project=project,
