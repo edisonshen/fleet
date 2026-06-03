@@ -15,6 +15,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/projectlookup"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -801,15 +802,26 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// sessions" and the operator drops back to their shell with
 		// no idea why. Surface the diagnosis in-TUI.
 		if !sessionAliveFn(cur.TmuxSession) {
-			// Resume-suggestion gate (resume-dead-coord-ab65): a dead
-			// COORD agent (TaskID == "coord-<project>") has a working
-			// resume path via [a] on the project row, which goes through
-			// the dispatch CLI's synth-handoff recovery flow. Suggest
-			// that instead of archive so the operator doesn't throw
-			// state away. Non-coord dead agents (workers, manual
-			// dispatches) keep the archive suggestion — there's no
-			// resume path to point at.
+			// F18 — attach-failover-59db: agent-row [a] on a dead-
+			// session COORD agent must NOT dead-end. Use the same
+			// projectlookup.FindLiveCoord resolver the CLI Tier 3
+			// uses; if a different live coord for the project exists
+			// (e.g. successor spawned after a handoff archived this
+			// record), attach to it. The TUI flashes a status so the
+			// operator sees the rotation before exec attach lands.
+			//
+			// Non-coord dead agents (workers, manual dispatches) have
+			// no resume path — keep the archive suggestion.
 			if cur.Project != "" && cur.TaskID == coordTaskID(cur.Project) {
+				if live, ok := projectlookup.FindLiveCoord(m.records, cur.Project); ok && live.ID != cur.ID {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"agent %s session is dead — attaching to live coord %s for %s",
+							cur.ID, live.ID, cur.Project),
+					}
+					m.pendingAttach = live.TmuxSession
+					return m, tea.Quit, true
+				}
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
 						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",

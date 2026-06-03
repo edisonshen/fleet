@@ -35,6 +35,36 @@ var (
 	listSessionsFn = tmux.ListSessions
 )
 
+// SetTestStubs lets external test packages (cmd/fleet/attach_failover
+// _test.go) replace the tmux seams without exposing the unexported
+// vars. Returns a restore func the caller can `defer` to undo. Pass
+// nil for any field to leave the existing seam unchanged. Test-only
+// — production never calls this.
+//
+// Without this hook, cmd/fleet's failover tests would have to spin up
+// a real tmux server (slow + flaky) or duplicate the projectlookup
+// helpers with their own seam plumbing (drift risk). One narrow
+// exported hook keeps both packages honest.
+func SetTestStubs(alive func(string) bool, probe func(string) (bool, error), list func() ([]string, error)) (restore func()) {
+	prevAlive := sessionAliveFn
+	prevProbe := sessionProbeFn
+	prevList := listSessionsFn
+	if alive != nil {
+		sessionAliveFn = alive
+	}
+	if probe != nil {
+		sessionProbeFn = probe
+	}
+	if list != nil {
+		listSessionsFn = list
+	}
+	return func() {
+		sessionAliveFn = prevAlive
+		sessionProbeFn = prevProbe
+		listSessionsFn = prevList
+	}
+}
+
 // CoordTaskID returns the canonical task_id for a project's coord
 // agent. Centralized here so callers don't reinvent the prefix.
 //

@@ -106,6 +106,22 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	}
 	prevTmuxAvailable := tmuxAvailableFnVar
 	tmuxAvailableFnVar = func() error { return nil }
+	// projectlookup has its own session-probe seams (different
+	// package); the failover paths route through them, so stub both
+	// the cmd/fleet seam (for direct tmux.Attach calls) and the
+	// projectlookup seams (for FindLiveCoord / FindCoordByLockBody /
+	// StaleCoordRecord / OrphanTmuxForProject lookups).
+	restorePL := projectlookup.SetTestStubs(
+		func(session string) bool { return s.aliveSessions[session] },
+		func(session string) (bool, error) { return s.aliveSessions[session], nil },
+		func() ([]string, error) {
+			var out []string
+			for s := range s.aliveSessions {
+				out = append(out, s)
+			}
+			return out, nil
+		},
+	)
 	t.Cleanup(func() {
 		attachFnVar = prevAttach
 		coordSpawnFnVar = prevDispatch
@@ -114,6 +130,7 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 		sessionProbeFnVar = prevSessionProbe
 		listSessionsFnVar = prevListSessions
 		tmuxAvailableFnVar = prevTmuxAvailable
+		restorePL()
 	})
 }
 
@@ -388,7 +405,11 @@ func TestF10_CwdBasenameFallback_Attaches(t *testing.T) {
 		t.Fatalf("F10: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "mystery0: deriving project from cwd basename → fleet") {
+	// F10 + F4 share the cwd-derivation surface. Per task plan F10
+	// the operator-visible cue is "deriving project from cwd basename
+	// → <p>" — accept the F4-shape prefix ("unknown identifier; ") as
+	// equivalent (it strictly adds context for unknown tokens).
+	if !strings.Contains(got, "deriving project from cwd basename → fleet") {
 		t.Errorf("F10 stderr missing derivation line: %q", got)
 	}
 	if !strings.Contains(got, "mystery0: attached to current coord e3836016 for fleet") {

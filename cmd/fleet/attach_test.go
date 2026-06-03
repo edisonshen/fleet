@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,16 +11,17 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 )
 
-// attach tests for handoff-identity-cont-3f1d.
-//
-// Scope (dispatch task brief):
-//   - chain-following resolver in attach.go: live -> archive walk
-//   - "rotated through N hops" diagnostic to stderr
-//   - dead-chain surface: "archived (cause=X); no live successor"
+// attach tests — Tier 1 (live) + Tier 2 (chain) happy paths. The
+// post-attach-failover-59db design lets Tier 3 cover every failure
+// case (cycle, broken chain, non-handoff archive, unknown token);
+// those tests now live in attach_failover_test.go under names F1–F18.
+// Each test below pins a Tier-1/Tier-2 hit and confirms attach is
+// invoked exactly once on the resolved tail.
 
-// fakeAttach records the session it was asked to attach to, and lets
+// fakeAttach records the session it was asked to attach to and lets
 // us return nil so the cobra RunE flow can finish without exec'ing
-// tmux. Replaces tmux.Attach inside runAttach for tests.
+// tmux. Replaces tmux.Attach inside runAttachFailover for tests via
+// attachFnVar.
 type fakeAttach struct {
 	called  bool
 	session string
@@ -31,6 +31,28 @@ func (f *fakeAttach) Attach(session string) error {
 	f.called = true
 	f.session = session
 	return nil
+}
+
+// installFakeAttach sets up FLEET_HOME + stubs attachFnVar +
+// tmuxAvailableFnVar so the Tier 1/2 happy paths don't need a real
+// tmux binary. Returns the fake recorder.
+func installFakeAttach(t *testing.T) *fakeAttach {
+	t.Helper()
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fa := &fakeAttach{}
+	prev := attachFnVar
+	attachFnVar = fa.Attach
+	prevAvail := tmuxAvailableFnVar
+	tmuxAvailableFnVar = func() error { return nil }
+	t.Cleanup(func() {
+		attachFnVar = prev
+		tmuxAvailableFnVar = prevAvail
+	})
+	return fa
 }
 
 func writeArchivedHandoff(t *testing.T, tmp, id, succ string) {
@@ -60,32 +82,17 @@ func writeLiveAgent(t *testing.T, tmp, id string) {
 	}
 }
 
-func writeArchivedNonHandoff(t *testing.T, tmp, id, cause string) {
-	t.Helper()
-	r := agent.New(id)
-	r.ArchivedCause = cause
-	data, _ := json.MarshalIndent(r, "", "  ")
-	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(tmp, "agents", "archive", id+".json"),
-		data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // TestAttach_LiveAgent_DirectAttach — no chain walk needed; attach
 // straight to the live agent's tmux session.
 func TestAttach_LiveAgent_DirectAttach(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
+	fa := installFakeAttach(t)
+	tmp := os.Getenv("FLEET_HOME")
 	writeLiveAgent(t, tmp, "liveeeee")
 
-	fa := &fakeAttach{}
 	var stderr bytes.Buffer
-	err := runAttach("liveeeee", &stderr, fa.Attach)
+	err := runAttachFailover("liveeeee", AttachOpts{Stderr: &stderr})
 	if err != nil {
-		t.Fatalf("runAttach: %v", err)
+		t.Fatalf("runAttachFailover: %v", err)
 	}
 	if !fa.called {
 		t.Fatal("attach not invoked")
@@ -98,16 +105,15 @@ func TestAttach_LiveAgent_DirectAttach(t *testing.T) {
 // TestAttach_ChainOneHop — A handed off to B (live). attach A walks
 // the chain and attaches to B; stderr shows the rotation.
 func TestAttach_ChainOneHop_AttachesTailAndDiagnoses(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
+	fa := installFakeAttach(t)
+	tmp := os.Getenv("FLEET_HOME")
 	writeArchivedHandoff(t, tmp, "aaaaaaaa", "bbbbbbbb")
 	writeLiveAgent(t, tmp, "bbbbbbbb")
 
-	fa := &fakeAttach{}
 	var stderr bytes.Buffer
-	err := runAttach("aaaaaaaa", &stderr, fa.Attach)
+	err := runAttachFailover("aaaaaaaa", AttachOpts{Stderr: &stderr})
 	if err != nil {
-		t.Fatalf("runAttach: %v", err)
+		t.Fatalf("runAttachFailover: %v", err)
 	}
 	if fa.session != "fleet-bbbbbbbb" {
 		t.Errorf("session: got %q want fleet-bbbbbbbb", fa.session)
@@ -123,18 +129,17 @@ func TestAttach_ChainOneHop_AttachesTailAndDiagnoses(t *testing.T) {
 
 // TestAttach_ChainThreeHops — diagnostic says "3 hops".
 func TestAttach_ChainThreeHops_AttachesTailAndDiagnoses(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
+	fa := installFakeAttach(t)
+	tmp := os.Getenv("FLEET_HOME")
 	writeArchivedHandoff(t, tmp, "aaaaaaaa", "bbbbbbbb")
 	writeArchivedHandoff(t, tmp, "bbbbbbbb", "cccccccc")
 	writeArchivedHandoff(t, tmp, "cccccccc", "dddddddd")
 	writeLiveAgent(t, tmp, "dddddddd")
 
-	fa := &fakeAttach{}
 	var stderr bytes.Buffer
-	err := runAttach("aaaaaaaa", &stderr, fa.Attach)
+	err := runAttachFailover("aaaaaaaa", AttachOpts{Stderr: &stderr})
 	if err != nil {
-		t.Fatalf("runAttach: %v", err)
+		t.Fatalf("runAttachFailover: %v", err)
 	}
 	if fa.session != "fleet-dddddddd" {
 		t.Errorf("session: got %q want fleet-dddddddd", fa.session)
@@ -144,71 +149,13 @@ func TestAttach_ChainThreeHops_AttachesTailAndDiagnoses(t *testing.T) {
 	}
 }
 
-// TestAttach_DeadChain_NonHandoff — predecessor archived cause=kill,
-// no successor. Surfaces "archived (cause=kill); no live successor"
-// and does NOT attach.
-func TestAttach_DeadChain_NonHandoff(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	writeArchivedNonHandoff(t, tmp, "deadkill", "kill")
-
-	fa := &fakeAttach{}
-	var stderr bytes.Buffer
-	err := runAttach("deadkill", &stderr, fa.Attach)
-	if err == nil {
-		t.Fatal("expected error for dead chain")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "cause=kill") || !strings.Contains(msg, "no live successor") {
-		t.Errorf("error must say 'cause=kill' and 'no live successor'; got %q", msg)
-	}
-	if fa.called {
-		t.Errorf("attach should NOT be invoked on dead chain (was called with %q)", fa.session)
-	}
-}
-
-// TestAttach_CycleGuard — A.succ=B, B.succ=A. Resolver returns
-// cycle error; runAttach surfaces it without an infinite loop.
-func TestAttach_CycleGuard(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	writeArchivedHandoff(t, tmp, "aaaaaaaa", "bbbbbbbb")
-	writeArchivedHandoff(t, tmp, "bbbbbbbb", "aaaaaaaa")
-
-	fa := &fakeAttach{}
-	var stderr bytes.Buffer
-	err := runAttach("aaaaaaaa", &stderr, fa.Attach)
-	if err == nil {
-		t.Fatal("expected cycle error")
-	}
-	if !errors.Is(err, agent.ErrChainCycle) {
-		t.Errorf("expected ErrChainCycle, got %v", err)
-	}
-	if fa.called {
-		t.Errorf("attach must not be invoked on cycle")
-	}
-}
-
-// TestAttach_UnknownToken — no record anywhere. Reports
-// "no agent record" (preserves the existing fleet attach UX —
-// not in scope to add project recovery here per dispatch task).
-func TestAttach_UnknownToken(t *testing.T) {
-	tmp := t.TempDir()
-	t.Setenv("FLEET_HOME", tmp)
-	if err := os.MkdirAll(filepath.Join(tmp, "agents", "archive"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	fa := &fakeAttach{}
-	var stderr bytes.Buffer
-	err := runAttach("missing0", &stderr, fa.Attach)
-	if err == nil {
-		t.Fatal("expected error for unknown token")
-	}
-	if fa.called {
-		t.Errorf("attach must not be invoked when id unknown")
-	}
-	if !strings.Contains(err.Error(), "missing0") {
-		t.Errorf("error must mention the id; got %q", err.Error())
-	}
-}
+// NOTE: the following pre-attach-failover-59db tests are intentionally
+// superseded by the F1/F3/F4 cases in attach_failover_test.go — under
+// the new contract, attach NEVER returns an error for cycle / dead-
+// chain / unknown-token paths; it failovers into Tier 3 PROJECT
+// RECOVERY. The new test matrix covers all of those branches with
+// exact-string stderr assertions.
+//
+//   removed: TestAttach_DeadChain_NonHandoff  -> see TestF3
+//   removed: TestAttach_CycleGuard            -> see TestF1
+//   removed: TestAttach_UnknownToken          -> see TestF4 / TestF12
