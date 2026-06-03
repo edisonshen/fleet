@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,9 +18,38 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
+// ErrChainCycle is returned by ResolveChain when the handoff chain
+// loops back on itself (A.successor=B, B.successor=A). Callers
+// surface this so the operator knows the predecessor archives are
+// corrupt — re-spawn manually rather than walk forever.
+var ErrChainCycle = errors.New("handoff chain cycle detected")
+
+// ErrNoLiveSuccessor is returned by ResolveChain when the chain
+// terminates without a live tail — either the chain reached an
+// archived record with non-handoff cause (kill/exit/gc) or the next
+// hop's id is missing from both live + archive. Error message
+// includes the cause (or "missing") so the operator sees why.
+var ErrNoLiveSuccessor = errors.New("no live successor")
+
 // SchemaVersion is bumped when Record's on-disk shape changes
 // incompatibly. Readers compare and refuse newer versions.
-const SchemaVersion = 1
+//
+// v2 adds the handoff-chain pointer fields (SuccessorID,
+// PredecessorID, ArchivedCause) so `fleet attach <predecessor>` can
+// walk to the live successor instead of dead-ending. Older v1 records
+// load cleanly — the new fields default to empty strings and the
+// ResolveChain walker treats absent successor as "no chain to walk."
+const SchemaVersion = 2
+
+// ArchivedCause* are the enumerated values for Record.ArchivedCause.
+// Only "handoff" makes ResolveChain attempt a successor walk; other
+// causes are terminal (the resolver surfaces a clear stderr message).
+const (
+	ArchivedCauseHandoff = "handoff"
+	ArchivedCauseExit    = "exit"
+	ArchivedCauseKill    = "kill"
+	ArchivedCauseGC      = "gc"
+)
 
 // DefaultEngine is the agent runtime spawned for new dispatches.
 // v1 only writes "claude-code"; v1.1 adds "codex" (or similar)
@@ -113,6 +143,32 @@ type Record struct {
 	// Inherited unchanged across handoffs (codex review iter-7 P2).
 	DisableAutoResume bool      `json:"disable_auto_resume,omitempty"`
 	SpawnedAt         time.Time `json:"spawned_at"`
+
+	// PredecessorID, SuccessorID, ArchivedCause are v2 schema fields
+	// that turn `fleet attach <token>` into a chain-following resolver:
+	// `ResolveChain` walks predecessor → successor pointers across
+	// archived records so an operator holding a stale id lands in the
+	// live tail's tmux session instead of dead-ending with "no agent."
+	//
+	// Write semantics (set by cmd/fleet/handoff.go via ArchiveWithHandoff
+	// at archive time, and by internal/spawn at spawn time):
+	//   - PredecessorID: set on the LIVE successor record when it is
+	//     spawned from a handoff. Empty for fresh dispatches.
+	//   - SuccessorID:   set on the ARCHIVED predecessor record after
+	//     the swap commits. Empty when archived for non-handoff causes
+	//     (kill / exit / gc) and on legacy v1 archives.
+	//   - ArchivedCause: set only at archive time. Live records carry
+	//     "" here. Empty on a v1 archive (legacy / pre-v2) means the
+	//     resolver treats the chain as terminal at that hop and falls
+	//     into the dead-chain branch.
+	//
+	// Backfill is NOT performed for pre-v2 archives — only new handoffs
+	// from this binary forward carry the pointer. Old chains dead-end
+	// at the first pre-v2 archive (acceptable: the operator gets a
+	// clean diagnostic from the resolver instead of a silent loop).
+	PredecessorID string `json:"predecessor_id,omitempty"`
+	SuccessorID   string `json:"successor_id,omitempty"`
+	ArchivedCause string `json:"archived_cause,omitempty"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random
@@ -296,4 +352,188 @@ func listInternal() (good []*Record, badIDs []string, err error) {
 		good = append(good, r)
 	}
 	return good, badIDs, nil
+}
+
+// LoadArchive reads an archived agent record from
+// ~/.fleet/agents/archive/<id>.json. Used by ResolveChain to walk
+// handoff pointers backwards through history.
+//
+// Only the bare <id>.json file is read; collision-stamped archives
+// (<id>-<utc>.json from Record.Archive's fallback path) are NOT
+// consulted because the chain pointer always references the bare
+// id and the stamp is reserved for the genuine birthday-paradox
+// case where a re-used id collides — too rare in practice to
+// support both lookup paths.
+//
+// Returns state.ErrNotFound (wrapped) when the file is absent so
+// callers can distinguish "no archive" from "read error."
+func LoadArchive(id string) (*Record, error) {
+	path, err := state.AgentArchivePath(id)
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("agent archive %s: %w", id, state.ErrNotFound)
+		}
+		return nil, fmt.Errorf("read agent archive %s: %w", id, err)
+	}
+	var r Record
+	if err := json.Unmarshal(data, &r); err != nil {
+		return nil, fmt.Errorf("parse agent archive %s: %w", id, err)
+	}
+	// Mirror Load's HandoffNumber backfill — same legacy v1 records
+	// could surface through this read path post-archive.
+	if r.HandoffNumber == 0 {
+		r.HandoffNumber = 1
+	}
+	return &r, nil
+}
+
+// ResolveChain finds the live tail of a handoff chain starting at
+// token. Walks the predecessor → successor pointer chain across
+// archived records:
+//
+//	live(token)              → return (rec, 0, nil) — direct hit
+//	archive(token) succ=B    → recurse with depth+1, cycle guard
+//	archive(token) no chain  → ErrNoLiveSuccessor with cause embedded
+//	missing everywhere       → state.ErrNotFound wrapper
+//
+// hops is 0 for a direct live hit and N for "had to traverse N
+// archived predecessors before landing on the live tail." Callers
+// emit "rotated through N hop(s)" to stderr so the operator sees
+// the resolution path.
+//
+// Cycle guard: a visited-set blocks the resolver from following
+// A.succ=B, B.succ=A back to A. Returns ErrChainCycle on detection.
+// (The dispatch task brief calls this out explicitly; corrupt
+// archives or operator-edited fields could produce one.)
+//
+// Dead-chain handling: when an archived record has either no
+// successor_id, or a non-handoff archived_cause, or its named
+// successor exists nowhere, the resolver returns ErrNoLiveSuccessor
+// wrapped with the visible cause string ("cause=kill",
+// "cause=handoff successor missing", etc.) so the cmd/fleet/attach.go
+// error message tells the operator what happened.
+func ResolveChain(token string) (*Record, int, error) {
+	visited := map[string]bool{}
+	return resolveChainStep(token, 0, visited)
+}
+
+func resolveChainStep(token string, depth int, visited map[string]bool) (*Record, int, error) {
+	if visited[token] {
+		return nil, depth, fmt.Errorf("%w: %s revisited at depth %d", ErrChainCycle, token, depth)
+	}
+	visited[token] = true
+
+	// Tier 1: live record wins immediately.
+	rec, err := Load(token)
+	if err == nil {
+		return rec, depth, nil
+	}
+	if !errors.Is(err, state.ErrNotFound) {
+		return nil, depth, err
+	}
+
+	// Tier 2: try archive. If neither, unknown token.
+	arec, aerr := LoadArchive(token)
+	if aerr != nil {
+		if errors.Is(aerr, state.ErrNotFound) {
+			// Token unknown — caller wraps with a friendly message.
+			return nil, depth, fmt.Errorf("agent %s: %w (no live or archived record)",
+				token, state.ErrNotFound)
+		}
+		return nil, depth, aerr
+	}
+
+	// Chain follow only when archived as handoff with a named successor.
+	if arec.ArchivedCause != ArchivedCauseHandoff || arec.SuccessorID == "" {
+		cause := arec.ArchivedCause
+		if cause == "" {
+			cause = "unknown"
+		}
+		return nil, depth, fmt.Errorf(
+			"%w for %s: archived (cause=%s)", ErrNoLiveSuccessor, token, cause)
+	}
+
+	// Recurse on the named successor. Depth bumped one per hop.
+	tail, total, terr := resolveChainStep(arec.SuccessorID, depth+1, visited)
+	if terr != nil {
+		// Re-wrap broken-mid-chain as ErrNoLiveSuccessor with a
+		// pointer-trace so the operator can see where the chain
+		// broke (e.g. cleaned-up successor archive). Leave cycle
+		// + other sentinel errors alone — they carry their own
+		// meaning.
+		if errors.Is(terr, state.ErrNotFound) {
+			return nil, total, fmt.Errorf(
+				"%w for %s: chain broken at %s (cause=handoff successor missing)",
+				ErrNoLiveSuccessor, token, arec.SuccessorID)
+		}
+		return nil, total, terr
+	}
+	return tail, total, nil
+}
+
+// ArchiveWithHandoff archives a record AND stamps the handoff chain
+// pointer atomically. The atomicity is achieved by writing the
+// updated archive payload directly to the destination path via
+// state.WriteAtomic (.tmp + rename), then removing the live file in
+// the same call. If the rename succeeds but the live remove fails,
+// the resolver tolerates the resulting "in both live and archive"
+// state as live-wins (Load returns first).
+//
+// successorID is required (caller is the handoff path); empty is a
+// caller bug.
+func (r *Record) ArchiveWithHandoff(successorID string) error {
+	if successorID == "" {
+		return fmt.Errorf("ArchiveWithHandoff: successorID required")
+	}
+	// Mutate the in-memory record so the on-disk archive carries the
+	// chain fields. Live record (if it still exists) does NOT get
+	// re-written — the live read path returns ErrNotFound after we
+	// unlink it below, so updating it would be a wasted syscall.
+	r.SuccessorID = successorID
+	r.ArchivedCause = ArchivedCauseHandoff
+
+	src, err := state.AgentPath(r.ID)
+	if err != nil {
+		return err
+	}
+	dst, err := state.AgentArchivePath(r.ID)
+	if err != nil {
+		return err
+	}
+	// Bare-archive collision keeps the same fallback shape as Archive
+	// for symmetry — vanishingly rare with 32-bit ids but trivial to
+	// support.
+	if _, err := os.Stat(dst); err == nil {
+		suffixed, derr := state.AgentArchivePath(r.ID + "-" + time.Now().UTC().Format("20060102-150405"))
+		if derr != nil {
+			return derr
+		}
+		dst = suffixed
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat archive path: %w", err)
+	}
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal archive payload: %w", err)
+	}
+	data = append(data, '\n')
+	if err := state.WriteAtomic(dst, data); err != nil {
+		return fmt.Errorf("write archive %s: %w", r.ID, err)
+	}
+	// Best-effort unlink of the live record. A failure here is
+	// recoverable — the resolver's live-wins behavior means the agent
+	// still surfaces as live until the live file goes away. Surface
+	// as a non-fatal error so callers can log + continue.
+	if err := os.Remove(src); err != nil {
+		if os.IsNotExist(err) {
+			// Already gone (another writer raced us); fine.
+			return nil
+		}
+		return fmt.Errorf("unlink live record %s (archive committed): %w", r.ID, err)
+	}
+	return nil
 }

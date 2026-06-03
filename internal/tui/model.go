@@ -316,6 +316,19 @@ type Model struct {
 	// shape but is a separate field so toggling the LEFT and RIGHT
 	// idle groups stays independent.
 	agentIdleExpanded bool
+
+	// rotationFlash maps a predecessor agent id → its successor agent
+	// id for the brief flash window after a handoff completes
+	// (handoff-identity-cont-3f1d Piece 3). agentBlockLines renders
+	// a dim "→ <succ>" chip on the predecessor row while the entry
+	// is set, so the operator sees the rotation even before the
+	// natural agents refresh moves the cursor onto the new live tail.
+	// The handoffDoneMsg handler populates this from the fleet handoff
+	// stdout (`agent <pred> handed off → <succ>` shape). A 3-second
+	// rotationFlashDropMsg drops the entry; subsequent refreshes
+	// already removed the predecessor from the live records set, so
+	// the row drops naturally on the next render.
+	rotationFlash map[string]string
 }
 
 // coordOp* are the kinds of coord-lifecycle op tracked by
@@ -496,6 +509,19 @@ type queueEventMsg struct{}
 type upgradeAvailableMsg struct {
 	text string
 }
+
+// rotationFlashDropMsg fires rotationFlashWindow after a successful
+// handoffDoneMsg seeded m.rotationFlash[predID]. The handler removes
+// the entry so the predecessor row's "→ <succ>" chip stops rendering.
+// (The predecessor row itself drops on the next agents refresh that
+// observes its archived state — usually within the same window.)
+type rotationFlashDropMsg struct{ predID string }
+
+// rotationFlashWindow is how long the predecessor row carries the
+// "→ <succ>" rotation chip after a handoff completes. 3s is short
+// enough that the visual hint doesn't outlive the operator's
+// attention but long enough to be readable on a single glance.
+const rotationFlashWindow = 3 * time.Second
 
 const pollInterval = 1 * time.Second
 
@@ -688,7 +714,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clearOpInFlight(msg.projectName)
 		fl := formatHandoffFlash(msg.out, msg.err)
 		m.flash = &fl
+		// Rotation flash (handoff-identity-cont-3f1d Piece 3) — when
+		// the handoff stdout exposes the "agent <pred> handed off →
+		// <succ>" shape, pin a "→ <succ>" chip on the predecessor row
+		// for rotationFlashWindow seconds so the operator sees the
+		// rotation. Errors / unexpected output shapes parse to empty
+		// strings and the flash is skipped.
+		var dropCmd tea.Cmd
+		if msg.err == nil {
+			pred, succ := parseRotationFromHandoff(msg.out)
+			if pred != "" && succ != "" {
+				if m.rotationFlash == nil {
+					m.rotationFlash = map[string]string{}
+				}
+				m.rotationFlash[pred] = succ
+				dropCmd = tea.Tick(rotationFlashWindow, func(_ time.Time) tea.Msg {
+					return rotationFlashDropMsg{predID: pred}
+				})
+			}
+		}
+		if dropCmd != nil {
+			return m, tea.Batch(loadAgentsCmd(), dropCmd)
+		}
 		return m, loadAgentsCmd() // refresh: agent should be archived
+
+	case rotationFlashDropMsg:
+		if m.rotationFlash != nil {
+			delete(m.rotationFlash, msg.predID)
+		}
+		return m, nil
 
 	case dispatchDoneMsg:
 		fl := formatDispatchFlash(msg.out, msg.err)

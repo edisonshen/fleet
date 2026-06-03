@@ -749,6 +749,13 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// Mark the spawn origin so the TUI can render the transition.
 		manualType := handoff.TypeManual
 		rec.HandoffType = &manualType
+		// Chain pointer (v2 schema): the successor records its
+		// predecessor so `fleet attach <successor>` can show the chain
+		// trace (and a future tooling pass can render the chain in TUI
+		// alongside HandoffNumber). The predecessor's matching
+		// successor_id is stamped at archive time by ArchiveWithHandoff
+		// in cmd/fleet/handoff.go.
+		rec.PredecessorID = opts.OldRecord.ID
 	} else {
 		rec.TaskID = opts.TaskID
 		rec.Project = opts.Project

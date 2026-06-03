@@ -1041,7 +1041,12 @@ func runHandoff(opts *handoffOpts, stdout, stderr io.Writer) error {
 		//     the stale record and double-spawn. If even the delete
 		//     fails, hard-error: the live record is stuck and must be
 		//     removed manually before retry.
-		if err := oldRec.Archive(); err != nil {
+		//
+		// v2 schema: ArchiveWithHandoff stamps successor_id + cause=handoff
+		// on the archive so the chain-following resolver in
+		// cmd/fleet/attach.go can walk pred → succ. spawn.Spawn already
+		// stamped predecessor_id on the live successor record.
+		if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
 			path, perr := state.AgentPath(oldRec.ID)
 			if perr == nil {
 				if rmErr := os.Remove(path); rmErr == nil {
@@ -1284,7 +1289,9 @@ func resumeHandoff(opts *handoffOpts, stdout, stderr io.Writer,
 				oldRec.TmuxSession, err)
 		}
 
-		if err := oldRec.Archive(); err != nil {
+		// v2 schema: stamp successor_id + cause=handoff on the archive
+		// so the chain resolver lands operators on the live tail.
+		if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
 			path, perr := state.AgentPath(oldRec.ID)
 			if perr == nil {
 				if rmErr := os.Remove(path); rmErr == nil {

@@ -883,7 +883,9 @@ func retireOldAgent(oldRec, newRec *agent.Record, docPath, queuePath string,
 				oldRec.TmuxSession, err)
 		}
 
-		if err := oldRec.Archive(); err != nil {
+		// v2 schema: stamp successor_id + cause=handoff so the chain
+		// resolver lands operators on the live tail.
+		if err := oldRec.ArchiveWithHandoff(newRec.ID); err != nil {
 			path, perr := state.AgentPath(oldRec.ID)
 			if perr == nil {
 				if rmErr := os.Remove(path); rmErr == nil {

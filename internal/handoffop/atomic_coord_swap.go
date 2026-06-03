@@ -638,7 +638,11 @@ func AtomicCoordSwap(in AtomicCoordSwapInputs, stderr io.Writer) (AtomicCoordSwa
 	// archiving is safe). FAILURE MODE 5 already returned earlier and
 	// archived OLD there.
 	if !in.OldIsDead {
-		if arcErr := in.OldRec.Archive(); arcErr != nil {
+		// v2 schema: stamp successor_id + cause=handoff on the archive so
+		// the chain resolver (cmd/fleet/attach.go) lands operators on the
+		// live tail. Newly-spawned successor record already carries
+		// predecessor_id from internal/spawn.
+		if arcErr := in.OldRec.ArchiveWithHandoff(newRec.ID); arcErr != nil {
 			// Kill is confirmed dead in step 5. Falling back to
 			// os.Remove on the live record keeps `fleet status` from
 			// showing a stale entry. If even Remove fails, return

@@ -901,7 +901,15 @@ func buildBodyLinesCore(m Model, leftW, rightW int) ([]string, []string, []strin
 		selected := i == m.dashCursor
 		switch row.kind {
 		case rowAgent:
-			agents = append(agents, agentBlockLines(row.agent, m.aliveByID, rightW, selected)...)
+			// Rotation flash (handoff-identity-cont-3f1d Piece 3):
+			// when the model has a pinned successor for this row's
+			// agent id, render the "→ <succ>" chip. Empty string
+			// (default) is the no-flash path.
+			rotation := ""
+			if m.rotationFlash != nil {
+				rotation = m.rotationFlash[row.agent.ID]
+			}
+			agents = append(agents, agentBlockLinesWithFlash(row.agent, m.aliveByID, rightW, selected, rotation)...)
 			hasAgents = true
 		case rowSeparator:
 			// dashboard-accumulation-f-4421 Sub-fix B: render the
@@ -1697,6 +1705,23 @@ func workerBlockLines(w *WorkerRow, records []*agent.Record, width int, selected
 // reads left-to-right as "id → context → handoff state → status".
 // Issue #95 dropped the bar glyph; only the colored percent remains.
 func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected bool) []string {
+	// rotationSucc="" is the no-flash path — the production renderer
+	// passes through agentBlockLinesWithFlash with whatever the model
+	// has pinned; the bare wrapper preserves the existing test
+	// fixtures (context_bar_test.go etc.) that don't care about the
+	// rotation chip.
+	return agentBlockLinesWithFlash(r, alive, width, selected, "")
+}
+
+// agentBlockLinesWithFlash renders one v0.1 agent's two-line block.
+// rotationSucc, when non-empty, appends a dim "→ <succ>" chip to the
+// chips slot so the operator can see the just-completed handoff
+// while the predecessor row is still in the live records snapshot
+// (handoff-identity-cont-3f1d Piece 3). The chip drops naturally on
+// the next agents refresh that observes the predecessor's archived
+// state — or sooner via rotationFlashDropMsg after
+// rotationFlashWindow elapses.
+func agentBlockLinesWithFlash(r *agent.Record, alive map[string]bool, width int, selected bool, rotationSucc string) []string {
 	if r == nil {
 		return nil
 	}
@@ -1720,6 +1745,19 @@ func agentBlockLines(r *agent.Record, alive map[string]bool, width int, selected
 	bar := renderContextBar(r.ContextPct)
 	tag := renderHandoffTag(r.HandoffType)
 	chips := joinChips(bar, tag)
+	// Rotation chip ("→ <succ>") appended last so it reads
+	// left-to-right after the context + handoff state. dimStyle
+	// matches the placeholder language of the existing slug/age
+	// pieces so it doesn't visually shout — it's a transient hint,
+	// not a status.
+	if rotationSucc != "" {
+		rotation := dimStyle.Render("→ " + rotationSucc)
+		if chips != "" {
+			chips = chips + " " + rotation
+		} else {
+			chips = rotation
+		}
+	}
 
 	line1raw := "  " + gStyle.Render(glyph) + " " + id
 	if chips != "" {
