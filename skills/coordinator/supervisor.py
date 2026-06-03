@@ -925,6 +925,13 @@ class WorkerProbe:
     agent_id: str = ""
     tmux_session: str = ""
     live_worker: bool = True
+    # R6 chokepoint (DESIGN §2.1/§3): the slug's AUTHORITATIVE task-row
+    # dispatch_generation, captured when the probe is built from
+    # tasks.md. The stuck-check reads workers/<slug>/state.json and
+    # nudges/escalates/blocks on it; a STALE state (prior generation)
+    # must drive none of those on the CURRENT attempt. 0 = legacy /
+    # un-migrated (matches a tokenless on-disk state as `current`).
+    dispatch_generation: int = 0
 
 
 def build_worker_probes(
@@ -947,12 +954,21 @@ def build_worker_probes(
         state_path = home / "projects" / project / "workers" / slug / "state.json"
         agent_id = agent_id_map.get(slug, "")
         live_worker = (t.status == "in-progress")
+        # R6: capture the slug's task-row dispatch_generation so the
+        # stuck-check can fence a stale prior-attempt state. `tasks` is
+        # any iterable of task-like objects; tolerate ones without the
+        # field (older test fixtures) by defaulting to 0.
+        try:
+            gen = int(getattr(t, "dispatch_generation", 0) or 0)
+        except (TypeError, ValueError):
+            gen = 0
         probes.append(WorkerProbe(
             slug=slug,
             state_path=state_path,
             agent_id=agent_id,
             tmux_session=session_name_for_agent(agent_id),
             live_worker=live_worker,
+            dispatch_generation=gen,
         ))
     return probes
 
@@ -1801,7 +1817,10 @@ def _run_stuck_check_pass(
 
     # Lazy import to avoid the supervisor depending on loop at import
     # time (loop imports supervisor for the run_supervisor entry).
-    from loop import _read_worker_state  # type: ignore[attr-defined]
+    from loop import (  # type: ignore[attr-defined]
+        WORKER_STATE_STALE,
+        read_current_worker_state,
+    )
 
     for p in probes:
         # codex iter-1 [P1]: in-review tasks have no live worker — the
@@ -1810,7 +1829,24 @@ def _run_stuck_check_pass(
         # the gh pr CI re-check that moves the task to done.
         if not p.live_worker:
             continue
-        st = _read_worker_state(project, p.slug, home=home)
+        # R6 chokepoint (DESIGN §2.1/§3): route the stuck-check read
+        # through the generation-aware reader. A STALE state (prior
+        # dispatch_generation) must NOT classify the CURRENT attempt as
+        # stuck → nudge/escalate/block on a prior attempt's frozen
+        # phase. `stale` short-circuits (no ladder advance, no block);
+        # `current`/`missing` proceed (the existing classifier treats a
+        # None state as "no phase" → benign).
+        scls, st = read_current_worker_state(
+            project, p.slug, int(p.dispatch_generation), home=home,
+        )
+        if scls == WORKER_STATE_STALE:
+            emit(
+                f"[coord] stuck-check skipped {p.slug} — stale worker "
+                f"state (prior dispatch_generation, authority="
+                f"{int(p.dispatch_generation)})",
+                stream=log_stream,
+            )
+            continue
         # Honor agent IDs from coord-state if probe didn't carry one
         # (probe is rebuilt from tasks.md every loop pass; agent_id
         # in coord-state is the durable source).

@@ -85,15 +85,29 @@ def _audit_freshness_seconds() -> int:
 
 # Sentinel grammar (ENG §5.3). Worker reports use these to communicate
 # state changes back to the coord through the inbox archive.
+#
+# DESIGN-coord-worktree-lifecycle §3 (sentinel-path readers S1-S5): a
+# STATE-MUTATING sentinel (task_done_pr, worker_failed, blocked_question)
+# carries the worker's dispatch_generation token so the coord can
+# corroborate it against the slug's current task-row authority and skip
+# ALL terminal side effects on a stale (prior-attempt) sentinel. The
+# token is an OPTIONAL `gen=<n>` clause placed immediately after the slug
+# (additive: a pre-migration worker that omits it parses as gen 0, the
+# tokenless-legacy path). A pure `new_task` wake carries no state
+# mutation and stays token-free. The clause sits BEFORE the payload so
+# the greedy `.+`/`\S+` payload captures can't swallow it.
 _SENTINEL_PATTERNS = {
     "task_done_pr": re.compile(
-        r"^TASK_DONE_PR\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<url>\S+)\s*$",
+        r"^TASK_DONE_PR\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<url>\S+)\s*$",
     ),
     "blocked_question": re.compile(
-        r"^BLOCKED_QUESTION\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<text>.+)$",
+        r"^BLOCKED_QUESTION\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<text>.+)$",
     ),
     "worker_failed": re.compile(
-        r"^WORKER_FAILED\s*=?\s*(?P<slug>[a-z0-9._-]+)\s+(?P<reason>.+)$",
+        r"^WORKER_FAILED\s*=?\s*(?P<slug>[a-z0-9._-]+)"
+        r"(?:\s+gen=(?P<gen>[0-9]+))?\s+(?P<reason>.+)$",
     ),
     "new_task": re.compile(
         r"^NEW_TASK\s*=?\s*(?P<slug>[a-z0-9._-]+)\s*$",
@@ -761,13 +775,18 @@ def _tick_locked(
             deferred_actions.append(action)
             continue
         try:
-            _apply_sentinel(
+            sentinel_outcome = _apply_sentinel(
                 action, project, fleet_bin,
                 repo=sentinel_repo,
                 tasks_by_slug=sentinel_tasks_by_slug,
                 home=home,
                 full_tasks_by_slug=tasks_by_slug,
             )
+            # DESIGN §3 S4: a STALE sentinel performed NO terminal side
+            # effects — consume it (no release/forget/handoff-clear, no
+            # re-defer). Only `applied` drives the in-flight teardown.
+            if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                continue
             result.drained += 1
             if action.raised_to_user:
                 result.raised += 1
@@ -1660,13 +1679,19 @@ def _run_supervisor(
                 still_deferred.append(action)
                 continue
             try:
-                _apply_sentinel(
+                sentinel_outcome = _apply_sentinel(
                     action, project, fleet_bin,
                     repo=sentinel_repo,
                     tasks_by_slug=sentinel_tbs,
                     home=home,
                     full_tasks_by_slug=tbs,
                 )
+                # DESIGN §3 S4: a STALE deferred-replay sentinel did NO
+                # terminal side effect — consume it (drop from the queue,
+                # no release/forget/handoff-clear). Not re-deferred: a
+                # stale sentinel never becomes current.
+                if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                    continue
                 # Codex iter-23 [P2]: same blocked_question carve-out
                 # as the non-replay drain — blocked workers stay alive,
                 # so we must preserve the agent_id mapping. Only the
@@ -1829,13 +1854,17 @@ def _run_supervisor(
                 deferred_actions.append(action)
                 continue
             try:
-                _apply_sentinel(
+                sentinel_outcome = _apply_sentinel(
                     action, project, fleet_bin,
                     repo=sentinel_repo,
                     tasks_by_slug=sentinel_tasks_by_slug,
                     home=home,
                     full_tasks_by_slug=tasks_by_slug,
                 )
+                # DESIGN §3 S4: STALE sentinel → consume, no teardown,
+                # no re-defer (a stale sentinel never becomes current).
+                if sentinel_outcome == SENTINEL_SKIPPED_STALE:
+                    continue
                 # Codex iter-22 [P1]: blocked workers stay ALIVE so
                 # the operator can answer the BLOCKED_QUESTION. We
                 # must NOT forget the agent_id mapping in that case —
@@ -1958,7 +1987,27 @@ def _build_reap_inputs(
         tmux_session = (
             supervisor_mod.session_name_for_agent(agent_id) if agent_id else ""
         )
-        worker_state = _read_worker_state(project, t.slug, home=home)
+        # R5 chokepoint (DESIGN §2.1/§3): the reaper judges this slug's
+        # worker_state (judge_completion) and may kill/reap on a
+        # terminal phase. A STALE state (prior dispatch_generation) must
+        # NOT drive a reap of the CURRENT attempt — skip the task
+        # entirely from the reap input set so a stale `phase=done`/
+        # `phase=failed` never reaps/kills the live worker. `current`
+        # passes its state through; `missing` passes None (the reaper
+        # judges PENDING — can't judge yet — a benign no-op).
+        rcls, rstate = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if rcls == WORKER_STATE_STALE:
+            import sys
+            print(
+                f"coord: reaper skipped {t.slug} — stale worker state "
+                f"(prior dispatch_generation, authority="
+                f"{int(t.dispatch_generation)}); not reaping, surfacing",
+                file=sys.stderr,
+            )
+            continue
+        worker_state = rstate
         pid = 0
         if worker_state is not None:
             raw_pid = worker_state.get("pid", 0) or worker_state.get("worker_pid", 0)
@@ -2051,12 +2100,26 @@ def _load_deferred_sentinels(coord_state: dict) -> list["_SentinelAction"]:
             "task_done_pr", "blocked_question", "worker_failed", "new_task",
         ):
             continue
+        # DESIGN §3 S5: round-trip the dispatch_generation token so a
+        # deferred→replayed sentinel corroborates on replay (neither
+        # fail-open removal nor fail-closed leak). Absent / null in the
+        # persisted entry → None (tokenless-legacy).
+        raw_gen = entry.get("dispatch_generation", None)
+        gen: int | None
+        if raw_gen is None:
+            gen = None
+        else:
+            try:
+                gen = int(raw_gen)
+            except (TypeError, ValueError):
+                gen = None
         out.append(_SentinelAction(
             slug=slug, kind=kind,
             payload=str(entry.get("payload", "") or ""),
             raised_to_user=bool(entry.get("raised_to_user", False)),
             raise_text=str(entry.get("raise_text", "") or ""),
             source_file=str(entry.get("source_file", "") or ""),
+            dispatch_generation=gen,
         ))
     return out
 
@@ -2092,6 +2155,9 @@ def _save_deferred_sentinels(
             "raised_to_user": a.raised_to_user,
             "raise_text": a.raise_text,
             "source_file": a.source_file,
+            # DESIGN §3 S5: persist the generation token (None for a
+            # tokenless-legacy sentinel) so replay corroborates correctly.
+            "dispatch_generation": a.dispatch_generation,
         }
         for a in actions
     ]
@@ -2669,6 +2735,15 @@ def _read_worker_state(
 WORKER_STATE_CURRENT = "current"
 WORKER_STATE_STALE = "stale"
 WORKER_STATE_MISSING = "missing"
+
+# _apply_sentinel outcomes (DESIGN §3 sentinel-path readers S4). The
+# caller gates release/forget/handoff-clear on `applied`; `skipped_stale`
+# performs NONE of those (consumed, deliberate no-op); `error` re-queues
+# (the watermark already advanced past the only durable record of the
+# transition, so a returned `error` must not silently consume it).
+SENTINEL_APPLIED = "applied"
+SENTINEL_SKIPPED_STALE = "skipped_stale"
+SENTINEL_ERROR = "error"
 
 
 def read_current_worker_state(
@@ -3499,6 +3574,32 @@ def _reconcile_inflight(
             continue
         if _is_worker_alive(t, project, home=home):
             continue
+        # R1-R4 chokepoint (DESIGN §2.1/§3): the worker is gone, but
+        # BEFORE the reconcile decision tree reads state.json (alive
+        # fall-through R1, terminal-state R2, mid-phase R3, the
+        # died-without-PR fall-through R4 — the highest-severity case),
+        # classify the on-disk state against the slug's AUTHORITATIVE
+        # task-row dispatch_generation. A STALE state is a PRIOR
+        # attempt's inert leftover: it must drive NO mutation — no
+        # status flip, no clear_worker, no delete_worker_dir, no
+        # worktree removal. Treating it as `missing` was the recurring
+        # bug (the died-without-PR branch then removed the CURRENT
+        # attempt's worktree + worker dir). `stale` short-circuits +
+        # surfaces; `current`/`missing` fall through to the existing
+        # tree (`missing` keeps died-without-PR semantics; `current`
+        # reads the live attempt's terminal/mid-phase signals below).
+        recon_cls, _ = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if recon_cls == WORKER_STATE_STALE:
+            import sys
+            print(
+                f"coord: reconcile skipped {t.slug} — stale worker state "
+                f"(prior dispatch_generation, authority="
+                f"{int(t.dispatch_generation)}); no mutation, surfacing",
+                file=sys.stderr,
+            )
+            continue
         # Worker is gone. Before falling through to pr_url + CI, check
         # whether state.json reports a terminal phase. v0.2 workers
         # only signal completion via `fleet workers update --phase done
@@ -4196,6 +4297,15 @@ class _SentinelAction:
     # so callers that defer (e.g., reaper-lane gate) can roll the
     # watermark back to before this file rather than losing the event.
     source_file: str = ""
+    # DESIGN §3 (sentinel-path readers S1-S5): the dispatch_generation
+    # token the worker stamped into a state-mutating sentinel (gen=<n>),
+    # or None for a TOKENLESS pre-migration sentinel. The apply path
+    # corroborates this against the slug's current task-row authority;
+    # mismatch → skipped_stale (no terminal side effects). new_task is
+    # never state-mutating so it stays None. Persisted through the
+    # deferred-sentinel queue (S5) so a deferred→replayed sentinel
+    # corroborates correctly on replay.
+    dispatch_generation: int | None = None
     # delete_worker_dir is set in _apply_sentinel based on `kind`
     # (task_done_pr / worker_failed → True; blocked_question /
     # new_task → False). It's not part of the parsed sentinel grammar
@@ -4287,23 +4397,104 @@ def _parse_sentinel(line: str) -> _SentinelAction | None:
         if not m:
             continue
         slug = m.group("slug")
+        # DESIGN §3: extract the optional gen=<n> token (state-mutating
+        # sentinels only; new_task has no group). None = tokenless
+        # pre-migration sentinel → the tokenless-legacy corroboration
+        # path in _apply_sentinel.
+        gen: int | None = None
+        if "gen" in m.groupdict() and m.group("gen") is not None:
+            try:
+                gen = int(m.group("gen"))
+            except (TypeError, ValueError):
+                gen = None
         if kind == "task_done_pr":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("url"),
+                dispatch_generation=gen,
             )
         if kind == "blocked_question":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("text"),
                 raised_to_user=True,
                 raise_text=f"{slug} blocked: {m.group('text')}",
+                dispatch_generation=gen,
             )
         if kind == "worker_failed":
             return _SentinelAction(
                 slug=slug, kind=kind, payload=m.group("reason"),
+                dispatch_generation=gen,
             )
         if kind == "new_task":
             return _SentinelAction(slug=slug, kind=kind)
     return None
+
+
+def _task_row_dispatch_generation(
+    project: str,
+    slug: str,
+    *,
+    home: Path | None = None,
+    tasks_by_slug: dict[str, parse.Task] | None = None,
+    full_tasks_by_slug: dict[str, parse.Task] | None = None,
+) -> int | None:
+    """Read the slug's AUTHORITATIVE task-row dispatch_generation (the
+    sentinel CAS authority, DESIGN §3). Prefers an in-memory pre-mutation
+    snapshot (full_tasks_by_slug, then tasks_by_slug); falls back to
+    re-reading tasks.md from disk.
+
+    Returns the int generation, or None when the slug is absent / the
+    read fails — the caller fails CLOSED (treats a tokenless sentinel as
+    legacy-trusted only when the authority is genuinely 0/absent).
+    """
+    for lookup in (full_tasks_by_slug, tasks_by_slug):
+        if lookup is not None:
+            tk = lookup.get(slug)
+            if tk is not None:
+                try:
+                    return int(tk.dispatch_generation)
+                except (TypeError, ValueError):
+                    return 0
+    fleet_home = home if home is not None else _resolve_home(None)
+    tasks_path = fleet_home / "projects" / project / "tasks.md"
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:  # noqa: BLE001
+        return None
+    for t in f.tasks:
+        if t.slug == slug:
+            try:
+                return int(t.dispatch_generation)
+            except (TypeError, ValueError):
+                return 0
+    return None
+
+
+def _sentinel_corroborates(
+    action: _SentinelAction, authority: int | None,
+) -> bool:
+    """DESIGN §3 sentinel generation corroboration. Returns True when the
+    sentinel's stamped generation matches the slug's current task-row
+    authority (so its terminal side effects may apply), False when it is
+    a STALE prior-attempt sentinel that must be skipped.
+
+      - Sentinel carries a token (action.dispatch_generation is not None):
+        corroborate by integer equality. Mismatch → stale.
+      - Tokenless legacy sentinel (None): legacy-trusted ONLY when the
+        slug has NOT been re-dispatched under the epoch (authority is 0,
+        absent, or unknown). If the slug HAS been re-dispatched
+        (authority >= 1) a tokenless sentinel is from a pre-migration
+        worker of a PRIOR attempt → STALE (fail safe: never reap a
+        re-dispatched slug's live tree on a tokenless legacy sentinel).
+    """
+    token = action.dispatch_generation
+    if token is None:
+        # Tokenless-legacy: trusted only when authority is 0/absent.
+        return authority is None or authority <= 0
+    # Tokened: strict integer corroboration. A None/absent authority
+    # means the task row is gone or unreadable — fail closed (skip).
+    if authority is None:
+        return False
+    return int(token) == int(authority)
 
 
 def _apply_sentinel(
@@ -4315,8 +4506,9 @@ def _apply_sentinel(
     tasks_by_slug: dict[str, parse.Task] | None = None,
     home: Path | None = None,
     full_tasks_by_slug: dict[str, parse.Task] | None = None,
-) -> None:
-    """Apply a parsed sentinel via the fleet CLI.
+) -> str:
+    """Apply a parsed sentinel via the fleet CLI. Returns one of
+    SENTINEL_APPLIED / SENTINEL_SKIPPED_STALE / SENTINEL_ERROR.
 
     `--project <project>` is threaded into every mutation so a coord
     whose cwd resolves to a different sanitized name than its project
@@ -4330,7 +4522,35 @@ def _apply_sentinel(
     the PR is open). WORKER_FAILED also clears the worktree because the
     next dispatch creates a fresh one. Both are best-effort — failures
     log to stderr but don't roll back the tasks.md mutation.
+
+    DESIGN §3 (S1-S3): a STATE-MUTATING sentinel (task_done_pr,
+    worker_failed, blocked_question) is corroborated against the slug's
+    current task-row dispatch_generation. A stale (prior-attempt)
+    sentinel — even with an IDENTICAL worker/<slug> branch + deterministic
+    path — is SKIPPED: NONE of its terminal side effects run (status
+    mutation, pr_url, worktree removal, worker-dir delete) — only
+    surface. The caller (S4) gates release/forget/handoff-clear on the
+    returned APPLIED outcome. new_task carries no state mutation and is
+    never gated.
     """
+    # DESIGN §3 (S1/S2/S3): corroborate state-mutating sentinels against
+    # the slug's current dispatch_generation before ANY side effect.
+    if action.kind in ("task_done_pr", "worker_failed", "blocked_question"):
+        authority = _task_row_dispatch_generation(
+            project, action.slug, home=home,
+            tasks_by_slug=tasks_by_slug,
+            full_tasks_by_slug=full_tasks_by_slug,
+        )
+        if not _sentinel_corroborates(action, authority):
+            import sys
+            print(
+                f"coord: sentinel {action.kind} {action.slug} SKIPPED — "
+                f"stale dispatch_generation (sentinel="
+                f"{action.dispatch_generation}, authority={authority}); "
+                f"all terminal side effects skipped, surfacing",
+                file=sys.stderr,
+            )
+            return SENTINEL_SKIPPED_STALE
     if action.kind == "task_done_pr":
         # Order matters for issue #101: pr_url onto tasks.md FIRST,
         # then status flip, then worker dir delete. The PR URL must
@@ -4364,12 +4584,14 @@ def _apply_sentinel(
                     f"coord: subagent archive write failed for {action.slug}: {exc}",
                     file=sys.stderr,
                 )
+        return SENTINEL_APPLIED
     elif action.kind == "blocked_question":
         # Lifecycle Waiting — operator may un-block the task; KEEP
         # the worker dir (its blocked_reason is still useful context).
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=blocked"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"BLOCKED_QUESTION: {action.payload}"])
+        return SENTINEL_APPLIED
     elif action.kind == "worker_failed":
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=todo"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
@@ -4378,11 +4600,14 @@ def _apply_sentinel(
         _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
         # Worker reached TerminalFailure — rm-rf workers/<slug>/.
         _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+        return SENTINEL_APPLIED
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
         # was the wake; dispatch_ready in the same tick will pick up
-        # the new task if it's ready.
-        return
+        # the new task if it's ready. Token-free → always "applied"
+        # (a benign no-op the caller consumes).
+        return SENTINEL_APPLIED
+    return SENTINEL_APPLIED
 
 
 def _maybe_delete_worker_dir(slug: str, fleet_bin: str, project: str) -> None:
@@ -4469,6 +4694,16 @@ def _sweep_done_worker_dirs(
     swept = 0
     for t in tasks:
         if t.status != "done":
+            continue
+        # D1 (DESIGN §4.2): a dirty-parked `done` row keeps its worker
+        # dir on purpose — it holds the recovery context the operator
+        # needs to inspect/commit/discard the leaked dirty worktree.
+        # This every-tick sweep must NOT erase it. Skip any worker dir
+        # whose task row is `parked`; the field is cleared on resolve
+        # (status leaves blocked / explicit `fleet tasks set parked=`)
+        # and the next sweep re-arms. (The claim-release wire below is
+        # also skipped — a parked row is still mid-lifecycle.)
+        if getattr(t, "parked", ""):
             continue
         # Codex iter-6 [P2]: even if the worker dir is already gone
         # (sweep already ran on a prior tick), the slug may still have

@@ -203,6 +203,29 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 			continue
 		}
 		if status == "done" || status == "abandoned" {
+			// D2 (DESIGN §4.2): a dirty-parked terminal row keeps its
+			// worker dir ON PURPOSE — it holds the recovery context the
+			// coord protects (a dirty leaked worktree the operator must
+			// inspect/commit/discard). A manual/global `fleet gc
+			// --kinds=worker-records --apply` MUST NOT erase it. Surface
+			// (don't silo) but never auto-remove a parked row's dir.
+			// Same projection seam as R7: the classifier reads the task
+			// row's `parked` field. Unwired dep / probe error → treat as
+			// not-parked (back-compat); a non-empty parked value protects.
+			if deps.LoadTaskParked != nil {
+				if parked, perr := deps.LoadTaskParked(info.Project, info.Slug); perr == nil && parked != "" {
+					r.Actions = append(r.Actions, Action{
+						Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+						Reason: fmt.Sprintf(
+							"task-terminal (status=%s) but row is PARKED (%s) — "+
+								"coord kept the worker dir for dirty-worktree recovery; "+
+								"surface only, refusing to remove. Resolve the park "+
+								"(commit/discard the worktree, clear `parked`) first",
+							status, parked),
+					})
+					continue
+				}
+			}
 			reason := fmt.Sprintf("task-terminal (task status=%s, worker dir orphan post-archive)", status)
 			// task-terminal IS a confirmed terminal state — apply is
 			// safe without the task-in-progress guard.
@@ -400,6 +423,82 @@ func loadTaskStatusOnDisk(project, slug string) (string, error) {
 	// classifier interprets this as not-terminal so the worker dir is
 	// kept (surface-don't-silo; could be a partial workflow).
 	return "", nil
+}
+
+// loadTaskParkedOnDisk is the production LoadTaskParked
+// (DESIGN-coord-worktree-lifecycle §4.2 / D2). Reads tasks.md for the
+// given (project, slug) and returns the raw `- parked:` field value.
+// Returns "" with nil err when the slug is absent or the field is unset.
+//
+// Only tasks.md is consulted (NOT tasks-archive.md): the parked-protect
+// invariant matters for LIVE rows the coord is mid-lifecycle on. An
+// archived row is terminal-by-definition and its worker dir is a normal
+// reap target.
+func loadTaskParkedOnDisk(project, slug string) (string, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return "", err
+	}
+	tasksPath := filepath.Join(filepath.Clean(dir), "tasks.md")
+	val, _, ferr := taskFieldRawInFile(tasksPath, slug, "- parked:")
+	if ferr != nil {
+		return "", ferr
+	}
+	// "null" is the explicit unset sentinel the Python parser emits.
+	if val == "null" {
+		return "", nil
+	}
+	return val, nil
+}
+
+// taskFieldRawInFile returns the raw value of an arbitrary
+// `<fieldPrefix>` bullet (e.g. "- parked:" / "- status:") under the
+// given slug's `## task:` heading. Shares the SAME fence-aware,
+// column-0-anchored grammar as taskStatusRawInFile — factored out so the
+// parked lookup doesn't duplicate the fence walk. found reports whether
+// the slug heading exists at all (vs. the field merely being unset).
+func taskFieldRawInFile(path, slug, fieldPrefix string) (value string, found bool, err error) {
+	data, rerr := os.ReadFile(path)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read %s: %w", path, rerr)
+	}
+	wantHeader := "## task: " + slug
+	lines := strings.Split(string(data), "\n")
+	inFence := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "```") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if line != wantHeader {
+			continue
+		}
+		innerFence := false
+		for j := i + 1; j < len(lines); j++ {
+			lj := lines[j]
+			if strings.HasPrefix(lj, "```") {
+				innerFence = !innerFence
+				continue
+			}
+			if innerFence {
+				continue
+			}
+			if strings.HasPrefix(lj, "## ") {
+				break
+			}
+			if strings.HasPrefix(lj, fieldPrefix) {
+				return strings.TrimSpace(strings.TrimPrefix(lj, fieldPrefix)), true, nil
+			}
+		}
+		return "", true, nil
+	}
+	return "", false, nil
 }
 
 // taskStatusRawInFile is a thin variant of taskStatusInFile that returns
