@@ -471,15 +471,19 @@ _QHEADING_RE = re.compile(r"^(?:\d+\.\s*)?Q\d+\b")
 # number so the counter advances past self-numbered sections and stays
 # monotonic. A heading counts as self-numbered only when the leading digits are
 # either a DOTTED multi-level number ("4.2 Bar") OR a single number trailed by
-# EXPLICIT punctuation (".", ")", "—"/"–"/"-", ":"). A bare digit run followed
-# only by whitespace + a word ("2026 Roadmap", "10 reasons") is section
-# CONTENT, not an ordinal, and must NOT be treated as self-numbered.
+# EXPLICIT ordinal punctuation. To avoid swallowing content headings:
+#   - "." / ")" / ":" must be followed by whitespace or end-of-text
+#     (so "3. Foo" matches but "3.5GHz" does not via this branch),
+#   - a dash/em-dash separator must be SPACE-PADDED (" — ", " - ")
+#     (so "12 — Foo" matches but the ISO date "2026-06 Roadmap" does not).
+# A bare digit run followed only by whitespace + a word ("2026 Roadmap",
+# "10 reasons") is section CONTENT, not an ordinal.
 _ALREADY_NUMBERED_RE = re.compile(
     r"^(?P<ordinal>\d+)"
     r"(?:"
-    r"(?:\.\d+)+\s*[.)—–:-]?\s*"   # dotted multi-level: "4.2", "1.2.3 ", "4.2."
+    r"(?:\.\d+)+(?:[.):]?(?=\s|$)|\s+[—–-]\s)\s*"  # dotted: "4.2", "4.2.", "1.2 — "
     r"|"
-    r"\s*[.)—–:-]\s*"              # single number + explicit punctuation
+    r"(?:[.):](?=\s|$)|\s+[—–-]\s)\s*"             # single num + ordinal punct
     r")"
 )
 
@@ -515,11 +519,28 @@ class HubTreeprocessor(Treeprocessor):
         aren't double-numbered. The running counter advances to the heading's
         own leading ordinal so a mixed doc (`## 1. Background` then `## Problem`)
         numbers monotonically (1, 2, ...) instead of emitting a duplicate `1.`.
+
+        Every ROOT-LEVEL h2 visited here is tagged ``class="hub-section"``.
+        Because we iterate only ``root``'s direct children, an h2 nested inside
+        a blockquote / list / admonition is never tagged — so the later
+        serialized-string passes (wrap_sections, build_toc) can match
+        ``class="hub-section"`` to operate on root-level sections only and skip
+        nested headings, which would otherwise produce mismatched
+        ``<section>``/container tags and pollute the TOC.
         """
         n = 0
         for el in list(root):
+            # Tag every ROOT-LEVEL decision heading (h3-h6 starting with `Q<n>`)
+            # with `hub-qbox` so wrap_qboxes boxes only root-level Q headings and
+            # skips ones nested in a blockquote/list/admonition (which would
+            # straddle the container and emit mismatched <div>/<blockquote>).
+            if el.tag in ("h3", "h4", "h5", "h6"):
+                if _QHEADING_RE.match("".join(el.itertext()).strip()):
+                    self._mark(el, "hub-qbox")
+                continue
             if el.tag != "h2":
                 continue
+            self._mark(el, "hub-section")
             text = "".join(el.itertext()).strip()
             m = _ALREADY_NUMBERED_RE.match(text)
             if m:
@@ -538,6 +559,12 @@ class HubTreeprocessor(Treeprocessor):
                     child.set("href", f"#{new_id}")
             # Leading prose lives in el.text (toc moved the anchor into a child).
             el.text = f"{n}. " + (el.text or "")
+
+    @staticmethod
+    def _mark(el, cls):
+        """Append ``cls`` to a root-level heading's class attribute."""
+        existing = el.get("class")
+        el.set("class", f"{existing} {cls}" if existing else cls)
 
 
 class HubExtension(Extension):
@@ -589,15 +616,18 @@ def wrap_qboxes(body_html: str) -> str:
     hand-authored `<div class="qbox" id="qN">` blocks of the hub template,
     derived automatically from `### Q3 — ...` markdown.
 
-    Only h3+ Q headings are boxed. A top-level `## Q1` is a numbered section
-    boundary — wrap_sections (which runs after this pass) splits the body at
-    each `<h2>`, so wrapping an h2 in a qbox here would straddle the section
-    cut and emit mismatched `<section>`/`<div>` tags. Top-level Q headings stay
-    ordinary numbered sections; nest decision points under a `##` to box them.
+    Only h3+ Q headings tagged ``class="hub-qbox"`` by HubTreeprocessor are
+    boxed. That marker is stamped on ROOT-LEVEL h3-h6 Q headings only, so:
+      - a top-level `## Q1` is never boxed (it is a numbered section boundary;
+        wrap_sections splits the body at each `<h2>` afterward, and an h2 qbox
+        would straddle that cut), and
+      - a `### Q1` nested in a blockquote/list/admonition is never boxed (the
+        box would straddle the container and emit mismatched `<div>` tags).
+    Nest decision points as plain `### Q<n>` under a `##` to box them.
     """
-    heading_re = re.compile(r"<(h[1-6])\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+    heading_re = re.compile(r"<(h[1-6])\b([^>]*)>.*?</\1>", re.IGNORECASE | re.DOTALL)
     headings = [
-        (m.start(), m.end(), int(m.group(1)[1]), m.group(0))
+        (m.start(), m.end(), int(m.group(1)[1]), m.group(0), m.group(2))
         for m in heading_re.finditer(body_html)
     ]
 
@@ -605,11 +635,12 @@ def wrap_qboxes(body_html: str) -> str:
     last = 0
     i = 0
     while i < len(headings):
-        h_start, _h_end, level, html_frag = headings[i]
-        visible = re.sub(r"<[^>]+>", "", html_frag).strip()
-        # Box only h3+ Q headings (see docstring): an h2 qbox would straddle
-        # the section split that wrap_sections applies afterward.
-        if level < 3 or not _QHEADING_RE.match(visible):
+        h_start, _h_end, level, html_frag, attrs = headings[i]
+        # Box only root-level h3+ Q headings, identified by the hub-qbox marker
+        # class (see docstring). Visible-text matching is unreliable here
+        # because section numbering may have prefixed the text and because a
+        # container-nested heading must NOT be boxed.
+        if 'hub-qbox' not in attrs:
             i += 1
             continue
         # End of this decision point: next heading with level <= this one.
@@ -646,7 +677,16 @@ def strip_leading_h1(body_html: str) -> str:
     return _LEADING_H1_RE.sub("", body_html, count=1) if body_html.lstrip().lower().startswith("<h1") else body_html
 
 
-_H2_OPEN_RE = re.compile(r'<h2\b[^>]*\bid="([^"]*)"[^>]*>', re.IGNORECASE)
+# Match only ROOT-LEVEL section headings: an <h2> open tag carrying the
+# `hub-section` class (stamped by HubTreeprocessor on root-level h2s only) AND
+# an id. Attribute order is not guaranteed by the serializer, so require both
+# but allow either order. Nested h2s (inside blockquote/list/admonition) lack
+# the class and are skipped — they don't become section boundaries or TOC rows.
+_H2_OPEN_RE = re.compile(
+    r'<h2\b(?=[^>]*\bclass="[^"]*\bhub-section\b[^"]*")'
+    r'[^>]*?\bid="([^"]*)"[^>]*>',
+    re.IGNORECASE,
+)
 
 
 def wrap_sections(body_html: str) -> str:

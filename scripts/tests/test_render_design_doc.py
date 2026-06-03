@@ -136,7 +136,7 @@ def test_sections_numbered_and_anchored(rdd):
     assert re.search(r"<h2[^>]*>\s*2\.\s*Mental model", body)
     # Anchored, hub exemplar style: id is the numbered slug `N-slug`, and the
     # permalink anchor uses class "heading-anchor" with ¶ pointing at it.
-    assert re.search(r'<h2 id="1-problem"', body)
+    assert re.search(r'<h2[^>]*\bid="1-problem"', body)
     assert 'class="heading-anchor"' in body
     assert 'href="#1-problem"' in body
     # Each top-level section is wrapped in <section id="N-slug"> (exemplar).
@@ -298,8 +298,8 @@ def test_mixed_numbering_stays_monotonic(rdd):
     # Self-numbered heading kept as-is (slug id, no re-prefix), counter = 1.
     assert re.search(r"<h2[^>]*>\s*1\.\s*Background", body)
     # Next auto-numbered section continues at 2, not 1.
-    assert re.search(r'<h2 id="2-problem"[^>]*>\s*2\.\s*Problem', body)
-    assert re.search(r'<h2 id="3-approach"[^>]*>\s*3\.\s*Approach', body)
+    assert re.search(r'<h2[^>]*\bid="2-problem"[^>]*>\s*2\.\s*Problem', body)
+    assert re.search(r'<h2[^>]*\bid="3-approach"[^>]*>\s*3\.\s*Approach', body)
     # No duplicate "1." sections.
     assert len(re.findall(r"<h2[^>]*>\s*1\.\s", body)) == 1
     # TOC mirrors monotonic numbering.
@@ -361,6 +361,57 @@ def test_nested_q_heading_boxed_under_numbered_section(rdd):
     assert body.count("<section") == body.count("</section>")
     m = re.search(r'<div class="qbox">(.*?)</div>', body, re.DOTALL)
     assert m and "Q1" in m.group(1) and "Reasoning" in m.group(1)
+
+
+def test_date_prefixed_heading_is_content_not_ordinal(rdd):
+    """codex P2: `## 2026-06 Roadmap` is a content heading, not ordinal 2026.
+
+    An ISO-date-prefixed heading must auto-number normally; the counter must
+    not jump to 2026 and produce `2027.` on the next section.
+    """
+    for date_head in ("## 2026-06 Roadmap\nr\n", "## 2026-06-03 Changelog\nc\n"):
+        md = "# Doc\n\n" + date_head + "\n## Plan\np\n"
+        body, toc = rdd.render_markdown(md)
+        assert re.search(r"<h2[^>]*>\s*1\.\s*2026", body), date_head
+        assert re.search(r"<h2[^>]*>\s*2\.\s*Plan", body), date_head
+        assert "2027" not in body and "2027" not in toc
+
+
+def test_nested_h2_not_promoted_to_section(rdd):
+    """codex P2: an `## h2` inside a blockquote is NOT a section boundary.
+
+    A container-nested h2 must stay inside its container (balanced markup) and
+    must not appear in the top-level TOC.
+    """
+    md = ("# Doc\n\n## Real\nbody\n\n"
+          "> ## Quoted\n> quoted body\n\n## Another\nx\n")
+    body, toc = rdd.render_markdown(md)
+    # Balanced section + blockquote markup (no straddling tags).
+    assert body.count("<section") == body.count("</section>")
+    assert body.count("<blockquote") == body.count("</blockquote>")
+    # Quoted heading stays inside the parent section's blockquote.
+    assert "<section id=\"quoted\">" not in body
+    # TOC has only the two real top-level sections.
+    assert "Quoted" not in toc
+    assert "Real" in toc and "Another" in toc
+
+
+def test_q_heading_in_container_not_boxed(rdd):
+    """codex P2: a `### Q1` inside a blockquote is NOT wrapped in a qbox.
+
+    Boxing it would straddle the blockquote and swallow following content,
+    emitting mismatched <div>/<blockquote> tags.
+    """
+    md = ("# Doc\n\n## Section\nintro\n\n"
+          "> ### Q1 — quoted decision?\n> quoted reasoning\n\n"
+          "After-quote paragraph.\n\n## Next\nx\n")
+    body, _toc = rdd.render_markdown(md)
+    assert '<div class="qbox">' not in body
+    assert body.count("<section") == body.count("</section>")
+    assert body.count("<blockquote") == body.count("</blockquote>")
+    assert body.count("<div") == body.count("</div>")
+    # The paragraph after the quote is not swallowed into a box.
+    assert "After-quote paragraph." in body
 
 
 def test_rejects_non_md(rdd, tmp_path):
