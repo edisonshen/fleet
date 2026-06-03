@@ -4483,17 +4483,25 @@ def _sentinel_corroborates(
 
       - Sentinel carries a token (action.dispatch_generation is not None):
         corroborate by integer equality. Mismatch → stale.
-      - Tokenless legacy sentinel (None): legacy-trusted ONLY when the
-        slug has NOT been re-dispatched under the epoch (authority is 0,
-        absent, or unknown). If the slug HAS been re-dispatched
-        (authority >= 1) a tokenless sentinel is from a pre-migration
-        worker of a PRIOR attempt → STALE (fail safe: never reap a
-        re-dispatched slug's live tree on a tokenless legacy sentinel).
+      - Tokenless legacy sentinel (None): legacy-trusted while the slug
+        has NOT been RE-dispatched. "Not re-dispatched" means the slug is
+        still on its FIRST attempt: authority is absent/unknown, 0 (legacy
+        / un-migrated), OR 1 (the first dispatch under the epoch sets
+        gen 1 — §1). Only a GENUINE re-dispatch advances the authority to
+        >= 2 (each re-dispatch increments by 1), so ONLY authority >= 2
+        fences a tokenless sentinel out as STALE. This is the rollout
+        path: current emitters (the coord agent following SKILL.md) do
+        NOT yet stamp `gen=` on every sentinel, so a first-attempt task's
+        tokenless TASK_DONE_PR / WORKER_FAILED must still apply — codex
+        iter-3 [P1]. The fail-safe still holds: a re-dispatched slug
+        (gen >= 2) never reaps its live tree on a tokenless prior-attempt
+        sentinel. The window closes as emitters adopt `gen=`.
     """
     token = action.dispatch_generation
     if token is None:
-        # Tokenless-legacy: trusted only when authority is 0/absent.
-        return authority is None or authority <= 0
+        # Tokenless-legacy: trusted on the FIRST attempt (authority
+        # absent/0/1); fenced once genuinely re-dispatched (>= 2).
+        return authority is None or authority <= 1
     # Tokened: strict integer corroboration. A None/absent authority
     # means the task row is gone or unreadable — fail closed (skip).
     if authority is None:

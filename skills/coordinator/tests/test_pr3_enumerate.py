@@ -362,8 +362,8 @@ class TestSentinelCorroboration:
         mrw.assert_called_once()
         mdwd.assert_called_once()
 
-    def test_tokenless_legacy_trusted_when_not_redispatched(self) -> None:
-        # Tokenless sentinel + authority 0 (never re-dispatched) → trusted.
+    def test_tokenless_legacy_trusted_when_authority_zero(self) -> None:
+        # Tokenless sentinel + authority 0 (legacy / un-migrated) → trusted.
         action = loop._SentinelAction(
             slug="leg-eeee", kind="task_done_pr",
             payload="https://x/pr/legacy", dispatch_generation=None,
@@ -372,15 +372,30 @@ class TestSentinelCorroboration:
         assert outcome == loop.SENTINEL_APPLIED
         mrw.assert_called_once()
 
+    def test_tokenless_legacy_trusted_on_first_dispatch_gen1(self) -> None:
+        # codex iter-3 [P1] rollout: the FIRST dispatch under the epoch
+        # sets gen 1, but current emitters don't yet stamp gen= on the
+        # sentinel. A tokenless TASK_DONE_PR for a first-attempt (gen 1,
+        # NOT re-dispatched) slug must STILL apply — else every dispatched
+        # task's completion silently stops draining.
+        action = loop._SentinelAction(
+            slug="leg-first", kind="task_done_pr",
+            payload="https://x/pr/first", dispatch_generation=None,
+        )
+        outcome, _calls, mrw, _mdwd = self._no_mutation(action, authority=1)
+        assert outcome == loop.SENTINEL_APPLIED
+        mrw.assert_called_once()
+
     def test_tokenless_legacy_skipped_when_redispatched(self) -> None:
-        # Tokenless sentinel + authority >= 1 (slug HAS been re-dispatched)
-        # → skipped_stale (fail safe: never reap a re-dispatched live tree
-        # on a tokenless legacy sentinel).
+        # Tokenless sentinel + authority >= 2 (slug GENUINELY re-dispatched
+        # — each re-dispatch increments by 1, so >= 2 means a second
+        # attempt) → skipped_stale (fail safe: never reap a re-dispatched
+        # live tree on a tokenless prior-attempt sentinel).
         action = loop._SentinelAction(
             slug="leg-ffff", kind="task_done_pr",
             payload="https://x/pr/legacy", dispatch_generation=None,
         )
-        outcome, calls, mrw, _mdwd = self._no_mutation(action, authority=1)
+        outcome, calls, mrw, _mdwd = self._no_mutation(action, authority=2)
         assert outcome == loop.SENTINEL_SKIPPED_STALE
         assert calls == []
         mrw.assert_not_called()
