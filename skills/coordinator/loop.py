@@ -62,6 +62,32 @@ COORD_CONFIG_FILE = "coord-config.json"
 # beyond this just wait for the next tick.
 _ARCHIVE_SCAN_CAP = 200
 
+# Worktree-GC backstop cadence (DESIGN-coord-worktree-lifecycle §4.4 /
+# open question #1). The coord invokes `fleet gc --kinds=worktrees` once
+# every N ticks (not every tick) — the in-line reconcile/sentinel reaping
+# is the primary path; this Go backstop only catches what that path
+# missed (crash mid-reconcile, non-reconcile terminal transition). 20
+# ticks balances "leak doesn't sit long" against "don't shell out every
+# tick"; overridable via FLEET_WORKTREE_GC_EVERY for operators who want a
+# tighter/looser cadence (<=0 disables the backstop entirely).
+_WORKTREE_GC_EVERY_DEFAULT = 20
+
+
+def _worktree_gc_every() -> int:
+    """Resolve the worktree-GC cadence (ticks between backstop runs).
+
+    Reads FLEET_WORKTREE_GC_EVERY; falls back to _WORKTREE_GC_EVERY_DEFAULT.
+    A value <= 0 disables the backstop (the in-line reaping path still
+    runs). A non-integer value falls back to the default.
+    """
+    raw = os.environ.get("FLEET_WORKTREE_GC_EVERY", "")
+    if not raw:
+        return _WORKTREE_GC_EVERY_DEFAULT
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return _WORKTREE_GC_EVERY_DEFAULT
+
 # How long after a subagent's archived_at the audit keeps probing its
 # branch for bonus PRs. Past this window the audit considers the
 # subagent's lane closed: a PR fired weeks later is operator-cleanup
@@ -619,8 +645,9 @@ def _tick_locked(
         f.tasks, project, fleet_bin, home=home, coord_state=state,
     )
     pre_reconcile_tasks_by_slug = {t.slug: t for t in f.tasks}
-    reconcile_repo = cwd if cap > 1 else ""
-    reconcile_tasks_by_slug = pre_reconcile_tasks_by_slug if cap > 1 else None
+    # DESIGN §4.3: cleanup args keyed on "project has any worktree", NOT
+    # cap — so an inherited tree on a now-cap==1 coord still reaps.
+    reconcile_repo, reconcile_tasks_by_slug = _worktree_cleanup_context(cwd, f.tasks)
     for action in reconciled:
         # Invariant 5 gate: if this action would clear the worker
         # (terminal-ish transition) but the reaper hasn't completed
@@ -747,11 +774,11 @@ def _tick_locked(
         tasks_by_slug=tasks_by_slug,
     )
     # Worktree cleanup needs a base repo + the pre-mutation snapshot of
-    # tasks.md (so we can read t.worktree before the sentinel clears
-    # it). Single-worker mode keeps tasks_by_slug empty so the cleanup
-    # path is a no-op — preserving v0.2.0 byte-identical behavior.
-    sentinel_repo = cwd if cap > 1 else ""
-    sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+    # tasks.md (so we can read t.worktree before the sentinel clears it).
+    # DESIGN §4.3: keyed on "project has any worktree", NOT cap — an
+    # inherited tree on a now-cap==1 coord still reaps. A worktree-free
+    # project is a no-op (preserving v0.2.0 byte-identical behavior).
+    sentinel_repo, sentinel_tasks_by_slug = _worktree_cleanup_context(cwd, f.tasks)
     # Codex iter-5 [P1]: stash deferred sentinels in coord-state so the
     # next tick can replay them after the reaper lane clears. Watermark
     # advances normally — the deferred sentinels are queued separately
@@ -1108,6 +1135,22 @@ def _tick_locked(
         # see the breadcrumb via `fleet status`/blocked_reason.
         result.errors.append(f"auto-archive: {exc}")
 
+    # 5.7. Worktree-GC backstop (DESIGN-coord-worktree-lifecycle §4.4).
+    # The reconcile/sentinel reaping path (§4.1-4.3) handles trees on the
+    # transition that fired; this catches trees that path missed (coord
+    # crashed mid-reconcile, non-reconcile terminal transition). ONE Go
+    # implementation (`fleet gc --kinds=worktrees`) — no Python/Go reap
+    # duplication. Bounded cadence (every-N-ticks) so we don't shell out
+    # every tick; coord-scope strict (--project <p> only). Fail-soft: a
+    # nonzero gc exit is captured to result.errors, never wedges the tick.
+    try:
+        _maybe_gc_worktrees(
+            state, project=project, cwd=cwd, cap=cap, fleet_bin=fleet_bin,
+            result=result,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"worktree-gc: {exc}")
+
     # 6. Supervisor loop (issue #79). After the initial reconcile + drain
     # + dispatch pass we keep the lock and watch in-flight workers. Cheap
     # mtime polling drives event-based reconciliation; a sparse stuck-
@@ -1255,6 +1298,9 @@ def _run_supervisor(
         )
         slot_freed = False
         full_map = {t.slug: t for t in f3.tasks}
+        # DESIGN §4.3: cleanup args keyed on "project has any worktree",
+        # NOT cap (supervisor-reconcile call site).
+        sup_recon_repo, sup_recon_tbs = _worktree_cleanup_context(cwd, f3.tasks)
         for action in actions:
             # Invariant 5 gate: defer terminal flips while the reaper
             # still has an open kill cycle for this slug. Primary tick
@@ -1267,8 +1313,8 @@ def _run_supervisor(
             try:
                 _apply_reconcile(
                     action, project, fleet_bin,
-                    repo=(cwd if cap > 1 else ""),
-                    tasks_by_slug=(full_map if cap > 1 else None),
+                    repo=sup_recon_repo,
+                    tasks_by_slug=sup_recon_tbs,
                     home=home,
                     full_tasks_by_slug=full_map,
                 )
@@ -1671,8 +1717,9 @@ def _run_supervisor(
             return 0
         tbs = {t.slug: t for t in f_local.tasks}
         still_deferred: list[_SentinelAction] = []
-        sentinel_repo = cwd if cap > 1 else ""
-        sentinel_tbs = tbs if cap > 1 else None
+        # DESIGN §4.3: cleanup args keyed on "project has any worktree",
+        # NOT cap (deferred-sentinel replay call site).
+        sentinel_repo, sentinel_tbs = _worktree_cleanup_context(cwd, f_local.tasks)
         applied = 0
         for action in deferred:
             if action.kind in ("task_done_pr", "worker_failed") and not (
@@ -1846,8 +1893,9 @@ def _run_supervisor(
         drained = prior_deferred + drained
         if not drained and not last_seen:
             return
-        sentinel_repo = cwd if cap > 1 else ""
-        sentinel_tasks_by_slug = tasks_by_slug if cap > 1 else None
+        # DESIGN §4.3: cleanup args keyed on "project has any worktree",
+        # NOT cap (supervisor-drain call site).
+        sentinel_repo, sentinel_tasks_by_slug = _worktree_cleanup_context(cwd, f6.tasks)
         deferred_actions: list[_SentinelAction] = []
         for action in drained:
             if action.kind in ("task_done_pr", "worker_failed") and not (
@@ -4407,20 +4455,53 @@ def _apply_reconcile(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
     if action.note:
         _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, action.note])
-    # Worktree cleanup on terminal transitions (cap>1 only). Done +
-    # todo-without-PR are the two states where the working tree is no
-    # longer needed: the PR is merged (done) or the worker bailed before
-    # opening a PR (todo). Other transitions (in-review, blocked) keep
-    # the worktree because a re-dispatch may want to resume on the same
-    # checkout.
+    # Worktree cleanup on terminal transitions (DESIGN §4.3: keyed on the
+    # task's persisted worktree=, NOT cap). Done + todo-without-PR are the
+    # two states where the working tree is no longer needed: the PR is
+    # merged (done) or the worker bailed before opening a PR (todo). Other
+    # transitions (in-review, blocked) keep the worktree because a
+    # re-dispatch may want to resume on the same checkout.
+    tree_left = False
     if action.new_status in ("done", "todo"):
-        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
+        outcome = _maybe_remove_worktree(
+            action.slug, repo, tasks_by_slug, fleet_bin, project,
+        )
+        # DESIGN §4.2 caller-specific PARK. A tree-left outcome
+        # (dirty-parked / error / branch-mismatch) means the worker's
+        # working copy is still on disk:
+        #   - reconcile-`done` (PR merged): PRESERVE `done` + surface.
+        #     Never reopen a merged task. Record `parked` so the
+        #     done-dir sweep keeps the recovery context.
+        #   - reconcile-`todo` (worker died, redispatch-eligible): flip
+        #     to `blocked` + surface. Leaving it `todo` with worktree=
+        #     set makes the next dispatch REUSE the dirty/wrong tree
+        #     (create_worktree treats a registered path collision as
+        #     success without a cleanliness/branch check). Only this
+        #     path blocks.
+        if outcome in (worktree_mod.OUTCOME_DIRTY_PARKED, worktree_mod.OUTCOME_ERROR):
+            tree_left = True
+            detail = (
+                "dirty worktree" if outcome == worktree_mod.OUTCOME_DIRTY_PARKED
+                else "unreapable worktree (branch mismatch / git error)"
+            )
+            if action.new_status == "todo":
+                # Redispatch-eligible: force blocked so _filter_ready
+                # (status=ready only) can't re-dispatch onto the left tree.
+                _run_fleet([
+                    fleet_bin, "tasks", "set", "--project", project,
+                    action.slug, "status=blocked",
+                ])
+            _set_parked(fleet_bin, project, action.slug, detail)
     # Issue #101 lifecycle hygiene: rm-rf workers/<slug>/ on terminal
     # transitions (done/failed). Delete is idempotent on missing dir
     # so a coord-then-TUI race is safe — first mover wins. Best-effort:
     # any failure logs to stderr and does NOT roll back the tasks.md
     # mutations above, matching the worktree-cleanup discipline.
-    if action.delete_worker_dir:
+    #
+    # DESIGN §4.1: skip the worker-dir delete when a tree was LEFT on disk
+    # (dirty-parked / error) — the worker dir is the recovery context the
+    # operator needs to inspect/commit/discard before resolving the park.
+    if action.delete_worker_dir and not tree_left:
         _maybe_delete_worker_dir(action.slug, fleet_bin, project)
     # Subagent-lifecycle archive receipt — only on the phase=done +
     # PR-shipped path. set_pr_url is the signal that this was a
@@ -4793,9 +4874,23 @@ def _apply_sentinel(
         # only on-disk source of the URL pre-persist) is rm-rf'd.
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"pr_url={action.payload}"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "status=in-review"])
-        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
-        # Worker reached TerminalSuccess — rm-rf workers/<slug>/.
-        _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+        tdp_outcome = _maybe_remove_worktree(
+            action.slug, repo, tasks_by_slug, fleet_bin, project,
+        )
+        # DESIGN §4.2: task_done_pr is already `in-review`. A tree-left
+        # outcome PRESERVES `in-review` (never stop PR polling for a
+        # shipped task) + records `parked` + surfaces; the worker dir is
+        # KEPT (recovery context). Not redispatch-eligible, so no block.
+        if tdp_outcome in (worktree_mod.OUTCOME_DIRTY_PARKED, worktree_mod.OUTCOME_ERROR):
+            detail = (
+                "dirty worktree" if tdp_outcome == worktree_mod.OUTCOME_DIRTY_PARKED
+                else "unreapable worktree (branch mismatch / git error)"
+            )
+            _set_parked(fleet_bin, project, action.slug, detail)
+        else:
+            # Worker reached TerminalSuccess + tree reaped/absent —
+            # rm-rf workers/<slug>/.
+            _maybe_delete_worker_dir(action.slug, fleet_bin, project)
         # Subagent-lifecycle archive receipt. Same Terminal-success
         # path as the reconcile branch above — a TASK_DONE_PR sentinel
         # IS the worker's "I shipped" signal, so we open the
@@ -4848,9 +4943,27 @@ def _apply_sentinel(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "worker_pid=0"])
         if action.payload:
             _run_fleet([fleet_bin, "tasks", "note", "--project", project, action.slug, f"WORKER_FAILED: {action.payload}"])
-        _maybe_remove_worktree(action.slug, repo, tasks_by_slug, fleet_bin, project)
-        # Worker reached TerminalFailure — rm-rf workers/<slug>/.
-        _maybe_delete_worker_dir(action.slug, fleet_bin, project)
+        wf_outcome = _maybe_remove_worktree(
+            action.slug, repo, tasks_by_slug, fleet_bin, project,
+        )
+        # DESIGN §4.2: worker_failed is redispatch-eligible (just set
+        # status=todo above). A tree-left outcome must flip to `blocked`
+        # (not leave `todo`) so the next dispatch can't re-promote onto
+        # the dirty/wrong tree, + record `parked` + keep the worker dir.
+        if wf_outcome in (worktree_mod.OUTCOME_DIRTY_PARKED, worktree_mod.OUTCOME_ERROR):
+            detail = (
+                "dirty worktree" if wf_outcome == worktree_mod.OUTCOME_DIRTY_PARKED
+                else "unreapable worktree (branch mismatch / git error)"
+            )
+            _run_fleet([
+                fleet_bin, "tasks", "set", "--project", project,
+                action.slug, "status=blocked",
+            ])
+            _set_parked(fleet_bin, project, action.slug, detail)
+        else:
+            # Worker reached TerminalFailure + tree reaped/absent —
+            # rm-rf workers/<slug>/.
+            _maybe_delete_worker_dir(action.slug, fleet_bin, project)
         return SENTINEL_APPLIED
     elif action.kind == "new_task":
         # Wake-only sentinel — nothing to apply. Presence of the file
@@ -5157,45 +5270,190 @@ def _sweep_non_inflight_claim_state(
             _clear_review_handoff_state(coord_state, slug)
 
 
+def _worktree_cleanup_context(
+    cwd: str,
+    tasks: list[parse.Task],
+) -> tuple[str, dict[str, parse.Task] | None]:
+    """Return (repo, tasks_by_slug) for the reaping consumer — keyed on
+    whether the project HAS any worktree, NOT on `cap` (DESIGN §4.3).
+
+    `cap` is the parallelism knob, not a 1-worker limit. The old gate
+    (`repo=cwd if cap>1`, `tasks_by_slug=… if cap>1`) meant a coord now
+    running `cap==1` that INHERITED worktrees from an earlier `cap>1` run
+    never reaped them — the exact 6.9 GB leak (worktrees persist across
+    cap changes). This helper is the ONE place that decides the cleanup
+    arguments; every _apply_reconcile / _apply_sentinel call site obtains
+    its (repo, tasks_by_slug) from here so the cap gate can't be
+    re-introduced inline on any path.
+
+    Returns (cwd, {slug: task}) whenever ANY task carries a persisted
+    `worktree=` field; otherwise ("", None) — a genuinely worktree-free
+    project is a no-op (byte-identical to the pre-fix cap==1 behavior).
+    The per-task `not t.worktree` guard inside _maybe_remove_worktree then
+    keeps individual worktree-free tasks safe even in a mixed project.
+    """
+    has_worktree = any(t.worktree for t in tasks)
+    if not has_worktree:
+        return ("", None)
+    return (cwd, {t.slug: t for t in tasks})
+
+
+def _maybe_gc_worktrees(
+    state: dict,
+    *,
+    project: str,
+    cwd: str,
+    cap: int,
+    fleet_bin: str,
+    result,
+) -> bool:
+    """Run the Go worktree-GC backstop every-N-ticks (DESIGN §4.4).
+
+    Returns True iff the gc was invoked this tick (for the caller/tests).
+    No-op when:
+      - cadence disabled (FLEET_WORKTREE_GC_EVERY <= 0),
+      - not a cadence tick (tick_count % every != 0),
+      - cap <= 1 AND no task carries a worktree= (a never-worktree'd
+        project has nothing to reap — but a cap==1 coord that INHERITED
+        trees from an earlier cap>1 run DOES run, mirroring §4.3).
+
+    Shells out to `fleet gc --kinds=worktrees --apply --project <p>`. The
+    Go side takes the project-scoped worktree-GC flock so a concurrent
+    operator-run can't race the removal. Fail-soft: a nonzero exit /
+    timeout / missing binary is appended to result.errors as a warning —
+    never raised, never wedges the tick.
+    """
+    every = _worktree_gc_every()
+    if every <= 0:
+        return False
+    try:
+        tick_count = int(state.get("tick_count", 0) or 0)
+    except (TypeError, ValueError):
+        tick_count = 0
+    if tick_count <= 0 or (tick_count % every) != 0:
+        return False
+    # Coord-scope strict: only ITS project. The Go side enumerates the
+    # project's worktree dirs; if the project has no worktrees this is a
+    # cheap no-op, so we don't need to pre-filter beyond the cadence gate.
+    try:
+        proc = subprocess.run(
+            [fleet_bin, "gc", "--kinds=worktrees", "--apply", "--project", project],
+            capture_output=True, text=True, timeout=120.0, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        result.errors.append(f"worktree-gc backstop: {exc}")
+        return True
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        result.errors.append(f"worktree-gc backstop nonzero exit: {msg}")
+    return True
+
+
 def _maybe_remove_worktree(
     slug: str,
     repo: str,
     tasks_by_slug: dict[str, parse.Task] | None,
     fleet_bin: str,
     project: str,
-) -> None:
-    """Best-effort `git worktree remove` for the named slug.
+) -> str:
+    """Dirty-guarded `git worktree remove` for the named slug.
 
-    No-op when:
-      - tasks_by_slug is None (single-worker tick),
-      - the task block has no worktree path set (cap=1 mode),
-      - repo is empty (caller didn't supply a base repo).
+    Returns one of the worktree_mod.OUTCOME_* strings (DESIGN §4.1):
+      OUTCOME_NOOP        — nothing to reap (single-worker tick, no
+                            persisted worktree=, empty repo, or the tree
+                            was already gone). The caller proceeds with
+                            its existing worker-dir delete.
+      OUTCOME_REMOVED     — clean terminal tree removed; worktree= cleared
+                            on tasks.md so a re-dispatch doesn't reuse it.
+      OUTCOME_DIRTY_PARKED— the tree had uncommitted work (or a TOCTOU
+                            dirty failure / undeterminable status); LEFT
+                            on disk. The caller keeps the worker dir +
+                            applies a caller-specific park status (§4.2).
+      OUTCOME_ERROR       — branch-identity mismatch (a CLEAN checkout of
+                            the WRONG branch — `force=False` does not
+                            protect a clean tree, so we refuse + surface)
+                            OR an unexpected git/path failure. Tree LEFT
+                            on disk; caller keeps the worker dir.
 
-    Worktree removal failures are logged to stderr but do NOT bubble up.
-    The worktree dir may persist on disk; the operator cleans manually
-    via `git worktree prune`. Aborting the sentinel apply on a cleanup
-    failure would leave tasks.md inconsistent with reality.
+    DESIGN §4.3: keyed on whether the SPECIFIC task carries a persisted
+    `worktree=` — NOT on `cap`. A `cap==1` coord that inherited a tree
+    from an earlier `cap>1` run still reaps it (the per-task `not
+    t.worktree` guard is byte-identical-safe for genuinely worktree-free
+    tasks). Caller supplies (repo, tasks_by_slug) via
+    _worktree_cleanup_context, which keys on "project has any worktree".
+
+    Failures are surfaced to stderr but never bubble up — the tasks.md
+    mutation the caller already applied stands.
     """
     if not tasks_by_slug or not repo:
-        return
+        return worktree_mod.OUTCOME_NOOP
     t = tasks_by_slug.get(slug)
     if t is None or not t.worktree:
-        return
+        # Per-task guard (§4.3): a genuinely worktree-free task is a clean
+        # no-op, so the caller's worker-dir delete proceeds as before.
+        return worktree_mod.OUTCOME_NOOP
+    # Branch-identity guard (§4.2/§4.4): a CLEAN checkout of the WRONG
+    # branch at this worktree path would slip past force=False (force=False
+    # only protects DIRTY trees). Corroborate the dir actually has this
+    # task's expected branch checked out before reaping. Expected branch =
+    # task.branch, or the deterministic worker/<slug> fallback when the
+    # task carries no branch= field. A detached/undeterminable HEAD ("")
+    # also fails identity → refuse + surface (never reap a tree we can't
+    # positively tie to this terminal task).
+    expected_branch = t.branch or f"worker/{slug}"
+    if os.path.exists(t.worktree):
+        actual_branch = worktree_mod.worktree_branch(t.worktree)
+        if actual_branch != expected_branch:
+            print(
+                f"coord: worktree {t.worktree} for {slug} has branch "
+                f"{actual_branch!r} != expected {expected_branch!r}; "
+                f"refusing to reap (surfacing, tree kept)",
+                file=sys.stderr,
+            )
+            return worktree_mod.OUTCOME_ERROR
     res = worktree_mod.remove_worktree(repo, t.worktree)
+    if res.outcome in (worktree_mod.OUTCOME_REMOVED, worktree_mod.OUTCOME_NOOP):
+        # Clear worktree= so a re-dispatch (CI red, operator re-promote)
+        # doesn't think the old worktree is still live. Both REMOVED (we
+        # just deleted it) AND NOOP (the dir was ALREADY gone but the task
+        # still carries a stale worktree= path) clear the field — codex
+        # [P2]: leaving a NOOP path set keeps future cleanup/dispatch
+        # treating the row as worktree-backed for a tree that's gone.
+        try:
+            _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worktree="])
+        except Exception:
+            # Non-fatal — same logic as worktree-remove failure.
+            pass
+        return res.outcome
+    # DIRTY_PARKED / ERROR — leave the tree, surface to stderr.
     if res.error:
-        # Surface to stderr; the tick result already records the
-        # caller's note. We don't fail the sentinel — the task is
-        # already in-review per the operator's tasks.md.
-        import sys
-        print(f"coord: worktree remove failed for {slug}: {res.error}", file=sys.stderr)
-        return
-    # Clear the worktree field on tasks.md so a re-dispatch (CI red,
-    # operator re-promote) doesn't think the old worktree is still live.
+        print(f"coord: worktree remove for {slug}: {res.error}", file=sys.stderr)
+    return res.outcome
+
+
+def _park_reason(detail: str) -> str:
+    """Format a durable `parked` task-row value: `<UTC ts> <detail>`.
+
+    Written via `fleet tasks set <slug> parked=<value>` when a dirty /
+    unreapable tree is left behind (DESIGN §4.2). `_sweep_done_worker_dirs`
+    + the Go worker-records classifier skip any row with a non-empty
+    parked field, so the worker dir (recovery context) survives until the
+    operator resolves + clears it.
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return f"{ts} {detail}"
+
+
+def _set_parked(fleet_bin: str, project: str, slug: str, detail: str) -> None:
+    """Best-effort `fleet tasks set <slug> parked=<reason>`."""
     try:
-        _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worktree="])
-    except Exception:
-        # Non-fatal — same logic as worktree-remove failure.
-        pass
+        _run_fleet([
+            fleet_bin, "tasks", "set", "--project", project, slug,
+            f"parked={_park_reason(detail)}",
+        ])
+    except Exception:  # noqa: BLE001
+        import sys
+        print(f"coord: failed to set parked for {slug}", file=sys.stderr)
 
 
 # ---------- dispatch ----------
@@ -5579,6 +5837,19 @@ def _dispatch_ready(
                     slug=t.slug,
                     error=f"worktree-path resolution failed for {t.slug}",
                 ))
+                continue
+            # DESIGN §4.2 dispatch preflight, keyed on the COMPUTED path
+            # (worker/<slug>), NOT the persisted worktree= (which can be
+            # "" on a leaked-dir row). A prior attempt's dirty-parked or
+            # branch-mismatch tree left at this path would be silently
+            # adopted by create_worktree's idempotent-collision path. If a
+            # tree exists at wt_path that is wrong-branch OR dirty, REFUSE
+            # dispatch + surface — the operator resolves the leaked tree.
+            pf_ok, pf_why = dispatch_mod.worktree_preflight_ok(
+                wt_path, worker_branch,
+            )
+            if not pf_ok:
+                actions.append(_DispatchAction(slug=t.slug, error=pf_why))
                 continue
             # Pick the worker's base ref. Several pulls are in tension:
             #   (a) the worker must see commits a dependency PR JUST merged
@@ -6402,6 +6673,15 @@ def _apply_dispatch(action: _DispatchAction, project: str, fleet_bin: str) -> No
         # up on terminal transition (done/abandoned). Single-worker
         # mode leaves this empty so existing behavior is unchanged.
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, f"worktree={action.worktree}"])
+    # DESIGN §4.2: clear any stale `parked` marker on (re-)dispatch
+    # (codex [P2]). A task gets here only after _dispatch_ready accepted
+    # it (status=ready + the §4.2 dispatch preflight verified no
+    # wrong-branch/dirty tree sits at the computed path) — i.e. the park
+    # has been RESOLVED. Leaving `parked` set would make the next
+    # successful completion's done-dir sweep + Go worker-records GC treat
+    # the row as a hard-keep forever, leaking workers/<slug>/. Idempotent:
+    # clearing an already-empty field is a no-op for never-parked tasks.
+    _run_fleet([fleet_bin, "tasks", "set", "--project", project, action.slug, "parked="])
     # Bootstrap state.json stamped with the SAME generation just
     # persisted to the task row (step 3). Passing --dispatch-generation
     # routes the bootstrap through the writer CAS: the task-row authority

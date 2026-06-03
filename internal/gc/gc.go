@@ -204,6 +204,47 @@ type Deps struct {
 	RemoveWorktree func(path string) error
 	IsTaskTerminal func(project, slug string) (bool, error)
 
+	// Worktrees — DESIGN-coord-worktree-lifecycle §4.4 SAFE orphan-dir
+	// resolver. The legacy ListWorktrees+IsTaskTerminal+RemoveWorktree
+	// trio above did exact-slug + terminal only; a CLEAN checkout of the
+	// WRONG branch at a terminal-slug path would be reaped (force=False
+	// does NOT protect a clean tree). These hooks add branch-identity,
+	// repo-registration, generation-aware veto, live-over-archive, and a
+	// dirty-guard. When ListTaskCandidates is non-nil the resolver runs
+	// the hardened path; nil falls back to the legacy trio (back-compat
+	// for older Deps / narrow unit tests).
+	//
+	// ListTaskCandidates returns EVERY live + archive task row for the
+	// project (NOT a per-dir exact lookup) so the resolver can do
+	// exact-slug → unique-prefix matching + live-over-archive precedence.
+	ListTaskCandidates func(project string) ([]TaskCandidate, error)
+	// WorktreeBranch returns the branch checked out at the worktree dir
+	// (`git -C <path> rev-parse --abbrev-ref HEAD`). "" on detached HEAD /
+	// non-git / error — which fails branch identity (never reap a tree we
+	// can't tie to the candidate's worker/<slug> branch).
+	WorktreeBranch func(path string) (string, error)
+	// WorktreeDirty reports whether the worktree dir has uncommitted
+	// changes (`git -C <path> status --porcelain` non-empty). A non-nil
+	// error is treated as "cannot prove clean" → dirty-parked (fail-safe).
+	WorktreeDirty func(path string) (bool, error)
+	// ProjectRepo returns the project's base repo path (the checkout the
+	// coord spawns workers from). The resolver requires the worktree dir
+	// to be REGISTERED in this repo's `git worktree list` and removes it
+	// THROUGH this repo with --no-force (repo-registration identity). ""
+	// or error → skip + surface (can't corroborate registration).
+	ProjectRepo func(project string) (string, error)
+	// WorktreeRegistered reports whether <path> is a registered worktree
+	// of <repo> (`git -C <repo> worktree list --porcelain`). A clean
+	// wrong checkout that merely SITS at the deterministic path (never
+	// `git worktree add`-ed) would pass a branch-only gate; this closes it.
+	WorktreeRegistered func(repo, path string) (bool, error)
+	// RemoveWorktreeNoForce removes the worktree THROUGH the base repo
+	// with --no-force (`git -C <repo> worktree remove --no-force <path>`).
+	// git itself refuses a dirty tree here (the TOCTOU belt: clean at the
+	// dirty-check, dirty by removal time → git fails → reported as
+	// dirty-parked, never blown away).
+	RemoveWorktreeNoForce func(repo, path string) error
+
 	// Coord-locks (KindCoordLocks).
 	// ListCoordLocks enumerates every coordinator.lock file under
 	// ~/.fleet/projects/<p>/.locks/. Production wiring is
@@ -377,8 +418,18 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("orphan-tmux: %w", err))
 		}
 	}
+	// dirtyParkedInRun tracks (project/slug) worktrees the worktrees pass
+	// just dirty-parked under --apply. The worker-records pass consults it
+	// so a tree dirty-parked in THIS sweep doesn't have its recovery-
+	// context worker dir removed before the coord persists the `parked`
+	// task-row field (codex [P2] / DESIGN §4.4 deferred-P2: the Go gc only
+	// reports counts; LoadTaskParked can still read "" in the same run).
+	// In-run suppression closes the cross-kind window without Go writing
+	// the Python-owned `parked` field. Worktrees runs BEFORE worker-records
+	// (kindRank order) so the set is populated before it's consulted.
+	dirtyParkedInRun := map[string]bool{}
 	if hasKind(opts.Kinds, KindWorktrees) {
-		if err := reconcileWorktrees(&r, opts, deps); err != nil {
+		if err := reconcileWorktrees(&r, opts, deps, dirtyParkedInRun); err != nil {
 			recordErr(fmt.Errorf("worktrees: %w", err))
 		}
 	}
@@ -388,7 +439,7 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 		}
 	}
 	if hasKind(opts.Kinds, KindWorkerRecords) {
-		if err := reconcileWorkerRecords(&r, opts, deps); err != nil {
+		if err := reconcileWorkerRecords(&r, opts, deps, dirtyParkedInRun); err != nil {
 			recordErr(fmt.Errorf("worker-records: %w", err))
 		}
 	}
@@ -674,7 +725,14 @@ func reconcileOrphanTmux(r *Report, opts Options, deps Deps) error {
 // Project scope: empty opts.Project enumerates every project via
 // ListProjects; an explicit name skips enumeration and calls
 // ListWorktrees(project) directly.
-func reconcileWorktrees(r *Report, opts Options, deps Deps) error {
+func reconcileWorktrees(r *Report, opts Options, deps Deps, dirtyParked map[string]bool) error {
+	// DESIGN §4.4: when the hardened-resolver deps are wired, run the
+	// branch-identity + repo-registration + generation-aware path. nil
+	// ListTaskCandidates falls back to the legacy exact-slug+terminal
+	// trio (back-compat for older Deps / narrow unit tests).
+	if deps.ListTaskCandidates != nil {
+		return reconcileWorktreesResolver(r, opts, deps, dirtyParked)
+	}
 	var projects []string
 	if opts.Project != "" {
 		projects = []string{opts.Project}
@@ -745,37 +803,43 @@ func humanDuration(d time.Duration) string {
 // real call for each hook."
 func DefaultDeps() Deps {
 	return Deps{
-		Now:                  time.Now,
-		ListSockets:          func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
-		RemoveSocket:         removeSocketFile,
-		SocketLive:           socketLiveOnDisk,
-		ListAgents:           agent.List,
-		ListAgentsStrict:     agent.ListStrict,
-		ArchiveAgent:         func(r *agent.Record) error { return r.Archive() },
-		SessionAlive:         tmux.SessionAlive,
-		AgentDirSane:         agentDirSane,
-		ListSessions:         tmux.ListSessionsWithCreated,
-		KillSession:          tmux.Kill,
-		OrphanTmuxFreshness:  orphanTmuxFreshness,
-		ListProjects:         listProjectsOnDisk,
-		ListWorktrees:        listProjectWorktrees,
-		RemoveWorktree:       removeGitWorktree,
-		IsTaskTerminal:       isTaskTerminalOnDisk,
-		ListCoordLocks:       listCoordLocksOnDisk,
-		LoadAgent:            agent.Load,
-		RemoveCoordLock:      removeCoordLockFile,
-		ListWorkerRecords:    listWorkerRecordsOnDisk,
-		LoadWorkerState:      loadWorkerStateOnDisk,
-		LoadTaskStatus:       loadTaskStatusOnDisk,
-		LoadTaskParked:       loadTaskParkedOnDisk,
-		PidAlive:             pidAliveOnDisk,
-		RemoveWorkerRecord:   removeWorkerRecordDir,
-		ListProjectDirs:      listProjectDirsRaw,
-		ValidProjectName:     func(name string) bool { return state.ValidateProjectName(name) == nil },
-		RemoveProjectDir:     removeProjectDirTree,
-		ProjectHasTasks:      projectHasTasksNow,
-		QuarantineProjectDir: quarantineProjectDir,
-		RestoreProjectDir:    restoreProjectDir,
+		Now:                   time.Now,
+		ListSockets:           func() ([]SocketInfo, error) { return scanSocketsDir("/tmp") },
+		RemoveSocket:          removeSocketFile,
+		SocketLive:            socketLiveOnDisk,
+		ListAgents:            agent.List,
+		ListAgentsStrict:      agent.ListStrict,
+		ArchiveAgent:          func(r *agent.Record) error { return r.Archive() },
+		SessionAlive:          tmux.SessionAlive,
+		AgentDirSane:          agentDirSane,
+		ListSessions:          tmux.ListSessionsWithCreated,
+		KillSession:           tmux.Kill,
+		OrphanTmuxFreshness:   orphanTmuxFreshness,
+		ListProjects:          listProjectsOnDisk,
+		ListWorktrees:         listProjectWorktrees,
+		RemoveWorktree:        removeGitWorktree,
+		IsTaskTerminal:        isTaskTerminalOnDisk,
+		ListTaskCandidates:    listTaskCandidatesOnDisk,
+		WorktreeBranch:        worktreeBranchOnDisk,
+		WorktreeDirty:         worktreeDirtyOnDisk,
+		ProjectRepo:           projectRepoOnDisk,
+		WorktreeRegistered:    worktreeRegisteredOnDisk,
+		RemoveWorktreeNoForce: removeWorktreeNoForce,
+		ListCoordLocks:        listCoordLocksOnDisk,
+		LoadAgent:             agent.Load,
+		RemoveCoordLock:       removeCoordLockFile,
+		ListWorkerRecords:     listWorkerRecordsOnDisk,
+		LoadWorkerState:       loadWorkerStateOnDisk,
+		LoadTaskStatus:        loadTaskStatusOnDisk,
+		LoadTaskParked:        loadTaskParkedOnDisk,
+		PidAlive:              pidAliveOnDisk,
+		RemoveWorkerRecord:    removeWorkerRecordDir,
+		ListProjectDirs:       listProjectDirsRaw,
+		ValidProjectName:      func(name string) bool { return state.ValidateProjectName(name) == nil },
+		RemoveProjectDir:      removeProjectDirTree,
+		ProjectHasTasks:       projectHasTasksNow,
+		QuarantineProjectDir:  quarantineProjectDir,
+		RestoreProjectDir:     restoreProjectDir,
 	}
 }
 

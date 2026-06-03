@@ -516,6 +516,21 @@ func ProjectStateLockPath(name string) (string, error) {
 	return filepath.Join(dir, ".locks", "state.lock"), nil
 }
 
+// ProjectWorktreeGCLockPath resolves
+// ~/.fleet/projects/<project>/.locks/worktree-gc.lock — the
+// project-scoped flock taken around the `fleet gc --kinds=worktrees`
+// scan → re-check → remove window (DESIGN-coord-worktree-lifecycle §
+// Concurrency) so a coord-invoked run and an operator-invoked run can't
+// race the same removal. Distinct from state.lock (tasks.md writes) so a
+// long GC scan doesn't block task mutations.
+func ProjectWorktreeGCLockPath(name string) (string, error) {
+	dir, err := ProjectDir(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, ".locks", "worktree-gc.lock"), nil
+}
+
 // EnsureProjectInitialized creates ~/.fleet/projects/<safe-name>/.locks/
 // (and the parent <safe-name>/ dir) when missing. Idempotent — calling
 // twice is a no-op once the directories exist.

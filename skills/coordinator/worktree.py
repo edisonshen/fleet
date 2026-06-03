@@ -30,6 +30,17 @@ import subprocess
 from dataclasses import dataclass
 
 
+# Removal outcomes (DESIGN-coord-worktree-lifecycle §4.1). remove_worktree
+# returns exactly one of these in WorktreeResult.outcome. The caller
+# branches on it: REMOVED/NOOP run the worker-dir delete + worktree= clear;
+# DIRTY_PARKED/ERROR leave a tree on disk so the worker dir is KEPT
+# (recovery context) and a caller-specific park status is applied.
+OUTCOME_REMOVED = "removed"            # tree was clean → git removed it
+OUTCOME_DIRTY_PARKED = "dirty-parked"  # `git status --porcelain` non-empty
+OUTCOME_NOOP = "noop"                  # nothing to remove (already gone)
+OUTCOME_ERROR = "error"                # unexpected git/path failure
+
+
 @dataclass
 class WorktreeResult:
     """Outcome of a create/remove call.
@@ -39,10 +50,18 @@ class WorktreeResult:
     Both are set when the operation partially succeeded — e.g. create
     races a sibling tick, the directory exists but `git worktree add`
     failed: caller can re-use path on next tick if it's safe.
+
+    outcome is populated by remove_worktree only — one of the OUTCOME_*
+    constants above. It is "" for create-path results (callers there
+    branch on error/path only). A non-empty outcome is the authoritative
+    "what happened" signal the §4.1/§4.2 reaping consumer branches on;
+    `error` is still set on OUTCOME_ERROR / OUTCOME_DIRTY_PARKED so the
+    existing stderr-surface path keeps working unchanged.
     """
 
     path: str = ""
     error: str = ""
+    outcome: str = ""
 
 
 # Paths outside this prefix are NEVER subject to worktree removal.
@@ -554,32 +573,136 @@ def _is_registered_worktree(
     return False
 
 
+def worktree_is_dirty(
+    wt_path: str,
+    *,
+    timeout_s: float = 15.0,
+) -> tuple[bool, str]:
+    """Return (is_dirty, error) for the worktree at wt_path.
+
+    `git -C <wt> status --porcelain` — any non-empty output means the
+    tree has uncommitted changes (modified, staged, or untracked) and
+    must NOT be reaped (DESIGN §4.1 dirty-guard). This is the gate that
+    stops the mid-work data-loss class (problem #2): a worker still
+    editing in its worktree would otherwise have its tree blown away.
+
+    Returns:
+      (True,  "")           — dirty (porcelain non-empty). DO NOT reap.
+      (False, "")           — clean. Safe to attempt remove.
+      (False, "<err>")      — could not determine cleanliness (git error,
+                              timeout, missing binary). The caller treats
+                              an undeterminable status as a REFUSAL to
+                              reap (fail-safe: never delete a tree we
+                              can't prove clean).
+
+    Never raises.
+    """
+    if not wt_path:
+        return (False, "worktree_is_dirty: empty wt_path")
+    try:
+        proc = subprocess.run(
+            ["git", "-C", wt_path, "status", "--porcelain"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return (False, f"worktree_is_dirty: {exc}")
+    if proc.returncode != 0:
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        return (False, f"worktree_is_dirty: git status --porcelain: {stderr}")
+    return (bool((proc.stdout or "").strip()), "")
+
+
+def worktree_branch(
+    wt_path: str,
+    *,
+    timeout_s: float = 10.0,
+) -> str:
+    """Return the branch checked out in the worktree at wt_path, or "".
+
+    `git -C <wt> rev-parse --abbrev-ref HEAD`. Empty on detached HEAD,
+    non-git path, or any error. Used by the branch-identity guard
+    (DESIGN §4.4 / §4.2): a CLEAN checkout of the WRONG branch sitting at
+    a terminal-slug worktree path must NOT be reaped — `force=False`
+    does not protect a clean tree, so we corroborate the dir actually has
+    the task's expected `worker/<slug>` branch checked out before reaping.
+    Never raises.
+    """
+    if not wt_path:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", wt_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=timeout_s, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    out = (proc.stdout or "").strip()
+    # Detached HEAD prints "HEAD"; treat as no-branch-identity.
+    return "" if out == "HEAD" else out
+
+
 def remove_worktree(
     repo: str,
     wt_path: str,
     *,
-    force: bool = True,
+    force: bool = False,
     timeout_s: float = 30.0,
 ) -> WorktreeResult:
-    """`git -C <repo> worktree remove [--force] <wt_path>`.
+    """`git -C <repo> worktree remove [--force] <wt_path>` — dirty-guarded.
 
     Refuses to act when wt_path is empty, equal to repo, or outside the
-    ~/.fleet/projects/ tree. Returns success when the worktree is already
-    absent (ENOENT-style — mirrors `rm -f`). Caller treats `error` as a
-    coord-side bug to log; the worktree may still need manual cleanup.
+    ~/.fleet/projects/ tree. Returns OUTCOME_NOOP when the worktree is
+    already absent (ENOENT-style — mirrors `rm -f`).
 
-    `force=True` is the default because reconcile callers reach this
-    after the worker reported done OR died — either way we don't care
-    about uncommitted changes. Operator-initiated cleanup (a future CLI)
-    can pass force=False for a safer path.
+    DESIGN §4.1: `force=False` is now the DEFAULT. Before removing, run
+    `git -C <wt> status --porcelain` — a non-empty result (uncommitted
+    work) → DO NOT remove; return OUTCOME_DIRTY_PARKED (the caller parks
+    + surfaces, keeping the worker's unsaved edits). `force=False` also
+    means a tree that turns dirty BETWEEN the porcelain check and the
+    `git worktree remove` makes git FAIL rather than blow the tree away;
+    we classify that TOCTOU failure as OUTCOME_DIRTY_PARKED too (not a
+    generic error), because the cause is the same — uncommitted work.
+
+    `force=True` is OPERATOR-EXPLICIT only (a future `--force` reap path,
+    DESIGN open question #2); no coord caller passes it. It skips both the
+    porcelain guard and the `--force`-free git invocation.
+
+    Returns WorktreeResult with .outcome set to exactly one OUTCOME_*:
+      - OUTCOME_REMOVED      git removed the (clean) tree.
+      - OUTCOME_DIRTY_PARKED porcelain non-empty, OR a TOCTOU dirty
+                             remove failure. error is set + path kept.
+      - OUTCOME_NOOP         nothing to remove (already gone / safe-skip).
+      - OUTCOME_ERROR        unexpected failure (path vanished mid-op,
+                             git internal error). error is set.
     """
     if not _safe_to_remove(repo, wt_path):
-        return WorktreeResult(error=f"remove_worktree: refuse unsafe path {wt_path!r}")
+        return WorktreeResult(
+            outcome=OUTCOME_ERROR,
+            error=f"remove_worktree: refuse unsafe path {wt_path!r}",
+        )
     if not os.path.exists(wt_path):
-        # Already gone — treat as success. The git worktree metadata in
-        # the parent repo may still need pruning; we run that next.
+        # Already gone — treat as a clean no-op. The git worktree metadata
+        # in the parent repo may still need pruning; we run that next.
         _prune(repo, timeout_s=timeout_s)
-        return WorktreeResult(path=wt_path)
+        return WorktreeResult(path=wt_path, outcome=OUTCOME_NOOP)
+    if not force:
+        # Dirty-guard (DESIGN §4.1). An undeterminable status is treated
+        # as a refusal to reap (fail-safe) — surfaced as DIRTY_PARKED so
+        # the caller keeps the tree + worker dir rather than risk a
+        # destructive remove on a tree we couldn't prove clean.
+        dirty, derr = worktree_is_dirty(wt_path, timeout_s=timeout_s)
+        if derr:
+            return WorktreeResult(
+                path=wt_path, outcome=OUTCOME_DIRTY_PARKED,
+                error=f"remove_worktree: cleanliness undeterminable: {derr}",
+            )
+        if dirty:
+            return WorktreeResult(
+                path=wt_path, outcome=OUTCOME_DIRTY_PARKED,
+                error=f"remove_worktree: {wt_path} has uncommitted changes; parked",
+            )
     cmd = ["git", "-C", repo, "worktree", "remove"]
     if force:
         cmd.append("--force")
@@ -589,12 +712,43 @@ def remove_worktree(
             cmd, capture_output=True, text=True, timeout=timeout_s, check=False,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
-        return WorktreeResult(error=f"remove_worktree: {exc}")
+        return WorktreeResult(
+            path=wt_path, outcome=OUTCOME_ERROR, error=f"remove_worktree: {exc}",
+        )
     if proc.returncode == 0:
         _prune(repo, timeout_s=timeout_s)
-        return WorktreeResult(path=wt_path)
+        return WorktreeResult(path=wt_path, outcome=OUTCOME_REMOVED)
     stderr = (proc.stderr or proc.stdout or "").strip()
-    return WorktreeResult(error=f"remove_worktree: git worktree remove: {stderr}")
+    # TOCTOU: force=False git refuses a tree that turned dirty between the
+    # porcelain check above and now. git reports "contains modified or
+    # untracked files, use --force to delete it". Classify as DIRTY_PARKED
+    # (same cause as the porcelain guard), NOT a generic error — the
+    # caller keeps the tree + worker dir rather than re-trying a remove.
+    if _is_dirty_remove_refusal(stderr):
+        return WorktreeResult(
+            path=wt_path, outcome=OUTCOME_DIRTY_PARKED,
+            error=f"remove_worktree: git refused dirty tree (TOCTOU): {stderr}",
+        )
+    return WorktreeResult(
+        path=wt_path, outcome=OUTCOME_ERROR,
+        error=f"remove_worktree: git worktree remove: {stderr}",
+    )
+
+
+def _is_dirty_remove_refusal(stderr: str) -> bool:
+    """Return True iff git refused `worktree remove` because the tree is
+    dirty (the TOCTOU window: clean at the porcelain check, dirty by the
+    time git ran). git's phrasing:
+      "fatal: '<path>' contains modified or untracked files, use --force
+       to delete it"
+    Anchored on the stable substring so it survives path interpolation.
+    """
+    if not stderr:
+        return False
+    low = stderr.lower()
+    return "use --force to delete it" in low or (
+        "modified or untracked files" in low
+    )
 
 
 def _safe_to_remove(repo: str, wt_path: str) -> bool:

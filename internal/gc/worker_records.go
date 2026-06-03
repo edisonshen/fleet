@@ -116,7 +116,7 @@ type WorkerState struct {
 //
 // Project scope (opts.Project): when non-empty, only that project's
 // workers/ subtree is examined.
-func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
+func reconcileWorkerRecords(r *Report, opts Options, deps Deps, dirtyParkedInRun map[string]bool) error {
 	if deps.ListWorkerRecords == nil {
 		return errors.New("worker-records: ListWorkerRecords dep not wired")
 	}
@@ -219,6 +219,23 @@ func reconcileWorkerRecords(r *Report, opts Options, deps Deps) error {
 
 		// 2. Live-PID guard — never touch a live worker.
 		if ws.Pid > 0 && deps.PidAlive(ws.Pid) {
+			continue
+		}
+
+		// In-run dirty-park guard (codex [P2]): the worktrees pass in THIS
+		// same `fleet gc --apply` sweep just dirty-parked this slug's tree
+		// but the coord hasn't persisted the `parked` task-row field yet,
+		// so the persisted-parked guard above (#1) read "". Without this
+		// guard the worker dir — the recovery context for that dirty tree —
+		// would be removed in the same sweep that decided to KEEP the tree.
+		// Skip + surface. (The persisted-`parked` guard already ran ahead of
+		// the mismatch branch; this only covers the not-yet-persisted case.)
+		if dirtyParkedInRun != nil && dirtyParkedInRun[info.Project+"/"+info.Slug] {
+			r.Actions = append(r.Actions, Action{
+				Kind: KindWorkerRecords, Target: info.Path, Verb: VerbSurface,
+				Reason: "worktree dirty-parked earlier in THIS gc run — keeping the " +
+					"worker dir as recovery context; resolve the worktree first",
+			})
 			continue
 		}
 
@@ -450,25 +467,43 @@ func loadTaskStatusOnDisk(project, slug string) (string, error) {
 // given (project, slug) and returns the raw `- parked:` field value.
 // Returns "" with nil err when the slug is absent or the field is unset.
 //
-// Only tasks.md is consulted (NOT tasks-archive.md): the parked-protect
-// invariant matters for LIVE rows the coord is mid-lifecycle on. An
-// archived row is terminal-by-definition and its worker dir is a normal
-// reap target.
+// BOTH tasks.md AND tasks-archive.md are consulted (codex [P2]): the
+// auto-archive sweep can move a dirty-parked `done` row from tasks.md to
+// tasks-archive.md while PRESERVING its `parked` field (tasks.Archive
+// copies the row verbatim). If this loader read only tasks.md, that
+// archived park would become invisible and worker-records GC would delete
+// `workers/<slug>/` — the recovery context the park exists to keep. So we
+// fall back to the archive when the live file has no (or no parked) row.
 func loadTaskParkedOnDisk(project, slug string) (string, error) {
 	dir, err := state.ProjectDir(project)
 	if err != nil {
 		return "", err
 	}
 	tasksPath := filepath.Join(filepath.Clean(dir), "tasks.md")
-	val, _, ferr := taskFieldRawInFile(tasksPath, slug, "- parked:")
+	val, found, ferr := taskFieldRawInFile(tasksPath, slug, "- parked:")
 	if ferr != nil {
 		return "", ferr
 	}
-	// "null" is the explicit unset sentinel the Python parser emits.
-	if val == "null" {
-		return "", nil
+	if v := normalizeParked(val); found && v != "" {
+		return v, nil
 	}
-	return val, nil
+	// Not parked in (or not present in) tasks.md → check the archive. A
+	// non-empty parked there still protects the worker dir.
+	archivePath := filepath.Join(filepath.Clean(dir), "tasks-archive.md")
+	aval, _, aerr := taskFieldRawInFile(archivePath, slug, "- parked:")
+	if aerr != nil {
+		return "", aerr
+	}
+	return normalizeParked(aval), nil
+}
+
+// normalizeParked maps the explicit "null" unset sentinel the Python
+// parser emits (and "") to "" (not parked).
+func normalizeParked(val string) string {
+	if val == "null" {
+		return ""
+	}
+	return val
 }
 
 // taskFieldRawInFile returns the raw value of an arbitrary

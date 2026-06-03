@@ -72,6 +72,35 @@ func LockProjectState(project string) (func(), error) {
 	return func() { _ = f.Close() }, nil
 }
 
+// LockProjectWorktreeGC takes an exclusive flock on
+// ~/.fleet/projects/<project>/.locks/worktree-gc.lock — held across the
+// `fleet gc --kinds=worktrees` scan → re-check-porcelain → `git worktree
+// remove` window (DESIGN-coord-worktree-lifecycle § Concurrency). A
+// coord-invoked run (every-N-ticks) and an operator-invoked run serialize
+// on this lock so they can't both decide to remove the same dir. Distinct
+// from LockProjectState (tasks.md writes) so a slow GC scan doesn't block
+// task mutations.
+//
+// The .locks/ dir is lazily created here (mirrors LockProjectState).
+func LockProjectWorktreeGC(project string) (func(), error) {
+	path, err := ProjectWorktreeGCLockPath(project)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir lock dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open lock %s: %w", path, err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("flock %s: %w", path, err)
+	}
+	return func() { _ = f.Close() }, nil
+}
+
 // LockAgent takes an exclusive flock on
 // ~/.fleet/agents/.locks/<id>.lock. Concurrent handoffs of the same
 // agent serialize; concurrent handoffs of DIFFERENT agents (even in
