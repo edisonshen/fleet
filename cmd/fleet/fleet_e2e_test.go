@@ -202,12 +202,20 @@ func TestFleetE2E_FullWorkflow(t *testing.T) {
 		// must converge on status=in-review with pr_url populated.
 		// --exit 0 is required so a later workers.Archive call (scenario
 		// 4) doesn't refuse on "pid=0 and no exit recorded".
+		//
+		// The tick dispatched this slug under the epoch (DESIGN §2.2), so
+		// its task row carries dispatch_generation>0 and the ungated
+		// `fleet workers update` path is now rejected. The done-report
+		// must carry --dispatch-generation <current> — exactly as the
+		// real worker prompt does (proj_flag folds the flag in). Read the
+		// gen off the task row so the test tracks the dispatched value.
 		prURL := "https://github.com/fake/repo/pull/777"
 		env.runFleet(t, "workers", "update",
 			"--project", env.project, slug,
 			"--phase", "done",
 			"--pr-url", prURL,
-			"--exit", "0")
+			"--exit", "0",
+			"--dispatch-generation", fmt.Sprintf("%d", f.Tasks[0].DispatchGeneration))
 		env.writeSentinelArchive(t,
 			fmt.Sprintf("TASK_DONE_PR=%s %s", slug, prURL))
 
