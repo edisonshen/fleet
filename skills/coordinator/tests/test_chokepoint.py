@@ -251,6 +251,54 @@ def test_apply_dispatch_persists_generation_with_in_progress_flip(
     assert "2" in calls[i_bootstrap]
 
 
+def test_handoff_reader_short_circuits_on_stale(fleet_home: Path) -> None:
+    # R8 (DESIGN §2.1/§3): a STALE prior-generation review-pending state
+    # must NOT dispatch a reviewer onto the re-dispatched slug. The task
+    # row authority is gen 2; the leftover state.json is gen 1.
+    task = _make_task("ho-stale", status="in-progress", dispatch_generation=2)
+    _write_worker_state(
+        fleet_home, "fleet", "ho-stale",
+        {"slug": "ho-stale", "phase": "review-pending", "dispatch_generation": 1},
+    )
+    with patch.object(dispatch, "project_is_git", return_value=True), \
+         patch.object(dispatch, "build_reviewer_prompt") as rb, \
+         patch.object(dispatch, "build_finisher_prompt") as fb:
+        actions = loop._dispatch_review_handoffs(
+            tasks=[task], project="fleet", fleet_bin="fleet",
+            fleet_home=str(fleet_home), home=fleet_home, coord_state={},
+        )
+    assert actions == [], "stale handoff must not dispatch"
+    rb.assert_not_called()
+    fb.assert_not_called()
+
+
+def test_handoff_reader_dispatches_on_current(fleet_home: Path) -> None:
+    # The same review-pending state at the CURRENT gen DOES dispatch a
+    # reviewer (proving the short-circuit is gen-specific, not blanket).
+    task = _make_task("ho-cur", status="in-progress", dispatch_generation=2)
+    _write_worker_state(
+        fleet_home, "fleet", "ho-cur",
+        {"slug": "ho-cur", "phase": "review-pending", "dispatch_generation": 2},
+    )
+    with patch.object(dispatch, "project_is_git", return_value=True), \
+         patch.object(dispatch, "build_reviewer_prompt", return_value="reviewer prompt") as rb, \
+         patch.object(dispatch, "mint_agent_id", return_value="bbbbbbbb"), \
+         patch.object(
+             dispatch, "acquire_coord_prompt_inbox",
+             return_value=str(fleet_home / "inbox" / "bbbbbbbb.md"),
+         ), \
+         patch.object(dispatch, "format_dispatch_instruction", return_value="DISPATCH ..."):
+        actions = loop._dispatch_review_handoffs(
+            tasks=[task], project="fleet", fleet_bin="fleet",
+            fleet_home=str(fleet_home), home=fleet_home, coord_state={},
+        )
+    assert len(actions) == 1 and not actions[0].error
+    assert actions[0].handoff_phase == "review-pending"
+    # The reviewer prompt INHERITS the slug's current gen (no increment).
+    assert actions[0].dispatch_generation == 2
+    assert rb.call_args.kwargs["dispatch_generation"] == 2
+
+
 def test_no_launchable_dispatch_emitted_while_ready(fleet_home: Path) -> None:
     # Structural invariant: _dispatch_ready does NOT itself flip the task
     # row (it only PROPOSES actions); the status=in-progress flip happens

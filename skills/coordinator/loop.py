@@ -5433,8 +5433,21 @@ def _dispatch_review_handoffs(
         # which is exactly the case we want to detect here.
         if t.worker_pid > 0 and _pid_alive(t.worker_pid):
             continue
-        st = _read_worker_state(project, t.slug, home=home)
-        if st is None:
+        # R8 chokepoint (DESIGN §2.1/§3): route the handoff-trigger read
+        # through the generation-aware reader. A STALE `review-pending` /
+        # `review-done` from a PRIOR attempt must NOT double-dispatch a
+        # reviewer/finisher onto the re-dispatched slug — that spawned
+        # subagent would be an accepted CURRENT-gen writer (e.g. a
+        # spurious phase=done), losing the live attempt's work + reaping
+        # its clean tree. `stale` short-circuits (no release, no pending-
+        # acquire mutation, no DISPATCH emit); `missing` falls to the
+        # existing handoff no-op; only `current` proceeds. This is the
+        # one reader PR2 wires (it's part of the epoch surface); the full
+        # R1-R7 reconcile/reaper routing is PR3.
+        cls, st = read_current_worker_state(
+            project, t.slug, int(t.dispatch_generation), home=home,
+        )
+        if cls != WORKER_STATE_CURRENT or st is None:
             continue
         phase = st.get("phase", "")
         if phase not in ("review-pending", "review-done"):

@@ -1405,6 +1405,36 @@ func TestUpdateStateGen_CAS(t *testing.T) {
 		}
 	})
 
+	// 3b. Codex iter-1 [P1]: a HIGHER on-disk generation is rejected, NOT
+	//     merged-and-downgraded. The CAS authority is read outside the
+	//     worker lock, so a stale worker can pass n==taskGen==N while a
+	//     newer attempt already bootstrapped state.json at N+1. Merging
+	//     would clobber the live newer attempt.
+	t.Run("rejected when on-disk gen is newer than authority", func(t *testing.T) {
+		tmp := t.TempDir()
+		t.Setenv("FLEET_HOME", tmp)
+		// Current attempt already wrote gen 5.
+		if err := UpdateStateGen("p", "newer-eeee", 5, 5, func(s *State) {
+			s.Phase = PhaseTDDGreen
+		}); err != nil {
+			t.Fatalf("seed gen-5 state: %v", err)
+		}
+		// A racing stale writer read authority N=4 (before the bump) and
+		// arrives with n==taskGen==4. The on-disk file is already gen 5.
+		err := UpdateStateGen("p", "newer-eeee", 4, 4, func(s *State) {
+			s.Phase = PhaseDone
+			s.PRURL = "https://example.com/pr/stale"
+		})
+		if !errors.Is(err, ErrStaleGeneration) {
+			t.Fatalf("higher on-disk gen must reject, got %v", err)
+		}
+		got, _ := ReadState("p", "newer-eeee")
+		if got.Phase != PhaseTDDGreen || got.DispatchGeneration != 5 {
+			t.Errorf("live newer state was clobbered: phase=%q gen=%d",
+				got.Phase, got.DispatchGeneration)
+		}
+	})
+
 	// 4. Repair: the current generation overwriting a PRIOR-generation
 	//    file is a FRESH replacement — empty pr_url/review/phases + new
 	//    started_at — never a field-merge (so an old PR can't leak into

@@ -451,6 +451,22 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			return err
 		}
+		// Codex iter-1 [P1]: REJECT when the on-disk gen is HIGHER than the
+		// authority this writer read. The CAS authority (taskRowDispatch-
+		// Generation) is read OUTSIDE this lock, so it can be stale: a
+		// worker reads taskGen=N just before the coord bumps the row to
+		// N+1 AND the current attempt bootstraps state.json at N+1. This
+		// writer then arrives with n==taskGen==N (its own gate passes) but
+		// the on-disk file is already at N+1 — the live current attempt.
+		// Merging it (the old code) would DOWNGRADE the file to N and
+		// clobber live state. A higher on-disk gen means "a newer attempt
+		// already wrote here": reject this writer as stale, never merge.
+		if cur != nil && cur.DispatchGeneration > taskGen {
+			return fmt.Errorf(
+				"%w: write gen=%d, on-disk gen=%d already newer, slug=%q",
+				ErrStaleGeneration, n, cur.DispatchGeneration, slug,
+			)
+		}
 		if cur == nil || cur.DispatchGeneration < taskGen {
 			// Absent, OR a prior-generation file the current attempt is
 			// repairing. Either way: brand-new state, never a merge of
@@ -462,12 +478,9 @@ func UpdateStateGen(project, slug string, n, taskGen int, mutate func(*State)) e
 				StartedAt: time.Now().UTC(),
 			}
 		}
-		// on-disk gen > taskGen is impossible under a monotonic per-slug
-		// counter persisted before any state write (DESIGN §3): the task
-		// row is bumped + persisted strictly before the worker can stamp
-		// a higher gen. If it ever happens (corruption), the n==taskGen
-		// gate already rejected the writer, so we never reach here for a
-		// higher-than-authority write.
+		// At this point cur.DispatchGeneration == taskGen (the > case was
+		// rejected, the < / absent case was replaced fresh). The stamp is
+		// a consistency reassertion.
 		cur.DispatchGeneration = taskGen
 		mutate(cur)
 		return writeStateLocked(project, slug, cur)
