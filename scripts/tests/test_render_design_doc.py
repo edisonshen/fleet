@@ -307,6 +307,62 @@ def test_mixed_numbering_stays_monotonic(rdd):
     assert "3. Approach" in toc
 
 
+def test_numberlike_content_heading_not_treated_as_ordinal(rdd):
+    """codex P2: `## 2026 Roadmap` / `## 10 reasons` is content, not an ordinal.
+
+    A bare digit run followed only by whitespace + a word must be auto-numbered
+    normally (1., 2.) — the counter must NOT jump to 2026.
+    """
+    md = "# Doc\n\n## 2026 Roadmap\nr\n\n## Plan\np\n"
+    body, toc = rdd.render_markdown(md)
+    # First section auto-numbers to "1." (prefix prepended), not skipped.
+    assert re.search(r"<h2[^>]*>\s*1\.\s*2026 Roadmap", body)
+    # Next section is "2.", not "2027.".
+    assert re.search(r"<h2[^>]*>\s*2\.\s*Plan", body)
+    assert "2. Plan" in toc
+    assert "2027" not in body and "2027" not in toc
+    # But genuine ordinals still skip: "4.2 Subsection" and "5) Foo".
+    for head in ("## 4.2 Subsection\nx\n", "## 5) Foo\ny\n", "## 3. Bar\nz\n",
+                 "## 12 — Baz\nw\n"):
+        b, _ = rdd.render_markdown("# D\n\n" + head)
+        # No prepended "1." ordinal on a self-numbered heading.
+        assert not re.search(r"<h2[^>]*>\s*1\.\s", b), head
+
+
+def test_toplevel_q_heading_renders_as_clean_section(rdd):
+    """codex P2: a top-level `## Q1 — ...` is a numbered SECTION, not a qbox.
+
+    An h2 qbox would straddle the section split wrap_sections applies after the
+    qbox pass, emitting mismatched <section>/<div> tags. So a top-level Q
+    heading must render as an ordinary numbered section with NO qbox and with
+    balanced section markup.
+    """
+    md = "# Doc\n\n## Q1 — should we cache?\n**Stake:** yes.\n\nReasoning.\n\n## Next\nb\n"
+    body, _toc = rdd.render_markdown(md)
+    # No qbox around the top-level Q heading.
+    assert '<div class="qbox">' not in body
+    # It is a proper numbered section, content intact, markup balanced.
+    assert re.search(r'<section id="1-q1[^"]*">\s*<h2[^>]*>\s*1\.\s*Q1', body)
+    assert "Reasoning." in body
+    assert body.count("<section") == body.count("</section>")
+
+
+def test_nested_q_heading_boxed_under_numbered_section(rdd):
+    """A nested `### Q1` decision point under a numbered `##` is still boxed.
+
+    Section numbering does not touch h3 text, so the qbox detector matches the
+    plain `Q1` and the box nests cleanly inside the parent section.
+    """
+    md = ("# Doc\n\n## Decisions\nIntro.\n\n"
+          "### Q1 — should we cache?\n**Stake:** yes.\n\nReasoning.\n\n"
+          "### Q2 — TTL?\nFive minutes.\n")
+    body, _toc = rdd.render_markdown(md)
+    assert body.count('<div class="qbox">') == 2
+    assert body.count("<section") == body.count("</section>")
+    m = re.search(r'<div class="qbox">(.*?)</div>', body, re.DOTALL)
+    assert m and "Q1" in m.group(1) and "Reasoning" in m.group(1)
+
+
 def test_rejects_non_md(rdd, tmp_path):
     bad = tmp_path / "notes.txt"
     bad.write_text("hi", encoding="utf-8")

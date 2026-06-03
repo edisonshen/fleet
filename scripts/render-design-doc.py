@@ -461,12 +461,27 @@ _DIAGRAM_GLYPHS = set(
 )
 
 # Heading text that opens a decision point: "Q3", "Q12 — title", "Q1:".
-_QHEADING_RE = re.compile(r"^Q\d+\b")
+# Tolerate an optional leading "N. " ordinal prefix: the section numberer may
+# rewrite a Q heading to "1. Q1 — ..." before wrap_qboxes runs (relevant only
+# for h3+ headings nested under a numbered ancestor that itself starts with Q).
+_QHEADING_RE = re.compile(r"^(?:\d+\.\s*)?Q\d+\b")
 
-# Heading text that already starts with its own ordinal ("3.", "4.2", "12 —").
-# `ordinal` captures the leading top-level number so the counter can advance
-# past self-numbered sections and keep auto-numbering monotonic.
-_ALREADY_NUMBERED_RE = re.compile(r"^(?P<ordinal>\d+)(\.\d+)*\s*[.)\s—:-]")
+# Heading text that already starts with its own ordinal ("3. Foo", "4.2 Bar",
+# "12 — Foo", "5) Foo", "6: Foo"). `ordinal` captures the leading top-level
+# number so the counter advances past self-numbered sections and stays
+# monotonic. A heading counts as self-numbered only when the leading digits are
+# either a DOTTED multi-level number ("4.2 Bar") OR a single number trailed by
+# EXPLICIT punctuation (".", ")", "—"/"–"/"-", ":"). A bare digit run followed
+# only by whitespace + a word ("2026 Roadmap", "10 reasons") is section
+# CONTENT, not an ordinal, and must NOT be treated as self-numbered.
+_ALREADY_NUMBERED_RE = re.compile(
+    r"^(?P<ordinal>\d+)"
+    r"(?:"
+    r"(?:\.\d+)+\s*[.)—–:-]?\s*"   # dotted multi-level: "4.2", "1.2.3 ", "4.2."
+    r"|"
+    r"\s*[.)—–:-]\s*"              # single number + explicit punctuation
+    r")"
+)
 
 
 class HubTreeprocessor(Treeprocessor):
@@ -573,6 +588,12 @@ def wrap_qboxes(body_html: str) -> str:
     equal-or-shallower depth (or end of doc). This reproduces the
     hand-authored `<div class="qbox" id="qN">` blocks of the hub template,
     derived automatically from `### Q3 — ...` markdown.
+
+    Only h3+ Q headings are boxed. A top-level `## Q1` is a numbered section
+    boundary — wrap_sections (which runs after this pass) splits the body at
+    each `<h2>`, so wrapping an h2 in a qbox here would straddle the section
+    cut and emit mismatched `<section>`/`<div>` tags. Top-level Q headings stay
+    ordinary numbered sections; nest decision points under a `##` to box them.
     """
     heading_re = re.compile(r"<(h[1-6])\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
     headings = [
@@ -586,7 +607,9 @@ def wrap_qboxes(body_html: str) -> str:
     while i < len(headings):
         h_start, _h_end, level, html_frag = headings[i]
         visible = re.sub(r"<[^>]+>", "", html_frag).strip()
-        if not _QHEADING_RE.match(visible):
+        # Box only h3+ Q headings (see docstring): an h2 qbox would straddle
+        # the section split that wrap_sections applies afterward.
+        if level < 3 or not _QHEADING_RE.match(visible):
             i += 1
             continue
         # End of this decision point: next heading with level <= this one.
