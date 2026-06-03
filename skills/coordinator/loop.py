@@ -3595,10 +3595,24 @@ def _reconcile_inflight(
         )
         if recon_cls == WORKER_STATE_STALE:
             import sys
+            # codex iter-4 [P1]: a `stale` state on an in-progress task can
+            # be either (a) a prior attempt's leftover while the current
+            # attempt is mid-relaunch, or (b) a dispatch partial-apply (gen
+            # bump landed, `starting` bootstrap didn't). In BOTH cases the
+            # correct owner of re-launch is the #184 dispatch journal
+            # replay (_replay_pending_dispatches re-emits the DISPATCH when
+            # worker_agent_ids[slug] is the adopted journal id + the task
+            # is in-progress), which makes the worker write a
+            # current-generation state. Reconcile must NOT requeue here:
+            # requeuing an in-progress task with an adopted journal is the
+            # exact double-dispatch trap #184 closed. So we short-circuit
+            # (no mutation) and surface; replay owns recovery.
             print(
                 f"coord: reconcile skipped {t.slug} — stale worker state "
                 f"(prior dispatch_generation, authority="
-                f"{int(t.dispatch_generation)}); no mutation, surfacing",
+                f"{int(t.dispatch_generation)}); no mutation. Re-launch (if "
+                f"the current attempt's bootstrap was lost) is owned by the "
+                f"dispatch-journal replay, not reconcile.",
                 file=sys.stderr,
             )
             continue

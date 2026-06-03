@@ -142,6 +142,43 @@ def test_case_c_pending_replayed(fleet_bin: str, home: Path) -> None:
     assert _journal(home, "aac00001")["replay_emit_attempts"] == 1
 
 
+def test_partial_apply_stale_state_replayed_not_wedged(
+    fleet_bin: str, home: Path,
+) -> None:
+    """codex iter-4 [P1] (wtlc-pr3): the dispatch partial-apply window —
+    the dispatch_generation task-row bump landed but the `starting`
+    state.json bootstrap did NOT (crash / failed _run_fleet). The task is
+    in-progress at the NEW generation while only a STALE prior-generation
+    state.json exists on disk.
+
+    PR3's reconcile correctly REFUSES to mutate a stale-state slug (it must
+    not requeue an in-progress task with an adopted journal — the #184
+    double-dispatch trap). Recovery is owned by the dispatch-journal
+    REPLAY: this test proves replay re-emits the DISPATCH for exactly this
+    case, so the relaunched worker writes a current-generation state and
+    the task is NOT wedged."""
+    _acquire(fleet_bin, home, "aac00099", "redisp-foo")
+    assert _journal(home, "aac00099")["exec_state"] == "pending"
+    # A stale prior-generation state.json (gen 1) sits on disk; the task
+    # row authority is now gen 2 (re-dispatched). The bootstrap to gen 2
+    # never ran (partial apply), so reconcile would short-circuit `stale`.
+    wdir = home / "projects" / "myproj" / "workers" / "redisp-foo"
+    wdir.mkdir(parents=True)
+    (wdir / "state.json").write_text(
+        json.dumps({"phase": "done", "dispatch_generation": 1,
+                    "pr_url": "https://x/old"}),
+        encoding="utf-8")
+    # Replay's identity predicate adopts aac00099 for redisp-foo.
+    actions = _replay(
+        home, fleet_bin,
+        coord_state={"worker_agent_ids": {"redisp-foo": "aac00099"}},
+    )
+    blocks = [a for a in actions if a.dispatch_instruction]
+    assert len(blocks) == 1, "replay must re-emit the partial-apply dispatch"
+    assert blocks[0].agent_id == "aac00099"
+    assert "DISPATCH: redisp-foo" in blocks[0].dispatch_instruction
+
+
 # ---------------------------------------------------------------------------
 # Case (a) — launched-but-unacked (launch_attempted, fresh) → no replay.
 # ---------------------------------------------------------------------------
