@@ -5083,7 +5083,6 @@ def _sweep_done_worker_dirs(
         if wt and os.path.exists(wt):
             dirty, derr = worktree_mod.worktree_is_dirty(wt)
             if dirty or derr:
-                import sys
                 print(
                     f"coord: sweep keeping worker dir for done task {t.slug} — "
                     f"worktree {wt} is dirty/undeterminable "
