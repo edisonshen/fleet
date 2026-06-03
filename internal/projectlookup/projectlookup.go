@@ -122,6 +122,13 @@ func KnownProjects() ([]string, error) {
 // no coord-spawn-marker requirement here. Tier 3 PROJECT RECOVERY is
 // failover, not dedup — any live coord for the project is acceptable.
 // The TUI's [a]-dedup helper layers the marker gate on top of this.
+//
+// Returned record always has TmuxSession populated (codex review iter-3
+// P2): legacy/pre-spawn records may have TmuxSession=="" on disk; we
+// probe via the synthesized name and, when the synthesized name is the
+// one that was alive, hand back a defensive COPY of the record with
+// TmuxSession set. Callers that assign `pendingAttach = rec.TmuxSession`
+// (notably the TUI F18 path) would otherwise quit with nothing to attach.
 func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	want := CoordTaskID(projectName)
 	for _, r := range records {
@@ -134,6 +141,11 @@ func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, 
 		}
 		if !sessionAliveOrProbe(session) {
 			continue
+		}
+		if r.TmuxSession == "" {
+			cp := *r
+			cp.TmuxSession = session
+			return &cp, true
 		}
 		return r, true
 	}
@@ -151,6 +163,11 @@ func FindLiveCoord(records []*agent.Record, projectName string) (*agent.Record, 
 // Returns (nil, false) when the lock body is missing/empty/malformed,
 // when no record has the matching ID, or when the matching record's
 // tmux session is definitively dead.
+//
+// Same TmuxSession normalization as FindLiveCoord (codex review iter-3
+// P2): when the record on disk has TmuxSession=="" we return a copy with
+// the synthesized session populated so TUI callers don't quit with an
+// empty pendingAttach.
 func FindCoordByLockBody(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	root, err := state.Root()
 	if err != nil {
@@ -170,6 +187,11 @@ func FindCoordByLockBody(records []*agent.Record, projectName string) (*agent.Re
 		}
 		if !sessionAliveOrProbe(session) {
 			continue
+		}
+		if r.TmuxSession == "" {
+			cp := *r
+			cp.TmuxSession = session
+			return &cp, true
 		}
 		return r, true
 	}

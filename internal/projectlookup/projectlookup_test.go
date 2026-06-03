@@ -227,6 +227,71 @@ func TestFindLiveCoord_WrongProjectMisses(t *testing.T) {
 	}
 }
 
+// TestFindLiveCoord_EmptyTmuxSession_ReturnsSynthesized — codex review
+// iter-3 P2 #2. Legacy records may have TmuxSession=="" on disk; the
+// helper probes the synthesized "fleet-<id>" and treats a live session
+// there as a match. The returned record MUST have TmuxSession populated
+// — TUI callers assign `pendingAttach = rec.TmuxSession` and would quit
+// with nothing to attach if the field were left empty. Original record
+// stays untouched (defensive copy).
+func TestFindLiveCoord_EmptyTmuxSession_ReturnsSynthesized(t *testing.T) {
+	withFleetHome(t)
+	// Bootstrap agents dir + write a record with TmuxSession="".
+	if dir, err := state.AgentDir(); err == nil {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	r := agent.New("12345678")
+	r.Project = "fleet"
+	r.TaskID = "coord-fleet"
+	r.TmuxSession = "" // legacy: empty session field on disk
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-12345678": true})
+	defer restore()
+	got, ok := FindLiveCoord(records, "fleet")
+	if !ok {
+		t.Fatal("FindLiveCoord: expected hit on synthesized session")
+	}
+	if got.TmuxSession != "fleet-12345678" {
+		t.Errorf("FindLiveCoord: returned TmuxSession=%q want fleet-12345678 (must be normalized)", got.TmuxSession)
+	}
+	// Defensive copy: original record must still have empty session so
+	// the caller can detect "was-synthesized" if needed.
+	for _, rr := range records {
+		if rr.ID == "12345678" && rr.TmuxSession != "" {
+			t.Errorf("FindLiveCoord mutated input record TmuxSession=%q", rr.TmuxSession)
+		}
+	}
+}
+
+// TestFindCoordByLockBody_EmptyTmuxSession_ReturnsSynthesized — same
+// invariant as FindLiveCoord above, applied to the lock-body path.
+func TestFindCoordByLockBody_EmptyTmuxSession_ReturnsSynthesized(t *testing.T) {
+	home := withFleetHome(t)
+	if dir, err := state.AgentDir(); err == nil {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	r := agent.New("12345678")
+	r.Project = "fleet"
+	r.TmuxSession = ""
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	writeCoordLockBody(t, home, "fleet", "12345678")
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-12345678": true})
+	defer restore()
+	got, ok := FindCoordByLockBody(records, "fleet")
+	if !ok {
+		t.Fatal("FindCoordByLockBody: expected hit")
+	}
+	if got.TmuxSession != "fleet-12345678" {
+		t.Errorf("FindCoordByLockBody: returned TmuxSession=%q want fleet-12345678", got.TmuxSession)
+	}
+}
+
 // --- FindCoordByLockBody ---
 
 // TestFindCoordByLockBody_ReadsLockBodyAndMatchesRecord — the lock

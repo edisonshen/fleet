@@ -216,6 +216,22 @@ func runAttachFailover(token string, opts AttachOpts) error {
 		return attachFnVar(session)
 	}
 
+	// Recoverable-error gate (codex review iter-3 P2): Tier 3 PROJECT
+	// RECOVERY exists to repair "chain semantics ran out" — cycles,
+	// broken chains, archived non-handoff records, unknown tokens.
+	// Generic FS / parse failures (corrupt JSON, EIO mid-read, perm
+	// denied) are NOT recoverable: agent.List inside Tier 3 may silently
+	// skip the bad file and spawn/reap a coord around it, masking the
+	// real state corruption. Surface those as a SystemError so the
+	// operator sees the actual fault rather than a confused recovery.
+	if !errors.Is(rerr, agent.ErrChainCycle) &&
+		!errors.Is(rerr, agent.ErrNoLiveSuccessor) &&
+		!errors.Is(rerr, state.ErrNotFound) {
+		return newSystemError(70, fmt.Sprintf(
+			"%s: agent record unreadable: %v — inspect ~/.fleet/agents/%s.json (or its archive) and re-run after repair",
+			token, rerr, token))
+	}
+
 	// Tier 2 result was an error → emit the surface-line then failover.
 	// Each branch writes EXACTLY one line so the test matrix can pin
 	// it. The cycle path embeds the cycle trace; the broken-chain path

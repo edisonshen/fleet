@@ -580,6 +580,48 @@ func TestF19_StaleLiveRecord_FailsOverToProjectRecovery(t *testing.T) {
 	}
 }
 
+// TestSystemFailure_CorruptArchiveRecord_DoesNotRecover — codex review
+// iter-3 P2 #1. If the archive record for the token is malformed (parse
+// error / FS read error) we must NOT fall through to Tier 3 — that path
+// could spawn/reap a coord on top of the corruption and bury the real
+// fault. The chain resolver returns a wrapped JSON-parse error in that
+// case (NOT one of the recoverable sentinels), and runAttachFailover
+// must surface SystemError with the exact next-step path so the operator
+// fixes the record.
+func TestSystemFailure_CorruptArchiveRecord_DoesNotRecover(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	// Write a malformed archive record: invalid JSON body.
+	corruptID := "corruptx"
+	path := filepath.Join(s.tmp, "agents", "archive", corruptID+".json")
+	if err := os.WriteFile(path, []byte("{not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Even with a derivable project + live coord, we must NOT recover —
+	// the right call is to surface the corruption.
+	s.addProjectDir(t, "projects-fleet")
+	s.addLiveCoord(t, "projects-fleet", "xxxxxxxx")
+	_, err := s.run(t, corruptID, AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("expected SystemError on corrupt archive, got nil (Tier 3 must not mask record read errors)")
+	}
+	// Surface must name the file path so the operator can fix it.
+	if !strings.Contains(err.Error(), "corruptx") || !strings.Contains(err.Error(), "agents") {
+		t.Errorf("err must name the corrupt record path: %q", err.Error())
+	}
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(corrupt record): got %d want 70", ec)
+	}
+	// Spawn/gc must NOT have fired — the bug we're guarding against is
+	// "Tier 3 hides the corruption by silently respawning."
+	if len(s.dispatched) != 0 {
+		t.Errorf("dispatch must not fire on corrupt record; got %v", s.dispatched)
+	}
+	if len(s.gcCalls) != 0 {
+		t.Errorf("gc must not fire on corrupt record; got %v", s.gcCalls)
+	}
+}
+
 // --- system failure tests: tmux missing, dispatch failed ---
 
 func TestSystemFailure_TmuxMissing_ReturnsSystemErr(t *testing.T) {
