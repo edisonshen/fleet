@@ -65,6 +65,18 @@ func SetTestStubs(alive func(string) bool, probe func(string) (bool, error), lis
 	}
 }
 
+// SetLoadArchiveStub replaces the loadArchiveFn seam used by
+// OrphanTmuxForProject's cross-project guard. Tests pass a closure that
+// fakes the archive contents (codex review iter-4 P1). Returns a
+// restore closure; production never calls this.
+func SetLoadArchiveStub(fn func(id string) (*agent.Record, error)) (restore func()) {
+	prev := loadArchiveFn
+	if fn != nil {
+		loadArchiveFn = fn
+	}
+	return func() { loadArchiveFn = prev }
+}
+
 // CoordTaskID returns the canonical task_id for a project's coord
 // agent. Centralized here so callers don't reinvent the prefix.
 //
@@ -231,17 +243,25 @@ func StaleCoordRecord(records []*agent.Record, projectName string) (*agent.Recor
 }
 
 // OrphanTmuxForProject scans live tmux sessions for fleet-<id>
-// patterns and returns the first <id> with NO matching agent record.
-// Drives the Tier 3 "no record but lingering tmux session" branch —
-// pass the returned ID into the gc reap path before respawning.
+// patterns and returns the first <id> that BELONGS TO projectName but
+// has no live agent record. "Belongs to projectName" requires evidence
+// in the archived records — same project tag on the archive matching
+// the orphan ID. Drives the Tier 3 "no record but lingering tmux
+// session" branch — pass the returned ID into the gc reap path before
+// respawning.
 //
-// projectName is hint-only today: tmux session names don't carry the
-// project, so the helper returns the first orphan it sees. (Future
-// work: bind orphan sessions to projects via a session-name suffix
-// or a record-of-record file. Not in this PR's scope.)
+// Codex review iter-4 P1: an earlier version returned the FIRST orphan
+// regardless of project, then the caller ran `fleet gc --aggressive
+// --project A` to reap it. Because tmux session names don't encode the
+// project, a `fleet attach --project A` could nuke a `fleet-<id>` left
+// over from project B. The archive-record gate stops the cross-project
+// reap; if the orphan can't be bound to projectName, OrphanTmuxForProject
+// returns ("", false) so the caller falls through to spawn-fresh (Path D)
+// instead of running gc against an unrelated session.
 //
-// Returns ("", false) on any list error or when every session has a
-// matching record.
+// Returns ("", false) on any list error, when every session has a live
+// matching record, or when no orphan session's archive ties it to
+// projectName.
 func OrphanTmuxForProject(records []*agent.Record, projectName string) (string, bool) {
 	sessions, err := listSessionsFn()
 	if err != nil {
@@ -266,9 +286,28 @@ func OrphanTmuxForProject(records []*agent.Record, projectName string) (string, 
 		if have[id] {
 			continue
 		}
+		// Cross-project guard: only return this orphan when the
+		// archived record agrees it belonged to projectName. No
+		// archive (unknown provenance) → leave it alone; reaping it
+		// might kill another project's lingering session. The gc
+		// reap that follows is project-scoped anyway, so the
+		// no-match case wouldn't actually clean this orphan — surface
+		// "no" so Tier 3 falls through to spawn-fresh and leaves the
+		// orphan for the cross-project gc sweep to handle.
+		arec, aerr := loadArchiveFn(id)
+		if aerr != nil || arec == nil || arec.Project != projectName {
+			continue
+		}
 		return id, true
 	}
 	return "", false
+}
+
+// loadArchiveFn is a seam for OrphanTmuxForProject's archive lookup —
+// tests stub it to avoid writing an on-disk archive for every orphan
+// scenario. Production delegates to agent.LoadArchive.
+var loadArchiveFn = func(id string) (*agent.Record, error) {
+	return agent.LoadArchive(id)
 }
 
 // sessionAliveOrProbe returns true when the session is alive OR when

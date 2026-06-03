@@ -335,7 +335,13 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
 	s.addProjectDir(t, "projects-fleet")
-	s.addOrphanTmux(t, "deadbeef") // tmux only, no record
+	s.addOrphanTmux(t, "deadbeef") // tmux only, no live record
+	// Codex iter-4 P1: OrphanTmuxForProject now requires the archive to
+	// tie the orphan to projectName. Without this, the cross-project
+	// guard rejects the orphan and we'd fall through to spawn-fresh
+	// (Path D) instead of the reap-and-respawn (Path C) F7 is meant to
+	// exercise.
+	s.addArchivedRecord(t, "deadbeef", "projects-fleet", agent.ArchivedCauseKill, "")
 	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
 	if err != nil {
 		t.Fatalf("F7: expected no error, got %v", err)
@@ -349,6 +355,85 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 	}
 	if len(s.dispatched) != 1 || s.dispatched[0] != "projects-fleet" {
 		t.Errorf("F7: expected one coord-spawn, got %v", s.dispatched)
+	}
+}
+
+// TestBuildCoordSpawnArgs_ShapeAndTaskID — codex review iter-4 P1
+// regression. The dispatch CLI is `dispatch <task-id> [flags]` with
+// cobra.ExactArgs(1); a missing positional fails with a usage error
+// and Tier 3 recovery breaks. Pin the argv shape so any future
+// refactor that drops the task-id is caught immediately.
+func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	// No meta.json: argv should be dispatch <task-id> --coord-spawn
+	// --project <p> (no --cwd suffix).
+	got := buildCoordSpawnArgs("projects-fleet")
+	want := []string{
+		"dispatch", "coord-projects-fleet",
+		"--coord-spawn", "--project", "projects-fleet",
+	}
+	if !stringSlicesEqual(got, want) {
+		t.Errorf("buildCoordSpawnArgs(no meta): got %v want %v", got, want)
+	}
+	// With meta.json: --cwd <repo_path> appended.
+	if err := os.MkdirAll(filepath.Join(tmp, "projects", "projects-fleet"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(tmp, "projects", "projects-fleet", "meta.json")
+	if err := os.WriteFile(metaPath, []byte(`{"schema":"v1","repo_path":"/repos/projects-fleet","added_at":"2026-01-01T00:00:00Z"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = buildCoordSpawnArgs("projects-fleet")
+	want = []string{
+		"dispatch", "coord-projects-fleet",
+		"--coord-spawn", "--project", "projects-fleet",
+		"--cwd", "/repos/projects-fleet",
+	}
+	if !stringSlicesEqual(got, want) {
+		t.Errorf("buildCoordSpawnArgs(with meta): got %v want %v", got, want)
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// An orphan tmux session whose archive ties it to project B must NOT
+// be reaped by `fleet attach --project A`. Tier 3 falls through to
+// Path D (spawn-fresh) instead. Without this guard, attach-failover
+// could nuke unrelated sessions.
+func TestF7b_CrossProjectOrphan_DoesNotReap(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Orphan session belongs to a DIFFERENT project (per its archive).
+	s.addOrphanTmux(t, "otherbbb")
+	s.addArchivedRecord(t, "otherbbb", "other-project", agent.ArchivedCauseKill, "")
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("F7b: expected no error, got %v", err)
+	}
+	got := stderr.String()
+	// Must take Path D, NOT Path C — diagnostic differs.
+	if strings.Contains(got, "reaped stale otherbbb") {
+		t.Errorf("F7b: must NOT reap cross-project orphan; stderr: %q", got)
+	}
+	if !strings.Contains(got, "no coord for projects-fleet; spawned newcoord") {
+		t.Errorf("F7b: must fall through to spawn-fresh; stderr: %q", got)
+	}
+	// GC must NOT have fired against projects-fleet — there's nothing
+	// for that project to reap (the orphan isn't ours).
+	if len(s.gcCalls) != 0 {
+		t.Errorf("F7b: must NOT run gc on cross-project orphan; got %v", s.gcCalls)
 	}
 }
 

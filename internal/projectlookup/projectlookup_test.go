@@ -378,24 +378,73 @@ func TestStaleCoordRecord_RecordPlusLiveTmuxIsNotStale(t *testing.T) {
 // --- OrphanTmuxForProject ---
 
 // TestOrphanTmuxForProject_OrphanSessionFound — tmux has a fleet-<id>
-// session with no matching record. Drives the "no record but lingering
-// tmux" stale branch.
+// session with no live record. After codex iter-4 P1 the helper also
+// requires an archived record tying the orphan ID to the requested
+// project; otherwise cross-project reap is too easy. Stub the archive
+// lookup to claim the orphan belonged to "fleet".
 func TestOrphanTmuxForProject_OrphanSessionFound(t *testing.T) {
 	withFleetHome(t)
-	// No agent record — but a tmux session "fleet-deadbeef" exists.
-	// The orphan helper only needs a stub for ListSessions; the
-	// project name is hint-only (Tier 3 doesn't currently bind
-	// tmux sessions to projects, so the helper returns the orphan
-	// list and the caller treats any one as the stale).
-	records := recordsFromList(t) // empty
-	restore := stubListSessions(t, []string{"fleet-deadbeef", "other-thing"})
-	defer restore()
+	records := recordsFromList(t) // empty — no live record for deadbeef
+	restoreList := stubListSessions(t, []string{"fleet-deadbeef", "other-thing"})
+	defer restoreList()
+	// Bind the orphan to the requested project via the archive seam.
+	restoreArch := SetLoadArchiveStub(func(id string) (*agent.Record, error) {
+		if id == "deadbeef" {
+			r := &agent.Record{ID: "deadbeef", Project: "fleet"}
+			return r, nil
+		}
+		return nil, errors.New("not found")
+	})
+	defer restoreArch()
 	got, ok := OrphanTmuxForProject(records, "fleet")
 	if !ok {
 		t.Fatal("OrphanTmuxForProject: ok=false want true")
 	}
 	if got != "deadbeef" {
 		t.Errorf("OrphanTmuxForProject: got %q want deadbeef", got)
+	}
+}
+
+// TestOrphanTmuxForProject_RejectsCrossProjectOrphan — codex review
+// iter-4 P1 guard. The orphan tmux session belongs to a DIFFERENT
+// project (per its archive); attach failover for project A must NOT
+// claim it and must NOT trigger gc that could reap it.
+func TestOrphanTmuxForProject_RejectsCrossProjectOrphan(t *testing.T) {
+	withFleetHome(t)
+	records := recordsFromList(t)
+	restoreList := stubListSessions(t, []string{"fleet-deadbeef"})
+	defer restoreList()
+	// Archive ties the orphan to project B; caller asks about A.
+	restoreArch := SetLoadArchiveStub(func(id string) (*agent.Record, error) {
+		if id == "deadbeef" {
+			r := &agent.Record{ID: "deadbeef", Project: "other-project"}
+			return r, nil
+		}
+		return nil, errors.New("not found")
+	})
+	defer restoreArch()
+	if _, ok := OrphanTmuxForProject(records, "fleet"); ok {
+		t.Errorf("OrphanTmuxForProject: must reject cross-project orphan; reaping it would terminate another project's session")
+	}
+}
+
+// TestOrphanTmuxForProject_RejectsUnknownProvenanceOrphan — same guard
+// as above for orphans with NO archive record. Without provenance we
+// can't safely tie the session to projectName; surface "no" so the
+// caller falls through to spawn-fresh instead of running gc that wouldn't
+// help anyway.
+func TestOrphanTmuxForProject_RejectsUnknownProvenanceOrphan(t *testing.T) {
+	withFleetHome(t)
+	records := recordsFromList(t)
+	restoreList := stubListSessions(t, []string{"fleet-deadbeef"})
+	defer restoreList()
+	// Archive lookup fails — no provenance.
+	restoreArch := SetLoadArchiveStub(func(id string) (*agent.Record, error) {
+		return nil, errors.New("not found")
+	})
+	defer restoreArch()
+	if _, ok := OrphanTmuxForProject(records, "fleet"); ok {
+		t.Errorf("OrphanTmuxForProject: must reject orphan of unknown provenance")
 	}
 }
 

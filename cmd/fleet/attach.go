@@ -655,27 +655,35 @@ var (
 // Implementation: re-exec the same binary so the dispatch path uses
 // the current process's PATH / FLEET_HOME / config. Same approach the
 // TUI startCoordSpawn uses.
+// buildCoordSpawnArgs assembles the argv for `fleet dispatch ...
+// --coord-spawn`. Extracted so unit tests can pin the shape without
+// shelling out — the dispatch CLI requires the task-id positional
+// (cobra.ExactArgs(1)) and a missing --cwd lands the recovered coord
+// in the wrong checkout. Codex review iter-2 P1 + iter-4 P1.
+//
+// Shape: `dispatch coord-<project> --coord-spawn --project <project>
+// [--cwd <repo_path>]`. The --cwd suffix only appears when meta.json
+// registers a repo_path; legacy projects without meta.json fall back to
+// dispatch's caller-cwd resolution.
+func buildCoordSpawnArgs(project string) []string {
+	args := []string{
+		"dispatch",
+		projectlookup.CoordTaskID(project),
+		"--coord-spawn",
+		"--project", project,
+	}
+	if meta, mErr := projects.Read(project); mErr == nil && meta.RepoPath != "" {
+		args = append(args, "--cwd", meta.RepoPath)
+	}
+	return args
+}
+
 func shellCoordSpawn(project string) (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", fmt.Errorf("locate self binary: %w", err)
 	}
-	args := []string{"dispatch", "--coord-spawn", "--project", project}
-	// Codex review iter-2 P1: pass --cwd <repo_path> when meta.json
-	// registers one. Without this, dispatch falls back to the attach
-	// process's cwd — which is almost certainly NOT the project's repo
-	// when the operator runs `fleet attach --project <p>` from another
-	// directory. The recovered coord would then run git/test/worktree
-	// commands against the wrong checkout.
-	//
-	// meta.json is optional (some legacy projects predate it); on absence
-	// or read failure, fall back to the existing behavior (no --cwd, let
-	// dispatch resolve). Don't fail the spawn for a missing meta — the
-	// invariant "never exit" still holds; the coord just lands in the
-	// caller's cwd as it did before this fix.
-	if meta, mErr := projects.Read(project); mErr == nil && meta.RepoPath != "" {
-		args = append(args, "--cwd", meta.RepoPath)
-	}
+	args := buildCoordSpawnArgs(project)
 	cmd := exec.Command(self, args...)
 	cmd.Env = os.Environ()
 	var stdout, stderr bytes.Buffer
