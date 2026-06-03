@@ -106,3 +106,62 @@ func TestAgentBlockLines_NoFlash_NoToken(t *testing.T) {
 		t.Errorf("no successor chip expected; got:\n%s", out)
 	}
 }
+
+// TestActionAttach_AgentRow_WalksChainOnStaleRow — handoff-identity-cont-3f1d
+// Piece 2: the rowAgent [a] handler runs the chain resolver before
+// the existing live-record path. When the row's agent has been
+// archived as a handoff and the live tail exists with a healthy tmux
+// session, [a] attaches to the live tail, not the stale row's session.
+func TestActionAttach_AgentRow_WalksChainOnStaleRow(t *testing.T) {
+	prevResolve := chainResolveFn
+	prevAlive := sessionAliveFn
+	t.Cleanup(func() {
+		chainResolveFn = prevResolve
+		sessionAliveFn = prevAlive
+	})
+	// Resolver claims the row id (cedacc55) handed off 2 hops away
+	// to 50fc19be (live).
+	tail := agent.New("50fc19be")
+	tail.TmuxSession = "fleet-50fc19be"
+	chainResolveFn = func(id string) (*agent.Record, int, error) {
+		if id == "cedacc55" {
+			return tail, 2, nil
+		}
+		return nil, 0, agent.ErrNoLiveSuccessor
+	}
+	// Live tail's tmux session is alive.
+	sessionAliveFn = func(session string) bool {
+		return session == "fleet-50fc19be"
+	}
+
+	m := New("test")
+	// Seed one agent row + cursor on it.
+	stale := agent.New("cedacc55")
+	stale.TmuxSession = "fleet-cedacc55"
+	m.records = []*agent.Record{stale}
+	m.aliveByID = map[string]bool{"cedacc55": true}
+	m.dashCursor = findCursorOnAgent(t, m, "cedacc55")
+
+	updated, _, _ := m.actionAttach()
+	um := updated
+	if um.pendingAttach != "fleet-50fc19be" {
+		t.Errorf("pendingAttach: got %q want fleet-50fc19be", um.pendingAttach)
+	}
+	if um.flash == nil || !strings.Contains(um.flash.text, "rotated through 2 hops") {
+		t.Errorf("flash should mention rotation; got: %#v", um.flash)
+	}
+}
+
+// findCursorOnAgent locates the agent row in dashboardRows() so the
+// test can position the cursor on it before calling actionAttach.
+func findCursorOnAgent(t *testing.T, m Model, id string) int {
+	t.Helper()
+	rows := m.dashboardRows()
+	for i, r := range rows {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == id {
+			return i
+		}
+	}
+	t.Fatalf("no agent row for %q in dashboardRows()", id)
+	return -1
+}
