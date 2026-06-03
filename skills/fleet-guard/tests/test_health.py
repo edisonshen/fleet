@@ -362,6 +362,19 @@ class TestResolveLimit:
     def test_dated_variant_strips_to_base(self) -> None:
         assert health._resolve_limit("claude-sonnet-4-6-20251101") == 200_000
 
+    def test_substring_1m_in_bracket_does_not_match(self) -> None:
+        """codex iter-2 (2026-06-03): the bracket token must equal "1m"
+        EXACTLY. A token that merely CONTAINS "1m" ("[v1m]", "[not-1m]") is a
+        different variant and must fall back to the stripped base limit, not
+        the 1M window."""
+        assert health._resolve_limit("claude-sonnet-4-6[v1m]") == 200_000
+        assert health._resolve_limit("claude-sonnet-4-6[not-1m]") == 200_000
+        # An unknown base with a non-exact-1m bracket stays unknown.
+        assert health._resolve_limit("claude-future-99[v1m]") is None
+
+    def test_one_m_bracket_is_case_insensitive(self) -> None:
+        assert health._resolve_limit("claude-sonnet-4-6[1M]") == 1_000_000
+
     def test_unknown_returns_none(self) -> None:
         assert health._resolve_limit("claude-future-99") is None
         assert health._resolve_limit("claude-future-99[1m]") == 1_000_000  # [1m] tag wins
@@ -432,8 +445,12 @@ class TestContextLimitsParity:
                     "claude-sonnet-4-6",
                     "claude-sonnet-4-6[1m]",
                     "claude-sonnet-4-6[beta]",
+                    "claude-sonnet-4-6[1M]",
+                    "claude-sonnet-4-6[v1m]",
+                    "claude-sonnet-4-6[not-1m]",
                     "claude-future-99",
                     "claude-future-99[1m]",
+                    "claude-future-99[v1m]",
                     ""):
             assert health._resolve_limit(mid) == stop_hook._resolve_limit(mid), mid
 

@@ -76,9 +76,11 @@ def _resolve_limit(raw):
     exact = CONTEXT_LIMITS.get(raw)
     if exact is not None:
         return exact
-    bracket = raw.find("[")
-    if bracket >= 0 and "1m" in raw[bracket:].lower():
-        return ONE_M_BRACKET_TOKENS
+    open_b = raw.find("[")
+    if open_b >= 0:
+        close_b = raw.find("]", open_b)
+        if close_b > open_b and raw[open_b + 1:close_b].strip().lower() == "1m":
+            return ONE_M_BRACKET_TOKENS
     return CONTEXT_LIMITS.get(_normalize_model(raw))
 
 SPIKE_DIR = Path.home() / ".fleet" / "spike"
