@@ -33,13 +33,14 @@ import (
 // FLEET_HOME tempdir, attach call recorder, dispatch/gc shell-out
 // recorders, session-alive map for tmux probes.
 type failoverSetup struct {
-	tmp           string
-	attachedTo    string
-	attachCalls   int
-	dispatched    []string // project names passed to coord-spawn
-	gcCalls       []string // project names passed to gc --aggressive
-	aliveSessions map[string]bool
-	newSpawnID    string // ID minted by the stub coord-spawn
+	tmp            string
+	attachedTo     string
+	attachCalls    int
+	dispatched     []string // project names passed to coord-spawn
+	gcCalls        []string // project names passed to gc --kinds=orphan-agents
+	killedSessions []string // tmux sessions passed to tmux.Kill (Path C')
+	aliveSessions  map[string]bool
+	newSpawnID     string // ID minted by the stub coord-spawn
 }
 
 // newFailoverSetup wires the env + a fresh setup and prepares the
@@ -83,9 +84,19 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 		s.aliveSessions["fleet-"+s.newSpawnID] = true
 		return s.newSpawnID, nil
 	}
-	prevGC := gcAggressiveFnVar
-	gcAggressiveFnVar = func(project string) error {
+	prevGC := gcOrphanAgentsFnVar
+	gcOrphanAgentsFnVar = func(project string) error {
 		s.gcCalls = append(s.gcCalls, project)
+		return nil
+	}
+	// Path C' (orphan tmux) uses a direct tmux kill — record those too
+	// so tests can distinguish single-session kill from gc invocation.
+	prevKill := killTmuxSessionFnVar
+	killTmuxSessionFnVar = func(session string) error {
+		s.killedSessions = append(s.killedSessions, session)
+		// Make the killed session disappear from the alive map so
+		// subsequent probes see it gone.
+		delete(s.aliveSessions, session)
 		return nil
 	}
 	prevSessionAlive := sessionAliveFnVar
@@ -123,7 +134,8 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	t.Cleanup(func() {
 		attachFnVar = prevAttach
 		coordSpawnFnVar = prevDispatch
-		gcAggressiveFnVar = prevGC
+		gcOrphanAgentsFnVar = prevGC
+		killTmuxSessionFnVar = prevKill
 		sessionAliveFnVar = prevSessionAlive
 		sessionProbeFnVar = prevSessionProbe
 		listSessionsFnVar = prevListSessions
@@ -350,8 +362,15 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 	if !strings.Contains(got, "foo: reaped stale deadbeef; spawned newcoord for projects-fleet; attaching") {
 		t.Errorf("F7 stderr: %q", got)
 	}
-	if len(s.gcCalls) != 1 || s.gcCalls[0] != "projects-fleet" {
-		t.Errorf("F7: expected one gc call, got %v", s.gcCalls)
+	// Codex iter-5 P1: Path C' uses targeted tmux.Kill, not the
+	// host-wide gc --aggressive. Assert the kill landed on the specific
+	// fleet-<id> session and NO gc was invoked (the old path's blast
+	// radius would have killed cross-project orphans).
+	if len(s.killedSessions) != 1 || s.killedSessions[0] != "fleet-deadbeef" {
+		t.Errorf("F7: expected one tmux.Kill on fleet-deadbeef, got %v", s.killedSessions)
+	}
+	if len(s.gcCalls) != 0 {
+		t.Errorf("F7: orphan-tmux path must NOT invoke gc (host-wide blast radius); got %v", s.gcCalls)
 	}
 	if len(s.dispatched) != 1 || s.dispatched[0] != "projects-fleet" {
 		t.Errorf("F7: expected one coord-spawn, got %v", s.dispatched)
@@ -704,6 +723,43 @@ func TestSystemFailure_CorruptArchiveRecord_DoesNotRecover(t *testing.T) {
 	}
 	if len(s.gcCalls) != 0 {
 		t.Errorf("gc must not fire on corrupt record; got %v", s.gcCalls)
+	}
+}
+
+// TestSystemFailure_CorruptLiveRecord_VetoesTier3 — codex review iter-5
+// P2. Tier 3 PROJECT RECOVERY scans ~/.fleet/agents/ via agent.List, which
+// silently skips unparseable records. If the skipped record is the
+// project's live coord, Path A misses → Path D spawns a duplicate →
+// split-brain (the operator now has two coords for the project, one
+// invisible to the dashboard).
+//
+// Fix: ListStrict + bad-ID veto. When any agent JSON fails to parse,
+// surface a SystemError naming the bad IDs and refuse to spawn.
+func TestSystemFailure_CorruptLiveRecord_VetoesTier3(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Write a malformed LIVE record (NOT in archive — this is the case
+	// that would silently slip through and let Path D spawn over it).
+	corruptPath := filepath.Join(s.tmp, "agents", "corruptv.json")
+	if err := os.WriteFile(corruptPath, []byte("{not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("expected SystemError when a live agent record is unparseable, got nil")
+	}
+	if !strings.Contains(err.Error(), "unparseable") || !strings.Contains(err.Error(), "corruptv") {
+		t.Errorf("err must name the bad record IDs: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "split-brain") {
+		t.Errorf("err must explain why we refuse to spawn (split-brain risk): %q", err.Error())
+	}
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(corrupt live record): got %d want 70", ec)
+	}
+	if len(s.dispatched) != 0 {
+		t.Errorf("must NOT spawn when records are corrupt; got %v", s.dispatched)
 	}
 }
 
