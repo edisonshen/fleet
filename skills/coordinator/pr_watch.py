@@ -661,23 +661,28 @@ def reconcile_watches(
     # state — raising here off the previous tick's snapshot would emit a
     # false orphan alert for a PR that merged/closed this tick, and a
     # slow-cadence READY watch might not even re-probe (codex iter-17 [P2]).
-    # Slugs of all CURRENT non-terminal tasks (regardless of pr_url) — used
-    # to PRESERVE a persisted backing slug whose pr_url the legacy reconcile
-    # cleared this/an-earlier tick. The pre-reconcile enroll snapshot is
-    # only available on the clear tick; on later ticks we'd recompute `live`
-    # to [] and lose the backing, so a later merge would orphan-prune the
-    # watch and leave the requeued task re-dispatchable (codex round 24
-    # [P2]). The task still EXISTS (it was requeued, not removed), so we
-    # keep it as backing until it goes terminal or the operator resolves it.
-    # Slugs of current non-terminal tasks that have NO pr_url — the pure
-    # legacy-clear case. We only preserve backing for these: a task that
-    # now points at a DIFFERENT pr_url is attached to its NEW watch, so
-    # keeping it on the OLD watch would let a stale-PR merge flip the
-    # active task done (codex round 25 [P1]).
-    current_urlless_slugs = {
+    # Slugs eligible to PRESERVE old-watch backing after their pr_url was
+    # cleared by legacy CI-red handling. The pre-reconcile enroll snapshot
+    # is only available on the clear tick; on later ticks we'd recompute
+    # `live` to [] and lose the backing, so a later merge of the old PR
+    # would orphan-prune the watch and leave the requeued task
+    # re-dispatchable (codex round 24 [P2]).
+    #
+    # Eligibility is NARROW — a task qualifies ONLY when it is:
+    #   - status == "todo"  (IDLE / requeued, NOT yet re-dispatched), AND
+    #   - pr_url == ""       (the pure legacy-clear case).
+    # Excluding non-todo statuses is load-bearing (codex round 34 [P1]): a
+    # re-dispatched retry is `in-progress` with no pr_url until its NEW
+    # worker opens a replacement PR. Preserving that ACTIVE attempt on the
+    # OLD watch would let a merge of the old PR flip the live retry to
+    # `done` and clear its worker — orphaning in-flight work. A task that
+    # now points at a DIFFERENT pr_url is attached to its NEW watch, so the
+    # empty-pr_url gate also keeps it off the old watch (codex round 25
+    # [P1]).
+    preservable_slugs = {
         getattr(t, "slug", "")
         for t in tasks
-        if getattr(t, "status", "") not in TERMINAL_TASK_STATUSES
+        if getattr(t, "status", "") == "todo"
         and not getattr(t, "pr_url", "")
         and getattr(t, "slug", "")
     }
@@ -700,7 +705,7 @@ def reconcile_watches(
         # owns them).
         if w.get("state") not in (STATE_MERGED, STATE_NOT_FOUND):
             for slug in w.get("tasks") or []:
-                if slug in current_urlless_slugs:
+                if slug in preservable_slugs:
                     live.add(slug)
         live = sorted(live)
         w["tasks"] = live

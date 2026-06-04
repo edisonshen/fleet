@@ -300,6 +300,41 @@ def test_old_watch_drops_task_that_moved_to_new_pr(tmp_path: Path) -> None:
     assert watches["200"]["tasks"] == ["foo"]
 
 
+def test_active_retry_not_flipped_by_old_pr_merge(tmp_path: Path) -> None:
+    """A re-dispatched retry (in-progress, no pr_url, new worker running)
+    must NOT remain backing its OLD watch — else a merge of the old PR
+    flips the live retry done + clears its worker, orphaning in-flight work
+    (codex round 34 [P1]). Only IDLE (todo) url-less tasks preserve."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "worker/foo", "main")}}
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    doc["watches"]["195"]["last_snapshot"] = {"pr_state": "OPEN"}
+    pw.save_watches(tmp_path, doc)
+    # foo was re-dispatched: in-progress, no pr_url (new worker running).
+    tasks = [_task("foo", status="in-progress", pr_url="", branch="worker/foo")]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=2, flips=flips)
+    # the live in-progress retry must NOT be flipped done by the old merge.
+    assert flips == []
+    # 195 had empty backing -> orphan-merge prune (no task mutated).
+    assert "195" not in pw.load_watches(tmp_path)["watches"]
+
+
+def test_idle_todo_retry_preserved_and_flipped_on_merge(tmp_path: Path) -> None:
+    """An IDLE (todo) requeued task IS preserved + flipped done when its old
+    PR merges (the round-24 case still works; only active retries excluded)."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "worker/foo", "main")}}
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    doc["watches"]["195"]["last_snapshot"] = {"pr_state": "OPEN"}
+    pw.save_watches(tmp_path, doc)
+    tasks = [_task("foo", status="todo", pr_url="", branch="worker/foo")]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=2, flips=flips)
+    assert flips == ["foo"]
+    assert out.pruned == 1
+
+
 def test_backing_dropped_when_task_archived(tmp_path: Path) -> None:
     """A persisted backing slug that NO LONGER exists as a live task (it was
     archived / went terminal) is NOT preserved — it correctly drops so the
