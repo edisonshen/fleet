@@ -1093,17 +1093,51 @@ class GhGitProber:
             data = json.loads(proc.stdout or "null")
         except json.JSONDecodeError as exc:
             return {n: PRSnapshot(number=n, error=f"json decode: {exc}") for n in pr_numbers}
+
+        # GraphQL fail-soft (codex iter-9 [P2]): `gh api graphql` can exit
+        # 0 with HTTP 200 yet carry a top-level `errors` array (rate-limit
+        # / RATE_LIMITED, FORBIDDEN/auth-scope, transient resolution
+        # errors) AND null data. Treating a null alias as not_found in that
+        # case raises FALSE `pr-not-found` alerts. So: collect the error
+        # `type`s; a null alias is NOT_FOUND-class ONLY when the errors
+        # array is empty OR explicitly carries a NOT_FOUND type — otherwise
+        # it's transient (SKIP + backoff, retain the watch).
+        gql_errors = data.get("errors") if isinstance(data, dict) else None
+        err_types = set()
+        err_summary = ""
+        if isinstance(gql_errors, list) and gql_errors:
+            for e in gql_errors:
+                if isinstance(e, dict):
+                    err_types.add(str(e.get("type", "") or "").upper())
+            err_summary = "; ".join(
+                str(e.get("message", "")) for e in gql_errors if isinstance(e, dict)
+            )[:300]
+        has_transient_error = bool(err_types) and err_types != {"NOT_FOUND"}
+
         repo = (data.get("data") or {}).get("repository") if isinstance(data, dict) else None
         out: dict[int, PRSnapshot] = {}
         for n in pr_numbers:
             pr = repo.get(f"pr{n}") if isinstance(repo, dict) else None
-            out[n] = self._snapshot_from_pr(n, pr)
+            out[n] = self._snapshot_from_pr(
+                n, pr, has_transient_error=has_transient_error,
+                err_summary=err_summary,
+            )
         return out
 
     @staticmethod
-    def _snapshot_from_pr(num: int, pr) -> PRSnapshot:
+    def _snapshot_from_pr(num: int, pr, *, has_transient_error: bool = False,
+                          err_summary: str = "") -> PRSnapshot:
         if pr is None:
-            # alias resolved to null -> PR genuinely gone (404-class).
+            # alias resolved to null. If the response carried a transient
+            # top-level error (rate-limit/auth/etc.), this is NOT a real
+            # 404 -> SKIP + backoff (retain). Only an error-free (or
+            # explicitly NOT_FOUND) null is treated as genuinely gone.
+            if has_transient_error:
+                return PRSnapshot(
+                    number=num,
+                    error=f"graphql transient error: {err_summary or 'unknown'}",
+                    not_found=False,
+                )
             return PRSnapshot(number=num, error="pullRequest is null", not_found=True)
         rollup_state = ""
         contexts = []

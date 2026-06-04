@@ -910,6 +910,33 @@ def test_ghgit_prober_null_pr_is_not_found(monkeypatch) -> None:
     assert rp.snapshots[9].not_found is True
 
 
+def test_ghgit_prober_graphql_rate_limit_is_transient(monkeypatch) -> None:
+    """HTTP 200 with a top-level errors array (rate-limit) + null alias ->
+    TRANSIENT (not_found=False) so the watch backs off instead of raising
+    a false pr-not-found (codex iter-9 [P2])."""
+    resp = json.dumps({
+        "data": {"repository": None},
+        "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}],
+    })
+    monkeypatch.setattr(pw.subprocess, "run",
+                        lambda cmd, **k: _FakeProc(0, resp) if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0))
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [9], [])
+    assert rp.snapshots[9].error                      # has an error
+    assert rp.snapshots[9].not_found is False         # NOT a real 404
+
+
+def test_ghgit_prober_graphql_explicit_not_found(monkeypatch) -> None:
+    """A NOT_FOUND-typed GraphQL error with null alias IS a real 404."""
+    resp = json.dumps({
+        "data": {"repository": {"pr9": None}},
+        "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a PullRequest"}],
+    })
+    monkeypatch.setattr(pw.subprocess, "run",
+                        lambda cmd, **k: _FakeProc(0, resp) if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0))
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [9], [])
+    assert rp.snapshots[9].not_found is True
+
+
 def test_ghgit_prober_batches_one_call(monkeypatch) -> None:
     """Multiple watched PRs -> exactly ONE `gh api graphql` shell-out
     (codex iter-2 [P2]: one batched query per repo, not O(PRs))."""
