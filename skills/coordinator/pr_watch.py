@@ -223,12 +223,15 @@ class Prober(Protocol):
 # ----------------------------------------------------------------------
 
 # https://github.com/<owner>/<repo>/pull/<N>  (also tolerate a trailing
-# slash / fragment / query). Captures owner/repo + number. The negative
-# lookbehind `(?<![\w.-])` anchors `github.com` to a real host boundary so
-# a lookalike host like `notgithub.com` / `evilgithub.com.attacker.net` is
-# NOT parsed as a GitHub PR (codex iter-19 [P2]).
+# slash / fragment / query). Captures owner/repo + number. `github.com`
+# must be the actual HOST: preceded by a scheme `//`, an SSH userinfo `@`,
+# or the start of the string (scp-style `github.com:owner/...`). This
+# rejects both a lookalike host (`notgithub.com`, codex iter-19 [P2]) AND
+# a path segment that merely contains the string
+# (`https://tracker.example/github.com/org/repo/pull/1`, codex round 27
+# [P2]) — neither should drive task reconciliation against a real PR.
 _PR_URL_RE = re.compile(
-    r"(?<![\w.-])github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)\b"
+    r"(?:^|//|@)github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)\b"
 )
 
 
@@ -1402,7 +1405,7 @@ def _rollup_state_to_verdict(state: str) -> str:
 # `.git` + `/` FIRST (below), then this matches the last two segments so a
 # dotted repo name is preserved (codex iter-1 [P2]).
 _REMOTE_URL_RE = re.compile(
-    r"(?<![\w.-])github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
+    r"(?:^|//|@)github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
 )
 
 

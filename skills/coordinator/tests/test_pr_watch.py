@@ -128,6 +128,11 @@ def test_parse_pr_url() -> None:
     # lookalike host must NOT parse as GitHub (codex iter-19 [P2]).
     assert pw.parse_pr_url("https://notgithub.com/edisonshen/fleet/pull/195") is None
     assert pw.parse_pr_url("https://evilgithub.com/a/b/pull/1") is None
+    # github.com as a PATH segment (not the host) must NOT parse (codex
+    # round 27 [P2]).
+    assert pw.parse_pr_url("https://tracker.example/github.com/org/repo/pull/1") is None
+    # scp-style remote-host form still parses (host at string start).
+    assert pw.parse_pr_url("github.com:edisonshen/fleet/pull/5") == ("edisonshen/fleet", 5)
 
 
 def test_coord_scope_case_insensitive(tmp_path: Path) -> None:
