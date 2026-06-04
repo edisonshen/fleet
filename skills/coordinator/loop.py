@@ -1622,10 +1622,22 @@ def _run_supervisor(
         n_blocks_before = len(result.dispatch_instructions)
         try:
             f_pw = parse.read(str(tasks_path))
+            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]).
+            # PR-watch's budgets (probe backoff, launch grace, unverified
+            # stale reclaim) all age by tick_count. During a long supervisor
+            # session external ticks are lock-busy, so a snapshot read of
+            # coord-state would keep passing the SAME tick_count and those
+            # timers would never reach threshold until the supervisor exits.
+            # Bump + persist the counter each periodic pass so the timers
+            # advance monotonically (the supervisor runs this on the
+            # stuck-check cadence — a real elapsed-time proxy).
+            cs_pw = _load_coord_state(state_path)
+            _bump_tick_counter(cs_pw)
+            _save_coord_state(state_path, cs_pw)
             _reconcile_pr_watches(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
-                state=_load_coord_state(state_path), result=result, home=home,
+                state=cs_pw, result=result, home=home,
                 # PRE-reconcile snapshot for ENROLLMENT (codex iter-23 [P1]):
                 # the legacy _reconcile_slugs above may have just cleared a
                 # newly-opened PR's pr_url (CI-red/not-mergeable). Mirroring
