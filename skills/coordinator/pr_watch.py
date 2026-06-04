@@ -583,6 +583,19 @@ def reconcile_watches(
             pr_num = int(w.get("pr_number", key))
         except (TypeError, ValueError):
             continue
+        # COORD-SCOPE re-assert on PROBE (codex iter-2 [P2]): a watch
+        # persisted on an earlier tick when derive_owner_repo failed
+        # (coord_owner_repo was None) could belong to a FOREIGN repo. Now
+        # that the repo is derivable, re-check the watch's stored pr_url
+        # owner before probing — else we'd probe <coord_repo>#N for a
+        # foreign #N and could record/terminate the wrong PR's state.
+        parsed = parse_pr_url(w.get("pr_url", ""))
+        if parsed is not None and parsed[0] != coord_owner_repo:
+            out.errors.append(
+                f"pr-watch: persisted watch {parsed[0]}#{pr_num} is not in this "
+                f"coord's repo {coord_owner_repo!r}; not probing (coord-scope)"
+            )
+            continue
         if not _probe_due(w, tick_count, slow_cadence_ticks):
             continue
         due_numbers.append(pr_num)
@@ -819,10 +832,10 @@ def _arm_backoff(watch: dict, tick_count: int) -> None:
 # Production prober — shells to git + gh (one fetch + one batched query)
 # ----------------------------------------------------------------------
 
-_GRAPHQL_PR = """
-query($owner:String!,$name:String!,$num:Int!){
-  repository(owner:$owner,name:$name){
-    pullRequest(number:$num){
+# The per-PR projection, reused inside each alias of the BATCHED query so
+# one `gh api graphql` call covers every watched PR in the repo (§3 cost
+# model — one fetch + one batched query per repo per tick).
+_PR_FIELDS = """{
       number state mergedAt mergeStateStatus reviewDecision
       headRefName baseRefName headRefOid baseRefOid
       commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){nodes{
@@ -830,10 +843,23 @@ query($owner:String!,$name:String!,$num:Int!){
         ... on CheckRun{status conclusion}
         ... on StatusContext{state}
       }}}}}}
-    }
-  }
-}
-"""
+    }"""
+
+
+def _build_batched_query(pr_numbers: list[int]) -> str:
+    """Build ONE GraphQL query aliasing each watched PR as `prN<num>` so a
+    single `gh api graphql` call returns every PR (codex iter-2 [P2])."""
+    aliases = "\n".join(
+        f"    pr{n}: pullRequest(number:{n}) {_PR_FIELDS}"
+        for n in pr_numbers
+    )
+    return (
+        "query($owner:String!,$name:String!){\n"
+        "  repository(owner:$owner,name:$name){\n"
+        f"{aliases}\n"
+        "  }\n"
+        "}\n"
+    )
 
 
 class GhGitProber:
@@ -860,15 +886,15 @@ class GhGitProber:
             result.error = f"unparseable owner/repo {owner_repo!r}"
             return result
 
-        # 1. Query the PRs FIRST. The §5.1(a) ancestor check needs the
-        # CURRENT head OID (which lives on GitHub), not last tick's
-        # snapshot — so we must learn the current heads from GraphQL
-        # before we fetch them (codex iter-1 [P1]). `head_oids` (prior
-        # snapshot heads) is still passed for the cheap "is it already
-        # local?" pre-filter; the authoritative head set comes from here.
-        for num in pr_numbers:
-            snap = self._query_pr(owner, name, num)
-            result.snapshots[num] = snap
+        # 1. Query the PRs FIRST, in ONE batched `gh api graphql` call
+        # (codex iter-2 [P2] — one shell-out per repo, not O(PRs)). The
+        # §5.1(a) ancestor check needs the CURRENT head OID (which lives
+        # on GitHub), not last tick's snapshot — so we must learn the
+        # current heads from GraphQL before we fetch them (codex iter-1
+        # [P1]). `head_oids` (prior snapshot heads) is still passed for
+        # the cheap "is it already local?" pre-filter; the authoritative
+        # head set comes from here.
+        result.snapshots = self._query_batch(owner, name, pr_numbers)
 
         # 2. ONE git fetch of the base ref + every current head OID that
         # isn't already local, so the ancestor check runs against FRESH,
@@ -912,13 +938,19 @@ class GhGitProber:
             return False
         return proc.returncode == 0
 
-    def _query_pr(self, owner: str, name: str, num: int) -> PRSnapshot:
+    def _query_batch(self, owner: str, name: str, pr_numbers: list[int]) -> dict[int, PRSnapshot]:
+        """ONE `gh api graphql` call for all watched PRs (codex iter-2
+        [P2]). On a whole-call failure (auth/5xx/timeout/rate-limit) EVERY
+        PR gets a transient error snapshot (fail-soft — retain + retry).
+        A single PR aliased to `null` (404-class) gets a not_found snap
+        while the rest parse normally."""
+        if not pr_numbers:
+            return {}
         cmd = [
             "gh", "api", "graphql",
-            "-f", f"query={_GRAPHQL_PR}",
+            "-f", f"query={_build_batched_query(pr_numbers)}",
             "-F", f"owner={owner}",
             "-F", f"name={name}",
-            "-F", f"num={num}",
         ]
         try:
             proc = subprocess.run(
@@ -926,26 +958,30 @@ class GhGitProber:
                 timeout=self.timeout_s, check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-            return PRSnapshot(number=num, error=str(exc))
+            return {n: PRSnapshot(number=n, error=str(exc)) for n in pr_numbers}
         if proc.returncode != 0:
             stderr = (proc.stderr or proc.stdout or "").strip()
-            kind = classify_probe_error(stderr)
-            return PRSnapshot(number=num, error=stderr or "gh nonzero exit",
-                              not_found=(kind == EVENT_NOT_FOUND))
+            not_found = classify_probe_error(stderr) == EVENT_NOT_FOUND
+            return {
+                n: PRSnapshot(number=n, error=stderr or "gh nonzero exit",
+                              not_found=not_found)
+                for n in pr_numbers
+            }
         try:
             data = json.loads(proc.stdout or "null")
         except json.JSONDecodeError as exc:
-            return PRSnapshot(number=num, error=f"json decode: {exc}")
-        return self._snapshot_from_graphql(num, data)
+            return {n: PRSnapshot(number=n, error=f"json decode: {exc}") for n in pr_numbers}
+        repo = (data.get("data") or {}).get("repository") if isinstance(data, dict) else None
+        out: dict[int, PRSnapshot] = {}
+        for n in pr_numbers:
+            pr = repo.get(f"pr{n}") if isinstance(repo, dict) else None
+            out[n] = self._snapshot_from_pr(n, pr)
+        return out
 
     @staticmethod
-    def _snapshot_from_graphql(num: int, data) -> PRSnapshot:
-        try:
-            pr = data["data"]["repository"]["pullRequest"]
-        except (TypeError, KeyError):
-            pr = None
+    def _snapshot_from_pr(num: int, pr) -> PRSnapshot:
         if pr is None:
-            # repository/pullRequest null -> genuinely gone (404-class).
+            # alias resolved to null -> PR genuinely gone (404-class).
             return PRSnapshot(number=num, error="pullRequest is null", not_found=True)
         rollup_state = ""
         contexts = []

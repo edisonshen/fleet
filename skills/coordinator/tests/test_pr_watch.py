@@ -661,7 +661,7 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
     fetch of the base ref + each non-local head, and rev-parses the base
     tracking ref (not FETCH_HEAD). Regression for codex iter-1 [P1]."""
     calls = []
-    graphql_resp = json.dumps({"data": {"repository": {"pullRequest": {
+    graphql_resp = json.dumps({"data": {"repository": {"pr5": {
         "number": 5, "state": "OPEN", "mergedAt": None,
         "mergeStateStatus": "BLOCKED", "reviewDecision": "APPROVED",
         "headRefName": "worker/x", "baseRefName": "main",
@@ -702,12 +702,57 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
 
 
 def test_ghgit_prober_null_pr_is_not_found(monkeypatch) -> None:
-    resp = json.dumps({"data": {"repository": {"pullRequest": None}}})
+    resp = json.dumps({"data": {"repository": {"pr9": None}}})
     monkeypatch.setattr(pw.subprocess, "run",
                         lambda cmd, **k: _FakeProc(0, resp) if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0))
     prober = pw.GhGitProber()
     rp = prober.probe_repo("/repo", OWNER_REPO, "main", [9], [])
     assert rp.snapshots[9].not_found is True
+
+
+def test_ghgit_prober_batches_one_call(monkeypatch) -> None:
+    """Multiple watched PRs -> exactly ONE `gh api graphql` shell-out
+    (codex iter-2 [P2]: one batched query per repo, not O(PRs))."""
+    gql_calls = []
+    resp = json.dumps({"data": {"repository": {
+        "pr5": {"number": 5, "state": "OPEN", "headRefOid": "H5", "baseRefOid": "B",
+                "mergeStateStatus": "CLEAN", "reviewDecision": "APPROVED",
+                "commits": {"nodes": []}},
+        "pr6": {"number": 6, "state": "MERGED", "headRefOid": "H6", "baseRefOid": "B",
+                "mergedAt": "2026", "commits": {"nodes": []}},
+    }}})
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            gql_calls.append(cmd)
+            return _FakeProc(0, resp)
+        return _FakeProc(0, "SHA\n") if "rev-parse" in cmd else _FakeProc(0)
+
+    monkeypatch.setattr(pw.subprocess, "run", fake_run)
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [5, 6], [])
+    assert len(gql_calls) == 1                       # ONE batched call
+    # the single query aliases both PR numbers.
+    qarg = next(a for a in gql_calls[0] if a.startswith("query="))
+    assert "pr5: pullRequest(number:5)" in qarg
+    assert "pr6: pullRequest(number:6)" in qarg
+    assert rp.snapshots[5].pr_state == "OPEN"
+    assert rp.snapshots[6].pr_state == "MERGED"
+
+
+def test_persisted_foreign_watch_not_probed(tmp_path: Path) -> None:
+    """A watch persisted on a prior tick (when coord_owner_repo was None)
+    that belongs to a FOREIGN repo is NOT probed once the repo is
+    derivable (codex iter-2 [P2] coord-scope re-assert on probe)."""
+    doc = {"schema": 1, "watches": {
+        "42": pw._new_watch(42, _pr_url(42, owner_repo="someone/other"), "b", "main"),
+    }}
+    pw.save_watches(tmp_path, doc)
+    prober = FakeProber(snaps={42: pw.PRSnapshot(number=42, pr_state="MERGED")})
+    flips = []
+    out = _run([], tmp_path, prober, owner_repo=OWNER_REPO, flips=flips)
+    assert prober.probe_calls == []                  # never probed
+    assert flips == []                               # never flipped a task
+    assert any("coord-scope" in e for e in out.errors)
 
 
 # ---------------------------------------------------------------------------
