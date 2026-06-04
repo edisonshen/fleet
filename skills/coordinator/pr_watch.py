@@ -641,10 +641,17 @@ def reconcile_watches(
     # watch and leave the requeued task re-dispatchable (codex round 24
     # [P2]). The task still EXISTS (it was requeued, not removed), so we
     # keep it as backing until it goes terminal or the operator resolves it.
-    current_live_slugs = {
+    # Slugs of current non-terminal tasks that have NO pr_url — the pure
+    # legacy-clear case. We only preserve backing for these: a task that
+    # now points at a DIFFERENT pr_url is attached to its NEW watch, so
+    # keeping it on the OLD watch would let a stale-PR merge flip the
+    # active task done (codex round 25 [P1]).
+    current_urlless_slugs = {
         getattr(t, "slug", "")
         for t in tasks
-        if getattr(t, "status", "") not in TERMINAL_TASK_STATUSES and getattr(t, "slug", "")
+        if getattr(t, "status", "") not in TERMINAL_TASK_STATUSES
+        and not getattr(t, "pr_url", "")
+        and getattr(t, "slug", "")
     }
     for key, w in watches.items():
         try:
@@ -665,7 +672,7 @@ def reconcile_watches(
         # owns them).
         if w.get("state") not in (STATE_MERGED, STATE_NOT_FOUND):
             for slug in w.get("tasks") or []:
-                if slug in current_live_slugs:
+                if slug in current_urlless_slugs:
                     live.add(slug)
         live = sorted(live)
         w["tasks"] = live

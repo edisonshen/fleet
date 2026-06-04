@@ -266,6 +266,30 @@ def test_pre_reconcile_backing_preserved_across_ticks(tmp_path: Path) -> None:
     assert out.pruned == 1
 
 
+def test_old_watch_drops_task_that_moved_to_new_pr(tmp_path: Path) -> None:
+    """A retried task that now points at a DIFFERENT pr_url must NOT remain
+    backing its OLD watch — else a stale-PR merge flips the active task done
+    (codex round 25 [P1]). Only url-less (pure legacy-clear) slugs preserve."""
+    # old watch 195 backed by foo; foo now points at a NEW PR 200.
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "worker/foo", "main")}}
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    doc["watches"]["195"]["last_snapshot"] = {"pr_state": "OPEN"}
+    pw.save_watches(tmp_path, doc)
+    tasks = [_task("foo", pr_url=_pr_url(200), branch="worker/foo")]
+    snaps = {
+        195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H"),  # stale old PR merges
+        200: pw.PRSnapshot(number=200, pr_state="OPEN", checks="SUCCESS", head_ref_oid="H2"),
+    }
+    flips = []
+    _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=2, flips=flips)
+    # foo is attached to PR 200 now; the stale 195 merge must NOT flip it.
+    assert flips == []
+    # 195 had empty backing -> orphan-merge prune (no task mutated); 200 lives.
+    watches = pw.load_watches(tmp_path)["watches"]
+    assert "195" not in watches
+    assert watches["200"]["tasks"] == ["foo"]
+
+
 def test_backing_dropped_when_task_archived(tmp_path: Path) -> None:
     """A persisted backing slug that NO LONGER exists as a live task (it was
     archived / went terminal) is NOT preserved — it correctly drops so the
