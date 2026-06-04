@@ -97,13 +97,13 @@ func TestState_JSONShape(t *testing.T) {
 func TestState_SchemaV2_RoundTrip(t *testing.T) {
 	withFleetHome(t)
 	rec := RecordedState{
-		Project:        "demo",
-		PID:            42,
-		HostID:         "test.local",
-		WorkingDir:     "/tmp/demo",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC().Truncate(time.Second),
-		ClaudeVersion:  "2.1.156",
+		Project:       "demo",
+		PID:           42,
+		HostID:        "test.local",
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC().Truncate(time.Second),
+		ClaudeVersion: "2.1.156",
 		OwningCoordID: "coord-abc123",
 	}
 	if err := WriteState(rec); err != nil {

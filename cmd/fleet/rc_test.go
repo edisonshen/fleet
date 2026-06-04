@@ -39,7 +39,7 @@ func TestRCCLI_UpEmitsJSONEnvelope(t *testing.T) {
 	// We use the explicit --cwd flag to short-circuit.
 
 	out := &bytes.Buffer{}
-	if err := runRCUp(out, "demo", t.TempDir(), false, false); err != nil {
+	if err := runRCUp(out, "demo", t.TempDir(), false, false, ""); err != nil {
 		// runRCUp returns errRC sentinels for non-zero exit outcomes
 		// (not_owned/contested). acquired/already_acquired return nil.
 		// If we got an error, the JSON envelope is already on stdout.

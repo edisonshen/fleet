@@ -72,6 +72,14 @@ func newGCCmd() *cobra.Command {
                    default; --apply rm -rf's the dir. A malformed name
                    WITH a tasks.md is surfaced but never auto-removed
                    (invalid-project-dir-guar-d636)
+  orphan-rc-daemons — live claude remote-control daemons (matched by
+                   --remote-control-session-name-prefix fleet-coord) whose
+                   PID is in no project's rc-state.json, OR whose claude
+                   version is superseded (the 2026-05-29 OOM root cause —
+                   5 stale daemons across 4 versions ate ~471 MB).
+                   SURFACE only by default; --apply sends SIGTERM with
+                   SIGKILL escalation. PR-B of leak-rc-daemon-lifecycle
+                   (DESIGN-lifecycle-leak-recurrence.md)
 
 Default behavior is DRY-RUN — prints a planned action list and exits
 0 WITHOUT mutating. Pass --apply to actually remove / archive / kill.
@@ -105,7 +113,7 @@ Exit codes:
 	cmd.Flags().DurationVar(&f.maxAge, "max-age", gcDefaultMaxAge,
 		"age floor for socket sweep (Go duration; default 24h)")
 	cmd.Flags().StringVar(&f.kindsCSV, "kinds", "",
-		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects); empty = all")
+		"comma-separated kinds to consider (sockets,orphan-agents,orphan-tmux,worktrees,coord-locks,worker-records,invalid-projects,orphan-rc-daemons); empty = all")
 	cmd.Flags().StringVar(&f.project, "project", "",
 		"scope worktree + agent enumeration to one project (default: all projects)")
 	return cmd
@@ -220,14 +228,14 @@ func parseKindsCSV(csv string) ([]gc.Kind, error) {
 		}
 		k := gc.Kind(p)
 		switch k {
-		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects:
+		case gc.KindSockets, gc.KindOrphanAgents, gc.KindOrphanTmux, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons:
 			out = append(out, k)
 		default:
-			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)", p)
+			return nil, fmt.Errorf("unknown --kinds value %q (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons)", p)
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects)")
+		return nil, fmt.Errorf("--kinds parsed empty list (allowed: sockets, orphan-agents, orphan-tmux, worktrees, coord-locks, worker-records, invalid-projects, orphan-rc-daemons)")
 	}
 	return out, nil
 }
@@ -248,7 +256,7 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 	_, _ = fmt.Fprintf(stdout, "fleet gc — mode=%s aggressive=%t max-age=%s\n",
 		mode, opts.Aggressive, opts.MaxAge)
 
-	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects int
+	var nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons int
 	for _, a := range r.Actions {
 		_, _ = fmt.Fprintf(stdout, "%s  %s  verb=%s  reason=%s\n",
 			a.Kind, a.Target, a.Verb, a.Reason)
@@ -267,9 +275,11 @@ func renderReport(stdout io.Writer, opts gc.Options, r gc.Report) {
 			nWorkerRecords++
 		case gc.KindInvalidProjects:
 			nInvalidProjects++
+		case gc.KindOrphanRCDaemons:
+			nRCDaemons++
 		}
 	}
 	_, _ = fmt.Fprintf(stdout,
-		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects\n",
-		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects)
+		"summary: %d sockets, %d agents, %d tmux (surface only by default), %d worktrees, %d coord-locks, %d worker-records, %d invalid-projects, %d orphan-rc-daemons\n",
+		nSockets, nAgents, nTmux, nWorktrees, nCoordLocks, nWorkerRecords, nInvalidProjects, nRCDaemons)
 }

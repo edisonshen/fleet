@@ -83,7 +83,12 @@ func rcExitCode(outcome string) int {
 		rc.OutcomeAlreadyAcquired,
 		rc.OutcomeReleased,
 		rc.OutcomeAlreadyReleased,
-		rc.OutcomeConnected:
+		rc.OutcomeConnected,
+		// leak-rc-daemon-lifecycle PR-B: self-heal outcomes are
+		// success codes (the daemon is now alive at the requested
+		// version with the new owner). Treat the same as acquired.
+		rc.OutcomeRespawnedStaleVersion,
+		rc.OutcomeRespawnedDeadOwner:
 		return 0
 	case rc.OutcomeNotEnabled, rc.OutcomeNotOwned:
 		return 10
@@ -123,26 +128,29 @@ func newRCUpCmd() *cobra.Command {
 	var cwd string
 	var idempotent bool
 	var respawnOnly bool
+	var coordID string
 	cmd := &cobra.Command{
 		Use:   "up <project>",
 		Short: "Enable RC for project (create marker + spawn listener; idempotent)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runRCUp(c.OutOrStdout(), args[0], cwd, idempotent, respawnOnly)
+			return runRCUp(c.OutOrStdout(), args[0], cwd, idempotent, respawnOnly, coordID)
 		},
 	}
 	cmd.Flags().StringVar(&cwd, "cwd", "", "explicit working_dir override (highest priority resolution source)")
 	cmd.Flags().BoolVar(&idempotent, "idempotent", false, "skill-friendly invocation: never error when already up (alias for stable-zero exit on already_acquired)")
 	cmd.Flags().BoolVar(&respawnOnly, "respawn-only", false, "respawn dead listener only; refuse to create marker (Python coord-tick safety: never auto-enable RC on a project the operator hasn't opted in to)")
+	cmd.Flags().StringVar(&coordID, "coord-id", "",
+		"owning coord agent ID, persisted in rc-state.json so self-healing Up can detect dead-owner across crashes (leak-rc-daemon-lifecycle PR-B)")
 	_ = idempotent // currently absorbed by Up's idempotent semantics
 	return cmd
 }
 
-func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool) error {
+func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool, coordID string) error {
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "up", Project: project, Error: err.Error()})
 	}
-	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd, RespawnOnly: respawnOnly})
+	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd, RespawnOnly: respawnOnly, CoordID: coordID})
 	resp := rcResponse{Outcome: out, Cmd: "up", Project: project}
 	if err != nil {
 		resp.Error = err.Error()

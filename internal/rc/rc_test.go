@@ -601,13 +601,13 @@ func TestSweepAllProjects_ReleasesStaleVersionDaemons(t *testing.T) {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	if err := WriteState(RecordedState{
-		Project:        "stale",
-		PID:            os.Getpid(),
-		HostID:         host,
-		WorkingDir:     "/tmp/stale",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.146", // older than 2.1.156
+		Project:       "stale",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/stale",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.146", // older than 2.1.156
 		OwningCoordID: "coord-live",
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
@@ -618,13 +618,13 @@ func TestSweepAllProjects_ReleasesStaleVersionDaemons(t *testing.T) {
 		t.Fatalf("WriteMarker healthy: %v", err)
 	}
 	if err := WriteState(RecordedState{
-		Project:        "healthy",
-		PID:            os.Getpid(),
-		HostID:         host,
-		WorkingDir:     "/tmp/healthy",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.156",
+		Project:       "healthy",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/healthy",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.156",
 		OwningCoordID: "coord-live",
 	}); err != nil {
 		t.Fatalf("WriteState healthy: %v", err)
@@ -669,13 +669,13 @@ func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
 		t.Fatalf("WriteMarker: %v", err)
 	}
 	if err := WriteState(RecordedState{
-		Project:        "orphan",
-		PID:            os.Getpid(),
-		HostID:         host,
-		WorkingDir:     "/tmp/orphan",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.156",
+		Project:       "orphan",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/orphan",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.156",
 		OwningCoordID: "dead-coord",
 	}); err != nil {
 		t.Fatalf("WriteState: %v", err)
@@ -793,13 +793,13 @@ func TestUp_SelfHeal_NoopForCurrentVersion(t *testing.T) {
 
 	host, _ := os.Hostname()
 	rec := RecordedState{
-		Project:        "demo",
-		PID:            os.Getpid(),
-		HostID:         host,
-		WorkingDir:     "/tmp/demo",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.156",
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.156",
 		OwningCoordID: "coord-live",
 	}
 	if err := WriteState(rec); err != nil {
@@ -843,13 +843,13 @@ func TestUp_SelfHeal_RespawnsOnStaleVersion(t *testing.T) {
 	host, _ := os.Hostname()
 	oldPID := os.Getpid()
 	rec := RecordedState{
-		Project:        "demo",
-		PID:            oldPID,
-		HostID:         host,
-		WorkingDir:     "/tmp/demo",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.146", // older
+		Project:       "demo",
+		PID:           oldPID,
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.146", // older
 		OwningCoordID: "coord-live",
 	}
 	if err := WriteState(rec); err != nil {
@@ -908,13 +908,13 @@ func TestUp_SelfHeal_RespawnsOnDeadOwner(t *testing.T) {
 	host, _ := os.Hostname()
 	oldPID := os.Getpid()
 	rec := RecordedState{
-		Project:        "demo",
-		PID:            oldPID,
-		HostID:         host,
-		WorkingDir:     "/tmp/demo",
-		SessionPrefix:  SessionPrefix,
-		LastSpawnAt:    time.Now().UTC(),
-		ClaudeVersion:  "2.1.156", // current
+		Project:       "demo",
+		PID:           oldPID,
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.156", // current
 		OwningCoordID: "dead-coord",
 	}
 	if err := WriteState(rec); err != nil {

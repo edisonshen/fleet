@@ -83,7 +83,7 @@ const (
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -294,6 +294,29 @@ type Deps struct {
 	// removeWorkerRecordDir.
 	RemoveWorkerRecord func(path string) error
 
+	// Orphan-rc-daemons (KindOrphanRCDaemons).
+	// ListRCDaemons enumerates live `claude remote-control
+	// --remote-control-session-name-prefix fleet-coord` PIDs (via
+	// pgrep) and the working_dir each is bound to (via lsof). Empty
+	// slice on hosts without pgrep — classifier becomes a no-op.
+	// Production wiring is listRCDaemonsOnDisk.
+	// leak-rc-daemon-lifecycle PR-B.
+	ListRCDaemons func() ([]RCDaemonInfo, error)
+	// ListRCStates enumerates every project's rc-state.json projected
+	// to the classifier's cross-check shape (PID + WorkingDir +
+	// ClaudeVersion + OwningCoordID). Production wiring is
+	// listRCStatesOnDisk.
+	ListRCStates func() ([]RCStateInfo, error)
+	// CurrentClaudeVersion reads `claude --version` so the classifier
+	// can detect stale-version daemons even when their PID matches a
+	// recorded state. Empty / err collapses to "skip the version
+	// branch" (PID-mismatch is still classified). Production wiring is
+	// currentClaudeVersionOnDisk.
+	CurrentClaudeVersion func() (string, error)
+	// KillRCDaemon sends SIGTERM with SIGKILL escalation to pid under
+	// --apply. Production wiring is killRCDaemonOnDisk.
+	KillRCDaemon func(pid int) error
+
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
 	// (unlike ListProjects, which already filters out invalid names) plus
@@ -448,6 +471,11 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("invalid-projects: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindOrphanRCDaemons) {
+		if err := reconcileOrphanRCDaemons(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("orphan-rc-daemons: %w", err))
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -477,6 +505,8 @@ func kindRank(k Kind) int {
 		return 5
 	case KindInvalidProjects:
 		return 6
+	case KindOrphanRCDaemons:
+		return 7
 	}
 	return 99
 }
@@ -840,6 +870,10 @@ func DefaultDeps() Deps {
 		ProjectHasTasks:       projectHasTasksNow,
 		QuarantineProjectDir:  quarantineProjectDir,
 		RestoreProjectDir:     restoreProjectDir,
+		ListRCDaemons:         listRCDaemonsOnDisk,
+		ListRCStates:          listRCStatesOnDisk,
+		CurrentClaudeVersion:  currentClaudeVersionOnDisk,
+		KillRCDaemon:          killRCDaemonOnDisk,
 	}
 }
 

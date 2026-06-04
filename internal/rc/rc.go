@@ -11,8 +11,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
+	"github.com/edisonshen/fleet/internal/tmux"
 	"github.com/edisonshen/fleet/internal/workers"
 )
 
@@ -37,6 +39,17 @@ const (
 	OutcomeAbsent          = "absent"
 	OutcomeContested       = "contested"
 	OutcomeError           = "error"
+
+	// OutcomeRespawnedStaleVersion / OutcomeRespawnedDeadOwner — emitted
+	// by Up's self-healing idempotent branch when the recorded daemon
+	// must be killed and replaced. leak-rc-daemon-lifecycle PR-B:
+	// before this, a stale-version daemon would return already_acquired
+	// forever and the old `claude remote-control` binary would live on
+	// across upgrades (5 daemons across 4 versions found during the
+	// 2026-05-29 OOM). Both are success codes; the CLI maps them the
+	// same as acquired (exit 0).
+	OutcomeRespawnedStaleVersion = "respawned-stale-version"
+	OutcomeRespawnedDeadOwner    = "respawned-dead-owner"
 )
 
 // UpOpts carries operator overrides for Up.
@@ -79,6 +92,14 @@ type UpOpts struct {
 	// idempotent fleet-rc-up shell-out NEVER auto-enables RC on a
 	// project the operator hasn't opted in to.
 	RespawnOnly bool
+
+	// CoordID is the agent ID of the coord invoking Up. Persisted in
+	// RecordedState.OwningCoordID so self-healing can detect a dead
+	// owner across coord crash/restart. Empty is allowed (legacy
+	// callers, manual `fleet rc up` invocations) — the state record
+	// keeps the field blank and dead-owner detection is skipped for
+	// that entry. leak-rc-daemon-lifecycle PR-B.
+	CoordID string
 }
 
 // State is the snapshot Status / Inspect return. Mirrors the
@@ -278,6 +299,16 @@ func Up(project string, opts UpOpts) (string, error) {
 		// listener AND emits a stderr diagnostic so the operator
 		// learns about the underlying state drift (surface, don't
 		// silo).
+		//
+		// Self-healing (leak-rc-daemon-lifecycle PR-B): even when
+		// the recorded daemon passes the PID + argv check, we now
+		// also check whether ClaudeVersion matches the current
+		// `claude --version` AND whether OwningCoordID is still
+		// alive. A version mismatch or dead owner triggers
+		// kill+respawn so superseded daemons (across upgrades) and
+		// orphaned daemons (after coord crash) self-heal on the
+		// next tick instead of living forever.
+		var healReason string // non-empty triggers respawn after spawn-side prep
 		if cur, err := ReadState(project); err == nil {
 			host, _ := os.Hostname()
 			if opts.AdoptIfFleetOwned && cur.PID > 0 && workers.IsAlive(cur.PID) && cur.HostID == host {
@@ -286,26 +317,44 @@ func Up(project string, opts UpOpts) (string, error) {
 					prefix = SessionPrefix
 				}
 				if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
-					// Ensure marker is present even if operator rm'd it
-					// while listener kept running (codex round 2: this
-					// is "re-up the marker, not the listener" semantics).
-					if !MarkerPresent(project) {
-						if _, err := state.EnsureProjectInitialized(project); err != nil {
-							return OutcomeError, err
+					// PID + argv verified — now apply the self-heal
+					// checks (version + owner). Both can short-circuit
+					// to a respawn below.
+					healReason = computeHealReason(cur)
+					if healReason == "" {
+						// Healthy daemon — adopt.
+						// Ensure marker is present even if operator rm'd it
+						// while listener kept running (codex round 2: this
+						// is "re-up the marker, not the listener" semantics).
+						if !MarkerPresent(project) {
+							if _, err := state.EnsureProjectInitialized(project); err != nil {
+								return OutcomeError, err
+							}
+							if err := WriteMarker(project); err != nil {
+								return OutcomeError, err
+							}
 						}
-						if err := WriteMarker(project); err != nil {
-							return OutcomeError, err
-						}
+						return OutcomeAlreadyAcquired, nil
 					}
-					return OutcomeAlreadyAcquired, nil
+					// Self-heal: surface what changed so the operator can
+					// see why we respawned (version drift / dead owner).
+					fmt.Fprintf(os.Stderr,
+						"rc.Up: project %q self-heal — %s; killing PID %d and respawning\n",
+						project, healReason, cur.PID)
+					killFn(cur.PID)
+					// Fall through to (5) fresh acquire path. Marker is
+					// already present; (5) re-publishes it idempotently
+					// and writes a fresh state.json with current version
+					// + new CoordID.
+				} else {
+					// argv/cwd mismatch — kernel PID reuse (possibly by
+					// another project's listener), external kill, or moved
+					// working_dir. Tell the operator what we observed
+					// before falling through to fresh spawn.
+					fmt.Fprintf(os.Stderr,
+						"rc.Up: project %q has recorded PID %d alive but does not match recorded session_prefix %q + working_dir %q; treating as dead and respawning (likely kernel PID reuse, cross-project reuse, or external kill)\n",
+						project, cur.PID, prefix, cur.WorkingDir)
 				}
-				// argv/cwd mismatch — kernel PID reuse (possibly by
-				// another project's listener), external kill, or moved
-				// working_dir. Tell the operator what we observed
-				// before falling through to fresh spawn.
-				fmt.Fprintf(os.Stderr,
-					"rc.Up: project %q has recorded PID %d alive but does not match recorded session_prefix %q + working_dir %q; treating as dead and respawning (likely kernel PID reuse, cross-project reuse, or external kill)\n",
-					project, cur.PID, prefix, cur.WorkingDir)
 			}
 		}
 
@@ -350,6 +399,11 @@ func Up(project string, opts UpOpts) (string, error) {
 			pid, spawnErr = activeSpawner(cwd)
 		}
 
+		// Capture current claude --version + owner ID for the new
+		// state record. Empty version is acceptable (degraded probe);
+		// the next tick will detect the empty value as stale and
+		// re-attempt the probe.
+		curVer, _ := claudeVersionFn()
 		rec := RecordedState{
 			Schema:        SchemaVersion,
 			Project:       project,
@@ -358,6 +412,8 @@ func Up(project string, opts UpOpts) (string, error) {
 			WorkingDir:    cwd,
 			SessionPrefix: SessionPrefix,
 			LastSpawnAt:   now,
+			ClaudeVersion: curVer,
+			OwningCoordID: opts.CoordID,
 		}
 		if spawnErr != nil {
 			rec.LastError = spawnErr.Error()
@@ -368,8 +424,55 @@ func Up(project string, opts UpOpts) (string, error) {
 		if spawnErr != nil {
 			return OutcomeError, spawnErr
 		}
-		return OutcomeAcquired, nil
+		// leak-rc-daemon-lifecycle PR-B: the self-healing path
+		// (healReason != "") falls through here after killing the
+		// stale daemon. Map healReason → outcome so the caller can
+		// observe what happened.
+		switch healReason {
+		case healReasonStaleVersion:
+			return OutcomeRespawnedStaleVersion, nil
+		case healReasonDeadOwner:
+			return OutcomeRespawnedDeadOwner, nil
+		default:
+			return OutcomeAcquired, nil
+		}
 	})
+}
+
+// healReason* are the internal labels for Up's self-healing branch.
+// computeHealReason returns one of these (or empty for "healthy").
+const (
+	healReasonStaleVersion = "stale claude version"
+	healReasonDeadOwner    = "owning coord is gone"
+)
+
+// computeHealReason inspects the recorded state against the current
+// claude binary version + owner liveness. Returns one of the
+// healReason* strings, or empty when the daemon is healthy (adopt).
+//
+// Empty recorded ClaudeVersion is treated as "always stale" so legacy
+// v1 records force one heal cycle which backfills the schema.
+//
+// Empty OwningCoordID skips the dead-owner check (legacy or
+// manually-invoked records without a coord hint).
+//
+// Probe failures collapse to "healthy" (no respawn) — better to leak
+// briefly than to kill a healthy daemon on a transient probe error.
+func computeHealReason(cur RecordedState) string {
+	// Version check.
+	curVer, err := claudeVersionFn()
+	if err == nil && curVer != "" {
+		// Legacy v1 record (empty recorded version) → force heal so the
+		// backfill happens once, on the next Up tick. Mismatch → heal.
+		if cur.ClaudeVersion == "" || cur.ClaudeVersion != curVer {
+			return healReasonStaleVersion
+		}
+	}
+	// Dead-owner check (skip on empty recorded owner).
+	if cur.OwningCoordID != "" && !ownerAliveFn(cur.OwningCoordID) {
+		return healReasonDeadOwner
+	}
+	return ""
 }
 
 // Down kills the local PID Fleet owns + removes marker + removes
@@ -556,21 +659,29 @@ func Reset(project string) (string, error) {
 	return Down(project)
 }
 
-// SweepAllProjects is the PR4 sweeper hook. Enumerates every
-// rc-state.json under ~/.fleet/projects/* and:
-//   - releases orphans (state alive but marker absent).
-//   - skips cross-host entries (host_id mismatch — unsafe to kill).
-//   - leaves alive+matching entries untouched.
+// SweepAllProjects is the cross-project reconcile hook. Enumerates
+// every rc-state.json under ~/.fleet/projects/* and reaps three
+// orphan classes:
+//
+//   - Marker-absent + live PID: operator removed the marker manually
+//     but the daemon kept running. Down it.
+//   - Stale-version daemon: recorded ClaudeVersion differs from current
+//     `claude --version` (or recorded version is empty / v1 legacy).
+//     Old daemons across upgrades — the 2026-05-29 OOM root cause.
+//   - Dead-owner daemon: recorded OwningCoordID has no live agent
+//     record / dead tmux session. Coord crashed without releasing.
+//
+// Skips cross-host entries (host_id mismatch — unsafe to kill).
+// Leaves alive + version-matching + owner-alive entries untouched.
 //
 // Never kills on prefix-only evidence; state.json must claim Fleet
-// ownership (codex round 3 free-form).
+// ownership (codex round 3 free-form). leak-rc-daemon-lifecycle PR-B
+// broadened from marker-absent only to the full three-class sweep
+// and wired it into fleet status via cmd/fleet/status.go.
 //
-// codex P2 (sweep-source correctness): the orphan-cleanup case we
-// most care about is exactly the one List() can't reach — marker
-// gone (=> List excludes it) but rc-state.json still on disk
-// pointing at a live PID. Iterate rc-state.json directly via
-// filepath.Glob so the sweeper actually sees the orphans it's
-// supposed to release.
+// codex P2 (sweep-source correctness): iterate rc-state.json directly
+// via filepath.Glob — List() filters marker-absent entries, which are
+// exactly the orphans we need to reach.
 func SweepAllProjects() error {
 	root, err := state.Root()
 	if err != nil {
@@ -594,12 +705,25 @@ func SweepAllProjects() error {
 		if cur.HostID != "" && cur.HostID != host {
 			continue
 		}
-		if !MarkerPresent(p) && cur.PID > 0 && workers.IsAlive(cur.PID) {
-			// Orphan: state says we own a live PID but the marker
-			// is gone (operator rm'd the marker manually). Down it.
-			if _, err := Down(p); err != nil {
-				continue
-			}
+		if cur.PID <= 0 || !workers.IsAlive(cur.PID) {
+			continue // recorded PID gone — sweeper has nothing to kill.
+		}
+		// Class 1: marker absent. Operator opted out manually; daemon
+		// kept running.
+		if !MarkerPresent(p) {
+			_, _ = Down(p)
+			continue
+		}
+		// Class 2/3: marker present, daemon alive — apply the same
+		// self-heal rubric Up uses. A stale version or dead owner
+		// means this daemon needs replacement; Down clears it so
+		// the next Up tick respawns under the current claude +
+		// fresh coord. Reuse computeHealReason for consistency.
+		if reason := computeHealReason(cur); reason != "" {
+			fmt.Fprintf(os.Stderr,
+				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d\n",
+				p, reason, cur.PID)
+			_, _ = Down(p)
 		}
 	}
 	return nil
@@ -744,6 +868,112 @@ func SetKillFnForTest(fn func(int)) func() {
 	prev := killFn
 	killFn = fn
 	return func() { killFn = prev }
+}
+
+// claudeVersionFn is the test seam for the self-healing version probe.
+// Production shells out to `claude --version` (cached for one Up call
+// via the package-level cache below). Tests stub to return a fixed
+// value so unit tests don't need a `claude` binary on PATH.
+//
+// leak-rc-daemon-lifecycle PR-B: the recorded daemon's ClaudeVersion
+// is compared to the current binary's version on every Up tick; a
+// mismatch triggers kill+respawn so the old daemon doesn't outlive
+// its claude install.
+var claudeVersionFn = defaultClaudeVersion
+
+// defaultClaudeVersion shells out to `claude --version` and returns
+// the trimmed first line. Errors collapse to ("", err) — the caller's
+// self-healing path falls back to "treat as stale" semantics so a
+// broken claude binary doesn't pin a stale daemon in place.
+//
+// The output shape from current claude CLI is a single line like:
+//
+//	2.1.156 (Claude Code)
+//
+// We split on whitespace and take the leading token; anything else is
+// treated as "unknown" (empty string).
+func defaultClaudeVersion() (string, error) {
+	bin, err := exec.LookPath("claude")
+	if err != nil {
+		return "", fmt.Errorf("claude binary not found on PATH: %w", err)
+	}
+	out, err := exec.Command(bin, "--version").Output()
+	if err != nil {
+		return "", fmt.Errorf("claude --version: %w", err)
+	}
+	line := strings.TrimSpace(string(out))
+	if line == "" {
+		return "", nil
+	}
+	// First whitespace-delimited token is the semver — anything after
+	// (e.g. "(Claude Code)") is metadata.
+	if i := strings.IndexAny(line, " \t"); i > 0 {
+		return line[:i], nil
+	}
+	return line, nil
+}
+
+// ownerAliveFn is the test seam for the owning-coord liveness probe.
+// Production: agent.Load(coordID) succeeds AND its TmuxSession is
+// alive on the current FLEET_TMUX_SOCKET. Tests stub to return true
+// for known-live IDs / false for known-dead IDs.
+//
+// leak-rc-daemon-lifecycle PR-B: when an RC daemon's owning coord
+// goes away (record archived, tmux session killed), the daemon
+// becomes an orphan — Up's self-healing path kills it and respawns
+// under the new caller.
+var ownerAliveFn = defaultOwnerAlive
+
+// defaultOwnerAlive checks whether the agent record for coordID is
+// present AND its TmuxSession is alive on the active tmux server.
+//
+// Conservative on errors: any probe failure collapses to "alive"
+// (return true) so a transient agent-dir read error doesn't trigger a
+// kill+respawn of a healthy daemon. The version probe is the load-
+// bearing self-heal signal; dead-owner is the secondary case.
+//
+// Empty coordID is treated as "alive" (skip dead-owner check) so
+// legacy v1 records and manual `fleet rc up` invocations without a
+// CoordID hint don't get respawned on every tick.
+func defaultOwnerAlive(coordID string) bool {
+	if coordID == "" {
+		return true
+	}
+	rec, err := agent.Load(coordID)
+	if err != nil {
+		// state.ErrNotFound is the only definitive dead-owner signal.
+		if errors.Is(err, state.ErrNotFound) {
+			return false
+		}
+		// Any other error (corrupt JSON, permission denied) — treat
+		// as alive to avoid flapping kill+respawn.
+		return true
+	}
+	if rec == nil || rec.TmuxSession == "" {
+		// Legacy record with no tmux session field — can't probe,
+		// treat as alive.
+		return true
+	}
+	alive, perr := tmux.SessionAlive(rec.TmuxSession)
+	if perr != nil {
+		return true // probe failure → conservative
+	}
+	return alive
+}
+
+// SetClaudeVersionFnForTest / SetOwnerAliveFnForTest are exported
+// stubs for cross-package tests (cmd/fleet/rc_test.go can swap them
+// to inject fixed values without shelling out).
+func SetClaudeVersionFnForTest(fn func() (string, error)) func() {
+	prev := claudeVersionFn
+	claudeVersionFn = fn
+	return func() { claudeVersionFn = prev }
+}
+
+func SetOwnerAliveFnForTest(fn func(coordID string) bool) func() {
+	prev := ownerAliveFn
+	ownerAliveFn = fn
+	return func() { ownerAliveFn = prev }
 }
 
 // pgrepDetect finds candidate listener PIDs via `pgrep -f
