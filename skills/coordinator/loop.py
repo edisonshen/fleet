@@ -5710,12 +5710,23 @@ def _reconcile_pr_watches(
         # worker register_subagent / terminal-release paths (no
         # worker_agent_ids entry, skipped by _iter_project_journals), so the
         # §6 lease resolution is the ONLY place that can reap it — fleet owns
-        # the lifecycle of what it creates. Best-effort: release never raises
-        # (it logs non-success outcomes); a failed release is a bounded
-        # journal/inbox file, not a correctness bug.
-        dispatch_mod.release_coord_prompt_inbox(
+        # the lifecycle of what it creates. release_coord_prompt_inbox never
+        # raises; SURFACE a non-success outcome to result.errors (codex
+        # iter-26 [P3]) so a transient `error`/failure is operator-visible
+        # rather than a silent journal/inbox leak (the lease is already
+        # cleared by the time we get here, so this is the only signal). The
+        # next PR-watch dispatch's acquire reuses a distinct fresh agent_id,
+        # so a leftover file is a bounded artifact, not a correctness bug —
+        # `fleet gc` is the durable sweep for any that slip through.
+        resp = dispatch_mod.release_coord_prompt_inbox(
             agent_id, fleet_bin=fleet_bin, fleet_home=fhome,
         )
+        oc = (resp or {}).get("outcome", "") if isinstance(resp, dict) else ""
+        if oc not in ("released", "already_released", "absent"):
+            result.errors.append(
+                f"pr-watch: release of journal/inbox for {agent_id} returned "
+                f"{oc or 'unknown'!r} — may leak; reap with `fleet gc`"
+            )
 
     staged_blocks: list[str] = []
     outcome = pr_watch_mod.reconcile_watches(
