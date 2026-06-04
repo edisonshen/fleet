@@ -1147,10 +1147,18 @@ def _tick_locked(
     # PR2 adds auto-rebase/fix dispatch + §6 action leases; PR1 watches +
     # surfaces + reconciles-on-merge only. Fail-soft: any exception is
     # logged to result.errors, never wedges the tick.
+    # Enrollment must see PRE-reconcile pr_urls: the legacy
+    # _reconcile_inflight path can CLEAR a red-CI task's pr_url + requeue
+    # it earlier this tick (and tasks.md was re-read since), so a fresh
+    # rollout with no pr-watches.json yet would otherwise never enroll
+    # that PR (codex iter-7 [P2]). We pass the pre-reconcile task
+    # snapshots for enrollment; refresh/probe/terminal still use the
+    # current `f.tasks`.
     try:
         _reconcile_pr_watches(
             f.tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
+            enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
@@ -5353,6 +5361,7 @@ def _reconcile_pr_watches(
     fleet_bin: str,
     state: dict,
     result,
+    enroll_tasks: list[parse.Task] | None = None,
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
     PR1). Hooks the pr_watch module into the tick:
@@ -5364,22 +5373,33 @@ def _reconcile_pr_watches(
         flip is the ONLY mutation, and it routes through `fleet` (the
         skill's single CLI seam) — pr_watch never shells out itself.
       - tick_count from coord-state drives the §3 adaptive probe cadence.
+      - enroll_tasks (default = `tasks`) is the PRE-reconcile snapshot used
+        for ENROLLMENT only; the legacy reconcile may have cleared a
+        red-CI task's pr_url earlier this tick, so enrolling from the
+        pre-clear snapshot keeps the durable watch from missing that PR on
+        a fresh rollout (codex iter-7 [P2]). refresh/probe/terminal use
+        the current `tasks`.
 
     Fail-soft throughout: a single flip failure leaves the MERGED watch
     un-pruned so the next tick re-reconciles (flip is idempotent); a
     transient probe failure retains the watch. raise-hand lines + notes
     are surfaced through result.errors so the operator sees them in
     `fleet status` (feedback_surface_dont_silo)."""
-    # Cheap early-out: a project with NO owned-PR task AND NO existing
-    # watch file has nothing to reconcile. Skip BEFORE any git/gh shell-out
+    if enroll_tasks is None:
+        enroll_tasks = tasks
+    # Cheap early-out: a project with NO owned-PR task (in EITHER the
+    # current or pre-reconcile snapshot) AND NO existing watch file has
+    # nothing to reconcile. Skip BEFORE any git/gh shell-out
     # (derive_owner_repo) so a worktree-free / PR-free tick stays
     # byte-identical to pre-watch behavior — no spurious `git remote`
     # call on every idle tick.
-    has_pr_task = any(
-        getattr(t, "pr_url", "") and getattr(t, "status", "") not in pr_watch_mod.TERMINAL_TASK_STATUSES
-        for t in tasks
-    )
-    if not has_pr_task and not pr_watch_mod.watch_path(project_dir).exists():
+    def _has_pr(ts):
+        return any(
+            getattr(t, "pr_url", "") and getattr(t, "status", "") not in pr_watch_mod.TERMINAL_TASK_STATUSES
+            for t in ts
+        )
+    if not _has_pr(tasks) and not _has_pr(enroll_tasks) \
+            and not pr_watch_mod.watch_path(project_dir).exists():
         return
 
     # Repo path: meta.json repo_path is authoritative (operator-set via
@@ -5408,6 +5428,7 @@ def _reconcile_pr_watches(
         now_iso=pr_watch_mod.utc_now_iso(),
         tick_count=tick_count,
         repo_path=repo_path,
+        enroll_tasks=enroll_tasks,
     )
 
     # Surface raise-hand events as operator-visible errors + count them as

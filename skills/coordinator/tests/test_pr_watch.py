@@ -173,6 +173,36 @@ def test_enrollment_recreates_after_watch_file_deletion(tmp_path: Path) -> None:
     assert "195" in pw.load_watches(tmp_path)["watches"]
 
 
+def test_enroll_from_pre_reconcile_when_url_cleared(tmp_path: Path) -> None:
+    """The legacy reconcile cleared a red-CI task's pr_url + requeued it
+    earlier this tick. On a fresh rollout (no watch file), enrolling from
+    the PRE-reconcile snapshot still captures the PR durably (codex iter-7
+    [P2])."""
+    # current task: requeued to todo, pr_url cleared.
+    current = [_task("foo", status="todo", pr_url="")]
+    # pre-reconcile snapshot: still in-review with the PR url.
+    pre = [_task("foo", status="in-review", pr_url=_pr_url(195), branch="worker/foo")]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="FAILURE",
+                                head_ref_oid="H")}
+
+    def _flip(slug):
+        pass
+
+    out = pw.reconcile_watches(
+        current, project="p", project_dir=tmp_path,
+        coord_owner_repo=OWNER_REPO, prober=FakeProber(snaps=snaps),
+        flip_task_done=_flip, now_iso="t", tick_count=1,
+        repo_path="/repo", enroll_tasks=pre,
+    )
+    assert out.enrolled == 1
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["pr_number"] == 195
+    # the just-cleared task is NOT a live backing task (refresh uses current).
+    assert w["tasks"] == []
+    # CI-failure still surfaced (durable watch tracks the PR).
+    assert w["last_event"] == pw.EVENT_CI_FAILED
+
+
 def test_terminal_task_not_enrolled(tmp_path: Path) -> None:
     """A done/abandoned task with a pr_url does NOT back a watch."""
     tasks = [_task("foo", status="done", pr_url=_pr_url(195))]

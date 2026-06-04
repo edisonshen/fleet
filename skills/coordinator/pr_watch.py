@@ -481,6 +481,7 @@ def reconcile_watches(
     tick_count: int,
     slow_cadence_ticks: int = _SLOW_CADENCE_TICKS_DEFAULT,
     repo_path: str = "",
+    enroll_tasks: list | None = None,
 ) -> WatchOutcome:
     """Run one PR-watch reconcile pass. Single writer = the tick (caller
     holds the coord flock). Returns a WatchOutcome the tick funnels into
@@ -514,23 +515,42 @@ def reconcile_watches(
     if coord_owner_repo is not None:
         coord_owner_repo = coord_owner_repo.lower()
 
+    if enroll_tasks is None:
+        enroll_tasks = tasks
+
+    def _owned(ts):
+        return [
+            t for t in ts
+            if getattr(t, "pr_url", "") and getattr(t, "status", "") not in TERMINAL_TASK_STATUSES
+        ]
+
     # --- 1. ENROLL: derive watches from durable task state (THIS coord's
     # project ONLY). Watch identity is the PR NUMBER, so two tasks
     # pointing at one PR collapse to one watch (dedupe-by-PR-number).
-    owned = [
-        t for t in tasks
-        if getattr(t, "pr_url", "") and getattr(t, "status", "") not in TERMINAL_TASK_STATUSES
+    #
+    # `owned` = current-snapshot owned tasks (drives refresh/orphan/probe).
+    # `enroll_owned` = current PLUS any pre-reconcile task with a pr_url
+    # that the legacy reconcile cleared earlier this tick (codex iter-7
+    # [P2]) — used ONLY to CREATE the watch so a fresh rollout doesn't miss
+    # a PR whose url was just cleared. A pre-reconcile dup of a current
+    # slug is dropped (current row is fresher).
+    owned = _owned(tasks)
+    current_slugs = {getattr(t, "slug", "") for t in owned}
+    enroll_owned = owned + [
+        t for t in _owned(enroll_tasks)
+        if getattr(t, "slug", "") not in current_slugs
     ]
-    # group owned by (owner_repo, pr_number); coord-scope assert per PR.
-    # `in_scope` is the subset of owned tasks that PASS the coord-scope
-    # assert — the §2 refresh loop below MUST use this, NOT raw `owned`,
-    # else a foreign-repo task that happens to share a PR number with an
-    # in-scope PR could become backing for the in-scope watch and get
-    # flipped done on merge (codex iter-1 [P2]).
+    # group enroll_owned by (owner_repo, pr_number); coord-scope assert per
+    # PR. `in_scope` is the subset of CURRENT owned tasks that PASS the
+    # coord-scope assert — the §2 refresh loop below MUST use this, NOT
+    # enroll_owned, else (a) a foreign-repo task sharing a PR number could
+    # become backing for the in-scope watch and get flipped done on merge
+    # (codex iter-1 [P2]), or (b) a just-cleared pre-reconcile task could
+    # wrongly keep tasks[] populated.
     by_pr: dict[int, list] = {}
     pr_meta: dict[int, tuple[str, str]] = {}  # pr_number -> (owner_repo, pr_url)
     in_scope: list = []
-    for t in owned:
+    for t in enroll_owned:
         parsed = parse_pr_url(getattr(t, "pr_url", ""))
         if parsed is None:
             continue
@@ -544,7 +564,11 @@ def reconcile_watches(
                 f"is not in this coord's repo {coord_owner_repo!r}; skipping (coord-scope)"
             )
             continue
-        in_scope.append(t)
+        # in_scope (drives refresh `live`) is CURRENT owned tasks only — a
+        # pre-reconcile-only task creates the watch but does NOT count as a
+        # live backing task.
+        if getattr(t, "slug", "") in current_slugs:
+            in_scope.append(t)
         by_pr.setdefault(pr_num, []).append(t)
         if pr_num not in pr_meta:
             pr_meta[pr_num] = (owner_repo, getattr(t, "pr_url", ""))
