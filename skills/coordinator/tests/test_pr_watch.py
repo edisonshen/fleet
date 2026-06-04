@@ -654,6 +654,22 @@ def test_foreign_repo_same_pr_number_not_backing(tmp_path: Path) -> None:
     assert out.tasks_flipped == 1
 
 
+def test_no_orphan_on_transient_probe_failure(tmp_path: Path) -> None:
+    """A transient probe failure on an empty-tasks OPEN watch must NOT
+    false-orphan — the PR wasn't observed this tick (it may have
+    merged/closed during the outage) (codex iter-18 [P2])."""
+    # seed an OPEN watch (prev snapshot OPEN) with empty tasks.
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}
+    doc["watches"]["195"]["last_snapshot"] = {"pr_state": "OPEN"}
+    pw.save_watches(tmp_path, doc)
+    # transient repo failure this tick.
+    out = _run([], tmp_path, FakeProber(repo_error="HTTP 502"), tick_count=2)
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w.get("orphaned") in (False, None)        # NOT orphaned
+    assert not any("orphaned-pr" in r for r in out.raises)
+    assert any("transient" in e for e in out.errors)
+
+
 def test_orphan_cleared_when_task_reacquired(tmp_path: Path) -> None:
     """A task re-appearing for an orphaned watch clears the orphan flag."""
     doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}

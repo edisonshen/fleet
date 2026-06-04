@@ -686,7 +686,7 @@ def reconcile_watches(
             continue
         snap = w.get("last_snapshot")
         probed_open_now = (
-            w.get("last_probe_at") == now_iso
+            w.get("_probed_ok_at") == now_iso       # SUCCESSFUL probe this tick
             and isinstance(snap, dict)
             and (snap.get("pr_state") or "").upper() == "OPEN"
         )
@@ -905,6 +905,12 @@ def _apply_probe(
             "up_to_date": head_contains_base,
         }
         w["last_event"] = event
+        # SUCCESSFUL-reduce marker (codex iter-18 [P2]): only set on a real
+        # snapshot reduction, NOT on a transient failure (which still
+        # stamps last_probe_at for backoff bookkeeping). The orphan pass
+        # gates on THIS so a probe outage can't false-orphan a watch whose
+        # PR may have merged/closed during the blip.
+        w["_probed_ok_at"] = now_iso
 
         if event == EVENT_MERGED:
             w["state"] = STATE_MERGED
