@@ -1488,7 +1488,7 @@ def _changes_snap(n, head="HEAD1"):
 
 def _run2(tasks, project_dir, prober, *, dispatch=None, agent_outcome=None,
           deps_done=None, owner_repo=OWNER_REPO, now="2026-06-03T08:00:00Z",
-          tick_count=1, slow=5, flips=None):
+          tick_count=1, slow=5, flips=None, enroll=None, release=None):
     """reconcile_watches WITH the PR2 auto-fix seam wired."""
     def _flip(slug, pr_url=""):
         if flips is not None:
@@ -1498,9 +1498,11 @@ def _run2(tasks, project_dir, prober, *, dispatch=None, agent_outcome=None,
         coord_owner_repo=owner_repo, prober=prober,
         flip_task_done=_flip, now_iso=now, tick_count=tick_count,
         slow_cadence_ticks=slow, repo_path="/repo",
+        enroll_tasks=enroll,
         dispatch_action=dispatch or _DispatchRecorder(),
         agent_outcome=agent_outcome or (lambda _aid: "running"),
         deps_done=deps_done or (lambda _deps: True),
+        release_action=release,
     )
 
 
@@ -1725,6 +1727,57 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
                  agent_outcome=lambda _aid: "gone")
     assert out3.dispatched == 0
     assert not any("BLOCKED" in r for r in out3.raises)
+
+
+def test_preserved_todo_slug_not_auto_fixed(tmp_path: Path) -> None:
+    """A watch backed ONLY by a preserved CI-red-requeued `todo` slug (its
+    pr_url cleared, kept for old-PR-merge reconcile) is NOT auto-fixed
+    (codex iter-7 [P2]) — that retry rides the normal cap'd worker path."""
+    # tick 1: enroll the watch while the task still has the PR url.
+    pre = [_task("a", status="in-review", pr_url=_pr_url(195), branch="worker/a")]
+    pw.reconcile_watches(
+        pre, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                          fresh_base="B", ancestors=set()),
+        flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=1, repo_path="/repo",
+    )
+    # tick 2: task 'a' is now a preserved todo (no pr_url); PR still CI-red.
+    current = [_task("a", status="todo", pr_url="", branch="worker/a")]
+    disp = _DispatchRecorder()
+    out = _run2(current, tmp_path, FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                                              fresh_base="B", ancestors=set()),
+                dispatch=disp, tick_count=2, enroll=pre)
+    assert out.dispatched == 0
+    assert disp.calls == []
+
+
+def test_running_lease_released_when_pr_merges(tmp_path: Path) -> None:
+    """A PR that MERGES while a fixer lease is still running -> the lease's
+    journal+inbox are released before the terminal prune (codex iter-7
+    [P3]) — no pr-* journal leak."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: CI fail -> dispatch fix (lease running).
+    p1 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                    fresh_base="B", ancestors=set())
+    _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
+    leased = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]["agent_id"]
+    # tick 2: PR merges while the fixer is still running.
+    p2 = FakeProber(snaps={195: pw.PRSnapshot(number=195, pr_state="MERGED",
+                                              merged_at="t", head_ref_oid="H1",
+                                              base_ref_name="main")},
+                    fresh_base="B", ancestors=set())
+    released: list[str] = []
+    pw.reconcile_watches(
+        tasks, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=p2, flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=2, repo_path="/repo",
+        dispatch_action=disp, agent_outcome=lambda _a: "running",
+        deps_done=lambda _d: True, release_action=lambda aid: released.append(aid),
+    )
+    assert leased in released  # journal released before prune
+    assert "195" not in pw.load_watches(tmp_path)["watches"]  # pruned
 
 
 def test_no_action_on_stale_probe_tick(tmp_path: Path) -> None:

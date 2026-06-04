@@ -1527,6 +1527,41 @@ def _apply_probe(
                     )
 
 
+def _reclaim_and_release(
+    watch: dict,
+    pr_num: int,
+    *,
+    tick_count: int,
+    current_head: str,
+    agent_outcome: Callable[[str], str],
+    release_action: "Callable[[str], None] | None",
+    out: WatchOutcome,
+) -> None:
+    """Resolve the watch's in-flight lease (§6) AND release its journal +
+    inbox if the lease left `running` this tick (codex iter-6/7 [P2]).
+
+    A PR-watch dispatch journal (kind pr-*) is invisible to the worker
+    register_subagent / terminal-release paths, so the §6 lease resolution
+    is the ONLY place that reaps it — fleet owns the lifecycle of what it
+    creates. Best-effort release: never raises (logged to out.errors)."""
+    prev_inflight = watch.get("inflight_action")
+    prev_agent = ""
+    if isinstance(prev_inflight, dict) and prev_inflight.get("outcome") == OUTCOME_RUNNING:
+        prev_agent = str(prev_inflight.get("agent_id", "") or "")
+    rec_note, _rec_raise = _reclaim_lease(
+        watch, tick_count=tick_count, current_head=current_head,
+        agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
+        agent_outcome=agent_outcome,
+    )
+    if rec_note:
+        out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
+    if prev_agent and watch.get("inflight_action") is None and release_action is not None:
+        try:
+            release_action(prev_agent)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never wedge
+            out.errors.append(f"pr-watch: release {prev_agent}: {exc}")
+
+
 def _dispatch_actions(
     watches: dict,
     *,
@@ -1573,6 +1608,22 @@ def _dispatch_actions(
         task_status[slug] = getattr(t, "status", "")
         task_deps_map[slug] = list(getattr(t, "depends_on", []) or [])
 
+    # PR numbers with a LIVE, CURRENT backing task — i.e. a non-terminal task
+    # whose pr_url STILL points at the PR (codex iter-7 [P2]). A watch's
+    # tasks[] can carry a PRESERVED slug (a CI-red-requeued `todo` row whose
+    # pr_url was cleared) that exists ONLY so an old-PR merge reconciles it —
+    # that row is NOT a dispatchable backer (its retry rides the normal
+    # cap'd worker path, NOT a PR-watch fixer; dispatching here would double-
+    # work the same branch). Auto-fix fires ONLY for a PR that still has a
+    # live PR-pointing task.
+    live_pr_backed: set = set()
+    for t in tasks:
+        if getattr(t, "status", "") in TERMINAL_TASK_STATUSES:
+            continue
+        parsed = parse_pr_url(getattr(t, "pr_url", ""))
+        if parsed is not None:
+            live_pr_backed.add(parsed[1])
+
     def _task_deps(slug: str) -> list:
         return task_deps_map.get(slug, [])
 
@@ -1592,6 +1643,25 @@ def _dispatch_actions(
     for key in list(watches.keys()):
         w = watches[key]
         if w.get("state") != STATE_OPEN:
+            # A watch that went TERMINAL (MERGED / CLOSED) this tick with a
+            # still-`running` lease must release that lease's journal+inbox
+            # BEFORE the §5 prune deletes the watch (codex iter-7 [P3]):
+            # the dispatch loop skips non-OPEN watches, and worker replay
+            # skips pr-* journals, so this is the only reap point — else the
+            # pr-* journal/inbox leaks forever when a PR merges mid-fix.
+            try:
+                pr_num_t = int(w.get("pr_number", key))
+            except (TypeError, ValueError):
+                pr_num_t = 0
+            inflight = w.get("inflight_action")
+            if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
+                agent = str(inflight.get("agent_id", "") or "")
+                w["inflight_action"] = None
+                if agent and release_action is not None:
+                    try:
+                        release_action(agent)
+                    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                        out.errors.append(f"pr-watch: release {agent}: {exc}")
             continue
         # NEVER auto-dispatch on an ORPHANED / unbacked watch (codex iter-3
         # [P1]). A watch that lost all backing tasks but whose PR is still
@@ -1621,33 +1691,32 @@ def _dispatch_actions(
             pr_num = int(w.get("pr_number", key))
         except (TypeError, ValueError):
             continue
+        # Only auto-fix a PR that still has a LIVE PR-pointing task (codex
+        # iter-7 [P2]). A watch backed solely by a preserved CI-red-requeued
+        # `todo` slug (pr_url cleared, kept only for old-PR-merge reconcile)
+        # is NOT dispatchable here — its retry rides the normal cap'd worker
+        # path. The lease (if any) is still reclaimed below before this gate
+        # so a resolved lease's journal gets released, but no NEW action is
+        # dispatched for a non-PR-backed watch.
+        if pr_num not in live_pr_backed:
+            # still reclaim a resolved lease (release its journal) but never
+            # dispatch a fresh action.
+            _reclaim_and_release(
+                w, pr_num, tick_count=tick_count, current_head=_watch_head(w),
+                agent_outcome=agent_outcome, release_action=release_action, out=out,
+            )
+            continue
         head = _watch_head(w)
         if not head:
             continue
 
         # 1. reclaim/resolve the in-flight lease (blocked / head-moved /
-        # dead agent / expiry; terminal -> ledger). Capture the prior lease's
-        # agent_id so we can RELEASE its journal + inbox once the lease leaves
-        # `running` (codex iter-6 [P2]: a PR-watch journal is invisible to
-        # the worker register_subagent/release paths, so without this it
-        # leaks in launch_attempted forever — cleanup is the tool's job).
-        prev_inflight = w.get("inflight_action")
-        prev_agent = ""
-        if isinstance(prev_inflight, dict) and prev_inflight.get("outcome") == OUTCOME_RUNNING:
-            prev_agent = str(prev_inflight.get("agent_id", "") or "")
-        rec_note, _rec_raise = _reclaim_lease(
-            w, tick_count=tick_count, current_head=head,
-            agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
-            agent_outcome=agent_outcome,
+        # dead agent / expiry; terminal -> ledger) + release a resolved
+        # lease's journal+inbox.
+        _reclaim_and_release(
+            w, pr_num, tick_count=tick_count, current_head=head,
+            agent_outcome=agent_outcome, release_action=release_action, out=out,
         )
-        if rec_note:
-            out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
-        # lease left `running` (cleared this tick) -> release its journal+inbox.
-        if prev_agent and w.get("inflight_action") is None and release_action is not None:
-            try:
-                release_action(prev_agent)
-            except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never wedge
-                out.errors.append(f"pr-watch: release {prev_agent}: {exc}")
         # 2. keep the dispatched_events ledger bounded.
         _prune_dispatched_events(w, head)
 
