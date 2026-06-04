@@ -949,19 +949,22 @@ class GhGitProber:
         # head set comes from here.
         result.snapshots = self._query_batch(owner, name, pr_numbers)
 
-        # 2. ONE git fetch of EVERY distinct base ref the PRs target
-        # (codex iter-3 [P2]: a stacked PR's base may not be `base_ref` —
-        # measure each PR against its OWN base) + every current head OID
-        # not already local, so the ancestor check runs against FRESH,
-        # locally-present SHAs (codex iter-1 [P1]: a plain `git fetch
-        # origin main` leaves the tip in FETCH_HEAD and never fetches the
-        # PR heads). We fetch each base into its tracking ref explicitly
-        # and rev-parse THOSE (not FETCH_HEAD, which the head fetches
-        # would clobber). Still ONE fetch shell-out for the whole repo.
+        # 2. ONE git fetch of EVERY distinct base ref the PRs ACTUALLY
+        # target (codex iter-3 [P2]: a stacked PR's base may differ;
+        # codex iter-5 [P2]: derive bases from the PRs' real baseRefName,
+        # NOT a hard-coded `main` hint — fetching a synthetic `main` that
+        # doesn't exist fails the WHOLE fetch and starves every PR) +
+        # every current head OID not already local, so the ancestor check
+        # runs against FRESH, locally-present SHAs (codex iter-1 [P1]: a
+        # plain `git fetch origin main` leaves the tip in FETCH_HEAD and
+        # never fetches the PR heads). One fetch shell-out per repo.
         base_refs = sorted({
-            r for r in ([base_ref] + [s.base_ref_name for s in result.snapshots.values()])
-            if r
+            s.base_ref_name for s in result.snapshots.values() if s.base_ref_name
         })
+        # Fallback to the caller's hint ONLY when no PR reported a base
+        # (e.g. every PR 404'd) — keeps the legacy single-base path working.
+        if not base_refs and base_ref:
+            base_refs = [base_ref]
         if repo_path and base_refs:
             want_heads = [
                 s.head_ref_oid for s in result.snapshots.values()
@@ -982,7 +985,12 @@ class GhGitProber:
                         sha = self._rev_parse(repo_path, f"refs/remotes/origin/{r}")
                         if sha:
                             result.fresh_base_shas[r] = sha
-                    result.fresh_base_sha = result.fresh_base_shas.get(base_ref, "")
+                    # default base sha = the caller's hint if fetched, else
+                    # any fetched base (per-PR checks use base_sha_for()).
+                    result.fresh_base_sha = (
+                        result.fresh_base_shas.get(base_ref)
+                        or next(iter(result.fresh_base_shas.values()), "")
+                    )
                 else:
                     # transient fetch failure -> surface so _apply_probe
                     # backs off instead of recording a misleading OPEN

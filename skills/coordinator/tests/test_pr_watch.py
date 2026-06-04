@@ -791,6 +791,34 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
     assert rp.snapshots[5].checks == "SUCCESS"
 
 
+def test_ghgit_prober_fetches_only_real_base_not_synthetic_main(monkeypatch) -> None:
+    """The fetch targets the PR's REAL baseRefName, never a synthetic
+    `main` hint that may not exist (codex iter-5 [P2]). A repo whose PR
+    targets `trunk` must fetch trunk, not main."""
+    calls = []
+    resp = json.dumps({"data": {"repository": {"pr7": {
+        "number": 7, "state": "OPEN", "headRefOid": "H7", "baseRefOid": "B",
+        "baseRefName": "trunk", "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED", "commits": {"nodes": []}}}}})
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _FakeProc(0, resp)
+        if "rev-parse" in cmd:
+            return _FakeProc(0, "TRUNKSHA\n")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(pw.subprocess, "run", fake_run)
+    # caller hint is "main" but the PR targets "trunk".
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [7], [])
+    fetch_cmd = next(c for c in calls if "fetch" in c)
+    assert "refs/heads/trunk:refs/remotes/origin/trunk" in fetch_cmd
+    # the synthetic main hint is NOT fetched (it may not exist).
+    assert "refs/heads/main:refs/remotes/origin/main" not in fetch_cmd
+    assert rp.fresh_base_shas.get("trunk") == "TRUNKSHA"
+
+
 def test_ghgit_prober_null_pr_is_not_found(monkeypatch) -> None:
     resp = json.dumps({"data": {"repository": {"pr9": None}}})
     monkeypatch.setattr(pw.subprocess, "run",
