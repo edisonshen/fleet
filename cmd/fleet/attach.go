@@ -437,13 +437,24 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	}
 	if staleID != "" {
 		if staleFromRecord {
-			if err := gcOrphanAgentsFnVar(project); err != nil {
-				return newSystemError(70, fmt.Sprintf(
-					"gc --kinds=orphan-agents --project %s failed: %v — re-run `fleet gc --apply --kinds=orphan-agents --project %s` manually",
-					project, err, project))
-			}
+			// Codex review iter-8 P1: do NOT archive the dead record
+			// here. dispatch --coord-spawn's own recovery path
+			// (findRecoveryCandidate) needs the live record on disk so
+			// it can synth a handoff doc inheriting cwd / engine /
+			// command from the dead coord. Pre-reaping severs that
+			// continuity and forces a fresh spawn that loses the
+			// operator's recovery context.
+			//
+			// dispatch archives the dead record itself as part of the
+			// recovery flow (post-synth-handoff). Path C just needs to
+			// dispatch and trust the established recovery surface.
 		} else {
-			// Path C': single-session kill instead of host-wide gc.
+			// Path C': single-session kill. dispatch's recovery probe
+			// won't help here (no live record to inherit from), and the
+			// orphan tmux session would just keep lingering. Kill it
+			// explicitly before spawning so the new coord's
+			// fleet-<newID> doesn't collide with the orphan in tmux's
+			// session list.
 			if err := killTmuxSessionFnVar(tmux.SessionName(staleID)); err != nil {
 				return newSystemError(70, fmt.Sprintf(
 					"tmux kill-session %s failed: %v — re-run `tmux kill-session -t %s` manually then retry attach",
@@ -456,9 +467,19 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch --coord-spawn --project %s` manually",
 				project, derr, project))
 		}
+		// Path C now says "recovered" instead of "reaped" because the
+		// reap is delegated to dispatch's recovery flow (which inherits
+		// cwd/engine). Path C' still reads "reaped stale" because we
+		// killed the orphan session ourselves.
+		var verb string
+		if staleFromRecord {
+			verb = "recovered"
+		} else {
+			verb = "reaped stale"
+		}
 		_, _ = fmt.Fprintf(opts.Stderr,
-			"%s: reaped stale %s; spawned %s for %s; attaching\n",
-			token, staleID, newID, project)
+			"%s: %s %s; spawned %s for %s; attaching\n",
+			token, verb, staleID, newID, project)
 		return attachSpawnedSession(token, project, newID, opts)
 	}
 	// Path D: no coord at all → spawn fresh.
@@ -490,9 +511,13 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 	session := tmux.SessionName(newID)
 	if alive, probeErr := sessionProbeFnVar(session); probeErr == nil && !alive {
+		// Codex review iter-8 P2: substitute the actual token so the
+		// retry command is copy-pasteable. The placeholder `<token>`
+		// would have left the operator with a literal-string command
+		// that fails arg parsing.
 		return newSystemError(70, fmt.Sprintf(
-			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach <token> --project %s` (or `fleet dispatch --coord-spawn --project %s`) to retry; check ~/.fleet/agents/%s.json for clues",
-			project, session, project, project, newID))
+			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` (or `fleet dispatch --coord-spawn --project %s`) to retry; check ~/.fleet/agents/%s.json for clues",
+			project, session, token, project, project, newID))
 	}
 	return attachFnVar(session)
 }
@@ -678,7 +703,6 @@ var (
 	listSessionsFnVar    = tmux.ListSessions
 	tmuxAvailableFnVar   = tmux.Available
 	coordSpawnFnVar      = shellCoordSpawn
-	gcOrphanAgentsFnVar  = shellGCOrphanAgents
 	killTmuxSessionFnVar = tmux.Kill
 )
 
@@ -771,33 +795,6 @@ func shellCoordSpawn(project string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("could not parse coord ID from dispatch output: %q", out)
-}
-
-// shellGCOrphanAgents runs `fleet gc --apply --kinds=orphan-agents
-// --project <p>`. Codex review iter-5 P1: the previous version invoked
-// `gc --apply --aggressive --project <p>` (all kinds, default kinds set),
-// but gc's orphan-tmux pass is NOT project-scoped — it would have killed
-// orphan fleet-* sessions belonging to OTHER projects on the same host.
-// Scoping to orphan-agents alone keeps the reap project-local: that pass
-// honors opts.Project and only archives records whose Project field
-// matches.
-//
-// --aggressive is intentionally dropped: orphan-agents doesn't need it
-// (it's the default-enabled kind), and removing it eliminates the
-// orphan-tmux opt-in entirely from this shell-out.
-func shellGCOrphanAgents(project string) error {
-	self, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locate self binary: %w", err)
-	}
-	cmd := exec.Command(self, "gc", "--apply", "--kinds=orphan-agents", "--project", project)
-	cmd.Env = os.Environ()
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
-	}
-	return nil
 }
 
 // isAgentIDShape mirrors internal/projectlookup.isAgentIDShape (kept

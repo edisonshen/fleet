@@ -84,13 +84,13 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 		s.aliveSessions["fleet-"+s.newSpawnID] = true
 		return s.newSpawnID, nil
 	}
-	prevGC := gcOrphanAgentsFnVar
-	gcOrphanAgentsFnVar = func(project string) error {
-		s.gcCalls = append(s.gcCalls, project)
-		return nil
-	}
 	// Path C' (orphan tmux) uses a direct tmux kill — record those too
 	// so tests can distinguish single-session kill from gc invocation.
+	// Path C (stale record) no longer calls gc at all (codex iter-8 P1
+	// — dispatch's findRecoveryCandidate needs the live record to
+	// inherit cwd/engine from; pre-archiving severs that). gcCalls left
+	// in the struct so a regression that re-introduces a gc shell-out is
+	// caught by F6/F7 assertions, but no production seam writes to it.
 	prevKill := killTmuxSessionFnVar
 	killTmuxSessionFnVar = func(session string) error {
 		s.killedSessions = append(s.killedSessions, session)
@@ -134,7 +134,6 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	t.Cleanup(func() {
 		attachFnVar = prevAttach
 		coordSpawnFnVar = prevDispatch
-		gcOrphanAgentsFnVar = prevGC
 		killTmuxSessionFnVar = prevKill
 		sessionAliveFnVar = prevSessionAlive
 		sessionProbeFnVar = prevSessionProbe
@@ -327,11 +326,17 @@ func TestF6_ProjectFlag_StaleCoord_ReapsAndRespawns(t *testing.T) {
 		t.Fatalf("F6: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "foo: reaped stale staleeee; spawned newcoord for projects-fleet; attaching") {
+	// Codex iter-8 P1: Path C delegates the archive to dispatch's
+	// recovery flow (findRecoveryCandidate). The verb changes from
+	// "reaped stale" to "recovered" to reflect that the dead record
+	// stays on disk for dispatch to inherit cwd/engine from. NO gc
+	// invocation here — dispatch archives it after writing the synth
+	// handoff doc.
+	if !strings.Contains(got, "foo: recovered staleeee; spawned newcoord for projects-fleet; attaching") {
 		t.Errorf("F6 stderr: %q", got)
 	}
-	if len(s.gcCalls) != 1 || s.gcCalls[0] != "projects-fleet" {
-		t.Errorf("F6: expected one gc call for projects-fleet, got %v", s.gcCalls)
+	if len(s.gcCalls) != 0 {
+		t.Errorf("F6: Path C must NOT pre-archive (dispatch needs the live record for recovery); got gc calls %v", s.gcCalls)
 	}
 	if len(s.dispatched) != 1 || s.dispatched[0] != "projects-fleet" {
 		t.Errorf("F6: expected one coord-spawn for projects-fleet, got %v", s.dispatched)
@@ -871,6 +876,15 @@ func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
 	// Must surface a concrete retry command (surface-don't-silo).
 	if !strings.Contains(err.Error(), "re-run") {
 		t.Errorf("err must surface next-step retry command: %q", err.Error())
+	}
+	// Codex iter-8 P2: retry command must embed the actual token, not
+	// the literal placeholder `<token>` (would fail arg parsing on
+	// copy-paste).
+	if strings.Contains(err.Error(), "<token>") {
+		t.Errorf("err must NOT contain literal `<token>` placeholder: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "attach foo") {
+		t.Errorf("err must embed the actual token in the retry command (`attach foo`): %q", err.Error())
 	}
 	if ec := ExitCodeFor(err); ec != 70 {
 		t.Errorf("ExitCodeFor(spawn session dead): got %d want 70", ec)
