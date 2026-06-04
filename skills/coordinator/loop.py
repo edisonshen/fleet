@@ -1185,6 +1185,7 @@ def _tick_locked(
         result.errors.append(f"pr-watch tasks re-read: {exc}")
         watch_tasks = f.tasks
     _n_blocks_before_pr_watch = len(result.dispatch_instructions)
+    _n_raised_before_pr_watch = result.raised
     try:
         _reconcile_pr_watches(
             watch_tasks, project=project, project_dir=project_dir,
@@ -1194,14 +1195,18 @@ def _tick_locked(
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
-    # Did the initial PR-watch pass STAGE a DISPATCH block? If so we must
-    # NOT enter the long-running supervisor (codex iter-18 [P1]) — it would
-    # hold the lock for the whole session while the block sits unprinted +
-    # the lease stays `running` with no Agent launched. main() prints the
-    # blocks the moment tick() returns, so skipping the supervisor flushes
-    # them immediately; the next tick re-enters the supervisor.
+    # Did the initial PR-watch pass STAGE a DISPATCH block OR RAISE an
+    # operator-actionable event? If so we must NOT enter the long-running
+    # supervisor (codex iter-18 [P1] / iter-28 [P2]) — it would hold the lock
+    # for the whole session while the block/alert sits unprinted (a staged
+    # block's lease stays `running` with no Agent launched; a raise — closed-
+    # unmerged / orphan / blocked / ambiguous-rebase — is exactly the alert
+    # PR-watch exists to surface). main() prints both the moment tick()
+    # returns, so skipping the supervisor flushes them immediately; the next
+    # tick re-enters the supervisor.
     _pr_watch_staged_dispatch = (
         len(result.dispatch_instructions) > _n_blocks_before_pr_watch
+        or result.raised > _n_raised_before_pr_watch
     )
 
     # 5.7. Worktree-GC backstop (DESIGN-coord-worktree-lifecycle §4.4).
@@ -1620,6 +1625,7 @@ def _run_supervisor(
         # cleared a red PR's pr_url) and run the SAME reconcile the primary
         # tick runs. Fail-soft.
         n_blocks_before = len(result.dispatch_instructions)
+        n_raised_before = result.raised
         try:
             f_pw = parse.read(str(tasks_path))
             # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]).
@@ -1648,10 +1654,18 @@ def _run_supervisor(
             )
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
-        pr_watch_dispatched = len(result.dispatch_instructions) > n_blocks_before
-        # Signal the supervisor to exit + flush if PR-watch staged a block
-        # (codex iter-17 [P1]): a persisted running lease with no launched
-        # Agent must not sit for the rest of the session.
+        # Signal the supervisor to exit + flush if PR-watch staged a DISPATCH
+        # block (codex iter-17 [P1]) OR raised an operator-actionable event
+        # (codex iter-28 [P2]: closed-unmerged / orphan / blocked / ambiguous
+        # rebase). Both must reach the coord promptly — a staged block's lease
+        # is running with no Agent launched, and a raise is the alert PR-watch
+        # exists to surface; holding either until the session ends defeats the
+        # feature. main() prints result.dispatch_instructions + result.errors
+        # the moment tick() returns.
+        pr_watch_dispatched = (
+            len(result.dispatch_instructions) > n_blocks_before
+            or result.raised > n_raised_before
+        )
         return pr_watch_dispatched
 
     def write_state_hook():

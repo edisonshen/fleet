@@ -2524,3 +2524,40 @@ def test_pending_journal_reclaimed_promptly(
             redispatched = True
             break
     assert redispatched, "pending (unlaunched) journal should be reclaimed + re-dispatched"
+
+
+def test_raise_only_event_skips_supervisor_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A raise-only PR-watch event (CLOSED-unmerged) on the initial tick
+    flushes promptly: the tick does NOT enter the long-running supervisor
+    so the alert reaches the coord now, not at session end (codex iter-28
+    [P2])."""
+    _write_tasks(it_project_dir, [_it_task("foo", status="in-review",
+                                           pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="CLOSED",
+                                head_ref_oid="H195", base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+    # force the supervisor "enabled" so the skip-on-raise gate is what
+    # prevents entry (not poll_interval_s<=0).
+    monkeypatch.setenv("FLEET_COORD_POLL_INTERVAL_S", "30")
+    sup_called = {"n": 0}
+    orig_sup = loop._run_supervisor
+    def _spy(*a, **k):
+        sup_called["n"] += 1
+        return orig_sup(*a, **k)
+    monkeypatch.setattr(loop, "_run_supervisor", _spy)
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        result = loop.tick("fleet", coord_id="cccccc01", cwd="/repo",
+                           fleet_home=str(it_home))
+    # the closed-unmerged raise surfaced...
+    assert result.raised >= 1
+    assert any("CLOSED" in e for e in result.errors)
+    # ...and the supervisor was NOT entered (alert flushes immediately).
+    assert sup_called["n"] == 0
