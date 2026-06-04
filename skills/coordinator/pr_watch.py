@@ -1420,13 +1420,48 @@ def _rollup_state_to_verdict(state: str) -> str:
 # Coord-own-repo derivation (coord-scope assert source, §2)
 # ----------------------------------------------------------------------
 
-# Owner is a path segment (no slash); repo allows dots (GitHub repo names
-# may contain `.`, e.g. `owner/foo.bar`). We strip an optional trailing
-# `.git` + `/` FIRST (below), then this matches the last two segments so a
-# dotted repo name is preserved (codex iter-1 [P2]).
-_REMOTE_URL_RE = re.compile(
-    r"(?:^|//|@)github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
-)
+# owner/repo[/...] tail of a remote URL path. repo allows dots (GitHub
+# repo names may contain `.`, e.g. `owner/foo.bar`, codex iter-1 [P2]).
+_REMOTE_PATH_RE = re.compile(r"^/?(?P<owner>[^/]+)/(?P<repo>[^/]+?)/?$")
+# scp-style remote: [user@]github.com[:port-not-valid-here]:owner/repo.
+# (git scp syntax has no port; ssh:// with a port goes through urlparse.)
+_REMOTE_SCP_RE = re.compile(r"^(?:[^/@]+@)?github\.com:(?P<path>.+)$")
+
+
+def parse_remote_owner_repo(url: str) -> str | None:
+    """Parse "<owner>/<repo>" (lowercased) from a GitHub remote URL, or
+    None. Validates github.com is the actual HOST via urllib (port-aware:
+    `ssh://git@github.com:22/owner/repo.git` parses, codex round 29 [P2])
+    or an anchored scp-style match. A trailing `.git`/slash is stripped so
+    a dotted repo name survives (codex iter-1 [P2]). Lowercased so the
+    coord-scope compare matches a differently-cased PR URL (iter-6 [P2])."""
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    raw = url.strip()
+    path: str | None = None
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.hostname is not None:
+        # scheme URL (https/ssh/git): host must be exactly github.com.
+        # `.hostname` strips userinfo + PORT, so an explicit port is fine.
+        if parsed.hostname.lower() != "github.com":
+            return None
+        path = parsed.path
+    else:
+        m = _REMOTE_SCP_RE.match(raw)
+        if m is None:
+            return None
+        path = "/" + m.group("path")
+
+    # strip trailing `.git` + slash so a dotted repo name survives.
+    path = (path or "").rstrip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    mp = _REMOTE_PATH_RE.match(path)
+    if mp is None:
+        return None
+    return f"{mp.group('owner')}/{mp.group('repo')}".lower()
 
 
 def derive_owner_repo(repo_path: str, *, timeout_s: float = 5.0) -> str | None:
@@ -1445,19 +1480,7 @@ def derive_owner_repo(repo_path: str, *, timeout_s: float = 5.0) -> str | None:
         return None
     if proc.returncode != 0:
         return None
-    url = proc.stdout.strip()
-    # Strip an optional trailing `.git` and slash BEFORE matching so a
-    # dotted repo name (`owner/foo.bar`) survives — `.git` is a suffix,
-    # not part of the repo name (codex iter-1 [P2]).
-    url = url.rstrip("/")
-    if url.endswith(".git"):
-        url = url[: -len(".git")]
-    m = _REMOTE_URL_RE.search(url)
-    if not m:
-        return None
-    # lowercase: GitHub owner/repo is case-insensitive, so the coord-scope
-    # comparison must match a differently-cased PR URL (codex iter-6 [P2]).
-    return f"{m.group('owner')}/{m.group('repo')}".lower()
+    return parse_remote_owner_repo(proc.stdout.strip())
 
 
 def utc_now_iso(now: _dt.datetime | None = None) -> str:

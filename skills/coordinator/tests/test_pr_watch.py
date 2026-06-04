@@ -1036,7 +1036,7 @@ class _FakeProc:
         self.stderr = stderr
 
 
-def test_derive_owner_repo_variants(monkeypatch) -> None:
+def test_parse_remote_owner_repo() -> None:
     cases = {
         "https://github.com/edisonshen/fleet.git": "edisonshen/fleet",
         "https://github.com/edisonshen/fleet": "edisonshen/fleet",
@@ -1044,14 +1044,25 @@ def test_derive_owner_repo_variants(monkeypatch) -> None:
         # dotted repo name must survive (codex iter-1 [P2]).
         "https://github.com/owner/foo.bar.git": "owner/foo.bar",
         "git@github.com:owner/foo.bar": "owner/foo.bar",
+        # explicit port must parse (codex round 29 [P2]).
+        "ssh://git@github.com:22/owner/repo.git": "owner/repo",
+        "https://github.com:443/owner/repo": "owner/repo",
+        # case-insensitive.
+        "git@github.com:EdisonShen/Fleet.git": "edisonshen/fleet",
     }
     for url, expect in cases.items():
-        monkeypatch.setattr(pw.subprocess, "run",
-                            lambda *a, **k: _FakeProc(0, url + "\n"))
-        assert pw.derive_owner_repo("/repo") == expect, url
-    # non-github / failure -> None.
-    monkeypatch.setattr(pw.subprocess, "run", lambda *a, **k: _FakeProc(0, "https://gitlab.com/a/b"))
-    assert pw.derive_owner_repo("/repo") is None
+        assert pw.parse_remote_owner_repo(url) == expect, url
+    # non-github / lookalike / path-embedded / empty -> None.
+    assert pw.parse_remote_owner_repo("https://gitlab.com/a/b") is None
+    assert pw.parse_remote_owner_repo("https://notgithub.com/a/b") is None
+    assert pw.parse_remote_owner_repo("https://x/foo@github.com/a/b") is None
+    assert pw.parse_remote_owner_repo("") is None
+
+
+def test_derive_owner_repo_shells_and_parses(monkeypatch) -> None:
+    monkeypatch.setattr(pw.subprocess, "run",
+                        lambda *a, **k: _FakeProc(0, "git@github.com:edisonshen/fleet.git\n"))
+    assert pw.derive_owner_repo("/repo") == "edisonshen/fleet"
     monkeypatch.setattr(pw.subprocess, "run", lambda *a, **k: _FakeProc(1, "", "no remote"))
     assert pw.derive_owner_repo("/repo") is None
     assert pw.derive_owner_repo("") is None
