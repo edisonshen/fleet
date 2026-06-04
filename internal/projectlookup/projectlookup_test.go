@@ -509,10 +509,12 @@ func TestOrphanTmuxForProject_OrphanSessionFound(t *testing.T) {
 	records := recordsFromList(t) // empty — no live record for deadbeef
 	restoreList := stubListSessions(t, []string{"fleet-deadbeef", "other-thing"})
 	defer restoreList()
-	// Bind the orphan to the requested project via the archive seam.
+	// Bind the orphan to the requested project's COORD lineage via the
+	// archive seam. The coord-only reap guard (codex P2) requires
+	// task_id == coord-<project>.
 	restoreArch := SetLoadArchiveStub(func(id string) (*agent.Record, error) {
 		if id == "deadbeef" {
-			r := &agent.Record{ID: "deadbeef", Project: "fleet"}
+			r := &agent.Record{ID: "deadbeef", Project: "fleet", TaskID: CoordTaskID("fleet")}
 			return r, nil
 		}
 		return nil, errors.New("not found")
@@ -567,6 +569,30 @@ func TestOrphanTmuxForProject_RejectsUnknownProvenanceOrphan(t *testing.T) {
 	defer restoreArch()
 	if _, ok := OrphanTmuxForProject(records, "fleet"); ok {
 		t.Errorf("OrphanTmuxForProject: must reject orphan of unknown provenance")
+	}
+}
+
+// TestOrphanTmuxForProject_RejectsSameProjectWorkerOrphan — codex P2
+// regression. The orphan's archive is tagged for the SAME project but is
+// a WORKER (task_id != coord-<project>), not the coord. Tier 3 Path C'
+// KILLS the returned session, so returning a worker orphan would let an
+// unrelated coord attach terminate a worker's session. The coord-only
+// guard must reject it → caller falls through to spawn-fresh (Path D).
+func TestOrphanTmuxForProject_RejectsSameProjectWorkerOrphan(t *testing.T) {
+	withFleetHome(t)
+	records := recordsFromList(t)
+	restoreList := stubListSessions(t, []string{"fleet-deadbeef"})
+	defer restoreList()
+	// Same project, but a worker task_id — NOT the coord lineage.
+	restoreArch := SetLoadArchiveStub(func(id string) (*agent.Record, error) {
+		if id == "deadbeef" {
+			return &agent.Record{ID: "deadbeef", Project: "fleet", TaskID: "fix-bug-1234"}, nil
+		}
+		return nil, errors.New("not found")
+	})
+	defer restoreArch()
+	if _, ok := OrphanTmuxForProject(records, "fleet"); ok {
+		t.Errorf("OrphanTmuxForProject: must reject same-project WORKER orphan (only coord lineage is a reap target); killing it would terminate a worker's session")
 	}
 }
 

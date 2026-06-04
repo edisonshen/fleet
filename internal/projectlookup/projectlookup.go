@@ -416,6 +416,18 @@ func OrphanTmuxForProject(records []*agent.Record, projectName string) (string, 
 		if aerr != nil || arec == nil || arec.Project != projectName {
 			continue
 		}
+		// Coord-only guard (codex P2): Tier 3 KILLS the returned session
+		// (Path C'). The project match alone also catches archived
+		// WORKER / manual-agent records — a stale worker orphan for the
+		// same project would be killed by an unrelated coord attach.
+		// Only the project's COORD lineage (task_id == coord-<project>)
+		// is a legitimate reap target here; a worker orphan is not ours
+		// to kill from the coord-recovery path. Non-coord archives fall
+		// through to spawn-fresh (Path D), leaving the worker session for
+		// the project-scoped gc sweep that owns worker lifecycle.
+		if arec.TaskID != CoordTaskID(projectName) {
+			continue
+		}
 		return id, true
 	}
 	return "", false

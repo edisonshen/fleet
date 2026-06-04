@@ -190,6 +190,12 @@ func (s *failoverSetup) addArchivedRecord(t *testing.T, id, project, cause, succ
 	t.Helper()
 	r := agent.New(id)
 	r.Project = project
+	// Tag as the project's coord lineage. OrphanTmuxForProject's coord-only
+	// reap guard (codex P2) requires task_id == coord-<project> before it
+	// will return an orphan for Path C' to kill. Handoff-chain tests
+	// (F1-F3) read SuccessorID/ArchivedCause, not TaskID, so this is inert
+	// for them.
+	r.TaskID = projectlookup.CoordTaskID(project)
 	r.ArchivedCause = cause
 	if successor != "" {
 		r.SuccessorID = successor
