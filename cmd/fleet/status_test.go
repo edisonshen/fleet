@@ -871,3 +871,54 @@ func TestStatusReconcileFn_DefaultsToGCReconcile(t *testing.T) {
 		t.Errorf("empty kinds should yield empty report; got %d actions", len(rep.Actions))
 	}
 }
+
+// TestStatus_InvokesRCSweepAllProjects (T8 leak-rc-daemon-lifecycle PR-B):
+// fleet status must invoke rc.SweepAllProjects so the orphan-rc-daemon
+// reconcile path actually runs. SweepAllProjects had ZERO production
+// callers before this PR; wiring it into the status path means the
+// reconcile happens on every operator triage and on every coord tick
+// that calls `fleet status` for the dashboard view.
+func TestStatus_InvokesRCSweepAllProjects(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	var sweepCalls int
+	prev := rcSweepFn
+	rcSweepFn = func() error {
+		sweepCalls++
+		return nil
+	}
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if sweepCalls != 1 {
+		t.Fatalf("expected exactly one rc.SweepAllProjects call from fleet status; got %d", sweepCalls)
+	}
+}
+
+// TestStatus_RCSweepError_LoggedToStderr_DoesNotBlockStatus: when
+// SweepAllProjects errors (filesystem hiccup, e.g. ~/.fleet/projects/
+// briefly unreadable), runStatus must NOT propagate the error.
+// Status is informational; the operator still sees agents + orphan
+// reconcile output. surface-don't-silo: error goes to stderr.
+func TestStatus_RCSweepError_LoggedToStderr_DoesNotBlockStatus(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	prev := rcSweepFn
+	rcSweepFn = func() error { return errors.New("disk full") }
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{}, &stdout, &stderr, "dev"); err != nil {
+		t.Errorf("rc sweep error must not propagate; got %v", err)
+	}
+	if !strings.Contains(stderr.String(), "disk full") {
+		t.Errorf("rc sweep error must be logged to stderr; got:\n%s", stderr.String())
+	}
+}

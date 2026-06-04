@@ -130,6 +130,19 @@ func defaultKinds() []Kind {
 	return []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords}
 }
 
+// withRCDaemonStubs wires the rc-daemons classifier deps on top of
+// stubDeps. Tests override individual hooks to exercise specific
+// classification branches. leak-rc-daemon-lifecycle PR-B.
+func withRCDaemonStubs(d Deps) Deps {
+	d.ListRCDaemons = func() ([]RCDaemonInfo, error) { return nil, nil }
+	d.ListRCStates = func() ([]RCStateInfo, error) { return nil, nil }
+	d.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	d.KillRCDaemon = func(int) error {
+		return errors.New("stubDeps: KillRCDaemon should not run")
+	}
+	return d
+}
+
 func findAction(r Report, kind Kind, target string) (Action, bool) {
 	for _, a := range r.Actions {
 		if a.Kind == kind && a.Target == target {
@@ -3647,5 +3660,143 @@ func TestLoadTaskParkedOnDisk_LiveRowWins(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("live row (cleared parked) must win over archived park; got %q", got)
+	}
+}
+
+// ----------------- KindOrphanRCDaemons tests (PR-B) -----------------
+//
+// leak-rc-daemon-lifecycle PR-B adds the eighth classifier:
+// orphan-rc-daemons. It enumerates live `claude remote-control` PIDs
+// (via pgrep -f), cross-references each against every project's
+// rc-state.json, and flags any daemon that matches NO live state
+// entry (or whose recorded version disagrees with the current claude
+// binary). Surface (default) / kill (--apply).
+//
+// T5: dry-run surfaces stale daemon (PID not in any rc-state.json).
+// T6: --apply kills the surfaced daemon.
+// T7: legitimate current-version daemon is NOT killed (verb=skip).
+
+// rcDaemonKinds returns the default kinds slice augmented with
+// KindOrphanRCDaemons so the new classifier runs in each test.
+func rcDaemonKinds() []Kind {
+	return append(defaultKinds(), KindOrphanRCDaemons)
+}
+
+func TestReconcile_OrphanRCDaemon_DryRunSurfaces(t *testing.T) {
+	// T5: a running fleet-coord `claude remote-control` PID that no
+	// project's rc-state.json references must be surfaced.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 5678, Version: "2.1.156", WorkingDir: "/tmp/orphan-proj"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		// No project claims PID 5678.
+		return nil, nil
+	}
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile dry-run: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "5678")
+	if !ok {
+		t.Fatalf("expected surface action for PID 5678; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dry-run verb=%q want %q", a.Verb, VerbSurface)
+	}
+}
+
+func TestReconcile_OrphanRCDaemon_ApplyKills(t *testing.T) {
+	// T6: under --apply, the surfaced orphan daemon is killed.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 5678, Version: "2.1.156", WorkingDir: "/tmp/orphan-proj"},
+		}, nil
+	}
+	var killed []int
+	deps.KillRCDaemon = func(pid int) error {
+		killed = append(killed, pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile apply: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "5678")
+	if !ok {
+		t.Fatalf("expected killed action; got %+v", got.Actions)
+	}
+	if a.Verb != VerbKilled {
+		t.Fatalf("apply verb=%q want %q", a.Verb, VerbKilled)
+	}
+	if len(killed) != 1 || killed[0] != 5678 {
+		t.Fatalf("killed=%v want [5678]", killed)
+	}
+}
+
+func TestReconcile_OrphanRCDaemon_HealthyDaemonPreserved(t *testing.T) {
+	// T7: a daemon whose PID + version + working_dir match a live
+	// rc-state.json entry must NOT be killed.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "2.1.156", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.KillRCDaemon = func(pid int) error {
+		t.Fatalf("KillRCDaemon must not run for healthy daemon; got pid=%d", pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanRCDaemons, "1234"); ok {
+		t.Fatalf("healthy daemon must not appear in report; got %+v", got.Actions)
+	}
+}
+
+func TestReconcile_OrphanRCDaemon_StaleVersionSurfaces(t *testing.T) {
+	// A daemon whose PID is recorded in rc-state.json BUT whose
+	// version disagrees with current claude is still an orphan
+	// (superseded version). Surface (or kill under --apply).
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "2.1.146", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.146", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "1234")
+	if !ok {
+		t.Fatalf("expected stale-version daemon to be surfaced; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("stale-version dry-run verb=%q want %q", a.Verb, VerbSurface)
 	}
 }

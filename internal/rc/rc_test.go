@@ -586,6 +586,113 @@ func TestDown_KillsWhenPIDVerified(t *testing.T) {
 	}
 }
 
+// TestSweepAllProjects_ReleasesStaleVersionDaemons (T8 leak-rc-daemon-lifecycle PR-B):
+// SweepAllProjects must also reap daemons whose ClaudeVersion disagrees
+// with the current binary. Without this, stale daemons across version
+// upgrades persist forever (the 2026-05-29 OOM root cause).
+func TestSweepAllProjects_ReleasesStaleVersionDaemons(t *testing.T) {
+	withFleetHome(t)
+	withStubVersionAndOwner(t, "2.1.156")
+
+	host, _ := os.Hostname()
+	// "stale": marker present, state alive, recorded version older
+	// than current.
+	if err := WriteMarker("stale"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project:        "stale",
+		PID:            os.Getpid(),
+		HostID:         host,
+		WorkingDir:     "/tmp/stale",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.146", // older than 2.1.156
+		OwningCoordID: "coord-live",
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	// "healthy": marker present, state alive, recorded version matches.
+	if err := WriteMarker("healthy"); err != nil {
+		t.Fatalf("WriteMarker healthy: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project:        "healthy",
+		PID:            os.Getpid(),
+		HostID:         host,
+		WorkingDir:     "/tmp/healthy",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.156",
+		OwningCoordID: "coord-live",
+	}); err != nil {
+		t.Fatalf("WriteState healthy: %v", err)
+	}
+
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
+	defer restoreVerify()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects: %v", err)
+	}
+
+	// Stale: state should be cleaned up + kill fired.
+	if _, err := ReadState("stale"); !errors.Is(err, ErrStateMissing) {
+		t.Fatalf("stale daemon state should be reaped by Sweep (version mismatch); err=%v", err)
+	}
+	if len(killed) != 1 {
+		t.Fatalf("expected 1 kill for stale daemon; got %d (%v)", len(killed), killed)
+	}
+	// Healthy: untouched.
+	if _, err := ReadState("healthy"); err != nil {
+		t.Fatalf("healthy daemon state should be preserved by Sweep; err=%v", err)
+	}
+}
+
+// TestSweepAllProjects_ReleasesDeadOwnerDaemons (T8 follow-through):
+// dead-owner daemons must also be reaped by Sweep so the orphan
+// reconcile path can self-heal across coord crashes.
+func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
+	withFleetHome(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	// Override owner-alive: pretend "dead-coord" is dead.
+	prevO := ownerAliveFn
+	ownerAliveFn = func(coordID string) bool { return coordID != "dead-coord" }
+	t.Cleanup(func() { ownerAliveFn = prevO })
+
+	host, _ := os.Hostname()
+	if err := WriteMarker("orphan"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project:        "orphan",
+		PID:            os.Getpid(),
+		HostID:         host,
+		WorkingDir:     "/tmp/orphan",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.156",
+		OwningCoordID: "dead-coord",
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) {})
+	defer restoreKill()
+
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects: %v", err)
+	}
+	if _, err := ReadState("orphan"); !errors.Is(err, ErrStateMissing) {
+		t.Fatalf("dead-owner daemon state should be reaped; err=%v", err)
+	}
+}
+
 // TestSweepAllProjects_ReleasesMarkerlessOrphans (codex P2): the
 // sweeper's whole point is to release entries where rc-state.json
 // claims a live PID but the marker is gone (operator rm'd it
@@ -644,6 +751,280 @@ func TestSweepAllProjects_ReleasesMarkerlessOrphans(t *testing.T) {
 	}
 	if _, err := ReadState("healthy"); err != nil {
 		t.Fatalf("healthy state should be preserved by sweep; err=%v", err)
+	}
+}
+
+// withStubVersionAndOwner sets up the test seams used by self-healing
+// Up: the claude --version probe is stubbed to a fixed string, and the
+// owner-liveness probe is stubbed to return alive=true for any non-
+// empty owner ID by default. Each test overrides as needed.
+//
+// leak-rc-daemon-lifecycle PR-B: self-healing Up needs both probes to
+// decide whether the recorded daemon is stale (version-mismatch or
+// dead-owner). Tests stub the seams so unit tests don't shell out to
+// `claude --version` or check live agent records.
+func withStubVersionAndOwner(t *testing.T, version string) {
+	t.Helper()
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { return version, nil }
+	prevO := ownerAliveFn
+	ownerAliveFn = func(coordID string) bool {
+		return coordID != "" // default: any non-empty owner is alive
+	}
+	t.Cleanup(func() {
+		claudeVersionFn = prevV
+		ownerAliveFn = prevO
+	})
+}
+
+// TestUp_SelfHeal_NoopForCurrentVersion (T1): recorded daemon has
+// current claude_version and live owner → outcome already_acquired,
+// no kill, no respawn, state unchanged.
+func TestUp_SelfHeal_NoopForCurrentVersion(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+
+	var killCalls int
+	restoreKill := SetKillFnForTest(func(pid int) { killCalls++ })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	rec := RecordedState{
+		Project:        "demo",
+		PID:            os.Getpid(),
+		HostID:         host,
+		WorkingDir:     "/tmp/demo",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.156",
+		OwningCoordID: "coord-live",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", SkipSpawn: true})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAlreadyAcquired {
+		t.Fatalf("outcome=%q want %q (current version + live owner = no-op)", out, OutcomeAlreadyAcquired)
+	}
+	if killCalls != 0 {
+		t.Fatalf("kill must not fire for current-version daemon; got %d calls", killCalls)
+	}
+	got, _ := ReadState("demo")
+	if got.PID != rec.PID || got.ClaudeVersion != rec.ClaudeVersion {
+		t.Fatalf("state was mutated unexpectedly; got %+v want %+v", got, rec)
+	}
+}
+
+// TestUp_SelfHeal_RespawnsOnStaleVersion (T2): recorded daemon's
+// claude_version is older than current → killFn is called once,
+// fresh daemon spawned, state updated with new PID + new version,
+// outcome=OutcomeRespawnedStaleVersion.
+func TestUp_SelfHeal_RespawnsOnStaleVersion(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+
+	var killedPIDs []int
+	restoreKill := SetKillFnForTest(func(pid int) { killedPIDs = append(killedPIDs, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	oldPID := os.Getpid()
+	rec := RecordedState{
+		Project:        "demo",
+		PID:            oldPID,
+		HostID:         host,
+		WorkingDir:     "/tmp/demo",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.146", // older
+		OwningCoordID: "coord-live",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	const newPID = 99999
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: newPID,
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeRespawnedStaleVersion {
+		t.Fatalf("outcome=%q want %q", out, OutcomeRespawnedStaleVersion)
+	}
+	if len(killedPIDs) != 1 || killedPIDs[0] != oldPID {
+		t.Fatalf("expected exactly one kill of oldPID=%d; got %v", oldPID, killedPIDs)
+	}
+	got, _ := ReadState("demo")
+	if got.PID != newPID {
+		t.Fatalf("state.pid=%d want newPID %d", got.PID, newPID)
+	}
+	if got.ClaudeVersion != "2.1.156" {
+		t.Fatalf("state.claude_version=%q want 2.1.156 (current)", got.ClaudeVersion)
+	}
+}
+
+// TestUp_SelfHeal_RespawnsOnDeadOwner (T3): recorded daemon's owning
+// coord is gone (agent record missing or tmux session dead) → killFn
+// is called once, fresh daemon spawned, state updated with new owner,
+// outcome=OutcomeRespawnedDeadOwner.
+func TestUp_SelfHeal_RespawnsOnDeadOwner(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	// Override owner-alive: pretend recorded owner is dead.
+	prevO := ownerAliveFn
+	ownerAliveFn = func(coordID string) bool {
+		return coordID != "dead-coord"
+	}
+	t.Cleanup(func() { ownerAliveFn = prevO })
+
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+
+	var killedPIDs []int
+	restoreKill := SetKillFnForTest(func(pid int) { killedPIDs = append(killedPIDs, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	oldPID := os.Getpid()
+	rec := RecordedState{
+		Project:        "demo",
+		PID:            oldPID,
+		HostID:         host,
+		WorkingDir:     "/tmp/demo",
+		SessionPrefix:  SessionPrefix,
+		LastSpawnAt:    time.Now().UTC(),
+		ClaudeVersion:  "2.1.156", // current
+		OwningCoordID: "dead-coord",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	const newPID = 88888
+	const newOwner = "coord-fresh"
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: newPID,
+		CoordID:     newOwner,
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeRespawnedDeadOwner {
+		t.Fatalf("outcome=%q want %q", out, OutcomeRespawnedDeadOwner)
+	}
+	if len(killedPIDs) != 1 || killedPIDs[0] != oldPID {
+		t.Fatalf("expected exactly one kill of oldPID=%d; got %v", oldPID, killedPIDs)
+	}
+	got, _ := ReadState("demo")
+	if got.OwningCoordID != newOwner {
+		t.Fatalf("state.owning_coord_id=%q want %q", got.OwningCoordID, newOwner)
+	}
+}
+
+// TestUp_SelfHeal_EmptyVersionForcesHeal (T4): legacy state.json
+// (v1 backcompat) loaded with empty ClaudeVersion must be treated as
+// "always stale" so one heal cycle fires to backfill the schema.
+// Outcome is OutcomeRespawnedStaleVersion (legacy = stale).
+func TestUp_SelfHeal_EmptyVersionForcesHeal(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) {})
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	rec := RecordedState{
+		Project:       "demo",
+		PID:           os.Getpid(),
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		// ClaudeVersion + OwningCoordID intentionally empty (legacy v1).
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: 77777,
+		CoordID:     "coord-new",
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeRespawnedStaleVersion {
+		t.Fatalf("outcome=%q want %q (empty version must force heal)", out, OutcomeRespawnedStaleVersion)
+	}
+	got, _ := ReadState("demo")
+	if got.ClaudeVersion != "2.1.156" {
+		t.Fatalf("post-heal state.claude_version=%q want 2.1.156", got.ClaudeVersion)
+	}
+	if got.OwningCoordID != "coord-new" {
+		t.Fatalf("post-heal state.owning_coord_id=%q want coord-new", got.OwningCoordID)
+	}
+}
+
+// TestUp_FreshAcquire_RecordsVersionAndOwner: the fresh-acquire path
+// (no prior state.json) must capture claude_version + owning_coord_id
+// in the new state.json so subsequent ticks can self-heal.
+func TestUp_FreshAcquire_RecordsVersionAndOwner(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+
+	const ownerID = "coord-xyz"
+	out, err := Up("demo", UpOpts{
+		Cwd:         "/tmp/demo",
+		SkipSpawn:   true,
+		InjectedPID: os.Getpid(),
+		CoordID:     ownerID,
+	})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAcquired {
+		t.Fatalf("outcome=%q want %q", out, OutcomeAcquired)
+	}
+	got, _ := ReadState("demo")
+	if got.ClaudeVersion != "2.1.156" {
+		t.Fatalf("ClaudeVersion=%q want 2.1.156", got.ClaudeVersion)
+	}
+	if got.OwningCoordID != ownerID {
+		t.Fatalf("OwningCoordID=%q want %q", got.OwningCoordID, ownerID)
 	}
 }
 
