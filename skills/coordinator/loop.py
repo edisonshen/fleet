@@ -5568,6 +5568,19 @@ def _reconcile_pr_watches(
             )
             return ""
 
+    def _release_action(agent_id: str) -> None:
+        # Release a resolved PR-watch dispatch's journal + inbox (codex
+        # iter-6 [P2]). A PR-watch journal (kind pr-*) is invisible to the
+        # worker register_subagent / terminal-release paths (no
+        # worker_agent_ids entry, skipped by _iter_project_journals), so the
+        # §6 lease resolution is the ONLY place that can reap it — fleet owns
+        # the lifecycle of what it creates. Best-effort: release never raises
+        # (it logs non-success outcomes); a failed release is a bounded
+        # journal/inbox file, not a correctness bug.
+        dispatch_mod.release_coord_prompt_inbox(
+            agent_id, fleet_bin=fleet_bin, fleet_home=fhome,
+        )
+
     staged_blocks: list[str] = []
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
@@ -5583,6 +5596,7 @@ def _reconcile_pr_watches(
         dispatch_action=_dispatch_action,
         agent_outcome=_agent_outcome,
         deps_done=_deps_done,
+        release_action=_release_action,
     )
 
     # reconcile_watches returned WITHOUT raising -> the watch doc (incl. the

@@ -1727,6 +1727,87 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
     assert not any("BLOCKED" in r for r in out3.raises)
 
 
+def test_no_action_on_stale_probe_tick(tmp_path: Path) -> None:
+    """If the probe is SKIPPED this tick (transient/backoff), the dispatch
+    pass acts on NOTHING — no reclaim, no re-dispatch off a stale head
+    (codex iter-6 [P1]). We dispatch on tick 1 (fresh probe), then tick 2
+    with a whole-repo transient error: the lease must be untouched + no new
+    dispatch."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    p1 = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
+    lease1 = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]
+    assert lease1 and lease1["outcome"] == pw.OUTCOME_RUNNING
+    # tick 2: probe transient-fails -> _probed_ok_at not advanced -> the
+    # dispatch pass skips this watch entirely (lease preserved, agent gone
+    # reported but NOT reclaimed because we never reach reclaim).
+    p2 = FakeProber(repo_error="gh 503")
+    out2 = _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "gone")
+    assert out2.dispatched == 0
+    lease2 = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]
+    assert lease2 is not None  # untouched, NOT reclaimed off the stale tick
+
+
+def test_release_called_on_lease_resolution(tmp_path: Path) -> None:
+    """When a lease leaves `running` (here: agent gone, head unchanged ->
+    reclaim), release_action is invoked with the prior agent_id so its
+    journal+inbox get reaped (codex iter-6 [P2] cleanup)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    leased_agent = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]["agent_id"]
+    released: list[str] = []
+    # tick 2: agent gone -> reclaim -> release_action(leased_agent).
+    pw.reconcile_watches(
+        tasks, project="p", project_dir=tmp_path,
+        coord_owner_repo=OWNER_REPO, prober=prober,
+        flip_task_done=lambda s, u="": None, now_iso="2026-06-03T08:00:00Z",
+        tick_count=2, slow_cadence_ticks=5, repo_path="/repo",
+        dispatch_action=disp, agent_outcome=lambda _aid: "gone",
+        deps_done=lambda _d: True,
+        release_action=lambda aid: released.append(aid),
+    )
+    assert leased_agent in released
+
+
+def test_active_retry_not_preserved_on_old_watch(tmp_path: Path) -> None:
+    """A CI-red task whose pr_url was cleared + RE-DISPATCHED (current row
+    in-progress, empty pr_url) must NOT be re-added to the OLD PR's watch
+    via pre-reconcile enrollment (codex iter-6 [P1]) — else a merge of the
+    old PR flips the live retry done."""
+    # pre-reconcile snapshot: task 'a' still had the old PR url.
+    pre = [_task("a", status="in-review", pr_url=_pr_url(195), branch="worker/a")]
+    # current snapshot: 'a' was requeued + re-dispatched -> in-progress, no url.
+    current = [_task("a", status="in-progress", pr_url="", branch="worker/a")]
+    # old PR 195 merges this tick.
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", merged_at="t",
+                                head_ref_oid="H1", base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    flips: list[str] = []
+    # seed the watch first (tick 1, pre-reconcile had the url).
+    pw.reconcile_watches(
+        pre, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                          fresh_base="B", ancestors=set()),
+        flip_task_done=lambda s, u="": flips.append(s),
+        now_iso="2026-06-03T08:00:00Z", tick_count=1, repo_path="/repo",
+    )
+    # tick 2: current row is in-progress/no-url; old PR merges. The active
+    # retry 'a' must NOT be flipped done.
+    out = pw.reconcile_watches(
+        current, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=prober, flip_task_done=lambda s, u="": flips.append(s),
+        now_iso="2026-06-03T08:00:00Z", tick_count=2, repo_path="/repo",
+        enroll_tasks=pre,
+    )
+    assert "a" not in flips  # the active retry was NOT flipped done
+
+
 def test_orphan_open_pr_does_not_block_legit_rebase(tmp_path: Path) -> None:
     """A parked-open ORPHANED PR (no backing task) must not count as a
     next-to-merge candidate; a single legitimately-stale BACKED PR alongside

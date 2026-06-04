@@ -926,6 +926,7 @@ def reconcile_watches(
     dispatch_action: "Callable[[ActionDispatch], str] | None" = None,
     agent_outcome: "Callable[[str], str] | None" = None,
     deps_done: "Callable[[list], bool] | None" = None,
+    release_action: "Callable[[str], None] | None" = None,
 ) -> WatchOutcome:
     """Run one PR-watch reconcile pass. Single writer = the tick (caller
     holds the coord flock). Returns a WatchOutcome the tick funnels into
@@ -988,9 +989,30 @@ def reconcile_watches(
     # slug is dropped (current row is fresher).
     owned = _owned(tasks)
     current_slugs = {getattr(t, "slug", "") for t in owned}
+    # A pre-reconcile row is re-added to enrollment ONLY when its CURRENT
+    # same-slug row is safe to associate with the old PR (codex iter-6 [P1]).
+    # The legacy CI-red path clears a slug's pr_url + requeues it; if
+    # _dispatch_ready then RE-DISPATCHED it, the current row is `in-progress`
+    # with an empty pr_url — an ACTIVE retry doing live work on a NEW branch.
+    # Re-adding the stale pre-reconcile row (old pr_url) would back the OLD
+    # watch with that active retry, so a merge of the OLD PR would flip the
+    # live retry `done`/clear its worker. So we re-add the pre-reconcile row
+    # only when the current row is ABSENT (fully archived) or still an IDLE
+    # `todo` (a requeued-but-not-yet-redispatched retry, safe to close on the
+    # old PR's merge). An `in-progress` current row is an active retry -> NOT
+    # re-added (its new PR, when opened, enrolls a fresh watch).
+    current_by_slug = {getattr(t, "slug", ""): t for t in tasks}
+
+    def _safe_to_preserve(slug: str) -> bool:
+        cur = current_by_slug.get(slug)
+        if cur is None:
+            return True  # archived off the list -> safe to close old PR
+        return getattr(cur, "status", "") == "todo"
+
     enroll_owned = owned + [
         t for t in _owned(enroll_tasks)
         if getattr(t, "slug", "") not in current_slugs
+        and _safe_to_preserve(getattr(t, "slug", ""))
     ]
     # group enroll_owned by (owner_repo, pr_number); coord-scope assert per
     # PR. `in_scope` is every enroll_owned task that PASSES the coord-scope
@@ -1188,6 +1210,7 @@ def reconcile_watches(
             dispatch_action=dispatch_action,
             agent_outcome=agent_outcome or (lambda _aid: "gone"),
             deps_done=deps_done or (lambda _deps: True),
+            release_action=release_action,
             now_iso=now_iso, out=out,
         )
 
@@ -1462,8 +1485,14 @@ def _apply_probe(
         # snapshot reduction, NOT on a transient failure (which still
         # stamps last_probe_at for backoff bookkeeping). The orphan pass
         # gates on THIS so a probe outage can't false-orphan a watch whose
-        # PR may have merged/closed during the blip.
+        # PR may have merged/closed during the blip. We stamp BOTH the
+        # wall-clock now_iso (orphan pass) AND the tick_count (the auto-fix
+        # dispatch pass): the dispatch gate must distinguish "probed THIS
+        # tick" from "probed a prior tick", and tick_count is monotonic +
+        # deterministic where two consecutive ticks can share a now_iso
+        # (codex iter-6 [P1]).
         w["_probed_ok_at"] = now_iso
+        w["_probed_ok_tick"] = tick_count
 
         if event == EVENT_MERGED:
             w["state"] = STATE_MERGED
@@ -1509,6 +1538,7 @@ def _dispatch_actions(
     dispatch_action: Callable[["ActionDispatch"], str],
     agent_outcome: Callable[[str], str],
     deps_done: Callable[[list], bool],
+    release_action: "Callable[[str], None] | None",
     now_iso: str,
     out: WatchOutcome,
 ) -> None:
@@ -1573,6 +1603,20 @@ def _dispatch_actions(
         # backing set directly, which is the orphan's defining condition.)
         if w.get("orphaned") or not w.get("tasks"):
             continue
+        # REQUIRE A FRESH PROBE THIS TICK before reclaiming/dispatching
+        # (codex iter-6 [P1]). If the probe was skipped (transient error /
+        # backoff cadence), `last_event` + `head` are from a PRIOR tick — a
+        # fixer that already pushed + exited could be re-dispatched against
+        # the stale CI_FAILED/STALE head, and reclaim would clear its lease
+        # off an unobserved-current head. Acting only on a snapshot we
+        # confirmed THIS tick (`_probed_ok_tick == tick_count`) guarantees
+        # `head` is the live head and the lease's head-moved/dead resolution
+        # is judged against ground truth. A non-probed watch simply waits
+        # for its next successful probe — its lease is preserved untouched.
+        # (tick_count, not now_iso: two consecutive ticks can share a
+        # wall-clock string but never a tick number — codex iter-6 [P1].)
+        if w.get("_probed_ok_tick") != tick_count:
+            continue
         try:
             pr_num = int(w.get("pr_number", key))
         except (TypeError, ValueError):
@@ -1582,7 +1626,15 @@ def _dispatch_actions(
             continue
 
         # 1. reclaim/resolve the in-flight lease (blocked / head-moved /
-        # dead agent / expiry; terminal -> ledger).
+        # dead agent / expiry; terminal -> ledger). Capture the prior lease's
+        # agent_id so we can RELEASE its journal + inbox once the lease leaves
+        # `running` (codex iter-6 [P2]: a PR-watch journal is invisible to
+        # the worker register_subagent/release paths, so without this it
+        # leaks in launch_attempted forever — cleanup is the tool's job).
+        prev_inflight = w.get("inflight_action")
+        prev_agent = ""
+        if isinstance(prev_inflight, dict) and prev_inflight.get("outcome") == OUTCOME_RUNNING:
+            prev_agent = str(prev_inflight.get("agent_id", "") or "")
         rec_note, _rec_raise = _reclaim_lease(
             w, tick_count=tick_count, current_head=head,
             agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
@@ -1590,6 +1642,12 @@ def _dispatch_actions(
         )
         if rec_note:
             out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
+        # lease left `running` (cleared this tick) -> release its journal+inbox.
+        if prev_agent and w.get("inflight_action") is None and release_action is not None:
+            try:
+                release_action(prev_agent)
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never wedge
+                out.errors.append(f"pr-watch: release {prev_agent}: {exc}")
         # 2. keep the dispatched_events ledger bounded.
         _prune_dispatched_events(w, head)
 
