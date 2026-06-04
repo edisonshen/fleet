@@ -163,6 +163,11 @@ ACTION_FIX = "fix"
 OUTCOME_RUNNING = "running"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_FAILED_LAUNCH = "failed_launch"
+# Reported by the tick's agent_outcome callback (not a persisted lease
+# outcome): the journal says the Agent was launched but no live agent record
+# confirms liveness (Agent-tool subagents expose no pid). Suppress like
+# running, but reclaimable past a generous stale bound (§6 / codex iter-20).
+OUTCOME_RUNNING_UNVERIFIED = "running-unverified"
 _OUTCOME_SUCCEEDED_PREFIX = "succeeded@"
 
 # Reference "long-lived lease" tick magnitude. NOTE (codex iter-11 [P1]):
@@ -182,6 +187,18 @@ _LEASE_EXPIRY_TICKS = 12
 # normal async launch window can't trigger a duplicate dispatch into the same
 # branch. After the grace, a still-gone agent is genuinely dead -> reclaimed.
 _LEASE_LAUNCH_GRACE_TICKS = 3
+
+# Generous stale bound for an UNVERIFIED-running lease (codex iter-20 [P1]):
+# a PR-watch Agent-tool subagent whose journal says launched but that wrote
+# no Fleet agent record (so liveness is unprovable). A genuinely-working
+# fixer/rebaser moves the head (push) or sets BLOCKED well before this; a
+# launch that never started (broken stdout / crash after
+# mark-launch-attempted) would otherwise wedge the lease forever. So past
+# this many ticks with NO head move + still no agent record, reclaim +
+# retry. Much larger than the launch grace (real work takes many polls:
+# fetch + rebase + full gates + multi-round review), small enough to not
+# strand a PR for an unbounded time. Tick-budget (deterministic).
+_LEASE_STALE_LAUNCH_TICKS = 40
 
 
 def _succeeded_outcome(head_sha: str) -> str:
@@ -382,6 +399,27 @@ def _reclaim_lease(
             return None, None  # pending startup; keep the lease, suppress
         watch["inflight_action"] = None
         return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
+
+    # 3b. UNVERIFIED-running (codex iter-20 [P1]): the journal says the Agent
+    # was launched but there's no live agent record to confirm it's alive
+    # (Agent subagents expose no pid). Suppress re-dispatch like `running`,
+    # but reclaim if the head HASN'T moved after a GENEROUS stale bound — a
+    # working fixer would have pushed (head move) / BLOCKED by then, so a
+    # still-stuck launch_attempted with no progress is a launch that never
+    # actually started (broken stdout / crash after mark-launch-attempted).
+    if reported == OUTCOME_RUNNING_UNVERIFIED:
+        leased_tick = inflight.get("leased_tick")
+        stale = (
+            isinstance(leased_tick, int)
+            and tick_count - leased_tick >= _LEASE_STALE_LAUNCH_TICKS
+        )
+        if stale:
+            watch["inflight_action"] = None
+            return (
+                f"reclaimed stale unverified-launch lease {key!r} "
+                f"(no head move + no agent record after {_LEASE_STALE_LAUNCH_TICKS} ticks)"
+            ), None
+        return None, None  # launched, in flight (unverifiable) -> hold
 
     # 4. The agent is PROVABLY ALIVE and the head hasn't moved -> it is still
     # working. NEVER expire a live lease on age alone (codex iter-11 [P1]): a

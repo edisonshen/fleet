@@ -1694,6 +1694,30 @@ def test_dead_agent_lease_reclaimed_and_redispatched(tmp_path: Path) -> None:
     assert len(disp.calls) == 2
 
 
+def test_unverified_launch_held_then_reclaimed_when_stale(tmp_path: Path) -> None:
+    """A journal-only 'running-unverified' lease (Agent-tool subagent, no
+    agent record) is HELD while in flight, but RECLAIMED + re-dispatched
+    past the generous stale bound when the head never moved (codex iter-20
+    [P1] — a launch that never actually started must not wedge forever)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # mid-bound: unverified -> held, no re-dispatch.
+    out_mid = _run2(tasks, tmp_path, prober, dispatch=disp,
+                    tick_count=1 + pw._LEASE_STALE_LAUNCH_TICKS - 1,
+                    agent_outcome=lambda _aid: "running-unverified")
+    assert out_mid.dispatched == 0
+    assert len(disp.calls) == 1
+    # past the stale bound (head never moved) -> reclaim + re-dispatch.
+    out_stale = _run2(tasks, tmp_path, prober, dispatch=disp,
+                      tick_count=1 + pw._LEASE_STALE_LAUNCH_TICKS,
+                      agent_outcome=lambda _aid: "running-unverified")
+    assert out_stale.dispatched == 1
+    assert len(disp.calls) == 2
+
+
 def test_gone_agent_within_launch_grace_not_reclaimed(tmp_path: Path) -> None:
     """A just-launched subagent whose agent record isn't written yet (reads
     'gone') WITHIN the launch grace is NOT reclaimed (codex iter-12 [P1]) —

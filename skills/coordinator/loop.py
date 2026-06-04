@@ -5600,10 +5600,20 @@ def _reconcile_pr_watches(
                 return "running"
         # No live agent record -> fall back to the journal (the coord's own
         # durable launch signal). A launched/in-flight journal means the
-        # Agent IS out there working even without a Fleet agent record.
+        # Agent was dispatched even without a Fleet agent record — but we
+        # CAN'T confirm it's still alive (Agent subagents expose no pid), so
+        # report "running-unverified": pr_watch suppresses re-dispatch like
+        # `running`, but a GENEROUS stale bound CAN reclaim it (codex iter-20
+        # [P1]) — distinguishing a working fixer (head will move / it'll
+        # BLOCK) from a launch that never started (broken stdout / crash
+        # after mark-launch-attempted, journal stuck launch_attempted with no
+        # agent forever). `acked` means register ran (a real worker) -> trust
+        # running.
         jstate = _pr_watch_journal_state(agent_id, home=home)
-        if jstate in ("pending", "launch_attempted", "acked"):
+        if jstate == "acked":
             return "running"
+        if jstate in ("pending", "launch_attempted"):
+            return "running-unverified"
         return "gone"
 
     def _dispatch_action(action) -> str:
