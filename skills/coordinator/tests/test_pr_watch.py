@@ -1727,6 +1727,46 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
     assert not any("BLOCKED" in r for r in out3.raises)
 
 
+def test_live_lease_blocks_different_event_same_head(tmp_path: Path) -> None:
+    """A live running lease for one event suppresses a dispatch for a
+    DIFFERENT event on the SAME head — one in-flight action per watch
+    (codex iter-2 [P1]: never put two agents on the same branch)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: CI fail on H1 -> dispatch fix.
+    p1 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
+    assert len(disp.calls) == 1
+    # tick 2: SAME head H1, but now CHANGES_REQUESTED (a different event/key)
+    # while the fix agent is still alive -> must NOT dispatch a second agent.
+    p2 = FakeProber(snaps={195: _changes_snap(195, head="H1")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    out2 = _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 0
+    assert len(disp.calls) == 1  # the live lease is preserved
+
+
+def test_watch_base_refreshed_from_snapshot(tmp_path: Path) -> None:
+    """A PR targeting a non-main base -> watch['base'] is refreshed from the
+    probe snapshot (codex iter-2 [P2]); a non-main PR is NOT treated as
+    main-based / rebase-eligible."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snap = pw.PRSnapshot(number=195, pr_state="OPEN", merge_state_status="BLOCKED",
+                         review_decision="", checks="SUCCESS", head_ref_oid="H1",
+                         base_ref_name="release-branch")
+    prober = FakeProber(snaps={195: snap}, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    # base refreshed to the real ref.
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["base"] == "release-branch"
+    # non-main base -> not rebase-eligible -> no rebase dispatched.
+    assert out.dispatched == 0
+    assert disp.calls == []
+
+
 def test_dispatched_events_pruned_by_head(tmp_path: Path) -> None:
     """dispatched_events keys whose head != current head are pruned on each
     persist so the file stays bounded (§6)."""

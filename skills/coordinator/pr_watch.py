@@ -1415,6 +1415,16 @@ def _apply_probe(
         w["_backoff_n"] = 0
         out.probed += 1
 
+        # Refresh the watch's BASE from the PR's actual base ref (codex
+        # iter-2 [P2]). _new_watch defaults base to "main", but a PR can
+        # target a non-main base (stacked at the PR level). The PR2 rebase
+        # path keys _base_protected / base_sha_for / the rebase prompt on
+        # watch["base"], so a stale "main" default would mis-classify a
+        # non-main PR as rebase-eligible and rebase it onto the wrong base.
+        # The probe is the authoritative source of the real base name.
+        if snap.base_ref_name:
+            w["base"] = snap.base_ref_name
+
         head_contains_base = False
         if pr_base_sha and snap.head_ref_oid:
             head_contains_base = is_anc(pr_base_sha, snap.head_ref_oid)
@@ -1625,7 +1635,21 @@ def _dispatch_actions(
                 key=key_str,
             )
 
-        # 4. §6 outcome suppression. A blocked latch raises-hand once.
+        # 4a. ONE in-flight action per watch (codex iter-2 [P1]). A live
+        # `running` lease — for ANY key, not just this event's — means a
+        # subagent is already operating on this PR's branch. If the
+        # actionable signal CHANGED while it ran (CI_FAILED -> STALE, or
+        # CI_FAILED -> CHANGES_REQUESTED on the same head), per-key
+        # suppression would miss it and overwrite the live lease, putting a
+        # SECOND agent on the same branch concurrently. Reclaim already ran
+        # this tick (dead / head-moved / blocked leases are cleared), so a
+        # surviving `running` lease is genuinely in flight -> suppress all
+        # dispatch until it resolves.
+        inflight = w.get("inflight_action")
+        if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
+            continue
+
+        # 4b. §6 per-key outcome suppression. A blocked latch raises-hand once.
         if _action_suppressed(w, key=key_str, current_head=head):
             de = w.get("dispatched_events")
             inflight = w.get("inflight_action")
