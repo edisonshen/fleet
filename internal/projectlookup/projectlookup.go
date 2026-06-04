@@ -237,6 +237,17 @@ func FindCoordByLockBody(records []*agent.Record, projectName string) (*agent.Re
 		if r == nil || r.ID != holderID {
 			continue
 		}
+		// Cross-project safety (codex P2): the lock body is per-project
+		// (projects/<projectName>/.locks/coordinator.lock), but an ID can
+		// be stale/copied and resolve to a record tagged for a DIFFERENT
+		// project. Without this guard `fleet attach --project A` could
+		// attach to project B's live coord. Require the record's project
+		// to match before treating it as A's coord. Mirrors the
+		// project-match the FindLiveCoord / StaleCoordRecord paths already
+		// enforce via CoordTaskID(projectName)+Project checks.
+		if r.Project != projectName {
+			continue
+		}
 		session := r.TmuxSession
 		if session == "" {
 			session = tmux.SessionName(r.ID)
@@ -323,6 +334,14 @@ func StaleLockBodyCoord(records []*agent.Record, projectName string) (*agent.Rec
 	}
 	for _, r := range records {
 		if r == nil || r.ID != holderID {
+			continue
+		}
+		// Cross-project safety (codex P2, mirrors FindCoordByLockBody): a
+		// stale/copied lock-body ID could resolve to a record tagged for
+		// a DIFFERENT project; treating it as projectName's recovery
+		// candidate would spawn/kill against the wrong lineage. Require
+		// the project to match.
+		if r.Project != projectName {
 			continue
 		}
 		session := r.TmuxSession

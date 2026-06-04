@@ -341,6 +341,25 @@ func TestFindCoordByLockBody_DeadSessionMisses(t *testing.T) {
 	}
 }
 
+// TestFindCoordByLockBody_CrossProjectRecordMisses — codex P2 regression.
+// Project A's coordinator.lock holds an ID whose record is tagged for a
+// DIFFERENT project B (stale/copied/reused ID). FindCoordByLockBody must
+// NOT return B's coord for an attach --project A — that would attach the
+// operator to the wrong project. The project-match guard makes it miss so
+// Tier 3 falls through to a fresh spawn for A.
+func TestFindCoordByLockBody_CrossProjectRecordMisses(t *testing.T) {
+	home := withFleetHome(t)
+	// Record is tagged project "otherproj"; lock body for "fleet" names it.
+	writeAgentRec(t, "bbbbbbbb", "otherproj", "")
+	writeCoordLockBody(t, home, "fleet", "bbbbbbbb")
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-bbbbbbbb": true}) // live
+	defer restore()
+	if got, ok := FindCoordByLockBody(records, "fleet"); ok {
+		t.Errorf("FindCoordByLockBody: must NOT return cross-project record; got %s for project=%s", got.ID, got.Project)
+	}
+}
+
 // --- StaleCoordRecord ---
 
 // TestStaleCoordRecord_RecordAliveTmuxDeadIsStale — the "record
