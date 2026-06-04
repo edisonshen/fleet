@@ -1158,6 +1158,7 @@ def _tick_locked(
         _reconcile_pr_watches(
             f.tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
+            home=home,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
@@ -4064,6 +4065,22 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _read_agent_record(agent_id: str, *, home: Path | None = None) -> dict | None:
+    """Load ~/.fleet/agents/<id>.json (the fleet-guard-written agent
+    record), or None on any read/parse failure. Used by the PR-watch
+    auto-fix lease to resolve a dispatched subagent's liveness (`pid`) +
+    blocked state (`blocked`). Never raises."""
+    if not agent_id:
+        return None
+    base = home if home is not None else _resolve_home(None)
+    try:
+        with open(base / "agents" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
 @dataclass
 class _CIResult:
     all_green: bool = False
@@ -5361,10 +5378,11 @@ def _reconcile_pr_watches(
     fleet_bin: str,
     state: dict,
     result,
+    home: Path | None = None,
     enroll_tasks: list[parse.Task] | None = None,
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
-    PR1). Hooks the pr_watch module into the tick:
+    PR1 tracking + PR2 auto-fix). Hooks the pr_watch module into the tick:
 
       - coord-own-repo for the coord-scope assert is derived from the
         repo's git remote (meta.json repo_path preferred over cwd — the
@@ -5431,6 +5449,87 @@ def _reconcile_pr_watches(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worker_pid=0"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
 
+    # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
+    # keep pr_watch shell-free: it decides WHAT to dispatch + owns the
+    # crash-safe lease; loop.py owns HOW (mint id, write inbox, emit the
+    # DISPATCH block) + reads the subagent's agent record for the lease
+    # outcome. The fleet-home for inbox + agent-record reads:
+    fhome = (str(home) if home else None) or os.environ.get("FLEET_HOME")
+    # Standards are fetched LAZILY (only on the first actual dispatch) so a
+    # quiescent PR-watch tick issues no extra `fleet standards` shell-out.
+    _standards_cache: dict[str, str] = {}
+
+    def _standards() -> str:
+        if "v" not in _standards_cache:
+            _standards_cache["v"] = dispatch_mod.fetch_standards(project, fleet_bin=fleet_bin)
+        return _standards_cache["v"]
+
+    # Build the set of done task slugs ONCE for the §5.1b deps gate.
+    done_slugs = {
+        t.slug for t in tasks
+        if t.slug and t.status in pr_watch_mod.TERMINAL_TASK_STATUSES
+    }
+
+    def _deps_done(deps: list) -> bool:
+        # All listed dependency slugs must be terminal. A dep we can't see
+        # in tasks.md (already archived off the list) counts as done — the
+        # row only stays while non-terminal, so its absence == done.
+        present = {t.slug for t in tasks if t.slug}
+        for d in deps:
+            if d in present and d not in done_slugs:
+                return False
+        return True
+
+    def _agent_outcome(agent_id: str) -> str:
+        # Resolve a dispatched subagent's lease outcome from its agent
+        # record (~/.fleet/agents/<id>.json), written by fleet-guard:
+        #   record gone / no pid           -> "gone"  (died / never started)
+        #   blocked flag true              -> "blocked"
+        #   pid alive                      -> "running"
+        # pr_watch maps these to lease transitions (§6). Never raises.
+        if not agent_id:
+            return "gone"
+        rec = _read_agent_record(agent_id, home=home)
+        if not isinstance(rec, dict):
+            return "gone"
+        if rec.get("blocked"):
+            return "blocked"
+        try:
+            pid = int(rec.get("pid", 0) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 0 and _pid_alive(pid):
+            return "running"
+        return "gone"
+
+    def _dispatch_action(action) -> str:
+        # Mint an agent_id, render the rebase/fix prompt, write the inbox,
+        # and emit the DISPATCH block (the launch boundary). The lease was
+        # already persisted (running) BEFORE this call by pr_watch — so a
+        # crash after the emit replays rather than duplicates. Returns the
+        # agent_id on a successful emit, "" on failure (-> failed_launch).
+        try:
+            agent_id = dispatch_mod.mint_agent_id()
+            label = f"pr-{action.kind}-{action.pr_number}"
+            if action.kind == pr_watch_mod.ACTION_REBASE:
+                prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
+            else:
+                prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
+            prompt_file = dispatch_mod.write_worker_inbox(
+                agent_id, prompt, fleet_home=fhome,
+            )
+            block = dispatch_mod.format_dispatch_instruction(
+                agent_id=agent_id, slug=label, prompt_file=prompt_file,
+                description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
+            )
+            result.dispatch_instructions.append(block)
+            return agent_id
+        except Exception as exc:  # noqa: BLE001 — a failed emit -> failed_launch
+            result.errors.append(
+                f"pr-watch: emit {action.kind} for #{action.pr_number}: {exc}"
+            )
+            return ""
+
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
         project=project,
@@ -5442,6 +5541,9 @@ def _reconcile_pr_watches(
         tick_count=tick_count,
         repo_path=repo_path,
         enroll_tasks=enroll_tasks,
+        dispatch_action=_dispatch_action,
+        agent_outcome=_agent_outcome,
+        deps_done=_deps_done,
     )
 
     # Surface raise-hand events as operator-visible errors + count them as

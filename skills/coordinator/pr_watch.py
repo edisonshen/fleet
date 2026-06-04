@@ -116,6 +116,254 @@ _ACTIONABLE_EVENTS = frozenset({
     EVENT_CHANGES_REQUESTED,
 })
 
+# Events that are remedied by a REBASE (auto-rebase the uniquely-eligible
+# next-to-merge PR, §5.1b/c). STALE = head missing fresh base under strict
+# protection; BEHIND/DIRTY = GitHub's stale/conflict words. All three mean
+# "the head must contain a fresher base"; the rebase subagent resolves it.
+_REBASE_EVENTS = frozenset({EVENT_STALE, EVENT_BEHIND, EVENT_DIRTY})
+# Events remedied by a FIX subagent (re-run/repair CI, apply review fixes).
+_FIX_EVENTS = frozenset({EVENT_CI_FAILED, EVENT_CHANGES_REQUESTED})
+
+
+# ----------------------------------------------------------------------
+# §6 crash-safe action leases — outcome, not boolean
+# ----------------------------------------------------------------------
+#
+# A naive "dispatch then persist a flag" is NOT crash-safe (design §6): a
+# crash after launching but before persisting wedges/duplicates, and an
+# existence-only flag suppresses a NEEDED retry forever if the fixer dies
+# before pushing. So an action is a LEASE with an OUTCOME persisted into
+# the watch's `inflight_action`, and the lease key + agent_id are written
+# BEFORE any launchable DISPATCH block is emitted (commit-then-emit, the
+# same ordering the merged dispatch chokepoint enforces for workers).
+#
+#   planned -> prompt_acquired -> launch_emitted -> running
+#                                                      |
+#                          terminal{succeeded@<head> | blocked | failed_launch}
+#
+# Suppression is by OUTCOME (not existence):
+#   running   + agent alive  -> suppress (someone's on it)
+#   succeeded@<current-head>  -> suppress (already handled THIS head)
+#   failed_launch             -> RETRY (it never actually ran)
+#   blocked                   -> raise-hand; require operator ack (one
+#                                attempt per <headSHA,baseSHA>); no silent
+#                                re-fire
+# Reclaim (every tick): a `running` lease whose agent_id is provably dead
+# OR whose `leased_at` is older than the lease bound is cleared -> eligible
+# to re-dispatch (closes the "fixer died silently -> PR unwatched-for-action
+# forever" hole). `dispatched_events` keys whose head-SHA != current head
+# are pruned on each persist so the file stays bounded.
+
+ACTION_REBASE = "rebase"
+ACTION_FIX = "fix"
+
+OUTCOME_RUNNING = "running"
+OUTCOME_BLOCKED = "blocked"
+OUTCOME_FAILED_LAUNCH = "failed_launch"
+_OUTCOME_SUCCEEDED_PREFIX = "succeeded@"
+
+# A `running` lease older than this many ticks with no liveness signal is
+# reclaimed (the agent likely died between launch and its first heartbeat,
+# or the launch silently failed). Tick-budget (not wall-clock) so tests are
+# deterministic — mirrors pr_watch's existing _BACKOFF_*_TICKS discipline.
+_LEASE_EXPIRY_TICKS = 12
+
+
+def _succeeded_outcome(head_sha: str) -> str:
+    return f"{_OUTCOME_SUCCEEDED_PREFIX}{head_sha}"
+
+
+def _succeeded_head(outcome: str) -> str | None:
+    """Return the head SHA a `succeeded@<sha>` outcome was recorded for,
+    or None if `outcome` isn't a succeeded marker."""
+    if isinstance(outcome, str) and outcome.startswith(_OUTCOME_SUCCEEDED_PREFIX):
+        return outcome[len(_OUTCOME_SUCCEEDED_PREFIX):]
+    return None
+
+
+def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "") -> str:
+    """Build the idempotency key for one action lease (§6).
+
+    rebase: `rebase:<baseSHA>:<headSHA>` — one attempt per (base, head)
+            pair, so a fresh base (an upstack merge moved origin/main) or
+            a moved head re-enables a rebase, but the SAME pair never
+            re-fires (the blocked latch is keyed on this).
+    fix:    `fix:<headSHA>:<event>` — keyed on the head + the failing
+            signal, so a NEW push (head change) re-enables a fix, and a
+            DIFFERENT event on the same head (CI-fail vs changes-requested)
+            is its own key.
+    """
+    if kind == ACTION_REBASE:
+        return f"{ACTION_REBASE}:{base_sha}:{head_sha}"
+    return f"{ACTION_FIX}:{head_sha}:{event}"
+
+
+def _prune_dispatched_events(watch: dict, current_head: str) -> None:
+    """Drop `dispatched_events` keys whose head-SHA != the current head
+    (§6 — keep the file bounded). A rebase key embeds the head as its LAST
+    colon-segment; a fix key embeds it as its SECOND segment. We keep a key
+    iff the current head appears in it, so an obsolete head's keys are
+    pruned the moment the head advances."""
+    de = watch.get("dispatched_events")
+    if not isinstance(de, dict) or not current_head:
+        return
+    kept = {}
+    for k, v in de.items():
+        # rebase:<base>:<head>  or  fix:<head>:<event>
+        parts = k.split(":")
+        head_in_key = ""
+        if k.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+            head_in_key = parts[-1]
+        elif k.startswith(ACTION_FIX + ":") and len(parts) >= 2:
+            head_in_key = parts[1]
+        if head_in_key == current_head:
+            kept[k] = v
+    watch["dispatched_events"] = kept
+
+
+def _action_suppressed(
+    watch: dict,
+    *,
+    key: str,
+    current_head: str,
+) -> bool:
+    """Should re-dispatch of `key` be SUPPRESSED this tick? (§6 outcome-
+    based suppression — NOT existence.)
+
+    Called AFTER _reclaim_lease has already resolved (cleared / moved to
+    ledger) any stale `running` lease, so the live `inflight_action` here
+    is either absent or a genuinely-in-flight action. Checks both the live
+    lease and the terminal `dispatched_events` ledger:
+      - running (same key, post-reclaim => alive) -> suppress
+      - succeeded@<current-head>                  -> suppress (handled)
+      - succeeded@<other-head>                    -> NOT suppressed
+      - blocked                                   -> suppress auto-redispatch
+                                                     (caller raises once)
+      - failed_launch / absent                    -> NOT suppressed (retry)
+    """
+    de = watch.get("dispatched_events")
+    if isinstance(de, dict):
+        recorded = de.get(key)
+        if recorded == OUTCOME_BLOCKED:
+            return True
+        sh = _succeeded_head(recorded) if isinstance(recorded, str) else None
+        if sh is not None and sh == current_head:
+            return True
+
+    inflight = watch.get("inflight_action")
+    if not isinstance(inflight, dict) or inflight.get("key") != key:
+        return False
+    outcome = inflight.get("outcome")
+    if outcome == OUTCOME_RUNNING:
+        # reclaim already ran this tick; a surviving running lease on this
+        # key is genuinely in flight -> suppress.
+        return True
+    if outcome == OUTCOME_BLOCKED:
+        return True
+    if outcome == OUTCOME_FAILED_LAUNCH:
+        return False
+    sh = _succeeded_head(outcome) if isinstance(outcome, str) else None
+    if sh is not None:
+        return sh == current_head
+    return False
+
+
+def _lease_head(key: str) -> str:
+    """Extract the head SHA a lease key was minted against (rebase key's
+    last segment, fix key's second segment), or "" if unparseable."""
+    if not isinstance(key, str):
+        return ""
+    parts = key.split(":")
+    if key.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+        return parts[-1]
+    if key.startswith(ACTION_FIX + ":") and len(parts) >= 2:
+        return parts[1]
+    return ""
+
+
+def _reclaim_lease(
+    watch: dict,
+    *,
+    tick_count: int,
+    current_head: str,
+    agent_alive: Callable[[str], bool],
+    agent_outcome: Callable[[str], str],
+) -> tuple[str | None, str | None]:
+    """Resolve the watch's in-flight lease (§6). Clears `inflight_action`
+    so a re-dispatch can re-lease, moving terminal outcomes to the durable
+    `dispatched_events` ledger. Returns (note, raise) — `note` is an
+    informational breadcrumb, `raise` is a once-only operator alert (set
+    when an action BLOCKED).
+
+    Outcome resolution for a `running` lease, in priority order:
+      1. agent reports BLOCKED (agent_outcome == blocked) -> ledger
+         blocked + RAISE (one attempt per <head,base> key; never re-fired).
+      2. HEAD MOVED (lease's target head != current) -> the fixer/rebaser
+         pushed (or a human advanced the head); record succeeded@<oldhead>
+         + free the slot.
+      3. agent DEAD (not alive) and head UNCHANGED and not blocked -> the
+         action died before pushing -> reclaim (clear) so it re-dispatches.
+      4. lease EXPIRED (no liveness signal for too long) -> reclaim.
+      5. otherwise still running -> leave it.
+
+    `agent_outcome(agent_id)` returns "blocked" | "running" | "gone" | ""
+    derived by the tick from the subagent's agent record (blocked flag /
+    record presence). pr_watch never reads the record itself (shell-free).
+    """
+    inflight = watch.get("inflight_action")
+    if not isinstance(inflight, dict):
+        return None, None
+    outcome = inflight.get("outcome")
+    key = str(inflight.get("key", "") or "")
+
+    # Already-terminal lease (set in-line by the dispatch path on a launch
+    # failure) -> move to ledger + free the slot.
+    if outcome != OUTCOME_RUNNING:
+        if outcome and key:
+            de = watch.setdefault("dispatched_events", {})
+            if isinstance(de, dict):
+                de[key] = outcome
+        watch["inflight_action"] = None
+        return None, None
+
+    agent_id = str(inflight.get("agent_id", "") or "")
+    reported = agent_outcome(agent_id) if agent_id else "gone"
+    lease_head = _lease_head(key)
+    head_moved = bool(current_head and lease_head and lease_head != current_head)
+
+    # 1. BLOCKED — the subagent aborted (conflict / guard abort). One
+    # attempt per key: record blocked in the ledger; the dispatch pass's
+    # suppression branch owns the (once-only) raise off the ledger, so we
+    # don't double-raise here.
+    if reported == OUTCOME_BLOCKED and not head_moved:
+        de = watch.setdefault("dispatched_events", {})
+        if isinstance(de, dict):
+            de[key] = OUTCOME_BLOCKED
+        watch["inflight_action"] = None
+        return None, None
+
+    # 2. HEAD MOVED -> success.
+    if head_moved:
+        de = watch.setdefault("dispatched_events", {})
+        if isinstance(de, dict):
+            de[key] = _succeeded_outcome(lease_head)
+        watch["inflight_action"] = None
+        return f"retired succeeded lease {key!r} (head advanced to {current_head})", None
+
+    # 3. agent gone (dead) + head unchanged + not blocked -> died pre-push.
+    if reported == "gone" or not agent_alive(agent_id):
+        watch["inflight_action"] = None
+        return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
+
+    # 4. lease expired.
+    leased_tick = inflight.get("leased_tick")
+    if isinstance(leased_tick, int) and tick_count - leased_tick >= _LEASE_EXPIRY_TICKS:
+        watch["inflight_action"] = None
+        return f"reclaimed expired lease {key!r} (>{_LEASE_EXPIRY_TICKS} ticks)", None
+
+    # 5. still running.
+    return None, None
+
 
 # ----------------------------------------------------------------------
 # Probe snapshot + injectable prober seam
@@ -407,6 +655,7 @@ class WatchOutcome:
     probed: int = 0
     pruned: int = 0
     tasks_flipped: int = 0
+    dispatched: int = 0     # PR2 auto-fix actions launched this pass (§5/§6)
     raises: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -532,8 +781,120 @@ def reduce_snapshot(
 
 
 # ----------------------------------------------------------------------
+# §5.1(b) next-to-merge eligibility — by DEPENDENCY, not PR number
+# ----------------------------------------------------------------------
+
+
+def _watch_head(watch: dict) -> str:
+    snap = watch.get("last_snapshot")
+    if isinstance(snap, dict):
+        return str(snap.get("head_ref_oid", "") or "")
+    return ""
+
+
+def compute_rebase_eligibility(
+    watches: dict,
+    *,
+    deps_done: Callable[[list], bool],
+    base_protected: Callable[[dict], bool],
+    is_ancestor: Callable[[str, str], bool],
+    task_deps: Callable[[str], list],
+) -> tuple[set, bool]:
+    """Resolve which OPEN watches are rebase-eligible (§5.1b). Returns
+    (eligible_pr_numbers, ambiguous).
+
+    PR NUMBER is creation order, not stack order (parallel / backfilled /
+    reopened PRs break it), so eligibility is derived from the BRANCH GRAPH
+    + dependency state, never the number. A watched PR is eligible iff:
+
+      1. all its backing tasks' `depends_on` are done, AND
+      2. its base is the protected branch (`main`), AND
+      3. NO other OPEN watched PR's head is an ancestor of this PR's head
+         (i.e. nothing open sits BENEATH it in the branch graph).
+
+    The caller then fires auto-rebase ONLY when exactly ONE PR is eligible:
+      - zero eligible  -> do nothing (all blocked on an open upstack; a
+                          downstack-stale PR is EXPECTED, not actionable).
+      - one eligible   -> rebase it.
+      - two+ eligible OR ambiguous -> raise-hand, DO NOT guess (returns
+                          `ambiguous=True` when >=2 candidates pass the
+                          per-PR gates so the caller can raise instead of
+                          picking one).
+
+    `is_ancestor(anc, desc)` runs against FRESH refs (the same prober seam
+    the mergeability check uses). An ancestry we can't prove (missing ref,
+    git error) reads False — fail-soft: we never assert a PR sits beneath
+    another off a missing ref, so a transient outage degrades to "treat as
+    independent" (the exactly-one gate then catches a >=2 ambiguity and
+    raises rather than rebasing the wrong one).
+    """
+    open_heads: dict[int, str] = {}
+    for key, w in watches.items():
+        if w.get("state") != STATE_OPEN:
+            continue
+        head = _watch_head(w)
+        if not head:
+            continue
+        try:
+            n = int(w.get("pr_number", key))
+        except (TypeError, ValueError):
+            continue
+        open_heads[n] = head
+
+    eligible: set = set()
+    for n, head in open_heads.items():
+        w = watches.get(str(n))
+        if w is None:
+            continue
+        # gate 1: all backing tasks' deps done.
+        deps: list = []
+        for slug in w.get("tasks") or []:
+            deps.extend(task_deps(slug))
+        if not deps_done(deps):
+            continue
+        # gate 2: base is the protected branch.
+        if not base_protected(w):
+            continue
+        # gate 3: no OTHER open watched head is an ancestor of this head.
+        beneath = False
+        for m, other_head in open_heads.items():
+            if m == n or other_head == head:
+                continue
+            if is_ancestor(other_head, head):
+                # `other` sits beneath `n` in the graph -> n is downstack of
+                # an open PR -> not next-to-merge.
+                beneath = True
+                break
+        if not beneath:
+            eligible.add(n)
+
+    ambiguous = len(eligible) >= 2
+    return eligible, ambiguous
+
+
+# ----------------------------------------------------------------------
 # The reconcile invariant (§2) — the public entry point for the tick
 # ----------------------------------------------------------------------
+
+
+@dataclass
+class ActionDispatch:
+    """One auto-fix action the tick should launch (§5.1c / §5 / §6). The
+    tick's `dispatch_action` callback consumes this: it mints an agent_id,
+    writes the subagent's inbox prompt, emits the DISPATCH block, and
+    returns the agent_id on a successful PROMPT-acquire+emit (commit the
+    lease BEFORE the launchable block). A failure returns "" (the lease is
+    marked failed_launch -> retried next tick)."""
+
+    kind: str            # ACTION_REBASE | ACTION_FIX
+    event: str           # the EVENT_* that triggered it (carried into the prompt)
+    pr_number: int
+    pr_url: str
+    branch: str
+    base: str
+    head_sha: str        # watch-snapshot head — the rebase guard verifies it's unchanged
+    base_sha: str        # fresh base tip to rebase onto (rebase only)
+    key: str             # the §6 lease key (idempotency)
 
 
 def reconcile_watches(
@@ -549,6 +910,9 @@ def reconcile_watches(
     slow_cadence_ticks: int = _SLOW_CADENCE_TICKS_DEFAULT,
     repo_path: str = "",
     enroll_tasks: list | None = None,
+    dispatch_action: "Callable[[ActionDispatch], str] | None" = None,
+    agent_outcome: "Callable[[str], str] | None" = None,
+    deps_done: "Callable[[list], bool] | None" = None,
 ) -> WatchOutcome:
     """Run one PR-watch reconcile pass. Single writer = the tick (caller
     holds the coord flock). Returns a WatchOutcome the tick funnels into
@@ -570,6 +934,14 @@ def reconcile_watches(
     flip_task_done: callback the tick supplies (wraps `fleet tasks set
       <slug> status=done`). reconcile_watches never shells out itself —
       the tick owns all CLI mutation (single-seam discipline).
+    dispatch_action / agent_outcome / deps_done: the PR2 (auto-fix) seam.
+      When `dispatch_action` is provided, actionable events drive a §6-
+      leased auto-rebase / fix-subagent dispatch (see _dispatch_actions);
+      when None, the function behaves exactly like PR1 (surface-only).
+      `agent_outcome(agent_id)` returns "blocked"|"running"|"gone"|"" from
+      the subagent's agent record (lease resolution / reclaim);
+      `deps_done(deps)` answers §5.1b dependency-completion. Both default
+      to safe stubs when only some are supplied.
     """
     out = WatchOutcome()
     doc = load_watches(project_dir)
@@ -776,15 +1148,34 @@ def reconcile_watches(
         if isinstance(prev_head, str) and prev_head:
             head_oids.append(prev_head)
 
+    pr2_active = dispatch_action is not None
+    last_repo_probe: RepoProbe | None = None
     if due_numbers:
         base_ref = _common_base_ref(watches, due_numbers)
         repo_probe = prober.probe_repo(
             repo_path, coord_owner_repo, base_ref, sorted(set(due_numbers)),
             sorted(set(head_oids)),
         )
+        last_repo_probe = repo_probe
         _apply_probe(
             watches, due_numbers, repo_probe, prober, repo_path,
             now_iso=now_iso, tick_count=tick_count, out=out,
+            pr2_active=pr2_active,
+        )
+
+    # --- 4.6. AUTO-FIX dispatch (§5.1b/c + §6) — only when the PR2 seam is
+    # wired (dispatch_action provided). Reclaim stale leases, derive the
+    # uniquely-eligible next-to-merge PR for rebases, and dispatch ONE
+    # action per watch under the §6 outcome-suppression lease. When the
+    # seam is absent we behave exactly like PR1 (surface-only, above).
+    if pr2_active:
+        _dispatch_actions(
+            watches, tasks=tasks, prober=prober, repo_path=repo_path,
+            repo_probe=last_repo_probe, tick_count=tick_count,
+            dispatch_action=dispatch_action,
+            agent_outcome=agent_outcome or (lambda _aid: "gone"),
+            deps_done=deps_done or (lambda _deps: True),
+            now_iso=now_iso, out=out,
         )
 
     # --- 4.5. ORPHAN raise — AFTER the probe (codex iter-17 [P2]) so it
@@ -939,11 +1330,17 @@ def _apply_probe(
     now_iso: str,
     tick_count: int,
     out: WatchOutcome,
+    pr2_active: bool = False,
 ) -> None:
     """Persist each due watch's snapshot + reduce to an event. Fail-soft:
     a whole-repo transient failure (repo_probe.error) skips + RETAINS
     every due watch with a jittered backoff (§3); a per-PR transient
-    failure does the same for just that PR; a definitive 404 raises hand."""
+    failure does the same for just that PR; a definitive 404 raises hand.
+
+    `pr2_active`: when True the auto-fix seam is wired, so an actionable
+    OPEN event is NOT surfaced here as a "PR1 surfaces only" raise — the
+    post-probe _dispatch_actions pass owns it (launching the fixer or
+    raising-hand with the right reason). READY notes still surface."""
     is_anc = lambda a, d: prober.is_ancestor(repo_path, a, d)  # noqa: E731
 
     for n in due_numbers:
@@ -1067,13 +1464,222 @@ def _apply_probe(
             if event != prev_event:
                 if event == EVENT_READY:
                     out.notes.append(f"pr-watch: #{n} is mergeable (READY)")
-                elif event in _ACTIONABLE_EVENTS:
+                elif event in _ACTIONABLE_EVENTS and not pr2_active:
                     # PR1 SURFACES the actionable event (raise-hand /
-                    # diagnostic). PR2 dispatches the fixer here.
+                    # diagnostic). With the PR2 seam wired, _dispatch_actions
+                    # owns this event (launch the fixer or raise with the
+                    # right reason) — so we do NOT double-surface here.
                     out.raises.append(
                         f"pr-watch: PR #{n} is {event.upper()} and needs a fix "
                         f"(PR1 surfaces only; auto-fix lands in PR2) — {w.get('pr_url', '')}"
                     )
+
+
+def _dispatch_actions(
+    watches: dict,
+    *,
+    tasks: list,
+    prober: Prober,
+    repo_path: str,
+    repo_probe: "RepoProbe | None",
+    tick_count: int,
+    dispatch_action: Callable[["ActionDispatch"], str],
+    agent_outcome: Callable[[str], str],
+    deps_done: Callable[[list], bool],
+    now_iso: str,
+    out: WatchOutcome,
+) -> None:
+    """The PR2 auto-fix pass (§5.1b/c + §6). Runs AFTER probe+reduce, for
+    every OPEN watch whose reduced `last_event` is actionable.
+
+    Per watch, in order:
+      1. RECLAIM a stale lease (dead agent / expiry; terminal -> ledger).
+      2. PRUNE dispatched_events keys whose head != current head (bounded).
+      3. Decide the action from last_event:
+           STALE/BEHIND/DIRTY -> REBASE (only if uniquely eligible §5.1b),
+           CI_FAILED          -> FIX (CI),
+           CHANGES_REQUESTED   -> FIX (review) unless substantive -> raise.
+      4. SUPPRESS by §6 outcome; otherwise lease + dispatch.
+
+    The lease (key + agent_id + outcome=running) is persisted into the
+    watch BEFORE the launchable DISPATCH block is emitted — the callback
+    does the emit, and the tick persists the whole doc at the end of
+    reconcile_watches, so a crash replays (lease present) rather than
+    duplicates. A callback returning "" means the prompt-acquire/emit
+    failed: we mark the lease failed_launch (retried next tick).
+    """
+    is_anc = lambda a, d: prober.is_ancestor(repo_path, a, d)  # noqa: E731
+
+    # slug -> (status, depends_on) for the §5.1b eligibility gates.
+    task_status: dict[str, str] = {}
+    task_deps_map: dict[str, list] = {}
+    for t in tasks:
+        slug = getattr(t, "slug", "")
+        if not slug:
+            continue
+        task_status[slug] = getattr(t, "status", "")
+        task_deps_map[slug] = list(getattr(t, "depends_on", []) or [])
+
+    def _task_deps(slug: str) -> list:
+        return task_deps_map.get(slug, [])
+
+    def _base_protected(w: dict) -> bool:
+        return (w.get("base") or "main") == "main"
+
+    # §5.1b: derive the rebase-eligible set ONCE for the whole repo so the
+    # exactly-one gate is consistent across all watches this tick.
+    eligible, ambiguous = compute_rebase_eligibility(
+        watches,
+        deps_done=deps_done,
+        base_protected=_base_protected,
+        is_ancestor=is_anc,
+        task_deps=_task_deps,
+    )
+
+    for key in list(watches.keys()):
+        w = watches[key]
+        if w.get("state") != STATE_OPEN:
+            continue
+        try:
+            pr_num = int(w.get("pr_number", key))
+        except (TypeError, ValueError):
+            continue
+        head = _watch_head(w)
+        if not head:
+            continue
+
+        # 1. reclaim/resolve the in-flight lease (blocked / head-moved /
+        # dead agent / expiry; terminal -> ledger).
+        rec_note, _rec_raise = _reclaim_lease(
+            w, tick_count=tick_count, current_head=head,
+            agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
+            agent_outcome=agent_outcome,
+        )
+        if rec_note:
+            out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
+        # 2. keep the dispatched_events ledger bounded.
+        _prune_dispatched_events(w, head)
+
+        event = w.get("last_event")
+        if event not in _ACTIONABLE_EVENTS:
+            continue
+
+        # 3. decide the action.
+        if event in _REBASE_EVENTS:
+            # rebase only the UNIQUELY-eligible next-to-merge PR (§5.1b).
+            if ambiguous:
+                # 2+ eligible -> never guess; raise-hand once.
+                if event != w.get("_raised_event"):
+                    w["_raised_event"] = event
+                    out.raises.append(
+                        f"pr-watch: PR #{pr_num} is {event.upper()} but rebase "
+                        f"eligibility is AMBIGUOUS (>=2 next-to-merge candidates); "
+                        f"not auto-rebasing — operator must pick — {w.get('pr_url', '')}"
+                    )
+                continue
+            if pr_num not in eligible:
+                # zero-eligible-for-this-PR: a downstack PR with an open
+                # upstack is EXPECTED-stale, not actionable. Do nothing
+                # (no churn, no raise).
+                continue
+            # The fresh base SHA the probe captured for this PR's base —
+            # the rebase subagent rebases onto exactly this. Empty when
+            # there was no probe this tick (cadence/backoff): we then skip
+            # the rebase dispatch rather than rebase onto an unknown base.
+            base_sha = ""
+            if repo_probe is not None:
+                base_sha = repo_probe.base_sha_for(w.get("base") or "main")
+            if not base_sha:
+                continue
+            kind = ACTION_REBASE
+            key_str = lease_key(kind, event, head_sha=head, base_sha=base_sha)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha=base_sha,
+                key=key_str,
+            )
+        elif event == EVENT_CHANGES_REQUESTED:
+            # CHANGES_REQUESTED: a fix subagent handles typo/style; a
+            # substantive/design change needs operator judgement. We can't
+            # read the review body here (the probe doesn't fetch it), so we
+            # dispatch a fix subagent whose prompt instructs it to apply
+            # mechanical fixes and RAISE (return BLOCKED) on substantive
+            # asks — keeping the "substantive -> raise-hand" guard in the
+            # subagent where the review text is available.
+            kind = ACTION_FIX
+            key_str = lease_key(kind, event, head_sha=head)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha="",
+                key=key_str,
+            )
+        else:  # EVENT_CI_FAILED
+            kind = ACTION_FIX
+            key_str = lease_key(kind, event, head_sha=head)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha="",
+                key=key_str,
+            )
+
+        # 4. §6 outcome suppression. A blocked latch raises-hand once.
+        if _action_suppressed(w, key=key_str, current_head=head):
+            de = w.get("dispatched_events")
+            inflight = w.get("inflight_action")
+            blocked_here = (
+                (isinstance(de, dict) and de.get(key_str) == OUTCOME_BLOCKED)
+                or (isinstance(inflight, dict)
+                    and inflight.get("key") == key_str
+                    and inflight.get("outcome") == OUTCOME_BLOCKED)
+            )
+            if blocked_here and key_str != w.get("_raised_blocked_key"):
+                w["_raised_blocked_key"] = key_str
+                out.raises.append(
+                    f"pr-watch: PR #{pr_num} {kind} is BLOCKED (one attempt per "
+                    f"head/base; conflict or guard abort) — needs operator "
+                    f"attention — {w.get('pr_url', '')}"
+                )
+            continue
+
+        # 5. LEASE then DISPATCH. Persist the lease (running) BEFORE the
+        # callback emits the launchable DISPATCH block (commit-then-emit).
+        # We set it on the watch dict; the doc is persisted at the end of
+        # reconcile_watches, so a crash after emit but before that persist
+        # replays — and the callback itself is the launch boundary.
+        w["inflight_action"] = {
+            "kind": kind,
+            "key": key_str,
+            "agent_id": "",
+            "leased_at": now_iso,
+            "leased_tick": tick_count,
+            "outcome": OUTCOME_RUNNING,
+        }
+        try:
+            agent_id = dispatch_action(action)
+        except Exception as exc:  # noqa: BLE001 — a dispatch failure must not wedge the tick
+            w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            out.errors.append(
+                f"pr-watch: dispatch {kind} for PR #{pr_num} failed: {exc}"
+            )
+            continue
+        if not agent_id:
+            # prompt-acquire/emit failed -> the action never ran. Mark
+            # failed_launch so the next tick retries (not a permanent latch).
+            w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            out.errors.append(
+                f"pr-watch: dispatch {kind} for PR #{pr_num} did not launch; "
+                f"will retry"
+            )
+            continue
+        w["inflight_action"]["agent_id"] = agent_id
+        out.dispatched += 1
+        out.notes.append(
+            f"pr-watch: dispatched {kind} subagent {agent_id} for PR #{pr_num} "
+            f"({event.upper()})"
+        )
 
 
 def _park_not_found(watch: dict, pr_num: int, out: WatchOutcome) -> None:

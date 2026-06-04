@@ -41,9 +41,10 @@ OWNER_REPO = "edisonshen/fleet"
 
 
 def _task(slug: str, *, status: str = "in-review", pr_url: str = "",
-          branch: str = "") -> parse.Task:
+          branch: str = "", depends_on=None) -> parse.Task:
     return parse.Task(slug=slug, status=status, priority="P1",
-                      pr_url=pr_url, branch=branch)
+                      pr_url=pr_url, branch=branch,
+                      depends_on=list(depends_on or []))
 
 
 def _pr_url(n: int, owner_repo: str = OWNER_REPO) -> str:
@@ -1323,9 +1324,11 @@ def test_persisted_foreign_watch_not_probed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _it_task(slug: str, *, status="in-review", pr_url="", branch="") -> parse.Task:
+def _it_task(slug: str, *, status="in-review", pr_url="", branch="",
+             depends_on=None) -> parse.Task:
     return parse.Task(
         slug=slug, status=status, priority="P1", pr_url=pr_url, branch=branch,
+        depends_on=list(depends_on or []),
         created=_dt.datetime(2026, 6, 3, 8, 0, tzinfo=_dt.timezone.utc),
         updated=_dt.datetime(2026, 6, 3, 8, 0, tzinfo=_dt.timezone.utc),
         spawned_by="user", spec="spec", acceptance="acc",
@@ -1434,3 +1437,470 @@ def test_tick_coord_scope_skips_foreign_pr_through_loop(
     assert pw.load_watches(it_project_dir)["watches"] == {}
     assert prober.probe_calls == []
     assert any("coord-scope" in e for e in result.errors)
+
+
+# ===========================================================================
+# PR2 — auto-fix half (§5.1b eligibility, §5.1c rebase guard, §6 leases).
+# Design: docs/DESIGN-coord-pr-watch-durable.md §5/§6.
+#
+# These exercise the pr_watch logic in isolation (the loop.py dispatch
+# callback is a recording fake here; the loop wiring + prompts are covered
+# by the integration tests further down). All deterministic — prober + the
+# dispatch / agent-outcome / deps-done callbacks are injected fakes.
+# ===========================================================================
+
+
+class _DispatchRecorder:
+    """Records ActionDispatch objects + returns a minted agent_id (or "" to
+    simulate a launch failure for the failed_launch path)."""
+
+    def __init__(self, *, return_id="aaaa0001", fail=False):
+        self.calls = []
+        self.return_id = return_id
+        self.fail = fail
+
+    def __call__(self, action):
+        self.calls.append(action)
+        if self.fail:
+            return ""
+        return self.return_id
+
+
+def _stale_snap(n, head="HEAD1"):
+    # OPEN, green CI, 0 reviews, BLOCKED word (stale-under-strict): head
+    # does NOT contain fresh base -> EVENT_STALE.
+    return pw.PRSnapshot(number=n, pr_state="OPEN", merge_state_status="BLOCKED",
+                         review_decision="", checks="SUCCESS", head_ref_oid=head,
+                         base_ref_name="main")
+
+
+def _ci_fail_snap(n, head="HEAD1"):
+    return pw.PRSnapshot(number=n, pr_state="OPEN", merge_state_status="UNSTABLE",
+                         review_decision="", checks="FAILURE", head_ref_oid=head,
+                         base_ref_name="main")
+
+
+def _changes_snap(n, head="HEAD1"):
+    return pw.PRSnapshot(number=n, pr_state="OPEN", merge_state_status="BLOCKED",
+                         review_decision="CHANGES_REQUESTED", checks="SUCCESS",
+                         head_ref_oid=head, base_ref_name="main")
+
+
+def _run2(tasks, project_dir, prober, *, dispatch=None, agent_outcome=None,
+          deps_done=None, owner_repo=OWNER_REPO, now="2026-06-03T08:00:00Z",
+          tick_count=1, slow=5, flips=None):
+    """reconcile_watches WITH the PR2 auto-fix seam wired."""
+    def _flip(slug, pr_url=""):
+        if flips is not None:
+            flips.append(slug)
+    return pw.reconcile_watches(
+        tasks, project="p", project_dir=project_dir,
+        coord_owner_repo=owner_repo, prober=prober,
+        flip_task_done=_flip, now_iso=now, tick_count=tick_count,
+        slow_cadence_ticks=slow, repo_path="/repo",
+        dispatch_action=dispatch or _DispatchRecorder(),
+        agent_outcome=agent_outcome or (lambda _aid: "running"),
+        deps_done=deps_done or (lambda _deps: True),
+    )
+
+
+# --- §5.1b eligibility -----------------------------------------------------
+
+
+def test_single_eligible_stale_pr_dispatches_rebase(tmp_path: Path) -> None:
+    """One STALE next-to-merge PR, deps done, base main, nothing beneath ->
+    exactly one rebase dispatch (§5.1b exactly-one)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _stale_snap(195, head="HEAD195")}
+    # fresh base NOT an ancestor of head -> STALE.
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 1
+    assert len(disp.calls) == 1
+    act = disp.calls[0]
+    assert act.kind == pw.ACTION_REBASE
+    assert act.pr_number == 195
+    assert act.head_sha == "HEAD195"
+    assert act.base_sha == "FRESHBASE"
+    # lease persisted with the agent_id + running outcome.
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["inflight_action"]["outcome"] == pw.OUTCOME_RUNNING
+    assert w["inflight_action"]["agent_id"] == "aaaa0001"
+    assert w["inflight_action"]["key"] == act.key
+
+
+def test_downstack_stale_pr_no_rebase(tmp_path: Path) -> None:
+    """A downstack PR whose upstack PR is still OPEN (its head is an
+    ancestor) -> NOT eligible -> no rebase, no raise (expected-stale)."""
+    tasks = [
+        _task("up", pr_url=_pr_url(195), branch="worker/up"),
+        _task("down", pr_url=_pr_url(196), branch="worker/down"),
+    ]
+    snaps = {195: _stale_snap(195, head="UP"), 196: _stale_snap(196, head="DOWN")}
+    # UP is an ancestor of DOWN -> DOWN sits above UP -> UP is next-to-merge.
+    # But UP is also stale; only UP eligible (nothing beneath UP). DOWN has
+    # UP beneath it -> NOT eligible.
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE",
+                        ancestors={("UP", "DOWN")})
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    # exactly one eligible (UP) -> one rebase, for 195 not 196.
+    assert out.dispatched == 1
+    assert disp.calls[0].pr_number == 195
+
+
+def test_two_independent_eligible_raises_no_rebase(tmp_path: Path) -> None:
+    """Two independent eligible STALE PRs (neither beneath the other) ->
+    ambiguous -> raise-hand, ZERO auto-rebase (§5.1b never-guess)."""
+    tasks = [
+        _task("a", pr_url=_pr_url(195), branch="worker/a"),
+        _task("b", pr_url=_pr_url(196), branch="worker/b"),
+    ]
+    snaps = {195: _stale_snap(195, head="A"), 196: _stale_snap(196, head="B")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 0
+    assert disp.calls == []
+    assert any("AMBIGUOUS" in r for r in out.raises)
+
+
+def test_deps_not_done_not_eligible(tmp_path: Path) -> None:
+    """A STALE PR whose task depends on an unfinished task -> NOT eligible
+    -> no rebase (zero-eligible noop)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a", depends_on=["x"])]
+    snaps = {195: _stale_snap(195, head="A")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp, deps_done=lambda deps: not deps)
+    assert out.dispatched == 0
+    assert disp.calls == []
+
+
+def test_high_number_base_not_mispicked(tmp_path: Path) -> None:
+    """A HIGH-number PR (#300) that is actually the BASE of a low-number
+    one (#195) is the next-to-merge; PR number must not pick #195. #300's
+    head is an ancestor of #195's head."""
+    tasks = [
+        _task("base", pr_url=_pr_url(300), branch="worker/base"),
+        _task("top", pr_url=_pr_url(195), branch="worker/top"),
+    ]
+    snaps = {300: _stale_snap(300, head="BASE"), 195: _stale_snap(195, head="TOP")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE",
+                        ancestors={("BASE", "TOP")})
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 1
+    assert disp.calls[0].pr_number == 300  # the base, not the high/low number
+
+
+# --- fix dispatch ----------------------------------------------------------
+
+
+def test_ci_failure_dispatches_fix(tmp_path: Path) -> None:
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 1
+    assert disp.calls[0].kind == pw.ACTION_FIX
+    assert disp.calls[0].event == pw.EVENT_CI_FAILED
+
+
+def test_changes_requested_dispatches_fix(tmp_path: Path) -> None:
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _changes_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 1
+    assert disp.calls[0].kind == pw.ACTION_FIX
+    assert disp.calls[0].event == pw.EVENT_CHANGES_REQUESTED
+
+
+# --- §6 idempotency / lease ------------------------------------------------
+
+
+def test_running_lease_suppresses_redispatch(tmp_path: Path) -> None:
+    """Same head + same event next tick while the lease is running + agent
+    alive -> no duplicate dispatch."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # tick 2: lease still running, agent alive -> suppressed.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 0
+    assert len(disp.calls) == 1  # only the first tick dispatched
+
+
+def test_succeeded_head_change_redispatches(tmp_path: Path) -> None:
+    """After the fixer pushes (head advances), the old lease retires
+    (succeeded) and a NEW actionable event on the new head re-dispatches."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: CI fail on H1 -> dispatch fix.
+    p1 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
+    assert len(disp.calls) == 1
+    # tick 2: head advanced to H2, still CI-failing -> old lease retires
+    # (head moved) + new dispatch for H2.
+    p2 = FakeProber(snaps={195: _ci_fail_snap(195, head="H2")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    out2 = _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 1
+    assert len(disp.calls) == 2
+    assert disp.calls[1].head_sha == "H2"
+
+
+def test_failed_launch_retries(tmp_path: Path) -> None:
+    """A dispatch that fails to launch (callback returns "") marks the
+    lease failed_launch -> next tick retries."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    fail_disp = _DispatchRecorder(fail=True)
+    out1 = _run2(tasks, tmp_path, prober, dispatch=fail_disp, tick_count=1)
+    assert out1.dispatched == 0
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["inflight_action"]["outcome"] == pw.OUTCOME_FAILED_LAUNCH
+    # tick 2: a working dispatcher retries.
+    ok_disp = _DispatchRecorder()
+    out2 = _run2(tasks, tmp_path, prober, dispatch=ok_disp, tick_count=2)
+    assert out2.dispatched == 1
+
+
+def test_dead_agent_lease_reclaimed_and_redispatched(tmp_path: Path) -> None:
+    """A running lease whose agent is gone (and head unchanged, not blocked)
+    -> reclaimed -> re-dispatch allowed."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # tick 2: agent gone, head unchanged -> reclaim + re-dispatch.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "gone")
+    assert out2.dispatched == 1
+    assert len(disp.calls) == 2
+
+
+def test_expired_lease_reclaimed(tmp_path: Path) -> None:
+    """A running lease past the expiry tick budget with no liveness signal
+    -> reclaimed -> re-dispatch."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # tick way past expiry; agent still "alive" but expired -> reclaim.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp,
+                 tick_count=1 + pw._LEASE_EXPIRY_TICKS,
+                 agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 1
+
+
+def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
+    """A subagent that reports BLOCKED (conflict / guard abort) -> ledger
+    blocked + raise-hand ONCE; subsequent ticks suppress (no silent re-fire,
+    no repeated raise)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _stale_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # tick 2: agent reports blocked -> ledger blocked + one raise.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "blocked")
+    assert out2.dispatched == 0
+    assert any("BLOCKED" in r for r in out2.raises)
+    # tick 3: still stale, blocked latched -> suppressed, NO new raise.
+    out3 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=3,
+                 agent_outcome=lambda _aid: "gone")
+    assert out3.dispatched == 0
+    assert not any("BLOCKED" in r for r in out3.raises)
+
+
+def test_dispatched_events_pruned_by_head(tmp_path: Path) -> None:
+    """dispatched_events keys whose head != current head are pruned on each
+    persist so the file stays bounded (§6)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: fix on H1 -> dispatch.
+    p1 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
+    # tick 2: head H2 -> H1 lease retires to ledger (succeeded@H1).
+    p2 = FakeProber(snaps={195: _ci_fail_snap(195, head="H2")},
+                    fresh_base="FRESHBASE", ancestors=set())
+    _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
+          agent_outcome=lambda _aid: "running")
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    de = w["dispatched_events"]
+    # the H1 key was pruned (head advanced to H2); only H2-headed keys (if
+    # any) survive. The succeeded@H1 ledger entry's key embeds H1 -> pruned.
+    assert all("H1" not in k for k in de)
+
+
+def test_pr2_active_suppresses_pr1_surface_raise(tmp_path: Path) -> None:
+    """With the PR2 seam wired, a dispatchable actionable event is NOT also
+    surfaced as the PR1 'surfaces only' raise (no double-noise)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    out = _run2(tasks, tmp_path, prober, dispatch=_DispatchRecorder())
+    assert not any("surfaces only" in r for r in out.raises)
+
+
+def test_dedupe_two_tasks_one_pr_one_dispatch(tmp_path: Path) -> None:
+    """Two task slugs sharing one PR -> one watch -> one fix dispatch."""
+    tasks = [
+        _task("a", pr_url=_pr_url(195), branch="worker/a"),
+        _task("b", pr_url=_pr_url(195), branch="worker/a"),
+    ]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 1
+    assert len(disp.calls) == 1
+
+
+# --- crash matrix (durability core) ----------------------------------------
+
+
+def test_crash_after_lease_before_launch_no_dup(tmp_path: Path) -> None:
+    """Simulate a crash AFTER the lease persisted but BEFORE the launch
+    completed: the dispatch callback raises. The lease is marked
+    failed_launch; the next tick retries (no lost watch, no dup)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+
+    def _boom(_action):
+        raise RuntimeError("crash mid-launch")
+
+    out1 = _run2(tasks, tmp_path, prober, dispatch=_boom, tick_count=1)
+    assert out1.dispatched == 0
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["inflight_action"]["outcome"] == pw.OUTCOME_FAILED_LAUNCH
+    # next tick retries cleanly.
+    ok = _DispatchRecorder()
+    out2 = _run2(tasks, tmp_path, prober, dispatch=ok, tick_count=2)
+    assert out2.dispatched == 1
+
+
+def test_crash_after_launch_before_clear_replays_not_dups(tmp_path: Path) -> None:
+    """A crash after launch but before the watch-clear: the running lease is
+    on disk. A fresh process (new reconcile) loads it and suppresses
+    re-dispatch while the agent is alive (replay, not dup)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # simulate a fresh process: a brand-new dispatch recorder, lease loaded
+    # from disk, agent reported alive -> suppress.
+    disp2 = _DispatchRecorder()
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp2, tick_count=2,
+                 agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 0
+    assert disp2.calls == []
+
+
+def test_no_rebase_when_base_sha_unknown(tmp_path: Path) -> None:
+    """A STALE next-to-merge PR whose probe could not capture a fresh base
+    SHA (cadence/backoff skip) -> no rebase dispatched onto an unknown base.
+    We simulate by reconciling with a watch that has a stale event but no
+    probe this tick (slow cadence, READY-quiescent never applies to STALE,
+    so instead drive an empty base)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _stale_snap(195, head="H1")}
+    # fresh_base empty -> base_sha_for returns "" -> rebase skipped.
+    prober = FakeProber(snaps=snaps, fresh_base="", ancestors=set(),
+                        fetch_error="net blip")
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    # the probe itself skips (fetch failed for the base check) -> no event
+    # recorded as STALE -> no rebase. Either way: zero dispatch.
+    assert out.dispatched == 0
+
+
+# --- PR2 e2e through loop.tick --------------------------------------------
+
+
+def test_tick_dispatches_fix_subagent_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """End-to-end through loop.tick: a watched PR with a FAILING check ->
+    the tick emits a DISPATCH block, writes the subagent inbox, and persists
+    a §6 running lease in pr-watches.json. No real gh/git/fleet binary."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="UNSTABLE", checks="FAILURE",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "STANDARDS")
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        result = loop.tick("fleet", coord_id="cccccc01", cwd="/repo",
+                           fleet_home=str(it_home))
+
+    assert not result.skipped
+    # a DISPATCH block was emitted for the fix subagent.
+    blocks = [b for b in result.dispatch_instructions if "pr-fix-195" in b]
+    assert len(blocks) == 1
+    # the lease is persisted (running) with the minted agent_id.
+    w = pw.load_watches(it_project_dir)["watches"]["195"]
+    assert w["inflight_action"]["kind"] == pw.ACTION_FIX
+    assert w["inflight_action"]["outcome"] == pw.OUTCOME_RUNNING
+    agent_id = w["inflight_action"]["agent_id"]
+    assert agent_id
+    # the subagent inbox prompt was written.
+    inbox = it_home / "inbox" / f"{agent_id}.md"
+    assert inbox.exists()
+    assert "FIX subagent for PR #195" in inbox.read_text()
+
+
+def test_tick_idempotent_no_duplicate_dispatch_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """Two consecutive ticks on the SAME failing head + a still-alive agent
+    -> exactly ONE dispatch (the lease suppresses the second). Simulates the
+    agent record so _agent_outcome reports running."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="UNSTABLE", checks="FAILURE",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r1 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    agent_id = pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"]
+    n1 = len([b for b in r1.dispatch_instructions if "pr-fix-195" in b])
+    assert n1 == 1
+
+    # Write a live agent record so _agent_outcome reports "running".
+    (it_home / "agents").mkdir(exist_ok=True)
+    import os as _os
+    (it_home / "agents" / f"{agent_id}.json").write_text(
+        json.dumps({"id": agent_id, "pid": _os.getpid(), "blocked": False})
+    )
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    n2 = len([b for b in r2.dispatch_instructions if "pr-fix-195" in b])
+    assert n2 == 0  # suppressed by the running lease
