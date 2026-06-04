@@ -565,20 +565,58 @@ scan_empty_command_dispatch() {
   local f="$1"
   awk -v file="$f" \
       -v exempt_marker="lint-test-isolation:command-exempt" '
+    # Per-literal tracking (codex review iter-3 [P2], 2026-06-04):
+    # the earlier function-wide aggregation of `saw_explicit` could mask
+    # a later empty-command literal when an earlier safe literal in the
+    # same test set the flag. Track each dispatchOpts{ literal
+    # independently — every one that appears in a runDispatch-bearing
+    # function MUST be marked commandExplicit:true (or carry the
+    # function-scope exempt marker). Any literal lacking the mark
+    # flags the enclosing function as a violation.
+    #
+    # State machine:
+    #   - func_brace          = brace depth relative to function start
+    #     (declaration line opens at depth 1 once { is seen)
+    #   - in_opts             = 1 inside a dispatchOpts{...} literal
+    #   - opts_open_depth     = func_brace depth at the moment the
+    #                           literal opened; literal closes when
+    #                           func_brace returns to opts_open_depth
+    #   - opts_explicit       = 1 if the CURRENT literal set
+    #                           commandExplicit:true
+    #   - unsafe_literal      = function-scope sticky bit: 1 once any
+    #                           literal closed without explicit; reset
+    #                           only at function end
     function reset() {
       in_func = 0
       func_name = ""
       start_line = 0
-      saw_opts = 0
       saw_run = 0
-      saw_explicit = 0
       saw_exempt = 0
-      brace = 0
+      func_brace = 0
       in_raw = 0
       in_str = 0
       in_blkcmt = 0
+      in_opts = 0
+      opts_open_depth = 0
+      opts_explicit = 0
+      unsafe_literal = 0
     }
-    function process_line(line,    i, ch, nch, prev, ln) {
+    # process_line walks the line char-by-char to:
+    #   - strip // line comments + /* */ block comments + Go string
+    #     contents (treated as opaque w.r.t. brace counting)
+    #   - track func_brace (whole-function depth)
+    #   - detect `dispatchOpts{` openings inline so opts_open_depth is
+    #     captured at the EXACT brace event, not summed across the line
+    #   - detect `commandExplicit: true` / `commandExplicit:      true`
+    #     inside the current literal so opts_explicit attaches to the
+    #     right literal even when multiple are present in one function
+    #   - detect literal close when func_brace returns to
+    #     opts_open_depth; closing unsafely sets unsafe_literal.
+    #
+    # code_line is still emitted so the caller can grep for
+    # runDispatch( / runDispatchIgnoringSpawnErr( / the exempt marker
+    # at function scope.
+    function process_line(line,    i, ch, nch, prev, ln, look) {
       code_line = ""
       prev = ""
       ln = length(line)
@@ -610,18 +648,60 @@ scan_empty_command_dispatch() {
           if (nch == "/") return
           if (nch == "*") { in_blkcmt = 1; i++; prev = ch; continue }
         }
+        # Inline `dispatchOpts{` detection: at the position of the `{`
+        # check the preceding 13 chars to match the literal.
+        if (ch == "{" && i >= 13) {
+          look = substr(line, i - 12, 13)
+          if (look == "dispatchOpts{") {
+            # Open a new literal. If we are nested inside another,
+            # finalize that one as unsafe (a dispatchOpts containing
+            # another dispatchOpts is implausible in practice; safe to
+            # mark the outer one unsafe and reset).
+            if (in_opts && !opts_explicit) unsafe_literal = 1
+            in_opts = 1
+            opts_open_depth = func_brace
+            opts_explicit = 0
+          }
+        }
+        # Inline `commandExplicit: true` / `commandExplicit:      true`
+        # detection inside the current literal. Match by looking at the
+        # tail substring ending at the current char.
+        if (in_opts && ch == "e" && i >= 21) {
+          look = substr(line, i - 20, 21)
+          if (look == "commandExplicit: true") opts_explicit = 1
+          look = substr(line, i - 25, 26)
+          if (i >= 26 && look == "commandExplicit:      true") opts_explicit = 1
+        }
         code_line = code_line ch
         if (ch == "`") in_raw = 1
         else if (ch == "\"") in_str = 1
-        else if (ch == "{") brace++
-        else if (ch == "}") brace--
+        else if (ch == "{") {
+          func_brace++
+        }
+        else if (ch == "}") {
+          # Close the current dispatchOpts literal if this brace
+          # returns func_brace to opts_open_depth.
+          if (in_opts && func_brace == opts_open_depth + 1) {
+            if (!opts_explicit) unsafe_literal = 1
+            in_opts = 0
+            opts_explicit = 0
+            opts_open_depth = 0
+          }
+          func_brace--
+        }
         prev = ch
       }
     }
+    function consume_body(body) {
+      # Function-scope: runDispatch call detection.
+      if (index(body, "runDispatch(") > 0) saw_run = 1
+      if (index(body, "runDispatchIgnoringSpawnErr(") > 0) saw_run = 1
+    }
     function check_emit() {
-      # Both patterns present (opts literal + dispatch call) — body
-      # MUST set commandExplicit:true or carry the explicit exemption.
-      if (saw_opts && saw_run && !saw_explicit && !saw_exempt) {
+      # Violation if: a runDispatch call exists AND any dispatchOpts
+      # literal closed without commandExplicit:true AND no function-
+      # scope exempt marker.
+      if (saw_run && unsafe_literal && !saw_exempt) {
         printf "%s:%d:%s\n", file, start_line, func_name
       }
     }
@@ -635,21 +715,9 @@ scan_empty_command_dispatch() {
       sub(/\(.*/, "", n)
       func_name = n
       process_line($0)
-      body = code_line
-      sub(/^[^{]*\{/, "", body)
-      if (body != "") {
-        if (index(body, "dispatchOpts{") > 0) saw_opts = 1
-        if (index(body, "runDispatch(") > 0) saw_run = 1
-        # Codex review iter-1 [P2] (2026-06-04): helper-wrapped
-        # runDispatch calls (currently only runDispatchIgnoringSpawnErr
-        # in dispatch_rc_auto_marker_test.go) must also trigger the
-        # guard so the wrapped path does not slip through.
-        if (index(body, "runDispatchIgnoringSpawnErr(") > 0) saw_run = 1
-        if (index(body, "commandExplicit: true") > 0) saw_explicit = 1
-        if (index(body, "commandExplicit:      true") > 0) saw_explicit = 1
-      }
+      consume_body(code_line)
       if (index($0, exempt_marker) > 0) saw_exempt = 1
-      if (brace == 0) {
+      if (func_brace == 0) {
         check_emit()
         reset()
       }
@@ -657,16 +725,9 @@ scan_empty_command_dispatch() {
     }
     in_func {
       process_line($0)
-      if (code_line != "") {
-        if (index(code_line, "dispatchOpts{") > 0) saw_opts = 1
-        if (index(code_line, "runDispatch(") > 0) saw_run = 1
-        # Codex review iter-1 [P2] (2026-06-04): helper-wrapped path.
-        if (index(code_line, "runDispatchIgnoringSpawnErr(") > 0) saw_run = 1
-        if (index(code_line, "commandExplicit: true") > 0) saw_explicit = 1
-        if (index(code_line, "commandExplicit:      true") > 0) saw_explicit = 1
-      }
+      consume_body(code_line)
       if (index($0, exempt_marker) > 0) saw_exempt = 1
-      if (brace == 0) {
+      if (func_brace == 0) {
         check_emit()
         reset()
       }

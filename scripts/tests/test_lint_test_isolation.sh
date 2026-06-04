@@ -184,6 +184,50 @@ func TestStubbedCommandViaHelper(t *testing.T) {
 }
 '
 
+# --- Case G (NEW — codex review iter-3 [P2], 2026-06-04): per-literal
+#     tracking — an earlier safe dispatchOpts literal must NOT mask a
+#     later unsafe literal that is the one actually dispatched. The
+#     earlier function-wide aggregation said this passed; the new
+#     per-literal tracking correctly flags it.
+run_case "mixed-safe-then-unsafe-dispatch-opts" 1 "dispatchOpts" \
+'package sub
+
+import "testing"
+
+func TestMixedSafeThenUnsafe(t *testing.T) {
+    tmuxtest.RequireTmux(t)
+    safe := &dispatchOpts{
+        taskID:          "demo",
+        command:         []string{"sleep", "30"},
+        commandExplicit: true,
+    }
+    _ = safe
+    unsafe := &dispatchOpts{taskID: "demo2"}
+    _ = runDispatch(unsafe, nil)
+}
+'
+
+# --- Case H (NEW): two safe dispatchOpts literals BOTH pass.
+run_case "both-safe-dispatch-opts" 0 "0 violations" \
+'package sub
+
+import "testing"
+
+func TestBothSafe(t *testing.T) {
+    tmuxtest.RequireTmux(t)
+    a := &dispatchOpts{
+        taskID:          "a",
+        commandExplicit: true,
+    }
+    b := &dispatchOpts{
+        taskID:          "b",
+        commandExplicit: true,
+    }
+    _ = runDispatch(a, nil)
+    _ = runDispatch(b, nil)
+}
+'
+
 echo ""
 echo "test_lint_test_isolation: $passed passed, $failed failed"
 if [[ "$failed" -gt 0 ]]; then
