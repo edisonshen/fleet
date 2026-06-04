@@ -991,6 +991,22 @@ def test_ghgit_prober_graphql_rate_limit_is_transient(monkeypatch) -> None:
     assert rp.snapshots[9].not_found is False         # NOT a real 404
 
 
+def test_ghgit_prober_repo_level_not_found_is_transient(monkeypatch) -> None:
+    """A repository-level NOT_FOUND (whole repository null — e.g. private
+    repo, token lost scope) is TRANSIENT, not a per-PR 404 — else tracking
+    parks forever even after auth is fixed (codex iter-15 [P2])."""
+    resp = json.dumps({
+        "data": {"repository": None},
+        "errors": [{"type": "NOT_FOUND", "message": "Could not resolve to a Repository"}],
+    })
+    monkeypatch.setattr(pw.subprocess, "run",
+                        lambda cmd, **k: _FakeProc(0, resp) if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0))
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [9, 10], [])
+    for n in (9, 10):
+        assert rp.snapshots[n].error
+        assert rp.snapshots[n].not_found is False     # NOT parked
+
+
 def test_ghgit_prober_graphql_explicit_not_found(monkeypatch) -> None:
     """A NOT_FOUND-typed GraphQL error with null alias IS a real 404."""
     resp = json.dumps({

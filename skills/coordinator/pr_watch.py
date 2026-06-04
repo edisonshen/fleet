@@ -1168,6 +1168,22 @@ class GhGitProber:
         has_transient_error = bool(err_types) and err_types != {"NOT_FOUND"}
 
         repo = (data.get("data") or {}).get("repository") if isinstance(data, dict) else None
+
+        # Repository-level NOT_FOUND (codex iter-15 [P2]): when the WHOLE
+        # `repository` is null, the response is ambiguous — it can mean the
+        # repo is genuinely gone OR the `gh` token lost scope for a private
+        # repo. Parking every PR as NOT_FOUND would stop tracking forever
+        # even after auth is fixed. So treat a null repository as TRANSIENT
+        # (SKIP + backoff + retain). Only a null PR alias UNDER A RESOLVED
+        # repository is a genuine per-PR 404.
+        if repo is None:
+            reason = err_summary or "repository unresolved (auth/scope?)"
+            return {
+                n: PRSnapshot(number=n, error=f"graphql repository null: {reason}",
+                              not_found=False)
+                for n in pr_numbers
+            }
+
         out: dict[int, PRSnapshot] = {}
         for n in pr_numbers:
             pr = repo.get(f"pr{n}") if isinstance(repo, dict) else None
