@@ -119,3 +119,65 @@ func TestSweep_NonDirectoryPath_ReturnsWrappedError(t *testing.T) {
 		t.Errorf("expected read-error wrapping; got %v", err)
 	}
 }
+
+// TestSweepAllDir_ReapsEverythingIgnoringFreshness pins the T4/T5 contract
+// from docs/TASK-PLAN-leak-test-spawn-stub.md: the suite-teardown mode of
+// the sweeper bypasses BOTH the freshness window AND the socketLive guard.
+// Once `go test` is exiting, a fresh OR live `/tmp/fleet-test-*.sock` is
+// BY DEFINITION an orphan — its owning test process is already gone
+// (panic, os.Exit, killed mid-run) or about to be (TestMain m.Run()
+// returned). The existing SweepDir spares both, which is the gap that
+// lets bypassed-t.Cleanup orphans (7-day-old claude/tmux procs in the
+// 2026-05-29 OOM) survive.
+//
+// T4: fresh-but-non-live socket (no tmux server bound). Existing SweepDir
+// would skip via the freshness window; SweepAllDir reaps it.
+// T5: stale or fresh socket regardless — even when socketLive() would
+// keep it (no tmux probe in this unit test; we just assert the freshness
+// guard is bypassed).
+func TestSweepAllDir_ReapsEverythingIgnoringFreshness(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	fresh := now.Add(-1 * time.Minute) // well inside any maxAge window
+
+	// Seed two fresh sockets that SweepDir(time.Hour) would spare.
+	fresh1 := filepath.Join(dir, "fleet-test-aaa111.sock")
+	fresh2 := filepath.Join(dir, "fleet-test-bbb222.sock")
+	for _, p := range []string{fresh1, fresh2} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed %s: %v", p, err)
+		}
+		if err := os.Chtimes(p, fresh, fresh); err != nil {
+			t.Fatalf("chtimes %s: %v", p, err)
+		}
+	}
+
+	// Unrelated file MUST still be spared (only fleet-test-* in scope).
+	unrelated := filepath.Join(dir, "other.sock")
+	if err := os.WriteFile(unrelated, []byte("x"), 0o600); err != nil {
+		t.Fatalf("seed %s: %v", unrelated, err)
+	}
+
+	if err := SweepAllDir(dir); err != nil {
+		t.Fatalf("SweepAllDir: %v", err)
+	}
+
+	for _, p := range []string{fresh1, fresh2} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("fresh socket %s not reaped by SweepAllDir (stat err=%v); freshness guard MUST be bypassed in suite-teardown mode", p, err)
+		}
+	}
+	if _, err := os.Stat(unrelated); err != nil {
+		t.Errorf("unrelated file %s should still be kept; got stat err=%v", unrelated, err)
+	}
+}
+
+// TestSweepAllDir_MissingDir_IsNoop mirrors TestSweep_MissingDir_IsNoop:
+// CI runners without any /tmp/fleet-test-* files must not see TestMain
+// teardown fail.
+func TestSweepAllDir_MissingDir_IsNoop(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := SweepAllDir(dir); err != nil {
+		t.Errorf("SweepAllDir on missing dir should be a no-op; got %v", err)
+	}
+}
