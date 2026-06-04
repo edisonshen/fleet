@@ -175,6 +175,14 @@ _OUTCOME_SUCCEEDED_PREFIX = "succeeded@"
 # bookkeeping + as a test magnitude, not as a reclaim trigger.
 _LEASE_EXPIRY_TICKS = 12
 
+# Startup grace (codex iter-12 [P1]): a just-launched subagent may not have
+# written its agent record (~/.fleet/agents/<id>.json) yet, so the very next
+# tick's liveness probe reads "gone". Within this many ticks of `leased_tick`
+# a gone/missing record is treated as STILL PENDING (not reclaimed), so the
+# normal async launch window can't trigger a duplicate dispatch into the same
+# branch. After the grace, a still-gone agent is genuinely dead -> reclaimed.
+_LEASE_LAUNCH_GRACE_TICKS = 3
+
 
 def _succeeded_outcome(head_sha: str) -> str:
     return f"{_OUTCOME_SUCCEEDED_PREFIX}{head_sha}"
@@ -358,7 +366,20 @@ def _reclaim_lease(
         return f"retired succeeded lease {key!r} (head advanced to {current_head})", None
 
     # 3. agent gone (dead) + head unchanged + not blocked -> died pre-push.
+    # BUT honor a STARTUP GRACE (codex iter-12 [P1]): a just-launched
+    # subagent may not have written its agent record yet, so the next tick
+    # reads "gone". Within _LEASE_LAUNCH_GRACE_TICKS of leased_tick we treat
+    # gone/missing as STILL PENDING (not reclaimed) so the async launch
+    # window can't double-dispatch into the same branch. After the grace, a
+    # still-gone agent is genuinely dead -> reclaimed.
     if reported == "gone" or not agent_alive(agent_id):
+        leased_tick = inflight.get("leased_tick")
+        within_grace = (
+            isinstance(leased_tick, int)
+            and tick_count - leased_tick < _LEASE_LAUNCH_GRACE_TICKS
+        )
+        if within_grace:
+            return None, None  # pending startup; keep the lease, suppress
         watch["inflight_action"] = None
         return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
 

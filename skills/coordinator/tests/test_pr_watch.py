@@ -1680,17 +1680,36 @@ def test_failed_launch_retries(tmp_path: Path) -> None:
 
 def test_dead_agent_lease_reclaimed_and_redispatched(tmp_path: Path) -> None:
     """A running lease whose agent is gone (and head unchanged, not blocked)
-    -> reclaimed -> re-dispatch allowed."""
+    -> reclaimed -> re-dispatch allowed, once PAST the launch grace."""
     tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
     snaps = {195: _ci_fail_snap(195, head="H1")}
     prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
     disp = _DispatchRecorder()
     _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
-    # tick 2: agent gone, head unchanged -> reclaim + re-dispatch.
-    out2 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=2,
+    # past the launch grace, agent gone, head unchanged -> reclaim + redispatch.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp,
+                 tick_count=1 + pw._LEASE_LAUNCH_GRACE_TICKS,
                  agent_outcome=lambda _aid: "gone")
     assert out2.dispatched == 1
     assert len(disp.calls) == 2
+
+
+def test_gone_agent_within_launch_grace_not_reclaimed(tmp_path: Path) -> None:
+    """A just-launched subagent whose agent record isn't written yet (reads
+    'gone') WITHIN the launch grace is NOT reclaimed (codex iter-12 [P1]) —
+    the async launch window can't double-dispatch into the same branch."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    # next tick (within grace), record not written yet -> gone -> still kept.
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=2,
+                 agent_outcome=lambda _aid: "gone")
+    assert out2.dispatched == 0
+    assert len(disp.calls) == 1
+    # the lease survives.
+    assert pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"] is not None
 
 
 def test_live_long_running_lease_not_expired(tmp_path: Path) -> None:
@@ -1923,12 +1942,13 @@ def test_release_called_on_lease_resolution(tmp_path: Path) -> None:
     _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
     leased_agent = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]["agent_id"]
     released: list[str] = []
-    # tick 2: agent gone -> reclaim -> release_action(leased_agent).
+    # past the launch grace, agent gone -> reclaim -> release_action.
     pw.reconcile_watches(
         tasks, project="p", project_dir=tmp_path,
         coord_owner_repo=OWNER_REPO, prober=prober,
         flip_task_done=lambda s, u="": None, now_iso="2026-06-03T08:00:00Z",
-        tick_count=2, slow_cadence_ticks=5, repo_path="/repo",
+        tick_count=1 + pw._LEASE_LAUNCH_GRACE_TICKS, slow_cadence_ticks=5,
+        repo_path="/repo",
         dispatch_action=disp, agent_outcome=lambda _aid: "gone",
         deps_done=lambda _d: True,
         release_action=lambda aid: released.append(aid),
