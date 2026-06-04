@@ -5503,11 +5503,19 @@ def _reconcile_pr_watches(
         return "gone"
 
     def _dispatch_action(action) -> str:
-        # Mint an agent_id, render the rebase/fix prompt, write the inbox,
-        # and emit the DISPATCH block (the launch boundary). The lease was
-        # already persisted (running) BEFORE this call by pr_watch — so a
-        # crash after the emit replays rather than duplicates. Returns the
-        # agent_id on a successful emit, "" on failure (-> failed_launch).
+        # Mint an agent_id, render the rebase/fix prompt, acquire the
+        # coord_prompt_inbox CLAIM (which creates the dispatch JOURNAL the
+        # coord's `mark-launch-attempted` gate predicates on — codex
+        # round-1 [P1]: a raw inbox write skips the journal, so the gate
+        # would predicate_fail and the coord would never launch the fixer),
+        # then emit the DISPATCH block (the launch boundary). The §6 lease
+        # was already persisted (running) BEFORE this call by pr_watch — so
+        # a crash after the emit is recovered by the next tick's lease
+        # reclaim (dead agent -> re-dispatch), NOT by the worker replay path
+        # (a PR-watch owner is not in worker_agent_ids, so replay correctly
+        # skips it). The journal exists only to satisfy the launch gate.
+        # Returns the agent_id on a successful acquire+emit, "" on failure
+        # (-> the lease is marked failed_launch and retried next tick).
         try:
             agent_id = dispatch_mod.mint_agent_id()
             label = f"pr-{action.kind}-{action.pr_number}"
@@ -5515,12 +5523,19 @@ def _reconcile_pr_watches(
                 prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
             else:
                 prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
-            prompt_file = dispatch_mod.write_worker_inbox(
-                agent_id, prompt, fleet_home=fhome,
+            # acquire-prompt mints the journal at ExecPending gen 0 and
+            # writes the inbox atomically; the DISPATCH block carries gen 0
+            # so `mark-launch-attempted <id> 0` returns ok.
+            prompt_file = dispatch_mod.acquire_coord_prompt_inbox(
+                agent_id, prompt,
+                owner=f"project/{project}/slug/{label}",
+                dispatch_kind=f"pr-{action.kind}",
+                fleet_bin=fleet_bin, fleet_home=fhome,
             )
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=label, prompt_file=prompt_file,
                 description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
+                generation=0,
             )
             result.dispatch_instructions.append(block)
             return agent_id

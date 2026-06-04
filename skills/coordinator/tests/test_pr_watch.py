@@ -1835,6 +1835,21 @@ def test_no_rebase_when_base_sha_unknown(tmp_path: Path) -> None:
 # --- PR2 e2e through loop.tick --------------------------------------------
 
 
+def _fake_acquire_factory(it_home: Path):
+    """A deterministic stand-in for dispatch.acquire_coord_prompt_inbox:
+    writes the inbox file (so the e2e assertions are real) WITHOUT shelling
+    out to a real `fleet` binary. Returns the inbox path, mirroring the
+    real helper's contract."""
+    def _fake(agent_id, prompt, *, owner, dispatch_kind="worker",
+             fleet_bin="fleet", fleet_home=None, **kw):
+        inbox_dir = it_home / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        path = inbox_dir / f"{agent_id}.md"
+        path.write_text(prompt)
+        return str(path)
+    return _fake
+
+
 def test_tick_dispatches_fix_subagent_e2e(
     it_home: Path, it_project_dir: Path, monkeypatch,
 ) -> None:
@@ -1851,6 +1866,8 @@ def test_tick_dispatches_fix_subagent_e2e(
     monkeypatch.setattr(loop, "_pr_watch_prober", prober)
     monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
     monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "STANDARDS")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
 
     with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
         result = loop.tick("fleet", coord_id="cccccc01", cwd="/repo",
@@ -1887,6 +1904,8 @@ def test_tick_idempotent_no_duplicate_dispatch_e2e(
     monkeypatch.setattr(loop, "_pr_watch_prober", prober)
     monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
     monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
 
     with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
         r1 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
