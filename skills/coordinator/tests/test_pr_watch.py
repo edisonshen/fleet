@@ -125,6 +125,9 @@ def test_parse_pr_url() -> None:
     assert pw.parse_pr_url("https://github.com/EdisonShen/Fleet/pull/42") == ("edisonshen/fleet", 42)
     assert pw.parse_pr_url("") is None
     assert pw.parse_pr_url("https://example.com/no-pr") is None
+    # lookalike host must NOT parse as GitHub (codex iter-19 [P2]).
+    assert pw.parse_pr_url("https://notgithub.com/edisonshen/fleet/pull/195") is None
+    assert pw.parse_pr_url("https://evilgithub.com/a/b/pull/1") is None
 
 
 def test_coord_scope_case_insensitive(tmp_path: Path) -> None:
@@ -795,6 +798,23 @@ def test_atomic_write_leaves_prior_intact_on_crash(tmp_path: Path, monkeypatch) 
     assert json.loads(original)["watches"] == {"1": doc1["watches"]["1"]}
     leftover = list(tmp_path.glob(pw.WATCH_FILE + ".tmp.*"))
     assert leftover == []
+
+
+def test_empty_watch_set_removes_file(tmp_path: Path) -> None:
+    """After the last watch is pruned (merged), the file is REMOVED so the
+    tick's no-PR idle early-out stays byte-identical (codex iter-19 [P2])."""
+    tasks = [_task("foo", pr_url=_pr_url(195))]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    _run(tasks, tmp_path, FakeProber(snaps=snaps), flips=[])
+    # the only watch merged + pruned -> file removed, not left empty.
+    assert not pw.watch_path(tmp_path).exists()
+
+
+def test_persist_watches_removes_empty(tmp_path: Path) -> None:
+    pw.save_watches(tmp_path, {"schema": 1, "watches": {"1": pw._new_watch(1, _pr_url(1), "b", "main")}})
+    assert pw.watch_path(tmp_path).exists()
+    pw.persist_watches(tmp_path, {"schema": 1, "watches": {}})
+    assert not pw.watch_path(tmp_path).exists()
 
 
 def test_load_malformed_yields_empty_schema(tmp_path: Path) -> None:

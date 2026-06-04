@@ -223,9 +223,12 @@ class Prober(Protocol):
 # ----------------------------------------------------------------------
 
 # https://github.com/<owner>/<repo>/pull/<N>  (also tolerate a trailing
-# slash / fragment / query). Captures owner/repo + number.
+# slash / fragment / query). Captures owner/repo + number. The negative
+# lookbehind `(?<![\w.-])` anchors `github.com` to a real host boundary so
+# a lookalike host like `notgithub.com` / `evilgithub.com.attacker.net` is
+# NOT parsed as a GitHub PR (codex iter-19 [P2]).
 _PR_URL_RE = re.compile(
-    r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)\b"
+    r"(?<![\w.-])github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)\b"
 )
 
 
@@ -301,6 +304,28 @@ def save_watches(project_dir: Path, doc: dict) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def persist_watches(project_dir: Path, doc: dict) -> None:
+    """Publish the watch doc, OR REMOVE the file when there are no watches
+    left (codex iter-19 [P2]). Leaving an empty pr-watches.json on disk
+    would defeat the tick's no-PR idle early-out (it gates on the file's
+    existence), so every idle tick would needlessly derive the repo +
+    shell `git remote`. Removing it restores the byte-identical idle path;
+    the watch set is a derived invariant, so a fresh tick recreates it the
+    moment an owned PR task reappears."""
+    if doc.get("watches"):
+        save_watches(project_dir, doc)
+        return
+    path = watch_path(project_dir)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # couldn't remove (perms?) — fall back to writing the empty doc so
+        # state is at least consistent; idle overhead is the lesser evil.
+        save_watches(project_dir, doc)
 
 
 def _new_watch(pr_number: int, pr_url: str, branch: str, base: str) -> dict:
@@ -619,7 +644,7 @@ def reconcile_watches(
         # Can't prove the repo is ours -> refuse to probe (coord-scope
         # strict). We still persisted enrollment/orphan above so the
         # watch survives; a later tick with a derivable repo probes it.
-        save_watches(project_dir, doc)
+        persist_watches(project_dir, doc)
         return out
 
     due_numbers: list[int] = []
@@ -747,7 +772,7 @@ def reconcile_watches(
                     f"needs operator attention — {w.get('pr_url', '')}"
                 )
 
-    save_watches(project_dir, doc)
+    persist_watches(project_dir, doc)
     return out
 
 
@@ -1298,7 +1323,7 @@ def _rollup_state_to_verdict(state: str) -> str:
 # `.git` + `/` FIRST (below), then this matches the last two segments so a
 # dotted repo name is preserved (codex iter-1 [P2]).
 _REMOTE_URL_RE = re.compile(
-    r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
+    r"(?<![\w.-])github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
 )
 
 
