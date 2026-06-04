@@ -1598,16 +1598,17 @@ def _apply_probe(
             "up_to_date": head_contains_base,
         }
         w["last_event"] = event
-        # SUCCESSFUL-reduce marker (codex iter-18 [P2]): only set on a real
-        # snapshot reduction, NOT on a transient failure (which still
-        # stamps last_probe_at for backoff bookkeeping). The orphan pass
-        # gates on THIS so a probe outage can't false-orphan a watch whose
-        # PR may have merged/closed during the blip. We stamp BOTH the
-        # wall-clock now_iso (orphan pass) AND the tick_count (the auto-fix
-        # dispatch pass): the dispatch gate must distinguish "probed THIS
-        # tick" from "probed a prior tick", and tick_count is monotonic +
-        # deterministic where two consecutive ticks can share a now_iso
-        # (codex iter-6 [P1]).
+        # SUCCESSFUL-reduce markers (codex iter-18 [P2]): set ONLY on a real
+        # snapshot reduction, NOT on a transient failure (which still stamps
+        # last_probe_at for backoff bookkeeping). `_probed_ok_tick` is the
+        # LOAD-BEARING freshness key — the orphan pass AND the auto-fix
+        # dispatch pass both gate on `_probed_ok_tick == tick_count` so a
+        # probe outage can't false-orphan / mis-dispatch off a stale snapshot
+        # (tick_count is monotonic + deterministic where two consecutive
+        # ticks can share a now_iso — codex iter-6 / iter-35 [P2]).
+        # `_probed_ok_at` is a wall-clock DIAGNOSTIC breadcrumb only (human-
+        # readable "last successful probe" in pr-watches.json, paired with
+        # last_probe_at / last_seen_at); no code gates on it.
         w["_probed_ok_at"] = now_iso
         w["_probed_ok_tick"] = tick_count
 
