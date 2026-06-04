@@ -15,6 +15,7 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
 	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/projectlookup"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
@@ -801,15 +802,43 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 		// sessions" and the operator drops back to their shell with
 		// no idea why. Surface the diagnosis in-TUI.
 		if !sessionAliveFn(cur.TmuxSession) {
-			// Resume-suggestion gate (resume-dead-coord-ab65): a dead
-			// COORD agent (TaskID == "coord-<project>") has a working
-			// resume path via [a] on the project row, which goes through
-			// the dispatch CLI's synth-handoff recovery flow. Suggest
-			// that instead of archive so the operator doesn't throw
-			// state away. Non-coord dead agents (workers, manual
-			// dispatches) keep the archive suggestion — there's no
-			// resume path to point at.
+			// F18 — attach-failover-59db: agent-row [a] on a dead-
+			// session COORD agent must NOT dead-end. Use the same
+			// projectlookup.FindLiveCoord resolver the CLI Tier 3
+			// uses; if a different live coord for the project exists
+			// (e.g. successor spawned after a handoff archived this
+			// record), attach to it. The TUI flashes a status so the
+			// operator sees the rotation before exec attach lands.
+			//
+			// Non-coord dead agents (workers, manual dispatches) have
+			// no resume path — keep the archive suggestion.
 			if cur.Project != "" && cur.TaskID == coordTaskID(cur.Project) {
+				if live, ok := projectlookup.FindLiveCoord(m.records, cur.Project); ok && live.ID != cur.ID {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"agent %s session is dead — attaching to live coord %s for %s",
+							cur.ID, live.ID, cur.Project),
+					}
+					m.pendingAttach = live.TmuxSession
+					return m, tea.Quit, true
+				}
+				// Codex review iter-7 P2: legacy / manually-spawned coords
+				// may not carry task_id == coord-<project> on disk; the CLI
+				// Tier 3 + project-row [a] paths cover them via the
+				// lock-body fallback. The dead-row [a] resolver advertises
+				// "shared with the CLI" — wire the same fallback here so
+				// it doesn't dead-end on legacy state the other paths can
+				// recover. FindCoordByLockBody returns a record with a
+				// populated TmuxSession (iter-3 P2 normalization).
+				if live, ok := projectlookup.FindCoordByLockBody(m.records, cur.Project); ok && live.ID != cur.ID {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"agent %s session is dead — attaching to lock-body coord %s for %s",
+							cur.ID, live.ID, cur.Project),
+					}
+					m.pendingAttach = live.TmuxSession
+					return m, tea.Quit, true
+				}
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
 						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",
@@ -1891,27 +1920,11 @@ func coordTaskID(projectName string) string {
 // the matching agent's tmux session being alive, which catches the
 // "coord crashed but lock body remains" case.
 var findCoordByLockBody = func(records []*agent.Record, projectName string) (*agent.Record, bool) {
-	root, err := state.Root()
-	if err != nil {
-		return nil, false
-	}
-	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
-	if holderID == "" {
-		return nil, false
-	}
-	for _, r := range records {
-		if r == nil || r.ID != holderID {
-			continue
-		}
-		if r.TmuxSession == "" {
-			continue
-		}
-		if !sessionProbeOrAliveFn(r.TmuxSession) {
-			continue
-		}
-		return r, true
-	}
-	return nil, false
+	// Delegate to the shared resolver (attach-failover-59db
+	// refactor). The TUI variant requires no marker gate, no
+	// freshness gate — just "the lock body's id, with a live
+	// tmux session." That's exactly projectlookup's contract.
+	return projectlookup.FindCoordByLockBody(records, projectName)
 }
 
 // findExistingCoordForProject searches records for an alive agent
@@ -1945,6 +1958,15 @@ var findCoordByLockBody = func(records []*agent.Record, projectName string) (*ag
 // Tristate liveness (codex iter-6 P2): use sessionProbeOrAliveFn so a
 // tmux transport error (bad FLEET_TMUX_SOCKET, restarting server)
 // doesn't drop a live coord and force a duplicate spawn.
+//
+// Relationship to projectlookup.FindLiveCoord (attach-failover-59db):
+// the shared helper is the DEDUP-AGNOSTIC version — it accepts ANY
+// live coord for the project (the right call for Tier 3 failover,
+// where the operator's intent is "land me in some live coord, any
+// one"). This TUI-local helper layers the marker gate on top: a coord
+// whose initial prompt failed is INTENTIONALLY excluded from
+// idempotency dedup so a second [a] respawns rather than dropping
+// into a bare Claude shell.
 func findExistingCoordForProject(records []*agent.Record, projectName string) (*agent.Record, bool) {
 	want := coordTaskID(projectName)
 	wantID := coordSpawnMarkerFn(projectName)
@@ -2188,33 +2210,12 @@ func (m Model) startCoordSpawn(projectName, cwd string) tea.Cmd {
 // not the original dispatch prompt).
 //
 // Multi-line: bracketed paste in sendInitialPrompt handles newlines.
+// coordSpawnPrompt delegates to projectlookup.CoordSpawnPrompt — the
+// canonical prompt lives there so the CLI attach Tier 3 spawn path
+// (codex review iter-6 P1) and this TUI [a] spawn path stay in sync.
+// Keeping the local thunk preserves the existing call sites + tests.
 func coordSpawnPrompt(projectName string) string {
-	return fmt.Sprintf(`You are a Fleet COORDINATOR agent for project %s.
-
-ROLE — discuss design with the operator, save approved plan docs, file tasks, dispatch workers. NEVER:
-- Edit code files (no Edit, Write, NotebookEdit on source code).
-- Run tests (no `+"`go test`"+`, `+"`pytest`"+`, etc. — workers handle this).
-- Implement features inline.
-- Run any tool that mutates the project source tree, except the narrow PLAN-DOC and TASK-PLAN-DOC steps below.
-
-DELEGATE — for any implementation, testing, or code-touching work:
-1. Discuss design with the operator until aligned.
-2. PLAN-DOC: save the approved implementation plan as `+"`docs/DESIGN-<kebab-topic>.md`"+` and render `+"`docs/DESIGN-<kebab-topic>.html`"+` when the project has a renderer.
-3. File tasks via `+"`fleet tasks add --project %s --spec <body>`"+` while keeping them unpromoted.
-4. TASK-PLAN-DOC: save `+"`docs/TASK-PLAN-<slug>.md`"+` and render `+"`docs/TASK-PLAN-<slug>.html`"+` when supported.
-5. Add the task plan path to worker-visible task text, e.g. `+"`fleet tasks note --project %s <slug> --section spec \"Task plan: docs/TASK-PLAN-<slug>.md\"`"+`.
-6. Promote the task with `+"`fleet tasks promote <slug>`"+` only after its task plan doc exists and is linked or embedded.
-7. The /coordinator skill auto-dispatches a worker on next tick.
-8. Track progress via the supervisor loop.
-
-ALLOWED — your toolbox is intentionally narrow:
-- Read code files for design discussion (Read, Grep, Bash with non-mutating commands).
-- Write/render approved implementation plan docs and per-task plan docs under the project's approved docs folder only (`+"`docs/`"+` when present).
-- Run fleet CLI: `+"`fleet tasks {add,list,show,set,note,promote}`"+`, `+"`fleet workers list`"+`, `+"`fleet peek`"+`, `+"`fleet learnings`"+`, `+"`fleet standards show`"+`.
-- Run gh CLI for status: `+"`gh pr view`"+`, `+"`gh pr checks`"+`, `+"`gh issue view`"+`.
-- Talk to the operator about design, scope, priority.
-
-Run /coordinator now to begin the supervisor loop.`, projectName, projectName, projectName)
+	return projectlookup.CoordSpawnPrompt(projectName)
 }
 
 // openDetail handles [⏎] open. Behavior by row kind:

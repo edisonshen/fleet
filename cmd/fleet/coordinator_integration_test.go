@@ -652,13 +652,20 @@ func assertNoTickErrors(t *testing.T, tickOutput string) {
 		return
 	}
 	const fleet175Marker = "coord-config.json::repo not set for"
+	// pr-watch durable tracking emits an informational breadcrumb when it
+	// can't derive the coord's owner/repo from the project's git remote
+	// (these integration fixtures have a task with a pr_url but no `origin`
+	// remote, so PR tracking is paused — operator-actionable, NOT a hard
+	// error). Same "informational degradation" class as the fleet#175
+	// fallback; tolerate it at the assertion site rather than seeding a
+	// fake remote into every fixture.
+	const prWatchScopeMarker = "pr-watch: cannot derive this coord's owner/repo"
 	var realErrors []string
 	for _, e := range parsed.Errors {
-		// Tolerate ONLY the canonical fleet#175 fallback warning.
-		// Any other error entry — including future fleet#175 warnings
-		// in other shapes — fails the test, surfacing the new
+		// Tolerate ONLY the canonical informational fallback warnings.
+		// Any other error entry fails the test, surfacing the new
 		// category for explicit triage.
-		if strings.Contains(e, fleet175Marker) {
+		if strings.Contains(e, fleet175Marker) || strings.Contains(e, prWatchScopeMarker) {
 			continue
 		}
 		realErrors = append(realErrors, e)

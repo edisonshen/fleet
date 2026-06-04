@@ -339,7 +339,7 @@ func TestRunInit_InstallsCoordinatorSkill(t *testing.T) {
 	}
 
 	coordRoot := filepath.Join(claudeHome, "skills", "coordinator")
-	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py", "worktree.py", "remote_control.py", "supervisor.py", "register_subagent.py", "handoff_resume.py", "workflow_state.py", "coord_config.py"} {
+	for _, want := range []string{"SKILL.md", "loop.py", "parse.py", "dispatch.py", "conflict.py", "worktree.py", "remote_control.py", "supervisor.py", "register_subagent.py", "handoff_resume.py", "workflow_state.py", "coord_config.py", "pr_watch.py"} {
 		got := filepath.Join(coordRoot, want)
 		info, err := os.Stat(got)
 		if err != nil {
@@ -391,6 +391,7 @@ func TestCoordinatorFS_EmbedsPhaseBCSkillFiles(t *testing.T) {
 		"handoff_resume.py",    // Phase B2 — re-issues Agent calls after coord handoff
 		"workflow_state.py",    // G5 — operator-readable workflow.md writer
 		"coord_config.py",      // fleet#175 — coord-config.json::repo helper imported by loop.py
+		"pr_watch.py",          // PR-watch durable tracking (DESIGN-coord-pr-watch-durable) imported by loop.py
 	} {
 		data, err := fs.ReadFile(fsys, want)
 		if err != nil {

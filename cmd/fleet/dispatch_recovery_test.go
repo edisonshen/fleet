@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -977,6 +978,23 @@ func TestRunDispatch_DeadCoord_FreshMtimeBlocksDispatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "mtime is recent") {
 		t.Errorf("error must mention recent mtime; got: %v", err)
+	}
+	// F23b (attach-failover BUG #2): the veto must be a TYPED *vetoError
+	// so main() maps it to exit 75 (EX_TEMPFAIL), distinct from the 70/1
+	// other dispatch failures take. This is the cross-process exit-code
+	// contract `fleet attach`'s shared coord-spawn wrapper classifies on
+	// via exec.ExitError.ExitCode()==75. A plain fmt.Errorf here would
+	// regress attach to exit 70 for a recoverable veto, violating the
+	// never-exit rule.
+	var ve *vetoError
+	if !errors.As(err, &ve) {
+		t.Fatalf("veto must return a typed *vetoError (main maps it to exit 75); got %T: %v", err, err)
+	}
+	if !vetoErrorFromErr(err) {
+		t.Errorf("vetoErrorFromErr must detect the veto sentinel main() exits 75 on")
+	}
+	if vetoExitCode != 75 {
+		t.Errorf("vetoExitCode = %d, want 75 (EX_TEMPFAIL) — the contract attach's wrapper classifies on", vetoExitCode)
 	}
 	// No successor should be on disk.
 	live, _ := agent.List()

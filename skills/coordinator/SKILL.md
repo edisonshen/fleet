@@ -119,6 +119,33 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
   linked or embedded in worker-visible task text.
 
+### Plan & design-doc writing standard
+
+Every PLAN-DOC and TASK-PLAN-DOC is **problem-first and readable by a
+non-expert engineer**. The doc is for a human to understand and approve, not a
+dump of implementer notes. This standard gates the operator-approval step:
+
+1. **Lead with the PROBLEM in plain English** — what is broken now, the
+   concrete symptom, why it matters — before any solution. Define jargon on
+   first use; no unexplained symbols or `file:line` citations at the top.
+2. **Structure:** Problem -> How it works today -> What goes wrong -> The fix
+   -> then a clearly-labeled `Implementation detail (for engineers)` section.
+   Push the dense spec (exact mechanics, exit codes, edge-case enumeration)
+   into that last section, after the accessible explanation.
+3. **ASCII diagrams** — one clean diagram each for today's flow, the failure,
+   and the fix. Cut redundant ones.
+4. **Short sentences, one idea per paragraph.** Halve length by removing
+   redundancy, never by dropping a technical decision.
+5. **Test plan = one line per test** (scenario / input / expected); group
+   near-identical cases.
+6. **Final version only:** no rev-by-rev review log, no "round 1/2/3" history,
+   no "superseded" appendix inside the doc — that lives in the task/PR. Minimal
+   header: status / scope / priority / depends-on / PR-base.
+
+Ship `.md` (agent source-of-truth) + rendered `.html` (human review) per the
+PLAN-DOC/TASK-PLAN-DOC steps. Readability rewrites NEVER change an agreed
+technical decision — preserve every invariant verbatim in meaning.
+
 ### Step 6 — IMPLEMENT
 
 Implementation is a three-stage flow across separate Agent subagents:
@@ -145,14 +172,29 @@ Rules:
 ### Step 7 — PR-TRACK
 
 Shepherd every PR you own. Watch for terminal close/merge, CI failure, BEHIND,
-DIRTY, and CHANGES_REQUESTED. Use async waits: a background `until ...; do
-sleep 30; done` loop should wake the coord with a task notification.
+DIRTY, and CHANGES_REQUESTED.
 
-Actions:
+**The durable PR-watch is now the source of truth, not a hand-armed shell loop.**
+Every tick derives a watch for each owned, non-terminal task with a `pr_url`
+(state on disk at `~/.fleet/projects/<project>/pr-watches.json`, keyed by PR
+number) and probes it — so a PR you own can never go unwatched across
+compaction / handoff / restart, and "CI green" never ends a watch (only MERGED
+or CLOSED does). The tick:
+- on **MERGED**: flips ALL backing tasks `done` and prunes the watch (worktree
+  reap rides the existing gc backstop);
+- on **CLOSED without merge / orphaned PR / definitive 404**: raises hand;
+- on **STALE (head not up-to-date under strict protection) / BEHIND / DIRTY /
+  CI-fail / CHANGES_REQUESTED**: surfaces the event in the tick result.
+
+A background `until ...; do sleep 30; done` loop may still be used **only** as an
+optional wake-accelerator that triggers a tick sooner — correctness never
+depends on it (the next tick re-derives the watch regardless).
+
+Actions (PR2 will auto-dispatch these; until then act on the surfaced event):
 - CI red: dispatch a fix-subagent on the same branch.
-- BEHIND/DIRTY: dispatch a rebase-subagent in an isolated worktree.
+- BEHIND/DIRTY/STALE: dispatch a rebase-subagent in an isolated worktree.
 - Substantive conflict or design feedback: raise hand.
-- Merged: Step 8.
+- Merged: Step 8 (the watch already flipped the task `done`).
 - Closed without merge: raise hand.
 
 ### Step 8 — DONE
