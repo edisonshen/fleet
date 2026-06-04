@@ -799,6 +799,7 @@ def compute_rebase_eligibility(
     base_protected: Callable[[dict], bool],
     is_ancestor: Callable[[str, str], bool],
     task_deps: Callable[[str], list],
+    is_candidate: "Callable[[dict], bool] | None" = None,
 ) -> tuple[set, bool]:
     """Resolve which OPEN watches are rebase-eligible (§5.1b). Returns
     (eligible_pr_numbers, ambiguous).
@@ -837,7 +838,7 @@ def compute_rebase_eligibility(
     # a stale backed PR can't inflate the eligible set to ambiguous and
     # block the legitimate rebase.
     open_heads: dict[int, str] = {}      # the full graph (incl. orphans)
-    candidate_nums: set = set()          # backed PRs only
+    candidate_nums: set = set()          # dispatchable PRs only
     for key, w in watches.items():
         if w.get("state") != STATE_OPEN:
             continue
@@ -849,7 +850,16 @@ def compute_rebase_eligibility(
         except (TypeError, ValueError):
             continue
         open_heads[n] = head
-        if w.get("tasks") and not w.get("orphaned"):
+        # A candidate must be backed AND DISPATCHABLE. `is_candidate`
+        # (codex iter-9 [P2]) excludes a preserved CI-red-requeued watch
+        # (non-empty tasks[] kept ONLY for old-PR-merge reconcile, but whose
+        # backing task no longer points at this PR) — otherwise such a watch
+        # would inflate the eligible set to ambiguous and spuriously block a
+        # legitimate live PR's auto-rebase, even though the later
+        # live_pr_backed gate would refuse to dispatch it anyway. Default
+        # (no callback) keeps the prior backed-and-not-orphaned predicate.
+        backed = bool(w.get("tasks")) and not w.get("orphaned")
+        if backed and (is_candidate is None or is_candidate(w)):
             candidate_nums.add(n)
 
     eligible: set = set()
@@ -1636,12 +1646,19 @@ def _dispatch_actions(
 
     # §5.1b: derive the rebase-eligible set ONCE for the whole repo so the
     # exactly-one gate is consistent across all watches this tick.
+    def _is_candidate(w: dict) -> bool:
+        # dispatchable iff the watch's own PR still has a LIVE PR-pointing
+        # task in this repo (same predicate the dispatch gate uses below).
+        p = parse_pr_url(w.get("pr_url", ""))
+        return p is not None and p in live_pr_backed
+
     eligible, ambiguous = compute_rebase_eligibility(
         watches,
         deps_done=deps_done,
         base_protected=_base_protected,
         is_ancestor=is_anc,
         task_deps=_task_deps,
+        is_candidate=_is_candidate,
     )
 
     for key in list(watches.keys()):

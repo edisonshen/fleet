@@ -1752,6 +1752,42 @@ def test_preserved_todo_slug_not_auto_fixed(tmp_path: Path) -> None:
     assert disp.calls == []
 
 
+def test_preserved_retry_does_not_block_live_rebase(tmp_path: Path) -> None:
+    """A preserved CI-red-requeued watch (non-empty tasks[], but its backing
+    task no longer points at the PR) must NOT count as a rebase candidate
+    and make a real live stale PR's rebase ambiguous (codex iter-9 [P2])."""
+    # tick 1: enroll BOTH watches while their tasks have the PR urls.
+    pre = [
+        _task("old", status="in-review", pr_url=_pr_url(300), branch="worker/old"),
+        _task("live", status="in-review", pr_url=_pr_url(195), branch="worker/live"),
+    ]
+    pw.reconcile_watches(
+        pre, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={300: _stale_snap(300, head="O"),
+                                 195: _stale_snap(195, head="L")},
+                          fresh_base="B", ancestors=set()),
+        flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=1, repo_path="/repo",
+    )
+    # tick 2: 'old' is now a preserved todo (no url); 'live' still stale +
+    # PR-backed. They're independent (no ancestry). Without the fix, 'old'
+    # would inflate the eligible set to ambiguous and block 'live'.
+    current = [
+        _task("old", status="todo", pr_url="", branch="worker/old"),
+        _task("live", status="in-review", pr_url=_pr_url(195), branch="worker/live"),
+    ]
+    disp = _DispatchRecorder()
+    out = _run2(current, tmp_path,
+                FakeProber(snaps={300: _stale_snap(300, head="O"),
+                                  195: _stale_snap(195, head="L")},
+                           fresh_base="B", ancestors=set()),
+                dispatch=disp, tick_count=2, enroll=pre)
+    # the live PR (195) rebases; the preserved 'old' (300) doesn't block it.
+    assert out.dispatched == 1
+    assert disp.calls[0].pr_number == 195
+    assert disp.calls[0].kind == pw.ACTION_REBASE
+
+
 def test_foreign_repo_same_number_does_not_enable_dispatch(tmp_path: Path) -> None:
     """A foreign-repo task sharing a PR number must NOT make a preserved
     owned watch look dispatchable (codex iter-8 [P2] — gate on owner/repo,
