@@ -1147,6 +1147,21 @@ def _tick_locked(
     # PR2 adds auto-rebase/fix dispatch + §6 action leases; PR1 watches +
     # surfaces + reconciles-on-merge only. Fail-soft: any exception is
     # logged to result.errors, never wedges the tick.
+    #
+    # BOUNDARY with the legacy CI/mergeability reconcile (codex iter-13 [P1]
+    # — intentional, not a missed dispatch): the legacy `_reconcile_inflight`
+    # + pr_url/`_gh_pr_checks` path above OWNS the post-worker-EXIT
+    # remediation — when an in-review worker has exited and its PR is CI-red
+    # or not-mergeable, it requeues a FRESH worker (clearing pr_url). By the
+    # time PR-watch runs (on the re-read tasks below), that task has NO live
+    # pr_url, so PR-watch's `live_pr_backed` gate (iter-7) deliberately does
+    # NOT also dispatch a competing fix — exactly one remediation per PR, no
+    # double-work on the same branch. PR-watch's NET-NEW, non-overlapping
+    # value is the cases the legacy path can't see: a PR STALE under strict
+    # branch protection (CI green + no conflict, but head missing the fresh
+    # base — auto-rebase), CHANGES_REQUESTED review state, and CI failures on
+    # a PR whose task is STILL live-pr-backed (worker alive / a re-run failed
+    # after the legacy path already settled the task in-review).
     # Enrollment must see PRE-reconcile pr_urls: the legacy
     # _reconcile_inflight path can CLEAR a red-CI task's pr_url + requeue
     # it earlier this tick (and tasks.md was re-read since), so a fresh
