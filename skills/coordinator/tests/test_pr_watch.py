@@ -1640,9 +1640,11 @@ def test_running_lease_suppresses_redispatch(tmp_path: Path) -> None:
     assert len(disp.calls) == 1  # only the first tick dispatched
 
 
-def test_succeeded_head_change_redispatches(tmp_path: Path) -> None:
-    """After the fixer pushes (head advances), the old lease retires
-    (succeeded) and a NEW actionable event on the new head re-dispatches."""
+def test_head_move_held_while_agent_alive_then_redispatches(tmp_path: Path) -> None:
+    """A head move while the fixer is PROVABLY ALIVE (record+pid -> 'running')
+    is HELD — no second agent into the same checkout (codex iter-24 [P2]).
+    Once the agent EXITS ('gone'), the head-move retires the old lease and a
+    still-actionable new head re-dispatches."""
     tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
     disp = _DispatchRecorder()
     # tick 1: CI fail on H1 -> dispatch fix.
@@ -1650,14 +1652,19 @@ def test_succeeded_head_change_redispatches(tmp_path: Path) -> None:
                     fresh_base="FRESHBASE", ancestors=set())
     _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
     assert len(disp.calls) == 1
-    # tick 2: head advanced to H2, still CI-failing -> old lease retires
-    # (head moved) + new dispatch for H2.
+    # tick 2: head advanced to H2 but the agent is STILL ALIVE -> suppress
+    # (don't launch a second agent into the branch the first still owns).
     p2 = FakeProber(snaps={195: _ci_fail_snap(195, head="H2")},
                     fresh_base="FRESHBASE", ancestors=set())
     out2 = _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
                  agent_outcome=lambda _aid: "running")
-    assert out2.dispatched == 1
-    assert len(disp.calls) == 2
+    assert out2.dispatched == 0
+    assert len(disp.calls) == 1
+    # tick 3: agent now exited ('gone') + head still H2/actionable -> retire
+    # the old lease (head moved) and re-dispatch for H2.
+    out3 = _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=3,
+                 agent_outcome=lambda _aid: "gone")
+    assert out3.dispatched == 1
     assert disp.calls[1].head_sha == "H2"
 
 
@@ -2178,11 +2185,12 @@ def test_dispatched_events_pruned_by_head(tmp_path: Path) -> None:
     p1 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
                     fresh_base="FRESHBASE", ancestors=set())
     _run2(tasks, tmp_path, p1, dispatch=disp, tick_count=1)
-    # tick 2: head H2 -> H1 lease retires to ledger (succeeded@H1).
+    # tick 2: head H2, agent EXITED ('gone') -> H1 lease retires to ledger
+    # (succeeded@H1), then dispatched_events is pruned of non-H2 keys.
     p2 = FakeProber(snaps={195: _ci_fail_snap(195, head="H2")},
                     fresh_base="FRESHBASE", ancestors=set())
     _run2(tasks, tmp_path, p2, dispatch=disp, tick_count=2,
-          agent_outcome=lambda _aid: "running")
+          agent_outcome=lambda _aid: "gone")
     w = pw.load_watches(tmp_path)["watches"]["195"]
     de = w["dispatched_events"]
     # the H1 key was pruned (head advanced to H2); only H2-headed keys (if

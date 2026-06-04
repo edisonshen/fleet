@@ -374,7 +374,22 @@ def _reclaim_lease(
         watch["inflight_action"] = None
         return None, None
 
-    # 2. HEAD MOVED -> success.
+    # 1b. AGENT STILL ALIVE -> ALWAYS suppress, even if the head moved
+    # (codex iter-24 [P2]). A head move while the fixer is still alive can
+    # be an EXTERNAL push (human / other automation) — retiring the lease as
+    # succeeded here would let _dispatch_actions launch a SECOND agent into
+    # the same branch checkout the first still owns (both prompts work in
+    # the existing checkout -> they'd race). Wait for the agent to exit; the
+    # head-move-as-success retirement below only fires once it's gone. A
+    # provably-running record (record + pid) is the only case treated as
+    # "definitely still alive" here — running-unverified falls through so
+    # its stale bound can still reclaim a never-started launch.
+    if reported == OUTCOME_RUNNING:
+        return None, None
+
+    # 2. HEAD MOVED (and the agent is NOT provably-alive) -> success: our
+    # fixer pushed + exited, or an external push advanced the head past a
+    # dead/finished agent. Retire the lease succeeded@<oldhead>.
     if head_moved:
         de = watch.setdefault("dispatched_events", {})
         if isinstance(de, dict):
