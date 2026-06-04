@@ -1160,7 +1160,7 @@ def run_supervisor(
     refresh_probes: Callable[[], list[WorkerProbe]],
     reconcile_one: Callable[[WorkerProbe], None],
     write_state: Callable[[], None],
-    periodic_full_reconcile: Callable[[], None] | None = None,
+    periodic_full_reconcile: Callable[[], bool | None] | None = None,
     force_tick_check: Callable[[], bool] | None = None,
     force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
@@ -1541,7 +1541,7 @@ def run_supervisor(
                 if run_periodic:
                     last_periodic_reconcile_unix = now_clock
                     try:
-                        periodic_full_reconcile()
+                        periodic_dispatched = periodic_full_reconcile()
                     except BrokenPipeError:
                         # loop-supervisor-sigpipe-5263: never let the
                         # fail-soft `except Exception` swallow a broken
@@ -1550,6 +1550,22 @@ def run_supervisor(
                         raise
                     except Exception as exc:  # noqa: BLE001
                         res.errors.append(f"periodic-reconcile: {exc}")
+                        periodic_dispatched = False
+                    # If the periodic reconcile STAGED new DISPATCH blocks
+                    # (e.g. PR-watch auto-fix/rebase), EXIT the loop now so
+                    # tick() returns and main() prints them to the coord
+                    # (codex iter-17 [P1]). The supervisor surfaces blocks
+                    # only on exit; holding the lock for the rest of the
+                    # session would leave a `running` lease persisted with
+                    # no Agent ever launched + risk a later duplicate.
+                    if periodic_dispatched:
+                        res.exit_reason = "dispatch-pending"
+                        emit(
+                            "[coord] supervisor loop exiting: periodic reconcile "
+                            "staged dispatch block(s) — flushing to coord",
+                            stream=log_stream,
+                        )
+                        break
                 if run_stuck:
                     last_stuck_check_unix = now_clock
                     res.stuck_check_passes += 1

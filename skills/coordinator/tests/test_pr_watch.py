@@ -2296,6 +2296,9 @@ def test_tick_dispatches_fix_subagent_e2e(
     blocks = [b for b in result.dispatch_instructions if "pr-fix-195" in b]
     assert len(blocks) == 1
     assert result.dispatched >= 1
+    # PR-watch blocks carry `register: false` so the coord skips the
+    # worker register_subagent step (codex iter-17 [P2]).
+    assert "register: false" in blocks[0]
     # the lease is persisted (running) with the minted agent_id.
     w = pw.load_watches(it_project_dir)["watches"]["195"]
     assert w["inflight_action"]["kind"] == pw.ACTION_FIX

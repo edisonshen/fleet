@@ -258,6 +258,15 @@ python3 /path/to/skills/coordinator/register_subagent.py \
   --project <project> <slug> <subagent_id>
 ```
 
+   **EXCEPTION — `register: false` blocks.** A DISPATCH block carrying a
+   `register: false` line is a PR-watch auto-fix/rebase dispatch whose
+   `slug` is a synthetic `pr-fix-<n>` / `pr-rebase-<n>` label, NOT a
+   tasks.md worker. Do the `mark-launch-attempted` gate + the Agent call as
+   normal, but SKIP `register_subagent.py` for it: that script keys on the
+   worker slug→agent_id map and would pollute worker state with a non-worker
+   label. The coordinator tick reaps these journals/inboxes itself via the
+   PR-watch lease lifecycle.
+
 One Agent call per DISPATCH block whose `mark-launch-attempted` returned
 `ok`. If a tick emits N blocks, run the step-2 gate then the Agent call for
 each before doing anything else. Skip registration only if no `subagent_id`

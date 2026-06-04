@@ -1200,6 +1200,7 @@ def format_dispatch_instruction(
     prompt_file: str,
     description: str | None = None,
     generation: int = 0,
+    register: bool = True,
 ) -> str:
     """Render the DISPATCH block the coord agent (Claude) will act on.
 
@@ -1246,7 +1247,7 @@ def format_dispatch_instruction(
     if not prompt_file:
         raise ValueError("prompt_file must be non-empty")
     desc = (description or f"fleet worker {slug}").strip()
-    return "\n".join([
+    lines = [
         f"DISPATCH: {slug}",
         f"  agent_id: {agent_id}",
         f"  generation: {int(generation)}",
@@ -1254,8 +1255,20 @@ def format_dispatch_instruction(
         f"  prompt_file: {prompt_file}",
         "  run_in_background: true",
         "  subagent_type: general-purpose",
-        "END_DISPATCH",
-    ])
+    ]
+    # `register: false` marks a dispatch whose agent_id is NOT a tasks.md
+    # worker slug (PR-watch auto-fix/rebase — slug is a synthetic
+    # `pr-fix-<n>`/`pr-rebase-<n>` label). The coord MUST skip the
+    # register_subagent.py step for it (codex iter-17 [P2]): that step
+    # writes worker_subagent_ids[slug] + acks via worker_agent_ids[slug],
+    # which would pollute worker state with a non-worker label and never
+    # actually ack the journal. The mark-launch-attempted gate still runs
+    # (the journal exists); only the post-launch worker registration is
+    # skipped. Omitted (== register: true) for normal worker dispatches.
+    if not register:
+        lines.append("  register: false")
+    lines.append("END_DISPATCH")
+    return "\n".join(lines)
 
 
 def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = None) -> str:

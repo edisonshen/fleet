@@ -1566,8 +1566,10 @@ def _run_supervisor(
         if _reconcile_slugs([probe.slug]):
             _maybe_dispatch_after_reconcile()
 
-    def periodic_full_reconcile():
+    def periodic_full_reconcile() -> bool:
         """Re-reconcile EVERY in-flight task (not just mtime-changed ones).
+        Returns True if it STAGED any DISPATCH block (PR-watch auto-fix), so
+        the supervisor can exit + flush them to the coord (codex iter-17).
 
         codex iter-1 [P1] regress: in-review tasks have no live worker,
         so their state.json mtime never advances and the mtime-driven
@@ -1581,7 +1583,7 @@ def _run_supervisor(
         try:
             f3 = parse.read(str(tasks_path))
         except Exception:
-            return
+            return False
         slugs = [
             t.slug for t in f3.tasks
             if t.status in ("in-progress", "in-review")
@@ -1596,6 +1598,7 @@ def _run_supervisor(
         # tick" durability guarantee. We re-read tasks.md (the legacy CI
         # path above may have just mutated it) and run the SAME reconcile
         # the primary tick runs, on the same stuck-check cadence. Fail-soft.
+        n_blocks_before = len(result.dispatch_instructions)
         try:
             f_pw = parse.read(str(tasks_path))
             _reconcile_pr_watches(
@@ -1605,10 +1608,13 @@ def _run_supervisor(
             )
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
-        if not slugs:
-            return
-        if _reconcile_slugs(slugs):
+        pr_watch_dispatched = len(result.dispatch_instructions) > n_blocks_before
+        if slugs and _reconcile_slugs(slugs):
             _maybe_dispatch_after_reconcile()
+        # Signal the supervisor to exit + flush if PR-watch staged a block
+        # (codex iter-17 [P1]): a persisted running lease with no launched
+        # Agent must not sit for the rest of the session.
+        return pr_watch_dispatched
 
     def write_state_hook():
         # Heartbeat publish. Re-load → no-op-write so any concurrent
@@ -5592,7 +5598,7 @@ def _reconcile_pr_watches(
             block = dispatch_mod.format_dispatch_instruction(
                 agent_id=agent_id, slug=label, prompt_file=prompt_file,
                 description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
-                generation=0,
+                generation=0, register=False,
             )
             staged_blocks.append(block)
             return agent_id
