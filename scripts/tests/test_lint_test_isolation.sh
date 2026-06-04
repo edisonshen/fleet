@@ -149,6 +149,41 @@ func TestStubbedCommand(t *testing.T) {
 }
 '
 
+# --- Case E (NEW — codex review iter-1 [P2], 2026-06-04): helper-wrapped
+#     runDispatch (currently the runDispatchIgnoringSpawnErr pattern in
+#     cmd/fleet/dispatch_rc_auto_marker_test.go) must ALSO be flagged
+#     when the dispatchOpts is empty-command. The earlier guard only
+#     matched the literal `runDispatch(` substring and missed wrappers.
+run_case "empty-command-wrapper-helper-dispatch" 1 "dispatchOpts" \
+'package sub
+
+import "testing"
+
+func TestEmptyCommandViaHelper(t *testing.T) {
+    tmuxtest.RequireTmux(t)
+    opts := &dispatchOpts{taskID: "demo", project: "default"}
+    runDispatchIgnoringSpawnErr(t, opts)
+}
+'
+
+# --- Case F (NEW): helper-wrapped dispatch WITH commandExplicit: true passes.
+run_case "stubbed-command-wrapper-helper-dispatch" 0 "0 violations" \
+'package sub
+
+import "testing"
+
+func TestStubbedCommandViaHelper(t *testing.T) {
+    tmuxtest.RequireTmux(t)
+    opts := &dispatchOpts{
+        taskID:          "demo",
+        project:         "default",
+        command:         []string{"sleep", "30"},
+        commandExplicit: true,
+    }
+    runDispatchIgnoringSpawnErr(t, opts)
+}
+'
+
 echo ""
 echo "test_lint_test_isolation: $passed passed, $failed failed"
 if [[ "$failed" -gt 0 ]]; then

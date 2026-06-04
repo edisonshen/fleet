@@ -550,8 +550,17 @@ fi
 # dispatch — only inspect cobra wiring.
 #
 # Scanner re-uses the comment-stripping awk used above; just a different
-# trigger / marker set. We DON'T re-use the function-helper chains since
-# the dispatchOpts pattern is always built inline at the test callsite.
+# trigger / marker set. The dispatchOpts literal is always built inline
+# at the test callsite, but the runDispatch CALL can be wrapped in a
+# helper (e.g. runDispatchIgnoringSpawnErr in
+# cmd/fleet/dispatch_rc_auto_marker_test.go). Codex review iter-1 [P2]
+# (2026-06-04): the previous "saw_run matches only `runDispatch(`"
+# leaked when a test built &dispatchOpts{} and called a helper wrapper
+# that itself reached runDispatch. We now also accept the documented
+# wrapper(s). Add to this list whenever a new helper wraps runDispatch;
+# the safer alternative (full helper-chain discovery like the first
+# guard) is intentionally deferred until a second wrapper appears, per
+# CLAUDE.md "no premature abstractions."
 scan_empty_command_dispatch() {
   local f="$1"
   awk -v file="$f" \
@@ -631,6 +640,11 @@ scan_empty_command_dispatch() {
       if (body != "") {
         if (index(body, "dispatchOpts{") > 0) saw_opts = 1
         if (index(body, "runDispatch(") > 0) saw_run = 1
+        # Codex review iter-1 [P2] (2026-06-04): helper-wrapped
+        # runDispatch calls (currently only runDispatchIgnoringSpawnErr
+        # in dispatch_rc_auto_marker_test.go) must also trigger the
+        # guard so the wrapped path does not slip through.
+        if (index(body, "runDispatchIgnoringSpawnErr(") > 0) saw_run = 1
         if (index(body, "commandExplicit: true") > 0) saw_explicit = 1
         if (index(body, "commandExplicit:      true") > 0) saw_explicit = 1
       }
@@ -646,6 +660,8 @@ scan_empty_command_dispatch() {
       if (code_line != "") {
         if (index(code_line, "dispatchOpts{") > 0) saw_opts = 1
         if (index(code_line, "runDispatch(") > 0) saw_run = 1
+        # Codex review iter-1 [P2] (2026-06-04): helper-wrapped path.
+        if (index(code_line, "runDispatchIgnoringSpawnErr(") > 0) saw_run = 1
         if (index(code_line, "commandExplicit: true") > 0) saw_explicit = 1
         if (index(code_line, "commandExplicit:      true") > 0) saw_explicit = 1
       }
@@ -671,7 +687,8 @@ if (( ${#cmd_violations[@]} > 0 )); then
   echo "test-isolation-lint: FAIL (empty-command dispatchOpts)" >&2
   echo "" >&2
   echo "The following test functions build a &dispatchOpts{...} literal" >&2
-  echo "and call runDispatch on it WITHOUT setting commandExplicit: true." >&2
+  echo "and call runDispatch (or runDispatchIgnoringSpawnErr) on it" >&2
+  echo "WITHOUT setting commandExplicit: true." >&2
   echo "With commandExplicit unset (or false) AND opts.command empty," >&2
   echo "runDispatch substitutes the engine wrapper (cmd/fleet/dispatch.go" >&2
   echo ":416-424) and forks a real detached tmux+claude on any host with" >&2
