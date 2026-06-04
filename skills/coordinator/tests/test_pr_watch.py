@@ -1752,6 +1752,36 @@ def test_preserved_todo_slug_not_auto_fixed(tmp_path: Path) -> None:
     assert disp.calls == []
 
 
+def test_foreign_repo_same_number_does_not_enable_dispatch(tmp_path: Path) -> None:
+    """A foreign-repo task sharing a PR number must NOT make a preserved
+    owned watch look dispatchable (codex iter-8 [P2] — gate on owner/repo,
+    not the bare number)."""
+    # tick 1: enroll the owned watch (#195 in OWNER_REPO).
+    pre = [_task("a", status="in-review", pr_url=_pr_url(195), branch="worker/a")]
+    pw.reconcile_watches(
+        pre, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                          fresh_base="B", ancestors=set()),
+        flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=1, repo_path="/repo",
+    )
+    # tick 2: owned task 'a' is a preserved todo (no url); a FOREIGN-repo
+    # task 'b' happens to point at #195 in someone/other.
+    current = [
+        _task("a", status="todo", pr_url="", branch="worker/a"),
+        _task("b", status="in-review",
+              pr_url=_pr_url(195, owner_repo="someone/other"), branch="worker/b"),
+    ]
+    disp = _DispatchRecorder()
+    out = _run2(current, tmp_path,
+                FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                           fresh_base="B", ancestors=set()),
+                dispatch=disp, tick_count=2, enroll=pre)
+    # the foreign #195 must not enable an auto-fix on the owned watch.
+    assert out.dispatched == 0
+    assert disp.calls == []
+
+
 def test_running_lease_released_when_pr_merges(tmp_path: Path) -> None:
     """A PR that MERGES while a fixer lease is still running -> the lease's
     journal+inbox are released before the terminal prune (codex iter-7

@@ -1616,13 +1616,17 @@ def _dispatch_actions(
     # cap'd worker path, NOT a PR-watch fixer; dispatching here would double-
     # work the same branch). Auto-fix fires ONLY for a PR that still has a
     # live PR-pointing task.
+    # Keyed on (owner_repo, pr_number) — NOT the number alone (codex iter-8
+    # [P2]): a FOREIGN-repo task sharing a PR number must not make an owned
+    # watch look dispatchable. The watch's own pr_url owner is matched
+    # against this set below.
     live_pr_backed: set = set()
     for t in tasks:
         if getattr(t, "status", "") in TERMINAL_TASK_STATUSES:
             continue
         parsed = parse_pr_url(getattr(t, "pr_url", ""))
         if parsed is not None:
-            live_pr_backed.add(parsed[1])
+            live_pr_backed.add(parsed)  # (owner_repo, pr_number)
 
     def _task_deps(slug: str) -> list:
         return task_deps_map.get(slug, [])
@@ -1692,13 +1696,16 @@ def _dispatch_actions(
         except (TypeError, ValueError):
             continue
         # Only auto-fix a PR that still has a LIVE PR-pointing task (codex
-        # iter-7 [P2]). A watch backed solely by a preserved CI-red-requeued
-        # `todo` slug (pr_url cleared, kept only for old-PR-merge reconcile)
-        # is NOT dispatchable here — its retry rides the normal cap'd worker
-        # path. The lease (if any) is still reclaimed below before this gate
-        # so a resolved lease's journal gets released, but no NEW action is
-        # dispatched for a non-PR-backed watch.
-        if pr_num not in live_pr_backed:
+        # iter-7 [P2]) IN THIS COORD'S REPO (codex iter-8 [P2] — match the
+        # watch's own owner/repo, not just the number, so a foreign-repo
+        # task sharing a number can't make the watch look dispatchable). A
+        # watch backed solely by a preserved CI-red-requeued `todo` slug
+        # (pr_url cleared, kept only for old-PR-merge reconcile) is NOT
+        # dispatchable here — its retry rides the normal cap'd worker path.
+        # The lease (if any) is still reclaimed below so a resolved lease's
+        # journal gets released, but no NEW action is dispatched.
+        w_parsed = parse_pr_url(w.get("pr_url", ""))
+        if w_parsed is None or w_parsed not in live_pr_backed:
             # still reclaim a resolved lease (release its journal) but never
             # dispatch a fresh action.
             _reclaim_and_release(
