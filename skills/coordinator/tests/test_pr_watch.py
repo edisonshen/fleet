@@ -2475,6 +2475,31 @@ def test_abandoned_dep_does_not_unblock_rebase_e2e(
     assert not [b for b in r.dispatch_instructions if "pr-rebase-195" in b]
 
 
+def test_missing_archived_dep_does_not_unblock_rebase_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A stale PR whose dep is ABSENT from tasks.md (abandoned then archived
+    out) must NOT auto-rebase (codex iter-30 [P2]) — a missing dep is not
+    'done', matching worker-dispatch _deps_satisfied (present AND done)."""
+    # 'dep' is NOT in tasks.md at all; 'a' depends on it.
+    _write_tasks(it_project_dir, [
+        _it_task("a", pr_url=_pr_url(195), branch="worker/a", depends_on=["dep"]),
+    ])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    assert not [b for b in r.dispatch_instructions if "pr-rebase-195" in b]
+
+
 def test_dead_pid_record_reclaimed_promptly_e2e(
     it_home: Path, it_project_dir: Path, monkeypatch,
 ) -> None:

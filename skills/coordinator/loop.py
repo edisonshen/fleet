@@ -5604,12 +5604,14 @@ def _reconcile_pr_watches(
     }
 
     def _deps_done(deps: list) -> bool:
-        # All listed dependency slugs must be DONE. A dep we can't see
-        # in tasks.md (already archived off the list) counts as done — the
-        # row only stays while non-terminal, so its absence == done.
-        present = {t.slug for t in tasks if t.slug}
+        # Every listed dependency must be PRESENT in tasks.md AND status ==
+        # "done" — EXACTLY matching the worker-dispatch _deps_satisfied gate
+        # (codex iter-30 [P2]). A dep MISSING from tasks.md is NOT treated as
+        # done: it may have been ABANDONED then archived out, which is not
+        # satisfied work, so auto-rebasing over it would be wrong (and would
+        # diverge from worker dispatch, which refuses a missing dep).
         for d in deps:
-            if d in present and d not in done_slugs:
+            if d not in done_slugs:
                 return False
         return True
 
