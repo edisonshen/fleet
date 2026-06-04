@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -265,6 +266,37 @@ the record. A full project manifest model lands later (see docs/DESIGN.md
 		"internal: allow reserved coord-<project> task_id prefix (used by the TUI)")
 	_ = cmd.Flags().MarkHidden("coord-spawn")
 	return cmd
+}
+
+// vetoExitCode is the process exit code dispatch uses when the
+// --coord-spawn live-coord veto fires. 75 == sysexits.h EX_TEMPFAIL
+// ("temporary failure; retry shortly"), deliberately distinct from the
+// 70 (EX_SOFTWARE) other dispatch failures map to. The veto is NOT a
+// hard error — it means a coord is alive on another tmux socket OR one
+// crashed within the freshness window and may be restarting. `fleet
+// attach`'s shared coord-spawn wrapper inspects exec.ExitError.ExitCode()
+// for this value and treats it as a wait+retry / re-resolve signal
+// instead of a never-exit-violating hard exit 70 (BUG #2,
+// docs/TASK-PLAN-attach-failover.md INVARIANT 3).
+const vetoExitCode = 75
+
+// vetoError is the typed sentinel runDispatch returns when the
+// --coord-spawn live-coord veto fires. main() detects it via errors.As
+// and maps it to vetoExitCode (75) — mirroring the errClaimsError /
+// errRC exit-code wiring. A typed/sentinel error can't cross the
+// exec.Command subprocess boundary attach uses, so the EXIT CODE (not a
+// stderr substring) is the contract attach classifies on.
+type vetoError struct {
+	msg string
+}
+
+func (e *vetoError) Error() string { return e.msg }
+
+// vetoErrorFromErr reports whether err (or anything it wraps) is a
+// *vetoError. Used by main()'s exit-code dispatch.
+func vetoErrorFromErr(err error) bool {
+	var e *vetoError
+	return errors.As(err, &e)
 }
 
 func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
@@ -634,12 +666,21 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
 	if opts.coordSpawn && coordStateFresh(opts.project) {
 		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
-			return fmt.Errorf(
+			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).
+			// This is a RETRY signal, not a hard failure: a live coord
+			// exists on another tmux socket OR one crashed within the
+			// freshness window and may be restarting. `fleet attach`'s
+			// shared coord-spawn wrapper classifies exit 75 (via
+			// exec.ExitError.ExitCode()) as wait+retry, NOT a never-exit-
+			// violating hard exit 70 (BUG #2, attach-failover plan
+			// INVARIANT 3). Spawning over a live/restarting coord here
+			// would split-brain the project.
+			return &vetoError{msg: fmt.Sprintf(
 				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
 					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
 					"in case (2), wait %s for the freshness signal to age out, then retry — recovery will pick up in-flight worker state. "+
 					"do NOT `fleet rm` the dead record first; that disables the recovery path",
-				opts.project, coordFreshnessWindow)
+				opts.project, coordFreshnessWindow)}
 		}
 	}
 
