@@ -213,7 +213,30 @@ func runAttachFailover(token string, opts AttachOpts) error {
 				"%s handed off → %s (rotated through %d %s); attaching to %s\n",
 				token, rec.ID, hops, hopWord, session)
 		}
-		return attachFnVar(session)
+		// Codex review iter-13 P2: race-window symmetry. The probe
+		// above passed, but the session could still die before
+		// attachFnVar exec's. For COORD records with a project tag,
+		// Tier 3 can recover exactly this stale-session case — fall
+		// through instead of surfacing the raw tmux error. For other
+		// records (workers, untagged), surface SystemError with the
+		// retry advice (no Tier 3 recovery path for non-coord agents).
+		if err := attachFnVar(session); err != nil {
+			coordTag := projectlookup.CoordTaskID(rec.Project)
+			if rec.Project != "" && rec.TaskID == coordTag {
+				_, _ = fmt.Fprintf(opts.Stderr,
+					"%s: session %s died between probe and attach; failing over to project recovery\n",
+					token, session)
+				recovery := opts
+				if recovery.Project == "" {
+					recovery.Project = rec.Project
+				}
+				return tier3ProjectRecovery(token, errors.New("attach race"), recovery)
+			}
+			return newSystemError(70, fmt.Sprintf(
+				"agent %s session %s died between probe and attach (%v) — re-run `fleet attach %s` to retry",
+				token, session, err, token))
+		}
+		return nil
 	}
 
 	// Recoverable-error gate (codex review iter-3 P2): Tier 3 PROJECT
@@ -478,8 +501,8 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		newID, derr := coordSpawnFnVar(project)
 		if derr != nil {
 			return newSystemError(70, fmt.Sprintf(
-				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code` manually",
-				project, derr, project, project))
+				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
+				project, derr, token, project))
 		}
 		// Path C now says "recovered" instead of "reaped" because the
 		// reap is delegated to dispatch's recovery flow (which inherits
@@ -500,8 +523,8 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	newID, derr := coordSpawnFnVar(project)
 	if derr != nil {
 		return newSystemError(70, fmt.Sprintf(
-			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code` manually",
-			project, derr, project, project))
+			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
+			project, derr, token, project))
 	}
 	_, _ = fmt.Fprintf(opts.Stderr,
 		"%s: no coord for %s; spawned %s; attaching\n",
@@ -550,8 +573,8 @@ func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 		// would have left the operator with a literal-string command
 		// that fails arg parsing.
 		return newSystemError(70, fmt.Sprintf(
-			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` (or `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code`) to retry; check ~/.fleet/agents/%s.json for clues",
-			project, session, token, project, project, project, newID))
+			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd); check ~/.fleet/agents/%s.json for clues",
+			project, session, token, project, newID))
 	}
 	// Codex review iter-10 P2: the probe-then-attach window is non-zero
 	// (the spawn could exit AFTER probe says alive AND BEFORE
@@ -563,8 +586,8 @@ func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 	// documented exit-code contract.
 	if err := attachFnVar(session); err != nil {
 		return newSystemError(70, fmt.Sprintf(
-			"coord-spawn for %s returned exit 0 and probe passed but tmux.Attach %s failed: %v — re-run `fleet attach %s --project %s` (or `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code`) to retry; check ~/.fleet/agents/%s.json for clues",
-			project, session, err, token, project, project, project, newID))
+			"coord-spawn for %s returned exit 0 and probe passed but tmux.Attach %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd); check ~/.fleet/agents/%s.json for clues",
+			project, session, err, token, project, newID))
 	}
 	return nil
 }

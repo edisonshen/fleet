@@ -936,6 +936,74 @@ func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
 	}
 }
 
+// TestTier12_AttachRaceCoord_FailsOverToTier3 — codex review iter-13 P2.
+// Tier 1 (live record) probe passed, but the session died before
+// tmux.Attach. For coord-tagged records, Tier 3 can recover — must fall
+// over instead of returning the raw tmux error.
+//
+// The trick: the SAME session must look alive to the probe (so Tier 1
+// fires) AND dead by the time attach runs (the race). Once Tier 3 kicks
+// in, the probe for the dead session is now consistent with the attach
+// failure → Path A FindLiveCoord skips it, Path B lock-body misses,
+// Path C StaleCoordRecord catches it (probe now reports dead) → Path C
+// runs dispatch which spawns the successor.
+func TestTier12_AttachRaceCoord_FailsOverToTier3(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Coord-tagged live record. aliveSessions is empty initially so
+	// the probe sees it as dead — but we override sessionProbeFnVar to
+	// say alive on the FIRST probe call (Tier 1) and dead thereafter
+	// (so Tier 3's recovery sees the truth).
+	r := agent.New("deadrace")
+	r.Project = "projects-fleet"
+	r.TaskID = projectlookup.CoordTaskID("projects-fleet")
+	r.TmuxSession = "fleet-deadrace"
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+
+	probeCalls := 0
+	sessionProbeFnVar = func(session string) (bool, error) {
+		if session == "fleet-deadrace" {
+			probeCalls++
+			if probeCalls == 1 {
+				return true, nil // Tier 1 sees alive
+			}
+			return false, nil // Tier 3 sees dead (the truth)
+		}
+		return s.aliveSessions[session], nil
+	}
+
+	// Attach stub: errors only for fleet-deadrace (the race target).
+	// dispatch stub registers fleet-newcoord as alive → spawned-session
+	// attach succeeds.
+	originalAttach := attachFnVar
+	attachFnVar = func(session string) error {
+		if session == "fleet-deadrace" {
+			return errors.New("tmux: no such session (race)")
+		}
+		return originalAttach(session)
+	}
+
+	stderr, err := s.run(t, "deadrace", AttachOpts{})
+	if err != nil {
+		t.Fatalf("expected Tier 3 to recover the race, got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "died between probe and attach") {
+		t.Errorf("stderr must surface the race fallover: %q", got)
+	}
+	// Tier 3 Path C should fire: StaleCoordRecord (probe says dead) →
+	// dispatch (no pre-archive after iter-8) → spawn fresh → attach.
+	if len(s.dispatched) != 1 || s.dispatched[0] != "projects-fleet" {
+		t.Errorf("expected Tier 3 to dispatch coord-spawn; got dispatched=%v", s.dispatched)
+	}
+	if s.attachedTo != "fleet-newcoord" {
+		t.Errorf("attached to %q want fleet-newcoord (Tier 3 spawn)", s.attachedTo)
+	}
+}
+
 // TestSystemFailure_ExistingCoordAttachRace — codex review iter-12 P2.
 // Path A (FindLiveCoord hit) probes the session alive, but it dies
 // between the probe and tmux.Attach. The operator should see the same
