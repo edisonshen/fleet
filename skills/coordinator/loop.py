@@ -1184,6 +1184,7 @@ def _tick_locked(
     except Exception as exc:  # noqa: BLE001
         result.errors.append(f"pr-watch tasks re-read: {exc}")
         watch_tasks = f.tasks
+    _n_blocks_before_pr_watch = len(result.dispatch_instructions)
     try:
         _reconcile_pr_watches(
             watch_tasks, project=project, project_dir=project_dir,
@@ -1193,6 +1194,15 @@ def _tick_locked(
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
+    # Did the initial PR-watch pass STAGE a DISPATCH block? If so we must
+    # NOT enter the long-running supervisor (codex iter-18 [P1]) — it would
+    # hold the lock for the whole session while the block sits unprinted +
+    # the lease stays `running` with no Agent launched. main() prints the
+    # blocks the moment tick() returns, so skipping the supervisor flushes
+    # them immediately; the next tick re-enters the supervisor.
+    _pr_watch_staged_dispatch = (
+        len(result.dispatch_instructions) > _n_blocks_before_pr_watch
+    )
 
     # 5.7. Worktree-GC backstop (DESIGN-coord-worktree-lifecycle §4.4).
     # The reconcile/sentinel reaping path (§4.1-4.3) handles trees on the
@@ -1217,7 +1227,7 @@ def _tick_locked(
     # single-tick behavior is preserved when poll_interval=0 (or no
     # in-flight tasks) — the supervisor returns immediately.
     sup_cfg = supervisor_mod.SupervisorConfig.from_env()
-    if sup_cfg.poll_interval_s > 0:
+    if sup_cfg.poll_interval_s > 0 and not _pr_watch_staged_dispatch:
         _run_supervisor(
             cfg=sup_cfg,
             project=project,
