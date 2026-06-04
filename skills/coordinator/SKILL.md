@@ -119,6 +119,33 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 - Promotion: run `fleet tasks promote <slug>` only after the doc exists and is
   linked or embedded in worker-visible task text.
 
+### Plan & design-doc writing standard
+
+Every PLAN-DOC and TASK-PLAN-DOC is **problem-first and readable by a
+non-expert engineer**. The doc is for a human to understand and approve, not a
+dump of implementer notes. This standard gates the operator-approval step:
+
+1. **Lead with the PROBLEM in plain English** — what is broken now, the
+   concrete symptom, why it matters — before any solution. Define jargon on
+   first use; no unexplained symbols or `file:line` citations at the top.
+2. **Structure:** Problem -> How it works today -> What goes wrong -> The fix
+   -> then a clearly-labeled `Implementation detail (for engineers)` section.
+   Push the dense spec (exact mechanics, exit codes, edge-case enumeration)
+   into that last section, after the accessible explanation.
+3. **ASCII diagrams** — one clean diagram each for today's flow, the failure,
+   and the fix. Cut redundant ones.
+4. **Short sentences, one idea per paragraph.** Halve length by removing
+   redundancy, never by dropping a technical decision.
+5. **Test plan = one line per test** (scenario / input / expected); group
+   near-identical cases.
+6. **Final version only:** no rev-by-rev review log, no "round 1/2/3" history,
+   no "superseded" appendix inside the doc — that lives in the task/PR. Minimal
+   header: status / scope / priority / depends-on / PR-base.
+
+Ship `.md` (agent source-of-truth) + rendered `.html` (human review) per the
+PLAN-DOC/TASK-PLAN-DOC steps. Readability rewrites NEVER change an agreed
+technical decision — preserve every invariant verbatim in meaning.
+
 ### Step 6 — IMPLEMENT
 
 Implementation is a three-stage flow across separate Agent subagents:
