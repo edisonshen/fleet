@@ -1693,18 +1693,36 @@ def test_dead_agent_lease_reclaimed_and_redispatched(tmp_path: Path) -> None:
     assert len(disp.calls) == 2
 
 
-def test_expired_lease_reclaimed(tmp_path: Path) -> None:
-    """A running lease past the expiry tick budget with no liveness signal
-    -> reclaimed -> re-dispatch."""
+def test_live_long_running_lease_not_expired(tmp_path: Path) -> None:
+    """A running lease far past the age budget but whose agent is STILL
+    ALIVE must NOT be reclaimed (codex iter-11 [P1]) — a long-running fixer
+    (gates + multi-round review) must not get a second agent launched into
+    its branch. Liveness wins over age."""
     tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
     snaps = {195: _ci_fail_snap(195, head="H1")}
     prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
     disp = _DispatchRecorder()
     _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
-    # tick way past expiry; agent still "alive" but expired -> reclaim.
+    # tick way past the old expiry budget; agent still alive -> NOT reclaimed.
     out2 = _run2(tasks, tmp_path, prober, dispatch=disp,
-                 tick_count=1 + pw._LEASE_EXPIRY_TICKS,
+                 tick_count=1 + pw._LEASE_EXPIRY_TICKS + 5,
                  agent_outcome=lambda _aid: "running")
+    assert out2.dispatched == 0
+    assert len(disp.calls) == 1
+
+
+def test_dead_long_running_lease_reclaimed(tmp_path: Path) -> None:
+    """A running lease whose agent is GONE (lost liveness) IS reclaimed +
+    re-dispatched regardless of age — the dead path is the age-independent
+    reclaim."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    out2 = _run2(tasks, tmp_path, prober, dispatch=disp,
+                 tick_count=1 + pw._LEASE_EXPIRY_TICKS + 5,
+                 agent_outcome=lambda _aid: "gone")
     assert out2.dispatched == 1
 
 

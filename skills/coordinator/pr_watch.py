@@ -149,10 +149,13 @@ _FIX_EVENTS = frozenset({EVENT_CI_FAILED, EVENT_CHANGES_REQUESTED})
 #                                attempt per <headSHA,baseSHA>); no silent
 #                                re-fire
 # Reclaim (every tick): a `running` lease whose agent_id is provably dead
-# OR whose `leased_at` is older than the lease bound is cleared -> eligible
-# to re-dispatch (closes the "fixer died silently -> PR unwatched-for-action
-# forever" hole). `dispatched_events` keys whose head-SHA != current head
-# are pruned on each persist so the file stays bounded.
+# (dead pid / missing agent record) is cleared -> eligible to re-dispatch
+# (closes the "fixer died silently -> PR unwatched-for-action forever"
+# hole). LIVENESS, not age, is the reclaim authority — a provably-alive
+# agent is NEVER force-expired (codex iter-11 [P1]: a long-running
+# fixer/rebaser must not get a second agent into its branch).
+# `dispatched_events` keys whose head-SHA != current head are pruned on
+# each persist so the file stays bounded.
 
 ACTION_REBASE = "rebase"
 ACTION_FIX = "fix"
@@ -162,10 +165,14 @@ OUTCOME_BLOCKED = "blocked"
 OUTCOME_FAILED_LAUNCH = "failed_launch"
 _OUTCOME_SUCCEEDED_PREFIX = "succeeded@"
 
-# A `running` lease older than this many ticks with no liveness signal is
-# reclaimed (the agent likely died between launch and its first heartbeat,
-# or the launch silently failed). Tick-budget (not wall-clock) so tests are
-# deterministic — mirrors pr_watch's existing _BACKOFF_*_TICKS discipline.
+# Reference "long-lived lease" tick magnitude. NOTE (codex iter-11 [P1]):
+# liveness — NOT age — is the lease-reclaim authority. A lease is reclaimed
+# only when its agent is provably GONE (dead pid / missing record); a
+# provably-ALIVE agent is never force-expired on age, because a legitimate
+# fixer/rebaser (gates + multi-round review) can run longer than any age
+# budget and force-expiring it would launch a SECOND agent into the same
+# branch. This constant is retained for the persisted `leased_tick`
+# bookkeeping + as a test magnitude, not as a reclaim trigger.
 _LEASE_EXPIRY_TICKS = 12
 
 
@@ -355,13 +362,14 @@ def _reclaim_lease(
         watch["inflight_action"] = None
         return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
 
-    # 4. lease expired.
-    leased_tick = inflight.get("leased_tick")
-    if isinstance(leased_tick, int) and tick_count - leased_tick >= _LEASE_EXPIRY_TICKS:
-        watch["inflight_action"] = None
-        return f"reclaimed expired lease {key!r} (>{_LEASE_EXPIRY_TICKS} ticks)", None
-
-    # 5. still running.
+    # 4. The agent is PROVABLY ALIVE and the head hasn't moved -> it is still
+    # working. NEVER expire a live lease on age alone (codex iter-11 [P1]): a
+    # legitimately long-running fixer/rebaser (gates + multi-round review can
+    # exceed a few coord polls) would otherwise get its lease cleared and a
+    # SECOND agent launched into the same branch, racing force-with-lease
+    # pushes. Liveness is the authority; the only age-based reclaim is the
+    # `gone`/dead path above (a lost liveness signal -> reclaim). So a live
+    # lease simply stays running -> suppressed.
     return None, None
 
 
