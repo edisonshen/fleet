@@ -2115,6 +2115,33 @@ def test_pr_watch_journals_excluded_from_worker_replay(tmp_path: Path) -> None:
     assert got == {"cccc0003"}  # only the real worker, not the pr-* journals
 
 
+def test_orphaned_watch_with_lease_releases_it(tmp_path: Path) -> None:
+    """A leased watch whose backing task is removed WHILE the fixer is in
+    flight must still RESOLVE the lease + release its journal when it
+    becomes orphaned (codex iter-29 [P2]) — not leak a running lease."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    _run2(tasks, tmp_path, prober, dispatch=disp, tick_count=1)
+    assert pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"] is not None
+    leased = pw.load_watches(tmp_path)["watches"]["195"]["inflight_action"]["agent_id"]
+    # tick 2: backing task removed (orphan) + the fixer's agent is gone.
+    released: list[str] = []
+    pw.reconcile_watches(
+        [], project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=prober, flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z",
+        tick_count=1 + pw._LEASE_LAUNCH_GRACE_TICKS, repo_path="/repo",
+        dispatch_action=disp, agent_outcome=lambda _aid: "gone",
+        deps_done=lambda _d: True, release_action=lambda aid: released.append(aid),
+    )
+    # the lease was resolved (cleared) + its journal released.
+    w = pw.load_watches(tmp_path)["watches"].get("195")
+    assert w is None or w.get("inflight_action") is None
+    assert leased in released
+
+
 def test_orphan_watch_no_auto_dispatch(tmp_path: Path) -> None:
     """A watch whose backing task was deleted while the PR is still OPEN +
     actionable -> NO auto fix/rebase (orphan -> raise-hand only, §5/§6

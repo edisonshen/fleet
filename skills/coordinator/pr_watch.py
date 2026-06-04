@@ -1797,6 +1797,23 @@ def _dispatch_actions(
         # orphan raise runs after this pass — so we gate on the empty
         # backing set directly, which is the orphan's defining condition.)
         if w.get("orphaned") or not w.get("tasks"):
+            # An orphaned/unbacked watch is never DISPATCHED to, but if it
+            # already holds a lease (the backing task went terminal / was
+            # removed WHILE a fixer was in flight), that lease + its pr-*
+            # journal/inbox must still be RESOLVED + released (codex iter-29
+            # [P2]) — worker replay skips pr-* journals, so this is the only
+            # reap point. Resolve the lease (head-moved success / dead-agent
+            # reclaim / release the journal) before skipping dispatch.
+            try:
+                _orphan_pr_num = int(w.get("pr_number", key))
+            except (TypeError, ValueError):
+                _orphan_pr_num = 0
+            if isinstance(w.get("inflight_action"), dict):
+                _reclaim_and_release(
+                    w, _orphan_pr_num, tick_count=tick_count,
+                    current_head=_watch_head(w), agent_outcome=agent_outcome,
+                    release_action=release_action, out=out,
+                )
             continue
         # REQUIRE A FRESH PROBE THIS TICK before reclaiming/dispatching
         # (codex iter-6 [P1]). If the probe was skipped (transient error /
