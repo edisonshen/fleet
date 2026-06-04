@@ -43,7 +43,7 @@ func newGCCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "gc",
 		Short: "Reap orphan fleet-owned resources (sockets, agent records, tmux, worktrees)",
-		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165, #172, #177). Six kinds:
+		Long: `gc one-shot reaper for fleet-created leftovers (fleet#165, #172, #177, leak-rc-daemon-lifecycle). Eight kinds:
 
   sockets        — /tmp/fleet-test-*.sock files older than --max-age
   orphan-agents  — ~/.fleet/agents/*.json records whose tmux session is gone
@@ -97,7 +97,7 @@ Per-action output format:
   <kind>  <target>  verb=<v>  reason=<r>
 
 Trailing summary line:
-  summary: N sockets, M agents, K tmux (surface only), L worktrees, P coord-locks, Q worker-records
+  summary: N sockets, M agents, K tmux (surface only), L worktrees, P coord-locks, Q worker-records, R invalid-projects, S orphan-rc-daemons
 
 Exit codes:
   0  — sweep ran (always; per-action failures surface in stderr lines)

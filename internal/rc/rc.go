@@ -114,6 +114,13 @@ type State struct {
 	LastSpawnAt   time.Time `json:"last_spawn_at,omitempty"`
 	LastError     string    `json:"last_error,omitempty"`
 	Alive         bool      `json:"alive"`
+	// ClaudeVersion + OwningCoordID surface the schema v2 fields from
+	// RecordedState so operators can see "what version is this daemon"
+	// + "what coord owns it" via `fleet rc status --json`. Empty on
+	// legacy v1 records that haven't been re-acquired since the schema
+	// bump. leak-rc-daemon-lifecycle PR-B.
+	ClaudeVersion string `json:"claude_version,omitempty"`
+	OwningCoordID string `json:"owning_coord_id,omitempty"`
 }
 
 // Enabled returns true iff the per-project rc-enabled marker is
@@ -575,6 +582,8 @@ func Inspect(project string) (State, error) {
 		s.LastSpawnAt = cur.LastSpawnAt
 		s.LastError = cur.LastError
 		s.Alive = cur.PID > 0 && workers.IsAlive(cur.PID)
+		s.ClaudeVersion = cur.ClaudeVersion
+		s.OwningCoordID = cur.OwningCoordID
 	} else if !errors.Is(err, ErrStateMissing) {
 		return s, err
 	}
