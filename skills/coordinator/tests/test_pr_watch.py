@@ -59,12 +59,13 @@ class FakeProber:
     cadence tests can assert how many probes fired."""
 
     def __init__(self, *, snaps=None, repo_error="", fresh_base="BASE",
-                 base_shas=None, ancestors=None):
+                 base_shas=None, ancestors=None, fetch_error=""):
         self.snaps = snaps or {}
         self.repo_error = repo_error
         self.fresh_base = fresh_base
         self.base_shas = base_shas or {}
         self.ancestors = ancestors or set()
+        self.fetch_error = fetch_error
         self.probe_calls = []          # list of (pr_numbers tuple)
         self.ancestor_calls = []
 
@@ -74,6 +75,7 @@ class FakeProber:
             fresh_base_sha=self.fresh_base,
             fresh_base_shas=dict(self.base_shas),
             fetch_ok=bool(self.fresh_base),
+            fetch_error=self.fetch_error,
         )
         if self.repo_error:
             rp.error = self.repo_error
@@ -303,10 +305,10 @@ def test_stale_pr_is_stale_not_ready(tmp_path: Path) -> None:
 
 def test_uptodate_green_is_ready(tmp_path: Path) -> None:
     """head DOES contain fresh base + checks green + no required review
-    pending -> READY surfaced."""
+    pending + no blocking merge-state word -> READY surfaced."""
     tasks = [_task("foo", pr_url=_pr_url(200))]
     snaps = {200: pw.PRSnapshot(number=200, pr_state="OPEN",
-                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                merge_state_status="CLEAN", checks="SUCCESS",
                                 review_decision="APPROVED", head_ref_oid="HEAD200")}
     prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE",
                         ancestors={("FRESHBASE", "HEAD200")})
@@ -325,7 +327,7 @@ def test_pr_measured_against_its_own_base(tmp_path: Path) -> None:
     # PR 300 targets base 'worker/parent'; head contains parent's tip but
     # NOT main's tip. Measured against its own base -> READY.
     snaps = {300: pw.PRSnapshot(number=300, pr_state="OPEN",
-                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                merge_state_status="CLEAN", checks="SUCCESS",
                                 review_decision="APPROVED",
                                 head_ref_oid="H300", base_ref_name="worker/parent")}
     prober = FakeProber(
@@ -341,16 +343,73 @@ def test_pr_measured_against_its_own_base(tmp_path: Path) -> None:
 
 
 def test_fetch_fail_never_asserts_ready(tmp_path: Path) -> None:
-    """A failed fetch (empty fresh_base) -> mergeability UNKNOWN -> keep
-    watching (EVENT_OPEN), never assert READY (fail-soft, §3)."""
+    """A missing fresh_base with NO fetch_error (e.g. brand-new watch, base
+    not yet known) -> mergeability UNKNOWN -> keep watching (EVENT_OPEN),
+    never assert READY (fail-soft, §3)."""
     tasks = [_task("foo", pr_url=_pr_url(201))]
     snaps = {201: pw.PRSnapshot(number=201, pr_state="OPEN", checks="SUCCESS",
                                 review_decision="APPROVED", head_ref_oid="H")}
-    prober = FakeProber(snaps=snaps, fresh_base="")  # fetch failed
+    prober = FakeProber(snaps=snaps, fresh_base="")  # no base, no error
     _run(tasks, tmp_path, prober)
     w = pw.load_watches(tmp_path)["watches"]["201"]
     assert w["last_event"] == pw.EVENT_OPEN          # NOT ready
     assert w["last_snapshot"]["up_to_date"] is False
+
+
+def test_fetch_failure_backs_off_not_silent_open(tmp_path: Path) -> None:
+    """A real git fetch failure (fetch_error set, no fresh base) for a PR
+    whose classification needs the ancestor check -> transient SKIP:
+    RETAIN + back off + surface, NOT a silent plain-OPEN (codex iter-4
+    [P2])."""
+    tasks = [_task("foo", pr_url=_pr_url(202))]
+    snaps = {202: pw.PRSnapshot(number=202, pr_state="OPEN", checks="SUCCESS",
+                                review_decision="APPROVED", head_ref_oid="H")}
+    prober = FakeProber(snaps=snaps, fresh_base="", fetch_error="fatal: unable to access")
+    out = _run(tasks, tmp_path, prober, tick_count=1)
+    w = pw.load_watches(tmp_path)["watches"]["202"]
+    assert w.get("last_event") is None               # NOT recorded as OPEN
+    assert w.get("probe_skip_until_tick", 0) > 1      # backoff armed
+    assert any("transient git fetch" in e for e in out.errors)
+
+
+def test_fetch_failure_still_records_merge(tmp_path: Path) -> None:
+    """A git fetch failure must NOT hide a terminal MERGED event — that
+    classification doesn't need the base check, so it's recorded."""
+    tasks = [_task("foo", pr_url=_pr_url(203))]
+    snaps = {203: pw.PRSnapshot(number=203, pr_state="MERGED", head_ref_oid="H")}
+    prober = FakeProber(snaps=snaps, fresh_base="", fetch_error="network down")
+    flips = []
+    out = _run(tasks, tmp_path, prober, flips=flips)
+    assert flips == ["foo"]                           # merge still reconciled
+    assert out.pruned == 1
+
+
+def test_draft_pr_not_ready(tmp_path: Path) -> None:
+    """A DRAFT PR (up-to-date + green) is NOT surfaced READY (codex iter-4
+    [P2]) — GitHub won't merge a draft."""
+    tasks = [_task("foo", pr_url=_pr_url(204))]
+    snaps = {204: pw.PRSnapshot(number=204, pr_state="OPEN", checks="SUCCESS",
+                                review_decision="APPROVED", is_draft=True,
+                                head_ref_oid="H204")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors={("B", "H204")})
+    out = _run(tasks, tmp_path, prober)
+    w = pw.load_watches(tmp_path)["watches"]["204"]
+    assert w["last_event"] == pw.EVENT_OPEN           # NOT ready
+    assert not any("READY" in n for n in out.notes)
+
+
+def test_blocked_uptodate_green_not_ready(tmp_path: Path) -> None:
+    """mergeStateStatus=BLOCKED + up-to-date + green -> withhold READY
+    (unresolved conversations / required deployments) (codex iter-4 [P2])."""
+    tasks = [_task("foo", pr_url=_pr_url(205))]
+    snaps = {205: pw.PRSnapshot(number=205, pr_state="OPEN",
+                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                review_decision="APPROVED", head_ref_oid="H205")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors={("B", "H205")})
+    out = _run(tasks, tmp_path, prober)
+    w = pw.load_watches(tmp_path)["watches"]["205"]
+    assert w["last_event"] == pw.EVENT_OPEN
+    assert not any("READY" in n for n in out.notes)
 
 
 # ---------------------------------------------------------------------------

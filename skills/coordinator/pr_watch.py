@@ -133,6 +133,7 @@ class PRSnapshot:
     base_ref_oid: str = ""
     head_ref_name: str = ""
     base_ref_name: str = ""
+    is_draft: bool = False          # GitHub draft PR (never mergeable)
     checks: str = ""                # SUCCESS | FAILURE | PENDING (derived rollup)
     # Transport outcome (not part of the GitHub projection):
     error: str = ""                 # non-empty => probe failed for this PR
@@ -158,6 +159,7 @@ class RepoProbe:
     fresh_base_sha: str = ""
     fresh_base_shas: dict[str, str] = field(default_factory=dict)
     fetch_ok: bool = False
+    fetch_error: str = ""           # non-empty => the git fetch failed (transient)
     error: str = ""
 
     def base_sha_for(self, base_ref_name: str) -> str:
@@ -443,7 +445,18 @@ def reduce_snapshot(
     if review == "REVIEW_REQUIRED":
         # required review still pending -> not mergeable yet; keep watching.
         return EVENT_OPEN
-    # Up-to-date + green + no required review pending -> READY.
+    # READY-gate (codex iter-4 [P2]): the ancestor check proves the head
+    # is up-to-date, but GitHub can STILL refuse the merge for reasons the
+    # ancestry/checks/review triad doesn't capture — a DRAFT PR, or a
+    # `BLOCKED` state from unresolved conversations / required deployments
+    # / a required-but-unconfigured check. We don't TRUST the status word
+    # to assert STALE (§5.1a), but we conservatively WITHHOLD READY when
+    # the word says the PR can't merge yet — keep watching instead of
+    # falsely surfacing "#N is mergeable".
+    if snap.is_draft or mss in ("DRAFT", "BLOCKED"):
+        return EVENT_OPEN
+    # Up-to-date + green + no required review pending + no blocking word
+    # -> READY.
     return EVENT_READY
 
 
@@ -778,15 +791,37 @@ def _apply_probe(
                 )
             continue
 
+        # mergeability ancestor check uses the FRESH tip of the PR's OWN
+        # base ref the fetch captured — never a stale local ref, and never
+        # the wrong base for a stacked PR (§5.1a / #199 + codex iter-3 [P2]).
+        pr_base_sha = repo_probe.base_sha_for(snap.base_ref_name)
+
+        # Fetch-failure handling (codex iter-4 [P2]): the GraphQL query
+        # succeeded but the git fetch failed, so we have NO fresh base for
+        # this PR's mergeability check. An OPEN PR whose only remaining
+        # classification depends on the ancestor check would silently
+        # reduce to plain OPEN forever (hiding READY/STALE transitions)
+        # while re-fetching every due tick. Treat that as a transient
+        # SKIP: RETAIN the watch, back off, surface — same as a probe
+        # failure. We still RECORD terminal/CI/conflict events that DON'T
+        # need the base check (MERGED/CLOSED/CI-fail/DIRTY/BEHIND/
+        # CHANGES_REQUESTED are decided before the ancestor step in
+        # reduce_snapshot), so a fetch blip never hides a real merge.
+        pre = reduce_snapshot(snap, fresh_base_sha="__present__", is_ancestor=lambda a, d: True)
+        needs_base_check = pre in (EVENT_READY, EVENT_STALE, EVENT_OPEN)
+        if repo_probe.fetch_error and not pr_base_sha and needs_base_check:
+            _arm_backoff(w, tick_count)
+            out.errors.append(
+                f"pr-watch: probe for PR #{n} skipped (transient git fetch): "
+                f"{repo_probe.fetch_error}"
+            )
+            continue
+
         # successful probe -> clear any backoff, reduce, persist snapshot.
         w.pop("probe_skip_until_tick", None)
         w["_backoff_n"] = 0
         out.probed += 1
 
-        # mergeability ancestor check uses the FRESH tip of the PR's OWN
-        # base ref the fetch captured — never a stale local ref, and never
-        # the wrong base for a stacked PR (§5.1a / #199 + codex iter-3 [P2]).
-        pr_base_sha = repo_probe.base_sha_for(snap.base_ref_name)
         head_contains_base = False
         if pr_base_sha and snap.head_ref_oid:
             head_contains_base = is_anc(pr_base_sha, snap.head_ref_oid)
@@ -802,6 +837,7 @@ def _apply_probe(
             "checks": (snap.checks or "").upper(),
             "head_ref_oid": snap.head_ref_oid,
             "base_ref_oid": snap.base_ref_oid,
+            "is_draft": snap.is_draft,
             "up_to_date": head_contains_base,
         }
         w["last_event"] = event
@@ -853,7 +889,7 @@ def _arm_backoff(watch: dict, tick_count: int) -> None:
 # one `gh api graphql` call covers every watched PR in the repo (§3 cost
 # model — one fetch + one batched query per repo per tick).
 _PR_FIELDS = """{
-      number state mergedAt mergeStateStatus reviewDecision
+      number state mergedAt mergeStateStatus reviewDecision isDraft
       headRefName baseRefName headRefOid baseRefOid
       commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){nodes{
         __typename
@@ -947,10 +983,17 @@ class GhGitProber:
                         if sha:
                             result.fresh_base_shas[r] = sha
                     result.fresh_base_sha = result.fresh_base_shas.get(base_ref, "")
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                # transient — leave fresh_base_shas empty so reduce()
-                # treats mergeability as UNKNOWN (never asserts READY).
+                else:
+                    # transient fetch failure -> surface so _apply_probe
+                    # backs off instead of recording a misleading OPEN
+                    # (codex iter-4 [P2]).
+                    result.fetch_error = (proc.stderr or proc.stdout or "").strip() or \
+                        f"git fetch exit {proc.returncode}"
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                # transient — record the error so the watch backs off +
+                # retries rather than silently reducing to plain OPEN.
                 result.fetch_ok = False
+                result.fetch_error = str(exc)
         return result
 
     def _object_present(self, repo_path: str, oid: str) -> bool:
@@ -1033,6 +1076,7 @@ class GhGitProber:
             base_ref_oid=str(pr.get("baseRefOid", "") or ""),
             head_ref_name=str(pr.get("headRefName", "") or ""),
             base_ref_name=str(pr.get("baseRefName", "") or ""),
+            is_draft=bool(pr.get("isDraft", False)),
             checks=checks,
         )
 
