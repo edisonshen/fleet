@@ -2409,3 +2409,41 @@ def test_journal_liveness_keeps_agentless_pr_watch_lease(
             f"tick {tk} wrongly re-dispatched an agentless-but-journaled fixer"
     # the original lease survives (not reclaimed).
     assert pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"] == agent_id
+
+
+def test_pending_journal_reclaimed_promptly(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A PR-watch journal stuck at `pending` (inbox acquired but
+    mark-launch-attempted never ran -> no Agent launched) is reclaimed
+    promptly past the launch grace + re-dispatched (codex iter-22 [P1]) —
+    NOT held for the full stale bound like a launch_attempted one."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="UNSTABLE", checks="FAILURE",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    agent_id = pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"]
+    # journal at `pending` (never launch-attempted), no agent record.
+    (it_home / "dispatches").mkdir(exist_ok=True)
+    (it_home / "dispatches" / f"{agent_id}.json").write_text(
+        json.dumps({"exec_state": "pending"})
+    )
+    # run ticks past the launch grace; pending -> gone -> reclaim+redispatch.
+    redispatched = False
+    for _tk in range(2, 2 + pw._LEASE_LAUNCH_GRACE_TICKS + 2):
+        with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+            r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+        if [b for b in r.dispatch_instructions if "pr-fix-195" in b]:
+            redispatched = True
+            break
+    assert redispatched, "pending (unlaunched) journal should be reclaimed + re-dispatched"

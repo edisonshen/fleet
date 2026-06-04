@@ -5621,8 +5621,17 @@ def _reconcile_pr_watches(
         jstate = _pr_watch_journal_state(agent_id, home=home)
         if jstate == "acked":
             return "running"
-        if jstate in ("pending", "launch_attempted"):
+        if jstate == "launch_attempted":
+            # The coord COMMITTED to launching (mark-launch-attempted ran)
+            # but we can't confirm the Agent is alive -> unverified (held
+            # with a stale bound). This is the "launched, no pid" case.
             return "running-unverified"
+        # `pending` = inbox acquired but mark-launch-attempted has NOT run,
+        # so NO Agent was launched yet (codex iter-22 [P1]). A crash / broken
+        # stdout in that window leaves a replayable journal; treating it as
+        # running-unverified would suppress re-dispatch for the whole stale
+        # bound. Report "gone" so the lease is reclaimed promptly (subject to
+        # the launch grace) and the action re-dispatches.
         return "gone"
 
     def _dispatch_action(action) -> str:
