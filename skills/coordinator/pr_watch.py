@@ -591,7 +591,11 @@ def reconcile_watches(
         w["tasks"] = sorted({getattr(t, "slug", "") for t in tasks_for_pr if getattr(t, "slug", "")})
 
     # --- 2. REFRESH tasks[] for EVERY existing watch (a task may have been
-    # added/removed/gone-terminal independently) + flag ORPHAN.
+    # added/removed/gone-terminal independently). The ORPHAN *raise* is
+    # deferred until AFTER the probe (§3) so it reflects the CURRENT PR
+    # state — raising here off the previous tick's snapshot would emit a
+    # false orphan alert for a PR that merged/closed this tick, and a
+    # slow-cadence READY watch might not even re-probe (codex iter-17 [P2]).
     for key, w in watches.items():
         try:
             pr_num = int(w.get("pr_number", key))
@@ -604,28 +608,8 @@ def reconcile_watches(
             and getattr(t, "slug", "")
         })
         w["tasks"] = live
-        # Orphan = the PR is CONFIRMED OPEN (we've probed it and saw an
-        # OPEN snapshot) but NO live in-scope task points at it anymore.
-        # We require the confirmed-OPEN snapshot before raising: a watch
-        # enrolled but never successfully probed (e.g. coord-scope can't
-        # derive the repo) must NOT assert "PR is OPEN" — we can't prove
-        # it, and a task archived before any probe is just a pending
-        # prune candidate, not an operator-actionable orphan.
-        snap = w.get("last_snapshot")
-        confirmed_open = (
-            isinstance(snap, dict)
-            and (snap.get("pr_state") or "").upper() == "OPEN"
-        )
-        if w.get("state") == STATE_OPEN and not live and confirmed_open and not w.get("orphaned"):
-            # OPEN PR with NO live non-terminal owned task -> orphan.
-            # raise-hand, NO auto-action (PR1 surfaces; never auto-rebase).
-            w["orphaned"] = True
-            out.raises.append(
-                f"pr-watch: PR #{pr_num} is OPEN but no live task points at it "
-                f"(orphaned-pr); needs operator attention — see {w.get('pr_url', '')}"
-            )
-        elif live:
-            # re-acquired a backing task -> clear the orphan flag.
+        if live:
+            # re-acquired a backing task -> clear any orphan flag.
             w["orphaned"] = False
 
     # --- 3+4. PROBE per repo (coord owns exactly one repo) + reduce.
@@ -689,6 +673,30 @@ def reconcile_watches(
             watches, due_numbers, repo_probe, prober, repo_path,
             now_iso=now_iso, tick_count=tick_count, out=out,
         )
+
+    # --- 4.5. ORPHAN raise — AFTER the probe (codex iter-17 [P2]) so it
+    # reflects the CURRENT PR state. An OPEN watch with no live task that
+    # was PROBED THIS TICK (last_probe_at == now_iso) and is still OPEN is
+    # a genuine orphan: the PR is live but nothing backs it. A watch that
+    # merged/closed this tick is handled by §5 (not orphaned); one we
+    # couldn't probe this tick (transient / coord-scope) is left for a
+    # later tick rather than raised off a stale snapshot.
+    for key, w in watches.items():
+        if w.get("state") != STATE_OPEN or w.get("tasks") or w.get("orphaned"):
+            continue
+        snap = w.get("last_snapshot")
+        probed_open_now = (
+            w.get("last_probe_at") == now_iso
+            and isinstance(snap, dict)
+            and (snap.get("pr_state") or "").upper() == "OPEN"
+        )
+        if probed_open_now:
+            w["orphaned"] = True
+            out.raises.append(
+                f"pr-watch: PR #{w.get('pr_number', key)} is OPEN but no live task "
+                f"points at it (orphaned-pr); needs operator attention — "
+                f"see {w.get('pr_url', '')}"
+            )
 
     # --- 5. TERMINAL handling — ORDER MATTERS (§2). Iterate a snapshot of
     # the keys because we prune (mutate) MERGED watches as we go.
@@ -761,6 +769,12 @@ def _probe_due(watch: dict, tick_count: int, slow_cadence_ticks: int) -> bool:
     skip_until = watch.get("probe_skip_until_tick")
     if isinstance(skip_until, int) and tick_count < skip_until:
         return False
+    # A watch with NO live backing task is a pending orphan candidate — it
+    # MUST probe this tick so the orphan decision (§ post-probe) reflects
+    # the CURRENT PR state (the PR may have merged/closed), overriding the
+    # slow cadence (codex iter-17 [P2]).
+    if not watch.get("tasks"):
+        return True
     last_event = watch.get("last_event")
     if last_event in (EVENT_READY,):
         # quiescent: slow cadence. probe when tick_count hits the cadence
