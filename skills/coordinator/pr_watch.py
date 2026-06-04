@@ -640,7 +640,17 @@ def reconcile_watches(
     due_numbers: list[int] = []
     head_oids: list[str] = []
     for key, w in watches.items():
-        if w.get("state") in _TERMINAL_PR_STATES:
+        state = w.get("state")
+        # MERGED is truly terminal (irreversible on GitHub) -> never
+        # re-probe. CLOSED_UNMERGED is retained-but-REVERSIBLE: the
+        # operator can reopen the PR, and a live task may still point at
+        # it — so re-probe a closed watch IFF it still has live backing
+        # tasks (codex iter-8 [P2]). A live task on a reopened PR then
+        # transitions back to OPEN and reconciles a later merge. A closed
+        # watch with NO live task stays parked until the operator acks.
+        if state == STATE_MERGED:
+            continue
+        if state == STATE_CLOSED_UNMERGED and not w.get("tasks"):
             continue
         try:
             pr_num = int(w.get("pr_number", key))

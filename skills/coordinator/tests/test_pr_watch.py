@@ -299,9 +299,46 @@ def test_closed_unmerged_raises_hand_and_retains(tmp_path: Path) -> None:
     w = pw.load_watches(tmp_path)["watches"]["195"]
     assert w["state"] == pw.STATE_CLOSED_UNMERGED   # retained
     assert out.pruned == 0
-    # second tick: closed watch is terminal -> not re-probed, not re-raised.
+    # second tick: closed watch with a LIVE task IS re-probed (operator
+    # may reopen) but not re-raised while still closed.
     out2 = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=2)
     assert not any("CLOSED without merging" in r for r in out2.raises)
+
+
+def test_closed_watch_no_task_not_reprobed(tmp_path: Path) -> None:
+    """A closed-unmerged watch with NO live backing task is NOT re-probed
+    (parked until operator acks) (codex iter-8 [P2])."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}
+    doc["watches"]["195"]["state"] = pw.STATE_CLOSED_UNMERGED
+    pw.save_watches(tmp_path, doc)
+    prober = FakeProber(snaps={195: pw.PRSnapshot(number=195, pr_state="OPEN")})
+    _run([], tmp_path, prober, tick_count=3)
+    assert prober.probe_calls == []                  # not re-probed
+
+
+def test_reopened_closed_pr_transitions_back_to_open(tmp_path: Path) -> None:
+    """A closed-unmerged watch with a LIVE task whose PR is REOPENED ->
+    re-probed, transitions back to OPEN, and a later merge reconciles
+    (codex iter-8 [P2])."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "worker/foo", "main")}}
+    doc["watches"]["195"]["state"] = pw.STATE_CLOSED_UNMERGED
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    pw.save_watches(tmp_path, doc)
+    tasks = [_task("foo", pr_url=_pr_url(195))]
+    # tick: PR reopened (OPEN) -> watch back to OPEN, re-probed.
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="SUCCESS",
+                                head_ref_oid="H")}
+    prober = FakeProber(snaps=snaps)
+    _run(tasks, tmp_path, prober, tick_count=2)
+    assert prober.probe_calls == [(195,)]
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["state"] == pw.STATE_OPEN
+    # next tick: it merges -> task flipped done.
+    snaps2 = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = _run(tasks, tmp_path, FakeProber(snaps=snaps2), tick_count=3, flips=flips)
+    assert flips == ["foo"]
+    assert out.pruned == 1
 
 
 # ---------------------------------------------------------------------------
@@ -662,14 +699,14 @@ def test_ready_pr_uses_slow_cadence(tmp_path: Path) -> None:
     assert prober.probe_calls == [(200,)]
 
 
-def test_terminal_watch_not_probed(tmp_path: Path) -> None:
-    """A closed-unmerged (terminal) watch is never re-probed."""
+def test_merged_watch_not_probed(tmp_path: Path) -> None:
+    """A MERGED watch (truly terminal) is never re-probed."""
     doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}
-    doc["watches"]["195"]["state"] = pw.STATE_CLOSED_UNMERGED
+    doc["watches"]["195"]["state"] = pw.STATE_MERGED
+    doc["watches"]["195"]["tasks"] = []   # already reconciled
     pw.save_watches(tmp_path, doc)
-    tasks = [_task("foo", pr_url=_pr_url(195))]
     prober = FakeProber()
-    _run(tasks, tmp_path, prober, tick_count=3)
+    _run([], tmp_path, prober, tick_count=3)
     assert prober.probe_calls == []
 
 
