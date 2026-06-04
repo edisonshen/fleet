@@ -206,6 +206,60 @@ func (s *failoverSetup) addProjectDir(t *testing.T, project string) {
 	}
 }
 
+// addEmptySessionCoord writes a coord-<project>-tagged record with an
+// EMPTY TmuxSession (the BUG #1 case): unprobeable, so StaleCoordRecord
+// must return (nil,false) and Tier 3 falls through to Path D.
+func (s *failoverSetup) addEmptySessionCoord(t *testing.T, project, id string) {
+	t.Helper()
+	r := agent.New(id)
+	r.Project = project
+	r.TaskID = projectlookup.CoordTaskID(project)
+	r.TmuxSession = "" // empty — the BUG #1 signal
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// addStaleLockBodyCoord writes an UNTAGGED record (task_id ≠
+// coord-<project>) whose ID is the project's coordinator.lock body, with
+// a DEFINITIVELY-dead tmux session (not in aliveSessions). This is the
+// Path B case: StaleCoordRecord skips it (untagged), StaleLockBodyCoord
+// catches it, and attach must NOT kill the already-dead session.
+func (s *failoverSetup) addStaleLockBodyCoord(t *testing.T, project, id string) {
+	t.Helper()
+	r := agent.New(id)
+	r.Project = project
+	r.TaskID = "manual-spawn" // NOT coord-<project>
+	r.TmuxSession = "fleet-" + id
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	// Intentionally NOT in aliveSessions — session proven dead.
+	lockDir := filepath.Join(s.tmp, "projects", project, ".locks")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lockDir, "coordinator.lock"), []byte(id+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// installVetoStub makes coordSpawnFullFnVar return errCoordSpawnVetoed
+// (simulating dispatch exit 75) and counts the spawn attempts, so tests
+// can assert exactly ONE spawn per invocation. Restores on cleanup.
+func (s *failoverSetup) installVetoStub(t *testing.T) *int {
+	t.Helper()
+	calls := 0
+	prev := coordSpawnFullFnVar
+	coordSpawnFullFnVar = func(project string) (coordSpawnResult, error) {
+		calls++
+		s.dispatched = append(s.dispatched, project)
+		return coordSpawnResult{}, errCoordSpawnVetoed
+	}
+	t.Cleanup(func() { coordSpawnFullFnVar = prev })
+	return &calls
+}
+
 func (s *failoverSetup) run(t *testing.T, token string, opts AttachOpts) (bytes.Buffer, error) {
 	t.Helper()
 	var stderr bytes.Buffer
@@ -377,7 +431,7 @@ func TestF7_ProjectFlag_OrphanTmux_ReapsAndRespawns(t *testing.T) {
 		t.Fatalf("F7: expected no error, got %v", err)
 	}
 	got := stderr.String()
-	if !strings.Contains(got, "foo: reaped stale deadbeef; spawned newcoord for projects-fleet; attaching") {
+	if !strings.Contains(got, "foo: reaped stale deadbeef (live orphan session); spawned newcoord for projects-fleet; attaching") {
 		t.Errorf("F7 stderr: %q", got)
 	}
 	// Codex iter-5 P1: Path C' uses targeted tmux.Kill, not the
@@ -1147,5 +1201,212 @@ func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 	// EX_SOFTWARE) per ExitCodeFor's default for SystemError.
 	if ec := ExitCodeFor(err); ec != 70 {
 		t.Errorf("ExitCodeFor(dispatch failed): got %d want 70", ec)
+	}
+}
+
+// --- F20: BUG #1 end-to-end — empty-session coord routes to Path D ---
+
+// TestF20_EmptySessionCoord_RoutesToPathD pins the attach-failover BUG #1
+// invariant end-to-end: a coord-<project> record with an EMPTY
+// TmuxSession is unprobeable, so StaleCoordRecord returns (nil,false),
+// Tier 3 falls through to Path D (fresh spawn), and the operator sees
+// the Path-D "no coord" wording — NOT a bogus "reaped/recovered stale X"
+// line. dispatch's own recovery still matches the empty-session record
+// (it guards its alive probe with TmuxSession != ""), so recovery
+// context is preserved without attach printing a false reap.
+func TestF20_EmptySessionCoord_RoutesToPathD(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addEmptySessionCoord(t, "projects-fleet", "emptyse5") // empty TmuxSession
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("F20: expected no error, got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "foo: no coord for projects-fleet; spawned newcoord; attaching") {
+		t.Errorf("F20: want Path-D wording, got %q", got)
+	}
+	if strings.Contains(got, "reaped stale") || strings.Contains(got, "recovered emptyse5") {
+		t.Errorf("F20: must NOT print a bogus reap/recover line for empty-session record; got %q", got)
+	}
+	if len(s.dispatched) != 1 {
+		t.Errorf("F20: expected exactly one dispatch, got %v", s.dispatched)
+	}
+	if len(s.killedSessions) != 0 {
+		t.Errorf("F20: must NOT kill any session for an empty-session record; got %v", s.killedSessions)
+	}
+}
+
+// --- F21: BUG #2 — veto = wait-retry naming both causes, exit 75 ---
+
+// TestF21_Veto_NoLiveCoord_WaitRetryExit75 pins the BUG #2 attach side:
+// when dispatch exits 75 (the live-coord veto) and the scan-only re-
+// resolve finds NO live coord, attach must exit 75 (NOT 70), name BOTH
+// veto causes (cross-socket live + recent crash) plus the next-step
+// command, and spawn EXACTLY ONCE (no in-process respawn loop).
+func TestF21_Veto_NoLiveCoord_WaitRetryExit75(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addRecordOnly(t, "projects-fleet", "staleeee") // Path C: tagged record, tmux dead
+	calls := s.installVetoStub(t)                    // dispatch exits 75
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("F21: expected exit-75 error on veto with no live coord")
+	}
+	if ec := ExitCodeFor(err); ec != 75 {
+		t.Errorf("F21: ExitCodeFor(veto) = %d, want 75 (never 70 for a veto)", ec)
+	}
+	got := err.Error()
+	if !strings.Contains(got, "different tmux socket") || !strings.Contains(got, "freshness window") {
+		t.Errorf("F21: error must name BOTH veto causes; got %q", got)
+	}
+	if !strings.Contains(got, "FLEET_TMUX_SOCKET") || !strings.Contains(got, "fleet attach foo --project projects-fleet") {
+		t.Errorf("F21: error must include next-step command; got %q", got)
+	}
+	if *calls != 1 {
+		t.Errorf("F21: expected exactly ONE spawn attempt (one-spawn-per-invocation), got %d", *calls)
+	}
+}
+
+// --- F22: BUG #2 — veto then coord now live → attach exit 0 ---
+
+// TestF22_Veto_CoordNowLive_Attaches pins the recover branch: dispatch
+// vetoes (exit 75), but the scan-only re-resolve finds a now-live coord
+// (the cross-socket/restarting one finished booting) → attach to it,
+// exit 0, still exactly ONE spawn attempt.
+func TestF22_Veto_CoordNowLive_Attaches(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addRecordOnly(t, "projects-fleet", "staleeee")
+	// Veto stub that, on its single call, makes a live coord appear (as
+	// if the restarting/cross-socket coord finished booting).
+	calls := 0
+	coordSpawnFullFnVar = func(project string) (coordSpawnResult, error) {
+		calls++
+		s.dispatched = append(s.dispatched, project)
+		s.addLiveCoord(t, project, "liveyyyy")
+		return coordSpawnResult{}, errCoordSpawnVetoed
+	}
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("F22: expected no error (attach to now-live coord), got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "foo: attached to current coord liveyyyy for projects-fleet") {
+		t.Errorf("F22: want attach-to-live line, got %q", got)
+	}
+	if s.attachedTo != "fleet-liveyyyy" {
+		t.Errorf("F22: attached to %q want fleet-liveyyyy", s.attachedTo)
+	}
+	if calls != 1 {
+		t.Errorf("F22: expected exactly ONE spawn attempt, got %d", calls)
+	}
+}
+
+// --- F23: BUG #3 — one spawn per invocation under persistent veto ---
+
+// TestF23_PersistentVeto_OneSpawnNoLoop: dispatch ALWAYS exits 75 and
+// re-resolve never finds a live coord. The veto handler must do a scan-
+// only re-resolve (NO 2nd spawn) and exit 75 — never enter an in-process
+// respawn loop.
+func TestF23_PersistentVeto_OneSpawnNoLoop(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addRecordOnly(t, "projects-fleet", "staleeee")
+	calls := s.installVetoStub(t)
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if ec := ExitCodeFor(err); ec != 75 {
+		t.Errorf("F23: ExitCodeFor = %d, want 75", ec)
+	}
+	if *calls != 1 {
+		t.Errorf("F23: dispatch must be invoked exactly ONCE (no respawn loop), got %d", *calls)
+	}
+}
+
+// --- F23c: BUG #2 scope — Path D honors the veto identically ---
+
+// TestF23c_PathD_Veto_Exit75 proves the veto classification lives in the
+// SHARED spawn wrapper, not special-cased inside Path C: a Path D
+// invocation (no coord at all) that hits the veto must behave exactly
+// like F21 — exit 75, one dispatch, both causes named.
+func TestF23c_PathD_Veto_Exit75(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet") // no coord → Path D
+	calls := s.installVetoStub(t)
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if ec := ExitCodeFor(err); ec != 75 {
+		t.Errorf("F23c: ExitCodeFor(Path D veto) = %d, want 75", ec)
+	}
+	if !strings.Contains(err.Error(), "different tmux socket") || !strings.Contains(err.Error(), "freshness window") {
+		t.Errorf("F23c: Path D veto must name both causes (shared wrapper); got %q", err.Error())
+	}
+	if *calls != 1 {
+		t.Errorf("F23c: expected exactly ONE spawn attempt on Path D veto, got %d", *calls)
+	}
+}
+
+// --- F26: MAJOR — Path B (proven-dead lock-body) does NOT kill ---
+
+// TestF26_PathB_StaleLockBody_DoesNotKill pins the safety split: a
+// proven-dead lock-body coord (session already dead) must spawn fresh
+// WITHOUT calling tmux kill-session — killing a dead session can error
+// and turn recovery into a false exit 70. The kill stub fails loudly if
+// invoked.
+func TestF26_PathB_StaleLockBody_DoesNotKill(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	// Override the kill stub to FAIL the test if Path B ever kills.
+	killTmuxSessionFnVar = func(session string) error {
+		t.Errorf("F26: Path B must NOT kill the already-dead session; got kill(%q)", session)
+		return errors.New("kill should not be called")
+	}
+	s.addProjectDir(t, "projects-fleet")
+	s.addStaleLockBodyCoord(t, "projects-fleet", "1ace0b0d") // untagged record + lock body, session dead
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("F26: expected no error (spawn-fresh proceeds), got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "foo: stale lock-body coord 1ace0b0d (session dead); spawned newcoord for projects-fleet; attaching") {
+		t.Errorf("F26: want Path-B wording, got %q", got)
+	}
+	if len(s.killedSessions) != 0 {
+		t.Errorf("F26: must NOT kill; got %v", s.killedSessions)
+	}
+	if len(s.dispatched) != 1 {
+		t.Errorf("F26: expected exactly one dispatch, got %v", s.dispatched)
+	}
+}
+
+// --- F27: MAJOR — Path C' (live orphan) DOES kill that one session ---
+
+// TestF27_PathCprime_LiveOrphan_Kills pins the other half of the split:
+// a LIVE orphan session (no record) must be killed exactly once before
+// the fresh spawn so its name doesn't collide. This is the Path C' case
+// F7 also exercises; F27 asserts the kill-once + live-orphan wording.
+func TestF27_PathCprime_LiveOrphan_Kills(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addOrphanTmux(t, "0a0bbeef") // LIVE session, no live record
+	s.addArchivedRecord(t, "0a0bbeef", "projects-fleet", agent.ArchivedCauseKill, "")
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("F27: expected no error, got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "foo: reaped stale 0a0bbeef (live orphan session); spawned newcoord for projects-fleet; attaching") {
+		t.Errorf("F27: want Path-C' live-orphan wording, got %q", got)
+	}
+	if len(s.killedSessions) != 1 || s.killedSessions[0] != "fleet-0a0bbeef" {
+		t.Errorf("F27: expected exactly one tmux.Kill on fleet-0a0bbeef, got %v", s.killedSessions)
+	}
+	if len(s.dispatched) != 1 {
+		t.Errorf("F27: expected exactly one dispatch, got %v", s.dispatched)
 	}
 }

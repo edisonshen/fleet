@@ -375,6 +375,38 @@ func TestStaleCoordRecord_RecordPlusLiveTmuxIsNotStale(t *testing.T) {
 	}
 }
 
+// TestStaleCoordRecord_EmptyTmuxSession_NotStale — F19 / BUG #1
+// (attach-failover INVARIANT 2). An empty-TmuxSession record is
+// UNPROBEABLE, not "stale": synthesizing fleet-<id> and probing it is a
+// FALSE signal (it checks a session that was never the real one), so
+// StaleCoordRecord must return (nil,false). Tier 3 then falls through to
+// Path D instead of printing a bogus "reaped stale X" line. Contrast
+// FindLiveCoord/FindCoordByLockBody, which DO synthesize for empty
+// sessions (those probe for LIVENESS to attach; this probes for DEATH to
+// reap — synthesizing a dead probe would falsely reap).
+func TestStaleCoordRecord_EmptyTmuxSession_NotStale(t *testing.T) {
+	withFleetHome(t)
+	if dir, err := state.AgentDir(); err == nil {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	r := agent.New("emptyse5")
+	r.Project = "fleet"
+	r.TaskID = "coord-fleet"
+	r.TmuxSession = "" // empty — the BUG #1 signal
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	records := recordsFromList(t)
+	// All sessions dead — a synthesized probe would (wrongly) classify
+	// this as stale. The fix short-circuits on empty TmuxSession before
+	// probing.
+	restore := stubSessionAlive(t, map[string]bool{})
+	defer restore()
+	if _, ok := StaleCoordRecord(records, "fleet"); ok {
+		t.Errorf("StaleCoordRecord: empty-TmuxSession record must return (nil,false), not classify stale")
+	}
+}
+
 // --- StaleLockBodyCoord ---
 
 // TestStaleLockBodyCoord_LegacyCoordHit — codex review iter-11 P2.

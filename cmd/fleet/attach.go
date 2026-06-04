@@ -436,102 +436,178 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		}
 		return attachExistingCoord(token, project, rec.ID, session)
 	}
-	// Path C: stale coord (record alive + tmux dead) OR Path C': orphan
-	// tmux session tied to this project (per its archive — see
-	// projectlookup.OrphanTmuxForProject's cross-project guard).
+	// Three recovery classes, in priority order. The KILL decision is
+	// the load-bearing safety split (attach-failover MAJOR / F26 / F27):
 	//
-	// Reap discipline (codex review iter-5 P1): the previous version ran
-	// `fleet gc --apply --aggressive --project <p>` with the default
-	// kinds set, but the orphan-tmux pass inside gc is NOT project-scoped
-	// — that call could kill orphan fleet-* sessions belonging to OTHER
-	// projects on the same host. Use the targeted shape instead:
+	//   Path C   StaleCoordRecord     tagged record (task_id=coord-<p>),
+	//            (recover, NO kill)   session DEFINITIVELY dead. dispatch's
+	//                                 findRecoveryCandidate inherits its
+	//                                 cwd/engine — so we DON'T pre-reap.
+	//                                 Verb "recovered".
+	//   Path B   StaleLockBodyCoord   lock-body holder record, session
+	//            (spawn, NO kill)     PROVEN dead. The session is already
+	//                                 dead → calling tmux kill-session on
+	//                                 it can ERROR and turn recovery into
+	//                                 a false exit 70. So Path B must NOT
+	//                                 kill. dispatch's recovery won't match
+	//                                 an untagged lock-body record, so it's
+	//                                 a fresh spawn; the dead record stays
+	//                                 on disk for the operator. Verb
+	//                                 "stale lock-body coord X (session
+	//                                 dead)".
+	//   Path C'  OrphanTmuxForProject a LIVE leftover fleet-<id> session
+	//            (KILL, then spawn)   with no record (project-scoped via
+	//                                 the archive guard). It's genuinely
+	//                                 alive and would COLLIDE with the new
+	//                                 coord's session name → kill that one
+	//                                 session first. Kill-failure here is a
+	//                                 real failure (exit 70). Verb "reaped
+	//                                 stale X (live orphan session)".
 	//
-	//   Path C  (record alive + tmux dead): gc --kinds=orphan-agents
-	//           --project <p> — project-scoped, archives the dead record.
-	//   Path C' (orphan tmux, no record):   tmux.Kill on the specific
-	//           session — surgical, no host-wide blast radius.
-	staleID := ""
-	staleFromRecord := false
+	// Reap discipline (codex iter-5 P1): kills are surgical single-session
+	// tmux.Kill, never `fleet gc --aggressive` (whose orphan-tmux pass is
+	// NOT project-scoped and could nuke other projects' sessions).
 	if stale, ok := projectlookup.StaleCoordRecord(records, project); ok {
-		staleID = stale.ID
-		staleFromRecord = true
-	} else if stale, ok := projectlookup.StaleLockBodyCoord(records, project); ok {
-		// Codex review iter-11 P2 + iter-12 P2: legacy / manually-
-		// spawned coord whose task_id ≠ coord-<project> but whose ID
-		// is in the lock body. dispatch's findRecoveryCandidate ONLY
-		// matches records tagged with coord-<project> — it won't
-		// inherit cwd/engine from this lock-body record, so
-		// staleFromRecord=true would falsely promise "recovered"
-		// while doing a fresh spawn. Treat as Path C' (no recovery
-		// context): kill the stale session, spawn fresh. The dead
-		// record stays on disk for the operator to inspect / archive
-		// manually — we'd lose info by silently archiving an untagged
-		// record dispatch won't acknowledge.
-		staleID = stale.ID
-		staleFromRecord = false
-	} else if id, ok := projectlookup.OrphanTmuxForProject(records, project); ok {
-		staleID = id
+		// Path C: recover, no kill, no pre-archive (codex iter-8 P1 —
+		// dispatch needs the live record on disk to synth the handoff
+		// doc that inherits cwd/engine/command).
+		return spawnAndAttachRecovered(token, project, opts,
+			func(stderr io.Writer, res coordSpawnResult) {
+				_, _ = fmt.Fprintf(stderr,
+					"%s: recovered %s; spawned %s for %s; attaching\n",
+					token, stale.ID, res.ID, project)
+			})
 	}
-	if staleID != "" {
-		if staleFromRecord {
-			// Codex review iter-8 P1: do NOT archive the dead record
-			// here. dispatch --coord-spawn's own recovery path
-			// (findRecoveryCandidate) needs the live record on disk so
-			// it can synth a handoff doc inheriting cwd / engine /
-			// command from the dead coord. Pre-reaping severs that
-			// continuity and forces a fresh spawn that loses the
-			// operator's recovery context.
-			//
-			// dispatch archives the dead record itself as part of the
-			// recovery flow (post-synth-handoff). Path C just needs to
-			// dispatch and trust the established recovery surface.
-		} else {
-			// Path C': single-session kill. dispatch's recovery probe
-			// won't help here (no live record to inherit from), and the
-			// orphan tmux session would just keep lingering. Kill it
-			// explicitly before spawning so the new coord's
-			// fleet-<newID> doesn't collide with the orphan in tmux's
-			// session list.
-			if err := killTmuxSessionFnVar(tmux.SessionName(staleID)); err != nil {
-				return newSystemError(70, fmt.Sprintf(
-					"tmux kill-session %s failed: %v — re-run `tmux kill-session -t %s` manually then retry attach",
-					tmux.SessionName(staleID), err, tmux.SessionName(staleID)))
-			}
-		}
-		res, derr := coordSpawnFullFnVar(project)
-		if derr != nil {
+	if stale, ok := projectlookup.StaleLockBodyCoord(records, project); ok {
+		// Path B: PROVEN-dead lock-body coord. Do NOT kill its session —
+		// it's already dead and killing a dead session can error → false
+		// exit 70 (attach-failover MAJOR / F26). Spawn fresh; the dead
+		// record stays on disk for the operator to archive manually
+		// (dispatch's findRecoveryCandidate won't match an untagged
+		// lock-body record, so there's no recovery context to preserve
+		// — but there's also nothing to kill).
+		return spawnAndAttachRecovered(token, project, opts,
+			func(stderr io.Writer, res coordSpawnResult) {
+				_, _ = fmt.Fprintf(stderr,
+					"%s: stale lock-body coord %s (session dead); spawned %s for %s; attaching\n",
+					token, stale.ID, res.ID, project)
+			})
+	}
+	if id, ok := projectlookup.OrphanTmuxForProject(records, project); ok {
+		// Path C': LIVE orphan session, no record. Kill that one session
+		// first so the new coord's fleet-<newID> doesn't collide in
+		// tmux's session list. Kill-failure IS a real failure here
+		// (exit 70) — the session is live, so the kill should succeed;
+		// if it doesn't, spawning over it would split-brain tmux.
+		if err := killTmuxSessionFnVar(tmux.SessionName(id)); err != nil {
 			return newSystemError(70, fmt.Sprintf(
-				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
-				project, derr, token, project))
+				"tmux kill-session %s failed: %v — re-run `tmux kill-session -t %s` manually then retry attach",
+				tmux.SessionName(id), err, tmux.SessionName(id)))
 		}
-		// Path C now says "recovered" instead of "reaped" because the
-		// reap is delegated to dispatch's recovery flow (which inherits
-		// cwd/engine). Path C' still reads "reaped stale" because we
-		// killed the orphan session ourselves.
-		var verb string
-		if staleFromRecord {
-			verb = "recovered"
-		} else {
-			verb = "reaped stale"
-		}
-		_, _ = fmt.Fprintf(opts.Stderr,
-			"%s: %s %s; spawned %s for %s; attaching\n",
-			token, verb, staleID, res.ID, project)
-		emitPromptDeliveryWarning(res, opts.Stderr)
-		return attachSpawnedSession(token, project, res.ID, opts)
+		return spawnAndAttachRecovered(token, project, opts,
+			func(stderr io.Writer, res coordSpawnResult) {
+				_, _ = fmt.Fprintf(stderr,
+					"%s: reaped stale %s (live orphan session); spawned %s for %s; attaching\n",
+					token, id, res.ID, project)
+			})
 	}
 	// Path D: no coord at all → spawn fresh.
+	return spawnAndAttachRecovered(token, project, opts,
+		func(stderr io.Writer, res coordSpawnResult) {
+			_, _ = fmt.Fprintf(stderr,
+				"%s: no coord for %s; spawned %s; attaching\n",
+				token, project, res.ID)
+		})
+}
+
+// spawnAndAttachRecovered is the SHARED coord-spawn wrapper for Tier 3
+// Paths B / C / C' / D. It enforces the one-spawn-per-invocation bound
+// (exactly one coordSpawnFullFnVar call), classifies the dispatch exit
+// code uniformly, and emits the path-specific success line.
+//
+// BUG #2 / INVARIANT 3 (attach-failover): the veto classification lives
+// HERE, in the shared wrapper, never special-cased inside one path — so
+// Paths B/C/C'/D all honor `dispatch` exit 75 identically (F23c proves
+// Path D does, F21 proves Path C does):
+//
+//	derr == nil                  → emit success line + attach (exit 0).
+//	errors.Is(derr, vetoed)      → scan-only re-resolve, no 2nd spawn:
+//	                               live coord now? → attach (exit 0)
+//	                               else → wait-retry → exit 75.
+//	other derr                   → hard failure → *SystemError(70).
+//
+// emitSuccess writes the path-specific "<token>: ... ; attaching" line
+// (verb/wording differs per path) only on the happy path.
+func spawnAndAttachRecovered(token, project string, opts AttachOpts, emitSuccess func(io.Writer, coordSpawnResult)) error {
 	res, derr := coordSpawnFullFnVar(project)
 	if derr != nil {
+		if errors.Is(derr, errCoordSpawnVetoed) {
+			return handleCoordSpawnVeto(token, project, opts)
+		}
 		return newSystemError(70, fmt.Sprintf(
 			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
 			project, derr, token, project))
 	}
-	_, _ = fmt.Fprintf(opts.Stderr,
-		"%s: no coord for %s; spawned %s; attaching\n",
-		token, project, res.ID)
+	emitSuccess(opts.Stderr, res)
 	emitPromptDeliveryWarning(res, opts.Stderr)
 	return attachSpawnedSession(token, project, res.ID, opts)
+}
+
+// handleCoordSpawnVeto runs the veto recovery (BUG #2, attach-failover
+// INVARIANT 3). Invoked by every Tier 3 spawn caller (Paths B/C/C'/D) via
+// spawnAndAttachRecovered when shellCoordSpawn reports errCoordSpawnVetoed
+// (dispatch exited 75). The
+// veto means a coord is alive on a different tmux socket OR one crashed
+// within the freshness window and may be restarting — neither is a hard
+// failure, so we must NOT exit 70.
+//
+// Policy (one-spawn-per-invocation): scan-only re-resolve ONCE — re-read
+// records + probe for a now-live coord. Do NOT re-enter full Tier 3, do
+// NOT spawn again.
+//
+//	live coord now? → Path A attach (exit 0).
+//	else            → stderr wait-and-retry naming BOTH causes + the
+//	                  cross-socket next step → *SystemError(75).
+func handleCoordSpawnVeto(token, project string, opts AttachOpts) error {
+	// Scan-only re-resolve: re-read records + probe for a live coord.
+	// ListStrict (not List) so an unparseable record that might BE the
+	// vetoing coord doesn't silently vanish into a Path-D-style respawn
+	// — but here we never spawn anyway, so a list error just degrades to
+	// the wait-retry message rather than masking a live coord.
+	records, _, lerr := agent.ListStrict()
+	if lerr == nil {
+		if rec, ok := projectlookup.FindLiveCoord(records, project); ok {
+			_, _ = fmt.Fprintf(opts.Stderr,
+				"%s: attached to current coord %s for %s\n",
+				token, rec.ID, project)
+			session := rec.TmuxSession
+			if session == "" {
+				session = tmux.SessionName(rec.ID)
+			}
+			return attachExistingCoord(token, project, rec.ID, session)
+		}
+		// Lock-body fallback: the marker may be absent on a prompt-
+		// delivery-failed dispatch, but a live coord's ID can still be in
+		// the lock body. Same Path-B treatment as the primary resolve.
+		if rec, ok := projectlookup.FindCoordByLockBody(records, project); ok {
+			_, _ = fmt.Fprintf(opts.Stderr,
+				"%s: attached to current coord %s for %s\n",
+				token, rec.ID, project)
+			session := rec.TmuxSession
+			if session == "" {
+				session = tmux.SessionName(rec.ID)
+			}
+			return attachExistingCoord(token, project, rec.ID, session)
+		}
+	}
+	// No live coord on re-resolve → wait-and-retry. Exit 75 (not 70):
+	// 75 means "something is alive/restarting elsewhere — don't pile on,
+	// re-run shortly (or check your socket)". Name BOTH veto causes per
+	// the plan's F21 contract + the cross-socket next-step command.
+	return newSystemError(dispatchVetoExitCode, fmt.Sprintf(
+		"%s: coord-spawn for %s vetoed — likely (1) a live coord on a different tmux socket, or (2) a coord crashed within the freshness window and is restarting. "+
+			"Re-run `fleet attach %s --project %s` shortly; if it persists, check `fleet status` / your FLEET_TMUX_SOCKET for a coord on another socket",
+		token, project, token, project))
 }
 
 // emitPromptDeliveryWarning surfaces dispatch's "initial prompt not
@@ -815,6 +891,24 @@ type coordSpawnResult struct {
 	PromptDelivered bool
 }
 
+// errCoordSpawnVetoed is the typed sentinel shellCoordSpawn returns when
+// `fleet dispatch --coord-spawn` exits with vetoExitCode (75) — the
+// live-coord veto fired (BUG #2, attach-failover INVARIANT 3). It is NOT
+// a hard failure: a coord is alive on another tmux socket OR one crashed
+// within the freshness window and may be restarting. The shared wrapper
+// classifies this via exec.ExitError.ExitCode() == 75 (NOT a stderr
+// substring match), and every Tier 3 spawn caller (Paths C/C'/D) handles
+// it identically: scan-only re-resolve once (no 2nd spawn) → attach to a
+// now-live coord (exit 0) or wait-and-retry (exit 75). Never exit 70 for
+// a veto.
+var errCoordSpawnVetoed = errors.New("coord-spawn vetoed (live/recently-crashed coord)")
+
+// dispatchVetoExitCode mirrors dispatch's vetoExitCode (75). Duplicated
+// (not imported) because it's the cross-process EXIT-CODE contract
+// between `fleet dispatch` and `fleet attach`'s subprocess wrapper, not
+// shared in-process state. Keep in sync with dispatch.go's vetoExitCode.
+const dispatchVetoExitCode = 75
+
 // shellCoordSpawn shells out `fleet dispatch --coord-spawn --project <p>`
 // and parses the new coord's ID from the dispatch output. The dispatch
 // CLI prints the new coord's record path / id to stdout — we extract
@@ -890,6 +984,16 @@ func shellCoordSpawn(project string) (coordSpawnResult, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		// BUG #2: classify the veto by EXIT CODE, not stderr substring.
+		// A typed/sentinel error can't cross the exec.Command subprocess
+		// boundary, so dispatch maps its *vetoError to exit 75 and we
+		// detect it here via exec.ExitError.ExitCode(). 75 ⇒ veto (the
+		// caller does a scan-only re-resolve, no 2nd spawn); anything
+		// else ⇒ hard failure the caller maps to *SystemError(70).
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == dispatchVetoExitCode {
+			return coordSpawnResult{}, errCoordSpawnVetoed
+		}
 		return coordSpawnResult{}, fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
 	// Codex review iter-9 P1: dispatch's recovery flow prints

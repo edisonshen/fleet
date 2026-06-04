@@ -255,6 +255,21 @@ func main() {
 			// sentinel. Skill consumers parse stdout, not stderr.
 			os.Exit(rcExitCode(outcome))
 		}
+		// `fleet dispatch --coord-spawn` live-coord veto (BUG #2,
+		// attach-failover): runDispatch returns a typed *vetoError when
+		// it refuses to spawn because a coord looks alive/recently-
+		// crashed. Map it to exit 75 (EX_TEMPFAIL), distinct from the
+		// 70/1 other dispatch failures take, so `fleet attach`'s shared
+		// coord-spawn wrapper can classify it via ExitCode() as a
+		// wait+retry signal rather than a hard exit. The RunE already
+		// wrote the diagnostic to stderr via cobra; print it once here
+		// (cobra's generic "Error:" line is suppressed below only for
+		// attach's typed errors, so emit the veto message ourselves and
+		// exit before the generic path double-prints).
+		if vetoErrorFromErr(err) {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(vetoExitCode)
+		}
 		// fleet attach (Tier 3 PROJECT RECOVERY, attach-failover-59db)
 		// owns its exit codes via ExitCodeFor: 64 (UsageError — non-tty +
 		// no derivation), 70/127 (SystemError — tmux missing, dispatch

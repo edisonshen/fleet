@@ -270,11 +270,23 @@ func StaleCoordRecord(records []*agent.Record, projectName string) (*agent.Recor
 		if r == nil || r.TaskID != want || r.Project != projectName {
 			continue
 		}
-		session := r.TmuxSession
-		if session == "" {
-			session = tmux.SessionName(r.ID)
+		// BUG #1 (attach-failover INVARIANT 2): an empty-TmuxSession
+		// record is UNPROBEABLE, not "stale". Synthesizing
+		// tmux.SessionName(r.ID) and probing it is a FALSE signal — it
+		// checks a fleet-<id> session that was never the real one, so
+		// the probe trivially returns dead and attach would print a
+		// bogus "reaped stale <id>" line. gc's reconcileOrphanAgents
+		// already SKIPS empty-TmuxSession records (gc.go), so the
+		// classifier and the reaper must agree: skip it here too. Tier 3
+		// falls through to Path D (fresh spawn); dispatch's own recovery
+		// still matches the empty-session record (it guards its alive
+		// probe with r.TmuxSession != "", so empty ⇒ "not alive" ⇒
+		// recovery candidate) — recovery context is preserved WITHOUT
+		// attach printing a false reap line.
+		if r.TmuxSession == "" {
+			continue
 		}
-		alive, err := sessionProbeFn(session)
+		alive, err := sessionProbeFn(r.TmuxSession)
 		if err != nil {
 			continue // transport error — don't classify as stale
 		}
