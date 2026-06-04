@@ -1789,6 +1789,45 @@ def test_preserved_todo_slug_not_auto_fixed(tmp_path: Path) -> None:
     assert disp.calls == []
 
 
+def test_blocked_task_pr_not_auto_dispatched(tmp_path: Path) -> None:
+    """A `blocked` task (operator-attention) keeps its watch but is NOT
+    auto-dispatched (codex iter-14 [P2]) — keep watching, never auto-fix."""
+    tasks = [_task("a", status="blocked", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _ci_fail_snap(195, head="H1")}
+    prober = FakeProber(snaps=snaps, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, prober, dispatch=disp)
+    assert out.dispatched == 0
+    assert disp.calls == []
+    # the watch is still tracked (blocked is non-terminal).
+    assert "195" in pw.load_watches(tmp_path)["watches"]
+
+
+def test_foreign_persisted_watch_pruned_on_probe(tmp_path: Path) -> None:
+    """A persisted watch whose pr_url resolves to a FOREIGN repo (created
+    when coord_owner_repo was None) is DROPPED on the probe coord-scope
+    re-check (codex iter-14 [P3]) — not left lingering + re-erroring."""
+    # Seed a watch for a foreign-repo PR while owner_repo is unknown (None):
+    # enrollment persists it (can't prove scope) without probing.
+    foreign = [_task("x", pr_url=_pr_url(195, owner_repo="someone/other"),
+                     branch="worker/x")]
+    pw.reconcile_watches(
+        foreign, project="p", project_dir=tmp_path, coord_owner_repo=None,
+        prober=FakeProber(), flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=1, repo_path="/repo",
+    )
+    assert "195" in pw.load_watches(tmp_path)["watches"]  # persisted, unprobed
+    # tick 2: owner_repo now resolves (to OUR repo); the foreign watch is
+    # out of scope -> dropped.
+    out = pw.reconcile_watches(
+        [], project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(), flip_task_done=lambda s, u="": None,
+        now_iso="2026-06-03T08:00:00Z", tick_count=2, repo_path="/repo",
+    )
+    assert "195" not in pw.load_watches(tmp_path)["watches"]
+    assert out.pruned >= 1
+
+
 def test_prompts_reuse_existing_checkout(tmp_path: Path) -> None:
     """Rebase/fix prompts must NOT blindly `git worktree add` the PR branch
     (an in-review task keeps its worker worktree with the branch checked

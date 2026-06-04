@@ -1183,6 +1183,7 @@ def reconcile_watches(
 
     due_numbers: list[int] = []
     head_oids: list[str] = []
+    foreign_keys: list[str] = []   # persisted watches that fail coord scope
     for key, w in watches.items():
         state = w.get("state")
         # MERGED is truly terminal (irreversible on GitHub) -> never
@@ -1209,10 +1210,19 @@ def reconcile_watches(
         # foreign #N and could record/terminate the wrong PR's state.
         parsed = parse_pr_url(w.get("pr_url", ""))
         if parsed is not None and parsed[0] != coord_owner_repo:
+            # DROP a foreign-repo persisted watch (codex iter-14 [P3]):
+            # created on a tick when coord_owner_repo was underivable (None),
+            # it now resolves to a DIFFERENT repo. Enrollment already drops
+            # foreign tasks, so this watch has no legit backing here; an OPEN
+            # foreign watch never reaches terminal/orphan pruning, so it would
+            # otherwise linger forever in pr-watches.json, re-erroring every
+            # tick + defeating the idle early-out. Reap it to match the
+            # enrollment-time coord-scope behavior (fleet owns its state).
             out.errors.append(
-                f"pr-watch: persisted watch {parsed[0]}#{pr_num} is not in this "
-                f"coord's repo {coord_owner_repo!r}; not probing (coord-scope)"
+                f"pr-watch: dropping persisted watch {parsed[0]}#{pr_num} — not in "
+                f"this coord's repo {coord_owner_repo!r} (coord-scope)"
             )
+            foreign_keys.append(key)
             continue
         if not _probe_due(w, tick_count, slow_cadence_ticks):
             continue
@@ -1221,6 +1231,13 @@ def reconcile_watches(
         prev_head = snap_prev.get("head_ref_oid") if isinstance(snap_prev, dict) else None
         if isinstance(prev_head, str) and prev_head:
             head_oids.append(prev_head)
+
+    # Reap foreign-repo persisted watches (codex iter-14 [P3]) AFTER the
+    # iteration (can't mutate dict during it). pruned++ surfaces the reap.
+    for fk in foreign_keys:
+        if fk in watches:
+            del watches[fk]
+            out.pruned += 1
 
     pr2_active = dispatch_action is not None
     last_repo_probe: RepoProbe | None = None
@@ -1659,9 +1676,14 @@ def _dispatch_actions(
     # [P2]): a FOREIGN-repo task sharing a PR number must not make an owned
     # watch look dispatchable. The watch's own pr_url owner is matched
     # against this set below.
+    # `blocked` is NOT terminal (the watch stays — the PR may still merge),
+    # but a coord-blocked task is operator-attention work, so it must NOT be
+    # auto-dispatchable (codex iter-14 [P2]) — matches the worker dispatch /
+    # resume paths that skip blocked tasks. Keep watching, never auto-fix.
+    _NON_DISPATCH_STATUSES = TERMINAL_TASK_STATUSES | {"blocked"}
     live_pr_backed: set = set()
     for t in tasks:
-        if getattr(t, "status", "") in TERMINAL_TASK_STATUSES:
+        if getattr(t, "status", "") in _NON_DISPATCH_STATUSES:
             continue
         parsed = parse_pr_url(getattr(t, "pr_url", ""))
         if parsed is not None:
