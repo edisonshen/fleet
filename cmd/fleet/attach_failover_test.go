@@ -84,6 +84,18 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 		s.aliveSessions["fleet-"+s.newSpawnID] = true
 		return s.newSpawnID, nil
 	}
+	// codex iter-14 P2: parallel stub for the struct-returning seam.
+	// Tests that don't override get the happy-path "prompt delivered"
+	// result; tests that need to simulate the dispatch warning override
+	// coordSpawnFullFnVar directly.
+	prevDispatchFull := coordSpawnFullFnVar
+	coordSpawnFullFnVar = func(project string) (coordSpawnResult, error) {
+		id, err := coordSpawnFnVar(project)
+		if err != nil {
+			return coordSpawnResult{}, err
+		}
+		return coordSpawnResult{ID: id, PromptDelivered: true}, nil
+	}
 	// Path C' (orphan tmux) uses a direct tmux kill — record those too
 	// so tests can distinguish single-session kill from gc invocation.
 	// Path C (stale record) no longer calls gc at all (codex iter-8 P1
@@ -134,6 +146,7 @@ func (s *failoverSetup) installStubs(t *testing.T) {
 	t.Cleanup(func() {
 		attachFnVar = prevAttach
 		coordSpawnFnVar = prevDispatch
+		coordSpawnFullFnVar = prevDispatchFull
 		killTmuxSessionFnVar = prevKill
 		sessionAliveFnVar = prevSessionAlive
 		sessionProbeFnVar = prevSessionProbe
@@ -1001,6 +1014,53 @@ func TestTier12_AttachRaceCoord_FailsOverToTier3(t *testing.T) {
 	}
 	if s.attachedTo != "fleet-newcoord" {
 		t.Errorf("attached to %q want fleet-newcoord (Tier 3 spawn)", s.attachedTo)
+	}
+}
+
+// TestTier3_PromptDeliveryWarning_Surfaced — codex review iter-14 P2.
+// dispatch can exit 0 with a "warning: initial prompt not delivered"
+// — the agent is alive but /coordinator never ran. Tier 3's attach
+// diagnostic must surface this so the operator knows the next step
+// (type /coordinator manually) instead of attaching to a bare Claude
+// session and assuming the project is owned.
+func TestTier3_PromptDeliveryWarning_Surfaced(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Override the full stub to report promptDelivered=false.
+	coordSpawnFullFnVar = func(project string) (coordSpawnResult, error) {
+		id, err := coordSpawnFnVar(project)
+		if err != nil {
+			return coordSpawnResult{}, err
+		}
+		return coordSpawnResult{ID: id, PromptDelivered: false}, nil
+	}
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("expected attach to succeed (prompt warning is non-fatal), got %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "initial prompt was NOT delivered") {
+		t.Errorf("stderr must surface the prompt-delivery warning: %q", got)
+	}
+	if !strings.Contains(got, "type /coordinator manually") {
+		t.Errorf("stderr must explain the next step: %q", got)
+	}
+}
+
+// TestTier3_PromptDelivered_NoWarning — happy path: promptDelivered=true
+// MUST NOT emit the warning (silent in the common case).
+func TestTier3_PromptDelivered_NoWarning(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	// Default stub (installStubs) sets PromptDelivered=true.
+	stderr, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err != nil {
+		t.Fatalf("expected attach to succeed, got %v", err)
+	}
+	if strings.Contains(stderr.String(), "prompt was NOT delivered") {
+		t.Errorf("happy-path stderr must NOT emit the warning: %q", stderr.String())
 	}
 }
 

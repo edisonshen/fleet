@@ -498,7 +498,7 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 					tmux.SessionName(staleID), err, tmux.SessionName(staleID)))
 			}
 		}
-		newID, derr := coordSpawnFnVar(project)
+		res, derr := coordSpawnFullFnVar(project)
 		if derr != nil {
 			return newSystemError(70, fmt.Sprintf(
 				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
@@ -516,11 +516,12 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		}
 		_, _ = fmt.Fprintf(opts.Stderr,
 			"%s: %s %s; spawned %s for %s; attaching\n",
-			token, verb, staleID, newID, project)
-		return attachSpawnedSession(token, project, newID, opts)
+			token, verb, staleID, res.ID, project)
+		emitPromptDeliveryWarning(res, opts.Stderr)
+		return attachSpawnedSession(token, project, res.ID, opts)
 	}
 	// Path D: no coord at all → spawn fresh.
-	newID, derr := coordSpawnFnVar(project)
+	res, derr := coordSpawnFullFnVar(project)
 	if derr != nil {
 		return newSystemError(70, fmt.Sprintf(
 			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet attach %s --project %s` to retry (uses the same recovery path with the bootstrap prompt + --cwd)",
@@ -528,8 +529,23 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	}
 	_, _ = fmt.Fprintf(opts.Stderr,
 		"%s: no coord for %s; spawned %s; attaching\n",
-		token, project, newID)
-	return attachSpawnedSession(token, project, newID, opts)
+		token, project, res.ID)
+	emitPromptDeliveryWarning(res, opts.Stderr)
+	return attachSpawnedSession(token, project, res.ID, opts)
+}
+
+// emitPromptDeliveryWarning surfaces dispatch's "initial prompt not
+// delivered" sigil so the operator knows /coordinator never ran inside
+// the freshly-spawned session. Without this, attach lands them in a
+// bare Claude that looks alive but never claims the project (codex
+// review iter-14 P2). Silent when the prompt delivered cleanly.
+func emitPromptDeliveryWarning(res coordSpawnResult, stderr io.Writer) {
+	if res.PromptDelivered {
+		return
+	}
+	_, _ = fmt.Fprintf(stderr,
+		"warning: coord %s spawned but initial prompt was NOT delivered — type /coordinator manually after attach, or `fleet rm %s` and re-run `fleet attach` to respawn\n",
+		res.ID, res.ID)
 }
 
 // attachSpawnedSession probes the freshly-spawned session before exec'ing
@@ -772,9 +788,32 @@ var (
 	sessionProbeFnVar    = tmux.SessionAlive
 	listSessionsFnVar    = tmux.ListSessions
 	tmuxAvailableFnVar   = tmux.Available
-	coordSpawnFnVar      = shellCoordSpawn
+	coordSpawnFnVar      = shellCoordSpawnID // backward-compat thin wrapper for existing test stubs
+	coordSpawnFullFnVar  = shellCoordSpawn   // codex iter-14 P2: carries promptDelivered through to attach diagnostic
 	killTmuxSessionFnVar = tmux.Kill
 )
+
+// shellCoordSpawnID is the legacy (string, error) shim around
+// shellCoordSpawn. The Tier 3 paths that need the prompt-delivered
+// signal call shellCoordSpawn directly via coordSpawnFullFnVar; legacy
+// callsites + tests keep the (id, err) shape via coordSpawnFnVar.
+func shellCoordSpawnID(project string) (string, error) {
+	res, err := shellCoordSpawn(project)
+	if err != nil {
+		return "", err
+	}
+	return res.ID, nil
+}
+
+// coordSpawnResult carries the structured outcome of a coord spawn.
+// promptDelivered=false signals the operator may need to manually
+// invoke /coordinator inside the new session — surface in the attach
+// diagnostic so the never-exit invariant doesn't silently strand the
+// project unowned (codex review iter-14 P2).
+type coordSpawnResult struct {
+	ID              string
+	PromptDelivered bool
+}
 
 // shellCoordSpawn shells out `fleet dispatch --coord-spawn --project <p>`
 // and parses the new coord's ID from the dispatch output. The dispatch
@@ -836,14 +875,14 @@ func buildCoordSpawnArgs(project string) ([]string, error) {
 	return args, nil
 }
 
-func shellCoordSpawn(project string) (string, error) {
+func shellCoordSpawn(project string) (coordSpawnResult, error) {
 	self, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("locate self binary: %w", err)
+		return coordSpawnResult{}, fmt.Errorf("locate self binary: %w", err)
 	}
 	args, err := buildCoordSpawnArgs(project)
 	if err != nil {
-		return "", err
+		return coordSpawnResult{}, err
 	}
 	cmd := exec.Command(self, args...)
 	cmd.Env = os.Environ()
@@ -851,7 +890,7 @@ func shellCoordSpawn(project string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+		return coordSpawnResult{}, fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
 	// Codex review iter-9 P1: dispatch's recovery flow prints
 	// "recovering dead coord <oldID>..." BEFORE the actual spawn line
@@ -860,14 +899,20 @@ func shellCoordSpawn(project string) (string, error) {
 	// session) — defeating the iter-2 P2 probe gate.
 	//
 	// Parse the canonical spawn line "agent <id> spawned" specifically.
-	// Fall back to the first-hex-token scan only when the canonical line
-	// is absent (defensive — handles dispatch shape drift without
-	// silently regressing the recovery path).
 	out := stdout.String() + " " + stderr.String()
-	if id := parseSpawnedAgentID(out); id != "" {
-		return id, nil
+	id := parseSpawnedAgentID(out)
+	if id == "" {
+		return coordSpawnResult{}, fmt.Errorf("could not parse spawned coord ID from dispatch output (expected `agent <id> spawned`, got: %q)", out)
 	}
-	return "", fmt.Errorf("could not parse spawned coord ID from dispatch output (expected `agent <id> spawned`, got: %q)", out)
+	// Codex iter-14 P2: dispatch prints "warning: initial prompt not
+	// delivered ..." when SendInitialPrompt failed (typed-but-not-
+	// submitted, send-keys error, etc.). The agent record is alive but
+	// /coordinator never ran — the project is unowned until the
+	// operator manually types it. Carry the signal to the attach
+	// diagnostic so the operator sees the next step.
+	const promptFailedMarker = "initial prompt not delivered"
+	delivered := !strings.Contains(out, promptFailedMarker)
+	return coordSpawnResult{ID: id, PromptDelivered: delivered}, nil
 }
 
 // parseSpawnedAgentID returns the <id> matched in the canonical
