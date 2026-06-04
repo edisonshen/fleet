@@ -1598,16 +1598,27 @@ def _run_supervisor(
             t.slug for t in f3.tasks
             if t.status in ("in-progress", "in-review")
         ]
-        # Durable PR-watch must run on the SUPERVISOR's cadence too (codex
-        # iter-16 [P1]): the supervisor holds the coord lock for the whole
-        # session (default up to 4h), so external ticks return lock-busy and
-        # _tick_locked's one-shot PR-watch reconcile never re-runs. Without
-        # this, a PR that merges / goes stale / gets changes-requested while
-        # the supervisor is parked on in-review work would go untracked +
-        # un-auto-fixed until the supervisor exits — defeating the "every
-        # tick" durability guarantee. We re-read tasks.md (the legacy CI
-        # path above may have just mutated it) and run the SAME reconcile
-        # the primary tick runs, on the same stuck-check cadence. Fail-soft.
+        # ORDER MATTERS (codex iter-21 [P1]): run the LEGACY reconcile FIRST
+        # — exactly as the primary tick does (_reconcile_inflight/CI before
+        # _reconcile_pr_watches). The legacy path owns post-worker-exit
+        # CI-red/not-mergeable remediation: it clears pr_url + requeues. If
+        # PR-watch ran FIRST it would see the still-present pr_url + stage a
+        # competing fix/rebase, and then the legacy `_reconcile_slugs` below
+        # would requeue the SAME task — two agents on one branch. Running
+        # legacy first (then re-reading for PR-watch) means PR-watch sees the
+        # cleared pr_url and its live_pr_backed gate skips it (iter-7/13).
+        if slugs and _reconcile_slugs(slugs):
+            _maybe_dispatch_after_reconcile()
+
+        # Durable PR-watch on the SUPERVISOR's cadence (codex iter-16 [P1]):
+        # the supervisor holds the coord lock for the whole session (up to
+        # 4h), so external ticks return lock-busy and _tick_locked's one-shot
+        # PR-watch never re-runs. Without this, a PR that merges / goes stale
+        # / gets changes-requested while the supervisor parks on in-review
+        # work goes untracked + un-auto-fixed until the supervisor exits. We
+        # re-read tasks.md AFTER the legacy reconcile above (it may have just
+        # cleared a red PR's pr_url) and run the SAME reconcile the primary
+        # tick runs. Fail-soft.
         n_blocks_before = len(result.dispatch_instructions)
         try:
             f_pw = parse.read(str(tasks_path))
@@ -1619,8 +1630,6 @@ def _run_supervisor(
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
         pr_watch_dispatched = len(result.dispatch_instructions) > n_blocks_before
-        if slugs and _reconcile_slugs(slugs):
-            _maybe_dispatch_after_reconcile()
         # Signal the supervisor to exit + flush if PR-watch staged a block
         # (codex iter-17 [P1]): a persisted running lease with no launched
         # Agent must not sit for the rest of the session.
