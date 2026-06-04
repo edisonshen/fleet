@@ -936,6 +936,37 @@ func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
 	}
 }
 
+// TestSystemFailure_ExistingCoordAttachRace — codex review iter-12 P2.
+// Path A (FindLiveCoord hit) probes the session alive, but it dies
+// between the probe and tmux.Attach. The operator should see the same
+// retry advice (re-run attach) instead of a generic exit-1.
+func TestSystemFailure_ExistingCoordAttachRace_ReturnsSystemErr(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	s.addProjectDir(t, "projects-fleet")
+	s.addLiveCoord(t, "projects-fleet", "xxxxxxxx") // probe sees alive
+	// Override attach stub: it errors as if the session died
+	// post-FindLiveCoord-probe.
+	attachFnVar = func(session string) error {
+		s.attachedTo = session
+		s.attachCalls++
+		return errors.New("tmux: no such session (race)")
+	}
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("expected SystemError when existing-coord attach races")
+	}
+	if !strings.Contains(err.Error(), "existing coord") || !strings.Contains(err.Error(), "xxxxxxxx") {
+		t.Errorf("err must name the dead coord ID: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "re-run") || !strings.Contains(err.Error(), "attach foo") {
+		t.Errorf("err must surface re-run retry with actual token: %q", err.Error())
+	}
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(existing-coord race): got %d want 70", ec)
+	}
+}
+
 // TestSystemFailure_AttachRaceAfterSpawn — codex review iter-10 P2.
 // The probe-then-attach window is non-zero: the session can die after
 // sessionProbeFnVar says alive but BEFORE tmux.Attach runs. The

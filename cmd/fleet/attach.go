@@ -398,7 +398,7 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		if session == "" {
 			session = tmux.SessionName(rec.ID)
 		}
-		return attachFnVar(session)
+		return attachExistingCoord(token, project, rec.ID, session)
 	}
 	// Path B: try lock-body fallback (issue #63 follow-on: marker may
 	// be absent on a prompt-delivery-failed dispatch; the lock body is
@@ -411,7 +411,7 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		if session == "" {
 			session = tmux.SessionName(rec.ID)
 		}
-		return attachFnVar(session)
+		return attachExistingCoord(token, project, rec.ID, session)
 	}
 	// Path C: stale coord (record alive + tmux dead) OR Path C': orphan
 	// tmux session tied to this project (per its archive — see
@@ -433,14 +433,19 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		staleID = stale.ID
 		staleFromRecord = true
 	} else if stale, ok := projectlookup.StaleLockBodyCoord(records, project); ok {
-		// Codex review iter-11 P2: legacy / manually-spawned coord
-		// whose task_id ≠ coord-<project> but whose ID is in the
-		// lock body. The record exists in live (just untagged), so
-		// staleFromRecord stays true — dispatch's recovery flow
-		// will inherit cwd/engine from it just like the
-		// StaleCoordRecord branch.
+		// Codex review iter-11 P2 + iter-12 P2: legacy / manually-
+		// spawned coord whose task_id ≠ coord-<project> but whose ID
+		// is in the lock body. dispatch's findRecoveryCandidate ONLY
+		// matches records tagged with coord-<project> — it won't
+		// inherit cwd/engine from this lock-body record, so
+		// staleFromRecord=true would falsely promise "recovered"
+		// while doing a fresh spawn. Treat as Path C' (no recovery
+		// context): kill the stale session, spawn fresh. The dead
+		// record stays on disk for the operator to inspect / archive
+		// manually — we'd lose info by silently archiving an untagged
+		// record dispatch won't acknowledge.
 		staleID = stale.ID
-		staleFromRecord = true
+		staleFromRecord = false
 	} else if id, ok := projectlookup.OrphanTmuxForProject(records, project); ok {
 		staleID = id
 	}
@@ -517,6 +522,26 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 // — a flaky tmux socket shouldn't force a re-spawn loop when the real
 // session may well be live. Same discipline as runAttachFailover's Tier
 // 1/2 stale-live-record gate (codex review iter-1 P1).
+// attachExistingCoord wraps tmux.Attach for Tier 3 Path A (FindLiveCoord)
+// and Path B (FindCoordByLockBody) attachments. Codex review iter-12 P2:
+// a live coord can die between the FindLiveCoord probe and the actual
+// tmux.Attach exec, leaving the operator on the generic exit-1 path
+// instead of the Tier 3 retry diagnostic.
+//
+// Symmetric to attachSpawnedSession but the retry advice differs:
+// existing-coord races mean dispatch isn't needed; the operator just
+// re-runs attach and Tier 3 picks a different recovery path (lock-body
+// fallback, stale reap, fresh spawn). retry shape is just
+// `fleet attach <token> --project <p>`.
+func attachExistingCoord(token, project, coordID, session string) error {
+	if err := attachFnVar(session); err != nil {
+		return newSystemError(70, fmt.Sprintf(
+			"existing coord %s for %s went away between probe and attach (%s): %v — re-run `fleet attach %s --project %s` (Tier 3 will retry recovery)",
+			coordID, project, session, err, token, project))
+	}
+	return nil
+}
+
 func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 	session := tmux.SessionName(newID)
 	if alive, probeErr := sessionProbeFnVar(session); probeErr == nil && !alive {
