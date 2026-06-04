@@ -298,6 +298,19 @@ def save_watches(project_dir: Path, doc: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        # fsync the PARENT DIRECTORY so the rename itself is durable — on
+        # filesystems that require a directory fsync for rename durability,
+        # a crash could otherwise lose the renamed entry (codex adversarial
+        # [P2]; matches the project's "fsync before signaling" rule). Best
+        # -effort: some platforms can't open a dir for fsync.
+        try:
+            dfd = os.open(str(parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp)
@@ -567,12 +580,15 @@ def reconcile_watches(
         if getattr(t, "slug", "") not in current_slugs
     ]
     # group enroll_owned by (owner_repo, pr_number); coord-scope assert per
-    # PR. `in_scope` is the subset of CURRENT owned tasks that PASS the
-    # coord-scope assert — the §2 refresh loop below MUST use this, NOT
-    # enroll_owned, else (a) a foreign-repo task sharing a PR number could
-    # become backing for the in-scope watch and get flipped done on merge
-    # (codex iter-1 [P2]), or (b) a just-cleared pre-reconcile task could
-    # wrongly keep tasks[] populated.
+    # PR. `in_scope` is every enroll_owned task that PASSES the coord-scope
+    # assert — INCLUDING a pre-reconcile-only task whose pr_url the legacy
+    # reconcile cleared this tick. That task IS a genuine backing task (it
+    # still exists, just got requeued), so it MUST count toward `tasks[]`
+    # (codex adversarial [P1]): otherwise a merge of its old PR takes the
+    # empty-backing prune path and the task is left re-dispatchable after
+    # its PR already merged. The coord-scope assert above already drops
+    # foreign-repo tasks before they reach in_scope, so a foreign task
+    # sharing a PR number can't sneak in (codex iter-1 [P2]).
     by_pr: dict[int, list] = {}
     pr_meta: dict[int, tuple[str, str]] = {}  # pr_number -> (owner_repo, pr_url)
     in_scope: list = []
@@ -590,11 +606,7 @@ def reconcile_watches(
                 f"is not in this coord's repo {coord_owner_repo!r}; skipping (coord-scope)"
             )
             continue
-        # in_scope (drives refresh `live`) is CURRENT owned tasks only — a
-        # pre-reconcile-only task creates the watch but does NOT count as a
-        # live backing task.
-        if getattr(t, "slug", "") in current_slugs:
-            in_scope.append(t)
+        in_scope.append(t)
         by_pr.setdefault(pr_num, []).append(t)
         if pr_num not in pr_meta:
             pr_meta[pr_num] = (owner_repo, getattr(t, "pr_url", ""))
@@ -644,6 +656,18 @@ def reconcile_watches(
         # Can't prove the repo is ours -> refuse to probe (coord-scope
         # strict). We still persisted enrollment/orphan above so the
         # watch survives; a later tick with a derivable repo probes it.
+        # SURFACE the reason (feedback_surface_dont_silo / codex
+        # adversarial [P2]): a bad meta.json repo_path / missing origin /
+        # transient git failure would otherwise silently disable PR
+        # tracking with no operator-visible signal. Only emit when there
+        # ARE watches to probe, so a no-PR project stays quiet.
+        if watches:
+            out.errors.append(
+                "pr-watch: cannot derive this coord's owner/repo from the "
+                "project's git remote (origin) — PR tracking is paused until "
+                "resolved. Check `git -C <repo> remote get-url origin` / "
+                "meta.json repo_path."
+            )
         persist_watches(project_dir, doc)
         return out
 
@@ -929,6 +953,7 @@ def _apply_probe(
         if pr_base_sha and snap.head_ref_oid:
             head_contains_base = is_anc(pr_base_sha, snap.head_ref_oid)
 
+        prev_event = w.get("last_event")
         event = reduce_snapshot(
             snap, fresh_base_sha=pr_base_sha, is_ancestor=is_anc,
         )
@@ -962,15 +987,24 @@ def _apply_probe(
             # OPEN sub-state. last_seen_at advances; stays watched.
             w["state"] = STATE_OPEN
             w["last_seen_at"] = now_iso
-            if event == EVENT_READY:
-                out.notes.append(f"pr-watch: #{n} is mergeable (READY)")
-            elif event in _ACTIONABLE_EVENTS:
-                # PR1 SURFACES the actionable event (raise-hand /
-                # diagnostic). PR2 dispatches the fixer here.
-                out.raises.append(
-                    f"pr-watch: PR #{n} is {event.upper()} and needs a fix "
-                    f"(PR1 surfaces only; auto-fix lands in PR2) — {w.get('pr_url', '')}"
-                )
+            # Surface READY / actionable events ONLY on a TRANSITION (the
+            # event changed since last probe) — NOT every tick. A red /
+            # stale / behind PR probes every tick (it's actionable), so
+            # raising unconditionally would spam result.errors until the
+            # PR is fixed (codex adversarial [P1]). Matches the once-raise
+            # discipline of CLOSED_UNMERGED / NOT_FOUND. PR2's
+            # dispatched_events latch will own re-dispatch suppression; PR1
+            # just avoids the alert spam.
+            if event != prev_event:
+                if event == EVENT_READY:
+                    out.notes.append(f"pr-watch: #{n} is mergeable (READY)")
+                elif event in _ACTIONABLE_EVENTS:
+                    # PR1 SURFACES the actionable event (raise-hand /
+                    # diagnostic). PR2 dispatches the fixer here.
+                    out.raises.append(
+                        f"pr-watch: PR #{n} is {event.upper()} and needs a fix "
+                        f"(PR1 surfaces only; auto-fix lands in PR2) — {w.get('pr_url', '')}"
+                    )
 
 
 def _park_not_found(watch: dict, pr_num: int, out: WatchOutcome) -> None:

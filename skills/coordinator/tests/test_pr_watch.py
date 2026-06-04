@@ -198,19 +198,63 @@ def test_enroll_from_pre_reconcile_when_url_cleared(tmp_path: Path) -> None:
     def _flip(slug):
         pass
 
+    flips = []
+
+    def _flip2(slug):
+        flips.append(slug)
+
     out = pw.reconcile_watches(
         current, project="p", project_dir=tmp_path,
         coord_owner_repo=OWNER_REPO, prober=FakeProber(snaps=snaps),
-        flip_task_done=_flip, now_iso="t", tick_count=1,
+        flip_task_done=_flip2, now_iso="t", tick_count=1,
         repo_path="/repo", enroll_tasks=pre,
     )
     assert out.enrolled == 1
     w = pw.load_watches(tmp_path)["watches"]["195"]
     assert w["pr_number"] == 195
-    # the just-cleared task is NOT a live backing task (refresh uses current).
-    assert w["tasks"] == []
+    # the cleared task IS a genuine backing task (its url was cleared this
+    # tick, but the task still exists) -> counts toward tasks[] so a later
+    # merge flips it done (codex adversarial [P1]).
+    assert w["tasks"] == ["foo"]
     # CI-failure still surfaced (durable watch tracks the PR).
     assert w["last_event"] == pw.EVENT_CI_FAILED
+
+
+def test_pre_reconcile_task_flipped_done_on_merge(tmp_path: Path) -> None:
+    """A pre-reconcile-only backing task is flipped done when its old PR
+    merges (codex adversarial [P1]) — NOT left re-dispatchable."""
+    current = [_task("foo", status="todo", pr_url="")]   # requeued, url cleared
+    pre = [_task("foo", status="in-review", pr_url=_pr_url(195), branch="worker/foo")]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = pw.reconcile_watches(
+        current, project="p", project_dir=tmp_path,
+        coord_owner_repo=OWNER_REPO, prober=FakeProber(snaps=snaps),
+        flip_task_done=lambda s: flips.append(s), now_iso="t", tick_count=1,
+        repo_path="/repo", enroll_tasks=pre,
+    )
+    assert flips == ["foo"]            # task flipped done, not orphan-merged
+    assert out.pruned == 1
+
+
+def test_actionable_event_raises_once_not_every_tick(tmp_path: Path) -> None:
+    """An actionable event (CI_FAILED) raises ONCE on the transition, not
+    every tick while it persists (codex adversarial [P1])."""
+    tasks = [_task("foo", pr_url=_pr_url(195))]
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="FAILURE",
+                                head_ref_oid="H")}
+    # tick 1: transition into CI_FAILED -> raise.
+    out1 = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=1)
+    assert any("CI-FAILED" in r for r in out1.raises)
+    # tick 2: still CI_FAILED (no change) -> NOT re-raised.
+    out2 = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=2)
+    assert not any("CI-FAILED" in r for r in out2.raises)
+    # event flips green->fail again later -> re-raises on the new transition.
+    green = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="SUCCESS",
+                                head_ref_oid="H")}
+    _run(tasks, tmp_path, FakeProber(snaps=green), tick_count=3)
+    out4 = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=4)
+    assert any("CI-FAILED" in r for r in out4.raises)
 
 
 def test_terminal_task_not_enrolled(tmp_path: Path) -> None:
@@ -759,6 +803,9 @@ def test_unknown_owner_repo_refuses_probe(tmp_path: Path) -> None:
     assert out.enrolled == 1
     assert prober.probe_calls == []                  # never probed
     assert "195" in pw.load_watches(tmp_path)["watches"]
+    # SURFACE the reason — don't silently disable tracking (codex
+    # adversarial [P2] / feedback_surface_dont_silo).
+    assert any("cannot derive" in e for e in out.errors)
 
 
 # ---------------------------------------------------------------------------
