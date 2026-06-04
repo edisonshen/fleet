@@ -561,14 +561,23 @@ def test_transient_probe_retains_watch(tmp_path: Path) -> None:
     assert out.pruned == 0
 
 
-def test_definitive_404_raises_hand(tmp_path: Path) -> None:
-    """A definitive 404 (PR genuinely gone) -> raise-hand pr-not-found."""
+def test_definitive_404_parks_and_raises_once(tmp_path: Path) -> None:
+    """A definitive 404 (PR gone) -> raise-hand pr-not-found ONCE, park as
+    NOT_FOUND, retain, and do NOT re-query/re-raise every tick (codex
+    iter-14 [P2])."""
     tasks = [_task("foo", pr_url=_pr_url(195))]
     snaps = {195: pw.PRSnapshot(number=195, error="HTTP 404 Not Found",
                                 not_found=True)}
-    out = _run(tasks, tmp_path, FakeProber(snaps=snaps))
-    assert any("pr-not-found" in r for r in out.raises)
-    # watch retained (not silently dropped) — operator must act.
+    # tick 1: raises + parks.
+    out1 = _run(tasks, tmp_path, FakeProber(snaps=snaps), tick_count=1)
+    assert any("pr-not-found" in r for r in out1.raises)
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["state"] == pw.STATE_NOT_FOUND
+    # tick 2: parked -> NOT re-probed, NOT re-raised.
+    prober2 = FakeProber(snaps=snaps)
+    out2 = _run(tasks, tmp_path, prober2, tick_count=2)
+    assert prober2.probe_calls == []
+    assert not any("pr-not-found" in r for r in out2.raises)
     assert "195" in pw.load_watches(tmp_path)["watches"]
 
 

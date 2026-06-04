@@ -65,7 +65,15 @@ TERMINAL_TASK_STATUSES = frozenset({"done", "abandoned"})
 STATE_OPEN = "open"
 STATE_MERGED = "merged"
 STATE_CLOSED_UNMERGED = "closed-unmerged"
+# Parked: the PR is definitively GONE (a 404 / deleted PR). Like
+# CLOSED_UNMERGED, it's retained for operator ack and raises ONLY on the
+# transition (never re-queried/re-raised every tick — codex iter-14 [P2]).
+STATE_NOT_FOUND = "not-found"
 _TERMINAL_PR_STATES = frozenset({STATE_MERGED, STATE_CLOSED_UNMERGED})
+# States that should NOT be probed/re-queried: MERGED is irreversible;
+# NOT_FOUND is parked until ack; CLOSED_UNMERGED is handled separately
+# (re-probed iff it still has live tasks, for reopen support, iter-8).
+_NO_PROBE_STATES = frozenset({STATE_MERGED, STATE_NOT_FOUND})
 
 # Adaptive probe cadence (§3). Actionable / next-to-merge PRs probe every
 # tick; a quiescent (green + READY/awaiting-merge) PR only needs to catch
@@ -648,13 +656,14 @@ def reconcile_watches(
     for key, w in watches.items():
         state = w.get("state")
         # MERGED is truly terminal (irreversible on GitHub) -> never
-        # re-probe. CLOSED_UNMERGED is retained-but-REVERSIBLE: the
-        # operator can reopen the PR, and a live task may still point at
-        # it — so re-probe a closed watch IFF it still has live backing
-        # tasks (codex iter-8 [P2]). A live task on a reopened PR then
-        # transitions back to OPEN and reconciles a later merge. A closed
-        # watch with NO live task stays parked until the operator acks.
-        if state == STATE_MERGED:
+        # re-probe. NOT_FOUND is parked (404) until operator ack -> never
+        # re-query/re-raise (codex iter-14 [P2]). CLOSED_UNMERGED is
+        # retained-but-REVERSIBLE: the operator can reopen the PR, and a
+        # live task may still point at it — so re-probe a closed watch IFF
+        # it still has live backing tasks (codex iter-8 [P2]). A live task
+        # on a reopened PR transitions back to OPEN and reconciles a later
+        # merge; a closed watch with NO live task stays parked until ack.
+        if state in _NO_PROBE_STATES:
             continue
         if state == STATE_CLOSED_UNMERGED and not w.get("tasks"):
             continue
@@ -823,18 +832,12 @@ def _apply_probe(
         if snap is None:
             # PR absent from the batched result but the repo query
             # SUCCEEDED -> the PR genuinely no longer exists -> 404-class.
-            out.raises.append(
-                f"pr-watch: PR #{n} not found in repo query (pr-not-found); "
-                f"needs operator attention — {w.get('pr_url', '')}"
-            )
+            _park_not_found(w, n, out)
             continue
 
         if snap.error:
             if snap.not_found:
-                out.raises.append(
-                    f"pr-watch: PR #{n} not found (pr-not-found); "
-                    f"needs operator attention — {w.get('pr_url', '')}"
-                )
+                _park_not_found(w, n, out)
             else:
                 _arm_backoff(w, tick_count)
                 out.errors.append(
@@ -922,6 +925,21 @@ def _apply_probe(
                     f"pr-watch: PR #{n} is {event.upper()} and needs a fix "
                     f"(PR1 surfaces only; auto-fix lands in PR2) — {w.get('pr_url', '')}"
                 )
+
+
+def _park_not_found(watch: dict, pr_num: int, out: WatchOutcome) -> None:
+    """Park a watch whose PR is definitively GONE (404). Raise-hand ONLY
+    on the transition into not-found (like CLOSED_UNMERGED's once-raise),
+    then retain in STATE_NOT_FOUND so the probe gate skips it — no
+    re-query / re-raise every tick (codex iter-14 [P2]). The watch stays
+    on disk until the operator resolves it (the task going terminal +
+    enrollment dropping it, or operator deleting it)."""
+    if watch.get("state") != STATE_NOT_FOUND:
+        out.raises.append(
+            f"pr-watch: PR #{pr_num} not found (pr-not-found); "
+            f"needs operator attention — {watch.get('pr_url', '')}"
+        )
+    watch["state"] = STATE_NOT_FOUND
 
 
 def _arm_backoff(watch: dict, tick_count: int) -> None:
