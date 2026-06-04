@@ -145,14 +145,29 @@ Rules:
 ### Step 7 — PR-TRACK
 
 Shepherd every PR you own. Watch for terminal close/merge, CI failure, BEHIND,
-DIRTY, and CHANGES_REQUESTED. Use async waits: a background `until ...; do
-sleep 30; done` loop should wake the coord with a task notification.
+DIRTY, and CHANGES_REQUESTED.
 
-Actions:
+**The durable PR-watch is now the source of truth, not a hand-armed shell loop.**
+Every tick derives a watch for each owned, non-terminal task with a `pr_url`
+(state on disk at `~/.fleet/projects/<project>/pr-watches.json`, keyed by PR
+number) and probes it — so a PR you own can never go unwatched across
+compaction / handoff / restart, and "CI green" never ends a watch (only MERGED
+or CLOSED does). The tick:
+- on **MERGED**: flips ALL backing tasks `done` and prunes the watch (worktree
+  reap rides the existing gc backstop);
+- on **CLOSED without merge / orphaned PR / definitive 404**: raises hand;
+- on **STALE (head not up-to-date under strict protection) / BEHIND / DIRTY /
+  CI-fail / CHANGES_REQUESTED**: surfaces the event in the tick result.
+
+A background `until ...; do sleep 30; done` loop may still be used **only** as an
+optional wake-accelerator that triggers a tick sooner — correctness never
+depends on it (the next tick re-derives the watch regardless).
+
+Actions (PR2 will auto-dispatch these; until then act on the surfaced event):
 - CI red: dispatch a fix-subagent on the same branch.
-- BEHIND/DIRTY: dispatch a rebase-subagent in an isolated worktree.
+- BEHIND/DIRTY/STALE: dispatch a rebase-subagent in an isolated worktree.
 - Substantive conflict or design feedback: raise hand.
-- Merged: Step 8.
+- Merged: Step 8 (the watch already flipped the task `done`).
 - Closed without merge: raise hand.
 
 ### Step 8 — DONE
