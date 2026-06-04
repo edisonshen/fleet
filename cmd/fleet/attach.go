@@ -464,8 +464,8 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 		newID, derr := coordSpawnFnVar(project)
 		if derr != nil {
 			return newSystemError(70, fmt.Sprintf(
-				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch --coord-spawn --project %s` manually",
-				project, derr, project))
+				"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code` manually",
+				project, derr, project, project))
 		}
 		// Path C now says "recovered" instead of "reaped" because the
 		// reap is delegated to dispatch's recovery flow (which inherits
@@ -486,8 +486,8 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	newID, derr := coordSpawnFnVar(project)
 	if derr != nil {
 		return newSystemError(70, fmt.Sprintf(
-			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch --coord-spawn --project %s` manually",
-			project, derr, project))
+			"dispatch --coord-spawn --project %s failed: %v — re-run `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code` manually",
+			project, derr, project, project))
 	}
 	_, _ = fmt.Fprintf(opts.Stderr,
 		"%s: no coord for %s; spawned %s; attaching\n",
@@ -516,8 +516,8 @@ func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 		// would have left the operator with a literal-string command
 		// that fails arg parsing.
 		return newSystemError(70, fmt.Sprintf(
-			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` (or `fleet dispatch --coord-spawn --project %s`) to retry; check ~/.fleet/agents/%s.json for clues",
-			project, session, token, project, project, newID))
+			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` (or `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code`) to retry; check ~/.fleet/agents/%s.json for clues",
+			project, session, token, project, project, project, newID))
 	}
 	return attachFnVar(session)
 }
@@ -783,18 +783,51 @@ func shellCoordSpawn(project string) (string, error) {
 	if err := cmd.Run(); err != nil {
 		return "", fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
 	}
-	// Dispatch prints something like:
-	//   dispatched <id> -> ~/.fleet/agents/<id>.json
-	// Pull the first 8-char hex token out.
+	// Codex review iter-9 P1: dispatch's recovery flow prints
+	// "recovering dead coord <oldID>..." BEFORE the actual spawn line
+	// "agent <newID> spawned". A first-hex-token scan would return the
+	// dead predecessor ID and we'd probe fleet-<oldID> (the dead
+	// session) — defeating the iter-2 P2 probe gate.
+	//
+	// Parse the canonical spawn line "agent <id> spawned" specifically.
+	// Fall back to the first-hex-token scan only when the canonical line
+	// is absent (defensive — handles dispatch shape drift without
+	// silently regressing the recovery path).
 	out := stdout.String() + " " + stderr.String()
-	for _, tok := range strings.FieldsFunc(out, func(r rune) bool {
-		return r == ' ' || r == '\n' || r == '\t' || r == '\r' || r == '"' || r == ',' || r == '.' || r == '/' || r == '`'
-	}) {
-		if isAgentIDShape(tok) {
-			return tok, nil
+	if id := parseSpawnedAgentID(out); id != "" {
+		return id, nil
+	}
+	return "", fmt.Errorf("could not parse spawned coord ID from dispatch output (expected `agent <id> spawned`, got: %q)", out)
+}
+
+// parseSpawnedAgentID returns the <id> matched in the canonical
+// dispatch spawn line `agent <id> spawned`. Returns "" when no match.
+// Whitespace-tolerant so trailing newlines / mixed line endings don't
+// trip the scan. Codex review iter-9 P1.
+func parseSpawnedAgentID(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// Pattern: "agent <id> spawned" (no prefix tolerance beyond
+		// optional surrounding whitespace, to avoid false-positives
+		// from dispatch lines that mention "agent" in a different
+		// context).
+		if !strings.HasPrefix(trimmed, "agent ") {
+			continue
+		}
+		rest := strings.TrimPrefix(trimmed, "agent ")
+		// Split on whitespace; first field is the candidate id.
+		fields := strings.Fields(rest)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] != "spawned" {
+			continue
+		}
+		if isAgentIDShape(fields[0]) {
+			return fields[0]
 		}
 	}
-	return "", fmt.Errorf("could not parse coord ID from dispatch output: %q", out)
+	return ""
 }
 
 // isAgentIDShape mirrors internal/projectlookup.isAgentIDShape (kept

@@ -443,6 +443,46 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	}
 }
 
+// TestParseSpawnedAgentID_RecoveryFlowAvoidsPredecessorID — codex
+// review iter-9 P1. dispatch's dead-coord recovery prints
+// "recovering dead coord <oldID> for project <p>..." BEFORE the
+// canonical "agent <newID> spawned" line. The first-hex-token scan
+// would have returned the dead predecessor ID and attach would have
+// probed the dead session, defeating the iter-2 P2 spawn probe gate.
+//
+// parseSpawnedAgentID must specifically match the `agent <id> spawned`
+// shape, skipping any earlier hex tokens.
+func TestParseSpawnedAgentID_RecoveryFlowAvoidsPredecessorID(t *testing.T) {
+	out := `recovering dead coord deadbeef for project projects-fleet: synth handoff written to /tmp/handoff.md
+agent c0ffee01 spawned
+`
+	got := parseSpawnedAgentID(out)
+	if got != "c0ffee01" {
+		t.Errorf("parseSpawnedAgentID: got %q want c0ffee01 (must skip the predecessor ID `deadbeef` on the recovery line)", got)
+	}
+}
+
+// TestParseSpawnedAgentID_HappyPath — fresh-spawn output (no recovery
+// line). The parser must still find the canonical spawn line.
+func TestParseSpawnedAgentID_HappyPath(t *testing.T) {
+	out := "agent abcd1234 spawned\n"
+	got := parseSpawnedAgentID(out)
+	if got != "abcd1234" {
+		t.Errorf("parseSpawnedAgentID: got %q want abcd1234", got)
+	}
+}
+
+// TestParseSpawnedAgentID_NoMatch — when dispatch output doesn't carry
+// the canonical line at all, the parser returns "" so shellCoordSpawn
+// surfaces a clear "could not parse" error instead of a silent bogus id.
+func TestParseSpawnedAgentID_NoMatch(t *testing.T) {
+	out := "some other unrelated text 12345678 here\n"
+	got := parseSpawnedAgentID(out)
+	if got != "" {
+		t.Errorf("parseSpawnedAgentID: got %q want \"\" (no canonical line)", got)
+	}
+}
+
 // TestBuildCoordSpawnArgs_MalformedMetaFailsClosed — codex review iter-7
 // P2. A corrupt meta.json (invalid JSON) must surface a clear error
 // rather than silently respawn the coord in the operator's shell cwd
