@@ -828,7 +828,16 @@ def compute_rebase_eligibility(
     independent" (the exactly-one gate then catches a >=2 ambiguity and
     raises rather than rebasing the wrong one).
     """
-    open_heads: dict[int, str] = {}
+    # ALL open heads stay in the ancestry GRAPH for gate 3 — including
+    # orphaned ones (codex iter-5 [P2]): an orphaned PR can still be the
+    # UPSTACK base of a backed PR, and a downstack PR with any open PR
+    # beneath it (orphaned or not) is NOT next-to-merge. But only BACKED
+    # watches are eligibility CANDIDATES (orphaned/unbacked watches are
+    # raised-hand, never auto-rebased), so an orphan sitting open alongside
+    # a stale backed PR can't inflate the eligible set to ambiguous and
+    # block the legitimate rebase.
+    open_heads: dict[int, str] = {}      # the full graph (incl. orphans)
+    candidate_nums: set = set()          # backed PRs only
     for key, w in watches.items():
         if w.get("state") != STATE_OPEN:
             continue
@@ -840,9 +849,12 @@ def compute_rebase_eligibility(
         except (TypeError, ValueError):
             continue
         open_heads[n] = head
+        if w.get("tasks") and not w.get("orphaned"):
+            candidate_nums.add(n)
 
     eligible: set = set()
-    for n, head in open_heads.items():
+    for n in candidate_nums:
+        head = open_heads[n]
         w = watches.get(str(n))
         if w is None:
             continue
@@ -855,7 +867,8 @@ def compute_rebase_eligibility(
         # gate 2: base is the protected branch.
         if not base_protected(w):
             continue
-        # gate 3: no OTHER open watched head is an ancestor of this head.
+        # gate 3: no OTHER open watched head (orphaned or backed) is an
+        # ancestor of this head.
         beneath = False
         for m, other_head in open_heads.items():
             if m == n or other_head == head:

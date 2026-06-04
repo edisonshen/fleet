@@ -1152,11 +1152,26 @@ def _tick_locked(
     # it earlier this tick (and tasks.md was re-read since), so a fresh
     # rollout with no pr-watches.json yet would otherwise never enroll
     # that PR (codex iter-7 [P2]). We pass the pre-reconcile task
-    # snapshots for enrollment; refresh/probe/terminal still use the
-    # current `f.tasks`.
+    # snapshots for enrollment.
+    #
+    # refresh/probe/terminal/AUTO-FIX must see the POST-DISPATCH task state
+    # (codex iter-5 [P1]): _dispatch_ready above just mutated tasks.md (a
+    # CI-red requeue clears pr_url + flips a slug to in-progress under a NEW
+    # worker). The pre-dispatch `f.tasks` would still show the stale todo +
+    # the OLD pr_url, letting the old PR's watch treat the active retry as
+    # its backing task — so a merge of the OLD PR could flip the live retry
+    # `done`/clear its worker, or a red old PR could launch a parallel fix
+    # subagent. Re-read tasks.md here so reconcile/dispatch key on current
+    # rows; fail-soft (a re-read error falls back to the pre-dispatch parse,
+    # which is still a valid reconcile input).
+    try:
+        watch_tasks = parse.read(str(tasks_path)).tasks
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"pr-watch tasks re-read: {exc}")
+        watch_tasks = f.tasks
     try:
         _reconcile_pr_watches(
-            f.tasks, project=project, project_dir=project_dir,
+            watch_tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
             home=home,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),

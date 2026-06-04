@@ -1727,6 +1727,37 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
     assert not any("BLOCKED" in r for r in out3.raises)
 
 
+def test_orphan_open_pr_does_not_block_legit_rebase(tmp_path: Path) -> None:
+    """A parked-open ORPHANED PR (no backing task) must not count as a
+    next-to-merge candidate; a single legitimately-stale BACKED PR alongside
+    it still auto-rebases (codex iter-5 [P2] — orphan doesn't inflate the
+    eligible set to ambiguous)."""
+    # Seed two watches via two ticks. PR 300 is orphaned-open (its task gets
+    # deleted); PR 195 is backed + stale. They are NOT in each other's
+    # ancestry (independent), so without the fix both would be 'eligible'.
+    tasks_t1 = [
+        _task("a", pr_url=_pr_url(195), branch="worker/a"),
+        _task("orph", pr_url=_pr_url(300), branch="worker/orph"),
+    ]
+    green300 = pw.PRSnapshot(number=300, pr_state="OPEN", merge_state_status="BLOCKED",
+                             checks="SUCCESS", review_decision="", head_ref_oid="O300",
+                             base_ref_name="main")
+    snaps_t1 = {195: _stale_snap(195, head="H195"), 300: green300}
+    prober1 = FakeProber(snaps=snaps_t1, fresh_base="FRESHBASE", ancestors=set())
+    _run2(tasks_t1, tmp_path, prober1, dispatch=_DispatchRecorder(), tick_count=1)
+
+    # tick 2: PR300's task deleted (orphaned), PR195 still stale + backed.
+    tasks_t2 = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps_t2 = {195: _stale_snap(195, head="H195"), 300: green300}
+    prober2 = FakeProber(snaps=snaps_t2, fresh_base="FRESHBASE", ancestors=set())
+    disp = _DispatchRecorder()
+    out = _run2(tasks_t2, tmp_path, prober2, dispatch=disp, tick_count=2)
+    # the orphan (300) is raised-hand but does NOT block 195's rebase.
+    assert out.dispatched == 1
+    assert disp.calls[0].pr_number == 195
+    assert disp.calls[0].kind == pw.ACTION_REBASE
+
+
 def test_pr_watch_journals_excluded_from_worker_replay(tmp_path: Path) -> None:
     """A PR-watch dispatch journal (kind pr-fix / pr-rebase) is NOT a worker
     dispatch -> excluded from _iter_project_journals so the worker replay /
