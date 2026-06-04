@@ -1752,6 +1752,30 @@ def test_preserved_todo_slug_not_auto_fixed(tmp_path: Path) -> None:
     assert disp.calls == []
 
 
+def test_prompts_reuse_existing_checkout(tmp_path: Path) -> None:
+    """Rebase/fix prompts must NOT blindly `git worktree add` the PR branch
+    (an in-review task keeps its worker worktree with the branch checked
+    out, so a second add fails 'already checked out') — they instruct
+    finding + reusing the existing checkout (codex iter-10 [P1])."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_REBASE, event=pw.EVENT_STALE, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="B", key="k",
+    )
+    rebase = dispatch_mod.build_rebase_prompt(act, standards_md="S")
+    assert "already checked out" in rebase
+    assert "git worktree list" in rebase
+    act_fix = pw.ActionDispatch(
+        kind=pw.ACTION_FIX, event=pw.EVENT_CI_FAILED, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="", key="k",
+    )
+    fix = dispatch_mod.build_fix_prompt(act_fix, standards_md="S")
+    assert "already checked out" in fix
+    assert "git worktree list" in fix
+
+
 def test_preserved_retry_does_not_block_live_rebase(tmp_path: Path) -> None:
     """A preserved CI-red-requeued watch (non-empty tasks[], but its backing
     task no longer points at the PR) must NOT count as a rebase candidate
