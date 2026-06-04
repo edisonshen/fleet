@@ -5836,6 +5836,17 @@ def _iter_project_journals(
         owner = j.get("owner", "")
         if not isinstance(owner, str) or not owner.startswith(owner_prefix):
             continue
+        # PR-watch auto-fix dispatches (kind pr-rebase / pr-fix) are NOT
+        # worker dispatches — they have no tasks.md slug, are absent from
+        # worker_agent_ids, and have no workers/<slug>/state.json. Their
+        # durability is the §6 lease in pr-watches.json (reclaim re-
+        # dispatches a dead lease), NOT this worker replay/residual-crash
+        # path. Including them here would (a) never replay (not in
+        # worker_agent_ids) and (b) after the ack grace, fire a FALSE
+        # phantom-crash escalation against a live PR-watch subagent (codex
+        # iter-4 [P2]). Skip them entirely.
+        if str(j.get("kind", "") or "").startswith("pr-"):
+            continue
         slug = owner[len(owner_prefix):]
         slug = slug[len("slug/"):] if slug.startswith("slug/") else slug
         out.append((agent_id, slug, j))

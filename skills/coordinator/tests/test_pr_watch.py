@@ -1727,6 +1727,31 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
     assert not any("BLOCKED" in r for r in out3.raises)
 
 
+def test_pr_watch_journals_excluded_from_worker_replay(tmp_path: Path) -> None:
+    """A PR-watch dispatch journal (kind pr-fix / pr-rebase) is NOT a worker
+    dispatch -> excluded from _iter_project_journals so the worker replay /
+    residual-crash path never fires a false phantom escalation against a
+    live PR-watch subagent (codex iter-4 [P2]). A real worker journal in the
+    same dir is still yielded."""
+    home = tmp_path / "fleet"
+    disp = home / "dispatches"
+    disp.mkdir(parents=True)
+    (disp / "aaaa0001.json").write_text(json.dumps({
+        "owner": "project/myproj/slug/pr-fix-195", "kind": "pr-fix",
+        "exec_state": "launch_attempted",
+    }))
+    (disp / "bbbb0002.json").write_text(json.dumps({
+        "owner": "project/myproj/slug/pr-rebase-196", "kind": "pr-rebase",
+        "exec_state": "pending",
+    }))
+    (disp / "cccc0003.json").write_text(json.dumps({
+        "owner": "project/myproj/slug/real-worker", "kind": "worker",
+        "exec_state": "pending",
+    }))
+    got = {aid for aid, _slug, _j in loop._iter_project_journals(home, "myproj")}
+    assert got == {"cccc0003"}  # only the real worker, not the pr-* journals
+
+
 def test_orphan_watch_no_auto_dispatch(tmp_path: Path) -> None:
     """A watch whose backing task was deleted while the PR is still OPEN +
     actionable -> NO auto fix/rebase (orphan -> raise-hand only, §5/§6
