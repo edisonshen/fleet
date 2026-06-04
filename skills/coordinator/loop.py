@@ -5416,6 +5416,15 @@ def _reconcile_pr_watches(
         tick_count = 0
 
     def _flip_done(slug: str) -> None:
+        # Flip the backing task done AND clear worker_pid so a
+        # PR-watch-driven merge can't leave a stale worker attached to a
+        # now-done task (codex iter-20 [P2]). The worktree/worker-dir reap
+        # rides the existing _maybe_gc_worktrees backstop (keyed on
+        # terminal task status), per the design's "flip done -> gc backstop
+        # -> prune" ordering — we deliberately do NOT add a duplicate
+        # per-merge reap here. status=done is set LAST so a crash between
+        # the two leaves a non-terminal row that re-reconciles next tick.
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worker_pid=0"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
 
     outcome = pr_watch_mod.reconcile_watches(

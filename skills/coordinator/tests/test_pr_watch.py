@@ -584,6 +584,31 @@ def test_definitive_404_parks_and_raises_once(tmp_path: Path) -> None:
     assert "195" in pw.load_watches(tmp_path)["watches"]
 
 
+def test_not_found_watch_pruned_when_task_resolved(tmp_path: Path) -> None:
+    """A parked NOT_FOUND watch is pruned once its backing task is resolved
+    (no live task) so a handled 404 doesn't keep the file alive (codex
+    iter-20 [P2])."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}
+    doc["watches"]["195"]["state"] = pw.STATE_NOT_FOUND
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    pw.save_watches(tmp_path, doc)
+    # task resolved -> no live task; watch pruned + file removed.
+    out = _run([], tmp_path, FakeProber(), tick_count=3)
+    assert out.pruned == 1
+    assert not pw.watch_path(tmp_path).exists()
+
+
+def test_not_found_watch_retained_while_task_live(tmp_path: Path) -> None:
+    """A parked NOT_FOUND watch is RETAINED while a task still points at
+    it (operator hasn't resolved) (codex iter-20 [P2])."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "b", "main")}}
+    doc["watches"]["195"]["state"] = pw.STATE_NOT_FOUND
+    pw.save_watches(tmp_path, doc)
+    tasks = [_task("foo", pr_url=_pr_url(195))]
+    _run(tasks, tmp_path, FakeProber(), tick_count=3)
+    assert "195" in pw.load_watches(tmp_path)["watches"]
+
+
 def test_missing_from_repo_query_raises_not_found(tmp_path: Path) -> None:
     """Repo query SUCCEEDED but the PR is absent -> 404-class raise-hand."""
     tasks = [_task("foo", pr_url=_pr_url(195))]
@@ -629,15 +654,15 @@ def test_orphan_pr_raises_hand(tmp_path: Path) -> None:
 
 
 def test_no_orphan_without_confirmed_open_snapshot(tmp_path: Path) -> None:
-    """A watch enrolled but never successfully probed-OPEN (e.g. its task
-    was archived before any probe) must NOT orphan-raise — we can't assert
-    the PR is OPEN. Regression for the E2E false-orphan."""
+    """A watch enrolled but never confirmed-OPEN this tick must NOT
+    orphan-raise — we can't assert the PR is OPEN. Regression for the E2E
+    false-orphan. (Here the probe finds the PR absent -> parked/cleaned as
+    not-found, NOT orphaned.)"""
     # seed a watch with NO snapshot (never probed), empty tasks.
     doc = {"schema": 1, "watches": {"777": pw._new_watch(777, _pr_url(777), "b", "main")}}
     pw.save_watches(tmp_path, doc)
     out = _run([], tmp_path, FakeProber(), tick_count=2)
-    w = pw.load_watches(tmp_path)["watches"]["777"]
-    assert w["orphaned"] is False
+    # no FALSE orphan alert (the key invariant).
     assert not any("orphaned-pr" in r for r in out.raises)
 
 
@@ -1197,8 +1222,13 @@ def test_tick_merged_flips_task_done_through_loop(
         c[1:3] == ["tasks", "set"] and "status=done" in c and "foo" in c
         for c in fleet_calls
     ), f"expected status=done flip in {fleet_calls!r}"
-    # watch pruned.
-    assert "195" not in pw.load_watches(it_project_dir)["watches"]
+    # worker_pid cleared too (no stale worker on a done task; iter-20 P2).
+    assert any(
+        c[1:3] == ["tasks", "set"] and "worker_pid=0" in c and "foo" in c
+        for c in fleet_calls
+    ), f"expected worker_pid=0 clear in {fleet_calls!r}"
+    # watch pruned + file removed.
+    assert not pw.watch_path(it_project_dir).exists()
 
 
 def test_tick_coord_scope_skips_foreign_pr_through_loop(

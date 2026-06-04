@@ -771,6 +771,20 @@ def reconcile_watches(
                     f"pr-watch: PR #{key} was CLOSED without merging; "
                     f"needs operator attention — {w.get('pr_url', '')}"
                 )
+            elif not w.get("tasks"):
+                # operator resolved the backing task (went terminal /
+                # archived) -> the parked closed watch is done its job;
+                # prune so it doesn't keep pr-watches.json alive forever.
+                del watches[key]
+                out.pruned += 1
+        elif state == STATE_NOT_FOUND:
+            # parked 404: prune once the backing task is resolved (no live
+            # task left) so a handled 404 doesn't keep the file on disk +
+            # defeat the idle early-out forever (codex iter-20 [P2]). While
+            # a task still points at it, retain (operator hasn't acted).
+            if not w.get("tasks"):
+                del watches[key]
+                out.pruned += 1
 
     persist_watches(project_dir, doc)
     return out
