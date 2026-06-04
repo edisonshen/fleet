@@ -519,7 +519,20 @@ func attachSpawnedSession(token, project, newID string, opts AttachOpts) error {
 			"coord-spawn for %s returned exit 0 but session %s never came up — re-run `fleet attach %s --project %s` (or `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code`) to retry; check ~/.fleet/agents/%s.json for clues",
 			project, session, token, project, project, project, newID))
 	}
-	return attachFnVar(session)
+	// Codex review iter-10 P2: the probe-then-attach window is non-zero
+	// (the spawn could exit AFTER probe says alive AND BEFORE
+	// tmux.Attach exec's). On a raw attach error here, fall back to the
+	// SAME retry diagnostic the dead-probe branch surfaces — the
+	// operator should never see the generic exit-1 "tmux: no sessions"
+	// for what is structurally a Tier 3 recovery race. Same SystemError
+	// shape (exit 70) so main()'s ExitCodeFor wiring keeps the
+	// documented exit-code contract.
+	if err := attachFnVar(session); err != nil {
+		return newSystemError(70, fmt.Sprintf(
+			"coord-spawn for %s returned exit 0 and probe passed but tmux.Attach %s failed: %v — re-run `fleet attach %s --project %s` (or `fleet dispatch coord-%s --coord-spawn --project %s --engine claude-code`) to retry; check ~/.fleet/agents/%s.json for clues",
+			project, session, err, token, project, project, project, newID))
+	}
+	return nil
 }
 
 // derivSource identifies which step in the derivation pipeline picked

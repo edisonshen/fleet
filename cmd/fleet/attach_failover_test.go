@@ -936,6 +936,40 @@ func TestSystemFailure_SpawnSessionDead_ReturnsSystemErr(t *testing.T) {
 	}
 }
 
+// TestSystemFailure_AttachRaceAfterSpawn — codex review iter-10 P2.
+// The probe-then-attach window is non-zero: the session can die after
+// sessionProbeFnVar says alive but BEFORE tmux.Attach runs. The
+// operator should see the same retry diagnostic, not a raw tmux error.
+func TestSystemFailure_AttachRaceAfterSpawn_ReturnsSystemErr(t *testing.T) {
+	s := newFailoverSetup(t)
+	s.installStubs(t)
+	// Spawn succeeds + registers the session as alive (so the probe
+	// passes), but the attach stub returns an error simulating "session
+	// died between probe and attach".
+	attachFnVar = func(session string) error {
+		s.attachedTo = session
+		s.attachCalls++
+		return errors.New("tmux: no such session")
+	}
+	s.addProjectDir(t, "projects-fleet")
+	_, err := s.run(t, "foo", AttachOpts{Project: "projects-fleet"})
+	if err == nil {
+		t.Fatal("expected SystemError when attach race kills the session post-probe")
+	}
+	// Must surface the retry command (same shape as the dead-probe
+	// branch — codex iter-10 P2 wants both windows to land on the same
+	// operator surface).
+	if !strings.Contains(err.Error(), "re-run") {
+		t.Errorf("err must surface next-step retry: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "attach foo") {
+		t.Errorf("err must embed actual token in retry: %q", err.Error())
+	}
+	if ec := ExitCodeFor(err); ec != 70 {
+		t.Errorf("ExitCodeFor(attach race): got %d want 70", ec)
+	}
+}
+
 func TestSystemFailure_DispatchFailed_ReturnsSystemErr(t *testing.T) {
 	s := newFailoverSetup(t)
 	s.installStubs(t)
