@@ -43,6 +43,7 @@ import conflict
 import coord_config
 import dispatch as dispatch_mod
 import parse
+import pr_watch as pr_watch_mod
 import reaper as reaper_mod
 import remote_control
 import supervisor as supervisor_mod
@@ -1134,6 +1135,25 @@ def _tick_locked(
         # Archive should never fail a tick — log + continue. Operators
         # see the breadcrumb via `fleet status`/blocked_reason.
         result.errors.append(f"auto-archive: {exc}")
+
+    # 5.65. Durable PR-watch reconcile (DESIGN-coord-pr-watch-durable,
+    # PR1 — the tracking half). Single writer = this tick (we still hold
+    # the coordinator flock). Derives the watch set from tasks.md every
+    # pass, probes each watched PR (1 git fetch + batched gh per repo,
+    # fail-soft), reduces through the PR state machine, SURFACES every
+    # actionable/orphan/closed event (raise-hand), and on MERGED flips
+    # ALL backing tasks done FIRST so the gc backstop below reaps their
+    # worktrees in the SAME tick (the §2 ordering: flip -> gc -> prune).
+    # PR2 adds auto-rebase/fix dispatch + §6 action leases; PR1 watches +
+    # surfaces + reconciles-on-merge only. Fail-soft: any exception is
+    # logged to result.errors, never wedges the tick.
+    try:
+        _reconcile_pr_watches(
+            f.tasks, project=project, project_dir=project_dir,
+            cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
+        )
+    except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
+        result.errors.append(f"pr-watch reconcile: {exc}")
 
     # 5.7. Worktree-GC backstop (DESIGN-coord-worktree-lifecycle §4.4).
     # The reconcile/sentinel reaping path (§4.1-4.3) handles trees on the
@@ -5317,6 +5337,91 @@ def _worktree_cleanup_context(
     if not has_worktree:
         return ("", None)
     return (cwd, {t.slug: t for t in tasks})
+
+
+# Injectable prober seam (test override). Production uses GhGitProber;
+# tests assign loop._pr_watch_prober = <fake> before calling tick().
+_pr_watch_prober = None  # lazily defaults to pr_watch_mod.GhGitProber()
+
+
+def _reconcile_pr_watches(
+    tasks: list[parse.Task],
+    *,
+    project: str,
+    project_dir: Path,
+    cwd: str,
+    fleet_bin: str,
+    state: dict,
+    result,
+) -> None:
+    """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
+    PR1). Hooks the pr_watch module into the tick:
+
+      - coord-own-repo for the coord-scope assert is derived from the
+        repo's git remote (meta.json repo_path preferred over cwd — the
+        same authority `loop.tick` uses for the worktree base).
+      - flip_task_done wraps `fleet tasks set <slug> status=done`; the
+        flip is the ONLY mutation, and it routes through `fleet` (the
+        skill's single CLI seam) — pr_watch never shells out itself.
+      - tick_count from coord-state drives the §3 adaptive probe cadence.
+
+    Fail-soft throughout: a single flip failure leaves the MERGED watch
+    un-pruned so the next tick re-reconciles (flip is idempotent); a
+    transient probe failure retains the watch. raise-hand lines + notes
+    are surfaced through result.errors so the operator sees them in
+    `fleet status` (feedback_surface_dont_silo)."""
+    # Cheap early-out: a project with NO owned-PR task AND NO existing
+    # watch file has nothing to reconcile. Skip BEFORE any git/gh shell-out
+    # (derive_owner_repo) so a worktree-free / PR-free tick stays
+    # byte-identical to pre-watch behavior — no spurious `git remote`
+    # call on every idle tick.
+    has_pr_task = any(
+        getattr(t, "pr_url", "") and getattr(t, "status", "") not in pr_watch_mod.TERMINAL_TASK_STATUSES
+        for t in tasks
+    )
+    if not has_pr_task and not pr_watch_mod.watch_path(project_dir).exists():
+        return
+
+    # Repo path: meta.json repo_path is authoritative (operator-set via
+    # `fleet project add`); fall back to the spawn cwd. Mirrors the
+    # worktree-base derivation in tick (#175).
+    repo_path = coord_config.read_project_repo_path(project_dir) or cwd
+    coord_owner_repo = pr_watch_mod.derive_owner_repo(repo_path)
+
+    prober = _pr_watch_prober or pr_watch_mod.GhGitProber()
+
+    try:
+        tick_count = int(state.get("tick_count", 0) or 0)
+    except (TypeError, ValueError):
+        tick_count = 0
+
+    def _flip_done(slug: str) -> None:
+        _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
+
+    outcome = pr_watch_mod.reconcile_watches(
+        tasks,
+        project=project,
+        project_dir=project_dir,
+        coord_owner_repo=coord_owner_repo,
+        prober=prober,
+        flip_task_done=_flip_done,
+        now_iso=pr_watch_mod.utc_now_iso(),
+        tick_count=tick_count,
+        repo_path=repo_path,
+    )
+
+    # Surface raise-hand events as operator-visible errors + count them as
+    # raises (feedback_surface_dont_silo — never silently auto-recover).
+    for line in outcome.raises:
+        result.errors.append(line)
+        result.raised += 1
+    # Notes (READY / merged reconcile) are informational breadcrumbs.
+    for line in outcome.notes:
+        result.errors.append(line)
+    # Soft errors (transient probe skips, flip failures) — surfaced but
+    # not counted as raises (they self-heal on retry).
+    for line in outcome.errors:
+        result.errors.append(line)
 
 
 def _maybe_gc_worktrees(
