@@ -375,6 +375,77 @@ func TestStaleCoordRecord_RecordPlusLiveTmuxIsNotStale(t *testing.T) {
 	}
 }
 
+// --- StaleLockBodyCoord ---
+
+// TestStaleLockBodyCoord_LegacyCoordHit — codex review iter-11 P2.
+// A legacy/manually-spawned coord whose task_id ≠ coord-<project> but
+// whose ID lives in the project's coordinator.lock body must be
+// classified stale when its tmux session is definitively dead. This
+// lets Tier 3 preserve dispatch's recovery context (inherit cwd/engine
+// from the dead record) instead of falling through to a fresh spawn.
+func TestStaleLockBodyCoord_LegacyCoordHit(t *testing.T) {
+	home := withFleetHome(t)
+	// Legacy coord: tag is NOT coord-<project>. StaleCoordRecord
+	// would skip it; StaleLockBodyCoord must catch it.
+	if dir, err := state.AgentDir(); err == nil {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	r := agent.New("12345678")
+	r.Project = "fleet"
+	r.TaskID = "manual-spawn"
+	r.TmuxSession = "fleet-12345678"
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	writeCoordLockBody(t, home, "fleet", "12345678")
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{}) // all dead
+	defer restore()
+	got, ok := StaleLockBodyCoord(records, "fleet")
+	if !ok {
+		t.Fatal("StaleLockBodyCoord: expected hit on legacy coord")
+	}
+	if got.ID != "12345678" {
+		t.Errorf("StaleLockBodyCoord: got %s want 12345678", got.ID)
+	}
+}
+
+// TestStaleLockBodyCoord_AliveMisses — guard against treating a live
+// coord as stale. Lock body still names the holder, but the holder's
+// session is alive, so the helper must report ok=false.
+func TestStaleLockBodyCoord_AliveMisses(t *testing.T) {
+	home := withFleetHome(t)
+	if dir, err := state.AgentDir(); err == nil {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	r := agent.New("12345678")
+	r.Project = "fleet"
+	r.TaskID = "manual-spawn"
+	r.TmuxSession = "fleet-12345678"
+	if err := r.Write(); err != nil {
+		t.Fatal(err)
+	}
+	writeCoordLockBody(t, home, "fleet", "12345678")
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{"fleet-12345678": true})
+	defer restore()
+	if _, ok := StaleLockBodyCoord(records, "fleet"); ok {
+		t.Errorf("StaleLockBodyCoord: must NOT mark live coord stale (would reap a healthy session)")
+	}
+}
+
+// TestStaleLockBodyCoord_NoLockBodyMisses — when the project has no
+// coordinator.lock at all, the helper returns (nil, false) cleanly.
+func TestStaleLockBodyCoord_NoLockBodyMisses(t *testing.T) {
+	withFleetHome(t)
+	records := recordsFromList(t)
+	restore := stubSessionAlive(t, map[string]bool{})
+	defer restore()
+	if _, ok := StaleLockBodyCoord(records, "fleet"); ok {
+		t.Errorf("StaleLockBodyCoord: must return false with no lock body")
+	}
+}
+
 // --- OrphanTmuxForProject ---
 
 // TestOrphanTmuxForProject_OrphanSessionFound — tmux has a fleet-<id>

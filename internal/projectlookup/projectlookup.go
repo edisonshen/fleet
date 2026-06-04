@@ -286,6 +286,49 @@ func StaleCoordRecord(records []*agent.Record, projectName string) (*agent.Recor
 	return nil, false
 }
 
+// StaleLockBodyCoord returns a record whose ID matches the project's
+// coordinator.lock body AND whose tmux session is DEFINITIVELY dead.
+// Covers the legacy / manually-spawned coord case (codex review iter-11
+// P2): such records are tagged with task_id ≠ coord-<project>, so
+// StaleCoordRecord skips them and Tier 3 would fall through to Path D
+// (fresh spawn) — losing the dead coord's recovery context (cwd /
+// engine / workers state). The lock body is authoritative ("this is
+// the coord for this project"); if its tmux session is dead, the
+// record is the right recovery candidate even without the task_id tag.
+//
+// Returns (nil, false) when the lock body is missing/empty/malformed,
+// when no record has the matching ID, or when the matching record's
+// session is alive or its liveness is ambiguous (transport-error
+// conservatism — same discipline as StaleCoordRecord).
+func StaleLockBodyCoord(records []*agent.Record, projectName string) (*agent.Record, bool) {
+	root, err := state.Root()
+	if err != nil {
+		return nil, false
+	}
+	holderID := readCoordHolder(filepath.Join(root, "projects"), projectName)
+	if holderID == "" {
+		return nil, false
+	}
+	for _, r := range records {
+		if r == nil || r.ID != holderID {
+			continue
+		}
+		session := r.TmuxSession
+		if session == "" {
+			session = tmux.SessionName(r.ID)
+		}
+		alive, perr := sessionProbeFn(session)
+		if perr != nil {
+			continue // transport error → conservative
+		}
+		if alive {
+			continue
+		}
+		return r, true
+	}
+	return nil, false
+}
+
 // OrphanTmuxForProject scans live tmux sessions for fleet-<id>
 // patterns and returns the first <id> that BELONGS TO projectName but
 // has no live agent record. "Belongs to projectName" requires evidence

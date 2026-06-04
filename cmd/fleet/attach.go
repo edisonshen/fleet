@@ -432,6 +432,15 @@ func tier3ProjectRecovery(token string, tier2err error, opts AttachOpts) error {
 	if stale, ok := projectlookup.StaleCoordRecord(records, project); ok {
 		staleID = stale.ID
 		staleFromRecord = true
+	} else if stale, ok := projectlookup.StaleLockBodyCoord(records, project); ok {
+		// Codex review iter-11 P2: legacy / manually-spawned coord
+		// whose task_id ≠ coord-<project> but whose ID is in the
+		// lock body. The record exists in live (just untagged), so
+		// staleFromRecord stays true — dispatch's recovery flow
+		// will inherit cwd/engine from it just like the
+		// StaleCoordRecord branch.
+		staleID = stale.ID
+		staleFromRecord = true
 	} else if id, ok := projectlookup.OrphanTmuxForProject(records, project); ok {
 		staleID = id
 	}
