@@ -53,6 +53,14 @@ func TestMain(m *testing.M) {
 	}
 	_ = testutil.Sweep(time.Hour) // start-of-run; best-effort
 	code := m.Run()
-	_ = testutil.Sweep(time.Hour) // end-of-run; best-effort
+	// End-of-run teardown: unconditional sweep (ignores freshness +
+	// socketLive guard) per docs/DESIGN-lifecycle-leak-recurrence.md PR-A
+	// root cause #1. A test that panics or hits os.Exit before its
+	// t.Cleanup fires leaves a LIVE /tmp/fleet-test-*.sock — Sweep with
+	// the freshness/liveness guards spares it (the suite-start guards
+	// are correct for concurrent `go test` runs that may own a fresh
+	// live socket; suite-end is the boundary where any live test
+	// socket is by definition an orphan).
+	_ = testutil.SweepAll() // end-of-run; force-mode, best-effort
 	os.Exit(code)
 }

@@ -13,9 +13,13 @@ import (
 // per-test tmuxtest.IsolateSocket cleanup is the first line of defense;
 // this sweeper is the belt-and-suspenders layer for the rare panic
 // path that bypasses t.Cleanup.
+//
+// End-of-run uses testutil.SweepAll (force-mode, ignores freshness +
+// socketLive guard) per DESIGN-lifecycle-leak-recurrence PR-A: once
+// `go test` is exiting, a LIVE test socket is by definition an orphan.
 func TestMain(m *testing.M) {
 	_ = testutil.Sweep(time.Hour)
 	code := m.Run()
-	_ = testutil.Sweep(time.Hour)
+	_ = testutil.SweepAll()
 	os.Exit(code)
 }
