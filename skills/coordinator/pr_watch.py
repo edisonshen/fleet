@@ -1882,6 +1882,21 @@ def _dispatch_actions(
                         f"not auto-rebasing — operator must pick — {w.get('pr_url', '')}"
                     )
                 continue
+            # NON-PROTECTED BASE (codex iter-32 [P2]): a watched PR whose
+            # base isn't the protected branch (e.g. `master`, a release
+            # branch, or a stacked PR-level base) is intentionally NOT
+            # auto-rebased — but it must not vanish silently. PR2 mode
+            # suppressed the PR1 actionable raise in _apply_probe, so SURFACE
+            # it here (once per event) so the operator can rebase it by hand.
+            if not _base_protected(w):
+                if event != w.get("_raised_event"):
+                    w["_raised_event"] = event
+                    out.raises.append(
+                        f"pr-watch: PR #{pr_num} is {event.upper()} but its base "
+                        f"{w.get('base', '?')!r} is not the protected branch; not "
+                        f"auto-rebasing — operator must handle — {w.get('pr_url', '')}"
+                    )
+                continue
             if pr_num not in eligible:
                 # zero-eligible-for-this-PR: a downstack PR with an open
                 # upstack is EXPECTED-stale, not actionable. Do nothing

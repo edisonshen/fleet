@@ -2198,9 +2198,11 @@ def test_watch_base_refreshed_from_snapshot(tmp_path: Path) -> None:
     # base refreshed to the real ref.
     w = pw.load_watches(tmp_path)["watches"]["195"]
     assert w["base"] == "release-branch"
-    # non-main base -> not rebase-eligible -> no rebase dispatched.
+    # non-main base -> not rebase-eligible -> no rebase dispatched, but the
+    # actionable event is SURFACED (codex iter-32 [P2]: not silently dropped).
     assert out.dispatched == 0
     assert disp.calls == []
+    assert any("not the protected branch" in r for r in out.raises)
 
 
 def test_dispatched_events_pruned_by_head(tmp_path: Path) -> None:
