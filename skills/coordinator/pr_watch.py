@@ -483,8 +483,14 @@ def reconcile_watches(
         if getattr(t, "pr_url", "") and getattr(t, "status", "") not in TERMINAL_TASK_STATUSES
     ]
     # group owned by (owner_repo, pr_number); coord-scope assert per PR.
+    # `in_scope` is the subset of owned tasks that PASS the coord-scope
+    # assert — the §2 refresh loop below MUST use this, NOT raw `owned`,
+    # else a foreign-repo task that happens to share a PR number with an
+    # in-scope PR could become backing for the in-scope watch and get
+    # flipped done on merge (codex iter-1 [P2]).
     by_pr: dict[int, list] = {}
     pr_meta: dict[int, tuple[str, str]] = {}  # pr_number -> (owner_repo, pr_url)
+    in_scope: list = []
     for t in owned:
         parsed = parse_pr_url(getattr(t, "pr_url", ""))
         if parsed is None:
@@ -499,6 +505,7 @@ def reconcile_watches(
                 f"is not in this coord's repo {coord_owner_repo!r}; skipping (coord-scope)"
             )
             continue
+        in_scope.append(t)
         by_pr.setdefault(pr_num, []).append(t)
         if pr_num not in pr_meta:
             pr_meta[pr_num] = (owner_repo, getattr(t, "pr_url", ""))
@@ -528,12 +535,24 @@ def reconcile_watches(
             continue
         live = sorted({
             getattr(t, "slug", "")
-            for t in owned
+            for t in in_scope
             if (parse_pr_url(getattr(t, "pr_url", "")) or (None, None))[1] == pr_num
             and getattr(t, "slug", "")
         })
         w["tasks"] = live
-        if w.get("state") == STATE_OPEN and not live and not w.get("orphaned"):
+        # Orphan = the PR is CONFIRMED OPEN (we've probed it and saw an
+        # OPEN snapshot) but NO live in-scope task points at it anymore.
+        # We require the confirmed-OPEN snapshot before raising: a watch
+        # enrolled but never successfully probed (e.g. coord-scope can't
+        # derive the repo) must NOT assert "PR is OPEN" — we can't prove
+        # it, and a task archived before any probe is just a pending
+        # prune candidate, not an operator-actionable orphan.
+        snap = w.get("last_snapshot")
+        confirmed_open = (
+            isinstance(snap, dict)
+            and (snap.get("pr_state") or "").upper() == "OPEN"
+        )
+        if w.get("state") == STATE_OPEN and not live and confirmed_open and not w.get("orphaned"):
             # OPEN PR with NO live non-terminal owned task -> orphan.
             # raise-hand, NO auto-action (PR1 surfaces; never auto-rebase).
             w["orphaned"] = True
@@ -841,11 +860,31 @@ class GhGitProber:
             result.error = f"unparseable owner/repo {owner_repo!r}"
             return result
 
-        # 1. ONE git fetch of the base ref (+ any head OIDs not local) so
-        # the §5.1(a) ancestor check runs against fresh SHAs.
-        if repo_path:
-            refspec = [base_ref] if base_ref else []
-            fetch_cmd = ["git", "-C", repo_path, "fetch", "origin", *refspec]
+        # 1. Query the PRs FIRST. The §5.1(a) ancestor check needs the
+        # CURRENT head OID (which lives on GitHub), not last tick's
+        # snapshot — so we must learn the current heads from GraphQL
+        # before we fetch them (codex iter-1 [P1]). `head_oids` (prior
+        # snapshot heads) is still passed for the cheap "is it already
+        # local?" pre-filter; the authoritative head set comes from here.
+        for num in pr_numbers:
+            snap = self._query_pr(owner, name, num)
+            result.snapshots[num] = snap
+
+        # 2. ONE git fetch of the base ref + every current head OID that
+        # isn't already local, so the ancestor check runs against FRESH,
+        # locally-present SHAs (codex iter-1 [P1]: a plain `git fetch
+        # origin main` leaves the tip in FETCH_HEAD and never fetches the
+        # PR heads; a stale `origin/main` or a head only on GitHub then
+        # mis-reads READY/STALE). We fetch the base into its tracking ref
+        # explicitly and rev-parse THAT (not FETCH_HEAD, which the head
+        # fetches would clobber).
+        if repo_path and base_ref:
+            want_heads = [
+                s.head_ref_oid for s in result.snapshots.values()
+                if s.head_ref_oid and not self._object_present(repo_path, s.head_ref_oid)
+            ]
+            base_refspec = f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
+            fetch_cmd = ["git", "-C", repo_path, "fetch", "origin", base_refspec, *want_heads]
             try:
                 proc = subprocess.run(
                     fetch_cmd, capture_output=True, text=True,
@@ -853,24 +892,25 @@ class GhGitProber:
                 )
                 result.fetch_ok = proc.returncode == 0
                 if proc.returncode == 0:
-                    sha = self._rev_parse(repo_path, f"origin/{base_ref}" if base_ref else "FETCH_HEAD")
-                    result.fresh_base_sha = sha
+                    result.fresh_base_sha = self._rev_parse(
+                        repo_path, f"refs/remotes/origin/{base_ref}",
+                    )
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 # transient — leave fresh_base_sha empty so reduce()
                 # treats mergeability as UNKNOWN (never asserts READY).
                 result.fetch_ok = False
-
-        # 2. ONE batched query. `gh api graphql` is per-PR in the GraphQL
-        # body; we issue them in a single process invocation via repeated
-        # -f params is not possible, so we batch by aliasing. To keep this
-        # robust + dependency-free we issue one graphql call per PR but
-        # within ONE prober pass (still bounded: cadence + slow-path keep
-        # the count low). For the common single-stack case this is 1-3
-        # calls/tick, well under the secondary-rate-limit budget.
-        for num in pr_numbers:
-            snap = self._query_pr(owner, name, num)
-            result.snapshots[num] = snap
         return result
+
+    def _object_present(self, repo_path: str, oid: str) -> bool:
+        """True if `oid` is already a local git object (skip re-fetching)."""
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo_path, "cat-file", "-e", f"{oid}^{{commit}}"],
+                capture_output=True, text=True, timeout=self.timeout_s, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return False
+        return proc.returncode == 0
 
     def _query_pr(self, owner: str, name: str, num: int) -> PRSnapshot:
         cmd = [
@@ -977,8 +1017,12 @@ def _rollup_state_to_verdict(state: str) -> str:
 # Coord-own-repo derivation (coord-scope assert source, §2)
 # ----------------------------------------------------------------------
 
+# Owner is a path segment (no slash); repo allows dots (GitHub repo names
+# may contain `.`, e.g. `owner/foo.bar`). We strip an optional trailing
+# `.git` + `/` FIRST (below), then this matches the last two segments so a
+# dotted repo name is preserved (codex iter-1 [P2]).
 _REMOTE_URL_RE = re.compile(
-    r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/.]+)(?:\.git)?/?$"
+    r"github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+?)$"
 )
 
 
@@ -998,7 +1042,14 @@ def derive_owner_repo(repo_path: str, *, timeout_s: float = 5.0) -> str | None:
         return None
     if proc.returncode != 0:
         return None
-    m = _REMOTE_URL_RE.search(proc.stdout.strip())
+    url = proc.stdout.strip()
+    # Strip an optional trailing `.git` and slash BEFORE matching so a
+    # dotted repo name (`owner/foo.bar`) survives — `.git` is a suffix,
+    # not part of the repo name (codex iter-1 [P2]).
+    url = url.rstrip("/")
+    if url.endswith(".git"):
+        url = url[: -len(".git")]
+    m = _REMOTE_URL_RE.search(url)
     if not m:
         return None
     return f"{m.group('owner')}/{m.group('repo')}"

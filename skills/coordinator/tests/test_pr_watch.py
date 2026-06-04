@@ -400,7 +400,7 @@ def test_classify_probe_error() -> None:
 def test_orphan_pr_raises_hand(tmp_path: Path) -> None:
     """Task removed while PR still OPEN -> watch marked orphaned + raise-hand,
     no auto-action."""
-    # tick 1: enroll + probe OPEN.
+    # tick 1: enroll + probe OPEN (confirmed-OPEN snapshot required for orphan).
     tasks = [_task("foo", pr_url=_pr_url(195))]
     snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="SUCCESS",
                                 head_ref_oid="H")}
@@ -411,6 +411,35 @@ def test_orphan_pr_raises_hand(tmp_path: Path) -> None:
     assert w["orphaned"] is True
     assert w["tasks"] == []
     assert any("orphaned-pr" in r for r in out.raises)
+
+
+def test_no_orphan_without_confirmed_open_snapshot(tmp_path: Path) -> None:
+    """A watch enrolled but never successfully probed-OPEN (e.g. its task
+    was archived before any probe) must NOT orphan-raise — we can't assert
+    the PR is OPEN. Regression for the E2E false-orphan."""
+    # seed a watch with NO snapshot (never probed), empty tasks.
+    doc = {"schema": 1, "watches": {"777": pw._new_watch(777, _pr_url(777), "b", "main")}}
+    pw.save_watches(tmp_path, doc)
+    out = _run([], tmp_path, FakeProber(), tick_count=2)
+    w = pw.load_watches(tmp_path)["watches"]["777"]
+    assert w["orphaned"] is False
+    assert not any("orphaned-pr" in r for r in out.raises)
+
+
+def test_foreign_repo_same_pr_number_not_backing(tmp_path: Path) -> None:
+    """An in-scope PR and a foreign-repo task sharing the same PR number:
+    the foreign slug must NOT become backing for the in-scope watch (codex
+    iter-1 [P2]). On merge only the in-scope task flips done."""
+    tasks = [
+        _task("mine", pr_url=_pr_url(42, owner_repo=OWNER_REPO)),
+        _task("foreign", pr_url=_pr_url(42, owner_repo="someone/other")),
+    ]
+    snaps = {42: pw.PRSnapshot(number=42, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = _run(tasks, tmp_path, FakeProber(snaps=snaps), owner_repo=OWNER_REPO, flips=flips)
+    # only the in-scope task flipped — the foreign slug never backed the watch.
+    assert flips == ["mine"]
+    assert out.tasks_flipped == 1
 
 
 def test_orphan_cleared_when_task_reacquired(tmp_path: Path) -> None:
@@ -592,6 +621,93 @@ def test_checks_from_rollup() -> None:
          {"status": "IN_PROGRESS", "conclusion": ""}]) == "PENDING"
     # StatusContext shape (state field).
     assert pw._checks_from_rollup([{"state": "FAILURE"}]) == "FAILURE"
+
+
+# ---------------------------------------------------------------------------
+# GhGitProber + derive_owner_repo (fake subprocess)
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_derive_owner_repo_variants(monkeypatch) -> None:
+    cases = {
+        "https://github.com/edisonshen/fleet.git": "edisonshen/fleet",
+        "https://github.com/edisonshen/fleet": "edisonshen/fleet",
+        "git@github.com:edisonshen/fleet.git": "edisonshen/fleet",
+        # dotted repo name must survive (codex iter-1 [P2]).
+        "https://github.com/owner/foo.bar.git": "owner/foo.bar",
+        "git@github.com:owner/foo.bar": "owner/foo.bar",
+    }
+    for url, expect in cases.items():
+        monkeypatch.setattr(pw.subprocess, "run",
+                            lambda *a, **k: _FakeProc(0, url + "\n"))
+        assert pw.derive_owner_repo("/repo") == expect, url
+    # non-github / failure -> None.
+    monkeypatch.setattr(pw.subprocess, "run", lambda *a, **k: _FakeProc(0, "https://gitlab.com/a/b"))
+    assert pw.derive_owner_repo("/repo") is None
+    monkeypatch.setattr(pw.subprocess, "run", lambda *a, **k: _FakeProc(1, "", "no remote"))
+    assert pw.derive_owner_repo("/repo") is None
+    assert pw.derive_owner_repo("") is None
+
+
+def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
+    """The prober queries PRs FIRST (to learn the current head), then ONE
+    fetch of the base ref + each non-local head, and rev-parses the base
+    tracking ref (not FETCH_HEAD). Regression for codex iter-1 [P1]."""
+    calls = []
+    graphql_resp = json.dumps({"data": {"repository": {"pullRequest": {
+        "number": 5, "state": "OPEN", "mergedAt": None,
+        "mergeStateStatus": "BLOCKED", "reviewDecision": "APPROVED",
+        "headRefName": "worker/x", "baseRefName": "main",
+        "headRefOid": "HEADSHA", "baseRefOid": "OLDBASE",
+        "commits": {"nodes": [{"commit": {"statusCheckRollup": {
+            "state": "SUCCESS", "contexts": {"nodes": []}}}}]},
+    }}}})
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _FakeProc(0, graphql_resp)
+        if "cat-file" in cmd:
+            return _FakeProc(1)               # head NOT local -> must fetch it
+        if "fetch" in cmd:
+            return _FakeProc(0)
+        if "rev-parse" in cmd:
+            return _FakeProc(0, "FRESHBASESHA\n")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(pw.subprocess, "run", fake_run)
+    prober = pw.GhGitProber()
+    rp = prober.probe_repo("/repo", OWNER_REPO, "main", [5], [])
+    # graphql ran before fetch (current head learned first).
+    gql_idx = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "api", "graphql"])
+    fetch_idx = next(i for i, c in enumerate(calls) if "fetch" in c)
+    assert gql_idx < fetch_idx
+    # the fetch included the base tracking refspec AND the non-local head.
+    fetch_cmd = calls[fetch_idx]
+    assert "refs/heads/main:refs/remotes/origin/main" in fetch_cmd
+    assert "HEADSHA" in fetch_cmd
+    # fresh base rev-parsed from the tracking ref, not FETCH_HEAD.
+    rp_cmd = next(c for c in calls if "rev-parse" in c)
+    assert "refs/remotes/origin/main" in rp_cmd
+    assert rp.fresh_base_sha == "FRESHBASESHA"
+    assert rp.snapshots[5].head_ref_oid == "HEADSHA"
+    assert rp.snapshots[5].checks == "SUCCESS"
+
+
+def test_ghgit_prober_null_pr_is_not_found(monkeypatch) -> None:
+    resp = json.dumps({"data": {"repository": {"pullRequest": None}}})
+    monkeypatch.setattr(pw.subprocess, "run",
+                        lambda cmd, **k: _FakeProc(0, resp) if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0))
+    prober = pw.GhGitProber()
+    rp = prober.probe_repo("/repo", OWNER_REPO, "main", [9], [])
+    assert rp.snapshots[9].not_found is True
 
 
 # ---------------------------------------------------------------------------
