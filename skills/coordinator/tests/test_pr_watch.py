@@ -59,13 +59,17 @@ class FakeProber:
     cadence tests can assert how many probes fired."""
 
     def __init__(self, *, snaps=None, repo_error="", fresh_base="BASE",
-                 base_shas=None, ancestors=None, fetch_error=""):
+                 base_shas=None, ancestors=None, fetch_error="",
+                 heads_missing=None):
         self.snaps = snaps or {}
         self.repo_error = repo_error
         self.fresh_base = fresh_base
         self.base_shas = base_shas or {}
         self.ancestors = ancestors or set()
         self.fetch_error = fetch_error
+        # PR numbers whose head is NOT locally present (head fetch failed).
+        # Default: all heads present (the common case).
+        self.heads_missing = set(heads_missing or set())
         self.probe_calls = []          # list of (pr_numbers tuple)
         self.ancestor_calls = []
 
@@ -83,6 +87,9 @@ class FakeProber:
         for n in pr_numbers:
             if n in self.snaps:
                 rp.snapshots[n] = self.snaps[n]
+                # mark head present unless the test opted it out.
+                if self.snaps[n].head_ref_oid and n not in self.heads_missing:
+                    rp.head_present.add(n)
         return rp
 
     def is_ancestor(self, repo_path, ancestor_sha, descendant_sha):
@@ -464,6 +471,24 @@ def test_fetch_failure_still_records_merge(tmp_path: Path) -> None:
     out = _run(tasks, tmp_path, prober, flips=flips)
     assert flips == ["foo"]                           # merge still reconciled
     assert out.pruned == 1
+
+
+def test_missing_head_is_transient_not_false_stale(tmp_path: Path) -> None:
+    """A PR whose head object isn't locally present (head fetch failed /
+    fork ref unavailable) must NOT be false-STALE — merge-base against a
+    missing head returns False. Treat as transient SKIP + backoff (codex
+    iter-12 [P2])."""
+    tasks = [_task("foo", pr_url=_pr_url(206))]
+    snaps = {206: pw.PRSnapshot(number=206, pr_state="OPEN", checks="SUCCESS",
+                                review_decision="APPROVED", head_ref_oid="FORKHEAD")}
+    # head NOT present; base IS fetched -> would otherwise compute STALE.
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set(),
+                        heads_missing={206})
+    out = _run(tasks, tmp_path, prober, tick_count=1)
+    w = pw.load_watches(tmp_path)["watches"]["206"]
+    assert w.get("last_event") is None               # NOT recorded as STALE
+    assert w.get("probe_skip_until_tick", 0) > 1      # backoff armed
+    assert any("PR head" in e for e in out.errors)
 
 
 def test_draft_pr_not_ready(tmp_path: Path) -> None:

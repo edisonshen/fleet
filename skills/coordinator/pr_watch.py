@@ -158,6 +158,12 @@ class RepoProbe:
     snapshots: dict[int, PRSnapshot] = field(default_factory=dict)
     fresh_base_sha: str = ""
     fresh_base_shas: dict[str, str] = field(default_factory=dict)
+    # PR numbers whose head OID is locally PRESENT after the fetch — the
+    # ancestor check is trustworthy only for these. A PR whose head fetch
+    # failed (transient / unavailable fork ref) is absent here, so
+    # _apply_probe treats its base-dependent classification as transient
+    # rather than false-STALE (codex iter-12 [P2]).
+    head_present: set = field(default_factory=set)
     fetch_ok: bool = False
     fetch_error: str = ""           # non-empty => the git fetch failed (transient)
     error: str = ""
@@ -854,13 +860,22 @@ def _apply_probe(
         # reduce_snapshot), so a fetch blip never hides a real merge.
         pre = reduce_snapshot(snap, fresh_base_sha="__present__", is_ancestor=lambda a, d: True)
         needs_base_check = pre in (EVENT_READY, EVENT_STALE, EVENT_OPEN)
-        if repo_probe.fetch_error and not pr_base_sha and needs_base_check:
-            _arm_backoff(w, tick_count)
-            out.errors.append(
-                f"pr-watch: probe for PR #{n} skipped (transient git fetch): "
-                f"{repo_probe.fetch_error}"
-            )
-            continue
+        if needs_base_check:
+            # transient if: the BASE couldn't be fetched, OR the PR's HEAD
+            # object isn't locally present (head fetch failed / unavailable
+            # fork ref) — running merge-base against a missing head returns
+            # False and would FALSE-STALE a green PR (codex iter-4 + iter-12
+            # [P2]). Either way: SKIP + backoff + retain, don't record.
+            base_missing = repo_probe.fetch_error and not pr_base_sha
+            head_missing = bool(snap.head_ref_oid) and n not in repo_probe.head_present
+            if base_missing or head_missing:
+                _arm_backoff(w, tick_count)
+                reason = "base ref" if base_missing else "PR head"
+                out.errors.append(
+                    f"pr-watch: probe for PR #{n} skipped (transient git fetch — "
+                    f"{reason} unavailable): {repo_probe.fetch_error or 'head object missing'}"
+                )
+                continue
 
         # successful probe -> clear any backoff, reduce, persist snapshot.
         w.pop("probe_skip_until_tick", None)
@@ -1043,13 +1058,18 @@ class GhGitProber:
 
             # (b) best-effort PR-head fetch — only for heads not already
             # local. Use the PR-number head ref (fork-safe). Failure is
-            # swallowed: a missing head only affects that PR's check.
-            pr_head_refspecs = [
-                f"refs/pull/{n}/head"
+            # swallowed at the command level, but we RE-CHECK each head's
+            # local presence afterwards and record it in head_present so
+            # _apply_probe can distinguish "head missing -> transient" from
+            # "head present but not an ancestor -> STALE" (codex iter-12
+            # [P2]: a missing head must not be false-STALE).
+            need_head = {
+                n: s.head_ref_oid
                 for n, s in result.snapshots.items()
                 if s.head_ref_oid and not self._object_present(repo_path, s.head_ref_oid)
-            ]
-            if pr_head_refspecs:
+            }
+            if need_head:
+                pr_head_refspecs = [f"refs/pull/{n}/head" for n in need_head]
                 try:
                     subprocess.run(
                         ["git", "-C", repo_path, "fetch", "origin", *pr_head_refspecs],
@@ -1057,7 +1077,11 @@ class GhGitProber:
                         timeout=self.timeout_s, check=False,
                     )
                 except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                    pass  # tolerated — per-PR ancestor check reads UNKNOWN
+                    pass  # tolerated — presence re-check below decides
+            # heads present = (already-local) ∪ (now-fetched-and-present).
+            for n, s in result.snapshots.items():
+                if s.head_ref_oid and self._object_present(repo_path, s.head_ref_oid):
+                    result.head_present.add(n)
         return result
 
     def _object_present(self, repo_path: str, oid: str) -> bool:
