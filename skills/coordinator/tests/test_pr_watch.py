@@ -2411,6 +2411,35 @@ def test_journal_liveness_keeps_agentless_pr_watch_lease(
     assert pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"] == agent_id
 
 
+def test_abandoned_dep_does_not_unblock_rebase_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A stale PR whose backing task depends on an ABANDONED task must NOT
+    auto-rebase (codex iter-23 [P2]) — only `done` deps unblock, matching
+    worker-dispatch semantics. Driven through loop.tick so the loop's
+    done_slugs gate is exercised."""
+    _write_tasks(it_project_dir, [
+        _it_task("dep", status="abandoned"),
+        _it_task("a", pr_url=_pr_url(195), branch="worker/a", depends_on=["dep"]),
+    ])
+    # STALE: green CI, head does NOT contain fresh base.
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    # abandoned dep -> not eligible -> NO rebase dispatched.
+    assert not [b for b in r.dispatch_instructions if "pr-rebase-195" in b]
+
+
 def test_pending_journal_reclaimed_promptly(
     it_home: Path, it_project_dir: Path, monkeypatch,
 ) -> None:

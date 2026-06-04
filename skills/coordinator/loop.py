@@ -1626,6 +1626,13 @@ def _run_supervisor(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
                 state=_load_coord_state(state_path), result=result, home=home,
+                # PRE-reconcile snapshot for ENROLLMENT (codex iter-23 [P1]):
+                # the legacy _reconcile_slugs above may have just cleared a
+                # newly-opened PR's pr_url (CI-red/not-mergeable). Mirroring
+                # the primary tick, enroll from the pre-clear `f3.tasks` so a
+                # PR opened mid-supervisor-session still gets a durable watch
+                # created (refresh/probe/auto-fix use the post-clear f_pw).
+                enroll_tasks=f3.tasks,
             )
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
@@ -5559,14 +5566,19 @@ def _reconcile_pr_watches(
             _standards_cache["v"] = dispatch_mod.fetch_standards(project, fleet_bin=fleet_bin)
         return _standards_cache["v"]
 
-    # Build the set of done task slugs ONCE for the §5.1b deps gate.
+    # Build the set of DONE task slugs ONCE for the §5.1b deps gate. Keyed
+    # on status == "done" ONLY (codex iter-23 [P2]) — NOT the broader
+    # TERMINAL_TASK_STATUSES ({done, abandoned}): an ABANDONED dependency is
+    # NOT satisfied work, so a stale upstack PR must not auto-rebase over an
+    # abandoned downstack dep. Matches the worker-dispatch dependency
+    # semantics (only `done` unblocks).
     done_slugs = {
         t.slug for t in tasks
-        if t.slug and t.status in pr_watch_mod.TERMINAL_TASK_STATUSES
+        if t.slug and t.status == "done"
     }
 
     def _deps_done(deps: list) -> bool:
-        # All listed dependency slugs must be terminal. A dep we can't see
+        # All listed dependency slugs must be DONE. A dep we can't see
         # in tasks.md (already archived off the list) counts as done — the
         # row only stays while non-terminal, so its absence == done.
         present = {t.slug for t in tasks if t.slug}
