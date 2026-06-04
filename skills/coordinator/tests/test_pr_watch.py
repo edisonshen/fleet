@@ -827,9 +827,10 @@ def test_derive_owner_repo_variants(monkeypatch) -> None:
 
 
 def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
-    """The prober queries PRs FIRST (to learn the current head), then ONE
-    fetch of the base ref + each non-local head, and rev-parses the base
-    tracking ref (not FETCH_HEAD). Regression for codex iter-1 [P1]."""
+    """The prober queries PRs FIRST (to learn the current head), then a
+    BASE fetch (load-bearing) + a SEPARATE best-effort PR-head fetch via
+    refs/pull/N/head (fork-safe, codex iter-11 [P2]), and rev-parses the
+    base tracking ref (not FETCH_HEAD). Regression for codex iter-1 [P1]."""
     calls = []
     graphql_resp = json.dumps({"data": {"repository": {"pr5": {
         "number": 5, "state": "OPEN", "mergedAt": None,
@@ -855,14 +856,17 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
     monkeypatch.setattr(pw.subprocess, "run", fake_run)
     prober = pw.GhGitProber()
     rp = prober.probe_repo("/repo", OWNER_REPO, "main", [5], [])
-    # graphql ran before fetch (current head learned first).
+    # graphql ran before any fetch (current head learned first).
     gql_idx = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "api", "graphql"])
-    fetch_idx = next(i for i, c in enumerate(calls) if "fetch" in c)
-    assert gql_idx < fetch_idx
-    # the fetch included the base tracking refspec AND the non-local head.
-    fetch_cmd = calls[fetch_idx]
-    assert "refs/heads/main:refs/remotes/origin/main" in fetch_cmd
-    assert "HEADSHA" in fetch_cmd
+    fetch_idxs = [i for i, c in enumerate(calls) if "fetch" in c]
+    assert gql_idx < fetch_idxs[0]
+    # base fetch carries the base tracking refspec, NOT the raw head OID.
+    base_fetch = next(c for c in calls if "fetch" in c and any("refs/heads/main" in a for a in c))
+    assert "refs/heads/main:refs/remotes/origin/main" in base_fetch
+    assert "HEADSHA" not in base_fetch
+    # head fetched in a SEPARATE command via the fork-safe PR head ref.
+    head_fetch = next(c for c in calls if "fetch" in c and any("refs/pull/5/head" in a for a in c))
+    assert "refs/pull/5/head" in head_fetch
     # fresh base rev-parsed from the tracking ref, not FETCH_HEAD.
     rp_cmd = next(c for c in calls if "rev-parse" in c)
     assert "refs/remotes/origin/main" in rp_cmd
@@ -871,6 +875,34 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
     assert rp.snapshots[5].head_ref_oid == "HEADSHA"
     assert rp.snapshots[5].base_ref_name == "main"
     assert rp.snapshots[5].checks == "SUCCESS"
+
+
+def test_ghgit_prober_head_fetch_failure_does_not_poison_base(monkeypatch) -> None:
+    """A failed PR-head fetch must NOT set fetch_error or wipe the base
+    SHA — base classification for other PRs is unaffected (codex iter-11
+    [P2])."""
+    resp = json.dumps({"data": {"repository": {"pr5": {
+        "number": 5, "state": "OPEN", "baseRefName": "main",
+        "headRefOid": "FORKHEAD", "baseRefOid": "B", "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED", "commits": {"nodes": []}}}}})
+
+    def fake_run(cmd, **kw):
+        if cmd[:3] == ["gh", "api", "graphql"]:
+            return _FakeProc(0, resp)
+        if "cat-file" in cmd:
+            return _FakeProc(1)               # head not local
+        if "fetch" in cmd and any("refs/pull" in a for a in cmd):
+            return _FakeProc(1, "", "couldn't find remote ref")  # head fetch FAILS
+        if "fetch" in cmd:
+            return _FakeProc(0)               # base fetch SUCCEEDS
+        if "rev-parse" in cmd:
+            return _FakeProc(0, "MAINSHA\n")
+        return _FakeProc(0)
+
+    monkeypatch.setattr(pw.subprocess, "run", fake_run)
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [5], [])
+    assert rp.fetch_error == ""                       # base fetch was fine
+    assert rp.fresh_base_shas.get("main") == "MAINSHA"
 
 
 def test_ghgit_prober_fetches_only_real_base_not_synthetic_main(monkeypatch) -> None:

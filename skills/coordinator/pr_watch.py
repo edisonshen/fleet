@@ -994,34 +994,34 @@ class GhGitProber:
         # head set comes from here.
         result.snapshots = self._query_batch(owner, name, pr_numbers)
 
-        # 2. ONE git fetch of EVERY distinct base ref the PRs ACTUALLY
-        # target (codex iter-3 [P2]: a stacked PR's base may differ;
-        # codex iter-5 [P2]: derive bases from the PRs' real baseRefName,
-        # NOT a hard-coded `main` hint — fetching a synthetic `main` that
-        # doesn't exist fails the WHOLE fetch and starves every PR) +
-        # every current head OID not already local, so the ancestor check
-        # runs against FRESH, locally-present SHAs (codex iter-1 [P1]: a
-        # plain `git fetch origin main` leaves the tip in FETCH_HEAD and
-        # never fetches the PR heads). One fetch shell-out per repo.
+        # 2. Fetch fresh refs for the ancestor check, in TWO separate
+        # commands so one unavailable head can't poison the base fetch
+        # (codex iter-11 [P2]):
+        #   (a) BASE refs — load-bearing. We fetch every distinct base the
+        #       PRs ACTUALLY target (codex iter-3 [P2]: stacked PRs differ;
+        #       codex iter-5 [P2]: derive from real baseRefName, not a
+        #       hard-coded `main` that may not exist). A failure here sets
+        #       fetch_error so _apply_probe backs off (codex iter-4 [P2]).
+        #   (b) PR HEADS — best-effort, via `refs/pull/<N>/head` (always
+        #       advertised by origin, even for FORK PRs — a raw head OID
+        #       refspec fails for forks/deleted heads and would poison the
+        #       whole fetch). A head-fetch failure is TOLERATED: that one
+        #       PR's head may be absent (its ancestor check then reads
+        #       UNKNOWN), but base-dependent classification for OTHER PRs
+        #       in the repo is unaffected.
         base_refs = sorted({
             s.base_ref_name for s in result.snapshots.values() if s.base_ref_name
         })
-        # Fallback to the caller's hint ONLY when no PR reported a base
-        # (e.g. every PR 404'd) — keeps the legacy single-base path working.
         if not base_refs and base_ref:
             base_refs = [base_ref]
         if repo_path and base_refs:
-            want_heads = [
-                s.head_ref_oid for s in result.snapshots.values()
-                if s.head_ref_oid and not self._object_present(repo_path, s.head_ref_oid)
-            ]
             base_refspecs = [
                 f"refs/heads/{r}:refs/remotes/origin/{r}" for r in base_refs
             ]
-            fetch_cmd = ["git", "-C", repo_path, "fetch", "origin", *base_refspecs, *want_heads]
             try:
                 proc = subprocess.run(
-                    fetch_cmd, capture_output=True, text=True,
+                    ["git", "-C", repo_path, "fetch", "origin", *base_refspecs],
+                    capture_output=True, text=True,
                     timeout=self.timeout_s, check=False,
                 )
                 result.fetch_ok = proc.returncode == 0
@@ -1030,23 +1030,34 @@ class GhGitProber:
                         sha = self._rev_parse(repo_path, f"refs/remotes/origin/{r}")
                         if sha:
                             result.fresh_base_shas[r] = sha
-                    # default base sha = the caller's hint if fetched, else
-                    # any fetched base (per-PR checks use base_sha_for()).
                     result.fresh_base_sha = (
                         result.fresh_base_shas.get(base_ref)
                         or next(iter(result.fresh_base_shas.values()), "")
                     )
                 else:
-                    # transient fetch failure -> surface so _apply_probe
-                    # backs off instead of recording a misleading OPEN
-                    # (codex iter-4 [P2]).
                     result.fetch_error = (proc.stderr or proc.stdout or "").strip() or \
                         f"git fetch exit {proc.returncode}"
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
-                # transient — record the error so the watch backs off +
-                # retries rather than silently reducing to plain OPEN.
                 result.fetch_ok = False
                 result.fetch_error = str(exc)
+
+            # (b) best-effort PR-head fetch — only for heads not already
+            # local. Use the PR-number head ref (fork-safe). Failure is
+            # swallowed: a missing head only affects that PR's check.
+            pr_head_refspecs = [
+                f"refs/pull/{n}/head"
+                for n, s in result.snapshots.items()
+                if s.head_ref_oid and not self._object_present(repo_path, s.head_ref_oid)
+            ]
+            if pr_head_refspecs:
+                try:
+                    subprocess.run(
+                        ["git", "-C", repo_path, "fetch", "origin", *pr_head_refspecs],
+                        capture_output=True, text=True,
+                        timeout=self.timeout_s, check=False,
+                    )
+                except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                    pass  # tolerated — per-PR ancestor check reads UNKNOWN
         return result
 
     def _object_present(self, repo_path: str, oid: str) -> bool:
