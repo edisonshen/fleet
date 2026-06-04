@@ -114,8 +114,23 @@ def test_parse_pr_url() -> None:
     assert pw.parse_pr_url(_pr_url(195)) == (OWNER_REPO, 195)
     assert pw.parse_pr_url("https://github.com/x/y/pull/3?foo=bar") == ("x/y", 3)
     assert pw.parse_pr_url("git@github.com:a/b/pull/9") == ("a/b", 9)
+    # case-insensitive: owner/repo lowercased (codex iter-6 [P2]).
+    assert pw.parse_pr_url("https://github.com/EdisonShen/Fleet/pull/42") == ("edisonshen/fleet", 42)
     assert pw.parse_pr_url("") is None
     assert pw.parse_pr_url("https://example.com/no-pr") is None
+
+
+def test_coord_scope_case_insensitive(tmp_path: Path) -> None:
+    """A remote cased EdisonShen/Fleet matches a PR URL edisonshen/fleet —
+    the owned PR is enrolled, not skipped as foreign (codex iter-6 [P2])."""
+    tasks = [_task("foo", pr_url="https://github.com/edisonshen/fleet/pull/42")]
+    snaps = {42: pw.PRSnapshot(number=42, pr_state="OPEN", checks="SUCCESS",
+                               head_ref_oid="H")}
+    # coord owns the repo under a differently-cased remote.
+    out = _run(tasks, tmp_path, FakeProber(snaps=snaps), owner_repo="EdisonShen/Fleet")
+    assert out.enrolled == 1
+    assert "42" in pw.load_watches(tmp_path)["watches"]
+    assert not any("coord-scope" in e for e in out.errors)
 
 
 # ---------------------------------------------------------------------------

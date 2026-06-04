@@ -232,14 +232,18 @@ def parse_pr_url(url: str) -> tuple[str, int] | None:
     """Return (owner_repo, pr_number) parsed from a GitHub PR URL, or None.
 
     owner_repo is the canonical "<owner>/<repo>" the coord-scope assert
-    (§2) compares against the coord's own repo.
+    (§2) compares against the coord's own repo. GitHub owner/repo names
+    are CASE-INSENSITIVE, so we lowercase here — and derive_owner_repo
+    does the same — so a remote `EdisonShen/Fleet` matches a PR URL
+    `edisonshen/fleet` (codex iter-6 [P2]; mirrors coord_config's
+    case-insensitive remote match).
     """
     if not url:
         return None
     m = _PR_URL_RE.search(url)
     if not m:
         return None
-    owner_repo = f"{m.group('owner')}/{m.group('repo')}"
+    owner_repo = f"{m.group('owner')}/{m.group('repo')}".lower()
     try:
         num = int(m.group("num"))
     except ValueError:
@@ -502,6 +506,13 @@ def reconcile_watches(
     out = WatchOutcome()
     doc = load_watches(project_dir)
     watches: dict = doc["watches"]
+
+    # Normalize the coord's own repo to lowercase so the coord-scope
+    # comparison is case-insensitive (GitHub owner/repo are; codex iter-6
+    # [P2]). parse_pr_url already lowercases the PR-side, so both sides
+    # match regardless of how the remote / PR URL was cased.
+    if coord_owner_repo is not None:
+        coord_owner_repo = coord_owner_repo.lower()
 
     # --- 1. ENROLL: derive watches from durable task state (THIS coord's
     # project ONLY). Watch identity is the PR NUMBER, so two tasks
@@ -1166,7 +1177,9 @@ def derive_owner_repo(repo_path: str, *, timeout_s: float = 5.0) -> str | None:
     m = _REMOTE_URL_RE.search(url)
     if not m:
         return None
-    return f"{m.group('owner')}/{m.group('repo')}"
+    # lowercase: GitHub owner/repo is case-insensitive, so the coord-scope
+    # comparison must match a differently-cased PR URL (codex iter-6 [P2]).
+    return f"{m.group('owner')}/{m.group('repo')}".lower()
 
 
 def utc_now_iso(now: _dt.datetime | None = None) -> str:
