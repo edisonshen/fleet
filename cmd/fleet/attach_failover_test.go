@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1380,6 +1382,42 @@ func TestF26_PathB_StaleLockBody_DoesNotKill(t *testing.T) {
 	}
 	if len(s.dispatched) != 1 {
 		t.Errorf("F26: expected exactly one dispatch, got %v", s.dispatched)
+	}
+}
+
+// TestClassifyCoordSpawnRunErr exercises the load-bearing BUG #2
+// cross-process exit-code contract against a REAL exec.ExitError (not a
+// stub): a subprocess that exits 75 must classify as errCoordSpawnVetoed;
+// exit 70 / other codes / non-exec errors must wrap as a hard failure.
+// This is the only test that proves attach correctly reads dispatch's
+// exit-75 veto over the actual subprocess boundary (F21/F23 stub the
+// sentinel directly and skip the exec layer).
+func TestClassifyCoordSpawnRunErr(t *testing.T) {
+	run := func(code int) error {
+		// `sh -c "exit N"` yields an *exec.ExitError with ExitCode()==N.
+		return exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+	}
+
+	// exit 75 → veto sentinel.
+	if got := classifyCoordSpawnRunErr(run(75), "stderr text"); !errors.Is(got, errCoordSpawnVetoed) {
+		t.Errorf("exit 75 must classify as errCoordSpawnVetoed; got %v", got)
+	}
+	// exit 70 → hard failure (NOT veto), stderr preserved.
+	got70 := classifyCoordSpawnRunErr(run(70), "boom")
+	if errors.Is(got70, errCoordSpawnVetoed) {
+		t.Errorf("exit 70 must NOT classify as veto; got %v", got70)
+	}
+	if !strings.Contains(got70.Error(), "boom") {
+		t.Errorf("exit 70 error must preserve stderr; got %v", got70)
+	}
+	// exit 1 → hard failure.
+	if got := classifyCoordSpawnRunErr(run(1), ""); errors.Is(got, errCoordSpawnVetoed) {
+		t.Errorf("exit 1 must NOT classify as veto; got %v", got)
+	}
+	// Non-exec error (e.g. binary missing) → hard failure, not veto.
+	nonExec := classifyCoordSpawnRunErr(errors.New("locate self binary: nope"), "")
+	if errors.Is(nonExec, errCoordSpawnVetoed) {
+		t.Errorf("non-exec error must NOT classify as veto; got %v", nonExec)
 	}
 }
 

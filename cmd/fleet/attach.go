@@ -969,6 +969,28 @@ func buildCoordSpawnArgs(project string) ([]string, error) {
 	return args, nil
 }
 
+// classifyCoordSpawnRunErr maps a failed `fleet dispatch --coord-spawn`
+// subprocess error to attach's recovery taxonomy (BUG #2, attach-failover
+// INVARIANT 3). The veto is classified by EXIT CODE, never by stderr
+// substring: a typed/sentinel error can't cross the exec.Command
+// subprocess boundary, so dispatch maps its *vetoError to exit 75 and we
+// detect it here via exec.ExitError.ExitCode().
+//
+//	exit 75 → errCoordSpawnVetoed (caller does scan-only re-resolve,
+//	          no 2nd spawn; ends in exit 0 attach or exit 75 wait-retry)
+//	any other failure → wrapped error (caller maps to *SystemError(70))
+//
+// Extracted as a pure function so the cross-process exit-code contract —
+// the load-bearing BUG #2 mechanism — is unit-testable without a full
+// dispatch harness (see TestClassifyCoordSpawnRunErr).
+func classifyCoordSpawnRunErr(runErr error, stderr string) error {
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) && exitErr.ExitCode() == dispatchVetoExitCode {
+		return errCoordSpawnVetoed
+	}
+	return fmt.Errorf("%w (stderr: %s)", runErr, strings.TrimSpace(stderr))
+}
+
 func shellCoordSpawn(project string) (coordSpawnResult, error) {
 	self, err := os.Executable()
 	if err != nil {
@@ -984,17 +1006,7 @@ func shellCoordSpawn(project string) (coordSpawnResult, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		// BUG #2: classify the veto by EXIT CODE, not stderr substring.
-		// A typed/sentinel error can't cross the exec.Command subprocess
-		// boundary, so dispatch maps its *vetoError to exit 75 and we
-		// detect it here via exec.ExitError.ExitCode(). 75 ⇒ veto (the
-		// caller does a scan-only re-resolve, no 2nd spawn); anything
-		// else ⇒ hard failure the caller maps to *SystemError(70).
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == dispatchVetoExitCode {
-			return coordSpawnResult{}, errCoordSpawnVetoed
-		}
-		return coordSpawnResult{}, fmt.Errorf("%w (stderr: %s)", err, strings.TrimSpace(stderr.String()))
+		return coordSpawnResult{}, classifyCoordSpawnRunErr(err, stderr.String())
 	}
 	// Codex review iter-9 P1: dispatch's recovery flow prints
 	// "recovering dead coord <oldID>..." BEFORE the actual spawn line
