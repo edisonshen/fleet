@@ -822,6 +822,23 @@ func (m Model) actionAttach() (Model, tea.Cmd, bool) {
 					m.pendingAttach = live.TmuxSession
 					return m, tea.Quit, true
 				}
+				// Codex review iter-7 P2: legacy / manually-spawned coords
+				// may not carry task_id == coord-<project> on disk; the CLI
+				// Tier 3 + project-row [a] paths cover them via the
+				// lock-body fallback. The dead-row [a] resolver advertises
+				// "shared with the CLI" — wire the same fallback here so
+				// it doesn't dead-end on legacy state the other paths can
+				// recover. FindCoordByLockBody returns a record with a
+				// populated TmuxSession (iter-3 P2 normalization).
+				if live, ok := projectlookup.FindCoordByLockBody(m.records, cur.Project); ok && live.ID != cur.ID {
+					m.flash = &flashMsg{
+						text: fmt.Sprintf(
+							"agent %s session is dead — attaching to lock-body coord %s for %s",
+							cur.ID, live.ID, cur.Project),
+					}
+					m.pendingAttach = live.TmuxSession
+					return m, tea.Quit, true
+				}
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
 						"coord %s session is dead — claude likely exited inside it. Press [a] on project %s to resume from last checkpoint (or [x] here to archive the orphan record).",

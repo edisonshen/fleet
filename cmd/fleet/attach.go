@@ -712,7 +712,7 @@ var (
 //   - --cwd suffix only appears when meta.json registers a repo_path;
 //     legacy projects without meta.json fall back to dispatch's
 //     caller-cwd resolution.
-func buildCoordSpawnArgs(project string) []string {
+func buildCoordSpawnArgs(project string) ([]string, error) {
 	args := []string{
 		"dispatch",
 		projectlookup.CoordTaskID(project),
@@ -721,10 +721,25 @@ func buildCoordSpawnArgs(project string) []string {
 		"--prompt", projectlookup.CoordSpawnPrompt(project),
 		"--engine", "claude-code",
 	}
-	if meta, mErr := projects.Read(project); mErr == nil && meta.RepoPath != "" {
-		args = append(args, "--cwd", meta.RepoPath)
+	// Codex review iter-7 P2: distinguish ENOENT (legacy project, OK to
+	// proceed without --cwd) from parse error / read error (malformed
+	// meta.json — must fail closed). The old version silently swallowed
+	// both as "no meta" and could respawn the coord in the operator's
+	// shell cwd instead of the project's registered repo, leaving the
+	// coord in the wrong checkout.
+	meta, mErr := projects.Read(project)
+	switch {
+	case mErr == nil:
+		if meta.RepoPath != "" {
+			args = append(args, "--cwd", meta.RepoPath)
+		}
+	case errors.Is(mErr, projects.ErrNotFound):
+		// Legacy project, no meta.json — proceed without --cwd; dispatch
+		// resolves cwd from the caller. Same behavior as before iter-7.
+	default:
+		return nil, fmt.Errorf("meta.json for project %s is unreadable: %w — inspect ~/.fleet/projects/%s/meta.json and re-run after repair (don't respawn coord in the wrong checkout)", project, mErr, project)
 	}
-	return args
+	return args, nil
 }
 
 func shellCoordSpawn(project string) (string, error) {
@@ -732,7 +747,10 @@ func shellCoordSpawn(project string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("locate self binary: %w", err)
 	}
-	args := buildCoordSpawnArgs(project)
+	args, err := buildCoordSpawnArgs(project)
+	if err != nil {
+		return "", err
+	}
 	cmd := exec.Command(self, args...)
 	cmd.Env = os.Environ()
 	var stdout, stderr bytes.Buffer

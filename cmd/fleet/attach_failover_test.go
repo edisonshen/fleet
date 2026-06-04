@@ -391,7 +391,10 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	wantPrompt := projectlookup.CoordSpawnPrompt("projects-fleet")
 	// No meta.json: argv should be dispatch <task-id> --coord-spawn
 	// --project <p> --prompt <p> --engine claude-code (no --cwd suffix).
-	got := buildCoordSpawnArgs("projects-fleet")
+	got, err := buildCoordSpawnArgs("projects-fleet")
+	if err != nil {
+		t.Fatalf("buildCoordSpawnArgs(no meta) err: %v", err)
+	}
 	want := []string{
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
@@ -409,7 +412,10 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	if err := os.WriteFile(metaPath, []byte(`{"schema":"v1","repo_path":"/repos/projects-fleet","added_at":"2026-01-01T00:00:00Z"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got = buildCoordSpawnArgs("projects-fleet")
+	got, err = buildCoordSpawnArgs("projects-fleet")
+	if err != nil {
+		t.Fatalf("buildCoordSpawnArgs(with meta) err: %v", err)
+	}
 	want = []string{
 		"dispatch", "coord-projects-fleet",
 		"--coord-spawn", "--project", "projects-fleet",
@@ -429,6 +435,29 @@ func TestBuildCoordSpawnArgs_ShapeAndTaskID(t *testing.T) {
 	}
 	if !strings.Contains(wantPrompt, "projects-fleet") {
 		t.Errorf("CoordSpawnPrompt missing project name: %q", wantPrompt)
+	}
+}
+
+// TestBuildCoordSpawnArgs_MalformedMetaFailsClosed — codex review iter-7
+// P2. A corrupt meta.json (invalid JSON) must surface a clear error
+// rather than silently respawn the coord in the operator's shell cwd
+// (which is almost certainly NOT the project's repo).
+func TestBuildCoordSpawnArgs_MalformedMetaFailsClosed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, "projects", "projects-fleet"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	metaPath := filepath.Join(tmp, "projects", "projects-fleet", "meta.json")
+	if err := os.WriteFile(metaPath, []byte("{not-json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := buildCoordSpawnArgs("projects-fleet")
+	if err == nil {
+		t.Fatal("expected error on malformed meta.json, got nil (would silently spawn in wrong cwd)")
+	}
+	if !strings.Contains(err.Error(), "meta.json") || !strings.Contains(err.Error(), "projects-fleet") {
+		t.Errorf("err must name the bad meta path: %q", err.Error())
 	}
 }
 

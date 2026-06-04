@@ -16,6 +16,7 @@
 package tui
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -36,8 +37,8 @@ func TestF18_AgentRowDeadCoord_AttachesToLiveCoord(t *testing.T) {
 	// projectlookup has its own seam vars; stub them so FindLiveCoord
 	// reports the successor alive without spinning up a real tmux.
 	restorePL := projectlookup.SetTestStubs(
-		func(s string) bool { return s == "fleet-livecoor" },
-		func(s string) (bool, error) { return s == "fleet-livecoor", nil },
+		func(s string) bool { return s == "fleet-1234abcd" },
+		func(s string) (bool, error) { return s == "fleet-1234abcd", nil },
 		nil,
 	)
 	t.Cleanup(restorePL)
@@ -45,7 +46,7 @@ func TestF18_AgentRowDeadCoord_AttachesToLiveCoord(t *testing.T) {
 	dead := sampleAgent("deadcoor")
 	dead.Project = "demo"
 	dead.TaskID = coordTaskID("demo")
-	live := sampleAgent("livecoor")
+	live := sampleAgent("1234abcd")
 	live.Project = "demo"
 	live.TaskID = coordTaskID("demo")
 
@@ -61,8 +62,8 @@ func TestF18_AgentRowDeadCoord_AttachesToLiveCoord(t *testing.T) {
 
 	updated, cmd := m.Update(keyMsg("a"))
 	mm := updated.(Model)
-	if mm.pendingAttach != "fleet-livecoor" {
-		t.Errorf("pendingAttach = %q; want fleet-livecoor (Tier 3 rotated to live coord)", mm.pendingAttach)
+	if mm.pendingAttach != "fleet-1234abcd" {
+		t.Errorf("pendingAttach = %q; want fleet-1234abcd (Tier 3 rotated to live coord)", mm.pendingAttach)
 	}
 	if cmd == nil {
 		t.Error("expected tea.Quit cmd after rotating to live coord")
@@ -73,8 +74,69 @@ func TestF18_AgentRowDeadCoord_AttachesToLiveCoord(t *testing.T) {
 	if mm.flash.isErr {
 		t.Errorf("flash should be informational, not error; got: %+v", mm.flash)
 	}
-	if !strings.Contains(mm.flash.text, "livecoor") || !strings.Contains(mm.flash.text, "demo") {
+	if !strings.Contains(mm.flash.text, "1234abcd") || !strings.Contains(mm.flash.text, "demo") {
 		t.Errorf("flash should name the live coord + project; got %q", mm.flash.text)
+	}
+}
+
+// TestF18b_AgentRowDeadCoord_LockBodyFallback_Attaches — codex review
+// iter-7 P2. When FindLiveCoord misses (legacy/manual coord with no
+// task_id=coord-<project> tag) but FindCoordByLockBody hits, the dead-
+// row [a] must attach via the lock-body fallback. The CLI Tier 3 and
+// project-row [a] paths already do this; the dead-row resolver claims
+// to share with the CLI and must match.
+func TestF18b_AgentRowDeadCoord_LockBodyFallback_Attaches(t *testing.T) {
+	// Set FLEET_HOME so projectlookup.readCoordHolder finds the lock body.
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	lockDir := tmp + "/projects/demo/.locks"
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockDir+"/coordinator.lock", []byte("1234abcd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	(&stubSessionAlive{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
+	(&stubSessionProbe{dead: map[string]bool{"fleet-deadcoor": true}}).install(t)
+	// projectlookup stubs: FindLiveCoord misses (no task-id tag on live);
+	// FindCoordByLockBody finds 1234abcd via the lock body.
+	restorePL := projectlookup.SetTestStubs(
+		func(s string) bool { return s == "fleet-1234abcd" },
+		func(s string) (bool, error) { return s == "fleet-1234abcd", nil },
+		nil,
+	)
+	t.Cleanup(restorePL)
+
+	dead := sampleAgent("deadcoor")
+	dead.Project = "demo"
+	dead.TaskID = coordTaskID("demo")
+	// Live coord WITHOUT the coord-<project> task-id tag — only the lock
+	// body knows about it. Mirrors a manual/legacy coord-spawn.
+	live := sampleAgent("1234abcd")
+	live.Project = "demo"
+	live.TaskID = "manual-spawn" // intentionally NOT coord-demo
+	m := makeModelWithAgents(dead, live)
+	for i, r := range m.dashboardRows() {
+		if r.kind == rowAgent && r.agent != nil && r.agent.ID == "deadcoor" {
+			m.dashCursor = i
+			break
+		}
+	}
+
+	updated, cmd := m.Update(keyMsg("a"))
+	mm := updated.(Model)
+	if mm.pendingAttach != "fleet-1234abcd" {
+		t.Errorf("pendingAttach = %q; want fleet-1234abcd (lock-body fallback)", mm.pendingAttach)
+	}
+	if cmd == nil {
+		t.Error("expected tea.Quit after lock-body rotation")
+	}
+	if mm.flash == nil || mm.flash.isErr {
+		t.Fatalf("expected informational flash, got %+v", mm.flash)
+	}
+	if !strings.Contains(mm.flash.text, "lock-body") || !strings.Contains(mm.flash.text, "1234abcd") {
+		t.Errorf("flash should name the lock-body rotation + live coord: %q", mm.flash.text)
 	}
 }
 
