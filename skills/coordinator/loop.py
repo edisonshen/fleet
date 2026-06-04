@@ -4146,6 +4146,27 @@ def _read_agent_record(agent_id: str, *, home: Path | None = None) -> dict | Non
     return rec if isinstance(rec, dict) else None
 
 
+def _pr_watch_journal_state(agent_id: str, *, home: Path | None = None) -> str:
+    """Read the dispatch journal exec_state for a PR-watch agent_id
+    (~/.fleet/dispatches/<id>.json), or "" if absent/unreadable. The
+    journal is the coord's OWN durable launch signal — a PR-watch Agent-
+    tool subagent (register: false) writes no Fleet agent record + exposes
+    no pid, so its lease liveness falls back to whether the coord recorded
+    the launch here (pending/launch_attempted/acked => in flight). Never
+    raises."""
+    if not agent_id:
+        return ""
+    base = home if home is not None else _resolve_home(None)
+    try:
+        with open(base / "dispatches" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(j, dict):
+        return ""
+    return str(j.get("exec_state", "") or "")
+
+
 @dataclass
 class _CIResult:
     all_green: bool = False
@@ -5546,24 +5567,42 @@ def _reconcile_pr_watches(
         return True
 
     def _agent_outcome(agent_id: str) -> str:
-        # Resolve a dispatched subagent's lease outcome from its agent
-        # record (~/.fleet/agents/<id>.json), written by fleet-guard:
-        #   record gone / no pid           -> "gone"  (died / never started)
-        #   blocked flag true              -> "blocked"
-        #   pid alive                      -> "running"
-        # pr_watch maps these to lease transitions (§6). Never raises.
+        # Resolve a dispatched PR-watch subagent's lease outcome (§6).
+        # Never raises. Returns "blocked" | "running" | "gone".
+        #
+        # PR-watch fixers/rebasers are Agent-tool subagents launched with
+        # `register: false`; they do NOT reliably write a Fleet agent record
+        # (~/.fleet/agents/<id>.json — that's fleet-guard's tmux-session
+        # artifact) and expose no pid. So a MISSING agent record does NOT
+        # mean dead (codex iter-19 [P1]) — treating it as "gone" would
+        # reclaim a live fixer after the launch grace + double-dispatch onto
+        # its branch. The DURABLE "was launched / still in flight" signal the
+        # COORD itself writes is the dispatch JOURNAL exec_state:
+        #   - agent record present + blocked flag   -> "blocked"
+        #   - agent record present + pid alive        -> "running"
+        #   - journal pending/launch_attempted/acked  -> "running" (launched,
+        #     no terminal/death signal — Agent subagents can't be probed for
+        #     liveness, so we hold the lease; HEAD-MOVE resolves it on
+        #     success, the prompt's BLOCKED contract resolves a guard abort)
+        #   - journal genuinely absent / terminal-failed, AND no live record
+        #     -> "gone" (never launched / launch failed -> reclaim+retry)
         if not agent_id:
             return "gone"
         rec = _read_agent_record(agent_id, home=home)
-        if not isinstance(rec, dict):
-            return "gone"
-        if rec.get("blocked"):
-            return "blocked"
-        try:
-            pid = int(rec.get("pid", 0) or 0)
-        except (TypeError, ValueError):
-            pid = 0
-        if pid > 0 and _pid_alive(pid):
+        if isinstance(rec, dict):
+            if rec.get("blocked"):
+                return "blocked"
+            try:
+                pid = int(rec.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid > 0 and _pid_alive(pid):
+                return "running"
+        # No live agent record -> fall back to the journal (the coord's own
+        # durable launch signal). A launched/in-flight journal means the
+        # Agent IS out there working even without a Fleet agent record.
+        jstate = _pr_watch_journal_state(agent_id, home=home)
+        if jstate in ("pending", "launch_attempted", "acked"):
             return "running"
         return "gone"
 

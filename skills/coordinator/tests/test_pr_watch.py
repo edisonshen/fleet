@@ -2345,3 +2345,43 @@ def test_tick_idempotent_no_duplicate_dispatch_e2e(
         r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
     n2 = len([b for b in r2.dispatch_instructions if "pr-fix-195" in b])
     assert n2 == 0  # suppressed by the running lease
+
+
+def test_journal_liveness_keeps_agentless_pr_watch_lease(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A PR-watch fixer that wrote NO Fleet agent record (the Agent-tool
+    register:false path) but whose dispatch journal is `launch_attempted`
+    is treated RUNNING via the journal — past the launch grace it is NOT
+    reclaimed/duplicated (codex iter-19 [P1])."""
+    import os as _os
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="UNSTABLE", checks="FAILURE",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    agent_id = pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"]
+    # NO agent record (Agent-tool subagent). Instead a launch_attempted
+    # journal — the coord's durable launch signal.
+    (it_home / "dispatches").mkdir(exist_ok=True)
+    (it_home / "dispatches" / f"{agent_id}.json").write_text(
+        json.dumps({"exec_state": "launch_attempted",
+                    "owner": f"project/fleet/slug/pr-fix-195"})
+    )
+    # Many ticks later (well past the launch grace) — still no agent record.
+    for tk in range(2, 8):
+        with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+            r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+        assert not [b for b in r.dispatch_instructions if "pr-fix-195" in b], \
+            f"tick {tk} wrongly re-dispatched an agentless-but-journaled fixer"
+    # the original lease survives (not reclaimed).
+    assert pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"] == agent_id
