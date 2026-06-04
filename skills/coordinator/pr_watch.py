@@ -207,28 +207,15 @@ class Prober(Protocol):
 # ----------------------------------------------------------------------
 # Transient-vs-definitive classification (§3)
 # ----------------------------------------------------------------------
-
+#
 # A *transient* failure must NEVER prune a watch or flip it terminal — we
-# skip + retain + retry. A *definitive* 404 means the PR/repo is genuinely
-# gone — raise-hand `pr-not-found`. Everything we can't positively prove
-# is a 404 is treated as transient (fail-soft bias: retain, never lose a
-# watch on an ambiguous error).
-_NOT_FOUND_RE = re.compile(
-    r"\b(404|could not resolve to|not found|no such pull request)\b",
-    re.IGNORECASE,
-)
-
-
-def classify_probe_error(stderr: str) -> str:
-    """Return EVENT_NOT_FOUND for a definitive 404, else EVENT_SKIP.
-
-    Bias is fail-soft: only a clearly-definitive 404 signature returns
-    NOT_FOUND. 5xx / timeout / auth blip / rate-limit / anything
-    ambiguous -> SKIP (retain + retry), per §3.
-    """
-    if _NOT_FOUND_RE.search(stderr or ""):
-        return EVENT_NOT_FOUND
-    return EVENT_SKIP
+# skip + retain + retry. A *definitive* 404 means the PR is genuinely gone
+# — raise-hand `pr-not-found` + park (STATE_NOT_FOUND). The fail-soft bias
+# is strict: we only treat a PR as a genuine 404 when GraphQL returns a
+# ZERO-exit response with a null PR ALIAS under a RESOLVED repository
+# (see GhGitProber._query_batch). A nonzero `gh` exit, a null repository,
+# or any ambiguous/auth/scope/rate-limit error is TRANSIENT — never
+# parked, so tracking recovers once the blip / auth clears.
 
 
 # ----------------------------------------------------------------------
@@ -1135,11 +1122,18 @@ class GhGitProber:
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
             return {n: PRSnapshot(number=n, error=str(exc)) for n in pr_numbers}
         if proc.returncode != 0:
+            # NONZERO exit -> the WHOLE batched call failed; we CANNOT prove
+            # any individual PR is a genuine 404 (a private-repo scope/auth
+            # blip or a repository-level NOT_FOUND looks the same as a real
+            # missing PR). Bias TRANSIENT for every PR (codex iter-16 [P2]):
+            # parking on a nonzero exit would move them to STATE_NOT_FOUND
+            # and never recover after auth is fixed. A true per-PR 404 only
+            # manifests as a null ALIAS under a RESOLVED repository on a
+            # ZERO-exit response (handled in the parsing path below).
             stderr = (proc.stderr or proc.stdout or "").strip()
-            not_found = classify_probe_error(stderr) == EVENT_NOT_FOUND
             return {
                 n: PRSnapshot(number=n, error=stderr or "gh nonzero exit",
-                              not_found=not_found)
+                              not_found=False)
                 for n in pr_numbers
             }
         try:

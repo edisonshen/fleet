@@ -588,12 +588,20 @@ def test_missing_from_repo_query_raises_not_found(tmp_path: Path) -> None:
     assert any("pr-not-found" in r for r in out.raises)
 
 
-def test_classify_probe_error() -> None:
-    assert pw.classify_probe_error("HTTP 404") == pw.EVENT_NOT_FOUND
-    assert pw.classify_probe_error("Could not resolve to a PullRequest") == pw.EVENT_NOT_FOUND
-    assert pw.classify_probe_error("HTTP 502 Bad Gateway") == pw.EVENT_SKIP
-    assert pw.classify_probe_error("timeout") == pw.EVENT_SKIP
-    assert pw.classify_probe_error("rate limit exceeded") == pw.EVENT_SKIP
+def test_ghgit_prober_nonzero_exit_is_transient(monkeypatch) -> None:
+    """A nonzero `gh` exit (even with a 404-looking stderr) is TRANSIENT
+    for every PR — the whole batch failed, we can't prove an individual
+    PR is gone, and parking would never recover after auth (codex iter-16
+    [P2])."""
+    monkeypatch.setattr(
+        pw.subprocess, "run",
+        lambda cmd, **k: _FakeProc(1, "", "Could not resolve to a Repository (404)")
+        if cmd[:3] == ["gh", "api", "graphql"] else _FakeProc(0),
+    )
+    rp = pw.GhGitProber().probe_repo("/repo", OWNER_REPO, "main", [9, 10], [])
+    for n in (9, 10):
+        assert rp.snapshots[n].error
+        assert rp.snapshots[n].not_found is False     # NOT parked
 
 
 # ---------------------------------------------------------------------------
