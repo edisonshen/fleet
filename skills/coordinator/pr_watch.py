@@ -143,14 +143,29 @@ class PRSnapshot:
 class RepoProbe:
     """Result of one per-repo probe pass (§3): one fetch + one batched
     query. `error` set => the whole repo probe failed transiently (every
-    watch in the repo skips + retains this tick). `fresh_base_sha` is the
-    base ref tip after the fetch — used for the §5.1(a) ancestor check.
+    watch in the repo skips + retains this tick).
+
+    `fresh_base_shas` maps each PR's actual base ref name -> the fetched
+    tip of that base, so the §5.1(a) ancestor check compares a PR head
+    against ITS OWN base (codex iter-3 [P2]: a stacked PR with a non-main
+    base would otherwise be measured against origin/main and mis-read
+    READY/STALE — though fleet's PR-base-is-always-main rule makes this
+    rare, other coords/repos may stack at the PR level). `fresh_base_sha`
+    is the primary/default base tip, kept for the common single-base case.
     """
 
     snapshots: dict[int, PRSnapshot] = field(default_factory=dict)
     fresh_base_sha: str = ""
+    fresh_base_shas: dict[str, str] = field(default_factory=dict)
     fetch_ok: bool = False
     error: str = ""
+
+    def base_sha_for(self, base_ref_name: str) -> str:
+        """Fresh tip for a PR's actual base ref; fall back to the
+        primary base SHA when that ref wasn't separately fetched."""
+        if base_ref_name and base_ref_name in self.fresh_base_shas:
+            return self.fresh_base_shas[base_ref_name]
+        return self.fresh_base_sha
 
 
 class Prober(Protocol):
@@ -768,14 +783,16 @@ def _apply_probe(
         w["_backoff_n"] = 0
         out.probed += 1
 
-        # mergeability ancestor check uses the FRESH base SHA the fetch
-        # captured — never a stale local ref (§5.1a / #199 regression).
+        # mergeability ancestor check uses the FRESH tip of the PR's OWN
+        # base ref the fetch captured — never a stale local ref, and never
+        # the wrong base for a stacked PR (§5.1a / #199 + codex iter-3 [P2]).
+        pr_base_sha = repo_probe.base_sha_for(snap.base_ref_name)
         head_contains_base = False
-        if repo_probe.fresh_base_sha and snap.head_ref_oid:
-            head_contains_base = is_anc(repo_probe.fresh_base_sha, snap.head_ref_oid)
+        if pr_base_sha and snap.head_ref_oid:
+            head_contains_base = is_anc(pr_base_sha, snap.head_ref_oid)
 
         event = reduce_snapshot(
-            snap, fresh_base_sha=repo_probe.fresh_base_sha, is_ancestor=is_anc,
+            snap, fresh_base_sha=pr_base_sha, is_ancestor=is_anc,
         )
 
         w["last_snapshot"] = {
@@ -896,21 +913,28 @@ class GhGitProber:
         # head set comes from here.
         result.snapshots = self._query_batch(owner, name, pr_numbers)
 
-        # 2. ONE git fetch of the base ref + every current head OID that
-        # isn't already local, so the ancestor check runs against FRESH,
+        # 2. ONE git fetch of EVERY distinct base ref the PRs target
+        # (codex iter-3 [P2]: a stacked PR's base may not be `base_ref` —
+        # measure each PR against its OWN base) + every current head OID
+        # not already local, so the ancestor check runs against FRESH,
         # locally-present SHAs (codex iter-1 [P1]: a plain `git fetch
         # origin main` leaves the tip in FETCH_HEAD and never fetches the
-        # PR heads; a stale `origin/main` or a head only on GitHub then
-        # mis-reads READY/STALE). We fetch the base into its tracking ref
-        # explicitly and rev-parse THAT (not FETCH_HEAD, which the head
-        # fetches would clobber).
-        if repo_path and base_ref:
+        # PR heads). We fetch each base into its tracking ref explicitly
+        # and rev-parse THOSE (not FETCH_HEAD, which the head fetches
+        # would clobber). Still ONE fetch shell-out for the whole repo.
+        base_refs = sorted({
+            r for r in ([base_ref] + [s.base_ref_name for s in result.snapshots.values()])
+            if r
+        })
+        if repo_path and base_refs:
             want_heads = [
                 s.head_ref_oid for s in result.snapshots.values()
                 if s.head_ref_oid and not self._object_present(repo_path, s.head_ref_oid)
             ]
-            base_refspec = f"refs/heads/{base_ref}:refs/remotes/origin/{base_ref}"
-            fetch_cmd = ["git", "-C", repo_path, "fetch", "origin", base_refspec, *want_heads]
+            base_refspecs = [
+                f"refs/heads/{r}:refs/remotes/origin/{r}" for r in base_refs
+            ]
+            fetch_cmd = ["git", "-C", repo_path, "fetch", "origin", *base_refspecs, *want_heads]
             try:
                 proc = subprocess.run(
                     fetch_cmd, capture_output=True, text=True,
@@ -918,11 +942,13 @@ class GhGitProber:
                 )
                 result.fetch_ok = proc.returncode == 0
                 if proc.returncode == 0:
-                    result.fresh_base_sha = self._rev_parse(
-                        repo_path, f"refs/remotes/origin/{base_ref}",
-                    )
+                    for r in base_refs:
+                        sha = self._rev_parse(repo_path, f"refs/remotes/origin/{r}")
+                        if sha:
+                            result.fresh_base_shas[r] = sha
+                    result.fresh_base_sha = result.fresh_base_shas.get(base_ref, "")
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                # transient — leave fresh_base_sha empty so reduce()
+                # transient — leave fresh_base_shas empty so reduce()
                 # treats mergeability as UNKNOWN (never asserts READY).
                 result.fetch_ok = False
         return result

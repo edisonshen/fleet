@@ -51,24 +51,30 @@ def _pr_url(n: int, owner_repo: str = OWNER_REPO) -> str:
 
 
 class FakeProber:
-    """Deterministic Prober. `repo_snaps` maps pr_number -> PRSnapshot;
+    """Deterministic Prober. `snaps` maps pr_number -> PRSnapshot;
     `repo_error` sets a whole-repo transient failure; `fresh_base` is the
-    fetched base SHA; `ancestors` is a set of (anc, desc) pairs that
+    fetched primary-base SHA; `base_shas` maps base-ref-name -> fresh sha
+    (per-PR-base check); `ancestors` is a set of (anc, desc) pairs that
     is_ancestor returns True for. Records the calls so cost-bound /
     cadence tests can assert how many probes fired."""
 
     def __init__(self, *, snaps=None, repo_error="", fresh_base="BASE",
-                 ancestors=None):
+                 base_shas=None, ancestors=None):
         self.snaps = snaps or {}
         self.repo_error = repo_error
         self.fresh_base = fresh_base
+        self.base_shas = base_shas or {}
         self.ancestors = ancestors or set()
         self.probe_calls = []          # list of (pr_numbers tuple)
         self.ancestor_calls = []
 
     def probe_repo(self, repo_path, owner_repo, base_ref, pr_numbers, head_oids):
         self.probe_calls.append(tuple(pr_numbers))
-        rp = pw.RepoProbe(fresh_base_sha=self.fresh_base, fetch_ok=bool(self.fresh_base))
+        rp = pw.RepoProbe(
+            fresh_base_sha=self.fresh_base,
+            fresh_base_shas=dict(self.base_shas),
+            fetch_ok=bool(self.fresh_base),
+        )
         if self.repo_error:
             rp.error = self.repo_error
             return rp
@@ -306,6 +312,29 @@ def test_uptodate_green_is_ready(tmp_path: Path) -> None:
                         ancestors={("FRESHBASE", "HEAD200")})
     out = _run(tasks, tmp_path, prober)
     w = pw.load_watches(tmp_path)["watches"]["200"]
+    assert w["last_event"] == pw.EVENT_READY
+    assert w["last_snapshot"]["up_to_date"] is True
+    assert any("mergeable (READY)" in n for n in out.notes)
+
+
+def test_pr_measured_against_its_own_base(tmp_path: Path) -> None:
+    """A stacked PR with a non-main base is measured against ITS base,
+    not origin/main (codex iter-3 [P2]). Up-to-date vs its parent base +
+    green -> READY; same head would be STALE vs main."""
+    tasks = [_task("foo", pr_url=_pr_url(300))]
+    # PR 300 targets base 'worker/parent'; head contains parent's tip but
+    # NOT main's tip. Measured against its own base -> READY.
+    snaps = {300: pw.PRSnapshot(number=300, pr_state="OPEN",
+                                merge_state_status="BLOCKED", checks="SUCCESS",
+                                review_decision="APPROVED",
+                                head_ref_oid="H300", base_ref_name="worker/parent")}
+    prober = FakeProber(
+        snaps=snaps, fresh_base="MAINSHA",
+        base_shas={"main": "MAINSHA", "worker/parent": "PARENTSHA"},
+        ancestors={("PARENTSHA", "H300")},   # contains parent, NOT main
+    )
+    out = _run(tasks, tmp_path, prober)
+    w = pw.load_watches(tmp_path)["watches"]["300"]
     assert w["last_event"] == pw.EVENT_READY
     assert w["last_snapshot"]["up_to_date"] is True
     assert any("mergeable (READY)" in n for n in out.notes)
@@ -697,7 +726,9 @@ def test_ghgit_prober_fetches_current_head_then_base(monkeypatch) -> None:
     rp_cmd = next(c for c in calls if "rev-parse" in c)
     assert "refs/remotes/origin/main" in rp_cmd
     assert rp.fresh_base_sha == "FRESHBASESHA"
+    assert rp.fresh_base_shas.get("main") == "FRESHBASESHA"
     assert rp.snapshots[5].head_ref_oid == "HEADSHA"
+    assert rp.snapshots[5].base_ref_name == "main"
     assert rp.snapshots[5].checks == "SUCCESS"
 
 
