@@ -2448,6 +2448,46 @@ def test_abandoned_dep_does_not_unblock_rebase_e2e(
     assert not [b for b in r.dispatch_instructions if "pr-rebase-195" in b]
 
 
+def test_dead_pid_record_reclaimed_promptly_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """A PR-watch fixer that WROTE an agent record then crashed (pid dead)
+    is reported 'gone' -> reclaimed after the launch grace, NOT held for the
+    long unverified stale bound (codex iter-25 [P2])."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="UNSTABLE", checks="FAILURE",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main")}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    agent_id = pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"]
+    # record with a DEAD pid (PID 0x7FFFFFFF is not a live process).
+    (it_home / "agents").mkdir(exist_ok=True)
+    (it_home / "agents" / f"{agent_id}.json").write_text(
+        json.dumps({"id": agent_id, "pid": 2147483646, "blocked": False})
+    )
+    # also stamp a launch_attempted journal — the dead pid must WIN over it.
+    (it_home / "dispatches").mkdir(exist_ok=True)
+    (it_home / "dispatches" / f"{agent_id}.json").write_text(
+        json.dumps({"exec_state": "launch_attempted"})
+    )
+    redispatched = False
+    for _tk in range(2, 2 + pw._LEASE_LAUNCH_GRACE_TICKS + 2):
+        with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+            r = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+        if [b for b in r.dispatch_instructions if "pr-fix-195" in b]:
+            redispatched = True
+            break
+    assert redispatched, "dead-pid record should be reclaimed promptly (not held for stale bound)"
+
+
 def test_pending_journal_reclaimed_promptly(
     it_home: Path, it_project_dir: Path, monkeypatch,
 ) -> None:

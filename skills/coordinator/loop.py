@@ -5617,9 +5617,16 @@ def _reconcile_pr_watches(
                 pid = int(rec.get("pid", 0) or 0)
             except (TypeError, ValueError):
                 pid = 0
-            if pid > 0 and _pid_alive(pid):
-                return "running"
-        # No live agent record -> fall back to the journal (the coord's own
+            if pid > 0:
+                # The agent WROTE a record with a real pid — a DEFINITIVE
+                # liveness signal. Alive -> running; dead -> "gone" (codex
+                # iter-25 [P2]): a recorded-then-crashed fixer must reclaim
+                # after the normal launch grace, NOT be held for the long
+                # unverified stale bound. Do NOT fall through to the journal
+                # (which would mask the dead pid as running-unverified).
+                return "running" if _pid_alive(pid) else "gone"
+        # No agent record with a usable pid -> fall back to the journal (the
+        # coord's own
         # durable launch signal). A launched/in-flight journal means the
         # Agent was dispatched even without a Fleet agent record — but we
         # CAN'T confirm it's still alive (Agent subagents expose no pid), so
