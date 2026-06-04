@@ -5415,15 +5415,19 @@ def _reconcile_pr_watches(
     except (TypeError, ValueError):
         tick_count = 0
 
-    def _flip_done(slug: str) -> None:
-        # Flip the backing task done AND clear worker_pid so a
-        # PR-watch-driven merge can't leave a stale worker attached to a
-        # now-done task (codex iter-20 [P2]). The worktree/worker-dir reap
-        # rides the existing _maybe_gc_worktrees backstop (keyed on
-        # terminal task status), per the design's "flip done -> gc backstop
-        # -> prune" ordering — we deliberately do NOT add a duplicate
-        # per-merge reap here. status=done is set LAST so a crash between
-        # the two leaves a non-terminal row that re-reconciles next tick.
+    def _flip_done(slug: str, pr_url: str) -> None:
+        # RESTORE pr_url first (codex round 31 [P2]): a task whose pr_url
+        # was cleared by legacy CI-red handling (then preserved as backing)
+        # would otherwise land `done` with no record of the PR that merged.
+        # Then clear worker_pid so a PR-watch-driven merge can't leave a
+        # stale worker attached to a now-done task (codex iter-20 [P2]).
+        # The worktree/worker-dir reap rides the existing _maybe_gc_worktrees
+        # backstop (keyed on terminal task status), per the design's "flip
+        # done -> gc backstop -> prune" ordering — no duplicate per-merge
+        # reap here. status=done is set LAST so a crash mid-way leaves a
+        # non-terminal row that re-reconciles next tick.
+        if pr_url:
+            _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, f"pr_url={pr_url}"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worker_pid=0"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
 

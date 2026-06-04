@@ -303,7 +303,12 @@ def load_watches(project_dir: Path) -> dict:
     watches = data.get("watches")
     if not isinstance(watches, dict):
         watches = {}
-    return {"schema": SCHEMA_VERSION, "watches": watches}
+    # Drop malformed individual entries (valid JSON but a non-object watch
+    # like {"195": null}) so the reconcile loop's w.get(...) can't error
+    # every tick (codex round 31 [P3]). The watch set is a derived
+    # invariant — a dropped entry self-heals from tasks.md next tick.
+    clean = {k: v for k, v in watches.items() if isinstance(v, dict)}
+    return {"schema": SCHEMA_VERSION, "watches": clean}
 
 
 def save_watches(project_dir: Path, doc: dict) -> None:
@@ -538,7 +543,7 @@ def reconcile_watches(
     project_dir: Path,
     coord_owner_repo: str | None,
     prober: Prober,
-    flip_task_done: Callable[[str], None],
+    flip_task_done: Callable[[str, str], None],
     now_iso: str,
     tick_count: int,
     slow_cadence_ticks: int = _SLOW_CADENCE_TICKS_DEFAULT,
@@ -813,7 +818,12 @@ def reconcile_watches(
                 # task already done is a no-op on the CLI side).
                 for slug in backing:
                     try:
-                        flip_task_done(slug)
+                        # pass the watch's pr_url so the callback can RESTORE
+                        # it before flipping done — a task whose pr_url was
+                        # cleared by legacy CI-red handling (then preserved as
+                        # backing) would otherwise lose the URL of the PR that
+                        # actually landed (codex round 31 [P2]).
+                        flip_task_done(slug, w.get("pr_url", "") or "")
                         out.tasks_flipped += 1
                     except Exception as exc:  # noqa: BLE001
                         # A flip failure must not lose the watch: leave it

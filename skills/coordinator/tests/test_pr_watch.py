@@ -101,7 +101,7 @@ def _run(tasks, project_dir, prober, *, owner_repo=OWNER_REPO, now="2026-06-03T0
          tick_count=1, slow=5, flips=None):
     """Run reconcile_watches with a recording flip callback. Returns the
     WatchOutcome; appends flipped slugs to `flips` (if provided)."""
-    def _flip(slug):
+    def _flip(slug, pr_url=""):
         if flips is not None:
             flips.append(slug)
     return pw.reconcile_watches(
@@ -207,12 +207,9 @@ def test_enroll_from_pre_reconcile_when_url_cleared(tmp_path: Path) -> None:
     snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="FAILURE",
                                 head_ref_oid="H")}
 
-    def _flip(slug):
-        pass
-
     flips = []
 
-    def _flip2(slug):
+    def _flip2(slug, pr_url=""):
         flips.append(slug)
 
     out = pw.reconcile_watches(
@@ -242,10 +239,11 @@ def test_pre_reconcile_task_flipped_done_on_merge(tmp_path: Path) -> None:
     out = pw.reconcile_watches(
         current, project="p", project_dir=tmp_path,
         coord_owner_repo=OWNER_REPO, prober=FakeProber(snaps=snaps),
-        flip_task_done=lambda s: flips.append(s), now_iso="t", tick_count=1,
+        flip_task_done=lambda s, u="": flips.append((s, u)), now_iso="t", tick_count=1,
         repo_path="/repo", enroll_tasks=pre,
     )
-    assert flips == ["foo"]            # task flipped done, not orphan-merged
+    # task flipped done WITH its pr_url restored (codex round 31 [P2]).
+    assert flips == [("foo", _pr_url(195))]
     assert out.pruned == 1
 
 
@@ -261,7 +259,7 @@ def test_pre_reconcile_backing_preserved_across_ticks(tmp_path: Path) -> None:
                                      head_ref_oid="H")}
     pw.reconcile_watches(
         current1, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
-        prober=FakeProber(snaps=snaps_open), flip_task_done=lambda s: None,
+        prober=FakeProber(snaps=snaps_open), flip_task_done=lambda s, u="": None,
         now_iso="t1", tick_count=1, repo_path="/repo", enroll_tasks=pre,
     )
     assert pw.load_watches(tmp_path)["watches"]["195"]["tasks"] == ["foo"]
@@ -396,7 +394,7 @@ def test_merged_flip_failure_leaves_watch_unpruned(tmp_path: Path) -> None:
     tasks = [_task("foo", pr_url=_pr_url(195))]
     snaps = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
 
-    def _boom(slug):
+    def _boom(slug, pr_url=""):
         raise RuntimeError("fleet tasks set failed")
 
     out = pw.reconcile_watches(
@@ -879,7 +877,7 @@ def test_unknown_owner_repo_refuses_probe(tmp_path: Path) -> None:
     out = pw.reconcile_watches(
         tasks, project="p", project_dir=tmp_path,
         coord_owner_repo=None, prober=prober,
-        flip_task_done=lambda s: None, now_iso="t", tick_count=1, repo_path="/repo",
+        flip_task_done=lambda s, u="": None, now_iso="t", tick_count=1, repo_path="/repo",
     )
     assert out.enrolled == 1
     assert prober.probe_calls == []                  # never probed
@@ -968,6 +966,19 @@ def test_persist_watches_removes_empty(tmp_path: Path) -> None:
     assert pw.watch_path(tmp_path).exists()
     pw.persist_watches(tmp_path, {"schema": 1, "watches": {}})
     assert not pw.watch_path(tmp_path).exists()
+
+
+def test_load_drops_malformed_watch_entries(tmp_path: Path) -> None:
+    """A valid-JSON file with a non-object watch entry ({"195": null}) has
+    that entry dropped on load so the reconcile loop can't error every tick
+    (codex round 31 [P3])."""
+    pw.watch_path(tmp_path).write_text(json.dumps({"schema": 1, "watches": {
+        "195": None,
+        "196": "not-an-object",
+        "197": pw._new_watch(197, _pr_url(197), "b", "main"),
+    }}))
+    doc = pw.load_watches(tmp_path)
+    assert set(doc["watches"].keys()) == {"197"}
 
 
 def test_load_malformed_yields_empty_schema(tmp_path: Path) -> None:
