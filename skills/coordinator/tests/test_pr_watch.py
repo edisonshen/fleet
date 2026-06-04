@@ -1727,6 +1727,27 @@ def test_blocked_outcome_raises_once_not_refired(tmp_path: Path) -> None:
     assert not any("BLOCKED" in r for r in out3.raises)
 
 
+def test_orphan_watch_no_auto_dispatch(tmp_path: Path) -> None:
+    """A watch whose backing task was deleted while the PR is still OPEN +
+    actionable -> NO auto fix/rebase (orphan -> raise-hand only, §5/§6
+    codex iter-3 [P1]). The orphan raise still fires."""
+    # tick 1: enroll + dispatch nothing (green) so the watch exists.
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    p_green = pw.PRSnapshot(number=195, pr_state="OPEN", merge_state_status="CLEAN",
+                            checks="SUCCESS", review_decision="APPROVED",
+                            head_ref_oid="H1", base_ref_name="main")
+    prober1 = FakeProber(snaps={195: p_green}, fresh_base="B", ancestors={("B", "H1")})
+    _run2(tasks, tmp_path, prober1, dispatch=_DispatchRecorder(), tick_count=1)
+    # tick 2: task deleted (empty task list), PR now CI-FAILING + still OPEN.
+    disp = _DispatchRecorder()
+    prober2 = FakeProber(snaps={195: _ci_fail_snap(195, head="H1")},
+                         fresh_base="B", ancestors=set())
+    out = _run2([], tmp_path, prober2, dispatch=disp, tick_count=2)
+    assert out.dispatched == 0
+    assert disp.calls == []
+    assert any("orphaned-pr" in r for r in out.raises)
+
+
 def test_live_lease_blocks_different_event_same_head(tmp_path: Path) -> None:
     """A live running lease for one event suppresses a dispatch for a
     DIFFERENT event on the SAME head — one in-flight action per watch
@@ -1914,9 +1935,10 @@ def test_tick_dispatches_fix_subagent_e2e(
                            fleet_home=str(it_home))
 
     assert not result.skipped
-    # a DISPATCH block was emitted for the fix subagent.
+    # a DISPATCH block was emitted for the fix subagent + counted.
     blocks = [b for b in result.dispatch_instructions if "pr-fix-195" in b]
     assert len(blocks) == 1
+    assert result.dispatched >= 1
     # the lease is persisted (running) with the minted agent_id.
     w = pw.load_watches(it_project_dir)["watches"]["195"]
     assert w["inflight_action"]["kind"] == pw.ACTION_FIX

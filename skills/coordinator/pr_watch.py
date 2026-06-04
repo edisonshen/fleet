@@ -1550,6 +1550,16 @@ def _dispatch_actions(
         w = watches[key]
         if w.get("state") != STATE_OPEN:
             continue
+        # NEVER auto-dispatch on an ORPHANED / unbacked watch (codex iter-3
+        # [P1]). A watch that lost all backing tasks but whose PR is still
+        # open + actionable must NOT have a fixer/rebaser launched against
+        # it — that's work on an unowned PR. The post-probe orphan pass
+        # raises-hand for it; the design is explicit: orphan -> raise-hand,
+        # no auto-rebase/fix. (`orphaned` may not be set yet this tick — the
+        # orphan raise runs after this pass — so we gate on the empty
+        # backing set directly, which is the orphan's defining condition.)
+        if w.get("orphaned") or not w.get("tasks"):
+            continue
         try:
             pr_num = int(w.get("pr_number", key))
         except (TypeError, ValueError):

@@ -5516,6 +5516,14 @@ def _reconcile_pr_watches(
         # skips it). The journal exists only to satisfy the launch gate.
         # Returns the agent_id on a successful acquire+emit, "" on failure
         # (-> the lease is marked failed_launch and retried next tick).
+        #
+        # The DISPATCH block is STAGED locally (not appended to
+        # result.dispatch_instructions here) and only flushed AFTER
+        # reconcile_watches returns — i.e. after the watch doc + its leases
+        # are durably persisted (codex iter-3 [P2]). If persist_watches
+        # fails, reconcile_watches raises, the staged blocks are dropped,
+        # and NO launchable block reaches the coord without a saved lease —
+        # so a persist failure can't launch a second fixer next tick.
         try:
             agent_id = dispatch_mod.mint_agent_id()
             label = f"pr-{action.kind}-{action.pr_number}"
@@ -5537,7 +5545,7 @@ def _reconcile_pr_watches(
                 description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
                 generation=0,
             )
-            result.dispatch_instructions.append(block)
+            staged_blocks.append(block)
             return agent_id
         except Exception as exc:  # noqa: BLE001 — a failed emit -> failed_launch
             result.errors.append(
@@ -5545,6 +5553,7 @@ def _reconcile_pr_watches(
             )
             return ""
 
+    staged_blocks: list[str] = []
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
         project=project,
@@ -5560,6 +5569,14 @@ def _reconcile_pr_watches(
         agent_outcome=_agent_outcome,
         deps_done=_deps_done,
     )
+
+    # reconcile_watches returned WITHOUT raising -> the watch doc (incl. the
+    # running leases for these dispatches) is durably persisted. Only NOW
+    # flush the staged DISPATCH blocks to the coord (codex iter-3 [P2]) +
+    # count them in the tick result (codex iter-3 [P2] — consumers read
+    # result.dispatched / dispatch_instructions; they were 0 before).
+    result.dispatch_instructions.extend(staged_blocks)
+    result.dispatched += outcome.dispatched
 
     # Surface raise-hand events as operator-visible errors + count them as
     # raises (feedback_surface_dont_silo — never silently auto-recover).
