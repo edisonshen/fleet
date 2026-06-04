@@ -222,37 +222,57 @@ class Prober(Protocol):
 # pr_url parsing
 # ----------------------------------------------------------------------
 
-# https://github.com/<owner>/<repo>/pull/<N>  (also tolerate a trailing
-# slash / fragment / query). Captures owner/repo + number. `github.com`
-# must be the actual HOST: preceded by a scheme `//`, an SSH userinfo `@`,
-# or the start of the string (scp-style `github.com:owner/...`). This
-# rejects both a lookalike host (`notgithub.com`, codex iter-19 [P2]) AND
-# a path segment that merely contains the string
-# (`https://tracker.example/github.com/org/repo/pull/1`, codex round 27
-# [P2]) — neither should drive task reconciliation against a real PR.
-_PR_URL_RE = re.compile(
-    r"(?:^|//|@)github\.com[:/]+(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)\b"
+# The path portion of a GitHub PR URL, once the host is validated:
+# <owner>/<repo>/pull/<N> with an optional trailing slash/query/fragment.
+_PR_PATH_RE = re.compile(
+    r"^/?(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<num>\d+)(?:[/?#].*)?$"
 )
+# scp-style git remote: [git@]github.com:owner/repo[/pull/N]. urllib can't
+# parse this shape, so we match it explicitly. The host is anchored at the
+# start (after an optional `user@`), so a path-embedded `@github.com` can't
+# masquerade as the host (codex round 28 [P2]).
+_SCP_RE = re.compile(r"^(?:[^/@]+@)?github\.com:(?P<path>.+)$")
 
 
 def parse_pr_url(url: str) -> tuple[str, int] | None:
     """Return (owner_repo, pr_number) parsed from a GitHub PR URL, or None.
 
+    Validates that `github.com` is the actual URL HOST (via urllib for
+    scheme URLs, or an anchored scp-style match) — NOT a lookalike host
+    (`notgithub.com`) or a path segment (`.../github.com/...`,
+    `...foo@github.com/...`) (codex iter-19 / round 27 / round 28 [P2]).
+    Only a genuine GitHub PR may drive task reconciliation.
+
     owner_repo is the canonical "<owner>/<repo>" the coord-scope assert
     (§2) compares against the coord's own repo. GitHub owner/repo names
     are CASE-INSENSITIVE, so we lowercase here — and derive_owner_repo
-    does the same — so a remote `EdisonShen/Fleet` matches a PR URL
-    `edisonshen/fleet` (codex iter-6 [P2]; mirrors coord_config's
-    case-insensitive remote match).
+    does the same (codex iter-6 [P2]).
     """
     if not url:
         return None
-    m = _PR_URL_RE.search(url)
-    if not m:
+    from urllib.parse import urlparse
+
+    path: str | None = None
+    parsed = urlparse(url.strip())
+    if parsed.scheme and parsed.hostname is not None:
+        # scheme URL (https/http/ssh/git): the HOST must be exactly
+        # github.com (hostname strips userinfo + port + path).
+        if parsed.hostname.lower() != "github.com":
+            return None
+        path = parsed.path
+    else:
+        # no scheme -> try scp-style `[user@]github.com:owner/repo/...`.
+        m = _SCP_RE.match(url.strip())
+        if m is None:
+            return None
+        path = "/" + m.group("path")
+
+    mp = _PR_PATH_RE.match(path or "")
+    if mp is None:
         return None
-    owner_repo = f"{m.group('owner')}/{m.group('repo')}".lower()
+    owner_repo = f"{mp.group('owner')}/{mp.group('repo')}".lower()
     try:
-        num = int(m.group("num"))
+        num = int(mp.group("num"))
     except ValueError:
         return None
     return owner_repo, num

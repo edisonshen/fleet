@@ -131,8 +131,15 @@ def test_parse_pr_url() -> None:
     # github.com as a PATH segment (not the host) must NOT parse (codex
     # round 27 [P2]).
     assert pw.parse_pr_url("https://tracker.example/github.com/org/repo/pull/1") is None
-    # scp-style remote-host form still parses (host at string start).
+    # path-embedded `@github.com` must NOT parse as the host (codex round 28).
+    assert pw.parse_pr_url("https://tracker.example/foo@github.com/org/repo/pull/123") is None
+    # scp-style remote-host form still parses (host at string start + userinfo).
     assert pw.parse_pr_url("github.com:edisonshen/fleet/pull/5") == ("edisonshen/fleet", 5)
+    assert pw.parse_pr_url("git@github.com:edisonshen/fleet/pull/7") == ("edisonshen/fleet", 7)
+    # ssh:// scheme form parses (urllib host = github.com).
+    assert pw.parse_pr_url("ssh://git@github.com/edisonshen/fleet/pull/8") == ("edisonshen/fleet", 8)
+    # trailing slash / query tolerated.
+    assert pw.parse_pr_url("https://github.com/a/b/pull/9/") == ("a/b", 9)
 
 
 def test_coord_scope_case_insensitive(tmp_path: Path) -> None:
