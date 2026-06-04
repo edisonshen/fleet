@@ -237,6 +237,51 @@ def test_pre_reconcile_task_flipped_done_on_merge(tmp_path: Path) -> None:
     assert out.pruned == 1
 
 
+def test_pre_reconcile_backing_preserved_across_ticks(tmp_path: Path) -> None:
+    """The pre-reconcile snapshot is only available on the clear tick. On a
+    LATER tick (no pre-reconcile data, task still requeued with no url) the
+    backing slug must be PRESERVED — else a later merge orphan-prunes the
+    watch and leaves the task re-dispatchable (codex round 24 [P2])."""
+    # tick 1: legacy reconcile cleared url; enroll from pre-reconcile.
+    current1 = [_task("foo", status="todo", pr_url="")]
+    pre = [_task("foo", status="in-review", pr_url=_pr_url(195), branch="worker/foo")]
+    snaps_open = {195: pw.PRSnapshot(number=195, pr_state="OPEN", checks="FAILURE",
+                                     head_ref_oid="H")}
+    pw.reconcile_watches(
+        current1, project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps=snaps_open), flip_task_done=lambda s: None,
+        now_iso="t1", tick_count=1, repo_path="/repo", enroll_tasks=pre,
+    )
+    assert pw.load_watches(tmp_path)["watches"]["195"]["tasks"] == ["foo"]
+    # tick 2: NO pre-reconcile snapshot; task still todo with no url. Backing
+    # preserved because the slug still exists as a live task.
+    current2 = [_task("foo", status="todo", pr_url="")]
+    _run(current2, tmp_path, FakeProber(snaps=snaps_open), tick_count=2)
+    assert pw.load_watches(tmp_path)["watches"]["195"]["tasks"] == ["foo"]
+    # tick 3: PR merges -> the preserved backing task is flipped done.
+    snaps_merged = {195: pw.PRSnapshot(number=195, pr_state="MERGED", head_ref_oid="H")}
+    flips = []
+    out = _run(current2, tmp_path, FakeProber(snaps=snaps_merged), tick_count=3, flips=flips)
+    assert flips == ["foo"]
+    assert out.pruned == 1
+
+
+def test_backing_dropped_when_task_archived(tmp_path: Path) -> None:
+    """A persisted backing slug that NO LONGER exists as a live task (it was
+    archived / went terminal) is NOT preserved — it correctly drops so the
+    orphan/cleanup paths handle it (codex round 24 [P2] guard)."""
+    doc = {"schema": 1, "watches": {"195": pw._new_watch(195, _pr_url(195), "worker/foo", "main")}}
+    doc["watches"]["195"]["tasks"] = ["foo"]
+    doc["watches"]["195"]["last_snapshot"] = {"pr_state": "OPEN"}
+    pw.save_watches(tmp_path, doc)
+    # foo no longer exists in the current snapshot (archived).
+    out = _run([], tmp_path, FakeProber(snaps={195: pw.PRSnapshot(
+        number=195, pr_state="OPEN", checks="SUCCESS", head_ref_oid="H")}), tick_count=2)
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["tasks"] == []                           # dropped, not preserved
+    assert any("orphaned-pr" in r for r in out.raises)
+
+
 def test_actionable_event_raises_once_not_every_tick(tmp_path: Path) -> None:
     """An actionable event (CI_FAILED) raises ONCE on the transition, not
     every tick while it persists (codex adversarial [P1])."""

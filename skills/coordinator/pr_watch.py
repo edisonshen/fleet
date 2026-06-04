@@ -633,17 +633,41 @@ def reconcile_watches(
     # state — raising here off the previous tick's snapshot would emit a
     # false orphan alert for a PR that merged/closed this tick, and a
     # slow-cadence READY watch might not even re-probe (codex iter-17 [P2]).
+    # Slugs of all CURRENT non-terminal tasks (regardless of pr_url) — used
+    # to PRESERVE a persisted backing slug whose pr_url the legacy reconcile
+    # cleared this/an-earlier tick. The pre-reconcile enroll snapshot is
+    # only available on the clear tick; on later ticks we'd recompute `live`
+    # to [] and lose the backing, so a later merge would orphan-prune the
+    # watch and leave the requeued task re-dispatchable (codex round 24
+    # [P2]). The task still EXISTS (it was requeued, not removed), so we
+    # keep it as backing until it goes terminal or the operator resolves it.
+    current_live_slugs = {
+        getattr(t, "slug", "")
+        for t in tasks
+        if getattr(t, "status", "") not in TERMINAL_TASK_STATUSES and getattr(t, "slug", "")
+    }
     for key, w in watches.items():
         try:
             pr_num = int(w.get("pr_number", key))
         except (TypeError, ValueError):
             continue
-        live = sorted({
+        live = {
             getattr(t, "slug", "")
             for t in in_scope
             if (parse_pr_url(getattr(t, "pr_url", "")) or (None, None))[1] == pr_num
             and getattr(t, "slug", "")
-        })
+        }
+        # PRESERVE persisted backing slugs that still exist as a live task
+        # but lost their pr_url (legacy-reconcile clear). A slug that no
+        # longer exists as a live task (archived / went terminal) is NOT
+        # preserved -> it correctly drops out (orphan/cleanup paths handle
+        # it). MERGED/NOT_FOUND watches don't preserve (terminal handling
+        # owns them).
+        if w.get("state") not in (STATE_MERGED, STATE_NOT_FOUND):
+            for slug in w.get("tasks") or []:
+                if slug in current_live_slugs:
+                    live.add(slug)
+        live = sorted(live)
         w["tasks"] = live
         if live:
             # re-acquired a backing task -> clear any orphan flag.
