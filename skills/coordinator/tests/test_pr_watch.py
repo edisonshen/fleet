@@ -2153,6 +2153,48 @@ def test_orphaned_watch_with_lease_releases_it(tmp_path: Path) -> None:
     assert leased in released
 
 
+def test_no_false_orphan_on_failed_probe_same_now(tmp_path: Path) -> None:
+    """A watch successfully probed OPEN on one pass must NOT be false-
+    orphaned on a LATER pass (same now_iso) whose probe transient-failed
+    (codex iter-35 [P2]) — the orphan gate keys on tick_count, not now_iso."""
+    # tick 1: probe OK, OPEN, but NO backing task -> orphan raised once.
+    open_snap = pw.PRSnapshot(number=195, pr_state="OPEN",
+                              merge_state_status="CLEAN", checks="SUCCESS",
+                              review_decision="APPROVED", head_ref_oid="H1",
+                              base_ref_name="main")
+    # seed the watch with a backing task first so it exists, then orphan it.
+    pw.reconcile_watches(
+        [_task("a", pr_url=_pr_url(195), branch="worker/a")],
+        project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={195: open_snap}, fresh_base="B",
+                          ancestors={("B", "H1")}),
+        flip_task_done=lambda s, u="": None, now_iso="2026-06-03T08:00:00Z",
+        tick_count=1, repo_path="/repo",
+    )
+    # tick 2 (same now_iso), task removed, probe OK OPEN -> orphan raised.
+    out2 = pw.reconcile_watches(
+        [], project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(snaps={195: open_snap}, fresh_base="B",
+                          ancestors={("B", "H1")}),
+        flip_task_done=lambda s, u="": None, now_iso="2026-06-03T08:00:00Z",
+        tick_count=2, repo_path="/repo",
+    )
+    assert any("orphaned-pr" in r for r in out2.raises)
+    # clear the orphaned flag so a re-raise is possible if (wrongly) re-judged.
+    doc = pw.load_watches(tmp_path)
+    doc["watches"]["195"]["orphaned"] = False
+    pw.save_watches(tmp_path, doc)
+    # tick 3 (SAME now_iso), probe TRANSIENT-FAILS -> _probed_ok_tick stays 2,
+    # != tick_count 3 -> must NOT false-orphan off the stale tick-2 snapshot.
+    out3 = pw.reconcile_watches(
+        [], project="p", project_dir=tmp_path, coord_owner_repo=OWNER_REPO,
+        prober=FakeProber(repo_error="gh 503"),
+        flip_task_done=lambda s, u="": None, now_iso="2026-06-03T08:00:00Z",
+        tick_count=3, repo_path="/repo",
+    )
+    assert not any("orphaned-pr" in r for r in out3.raises)
+
+
 def test_orphan_watch_no_auto_dispatch(tmp_path: Path) -> None:
     """A watch whose backing task was deleted while the PR is still OPEN +
     actionable -> NO auto fix/rebase (orphan -> raise-hand only, §5/§6

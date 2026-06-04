@@ -1329,17 +1329,21 @@ def reconcile_watches(
 
     # --- 4.5. ORPHAN raise — AFTER the probe (codex iter-17 [P2]) so it
     # reflects the CURRENT PR state. An OPEN watch with no live task that
-    # was PROBED THIS TICK (last_probe_at == now_iso) and is still OPEN is
-    # a genuine orphan: the PR is live but nothing backs it. A watch that
-    # merged/closed this tick is handled by §5 (not orphaned); one we
-    # couldn't probe this tick (transient / coord-scope) is left for a
-    # later tick rather than raised off a stale snapshot.
+    # was SUCCESSFULLY PROBED THIS TICK and is still OPEN is a genuine
+    # orphan: the PR is live but nothing backs it. A watch that merged/closed
+    # this tick is handled by §5 (not orphaned); one we couldn't probe this
+    # tick (transient / coord-scope) is left for a later tick rather than
+    # raised off a stale snapshot. Freshness is keyed on `_probed_ok_tick ==
+    # tick_count` (codex iter-35 [P2]), NOT `_probed_ok_at == now_iso`: two
+    # consecutive reconcile passes can share a wall-clock now_iso (the
+    # supervisor cadence), so a stale successful probe would otherwise
+    # false-orphan a watch on a later pass whose probe was skipped/failed.
     for key, w in watches.items():
         if w.get("state") != STATE_OPEN or w.get("tasks") or w.get("orphaned"):
             continue
         snap = w.get("last_snapshot")
         probed_open_now = (
-            w.get("_probed_ok_at") == now_iso       # SUCCESSFUL probe this tick
+            w.get("_probed_ok_tick") == tick_count  # SUCCESSFUL probe this tick
             and isinstance(snap, dict)
             and (snap.get("pr_state") or "").upper() == "OPEN"
         )
