@@ -2115,6 +2115,17 @@ def test_pr_watch_journals_excluded_from_worker_replay(tmp_path: Path) -> None:
     assert got == {"cccc0003"}  # only the real worker, not the pr-* journals
 
 
+def test_expected_status_context_is_pending() -> None:
+    """A StatusContext with state=EXPECTED (a required check that hasn't
+    reported yet) is PENDING, not SUCCESS (codex iter-33 [P2])."""
+    assert pw._checks_from_rollup([{"state": "EXPECTED"}]) == "PENDING"
+    assert pw._checks_from_rollup([{"state": "SUCCESS"}]) == "SUCCESS"
+    # mixed: one expected + one success -> pending dominates.
+    assert pw._checks_from_rollup(
+        [{"state": "SUCCESS"}, {"state": "EXPECTED"}]
+    ) == "PENDING"
+
+
 def test_orphaned_watch_with_lease_releases_it(tmp_path: Path) -> None:
     """A leased watch whose backing task is removed WHILE the fixer is in
     flight must still RESOLVE the lease + release its journal when it

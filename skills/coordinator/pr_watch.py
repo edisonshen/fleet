@@ -765,14 +765,18 @@ def _checks_from_rollup(rollup) -> str:
         # CheckRun uses status+conclusion; StatusContext uses `state`.
         state = str(c.get("state", "") or "").upper()
         if status in ("QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED") \
-                or state == "PENDING" \
+                or state in ("PENDING", "EXPECTED") \
                 or (status == "" and conclusion == "" and state == ""):
+            # state=EXPECTED is a REQUIRED StatusContext that hasn't reported
+            # yet (codex iter-33 [P2]) — pending, NOT success. Without this it
+            # fell through to SUCCESS and could emit a false READY for a PR
+            # whose required check never ran.
             pending = True
         elif conclusion in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
                             "STALE", "STARTUP_FAILURE") \
                 or state in ("FAILURE", "ERROR"):
             failed = True
-        # SUCCESS / NEUTRAL / SKIPPED / EXPECTED == not failing, not pending.
+        # SUCCESS / NEUTRAL / SKIPPED == not failing, not pending.
     if failed:
         return "FAILURE"
     if pending:
