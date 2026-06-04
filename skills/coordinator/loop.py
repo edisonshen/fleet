@@ -1586,6 +1586,25 @@ def _run_supervisor(
             t.slug for t in f3.tasks
             if t.status in ("in-progress", "in-review")
         ]
+        # Durable PR-watch must run on the SUPERVISOR's cadence too (codex
+        # iter-16 [P1]): the supervisor holds the coord lock for the whole
+        # session (default up to 4h), so external ticks return lock-busy and
+        # _tick_locked's one-shot PR-watch reconcile never re-runs. Without
+        # this, a PR that merges / goes stale / gets changes-requested while
+        # the supervisor is parked on in-review work would go untracked +
+        # un-auto-fixed until the supervisor exits — defeating the "every
+        # tick" durability guarantee. We re-read tasks.md (the legacy CI
+        # path above may have just mutated it) and run the SAME reconcile
+        # the primary tick runs, on the same stuck-check cadence. Fail-soft.
+        try:
+            f_pw = parse.read(str(tasks_path))
+            _reconcile_pr_watches(
+                f_pw.tasks, project=project, project_dir=project_dir,
+                cwd=cwd, fleet_bin=fleet_bin,
+                state=_load_coord_state(state_path), result=result, home=home,
+            )
+        except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
+            result.errors.append(f"supervisor pr-watch reconcile: {exc}")
         if not slugs:
             return
         if _reconcile_slugs(slugs):
