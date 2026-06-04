@@ -53,6 +53,21 @@ func TestMain(m *testing.M) {
 	}
 	_ = testutil.Sweep(time.Hour) // start-of-run; best-effort
 	code := m.Run()
+	// End-of-run teardown: guarded sweep (freshness window +
+	// socketLive probe). The force-mode testutil.SweepAll is
+	// deliberately NOT used here: `go test ./...` runs sibling test
+	// binaries in parallel (default -p=GOMAXPROCS), all sharing the
+	// /tmp/fleet-test-*.sock namespace via tmuxtest.isolatedSocketPath.
+	// SweepAll on teardown would force-kill sockets owned by sibling
+	// packages whose tests are still running, causing a P0 CI
+	// regression (cmd/fleet finishes last in practice but the trade-
+	// off is identical across all packages). SweepAll/SweepAllDir
+	// remain in sweeper.go for PR-D's operator-invoked
+	// `fleet gc --force-test-sockets` path. The lint guard in
+	// scripts/lint-test-isolation.sh closes the original root cause
+	// (empty-command dispatch tests forking real claude) at the
+	// source; bypassed t.Cleanup orphans (rare panic path) get reaped
+	// by the next test run's start-of-run sweep once they age past 1h.
 	_ = testutil.Sweep(time.Hour) // end-of-run; best-effort
 	os.Exit(code)
 }

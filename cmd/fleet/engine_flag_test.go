@@ -78,10 +78,15 @@ func TestDispatch_UnknownEngineRejected(t *testing.T) {
 	// fires before tmux.Spawn, but isolating up front matches the
 	// "rather block CI than re-leak production" rule.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Rejection fires before wrapper-swap, but pin the
+	// stub for gate-reorder safety.
 	opts := &dispatchOpts{
-		taskID:  "t1",
-		project: "p1",
-		engine:  "nopeengine",
+		taskID:          "t1",
+		project:         "p1",
+		engine:          "nopeengine",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)
@@ -110,10 +115,17 @@ func TestDispatch_EngineFromEnv(t *testing.T) {
 	t.Setenv("FLEET_HOME", root)
 	t.Setenv("FLEET_ENGINE", "codex")
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Without the stub, runDispatch reaches the wrapper-
+	// swap branch which now substitutes the CODEX wrapper (from
+	// FLEET_ENGINE=codex) — and on a host with codex on PATH it would fork
+	// a real detached codex.
 	opts := &dispatchOpts{
 		taskID:  "t1",
 		project: "p1",
 		// opts.engine left empty → reads env.
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)
@@ -206,10 +218,15 @@ func TestDispatch_FleetEngineEnvStamped(t *testing.T) {
 	// environment; without isolation it would target the operator's
 	// default tmux server.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Without the stub, a host with codex on PATH would
+	// fork a real session (engine=codex resolves the codex wrapper).
 	opts := &dispatchOpts{
-		taskID:  "t1",
-		project: "p1",
-		engine:  "codex",
+		taskID:          "t1",
+		project:         "p1",
+		engine:          "codex",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	// runDispatch will fail later (no tmux in CI), but only AFTER it
@@ -251,6 +268,12 @@ func TestDispatch_ProgrammaticCommandNotOverriddenByEngine(t *testing.T) {
 	isolateTmuxSocket(t)
 	t.Setenv("FLEET_ENGINE", "codex")
 
+	// lint-test-isolation:command-exempt — this test intentionally exercises
+	// the wrapper-swap branch's "programmatic non-default command stays
+	// intact" contract: commandExplicit MUST be false and command MUST be a
+	// non-default argv. Setting commandExplicit:true would defeat the
+	// regression invariant. The tmuxtest isolation + explicit tmux.Kill
+	// below reap the per-test tmux server even on a dev host.
 	opts := &dispatchOpts{
 		taskID:  "t1",
 		project: "p1",
@@ -318,6 +341,14 @@ func TestDispatch_CobraDefaultCommandSwappedForEngine(t *testing.T) {
 	isolateTmuxSocket(t)
 	t.Setenv("FLEET_ENGINE", "codex")
 
+	// lint-test-isolation:command-exempt — this test intentionally exercises
+	// the wrapper-swap branch's CLI-path simulation: cobra pre-fills
+	// opts.command with the claude default and the swap must replace it
+	// with the codex wrapper for FLEET_ENGINE=codex. Setting
+	// commandExplicit:true would defeat the regression invariant. The
+	// tmuxtest isolation + explicit tmux.Kill below reap the per-test
+	// tmux server even on a dev host.
+	//
 	// Mirror what cobra leaves on the dispatch RunE path when the
 	// operator did NOT pass --command. A copy of defaultClaudeCommand
 	// guards against accidental in-place mutation by sameCommand /

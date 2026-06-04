@@ -1117,6 +1117,12 @@ func TestRunDispatch_DeadCoord_InheritsCommandWhenEngineMatchesExplicit(t *testi
 	}
 
 	// engineExplicit=true (programmatic) AND engine matches dead's.
+	// lint-test-isolation:command-exempt — this test intentionally exercises
+	// the wrapper-inheritance branch which fires only when commandExplicit
+	// is false AND opts.command is empty. The dead-coord recovery probe
+	// runs BEFORE the wrapper-swap, and inheritance replaces opts.command
+	// with the dead record's Command (the sentinel ["sleep","240"] seeded
+	// above) — so no real claude/codex argv ever reaches spawn.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1317,6 +1323,10 @@ func TestRunDispatch_DeadCoord_InheritsCommandFromOldRecord(t *testing.T) {
 	// No --command on the recovery dispatch — simulates plain
 	// `fleet dispatch <task> --coord-spawn`. commandExplicit=false
 	// triggers the inheritance branch.
+	// lint-test-isolation:command-exempt — same rationale as the sibling
+	// InheritsCommandWhenEngineMatchesExplicit test: inheritance replaces
+	// opts.command with the dead record's sentinel before spawn, so no real
+	// engine argv is ever launched.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1390,6 +1400,10 @@ func TestRunDispatch_DeadCoord_EngineClampSkipsCommandInherit(t *testing.T) {
 	// Operator forces claude-code (TUI auto-spawn pattern). No
 	// --command on the dispatch — without the iter-8 gate, the
 	// inheritance branch would silently install the codex Command.
+	// lint-test-isolation:command-exempt — this test asserts the engine-clamp
+	// branch SKIPS inheritance and falls back to the claude-code default
+	// wrapper from the wrapper-swap. Setting commandExplicit:true would
+	// defeat the contract under test.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1475,6 +1489,11 @@ func TestRunDispatch_DeadCoord_LegacyRecordSkipsCommandInherit(t *testing.T) {
 	// block populates opts.command with the claude-code default. The
 	// inheritance branch must NOT overwrite that with the legacy
 	// custom command.
+	// lint-test-isolation:command-exempt — this test asserts the legacy-record
+	// bypass: inheritance is REFUSED and the claude-code default wrapper
+	// wins. Setting commandExplicit:true would defeat the contract under
+	// test. requireTmux + isolateTmuxSocket (via setupFleetHome →
+	// requireTmux earlier) reap the per-test tmux server.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
@@ -1528,11 +1547,16 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnUnparseableRecord(t *testing.T) {
 		t.Fatalf("write corrupt record: %v", err)
 	}
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Rejection fires before wrapper-swap, but pin the
+	// stub for gate-reorder safety.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)
@@ -1689,11 +1713,16 @@ func TestRunDispatch_CoordSpawn_FailsClosedOnAgentListError(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(agentsDir, 0o755) })
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Rejection fires before wrapper-swap, but pin the
+	// stub for gate-reorder safety.
 	opts := &dispatchOpts{
 		taskID:          "coord-myproj",
 		project:         "myproj",
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)

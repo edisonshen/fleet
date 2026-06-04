@@ -80,11 +80,15 @@ func TestRunDispatch_Concurrent_OnlyOneSpawns(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
+			// command + commandExplicit: leak-test-spawn-stub (DESIGN-
+			// lifecycle-leak-recurrence PR-A).
 			opts := &dispatchOpts{
 				taskID:          "coord-" + project,
 				project:         project,
 				projectExplicit: true,
 				coordSpawn:      true,
+				command:         []string{"sleep", "30"},
+				commandExplicit: true,
 			}
 			var out bytes.Buffer
 			err := runDispatch(opts, &out)

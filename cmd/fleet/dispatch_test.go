@@ -124,9 +124,15 @@ func TestDispatch_RejectsCoordPrefixWithoutFlag(t *testing.T) {
 	// would still block the leak — but it's cheaper to isolate the
 	// socket up front than to debug a sink-guard error in CI.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Rejection fires before the wrapper-swap branch in
+	// runDispatch, but pin the stub anyway so future gate-reordering can't
+	// regress this into a live-claude spawn.
 	opts := &dispatchOpts{
-		taskID:  "coord-foo",
-		project: "foo",
+		taskID:          "coord-foo",
+		project:         "foo",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 		// coordSpawn left at its zero value: false (operator path).
 	}
 	var out bytes.Buffer
@@ -156,9 +162,15 @@ func TestDispatch_AllowsBenignCoordPrefix(t *testing.T) {
 	// tmux server. The test wasn't designed to spawn but does so as a
 	// side-effect; isolate + clean up unconditionally.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). This test reaches past the reservation gate; without
+	// the stub the wrapper-swap substitutes the real claude wrapper and a
+	// dev host with tmux + claude on PATH forks a real session.
 	opts := &dispatchOpts{
-		taskID:  "coord-cache-warm",
-		project: "ops",
+		taskID:          "coord-cache-warm",
+		project:         "ops",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	// We're not actually spawning here (would need tmux); we just
 	// verify the reservation gate doesn't fire. runDispatch will fail
@@ -302,12 +314,17 @@ func TestDispatch_CoordSpawnRequiresExplicitProject(t *testing.T) {
 	// is expected to fire before tmux.Spawn, but isolate so a logic
 	// regression can't leak onto the operator's default tmux server.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Rejection gate fires before wrapper-swap, but pin
+	// the stub anyway for gate-reorder safety.
 	opts := &dispatchOpts{
 		taskID:  "coord-default", // matches CoordTaskIDPrefix + project="default"
 		project: "default",
 		// projectExplicit deliberately false: simulates the bug where
 		// --project was dropped from the args slice.
-		coordSpawn: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)
@@ -332,11 +349,17 @@ func TestDispatch_CoordSpawnAcceptsExplicitProject(t *testing.T) {
 	// tmux installed doesn't leak a session via runDispatch → spawn.Spawn
 	// onto the operator's default tmux server.
 	isolateTmuxSocket(t)
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). This test reaches past the issue #70 gate into the
+	// spawn path; without the stub a dev host with claude on PATH forks a
+	// real session.
 	opts := &dispatchOpts{
 		taskID:          "coord-tatoosh",
 		project:         "tatoosh",
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var out bytes.Buffer
 	err := runDispatch(opts, &out)
@@ -941,9 +964,13 @@ func TestDispatch_SurfacesOrphanAgentRecord(t *testing.T) {
 		{ID: "deadbeef", TaskID: "some-task", Project: "p1"},
 	})
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). This test runs past wrapper-swap.
 	opts := &dispatchOpts{
-		taskID:  "some-task",
-		project: "p1",
+		taskID:          "some-task",
+		project:         "p1",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var stdout bytes.Buffer
 	prevStderr := os.Stderr
@@ -1006,9 +1033,13 @@ func TestDispatch_WarnsOnOrphanTmuxNotKilled(t *testing.T) {
 	emptyReport := gc.Report{}
 	calls := stubDispatchReconcile(t, []gc.Report{emptyReport, tmuxOrphan}, nil)
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
-		taskID:  "some-task",
-		project: "p1",
+		taskID:          "some-task",
+		project:         "p1",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var stdout bytes.Buffer
 	// runDispatch fails later but the warning must already be on
@@ -1063,9 +1094,13 @@ func TestDispatch_HealthyState_Silent(t *testing.T) {
 	isolateTmuxSocket(t)
 	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
-		taskID:  "some-task",
-		project: "p1",
+		taskID:          "some-task",
+		project:         "p1",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var stdout bytes.Buffer
 	prevStderr := os.Stderr
@@ -1111,9 +1146,13 @@ func TestDispatch_ReconcileErrorDoesNotBlockDispatch(t *testing.T) {
 	bad := errors.New("orphan-agents: stat agents dir: permission denied")
 	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, []error{bad, bad})
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
-		taskID:  "some-task",
-		project: "p1",
+		taskID:          "some-task",
+		project:         "p1",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var stdout bytes.Buffer
 	prevStderr := os.Stderr
@@ -1163,11 +1202,15 @@ func TestDispatch_CoordSpawn_SkipsOrphanAgentsPass(t *testing.T) {
 	// orphan-tmux surface pass, not the orphan-agents pass.
 	calls := stubDispatchReconcile(t, []gc.Report{{}, {}}, nil)
 
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "coord-foo",
 		project:         "foo",
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	var stdout bytes.Buffer
 	_ = runDispatch(opts, &stdout)

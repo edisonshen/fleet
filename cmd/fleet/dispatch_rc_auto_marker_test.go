@@ -75,11 +75,15 @@ func TestCoordSpawn_AutoWritesMarker_InjectsRemoteControl(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	const project = "test-auto-marker"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "coord-" + project,
 		project:         project,
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	runDispatchIgnoringSpawnErr(t, opts)
 
@@ -132,12 +136,16 @@ func TestWorkerSpawn_NoMarker_NoRemoteControl(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	const project = "test-worker-no-marker"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "worker-task",
 		project:         project,
 		projectExplicit: true,
 		// coordSpawn deliberately left false: this is the worker /
 		// operator-shelled-dispatch / Agent-tool-subagent path.
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	runDispatchIgnoringSpawnErr(t, opts)
 
@@ -175,11 +183,15 @@ func TestCoordSpawn_RCConnectGateClears(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	const project = "test-rc-connect-gate"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "coord-" + project,
 		project:         project,
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	runDispatchIgnoringSpawnErr(t, opts)
 
@@ -224,11 +236,15 @@ func TestCoordSpawn_EnvGateOverridesAutoMarker(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
 
 	const project = "test-env-gate-precedence"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "coord-" + project,
 		project:         project,
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	runDispatchIgnoringSpawnErr(t, opts)
 
@@ -270,11 +286,15 @@ func TestCoordSpawn_MarkerWriteFailure_Degrades(t *testing.T) {
 	t.Cleanup(func() { writeMarkerFn = prev })
 
 	const project = "test-marker-fail-degrade"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A).
 	opts := &dispatchOpts{
 		taskID:          "coord-" + project,
 		project:         project,
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	// Run + capture stdout to verify the non-fatal warning was emitted.
 	isolateTmuxSocket(t)
@@ -344,11 +364,16 @@ func TestCoordSpawn_MarkerNotWrittenWhenSpawnRefused(t *testing.T) {
 	}
 
 	const project = "test-refused-no-marker"
+	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
+	// recurrence PR-A). Refusal fires before wrapper-swap, but pin the
+	// stub for gate-reorder safety.
 	opts := &dispatchOpts{
 		taskID:          "coord-" + project,
 		project:         project,
 		projectExplicit: true,
 		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
 	}
 	isolateTmuxSocket(t)
 	var out bytes.Buffer

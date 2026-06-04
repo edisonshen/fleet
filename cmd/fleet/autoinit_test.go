@@ -226,7 +226,19 @@ func TestMaybeAutoInit_DispatchHooked(t *testing.T) {
 		t.Fatalf("precondition: main.py must not exist")
 	}
 
-	opts := &dispatchOpts{taskID: "demo", project: "default"}
+	// Stub command + commandExplicit:true so runDispatch's wrapper-swap
+	// (dispatch.go:416-424) does NOT substitute the real
+	// `claude --dangerously-skip-permissions` argv. On a dev host with
+	// both tmux and claude on PATH, the substituted argv forks a real
+	// detached claude that survives `go test` — found procs up to 7
+	// days old in the 2026-05-29 OOM. See
+	// docs/DESIGN-lifecycle-leak-recurrence.md PR-A.
+	opts := &dispatchOpts{
+		taskID:          "demo",
+		project:         "default",
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
 	var out bytes.Buffer
 	// Run dispatch; expect it to fail (no tmux / FLEET_HOME may not be
 	// writable / etc.), but auto-init should run first.

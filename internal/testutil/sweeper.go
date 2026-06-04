@@ -125,3 +125,62 @@ func socketLive(path string) bool {
 	}
 	return true
 }
+
+// SweepAll is the suite-teardown variant of Sweep. Reaps EVERY
+// /tmp/fleet-test-*.sock regardless of freshness AND regardless of
+// whether a tmux server is still bound. Use ONLY from TestMain
+// teardown (after m.Run()) — once `go test` is exiting, a live test
+// socket is by definition an orphan whose owning test process either
+// panicked, called os.Exit, or was killed mid-run.
+//
+// Closes the gap that lets bypassed-t.Cleanup orphans (7-day-old
+// claude/tmux procs in the 2026-05-29 OOM, per
+// docs/DESIGN-lifecycle-leak-recurrence.md PR-A root cause #1) survive.
+// Sweep (with freshness + socketLive guards) is still correct for the
+// SUITE-START sweep where another concurrent `go test` may legitimately
+// own a fresh live socket; SweepAll is intentionally narrower in scope.
+func SweepAll() error {
+	return SweepAllDir("/tmp")
+}
+
+// SweepAllDir is SweepAll with the scan directory injectable for tests.
+// Like SweepDir but bypasses BOTH the freshness window AND the
+// socketLive() guard. For each `fleet-test-*.sock` entry:
+//
+//  1. If a tmux server is still bound to the socket, kill it via
+//     `tmux -S <path> kill-server` (idempotent — exits non-zero with no
+//     server, which we ignore). This stops the leaked claude/tmux
+//     process before the file is unlinked, so we don't strand orphans
+//     after the .sock disappears.
+//  2. Unlink the socket file. ENOENT is success.
+func SweepAllDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("testutil.SweepAllDir read %s: %w", dir, err)
+	}
+	var firstErr error
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "fleet-test-") {
+			continue
+		}
+		if !strings.HasSuffix(name, ".sock") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		// kill-server is idempotent: tmux exits non-zero when no
+		// server is running, which is fine — we only want any bound
+		// server reaped before the socket file is unlinked. Errors
+		// here are best-effort; we proceed to unlink regardless.
+		_ = exec.Command("tmux", "-S", path, "kill-server").Run()
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("testutil.SweepAllDir remove %s: %w", path, err)
+			}
+		}
+	}
+	return firstErr
+}

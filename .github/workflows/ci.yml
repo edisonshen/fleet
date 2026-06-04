@@ -55,6 +55,16 @@ jobs:
         # This guard fails CI when a future PR forgets the isolation.
         run: bash scripts/lint-test-isolation.sh
 
+      - name: Test isolation lint — regression fixtures
+        # Codex review iter-2 [P2] (2026-06-04, fleet#165 PR-A): the
+        # shell-fixture regression suite for scripts/lint-test-isolation.sh
+        # was not exercised by CI before this step. Python pytest skips
+        # *.sh files, so the lint scanner could silently regress as long
+        # as the current repo happens to lint clean. This step pins both
+        # the test-isolation marker contract AND the empty-command
+        # dispatchOpts guard against future awk/regex drift.
+        run: bash scripts/tests/test_lint_test_isolation.sh
+
       - name: Pre-test leak sentinel
         # fleet#165 PR-B (per feedback_fleet_owns_its_resources.md): a
         # green CI run with /tmp/fleet-test-* debris left over is NOT a
