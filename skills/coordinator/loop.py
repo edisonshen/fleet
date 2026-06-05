@@ -1147,21 +1147,67 @@ def _tick_locked(
     # PR2 adds auto-rebase/fix dispatch + §6 action leases; PR1 watches +
     # surfaces + reconciles-on-merge only. Fail-soft: any exception is
     # logged to result.errors, never wedges the tick.
+    #
+    # BOUNDARY with the legacy CI/mergeability reconcile (codex iter-13 [P1]
+    # — intentional, not a missed dispatch): the legacy `_reconcile_inflight`
+    # + pr_url/`_gh_pr_checks` path above OWNS the post-worker-EXIT
+    # remediation — when an in-review worker has exited and its PR is CI-red
+    # or not-mergeable, it requeues a FRESH worker (clearing pr_url). By the
+    # time PR-watch runs (on the re-read tasks below), that task has NO live
+    # pr_url, so PR-watch's `live_pr_backed` gate (iter-7) deliberately does
+    # NOT also dispatch a competing fix — exactly one remediation per PR, no
+    # double-work on the same branch. PR-watch's NET-NEW, non-overlapping
+    # value is the cases the legacy path can't see: a PR STALE under strict
+    # branch protection (CI green + no conflict, but head missing the fresh
+    # base — auto-rebase), CHANGES_REQUESTED review state, and CI failures on
+    # a PR whose task is STILL live-pr-backed (worker alive / a re-run failed
+    # after the legacy path already settled the task in-review).
     # Enrollment must see PRE-reconcile pr_urls: the legacy
     # _reconcile_inflight path can CLEAR a red-CI task's pr_url + requeue
     # it earlier this tick (and tasks.md was re-read since), so a fresh
     # rollout with no pr-watches.json yet would otherwise never enroll
     # that PR (codex iter-7 [P2]). We pass the pre-reconcile task
-    # snapshots for enrollment; refresh/probe/terminal still use the
-    # current `f.tasks`.
+    # snapshots for enrollment.
+    #
+    # refresh/probe/terminal/AUTO-FIX must see the POST-DISPATCH task state
+    # (codex iter-5 [P1]): _dispatch_ready above just mutated tasks.md (a
+    # CI-red requeue clears pr_url + flips a slug to in-progress under a NEW
+    # worker). The pre-dispatch `f.tasks` would still show the stale todo +
+    # the OLD pr_url, letting the old PR's watch treat the active retry as
+    # its backing task — so a merge of the OLD PR could flip the live retry
+    # `done`/clear its worker, or a red old PR could launch a parallel fix
+    # subagent. Re-read tasks.md here so reconcile/dispatch key on current
+    # rows; fail-soft (a re-read error falls back to the pre-dispatch parse,
+    # which is still a valid reconcile input).
+    try:
+        watch_tasks = parse.read(str(tasks_path)).tasks
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(f"pr-watch tasks re-read: {exc}")
+        watch_tasks = f.tasks
+    _n_blocks_before_pr_watch = len(result.dispatch_instructions)
+    _n_raised_before_pr_watch = result.raised
     try:
         _reconcile_pr_watches(
-            f.tasks, project=project, project_dir=project_dir,
+            watch_tasks, project=project, project_dir=project_dir,
             cwd=cwd, fleet_bin=fleet_bin, state=state, result=result,
+            home=home,
             enroll_tasks=list(pre_reconcile_tasks_by_slug.values()),
         )
     except Exception as exc:  # noqa: BLE001 — watch reconcile must never wedge a tick
         result.errors.append(f"pr-watch reconcile: {exc}")
+    # Did the initial PR-watch pass STAGE a DISPATCH block OR RAISE an
+    # operator-actionable event? If so we must NOT enter the long-running
+    # supervisor (codex iter-18 [P1] / iter-28 [P2]) — it would hold the lock
+    # for the whole session while the block/alert sits unprinted (a staged
+    # block's lease stays `running` with no Agent launched; a raise — closed-
+    # unmerged / orphan / blocked / ambiguous-rebase — is exactly the alert
+    # PR-watch exists to surface). main() prints both the moment tick()
+    # returns, so skipping the supervisor flushes them immediately; the next
+    # tick re-enters the supervisor.
+    _pr_watch_staged_dispatch = (
+        len(result.dispatch_instructions) > _n_blocks_before_pr_watch
+        or result.raised > _n_raised_before_pr_watch
+    )
 
     # 5.7. Worktree-GC backstop (DESIGN-coord-worktree-lifecycle §4.4).
     # The reconcile/sentinel reaping path (§4.1-4.3) handles trees on the
@@ -1186,7 +1232,7 @@ def _tick_locked(
     # single-tick behavior is preserved when poll_interval=0 (or no
     # in-flight tasks) — the supervisor returns immediately.
     sup_cfg = supervisor_mod.SupervisorConfig.from_env()
-    if sup_cfg.poll_interval_s > 0:
+    if sup_cfg.poll_interval_s > 0 and not _pr_watch_staged_dispatch:
         _run_supervisor(
             cfg=sup_cfg,
             project=project,
@@ -1535,8 +1581,10 @@ def _run_supervisor(
         if _reconcile_slugs([probe.slug]):
             _maybe_dispatch_after_reconcile()
 
-    def periodic_full_reconcile():
+    def periodic_full_reconcile() -> bool:
         """Re-reconcile EVERY in-flight task (not just mtime-changed ones).
+        Returns True if it STAGED any DISPATCH block (PR-watch auto-fix), so
+        the supervisor can exit + flush them to the coord (codex iter-17).
 
         codex iter-1 [P1] regress: in-review tasks have no live worker,
         so their state.json mtime never advances and the mtime-driven
@@ -1550,15 +1598,75 @@ def _run_supervisor(
         try:
             f3 = parse.read(str(tasks_path))
         except Exception:
-            return
+            return False
         slugs = [
             t.slug for t in f3.tasks
             if t.status in ("in-progress", "in-review")
         ]
-        if not slugs:
-            return
-        if _reconcile_slugs(slugs):
+        # ORDER MATTERS (codex iter-21 [P1]): run the LEGACY reconcile FIRST
+        # — exactly as the primary tick does (_reconcile_inflight/CI before
+        # _reconcile_pr_watches). The legacy path owns post-worker-exit
+        # CI-red/not-mergeable remediation: it clears pr_url + requeues. If
+        # PR-watch ran FIRST it would see the still-present pr_url + stage a
+        # competing fix/rebase, and then the legacy `_reconcile_slugs` below
+        # would requeue the SAME task — two agents on one branch. Running
+        # legacy first (then re-reading for PR-watch) means PR-watch sees the
+        # cleared pr_url and its live_pr_backed gate skips it (iter-7/13).
+        if slugs and _reconcile_slugs(slugs):
             _maybe_dispatch_after_reconcile()
+
+        # Durable PR-watch on the SUPERVISOR's cadence (codex iter-16 [P1]):
+        # the supervisor holds the coord lock for the whole session (up to
+        # 4h), so external ticks return lock-busy and _tick_locked's one-shot
+        # PR-watch never re-runs. Without this, a PR that merges / goes stale
+        # / gets changes-requested while the supervisor parks on in-review
+        # work goes untracked + un-auto-fixed until the supervisor exits. We
+        # re-read tasks.md AFTER the legacy reconcile above (it may have just
+        # cleared a red PR's pr_url) and run the SAME reconcile the primary
+        # tick runs. Fail-soft.
+        n_blocks_before = len(result.dispatch_instructions)
+        n_raised_before = result.raised
+        try:
+            f_pw = parse.read(str(tasks_path))
+            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]).
+            # PR-watch's budgets (probe backoff, launch grace, unverified
+            # stale reclaim) all age by tick_count. During a long supervisor
+            # session external ticks are lock-busy, so a snapshot read of
+            # coord-state would keep passing the SAME tick_count and those
+            # timers would never reach threshold until the supervisor exits.
+            # Bump + persist the counter each periodic pass so the timers
+            # advance monotonically (the supervisor runs this on the
+            # stuck-check cadence — a real elapsed-time proxy).
+            cs_pw = _load_coord_state(state_path)
+            _bump_tick_counter(cs_pw)
+            _save_coord_state(state_path, cs_pw)
+            _reconcile_pr_watches(
+                f_pw.tasks, project=project, project_dir=project_dir,
+                cwd=cwd, fleet_bin=fleet_bin,
+                state=cs_pw, result=result, home=home,
+                # PRE-reconcile snapshot for ENROLLMENT (codex iter-23 [P1]):
+                # the legacy _reconcile_slugs above may have just cleared a
+                # newly-opened PR's pr_url (CI-red/not-mergeable). Mirroring
+                # the primary tick, enroll from the pre-clear `f3.tasks` so a
+                # PR opened mid-supervisor-session still gets a durable watch
+                # created (refresh/probe/auto-fix use the post-clear f_pw).
+                enroll_tasks=f3.tasks,
+            )
+        except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
+            result.errors.append(f"supervisor pr-watch reconcile: {exc}")
+        # Signal the supervisor to exit + flush if PR-watch staged a DISPATCH
+        # block (codex iter-17 [P1]) OR raised an operator-actionable event
+        # (codex iter-28 [P2]: closed-unmerged / orphan / blocked / ambiguous
+        # rebase). Both must reach the coord promptly — a staged block's lease
+        # is running with no Agent launched, and a raise is the alert PR-watch
+        # exists to surface; holding either until the session ends defeats the
+        # feature. main() prints result.dispatch_instructions + result.errors
+        # the moment tick() returns.
+        pr_watch_dispatched = (
+            len(result.dispatch_instructions) > n_blocks_before
+            or result.raised > n_raised_before
+        )
+        return pr_watch_dispatched
 
     def write_state_hook():
         # Heartbeat publish. Re-load → no-op-write so any concurrent
@@ -4064,6 +4172,43 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _read_agent_record(agent_id: str, *, home: Path | None = None) -> dict | None:
+    """Load ~/.fleet/agents/<id>.json (the fleet-guard-written agent
+    record), or None on any read/parse failure. Used by the PR-watch
+    auto-fix lease to resolve a dispatched subagent's liveness (`pid`) +
+    blocked state (`blocked`). Never raises."""
+    if not agent_id:
+        return None
+    base = home if home is not None else _resolve_home(None)
+    try:
+        with open(base / "agents" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _pr_watch_journal_state(agent_id: str, *, home: Path | None = None) -> str:
+    """Read the dispatch journal exec_state for a PR-watch agent_id
+    (~/.fleet/dispatches/<id>.json), or "" if absent/unreadable. The
+    journal is the coord's OWN durable launch signal — a PR-watch Agent-
+    tool subagent (register: false) writes no Fleet agent record + exposes
+    no pid, so its lease liveness falls back to whether the coord recorded
+    the launch here (pending/launch_attempted/acked => in flight). Never
+    raises."""
+    if not agent_id:
+        return ""
+    base = home if home is not None else _resolve_home(None)
+    try:
+        with open(base / "dispatches" / f"{agent_id}.json", "r", encoding="utf-8") as fh:
+            j = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(j, dict):
+        return ""
+    return str(j.get("exec_state", "") or "")
+
+
 @dataclass
 class _CIResult:
     all_green: bool = False
@@ -5361,10 +5506,11 @@ def _reconcile_pr_watches(
     fleet_bin: str,
     state: dict,
     result,
+    home: Path | None = None,
     enroll_tasks: list[parse.Task] | None = None,
 ) -> None:
     """Drive one PR-watch reconcile pass (DESIGN-coord-pr-watch-durable,
-    PR1). Hooks the pr_watch module into the tick:
+    PR1 tracking + PR2 auto-fix). Hooks the pr_watch module into the tick:
 
       - coord-own-repo for the coord-scope assert is derived from the
         repo's git remote (meta.json repo_path preferred over cwd — the
@@ -5431,6 +5577,186 @@ def _reconcile_pr_watches(
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "worker_pid=0"])
         _run_fleet([fleet_bin, "tasks", "set", "--project", project, slug, "status=done"])
 
+    # --- PR2 auto-fix seam (DESIGN §5.1c / §6). Three injected callbacks
+    # keep pr_watch shell-free: it decides WHAT to dispatch + owns the
+    # crash-safe lease; loop.py owns HOW (mint id, write inbox, emit the
+    # DISPATCH block) + reads the subagent's agent record for the lease
+    # outcome. The fleet-home for inbox + agent-record reads:
+    fhome = (str(home) if home else None) or os.environ.get("FLEET_HOME")
+    # Standards are fetched LAZILY (only on the first actual dispatch) so a
+    # quiescent PR-watch tick issues no extra `fleet standards` shell-out.
+    _standards_cache: dict[str, str] = {}
+
+    def _standards() -> str:
+        if "v" not in _standards_cache:
+            _standards_cache["v"] = dispatch_mod.fetch_standards(project, fleet_bin=fleet_bin)
+        return _standards_cache["v"]
+
+    # Build the set of DONE task slugs ONCE for the §5.1b deps gate. Keyed
+    # on status == "done" ONLY (codex iter-23 [P2]) — NOT the broader
+    # TERMINAL_TASK_STATUSES ({done, abandoned}): an ABANDONED dependency is
+    # NOT satisfied work, so a stale upstack PR must not auto-rebase over an
+    # abandoned downstack dep. Matches the worker-dispatch dependency
+    # semantics (only `done` unblocks).
+    done_slugs = {
+        t.slug for t in tasks
+        if t.slug and t.status == "done"
+    }
+
+    def _deps_done(deps: list) -> bool:
+        # Every listed dependency must be PRESENT in tasks.md AND status ==
+        # "done" — EXACTLY matching the worker-dispatch _deps_satisfied gate
+        # (codex iter-30 [P2]). A dep MISSING from tasks.md is NOT treated as
+        # done: it may have been ABANDONED then archived out, which is not
+        # satisfied work, so auto-rebasing over it would be wrong (and would
+        # diverge from worker dispatch, which refuses a missing dep).
+        for d in deps:
+            if d not in done_slugs:
+                return False
+        return True
+
+    def _agent_outcome(agent_id: str) -> str:
+        # Resolve a dispatched PR-watch subagent's lease outcome (§6).
+        # Never raises. Returns "blocked" | "running" | "gone".
+        #
+        # PR-watch fixers/rebasers are Agent-tool subagents launched with
+        # `register: false`; they do NOT reliably write a Fleet agent record
+        # (~/.fleet/agents/<id>.json — that's fleet-guard's tmux-session
+        # artifact) and expose no pid. So a MISSING agent record does NOT
+        # mean dead (codex iter-19 [P1]) — treating it as "gone" would
+        # reclaim a live fixer after the launch grace + double-dispatch onto
+        # its branch. The DURABLE "was launched / still in flight" signal the
+        # COORD itself writes is the dispatch JOURNAL exec_state:
+        #   - agent record present + blocked flag   -> "blocked"
+        #   - agent record present + pid alive        -> "running"
+        #   - journal pending/launch_attempted/acked  -> "running" (launched,
+        #     no terminal/death signal — Agent subagents can't be probed for
+        #     liveness, so we hold the lease; HEAD-MOVE resolves it on
+        #     success, the prompt's BLOCKED contract resolves a guard abort)
+        #   - journal genuinely absent / terminal-failed, AND no live record
+        #     -> "gone" (never launched / launch failed -> reclaim+retry)
+        if not agent_id:
+            return "gone"
+        rec = _read_agent_record(agent_id, home=home)
+        if isinstance(rec, dict):
+            if rec.get("blocked"):
+                return "blocked"
+            try:
+                pid = int(rec.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid > 0:
+                # The agent WROTE a record with a real pid — a DEFINITIVE
+                # liveness signal. Alive -> running; dead -> "gone" (codex
+                # iter-25 [P2]): a recorded-then-crashed fixer must reclaim
+                # after the normal launch grace, NOT be held for the long
+                # unverified stale bound. Do NOT fall through to the journal
+                # (which would mask the dead pid as running-unverified).
+                return "running" if _pid_alive(pid) else "gone"
+        # No agent record with a usable pid -> fall back to the journal (the
+        # coord's own
+        # durable launch signal). A launched/in-flight journal means the
+        # Agent was dispatched even without a Fleet agent record — but we
+        # CAN'T confirm it's still alive (Agent subagents expose no pid), so
+        # report "running-unverified": pr_watch suppresses re-dispatch like
+        # `running`, but a GENEROUS stale bound CAN reclaim it (codex iter-20
+        # [P1]) — distinguishing a working fixer (head will move / it'll
+        # BLOCK) from a launch that never started (broken stdout / crash
+        # after mark-launch-attempted, journal stuck launch_attempted with no
+        # agent forever). `acked` means register ran (a real worker) -> trust
+        # running.
+        jstate = _pr_watch_journal_state(agent_id, home=home)
+        if jstate == "acked":
+            return "running"
+        if jstate == "launch_attempted":
+            # The coord COMMITTED to launching (mark-launch-attempted ran)
+            # but we can't confirm the Agent is alive -> unverified (held
+            # with a stale bound). This is the "launched, no pid" case.
+            return "running-unverified"
+        # `pending` = inbox acquired but mark-launch-attempted has NOT run,
+        # so NO Agent was launched yet (codex iter-22 [P1]). A crash / broken
+        # stdout in that window leaves a replayable journal; treating it as
+        # running-unverified would suppress re-dispatch for the whole stale
+        # bound. Report "gone" so the lease is reclaimed promptly (subject to
+        # the launch grace) and the action re-dispatches.
+        return "gone"
+
+    def _dispatch_action(action) -> str:
+        # Mint an agent_id, render the rebase/fix prompt, acquire the
+        # coord_prompt_inbox CLAIM (which creates the dispatch JOURNAL the
+        # coord's `mark-launch-attempted` gate predicates on — codex
+        # round-1 [P1]: a raw inbox write skips the journal, so the gate
+        # would predicate_fail and the coord would never launch the fixer),
+        # then emit the DISPATCH block (the launch boundary). The §6 lease
+        # was already persisted (running) BEFORE this call by pr_watch — so
+        # a crash after the emit is recovered by the next tick's lease
+        # reclaim (dead agent -> re-dispatch), NOT by the worker replay path
+        # (a PR-watch owner is not in worker_agent_ids, so replay correctly
+        # skips it). The journal exists only to satisfy the launch gate.
+        # Returns the agent_id on a successful acquire+emit, "" on failure
+        # (-> the lease is marked failed_launch and retried next tick).
+        #
+        # The DISPATCH block is STAGED locally (not appended to
+        # result.dispatch_instructions here) and only flushed AFTER
+        # reconcile_watches returns — i.e. after the watch doc + its leases
+        # are durably persisted (codex iter-3 [P2]). If persist_watches
+        # fails, reconcile_watches raises, the staged blocks are dropped,
+        # and NO launchable block reaches the coord without a saved lease —
+        # so a persist failure can't launch a second fixer next tick.
+        try:
+            agent_id = dispatch_mod.mint_agent_id()
+            label = f"pr-{action.kind}-{action.pr_number}"
+            if action.kind == pr_watch_mod.ACTION_REBASE:
+                prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
+            else:
+                prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
+            # acquire-prompt mints the journal at ExecPending gen 0 and
+            # writes the inbox atomically; the DISPATCH block carries gen 0
+            # so `mark-launch-attempted <id> 0` returns ok.
+            prompt_file = dispatch_mod.acquire_coord_prompt_inbox(
+                agent_id, prompt,
+                owner=f"project/{project}/slug/{label}",
+                dispatch_kind=f"pr-{action.kind}",
+                fleet_bin=fleet_bin, fleet_home=fhome,
+            )
+            block = dispatch_mod.format_dispatch_instruction(
+                agent_id=agent_id, slug=label, prompt_file=prompt_file,
+                description=f"fleet PR-watch {action.kind} for #{action.pr_number}",
+                generation=0, register=False,
+            )
+            staged_blocks.append(block)
+            return agent_id
+        except Exception as exc:  # noqa: BLE001 — a failed emit -> failed_launch
+            result.errors.append(
+                f"pr-watch: emit {action.kind} for #{action.pr_number}: {exc}"
+            )
+            return ""
+
+    def _release_action(agent_id: str) -> None:
+        # Release a resolved PR-watch dispatch's journal + inbox (codex
+        # iter-6 [P2]). A PR-watch journal (kind pr-*) is invisible to the
+        # worker register_subagent / terminal-release paths (no
+        # worker_agent_ids entry, skipped by _iter_project_journals), so the
+        # §6 lease resolution is the ONLY place that can reap it — fleet owns
+        # the lifecycle of what it creates. release_coord_prompt_inbox never
+        # raises; SURFACE a non-success outcome to result.errors (codex
+        # iter-26 [P3]) so a transient `error`/failure is operator-visible
+        # rather than a silent journal/inbox leak (the lease is already
+        # cleared by the time we get here, so this is the only signal). The
+        # next PR-watch dispatch's acquire reuses a distinct fresh agent_id,
+        # so a leftover file is a bounded artifact, not a correctness bug —
+        # `fleet gc` is the durable sweep for any that slip through.
+        resp = dispatch_mod.release_coord_prompt_inbox(
+            agent_id, fleet_bin=fleet_bin, fleet_home=fhome,
+        )
+        oc = (resp or {}).get("outcome", "") if isinstance(resp, dict) else ""
+        if oc not in ("released", "already_released", "absent"):
+            result.errors.append(
+                f"pr-watch: release of journal/inbox for {agent_id} returned "
+                f"{oc or 'unknown'!r} — may leak; reap with `fleet gc`"
+            )
+
+    staged_blocks: list[str] = []
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
         project=project,
@@ -5442,7 +5768,19 @@ def _reconcile_pr_watches(
         tick_count=tick_count,
         repo_path=repo_path,
         enroll_tasks=enroll_tasks,
+        dispatch_action=_dispatch_action,
+        agent_outcome=_agent_outcome,
+        deps_done=_deps_done,
+        release_action=_release_action,
     )
+
+    # reconcile_watches returned WITHOUT raising -> the watch doc (incl. the
+    # running leases for these dispatches) is durably persisted. Only NOW
+    # flush the staged DISPATCH blocks to the coord (codex iter-3 [P2]) +
+    # count them in the tick result (codex iter-3 [P2] — consumers read
+    # result.dispatched / dispatch_instructions; they were 0 before).
+    result.dispatch_instructions.extend(staged_blocks)
+    result.dispatched += outcome.dispatched
 
     # Surface raise-hand events as operator-visible errors + count them as
     # raises (feedback_surface_dont_silo — never silently auto-recover).
@@ -5701,6 +6039,17 @@ def _iter_project_journals(
             continue
         owner = j.get("owner", "")
         if not isinstance(owner, str) or not owner.startswith(owner_prefix):
+            continue
+        # PR-watch auto-fix dispatches (kind pr-rebase / pr-fix) are NOT
+        # worker dispatches — they have no tasks.md slug, are absent from
+        # worker_agent_ids, and have no workers/<slug>/state.json. Their
+        # durability is the §6 lease in pr-watches.json (reclaim re-
+        # dispatches a dead lease), NOT this worker replay/residual-crash
+        # path. Including them here would (a) never replay (not in
+        # worker_agent_ids) and (b) after the ack grace, fire a FALSE
+        # phantom-crash escalation against a live PR-watch subagent (codex
+        # iter-4 [P2]). Skip them entirely.
+        if str(j.get("kind", "") or "").startswith("pr-"):
             continue
         slug = owner[len(owner_prefix):]
         slug = slug[len("slug/"):] if slug.startswith("slug/") else slug

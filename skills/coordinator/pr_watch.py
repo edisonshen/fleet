@@ -116,6 +116,336 @@ _ACTIONABLE_EVENTS = frozenset({
     EVENT_CHANGES_REQUESTED,
 })
 
+# Events that are remedied by a REBASE (auto-rebase the uniquely-eligible
+# next-to-merge PR, §5.1b/c). STALE = head missing fresh base under strict
+# protection; BEHIND/DIRTY = GitHub's stale/conflict words. All three mean
+# "the head must contain a fresher base"; the rebase subagent resolves it.
+_REBASE_EVENTS = frozenset({EVENT_STALE, EVENT_BEHIND, EVENT_DIRTY})
+# Events remedied by a FIX subagent (re-run/repair CI, apply review fixes).
+_FIX_EVENTS = frozenset({EVENT_CI_FAILED, EVENT_CHANGES_REQUESTED})
+
+
+# ----------------------------------------------------------------------
+# §6 crash-safe action leases — outcome, not boolean
+# ----------------------------------------------------------------------
+#
+# A naive "dispatch then persist a flag" is NOT crash-safe (design §6): a
+# crash after launching but before persisting wedges/duplicates, and an
+# existence-only flag suppresses a NEEDED retry forever if the fixer dies
+# before pushing. So an action is a LEASE with an OUTCOME persisted into
+# the watch's `inflight_action`, and the lease key + agent_id are written
+# BEFORE any launchable DISPATCH block is emitted (commit-then-emit, the
+# same ordering the merged dispatch chokepoint enforces for workers).
+#
+#   planned -> prompt_acquired -> launch_emitted -> running
+#                                                      |
+#                          terminal{succeeded@<head> | blocked | failed_launch}
+#
+# Suppression is by OUTCOME (not existence):
+#   running   + agent alive  -> suppress (someone's on it)
+#   succeeded@<current-head>  -> suppress (already handled THIS head)
+#   failed_launch             -> RETRY (it never actually ran)
+#   blocked                   -> raise-hand; require operator ack (one
+#                                attempt per <headSHA,baseSHA>); no silent
+#                                re-fire
+# Reclaim (every tick): a `running` lease whose agent_id is provably dead
+# (dead pid / missing agent record) is cleared -> eligible to re-dispatch
+# (closes the "fixer died silently -> PR unwatched-for-action forever"
+# hole). LIVENESS, not age, is the reclaim authority — a provably-alive
+# agent is NEVER force-expired (codex iter-11 [P1]: a long-running
+# fixer/rebaser must not get a second agent into its branch).
+# `dispatched_events` keys whose head-SHA != current head are pruned on
+# each persist so the file stays bounded.
+
+ACTION_REBASE = "rebase"
+ACTION_FIX = "fix"
+
+OUTCOME_RUNNING = "running"
+OUTCOME_BLOCKED = "blocked"
+OUTCOME_FAILED_LAUNCH = "failed_launch"
+# Reported by the tick's agent_outcome callback (not a persisted lease
+# outcome): the journal says the Agent was launched but no live agent record
+# confirms liveness (Agent-tool subagents expose no pid). Suppress like
+# running, but reclaimable past a generous stale bound (§6 / codex iter-20).
+OUTCOME_RUNNING_UNVERIFIED = "running-unverified"
+_OUTCOME_SUCCEEDED_PREFIX = "succeeded@"
+
+# Reference "long-lived lease" tick magnitude. NOTE (codex iter-11 [P1]):
+# liveness — NOT age — is the lease-reclaim authority. A lease is reclaimed
+# only when its agent is provably GONE (dead pid / missing record); a
+# provably-ALIVE agent is never force-expired on age, because a legitimate
+# fixer/rebaser (gates + multi-round review) can run longer than any age
+# budget and force-expiring it would launch a SECOND agent into the same
+# branch. This constant is retained for the persisted `leased_tick`
+# bookkeeping + as a test magnitude, not as a reclaim trigger.
+_LEASE_EXPIRY_TICKS = 12
+
+# Startup grace (codex iter-12 [P1]): a just-launched subagent may not have
+# written its agent record (~/.fleet/agents/<id>.json) yet, so the very next
+# tick's liveness probe reads "gone". Within this many ticks of `leased_tick`
+# a gone/missing record is treated as STILL PENDING (not reclaimed), so the
+# normal async launch window can't trigger a duplicate dispatch into the same
+# branch. After the grace, a still-gone agent is genuinely dead -> reclaimed.
+_LEASE_LAUNCH_GRACE_TICKS = 3
+
+# Generous stale bound for an UNVERIFIED-running lease (codex iter-20 [P1]):
+# a PR-watch Agent-tool subagent whose journal says launched but that wrote
+# no Fleet agent record (so liveness is unprovable). A genuinely-working
+# fixer/rebaser moves the head (push) or sets BLOCKED well before this; a
+# launch that never started (broken stdout / crash after
+# mark-launch-attempted) would otherwise wedge the lease forever. So past
+# this many ticks with NO head move + still no agent record, reclaim +
+# retry. Much larger than the launch grace (real work takes many polls:
+# fetch + rebase + full gates + multi-round review), small enough to not
+# strand a PR for an unbounded time. Tick-budget (deterministic).
+_LEASE_STALE_LAUNCH_TICKS = 40
+
+
+def _succeeded_outcome(head_sha: str) -> str:
+    return f"{_OUTCOME_SUCCEEDED_PREFIX}{head_sha}"
+
+
+def _succeeded_head(outcome: str) -> str | None:
+    """Return the head SHA a `succeeded@<sha>` outcome was recorded for,
+    or None if `outcome` isn't a succeeded marker."""
+    if isinstance(outcome, str) and outcome.startswith(_OUTCOME_SUCCEEDED_PREFIX):
+        return outcome[len(_OUTCOME_SUCCEEDED_PREFIX):]
+    return None
+
+
+def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "") -> str:
+    """Build the idempotency key for one action lease (§6).
+
+    rebase: `rebase:<baseSHA>:<headSHA>` — one attempt per (base, head)
+            pair, so a fresh base (an upstack merge moved origin/main) or
+            a moved head re-enables a rebase, but the SAME pair never
+            re-fires (the blocked latch is keyed on this).
+    fix:    `fix:<headSHA>:<event>` — keyed on the head + the failing
+            signal, so a NEW push (head change) re-enables a fix, and a
+            DIFFERENT event on the same head (CI-fail vs changes-requested)
+            is its own key.
+    """
+    if kind == ACTION_REBASE:
+        return f"{ACTION_REBASE}:{base_sha}:{head_sha}"
+    return f"{ACTION_FIX}:{head_sha}:{event}"
+
+
+def _prune_dispatched_events(watch: dict, current_head: str) -> None:
+    """Drop `dispatched_events` keys whose head-SHA != the current head
+    (§6 — keep the file bounded). A rebase key embeds the head as its LAST
+    colon-segment; a fix key embeds it as its SECOND segment. We keep a key
+    iff the current head appears in it, so an obsolete head's keys are
+    pruned the moment the head advances."""
+    de = watch.get("dispatched_events")
+    if not isinstance(de, dict) or not current_head:
+        return
+    kept = {}
+    for k, v in de.items():
+        # rebase:<base>:<head>  or  fix:<head>:<event>
+        parts = k.split(":")
+        head_in_key = ""
+        if k.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+            head_in_key = parts[-1]
+        elif k.startswith(ACTION_FIX + ":") and len(parts) >= 2:
+            head_in_key = parts[1]
+        if head_in_key == current_head:
+            kept[k] = v
+    watch["dispatched_events"] = kept
+
+
+def _action_suppressed(
+    watch: dict,
+    *,
+    key: str,
+    current_head: str,
+) -> bool:
+    """Should re-dispatch of `key` be SUPPRESSED this tick? (§6 outcome-
+    based suppression — NOT existence.)
+
+    Called AFTER _reclaim_lease has already resolved (cleared / moved to
+    ledger) any stale `running` lease, so the live `inflight_action` here
+    is either absent or a genuinely-in-flight action. Checks both the live
+    lease and the terminal `dispatched_events` ledger:
+      - running (same key, post-reclaim => alive) -> suppress
+      - succeeded@<current-head>                  -> suppress (handled)
+      - succeeded@<other-head>                    -> NOT suppressed
+      - blocked                                   -> suppress auto-redispatch
+                                                     (caller raises once)
+      - failed_launch / absent                    -> NOT suppressed (retry)
+    """
+    de = watch.get("dispatched_events")
+    if isinstance(de, dict):
+        recorded = de.get(key)
+        if recorded == OUTCOME_BLOCKED:
+            return True
+        sh = _succeeded_head(recorded) if isinstance(recorded, str) else None
+        if sh is not None and sh == current_head:
+            return True
+
+    inflight = watch.get("inflight_action")
+    if not isinstance(inflight, dict) or inflight.get("key") != key:
+        return False
+    outcome = inflight.get("outcome")
+    if outcome == OUTCOME_RUNNING:
+        # reclaim already ran this tick; a surviving running lease on this
+        # key is genuinely in flight -> suppress.
+        return True
+    if outcome == OUTCOME_BLOCKED:
+        return True
+    if outcome == OUTCOME_FAILED_LAUNCH:
+        return False
+    sh = _succeeded_head(outcome) if isinstance(outcome, str) else None
+    if sh is not None:
+        return sh == current_head
+    return False
+
+
+def _lease_head(key: str) -> str:
+    """Extract the head SHA a lease key was minted against (rebase key's
+    last segment, fix key's second segment), or "" if unparseable."""
+    if not isinstance(key, str):
+        return ""
+    parts = key.split(":")
+    if key.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+        return parts[-1]
+    if key.startswith(ACTION_FIX + ":") and len(parts) >= 2:
+        return parts[1]
+    return ""
+
+
+def _reclaim_lease(
+    watch: dict,
+    *,
+    tick_count: int,
+    current_head: str,
+    agent_alive: Callable[[str], bool],
+    agent_outcome: Callable[[str], str],
+) -> tuple[str | None, str | None]:
+    """Resolve the watch's in-flight lease (§6). Clears `inflight_action`
+    so a re-dispatch can re-lease, moving terminal outcomes to the durable
+    `dispatched_events` ledger. Returns (note, raise) — `note` is an
+    informational breadcrumb, `raise` is a once-only operator alert (set
+    when an action BLOCKED).
+
+    Outcome resolution for a `running` lease, in priority order:
+      1. agent reports BLOCKED (agent_outcome == blocked) -> ledger
+         blocked + RAISE (one attempt per <head,base> key; never re-fired).
+      2. HEAD MOVED (lease's target head != current) -> the fixer/rebaser
+         pushed (or a human advanced the head); record succeeded@<oldhead>
+         + free the slot.
+      3. agent DEAD (not alive) and head UNCHANGED and not blocked -> the
+         action died before pushing -> reclaim (clear) so it re-dispatches.
+      4. lease EXPIRED (no liveness signal for too long) -> reclaim.
+      5. otherwise still running -> leave it.
+
+    `agent_outcome(agent_id)` returns "blocked" | "running" | "gone" | ""
+    derived by the tick from the subagent's agent record (blocked flag /
+    record presence). pr_watch never reads the record itself (shell-free).
+    """
+    inflight = watch.get("inflight_action")
+    if not isinstance(inflight, dict):
+        return None, None
+    outcome = inflight.get("outcome")
+    key = str(inflight.get("key", "") or "")
+
+    # Already-terminal lease (set in-line by the dispatch path on a launch
+    # failure) -> move to ledger + free the slot.
+    if outcome != OUTCOME_RUNNING:
+        if outcome and key:
+            de = watch.setdefault("dispatched_events", {})
+            if isinstance(de, dict):
+                de[key] = outcome
+        watch["inflight_action"] = None
+        return None, None
+
+    agent_id = str(inflight.get("agent_id", "") or "")
+    reported = agent_outcome(agent_id) if agent_id else "gone"
+    lease_head = _lease_head(key)
+    head_moved = bool(current_head and lease_head and lease_head != current_head)
+
+    # 1. BLOCKED — the subagent aborted (conflict / guard abort). One
+    # attempt per key: record blocked in the ledger; the dispatch pass's
+    # suppression branch owns the (once-only) raise off the ledger, so we
+    # don't double-raise here.
+    if reported == OUTCOME_BLOCKED and not head_moved:
+        de = watch.setdefault("dispatched_events", {})
+        if isinstance(de, dict):
+            de[key] = OUTCOME_BLOCKED
+        watch["inflight_action"] = None
+        return None, None
+
+    # 1b. AGENT STILL ALIVE -> ALWAYS suppress, even if the head moved
+    # (codex iter-24 [P2]). A head move while the fixer is still alive can
+    # be an EXTERNAL push (human / other automation) — retiring the lease as
+    # succeeded here would let _dispatch_actions launch a SECOND agent into
+    # the same branch checkout the first still owns (both prompts work in
+    # the existing checkout -> they'd race). Wait for the agent to exit; the
+    # head-move-as-success retirement below only fires once it's gone. A
+    # provably-running record (record + pid) is the only case treated as
+    # "definitely still alive" here — running-unverified falls through so
+    # its stale bound can still reclaim a never-started launch.
+    if reported == OUTCOME_RUNNING:
+        return None, None
+
+    # 2. HEAD MOVED (and the agent is NOT provably-alive) -> success: our
+    # fixer pushed + exited, or an external push advanced the head past a
+    # dead/finished agent. Retire the lease succeeded@<oldhead>.
+    if head_moved:
+        de = watch.setdefault("dispatched_events", {})
+        if isinstance(de, dict):
+            de[key] = _succeeded_outcome(lease_head)
+        watch["inflight_action"] = None
+        return f"retired succeeded lease {key!r} (head advanced to {current_head})", None
+
+    # 3. agent gone (dead) + head unchanged + not blocked -> died pre-push.
+    # BUT honor a STARTUP GRACE (codex iter-12 [P1]): a just-launched
+    # subagent may not have written its agent record yet, so the next tick
+    # reads "gone". Within _LEASE_LAUNCH_GRACE_TICKS of leased_tick we treat
+    # gone/missing as STILL PENDING (not reclaimed) so the async launch
+    # window can't double-dispatch into the same branch. After the grace, a
+    # still-gone agent is genuinely dead -> reclaimed.
+    if reported == "gone" or not agent_alive(agent_id):
+        leased_tick = inflight.get("leased_tick")
+        within_grace = (
+            isinstance(leased_tick, int)
+            and tick_count - leased_tick < _LEASE_LAUNCH_GRACE_TICKS
+        )
+        if within_grace:
+            return None, None  # pending startup; keep the lease, suppress
+        watch["inflight_action"] = None
+        return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
+
+    # 3b. UNVERIFIED-running (codex iter-20 [P1]): the journal says the Agent
+    # was launched but there's no live agent record to confirm it's alive
+    # (Agent subagents expose no pid). Suppress re-dispatch like `running`,
+    # but reclaim if the head HASN'T moved after a GENEROUS stale bound — a
+    # working fixer would have pushed (head move) / BLOCKED by then, so a
+    # still-stuck launch_attempted with no progress is a launch that never
+    # actually started (broken stdout / crash after mark-launch-attempted).
+    if reported == OUTCOME_RUNNING_UNVERIFIED:
+        leased_tick = inflight.get("leased_tick")
+        stale = (
+            isinstance(leased_tick, int)
+            and tick_count - leased_tick >= _LEASE_STALE_LAUNCH_TICKS
+        )
+        if stale:
+            watch["inflight_action"] = None
+            return (
+                f"reclaimed stale unverified-launch lease {key!r} "
+                f"(no head move + no agent record after {_LEASE_STALE_LAUNCH_TICKS} ticks)"
+            ), None
+        return None, None  # launched, in flight (unverifiable) -> hold
+
+    # 4. The agent is PROVABLY ALIVE and the head hasn't moved -> it is still
+    # working. NEVER expire a live lease on age alone (codex iter-11 [P1]): a
+    # legitimately long-running fixer/rebaser (gates + multi-round review can
+    # exceed a few coord polls) would otherwise get its lease cleared and a
+    # SECOND agent launched into the same branch, racing force-with-lease
+    # pushes. Liveness is the authority; the only age-based reclaim is the
+    # `gone`/dead path above (a lost liveness signal -> reclaim). So a live
+    # lease simply stays running -> suppressed.
+    return None, None
+
 
 # ----------------------------------------------------------------------
 # Probe snapshot + injectable prober seam
@@ -407,6 +737,7 @@ class WatchOutcome:
     probed: int = 0
     pruned: int = 0
     tasks_flipped: int = 0
+    dispatched: int = 0     # PR2 auto-fix actions launched this pass (§5/§6)
     raises: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -434,14 +765,18 @@ def _checks_from_rollup(rollup) -> str:
         # CheckRun uses status+conclusion; StatusContext uses `state`.
         state = str(c.get("state", "") or "").upper()
         if status in ("QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED") \
-                or state == "PENDING" \
+                or state in ("PENDING", "EXPECTED") \
                 or (status == "" and conclusion == "" and state == ""):
+            # state=EXPECTED is a REQUIRED StatusContext that hasn't reported
+            # yet (codex iter-33 [P2]) — pending, NOT success. Without this it
+            # fell through to SUCCESS and could emit a false READY for a PR
+            # whose required check never ran.
             pending = True
         elif conclusion in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
                             "STALE", "STARTUP_FAILURE") \
                 or state in ("FAILURE", "ERROR"):
             failed = True
-        # SUCCESS / NEUTRAL / SKIPPED / EXPECTED == not failing, not pending.
+        # SUCCESS / NEUTRAL / SKIPPED == not failing, not pending.
     if failed:
         return "FAILURE"
     if pending:
@@ -532,8 +867,143 @@ def reduce_snapshot(
 
 
 # ----------------------------------------------------------------------
+# §5.1(b) next-to-merge eligibility — by DEPENDENCY, not PR number
+# ----------------------------------------------------------------------
+
+
+def _watch_head(watch: dict) -> str:
+    snap = watch.get("last_snapshot")
+    if isinstance(snap, dict):
+        return str(snap.get("head_ref_oid", "") or "")
+    return ""
+
+
+def compute_rebase_eligibility(
+    watches: dict,
+    *,
+    deps_done: Callable[[list], bool],
+    base_protected: Callable[[dict], bool],
+    is_ancestor: Callable[[str, str], bool],
+    task_deps: Callable[[str], list],
+    is_candidate: "Callable[[dict], bool] | None" = None,
+) -> tuple[set, bool]:
+    """Resolve which OPEN watches are rebase-eligible (§5.1b). Returns
+    (eligible_pr_numbers, ambiguous).
+
+    PR NUMBER is creation order, not stack order (parallel / backfilled /
+    reopened PRs break it), so eligibility is derived from the BRANCH GRAPH
+    + dependency state, never the number. A watched PR is eligible iff:
+
+      1. all its backing tasks' `depends_on` are done, AND
+      2. its base is the protected branch (`main`), AND
+      3. NO other OPEN watched PR's head is an ancestor of this PR's head
+         (i.e. nothing open sits BENEATH it in the branch graph).
+
+    The caller then fires auto-rebase ONLY when exactly ONE PR is eligible:
+      - zero eligible  -> do nothing (all blocked on an open upstack; a
+                          downstack-stale PR is EXPECTED, not actionable).
+      - one eligible   -> rebase it.
+      - two+ eligible OR ambiguous -> raise-hand, DO NOT guess (returns
+                          `ambiguous=True` when >=2 candidates pass the
+                          per-PR gates so the caller can raise instead of
+                          picking one).
+
+    `is_ancestor(anc, desc)` runs against FRESH refs (the same prober seam
+    the mergeability check uses). An ancestry we can't prove (missing ref,
+    git error) reads False — fail-soft: we never assert a PR sits beneath
+    another off a missing ref, so a transient outage degrades to "treat as
+    independent" (the exactly-one gate then catches a >=2 ambiguity and
+    raises rather than rebasing the wrong one).
+    """
+    # ALL open heads stay in the ancestry GRAPH for gate 3 — including
+    # orphaned ones (codex iter-5 [P2]): an orphaned PR can still be the
+    # UPSTACK base of a backed PR, and a downstack PR with any open PR
+    # beneath it (orphaned or not) is NOT next-to-merge. But only BACKED
+    # watches are eligibility CANDIDATES (orphaned/unbacked watches are
+    # raised-hand, never auto-rebased), so an orphan sitting open alongside
+    # a stale backed PR can't inflate the eligible set to ambiguous and
+    # block the legitimate rebase.
+    open_heads: dict[int, str] = {}      # the full graph (incl. orphans)
+    candidate_nums: set = set()          # dispatchable PRs only
+    for key, w in watches.items():
+        if w.get("state") != STATE_OPEN:
+            continue
+        head = _watch_head(w)
+        if not head:
+            continue
+        try:
+            n = int(w.get("pr_number", key))
+        except (TypeError, ValueError):
+            continue
+        open_heads[n] = head
+        # A candidate must be backed AND DISPATCHABLE. `is_candidate`
+        # (codex iter-9 [P2]) excludes a preserved CI-red-requeued watch
+        # (non-empty tasks[] kept ONLY for old-PR-merge reconcile, but whose
+        # backing task no longer points at this PR) — otherwise such a watch
+        # would inflate the eligible set to ambiguous and spuriously block a
+        # legitimate live PR's auto-rebase, even though the later
+        # live_pr_backed gate would refuse to dispatch it anyway. Default
+        # (no callback) keeps the prior backed-and-not-orphaned predicate.
+        backed = bool(w.get("tasks")) and not w.get("orphaned")
+        if backed and (is_candidate is None or is_candidate(w)):
+            candidate_nums.add(n)
+
+    eligible: set = set()
+    for n in candidate_nums:
+        head = open_heads[n]
+        w = watches.get(str(n))
+        if w is None:
+            continue
+        # gate 1: all backing tasks' deps done.
+        deps: list = []
+        for slug in w.get("tasks") or []:
+            deps.extend(task_deps(slug))
+        if not deps_done(deps):
+            continue
+        # gate 2: base is the protected branch.
+        if not base_protected(w):
+            continue
+        # gate 3: no OTHER open watched head (orphaned or backed) is an
+        # ancestor of this head.
+        beneath = False
+        for m, other_head in open_heads.items():
+            if m == n or other_head == head:
+                continue
+            if is_ancestor(other_head, head):
+                # `other` sits beneath `n` in the graph -> n is downstack of
+                # an open PR -> not next-to-merge.
+                beneath = True
+                break
+        if not beneath:
+            eligible.add(n)
+
+    ambiguous = len(eligible) >= 2
+    return eligible, ambiguous
+
+
+# ----------------------------------------------------------------------
 # The reconcile invariant (§2) — the public entry point for the tick
 # ----------------------------------------------------------------------
+
+
+@dataclass
+class ActionDispatch:
+    """One auto-fix action the tick should launch (§5.1c / §5 / §6). The
+    tick's `dispatch_action` callback consumes this: it mints an agent_id,
+    writes the subagent's inbox prompt, emits the DISPATCH block, and
+    returns the agent_id on a successful PROMPT-acquire+emit (commit the
+    lease BEFORE the launchable block). A failure returns "" (the lease is
+    marked failed_launch -> retried next tick)."""
+
+    kind: str            # ACTION_REBASE | ACTION_FIX
+    event: str           # the EVENT_* that triggered it (carried into the prompt)
+    pr_number: int
+    pr_url: str
+    branch: str
+    base: str
+    head_sha: str        # watch-snapshot head — the rebase guard verifies it's unchanged
+    base_sha: str        # fresh base tip to rebase onto (rebase only)
+    key: str             # the §6 lease key (idempotency)
 
 
 def reconcile_watches(
@@ -549,6 +1019,10 @@ def reconcile_watches(
     slow_cadence_ticks: int = _SLOW_CADENCE_TICKS_DEFAULT,
     repo_path: str = "",
     enroll_tasks: list | None = None,
+    dispatch_action: "Callable[[ActionDispatch], str] | None" = None,
+    agent_outcome: "Callable[[str], str] | None" = None,
+    deps_done: "Callable[[list], bool] | None" = None,
+    release_action: "Callable[[str], None] | None" = None,
 ) -> WatchOutcome:
     """Run one PR-watch reconcile pass. Single writer = the tick (caller
     holds the coord flock). Returns a WatchOutcome the tick funnels into
@@ -570,6 +1044,14 @@ def reconcile_watches(
     flip_task_done: callback the tick supplies (wraps `fleet tasks set
       <slug> status=done`). reconcile_watches never shells out itself —
       the tick owns all CLI mutation (single-seam discipline).
+    dispatch_action / agent_outcome / deps_done: the PR2 (auto-fix) seam.
+      When `dispatch_action` is provided, actionable events drive a §6-
+      leased auto-rebase / fix-subagent dispatch (see _dispatch_actions);
+      when None, the function behaves exactly like PR1 (surface-only).
+      `agent_outcome(agent_id)` returns "blocked"|"running"|"gone"|"" from
+      the subagent's agent record (lease resolution / reclaim);
+      `deps_done(deps)` answers §5.1b dependency-completion. Both default
+      to safe stubs when only some are supplied.
     """
     out = WatchOutcome()
     doc = load_watches(project_dir)
@@ -603,9 +1085,30 @@ def reconcile_watches(
     # slug is dropped (current row is fresher).
     owned = _owned(tasks)
     current_slugs = {getattr(t, "slug", "") for t in owned}
+    # A pre-reconcile row is re-added to enrollment ONLY when its CURRENT
+    # same-slug row is safe to associate with the old PR (codex iter-6 [P1]).
+    # The legacy CI-red path clears a slug's pr_url + requeues it; if
+    # _dispatch_ready then RE-DISPATCHED it, the current row is `in-progress`
+    # with an empty pr_url — an ACTIVE retry doing live work on a NEW branch.
+    # Re-adding the stale pre-reconcile row (old pr_url) would back the OLD
+    # watch with that active retry, so a merge of the OLD PR would flip the
+    # live retry `done`/clear its worker. So we re-add the pre-reconcile row
+    # only when the current row is ABSENT (fully archived) or still an IDLE
+    # `todo` (a requeued-but-not-yet-redispatched retry, safe to close on the
+    # old PR's merge). An `in-progress` current row is an active retry -> NOT
+    # re-added (its new PR, when opened, enrolls a fresh watch).
+    current_by_slug = {getattr(t, "slug", ""): t for t in tasks}
+
+    def _safe_to_preserve(slug: str) -> bool:
+        cur = current_by_slug.get(slug)
+        if cur is None:
+            return True  # archived off the list -> safe to close old PR
+        return getattr(cur, "status", "") == "todo"
+
     enroll_owned = owned + [
         t for t in _owned(enroll_tasks)
         if getattr(t, "slug", "") not in current_slugs
+        and _safe_to_preserve(getattr(t, "slug", ""))
     ]
     # group enroll_owned by (owner_repo, pr_number); coord-scope assert per
     # PR. `in_scope` is every enroll_owned task that PASSES the coord-scope
@@ -737,6 +1240,7 @@ def reconcile_watches(
 
     due_numbers: list[int] = []
     head_oids: list[str] = []
+    foreign_keys: list[str] = []   # persisted watches that fail coord scope
     for key, w in watches.items():
         state = w.get("state")
         # MERGED is truly terminal (irreversible on GitHub) -> never
@@ -763,10 +1267,19 @@ def reconcile_watches(
         # foreign #N and could record/terminate the wrong PR's state.
         parsed = parse_pr_url(w.get("pr_url", ""))
         if parsed is not None and parsed[0] != coord_owner_repo:
+            # DROP a foreign-repo persisted watch (codex iter-14 [P3]):
+            # created on a tick when coord_owner_repo was underivable (None),
+            # it now resolves to a DIFFERENT repo. Enrollment already drops
+            # foreign tasks, so this watch has no legit backing here; an OPEN
+            # foreign watch never reaches terminal/orphan pruning, so it would
+            # otherwise linger forever in pr-watches.json, re-erroring every
+            # tick + defeating the idle early-out. Reap it to match the
+            # enrollment-time coord-scope behavior (fleet owns its state).
             out.errors.append(
-                f"pr-watch: persisted watch {parsed[0]}#{pr_num} is not in this "
-                f"coord's repo {coord_owner_repo!r}; not probing (coord-scope)"
+                f"pr-watch: dropping persisted watch {parsed[0]}#{pr_num} — not in "
+                f"this coord's repo {coord_owner_repo!r} (coord-scope)"
             )
+            foreign_keys.append(key)
             continue
         if not _probe_due(w, tick_count, slow_cadence_ticks):
             continue
@@ -776,30 +1289,61 @@ def reconcile_watches(
         if isinstance(prev_head, str) and prev_head:
             head_oids.append(prev_head)
 
+    # Reap foreign-repo persisted watches (codex iter-14 [P3]) AFTER the
+    # iteration (can't mutate dict during it). pruned++ surfaces the reap.
+    for fk in foreign_keys:
+        if fk in watches:
+            del watches[fk]
+            out.pruned += 1
+
+    pr2_active = dispatch_action is not None
+    last_repo_probe: RepoProbe | None = None
     if due_numbers:
         base_ref = _common_base_ref(watches, due_numbers)
         repo_probe = prober.probe_repo(
             repo_path, coord_owner_repo, base_ref, sorted(set(due_numbers)),
             sorted(set(head_oids)),
         )
+        last_repo_probe = repo_probe
         _apply_probe(
             watches, due_numbers, repo_probe, prober, repo_path,
             now_iso=now_iso, tick_count=tick_count, out=out,
+            pr2_active=pr2_active,
+        )
+
+    # --- 4.6. AUTO-FIX dispatch (§5.1b/c + §6) — only when the PR2 seam is
+    # wired (dispatch_action provided). Reclaim stale leases, derive the
+    # uniquely-eligible next-to-merge PR for rebases, and dispatch ONE
+    # action per watch under the §6 outcome-suppression lease. When the
+    # seam is absent we behave exactly like PR1 (surface-only, above).
+    if pr2_active:
+        _dispatch_actions(
+            watches, tasks=tasks, prober=prober, repo_path=repo_path,
+            repo_probe=last_repo_probe, tick_count=tick_count,
+            dispatch_action=dispatch_action,
+            agent_outcome=agent_outcome or (lambda _aid: "gone"),
+            deps_done=deps_done or (lambda _deps: True),
+            release_action=release_action,
+            now_iso=now_iso, out=out,
         )
 
     # --- 4.5. ORPHAN raise — AFTER the probe (codex iter-17 [P2]) so it
     # reflects the CURRENT PR state. An OPEN watch with no live task that
-    # was PROBED THIS TICK (last_probe_at == now_iso) and is still OPEN is
-    # a genuine orphan: the PR is live but nothing backs it. A watch that
-    # merged/closed this tick is handled by §5 (not orphaned); one we
-    # couldn't probe this tick (transient / coord-scope) is left for a
-    # later tick rather than raised off a stale snapshot.
+    # was SUCCESSFULLY PROBED THIS TICK and is still OPEN is a genuine
+    # orphan: the PR is live but nothing backs it. A watch that merged/closed
+    # this tick is handled by §5 (not orphaned); one we couldn't probe this
+    # tick (transient / coord-scope) is left for a later tick rather than
+    # raised off a stale snapshot. Freshness is keyed on `_probed_ok_tick ==
+    # tick_count` (codex iter-35 [P2]), NOT `_probed_ok_at == now_iso`: two
+    # consecutive reconcile passes can share a wall-clock now_iso (the
+    # supervisor cadence), so a stale successful probe would otherwise
+    # false-orphan a watch on a later pass whose probe was skipped/failed.
     for key, w in watches.items():
         if w.get("state") != STATE_OPEN or w.get("tasks") or w.get("orphaned"):
             continue
         snap = w.get("last_snapshot")
         probed_open_now = (
-            w.get("_probed_ok_at") == now_iso       # SUCCESSFUL probe this tick
+            w.get("_probed_ok_tick") == tick_count  # SUCCESSFUL probe this tick
             and isinstance(snap, dict)
             and (snap.get("pr_state") or "").upper() == "OPEN"
         )
@@ -939,11 +1483,17 @@ def _apply_probe(
     now_iso: str,
     tick_count: int,
     out: WatchOutcome,
+    pr2_active: bool = False,
 ) -> None:
     """Persist each due watch's snapshot + reduce to an event. Fail-soft:
     a whole-repo transient failure (repo_probe.error) skips + RETAINS
     every due watch with a jittered backoff (§3); a per-PR transient
-    failure does the same for just that PR; a definitive 404 raises hand."""
+    failure does the same for just that PR; a definitive 404 raises hand.
+
+    `pr2_active`: when True the auto-fix seam is wired, so an actionable
+    OPEN event is NOT surfaced here as a "PR1 surfaces only" raise — the
+    post-probe _dispatch_actions pass owns it (launching the fixer or
+    raising-hand with the right reason). READY notes still surface."""
     is_anc = lambda a, d: prober.is_ancestor(repo_path, a, d)  # noqa: E731
 
     for n in due_numbers:
@@ -1018,6 +1568,16 @@ def _apply_probe(
         w["_backoff_n"] = 0
         out.probed += 1
 
+        # Refresh the watch's BASE from the PR's actual base ref (codex
+        # iter-2 [P2]). _new_watch defaults base to "main", but a PR can
+        # target a non-main base (stacked at the PR level). The PR2 rebase
+        # path keys _base_protected / base_sha_for / the rebase prompt on
+        # watch["base"], so a stale "main" default would mis-classify a
+        # non-main PR as rebase-eligible and rebase it onto the wrong base.
+        # The probe is the authoritative source of the real base name.
+        if snap.base_ref_name:
+            w["base"] = snap.base_ref_name
+
         head_contains_base = False
         if pr_base_sha and snap.head_ref_oid:
             head_contains_base = is_anc(pr_base_sha, snap.head_ref_oid)
@@ -1038,12 +1598,19 @@ def _apply_probe(
             "up_to_date": head_contains_base,
         }
         w["last_event"] = event
-        # SUCCESSFUL-reduce marker (codex iter-18 [P2]): only set on a real
-        # snapshot reduction, NOT on a transient failure (which still
-        # stamps last_probe_at for backoff bookkeeping). The orphan pass
-        # gates on THIS so a probe outage can't false-orphan a watch whose
-        # PR may have merged/closed during the blip.
+        # SUCCESSFUL-reduce markers (codex iter-18 [P2]): set ONLY on a real
+        # snapshot reduction, NOT on a transient failure (which still stamps
+        # last_probe_at for backoff bookkeeping). `_probed_ok_tick` is the
+        # LOAD-BEARING freshness key — the orphan pass AND the auto-fix
+        # dispatch pass both gate on `_probed_ok_tick == tick_count` so a
+        # probe outage can't false-orphan / mis-dispatch off a stale snapshot
+        # (tick_count is monotonic + deterministic where two consecutive
+        # ticks can share a now_iso — codex iter-6 / iter-35 [P2]).
+        # `_probed_ok_at` is a wall-clock DIAGNOSTIC breadcrumb only (human-
+        # readable "last successful probe" in pr-watches.json, paired with
+        # last_probe_at / last_seen_at); no code gates on it.
         w["_probed_ok_at"] = now_iso
+        w["_probed_ok_tick"] = tick_count
 
         if event == EVENT_MERGED:
             w["state"] = STATE_MERGED
@@ -1067,13 +1634,395 @@ def _apply_probe(
             if event != prev_event:
                 if event == EVENT_READY:
                     out.notes.append(f"pr-watch: #{n} is mergeable (READY)")
-                elif event in _ACTIONABLE_EVENTS:
+                elif event in _ACTIONABLE_EVENTS and not pr2_active:
                     # PR1 SURFACES the actionable event (raise-hand /
-                    # diagnostic). PR2 dispatches the fixer here.
+                    # diagnostic). With the PR2 seam wired, _dispatch_actions
+                    # owns this event (launch the fixer or raise with the
+                    # right reason) — so we do NOT double-surface here.
                     out.raises.append(
                         f"pr-watch: PR #{n} is {event.upper()} and needs a fix "
                         f"(PR1 surfaces only; auto-fix lands in PR2) — {w.get('pr_url', '')}"
                     )
+
+
+def _reclaim_and_release(
+    watch: dict,
+    pr_num: int,
+    *,
+    tick_count: int,
+    current_head: str,
+    agent_outcome: Callable[[str], str],
+    release_action: "Callable[[str], None] | None",
+    out: WatchOutcome,
+) -> None:
+    """Resolve the watch's in-flight lease (§6) AND release its journal +
+    inbox if the lease left `running` this tick (codex iter-6/7 [P2]).
+
+    A PR-watch dispatch journal (kind pr-*) is invisible to the worker
+    register_subagent / terminal-release paths, so the §6 lease resolution
+    is the ONLY place that reaps it — fleet owns the lifecycle of what it
+    creates. Best-effort release: never raises (logged to out.errors)."""
+    prev_inflight = watch.get("inflight_action")
+    prev_agent = ""
+    if isinstance(prev_inflight, dict) and prev_inflight.get("outcome") == OUTCOME_RUNNING:
+        prev_agent = str(prev_inflight.get("agent_id", "") or "")
+    rec_note, _rec_raise = _reclaim_lease(
+        watch, tick_count=tick_count, current_head=current_head,
+        agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
+        agent_outcome=agent_outcome,
+    )
+    if rec_note:
+        out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
+    if prev_agent and watch.get("inflight_action") is None and release_action is not None:
+        try:
+            release_action(prev_agent)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never wedge
+            out.errors.append(f"pr-watch: release {prev_agent}: {exc}")
+
+
+def _dispatch_actions(
+    watches: dict,
+    *,
+    tasks: list,
+    prober: Prober,
+    repo_path: str,
+    repo_probe: "RepoProbe | None",
+    tick_count: int,
+    dispatch_action: Callable[["ActionDispatch"], str],
+    agent_outcome: Callable[[str], str],
+    deps_done: Callable[[list], bool],
+    release_action: "Callable[[str], None] | None",
+    now_iso: str,
+    out: WatchOutcome,
+) -> None:
+    """The PR2 auto-fix pass (§5.1b/c + §6). Runs AFTER probe+reduce, for
+    every OPEN watch whose reduced `last_event` is actionable.
+
+    Per watch, in order:
+      1. RECLAIM a stale lease (dead agent / expiry; terminal -> ledger).
+      2. PRUNE dispatched_events keys whose head != current head (bounded).
+      3. Decide the action from last_event:
+           STALE/BEHIND/DIRTY -> REBASE (only if uniquely eligible §5.1b),
+           CI_FAILED          -> FIX (CI),
+           CHANGES_REQUESTED   -> FIX (review) unless substantive -> raise.
+      4. SUPPRESS by §6 outcome; otherwise lease + dispatch.
+
+    The lease (key + agent_id + outcome=running) is persisted into the
+    watch BEFORE the launchable DISPATCH block is emitted — the callback
+    does the emit, and the tick persists the whole doc at the end of
+    reconcile_watches, so a crash replays (lease present) rather than
+    duplicates. A callback returning "" means the prompt-acquire/emit
+    failed: we mark the lease failed_launch (retried next tick).
+    """
+    is_anc = lambda a, d: prober.is_ancestor(repo_path, a, d)  # noqa: E731
+
+    # slug -> (status, depends_on) for the §5.1b eligibility gates.
+    task_status: dict[str, str] = {}
+    task_deps_map: dict[str, list] = {}
+    for t in tasks:
+        slug = getattr(t, "slug", "")
+        if not slug:
+            continue
+        task_status[slug] = getattr(t, "status", "")
+        task_deps_map[slug] = list(getattr(t, "depends_on", []) or [])
+
+    # PR numbers with a LIVE, CURRENT backing task — i.e. a non-terminal task
+    # whose pr_url STILL points at the PR (codex iter-7 [P2]). A watch's
+    # tasks[] can carry a PRESERVED slug (a CI-red-requeued `todo` row whose
+    # pr_url was cleared) that exists ONLY so an old-PR merge reconciles it —
+    # that row is NOT a dispatchable backer (its retry rides the normal
+    # cap'd worker path, NOT a PR-watch fixer; dispatching here would double-
+    # work the same branch). Auto-fix fires ONLY for a PR that still has a
+    # live PR-pointing task.
+    # Keyed on (owner_repo, pr_number) — NOT the number alone (codex iter-8
+    # [P2]): a FOREIGN-repo task sharing a PR number must not make an owned
+    # watch look dispatchable. The watch's own pr_url owner is matched
+    # against this set below.
+    # `blocked` is NOT terminal (the watch stays — the PR may still merge),
+    # but a coord-blocked task is operator-attention work, so it must NOT be
+    # auto-dispatchable (codex iter-14 [P2]) — matches the worker dispatch /
+    # resume paths that skip blocked tasks. Keep watching, never auto-fix.
+    _NON_DISPATCH_STATUSES = TERMINAL_TASK_STATUSES | {"blocked"}
+    live_pr_backed: set = set()
+    for t in tasks:
+        if getattr(t, "status", "") in _NON_DISPATCH_STATUSES:
+            continue
+        parsed = parse_pr_url(getattr(t, "pr_url", ""))
+        if parsed is not None:
+            live_pr_backed.add(parsed)  # (owner_repo, pr_number)
+
+    def _task_deps(slug: str) -> list:
+        return task_deps_map.get(slug, [])
+
+    def _base_protected(w: dict) -> bool:
+        return (w.get("base") or "main") == "main"
+
+    # §5.1b: derive the rebase-eligible set ONCE for the whole repo so the
+    # exactly-one gate is consistent across all watches this tick.
+    def _is_candidate(w: dict) -> bool:
+        # dispatchable iff the watch's own PR still has a LIVE PR-pointing
+        # task in this repo (same predicate the dispatch gate uses below).
+        p = parse_pr_url(w.get("pr_url", ""))
+        return p is not None and p in live_pr_backed
+
+    eligible, ambiguous = compute_rebase_eligibility(
+        watches,
+        deps_done=deps_done,
+        base_protected=_base_protected,
+        is_ancestor=is_anc,
+        task_deps=_task_deps,
+        is_candidate=_is_candidate,
+    )
+
+    for key in list(watches.keys()):
+        w = watches[key]
+        if w.get("state") != STATE_OPEN:
+            # A watch that went TERMINAL (MERGED / CLOSED) this tick with a
+            # still-`running` lease must release that lease's journal+inbox
+            # BEFORE the §5 prune deletes the watch (codex iter-7 [P3]):
+            # the dispatch loop skips non-OPEN watches, and worker replay
+            # skips pr-* journals, so this is the only reap point — else the
+            # pr-* journal/inbox leaks forever when a PR merges mid-fix.
+            try:
+                pr_num_t = int(w.get("pr_number", key))
+            except (TypeError, ValueError):
+                pr_num_t = 0
+            inflight = w.get("inflight_action")
+            if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
+                agent = str(inflight.get("agent_id", "") or "")
+                w["inflight_action"] = None
+                if agent and release_action is not None:
+                    try:
+                        release_action(agent)
+                    except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                        out.errors.append(f"pr-watch: release {agent}: {exc}")
+            continue
+        # NEVER auto-dispatch on an ORPHANED / unbacked watch (codex iter-3
+        # [P1]). A watch that lost all backing tasks but whose PR is still
+        # open + actionable must NOT have a fixer/rebaser launched against
+        # it — that's work on an unowned PR. The post-probe orphan pass
+        # raises-hand for it; the design is explicit: orphan -> raise-hand,
+        # no auto-rebase/fix. (`orphaned` may not be set yet this tick — the
+        # orphan raise runs after this pass — so we gate on the empty
+        # backing set directly, which is the orphan's defining condition.)
+        if w.get("orphaned") or not w.get("tasks"):
+            # An orphaned/unbacked watch is never DISPATCHED to, but if it
+            # already holds a lease (the backing task went terminal / was
+            # removed WHILE a fixer was in flight), that lease + its pr-*
+            # journal/inbox must still be RESOLVED + released (codex iter-29
+            # [P2]) — worker replay skips pr-* journals, so this is the only
+            # reap point. Resolve the lease (head-moved success / dead-agent
+            # reclaim / release the journal) before skipping dispatch.
+            try:
+                _orphan_pr_num = int(w.get("pr_number", key))
+            except (TypeError, ValueError):
+                _orphan_pr_num = 0
+            if isinstance(w.get("inflight_action"), dict):
+                _reclaim_and_release(
+                    w, _orphan_pr_num, tick_count=tick_count,
+                    current_head=_watch_head(w), agent_outcome=agent_outcome,
+                    release_action=release_action, out=out,
+                )
+            continue
+        # REQUIRE A FRESH PROBE THIS TICK before reclaiming/dispatching
+        # (codex iter-6 [P1]). If the probe was skipped (transient error /
+        # backoff cadence), `last_event` + `head` are from a PRIOR tick — a
+        # fixer that already pushed + exited could be re-dispatched against
+        # the stale CI_FAILED/STALE head, and reclaim would clear its lease
+        # off an unobserved-current head. Acting only on a snapshot we
+        # confirmed THIS tick (`_probed_ok_tick == tick_count`) guarantees
+        # `head` is the live head and the lease's head-moved/dead resolution
+        # is judged against ground truth. A non-probed watch simply waits
+        # for its next successful probe — its lease is preserved untouched.
+        # (tick_count, not now_iso: two consecutive ticks can share a
+        # wall-clock string but never a tick number — codex iter-6 [P1].)
+        if w.get("_probed_ok_tick") != tick_count:
+            continue
+        try:
+            pr_num = int(w.get("pr_number", key))
+        except (TypeError, ValueError):
+            continue
+        # Only auto-fix a PR that still has a LIVE PR-pointing task (codex
+        # iter-7 [P2]) IN THIS COORD'S REPO (codex iter-8 [P2] — match the
+        # watch's own owner/repo, not just the number, so a foreign-repo
+        # task sharing a number can't make the watch look dispatchable). A
+        # watch backed solely by a preserved CI-red-requeued `todo` slug
+        # (pr_url cleared, kept only for old-PR-merge reconcile) is NOT
+        # dispatchable here — its retry rides the normal cap'd worker path.
+        # The lease (if any) is still reclaimed below so a resolved lease's
+        # journal gets released, but no NEW action is dispatched.
+        w_parsed = parse_pr_url(w.get("pr_url", ""))
+        if w_parsed is None or w_parsed not in live_pr_backed:
+            # still reclaim a resolved lease (release its journal) but never
+            # dispatch a fresh action.
+            _reclaim_and_release(
+                w, pr_num, tick_count=tick_count, current_head=_watch_head(w),
+                agent_outcome=agent_outcome, release_action=release_action, out=out,
+            )
+            continue
+        head = _watch_head(w)
+        if not head:
+            continue
+
+        # 1. reclaim/resolve the in-flight lease (blocked / head-moved /
+        # dead agent / expiry; terminal -> ledger) + release a resolved
+        # lease's journal+inbox.
+        _reclaim_and_release(
+            w, pr_num, tick_count=tick_count, current_head=head,
+            agent_outcome=agent_outcome, release_action=release_action, out=out,
+        )
+        # 2. keep the dispatched_events ledger bounded.
+        _prune_dispatched_events(w, head)
+
+        event = w.get("last_event")
+        if event not in _ACTIONABLE_EVENTS:
+            continue
+
+        # 3. decide the action.
+        if event in _REBASE_EVENTS:
+            # rebase only the UNIQUELY-eligible next-to-merge PR (§5.1b).
+            if ambiguous:
+                # 2+ eligible -> never guess; raise-hand once.
+                if event != w.get("_raised_event"):
+                    w["_raised_event"] = event
+                    out.raises.append(
+                        f"pr-watch: PR #{pr_num} is {event.upper()} but rebase "
+                        f"eligibility is AMBIGUOUS (>=2 next-to-merge candidates); "
+                        f"not auto-rebasing — operator must pick — {w.get('pr_url', '')}"
+                    )
+                continue
+            # NON-PROTECTED BASE (codex iter-32 [P2]): a watched PR whose
+            # base isn't the protected branch (e.g. `master`, a release
+            # branch, or a stacked PR-level base) is intentionally NOT
+            # auto-rebased — but it must not vanish silently. PR2 mode
+            # suppressed the PR1 actionable raise in _apply_probe, so SURFACE
+            # it here (once per event) so the operator can rebase it by hand.
+            if not _base_protected(w):
+                if event != w.get("_raised_event"):
+                    w["_raised_event"] = event
+                    out.raises.append(
+                        f"pr-watch: PR #{pr_num} is {event.upper()} but its base "
+                        f"{w.get('base', '?')!r} is not the protected branch; not "
+                        f"auto-rebasing — operator must handle — {w.get('pr_url', '')}"
+                    )
+                continue
+            if pr_num not in eligible:
+                # zero-eligible-for-this-PR: a downstack PR with an open
+                # upstack is EXPECTED-stale, not actionable. Do nothing
+                # (no churn, no raise).
+                continue
+            # The fresh base SHA the probe captured for this PR's base —
+            # the rebase subagent rebases onto exactly this. Empty when
+            # there was no probe this tick (cadence/backoff): we then skip
+            # the rebase dispatch rather than rebase onto an unknown base.
+            base_sha = ""
+            if repo_probe is not None:
+                base_sha = repo_probe.base_sha_for(w.get("base") or "main")
+            if not base_sha:
+                continue
+            kind = ACTION_REBASE
+            key_str = lease_key(kind, event, head_sha=head, base_sha=base_sha)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha=base_sha,
+                key=key_str,
+            )
+        elif event == EVENT_CHANGES_REQUESTED:
+            # CHANGES_REQUESTED: a fix subagent handles typo/style; a
+            # substantive/design change needs operator judgement. We can't
+            # read the review body here (the probe doesn't fetch it), so we
+            # dispatch a fix subagent whose prompt instructs it to apply
+            # mechanical fixes and RAISE (return BLOCKED) on substantive
+            # asks — keeping the "substantive -> raise-hand" guard in the
+            # subagent where the review text is available.
+            kind = ACTION_FIX
+            key_str = lease_key(kind, event, head_sha=head)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha="",
+                key=key_str,
+            )
+        else:  # EVENT_CI_FAILED
+            kind = ACTION_FIX
+            key_str = lease_key(kind, event, head_sha=head)
+            action = ActionDispatch(
+                kind=kind, event=event, pr_number=pr_num,
+                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                base=w.get("base") or "main", head_sha=head, base_sha="",
+                key=key_str,
+            )
+
+        # 4a. ONE in-flight action per watch (codex iter-2 [P1]). A live
+        # `running` lease — for ANY key, not just this event's — means a
+        # subagent is already operating on this PR's branch. If the
+        # actionable signal CHANGED while it ran (CI_FAILED -> STALE, or
+        # CI_FAILED -> CHANGES_REQUESTED on the same head), per-key
+        # suppression would miss it and overwrite the live lease, putting a
+        # SECOND agent on the same branch concurrently. Reclaim already ran
+        # this tick (dead / head-moved / blocked leases are cleared), so a
+        # surviving `running` lease is genuinely in flight -> suppress all
+        # dispatch until it resolves.
+        inflight = w.get("inflight_action")
+        if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
+            continue
+
+        # 4b. §6 per-key outcome suppression. A blocked latch raises-hand once.
+        if _action_suppressed(w, key=key_str, current_head=head):
+            de = w.get("dispatched_events")
+            inflight = w.get("inflight_action")
+            blocked_here = (
+                (isinstance(de, dict) and de.get(key_str) == OUTCOME_BLOCKED)
+                or (isinstance(inflight, dict)
+                    and inflight.get("key") == key_str
+                    and inflight.get("outcome") == OUTCOME_BLOCKED)
+            )
+            if blocked_here and key_str != w.get("_raised_blocked_key"):
+                w["_raised_blocked_key"] = key_str
+                out.raises.append(
+                    f"pr-watch: PR #{pr_num} {kind} is BLOCKED (one attempt per "
+                    f"head/base; conflict or guard abort) — needs operator "
+                    f"attention — {w.get('pr_url', '')}"
+                )
+            continue
+
+        # 5. LEASE then DISPATCH. Persist the lease (running) BEFORE the
+        # callback emits the launchable DISPATCH block (commit-then-emit).
+        # We set it on the watch dict; the doc is persisted at the end of
+        # reconcile_watches, so a crash after emit but before that persist
+        # replays — and the callback itself is the launch boundary.
+        w["inflight_action"] = {
+            "kind": kind,
+            "key": key_str,
+            "agent_id": "",
+            "leased_at": now_iso,
+            "leased_tick": tick_count,
+            "outcome": OUTCOME_RUNNING,
+        }
+        try:
+            agent_id = dispatch_action(action)
+        except Exception as exc:  # noqa: BLE001 — a dispatch failure must not wedge the tick
+            w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            out.errors.append(
+                f"pr-watch: dispatch {kind} for PR #{pr_num} failed: {exc}"
+            )
+            continue
+        if not agent_id:
+            # prompt-acquire/emit failed -> the action never ran. Mark
+            # failed_launch so the next tick retries (not a permanent latch).
+            w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            out.errors.append(
+                f"pr-watch: dispatch {kind} for PR #{pr_num} did not launch; "
+                f"will retry"
+            )
+            continue
+        w["inflight_action"]["agent_id"] = agent_id
+        out.dispatched += 1
+        out.notes.append(
+            f"pr-watch: dispatched {kind} subagent {agent_id} for PR #{pr_num} "
+            f"({event.upper()})"
+        )
 
 
 def _park_not_found(watch: dict, pr_num: int, out: WatchOutcome) -> None:

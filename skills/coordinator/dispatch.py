@@ -960,6 +960,191 @@ def build_finisher_prompt(
     return out
 
 
+# ----------------------------------------------------------------------
+# PR-watch auto-fix subagent prompts (DESIGN-coord-pr-watch-durable §5.1c
+# / §5). The coordinator tick dispatches these when a watched PR goes
+# STALE/BEHIND/DIRTY (rebase) or CI-fails / CHANGES_REQUESTED (fix). Both
+# are general-purpose Agent subagents that run fleet-guard (so the tick can
+# read their agent record for the §6 lease outcome: blocked flag /
+# liveness). They MUST set `blocked` (via the BLOCKED contract) on any
+# guard abort so the lease latches blocked rather than silently re-firing.
+# ----------------------------------------------------------------------
+
+
+def _standards_section(standards_md: str) -> str:
+    s = (standards_md or "").strip()
+    return s or "(no standards configured)"
+
+
+def build_rebase_prompt(action, *, standards_md: str = "") -> str:
+    """Assemble the rebase subagent's first-turn prompt (§5.1c).
+
+    `action` is a pr_watch.ActionDispatch carrying the PR number, url,
+    branch, base, the watch-snapshot head_sha, and the fresh base_sha to
+    rebase onto. The guard rules (verify head unchanged, isolated worktree,
+    full gates, re-check OPEN, force-with-lease only, abort+blocked on any
+    conflict, NEVER auto-resolve) are spelled out verbatim — a wrong rebase
+    destroys live work, so the prompt is the load-bearing guard alongside
+    the §6 lease.
+    """
+    pr = action.pr_number
+    branch = action.branch or f"worker/pr-{pr}"
+    base = action.base or "main"
+    lines = [
+        f"You are a Fleet PR-watch REBASE subagent for PR #{pr} ({action.pr_url}).",
+        "",
+        "The coordinator detected this PR is the uniquely-eligible next-to-merge",
+        f"PR but its head no longer contains the current {base} tip (stale under",
+        "strict branch protection). Rebase it cleanly onto the fresh base.",
+        "",
+        "## Read first",
+        "- your engine's GLOBAL Subagent Dispatch Contract in your engine's",
+        "  config dir: claude -> CLAUDE.md under ~/.claude; codex -> AGENTS.md",
+        "  under your codex config dir (e.g. ~/.codex or ~/.Codex — read",
+        "  whichever your engine actually uses; the dir name's case is",
+        "  host-dependent).",
+        "- the project's CLAUDE.md AND/OR AGENTS.md (whichever exists) + memory.",
+        "",
+        "## HARD GUARDS — a wrong rebase destroys live work. Follow EXACTLY.",
+        f"1. `git fetch origin {base}` ONCE. Capture the fresh base SHA.",
+        f"   Expected fresh base to rebase onto: {action.base_sha or '(fetch + use origin/' + base + ')'}.",
+        f"2. Work where {branch} is ALREADY checked out — do NOT `git worktree",
+        f"   add` it (an in-review task keeps its worker worktree with {branch}",
+        "   checked out, so a second add fails 'already checked out'). Resolve",
+        "   the existing checkout and cd into it:",
+        f"     `git worktree list --porcelain | grep -B2 'branch refs/heads/{branch}'`",
+        "   cd into that worktree's path. ONLY if no worktree has it checked",
+        f"   out, create one: `git worktree add /tmp/fleet-rebase-{pr} {branch}`",
+        "   (and remove it at the end). Never operate in the coord's main",
+        "   checkout.",
+        f"3. VERIFY the head is UNCHANGED before touching anything: the branch",
+        f"   {branch} head MUST still equal {action.head_sha}. If it moved,",
+        "   ABORT immediately (the branch changed under you) — do nothing,",
+        "   report BLOCKED, exit. Do not force anything onto a moved head.",
+        f"4. Re-check PR #{pr} is still OPEN (`gh pr view {pr} --json state`).",
+        "   If MERGED/CLOSED, clean up the worktree and exit (nothing to do).",
+        f"5. Rebase onto the fresh base: `git rebase {action.base_sha or 'origin/' + base}`.",
+        "   On ANY conflict: `git rebase --abort`, preserve a WIP note, set",
+        "   yourself BLOCKED, raise-hand, and exit. NEVER auto-resolve a",
+        "   conflict (no --theirs/--ours, no half-resolved commits).",
+        "6. Run the FULL project gates (a textually-clean rebase can still",
+        "   break behavior): `go build ./... && go test -race -count=1 ./...`,",
+        "   `gofmt -l .`, `golangci-lint run ./...`, `python3 -m pytest skills/ -q`.",
+        "   On any gate failure: do NOT push. Report BLOCKED + raise-hand.",
+        f"7. Re-check PR #{pr} is STILL OPEN, then push with a LEASE only:",
+        f"   `git push --force-with-lease={branch}:{action.head_sha} origin {branch}`.",
+        "   NEVER plain --force. If the lease push is rejected (a human merged",
+        "   or pushed mid-rebase), that is a CLEAN loss — abort, do not retry,",
+        "   report BLOCKED, exit. No data is destroyed.",
+        "8. Clean up: if YOU created a /tmp/fleet-rebase worktree, remove it",
+        "   (`git worktree remove`). Do NOT remove the task's own worker",
+        "   worktree. Cleanup is the LAST step, on success AND failure paths.",
+        "",
+        "## On BLOCKED",
+        "Set yourself blocked (so the coordinator's lease latches blocked and",
+        "raises to the operator — one attempt per head/base, never silently",
+        "re-fired). Preserve a WIP note describing the conflict / guard abort.",
+        "",
+        "## Standards",
+        _standards_section(standards_md),
+        "",
+        "Do NOT open or merge PRs. Do NOT change the PR base. Do NOT touch any",
+        "PR other than this one. Rebase + force-with-lease push only.",
+    ]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
+        raise PromptTooLargeError(
+            f"rebase prompt for PR #{pr} is "
+            f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
+        )
+    return out
+
+
+def build_fix_prompt(action, *, standards_md: str = "") -> str:
+    """Assemble the fix subagent's first-turn prompt (§5 fix dispatch).
+
+    Covers two events: EVENT_CI_FAILED (re-run / repair failing checks) and
+    EVENT_CHANGES_REQUESTED (apply mechanical review fixes; raise on
+    substantive/design asks — the substantive guard lives here because the
+    review body is only readable from inside the subagent).
+    """
+    pr = action.pr_number
+    branch = action.branch or f"worker/pr-{pr}"
+    is_review = action.event == "changes-requested"
+    lines = [
+        f"You are a Fleet PR-watch FIX subagent for PR #{pr} ({action.pr_url}).",
+        "",
+        "## Read first",
+        "- your engine's GLOBAL Subagent Dispatch Contract in your engine's",
+        "  config dir: claude -> CLAUDE.md under ~/.claude; codex -> AGENTS.md",
+        "  under your codex config dir (e.g. ~/.codex or ~/.Codex — read",
+        "  whichever your engine actually uses; the dir name's case is",
+        "  host-dependent).",
+        "- the project's CLAUDE.md AND/OR AGENTS.md (whichever exists) + memory.",
+        "",
+        "## Guards",
+        f"1. Work where {branch} is ALREADY checked out — do NOT `git worktree",
+        f"   add` it (the in-review task keeps its worker worktree with {branch}",
+        "   checked out; a second add fails 'already checked out'). Find it via",
+        f"   `git worktree list --porcelain | grep -B2 'branch refs/heads/{branch}'`",
+        "   and cd in; only create a fresh worktree if NONE has it checked out",
+        "   (and remove that one at the end). Never use the coord's main",
+        f"   checkout. Verify the head still equals {action.head_sha} before",
+        "   pushing (if it moved, a newer attempt is in flight -> BLOCKED, exit).",
+        f"2. Re-check PR #{pr} is still OPEN before and after your fix.",
+        f"3. Push with `git push --force-with-lease={branch}:{action.head_sha}`",
+        "   ONLY — never plain --force. A rejected lease (human pushed/merged",
+        "   mid-flight) is a clean loss: abort, report BLOCKED, exit.",
+        "4. Cleanup is the LAST step (success or fail): remove ONLY a /tmp",
+        "   worktree YOU created — never the task's own worker worktree.",
+        "",
+    ]
+    if is_review:
+        lines += [
+            "## Task — review CHANGES_REQUESTED",
+            f"Read the review on PR #{pr} (`gh pr view {pr} --comments`).",
+            "- MECHANICAL asks (typo, style, lint, rename, formatting): apply",
+            "  them, re-run gates, push with the lease.",
+            "- SUBSTANTIVE / design asks (API change, behavior change, anything",
+            "  needing a judgement call): do NOT guess. Set yourself BLOCKED,",
+            "  raise-hand with a summary, and exit. The operator decides.",
+        ]
+    else:
+        lines += [
+            "## Task — CI FAILURE",
+            f"Fetch the failing checks (`gh pr checks {pr}` + the failing job",
+            "logs) and fix the ROOT CAUSE (not a flake-retry unless the log",
+            "proves a flake). Add/repair a regression test for the failure.",
+            "If the failure is infra/flake only (not your diff) and a re-run is",
+            "the right move, say so explicitly; if you cannot fix it, set",
+            "yourself BLOCKED + raise-hand rather than pushing a guess.",
+        ]
+    lines += [
+        "",
+        "## Gates (mandatory before any push)",
+        "`go build ./... && go test -race -count=1 ./...`, `gofmt -l .`,",
+        "`golangci-lint run ./...`, `python3 -m pytest skills/ -q`.",
+        "Run /codex review then /review until clean (CLAUDE.md §4).",
+        "",
+        "## On BLOCKED",
+        "Set yourself blocked so the coordinator's lease latches blocked +",
+        "raises to the operator (one attempt per head; never silently re-fired).",
+        "",
+        "## Standards",
+        _standards_section(standards_md),
+        "",
+        "Do NOT open new PRs. Do NOT change the PR base. Do NOT touch any PR",
+        "other than this one.",
+    ]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
+        raise PromptTooLargeError(
+            f"fix prompt for PR #{pr} is "
+            f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
+        )
+    return out
+
+
 def _select_learnings(raw: str) -> str:
     """Trim raw `fleet learnings list` output to the inline budget.
 
@@ -1023,6 +1208,7 @@ def format_dispatch_instruction(
     prompt_file: str,
     description: str | None = None,
     generation: int = 0,
+    register: bool = True,
 ) -> str:
     """Render the DISPATCH block the coord agent (Claude) will act on.
 
@@ -1069,7 +1255,7 @@ def format_dispatch_instruction(
     if not prompt_file:
         raise ValueError("prompt_file must be non-empty")
     desc = (description or f"fleet worker {slug}").strip()
-    return "\n".join([
+    lines = [
         f"DISPATCH: {slug}",
         f"  agent_id: {agent_id}",
         f"  generation: {int(generation)}",
@@ -1077,8 +1263,20 @@ def format_dispatch_instruction(
         f"  prompt_file: {prompt_file}",
         "  run_in_background: true",
         "  subagent_type: general-purpose",
-        "END_DISPATCH",
-    ])
+    ]
+    # `register: false` marks a dispatch whose agent_id is NOT a tasks.md
+    # worker slug (PR-watch auto-fix/rebase — slug is a synthetic
+    # `pr-fix-<n>`/`pr-rebase-<n>` label). The coord MUST skip the
+    # register_subagent.py step for it (codex iter-17 [P2]): that step
+    # writes worker_subagent_ids[slug] + acks via worker_agent_ids[slug],
+    # which would pollute worker state with a non-worker label and never
+    # actually ack the journal. The mark-launch-attempted gate still runs
+    # (the journal exists); only the post-launch worker registration is
+    # skipped. Omitted (== register: true) for normal worker dispatches.
+    if not register:
+        lines.append("  register: false")
+    lines.append("END_DISPATCH")
+    return "\n".join(lines)
 
 
 def write_worker_inbox(agent_id: str, prompt: str, *, fleet_home: str | None = None) -> str:
