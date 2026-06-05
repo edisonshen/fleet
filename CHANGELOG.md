@@ -6,6 +6,100 @@ follows [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-05
+
+Coord-owned PR shepherding lands as a durable, tick-owned loop:
+the coord watches every PR it opened, holds a lease per watch, and
+auto-dispatches the right rebase/fix subagent on BEHIND / DIRTY /
+CI-fail / CR-comments — closing the operator's biggest manual-toil
+loop. A four-PR worktree-lifecycle series routes every reconcile,
+reaper, supervisor, sentinel, and sweep through a single
+chokepoint reader + writer-CAS so coord generations stay
+strictly-ordered, and a worktree-reaping consumer plus a Go `gc`
+resolver close the unreaped-worktree leak. Handoff identity gets a
+v2 chain pointer so attach follows the live successor instead of a
+dead head, with a TUI rotation flash to signal the swap. `fleet
+attach` adds Tier 3 PROJECT RECOVERY — a never-exit failover so an
+attach against a stale coord finds the live one instead of
+dropping the operator. Coord robustness sees a wave of fixes:
+supervisor lock-hold safety, self-exit on lock-busy, worktree base
+from fresh upstream not stale local HEAD, flag-misparse project
+names rejected, fleet-guard model-id normalized so 50/70 handoff
+fires on opus-4-8 1M. TUI fixes a project-list truncation bug and
+dedups in-flight coord spawn from `[h]`/`[a]`.
+
+### Added
+
+- Coord-owned durable PR-watch: tick-owned tracking half (#203)
+  plus auto-fix half with §6 leases and §5.1b/c rebase/fix
+  dispatch (#206). The coord now persists per-PR watches across
+  ticks, holds a lease while a fix is in flight, and dispatches
+  the appropriate subagent on BEHIND / DIRTY / CI-fail / CR-comments
+  without operator intervention. Hardened across 35 codex
+  iterations covering claim-backed inbox routing, lease liveness,
+  journal-based liveness for agentless fixers, bounded reclaim for
+  never-started launches, and engine-agnostic contract paths.
+- Worktree-lifecycle chokepoint architecture (4-PR series):
+  - `dispatch_generation` + parked task-row fields on tasks
+    (PR1/4 #196).
+  - Chokepoint reader, writer-CAS, and epoch/dispatch-ordering
+    primitives (PR2/4 #198).
+  - Reconcile / reaper / supervisor / sentinel / sweep all routed
+    through the generation chokepoint (PR3/4 #199).
+  - Worktree-reaping consumer plus a Go `gc` resolver that
+    completes the lifecycle (PR4/4 #200).
+- Handoff identity continuity: schema v2 chain pointer, chain-
+  following attach, and a TUI rotation flash so the operator sees
+  the swap happen (#201).
+- `fleet attach` Tier 3 PROJECT RECOVERY — never-exit failover
+  that searches for the live coord when the targeted one is
+  gone, so attach doesn't drop the operator on a stale id (#202).
+- `fleet skills link / sync / status` subcommands that close the
+  coord-skill deploy gap (#186).
+- Coord rolling-checkpoint primitive plus synthetic checkpoint-
+  preference (#187), wired into the tick (#194).
+- `scripts/render-design-doc.py` rewrite that emits the operator
+  hub style end-to-end (#195).
+
+### Changed
+
+- Coordinator skill now ships a plan & design-doc writing
+  standard inline so dispatched workers produce hub-style docs
+  by default (#204).
+
+### Fixed
+
+- Coord supervisor lock-hold safety and dispatch durability
+  (fleet#184 #190): the supervisor no longer holds the project
+  lock across long-running operations, and dispatch survives
+  coord crashes mid-write.
+- Coord self-exit on lock-busy when a different live coord holds
+  the project lock (#191) — the racing-coord case now resolves
+  cleanly instead of two coords fighting over the same project.
+- Coord branches worker worktrees off fresh `origin/main` rather
+  than a stale local HEAD (#193) — workers start on the right base
+  even when the coord's checkout has drifted.
+- `state` / `tui` / `gc` reject flag-misparse project names
+  (e.g. `--foo` accidentally consumed as a project name) and
+  reap bogus project directories created by prior parsing bugs
+  (#192).
+- `fleet-guard` adds the opus-4-8 1M-context model and normalizes
+  the model-id suffix so the 50/70 handoff threshold fires on
+  the new model id (#197).
+- TUI dedups coord spawn from `[h]` / `[a]`: in-flight guard
+  prevents double-spawn and the row shows a visible "spawning"
+  status (#189).
+- TUI bounds + scrolls the left PROJECTS pane so a long project
+  list no longer overflows the viewport (#185).
+
+### Tests
+
+- TDD-red coverage for empty-command dispatch leaks:
+  `SweepAllDir` test helper plus a lint guard that rejects any
+  helper-wrapped `runDispatch` call missing an explicit command
+  (#205). Catches the entire class of stub-test-leaves-orphan
+  bugs at lint time.
+
 ## [0.11.0] - 2026-05-30
 
 Resource lifecycle is now Fleet's job, not the operator's. A new
@@ -941,7 +1035,8 @@ Initial public release.
 - Filesystem packages: `internal/state`, `internal/handoff`,
   `internal/queue`, `internal/spawn`, `internal/tmux`.
 
-[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/edisonshen/fleet/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/edisonshen/fleet/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/edisonshen/fleet/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/edisonshen/fleet/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/edisonshen/fleet/compare/v0.8.3...v0.9.0
