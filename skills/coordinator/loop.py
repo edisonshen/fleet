@@ -341,6 +341,21 @@ def tick(
     # write-only breadcrumb the Go binder stamps; the tick never reads
     # it as a resolution authority.
     #
+    # OWNED CONSEQUENCE (Option C, design §4.1/§10, operator-approved
+    # 2026-06-06): a legacy project whose ONLY binding was
+    # coord-config.json::repo — no meta.json, no corroborating worktrees —
+    # now REFUSES this tick with an actionable hint instead of silently
+    # honoring the spawn-time breadcrumb. This is deliberate: the
+    # breadcrumb can be the #175 wrong-cwd value, so trusting it is the
+    # bug, not a feature. The operator runs `fleet project add --project
+    # <p> <path>` once (the binder's stderr hint spells out the exact
+    # command); existing projects with prior fleet worktrees self-heal via
+    # the binder's tier-2 derive. Re-adding a Python coord-config
+    # compatibility tier here would reintroduce the split-authority drift
+    # this whole PR removes — so we do NOT. (Re-stamping coord-config from
+    # the resolved repo on every coord spawn is the Go side's job, design
+    # §6 / PR3 — not the read-only tick's.)
+    #
     # Lives between lock acquire and _tick_locked so the refuse-path
     # releases the lock cleanly via the local fcntl.flock_un dance.
 
