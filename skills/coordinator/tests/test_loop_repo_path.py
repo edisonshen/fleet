@@ -289,6 +289,144 @@ def test_p5b_binder_timeout_refuses_tick_end_to_end(
     assert any("timed out" in e for e in result.errors), result.errors
 
 
+# ---------- binder result parsing: lossless path, error branches ----------
+
+
+def test_binder_path_preserves_trailing_whitespace(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The binder emits exactly `<path>\\n`. The helper strips ONLY the
+    trailing newline, NOT arbitrary whitespace — a POSIX checkout path can
+    legitimately end in a space, and `.strip()` would silently rebind the
+    coord to a different sibling checkout (codex P1)."""
+    project = "projects-rainier"
+    home = tmp_path / "fleet"
+
+    class _Proc:
+        returncode = 0
+        # Path with a REAL trailing space, then the binder's newline.
+        stdout = "/checkouts/repo with trailing space \n"
+        stderr = ""
+
+    monkeypatch.setattr(loop.subprocess, "run", lambda cmd, **kw: _Proc())
+
+    path, hint = loop._resolve_repo_via_binder(project, home=home)
+    assert hint == ""
+    assert path == "/checkouts/repo with trailing space ", (
+        f"trailing space must be preserved; got {path!r}"
+    )
+
+
+def test_binder_path_strips_crlf(tmp_path: Path, monkeypatch) -> None:
+    """A CRLF line terminator is tolerated (only the terminator stripped)."""
+    project = "projects-rainier"
+    home = tmp_path / "fleet"
+
+    class _Proc:
+        returncode = 0
+        stdout = "/checkouts/repo\r\n"
+        stderr = ""
+
+    monkeypatch.setattr(loop.subprocess, "run", lambda cmd, **kw: _Proc())
+    path, hint = loop._resolve_repo_via_binder(project, home=home)
+    assert path == "/checkouts/repo", f"CRLF not handled; got {path!r}"
+    assert hint == ""
+
+
+def test_binder_empty_stdout_on_success_refuses(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """rc 0 with an empty stdout is a broken binder, not a bind — refuse."""
+    project = "projects-rainier"
+    home = tmp_path / "fleet"
+
+    class _Proc:
+        returncode = 0
+        stdout = "\n"   # only the terminator → empty path
+        stderr = ""
+
+    monkeypatch.setattr(loop.subprocess, "run", lambda cmd, **kw: _Proc())
+    path, hint = loop._resolve_repo_via_binder(project, home=home)
+    assert path is None, "empty path must refuse, not bind"
+    assert "empty path" in hint, f"expected empty-path hint; got {hint!r}"
+
+
+def test_binder_missing_binary_refuses(tmp_path: Path, monkeypatch) -> None:
+    """`fleet` not on PATH (FileNotFoundError) → refuse with a PATH hint,
+    never a crash or a cwd fallback."""
+    project = "projects-rainier"
+    home = tmp_path / "fleet"
+
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "fleet")
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    path, hint = loop._resolve_repo_via_binder(
+        project, home=home, fleet_bin="fleet",
+    )
+    assert path is None, "missing binary must refuse"
+    assert "on PATH" in hint, f"expected PATH hint; got {hint!r}"
+
+
+def test_binder_nonzero_empty_output_synthesizes_hint(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """rc != 0 with NO stderr/stdout still yields a non-empty refusal hint
+    (the synthesized fallback), so the tick never refuses with a blank
+    message."""
+    project = "projects-rainier"
+    home = tmp_path / "fleet"
+
+    class _Proc:
+        returncode = 3
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(loop.subprocess, "run", lambda cmd, **kw: _Proc())
+    path, hint = loop._resolve_repo_via_binder(project, home=home)
+    assert path is None
+    assert "exit 3" in hint and hint.strip(), f"want synthesized hint; got {hint!r}"
+
+
+def test_resolver_exception_refuses_and_releases_lock(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """An UNEXPECTED resolver exception (not a clean (None, hint) return)
+    must refuse the tick AND release the coordinator lock — never leak the
+    lock and wedge every future tick (codex P2). Asserts the lock is
+    re-acquirable after the refusal."""
+    project = "projects-rainier"
+    home = _seed_fleet_home(tmp_path, project)
+    _patch_bootstrap(monkeypatch)
+
+    def boom(project, *, home, fleet_bin="fleet", cwd=None):
+        raise RuntimeError("resolver blew up mid-flight")
+
+    monkeypatch.setattr(loop, "_resolve_repo_fn", boom)
+
+    called = {"n": 0}
+    real = loop._tick_locked
+
+    def spy(*args, **kwargs):
+        called["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_tick_locked", spy)
+
+    result = loop.tick(project, coord_id="", cwd=str(tmp_path), fleet_home=str(home))
+
+    assert called["n"] == 0, "exception must short-circuit BEFORE _tick_locked"
+    assert result.skipped is True
+    assert result.reason == "repo-unresolved"
+    assert any("unexpected error" in e for e in result.errors), result.errors
+
+    # The lock must be released despite the exception.
+    lock_path = home / "projects" / project / ".locks" / "coordinator.lock"
+    fd = loop._try_lock(lock_path, holder_id="other")
+    assert fd is not None, "coordinator lock leaked after resolver exception"
+    os.close(fd)
+
+
 # ---------- P6: no homegrown ladder remains ----------
 
 

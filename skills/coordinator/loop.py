@@ -375,9 +375,24 @@ def tick(
             os.close(lock_fd)
         return result
 
-    resolved_repo, resolve_hint = _resolve_repo_fn(
-        project, home=home, fleet_bin=fleet_bin, cwd=cwd,
-    )
+    # The resolver runs AFTER the coordinator lock is acquired but BEFORE
+    # _tick_locked's try/finally. Its expected failures already come back
+    # as (None, hint) and refuse cleanly via _refuse_stale (which releases
+    # the lock). But an UNEXPECTED exception (a future resolver bug, a
+    # UnicodeDecodeError from text=True on garbage binder output, etc.)
+    # would otherwise propagate past _refuse_stale and leak the held lock
+    # — wedging every future tick on this project. Catch broadly here and
+    # convert to a refused tick so the lock is always released.
+    try:
+        resolved_repo, resolve_hint = _resolve_repo_fn(
+            project, home=home, fleet_bin=fleet_bin, cwd=cwd,
+        )
+    except Exception as exc:  # noqa: BLE001 — must release the lock on ANY failure
+        return _refuse_stale(
+            "repo-unresolved",
+            f"repo resolve-repo for project {project!r} raised an "
+            f"unexpected error ({exc!r}) — refusing dispatch.",
+        )
     if resolved_repo is None:
         return _refuse_stale("repo-unresolved", resolve_hint)
     cwd = resolved_repo
@@ -7339,7 +7354,16 @@ def _resolve_repo_via_binder(
                 f"(exit {proc.returncode}) — refusing dispatch."
             )
         return None, hint
-    path = (proc.stdout or "").strip()
+    # LOSSLESS parse: the binder emits exactly `<path>\n` (Go Fprintln,
+    # cmd/fleet/project.go). Strip ONLY the single trailing line
+    # terminator — NOT arbitrary whitespace via .strip() — because a
+    # POSIX checkout path can legitimately contain leading/trailing
+    # spaces. `.strip()` would map `/tmp/repo ` → `/tmp/repo`, silently
+    # rebinding the coord to a different sibling checkout if it exists.
+    raw = proc.stdout or ""
+    path = raw[:-1] if raw.endswith("\n") else raw
+    if path.endswith("\r"):  # tolerate CRLF on the off chance
+        path = path[:-1]
     if not path:
         return None, (
             f"repo resolve-repo for project {project!r} returned an empty "
