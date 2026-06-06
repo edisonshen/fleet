@@ -58,6 +58,7 @@ func TestPathParity_AllCoordBindingPathsUseResolver(t *testing.T) {
 		"internal/tui/model.go":           "coordRepoForProject",          // [r] reset respawn
 		"cmd/fleet/dispatch.go":           "coordrepo.ResolveProjectRepo", // crash recovery
 		"cmd/fleet/handoff.go":            "coordrepo.ResolveProjectRepo", // manual [h]
+		"cmd/fleet/attach.go":             "coordrepo.ResolveProjectRepo", // fleet attach recovery spawn
 		"internal/handoffop/handoffop.go": "coordrepo.ResolveProjectRepo", // drain
 	}
 	for rel, token := range cases {
