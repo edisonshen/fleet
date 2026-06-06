@@ -1,4 +1,4 @@
-"""coord-config.json read/write helper + project↔origin validation.
+"""coord-config.json writer + project↔origin validation heuristic.
 
 Schema (additive — new fields land alongside without breaking the loader):
 
@@ -7,59 +7,29 @@ Schema (additive — new fields land alongside without breaking the loader):
         "repo":        <str>     # absolute path to project's git checkout
     }
 
-The `repo` field plugs the bug described in issue #175: loop.py used
-to compute the worktree base via `cwd = cwd or os.getcwd()`. A coord
-running in the wrong shell cwd (cross-project tmux env inheritance)
-would silently land `git worktree add` against the wrong repo. With
-`repo` recorded at coord-spawn time and read at tick-start, the
-coord skill always has an authoritative source-of-truth for its
-project's checkout — independent of whatever cwd inherited via tmux.
+Repo binding is owned by Go (Design 3,
+DESIGN-coord-repo-binding-from-project.md). The single binder —
+`fleet project resolve-repo --project <p>` — is the ONLY authority on
+which checkout a project binds to. The Python coordinator tick shells
+out to it (read-only) instead of reimplementing a tier ladder; it no
+longer reads meta.json or coord-config.json::repo as a resolution
+authority. coord-config.json::repo is now a write-only breadcrumb the Go
+binder stamps at coord spawn/handoff (the launch cwd is never a tier).
 
-Spawn (internal/spawn/spawn.go) writes this file on coord-spawn:
-  - idempotent: existing non-empty `repo` is preserved
-  - merge-safe: existing parallelism + future fields untouched
-  - atomic: write to tmp + rename + fsync (no half-written files)
+This module therefore keeps only:
 
-loop.tick (skills/coordinator/loop.py) reads + validates (iter-19
-final tiered authority):
+  - `write_repo_idempotent` — the Python mirror of Spawn's coord-config
+    writer, exercised by tests of the merge/atomic-write logic.
+  - `git_remote_origin` / `remote_matches_project` — the fuzzy
+    origin/basename heuristic. These survive ONLY as the reference for
+    (and a parallel of) the Go binder's tier-2 legacy-bridge
+    corroboration signal; they are no longer a Python resolution gate.
 
-  1. meta.json::repo_path (operator-set via `fleet project add`) is
-     the AUTHORITATIVE source. When present, wins outright; URL
-     heuristic bypassed. Custom-named clones / forks / vanity URLs
-     all work — operator's explicit registration overrides
-     heuristic ambiguity. Strict safety lives here: stale path →
-     refuse; divergence from coord-config → warn + override.
-
-  2. coord-config.json::repo (set by Spawn from cwd at spawn-time)
-     is the fallback for projects without meta.json. URL heuristic
-     is a SOFT SIGNAL — mismatch warns but doesn't refuse, because
-     the operator stamped this value explicitly at coord-spawn and
-     refusing on a fuzzy match would defeat their choice. Stale
-     path / non-git path → refuse (unambiguous errors).
-
-  3. Caller cwd / os.getcwd() — legacy fallback (pre-#175 installs).
-
-  Refuse-with-skip paths (return early after lock release):
-    - meta.json::repo_path points at missing dir → meta-repo-missing
-    - coord-config.json::repo points at missing dir →
-      coord-config-repo-missing
-    - coord-config.json::repo is not a git work tree →
-      coord-config-repo-not-git
-
-  Warn-and-proceed paths (cwd set, dispatch continues):
-    - meta.json present + differs from coord-config → use meta.json
-      + divergence warning (operator-authoritative override)
-    - coord-config present + no `origin` remote (local-only repo
-      with .git) → soft warning, can't heuristic-validate
-    - coord-config present + origin URL mismatches heuristic →
-      soft warning, recovery hint `fleet project add`
-    - No repo at all → fall back to caller cwd + warning
-
-iter-history note: codex flipped 5+ times between refuse-on-mismatch
-and warn-on-mismatch for the no-meta.json branch. Both behaviors
-have real downsides. Iter-19 chose warn-but-proceed per
-feedback_coord_makes_engineering_calls — the meta.json tier is
-where strict safety lives; the coord-config tier is best-effort.
+The pre-Design-3 Python tier ladder (its own meta.json read via
+`read_project_repo_path`, the coord-config `read_repo` tier, and the
+os.getcwd() fallback) was DELETED: a Python fast-path that read/validated
+binding state its own way recreated the exact split-authority drift Go
+validates one way and Python validated another.
 """
 from __future__ import annotations
 
@@ -68,71 +38,6 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-
-
-def read_project_repo_path(project_dir: Path | str) -> str | None:
-    """Return `repo_path` from ~/.fleet/projects/<p>/meta.json — the
-    operator-authoritative checkout path set by `fleet project add`.
-
-    Returns None when:
-      - meta.json doesn't exist (project pre-dates `fleet project add`,
-        or coord was spawned without prior `fleet project add`)
-      - meta.json unreadable / malformed JSON
-      - root is not an object
-      - `repo_path` field missing or non-string or whitespace-only
-
-    Callers (loop.tick) use this as the AUTHORITATIVE source for the
-    worktree-base cwd when present. Coord-config.json::repo is
-    secondary (written by Spawn from the cwd at spawn-time, which
-    can be wrong per issue #175). When meta.json::repo_path is
-    present AND it differs from coord-config.json::repo, the meta.json
-    value wins — the operator explicitly registered that path via
-    `fleet project add`.
-    """
-    path = Path(project_dir) / "meta.json"
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    raw = data.get("repo_path")
-    if not isinstance(raw, str):
-        return None
-    stripped = raw.strip()
-    if not stripped:
-        return None
-    return stripped
-
-
-def read_repo(config_path: Path | str) -> str | None:
-    """Return the `repo` field from coord-config.json, or None when:
-      - file missing
-      - file unreadable / not valid JSON
-      - root is not an object
-      - `repo` field missing
-      - `repo` value is non-string or whitespace-only
-
-    None is the signal for "fall back to legacy cwd-based behavior" —
-    so the coord skill can keep running on projects whose
-    coord-config.json predates this field.
-    """
-    path = Path(config_path)
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    raw = data.get("repo")
-    if not isinstance(raw, str):
-        return None
-    stripped = raw.strip()
-    if not stripped:
-        return None
-    return stripped
 
 
 def write_repo_idempotent(config_path: Path | str, repo: str) -> None:

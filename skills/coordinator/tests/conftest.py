@@ -61,6 +61,33 @@ def _disable_rc_bootstrap_session() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _stub_repo_binder_to_cwd(monkeypatch):
+    """Default: resolve the coord's repo binding to the test-supplied cwd.
+
+    Design 3 (loop-binder-shellout-d6a1) made `loop.tick` resolve its repo
+    binding by shelling out to `fleet project resolve-repo` (the single Go
+    binder). The vast majority of coordinator tests exercise UNRELATED tick
+    behavior (pr-watch, reaper, remote-control, dispatch) and pass an
+    explicit `cwd=` expecting it to be used as the worktree base — they
+    must not have to stand up a real binder + meta.json. This autouse
+    fixture substitutes the resolver seam with a stub that echoes the
+    test's cwd, restoring the pre-Design-3 "use the caller cwd" behavior
+    those tests rely on.
+
+    Tests that specifically exercise the binder shell-out (P1..P7 in
+    test_loop_repo_path.py) override `loop._resolve_repo_fn` /
+    `loop.subprocess.run` themselves; a later monkeypatch in the test body
+    wins over this autouse default.
+    """
+    import loop
+
+    def _echo_cwd(project, *, home, fleet_bin="fleet", cwd=None):
+        return (cwd, "")
+
+    monkeypatch.setattr(loop, "_resolve_repo_fn", _echo_cwd)
+
+
+@pytest.fixture(autouse=True)
 def _disable_supervisor_by_default(monkeypatch):
     """Default: supervisor disabled. Tests that need it set their own
     FLEET_COORD_POLL_INTERVAL_S inside the test body via monkeypatch.
