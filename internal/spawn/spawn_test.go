@@ -288,7 +288,10 @@ func TestSpawn_CoordEmptyCwdErrors(t *testing.T) {
 	// with an empty Cwd means the upstream resolver was not run or
 	// refused. Spawn must REFUSE (return an error) rather than fall back
 	// to os.Getwd() — launch cwd is not a binding tier. The error path
-	// fires before any tmux session is created, so no requireTmux.
+	// fires before any tmux session is created; requireTmux is the
+	// test-isolation lint marker (a defensive socket pin in case the
+	// belt ever regresses and reaches tmux.Spawn).
+	requireTmux(t)
 	setupFleetHome(t)
 
 	_, err := Spawn(Options{
@@ -310,6 +313,9 @@ func TestSpawn_CoordHandoffEmptyCwdErrors(t *testing.T) {
 	// coord identity is inherited from OldRecord on a handoff replacement
 	// (effective TaskID/Project come from OldRecord). Guards the
 	// handoffop/handoff.go paths against a resolver that returned empty.
+	// requireTmux is the test-isolation lint marker — the empty-Cwd belt
+	// errors before tmux.Spawn, but the socket pin is defensive.
+	requireTmux(t)
 	setupFleetHome(t)
 
 	old := agent.New("aaaa1111")
