@@ -146,11 +146,25 @@ func isDir(p string) bool {
 // operator-initiated paths (attach/recovery/handoff) pass true; routine
 // read-only ticks pass false. Tier 1 and tier 3 never persist regardless.
 func ResolveProjectRepo(project string, persist bool) (string, error) {
-	return resolveProjectRepo(project, persist)
+	return resolveOnce(project, persist, 0)
 }
 
-// resolveProjectRepo runs the tier ladder. NO os.Getwd on any path.
+// maxResolveRetries bounds the persist-lost-race re-resolution. A lost CAS
+// race means a concurrent `project add` won and durably wrote a pin, so the
+// very next read hits tier 1 and terminates. The bound guards against a
+// pathological ping-pong of concurrent racing writers from looping forever
+// — after the bound we refuse + surface rather than spin.
+const maxResolveRetries = 3
+
+// resolveProjectRepo runs the tier ladder once (top-level entry). NO
+// os.Getwd on any path.
 func resolveProjectRepo(project string, persist bool) (string, error) {
+	return resolveOnce(project, persist, 0)
+}
+
+// resolveOnce is resolveProjectRepo with an explicit retry depth so the
+// lost-race re-resolution is bounded (see maxResolveRetries).
+func resolveOnce(project string, persist bool, depth int) (string, error) {
 	meta, err := projects.Read(project)
 	// DISTINGUISH meta read errors: only ErrNotFound permits tier-2
 	// derivation. A malformed / EACCES meta.json is a hand-edit gone wrong,
@@ -175,8 +189,12 @@ func resolveProjectRepo(project string, persist bool) (string, error) {
 		path, done, terr := tier1(project, meta, persist)
 		if errors.Is(terr, errPinRetry) {
 			// first-certify lost the race → re-resolve so tier 1 binds the
-			// winning operator pin (never the stale path). One retry.
-			return resolveProjectRepo(project, persist)
+			// winning operator pin (never the stale path). Bounded retry.
+			if depth >= maxResolveRetries {
+				return "", ErrRepoUnresolved{Project: project,
+					Rejected: "repo pin kept changing under concurrent writers — retry the attach"}
+			}
+			return resolveOnce(project, persist, depth+1)
 		}
 		if done {
 			return path, terr
@@ -199,9 +217,13 @@ func resolveProjectRepo(project string, persist bool) (string, error) {
 					// A `project add` for a DIFFERENT repo won the race and
 					// pinned identity mid-flight. Our derived path is now
 					// possibly wrong → re-resolve from the freshly-written meta
-					// (tier 1 uses the operator pin). One retry.
+					// (tier 1 uses the operator pin). Bounded retry.
 					if errors.As(perr, &projects.ErrPinLostRace{}) {
-						return resolveProjectRepo(project, persist)
+						if depth >= maxResolveRetries {
+							return "", ErrRepoUnresolved{Project: project,
+								Rejected: "repo pin kept changing under concurrent writers — retry the attach"}
+						}
+						return resolveOnce(project, persist, depth+1)
 					}
 					return "", perr
 				}
