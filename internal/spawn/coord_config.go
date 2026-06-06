@@ -34,6 +34,16 @@ func isCoordSpawn(taskID, project string) bool {
 	return taskID == coordTaskIDPrefix+project
 }
 
+// IsCoordSpawn is the exported form of isCoordSpawn so other packages
+// (cmd/fleet, internal/handoffop) can apply the SAME coord-vs-worker
+// discriminator the spawn path uses, rather than re-deriving the
+// convention and drifting. DESIGN-coord-repo-binding-from-project.md
+// §6: coord binding resolves through the shared resolver; worker binding
+// keeps inheriting its dispatch cwd. Callers gate that split on this.
+func IsCoordSpawn(taskID, project string) bool {
+	return isCoordSpawn(taskID, project)
+}
+
 // writeCoordConfigRepoIdempotent stamps the resolved repo path into
 // ~/.fleet/projects/<project>/coord-config.json under the `repo` key.
 //
@@ -80,23 +90,20 @@ func writeCoordConfigRepoIdempotent(fleetHome, project, repo string) error {
 		return fmt.Errorf("read existing coord-config.json: %w", err)
 	}
 
-	// iter-9 (codex P1): always overwrite `repo` with the respawn
-	// cwd. The earlier "preserve existing non-empty" rule (iter-3..7)
-	// trapped legacy/non-meta.json projects in the #175 wrong-repo
-	// state — once any wrong cwd got stamped, respawn from the
-	// correct checkout couldn't fix it. iter-8 made the overwrite
-	// fire only for stale paths; iter-9 makes it unconditional,
-	// because a LIVE but wrong path is exactly the #175 scenario
-	// the on-screen guidance "re-spawn from the correct checkout"
-	// is supposed to recover.
+	// Always overwrite `repo` with the resolved repo (the `repo` arg).
 	//
-	// Operators wanting a permanent fork pin (the original
-	// preservation use case) should set meta.json::repo_path via
-	// `fleet project add <fork-path>`. meta.json wins over
-	// coord-config.json in loop.tick (iter-7), so the fork pin
-	// survives any number of respawns. coord-config.json::repo is
-	// purely the spawn-time signal; respawning IS the operator
-	// changing that signal.
+	// DESIGN-coord-repo-binding-from-project.md (PR3): the INPUT is now
+	// the output of coordrepo.ResolveProjectRepo (a project-derived
+	// checkout), NOT the launch cwd that the #175-era code stamped. The
+	// caller (spawn.Spawn coord branch) runs this on EVERY coord spawn
+	// AND handoff. The overwrite is unconditional so a respawn from the
+	// freshly-resolved repo can correct any prior wrong value.
+	//
+	// coord-config.json::repo is now a strictly NON-authoritative
+	// write-only breadcrumb: the Python tick (PR4) shells out to the Go
+	// resolver instead of reading this file. The operator's durable pin
+	// lives in meta.json::repo_path (set via `fleet project add`), which
+	// the resolver reads first (tier 1) on every bind.
 	data["repo"] = repo
 
 	// Atomic write: tmp + fsync + rename in the same directory.

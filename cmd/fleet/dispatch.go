@@ -12,6 +12,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/enginecfg"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/handoff"
@@ -839,17 +840,31 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
-	// Cwd inheritance on recovery (codex review iter-9 P2): spawn.Spawn
-	// resolves an empty Cwd to the caller's cwd (os.Getwd). When the
-	// dispatch is a dead-coord recovery and the operator didn't pass
-	// --cwd, fall back to the dead coord's recorded cwd so the resumed
-	// coord runs against the same checkout. Without this, running
-	// `fleet dispatch coord-X --coord-spawn` from a different shell
-	// would restart the coord in the WRONG checkout, leaving any
-	// relative git/test commands acting on the wrong tree. Mirrors
-	// cmd/fleet/handoff.go's pattern (`if cwd == "" { cwd = oldRec.Cwd }`).
+	// Cwd resolution on recovery.
+	//
+	// DESIGN-coord-repo-binding-from-project.md (PR3): for COORD spawns,
+	// the repo binding is a property of the PROJECT — resolved through
+	// the shared resolver, NEVER inherited from the dead coord's stored
+	// Cwd (which may itself be a cwd-bug victim pointing at the wrong
+	// tree). When the operator passed an explicit --cwd it is honored
+	// (operator authority, same as a `fleet project add` pin); otherwise
+	// the resolver runs and REFUSES on an unresolvable project rather
+	// than falling back to oldRecord.Cwd. persist=true because recovery
+	// is an operator-initiated repair path.
+	//
+	// Worker recovery (opts.coordSpawn=false) keeps the legacy behavior:
+	// inherit oldRecord.Cwd, then spawn.Spawn resolves empty to os.Getwd
+	// — workers legitimately follow their dispatch tree (codex iter-9 P2).
 	spawnCwd := opts.cwd
-	if spawnCwd == "" && oldRecord != nil && oldRecord.Cwd != "" {
+	if opts.coordSpawn {
+		if spawnCwd == "" {
+			resolved, rerr := coordrepo.ResolveProjectRepo(opts.project, true)
+			if rerr != nil {
+				return fmt.Errorf("coord recovery for project %q: %w", opts.project, rerr)
+			}
+			spawnCwd = resolved
+		}
+	} else if spawnCwd == "" && oldRecord != nil && oldRecord.Cwd != "" {
 		spawnCwd = oldRecord.Cwd
 	}
 	// DisableAutoResume inheritance on recovery (codex review iter-19

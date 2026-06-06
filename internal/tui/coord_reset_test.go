@@ -267,6 +267,7 @@ func TestKeyR_OnProjectRow_EntersConfirmReset(t *testing.T) {
 // handler then spawns a fresh coord.
 func TestKeyR_Confirm_Y_ReapsAndRespawns(t *testing.T) {
 	withFleetHome(t)
+	seedProjectMeta(t, "demo", t.TempDir()) // [r] respawn binds via meta (PR3)
 	reap := &stubResetReap{}
 	reap.install(t)
 	(&stubSessionAlive{}).install(t)
@@ -744,8 +745,9 @@ func TestCoordLockStillPresent(t *testing.T) {
 func TestIntegration_StaleCoordLock_DeadEndRecovery_AndReset(t *testing.T) {
 	projectsRoot := withFleetHome(t)
 	const project = "fengshen-site"
-	const staleID = "129c9824" // archived holder still in the lock body
-	const liveID = "68c6db50"  // live successor coord
+	seedProjectMeta(t, project, t.TempDir()) // [r] respawn binds via meta (PR3)
+	const staleID = "129c9824"               // archived holder still in the lock body
+	const liveID = "68c6db50"                // live successor coord
 
 	// Seed the archived holder record so coordArchivedFn (production,
 	// not stubbed here) sees agents/archive/129c9824.json.

@@ -283,6 +283,80 @@ func TestSpawn_CapturesCwdAndCommandOnRecord(t *testing.T) {
 	}
 }
 
+func TestSpawn_CoordEmptyCwdErrors(t *testing.T) {
+	// U1 — DESIGN-coord-repo-binding-from-project.md PR3: a COORD spawn
+	// with an empty Cwd means the upstream resolver was not run or
+	// refused. Spawn must REFUSE (return an error) rather than fall back
+	// to os.Getwd() — launch cwd is not a binding tier. The error path
+	// fires before any tmux session is created, so no requireTmux.
+	setupFleetHome(t)
+
+	_, err := Spawn(Options{
+		TaskID:  "coord-p", // isCoordSpawn: "coord-"+project
+		Project: "p",
+		Cwd:     "", // empty → coord belt must error
+		Command: []string{"sleep", "30"},
+	})
+	if err == nil {
+		t.Fatal("coord spawn with empty Cwd must error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no resolved repo") {
+		t.Errorf("error should name the unresolved-repo cause, got: %v", err)
+	}
+}
+
+func TestSpawn_CoordHandoffEmptyCwdErrors(t *testing.T) {
+	// U1 (handoff branch) — the empty-Cwd coord belt also fires when the
+	// coord identity is inherited from OldRecord on a handoff replacement
+	// (effective TaskID/Project come from OldRecord). Guards the
+	// handoffop/handoff.go paths against a resolver that returned empty.
+	setupFleetHome(t)
+
+	old := agent.New("aaaa1111")
+	old.TaskID = "coord-p"
+	old.Project = "p"
+	old.Engine = "claude-code"
+
+	_, err := Spawn(Options{
+		OldRecord:  old,
+		NewDocPath: "/some/handoffs/aaaa1111.md",
+		Cwd:        "", // empty → coord belt must error
+		Command:    []string{"sleep", "30"},
+	})
+	if err == nil {
+		t.Fatal("coord handoff spawn with empty Cwd must error, got nil")
+	}
+	if !strings.Contains(err.Error(), "no resolved repo") {
+		t.Errorf("error should name the unresolved-repo cause, got: %v", err)
+	}
+}
+
+func TestSpawn_WorkerEmptyCwdInheritsGetwd(t *testing.T) {
+	// U2 — worker (non-coord) spawns keep the os.Getwd() fallback on an
+	// empty Cwd: workers legitimately inherit the dispatch cwd. This
+	// design touches COORD binding only; the worker path is unchanged.
+	requireTmux(t)
+	setupFleetHome(t)
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	rec, err := Spawn(Options{
+		TaskID:  "real-task-slug", // NOT coord-<project> → worker
+		Project: "p",
+		Cwd:     "", // empty → worker inherits os.Getwd
+		Command: []string{"sleep", "30"},
+	})
+	if err != nil {
+		t.Fatalf("worker spawn with empty Cwd should succeed: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+	if rec.Cwd != wd {
+		t.Errorf("worker empty-Cwd did not inherit os.Getwd: got %q want %q", rec.Cwd, wd)
+	}
+}
+
 func TestSpawn_AbsolutizesRelativeCwd(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
@@ -1863,27 +1937,28 @@ func TestSpawn_ResolvesRelativeCwdToAbsoluteInCoordConfig(t *testing.T) {
 	}
 }
 
-func TestSpawn_HandoffInheritedCwdSkipsCoordConfigStamp(t *testing.T) {
-	// iter-18: on coord handoff where Cwd is INHERITED (== OldRecord.Cwd),
-	// Spawn must NOT write coord-config.json::repo. The handoff
-	// inherits cwd from the outgoing record — that's system-driven
-	// inheritance, not operator-explicit. Restamping with the inherited
-	// value (which could be the wrong #175 cwd) blocks recovery via
-	// fresh-dispatch.
+func TestSpawn_HandoffInheritedCwdAlwaysRestampsCoordConfig(t *testing.T) {
+	// E9 (spawn layer) — DESIGN-coord-repo-binding-from-project.md PR3:
+	// coord-config.json::repo is ALWAYS re-stamped on EVERY coord spawn
+	// AND handoff, even when Cwd is inherited from OldRecord. The input
+	// `Cwd` is now the resolver's output (run upstream at the call-site),
+	// NOT a launch cwd, so re-stamping is cheap and correct. This inverts
+	// the old iter-18 "skip on inheritance" behavior, which could leave a
+	// STALE wrong-repo value on a handoff replacement.
 	requireTmux(t)
 	home := setupFleetHome(t)
 
-	// Seed coord-config.json with a sentinel value the handoff must
-	// NOT overwrite.
+	// Seed coord-config.json with a stale value the handoff must
+	// OVERWRITE with the freshly-resolved (inherited) repo.
 	projDir := filepath.Join(home, "projects", "projects-rainier")
 	if err := os.MkdirAll(projDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(projDir, "coord-config.json")
-	sentinelRepo := "/sentinel/operator/path"
+	staleRepo := "/stale/leftover/path"
 	if err := os.WriteFile(
 		cfgPath,
-		[]byte(`{"parallelism": 2, "repo": "`+sentinelRepo+`"}`+"\n"),
+		[]byte(`{"parallelism": 2, "repo": "`+staleRepo+`"}`+"\n"),
 		0o644,
 	); err != nil {
 		t.Fatal(err)
@@ -1913,9 +1988,13 @@ func TestSpawn_HandoffInheritedCwdSkipsCoordConfigStamp(t *testing.T) {
 	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
 
 	data := readCoordConfig(t, home, "projects-rainier")
-	if data["repo"] != sentinelRepo {
-		t.Errorf("inherited-cwd handoff overwrote coord-config.json::repo: got %v want %q",
-			data["repo"], sentinelRepo)
+	if data["repo"] != inheritedCwd {
+		t.Errorf("inherited-cwd handoff did NOT re-stamp coord-config.json::repo: got %v want %q (always re-stamp, even on inheritance)",
+			data["repo"], inheritedCwd)
+	}
+	// parallelism must survive the re-stamp (additive merge).
+	if data["parallelism"] != float64(2) {
+		t.Errorf("re-stamp clobbered parallelism: got %v want 2", data["parallelism"])
 	}
 }
 

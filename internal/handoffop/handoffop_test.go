@@ -142,6 +142,162 @@ _(operator-triggered handoff — fill in before resuming)_
 	return req, qp, dp
 }
 
+// seedCoordRepoMeta writes a non-git meta.json pinning repo_path for the
+// project so a COORD drain handoff resolves via the resolver (PR3).
+func seedCoordRepoMeta(t *testing.T, project string) string {
+	t.Helper()
+	home := os.Getenv("FLEET_HOME")
+	repo := t.TempDir()
+	pdir := filepath.Join(home, "projects", project)
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir project dir: %v", err)
+	}
+	meta := `{"schema":"v1","is_git":false,"repo_path":"` + repo + `","added_at":"2026-01-01T00:00:00Z"}`
+	if err := os.WriteFile(filepath.Join(pdir, "meta.json"), []byte(meta), 0o644); err != nil {
+		t.Fatalf("write meta.json: %v", err)
+	}
+	return repo
+}
+
+// spawnSeedCoord seeds an outgoing COORD (task_id = coord-<project>) in a
+// WRONG tree, used to prove the drain handoff resolves via the resolver.
+func spawnSeedCoord(t *testing.T, project, wrongCwd string) *agent.Record {
+	t.Helper()
+	now := time.Now().UTC()
+	rec := agent.New(agent.NewID())
+	rec.TaskID = "coord-" + project
+	rec.Project = project
+	rec.SpawnedAt = now
+	rec.LastActivityTS = now
+	rec.Cwd = wrongCwd
+	rec.Command = []string{"sleep", "60"}
+	rec.TmuxSession = tmux.SessionName(rec.ID)
+	if err := tmux.Spawn(rec.TmuxSession, rec.Cwd, rec.Command,
+		[]string{"FLEET_AGENT_ID=" + rec.ID}); err != nil {
+		t.Fatalf("tmux.Spawn: %v", err)
+	}
+	if err := rec.Write(); err != nil {
+		_ = tmux.Kill(rec.TmuxSession)
+		t.Fatalf("agent.Write: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(rec.TmuxSession) })
+	return rec
+}
+
+// writeCoordSkillQueue mirrors writeSkillQueue but for a coord oldRec
+// (inherits oldRec.TaskID / Project instead of the hardcoded worker slug).
+func writeCoordSkillQueue(t *testing.T, oldRec *agent.Record) (queue.SpawnFresh, string) {
+	t.Helper()
+	now := time.Now().UTC()
+	dp, err := state.HandoffPath(oldRec.ID, now)
+	if err != nil {
+		t.Fatalf("HandoffPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dp), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "---\nagent_id: \"" + oldRec.ID + "\"\ntask_id: \"" + oldRec.TaskID +
+		"\"\nproject: \"" + oldRec.Project + "\"\ncontext_pct_at_handoff: 55\n" +
+		"previous_handoff: null\nhandoff_number: 1\ntimestamp: \"" +
+		now.Format(time.RFC3339) + "\"\nhandoff_type: \"auto-yellow\"\n---\n\n## Completed\nx\n"
+	if err := os.WriteFile(dp, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	newID := agent.NewID()
+	req := queue.SpawnFresh{
+		SchemaVersion: queue.SchemaVersion,
+		OldAgentID:    oldRec.ID,
+		HandoffDoc:    dp,
+		Project:       oldRec.Project,
+		TaskID:        oldRec.TaskID,
+		NewAgentID:    newID,
+		NewSession:    tmux.SessionName(newID),
+	}
+	qp, err := queue.WriteSpawnFresh(req)
+	if err != nil {
+		t.Fatalf("WriteSpawnFresh: %v", err)
+	}
+	return req, qp
+}
+
+// E7 (drain handoff) — a COORD drain handoff resolves the replacement's
+// Cwd via the shared resolver (meta repo), NOT the outgoing coord's Cwd.
+func TestResume_CoordDrain_ResolvesRepoNotOldCwd(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	const project = "rainier"
+	correctRepo := seedCoordRepoMeta(t, project)
+	wrongCwd := t.TempDir()
+	oldRec := spawnSeedCoord(t, project, wrongCwd)
+	req, qp := writeCoordSkillQueue(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if newRec.Cwd != correctRepo {
+		t.Errorf("coord drain bound wrong tree: newRec.Cwd = %q; want %q (resolver meta, not old Cwd %q)",
+			newRec.Cwd, correctRepo, wrongCwd)
+	}
+}
+
+// E7 (drain handoff, refuse) — a COORD drain handoff REFUSES when the
+// resolver cannot bind; it does NOT fall back to oldRec.Cwd.
+func TestResume_CoordDrain_RefusesWhenUnresolvable(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	const project = "ghostproj" // no meta, no worktrees → refuse
+	wrongCwd := t.TempDir()
+	oldRec := spawnSeedCoord(t, project, wrongCwd)
+	req, qp := writeCoordSkillQueue(t, oldRec)
+
+	out := &bytes.Buffer{}
+	err := Resume(req, qp, 0, out, out)
+	if err == nil {
+		t.Fatal("coord drain must REFUSE when resolver cannot bind, got nil")
+	}
+	if !strings.Contains(err.Error(), "no usable checkout") {
+		t.Errorf("refusal should surface the resolver hint; got %v", err)
+	}
+	// No replacement record should be loadable.
+	if _, lerr := agent.Load(req.NewAgentID); lerr == nil {
+		t.Cleanup(func() { _ = tmux.Kill(tmux.SessionName(req.NewAgentID)) })
+		t.Error("coord drain spawned a replacement despite refusal")
+	}
+}
+
+// E8 (drain handoff) — a WORKER drain handoff still inherits oldRec.Cwd.
+func TestResume_WorkerDrain_StillInheritsOldCwd(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+	// Seed meta for the project to prove the worker path ignores it.
+	otherRepo := seedCoordRepoMeta(t, "rainier")
+	oldRec := spawnSeedAgent(t) // task_id "auth-fix" (worker), project "rainier"
+	workerCwd := oldRec.Cwd
+	req, qp, _ := writeSkillQueue(t, oldRec)
+
+	out := &bytes.Buffer{}
+	if err := Resume(req, qp, 0, out, out); err != nil {
+		t.Fatalf("Resume: %v\n%s", err, out.String())
+	}
+	newRec, err := agent.Load(req.NewAgentID)
+	if err != nil {
+		t.Fatalf("load new record: %v", err)
+	}
+	t.Cleanup(func() { _ = tmux.Kill(newRec.TmuxSession) })
+	if newRec.Cwd != workerCwd {
+		t.Errorf("worker drain Cwd: got %q want %q (inherited, NOT resolver)", newRec.Cwd, workerCwd)
+	}
+	if newRec.Cwd == otherRepo {
+		t.Errorf("worker drain incorrectly used the resolver meta repo %q", otherRepo)
+	}
+}
+
 // -- happy path: skill wrote queue, no replacement yet ----------------------
 
 func TestResume_SkillDrivenSpawnsAndRetires(t *testing.T) {

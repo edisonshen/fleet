@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,9 +15,9 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/gc"
 	"github.com/edisonshen/fleet/internal/projectlookup"
-	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -1307,29 +1308,30 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 					}
 					return m, nil, true
 				}
+				// Resolve the repo binding via the shared resolver, NOT
+				// the dead coord's stored rec.Cwd (DESIGN-coord-repo-
+				// binding-from-project.md PR3). A live/stored cwd proves
+				// the dead coord once ran SOMEWHERE; it does not prove
+				// that SOMEWHERE was the correct checkout — if the dead
+				// coord was itself a victim of the cwd bug, rec.Cwd is
+				// the wrong tree and reusing it would perpetuate the
+				// corruption across the resume. Resolve fresh; refuse
+				// (flash, no respawn) when the resolver cannot bind.
+				cwd, rerr := coordRepoForProject(p.Name)
+				if rerr != nil {
+					m.flash = &flashMsg{text: rerr.Error(), isErr: true}
+					return m, nil, true
+				}
 				// In-flight ops are already refused at Path 0 (top of
 				// this func), so reaching here means no spawn/handoff is
 				// in flight — safe to arm the recovery spawn's guard.
 				m.setOpInFlight(p.Name, coordOpSpawn)
-				// Pass the DEAD COORD's own cwd, not the project's
-				// first-record cwd (codex review iter-11 P2). The
-				// dispatch CLI's recovery path falls back to the dead
-				// coord's Cwd when --cwd is empty (codex iter-9 P2),
-				// but if we pass any --cwd here it wins. Sending
-				// rec.Cwd specifically keeps the resumed coord in the
-				// SAME checkout the dead coord ran in, even when
-				// other workers/reviewers for the same project live
-				// in different worktrees.
-				//
-				// Empty rec.Cwd legitimately falls through to
-				// startCoordSpawn → omits --cwd → dispatch CLI's
-				// OldRecord.Cwd fallback fires.
 				m.flash = &flashMsg{
 					text: fmt.Sprintf(
 						"resuming coord %s for project %s from last checkpoint (dead tmux session — synth handoff)",
 						rec.ID, p.Name),
 				}
-				return m, m.startCoordSpawn(p.Name, rec.Cwd), true
+				return m, m.startCoordSpawn(p.Name, cwd), true
 			}
 			m.pendingAttach = rec.TmuxSession
 			return m, tea.Quit, true
@@ -1428,8 +1430,16 @@ func (m Model) actionAttachProject(p *ProjectRow) (Model, tea.Cmd, bool) {
 		}
 		return m, nil, true
 	}
+	// Resolve the repo binding via the shared resolver BEFORE arming the
+	// spawn guard (DESIGN-coord-repo-binding-from-project.md PR3). On an
+	// unresolvable project, refuse: flash the surfaced hint and do NOT
+	// spawn a wrong-repo coord. cwd is never a binding tier.
+	cwd, rerr := coordRepoForProject(p.Name)
+	if rerr != nil {
+		m.flash = &flashMsg{text: rerr.Error(), isErr: true}
+		return m, nil, true
+	}
 	m.setOpInFlight(p.Name, coordOpSpawn)
-	cwd := coordCwdForProject(m.records, p.Name)
 	return m, m.startCoordSpawn(p.Name, cwd), true
 }
 
@@ -2000,32 +2010,55 @@ func findExistingCoordForProject(records []*agent.Record, projectName string) (*
 	return nil, false
 }
 
-// coordCwdForProject best-guess resolves the working directory for a
-// freshly-spawned coord agent.
+// coordRepoForProject resolves the git checkout a freshly-spawned coord
+// agent must run all of its project's git work against.
 //
-// Precedence:
-//  1. The registered project meta.json repo_path. Fresh dashboard
-//     coord spawns need this path because PLAN-DOC/TASK-PLAN-DOC write
-//     relative docs/ files in the target project.
-//  2. Any existing agent record tagged with the same Project — legacy
-//     fallback for projects registered before meta.json existed.
-//  3. The TUI process's own cwd via os.Getwd() — works when the
-//     operator launched `fleet` from inside the project repo.
-//  4. Empty string — `fleet dispatch` resolves empty cwd to caller's
-//     wd, same as (2). Acceptable fallback.
-func coordCwdForProject(records []*agent.Record, projectName string) string {
-	if meta, err := projects.Read(projectName); err == nil && meta.RepoPath != "" {
-		return meta.RepoPath
+// DESIGN-coord-repo-binding-from-project.md (Option C / PR3): the repo
+// binding is a property of the PROJECT, resolved through the ONE shared
+// resolver (coordrepo.ResolveProjectRepo), NEVER the folder `fleet` was
+// launched in. The previous os.Getwd() / first-record-cwd tiers are
+// DELETED — they silently bound the wrong tree on a multi-project
+// machine (the headline bug). persist=true because attach is an
+// operator-initiated path (tier-2 derivations are written back to
+// meta.json so the next bind hits the operator pin).
+//
+// On an unresolvable project the resolver returns ErrRepoUnresolved; the
+// caller flashes the surfaced hint and does NOT spawn a wrong-repo coord.
+// The caller enriches the error with a cwd candidate (cwdGitCandidate)
+// so the refusal hint can suggest `fleet project add --project <p> <cwd>`
+// — cwd appears ONLY as a suggestion string, never as a binding tier.
+func coordRepoForProject(projectName string) (string, error) {
+	repo, err := coordrepo.ResolveProjectRepo(projectName, true)
+	if err != nil {
+		return "", withCwdCandidate(err)
 	}
-	for _, r := range records {
-		if r != nil && r.Project == projectName && r.Cwd != "" {
-			return r.Cwd
+	return repo, nil
+}
+
+// withCwdCandidate enriches an ErrRepoUnresolved with the launch cwd as a
+// suggestion string IF cwd is itself a git checkout. cwd is text the
+// operator copy-pastes into `fleet project add`, NOT a binding the
+// resolver ever reads. Any other error type is returned unchanged.
+func withCwdCandidate(err error) error {
+	var unresolved coordrepo.ErrRepoUnresolved
+	if errors.As(err, &unresolved) {
+		if cwd := cwdGitCandidate(); cwd != "" {
+			unresolved.Candidate = cwd
 		}
+		return unresolved
 	}
-	if wd, err := os.Getwd(); err == nil {
-		return wd
+	return err
+}
+
+// cwdGitCandidate returns the launch cwd's git toplevel IF cwd is inside
+// a git checkout, else "". Used ONLY to populate the refusal hint's
+// suggestion (`fleet project add --project <p> <cwd>`). Never a binding.
+func cwdGitCandidate() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
 	}
-	return ""
+	return strings.TrimSpace(string(out))
 }
 
 // writeCoordSpawnMarkerFn writes the coord-spawn marker file under the

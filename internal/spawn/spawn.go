@@ -620,6 +620,32 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// the tmux server's cwd, not the operator's checkout.
 	cwd := opts.Cwd
 	if cwd == "" {
+		// COORD belt (DESIGN-coord-repo-binding-from-project.md §6 /
+		// PR3): an empty Cwd on a COORD spawn means the upstream
+		// resolver (coordrepo.ResolveProjectRepo, run at the attach /
+		// recovery / handoff call-site) either was not run or refused —
+		// either way the binding is unknown. A coord must NEVER fall
+		// back to os.Getwd(): the launch cwd is not a binding tier
+		// (that is the whole bug this design fixes). Refuse so the
+		// caller surfaces it, rather than silently binding the wrong
+		// tree. Workers legitimately inherit the dispatch cwd, so the
+		// os.Getwd() fallback is preserved for the non-coord path.
+		effTaskID := opts.TaskID
+		effProject := opts.Project
+		if opts.OldRecord != nil {
+			if opts.OldRecord.TaskID != "" {
+				effTaskID = opts.OldRecord.TaskID
+			}
+			if opts.OldRecord.Project != "" {
+				effProject = opts.OldRecord.Project
+			}
+		}
+		if isCoordSpawn(effTaskID, effProject) {
+			return nil, fmt.Errorf(
+				"coord spawn for project %q has no resolved repo (empty Cwd): "+
+					"the repo binding must be resolved via coordrepo.ResolveProjectRepo "+
+					"at the call-site — launch cwd is not a binding tier", effProject)
+		}
 		wd, err := os.Getwd()
 		if err != nil {
 			return nil, fmt.Errorf("resolve current working directory: %w", err)
@@ -864,25 +890,24 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// fails the spawn. The worst case is the coord skill falls back
 	// to legacy cwd-derived behavior + emits a fallback warning.
 	if isCoordSpawn(rec.TaskID, rec.Project) {
-		// Operator-supplied cwd (vs system-inherited)?
-		// - OldRecord nil → fresh dispatch (operator chose cwd).
-		// - OldRecord.Cwd empty → legacy/upgraded record without cwd
-		//   info; treat any cwd as operator-supplied (iter-19 P2:
-		//   without this, legacy recovery never stamps).
-		// - OldRecord.Cwd non-empty + cwd differs → operator override.
-		// - OldRecord.Cwd non-empty + cwd matches → inheritance (skip).
-		operatorOverrideCwd := opts.OldRecord == nil ||
-			opts.OldRecord.Cwd == "" ||
-			cwd != opts.OldRecord.Cwd
-		if operatorOverrideCwd {
-			fhome := fleetHomeForSpawn()
-			if fhome != "" {
-				if werr := writeCoordConfigRepoIdempotent(fhome, rec.Project, cwd); werr != nil {
-					_, _ = fmt.Fprintf(os.Stderr,
-						"warning: write coord-config.json::repo for %s failed: %v "+
-							"(coord skill will fall back to cwd-derived worktree base)\n",
-						rec.Project, werr)
-				}
+		// ALWAYS re-stamp coord-config.json::repo on EVERY coord spawn
+		// AND handoff (DESIGN-coord-repo-binding-from-project.md §6 /
+		// PR3). The input `cwd` is now the resolver's output (run at the
+		// attach / recovery / handoff call-site), NOT a launch cwd, so
+		// re-stamping is cheap and correct. The previous
+		// "skip on OldRecord inheritance" heuristic (iter-17..19) could
+		// leave coord-config.json holding a STALE wrong-repo value on a
+		// handoff replacement; with the resolver upstream, the freshly
+		// resolved repo is authoritative, so we stamp unconditionally.
+		// coord-config.json is now a write-only breadcrumb — the Python
+		// tick never reads it as a resolution authority (PR4).
+		fhome := fleetHomeForSpawn()
+		if fhome != "" {
+			if werr := writeCoordConfigRepoIdempotent(fhome, rec.Project, cwd); werr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: write coord-config.json::repo for %s failed: %v "+
+						"(coord skill will fall back to cwd-derived worktree base)\n",
+					rec.Project, werr)
 			}
 		}
 	}

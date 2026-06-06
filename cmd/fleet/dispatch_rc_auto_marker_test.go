@@ -75,6 +75,7 @@ func TestCoordSpawn_AutoWritesMarker_InjectsRemoteControl(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	const project = "test-auto-marker"
+	seedRecoveryRepo(t, fleetHome, project) // coord spawn binds via resolver (PR3)
 	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
 	// recurrence PR-A).
 	opts := &dispatchOpts{
@@ -183,6 +184,7 @@ func TestCoordSpawn_RCConnectGateClears(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "")
 
 	const project = "test-rc-connect-gate"
+	seedRecoveryRepo(t, fleetHome, project) // coord spawn binds via resolver (PR3)
 	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
 	// recurrence PR-A).
 	opts := &dispatchOpts{
@@ -236,6 +238,7 @@ func TestCoordSpawn_EnvGateOverridesAutoMarker(t *testing.T) {
 	t.Setenv("FLEET_RC_BOOTSTRAP_DISABLED", "1")
 
 	const project = "test-env-gate-precedence"
+	seedRecoveryRepo(t, fleetHome, project) // coord spawn binds via resolver (PR3)
 	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
 	// recurrence PR-A).
 	opts := &dispatchOpts{
@@ -286,6 +289,7 @@ func TestCoordSpawn_MarkerWriteFailure_Degrades(t *testing.T) {
 	t.Cleanup(func() { writeMarkerFn = prev })
 
 	const project = "test-marker-fail-degrade"
+	seedRecoveryRepo(t, fleetHome, project) // coord spawn binds via resolver (PR3)
 	// command + commandExplicit: leak-test-spawn-stub (DESIGN-lifecycle-leak-
 	// recurrence PR-A).
 	opts := &dispatchOpts{
