@@ -52,6 +52,15 @@ import (
 func TestFleetE2E_FullWorkflow(t *testing.T) {
 	env := setupCoordIntegration(t, "fleet-e2e")
 	env.plantCoord(t)
+	// Option C repo-binding contract (DESIGN-coord-repo-binding-from-
+	// project.md): the loop.py tick resolves the coord's checkout via
+	// `fleet project resolve-repo`, which REFUSES when the project has no
+	// meta.json pin and no corroborated worktrees — the launch cwd is
+	// never a binding tier. Register repoCwd as the project's checkout up
+	// front (as the operator would via `fleet project add`) so the tick
+	// resolves the repo through the project binding, not cwd.
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Snapshot a steady "now" basis. The dashboard's coord-active /
 	// worker-stale windows are time.Sub-based; passing now=time.Now()
