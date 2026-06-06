@@ -101,6 +101,22 @@ def test_skill_md_names_narrow_plan_doc_write_exception():
         assert needle in body
 
 
+def test_skill_md_opens_rendered_html_at_doc_gates():
+    """After rendering a plan-doc or task-plan-doc .html, the coord must
+    `open` it so the human reviewer sees it immediately (auto-open-html
+    rule). Pinned at both gates; if the instruction drifts out, a coord
+    silently renders HTML the operator never gets shown."""
+    body = _read_skill_md()
+    assert "open docs/DESIGN-<kebab-topic>.html" in body, (
+        "SKILL.md PLAN-DOC gate must instruct opening the rendered .html "
+        "(auto-open-html rule)."
+    )
+    assert "open docs/TASK-PLAN-<slug>.html" in body, (
+        "SKILL.md TASK-PLAN-DOC gate must instruct opening the rendered "
+        ".html (auto-open-html rule)."
+    )
+
+
 # ---------- Worker dispatch protocol (issue #84 Phase A) ----------
 
 

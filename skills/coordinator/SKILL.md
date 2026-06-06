@@ -47,6 +47,9 @@ subagents, and shepherds PRs. It does not implement features inline.
 - Run read-only `gh` status commands.
 - Talk to the operator about scope, priority, blockers, and decisions.
 
+Any `.html` the coord renders at these gates gets `open`ed in the same step so
+the human reviewer sees it immediately.
+
 The plan-doc gates are the coordinator's only source-tree mutation exceptions.
 If PLAN-DOC save/render fails, the coord raises hand and does **not** proceed to SPLIT.
 If TASK-PLAN-DOC save/render fails, the coord leaves that task unpromoted and
@@ -58,10 +61,10 @@ Every engagement follows this eight-step order:
 
 ```text
 1. DISCUSS        plan + engineering detail + tests; operator approval is G2
-2. PLAN-DOC       save docs/DESIGN-<topic>.md (+ .html when renderer exists)
+2. PLAN-DOC       save docs/DESIGN-<topic>.md (+ render & open .html)
 3. SPLIT          approved plan -> tasks.md, inline <=10 or planner >10
 4. TASK LIST      one-line goal per task; structured state remains in fields
-5. TASK-PLAN-DOC  save docs/TASK-PLAN-<slug>.md (+ .html), link in task, promote
+5. TASK-PLAN-DOC  save docs/TASK-PLAN-<slug>.md (+ render & open .html), link, promote
 6. IMPLEMENT      worker -> reviewer -> finisher; cap=1 by default
 7. PR-TRACK       async PR/CI shepherding; fix/rebase subagents when needed
 8. DONE           set pr_url + status=done; advance or raise hand when empty
@@ -81,6 +84,8 @@ Before splitting tasks, save the approved implementation plan.
 - Filename: `docs/DESIGN-<kebab-topic>.md`.
 - Render: `docs/DESIGN-<kebab-topic>.html` when a renderer such as
   `scripts/render-design-doc.py` exists.
+- Open: after rendering, run `open docs/DESIGN-<kebab-topic>.html` so the human
+  reviewer sees it immediately.
 - Contents: summary, design decisions, task split, test plan, assumptions, and
   approval timestamp.
 
@@ -110,6 +115,8 @@ Before any task is promoted to ready, save its worker-ready task plan doc.
 
 - Filename: `docs/TASK-PLAN-<slug>.md`.
 - Render: `docs/TASK-PLAN-<slug>.html` when supported.
+- Open: after rendering, run `open docs/TASK-PLAN-<slug>.html` so the human
+  reviewer sees it immediately.
 - Contents: parent design doc link, task goal, acceptance criteria,
   expected files/surfaces, tests, non-goals, dependencies, and approval
   timestamp.
