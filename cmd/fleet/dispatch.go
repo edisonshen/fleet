@@ -855,6 +855,17 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// Worker recovery (opts.coordSpawn=false) keeps the legacy behavior:
 	// inherit oldRecord.Cwd, then spawn.Spawn resolves empty to os.Getwd
 	// — workers legitimately follow their dispatch tree (codex iter-9 P2).
+	//
+	// Durability note (codex PR3 review [P2], owned): an explicit --cwd
+	// on a coord spawn for a project with NO usable meta.json is honored
+	// for THIS spawn only — it is NOT persisted as the project's pin.
+	// Subsequent handoff/drain/recovery (which now ignore record.Cwd and
+	// resolve via the resolver) will refuse until the operator registers
+	// the checkout durably with `fleet project add --project <p> <cwd>`.
+	// This is the §10 owned UX consequence, not a regression: persisting
+	// --cwd here would re-implement the resolver's fingerprint+SetRepoPath
+	// persist outside the single binder, the exact split-authority the
+	// design forbids. The refusal surfaces the `fleet project add` hint.
 	spawnCwd := opts.cwd
 	if opts.coordSpawn {
 		if spawnCwd == "" {
