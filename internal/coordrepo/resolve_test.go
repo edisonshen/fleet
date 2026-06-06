@@ -168,6 +168,41 @@ func TestResolve_Tier1ShallowBindsNoStamp(t *testing.T) {
 	}
 }
 
+// U7b (codex iter-1 [P2]) — tier 1 first-certify where mintFingerprint
+// FAILS mid-write (no-origin repo whose .git/config is unwritable): the
+// resolver must BIND on operator authority but persist NO fingerprint
+// (never an empty "certified" stamp).
+func TestResolve_Tier1CertifyMintFailureBindsNoStamp(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	repo := newRepo(t, t.TempDir(), "x", "") // no origin → mint must write fleet.repoId
+	seedMeta(t, "proj", projects.Meta{RepoPath: repo, IsGit: projects.BoolPtr(true)})
+
+	// Make the .git DIR read-only so `git config fleet.repoId` cannot write
+	// its lock/temp file (chmod on config alone doesn't block git — it
+	// rewrites via the parent dir).
+	gitDir := filepath.Join(repo, ".git")
+	fi, err := os.Stat(gitDir)
+	if err != nil {
+		t.Fatalf("stat .git: %v", err)
+	}
+	if err := os.Chmod(gitDir, 0o500); err != nil {
+		t.Fatalf("chmod .git: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitDir, fi.Mode()) })
+
+	got, err := resolveProjectRepo("proj", true)
+	if err != nil {
+		t.Fatalf("resolve should bind on operator authority, got err: %v", err)
+	}
+	if got != repo {
+		t.Errorf("got %q want %q", got, repo)
+	}
+	m, _ := projects.Read("proj")
+	if m.RepoFingerprint != "" {
+		t.Errorf("persisted a fingerprint despite mint failure: %q", m.RepoFingerprint)
+	}
+}
+
 // U8 — tier 2 strong derive (legacy bridge): meta absent; >=2 worktrees
 // all derive to R, registered, heuristic matches; persist=true → returns R
 // and persists repo_path + fingerprint, preserving nothing-to-preserve.

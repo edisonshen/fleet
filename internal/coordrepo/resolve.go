@@ -254,7 +254,18 @@ func tier1(project string, meta projects.Meta, persist bool) (string, bool, erro
 	// usable + non-shallow → FIRST-CERTIFY when persisting (mint writes
 	// .git/config, so only on the persist path; read-only ticks never write).
 	if persist {
-		fp, _ := mintFingerprint(meta.RepoPath) // == repoIdentity here; WRITE-allowed
+		fp, merr := mintFingerprint(meta.RepoPath) // == repoIdentity here; WRITE-allowed
+		if merr != nil {
+			// Mint can fail mid-write (.git/config lock, EACCES) even though
+			// the read-only probe above succeeded. Do NOT persist an empty
+			// fingerprint — that would falsely look "certified" while storing
+			// no verifiable identity. Bind on operator authority (the pin is
+			// real), skip the stamp, and surface so the next persist retries.
+			warnf("project %s: could not stamp repo identity for %s (%v) — "+
+				"binding on path existence only; re-attach to retry hardening.",
+				project, meta.RepoPath, merr)
+			return meta.RepoPath, true, nil
+		}
 		if perr := projects.SetRepoPath(project, meta.RepoPath, meta.RepoPath, fp); perr != nil {
 			if errors.As(perr, &projects.ErrPinLostRace{}) {
 				// A `project add` for a different repo won the race; re-resolve
