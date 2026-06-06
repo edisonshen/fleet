@@ -443,8 +443,11 @@ func remoteIdentity(repo string, mint bool) (string, error) {
 	if origin != "" {
 		return hashOrigin(origin), nil
 	}
-	// No origin — use fleet.repoId.
-	id := gitConfigGet(repo, "fleet.repoId")
+	// No origin — use the durable per-clone fleet.repoId. Read from LOCAL
+	// config only: a fleet.repoId in global/system config would otherwise be
+	// returned for every no-origin repo, collapsing distinct clones onto one
+	// identity (codex iter-2 [P2]).
+	id := gitConfigGetLocal(repo, "fleet.repoId")
 	if id != "" {
 		return id, nil
 	}
@@ -457,6 +460,14 @@ func remoteIdentity(repo string, mint bool) (string, error) {
 	}
 	if err := gitConfigSet(repo, "fleet.repoId", newID); err != nil {
 		return "", err
+	}
+	// Re-read after the set: if a concurrent first-certify of the SAME repo
+	// raced us, last-write-wins on .git/config means the stored value may be
+	// the OTHER process's UUID. Return whatever is actually stored so the
+	// persisted fingerprint always matches .git/config — never a value the
+	// other process already overwrote (codex iter-2 [P2]).
+	if stored := gitConfigGetLocal(repo, "fleet.repoId"); stored != "" {
+		return stored, nil
 	}
 	return newID, nil
 }
@@ -513,18 +524,22 @@ func gitRemoteOrigin(repo string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// gitConfigGet returns `git config --get <key>`, trimmed; "" on miss/error.
-func gitConfigGet(repo, key string) string {
-	out, err := exec.Command("git", "-C", repo, "config", "--get", key).Output()
+// gitConfigGetLocal returns `git config --local --get <key>`, trimmed; ""
+// on miss/error. --local scopes the read to the repo's own .git/config so
+// a fleet.repoId in global/system config cannot be mistaken for a
+// per-clone identity.
+func gitConfigGetLocal(repo, key string) string {
+	out, err := exec.Command("git", "-C", repo, "config", "--local", "--get", key).Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
 }
 
-// gitConfigSet writes a local repo config value (`git config <key> <val>`).
+// gitConfigSet writes a per-clone local repo config value
+// (`git config --local <key> <val>`).
 func gitConfigSet(repo, key, val string) error {
-	if out, err := exec.Command("git", "-C", repo, "config", key, val).CombinedOutput(); err != nil {
+	if out, err := exec.Command("git", "-C", repo, "config", "--local", key, val).CombinedOutput(); err != nil {
 		return fmt.Errorf("git config %s in %s: %w (%s)", key, repo, err, strings.TrimSpace(string(out)))
 	}
 	return nil

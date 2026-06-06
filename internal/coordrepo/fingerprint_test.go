@@ -171,6 +171,45 @@ func TestFingerprint_MintCreatesOnPersist(t *testing.T) {
 	}
 }
 
+// U20b (codex iter-2 [P2]) — a fleet.repoId in GLOBAL git config must NOT
+// be read as a per-clone identity: distinct no-origin clones must still get
+// distinct identities. repoIdentity reads --local only.
+func TestFingerprint_GlobalRepoIdIgnored(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	parent := t.TempDir()
+
+	// A global gitconfig that pins a fleet.repoId for ALL repos.
+	globalCfg := filepath.Join(parent, "globalconfig")
+	if err := writeFile(globalCfg, "[fleet]\n\trepoId = GLOBAL-SHARED-ID\n"); err != nil {
+		t.Fatalf("write global config: %v", err)
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalCfg)
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
+	repo := newRepoEnv(t, parent, "x", "") // no origin; uses ambient env (incl GIT_CONFIG_GLOBAL)
+
+	// read-only: local has no fleet.repoId, global does → must be ignored → "".
+	fp, err := repoIdentity(repo)
+	if err != nil {
+		t.Fatalf("repoIdentity: %v", err)
+	}
+	if strings.Contains(fp, "GLOBAL-SHARED-ID") {
+		t.Fatalf("read fleet.repoId from global config: %q", fp)
+	}
+	if !strings.HasSuffix(fp, "|") {
+		t.Errorf("expected empty remote component (global ignored), got %q", fp)
+	}
+
+	// mint: creates a LOCAL id distinct from the global one.
+	mfp, err := mintFingerprint(repo)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if strings.Contains(mfp, "GLOBAL-SHARED-ID") {
+		t.Errorf("minted fingerprint used global id: %q", mfp)
+	}
+}
+
 // U22 — shallow clone → both functions return errShallow.
 func TestFingerprint_ShallowSentinel(t *testing.T) {
 	t.Setenv("FLEET_HOME", t.TempDir())

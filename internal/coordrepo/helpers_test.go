@@ -63,6 +63,42 @@ func eval(t *testing.T, p string) string {
 	return r
 }
 
+// newRepoEnv is newRepo but using the AMBIENT process env (it does NOT
+// override GIT_CONFIG_GLOBAL), so a t.Setenv("GIT_CONFIG_GLOBAL", ...) in
+// the test is honored. Author identity is still pinned via env so commits
+// succeed regardless of the developer's global config.
+func newRepoEnv(t *testing.T, parent, name, origin string) string {
+	t.Helper()
+	repo := filepath.Join(parent, name)
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
+	}
+	ambient := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	ambient("init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("hi"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	ambient("add", ".")
+	ambient("commit", "-q", "-m", "init")
+	if origin != "" {
+		ambient("remote", "add", "origin", origin)
+	}
+	return eval(t, repo)
+}
+
+// writeFile is a tiny os.WriteFile wrapper for test fixtures.
+func writeFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
 // makeShallow rewrites repo into a shallow clone (depth 1) of itself by
 // cloning from a second commit. Simplest reliable way: add a commit, then
 // shallow-clone into a fresh dir.
