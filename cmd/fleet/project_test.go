@@ -55,7 +55,7 @@ func TestProjectAdd_HappyPath_WritesTasksAndMeta(t *testing.T) {
 	repo := makeRepo(t, "dir")
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("runProjectAdd: %v\n%s", err, out.String())
 	}
 
@@ -103,7 +103,7 @@ func TestProjectAdd_WorktreeGitFile_Accepted(t *testing.T) {
 	repo := makeRepo(t, "file")
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("runProjectAdd worktree: %v\n%s", err, out.String())
 	}
 }
@@ -111,7 +111,7 @@ func TestProjectAdd_WorktreeGitFile_Accepted(t *testing.T) {
 func TestProjectAdd_MissingPath_Errors(t *testing.T) {
 	setupFleetHome(t)
 	out := &bytes.Buffer{}
-	err := runProjectAdd("/no/such/path/here", out, out)
+	err := runProjectAdd("/no/such/path/here", "", out, out)
 	if err == nil {
 		t.Fatal("expected error on missing path, got nil")
 	}
@@ -130,7 +130,7 @@ func TestProjectAdd_NonGitDirectory_AcceptedWithWarning(t *testing.T) {
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := runProjectAdd(dir, stdout, stderr); err != nil {
+	if err := runProjectAdd(dir, "", stdout, stderr); err != nil {
 		t.Fatalf("non-git add must succeed, got: %v", err)
 	}
 
@@ -176,7 +176,7 @@ func TestProjectAdd_GitDirectoryHasIsGitTrue(t *testing.T) {
 	repo := makeRepo(t, "dir")
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("git add: %v", err)
 	}
 
@@ -213,7 +213,7 @@ func TestProjectAdd_Idempotent_RefreshesAddedAt(t *testing.T) {
 	repo := makeRepo(t, "dir")
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 	tag := projectTagForTest(t, repo)
@@ -233,7 +233,7 @@ func TestProjectAdd_Idempotent_RefreshesAddedAt(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 
@@ -268,7 +268,7 @@ func TestProjectAdd_TagCollisionDifferentPath_RefreshesRepoPath(t *testing.T) {
 
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := runProjectAdd(repoA, stdout, stderr); err != nil {
+	if err := runProjectAdd(repoA, "", stdout, stderr); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 	tag := projectTagForTest(t, repoA)
@@ -287,7 +287,7 @@ func TestProjectAdd_TagCollisionDifferentPath_RefreshesRepoPath(t *testing.T) {
 
 	stdout.Reset()
 	stderr.Reset()
-	if err := runProjectAdd(repoB, stdout, stderr); err != nil {
+	if err := runProjectAdd(repoB, "", stdout, stderr); err != nil {
 		t.Fatalf("collision add: %v", err)
 	}
 
@@ -315,7 +315,7 @@ func TestProjectAdd_PreservesExistingTasksMd(t *testing.T) {
 	repo := makeRepo(t, "dir")
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 
@@ -330,7 +330,7 @@ func TestProjectAdd_PreservesExistingTasksMd(t *testing.T) {
 	}
 
 	out.Reset()
-	if err := runProjectAdd(repo, out, out); err != nil {
+	if err := runProjectAdd(repo, "", out, out); err != nil {
 		t.Fatalf("re-add: %v", err)
 	}
 
@@ -364,7 +364,7 @@ func TestProjectAdd_RelativePath_IsResolvedToAbsolute(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := runProjectAdd(name, out, out); err != nil {
+	if err := runProjectAdd(name, "", out, out); err != nil {
 		t.Fatalf("runProjectAdd relative: %v", err)
 	}
 	tag := projectTagForTest(t, repo)

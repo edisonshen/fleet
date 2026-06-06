@@ -12,11 +12,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/projects"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tasks"
@@ -36,6 +39,7 @@ that holds tasks.md, learnings.md, workers/, worktrees/, and the
 .locks/ subdir. v1 ships ` + "`add`" + ` only.`,
 	}
 	cmd.AddCommand(newProjectAddCmd())
+	cmd.AddCommand(newProjectResolveRepoCmd())
 	return cmd
 }
 
@@ -63,9 +67,17 @@ prints a one-line warning on stderr — the operator-supplied path wins,
 but you'll know it happened.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
-			return runProjectAdd(args[0], c.OutOrStdout(), c.ErrOrStderr())
+			project, _ := c.Flags().GetString("project")
+			return runProjectAdd(args[0], project, c.OutOrStdout(), c.ErrOrStderr())
 		},
 	}
+	// --project pins the registration tag to <p>, skipping the
+	// parent-basename TagForPath derivation. The refusal hint
+	// (`fleet project add --project <p> <cwd>`) needs this so a custom
+	// checkout binds the EXACT project being attached, not the tag the
+	// path would otherwise derive (DESIGN §4 move 3).
+	cmd.Flags().String("project", "",
+		"register under this project tag instead of deriving it from <path>")
 	return cmd
 }
 
@@ -89,7 +101,7 @@ but you'll know it happened.`,
 //  9. Write meta.json atomically (refreshes added_at + repo_path).
 //  10. Stdout: "added project <tag>" or "refreshed project <tag>".
 //     Stderr: warning if tag collided with a different repo.
-func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
+func runProjectAdd(rawPath, projectOverride string, stdout, stderr io.Writer) error {
 	if rawPath == "" {
 		return errors.New("project add: <path> must not be empty")
 	}
@@ -136,14 +148,27 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	// (4) tag.
-	tag := projects.TagForPath(abs)
-	if err := state.ValidateProjectName(tag); err != nil {
-		// projects.TagForPath is supposed to produce a name that
-		// passes ValidateProjectName ("fleet" fallback included). If
-		// validation still fails, the input was so degenerate that we
-		// can't safely register it — surface the underlying error.
-		return fmt.Errorf("project add: derived tag %q invalid: %w", tag, err)
+	// (4) tag. When --project is given, pin the registration to that tag
+	// (skip the parent-basename derivation) so the refusal hint can bind a
+	// checkout to the EXACT project being attached (DESIGN §4 move 3). The
+	// override is validated through the SAME gate every project tag passes.
+	// Without --project, behavior is byte-for-byte unchanged: derive via
+	// TagForPath.
+	var tag string
+	if projectOverride != "" {
+		if err := state.ValidateProjectName(projectOverride); err != nil {
+			return fmt.Errorf("project add: --project %q invalid: %w", projectOverride, err)
+		}
+		tag = projectOverride
+	} else {
+		tag = projects.TagForPath(abs)
+		if err := state.ValidateProjectName(tag); err != nil {
+			// projects.TagForPath is supposed to produce a name that
+			// passes ValidateProjectName ("fleet" fallback included). If
+			// validation still fails, the input was so degenerate that we
+			// can't safely register it — surface the underlying error.
+			return fmt.Errorf("project add: derived tag %q invalid: %w", tag, err)
+		}
 	}
 
 	// (5) ~/.fleet bootstrap.
@@ -223,6 +248,37 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 		AddedAt:  now,
 		IsGit:    projects.BoolPtr(isGit),
 	}
+
+	// Stamp the strong, machine-independent repo identity at registration
+	// for git projects so the operator pin is fingerprint-guarded from the
+	// very first attach (DESIGN §7.1 "two identity signals"). The mint uses
+	// the SAME logic the resolver persists with — no second implementation
+	// to drift. A shallow clone cannot produce a stable fingerprint (its
+	// root commit is the shallow boundary): bind on existence and surface
+	// the `git fetch --unshallow` fix rather than store an unstable value.
+	// Non-git projects have no git identity, so we never stamp them.
+	if isGit {
+		fp, ferr := coordrepo.MintFingerprint(abs)
+		switch {
+		case ferr == nil:
+			m.RepoFingerprint = fp
+		case strings.Contains(ferr.Error(), "shallow"):
+			_, _ = fmt.Fprintf(stderr,
+				"warning: %s is a shallow clone — cannot stamp a stable repo "+
+					"identity; a copied meta.json could later bind a different "+
+					"same-path repo. Run `git fetch --unshallow` then re-run "+
+					"`fleet project add` to harden.\n", abs)
+		default:
+			// Mint failed for another reason (git error, .git/config write
+			// denied). The pin is still real — register it, skip the stamp,
+			// and surface so a re-add can retry hardening.
+			_, _ = fmt.Fprintf(stderr,
+				"warning: could not stamp repo identity for %s (%v) — "+
+					"registering without a fingerprint; re-run `fleet project add` "+
+					"to retry.\n", abs, ferr)
+		}
+	}
+
 	if err := projects.Write(tag, m); err != nil {
 		return fmt.Errorf("project add: write meta.json: %w", err)
 	}
@@ -242,6 +298,111 @@ func runProjectAdd(rawPath string, stdout, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "added project %s (%s)\n", tag, abs)
 	}
 	return nil
+}
+
+// newProjectResolveRepoCmd is `fleet project resolve-repo --project <p>
+// [--persist]` — the single binder surface the Python coordinator tick
+// (PR4) shells out to instead of reimplementing the tier ladder. It is a
+// THIN wrapper over coordrepo.ResolveProjectRepo (the PR1 resolver):
+//
+//	ok   → resolved checkout path on stdout, exit 0
+//	fail → the §7.1 refusal hint on stderr, exit non-zero
+//
+// stdout carries ONLY the path so loop.py can read it machine-parseably;
+// every diagnostic goes to stderr.
+//
+// --persist controls whether a tier-2 derivation is written back to
+// meta.json. Operator-initiated repair paths pass it; the routine
+// read-only tick does NOT (so a poll never mutates authoritative metadata).
+func newProjectResolveRepoCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "resolve-repo --project <p> [--persist]",
+		Short: "Resolve a project's bound git checkout (the single repo binder)",
+		Long: `resolve-repo maps a project tag to the git checkout on disk a
+coordinator runs all of that project's git work against. It is the single
+shared binder — the launch cwd is NEVER a resolution tier.
+
+On success the resolved checkout path is printed to stdout (nothing else),
+and the command exits 0. When the project has no usable checkout it prints
+an actionable hint to stderr and exits non-zero, so a caller (loop.py) can
+refuse the tick on a non-zero exit.
+
+--persist writes a tier-2 worktree-derivation back to meta.json. Pass it
+only on operator-initiated repair (attach/recovery/handoff); routine
+read-only resolution must omit it.`,
+		Args: cobra.NoArgs,
+		// Cobra prints usage + the returned error to stderr and exits 1 on a
+		// RunE error; SilenceUsage/SilenceErrors keep the hint clean (only the
+		// §7.1 text, no cobra usage dump) so stdout stays empty on refuse.
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(c *cobra.Command, _ []string) error {
+			project, _ := c.Flags().GetString("project")
+			persist, _ := c.Flags().GetBool("persist")
+			return runProjectResolveRepo(project, persist, c.OutOrStdout(), c.ErrOrStderr())
+		},
+	}
+	cmd.Flags().String("project", "", "project tag to resolve (required)")
+	cmd.Flags().Bool("persist", false,
+		"write a tier-2 worktree derivation back to meta.json (operator repair paths only)")
+	return cmd
+}
+
+// runProjectResolveRepo is the core of `fleet project resolve-repo`.
+// Returns nil after printing the path (exit 0); returns a non-nil error
+// after printing the hint to stderr (exit non-zero). The error value is
+// surfaced by cobra but we already wrote the human-readable hint, so we
+// return a terse sentinel to avoid a duplicate dump.
+func runProjectResolveRepo(project string, persist bool, stdout, stderr io.Writer) error {
+	if project == "" {
+		_, _ = fmt.Fprintln(stderr, "project resolve-repo: --project <p> is required")
+		return errResolveRepoFailed
+	}
+	if err := state.ValidateProjectName(project); err != nil {
+		_, _ = fmt.Fprintf(stderr, "project resolve-repo: --project %q invalid: %v\n", project, err)
+		return errResolveRepoFailed
+	}
+
+	path, err := coordrepo.ResolveProjectRepo(project, persist)
+	if err != nil {
+		// Refuse + surface. ErrRepoUnresolved.Error() renders the §7.1 hint.
+		// The resolver never reads cwd, so the CLI layer supplies the
+		// candidate path (the launch cwd when it is a git checkout) for the
+		// `fleet project add --project <p> <candidate>` line — text only,
+		// never an auto-bind.
+		var unresolved coordrepo.ErrRepoUnresolved
+		if errors.As(err, &unresolved) {
+			if cand := cwdGitToplevel(); cand != "" {
+				unresolved.Candidate = cand
+			}
+			_, _ = fmt.Fprintln(stderr, unresolved.Error())
+		} else {
+			_, _ = fmt.Fprintf(stderr, "project resolve-repo: %v\n", err)
+		}
+		return errResolveRepoFailed
+	}
+
+	// Success: ONLY the path on stdout (machine-parseable for loop.py).
+	_, _ = fmt.Fprintln(stdout, path)
+	return nil
+}
+
+// errResolveRepoFailed is the terse sentinel returned to cobra after the
+// human-readable hint was already written to stderr. SilenceErrors keeps
+// cobra from printing it, so the operator sees only the §7.1 hint and the
+// process exits non-zero.
+var errResolveRepoFailed = errors.New("resolve-repo: no usable checkout")
+
+// cwdGitToplevel returns `git rev-parse --show-toplevel` for the launch
+// cwd when it is a git checkout, else "". This is the ONLY place cwd
+// appears, and purely as a suggestion STRING for the refusal hint — never
+// a binding tier (DESIGN §4: cwd is never a resolution tier).
+func cwdGitToplevel() string {
+	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // nowFn lets tests stub the timestamp without time.Sleep. Production
