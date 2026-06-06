@@ -42,6 +42,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/edisonshen/fleet/internal/gc"
@@ -174,6 +175,20 @@ func resolveOnce(project string, persist bool, depth int) (string, error) {
 			Rejected: "meta.json unreadable: " + err.Error()}
 	}
 	metaPresent := err == nil
+
+	// ABSOLUTE-PATH GUARD — the load-bearing "cwd is never a tier" invariant.
+	// `fleet project add` always stores an absolute, cleaned repo_path, but a
+	// LEGACY or HAND-EDITED meta.json can carry a RELATIVE one. A relative
+	// path makes os.Stat / `git -C <rel>` resolve against the process launch
+	// cwd — silently reintroducing the exact cwd-binding leak Option C forbids
+	// (a launch dir holding `./repo` would hijack a legacy pin, and persist
+	// would first-certify the cwd-relative checkout). Refuse + surface before
+	// ANY isDir / git probe touches the path. Empty repo_path falls through
+	// (tier-2 derive / refuse handles it; "" is not a cwd hijack).
+	if metaPresent && meta.RepoPath != "" && !filepath.IsAbs(meta.RepoPath) {
+		return "", ErrRepoUnresolved{Project: project,
+			MetaReason: fmt.Sprintf("repo_path %q is not absolute — refusing (a relative path would bind against the launch cwd; re-pin with `fleet project add`)", meta.RepoPath)}
+	}
 
 	// NON-GIT short-circuit — no git identity, no worktrees to derive.
 	if metaPresent && !meta.GitMode() {
@@ -461,7 +476,17 @@ func rootCommit(repo string) (string, error) {
 //   - no origin → the durable per-clone fleet.repoId UUID in .git/config.
 //     Read-only mode leaves it "" when absent; mint mode creates it.
 func remoteIdentity(repo string, mint bool) (string, error) {
-	origin := gitRemoteOrigin(repo)
+	// Use the STRICT probe here (not the lenient gitRemoteOrigin the fuzzy
+	// heuristic uses): a transient/corrupt-config git failure must NOT be
+	// silently treated as "no origin", or we'd mint a fleet.repoId and persist
+	// a no-origin identity for a repo that actually HAS an origin — a later
+	// successful probe would then mismatch and wrongly refuse (codex [P2]). A
+	// real error propagates; only a genuine "no origin remote" falls through to
+	// the fleet.repoId path.
+	origin, err := gitRemoteOriginStrict(repo)
+	if err != nil {
+		return "", err
+	}
 	if origin != "" {
 		return hashOrigin(origin), nil
 	}
@@ -537,13 +562,36 @@ func normalizeOrigin(origin string) string {
 }
 
 // gitRemoteOrigin returns `git remote get-url origin`, trimmed; "" on any
-// failure (no git, no repo, no origin remote).
+// failure (no git, no repo, no origin remote). LENIENT — used by the fuzzy
+// tier-2 heuristic where "" just fails the heuristic conservatively. Identity
+// minting uses gitRemoteOriginStrict instead.
 func gitRemoteOrigin(repo string) string {
 	out, err := exec.Command("git", "-C", repo, "remote", "get-url", "origin").Output()
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// gitRemoteOriginStrict returns the origin URL, distinguishing a genuine
+// "no origin remote" (→ "", nil) from a real git failure (→ "", err). git
+// exits 2 with "No such remote 'origin'" / "No such remote: 'origin'" when the
+// remote is simply absent; any OTHER non-zero exit (corrupt config, not a git
+// repo, git missing) is a real error the caller must not paper over as
+// no-origin. Used ONLY on the identity-mint path so a transient failure never
+// freezes a false no-origin fingerprint.
+func gitRemoteOriginStrict(repo string) (string, error) {
+	out, err := exec.Command("git", "-C", repo, "remote", "get-url", "origin").CombinedOutput()
+	if err == nil {
+		return strings.TrimSpace(string(out)), nil
+	}
+	msg := strings.ToLower(string(out))
+	// git's wording has varied ("No such remote 'origin'" /
+	// "No such remote: 'origin'") — match the stable prefix + the remote name.
+	if strings.Contains(msg, "no such remote") && strings.Contains(msg, "origin") {
+		return "", nil // genuinely no origin remote
+	}
+	return "", fmt.Errorf("git remote get-url origin in %s: %w (%s)", repo, err, strings.TrimSpace(string(out)))
 }
 
 // gitConfigGetLocal returns `git config --local --get <key>`, trimmed; ""

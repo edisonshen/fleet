@@ -1,6 +1,7 @@
 package coordrepo
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -221,6 +222,38 @@ func TestFingerprint_ShallowSentinel(t *testing.T) {
 	}
 	if _, err := mintFingerprint(repo); err != errShallow {
 		t.Errorf("mintFingerprint err=%v want errShallow", err)
+	}
+}
+
+// U22b (review iter-1, codex [P2]) — gitRemoteOriginStrict distinguishes a
+// genuine "no origin remote" (→ "", nil) from a real git failure (→ "", err).
+// A transient/real failure must NOT be silently treated as no-origin, or
+// remoteIdentity would mint a fleet.repoId and freeze a false no-origin
+// fingerprint for a repo that actually has an origin.
+func TestGitRemoteOriginStrict_DistinguishesFailureFromNoOrigin(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	parent := t.TempDir()
+
+	// (a) genuine no-origin repo → "", nil (falls through to fleet.repoId).
+	noOrigin := newRepo(t, parent, "no", "")
+	if got, err := gitRemoteOriginStrict(noOrigin); err != nil || got != "" {
+		t.Errorf("no-origin: got %q err %v want \"\",nil", got, err)
+	}
+
+	// (b) has-origin repo → returns the URL, no error.
+	withOrigin := newRepo(t, parent, "yes", "https://github.com/acme/yes.git")
+	if got, err := gitRemoteOriginStrict(withOrigin); err != nil || got != "https://github.com/acme/yes.git" {
+		t.Errorf("with-origin: got %q err %v want the url,nil", got, err)
+	}
+
+	// (c) real git failure (not a git repo) → error, NOT silent "",nil. This is
+	// the case that would otherwise mint a false no-origin identity.
+	notRepo := filepath.Join(parent, "plain")
+	if err := os.MkdirAll(notRepo, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got, err := gitRemoteOriginStrict(notRepo); err == nil {
+		t.Errorf("not-a-repo: got %q nil err — want a propagated error, not silent no-origin", got)
 	}
 }
 

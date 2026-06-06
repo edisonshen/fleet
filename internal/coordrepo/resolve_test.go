@@ -515,6 +515,63 @@ func TestResolve_RetryAfterLostRace(t *testing.T) {
 	}
 }
 
+// TestResolve_RelativeRepoPathRefuses (review iter-1, codex [P1]) — a legacy /
+// hand-edited meta.json with a RELATIVE repo_path must REFUSE, never bind. A
+// relative path makes os.Stat / `git -C <rel>` resolve against the launch cwd,
+// which would silently reintroduce the cwd-binding leak Option C forbids. The
+// guard fires for BOTH git and non-git projects and on persist=false too (a
+// read-only tick must not bind a cwd-relative path either), and it must NOT
+// mutate meta.json.
+func TestResolve_RelativeRepoPathRefuses(t *testing.T) {
+	t.Setenv("FLEET_HOME", t.TempDir())
+	// Make the launch cwd a real git checkout named "repo" so a relative
+	// "repo" WOULD resolve to a valid-looking checkout if the guard were
+	// missing — proving the guard, not an incidental isDir miss.
+	work := t.TempDir()
+	newRepo(t, work, "repo", "https://github.com/acme/repo.git")
+	chdir(t, work)
+
+	for _, tc := range []struct {
+		name  string
+		isGit bool
+	}{
+		{"git", true}, {"nongit", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			project := "rel-" + tc.name
+			seedMeta(t, project, projects.Meta{RepoPath: "repo", IsGit: projects.BoolPtr(tc.isGit)})
+			for _, persist := range []bool{false, true} {
+				got, err := resolveProjectRepo(project, persist)
+				var unresolved ErrRepoUnresolved
+				if !errors.As(err, &unresolved) {
+					t.Fatalf("persist=%v got=%q err=%v want ErrRepoUnresolved", persist, got, err)
+				}
+				if !strings.Contains(err.Error(), "not absolute") {
+					t.Errorf("persist=%v hint missing 'not absolute': %v", persist, err)
+				}
+				// meta untouched (no first-certify / no clobber).
+				m, _ := projects.Read(project)
+				if m.RepoPath != "repo" || m.RepoFingerprint != "" {
+					t.Errorf("persist=%v meta mutated: %+v", persist, m)
+				}
+			}
+		})
+	}
+}
+
+// chdir changes the working directory for the test and restores it after.
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(prev) })
+}
+
 // writeRawMeta writes raw bytes to the project's meta.json (for malformed
 // tests). Uses the same path projects.Read reads from.
 func writeRawMeta(t *testing.T, project, content string) {
