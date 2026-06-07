@@ -200,7 +200,7 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 				r.Actions = append(r.Actions, act)
 				continue
 			}
-			if kerr := deps.KillRCDaemon(d.PID); kerr != nil {
+			if kerr := deps.KillRCDaemon(d.PID, d.WorkingDir); kerr != nil {
 				act.Verb = VerbSurface
 				act.Reason = fmt.Sprintf("kill failed: %v", kerr)
 			} else {
@@ -338,16 +338,18 @@ func currentClaudeVersionOnDisk() (string, error) {
 // codex P2 (PID-reuse defense before the kill): the process can exit
 // between ListRCDaemons/pgrep enumeration and this signal, and the kernel
 // can recycle the PID for an unrelated process. Re-verify the PID's argv
-// still looks like a `claude remote-control` listener IMMEDIATELY before
-// signaling — same defense rc.Down's verifyPIDIsListener applies. If the
-// argv no longer matches (recycled PID) or already gone, refuse the kill.
-func killRCDaemonOnDisk(pid int) error {
-	if !pidIsRCListenerFn(pid) {
-		// Either the process already exited (nothing to kill) or the PID
-		// was recycled by an unrelated process (must not signal it).
+// AND its working_dir still match IMMEDIATELY before signaling — every
+// Fleet RC listener shares the fleet-coord prefix, so an argv-only re-check
+// would still pass for a REUSED PID now owned by another project's healthy
+// listener. The cwd re-check fails closed: if expectedCwd can't be
+// confirmed against the live PID, refuse the kill.
+func killRCDaemonOnDisk(pid int, expectedCwd string) error {
+	if !pidIsRCListenerFn(pid, expectedCwd) {
+		// Process already exited, PID recycled by an unrelated process, or
+		// the live cwd no longer matches — must not signal it.
 		fmt.Fprintf(os.Stderr,
-			"gc: rc daemon PID %d no longer matches a claude remote-control listener (exited or PID reuse); skipping kill\n",
-			pid)
+			"gc: rc daemon PID %d no longer matches a claude remote-control listener at %q (exited, PID reuse, or cwd drift); skipping kill\n",
+			pid, expectedCwd)
 		return nil
 	}
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
@@ -369,21 +371,21 @@ func killRCDaemonOnDisk(pid int) error {
 }
 
 // pidIsRCListenerFn is the test seam for the pre-kill PID-reuse defense.
-// Production uses pidIsRCListener (shells out to ps). Tests override it to
-// exercise the "refuse to signal a recycled PID" branch deterministically.
+// Production uses pidIsRCListener (shells out to ps + lsof). Tests override
+// it to exercise the "refuse to signal a recycled PID" branch deterministically.
 var pidIsRCListenerFn = pidIsRCListener
 
-// pidIsRCListener re-confirms a PID's argv still looks like a fleet
-// `claude remote-control` listener via `ps -p <pid> -o args=`. Mirrors
-// the argv half of rc.psArgsVerify (claude + remote-control + the
-// fleet-coord session prefix). Conservative: any probe failure, empty
-// argv, or a non-matching command returns false so we refuse to signal a
-// recycled / unrelated PID. The cwd half (lsof) is intentionally skipped
-// here — the version/owner cross-check already tied this PID to fleet
-// state during classification; this final gate only needs to prove the
-// LIVE process is still the listener and not a recycled stranger.
-func pidIsRCListener(pid int) bool {
-	if pid <= 0 {
+// pidIsRCListener re-confirms a live PID is STILL the fleet `claude
+// remote-control` listener we classified: its argv contains claude +
+// remote-control + the fleet-coord session prefix (via `ps -p <pid> -o
+// args=`) AND its working_dir matches expectedCwd (via lsof). Both are
+// required (codex P2): every project shares the fleet-coord prefix, so
+// argv alone can't distinguish project A's listener from a reused PID now
+// running project B's healthy listener. Fails CLOSED: any probe failure,
+// empty argv, non-matching command, empty expectedCwd, or cwd mismatch
+// returns false so we never signal a recycled / unrelated process.
+func pidIsRCListener(pid int, expectedCwd string) bool {
+	if pid <= 0 || expectedCwd == "" {
 		return false
 	}
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
@@ -394,9 +396,18 @@ func pidIsRCListener(pid int) bool {
 	if args == "" {
 		return false
 	}
-	return strings.Contains(args, "claude") &&
-		strings.Contains(args, "remote-control") &&
-		strings.Contains(args, rc.SessionPrefix)
+	if !strings.Contains(args, "claude") ||
+		!strings.Contains(args, "remote-control") ||
+		!strings.Contains(args, rc.SessionPrefix) {
+		return false
+	}
+	// cwd re-check (lsof). Fail closed when lsof is missing or the cwd
+	// doesn't match — better to leak a stale daemon than kill a live one.
+	cwd, cerr := lsofProcessCwd(pid)
+	if cerr != nil {
+		return false
+	}
+	return cwd == expectedCwd
 }
 
 // processAlive probes whether pid is still running via signal-0

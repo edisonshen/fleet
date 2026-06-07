@@ -137,7 +137,7 @@ func withRCDaemonStubs(d Deps) Deps {
 	d.ListRCDaemons = func() ([]RCDaemonInfo, error) { return nil, nil }
 	d.ListRCStates = func() ([]RCStateInfo, error) { return nil, nil }
 	d.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
-	d.KillRCDaemon = func(int) error {
+	d.KillRCDaemon = func(int, string) error {
 		return errors.New("stubDeps: KillRCDaemon should not run")
 	}
 	return d
@@ -3720,7 +3720,7 @@ func TestReconcile_OrphanRCDaemon_ApplyKills(t *testing.T) {
 		}, nil
 	}
 	var killed []int
-	deps.KillRCDaemon = func(pid int) error {
+	deps.KillRCDaemon = func(pid int, _ string) error {
 		killed = append(killed, pid)
 		return nil
 	}
@@ -3756,7 +3756,7 @@ func TestReconcile_OrphanRCDaemon_HealthyDaemonPreserved(t *testing.T) {
 			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet"},
 		}, nil
 	}
-	deps.KillRCDaemon = func(pid int) error {
+	deps.KillRCDaemon = func(pid int, _ string) error {
 		t.Fatalf("KillRCDaemon must not run for healthy daemon; got pid=%d", pid)
 		return nil
 	}
@@ -3837,16 +3837,16 @@ func TestReconcile_OrphanRCDaemon_LegacyEmptyVersionSurfaces(t *testing.T) {
 func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
 	// codex P2: the PID can exit between pgrep enumeration and the kill,
 	// and the kernel can recycle it. killRCDaemonOnDisk must re-verify the
-	// argv still matches a claude remote-control listener and REFUSE to
+	// argv + cwd still match a claude remote-control listener and REFUSE to
 	// signal a recycled / unrelated PID. We stub the verifier to false and
 	// assert no signal is attempted (the call returns nil, no error).
 	prev := pidIsRCListenerFn
-	pidIsRCListenerFn = func(int) bool { return false }
+	pidIsRCListenerFn = func(int, string) bool { return false }
 	t.Cleanup(func() { pidIsRCListenerFn = prev })
 
 	// PID 1 (init) would be catastrophic to actually signal; the verifier
 	// stub returns false so the kill is refused before any syscall.Kill.
-	if err := killRCDaemonOnDisk(1); err != nil {
+	if err := killRCDaemonOnDisk(1, "/tmp/whatever"); err != nil {
 		t.Fatalf("killRCDaemonOnDisk must no-op (nil) when PID-reuse check fails; got %v", err)
 	}
 }
@@ -3872,7 +3872,7 @@ func TestReconcile_OrphanRCDaemon_HealthyDuplicateStateWins(t *testing.T) {
 		}, nil
 	}
 	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
-	deps.KillRCDaemon = func(pid int) error {
+	deps.KillRCDaemon = func(pid int, _ string) error {
 		t.Fatalf("must not kill: a current-version state owns PID %d", pid)
 		return nil
 	}
@@ -3905,7 +3905,7 @@ func TestReconcile_OrphanRCDaemon_LooseStaleMatch_SurfacesNotKilled(t *testing.T
 		}, nil
 	}
 	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
-	deps.KillRCDaemon = func(pid int) error {
+	deps.KillRCDaemon = func(pid int, _ string) error {
 		t.Fatalf("must not kill on a loose (cwd-unconfirmed) stale match; pid=%d", pid)
 		return nil
 	}

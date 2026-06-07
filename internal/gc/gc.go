@@ -314,8 +314,13 @@ type Deps struct {
 	// currentClaudeVersionOnDisk.
 	CurrentClaudeVersion func() (string, error)
 	// KillRCDaemon sends SIGTERM with SIGKILL escalation to pid under
-	// --apply. Production wiring is killRCDaemonOnDisk.
-	KillRCDaemon func(pid int) error
+	// --apply. expectedCwd is the daemon's confirmed working_dir; the
+	// production wiring re-verifies the live PID's argv AND cwd match it
+	// immediately before signaling (codex P2: a PID that exits after
+	// enumeration and is reused by another project's listener shares the
+	// fleet-coord prefix, so argv-only re-verify isn't enough — the cwd
+	// re-check fails closed). Production wiring is killRCDaemonOnDisk.
+	KillRCDaemon func(pid int, expectedCwd string) error
 
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry

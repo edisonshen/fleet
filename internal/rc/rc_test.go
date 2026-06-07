@@ -745,6 +745,58 @@ func TestDefaultOwnerAlive_RecordMissingIsDead(t *testing.T) {
 	}
 }
 
+// TestUp_FreshAcquire_DropsOwnerWithoutRecord (codex P2): when the caller
+// passes a well-formed coord_id that has NO agent record yet (coordinator
+// legacy/upgrade path), Up must persist owning_coord_id as EMPTY — not the
+// ghost id. Persisting the ghost would make the next tick's dead-owner check
+// reap + respawn + re-persist the same ghost, flapping the listener forever.
+func TestUp_FreshAcquire_DropsOwnerWithoutRecord(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { return "2.1.156", nil }
+	t.Cleanup(func() { claudeVersionFn = prevV })
+	// Owner record does NOT exist for this coord-id.
+	restoreExists := SetOwnerRecordExistsForTest(func(coordID string) bool { return false })
+	defer restoreExists()
+	restoreSpawn := SetSpawnerForTest(func(string) (int, error) { return os.Getpid(), nil })
+	defer restoreSpawn()
+
+	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", CoordID: "abcd1234", SkipSpawn: true, InjectedPID: 4242})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAcquired {
+		t.Fatalf("outcome=%q want acquired", out)
+	}
+	got, _ := ReadState("demo")
+	if got.OwningCoordID != "" {
+		t.Fatalf("owner with no agent record must be persisted empty; got %q", got.OwningCoordID)
+	}
+}
+
+// TestUp_FreshAcquire_PersistsOwnerWithRecord: the complement — when the
+// agent record DOES exist, the owner is persisted.
+func TestUp_FreshAcquire_PersistsOwnerWithRecord(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { return "2.1.156", nil }
+	t.Cleanup(func() { claudeVersionFn = prevV })
+	restoreExists := SetOwnerRecordExistsForTest(func(coordID string) bool { return coordID == "abcd1234" })
+	defer restoreExists()
+	restoreSpawn := SetSpawnerForTest(func(string) (int, error) { return os.Getpid(), nil })
+	defer restoreSpawn()
+
+	if _, err := Up("demo", UpOpts{Cwd: "/tmp/demo", CoordID: "abcd1234", SkipSpawn: true, InjectedPID: 4242}); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	got, _ := ReadState("demo")
+	if got.OwningCoordID != "abcd1234" {
+		t.Fatalf("owner with an agent record must be persisted; got %q", got.OwningCoordID)
+	}
+}
+
 // TestReapDaemonKeepMarker_AbortsOnConcurrentRespawn (codex P1 race guard):
 // SweepAllProjects snapshots state WITHOUT the lock, then reapDaemonKeepMarker
 // locks + removes. If a coord respawned a FRESH daemon (new PID + current
@@ -1076,9 +1128,14 @@ func withStubVersionAndOwner(t *testing.T, version string) {
 	ownerAliveFn = func(coordID string) bool {
 		return coordID != "" // default: any non-empty owner is alive
 	}
+	prevE := ownerRecordExistsFn
+	ownerRecordExistsFn = func(coordID string) bool {
+		return coordID != "" // default: any non-empty owner has a record
+	}
 	t.Cleanup(func() {
 		claudeVersionFn = prevV
 		ownerAliveFn = prevO
+		ownerRecordExistsFn = prevE
 	})
 }
 

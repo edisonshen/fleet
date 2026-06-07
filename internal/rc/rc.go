@@ -359,8 +359,8 @@ func Up(project string, opts UpOpts) (string, error) {
 						// record has none, stamp it in (idempotent: only when
 						// the recorded owner is empty, so we never clobber an
 						// existing owner with a different coord's tick).
-						if opts.CoordID != "" && cur.OwningCoordID == "" {
-							cur.OwningCoordID = opts.CoordID
+						if owner := persistableOwner(opts.CoordID); owner != "" && cur.OwningCoordID == "" {
+							cur.OwningCoordID = owner
 							if err := WriteState(cur); err != nil {
 								return OutcomeError, err
 							}
@@ -469,7 +469,7 @@ func Up(project string, opts UpOpts) (string, error) {
 			SessionPrefix: SessionPrefix,
 			LastSpawnAt:   now,
 			ClaudeVersion: curVer,
-			OwningCoordID: opts.CoordID,
+			OwningCoordID: persistableOwner(opts.CoordID),
 		}
 		if spawnErr != nil {
 			rec.LastError = spawnErr.Error()
@@ -1153,6 +1153,56 @@ func defaultClaudeVersion() (string, error) {
 		return line[:i], nil
 	}
 	return line, nil
+}
+
+// ownerRecordExistsFn is the test seam for the agent-record existence
+// probe used by persistableOwner. Production: agent.Load(coordID) returns
+// without state.ErrNotFound. Tests stub it.
+var ownerRecordExistsFn = defaultOwnerRecordExists
+
+func defaultOwnerRecordExists(coordID string) bool {
+	if coordID == "" {
+		return false
+	}
+	_, err := agent.Load(coordID)
+	if err == nil {
+		return true
+	}
+	// Only a definitively-missing record is "doesn't exist". A corrupt /
+	// permission-denied read is ambiguous — treat as exists so we don't
+	// drop a legitimate owner on a transient read error.
+	return !errors.Is(err, state.ErrNotFound)
+}
+
+// SetOwnerRecordExistsForTest swaps ownerRecordExistsFn; returns a restore
+// func tests defer.
+func SetOwnerRecordExistsForTest(fn func(coordID string) bool) func() {
+	prev := ownerRecordExistsFn
+	ownerRecordExistsFn = fn
+	return func() { ownerRecordExistsFn = prev }
+}
+
+// persistableOwner returns coordID only when an agent record actually
+// exists for it; otherwise "". codex P2: the coordinator's documented
+// legacy/upgrade path (loop.tick) allows a well-formed coord_id even when
+// ~/.fleet/agents/<id>.json is missing. Persisting that ID as
+// owning_coord_id would make defaultOwnerAlive classify it dead-owner on
+// the NEXT tick (record missing → reap → respawn → re-persist same ghost
+// owner), flapping the listener every tick. Persisting "" instead leaves
+// the daemon ownerless (dead-owner check is skipped for empty owners), so
+// it stays stable on the version-mismatch signal until a real record
+// appears — at which point a later adopt tick backfills the true owner.
+func persistableOwner(coordID string) string {
+	if coordID == "" {
+		return ""
+	}
+	if ownerRecordExistsFn(coordID) {
+		return coordID
+	}
+	fmt.Fprintf(os.Stderr,
+		"rc: coord-id %q has no agent record yet (legacy/upgrade path); persisting owning_coord_id as empty to avoid dead-owner flapping — a later tick will backfill once the record exists\n",
+		coordID)
+	return ""
 }
 
 // ownerAliveFn is the test seam for the owning-coord liveness probe.
