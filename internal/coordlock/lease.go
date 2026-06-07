@@ -470,6 +470,13 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 	// recorded Owner (the original OLD holder, preserved by the two-phase
 	// rule), NOT the dead candidate.
 	old := rec.Owner
+	// priorCandidate is the candidate recorded in a fencing/fenced record
+	// we are RESUMING — it may be the process that actually holds the flock
+	// (it acquired it and hung before casFencingToActive), even if its
+	// best-effort flock-body stamp is missing/stale. We must include it in
+	// the kill targets so a hung resumed-candidate is reaped (else
+	// retryFlock just times out into fenced_not_acquired).
+	priorCandidate := rec.Candidate
 
 	// Phase 1: fence under epoch.lock.
 	fenced, err := l.withEpochLock(func() (bool, error) {
@@ -505,6 +512,12 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 		if cur.Owner.Pid != 0 {
 			old = cur.Owner
 		} // else keep `old` = rec.Owner (the flock-body holder)
+		// If resuming a transient record, the on-disk candidate is the
+		// prior takeover driver that may hold the flock — prefer it over the
+		// (possibly stale) value passed in via rec.
+		if (cur.State == stateFencing || cur.State == stateFencedNotAcquired) && cur.Candidate.Pid != 0 {
+			priorCandidate = cur.Candidate
+		}
 		l.epoch = cur.Epoch + 1
 		return true, l.writeEpochLocked(epochRecord{
 			Epoch:     l.epoch,
@@ -530,9 +543,11 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 	// whose previous candidate acquired the flock + stamped it before
 	// hanging, the live flock holder is that candidate, not the original
 	// owner. Kill every distinct live identity that could be holding the
-	// flock — the recorded owner AND the current flock-body holder — so a
-	// hung resumed-candidate is reaped too (else retryFlock just times out).
-	for _, target := range l.killTargets(old) {
+	// flock — the recorded owner, the prior fencing candidate (the flock
+	// holder when resuming a stale takeover, even if its body stamp is
+	// missing), AND the current flock-body holder — so a hung resumed
+	// candidate is reaped too (else retryFlock just times out).
+	for _, target := range l.killTargets(old, priorCandidate) {
 		if kerr := l.cfg.killStub(target); kerr != nil {
 			_ = l.markFencedNotAcquired(old)
 			return false, false, fmt.Errorf("coordlock.TakeOver: kill stub failed for pid=%d: %w", target.Pid, kerr)
@@ -856,13 +871,16 @@ func (l *Lease) syntheticRecordFromFlockBody() epochRecord {
 }
 
 // killTargets returns the distinct live identities a takeover must kill to
-// free coordinator.flock: the recorded OLD owner plus the current
-// flock-body holder (which differs from OLD when resuming a stale fencing
-// record whose candidate acquired the flock then hung). Dead/empty/self
-// identities are dropped — the kill primitive (PR2) re-validates again
-// before signaling, but we avoid handing it provably-irrelevant targets.
-func (l *Lease) killTargets(old identity) []identity {
-	targets := make([]identity, 0, 2)
+// free coordinator.flock: the recorded OLD owner, any extra identities the
+// caller passes (the prior fencing candidate when resuming a stale
+// takeover), and the current flock-body holder. The candidate is included
+// EXPLICITLY because stampFlockBody is best-effort — the candidate may hold
+// the flock with a missing/stale body, and missing it would leave the
+// takeover to time out into fenced_not_acquired. Dead/empty/self identities
+// are dropped — the kill primitive (PR2) re-validates again before
+// signaling, but we avoid handing it provably-irrelevant targets.
+func (l *Lease) killTargets(old identity, extra ...identity) []identity {
+	targets := make([]identity, 0, 3)
 	add := func(id identity) {
 		if id.Pid <= 0 || id.Pid == l.self.Pid || !l.pidAlive(id) {
 			return
@@ -875,6 +893,9 @@ func (l *Lease) killTargets(old identity) []identity {
 		targets = append(targets, id)
 	}
 	add(old)
+	for _, e := range extra {
+		add(e)
+	}
 	// The flock-body holder (whoever stamped coordinator.flock last).
 	if b, err := os.ReadFile(l.paths.flock); err == nil && len(b) > 0 {
 		var body flockBody
@@ -882,7 +903,7 @@ func (l *Lease) killTargets(old identity) []identity {
 			add(identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project})
 		}
 	}
-	// If neither is live (both already dead), still hand the kill primitive
+	// If none are live (all already dead), still hand the kill primitive
 	// the recorded owner so the PR1 stub / PR2 kill has a stable target;
 	// the flock is already free in that case so retryFlock will win anyway.
 	if len(targets) == 0 {
