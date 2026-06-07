@@ -106,6 +106,18 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 		return records[i].SpawnedAt.After(records[j].SpawnedAt)
 	})
 
+	// RC daemon sweep (leak-rc-daemon-lifecycle PR-B). Reaps stale-
+	// version + dead-owner daemons across all projects. Mutates only
+	// fleet's own resources (kills the orphan PID, removes the
+	// per-project rc-state.json) — matches the fleet-owns-its-resources
+	// rule. Runs on BOTH the table and --json paths (codex P2: the JSON
+	// branch returns early, so placing the sweep here is the only way it
+	// fires for machine-readable callers like dashboards / coord ticks).
+	// Surface-don't-silo: errors log to stderr — stdout stays valid JSON.
+	if err := rcSweepFn(); err != nil {
+		_, _ = fmt.Fprintf(stderr, "warning: rc sweep failed: %v (continuing)\n", err)
+	}
+
 	if opts.jsonOut {
 		if records == nil {
 			records = []*agent.Record{}
@@ -151,16 +163,6 @@ func runStatus(opts *statusOpts, stdout, stderr io.Writer, current string) error
 	// `fleet status | jq` and `fleet status | grep` consumers
 	// reading stdout aren't broken by the banner.
 	emitSessionCapBanner(stderr)
-
-	// RC daemon sweep (leak-rc-daemon-lifecycle PR-B). Reaps stale-
-	// version + dead-owner daemons across all projects. Mutates only
-	// fleet's own resources (kills the orphan PID, removes the
-	// per-project rc-state.json) — matches the fleet-owns-its-resources
-	// rule. Surface-don't-silo on errors: any sweep error logs to
-	// stderr but never blocks status output.
-	if err := rcSweepFn(); err != nil {
-		_, _ = fmt.Fprintf(stderr, "warning: rc sweep failed: %v (continuing)\n", err)
-	}
 
 	// Auto-reconcile pass (fleet#165 PR-D). Dry-run only — status is
 	// informational and must NEVER mutate state. Errors log to stderr

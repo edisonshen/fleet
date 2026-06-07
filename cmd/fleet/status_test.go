@@ -900,6 +900,37 @@ func TestStatus_InvokesRCSweepAllProjects(t *testing.T) {
 	}
 }
 
+// TestStatus_InvokesRCSweepAllProjects_JSONPath (codex P2): the --json
+// branch returns early, so the sweep must run BEFORE that return or it
+// never fires for machine-readable callers (dashboards, coord ticks using
+// --json). Assert the sweep runs AND stdout stays a valid JSON array
+// (sweep diagnostics go to stderr, never stdout).
+func TestStatus_InvokesRCSweepAllProjects_JSONPath(t *testing.T) {
+	stubEnsureFresh(t)
+	dir := t.TempDir()
+	t.Setenv("FLEET_HOME", dir)
+
+	var sweepCalls int
+	prev := rcSweepFn
+	rcSweepFn = func() error {
+		sweepCalls++
+		return nil
+	}
+	t.Cleanup(func() { rcSweepFn = prev })
+
+	var stdout, stderr bytes.Buffer
+	if err := runStatus(&statusOpts{jsonOut: true}, &stdout, &stderr, "dev"); err != nil {
+		t.Fatalf("runStatus: %v", err)
+	}
+	if sweepCalls != 1 {
+		t.Fatalf("expected exactly one rc.SweepAllProjects call on --json path; got %d", sweepCalls)
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &arr); err != nil {
+		t.Fatalf("--json stdout must remain a valid JSON array after sweep; got %q err=%v", stdout.String(), err)
+	}
+}
+
 // TestStatus_RCSweepError_LoggedToStderr_DoesNotBlockStatus: when
 // SweepAllProjects errors (filesystem hiccup, e.g. ~/.fleet/projects/
 // briefly unreadable), runStatus must NOT propagate the error.

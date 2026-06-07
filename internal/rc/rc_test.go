@@ -706,6 +706,59 @@ func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
 	}
 }
 
+// TestReapDaemonKeepMarker_AbortsOnConcurrentRespawn (codex P1 race guard):
+// SweepAllProjects snapshots state WITHOUT the lock, then reapDaemonKeepMarker
+// locks + removes. If a coord respawned a FRESH daemon (new PID + current
+// version) between snapshot and lock, the reap must abort — removing the
+// fresh state would leave marker + no-state + live listener, forcing the
+// next respawn-only tick into the contested path. The race guard re-reads
+// under the lock and bails when PID differs or the record is no longer stale.
+func TestReapDaemonKeepMarker_AbortsOnConcurrentRespawn(t *testing.T) {
+	withFleetHome(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	// Snapshot the sweeper would have taken: stale-version daemon, old PID.
+	snapshot := RecordedState{
+		Project: "demo", PID: 11111, HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, ClaudeVersion: "2.1.146", OwningCoordID: "coord-live",
+	}
+	// On-disk state has ALREADY been refreshed by a concurrent respawn:
+	// new PID, current version, alive owner → no longer stale.
+	fresh := RecordedState{
+		Project: "demo", PID: 22222, HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, ClaudeVersion: "2.1.156", OwningCoordID: "coord-live",
+	}
+	if err := WriteState(fresh); err != nil {
+		t.Fatalf("WriteState fresh: %v", err)
+	}
+
+	reapDaemonKeepMarker("demo", snapshot)
+
+	// Fresh state must survive untouched, no kill issued, marker preserved.
+	got, err := ReadState("demo")
+	if err != nil {
+		t.Fatalf("fresh state must be preserved after aborted reap; err=%v", err)
+	}
+	if got.PID != 22222 {
+		t.Fatalf("fresh state.pid=%d want preserved 22222 (reap must not clobber concurrent respawn)", got.PID)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("no kill must fire when state changed under lock; killed=%v", killed)
+	}
+	if !MarkerPresent("demo") {
+		t.Fatalf("marker must remain present")
+	}
+}
+
 // TestSweepAllProjects_ReleasesMarkerlessOrphans (codex P2): the
 // sweeper's whole point is to release entries where rc-state.json
 // claims a live PID but the marker is gone (operator rm'd it

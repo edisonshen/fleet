@@ -768,10 +768,39 @@ func SweepAllProjects() error {
 //	Down()                 → kill + RemoveState + RemoveMarker (opt-out)
 //	reapDaemonKeepMarker() → kill + RemoveState, marker preserved (heal)
 //
+// codex P1 (re-read under lock): SweepAllProjects reads the state snapshot
+// WITHOUT the lock, so a coord tick's `fleet rc up --respawn-only` can
+// respawn + rewrite rc-state.json between the snapshot and this call. We
+// MUST re-read under the lock and confirm (a) the PID still matches the
+// snapshot and (b) computeHealReason still flags it stale. If the state
+// changed (fresh respawn) we abort — removing the fresh state here would
+// leave marker + no-state + live listener, forcing the next respawn-only
+// tick down the contested path instead of clean adoption.
+//
 // Best-effort: errors are swallowed (sweep is fire-and-forget across all
 // projects; one bad entry must not abort the rest).
-func reapDaemonKeepMarker(project string, cur RecordedState) {
+func reapDaemonKeepMarker(project string, snapshot RecordedState) {
 	_, _ = withLock(project, func() (string, error) {
+		// Re-read under the lock. If state vanished, nothing to reap.
+		cur, err := ReadState(project)
+		if err != nil {
+			return OutcomeAlreadyReleased, nil
+		}
+		// Race guard: a fresh respawn between snapshot and lock rewrites
+		// PID/version/owner. If the current record no longer matches the
+		// snapshot PID, or no longer warrants a heal, leave it alone.
+		if cur.PID != snapshot.PID {
+			fmt.Fprintf(os.Stderr,
+				"rc.reapDaemonKeepMarker: project %q state changed under lock (snapshot PID %d -> current PID %d); aborting reap (likely concurrent respawn)\n",
+				project, snapshot.PID, cur.PID)
+			return OutcomeAlreadyAcquired, nil
+		}
+		if computeHealReason(cur) == "" {
+			fmt.Fprintf(os.Stderr,
+				"rc.reapDaemonKeepMarker: project %q no longer stale under lock (PID %d); aborting reap\n",
+				project, cur.PID)
+			return OutcomeAlreadyAcquired, nil
+		}
 		host, _ := os.Hostname()
 		// Cross-host entries are filtered by the caller, but re-check
 		// under the lock so a racing host change can't make us signal a

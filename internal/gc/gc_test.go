@@ -3834,6 +3834,23 @@ func TestReconcile_OrphanRCDaemon_LegacyEmptyVersionSurfaces(t *testing.T) {
 	}
 }
 
+func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
+	// codex P2: the PID can exit between pgrep enumeration and the kill,
+	// and the kernel can recycle it. killRCDaemonOnDisk must re-verify the
+	// argv still matches a claude remote-control listener and REFUSE to
+	// signal a recycled / unrelated PID. We stub the verifier to false and
+	// assert no signal is attempted (the call returns nil, no error).
+	prev := pidIsRCListenerFn
+	pidIsRCListenerFn = func(int) bool { return false }
+	t.Cleanup(func() { pidIsRCListenerFn = prev })
+
+	// PID 1 (init) would be catastrophic to actually signal; the verifier
+	// stub returns false so the kill is refused before any syscall.Kill.
+	if err := killRCDaemonOnDisk(1); err != nil {
+		t.Fatalf("killRCDaemonOnDisk must no-op (nil) when PID-reuse check fails; got %v", err)
+	}
+}
+
 func TestReconcile_OrphanRCDaemon_UnknownCurrentVersion_PreservesLegacy(t *testing.T) {
 	// Guard against over-eager reaping: when the CURRENT claude version
 	// can't be probed (curVer empty — degraded host), a legacy empty-
