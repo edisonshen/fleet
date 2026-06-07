@@ -1421,3 +1421,63 @@ func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
 		t.Fatal("a fenced_not_acquired record must drive a fresh takeover attempt (re-fence/kill)")
 	}
 }
+
+// ---- codex iter-12 [P2]: Release invalidates outstanding tokens ----
+
+// After a clean Release(), a previously-issued LeaseToken must STOP
+// validating immediately (the record is demoted to `released`), so a
+// racing goroutine's lease-gated mutation can't be admitted in the window
+// before TTL/successor.
+func TestReleaseInvalidatesOutstandingToken(t *testing.T) {
+	setupHome(t)
+	t.Setenv(FailoverEnvVar, "1")
+	const project = "rainier"
+
+	lease, acquired, err := acquireLease(project, "me", testCfg(&fakeClock{}, newFakeLiveness()))
+	if err != nil || !acquired {
+		t.Fatalf("first acquire: acquired=%v err=%v", acquired, err)
+	}
+	tok := lease.Token()
+	if !tok.StillOwned() {
+		t.Fatal("token should be valid while the lease is held")
+	}
+
+	lease.Release()
+
+	if tok.StillOwned() {
+		t.Fatal("token must NOT be StillOwned after Release() (record demoted to released)")
+	}
+	rec := readEpochFor(t, project)
+	if rec.State != stateReleased {
+		t.Fatalf("expected released state after Release, got %s", rec.State)
+	}
+}
+
+// A successor must still be able to acquire after a clean Release (the
+// released record + freed flock -> free-flock promote).
+func TestSuccessorAcquiresAfterRelease(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	first, acquired, err := acquireLease(project, "first", testCfg(clk, live))
+	if err != nil || !acquired {
+		t.Fatalf("first acquire: acquired=%v err=%v", acquired, err)
+	}
+	firstEpoch := first.epoch
+	first.Release()
+
+	second, acquired2, err := acquireLease(project, "second", testCfg(clk, live))
+	if err != nil || !acquired2 {
+		t.Fatalf("successor acquire after release: acquired=%v err=%v", acquired2, err)
+	}
+	defer second.Release()
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive || rec.Owner.AgentID != "second" {
+		t.Fatalf("expected active second after release, got %s/%s", rec.State, rec.Owner.AgentID)
+	}
+	if rec.Epoch <= firstEpoch {
+		t.Fatalf("successor epoch (%d) must advance past the released epoch (%d)", rec.Epoch, firstEpoch)
+	}
+}
