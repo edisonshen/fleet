@@ -13,19 +13,19 @@ type drainHarness struct {
 	deps       Deps
 	killCalls  []DrainKillTarget
 	removed    []string
-	killReturn func(DrainKillTarget) (bool, error)
+	killReturn func(DrainKillTarget) (DrainKillResult, error)
 }
 
 func newDrainHarness(now time.Time) *drainHarness {
 	h := &drainHarness{}
 	h.deps = Deps{
 		Now: func() time.Time { return now },
-		KillDrain: func(t DrainKillTarget) (bool, error) {
+		KillDrain: func(t DrainKillTarget) (DrainKillResult, error) {
 			h.killCalls = append(h.killCalls, t)
 			if h.killReturn != nil {
 				return h.killReturn(t)
 			}
-			return true, nil // default: identity held, killed
+			return DrainKillResult{Killed: true}, nil // default: killed
 		},
 		RemoveDrainRun: func(path string) error {
 			h.removed = append(h.removed, path)
@@ -222,7 +222,7 @@ func TestDrainProcs_T18c_PidReuse_NoKill(t *testing.T) {
 func TestDrainProcs_KillRacedToExit_NoError(t *testing.T) {
 	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
 	h := newDrainHarness(now)
-	h.killReturn = func(DrainKillTarget) (bool, error) { return false, nil } // raced
+	h.killReturn = func(DrainKillTarget) (DrainKillResult, error) { return DrainKillResult{Gone: true}, nil } // raced to exit
 	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
 		return []DrainRun{{
 			Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute),
@@ -239,6 +239,33 @@ func TestDrainProcs_KillRacedToExit_NoError(t *testing.T) {
 	}
 	if len(h.removed) != 1 {
 		t.Fatalf("expected the now-dead record cleaned; got %v", h.removed)
+	}
+}
+
+// Ambiguous guard (codex [P2]): KillDrain returns the zero result
+// (could NOT confirm liveness/identity). The wedged drain may still be
+// live — the record must be KEPT (not deleted) and the action surfaced
+// so the next sweep retries. Never strand a wedged drain.
+func TestDrainProcs_AmbiguousGuard_RecordKept(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.killReturn = func(DrainKillTarget) (DrainKillResult, error) { return DrainKillResult{}, nil } // unconfirmed
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute),
+			Path: "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbSurface {
+		t.Fatalf("ambiguous guard should SURFACE (not kill/remove), got %s reason=%s", act.Verb, act.Reason)
+	}
+	if len(h.removed) != 0 {
+		t.Fatalf("ambiguous guard must KEEP the record (no delete); got removed=%v", h.removed)
 	}
 }
 
@@ -293,7 +320,7 @@ func TestLegacyDrains_TLD2_ReapsAndIdempotent(t *testing.T) {
 
 	// 2nd run: pid already gone → KillDrain returns (false, nil).
 	h2 := newDrainHarness(now)
-	h2.killReturn = func(DrainKillTarget) (bool, error) { return false, nil }
+	h2.killReturn = func(DrainKillTarget) (DrainKillResult, error) { return DrainKillResult{Gone: true}, nil }
 	h2.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
 	h2.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
 		return []DrainProcInfo{{Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: true, Age: time.Hour}}, nil

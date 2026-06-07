@@ -95,13 +95,32 @@ type DrainProcInfo struct {
 
 // DrainKillTarget is the identity passed to KillDrain. The killer
 // RE-VALIDATES pid_start + exe immediately before signaling and is a
-// no-op (returns nil) on a pid that is already dead OR whose identity no
-// longer matches — so a reaped record never shoots an unrelated process
-// that reused the PID.
+// no-op on a pid that is already dead OR whose identity no longer
+// matches — so a reaped record never shoots an unrelated process that
+// reused the PID.
 type DrainKillTarget struct {
 	Pid      int
 	PidStart string
 	Exe      string
+}
+
+// DrainKillResult is the three-way outcome of a guarded kill (codex
+// [P2]). The caller MUST distinguish these to decide whether the stale
+// run-record is safe to delete:
+//
+//	Killed → SIGTERM delivered to the confirmed-identity drain. Delete
+//	         the record (LAST reap step).
+//	Gone   → the pid is confirmed dead OR its start identity changed (PID
+//	         reuse). No signal sent. Safe to delete the now-meaningless
+//	         record.
+//	neither (zero value) → the guard could NOT confirm liveness/identity
+//	         (e.g. the argv re-probe failed transiently). The pid MAY
+//	         still be the wedged drain, so the record is KEPT and the next
+//	         sweep retries. Never strand a wedged drain on an ambiguous
+//	         guard result.
+type DrainKillResult struct {
+	Killed bool
+	Gone   bool
 }
 
 // reconcileDrainProcs runs the steady-state run-record classifier. For
@@ -176,25 +195,32 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 				act.Verb = VerbSurface
 				act.Reason = fmt.Sprintf("%s; --apply requested but KillDrain dep not wired", act.Reason)
 			} else {
-				killed, kerr := deps.KillDrain(DrainKillTarget{Pid: run.Pid, PidStart: run.PidStart})
+				res, kerr := deps.KillDrain(DrainKillTarget{Pid: run.Pid, PidStart: run.PidStart})
 				switch {
 				case kerr != nil:
 					act.Verb = VerbSurface
 					act.Reason = fmt.Sprintf("%s; kill failed: %v", act.Reason, kerr)
-				case !killed:
-					// Identity re-validation failed at signal time (the
-					// proc died / changed between classification and kill)
-					// — surface, don't kill. The record is now stale-dead;
-					// clean it.
-					act.Verb = VerbRemoved
-					act.Reason = fmt.Sprintf("pid=%d no longer matched at signal time (raced to exit) — record cleaned, no kill", run.Pid)
-					_ = removeDrainRunIfWired(deps, run.Path)
-				default:
+				case res.Killed:
 					act.Verb = VerbKilled
 					// LAST step of the sweep: delete the stale run-record.
 					if rerr := removeDrainRunIfWired(deps, run.Path); rerr != nil {
 						act.Reason = fmt.Sprintf("reaped pid=%d but remove record failed: %v", run.Pid, rerr)
 					}
+				case res.Gone:
+					// pid confirmed dead / identity changed between
+					// classification and signal (raced to exit, or PID
+					// reuse) — no kill, record is now meaningless: clean it.
+					act.Verb = VerbRemoved
+					act.Reason = fmt.Sprintf("pid=%d gone / identity changed at signal time (raced to exit or PID reuse) — record cleaned, no kill", run.Pid)
+					_ = removeDrainRunIfWired(deps, run.Path)
+				default:
+					// Guard could NOT confirm liveness/identity (e.g. a
+					// transient argv-probe failure). The pid MAY still be
+					// the wedged drain — KEEP the record (codex [P2]: don't
+					// strand a wedged drain on an ambiguous guard result)
+					// and surface so the next sweep retries.
+					act.Verb = VerbSurface
+					act.Reason = fmt.Sprintf("pid=%d kill guard could not confirm identity (transient probe failure) — record KEPT, will retry next sweep", run.Pid)
 				}
 			}
 		}
@@ -244,18 +270,23 @@ func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 				act.Verb = VerbSurface
 				act.Reason = fmt.Sprintf("%s; --apply requested but KillDrain dep not wired", act.Reason)
 			} else {
-				killed, kerr := deps.KillDrain(DrainKillTarget{Pid: p.Pid, PidStart: p.PidStart, Exe: p.Exe})
+				res, kerr := deps.KillDrain(DrainKillTarget{Pid: p.Pid, PidStart: p.PidStart, Exe: p.Exe})
 				switch {
 				case kerr != nil:
 					act.Verb = VerbSurface
 					act.Reason = fmt.Sprintf("%s; kill failed: %v", act.Reason, kerr)
-				case !killed:
-					// Idempotent: already dead / identity changed at
-					// signal time → no-op, not an error (TLD2 2nd run).
+				case res.Killed:
+					act.Verb = VerbKilled
+				case res.Gone:
+					// Idempotent: already dead / identity changed at signal
+					// time → no-op, not an error (TLD2 2nd run). Legacy
+					// procs have no run-record to clean.
 					act.Verb = VerbSurface
 					act.Reason = fmt.Sprintf("pid=%d already gone at signal time — no-op (idempotent)", p.Pid)
 				default:
-					act.Verb = VerbKilled
+					// Guard could not confirm — surface, don't claim a kill.
+					act.Verb = VerbSurface
+					act.Reason = fmt.Sprintf("pid=%d kill guard could not confirm identity — not killed, will retry next sweep", p.Pid)
 				}
 			}
 		}

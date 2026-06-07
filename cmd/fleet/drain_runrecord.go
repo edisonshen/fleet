@@ -158,13 +158,48 @@ func writeDrainRunRecord(path string, rec drainRunRecord) error {
 	return nil
 }
 
-// procStartTimeForSelf reads this process's start-time fingerprint via
-// `ps -p <pid> -o lstart=` (the same format the gc reaper compares). ""
-// on any probe failure.
+// procStartTimeForSelf reads this process's start fingerprint. MUST stay
+// byte-identical to internal/gc's procStartFingerprint so the reaper's
+// comparison holds: prefer the Linux sub-second /proc/<pid>/stat
+// starttime ("linux-stat:"), fall back to `ps lstart` ("lstart:") on
+// darwin. The Linux source defeats same-second PID reuse (codex [P2]).
+// "" on any probe failure (the reaper then falls back to a bare liveness
+// probe for an empty fingerprint).
 func procStartTimeForSelf(pid int) string {
+	if hi, ok := linuxProcStarttimeSelf(pid); ok {
+		return "linux-stat:" + hi
+	}
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(out))
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return ""
+	}
+	return "lstart:" + s
+}
+
+// linuxProcStarttimeSelf mirrors internal/gc.linuxProcStarttime — field
+// 22 (starttime) of /proc/<pid>/stat. (value, false) on any non-Linux /
+// read / parse failure.
+func linuxProcStarttimeSelf(pid int) (string, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", false
+	}
+	s := string(data)
+	closeParen := strings.LastIndexByte(s, ')')
+	if closeParen < 0 || closeParen+2 >= len(s) {
+		return "", false
+	}
+	fields := strings.Fields(s[closeParen+2:])
+	if len(fields) < 20 {
+		return "", false
+	}
+	st := fields[19]
+	if _, perr := strconv.ParseUint(st, 10, 64); perr != nil {
+		return "", false
+	}
+	return st, true
 }

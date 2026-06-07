@@ -391,11 +391,15 @@ type Deps struct {
 	// that reused the number). Production wiring is drainProcLiveOnDisk.
 	DrainProcLive func(pid int, pidStart string) bool
 	// KillDrain reaps a wedged drain via the guarded kill: it RE-VALIDATES
-	// pid_start (+ exe for the legacy path) immediately before SIGTERM and
-	// returns (killed=false, nil) — NOT an error — when the pid is already
-	// dead or its identity no longer matches (idempotent, PID-reuse-safe).
-	// Production wiring is killDrainGuarded.
-	KillDrain func(target DrainKillTarget) (killed bool, err error)
+	// pid_start (+ exe for the legacy path) immediately before SIGTERM.
+	// Returns a DrainKillResult so the caller can tell the three outcomes
+	// apart (codex [P2]): Killed (SIGTERM delivered), Gone (pid confirmed
+	// dead / identity changed — safe to clean the record), or neither
+	// (guard could NOT confirm — e.g. the argv probe failed; the pid may
+	// STILL be the wedged drain, so the record is KEPT for the next sweep
+	// rather than stranded). Never an error for the already-dead case
+	// (idempotent). Production wiring is killDrainGuarded.
+	KillDrain func(target DrainKillTarget) (DrainKillResult, error)
 	// RemoveDrainRun deletes a stale run-record file (LAST step of a reap).
 	// ENOENT-tolerant. Production wiring is removeDrainRunFile.
 	RemoveDrainRun func(path string) error

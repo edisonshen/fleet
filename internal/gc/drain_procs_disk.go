@@ -95,45 +95,79 @@ func drainProcLiveOnDisk(pid int, pidStart string) bool {
 // killDrainGuarded is the production KillDrain. RE-VALIDATES identity
 // immediately before signaling (the gap between classification and kill
 // is a PID-reuse window) and signals SIGTERM only when identity holds.
-// Returns:
+// Returns a DrainKillResult so the classifier can distinguish a real
+// kill from a confirmed-gone no-op from an UNconfirmed guard failure
+// (codex [P2] — the last case must NOT delete the run-record):
 //
-//	(false, nil) — pid already dead OR identity no longer matches → no-op
-//	               (idempotent; never shoots an unrelated reused PID).
-//	(true,  nil) — identity confirmed → SIGTERM delivered.
-//	(false, err) — the signal call itself failed for a non-ESRCH reason.
-//
-// Prints a one-line stderr-style audit via the standard log surface is
-// intentionally omitted here (the CLI renders the Action verb/reason);
-// the guard is the load-bearing safety, not the logging.
-func killDrainGuarded(target DrainKillTarget) (bool, error) {
+//	{Killed:true}            — identity confirmed → SIGTERM delivered.
+//	{Gone:true}              — pid confirmed dead OR start identity changed
+//	                           (PID reuse) → no signal, safe to clean.
+//	{} (zero)                — guard could NOT confirm (transient argv-probe
+//	                           failure) → KEEP the record, retry next sweep.
+//	{}, err                  — the signal call failed for a non-ESRCH reason.
+func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 	if target.Pid <= 0 {
-		return false, nil
+		return DrainKillResult{Gone: true}, nil
 	}
-	// Re-validate liveness + start-time fingerprint at signal time.
+	// Re-validate liveness at signal time.
 	if !pidAliveOnDisk(target.Pid) {
-		return false, nil // already gone — idempotent no-op
+		return DrainKillResult{Gone: true}, nil // already gone — idempotent
 	}
+	// Re-validate the start-time fingerprint (PID-reuse defense). A
+	// mismatch means the live PID is an UNRELATED process → confirmed the
+	// recorded drain is gone. An unreadable fingerprint is AMBIGUOUS (we
+	// saw it alive but can't prove identity) → do NOT kill, do NOT claim
+	// gone — return the zero result so the record is kept.
 	if target.PidStart != "" {
 		cur, err := procStartTime(target.Pid)
-		if err != nil || cur != target.PidStart {
-			// Identity changed (PID reuse) or unreadable → surface, don't
-			// kill. The classifier records this as a no-op.
-			return false, nil
+		switch {
+		case err != nil:
+			return DrainKillResult{}, nil // ambiguous — keep record, retry
+		case cur != target.PidStart:
+			return DrainKillResult{Gone: true}, nil // PID reuse — unrelated proc
 		}
 	}
 	// Corroborate the process is still a `fleet drain` (defends both
-	// paths; the legacy sweep also passes Exe). argv must contain
-	// "fleet" AND "drain" — anything else is out of blast radius.
-	if !procIsFleetDrain(target.Pid) {
-		return false, nil
+	// paths). A probe failure is AMBIGUOUS (keep record); a clean
+	// non-match means the PID is now a different command → gone.
+	switch procDrainState(target.Pid) {
+	case drainProbeFailed:
+		return DrainKillResult{}, nil // ambiguous — keep record, retry
+	case drainProbeNotDrain:
+		return DrainKillResult{Gone: true}, nil // reused by a non-drain command
 	}
 	if err := syscall.Kill(target.Pid, syscall.SIGTERM); err != nil {
 		if errors.Is(err, syscall.ESRCH) {
-			return false, nil // raced to exit between probe and signal
+			return DrainKillResult{Gone: true}, nil // raced to exit
 		}
-		return false, fmt.Errorf("SIGTERM pid %d: %w", target.Pid, err)
+		return DrainKillResult{}, fmt.Errorf("SIGTERM pid %d: %w", target.Pid, err)
 	}
-	return true, nil
+	return DrainKillResult{Killed: true}, nil
+}
+
+// procDrainState is a three-way argv probe for the guarded kill: probe
+// failed (ambiguous), confirmed NOT a fleet-drain, or confirmed drain.
+type drainProbe int
+
+const (
+	drainProbeIsDrain drainProbe = iota
+	drainProbeNotDrain
+	drainProbeFailed
+)
+
+func procDrainState(pid int) drainProbe {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+	if err != nil {
+		return drainProbeFailed
+	}
+	argv := strings.TrimSpace(string(out))
+	if argv == "" {
+		return drainProbeFailed
+	}
+	if argvIsFleetDrain(argv) {
+		return drainProbeIsDrain
+	}
+	return drainProbeNotDrain
 }
 
 // removeDrainRunFile is the production RemoveDrainRun. ENOENT-tolerant so
@@ -205,10 +239,30 @@ func listDrainProcsOnDisk() ([]DrainProcInfo, error) {
 	return procs, nil
 }
 
-// procStartTime returns the `ps -p <pid> -o lstart=` start-time string —
-// the stable per-process fingerprint used to defeat PID reuse. Empty
-// output / ps error → an error (caller treats as unverifiable).
+// procStartTime returns the per-process start fingerprint used to defeat
+// PID reuse. MUST format-match cmd/fleet's drain-record producer
+// (procStartTimeForSelf) so the reaper's comparison holds.
+//
+// Resolution (codex [P2]): `ps lstart` has only 1-second granularity, so
+// a stale drain PID reused within the SAME second by another `fleet
+// drain` could spuriously match. To raise resolution we prefer the
+// Linux per-boot starttime from /proc/<pid>/stat (field 22, in clock
+// ticks — sub-second and monotonic), prefixed "linux-stat:". On darwin
+// (no /proc) we fall back to lstart, prefixed "lstart:". A same-second
+// reuse is then only a residual on darwin, further narrowed by the
+// argv re-probe in the guard (a reuse by a NON-drain command is
+// excluded). The prefix keeps the two encodings unambiguous so a
+// cross-platform record never false-matches.
 func procStartTime(pid int) (string, error) {
+	return procStartFingerprint(pid)
+}
+
+// procStartFingerprint is shared between gc's reaper and (by identical
+// reimplementation) cmd/fleet's drain producer. Keep them byte-identical.
+func procStartFingerprint(pid int) (string, error) {
+	if hi, ok := linuxProcStarttime(pid); ok {
+		return "linux-stat:" + hi, nil
+	}
 	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
 	if err != nil {
 		return "", fmt.Errorf("ps lstart pid %d: %w", pid, err)
@@ -217,18 +271,36 @@ func procStartTime(pid int) (string, error) {
 	if s == "" {
 		return "", fmt.Errorf("ps lstart pid %d: empty", pid)
 	}
-	return s, nil
+	return "lstart:" + s, nil
 }
 
-// procIsFleetDrain reports whether the live process's argv is a
-// `fleet drain` invocation. Used as the final guard before SIGTERM.
-// Any probe failure → false (don't kill what we can't confirm).
-func procIsFleetDrain(pid int) bool {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "args=").Output()
+// linuxProcStarttime reads field 22 (starttime, clock ticks since boot)
+// from /proc/<pid>/stat — a sub-second, monotonic, per-boot start
+// fingerprint that defeats same-second PID reuse on Linux. Returns
+// (value, false) on any non-Linux / read / parse failure so the caller
+// falls back to lstart. The comm field (field 2) can contain spaces and
+// parens, so we split on the LAST ')' before counting fields.
+func linuxProcStarttime(pid int) (string, bool) {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
-		return false
+		return "", false
 	}
-	return argvIsFleetDrain(strings.TrimSpace(string(out)))
+	s := string(data)
+	close := strings.LastIndexByte(s, ')')
+	if close < 0 || close+2 >= len(s) {
+		return "", false
+	}
+	fields := strings.Fields(s[close+2:]) // after "comm) "
+	// After comm, field indices shift: original field 3 (state) is now
+	// fields[0]; field 22 (starttime) is fields[19].
+	if len(fields) < 20 {
+		return "", false
+	}
+	st := fields[19]
+	if _, perr := strconv.ParseUint(st, 10, 64); perr != nil {
+		return "", false
+	}
+	return st, true
 }
 
 // argvIsFleetDrain matches a `fleet drain` command line. Requires BOTH
