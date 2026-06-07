@@ -90,6 +90,72 @@ _SLOW_CADENCE_TICKS_DEFAULT = 5
 _BACKOFF_BASE_TICKS = 1
 _BACKOFF_MAX_TICKS = 8
 
+# ----------------------------------------------------------------------
+# Auto-remediation bounds (DESIGN-pr-watch-autoremediate §2.1) — the
+# anti-spawn-storm core. TWO independent bounds, because neither is
+# airtight alone (both reviewers, P1):
+#   1. per-signature `attempts` — same head + same failing wall. Defeated
+#      by a fixer that pushes a NEW head each pass (head change -> new
+#      signature -> attempts resets -> never bound).
+#   2. per-series `series_dispatches` — total fixer dispatches since the
+#      LAST real progress (the failure frontier strictly shrank, or the PR
+#      reached READY). A head move alone does NOT reset it, so the
+#      pushes-a-new-head-each-time loop converges on max_series.
+# A dispatch is blocked if EITHER trips.
+# ----------------------------------------------------------------------
+_MAX_REMEDIATION_ATTEMPTS_DEFAULT = 3   # env PR_WATCH_MAX_REMEDIATION_ATTEMPTS
+_MAX_REMEDIATION_SERIES_DEFAULT = 6     # env PR_WATCH_MAX_REMEDIATION_SERIES
+
+# best_signal sentinels (§2.1). UNSET = no frontier observed yet this
+# episode (baseline on the next observation). UNKNOWN = a DIRTY whose
+# conflicted paths aren't reported yet — distinct from an EMPTY/clean
+# frontier so a later real conflicted-path update is scored correctly
+# (codex round-2 P2). Neither is "clean"; neither is a strict-shrink
+# target.
+_FRONTIER_UNSET = "\x00UNSET"
+_FRONTIER_UNKNOWN = "\x00UNKNOWN"
+# Frontier/detail-key element separator. A NEWLINE — NOT a comma (codex P2):
+# a GitHub matrix check name can contain a comma (e.g. "tests (linux,
+# py3.12)"), which a comma-join+split would shred into multiple fake elements
+# and corrupt the subset/progress comparison. Newlines can't appear in a
+# check name or a git path, so the join/split round-trips faithfully.
+_FRONTIER_SEP = "\n"
+
+
+def _encode_frontier(items) -> str:
+    """Join a set of frontier elements (check names / conflicted paths) into
+    the stable, comma-safe frontier string (§2.1)."""
+    return _FRONTIER_SEP.join(sorted(str(x) for x in items))
+
+
+def _frontier_set(s: str) -> set:
+    """Decode a frontier string back to its element set (inverse of
+    _encode_frontier)."""
+    return set(s.split(_FRONTIER_SEP)) if s else set()
+
+
+def env_max_remediation_attempts() -> int:
+    """Per-signature attempt bound (§2.1 bound 1). env override; default 3."""
+    return _env_positive_int("PR_WATCH_MAX_REMEDIATION_ATTEMPTS",
+                             _MAX_REMEDIATION_ATTEMPTS_DEFAULT)
+
+
+def env_max_remediation_series() -> int:
+    """Per-progress-frontier series bound (§2.1 bound 2). default 6."""
+    return _env_positive_int("PR_WATCH_MAX_REMEDIATION_SERIES",
+                             _MAX_REMEDIATION_SERIES_DEFAULT)
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
 
 # ----------------------------------------------------------------------
 # Event taxonomy — the reduced result of one probe (§4 / §5.1)
@@ -159,10 +225,23 @@ _FIX_EVENTS = frozenset({EVENT_CI_FAILED, EVENT_CHANGES_REQUESTED})
 
 ACTION_REBASE = "rebase"
 ACTION_FIX = "fix"
+# Re-derive (DESIGN-pr-watch-autoremediate §2.2/§2.3): regenerate the
+# change from the backing task's spec on a fresh base. The auto-remediation
+# ladder advances to this step ONLY for an UNAPPROVED DIRTY PR whose clean
+# rebase conflicted (rebase_conflicted_needs_rederive). A human-approved PR
+# NEVER re-derives — it escalates.
+ACTION_REDERIVE = "rederive"
 
 OUTCOME_RUNNING = "running"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_FAILED_LAUNCH = "failed_launch"
+# Nonterminal lease outcome (DESIGN-pr-watch-autoremediate §2.2, codex P1):
+# a rebase subagent that hit a conflict does NOT block — it aborts the
+# rebase, reports this outcome + the conflicted paths, and exits. The next
+# pass advances the ladder to the re-derive step instead of latching
+# blocked. MUST be excluded from the §6 per-key suppression latch (round-2
+# P3) — it is the one outcome that REQUIRES a follow-on dispatch.
+OUTCOME_REBASE_CONFLICTED = "rebase_conflicted_needs_rederive"
 # Reported by the tick's agent_outcome callback (not a persisted lease
 # outcome): the journal says the Agent was launched but no live agent record
 # confirms liveness (Agent-tool subagents expose no pid). Suppress like
@@ -213,21 +292,34 @@ def _succeeded_head(outcome: str) -> str | None:
     return None
 
 
-def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "") -> str:
+def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "",
+              detail_key: str = "") -> str:
     """Build the idempotency key for one action lease (§6).
 
     rebase: `rebase:<baseSHA>:<headSHA>` — one attempt per (base, head)
             pair, so a fresh base (an upstack merge moved origin/main) or
             a moved head re-enables a rebase, but the SAME pair never
             re-fires (the blocked latch is keyed on this).
-    fix:    `fix:<headSHA>:<event>` — keyed on the head + the failing
-            signal, so a NEW push (head change) re-enables a fix, and a
-            DIFFERENT event on the same head (CI-fail vs changes-requested)
-            is its own key.
+    fix:    `fix:<headSHA>:<event>:<detailKey>` — keyed on the head + the
+            failing signal + a STABLE detail (failing-check NAME set for CI,
+            review fingerprint for CHANGES_REQUESTED). A NEW push (head
+            change) re-enables a fix, a DIFFERENT event on the same head is
+            its own key, AND a NEW failing wall on the same head/event (a new
+            review fingerprint, a different failing-check set) is its OWN key
+            so a prior `blocked` latch on the OLD detail doesn't suppress the
+            fresh wall (codex P2). The head stays `parts[1]` so _lease_head /
+            _prune_dispatched_events are unaffected.
     """
     if kind == ACTION_REBASE:
         return f"{ACTION_REBASE}:{base_sha}:{head_sha}"
-    return f"{ACTION_FIX}:{head_sha}:{event}"
+    if kind == ACTION_REDERIVE:
+        # Re-derive replaces the whole branch from spec — keyed on (base,
+        # head) like rebase (one attempt per base/head pair), in its own
+        # namespace so it never collides with the rebase key on the same
+        # pair (the rebase that conflicted into this re-derive used the
+        # rebase key; the follow-on re-derive gets a distinct key).
+        return f"{ACTION_REDERIVE}:{base_sha}:{head_sha}"
+    return f"{ACTION_FIX}:{head_sha}:{event}:{detail_key}"
 
 
 def _prune_dispatched_events(watch: dict, current_head: str) -> None:
@@ -244,7 +336,8 @@ def _prune_dispatched_events(watch: dict, current_head: str) -> None:
         # rebase:<base>:<head>  or  fix:<head>:<event>
         parts = k.split(":")
         head_in_key = ""
-        if k.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+        if (k.startswith(ACTION_REBASE + ":") or k.startswith(ACTION_REDERIVE + ":")) \
+                and len(parts) >= 3:
             head_in_key = parts[-1]
         elif k.startswith(ACTION_FIX + ":") and len(parts) >= 2:
             head_in_key = parts[1]
@@ -306,11 +399,41 @@ def _lease_head(key: str) -> str:
     if not isinstance(key, str):
         return ""
     parts = key.split(":")
-    if key.startswith(ACTION_REBASE + ":") and len(parts) >= 3:
+    if (key.startswith(ACTION_REBASE + ":") or key.startswith(ACTION_REDERIVE + ":")) \
+            and len(parts) >= 3:
         return parts[-1]
     if key.startswith(ACTION_FIX + ":") and len(parts) >= 2:
         return parts[1]
     return ""
+
+
+def _lease_base(key: str) -> str:
+    """Extract the base SHA a rebase/rederive lease key was minted against
+    (the middle segment of `rebase:<base>:<head>` / `rederive:<base>:<head>`),
+    or "" for a fix key / unparseable key."""
+    if not isinstance(key, str):
+        return ""
+    parts = key.split(":")
+    if (key.startswith(ACTION_REBASE + ":") or key.startswith(ACTION_REDERIVE + ":")) \
+            and len(parts) >= 3:
+        return parts[1]
+    return ""
+
+
+def _restore_rederive_ladder(watch: dict, inflight: dict) -> None:
+    """When a RE-DERIVE lease is reclaimed WITHOUT a push (head unchanged:
+    gates failed / crashed pre-push), keep the ladder on the re-derive step
+    (codex P2). Dispatching the re-derive overwrote remediation.last_outcome
+    to `running`; if we leave it there, the next pass's `want_rederive` gate
+    (last_outcome == rebase_conflicted_needs_rederive) fails and the ladder
+    falls back to a plain rebase that re-hits the same conflict. Restoring it
+    keeps re-derive selected until it succeeds (head moves) or BLOCKS; the
+    §2.1 bounds still cap the retries."""
+    if not isinstance(inflight, dict) or inflight.get("kind") != ACTION_REDERIVE:
+        return
+    rem = watch.get("remediation")
+    if isinstance(rem, dict) and rem.get("last_outcome") == OUTCOME_RUNNING:
+        rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
 
 
 def _reclaim_lease(
@@ -320,6 +443,7 @@ def _reclaim_lease(
     current_head: str,
     agent_alive: Callable[[str], bool],
     agent_outcome: Callable[[str], str],
+    agent_conflicts: "Callable[[str], list] | None" = None,
 ) -> tuple[str | None, str | None]:
     """Resolve the watch's in-flight lease (§6). Clears `inflight_action`
     so a re-dispatch can re-lease, moving terminal outcomes to the durable
@@ -371,8 +495,59 @@ def _reclaim_lease(
         de = watch.setdefault("dispatched_events", {})
         if isinstance(de, dict):
             de[key] = OUTCOME_BLOCKED
+        # A BLOCKED RE-DERIVE must keep the ladder on the re-derive step
+        # (codex P2): dispatch overwrote last_outcome to RUNNING, so without
+        # restoring the breadcrumb the next DIRTY pass would select a plain
+        # REBASE key — never re-selecting the now-blocked rederive key, so the
+        # blocked latch (raise + suppress) is never surfaced and the
+        # rebase/re-derive loop churns until the budget exhausts. Restore it so
+        # the next pass re-selects the rederive key, _action_suppressed sees
+        # the BLOCKED ledger entry, raises once, and suppresses re-dispatch.
+        inflight_kind = inflight.get("kind") if isinstance(inflight, dict) else None
+        if inflight_kind == ACTION_REDERIVE:
+            rem = _remediation(watch)
+            if rem.get("last_outcome") == OUTCOME_RUNNING:
+                rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
         watch["inflight_action"] = None
         return None, None
+
+    # 1a. REBASE CONFLICTED -> NEEDS RE-DERIVE (DESIGN-pr-watch-autoremediate
+    # §2.2, codex P1). A rebase subagent that hit a conflict does NOT block —
+    # it aborts, reports this NONTERMINAL outcome (+ the conflicted paths via
+    # the agent record, which loop.py persists into the watch BEFORE this
+    # reclaim), and exits. We free the lease slot and record the breadcrumb
+    # in `remediation.last_outcome` so the NEXT pass advances the ladder to
+    # the re-derive step instead of latching blocked. NOT written to
+    # `dispatched_events` (that's the per-key suppression latch) — this is
+    # the one outcome that REQUIRES a follow-on dispatch (round-2 P3).
+    if reported == OUTCOME_REBASE_CONFLICTED and not head_moved:
+        rem = _remediation(watch)
+        rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
+        # Key the re-derive breadcrumb to the HEAD *and BASE SHA* that
+        # produced the conflict (codex P2): if the head moves (human push /
+        # failed re-derive) OR `main` advances to a new base, the next DIRTY
+        # must try a CLEAN REBASE first — the old conflict may no longer apply
+        # against the new base. The want_rederive gate requires BOTH to match
+        # the live head + fresh base. The base SHA is the rebase key's middle
+        # segment (rebase:<base>:<head>).
+        rem["rederive_for_head"] = current_head
+        rem["rederive_for_base"] = _lease_base(key)
+        # Persist the conflicted paths the rebase subagent reported onto the
+        # snapshot so the next pass's DIRTY signature/frontier reflect them
+        # (§2.1 — the coord has no conflicted index of its own). Keyed to the
+        # current head so a later head move drops them.
+        if agent_conflicts is not None:
+            try:
+                paths = agent_conflicts(agent_id)
+            except Exception:  # noqa: BLE001 — best-effort breadcrumb
+                paths = []
+            snap = watch.get("last_snapshot")
+            if isinstance(snap, dict) and isinstance(paths, (list, tuple)) and paths:
+                snap["conflicted_paths"] = sorted(str(p) for p in paths)
+        watch["inflight_action"] = None
+        return (
+            f"rebase conflicted -> re-derive eligible (key {key!r})"
+        ), None
 
     # 1b. AGENT STILL ALIVE -> ALWAYS suppress, even if the head moved
     # (codex iter-24 [P2]). A head move while the fixer is still alive can
@@ -413,6 +588,12 @@ def _reclaim_lease(
         if within_grace:
             return None, None  # pending startup; keep the lease, suppress
         watch["inflight_action"] = None
+        # A re-derive that exited WITHOUT pushing (head unchanged: gates
+        # failed / crashed pre-push) must KEEP the ladder on the re-derive
+        # step, else the next pass falls back to a rebase that hits the same
+        # conflict (codex P2). Restore last_outcome so want_rederive stays
+        # true; the §2.1 bounds still cap the retries.
+        _restore_rederive_ladder(watch, inflight)
         return f"reclaimed dead-agent lease {key!r} (agent {agent_id} not alive)", None
 
     # 3b. UNVERIFIED-running (codex iter-20 [P1]): the journal says the Agent
@@ -430,6 +611,7 @@ def _reclaim_lease(
         )
         if stale:
             watch["inflight_action"] = None
+            _restore_rederive_ladder(watch, inflight)
             return (
                 f"reclaimed stale unverified-launch lease {key!r} "
                 f"(no head move + no agent record after {_LEASE_STALE_LAUNCH_TICKS} ticks)"
@@ -445,6 +627,227 @@ def _reclaim_lease(
     # `gone`/dead path above (a lost liveness signal -> reclaim). So a live
     # lease simply stays running -> suppressed.
     return None, None
+
+
+# ----------------------------------------------------------------------
+# Auto-remediation state machine (DESIGN-pr-watch-autoremediate §2.1/§3)
+# ----------------------------------------------------------------------
+#
+# Each watch gains a `remediation` sub-object layered on the §6 lease:
+#
+#   remediation = {
+#     signature, attempts, max_attempts,          # bound 1 (per-signature)
+#     series_dispatches, max_series, best_signal,  # bound 2 (per-frontier)
+#     ladder_step, last_outcome, escalated,
+#   }
+#
+# Two passes per reconcile (§3):
+#   PASS A — progress accounting over ALL freshly-probed OPEN watches
+#            (incl. quiescent/READY) so a remediation that REACHED READY
+#            resets the series before the actionable-event filter.
+#   PASS B — dispatch over backed watches with an actionable event:
+#            check the bounds, advance the ladder, lease + dispatch.
+
+
+def _new_remediation() -> dict:
+    return {
+        "signature": "",
+        "attempts": 0,
+        "max_attempts": env_max_remediation_attempts(),
+        "series_dispatches": 0,
+        "max_series": env_max_remediation_series(),
+        "best_signal": _FRONTIER_UNSET,
+        "ladder_step": "",
+        "last_outcome": "",
+        "escalated": False,
+        "escalated_cause": "",
+        "rederive_for_head": "",
+        "rederive_for_base": "",
+    }
+
+
+def _remediation(watch: dict) -> dict:
+    """Return the watch's remediation sub-object, creating it (defaults)
+    if absent. Refreshes the env-driven max bounds each access so an
+    operator env change takes effect without rewriting the file."""
+    rem = watch.get("remediation")
+    if not isinstance(rem, dict):
+        rem = _new_remediation()
+        watch["remediation"] = rem
+    rem.setdefault("signature", "")
+    rem.setdefault("attempts", 0)
+    rem.setdefault("series_dispatches", 0)
+    rem.setdefault("best_signal", _FRONTIER_UNSET)
+    rem.setdefault("ladder_step", "")
+    rem.setdefault("last_outcome", "")
+    rem.setdefault("escalated", False)
+    rem.setdefault("escalated_cause", "")
+    rem.setdefault("rederive_for_head", "")
+    rem.setdefault("rederive_for_base", "")
+    rem["max_attempts"] = env_max_remediation_attempts()
+    rem["max_series"] = env_max_remediation_series()
+    return rem
+
+
+def _frontier(event: str, snap: dict) -> str:
+    """The current failure "size" (§2.1). Smaller is better; "" (empty) is
+    clean. Used as both the per-series running-minimum target AND, for
+    ci_failed/dirty, the signature detail_key source.
+
+      ci_failed : the sorted failing-check NAME set, joined (smaller = fewer
+                  failing checks). "" once none fail.
+      dirty     : the sorted conflicted-path set, OR _FRONTIER_UNKNOWN before
+                  the rebase subagent reports the paths (NOT clean, never a
+                  shrink target).
+      behind/stale/changes_requested : the event itself (one wall, no size).
+    """
+    if event == EVENT_CI_FAILED:
+        fc = snap.get("failing_checks") if isinstance(snap, dict) else None
+        if isinstance(fc, (list, tuple)) and fc:
+            return _encode_frontier(fc)
+        # CI failed but no named checks parsed -> a single unnamed failing
+        # frontier (never empty/clean, so it can't false-shrink to "done").
+        return EVENT_CI_FAILED
+    if event == EVENT_DIRTY:
+        # Conflicted paths the rebase subagent reported (persisted into the
+        # remediation/dirty detail), else UNKNOWN until it does.
+        paths = snap.get("conflicted_paths") if isinstance(snap, dict) else None
+        if isinstance(paths, (list, tuple)) and paths:
+            return _encode_frontier(paths)
+        return _FRONTIER_UNKNOWN
+    return event or ""
+
+
+def _frontier_strictly_shrinks(new: str, best: str) -> bool:
+    """Does `new` represent strictly MORE progress than the running
+    minimum `best`? (§2.1). UNSET/UNKNOWN are never shrink targets; "" (no
+    frontier this pass — quiescent/READY accounted elsewhere) is not a
+    shrink signal here. A set-based frontier (ci_failed names / conflicted
+    paths) shrinks when it's a PROPER SUBSET; a scalar (event word)
+    shrinks only when it becomes empty."""
+    if best in (_FRONTIER_UNSET, _FRONTIER_UNKNOWN):
+        return False
+    if new in (_FRONTIER_UNSET, _FRONTIER_UNKNOWN):
+        return False
+    if new == best:
+        return False
+    new_set = _frontier_set(new)
+    best_set = _frontier_set(best)
+    # Proper-subset shrink (a failing check cleared / a conflicted path
+    # resolved). An empty new_set (all cleared) is the strongest shrink.
+    return new_set < best_set
+
+
+def _review_sig(snap: "PRSnapshot") -> str:
+    """A stable fingerprint of the latest CHANGES_REQUESTED review state
+    (§2.1) so a NEW review body on the same head is a new signature and an
+    unchanged review doesn't re-fire. The probe carries a precomputed
+    `review_sig` field when available; absent that we fall back to the
+    review_decision word (which at least distinguishes the broad state)."""
+    rs = getattr(snap, "review_sig", "") or ""
+    if rs:
+        return str(rs)
+    return (snap.review_decision or "").upper()
+
+
+def _signature(head_sha: str, event: str, detail_key: str) -> str:
+    """The §2.1 per-signature key: same head + same wall + same STABLE
+    detail. attempts resets when this changes (a new wall on this head)."""
+    return f"{head_sha}:{event}:{detail_key}"
+
+
+def _detail_key(event: str, snap: dict, rem: dict) -> str:
+    """The STABLE detail component of the signature (§2.1). Anti-flake:
+    derived from check NAMES / conflicted PATHS, never per-test ids or the
+    conclusion word."""
+    if event == EVENT_CI_FAILED:
+        fc = snap.get("failing_checks") if isinstance(snap, dict) else None
+        if isinstance(fc, (list, tuple)) and fc:
+            return _encode_frontier(fc)
+        return ""
+    if event == EVENT_DIRTY:
+        # "" on first detection (the coord has no conflicted index); the
+        # rebase subagent RETURNS the conflicted paths, persisted into the
+        # remediation so the NEXT pass's signature reflects them.
+        paths = snap.get("conflicted_paths") if isinstance(snap, dict) else None
+        if isinstance(paths, (list, tuple)) and paths:
+            return _encode_frontier(paths)
+        return ""
+    if event == EVENT_CHANGES_REQUESTED:
+        # A NEW review body on the same head is a new wall; an unchanged
+        # review doesn't re-fire. We can't read review bodies in the probe,
+        # so the snapshot carries a review fingerprint when available.
+        return str(snap.get("review_sig", "") or "") if isinstance(snap, dict) else ""
+    return ""
+
+
+def account_progress(watch: dict, event: str) -> None:
+    """PASS A (§3) — progress accounting for ONE freshly-probed OPEN watch.
+    Runs for EVERY open watch, INCLUDING quiescent/READY ones, BEFORE the
+    actionable-event filter, so a remediation that REACHED READY resets the
+    series (codex round-2 P1) and a stale counter doesn't trip max_series
+    on the next independent failure.
+
+      READY -> episode over: reset series + escalated, clear best_signal to
+               UNSET (NOT empty: an empty baseline would make a SUBSEQUENT
+               one-at-a-time shrink never strict-shrink-vs-empty, falsely
+               escalating the next episode — round-3 P2).
+      first pass of an episode -> baseline best_signal to the FIRST observed
+               frontier (NOT empty — round-2 P2).
+      UNKNOWN -> concrete -> re-baseline (NOT counted as progress, round-3 P3).
+      strict shrink -> reset series + escalated, lower the running minimum.
+    """
+    rem = _remediation(watch)
+    snap = watch.get("last_snapshot") or {}
+    # Reset the per-series budget ONLY when the failure EPISODE has genuinely
+    # ended: READY (merge-ready), OR a GREEN EVENT_OPEN — checks SUCCESS,
+    # blocked only by a pending REQUIRED REVIEW. A PENDING-CI EVENT_OPEN is
+    # NOT episode-end (codex P1): in the convergent loop a fixer pushes a new
+    # head, CI goes pending (-> EVENT_OPEN) then fails again with the SAME
+    # frontier; resetting on the pending tick would clear the per-series bound
+    # every push and defeat the spawn-storm protection. So gate the OPEN reset
+    # on checks==SUCCESS (a green-but-review-pending PR), never on PENDING /
+    # unknown freshness.
+    episode_ended = event == EVENT_READY or (
+        event == EVENT_OPEN and str(snap.get("checks", "")).upper() == "SUCCESS"
+    )
+    if episode_ended:
+        # Reset BOTH bounds + the signature (codex P2): a failure episode that
+        # reaches green is over, so a later re-flake (even the SAME failing
+        # check on the SAME head after it went green) is a NEW episode that
+        # deserves a fresh per-signature attempt budget — not an immediate
+        # budget-exhausted re-escalation off the prior episode's attempts.
+        rem["series_dispatches"] = 0
+        rem["attempts"] = 0
+        rem["signature"] = ""
+        rem["escalated"] = False
+        rem["escalated_cause"] = ""
+        rem["best_signal"] = _FRONTIER_UNSET
+        # Clear the re-derive ladder breadcrumb too (codex P2): a DIRTY that
+        # went green has ended its conflict episode. If the SAME head/base goes
+        # DIRTY again later, want_rederive must NOT still match the stale
+        # conflict and skip the safe clean-rebase first step. A genuinely
+        # fresh conflict will re-record the breadcrumb via its own rebase.
+        rem["last_outcome"] = ""
+        rem["rederive_for_head"] = ""
+        rem["rederive_for_base"] = ""
+        return
+    if event == EVENT_OPEN:
+        # A non-green OPEN (PENDING CI / unknown freshness) is NOT progress
+        # and NOT episode-end: leave the counters + best_signal untouched so
+        # the bound survives the pending->fail transition.
+        return
+    frontier = _frontier(event, snap)
+    best = rem.get("best_signal", _FRONTIER_UNSET)
+    if best == _FRONTIER_UNSET:
+        rem["best_signal"] = frontier                  # baseline to FIRST observed
+    elif best == _FRONTIER_UNKNOWN and frontier not in (_FRONTIER_UNKNOWN,):
+        rem["best_signal"] = frontier                  # UNKNOWN->concrete re-baseline
+    elif _frontier_strictly_shrinks(frontier, best):
+        rem["series_dispatches"] = 0                    # genuine progress
+        rem["escalated"] = False
+        rem["escalated_cause"] = ""
+        rem["best_signal"] = frontier                  # running minimum (only shrinks)
 
 
 # ----------------------------------------------------------------------
@@ -473,6 +876,24 @@ class PRSnapshot:
     base_ref_name: str = ""
     is_draft: bool = False          # GitHub draft PR (never mergeable)
     checks: str = ""                # SUCCESS | FAILURE | PENDING (derived rollup)
+    # Human-approval signal (DESIGN-pr-watch-autoremediate §2.3) — TRUE iff
+    # any non-bot review on this PR is in state APPROVED. NOT derived from
+    # reviewDecision (which is null on a repo without required-reviewers
+    # protection even when a human approved — round-2 P1). A human-approved
+    # DIRTY PR ESCALATES rather than auto-re-deriving (never silently
+    # regenerate a reviewed diff). Over-detection is the deliberate bias:
+    # any uncertainty defaults to human.
+    human_approved: bool = False
+    # The failing check/job NAMES (sorted, stable) for a CI_FAILED snapshot
+    # — the §2.1 ci_failed detail_key + frontier. Empty when not CI-failed
+    # or unknown. Never per-test identities, never the conclusion word, so a
+    # flake flapping FAILURE<->TIMED_OUT on the same job doesn't churn the
+    # signature.
+    failing_checks: tuple = ()
+    # A stable fingerprint of the latest review (submittedAt + review IDs)
+    # for the §2.1 changes_requested detail_key — a NEW review body on the
+    # same head is a new signature; an unchanged review doesn't re-fire.
+    review_sig: str = ""
     # Transport outcome (not part of the GitHub projection):
     error: str = ""                 # non-empty => probe failed for this PR
     not_found: bool = False         # True => definitive 404 (raise-hand)
@@ -714,9 +1135,11 @@ def _new_watch(pr_number: int, pr_url: str, branch: str, base: str) -> dict:
         "last_seen_at": None,
         "last_probe_at": None,
         "last_snapshot": None,
-        # --- PR2 forward-compat (NOT populated in PR1) ---
+        # --- PR2 auto-fix lease + ledger ---
         "inflight_action": None,
         "dispatched_events": {},
+        # --- auto-remediation bounds (DESIGN-pr-watch-autoremediate §2.1) ---
+        "remediation": None,
     }
 
 
@@ -782,6 +1205,68 @@ def _checks_from_rollup(rollup) -> str:
     if pending:
         return "PENDING"
     return "SUCCESS"
+
+
+# Check conclusions that count as FAILING (mirrors _checks_from_rollup).
+_FAILING_CONCLUSIONS = frozenset({
+    "FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+    "STALE", "STARTUP_FAILURE",
+})
+
+
+def _failing_check_names(rollup) -> tuple:
+    """The sorted set of STABLE failing check/job NAMES from a
+    statusCheckRollup context list (§2.1 ci_failed detail_key + frontier).
+
+    Uses the check NAME (CheckRun.name / StatusContext.context), never the
+    conclusion WORD and never a per-test identity, so a flake flapping
+    FAILURE<->TIMED_OUT on the SAME job does NOT churn the signature. An
+    unnamed failing context falls back to its conclusion word only so the
+    set is never silently empty when something is red."""
+    if not isinstance(rollup, list) or not rollup:
+        return ()
+    names: set = set()
+    for c in rollup:
+        if not isinstance(c, dict):
+            continue
+        conclusion = str(c.get("conclusion", "") or "").upper()
+        state = str(c.get("state", "") or "").upper()
+        is_failing = conclusion in _FAILING_CONCLUSIONS or state in ("FAILURE", "ERROR")
+        if not is_failing:
+            continue
+        name = str(c.get("name", "") or c.get("context", "") or "").strip()
+        names.add(name or (conclusion or state or "unknown-check"))
+    return tuple(sorted(names))
+
+
+def _reviews_summary(latest_reviews) -> tuple:
+    """Return (human_approved, review_sig) from a PR's latestReviews nodes
+    (§2.3). human_approved is True iff ANY non-bot review is state APPROVED.
+    A bot author is one whose __typename == "Bot"; any uncertainty (missing
+    author / unknown typename) DEFAULTS TO HUMAN (over-detect bias).
+    review_sig is a stable fingerprint of the latest CHANGES_REQUESTED-class
+    review state so a new review body on the same head is a new signature."""
+    human_approved = False
+    sig_parts: list = []
+    if isinstance(latest_reviews, dict):
+        nodes = latest_reviews.get("nodes")
+    else:
+        nodes = latest_reviews
+    if isinstance(nodes, list):
+        for r in nodes:
+            if not isinstance(r, dict):
+                continue
+            state = str(r.get("state", "") or "").upper()
+            author = r.get("author") if isinstance(r.get("author"), dict) else {}
+            typename = str((author or {}).get("__typename", "") or "")
+            is_bot = typename == "Bot"
+            login = str((author or {}).get("login", "") or "")
+            submitted = str(r.get("submittedAt", "") or "")
+            if state == "APPROVED" and not is_bot:
+                human_approved = True
+            if state in ("CHANGES_REQUESTED", "APPROVED", "DISMISSED"):
+                sig_parts.append(f"{login}:{state}:{submitted}")
+    return human_approved, "|".join(sorted(sig_parts))
 
 
 def reduce_snapshot(
@@ -1004,6 +1489,14 @@ class ActionDispatch:
     head_sha: str        # watch-snapshot head — the rebase guard verifies it's unchanged
     base_sha: str        # fresh base tip to rebase onto (rebase only)
     key: str             # the §6 lease key (idempotency)
+    # auto-remediation extras (DESIGN-pr-watch-autoremediate). Defaulted so
+    # the PR2 call sites that don't set them stay valid.
+    task_slugs: tuple = ()       # backing task slugs (re-derive reads the spec)
+    conflicted_paths: tuple = () # the conflicted paths a prior rebase reported
+    attempt: int = 0             # this signature's attempt # (1-based)
+    max_attempts: int = 0        # the per-signature bound
+    series: int = 0              # series dispatch # since last progress (1-based)
+    max_series: int = 0          # the per-series bound
 
 
 def reconcile_watches(
@@ -1023,6 +1516,7 @@ def reconcile_watches(
     agent_outcome: "Callable[[str], str] | None" = None,
     deps_done: "Callable[[list], bool] | None" = None,
     release_action: "Callable[[str], None] | None" = None,
+    agent_conflicts: "Callable[[str], list] | None" = None,
 ) -> WatchOutcome:
     """Run one PR-watch reconcile pass. Single writer = the tick (caller
     holds the coord flock). Returns a WatchOutcome the tick funnels into
@@ -1317,6 +1811,21 @@ def reconcile_watches(
     # action per watch under the §6 outcome-suppression lease. When the
     # seam is absent we behave exactly like PR1 (surface-only, above).
     if pr2_active:
+        # PASS A (DESIGN-pr-watch-autoremediate §3) — progress accounting
+        # over EVERY freshly-probed OPEN watch (incl. quiescent/READY),
+        # BEFORE the actionable-event filter. A remediation that REACHED
+        # READY resets its series here (codex round-2 P1); a stale counter
+        # would otherwise carry into the next independent failure and trip
+        # max_series early. Gated on a fresh successful probe THIS tick so a
+        # skipped/stale snapshot never mis-accounts.
+        for key, w in watches.items():
+            if w.get("state") != STATE_OPEN:
+                continue
+            if w.get("_probed_ok_tick") != tick_count:
+                continue
+            account_progress(w, w.get("last_event") or "")
+
+        # PASS B — dispatch.
         _dispatch_actions(
             watches, tasks=tasks, prober=prober, repo_path=repo_path,
             repo_probe=last_repo_probe, tick_count=tick_count,
@@ -1325,6 +1834,7 @@ def reconcile_watches(
             deps_done=deps_done or (lambda _deps: True),
             release_action=release_action,
             now_iso=now_iso, out=out,
+            agent_conflicts=agent_conflicts,
         )
 
     # --- 4.5. ORPHAN raise — AFTER the probe (codex iter-17 [P2]) so it
@@ -1587,6 +2097,19 @@ def _apply_probe(
             snap, fresh_base_sha=pr_base_sha, is_ancestor=is_anc,
         )
 
+        # Conflicted paths a prior rebase subagent reported for THIS head
+        # (DESIGN-pr-watch-autoremediate §2.1/§2.2) — carried forward across
+        # probes (the probe can't see them; the rebase outcome supplies
+        # them). Drop them when the head moved (a fresh head invalidates the
+        # old conflict frontier).
+        prev_snap = w.get("last_snapshot")
+        carried_conflicts: list = []
+        if isinstance(prev_snap, dict):
+            prev_h = prev_snap.get("head_ref_oid")
+            cp = prev_snap.get("conflicted_paths")
+            if prev_h == snap.head_ref_oid and isinstance(cp, (list, tuple)):
+                carried_conflicts = list(cp)
+
         w["last_snapshot"] = {
             "pr_state": (snap.pr_state or "").upper(),
             "merge_state_status": (snap.merge_state_status or "").upper(),
@@ -1596,6 +2119,11 @@ def _apply_probe(
             "base_ref_oid": snap.base_ref_oid,
             "is_draft": snap.is_draft,
             "up_to_date": head_contains_base,
+            # auto-remediation inputs (DESIGN-pr-watch-autoremediate):
+            "human_approved": bool(snap.human_approved),
+            "failing_checks": list(snap.failing_checks or ()),
+            "review_sig": _review_sig(snap),
+            "conflicted_paths": carried_conflicts,
         }
         w["last_event"] = event
         # SUCCESSFUL-reduce markers (codex iter-18 [P2]): set ONLY on a real
@@ -1654,6 +2182,7 @@ def _reclaim_and_release(
     agent_outcome: Callable[[str], str],
     release_action: "Callable[[str], None] | None",
     out: WatchOutcome,
+    agent_conflicts: "Callable[[str], list] | None" = None,
 ) -> None:
     """Resolve the watch's in-flight lease (§6) AND release its journal +
     inbox if the lease left `running` this tick (codex iter-6/7 [P2]).
@@ -1670,6 +2199,7 @@ def _reclaim_and_release(
         watch, tick_count=tick_count, current_head=current_head,
         agent_alive=lambda aid: agent_outcome(aid) not in ("gone", ""),
         agent_outcome=agent_outcome,
+        agent_conflicts=agent_conflicts,
     )
     if rec_note:
         out.notes.append(f"pr-watch: PR #{pr_num} {rec_note}")
@@ -1694,6 +2224,7 @@ def _dispatch_actions(
     release_action: "Callable[[str], None] | None",
     now_iso: str,
     out: WatchOutcome,
+    agent_conflicts: "Callable[[str], list] | None" = None,
 ) -> None:
     """The PR2 auto-fix pass (§5.1b/c + §6). Runs AFTER probe+reduce, for
     every OPEN watch whose reduced `last_event` is actionable.
@@ -1822,6 +2353,7 @@ def _dispatch_actions(
                     w, _orphan_pr_num, tick_count=tick_count,
                     current_head=_watch_head(w), agent_outcome=agent_outcome,
                     release_action=release_action, out=out,
+                    agent_conflicts=agent_conflicts,
                 )
             continue
         # REQUIRE A FRESH PROBE THIS TICK before reclaiming/dispatching
@@ -1858,6 +2390,7 @@ def _dispatch_actions(
             _reclaim_and_release(
                 w, pr_num, tick_count=tick_count, current_head=_watch_head(w),
                 agent_outcome=agent_outcome, release_action=release_action, out=out,
+                agent_conflicts=agent_conflicts,
             )
             continue
         head = _watch_head(w)
@@ -1870,12 +2403,77 @@ def _dispatch_actions(
         _reclaim_and_release(
             w, pr_num, tick_count=tick_count, current_head=head,
             agent_outcome=agent_outcome, release_action=release_action, out=out,
+            agent_conflicts=agent_conflicts,
         )
         # 2. keep the dispatched_events ledger bounded.
         _prune_dispatched_events(w, head)
 
         event = w.get("last_event")
         if event not in _ACTIONABLE_EVENTS:
+            continue
+
+        # --- DESIGN-pr-watch-autoremediate §3 PASS B — bound the remediation
+        # BEFORE deciding/dispatching the action. The running-lease guard
+        # precedes the bound raise so the in-flight fixer's result is observed
+        # before we declare "budget exhausted" (round-3 P3: no premature ping).
+        snap = w.get("last_snapshot") or {}
+        rem = _remediation(w)
+        detail_key = _detail_key(event, snap, rem)
+        sig = _signature(head, event, detail_key)
+        if rem.get("signature") != sig:
+            # A different wall on this head (or a moved head). attempts
+            # resets; series_dispatches is UNTOUCHED (§2.1 — a head move
+            # alone must NOT reset the series, or a pushes-a-new-head-each-
+            # time loop never converges).
+            rem["signature"] = sig
+            rem["attempts"] = 0
+            # Clear a PER-SIGNATURE escalation latch on a genuinely new wall
+            # (codex P2): if the prior escalation was the per-signature bound
+            # tripping, a different failing-check set / new review fingerprint
+            # is a NEW signature that deserves a fresh attempt budget — leaving
+            # `escalated` set would skip it forever (until READY / a frontier
+            # shrink). A PER-SERIES escalation is NOT cleared here: the series
+            # survives signature/head changes by design, so only real progress
+            # (account_progress) clears it.
+            if (rem.get("escalated")
+                    and rem.get("escalated_cause") == "attempts"
+                    and rem["series_dispatches"] < rem["max_series"]):
+                rem["escalated"] = False
+                rem["escalated_cause"] = ""
+
+        # ONE in-flight action per watch (§6 4a) — BEFORE the bound raise so
+        # the running fixer's outcome is seen before "exhausted". Reclaim
+        # already ran this tick, so a surviving `running` lease is genuinely
+        # in flight -> suppress all dispatch (and any bound raise) until it
+        # resolves.
+        inflight = w.get("inflight_action")
+        if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
+            continue
+
+        # Already escalated this frontier -> wait for real progress to clear
+        # the latch (account_progress clears it on a strict shrink / READY).
+        if rem.get("escalated"):
+            continue
+
+        # The two bounds (§2.1). EITHER trip -> escalate ONCE (loud) + stop.
+        if (rem["attempts"] >= rem["max_attempts"]
+                or rem["series_dispatches"] >= rem["max_series"]):
+            rem["escalated"] = True
+            # Record WHICH bound tripped so a later new signature can clear a
+            # per-signature latch while a per-series latch persists (codex P2).
+            # series takes precedence (it's the harder stop) when both trip.
+            rem["escalated_cause"] = (
+                "series" if rem["series_dispatches"] >= rem["max_series"]
+                else "attempts"
+            )
+            out.raises.append(
+                f"pr-watch: PR #{pr_num} remediation budget exhausted on "
+                f"{sig!r} / frontier {rem.get('best_signal')!r} after "
+                f"{rem['attempts']}/{rem['series_dispatches']} tries "
+                f"(per-sig max {rem['max_attempts']}, per-series max "
+                f"{rem['max_series']}) — needs operator attention — "
+                f"{w.get('pr_url', '')}"
+            )
             continue
 
         # 3. decide the action.
@@ -1920,14 +2518,66 @@ def _dispatch_actions(
                 base_sha = repo_probe.base_sha_for(w.get("base") or "main")
             if not base_sha:
                 continue
-            kind = ACTION_REBASE
-            key_str = lease_key(kind, event, head_sha=head, base_sha=base_sha)
-            action = ActionDispatch(
-                kind=kind, event=event, pr_number=pr_num,
-                pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
-                base=w.get("base") or "main", head_sha=head, base_sha=base_sha,
-                key=key_str,
+
+            # LADDER (DESIGN-pr-watch-autoremediate §2.2): a DIRTY whose prior
+            # clean rebase CONFLICTED (last_outcome == rebase_conflicted_needs
+            # _rederive) advances to the RE-DERIVE step — but ONLY for an
+            # UNAPPROVED PR. A human-approved PR ESCALATES instead (§2.3 rule
+            # 1: never silently regenerate a reviewed diff). BEHIND/STALE and a
+            # first-time DIRTY -> a clean rebase (clean rebase of an approved
+            # PR is allowed but noted).
+            human_approved = bool(snap.get("human_approved"))
+            # want_rederive only when the recorded conflict was for the
+            # CURRENT head AND the CURRENT fresh base (codex P2): a stale
+            # rebase_conflicted_needs_rederive from an earlier head OR an
+            # earlier base must NOT make a fresh DIRTY skip the safe clean
+            # rebase. If `main` advanced (new base SHA) the conflict may no
+            # longer apply, so try a clean rebase against the new base first.
+            want_rederive = (
+                event == EVENT_DIRTY
+                and rem.get("last_outcome") == OUTCOME_REBASE_CONFLICTED
+                and rem.get("rederive_for_head") == head
+                and rem.get("rederive_for_base") == base_sha
             )
+            if want_rederive and human_approved:
+                # Escalate, don't re-derive (§2.3 rule 1). One raise per head.
+                if head != w.get("_raised_approved_conflict_head"):
+                    w["_raised_approved_conflict_head"] = head
+                    out.raises.append(
+                        f"pr-watch: PR #{pr_num} has a merge conflict but carries a "
+                        f"human APPROVED review — NOT auto-re-deriving (would discard "
+                        f"the reviewed diff); operator must rebase/re-review or "
+                        f"authorize a re-derive — {w.get('pr_url', '')}"
+                    )
+                continue
+            if want_rederive:
+                # RE-DERIVE: regenerate from the backing task's spec on fresh
+                # base. Needs the spec — if no backing slug carries it, the
+                # subagent escalates (spec-gone check lives in the subagent +
+                # the §2.2 spec-availability rule).
+                task_slugs = tuple(w.get("tasks") or [])
+                conflicted = tuple(snap.get("conflicted_paths") or [])
+                kind = ACTION_REDERIVE
+                key_str = lease_key(kind, event, head_sha=head, base_sha=base_sha)
+                action = ActionDispatch(
+                    kind=kind, event=event, pr_number=pr_num,
+                    pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                    base=w.get("base") or "main", head_sha=head, base_sha=base_sha,
+                    key=key_str, task_slugs=task_slugs, conflicted_paths=conflicted,
+                    attempt=rem["attempts"] + 1, max_attempts=rem["max_attempts"],
+                    series=rem["series_dispatches"] + 1, max_series=rem["max_series"],
+                )
+            else:
+                kind = ACTION_REBASE
+                key_str = lease_key(kind, event, head_sha=head, base_sha=base_sha)
+                action = ActionDispatch(
+                    kind=kind, event=event, pr_number=pr_num,
+                    pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
+                    base=w.get("base") or "main", head_sha=head, base_sha=base_sha,
+                    key=key_str, task_slugs=tuple(w.get("tasks") or []),
+                    attempt=rem["attempts"] + 1, max_attempts=rem["max_attempts"],
+                    series=rem["series_dispatches"] + 1, max_series=rem["max_series"],
+                )
         elif event == EVENT_CHANGES_REQUESTED:
             # CHANGES_REQUESTED: a fix subagent handles typo/style; a
             # substantive/design change needs operator judgement. We can't
@@ -1937,36 +2587,31 @@ def _dispatch_actions(
             # asks — keeping the "substantive -> raise-hand" guard in the
             # subagent where the review text is available.
             kind = ACTION_FIX
-            key_str = lease_key(kind, event, head_sha=head)
+            key_str = lease_key(kind, event, head_sha=head, detail_key=detail_key)
             action = ActionDispatch(
                 kind=kind, event=event, pr_number=pr_num,
                 pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
                 base=w.get("base") or "main", head_sha=head, base_sha="",
-                key=key_str,
+                key=key_str, task_slugs=tuple(w.get("tasks") or []),
+                attempt=rem["attempts"] + 1, max_attempts=rem["max_attempts"],
+                series=rem["series_dispatches"] + 1, max_series=rem["max_series"],
             )
         else:  # EVENT_CI_FAILED
             kind = ACTION_FIX
-            key_str = lease_key(kind, event, head_sha=head)
+            key_str = lease_key(kind, event, head_sha=head, detail_key=detail_key)
             action = ActionDispatch(
                 kind=kind, event=event, pr_number=pr_num,
                 pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
                 base=w.get("base") or "main", head_sha=head, base_sha="",
-                key=key_str,
+                key=key_str, task_slugs=tuple(w.get("tasks") or []),
+                attempt=rem["attempts"] + 1, max_attempts=rem["max_attempts"],
+                series=rem["series_dispatches"] + 1, max_series=rem["max_series"],
             )
 
-        # 4a. ONE in-flight action per watch (codex iter-2 [P1]). A live
-        # `running` lease — for ANY key, not just this event's — means a
-        # subagent is already operating on this PR's branch. If the
-        # actionable signal CHANGED while it ran (CI_FAILED -> STALE, or
-        # CI_FAILED -> CHANGES_REQUESTED on the same head), per-key
-        # suppression would miss it and overwrite the live lease, putting a
-        # SECOND agent on the same branch concurrently. Reclaim already ran
-        # this tick (dead / head-moved / blocked leases are cleared), so a
-        # surviving `running` lease is genuinely in flight -> suppress all
-        # dispatch until it resolves.
-        inflight = w.get("inflight_action")
-        if isinstance(inflight, dict) and inflight.get("outcome") == OUTCOME_RUNNING:
-            continue
+        # (The ONE-in-flight-per-watch guard now runs BEFORE the bound check
+        # above — codex iter-2 [P1] + round-3 P3: a running lease suppresses
+        # ALL dispatch AND the budget-exhausted raise until it resolves, so
+        # the in-flight fixer's result is observed before declaring exhausted.)
 
         # 4b. §6 per-key outcome suppression. A blocked latch raises-hand once.
         if _action_suppressed(w, key=key_str, current_head=head):
@@ -1987,11 +2632,17 @@ def _dispatch_actions(
                 )
             continue
 
-        # 5. LEASE then DISPATCH. Persist the lease (running) BEFORE the
-        # callback emits the launchable DISPATCH block (commit-then-emit).
-        # We set it on the watch dict; the doc is persisted at the end of
+        # 5. LEASE then DISPATCH. Persist the lease (running) AND the bound
+        # counters BEFORE the callback emits the launchable DISPATCH block
+        # (commit-then-emit, §3). The doc is persisted at the end of
         # reconcile_watches, so a crash after emit but before that persist
-        # replays — and the callback itself is the launch boundary.
+        # replays without double-counting — and the callback itself is the
+        # launch boundary.
+        rem["attempts"] += 1
+        rem["series_dispatches"] += 1
+        rem["ladder_step"] = kind
+        rem["last_outcome"] = OUTCOME_RUNNING
+        rem["last_attempt_tick"] = tick_count
         w["inflight_action"] = {
             "kind": kind,
             "key": key_str,
@@ -2004,6 +2655,19 @@ def _dispatch_actions(
             agent_id = dispatch_action(action)
         except Exception as exc:  # noqa: BLE001 — a dispatch failure must not wedge the tick
             w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            # The action NEVER LAUNCHED -> it didn't consume a remediation
+            # attempt/series (unlike a dead fixer that DID run). Roll the
+            # counters back so a failed_launch retry isn't double-charged
+            # toward the bounds.
+            rem["attempts"] = max(0, rem["attempts"] - 1)
+            rem["series_dispatches"] = max(0, rem["series_dispatches"] - 1)
+            # Preserve the re-derive ladder on a launch failure (codex P2): a
+            # re-derive that never launched must re-select re-derive next
+            # pass, not fall back to a rebase that re-hits the same conflict.
+            rem["last_outcome"] = (
+                OUTCOME_REBASE_CONFLICTED if kind == ACTION_REDERIVE
+                else OUTCOME_FAILED_LAUNCH
+            )
             out.errors.append(
                 f"pr-watch: dispatch {kind} for PR #{pr_num} failed: {exc}"
             )
@@ -2012,6 +2676,12 @@ def _dispatch_actions(
             # prompt-acquire/emit failed -> the action never ran. Mark
             # failed_launch so the next tick retries (not a permanent latch).
             w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
+            rem["attempts"] = max(0, rem["attempts"] - 1)
+            rem["series_dispatches"] = max(0, rem["series_dispatches"] - 1)
+            rem["last_outcome"] = (
+                OUTCOME_REBASE_CONFLICTED if kind == ACTION_REDERIVE
+                else OUTCOME_FAILED_LAUNCH
+            )
             out.errors.append(
                 f"pr-watch: dispatch {kind} for PR #{pr_num} did not launch; "
                 f"will retry"
@@ -2067,10 +2737,13 @@ def _arm_backoff(watch: dict, tick_count: int) -> None:
 _PR_FIELDS = """{
       number state mergedAt mergeStateStatus reviewDecision isDraft
       headRefName baseRefName headRefOid baseRefOid
+      latestReviews(first:50){nodes{
+        state submittedAt author{login __typename}
+      }}
       commits(last:1){nodes{commit{statusCheckRollup{state contexts(first:100){nodes{
         __typename
-        ... on CheckRun{status conclusion}
-        ... on StatusContext{state}
+        ... on CheckRun{name status conclusion}
+        ... on StatusContext{context state}
       }}}}}}
     }"""
 
@@ -2327,6 +3000,16 @@ class GhGitProber:
             pass
         # prefer the rollup `state` if present, else derive from contexts.
         checks = _rollup_state_to_verdict(rollup_state) if rollup_state else _checks_from_rollup(contexts)
+        # Always derive the failing-check NAME set from contexts (the rollup
+        # `state` is a single verdict with no names) for the §2.1 ci_failed
+        # detail_key + frontier (stable check names, never per-test ids).
+        failing = _failing_check_names(contexts)
+        # human_approved + review_sig (§2.3): any NON-BOT review in state
+        # APPROVED makes the PR human-approved. A bot review author is one
+        # whose GraphQL __typename == "Bot"; ANY uncertainty defaults to
+        # human (over-detect — a misclassified bot only causes an unneeded
+        # escalation; a misclassified human risks clobbering an approval).
+        human_approved, review_sig = _reviews_summary(pr.get("latestReviews"))
         return PRSnapshot(
             number=int(pr.get("number", num) or num),
             pr_state=str(pr.get("state", "") or ""),
@@ -2339,6 +3022,9 @@ class GhGitProber:
             base_ref_name=str(pr.get("baseRefName", "") or ""),
             is_draft=bool(pr.get("isDraft", False)),
             checks=checks,
+            failing_checks=tuple(failing),
+            human_approved=human_approved,
+            review_sig=review_sig,
         )
 
     def _rev_parse(self, repo_path: str, ref: str) -> str:
