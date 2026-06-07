@@ -1059,3 +1059,51 @@ func TestResumesFencingWhenCandidateDead(t *testing.T) {
 			rec.State, rec.Owner.AgentID)
 	}
 }
+
+// ---- codex iter-4 [P2]: StillOwned rejects a self-expired token ----
+
+// A leader that paused past its OWN TTL and wakes before any candidate has
+// fenced it still reads its own active epoch+owner on disk. StillOwned()
+// must reject it (self-demote at the boundary) on the stale-renewed_at and
+// cross-boot clauses — not only after another candidate bumps the epoch.
+func TestStillOwnedRejectsSelfExpiredToken(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	paths, _ := resolvePaths(project)
+
+	owner := identity{Pid: 4242, PidStart: 222222, AgentID: "me", Project: project}
+	// On disk: still MY active record @ epoch 5, renewed at mono=0.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: 0,
+	})
+	tok := LeaseToken{
+		Epoch: 5, Project: project, Pid: 4242, PidStart: 222222, AgentID: "me",
+		paths: paths, boot: "test-boot-1", cfg: cfg,
+	}
+
+	// Fresh: within TTL -> still owned (control).
+	if !tok.StillOwned() {
+		t.Fatal("a fresh in-TTL token should be StillOwned")
+	}
+
+	// Advance the monotonic clock past TTL without anyone fencing us.
+	clk.advance(31 * time.Second)
+	if tok.StillOwned() {
+		t.Fatal("a self-expired token (renewed_at past TTL) must NOT be StillOwned")
+	}
+
+	// Cross-boot record is also rejected regardless of TTL.
+	clk2 := &fakeClock{}
+	cfg2 := testCfg(clk2, live)
+	tokOtherBoot := LeaseToken{
+		Epoch: 5, Project: project, Pid: 4242, PidStart: 222222, AgentID: "me",
+		paths: paths, boot: "DIFFERENT-BOOT", cfg: cfg2,
+	}
+	if tokOtherBoot.StillOwned() {
+		t.Fatal("a token whose boot != record boot must NOT be StillOwned")
+	}
+}
