@@ -9,6 +9,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
@@ -133,23 +134,27 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 
 // drainOne handles a single queue file.
 //
-// FLEET_LEASE_FAILOVER routes the behavior (DESIGN-handoff-drain-storm-leak
-// §3(D), PR3):
+// FLEET_LEASE_FAILOVER + the COORD-vs-WORKER classification route the
+// behavior (DESIGN-handoff-drain-storm-leak §3(D), PR3):
 //
-//   - OFF (default): the LEGACY path — take the per-agent flock and run
-//     handoffop.Resume under it. Byte-identical to pre-PR3 behavior. This is
-//     the only path that runs in production today; the lease-aware path is
-//     dev-only until the stack lands.
-//   - ON: the BOUNDED, lease-aware path (drainOneLeaseAware) — NEVER holds a
-//     lock across Resume, stands down under a healthy leader, verifies the
-//     handoff-complete barrier before a graceful kill, and escalates a
-//     slow/hung handoff to the safety-net takeover after the timeout. This
-//     is the structural fix that removes the forever-held lock + the
-//     81-drain leak.
+//   - flag OFF (default): the LEGACY path — take the per-agent flock and run
+//     handoffop.Resume under it. Byte-identical to pre-PR3 behavior.
+//   - flag ON + a COORD handoff: the BOUNDED, lease-aware path
+//     (drainOneLeaseAware) — the lease is the single-flight guarantee, so the
+//     graceful/hung path holds NO lock across kill/escalate (the structural
+//     fix for the forever-held lock + 81-drain leak).
+//   - flag ON + a WORKER (non-coord) handoff: the LEGACY path. A worker
+//     handoff carries a Project but is NOT the project coord, so the coord
+//     lease says nothing about it; routing it through the coord lease
+//     stand-down would strand it forever (codex PR3 iter-4 [P1]). Workers
+//     keep the per-agent-flock serialization their Resume contract requires.
+//
+// The discriminator is spawn.IsCoordSpawn(req.TaskID, req.Project) — the SAME
+// coord-vs-worker convention the spawn path uses, so the two never drift.
 func drainOne(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer) error {
 
-	if leaseDrainEnabled() {
+	if leaseDrainEnabled() && spawn.IsCoordSpawn(req.TaskID, req.Project) {
 		return drainOneLeaseAware(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
 	}
 	return drainOneLegacy(req, path, graceMillis, stdout, stderr)

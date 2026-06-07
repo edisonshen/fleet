@@ -271,11 +271,16 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	out := &bytes.Buffer{}
 	var resumed, tookOver int32
+	var locked int32
 	d := drainLeaseDeps{
 		LeaderPresent:  func(string) bool { return false },
 		CurrentEpoch:   func(string) (int64, bool) { return 0, false }, // no lease ever held
 		BarrierExists:  func(string, int64) bool { return false },
 		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		LockAgent: func(string) (func(), error) {
+			atomic.AddInt32(&locked, 1)
+			return func() {}, nil
+		},
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			atomic.AddInt32(&resumed, 1)
 			return nil
@@ -292,39 +297,80 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	if atomic.LoadInt32(&tookOver) != 0 {
 		t.Errorf("escalated to takeover %d times on a cold no-leader queue — must cold-spawn instead", tookOver)
 	}
+	if atomic.LoadInt32(&locked) != 1 {
+		t.Errorf("cold Resume took the per-agent lock %d times, want 1 (serialization contract)", locked)
+	}
 }
 
-// T40: the cold Resume (no-project fallback) holds NO lock across Resume — a
-// sibling LockAgent(OLD) acquires IMMEDIATELY while Resume is in flight. The
-// drain runs Resume synchronously (codex PR3 iter-3 [P2]: no abandoned
-// goroutine the CLI would kill on exit) and returns Resume's result.
-func TestDrainLease_ColdResume_NoLockAcrossResume(t *testing.T) {
-	requireTmux(t)
-	setupFleetHome(t)
-
-	releaseResume := make(chan struct{})
-	resumeStarted := make(chan struct{})
+// codex PR3 iter-4 [P1]: the cold Resume path SERIALIZES via a per-agent lock
+// (Resume's contract) — coldResume takes LockAgent around Resume. This is the
+// stealable-lease cold-spawn case, NOT the hung-leader swap, so the brief lock
+// does not reintroduce the 81-leak.
+func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	out := &bytes.Buffer{}
+	var lockedDuringResume bool
+	var locked, released int32
 	d := drainLeaseDeps{
+		CurrentEpoch: func(string) (int64, bool) { return 0, false }, // stealable
+		LockAgent: func(string) (func(), error) {
+			atomic.AddInt32(&locked, 1)
+			return func() { atomic.AddInt32(&released, 1) }, nil
+		},
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			close(resumeStarted)
-			<-releaseResume // hold Resume open while we probe the lock
+			// The lock must be held while Resume runs (serialization).
+			lockedDuringResume = atomic.LoadInt32(&locked) == 1 && atomic.LoadInt32(&released) == 0
 			return nil
 		},
 	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+		t.Fatalf("cold resume returned %v, want nil", err)
+	}
+	if !lockedDuringResume {
+		t.Error("cold Resume ran WITHOUT the per-agent lock held — serialization contract broken")
+	}
+	if atomic.LoadInt32(&released) != 1 {
+		t.Errorf("per-agent lock released %d times, want 1 (must always release)", released)
+	}
+}
 
-	// No project -> coldResume path. Run the drain in a goroutine because
-	// coldResume now runs Resume SYNCHRONOUSLY.
-	req := queue.SpawnFresh{OldAgentID: "oldcoord1", Project: ""}
+// T40: the GRACEFUL coord path holds NO per-agent lock across the
+// kill/self-release work (the root cause of the 81-leak — a lock held across a
+// hung leader's slow swap — is gone). Here the graceful self-release wait runs
+// while a sibling LockAgent(OLD) acquires immediately. The graceful path never
+// calls Resume / LockAgent, so the sibling is never blocked.
+func TestDrainLease_GracefulPath_HoldsNoPerAgentLock(t *testing.T) {
+	requireTmux(t)
+	setupFleetHome(t)
+
+	out := &bytes.Buffer{}
+	probed := make(chan struct{})
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) {
+			// First read: OLD still leader (enters the self-release wait, during
+			// which we probe the sibling lock). Then OLD releases.
+			if atomic.AddInt32(&reads, 1) == 1 {
+				close(probed)
+				return 424242, true
+			}
+			return 0, false
+		},
+		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		BarrierPoll: 50 * time.Millisecond,
+		// LockAgent must NEVER be called on the graceful path; fail loudly if so.
+		LockAgent: func(string) (func(), error) {
+			t.Error("graceful path took the per-agent lock — must be lock-free")
+			return func() {}, nil
+		},
+	}
 	done := make(chan error, 1)
-	go func() {
-		done <- drainOneLeaseAwareWith(req, "/tmp/q.json", 0, 50, out, out, d)
-	}()
-	<-resumeStarted
+	go func() { done <- drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5000, out, out, d) }()
+	<-probed
 
-	// T40: a sibling LockAgent must acquire IMMEDIATELY while Resume is in
-	// flight — proves the drain holds no per-agent lock across Resume (the
-	// root-cause of the 81-process leak is gone).
+	// While the graceful self-release wait is running, a sibling LockAgent(OLD)
+	// must acquire immediately — the drain holds no per-agent lock (T40).
 	lockAcquired := make(chan struct{})
 	go func() {
 		rel, err := state.LockAgent("oldcoord1")
@@ -336,18 +382,11 @@ func TestDrainLease_ColdResume_NoLockAcrossResume(t *testing.T) {
 	select {
 	case <-lockAcquired:
 	case <-time.After(5 * time.Second):
-		close(releaseResume)
-		t.Fatal("sibling LockAgent BLOCKED while Resume in flight — a lock IS held across Resume (T40 regression)")
+		t.Fatal("sibling LockAgent BLOCKED during the graceful wait — a per-agent lock IS held (T40 regression)")
 	}
-
-	// Let Resume finish; the drain returns its (nil) result.
-	close(releaseResume)
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("cold Resume drain returned %v, want nil", err)
-		}
+	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("cold Resume drain did not return after Resume completed")
+		t.Fatal("graceful path did not converge")
 	}
 }

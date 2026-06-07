@@ -87,10 +87,17 @@ type drainLeaseDeps struct {
 	// keep the lease (it is not the coord); it only needs the side effect of
 	// the OLD holder being fenced/killed so a standby/successor can lead.
 	TakeOver func(project, agentID string) (acquired bool, err error)
-	// Resume runs the cold-spawn fallback (no live leader; spawn a successor
-	// from the queue). Production: handoffop.Resume. Run BOUNDED + with NO
-	// lock held across it.
+	// Resume runs the cold-spawn fallback (no lease epoch; spawn a successor
+	// from the queue). Production: handoffop.Resume. It is run under a SHORT
+	// per-agent LockAgent (Resume's contract requires it) — but only on the
+	// COLD path, which spawns fresh and does NOT swap a hung live leader, so
+	// the forever-hold class does not apply. The graceful/hung COORD path
+	// never calls Resume; it kills/escalates lock-free.
 	Resume func(req queue.SpawnFresh, queuePath string, graceMillis int, stdout, stderr io.Writer) error
+	// LockAgent serializes the cold Resume against a concurrent drain so two
+	// drains cannot both spawn a replacement (codex PR3 iter-4 [P1]).
+	// Production: state.LockAgent. Returns a release func.
+	LockAgent func(agentID string) (func(), error)
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -142,6 +149,7 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			return acquired, err
 		},
 		Resume:      handoffop.Resume,
+		LockAgent:   state.LockAgent,
 		BarrierPoll: defaultBarrierPoll,
 		Self:        os.Getpid,
 	}
@@ -162,10 +170,11 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	d = fillDrainLeaseDeps(d)
 	project := req.Project
 	if project == "" {
-		// No project scope (legacy worker queue without project) — fall back
-		// to a BOUNDED cold Resume with NO lock held (the lease-aware path's
-		// hard invariant). The lease machinery is per-project; without one we
-		// cannot stand-down/verify, so just run the successor spawn bounded.
+		// Defensive: drainOne only routes COORD handoffs here (they always
+		// carry a project), but if a projectless queue reaches this seam we
+		// cannot stand-down/verify (the lease machinery is per-project). Fall
+		// back to a cold Resume under a SHORT per-agent lock (coldResume holds
+		// LockAgent — Resume's serialization contract).
 		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 
@@ -204,9 +213,11 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		// COLD recovery: failover is on but there is NO lease epoch for this
 		// project (no coord ever held the lease here, or the record is gone)
 		// — the lease is stealable and nothing to fence/kill. Spawn the
-		// successor via a BOUNDED Resume with NO lock held (codex PR3 iter-1
-		// [P2]). This is the "stealable lease -> cold-spawn" path.
-		_, _ = fmt.Fprintf(stderr, "fleet drain: no lease leader for %s; cold-spawning successor (bounded)\n", project)
+		// successor via coldResume (codex PR3 iter-1 [P2]). coldResume holds a
+		// SHORT per-agent lock for Resume's serialization contract (codex PR3
+		// iter-4 [P1]) — safe here: a cold spawn has no hung live leader to
+		// wedge on. This is the "stealable lease -> cold-spawn" path.
+		_, _ = fmt.Fprintf(stderr, "fleet drain: no lease leader for %s; cold-spawning successor\n", project)
 		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	default:
@@ -365,21 +376,29 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	return ErrEscalatedToTakeOver
 }
 
-// coldResume runs handoffop.Resume to spawn a successor — with NO lock held
-// across it (the lease-aware path's hard invariant, T40). It runs Resume
-// SYNCHRONOUSLY: the 81-process leak was caused by holding the per-agent
-// FLOCK across a slow Resume, NOT by Resume being slow per se. Without that
-// lock a slow Resume cannot wedge any OTHER drain, so there is no need to
-// abandon it on a timer — and abandoning it would be unsafe here because
-// `fleet drain` is a short-lived CLI: the process exits right after this
-// returns and would kill a still-running Resume goroutine mid-spawn (codex
-// PR3 iter-3 [P2]). So we let Resume finish and return its result verbatim.
-// (The COORD path's boundedness comes from the barrier-wait + takeover
-// escalation, which never runs Resume at all on a hung leader.)
+// coldResume runs handoffop.Resume to spawn a successor for a STEALABLE
+// (no-epoch) coord lease. It holds a SHORT per-agent LockAgent for the
+// duration (codex PR3 iter-4 [P1]) — Resume's contract requires that lock,
+// and two concurrent drains would otherwise both spawn a replacement. This
+// does NOT reintroduce the 81-leak: that leak was holding the lock across a
+// HUNG live leader's coord swap (tmux probes / nested flock / spawn that can
+// wedge forever). A COLD spawn has no live leader to swap and no hung holder
+// — it is the fresh first-spawn path, where the per-agent lock is brief and
+// always released. The graceful/hung COORD path never calls Resume at all; it
+// kills/escalates lock-free (that is where the T40 no-lock invariant lives).
+//
+// Run SYNCHRONOUSLY: `fleet drain` is a short-lived CLI, so an abandoned
+// Resume goroutine would be killed on process exit mid-spawn (codex PR3
+// iter-3 [P2]).
 func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	_ = resumeTimeoutMillis // not used: no lock is held, so Resume need not be abandoned
+	_ = resumeTimeoutMillis // the cold spawn is not abandoned on a timer
+	release, err := d.LockAgent(req.OldAgentID)
+	if err != nil {
+		return fmt.Errorf("fleet drain: lock agent %s for cold resume: %w", req.OldAgentID, err)
+	}
+	defer release()
 	return d.Resume(req, path, graceMillis, stdout, stderr)
 }
 
@@ -408,6 +427,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.Resume == nil {
 		d.Resume = def.Resume
+	}
+	if d.LockAgent == nil {
+		d.LockAgent = def.LockAgent
 	}
 	if d.BarrierPoll == 0 {
 		d.BarrierPoll = def.BarrierPoll
