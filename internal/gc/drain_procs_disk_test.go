@@ -26,17 +26,35 @@ func TestKillDrainGuarded_RequireFingerprint_FailsClosed(t *testing.T) {
 	}
 }
 
-// sameFleetExe matches the current process against itself and mismatches
-// against pid 1 (launchd/init — definitely not the test binary).
-func TestSameFleetExe(t *testing.T) {
-	if got := sameFleetExe(os.Getpid()); got != exeProbeMatch {
-		t.Fatalf("sameFleetExe(self) = %v, want match", got)
+// isFleetExeBasename accepts any path whose basename is `fleet`,
+// tolerating the Linux "(deleted)" suffix (codex iter-10 [P2]: legacy
+// drains come from a PREVIOUS fleet binary at a different/deleted path).
+func TestIsFleetExeBasename(t *testing.T) {
+	for _, c := range []struct {
+		path string
+		want bool
+	}{
+		{"/usr/local/bin/fleet", true},
+		{"/opt/old/v1/fleet", true},             // previous version, different path
+		{"/old/path/fleet (deleted)", true},     // upgraded-away on Linux
+		{"  /old/path/fleet (deleted)  ", true}, // trimmed
+		{"/usr/local/bin/fleetctl", false},      // different binary
+		{"/usr/bin/claude", false},
+		{"fleet", true}, // bare basename
+		{"/sbin/launchd", false},
+	} {
+		if got := isFleetExeBasename(c.path); got != c.want {
+			t.Errorf("isFleetExeBasename(%q) = %v, want %v", c.path, got, c.want)
+		}
 	}
-	// pid 1 is init/launchd — a different executable from the test binary.
-	// (On the rare host where the exe is unreadable we accept Failed too,
-	// since the guard treats both non-Match outcomes as "don't kill".)
-	if got := sameFleetExe(1); got == exeProbeMatch {
-		t.Fatalf("sameFleetExe(1) must not match the test binary; got %v", got)
+}
+
+// fleetBasenameExe against pid 1 (launchd/init) must NOT match (its exe
+// basename is not `fleet`) — or report Failed if the host hides it. The
+// guard treats both non-Match outcomes as "don't kill".
+func TestFleetBasenameExe_InitNotFleet(t *testing.T) {
+	if got := fleetBasenameExe(1); got == exeProbeMatch {
+		t.Fatalf("fleetBasenameExe(1) must not match a fleet binary; got %v", got)
 	}
 }
 

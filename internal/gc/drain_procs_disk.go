@@ -146,16 +146,21 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 	}
 
 	if legacy {
-		// Legacy path ALWAYS requires the executable-identity gate (codex
-		// iter-9 [P2]): argv-basename alone is spoofable (a different
-		// binary/symlink named `fleet` with a `drain` arg), and a legacy
-		// fingerprint does NOT prove the proc is OUR fleet binary. Require
-		// the target's exe to be the same fleet binary we are running.
-		switch sameFleetExe(target.Pid) {
+		// Legacy path requires an executable-identity gate (codex iter-9
+		// [P2]): argv-basename alone is spoofable (a different
+		// binary/symlink named `fleet` with a `drain` arg). But the gate
+		// must NOT require equality to the CURRENT binary (codex iter-10
+		// [P2]): the whole point of --legacy-drains is reaping drains from
+		// a PREVIOUS fleet binary (different path, possibly `(deleted)` on
+		// Linux). So the legacy gate accepts ANY executable whose basename
+		// is `fleet` (the `(deleted)` suffix tolerated) — combined with the
+		// argv `fleet drain` re-probe + age/sleeping gates, that keeps an
+		// unrelated non-fleet binary out of blast radius.
+		switch fleetBasenameExe(target.Pid) {
 		case exeProbeMismatch:
-			return DrainKillResult{Gone: true}, nil // a different binary owns the PID
+			return DrainKillResult{Gone: true}, nil // not a fleet binary
 		case exeProbeFailed:
-			return DrainKillResult{}, nil // can't prove ownership — surface, don't kill
+			return DrainKillResult{}, nil // can't read exe — surface, don't kill
 		}
 	}
 	// Steady-state path (pid_start matched above): identity is proven by
@@ -191,39 +196,33 @@ const (
 	exeProbeFailed                   // could not read one/both exes (ambiguous)
 )
 
-// sameFleetExe compares the target pid's executable to THIS fleet
-// process's executable (os.Executable). A match proves the target is the
-// same fleet binary (legacy-path ownership proof, codex iter-6 [P2]).
-//
-// Resolution (codex iter-8 [P1] — darwin must actually reap): Linux reads
-// /proc/<pid>/exe; darwin tries `ps -o comm=` then `lsof` txt. When BOTH
-// sides yield absolute paths we compare them (EvalSymlinks-resolved) — a
-// strong match. When the target's path is only a basename (a PATH-launched
-// `fleet` whose comm is just "fleet"), we fall back to a basename match
-// against our own exe basename so darwin can still reap (a weaker but
-// real signal; combined with the argv `fleet drain` re-probe + pid age
-// gate, the legacy blast radius stays narrow). Unreadable target →
-// exeProbeFailed (don't kill on ambiguity).
-func sameFleetExe(pid int) exeProbe {
-	self, err := os.Executable()
-	if err != nil {
-		return exeProbeFailed
-	}
-	other, abs, ok := procExePath(pid)
+// fleetBasenameExe is the LEGACY-path exe gate (codex iter-6/8/10 [P1/P2]):
+// accept ANY executable whose basename is `fleet`. A previous-version
+// fleet binary lives at a different path than the current `fleet gc`
+// process (and on Linux an upgraded-away binary shows as
+// `/old/path/fleet (deleted)`), so equality to os.Executable() would
+// wrongly reject the very drains --legacy-drains exists to reap. The
+// basename check still excludes a non-fleet binary that merely spoofs the
+// `fleet drain` argv. Resolution: Linux /proc/<pid>/exe; darwin `ps -o
+// comm=` then `lsof` txt. exeProbeFailed when the exe can't be read at all
+// (don't kill on ambiguity).
+func fleetBasenameExe(pid int) exeProbe {
+	other, _, ok := procExePath(pid)
 	if !ok {
 		return exeProbeFailed
 	}
-	if abs {
-		if resolvePath(other) == resolvePath(self) {
-			return exeProbeMatch
-		}
-		return exeProbeMismatch
-	}
-	// Target gave only a basename — compare basenames.
-	if filepath.Base(other) == filepath.Base(self) {
+	if isFleetExeBasename(other) {
 		return exeProbeMatch
 	}
 	return exeProbeMismatch
+}
+
+// isFleetExeBasename reports whether an executable path's basename is
+// `fleet`, tolerating the Linux " (deleted)" suffix on a replaced binary.
+// Pure (testable without a real process).
+func isFleetExeBasename(exePath string) bool {
+	p := strings.TrimSuffix(strings.TrimSpace(exePath), " (deleted)")
+	return filepath.Base(p) == "fleet"
 }
 
 // procExePath returns the executable path of pid and whether it is
@@ -290,16 +289,6 @@ func lsofTxtPath(pid int) (string, bool) {
 		return firstAbs, true
 	}
 	return "", false
-}
-
-// resolvePath best-effort canonicalizes p via EvalSymlinks; on failure
-// it returns p unchanged (the comparison then falls back to the raw
-// path, which is still correct for a non-symlinked install).
-func resolvePath(p string) string {
-	if r, err := filepath.EvalSymlinks(p); err == nil {
-		return r
-	}
-	return p
 }
 
 // procDrainState is a three-way argv probe for the guarded kill: probe
