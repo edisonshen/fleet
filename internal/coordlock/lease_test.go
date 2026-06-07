@@ -1373,3 +1373,51 @@ func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
 		t.Fatalf("expected active cand2 after resume, got %s/%s", rec.State, rec.Owner.AgentID)
 	}
 }
+
+// ---- codex iter-10 [P2]: don't silently stand down on fenced_not_acquired ----
+
+// A fenced_not_acquired record is a GAVE-UP escalation, not an in-progress
+// takeover. A new AcquireLease must immediately re-attempt recovery (and,
+// in PR1 where the kill is a no-op and a real flock is still held, SURFACE
+// an escalation) — never return acquired=false,err=nil silently until TTL.
+func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// Busy flock (a hung holder still owns it), fenced_not_acquired record
+	// with a STILL-ALIVE candidate, renewed_at FRESH (within TTL).
+	const oldPid = 4242
+	live.set(oldPid, int64(222222))
+	holdFlock(t, project)
+	const liveCandPid = 6000
+	live.set(liveCandPid, int64(666666))
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 7, State: stateFencedNotAcquired,
+		Owner:         identity{Pid: oldPid, PidStart: int64(222222), AgentID: "old", Project: project},
+		Candidate:     identity{Pid: liveCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(), // fresh, within TTL
+	})
+
+	cfg := testCfg(clk, live)
+	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free a real flock
+	var fenced atomic.Bool
+	cfg.killStub = func(identity) error { fenced.Store(true); return nil }
+
+	clk.advance(5 * time.Second) // still within TTL
+
+	_, acquired, err := acquireLease(project, "cand2", cfg)
+	if acquired {
+		t.Fatal("PR1 stub cannot free the held flock; should not acquire")
+	}
+	// Must NOT silently stand down: it re-attempts the takeover (fences +
+	// kill-stub) and surfaces an escalation error since the flock is held.
+	if err == nil {
+		t.Fatal("fenced_not_acquired must trigger recovery/escalation, not silent stand-down")
+	}
+	if !fenced.Load() {
+		t.Fatal("a fenced_not_acquired record must drive a fresh takeover attempt (re-fence/kill)")
+	}
+}
