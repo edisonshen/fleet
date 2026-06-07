@@ -1,0 +1,412 @@
+package gc
+
+import (
+	"testing"
+	"time"
+)
+
+// drainTestDeps builds a minimal Deps wired only for the drain-procs
+// classifier. Each test overrides the relevant hooks. now is the pinned
+// clock; killCalls records every guarded-kill target so a test can
+// assert kill-or-not. recordRemoves records every deleted run-record.
+type drainHarness struct {
+	deps       Deps
+	killCalls  []DrainKillTarget
+	removed    []string
+	killReturn func(DrainKillTarget) (bool, error)
+}
+
+func newDrainHarness(now time.Time) *drainHarness {
+	h := &drainHarness{}
+	h.deps = Deps{
+		Now: func() time.Time { return now },
+		KillDrain: func(t DrainKillTarget) (bool, error) {
+			h.killCalls = append(h.killCalls, t)
+			if h.killReturn != nil {
+				return h.killReturn(t)
+			}
+			return true, nil // default: identity held, killed
+		},
+		RemoveDrainRun: func(path string) error {
+			h.removed = append(h.removed, path)
+			return nil
+		},
+	}
+	return h
+}
+
+func reconcileDrains(t *testing.T, opts Options, deps Deps) Report {
+	t.Helper()
+	opts.Kinds = []Kind{KindDrainProcs}
+	r, err := Reconcile(opts, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	return r
+}
+
+// ---------------- T17: steady-state wedged-drain reaping ----------------
+
+// T17a — gc surfaces a wedged drain in dry-run; no kill, record kept.
+func TestDrainProcs_T17a_SurfacesWedged_DryRun(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "Mon Jun  2 10:00:00 2026",
+			StartedAt:   now.Add(-3 * time.Hour),
+			HeartbeatAt: now.Add(-10 * time.Minute), // stale > TTL
+			Path:        "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(pid int, start string) bool { return true } // live + identity match
+
+	r := reconcileDrains(t, Options{Apply: false}, h.deps)
+
+	act, ok := findAction(r, KindDrainProcs, "drain pid=4242")
+	if !ok {
+		t.Fatalf("expected a drain-procs action for pid 4242; got %+v", r.Actions)
+	}
+	if act.Verb != VerbSurface {
+		t.Fatalf("dry-run should SURFACE, got verb=%s", act.Verb)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("dry-run must not kill; got %d kill calls", len(h.killCalls))
+	}
+	if len(h.removed) != 0 {
+		t.Fatalf("dry-run must not delete the record; got %v", h.removed)
+	}
+}
+
+// T17b — --apply reaps a wedged drain: kill once, record deleted.
+func TestDrainProcs_T17b_ReapsWedged_Apply(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "Mon Jun  2 10:00:00 2026",
+			HeartbeatAt: now.Add(-10 * time.Minute),
+			Path:        "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(pid int, start string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbKilled {
+		t.Fatalf("apply should KILL the wedged drain, got verb=%s reason=%s", act.Verb, act.Reason)
+	}
+	if len(h.killCalls) != 1 || h.killCalls[0].Pid != 4242 {
+		t.Fatalf("expected exactly one kill of pid 4242; got %+v", h.killCalls)
+	}
+	if h.killCalls[0].PidStart != "Mon Jun  2 10:00:00 2026" {
+		t.Fatalf("kill target must carry recorded pid_start for re-validation; got %q", h.killCalls[0].PidStart)
+	}
+	if len(h.removed) != 1 || h.removed[0] != "/tmp/drain-runs/4242.json" {
+		t.Fatalf("expected the stale run-record deleted after kill; got %v", h.removed)
+	}
+}
+
+// T17c — reap is idempotent: after the record is gone / pid dead, a
+// re-run produces no kill and exits clean.
+func TestDrainProcs_T17c_Idempotent(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	// Record still on disk (delete lagged) but the pid is now dead.
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "Mon Jun  2 10:00:00 2026",
+			HeartbeatAt: now.Add(-10 * time.Minute),
+			Path:        "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(pid int, start string) bool { return false } // dead now
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	if len(h.killCalls) != 0 {
+		t.Fatalf("idempotent re-run must NOT kill a dead pid; got %+v", h.killCalls)
+	}
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbRemoved {
+		t.Fatalf("dead pid should clean the stale record (VerbRemoved), got %s", act.Verb)
+	}
+	if len(h.removed) != 1 {
+		t.Fatalf("expected stale record cleaned exactly once; got %v", h.removed)
+	}
+}
+
+// ---------------- T18: never-kill-a-good-drain guards ----------------
+
+// T18a — a fresh drain (heartbeat within TTL) is never killed.
+func TestDrainProcs_T18a_FreshDrain_Untouched(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 7, PidStart: "x", HeartbeatAt: now, // fresh
+			Path: "/tmp/drain-runs/7.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	if len(r.Actions) != 0 {
+		t.Fatalf("fresh drain must produce zero actions; got %+v", r.Actions)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("fresh drain must not be killed; got %+v", h.killCalls)
+	}
+}
+
+// T18b — a long-recovery drain (old started_at but heartbeat fresh) is
+// never killed. Heartbeat, not age, is the wedged signal.
+func TestDrainProcs_T18b_LongRecovery_Untouched(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 7, PidStart: "x",
+			StartedAt:   now.Add(-6 * time.Hour),   // hours old
+			HeartbeatAt: now.Add(-5 * time.Second), // but fresh!
+			Path:        "/tmp/drain-runs/7.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	if len(r.Actions) != 0 {
+		t.Fatalf("long-recovery (fresh heartbeat) drain must produce zero actions; got %+v", r.Actions)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("long-recovery drain must not be killed; got %+v", h.killCalls)
+	}
+}
+
+// T18c — PID-reuse safety: stale heartbeat, but the live pid now has a
+// DIFFERENT start time than recorded. Treated as already-dead → record
+// cleaned, NO kill (the live PID is an unrelated process).
+func TestDrainProcs_T18c_PidReuse_NoKill(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "Mon Jun  2 10:00:00 2026",
+			HeartbeatAt: now.Add(-10 * time.Minute),
+			Path:        "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	// DrainProcLive encodes the PID-reuse check: live pid but start
+	// mismatch → false (the production drainProcLiveOnDisk returns false
+	// on start-time mismatch).
+	h.deps.DrainProcLive = func(pid int, recordedStart string) bool {
+		return false // mismatch → not the recorded drain
+	}
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	if len(h.killCalls) != 0 {
+		t.Fatalf("PID reuse must NOT kill the unrelated live process; got %+v", h.killCalls)
+	}
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbRemoved {
+		t.Fatalf("PID-reuse case should clean the stale record only, got %s", act.Verb)
+	}
+}
+
+// T17b-variant — kill races to exit between classify + signal:
+// KillDrain returns (false, nil). No error; record cleaned; no double-kill.
+func TestDrainProcs_KillRacedToExit_NoError(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.killReturn = func(DrainKillTarget) (bool, error) { return false, nil } // raced
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute),
+			Path: "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbRemoved {
+		t.Fatalf("raced-to-exit kill should clean the record, got %s reason=%s", act.Verb, act.Reason)
+	}
+	if len(h.removed) != 1 {
+		t.Fatalf("expected the now-dead record cleaned; got %v", h.removed)
+	}
+}
+
+// ---------------- TLD: --legacy-drains coarse ps sweep ----------------
+
+// TLD1 — --legacy-drains surfaces an old sleeping drain (dry-run).
+func TestLegacyDrains_TLD1_SurfacesOldSleeping(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil } // no run-records (legacy)
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{
+			Pid: 909, PidStart: "Mon Jun  2 00:00:00 2026",
+			Exe: "/usr/local/bin/fleet", Sleeping: true, Age: 30 * time.Minute,
+		}}, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: false, LegacyDrains: true}, h.deps)
+
+	act, ok := findAction(r, KindDrainProcs, "drain pid=909")
+	if !ok {
+		t.Fatalf("expected legacy drain surfaced; got %+v", r.Actions)
+	}
+	if act.Verb != VerbSurface {
+		t.Fatalf("legacy dry-run should SURFACE, got %s", act.Verb)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("legacy dry-run must not kill; got %+v", h.killCalls)
+	}
+}
+
+// TLD2 — --legacy-drains --apply reaps the 81-shape; idempotent on a 2nd
+// run (KillDrain returns false=already-gone → no error, no double-kill).
+func TestLegacyDrains_TLD2_ReapsAndIdempotent(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{
+			Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: true, Age: time.Hour,
+		}}, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	act, _ := findAction(r, KindDrainProcs, "drain pid=909")
+	if act.Verb != VerbKilled {
+		t.Fatalf("legacy apply should kill pid 909, got %s", act.Verb)
+	}
+	if len(h.killCalls) != 1 {
+		t.Fatalf("expected one kill; got %+v", h.killCalls)
+	}
+
+	// 2nd run: pid already gone → KillDrain returns (false, nil).
+	h2 := newDrainHarness(now)
+	h2.killReturn = func(DrainKillTarget) (bool, error) { return false, nil }
+	h2.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
+	h2.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: true, Age: time.Hour}}, nil
+	}
+	r2 := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h2.deps)
+	act2, _ := findAction(r2, KindDrainProcs, "drain pid=909")
+	if act2.Verb == VerbKilled {
+		t.Fatalf("2nd run must NOT report a 2nd kill of an already-dead pid; verb=%s", act2.Verb)
+	}
+}
+
+// TLD3 — --legacy-drains skips a young drain (below the 5-min floor).
+func TestLegacyDrains_TLD3_SkipsYoung(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{
+			Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: true, Age: 1 * time.Minute,
+		}}, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	if _, ok := findAction(r, KindDrainProcs, "drain pid=909"); ok {
+		t.Fatalf("young drain (age < floor) must NOT be surfaced/killed")
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("young drain must not be killed; got %+v", h.killCalls)
+	}
+}
+
+// TLD3b — a non-sleeping (running) drain is also skipped by the legacy
+// sweep even when old.
+func TestLegacyDrains_SkipsRunning(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{
+			Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: false, Age: time.Hour,
+		}}, nil
+	}
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	if _, ok := findAction(r, KindDrainProcs, "drain pid=909"); ok {
+		t.Fatalf("a running (non-sleeping) drain must not be reaped by the legacy sweep")
+	}
+}
+
+// TLD4 — --legacy-drains skips non-fleet procs. The production lister
+// only yields fleet-drain procs; here we assert the classifier honors an
+// EMPTY list (a non-fleet proc the lister already filtered out is never
+// seen) AND that the legacy sweep never runs without --legacy-drains.
+func TestLegacyDrains_TLD4_NonFleetOutOfBlastRadius(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) { return nil, nil }
+	// Lister yields nothing (it already excluded the non-fleet sleeping
+	// proc by argv). ListDrainProcs must NOT even be consulted unless
+	// LegacyDrains is set — assert that too.
+	legacyCalled := false
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		legacyCalled = true
+		return nil, nil
+	}
+
+	// Without --legacy-drains: the coarse sweep is not run at all.
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: false}, h.deps)
+	if legacyCalled {
+		t.Fatalf("ListDrainProcs must NOT be called without --legacy-drains")
+	}
+	if len(r.Actions) != 0 {
+		t.Fatalf("no run-records + no legacy sweep → zero actions; got %+v", r.Actions)
+	}
+
+	// With --legacy-drains and an empty (filtered) list: zero actions.
+	r2 := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	if !legacyCalled {
+		t.Fatalf("ListDrainProcs SHOULD be called with --legacy-drains")
+	}
+	if len(r2.Actions) != 0 {
+		t.Fatalf("non-fleet proc filtered by lister → zero actions; got %+v", r2.Actions)
+	}
+}
+
+// Steady-state + legacy run together: a wedged run-record AND a legacy
+// proc are both reaped in one --legacy-drains --apply sweep.
+func TestDrainProcs_SteadyAndLegacy_BothReaped(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{Pid: 100, PidStart: "a", HeartbeatAt: now.Add(-30 * time.Minute), Path: "/tmp/100.json"}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{Pid: 200, PidStart: "b", Exe: "fleet", Sleeping: true, Age: time.Hour}}, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	if a, _ := findAction(r, KindDrainProcs, "drain pid=100"); a.Verb != VerbKilled {
+		t.Fatalf("steady-state wedged drain should be killed, got %s", a.Verb)
+	}
+	if a, _ := findAction(r, KindDrainProcs, "drain pid=200"); a.Verb != VerbKilled {
+		t.Fatalf("legacy drain should be killed, got %s", a.Verb)
+	}
+	if len(h.killCalls) != 2 {
+		t.Fatalf("expected 2 kills (steady + legacy); got %+v", h.killCalls)
+	}
+}
+
+// Missing-dep guard: KindDrainProcs without ListDrainRuns errors clearly.
+func TestDrainProcs_MissingDep_Errors(t *testing.T) {
+	_, err := Reconcile(Options{Kinds: []Kind{KindDrainProcs}, Apply: false}, Deps{Now: time.Now})
+	if err == nil {
+		t.Fatalf("expected a wiring error when ListDrainRuns is nil")
+	}
+}

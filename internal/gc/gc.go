@@ -80,10 +80,21 @@ const (
 	// is surfaced-only, never auto-removed — the operator may have real
 	// state to migrate). SURFACE by default; --apply rm -rf's the dir.
 	// See invalid_projects.go.
+
+	// KindDrainProcs (handoff-drain-storm-leak PR5) is the eighth
+	// classifier — reaps leaked/wedged `fleet drain` processes (the
+	// 81-process leak). Steady-state path keys off the per-drain
+	// run-record heartbeat (~/.fleet/drain-runs/<pid>.json): wedged iff
+	// heartbeat stale past TTL AND pid+pid_start still live (reuse-safe).
+	// The one-time --legacy-drains sweep falls back to a coarse `ps`
+	// heuristic (sleeping + age floor) for the existing 81 that predate
+	// the run-record. SURFACE by default; --apply → guarded kill (exe +
+	// pid_start re-validated before signal), then deletes the stale
+	// record. Idempotent on already-dead PIDs. See drain_procs.go.
 )
 
 // AllKinds is the default --kinds set when the flag is omitted.
-var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons}
+var AllKinds = []Kind{KindSockets, KindOrphanAgents, KindOrphanTmux, KindWorktrees, KindCoordLocks, KindWorkerRecords, KindInvalidProjects, KindOrphanRCDaemons, KindDrainProcs}
 
 // Verb enumerates the operation attached to each report entry. Two
 // flavors per mutator (would-X vs X) so dry-run vs apply paths share
@@ -137,6 +148,12 @@ type Options struct {
 	Kinds []Kind
 	// Project scopes worktree + agent enumeration. Empty = all projects.
 	Project string
+	// LegacyDrains opts the KindDrainProcs classifier into the one-time
+	// coarse `ps`-state sweep for the existing 81 leaked drains that
+	// predate the run-record (CLI: --legacy-drains). When true, the
+	// classifier runs reconcileLegacyDrains IN ADDITION to the
+	// steady-state run-record pass. Default false (run-record path only).
+	LegacyDrains bool
 }
 
 // Deps groups every external read/write Reconcile needs. Tests stub
@@ -362,6 +379,32 @@ type Deps struct {
 	// RestoreProjectDir renames a quarantined dir back when the recheck
 	// found tasks.md (un-quarantine). Production wiring is restoreProjectDir.
 	RestoreProjectDir func(quarantined, original string) error
+
+	// Drain-procs (KindDrainProcs).
+	// ListDrainRuns enumerates ~/.fleet/drain-runs/<pid>.json run-records
+	// (each parsed into a DrainRun with its Path set). Production wiring
+	// is listDrainRunsOnDisk.
+	ListDrainRuns func() ([]DrainRun, error)
+	// DrainProcLive reports whether the recorded pid is STILL a live
+	// process whose start identity matches pidStart (PID-reuse-safe). A
+	// start-time mismatch → false (the live PID is an unrelated process
+	// that reused the number). Production wiring is drainProcLiveOnDisk.
+	DrainProcLive func(pid int, pidStart string) bool
+	// KillDrain reaps a wedged drain via the guarded kill: it RE-VALIDATES
+	// pid_start (+ exe for the legacy path) immediately before SIGTERM and
+	// returns (killed=false, nil) — NOT an error — when the pid is already
+	// dead or its identity no longer matches (idempotent, PID-reuse-safe).
+	// Production wiring is killDrainGuarded.
+	KillDrain func(target DrainKillTarget) (killed bool, err error)
+	// RemoveDrainRun deletes a stale run-record file (LAST step of a reap).
+	// ENOENT-tolerant. Production wiring is removeDrainRunFile.
+	RemoveDrainRun func(path string) error
+	// ListDrainProcs enumerates `fleet drain` processes from the OS for the
+	// one-time --legacy-drains coarse sweep (the existing 81 predate the
+	// run-record). Yields ONLY provably-fleet-owned `fleet drain` procs
+	// (argv-matched + fleet-shaped exe). Production wiring is
+	// listDrainProcsOnDisk.
+	ListDrainProcs func() ([]DrainProcInfo, error)
 }
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
@@ -490,6 +533,20 @@ func Reconcile(opts Options, deps Deps) (Report, error) {
 			recordErr(fmt.Errorf("orphan-rc-daemons: %w", err))
 		}
 	}
+	if hasKind(opts.Kinds, KindDrainProcs) {
+		// Steady-state run-record pass always runs when the kind is
+		// enabled. The coarse legacy `ps` sweep runs ADDITIONALLY only
+		// when opts.LegacyDrains is set (the one-time --legacy-drains
+		// reclaim of the existing 81 that predate the run-record).
+		if err := reconcileDrainProcs(&r, opts, deps); err != nil {
+			recordErr(fmt.Errorf("drain-procs: %w", err))
+		}
+		if opts.LegacyDrains {
+			if err := reconcileLegacyDrains(&r, opts, deps); err != nil {
+				recordErr(fmt.Errorf("drain-procs (legacy): %w", err))
+			}
+		}
+	}
 
 	// Stable order: Kind primary, Target secondary. Tests rely on
 	// findAction() (linear scan) so the order is for human-readable
@@ -521,6 +578,8 @@ func kindRank(k Kind) int {
 		return 6
 	case KindOrphanRCDaemons:
 		return 7
+	case KindDrainProcs:
+		return 8
 	}
 	return 99
 }
@@ -889,6 +948,11 @@ func DefaultDeps() Deps {
 		CurrentClaudeVersion:  currentClaudeVersionOnDisk,
 		KillRCDaemon:          killRCDaemonOnDisk,
 		CoordRecordExists:     coordRecordExistsOnDisk,
+		ListDrainRuns:         listDrainRunsOnDisk,
+		DrainProcLive:         drainProcLiveOnDisk,
+		KillDrain:             killDrainGuarded,
+		RemoveDrainRun:        removeDrainRunFile,
+		ListDrainProcs:        listDrainProcsOnDisk,
 	}
 }
 

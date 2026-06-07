@@ -57,6 +57,19 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 		return err
 	}
 
+	// Write the run-record + start the heartbeat, deferring the delete so
+	// it runs on the happy AND failure/panic path (fleet-owns-its-
+	// resources: cleanup is the LAST step, via defer). A drain SIGKILLed
+	// mid-flight can't run the defer — that leaked record is exactly what
+	// `fleet gc --kinds drain-procs` reaps once the heartbeat goes stale.
+	// A write failure is non-fatal: the drain still completes its work;
+	// it just isn't gc-reapable via the run-record path this run.
+	if rh, rerr := startDrainRunRecord(); rerr != nil {
+		_, _ = fmt.Fprintf(stderr, "fleet drain: run-record: %v (continuing)\n", rerr)
+	} else {
+		defer rh.Stop()
+	}
+
 	paths, err := queue.ListPending()
 	if err != nil {
 		return fmt.Errorf("list queue: %w", err)
