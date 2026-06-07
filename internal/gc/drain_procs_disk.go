@@ -84,10 +84,14 @@ func drainProcLiveOnDisk(pid int, pidStart string) bool {
 	}
 	cur, err := procStartTime(pid)
 	if err != nil {
-		// Can't read the start time of a process we just saw alive →
-		// conservative: treat as NOT a confirmed identity match so we do
-		// not kill on ambiguity (surface-don't-silo).
-		return false
+		// Alive but start-time unreadable (transient ps failure /
+		// permissions). Treat as LIVE/ambiguous (codex [P2]): returning
+		// false here would route the classifier into the !live branch
+		// which DELETES the run-record under --apply, stranding a
+		// potentially-wedged drain. Returning true sends it through the
+		// WEDGED branch instead, where the guarded kill itself re-probes
+		// and, on the same ambiguity, KEEPS the record for the next sweep.
+		return true
 	}
 	return cur == pidStart
 }
@@ -228,9 +232,16 @@ func listDrainProcsOnDisk() ([]DrainProcInfo, error) {
 		if terr == nil {
 			age = now.Sub(started)
 		}
+		// PidStart MUST be the SAME fingerprint format killDrainGuarded
+		// re-derives via procStartTime (codex [P1]) — a raw lstart here
+		// would never equal the guard's prefixed "linux-stat:"/"lstart:"
+		// value, so the guard would treat it as PID reuse and skip the
+		// SIGTERM, leaving the legacy drain alive. Empty fingerprint (read
+		// failed) → the guard falls back to a bare liveness check.
+		fp, _ := procStartFingerprint(pid)
 		procs = append(procs, DrainProcInfo{
 			Pid:      pid,
-			PidStart: lstart, // the lstart string IS the fingerprint
+			PidStart: fp,
 			Exe:      firstField(args),
 			Sleeping: isSleepingState(stateTok),
 			Age:      age,
@@ -303,32 +314,47 @@ func linuxProcStarttime(pid int) (string, bool) {
 	return st, true
 }
 
-// argvIsFleetDrain matches a `fleet drain` command line. Requires BOTH
-// the fleet binary token (basename "fleet") AND the `drain` subcommand
-// to appear, so a different fleet subcommand or an unrelated binary
-// mentioning "drain" is excluded.
+// rootValueFlags are the fleet ROOT persistent flags that consume the
+// NEXT argv token as their value (so the token after them is NOT the
+// subcommand). `--engine codex drain` → skip `codex`, match `drain`.
+// Bool root flags (--codex/--claude) take no value and are handled by
+// the generic flag-skip. Mirrors cmd/fleet/main.go's root.PersistentFlags.
+var rootValueFlags = map[string]bool{
+	"--engine": true,
+	"-engine":  true,
+}
+
+// argvIsFleetDrain matches a `fleet [root-flags] drain ...` command line.
+// Requires the fleet binary (basename "fleet") AND that the resolved
+// SUBCOMMAND (the first bare token after the binary, skipping root flags
+// and their values) is `drain`. Handles `--engine codex drain`,
+// `--engine=codex drain`, and `-codex drain` (codex [P2]); a different
+// fleet subcommand (e.g. `fleet tasks add drain`) is correctly excluded
+// because `tasks` is the resolved subcommand, not `drain`.
 func argvIsFleetDrain(argv string) bool {
 	fields := strings.Fields(argv)
 	if len(fields) < 2 {
 		return false
 	}
 	exe := filepath.Base(fields[0])
-	// Accept "fleet" or a test/dev binary basename that ends in "fleet".
-	if exe != "fleet" && !strings.HasSuffix(exe, "/fleet") {
-		// Also accept an absolute path whose basename is exactly fleet.
-		if filepath.Base(exe) != "fleet" {
-			return false
-		}
+	if exe != "fleet" && filepath.Base(exe) != "fleet" {
+		return false
 	}
-	for _, f := range fields[1:] {
-		if f == "drain" {
-			return true
+	for i := 1; i < len(fields); i++ {
+		f := fields[i]
+		if strings.HasPrefix(f, "-") {
+			// `--engine=codex` carries its value inline → just skip it.
+			if strings.Contains(f, "=") {
+				continue
+			}
+			// `--engine codex` consumes the next token as its value.
+			if rootValueFlags[f] && i+1 < len(fields) {
+				i++ // skip the value token
+			}
+			continue
 		}
-		// First non-flag token after the binary is the subcommand; if it
-		// is not "drain", this is a different fleet command.
-		if !strings.HasPrefix(f, "-") {
-			return f == "drain"
-		}
+		// First bare token = the resolved subcommand.
+		return f == "drain"
 	}
 	return false
 }
