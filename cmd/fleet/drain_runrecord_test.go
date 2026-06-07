@@ -197,4 +197,9 @@ func TestDrainRunRecord_GraceRecorded(t *testing.T) {
 	if rec.GraceMillis != 600000 {
 		t.Fatalf("grace_ms = %d, want 600000", rec.GraceMillis)
 	}
+	// The drain's PID-resolve budget is recorded so the reaper derives the
+	// TTL from THIS drain's env, not the gc process's (codex iter-14 [P2]).
+	if rec.PidResolveMillis <= 0 {
+		t.Fatalf("pid_resolve_ms must be recorded (>0); got %d", rec.PidResolveMillis)
+	}
 }

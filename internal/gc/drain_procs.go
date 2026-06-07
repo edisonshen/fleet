@@ -77,14 +77,20 @@ const drainHeartbeatFloor = 5 * time.Minute
 // testable. The lease/bounded-drain rewrite (PR1-4) shrinks Resume's
 // worst case; until then this is the conservative reaping signal.
 var drainHeartbeatTTLFn = func() time.Duration {
-	budget := 2 * spawn.PidResolveTimeout()
-	if budget > drainHeartbeatFloor {
-		return budget
-	}
-	return drainHeartbeatFloor
+	return drainTTLFromBudget(spawn.PidResolveTimeout())
 }
 
 func drainHeartbeatTTL() time.Duration { return drainHeartbeatTTLFn() }
+
+// drainTTLFromBudget maps a PID-resolution budget to a stale-heartbeat
+// TTL: max(floor, 2 x budget). Shared by the gc-env default and the
+// per-record (recorded-budget) path so both use identical math.
+func drainTTLFromBudget(budget time.Duration) time.Duration {
+	if doubled := 2 * budget; doubled > drainHeartbeatFloor {
+		return doubled
+	}
+	return drainHeartbeatFloor
+}
 
 // drainLegacyAgeFloor is the floor for the --legacy-drains coarse
 // sweep. The existing 81 leaked drains have no run-record (they predate
@@ -108,6 +114,12 @@ type DrainRun struct {
 	// long grace sleep inside Resume (between Beats) doesn't look wedged
 	// (codex iter-11 [P2]).
 	GraceMillis int `json:"grace_ms,omitempty"`
+	// PidResolveMillis is THIS drain's spawn PID-resolution budget at
+	// launch (FLEET_PID_RESOLVE_S). The classifier derives the base TTL
+	// from THIS value rather than the gc process's env (codex iter-14
+	// [P2]), so a drain launched with a raised budget isn't reaped early by
+	// a gc run from a normal shell. 0 ⇒ fall back to the gc-env-derived TTL.
+	PidResolveMillis int `json:"pid_resolve_ms,omitempty"`
 	// Path is the run-record file on disk (set by the lister, not
 	// serialized). RemoveDrainRun targets it after a kill.
 	Path string `json:"-"`
@@ -189,12 +201,20 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 	sort.SliceStable(runs, func(i, j int) bool { return runs[i].Pid < runs[j].Pid })
 
 	now := deps.Now()
-	baseTTL := drainHeartbeatTTL()
+	envTTL := drainHeartbeatTTL()
 	for _, run := range runs {
-		// Effective TTL extends the base by this drain's configured grace
-		// window (codex iter-11 [P2]): a long --grace-ms sleep inside
-		// Resume happens between Beats, so without this a healthy drain in
-		// a legitimately-long grace would look wedged.
+		// Effective TTL = base(from THIS drain's recorded PID-resolve budget,
+		// not the gc env — codex iter-14 [P2]) + this drain's grace window
+		// (codex iter-11 [P2]). Both legitimate waits (slow spawn PID
+		// resolution, long /exit→Kill grace) happen between Beats, so the
+		// TTL must absorb them or a healthy drain looks wedged.
+		baseTTL := envTTL
+		if run.PidResolveMillis > 0 {
+			recorded := drainTTLFromBudget(time.Duration(run.PidResolveMillis) * time.Millisecond)
+			if recorded > baseTTL {
+				baseTTL = recorded
+			}
+		}
 		ttl := baseTTL + time.Duration(run.GraceMillis)*time.Millisecond
 		age := now.Sub(run.HeartbeatAt)
 		if age < ttl {

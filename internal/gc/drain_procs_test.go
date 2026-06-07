@@ -614,6 +614,48 @@ func TestDrainProcs_GraceExtendsTTL(t *testing.T) {
 	}
 }
 
+// Per-record PID-resolve budget extends the TTL (codex iter-14 [P2]):
+// the gc env TTL is the 5min floor, but a drain that recorded a large
+// PID-resolve budget gets a longer effective TTL from ITS budget, so a gc
+// run from a normal shell does not reap it early.
+func TestDrainProcs_RecordedBudgetExtendsTTL(t *testing.T) {
+	prev := drainHeartbeatTTLFn
+	drainHeartbeatTTLFn = func() time.Duration { return 5 * time.Minute } // gc-env default
+	t.Cleanup(func() { drainHeartbeatTTLFn = prev })
+
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	// 8min stale: > 5min env TTL → would be reaped on the env TTL alone.
+	// But this drain recorded a 10min PID-resolve budget → base TTL = 20min,
+	// so it is NOT reaped.
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 7, PidStart: "s", HeartbeatAt: now.Add(-8 * time.Minute),
+			PidResolveMillis: int((10 * time.Minute) / time.Millisecond),
+			Path:             "/tmp/7.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	if len(r.Actions) != 0 {
+		t.Fatalf("a drain within its recorded-budget TTL must not be reaped; got %+v", r.Actions)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("must not kill within recorded-budget TTL; got %+v", h.killCalls)
+	}
+}
+
+// drainTTLFromBudget: floor wins for a small budget; 2x wins for a large one.
+func TestDrainTTLFromBudget(t *testing.T) {
+	if got := drainTTLFromBudget(10 * time.Second); got != drainHeartbeatFloor {
+		t.Fatalf("small budget should yield the floor %v; got %v", drainHeartbeatFloor, got)
+	}
+	if got := drainTTLFromBudget(10 * time.Minute); got != 20*time.Minute {
+		t.Fatalf("large budget should yield 2x = 20m; got %v", got)
+	}
+}
+
 // Missing-dep guard: KindDrainProcs without ListDrainRuns errors clearly.
 func TestDrainProcs_MissingDep_Errors(t *testing.T) {
 	_, err := Reconcile(Options{Kinds: []Kind{KindDrainProcs}, Apply: false}, Deps{Now: time.Now})

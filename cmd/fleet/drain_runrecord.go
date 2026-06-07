@@ -33,6 +33,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -48,6 +49,13 @@ type drainRunRecord struct {
 	// The reaper adds it to the per-record effective TTL so a legitimately
 	// long grace sleep inside Resume doesn't look wedged (codex iter-11 [P2]).
 	GraceMillis int `json:"grace_ms,omitempty"`
+	// PidResolveMillis is THIS drain's spawn PID-resolution budget
+	// (FLEET_PID_RESOLVE_S at drain-launch time). Recorded so the reaper
+	// derives the stale-heartbeat TTL from the DRAIN's budget, not the
+	// gc process's env (codex iter-14 [P2]) — a drain launched with a
+	// raised budget can legitimately go longer between Beats than a gc run
+	// from a normal shell would otherwise allow.
+	PidResolveMillis int `json:"pid_resolve_ms,omitempty"`
 }
 
 // drainRunHandle owns one live run-record. Beat() advances heartbeat_at
@@ -109,11 +117,12 @@ func startDrainRunRecord(graceMillis int) (*drainRunHandle, error) {
 	path := filepath.Join(dir, strconv.Itoa(pid)+".json")
 	now := drainRunNow()
 	rec := drainRunRecord{
-		Pid:         pid,
-		PidStart:    fp,
-		StartedAt:   now,
-		HeartbeatAt: now,
-		GraceMillis: graceMillis,
+		Pid:              pid,
+		PidStart:         fp,
+		StartedAt:        now,
+		HeartbeatAt:      now,
+		GraceMillis:      graceMillis,
+		PidResolveMillis: int(spawn.PidResolveTimeout() / time.Millisecond),
 	}
 	if werr := writeDrainRunRecord(path, rec); werr != nil {
 		return nil, werr
