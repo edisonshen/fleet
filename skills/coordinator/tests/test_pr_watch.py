@@ -3099,7 +3099,7 @@ def test_rederive_prompt_has_safety_rails() -> None:
         kind=pw.ACTION_REDERIVE, event=pw.EVENT_DIRTY, pr_number=195,
         pr_url=_pr_url(195), branch="worker/a", base="main",
         head_sha="H1", base_sha="B", key="k",
-        task_slugs=("a",), conflicted_paths=("cli.py",),
+        task_slugs=("a", "b"), conflicted_paths=("cli.py",),
         attempt=2, max_attempts=3, series=2, max_series=6,
     )
     p = dispatch_mod.build_rederive_prompt(act, standards_md="S")
@@ -3111,6 +3111,9 @@ def test_rederive_prompt_has_safety_rails() -> None:
     assert "worktree remove" in p            # cleanup
     assert "cli.py" in p                      # conflicted-path hint
     assert "attempt 2/3" in p                 # bound note
+    # codex P2: multi-task PRs must reconstruct EVERY backing spec.
+    assert "MULTIPLE tasks" in p
+    assert "a, b" in p                        # both slugs listed
 
 
 def test_rebase_prompt_conflict_is_nonterminal_and_reviews() -> None:
