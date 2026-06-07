@@ -2542,7 +2542,13 @@ def _dispatch_actions(
             # toward the bounds.
             rem["attempts"] = max(0, rem["attempts"] - 1)
             rem["series_dispatches"] = max(0, rem["series_dispatches"] - 1)
-            rem["last_outcome"] = OUTCOME_FAILED_LAUNCH
+            # Preserve the re-derive ladder on a launch failure (codex P2): a
+            # re-derive that never launched must re-select re-derive next
+            # pass, not fall back to a rebase that re-hits the same conflict.
+            rem["last_outcome"] = (
+                OUTCOME_REBASE_CONFLICTED if kind == ACTION_REDERIVE
+                else OUTCOME_FAILED_LAUNCH
+            )
             out.errors.append(
                 f"pr-watch: dispatch {kind} for PR #{pr_num} failed: {exc}"
             )
@@ -2553,7 +2559,10 @@ def _dispatch_actions(
             w["inflight_action"]["outcome"] = OUTCOME_FAILED_LAUNCH
             rem["attempts"] = max(0, rem["attempts"] - 1)
             rem["series_dispatches"] = max(0, rem["series_dispatches"] - 1)
-            rem["last_outcome"] = OUTCOME_FAILED_LAUNCH
+            rem["last_outcome"] = (
+                OUTCOME_REBASE_CONFLICTED if kind == ACTION_REDERIVE
+                else OUTCOME_FAILED_LAUNCH
+            )
             out.errors.append(
                 f"pr-watch: dispatch {kind} for PR #{pr_num} did not launch; "
                 f"will retry"

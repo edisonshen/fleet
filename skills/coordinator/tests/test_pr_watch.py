@@ -3334,3 +3334,38 @@ def test_rebase_prompt_requires_agent_record_outcome() -> None:
     assert "agents/<your-agent-id>.json" in p
     assert '"remediation_outcome"' in p
     assert '"conflicted_paths"' in p
+
+
+def test_rederive_ladder_persists_across_failed_launch(tmp_path: Path) -> None:
+    """codex P2: a re-derive whose DISPATCH FAILS to launch (empty agent_id)
+    must keep the ladder on re-derive — the next pass re-dispatches a
+    RE-DERIVE, not a rebase that re-hits the conflict."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "9"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "9"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        snaps = {195: _dirty_snap(195, head="H1")}
+        ok = _DispatchRecorder()
+        # tick 1: rebase (running).
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=ok,
+              agent_outcome=lambda _a: "running", tick_count=1)
+        # tick 2: rebase conflicted -> ladder advances to re-derive, but the
+        # re-derive dispatch FAILS to launch (recorder returns "").
+        failing = _DispatchRecorder(fail=True)
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=failing,
+              agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+              agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+        assert failing.calls[-1].kind == pw.ACTION_REDERIVE
+        # tick 3: a fresh dispatch must be RE-DERIVE again (failed_launch on a
+        # re-derive must not regress the ladder to rebase).
+        again = _DispatchRecorder()
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors=set()), dispatch=again,
+              agent_outcome=lambda _a: "gone", tick_count=3)
+        assert again.calls[-1].kind == pw.ACTION_REDERIVE
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
