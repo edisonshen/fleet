@@ -408,6 +408,54 @@ func listTaskCandidatesOnDisk(project string) ([]TaskCandidate, error) {
 	return out, nil
 }
 
+// WorktreeBase is one project worktree dir paired with the base repo it
+// derives to (via `--git-common-dir`). Repo is "" when the dir does not
+// resolve to a usable base checkout (git error, bare/linked layout whose
+// common-dir is not a `.git` basename). The §4 self-heal resolver in
+// internal/coordrepo consumes the PER-worktree results so it can refuse a
+// MIXED tree (worktrees deriving to different repos — §3.1 corruption)
+// instead of trusting the first dir.
+type WorktreeBase struct {
+	Worktree string // absolute worktree dir under <project>/worktrees/
+	Repo     string // derived base repo ("" when underivable)
+}
+
+// ProjectWorktreeBases returns the per-worktree base-repo derivations for
+// a project (one entry per worktree DIR, in ReadDir order). Exported so
+// internal/coordrepo's deriveStrong consumes the SAME single derivation
+// implementation as gc — no second copy to drift. Returns nil with nil
+// err when the project has no worktrees dir / no directory entries.
+func ProjectWorktreeBases(project string) ([]WorktreeBase, error) {
+	dir, err := state.ProjectDir(project)
+	if err != nil {
+		return nil, err
+	}
+	wtRoot := filepath.Join(filepath.Clean(dir), "worktrees")
+	entries, rerr := os.ReadDir(wtRoot)
+	if rerr != nil {
+		if os.IsNotExist(rerr) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read %s: %w", wtRoot, rerr)
+	}
+	var out []WorktreeBase
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		wt := filepath.Join(wtRoot, e.Name())
+		base := WorktreeBase{Worktree: wt}
+		common, cerr := gitCommonDir(wt)
+		// <repo>/.git → <repo>. A bare/linked layout where common-dir is
+		// not a `.git` basename leaves Repo="" (can't safely infer).
+		if cerr == nil && common != "" && filepath.Base(common) == ".git" {
+			base.Repo = filepath.Dir(common)
+		}
+		out = append(out, base)
+	}
+	return out, nil
+}
+
 // projectRepoOnDisk resolves the project's base repo (the main checkout
 // worktrees were `git worktree add`-ed from). Fleet does not persist a
 // per-project repo path, so we derive it from the worktrees themselves:
@@ -417,32 +465,17 @@ func listTaskCandidatesOnDisk(project string) ([]TaskCandidate, error) {
 // the resolved base repo, so WorktreeRegistered fails it. Returns "" with
 // nil err when the project has no usable worktree (the resolver then
 // surfaces every dir, reaps none).
+//
+// Net behavior unchanged from before the per-worktree refactor: returns
+// the FIRST worktree dir that derives to a usable base repo.
 func projectRepoOnDisk(project string) (string, error) {
-	dir, err := state.ProjectDir(project)
+	bases, err := ProjectWorktreeBases(project)
 	if err != nil {
 		return "", err
 	}
-	wtRoot := filepath.Join(filepath.Clean(dir), "worktrees")
-	entries, rerr := os.ReadDir(wtRoot)
-	if rerr != nil {
-		if os.IsNotExist(rerr) {
-			return "", nil
-		}
-		return "", fmt.Errorf("read %s: %w", wtRoot, rerr)
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		wt := filepath.Join(wtRoot, e.Name())
-		common, cerr := gitCommonDir(wt)
-		if cerr != nil || common == "" {
-			continue
-		}
-		// <repo>/.git → <repo>. A bare/linked layout where common-dir is
-		// not a `.git` basename is skipped (can't safely infer the repo).
-		if filepath.Base(common) == ".git" {
-			return filepath.Dir(common), nil
+	for _, b := range bases {
+		if b.Repo != "" {
+			return b.Repo, nil
 		}
 	}
 	return "", nil
@@ -482,6 +515,15 @@ func worktreeDirtyOnDisk(path string) (bool, error) {
 		return false, fmt.Errorf("status --porcelain in %s: %w", path, err)
 	}
 	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// WorktreeRegistered reports whether path is a registered worktree of
+// repo (`git -C <repo> worktree list --porcelain` contains it). Exported
+// wrapper over the production probe so internal/coordrepo's deriveStrong
+// corroborates that a derived base repo actually lists each worktree —
+// the §4 move-2 registration check — without re-implementing it.
+func WorktreeRegistered(repo, path string) (bool, error) {
+	return worktreeRegisteredOnDisk(repo, path)
 }
 
 // worktreeRegisteredOnDisk is the production WorktreeRegistered: scans

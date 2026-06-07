@@ -40,6 +40,14 @@ type Meta struct {
 	RepoPath string    `json:"repo_path"`
 	AddedAt  time.Time `json:"added_at"`
 	IsGit    *bool     `json:"is_git,omitempty"`
+
+	// RepoFingerprint is the strong, machine-independent identity of the
+	// repo at RepoPath: `<root-commit-sha>|<origin-hash-OR-fleet-repoId>`
+	// (minted by internal/coordrepo). Stamped at `fleet project add` / on
+	// first successful bind. Empty for legacy meta.json files written
+	// before the field existed, and for shallow clones that cannot be
+	// stamped. omitempty so legacy readers round-trip absent files.
+	RepoFingerprint string `json:"repo_fingerprint,omitempty"`
 }
 
 // GitMode returns true when the project is git-backed. Defaults to true
@@ -229,6 +237,69 @@ func sanitizeTag(s string) string {
 		return "fleet"
 	}
 	return out
+}
+
+// ErrPinLostRace signals that a concurrent writer (`fleet project add`,
+// another resolver) changed the project's repo pin between the time the
+// caller observed it and the time SetRepoPath re-read it under the lock.
+// The caller MUST NOT clobber the winner — it re-resolves from the
+// freshly-written meta.json instead of persisting its now-stale value.
+type ErrPinLostRace struct {
+	// Stored is the repo_path the winning writer left in meta.json.
+	Stored string
+}
+
+func (e ErrPinLostRace) Error() string {
+	return fmt.Sprintf("projects: repo pin changed under us (stored repo_path=%q)", e.Stored)
+}
+
+// SetRepoPath persists path (+ fingerprint) into the project's meta.json
+// as a race-safe Read-modify-Write under state.LockProjectState — the
+// SAME lock `fleet project add` holds across its meta.json write, so the
+// two serialize. A naive Write(project, Meta{RepoPath: path}) would
+// CLOBBER is_git/added_at/schema (Write marshals the whole struct); this
+// re-reads the on-disk Meta inside the lock and updates ONLY RepoPath +
+// RepoFingerprint, preserving every other field.
+//
+// Compare-and-set guard (operator-pin protection):
+//
+//	prevPath = the meta.RepoPath the caller observed BEFORE deriving
+//	           ("" for a from-scratch derive).
+//
+//	┌─ re-read meta under lock
+//	│  stored fp != "" AND stored fp != fingerprint → ErrPinLostRace
+//	│      (a different identity was pinned mid-flight)
+//	│  stored repo_path != "" AND != prevPath AND != path → ErrPinLostRace
+//	│      (path appeared/changed under us — covers the empty-fingerprint
+//	│       non-git / shallow case where the fp check can't fire)
+//	└─ else: set RepoPath + RepoFingerprint, Write merged struct
+//
+// On a matching stored fingerprint (cross-machine missing-path re-derive)
+// the write proceeds and updates repo_path to the local path.
+func SetRepoPath(project, prevPath, path, fingerprint string) error {
+	release, err := state.LockProjectState(project)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	m, err := Read(project)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	// Different identity already pinned → lost race, don't clobber.
+	if m.RepoFingerprint != "" && m.RepoFingerprint != fingerprint {
+		return ErrPinLostRace{Stored: m.RepoPath}
+	}
+	// repo_path appeared/changed to something other than our prev or our
+	// intended path → lost race (catches the empty-fingerprint cases the
+	// fingerprint check above can't see).
+	if m.RepoPath != "" && m.RepoPath != prevPath && m.RepoPath != path {
+		return ErrPinLostRace{Stored: m.RepoPath}
+	}
+	m.RepoPath = path
+	m.RepoFingerprint = fingerprint
+	return Write(project, m)
 }
 
 // hasAlnum reports whether s contains at least one lowercase letter or
