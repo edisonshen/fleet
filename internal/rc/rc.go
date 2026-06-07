@@ -343,6 +343,18 @@ func Up(project string, opts UpOpts) (string, error) {
 						}
 						return OutcomeAlreadyAcquired, nil
 					}
+					// codex P2 (resolve-before-kill): we must be able to
+					// resolve the replacement working_dir BEFORE signaling
+					// the old listener. If we kill first and resolution
+					// then fails, we've taken down a working daemon and
+					// left rc-state.json pointing at a dead PID with no
+					// respawn. Resolve now; on failure, leave the daemon
+					// alive and surface the error so the next tick retries.
+					if _, rerr := ResolveWorkingDir(project, opts.Cwd); rerr != nil {
+						return OutcomeError, fmt.Errorf(
+							"rc.Up: project %q self-heal (%s) aborted — cannot resolve replacement working_dir, leaving existing PID %d alive: %w",
+							project, healReason, cur.PID, rerr)
+					}
 					// Self-heal: surface what changed so the operator can
 					// see why we respawned (version drift / dead owner).
 					fmt.Fprintf(os.Stderr,
@@ -352,7 +364,8 @@ func Up(project string, opts UpOpts) (string, error) {
 					// Fall through to (5) fresh acquire path. Marker is
 					// already present; (5) re-publishes it idempotently
 					// and writes a fresh state.json with current version
-					// + new CoordID.
+					// + new CoordID. ResolveWorkingDir runs again there;
+					// it is pure (no side effects) so re-resolving is safe.
 				} else {
 					// argv/cwd mismatch — kernel PID reuse (possibly by
 					// another project's listener), external kill, or moved

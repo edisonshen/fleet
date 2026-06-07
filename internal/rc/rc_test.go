@@ -896,6 +896,60 @@ func TestUp_SelfHeal_RespawnsOnStaleVersion(t *testing.T) {
 	}
 }
 
+// TestUp_SelfHeal_AbortsWhenCwdUnresolvable (codex P2 resolve-before-kill):
+// a stale-version daemon needs respawn, but the replacement working_dir
+// cannot be resolved (no --cwd, no meta repo_path, no live coord). Up MUST
+// NOT kill the working listener — killing first then failing resolution
+// would leave rc-state.json pointing at a dead PID with no respawn. Expect:
+// error returned, killFn never called, original state preserved.
+func TestUp_SelfHeal_AbortsWhenCwdUnresolvable(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t) // no live coord → no agent-record cwd
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+
+	var killedPIDs []int
+	restoreKill := SetKillFnForTest(func(pid int) { killedPIDs = append(killedPIDs, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	oldPID := os.Getpid()
+	rec := RecordedState{
+		Project:       "demo",
+		PID:           oldPID,
+		HostID:        host,
+		WorkingDir:    "/tmp/demo",
+		SessionPrefix: SessionPrefix,
+		LastSpawnAt:   time.Now().UTC(),
+		ClaudeVersion: "2.1.146", // older → triggers self-heal
+		OwningCoordID: "coord-live",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	// No Cwd override + no meta repo_path + empty agent list → cwd is
+	// unresolvable, so self-heal must abort BEFORE the kill.
+	_, err := Up("demo", UpOpts{SkipSpawn: true, InjectedPID: 99999})
+	if err == nil {
+		t.Fatalf("expected Up to error when replacement cwd is unresolvable")
+	}
+	if len(killedPIDs) != 0 {
+		t.Fatalf("working daemon must NOT be killed when cwd unresolvable; killed=%v", killedPIDs)
+	}
+	got, rerr := ReadState("demo")
+	if rerr != nil {
+		t.Fatalf("original state must be preserved; ReadState err=%v", rerr)
+	}
+	if got.PID != oldPID {
+		t.Fatalf("original state.pid=%d want preserved oldPID=%d", got.PID, oldPID)
+	}
+}
+
 // TestUp_SelfHeal_RespawnsOnDeadOwner (T3): recorded daemon's owning
 // coord is gone (agent record missing or tmux session dead) → killFn
 // is called once, fresh daemon spawned, state updated with new owner,

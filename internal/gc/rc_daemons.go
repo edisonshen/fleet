@@ -106,24 +106,36 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 		}
 	}
 
-	// Index states by PID for O(1) lookup. Multiple states with the
-	// same PID across projects would be a separate bug; we just pick
-	// the first match — the cross-check then validates working_dir.
-	byPID := make(map[int]RCStateInfo, len(states))
+	// Index states by PID. A PID can appear in multiple rc-state.json
+	// files (kernel PID reuse across projects) — keep ALL of them so the
+	// working_dir cross-check below can find the CORRECT match rather
+	// than latching onto whichever was enumerated first (codex P2: a
+	// stale entry seen before the healthy one would otherwise mask the
+	// live daemon's real state and get it killed under --apply).
+	byPID := make(map[int][]RCStateInfo, len(states))
 	for _, s := range states {
-		if _, dup := byPID[s.PID]; dup {
-			continue
-		}
-		byPID[s.PID] = s
+		byPID[s.PID] = append(byPID[s.PID], s)
 	}
 
 	for _, d := range daemons {
 		if d.PID <= 0 {
 			continue
 		}
-		recorded, found := byPID[d.PID]
-		matches := found &&
-			(d.WorkingDir == "" || recorded.WorkingDir == "" || d.WorkingDir == recorded.WorkingDir)
+		// Find the best match among all states sharing this PID: prefer a
+		// working_dir match; fall back to any entry when either side has
+		// no working_dir recorded (best-effort probe).
+		candidates := byPID[d.PID]
+		var recorded RCStateInfo
+		matches := false
+		for _, s := range candidates {
+			if d.WorkingDir != "" && s.WorkingDir != "" && d.WorkingDir == s.WorkingDir {
+				recorded, matches = s, true
+				break // exact working_dir match wins.
+			}
+			if !matches && (d.WorkingDir == "" || s.WorkingDir == "") {
+				recorded, matches = s, true // tentative; keep scanning for an exact match.
+			}
+		}
 		var reason string
 		switch {
 		case !matches:
