@@ -158,6 +158,9 @@ func TestDrainLease_GracefulKillRefusalSurfaced(t *testing.T) {
 		LeaderPresent: func(string) bool { return true },
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return true }, // graceful path
+		// OLD is NOT the active owner (already releasing/stale) -> direct reap
+		// path (not the self-release wait).
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
 		LoadAgent: func(string) (*agent.Record, error) {
 			return oldCoordRec(), nil
 		},
@@ -186,11 +189,12 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	out := &bytes.Buffer{}
 	var killed int32
 	d := drainLeaseDeps{
-		LeaderPresent: func(string) bool { return true },
-		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return true },
-		LoadAgent:     func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
-		KillCoord:     func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		LeaderPresent:  func(string) bool { return true },
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		LoadAgent:      func(string) (*agent.Record, error) { return nil, state.ErrNotFound },
+		KillCoord:      func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 	}
 	// queue.Delete on a non-existent path is tolerated by handoffop's
 	// cleanUpStaleQueue elsewhere; here Delete returns its own error which we
@@ -198,6 +202,95 @@ func TestDrainLease_GracefulOldAlreadyArchived(t *testing.T) {
 	_ = drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/does-not-exist-q.json", 0, 1000, out, out, d)
 	if atomic.LoadInt32(&killed) != 0 {
 		t.Errorf("kill ran %d times though OLD was already archived", killed)
+	}
+}
+
+// codex PR3 iter-1 [P1]: barrier present + OLD still the ACTIVE lease owner
+// -> drain does NOT force-kill the active leader (the epoch gate would
+// refuse); it WAITS for OLD's self-release. When OLD releases, the handoff is
+// complete and the queue is cleaned — no kill, no escalation.
+func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
+	out := &bytes.Buffer{}
+	var killed, tookOver int32
+	// OLD is the active owner for the first two reads, then releases.
+	var reads int32
+	d := drainLeaseDeps{
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) {
+			if atomic.AddInt32(&reads, 1) <= 2 {
+				return 424242, true // OLD still leader
+			}
+			return 0, false // OLD released
+		},
+		LoadAgent:   func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		KillCoord:   func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
+		TakeOver:    func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
+	if err != nil {
+		t.Fatalf("graceful self-release path returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&killed) != 0 {
+		t.Errorf("force-killed the active leader %d times — must wait for self-release", killed)
+	}
+	if atomic.LoadInt32(&tookOver) != 0 {
+		t.Errorf("escalated to takeover %d times — OLD released cleanly, no escalation needed", tookOver)
+	}
+	if !strings.Contains(out.String(), "released the lease") {
+		t.Errorf("expected self-release completion message, got: %q", out.String())
+	}
+}
+
+// codex PR3 iter-1 [P1]: barrier present + OLD STILL the active owner past the
+// budget -> escalate to takeover (OLD wedged after writing the barrier).
+func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
+	out := &bytes.Buffer{}
+	var tookOver int32
+	d := drainLeaseDeps{
+		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
+		BarrierExists:  func(string, int64) bool { return true },
+		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // never releases
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return false, nil },
+		BarrierPoll:    time.Millisecond,
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+	if !errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("expected escalation when OLD holds the lease past budget, got %v", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 1 {
+		t.Errorf("TakeOver ran %d times, want 1", tookOver)
+	}
+}
+
+// codex PR3 iter-1 [P2]: failover on, NO lease epoch for the project (stealable
+// / cold) -> cold-spawn the successor via a bounded Resume (NOT a takeover
+// loop that never spawns a replacement).
+func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
+	out := &bytes.Buffer{}
+	var resumed, tookOver int32
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return false },
+		CurrentEpoch:   func(string) (int64, bool) { return 0, false }, // no lease ever held
+		BarrierExists:  func(string, int64) bool { return false },
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		TakeOver: func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return false, nil },
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d)
+	if err != nil {
+		t.Fatalf("cold-spawn path returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("Resume (cold-spawn) ran %d times, want 1", resumed)
+	}
+	if atomic.LoadInt32(&tookOver) != 0 {
+		t.Errorf("escalated to takeover %d times on a cold no-leader queue — must cold-spawn instead", tookOver)
 	}
 }
 

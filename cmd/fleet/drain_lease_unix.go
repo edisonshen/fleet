@@ -63,6 +63,14 @@ type drainLeaseDeps struct {
 	// CurrentEpoch returns the project's current lease epoch (the barrier's
 	// generation). Production: coordlock.CurrentEpoch.
 	CurrentEpoch func(project string) (int64, bool)
+	// ActiveOwnerPID returns the pid of the current ACTIVE lease owner (and
+	// ok=false if none). Used to tell "OLD is still the active leader,
+	// finishing its graceful exit" (must NOT be force-killed — the epoch gate
+	// refuses; wait for its self-release / escalate to takeover, which fences
+	// first) apart from "OLD already releasing/stale" (safe to reap directly
+	// through the authenticated primitive). Production:
+	// coordlock.CurrentActiveOwnerPID.
+	ActiveOwnerPID func(project string) (int, bool)
 	// BarrierExists reports whether the handoff-complete-<epoch>.json barrier
 	// for (project, epoch) is on disk. Production: a stat through
 	// coordlock.BarrierPath.
@@ -102,8 +110,9 @@ const defaultBarrierPoll = 200 * time.Millisecond
 
 func defaultDrainLeaseDeps() drainLeaseDeps {
 	return drainLeaseDeps{
-		LeaderPresent: coordlock.LeaderPresent,
-		CurrentEpoch:  coordlock.CurrentEpoch,
+		LeaderPresent:  coordlock.LeaderPresent,
+		CurrentEpoch:   coordlock.CurrentEpoch,
+		ActiveOwnerPID: coordlock.CurrentActiveOwnerPID,
 		BarrierExists: func(project string, epoch int64) bool {
 			p, err := coordlock.BarrierPath(project, epoch)
 			if err != nil {
@@ -166,12 +175,26 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 	timeout := time.Duration(resumeTimeoutMillis) * time.Millisecond
 	deadline := time.Now().Add(timeout)
 
-	leaderHealthy := d.LeaderPresent(project)
 	epoch, hasEpoch := d.CurrentEpoch(project)
 	barrierUp := hasEpoch && d.BarrierExists(project, epoch)
+	leaderHealthy := d.LeaderPresent(project)
 
 	switch {
-	case leaderHealthy && !barrierUp:
+	case barrierUp:
+		// Graceful path: the OLD coord wrote the completion barrier — doc +
+		// checkpoint are durable. How we finish depends on whether OLD is
+		// STILL the active lease owner:
+		//   - OLD still active owner -> it is responsive and exiting on its
+		//     own; the authenticated kill's epoch gate would (correctly)
+		//     refuse to shoot the active leader, so we WAIT (bounded) for OLD
+		//     to release the flock — the standby then acquires it. On timeout
+		//     -> escalate to takeover (which FENCES first, so its kill is no
+		//     longer gated by "is the active owner"). codex PR3 iter-1 [P1].
+		//   - OLD already releasing / not the active owner -> reap directly
+		//     through the authenticated primitive (the gate passes).
+		return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
+
+	case leaderHealthy:
 		// T13: a healthy heartbeating leader holds the lease and no graceful
 		// handoff has completed (no barrier). Nothing to drain — STAND DOWN.
 		// We do NOT kill a live leader, and we hold no lock. If the queue
@@ -180,26 +203,33 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		_, _ = fmt.Fprintf(stdout, "fleet drain: coord live for %s; nothing to drain\n", project)
 		return nil
 
-	case barrierUp:
-		// Graceful path: the OLD coord wrote the completion barrier — doc +
-		// checkpoint are durable. Reap OLD's supervisor through the ONE
-		// authenticated kill primitive (NO lock held across the kill). The
-		// kill primitive itself is bounded (grace + SIGTERM->SIGKILL poll).
-		return drainGracefulKill(req, path, epoch, stdout, stderr, d)
+	case !hasEpoch:
+		// COLD recovery: failover is on but there is NO lease epoch for this
+		// project (no coord ever held the lease here, or the record is gone)
+		// — the lease is stealable and nothing to fence/kill. Spawn the
+		// successor via a BOUNDED Resume with NO lock held (codex PR3 iter-1
+		// [P2]). This is the "stealable lease -> cold-spawn" path.
+		_, _ = fmt.Fprintf(stderr, "fleet drain: no lease leader for %s; cold-spawning successor (bounded)\n", project)
+		return boundedResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	default:
-		// No barrier yet. Either OLD is mid-handoff (responsive, will write
-		// the barrier soon) OR it is HUNG before the barrier (the incident).
-		// Wait BOUNDED for the barrier; if it appears -> graceful kill; if the
+		// An epoch exists but the leader is NOT healthy (hung past TTL /
+		// stale) and NO barrier. Either OLD is mid-handoff (will write the
+		// barrier soon) OR HUNG before the barrier (the incident). Wait
+		// BOUNDED for the barrier; if it appears -> graceful finish; if the
 		// deadline passes -> ESCALATE to the safety-net takeover (never block).
 		return drainWaitBarrierOrEscalate(req, path, deadline, stdout, stderr, d)
 	}
 }
 
-// drainGracefulKill verifies OLD's identity and reaps its coord-run
-// supervisor through the authenticated primitive. Holds NO lock. T42: a
-// recycled PID is refused by the primitive (start-time mismatch).
-func drainGracefulKill(req queue.SpawnFresh, path string, epoch int64,
+// drainGraceful finishes a graceful handoff once the completion barrier is
+// up. If OLD is still the ACTIVE lease owner it is finishing its own exit;
+// we wait (bounded) for it to release (the standby then acquires) and
+// escalate to takeover on timeout (the takeover fences first, so its kill is
+// not blocked by the active-owner gate). Otherwise OLD is already
+// releasing/stale and we reap it directly through the authenticated
+// primitive. Holds NO lock.
+func drainGraceful(req queue.SpawnFresh, path string, epoch int64, deadline time.Time,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	oldRec, err := d.LoadAgent(req.OldAgentID)
@@ -211,6 +241,55 @@ func drainGracefulKill(req queue.SpawnFresh, path string, epoch int64,
 	case err != nil:
 		return fmt.Errorf("fleet drain: load old agent %s: %w", req.OldAgentID, err)
 	}
+
+	// If OLD is still the recorded ACTIVE lease owner, do NOT force-kill it
+	// (the epoch gate refuses, correctly). Wait bounded for its self-release;
+	// escalate to takeover on timeout.
+	if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid == oldRec.SupervisorPID {
+		_, _ = fmt.Fprintf(stdout,
+			"fleet drain: %s wrote the barrier and is still the active leader; waiting for its self-release\n",
+			oldRec.ID)
+		for {
+			if op, ok := d.ActiveOwnerPID(req.Project); !ok || op != oldRec.SupervisorPID {
+				// OLD released (or a takeover advanced past it). The standby
+				// acquires the freed flock; the handoff is complete. Clean up.
+				_, _ = fmt.Fprintf(stdout, "fleet drain: %s released the lease; handoff complete\n", oldRec.ID)
+				return queue.Delete(path)
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+			wait := d.BarrierPoll
+			if rem := time.Until(deadline); rem < wait {
+				wait = rem
+			}
+			if wait > 0 {
+				time.Sleep(wait)
+			}
+		}
+		// OLD held the lease past the budget despite writing the barrier —
+		// treat as hung; escalate to the safety-net takeover (fence -> kill ->
+		// acquire). Never block.
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: %s did not release the lease after writing the barrier within the budget; escalating to takeover\n",
+			oldRec.ID)
+		if _, terr := d.TakeOver(req.Project, req.OldAgentID); terr != nil {
+			return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", req.Project, terr)
+		}
+		return ErrEscalatedToTakeOver
+	}
+
+	// OLD is not the active owner (already releasing / stale record) — reap it
+	// directly through the authenticated primitive.
+	return drainReapOld(oldRec, req, path, epoch, stdout, stderr, d)
+}
+
+// drainReapOld reaps OLD's coord-run supervisor through the ONE
+// authenticated kill primitive (NO unguarded kill). T42: a recycled PID is
+// refused by the primitive (start-time mismatch).
+func drainReapOld(oldRec *agent.Record, req queue.SpawnFresh, path string, epoch int64,
+	stdout, stderr io.Writer, d drainLeaseDeps) error {
+
 	if oldRec.SupervisorPID <= 0 {
 		// No supervisor identity recorded — cannot authenticate a kill.
 		// Surface-don't-silo: refuse rather than an unguarded kill.
@@ -255,8 +334,8 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	project := req.Project
 	for {
 		if epoch, ok := d.CurrentEpoch(project); ok && d.BarrierExists(project, epoch) {
-			// Barrier appeared while we waited — graceful path.
-			return drainGracefulKill(req, path, epoch, stdout, stderr, d)
+			// Barrier appeared while we waited — finish the graceful path.
+			return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
 		}
 		if !time.Now().Before(deadline) {
 			break
@@ -324,6 +403,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.CurrentEpoch == nil {
 		d.CurrentEpoch = def.CurrentEpoch
+	}
+	if d.ActiveOwnerPID == nil {
+		d.ActiveOwnerPID = def.ActiveOwnerPID
 	}
 	if d.BarrierExists == nil {
 		d.BarrierExists = def.BarrierExists
