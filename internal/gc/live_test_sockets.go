@@ -43,8 +43,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-
-	"github.com/edisonshen/fleet/internal/tmux"
 )
 
 // LiveTestSocket describes one live tmux server bound to a
@@ -277,8 +275,3 @@ func killTmuxServerOnDisk(sock string) error {
 	_ = os.Remove(sock)
 	return nil
 }
-
-// compile-time assertion that tmux.SessionName's prefix matches the
-// "fleet-" literal this file greps for (keeps the two in sync if the
-// prefix ever changes).
-var _ = tmux.SessionName
