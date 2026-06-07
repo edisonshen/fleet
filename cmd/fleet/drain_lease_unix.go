@@ -166,7 +166,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		// to a BOUNDED cold Resume with NO lock held (the lease-aware path's
 		// hard invariant). The lease machinery is per-project; without one we
 		// cannot stand-down/verify, so just run the successor spawn bounded.
-		return boundedResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 
 	timeout := time.Duration(resumeTimeoutMillis) * time.Millisecond
@@ -207,7 +207,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		// successor via a BOUNDED Resume with NO lock held (codex PR3 iter-1
 		// [P2]). This is the "stealable lease -> cold-spawn" path.
 		_, _ = fmt.Fprintf(stderr, "fleet drain: no lease leader for %s; cold-spawning successor (bounded)\n", project)
-		return boundedResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	default:
 		// An epoch exists but the leader is NOT healthy (hung past TTL /
@@ -365,32 +365,22 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	return ErrEscalatedToTakeOver
 }
 
-// boundedResume runs handoffop.Resume with a wall-clock budget and NO lock
-// held across it (the lease-aware path's hard invariant). On timeout it
-// returns without waiting for Resume to finish — the goroutine running Resume
-// is allowed to complete in the background (it holds no shared lock, so a
-// slow one cannot wedge later drains). T12 + T40.
-func boundedResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
+// coldResume runs handoffop.Resume to spawn a successor — with NO lock held
+// across it (the lease-aware path's hard invariant, T40). It runs Resume
+// SYNCHRONOUSLY: the 81-process leak was caused by holding the per-agent
+// FLOCK across a slow Resume, NOT by Resume being slow per se. Without that
+// lock a slow Resume cannot wedge any OTHER drain, so there is no need to
+// abandon it on a timer — and abandoning it would be unsafe here because
+// `fleet drain` is a short-lived CLI: the process exits right after this
+// returns and would kill a still-running Resume goroutine mid-spawn (codex
+// PR3 iter-3 [P2]). So we let Resume finish and return its result verbatim.
+// (The COORD path's boundedness comes from the barrier-wait + takeover
+// escalation, which never runs Resume at all on a hung leader.)
+func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	timeout := time.Duration(resumeTimeoutMillis) * time.Millisecond
-	done := make(chan error, 1)
-	go func() {
-		done <- d.Resume(req, path, graceMillis, stdout, stderr)
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
-		_, _ = fmt.Fprintf(stderr,
-			"fleet drain: Resume for %s exceeded %dms budget; not blocking (no lock held)\n",
-			req.OldAgentID, resumeTimeoutMillis)
-		// For a project-scoped queue this would escalate to takeover; the
-		// no-project fallback has no lease, so we simply stop waiting. The
-		// background Resume holds no shared lock, so later drains are not
-		// wedged — the structural fix for the 81-process leak.
-		return ErrEscalatedToTakeOver
-	}
+	_ = resumeTimeoutMillis // not used: no lock is held, so Resume need not be abandoned
+	return d.Resume(req, path, graceMillis, stdout, stderr)
 }
 
 func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {

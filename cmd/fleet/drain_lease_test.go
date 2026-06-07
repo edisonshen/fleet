@@ -294,11 +294,11 @@ func TestDrainLease_NoEpochColdSpawnsViaResume(t *testing.T) {
 	}
 }
 
-// T12 + T40: the bounded cold Resume (no-project fallback) does not block
-// past the budget and holds no lock across Resume. A Resume that blocks
-// forever returns at ~budget with the escalation signal; a sibling LockAgent
-// acquires while Resume is still "in flight" (proving no shared lock).
-func TestDrainLease_BoundedResume_NoLockAcrossResume(t *testing.T) {
+// T40: the cold Resume (no-project fallback) holds NO lock across Resume — a
+// sibling LockAgent(OLD) acquires IMMEDIATELY while Resume is in flight. The
+// drain runs Resume synchronously (codex PR3 iter-3 [P2]: no abandoned
+// goroutine the CLI would kill on exit) and returns Resume's result.
+func TestDrainLease_ColdResume_NoLockAcrossResume(t *testing.T) {
 	requireTmux(t)
 	setupFleetHome(t)
 
@@ -308,13 +308,13 @@ func TestDrainLease_BoundedResume_NoLockAcrossResume(t *testing.T) {
 	d := drainLeaseDeps{
 		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
 			close(resumeStarted)
-			<-releaseResume // block past the budget
+			<-releaseResume // hold Resume open while we probe the lock
 			return nil
 		},
 	}
-	defer close(releaseResume)
 
-	// No project -> boundedResume path.
+	// No project -> coldResume path. Run the drain in a goroutine because
+	// coldResume now runs Resume SYNCHRONOUSLY.
 	req := queue.SpawnFresh{OldAgentID: "oldcoord1", Project: ""}
 	done := make(chan error, 1)
 	go func() {
@@ -323,7 +323,8 @@ func TestDrainLease_BoundedResume_NoLockAcrossResume(t *testing.T) {
 	<-resumeStarted
 
 	// T40: a sibling LockAgent must acquire IMMEDIATELY while Resume is in
-	// flight — proves no lock is held across Resume.
+	// flight — proves the drain holds no per-agent lock across Resume (the
+	// root-cause of the 81-process leak is gone).
 	lockAcquired := make(chan struct{})
 	go func() {
 		rel, err := state.LockAgent("oldcoord1")
@@ -335,17 +336,18 @@ func TestDrainLease_BoundedResume_NoLockAcrossResume(t *testing.T) {
 	select {
 	case <-lockAcquired:
 	case <-time.After(5 * time.Second):
+		close(releaseResume)
 		t.Fatal("sibling LockAgent BLOCKED while Resume in flight — a lock IS held across Resume (T40 regression)")
 	}
 
-	// T12: the bounded drain returns at ~budget (Resume still blocked) with
-	// the escalation signal — it does NOT wait for the wedged Resume.
+	// Let Resume finish; the drain returns its (nil) result.
+	close(releaseResume)
 	select {
 	case err := <-done:
-		if !errors.Is(err, ErrEscalatedToTakeOver) {
-			t.Fatalf("bounded drain returned %v, want ErrEscalatedToTakeOver", err)
+		if err != nil {
+			t.Fatalf("cold Resume drain returned %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("bounded drain BLOCKED on a wedged Resume — the forever-hold regression")
+		t.Fatal("cold Resume drain did not return after Resume completed")
 	}
 }

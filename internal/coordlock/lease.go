@@ -1319,16 +1319,40 @@ func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
 	if err != nil {
 		return false
 	}
+	// Throwaway lease carrying the seams so holderHealthy /
+	// transientResumable / flockHolderRecoverable apply the same logic the
+	// acquire path does. self is zero (we only read foreign records);
+	// transientResumable's "is this MY fencing record" short-circuit can
+	// never fire on a zero self vs a real candidate.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+
 	rec, err := readEpoch(paths.epoch)
 	if err != nil {
-		return false
+		// MISSING epoch — mirror the acquire path's busy-flock booting check
+		// (codex PR3 iter-3 [P2]). A holder can grab coordinator.flock and not
+		// yet have written coordinator.epoch (it is still booting). Returning
+		// false here would misclassify that fresh booting leader as "no leader"
+		// — making a duplicate spawn report a failure instead of a clean
+		// stand-down. So: if the flock is BUSY and its body vouches for a
+		// FRESH same-boot live holder (flockHolderRecoverable == false), a
+		// leader is present. A free flock, or a stale/dead/hung body, is no
+		// healthy leader.
+		if !errors.Is(err, os.ErrNotExist) {
+			return false // unreadable epoch (not just "absent") -> conservative
+		}
+		f, gotFlock, ferr := tryFlock(paths.flock)
+		if ferr != nil {
+			return false
+		}
+		if gotFlock {
+			// We acquired it -> nobody holds it -> no leader. Release at once.
+			_ = releaseFlock(f)
+			return false
+		}
+		// Busy flock, no epoch yet: present iff the holder is a fresh booting
+		// one (not recoverable/stealable).
+		return !l.flockHolderRecoverable()
 	}
-	// Throwaway lease carrying the seams so holderHealthy /
-	// transientResumable apply the same logic the acquire path does. self
-	// is zero (we only read foreign records); transientResumable's
-	// "is this MY fencing record" short-circuit can never fire on a zero
-	// self vs a real candidate.
-	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
 	switch rec.State {
 	case stateActive:
 		return l.holderHealthy(rec)
