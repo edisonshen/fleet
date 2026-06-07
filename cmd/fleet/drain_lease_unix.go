@@ -455,14 +455,36 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 
 // takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
 // and then brings up a FRESH lease-wrapped successor from the CACHED old record
-// (dead-coord recovery), deleting the queue on success. It NEVER blocks and
-// holds no lock across the kill. Shared by the hung-leader escalation and the
-// Resume-timeout escalation (codex PR3 iter-7/8). Returns ErrEscalatedToTakeOver
-// on success (a non-fatal processed outcome).
+// (dead-coord recovery), deleting the queue on success. It NEVER blocks across
+// the kill, but it DOES hold a SHORT per-agent lock across the
+// takeover->recover sequence (codex PR3 iter-11 [P1]): the production TakeOver
+// releases the lease as soon as OLD is proven gone, opening a window where a
+// SECOND concurrent drain could acquire the freed lease and ALSO RecoverSpawn —
+// a duplicate successor. The per-agent LockAgent serializes the whole sequence
+// (it is BOUNDED — state.acquireBoundedAt — so a contending drain times out
+// instead of hanging, then re-reads state and stands down). Shared by the
+// hung-leader, graceful-past-budget, and Resume-timeout escalations. Returns
+// ErrEscalatedToTakeOver on success (a non-fatal processed outcome).
 func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
+	// Serialize the takeover->recover sequence against a concurrent drain so
+	// only ONE successor is recovered (codex PR3 iter-11 [P1]).
+	release, lerr := d.LockAgent(req.OldAgentID)
+	if lerr != nil {
+		return fmt.Errorf("fleet drain: lock agent %s for takeover recovery: %w", req.OldAgentID, lerr)
+	}
+	defer release()
+
+	// Re-check under the lock: a drain that won the race may have already
+	// recovered (queue gone / a successor now leads). If the queue file is gone
+	// the work is done — stand down (another drain handled it).
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		_, _ = fmt.Fprintf(stdout, "fleet drain: %s already recovered by a concurrent drain; nothing to do\n", project)
+		return nil
+	}
+
 	acquired, err := d.TakeOver(project, req.OldAgentID)
 	if err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
@@ -500,9 +522,14 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	}
 	// Successor recovered after a clean takeover. The queue file's handoff
 	// request is fulfilled by the recovery spawn; delete it so a later drain
-	// doesn't re-escalate.
+	// doesn't re-escalate. A delete FAILURE is surfaced as an error (codex PR3
+	// iter-11 [P2]): if we returned ErrEscalatedToTakeOver, runDrain would
+	// count this processed while the queue lingers, and a later drain would
+	// re-escalate / re-spawn for an already-completed handoff.
 	if derr := queue.Delete(path); derr != nil {
-		_, _ = fmt.Fprintf(stderr, "fleet drain: recovered %s but queue delete failed: %v\n", project, derr)
+		return fmt.Errorf(
+			"fleet drain: recovered %s after takeover but queue delete failed (%w); rerun fleet drain to clean it",
+			project, derr)
 	}
 	return ErrEscalatedToTakeOver
 }

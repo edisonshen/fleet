@@ -21,6 +21,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -49,6 +51,19 @@ func oldCoordRec() *agent.Record {
 	r.SupervisorPidStart = 99999
 	r.SupervisorExePath = "/usr/local/bin/fleet"
 	return r
+}
+
+// existingQueuePath writes a placeholder queue file in a temp dir and returns
+// its path. takeoverAndRecover's concurrent-recovery guard stat()s the queue
+// file (a missing file means "already recovered by a peer drain"), so tests
+// that exercise the escalation must point at a file that actually exists.
+func existingQueuePath(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "spawn-fresh-test.json")
+	if err := os.WriteFile(p, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 // T13: a healthy leader holds the lease, no barrier, and OLD is ALREADY
@@ -173,13 +188,14 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 			recoveredID = preAllocatedID
 			return nil
 		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
 		BarrierPoll: time.Millisecond,
 	}
 	// tiny budget so the bounded wait returns fast (not a timing assertion —
 	// we assert it RETURNS + escalates, not how long it took).
 	req := leaseDrainReq()
 	req.NewAgentID = "preallocated-succ" // codex PR3 iter-10 [P2]
-	err := drainOneLeaseAwareWith(req, "/tmp/q.json", 0, 5, out, out, d)
+	err := drainOneLeaseAwareWith(req, existingQueuePath(t), 0, 5, out, out, d)
 	if !errors.Is(err, ErrEscalatedToTakeOver) {
 		t.Fatalf("expected ErrEscalatedToTakeOver, got %v", err)
 	}
@@ -205,6 +221,39 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-11 [P1]: takeoverAndRecover serializes on the per-agent lock
+// and re-checks the queue file under it — if a concurrent drain already
+// recovered (queue gone), this drain stands down WITHOUT a second
+// takeover/RecoverSpawn (no duplicate successor).
+func TestDrainLease_ConcurrentRecovery_NoDuplicate(t *testing.T) {
+	out := &bytes.Buffer{}
+	var tookOver, recovered int32
+	// The queue file is ALREADY gone (a peer drain deleted it after recovering).
+	gonePath := filepath.Join(t.TempDir(), "already-deleted.json")
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:      func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), gonePath, 0, 5, out, out, d); err != nil {
+		t.Fatalf("concurrent-recovery stand-down returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&tookOver) != 0 {
+		t.Errorf("TakeOver ran %d times though a peer already recovered, want 0", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 0 {
+		t.Errorf("RecoverSpawn ran %d times though a peer already recovered, want 0 (no duplicate)", recovered)
+	}
+}
+
 // T41: a HUNG OLD (no barrier, deadline passes) escalates to TakeOver, then
 // recovers a lease-wrapped successor from the cached record, and never blocks.
 func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
@@ -225,10 +274,12 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
 		BarrierPoll: time.Millisecond,
 	}
+	qp := existingQueuePath(t)
 	go func() {
-		done <- drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+		done <- drainOneLeaseAwareWith(leaseDrainReq(), qp, 0, 5, out, out, d)
 	}()
 	select {
 	case err := <-done:
@@ -358,9 +409,10 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
 		BarrierPoll: time.Millisecond,
 	}
-	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 5, out, out, d)
 	if !errors.Is(err, ErrEscalatedToTakeOver) {
 		t.Fatalf("expected escalation when OLD holds the lease past budget, got %v", err)
 	}
@@ -389,9 +441,10 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
 		BarrierPoll: time.Millisecond,
 	}
-	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+	err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 5, out, out, d)
 	if err == nil || errors.Is(err, ErrEscalatedToTakeOver) {
 		t.Fatalf("expected a 'did not confirm gone' error, got %v", err)
 	}
