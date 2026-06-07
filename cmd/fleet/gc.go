@@ -52,11 +52,12 @@ func newGCCmd() *cobra.Command {
   orphan-tmux    — fleet-<id> tmux sessions with no live agent record
                    (SURFACE only by default; --aggressive opts into kill).
                    ALSO reaps live fleet-<id> tmux SERVERS bound to a
-                   /tmp/fleet-test-*.sock whose owning go-test process is
-                   gone (the 2026-05-29 hand-kill leak): surfaced by
-                   default, killed under --apply --aggressive
-                   (tmux -S <sock> kill-server). A server still owned by
-                   a live go-test process is never touched.
+                   /tmp/fleet-test-*.sock left behind when the test fleet
+                   went quiescent (the 2026-05-29 hand-kill leak): surfaced
+                   by default, killed under --apply --aggressive
+                   (tmux -S <sock> kill-server). Reaped ONLY when no
+                   go-test process is running anywhere on the host — if any
+                   test is in flight, every test-socket server is spared.
   worktrees      — ~/.fleet/projects/*/worktrees/<slug> trees whose task
                    is done or abandoned
   coord-locks    — ~/.fleet/projects/<p>/.locks/coordinator.lock files

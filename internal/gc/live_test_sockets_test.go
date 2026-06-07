@@ -249,11 +249,27 @@ func TestReconcile_LiveTestSock_KillFailureReported(t *testing.T) {
 	}
 }
 
-// Integration: the production lister enumerates a REAL orphan tmux
-// server on a /tmp/fleet-test-*.sock (no live go test owner from gc's
-// perspective is impossible inside a test — the running `go test` IS the
-// owner — so this test only verifies the lister SEES the server and the
-// killer removes it). The live-owner skip is covered by the unit T4.
+// goTestOwnerVerdict must report SPARE (the unknown sentinel) whenever a
+// `go test` is alive on the host — and this test IS running under
+// `go test`, so the verdict is deterministically the spare sentinel.
+// This is the production-side proof of the codex iter-1 [P1] fix: the
+// host-wide quiescence gate, not lsof-on-socket, decides reapability.
+func TestGoTestOwnerVerdict_SparesWhileTestRunning(t *testing.T) {
+	if !anyGoTestRunning() {
+		t.Fatal("anyGoTestRunning() = false while running under `go test` — pgrep needle missed the test binary")
+	}
+	if v := goTestOwnerVerdict(); v != ownerProbeFailedPID {
+		t.Errorf("goTestOwnerVerdict() = %d while a go test runs; want spare sentinel %d (a 0 verdict would reap live test servers)", v, ownerProbeFailedPID)
+	}
+}
+
+// Integration: the production lister enumerates a REAL tmux server on a
+// /tmp/fleet-test-*.sock. Because the test itself runs under `go test`,
+// the host is NOT quiescent, so the lister MUST mark the server spared
+// (OwnerPID == ownerProbeFailedPID) — this is the live-in-flight-spare
+// guarantee that closes codex iter-1 [P1] at the production-helper level
+// (the unit T4 only covers the stubbed-classifier branch). The killer is
+// then exercised directly to confirm it removes the server.
 func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	tmuxtest.RequireTmux(t)
 	sock := "/tmp/fleet-test-gcint.sock"
@@ -266,6 +282,14 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	if out, err := exec.Command("tmux", "-S", sock, "new-session", "-d",
 		"-s", "fleet-deadbeef", "sleep", "300").CombinedOutput(); err != nil {
 		t.Fatalf("spawn tmux: %v (%s)", err, out)
+	}
+	// codex iter-1 [P2]: `tmux new-session` can print "error creating ..."
+	// yet exit 0 on some hosts, so a clean exit is NOT proof the server
+	// exists. Verify the session is actually live before asserting the
+	// lister sees it — otherwise the failure surfaces downstream as a
+	// confusing "lister did not see live server" instead of a spawn skip.
+	if err := exec.Command("tmux", "-S", sock, "has-session", "-t", "fleet-deadbeef").Run(); err != nil {
+		t.Skipf("tmux exited 0 but no live session on %s (host tmux quirk): %v", sock, err)
 	}
 
 	socks, err := listLiveTestSocketsOnDisk()
@@ -284,6 +308,14 @@ func TestLiveTestSockets_Integration_ListAndKill(t *testing.T) {
 	}
 	if found.SessionName != "fleet-deadbeef" {
 		t.Errorf("session name = %q, want fleet-deadbeef", found.SessionName)
+	}
+	// codex iter-1 [P1] regression: the running test IS a `go test`, so
+	// the host is non-quiescent and the production lister must SPARE the
+	// server (never report OwnerPID==0 mid-run). A regression to the old
+	// lsof-on-socket logic would report OwnerPID==0 here and the kill path
+	// would reap a live test server.
+	if found.OwnerPID == 0 {
+		t.Errorf("OwnerPID=0 while a go test is running — live-in-flight server would be reaped (lsof-on-socket regression); want spare sentinel %d", ownerProbeFailedPID)
 	}
 
 	// Kill via the production killer and confirm the server is gone.

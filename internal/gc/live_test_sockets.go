@@ -8,8 +8,8 @@ package gc
 // but DELIBERATELY spares any socket whose tmux server is still alive
 // (reconcileSockets's SocketLive gate) so a long-running test fixture
 // isn't stranded mid-run. That left a gap: a `fleet-<id>` tmux server
-// bound to a /tmp/fleet-test-*.sock whose owning `go test` process is
-// long dead is NEVER reaped — the operator had to `tmux -S <sock>
+// bound to a /tmp/fleet-test-*.sock left behind after the test fleet went
+// quiescent is NEVER reaped — the operator had to `tmux -S <sock>
 // kill-server` BY HAND during the 2026-05-29 OOM. That violates
 // feedback_fleet_owns_its_resources.md ("operator never manually
 // kills"). This classifier closes the gap.
@@ -18,16 +18,19 @@ package gc
 //
 //	/tmp/fleet-test-*.sock  ──→  tmux -S <sock> ls (fleet-<id> session?)
 //	                                     │
-//	                          lsof <sock>: any live `go test` (*.test)
-//	                          process still holding it open?
+//	                          host-wide gate: is ANY `go test` /
+//	                          *.test process alive on the host?
+//	                          (pgrep — NOT lsof on the socket, because
+//	                           tmux daemonizes and the socket FD is held
+//	                           by the server, not the parent go test)
 //	                                     │
 //	              ┌──────────────────────┴───────────────────────┐
-//	         OwnerPID > 0                                    OwnerPID == 0
-//	      (live test owns it)                              (no live owner)
-//	              │                                              │
-//	         skip (healthy,                          surface (default) /
-//	          in-flight test)                        would-kill / killed
-//	                                                 under --aggressive
+//	      go test alive (or probe failed)              host quiescent
+//	         OwnerPID != 0 (spare)                      OwnerPID == 0
+//	              │                                          │
+//	         skip (in-flight / unknown,          surface (default) /
+//	          fail-safe)                         would-kill / killed
+//	                                             under --aggressive
 //
 // Why it lives under orphan-tmux (not sockets): it KILLS a live tmux
 // server — that is operator-owned-tmux territory gated by --aggressive,
@@ -41,21 +44,38 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 )
 
 // LiveTestSocket describes one live tmux server bound to a
-// /tmp/fleet-test-*.sock. OwnerPID is the PID of a live `go test`
-// (*.test) process still holding the socket open, or 0 when none does
-// — the 0 case is the orphan this classifier reaps under --aggressive.
+// /tmp/fleet-test-*.sock. OwnerPID encodes whether the server may still
+// belong to an in-flight `go test`:
+//
+//	OwnerPID == 0   — DEFINITIVELY orphan: no live `go test` exists on the
+//	                  host, so no test could own this server. Reapable
+//	                  under --apply --aggressive.
+//	OwnerPID  > 0   — a live `go test` owns it (unit-test stubs set a real
+//	                  PID here). Spared.
+//	OwnerPID  < 0   — owner UNKNOWN (ownerProbeFailedPID): a `go test`
+//	                  process IS alive on the host but cannot be attributed
+//	                  to this specific socket, OR the probe failed. Spared
+//	                  (fail-safe).
+//
+// Why not lsof the socket? A tmux server daemonizes — the `go test`
+// process launches a transient `tmux` client that exits, leaving only
+// the long-lived server holding the socket FD. `lsof -t <sock>` therefore
+// sees `tmux`, not the parent `go test`, so per-socket FD attribution
+// reports OwnerPID==0 for IN-FLIGHT tests and the kill path would reap a
+// live test server (codex iter-1 [P1]). The sound primitive is a
+// host-wide "is ANY go test running?" gate: a fleet-test socket is only
+// reaped when the entire test fleet is quiescent.
 type LiveTestSocket struct {
 	// SocketPath is the /tmp/fleet-test-*.sock the server is bound to.
 	SocketPath string
 	// SessionName is the first fleet-<id> session on the server (used as
 	// the Action.Target so the output reads like the rest of orphan-tmux).
 	SessionName string
-	// OwnerPID is a live go-test process holding the socket open, or 0.
+	// OwnerPID classifies ownership; see the type doc for the tri-state.
 	OwnerPID int
 }
 
@@ -81,10 +101,11 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 	for _, s := range socks {
 		if s.OwnerPID != 0 {
 			// Non-zero OwnerPID = an in-flight test owns it (positive PID),
-			// OR the owner probe could not prove there's no owner
-			// (ownerProbeFailedPID sentinel). Either way: never touch it,
-			// even under --aggressive --apply (T4). Only a definitive
-			// OwnerPID==0 ("no holder is a go-test process") is reaped.
+			// OR ownership is unknown / a live go test is running but
+			// unattributable (ownerProbeFailedPID sentinel, negative).
+			// Either way: never touch it, even under --aggressive --apply
+			// (T4 + probe-failure spare). Only a definitive OwnerPID==0
+			// ("no live go test exists on the host") is reaped.
 			continue
 		}
 		target := s.SessionName
@@ -119,18 +140,26 @@ func reconcileLiveTestSockets(r *Report, opts Options, deps Deps) error {
 
 // ----------------- production wiring (DefaultDeps) ------------------
 
-// listLiveTestSocketsOnDisk scans /tmp for fleet-test-*.sock files,
-// probes each for a live fleet-<id> tmux server, and resolves whether a
-// live `go test` (*.test) process still holds the socket open.
+// listLiveTestSocketsOnDisk scans /tmp for fleet-test-*.sock files and
+// probes each for a live fleet-<id> tmux server.
 //
-// Best-effort: a missing tmux binary, an lsof failure, or a socket with
-// no server simply drops that entry — the classifier degrades to "no
-// orphans found", never to a spurious kill.
+// Ownership is resolved ONCE per sweep via a host-wide gate, not per
+// socket: see goTestOwnerVerdict. A fleet-test socket server is reapable
+// (OwnerPID==0) ONLY when no `go test` process is alive anywhere on the
+// host. If a `go test` IS running — even one we can't tie to a specific
+// socket — every test-socket server is spared (OwnerPID set to the
+// unknown sentinel). If the probe itself fails, fail-safe: spare.
+//
+// Best-effort: a missing tmux binary or a socket with no server simply
+// drops that entry — the classifier degrades to "no orphans found",
+// never to a spurious kill.
 func listLiveTestSocketsOnDisk() ([]LiveTestSocket, error) {
 	infos, err := scanSocketsDir("/tmp")
 	if err != nil {
 		return nil, err
 	}
+	// One host-wide ownership verdict for the whole sweep (see doc).
+	ownerVerdict := goTestOwnerVerdict()
 	var out []LiveTestSocket
 	for _, info := range infos {
 		sock := info.Path
@@ -141,7 +170,7 @@ func listLiveTestSocketsOnDisk() ([]LiveTestSocket, error) {
 		out = append(out, LiveTestSocket{
 			SocketPath:  sock,
 			SessionName: session,
-			OwnerPID:    socketGoTestOwner(sock),
+			OwnerPID:    ownerVerdict,
 		})
 	}
 	return out, nil
@@ -180,74 +209,78 @@ func firstFleetSession(sock string) (string, bool) {
 	return "", false
 }
 
-// socketGoTestOwner returns the PID of a live `go test` (*.test) process
-// that holds sock open, or 0 when none does. The tmux server process
-// itself always holds the socket; the OWNER we look for is the test
-// harness that spawned it (a `*.test` binary, `go`, or the compile/link
-// driver). When only the tmux server holds the socket open, the test
-// that created it is gone → orphan.
+// goTestOwnerVerdict returns the host-wide ownership classification used
+// for EVERY fleet-test socket server in a sweep:
 //
-// `lsof -t <sock>` lists every PID with the file open (one per line).
-// For each, `ps -o comm=` gives the command basename used to recognize
-// a go-test process. Fail-safe: any probe failure returns 0 (orphan)
-// ONLY for the owner question — but a probe failure on the WHOLE lsof
-// call returns 0 too, which would mis-reap a live-owned server. To stay
-// conservative we treat an lsof ERROR (not "no holders") as "owner
-// unknown" and report a sentinel positive PID so the classifier spares
-// it (see ownerProbeFailedPID).
-func socketGoTestOwner(sock string) int {
-	out, err := exec.Command("lsof", "-t", sock).Output()
-	if err != nil {
-		// lsof exits 1 when no process holds the file — that's a genuine
-		// "no holders" answer (the .sock can linger after kill-server).
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return 0
-		}
-		// lsof missing / permission denied / other: owner unknown. Fail
-		// closed — spare the server rather than risk killing a live test.
-		var execErr *exec.Error
-		if errors.As(err, &execErr) {
-			return ownerProbeFailedPID
-		}
+//	0                    — no `go test` process is alive on the host, so a
+//	                       fleet-test socket server is definitively orphan.
+//	ownerProbeFailedPID  — a `go test` IS running (or the probe failed):
+//	                       ownership is ambiguous, spare every server.
+//
+// Why host-wide, not per-socket: a tmux server daemonizes, so `lsof` on
+// the socket sees `tmux`, not the parent `go test` (codex iter-1 [P1]).
+// We cannot attribute a specific socket to a specific test run, so the
+// only sound, fail-safe gate is "are we sure NO test is running?" — and
+// only then reap. A running test on ANY socket spares ALL of them; that
+// is acceptable because the leak being closed is dead servers left after
+// the test fleet went quiescent (the 2026-05-29 OOM), not a server
+// stranded mid-run.
+//
+// Fail-safe: any probe error (pgrep missing, unexpected exit) returns the
+// unknown sentinel so a flaky probe never drives a kill.
+func goTestOwnerVerdict() int {
+	if anyGoTestRunning() {
 		return ownerProbeFailedPID
-	}
-	for _, line := range strings.Fields(string(out)) {
-		pid, perr := strconv.Atoi(line)
-		if perr != nil || pid <= 0 {
-			continue
-		}
-		comm, cerr := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
-		if cerr != nil {
-			continue
-		}
-		if isGoTestComm(strings.TrimSpace(string(comm))) {
-			return pid
-		}
 	}
 	return 0
 }
 
 // ownerProbeFailedPID is a sentinel non-zero OwnerPID meaning "could not
-// determine the owner" — the classifier treats any OwnerPID > 0 as
-// "spare it", so an ambiguous probe never drives a kill (fail-safe).
+// prove the host is test-quiescent" — the classifier treats any
+// OwnerPID != 0 as "spare it", so an ambiguous probe never drives a kill
+// (fail-safe).
 const ownerProbeFailedPID = -1
 
-// isGoTestComm recognizes a process command basename as a Go test
-// harness: the compiled `*.test` binary, the `go` driver, or the
-// compile/link toolchain processes that run during `go test`.
-func isGoTestComm(comm string) bool {
-	if comm == "" {
-		return false
+// anyGoTestRunning reports whether at least one `go test` / test-binary
+// process is alive on the host. It probes pgrep for the canonical test
+// process shapes:
+//
+//   - "go test"  — the driver while compiling + running a package's tests
+//   - "/.test"   — a compiled `pkg.test` binary (go builds these to a temp
+//     dir and execs them; their argv[0] ends in ".test")
+//   - "compile"/"link"/"vet" toolchain processes are NOT matched: they run
+//     for plain `go build` too, so matching them would spare
+//     sockets during unrelated builds. The two shapes above
+//     bracket the entire window in which a fleet-test socket
+//     can legitimately be owned.
+//
+// Fail-safe defaults:
+//   - pgrep exit 1 ("no match") for a needle → that needle found nothing.
+//   - pgrep missing (*exec.Error) → return true (unknown → spare). A host
+//     without pgrep cannot prove quiescence, so we never reap there.
+//   - any other pgrep error → return true (spare).
+func anyGoTestRunning() bool {
+	// pgrep -f matches against the full argv. "-x" is NOT used because the
+	// argv carries package paths / flags after the needle.
+	needles := []string{"go test", ".test"}
+	for _, needle := range needles {
+		out, err := exec.Command("pgrep", "-f", needle).Output()
+		if err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				continue // this needle matched nothing; try the next
+			}
+			// pgrep missing / unexpected failure: cannot prove quiescence.
+			var execErr *exec.Error
+			if errors.As(err, &execErr) {
+				return true
+			}
+			return true
+		}
+		if strings.TrimSpace(string(out)) != "" {
+			return true
+		}
 	}
-	base := comm
-	if i := strings.LastIndexByte(base, '/'); i >= 0 {
-		base = base[i+1:]
-	}
-	switch base {
-	case "go", "compile", "link", "vet":
-		return true
-	}
-	return strings.HasSuffix(base, ".test")
+	return false
 }
 
 // killTmuxServerOnDisk runs `tmux -S <sock> kill-server` and best-effort
