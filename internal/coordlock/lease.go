@@ -648,9 +648,18 @@ type LeaseToken struct {
 }
 
 // StillOwned reports whether this token still owns the active lease:
-// state==active AND epoch==tok.Epoch AND owner==tok identity. False for a
-// fenced candidate or a stale holder. This is the boundary check the
-// central mutation APIs (PR4) use to reject a woken zombie.
+// state==active AND epoch==tok.Epoch AND owner==tok identity AND the
+// record is NOT self-expired (same boot AND renewed_at within TTL). This
+// is the boundary check the central mutation APIs (PR4) use to reject a
+// woken zombie BEFORE it mutates.
+//
+// The self-expiry clause is load-bearing (Patroni "only act if I still
+// own the lease", Kleppmann): a leader that paused past its own TTL and
+// wakes BEFORE any candidate has fenced it would otherwise still read its
+// own active epoch+owner and pass — yet it has provably missed its renewal
+// window and a takeover may be imminent. Rejecting on stale renewed_at /
+// cross-boot makes a paused holder self-demote at the boundary rather than
+// race a takeover.
 func (t LeaseToken) StillOwned() bool {
 	rec, err := readEpoch(t.paths.epoch)
 	if err != nil {
@@ -661,6 +670,12 @@ func (t LeaseToken) StillOwned() bool {
 	}
 	if rec.Epoch != t.Epoch {
 		return false
+	}
+	if rec.BootID != t.boot {
+		return false // record from a previous boot -> mono stamp meaningless
+	}
+	if t.cfg.nowMono()-rec.RenewedAtMono > int64(t.cfg.ttl) {
+		return false // self-expired: missed our own TTL renewal window
 	}
 	want := identity{Pid: t.Pid, PidStart: t.PidStart, AgentID: t.AgentID, Project: t.Project}
 	return rec.Owner.equal(want)
