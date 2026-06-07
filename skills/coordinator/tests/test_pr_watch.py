@@ -3814,3 +3814,40 @@ def test_fix_key_includes_detail_new_review_not_suppressed(tmp_path: Path) -> No
                  agent_outcome=lambda _a: "gone", tick_count=3)
     assert out3.dispatched == 1, "a new review fingerprint must not be suppressed"
     assert len(disp.calls) == n_after_block + 1
+
+
+def test_episode_end_clears_rederive_breadcrumb(tmp_path: Path) -> None:
+    """codex P2: after a rebase conflict records the re-derive breadcrumb, if
+    the PR goes GREEN (episode end) and then the SAME head/base goes DIRTY
+    again, the ladder must try a CLEAN REBASE first — the stale breadcrumb
+    must be cleared on green so want_rederive no longer matches."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    disp = _DispatchRecorder()
+    # tick 1: DIRTY -> rebase (running).
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H1")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    # tick 2: rebase conflicted @ (B,H1) -> rederive breadcrumb set.
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H1")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+          agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+    assert disp.calls[-1].kind == pw.ACTION_REDERIVE
+    # tick 3: the re-derive PUSHED (head -> H2) and the PR is GREEN (READY) on
+    # H2 -> the lease retires as succeeded (head moved) + account_progress
+    # ends the episode and clears the breadcrumb.
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _ready_snap(195, head="H2")},
+          fresh_base="B", ancestors={("B", "H2")}), dispatch=disp,
+          agent_outcome=lambda _a: "gone", tick_count=3)
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["remediation"]["last_outcome"] == ""
+    assert w["remediation"]["rederive_for_head"] == ""
+    # tick 4: H2 goes DIRTY again -> must try a CLEAN REBASE, NOT inherit the
+    # stale H1 conflict and jump to re-derive. slow=1 so the (now-READY) watch
+    # is re-probed this tick (floor cadence) rather than skipped by the slow
+    # 5-tick cadence.
+    _run2(tasks, tmp_path, FakeProber(snaps={195: _dirty_snap(195, head="H2")},
+          fresh_base="B", ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "gone", tick_count=4, slow=1)
+    assert disp.calls[-1].kind == pw.ACTION_REBASE, \
+        "a re-DIRTY after green must try a clean rebase, not a stale re-derive"

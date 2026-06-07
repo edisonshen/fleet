@@ -823,6 +823,14 @@ def account_progress(watch: dict, event: str) -> None:
         rem["escalated"] = False
         rem["escalated_cause"] = ""
         rem["best_signal"] = _FRONTIER_UNSET
+        # Clear the re-derive ladder breadcrumb too (codex P2): a DIRTY that
+        # went green has ended its conflict episode. If the SAME head/base goes
+        # DIRTY again later, want_rederive must NOT still match the stale
+        # conflict and skip the safe clean-rebase first step. A genuinely
+        # fresh conflict will re-record the breadcrumb via its own rebase.
+        rem["last_outcome"] = ""
+        rem["rederive_for_head"] = ""
+        rem["rederive_for_base"] = ""
         return
     if event == EVENT_OPEN:
         # A non-green OPEN (PENDING CI / unknown freshness) is NOT progress
