@@ -57,26 +57,30 @@ func TestLeaseFailoverEnabled_Gate(t *testing.T) {
 	}
 }
 
-// codex PR2 iter-7 [P1]: only FRESH coord spawns are lease-wrapped; a
-// handoff/drain successor (hasOldRecord) is NOT, because the outgoing
-// coord still holds the lease and a wrapped successor would stand down.
+// codex PR2 iter-7/8 [P1]: FRESH coord spawns AND dead-coord RECOVERIES
+// are lease-wrapped (both are fresh leaders); only a LIVE handoff/drain
+// successor is NOT (the outgoing coord still holds the lease, so a wrapped
+// successor would stand down and never start). The dead-coord recovery
+// case is exercised here via liveHandoffSuccessor=false (the dispatch
+// call computes OldRecord!=nil && !RecoverDeadCoord).
 func TestShouldLeaseWrap(t *testing.T) {
 	cases := []struct {
-		name                           string
-		failoverOn, isCoord, hasOldRec bool
-		want                           bool
+		name                                      string
+		failoverOn, isCoord, liveHandoffSuccessor bool
+		want                                      bool
 	}{
 		{"fresh coord, flag on", true, true, false, true},
-		{"handoff successor, flag on", true, true, true, false},
+		{"dead-coord recovery (not a live successor)", true, true, false, true},
+		{"live handoff successor, flag on", true, true, true, false},
 		{"flag off", false, true, false, false},
 		{"worker (not coord)", true, false, false, false},
-		{"handoff worker", true, false, true, false},
+		{"live handoff worker", true, false, true, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := shouldLeaseWrap(c.failoverOn, c.isCoord, c.hasOldRec); got != c.want {
+			if got := shouldLeaseWrap(c.failoverOn, c.isCoord, c.liveHandoffSuccessor); got != c.want {
 				t.Errorf("shouldLeaseWrap(%v,%v,%v) = %v, want %v",
-					c.failoverOn, c.isCoord, c.hasOldRec, got, c.want)
+					c.failoverOn, c.isCoord, c.liveHandoffSuccessor, got, c.want)
 			}
 		})
 	}

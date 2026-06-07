@@ -235,18 +235,32 @@ func New(id string) *Record {
 	}
 }
 
-// StampSupervisorIdentity load-modify-writes the agent record's
-// supervisor identity fields (the coord-run lease holder). Called by
-// `fleet coord-run` at startup — the supervisor is the only process that
-// knows its own pid/start/exe. It reads the freshest record on disk,
-// overlays the three supervisor fields, and atomically rewrites it, so a
-// field set by an earlier writer (dispatch) is preserved. A missing
-// record is NOT an error (the supervisor may start before the record is
-// fully written in a degraded path) — it logs nothing and returns
-// state.ErrNotFound for the caller to surface. Behind FLEET_LEASE_
-// FAILOVER (the caller gates it); off-flag coords never call this, so
-// off-flag records keep the supervisor fields empty (omitempty).
+// StampSupervisorIdentity load-modify-writes ONLY the agent record's
+// three supervisor identity fields (the coord-run lease holder). Called
+// by `fleet coord-run` at startup — the supervisor is the only process
+// that knows its own pid/start/exe.
+//
+// CONCURRENCY (codex PR2 iter-8 [P2]): this races spawn.Spawn's final
+// record write (which sets the engine PID). Both sides take the per-agent
+// lock (state.LockAgent) and do a LOCKED load-modify-write that touches
+// only THEIR fields, so neither writer can clobber the other's:
+//   - this function preserves the engine PID + every non-supervisor field
+//     by re-reading under the lock and overlaying only the 3 supervisor
+//     fields,
+//   - spawn re-reads + preserves the supervisor fields under the same
+//     lock before its final write.
+//
+// A missing record returns state.ErrNotFound for the caller to retry/
+// surface (the supervisor may start before spawn's record write lands;
+// coord-run retries — see stampSupervisorWithRetry). Off-flag coords
+// never call this, so off-flag records keep the fields empty (omitempty).
 func StampSupervisorIdentity(id string, pid int, pidStart int64, exePath string) error {
+	unlock, err := state.LockAgent(id)
+	if err != nil {
+		return fmt.Errorf("lock agent %s for supervisor stamp: %w", id, err)
+	}
+	defer unlock()
+
 	rec, err := Load(id)
 	if err != nil {
 		return err

@@ -195,12 +195,16 @@ func leaseFailoverEnabled() bool {
 // shouldLeaseWrap decides whether this spawn wraps the coord in the
 // `fleet coord-run` lease supervisor (DESIGN-handoff-drain-storm-leak
 // PR2). ALL must hold: failover on; this is a coord spawn; and it is NOT
-// a handoff/drain successor. A successor (hasOldRecord) is spawned while
-// the outgoing coord still holds the lease, so wrapping it would make it
-// stand down and never start — lease-transfer handoff is PR3 (codex PR2
-// iter-7 [P1]).
-func shouldLeaseWrap(failoverOn, isCoord, hasOldRecord bool) bool {
-	return failoverOn && isCoord && !hasOldRecord
+// a LIVE handoff/drain successor.
+//
+// A live handoff successor is spawned while the outgoing coord still
+// holds the lease, so wrapping it would make it stand down and never
+// start — lease-transfer handoff is PR3 (codex PR2 iter-7 [P1]). A
+// dead-coord RECOVERY, by contrast, is a fresh leader (predecessor gone)
+// and IS wrapped, so the caller must NOT classify a recovery as a live
+// successor (codex PR2 iter-8 [P1] — see Options.RecoverDeadCoord).
+func shouldLeaseWrap(failoverOn, isCoord, liveHandoffSuccessor bool) bool {
+	return failoverOn && isCoord && !liveHandoffSuccessor
 }
 
 // coordRunWrap builds the lease-failover exec argv: the engine argv
@@ -654,6 +658,15 @@ type Options struct {
 	// coordlock — it is build-tagged to linux/darwin while spawn is
 	// all-platforms).
 	LeaderCheck func(project string) bool
+
+	// RecoverDeadCoord marks an OldRecord-carrying spawn as a DEAD-coord
+	// RECOVERY (the predecessor is gone) rather than a LIVE handoff
+	// successor. It flips the lease-wrap decision: a recovery is a fresh
+	// leader and MUST be lease-wrapped, while a live handoff successor must
+	// NOT (the outgoing coord still holds the lease). Set by the dispatch
+	// recovery path; left false by internal/handoffop's live handoff
+	// (codex PR2 iter-8 [P1]). Ignored when OldRecord is nil.
+	RecoverDeadCoord bool
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -922,8 +935,12 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// ExecCommand (codex iter-6 [P2]) so the pre-launch record +
 	// stand-down lifecycle handling below still applies — but only on the
 	// fresh path; a handoff successor is never wrapped here.
+	// A LIVE handoff successor = OldRecord present AND not a dead-coord
+	// recovery. A dead-coord recovery (RecoverDeadCoord) is a fresh leader
+	// and IS wrapped.
+	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord
 	leaseWrapped := false
-	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), opts.OldRecord != nil) {
+	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), liveHandoffSuccessor) {
 		switch {
 		case alreadyCoordRunWrapped(execArgv):
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
@@ -1021,22 +1038,30 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// live record for a dead coord. So on ErrNotFound: skip the final
 	// write entirely and return the in-memory rec (for the caller's
 	// stdout) WITHOUT persisting — the supervisor owns the lifecycle.
+	// Final record write.
+	//
+	// LEASE COORDS: the coord-run supervisor concurrently stamps the 3
+	// supervisor fields via agent.StampSupervisorIdentity. To keep both
+	// writers' fields (engine PID here + supervisor identity there) the
+	// merge + write runs UNDER the per-agent lock both sides take (codex
+	// PR2 iter-8 [P2]) — a locked load-modify-write that overlays only the
+	// fields this side owns. Also handles the do-not-resurrect /
+	// stand-down disambiguation (iter-3/6) inside the same critical
+	// section.
 	if leaseWrapped {
+		unlock, lkErr := state.LockAgent(id)
+		if lkErr != nil {
+			_ = tmux.Kill(session)
+			return nil, fmt.Errorf("lock agent %s for final write (orphan tmux session killed): %w", id, lkErr)
+		}
 		onDisk, lerr := agent.Load(id)
 		switch {
 		case errors.Is(lerr, state.ErrNotFound):
 			// The supervisor already archived the pre-launch record before
-			// we reached the merge. This is AMBIGUOUS (codex PR2 iter-6
-			// [P2]): it is a clean STAND-DOWN only if a healthy leader now
-			// holds the lease; otherwise coord-run hit a real fault
-			// (lease-acquire error, child start failure) and its cleanup
-			// archived the record while leaving NO coord running. Use
-			// LeaderCheck to tell them apart so a failure is NOT hidden as
-			// a success.
-			//   - leader present -> clean stand-down: ErrCoordStoodDown
-			//     (caller reports "already running", exit 0).
-			//   - no leader (or no checker) -> surface a real error so the
-			//     caller does NOT print a false success for a dead coord.
+			// we reached the merge. AMBIGUOUS (codex PR2 iter-6 [P2]): a
+			// clean STAND-DOWN only if a healthy leader now holds the lease;
+			// otherwise coord-run hit a real fault and left NO coord running.
+			unlock()
 			if opts.LeaderCheck != nil && opts.LeaderCheck(rec.Project) {
 				_, _ = fmt.Fprintf(os.Stderr,
 					"spawn: coord %s stood down — a healthy leader already holds the lease "+
@@ -1048,29 +1073,29 @@ func Spawn(opts Options) (*agent.Record, error) {
 					"healthy leader holds the lease for %q (lease-acquire or child-start "+
 					"failure); no coord is running", id, rec.Project)
 		case lerr == nil:
+			// Preserve the supervisor identity the coord-run process wrote.
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
 		}
-		// Any other load error: fall through to the write (best-effort —
-		// the supervisor fields stay empty, same as off-flag).
-	}
-
-	if err := rec.Write(); err != nil {
-		// Orphan rollback: tmux session up, record missing → operator
-		// would see a ghost session in `tmux ls` with no `fleet status`
-		// entry. Kill the session so spawn is all-or-nothing.
-		_ = tmux.Kill(session)
-		// For a lease-wrapped coord the PRE-LAUNCH record is already on
-		// disk; an atomic rec.Write failure leaves THAT stale record
-		// behind, advertising a live coord for the session we just killed
-		// (codex PR2 iter-6 [P2]). Remove it so the failure is all-or-
-		// nothing here too. Best-effort.
-		if leaseWrapped {
+		// Any other load error: fall through to the write (best-effort).
+		if werr := rec.Write(); werr != nil {
+			unlock()
+			_ = tmux.Kill(session)
+			// The pre-launch record is already on disk; an atomic write
+			// failure leaves THAT stale record advertising a killed
+			// session — remove it (codex iter-6 [P2]).
 			if livePath, perr := state.AgentPath(id); perr == nil {
 				_ = os.Remove(livePath)
 			}
+			return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", werr)
 		}
+		unlock()
+	} else if err := rec.Write(); err != nil {
+		// Non-lease path (unchanged): single writer, no per-agent lock
+		// needed. Orphan rollback: tmux session up, record missing →
+		// operator would see a ghost session with no fleet status entry.
+		_ = tmux.Kill(session)
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
 
