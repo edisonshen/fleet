@@ -499,6 +499,63 @@ func TestResolveEnginePid_RawShellLeafFastReturns(t *testing.T) {
 	}
 }
 
+// TestResolveEnginePid_RawShellUnderCoordRun (codex PR2 iter-14 [P2]):
+// a RAW-SHELL coord command (`--command sh`) wrapped by coord-run under
+// FLEET_LEASE_FAILOVER. The pane is the coord-run SUPERVISOR; its only
+// child is the bare shell engine (no deeper child). The resolver must
+// record the SHELL pid (the engine), NOT the coord-run supervisor pid —
+// else PID == SupervisorPID breaks liveness.
+func TestResolveEnginePid_RawShellUnderCoordRun(t *testing.T) {
+	procs := []procEntry{
+		{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A --project p -- sh"},
+		{PID: 201, PPID: 200, Args: "sh"}, // the raw-shell engine, no children
+	}
+	deps := resolveEnginePidDeps{
+		panePID:   func(string) (int, error) { return 200, nil },
+		listProcs: func() ([]procEntry, error) { return procs, nil },
+		now:       func() time.Time { return time.Unix(0, 0) },
+		sleep:     func(time.Duration) {},
+	}
+	pid, _, err := resolveEnginePid("fleet-A", "", "", 10*time.Second, deps)
+	if err != nil {
+		t.Fatalf("resolveEnginePid: %v", err)
+	}
+	if pid != 201 {
+		t.Errorf("raw-shell-under-coord-run must record the shell pid 201, not the supervisor 200; got %d", pid)
+	}
+}
+
+// TestRawShellLeafPid covers the helper for the coord-run cases.
+func TestRawShellLeafPid(t *testing.T) {
+	t.Run("coord-run pane with raw-shell child → child pid", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh"},
+			{PID: 201, PPID: 200, Args: "sh"},
+		}
+		pid, ok := rawShellLeafPid(procs, 200)
+		if !ok || pid != 201 {
+			t.Errorf("want (201,true), got (%d,%v)", pid, ok)
+		}
+	})
+	t.Run("coord-run pane whose shell child has a claude grandchild → false", func(t *testing.T) {
+		procs := []procEntry{
+			{PID: 200, PPID: 1, Args: "/usr/local/bin/fleet coord-run --agent A -- sh -c claude"},
+			{PID: 201, PPID: 200, Args: "sh -c claude"},
+			{PID: 202, PPID: 201, Args: "claude"},
+		}
+		if _, ok := rawShellLeafPid(procs, 200); ok {
+			t.Error("want false; the shell has a claude grandchild (real engine)")
+		}
+	})
+	t.Run("bare-shell pane → pane pid", func(t *testing.T) {
+		procs := []procEntry{{PID: 200, PPID: 1, Args: "sh"}}
+		pid, ok := rawShellLeafPid(procs, 200)
+		if !ok || pid != 200 {
+			t.Errorf("want (200,true), got (%d,%v)", pid, ok)
+		}
+	})
+}
+
 // TestPaneIsRawShellLeaf covers the helper in isolation.
 func TestPaneIsRawShellLeaf(t *testing.T) {
 	t.Run("shell pane, no children → true", func(t *testing.T) {

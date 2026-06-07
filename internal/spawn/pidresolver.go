@@ -196,10 +196,10 @@ func resolveEnginePid(
 			// has clearly NOT exec'd a real child, so the pane IS
 			// the correct recorded pid (operator dispatched a
 			// bare shell with no command).
-			if paneIsRawShellLeaf(procs, panePid) {
+			if leafPid, ok := rawShellLeafPid(procs, panePid); ok {
 				rawShellLeafObservations++
 				if rawShellLeafObservations >= rawShellLeafConfirmPolls {
-					return panePid, "", nil
+					return leafPid, "", nil
 				}
 			} else {
 				rawShellLeafObservations = 0
@@ -381,23 +381,60 @@ func findEngineDescendant(
 // timeout would gratuitously stall the spawn. Codex iter-5
 // hardening (2026-05-14).
 func paneIsRawShellLeaf(procs []procEntry, panePID int) bool {
+	_, ok := rawShellLeafPid(procs, panePID)
+	return ok
+}
+
+// rawShellLeafPid returns the pid to record as the engine when the coord's
+// command is a RAW SHELL/REPL with no real engine child (`--command sh`),
+// and ok=false otherwise. It handles two shapes:
+//
+//   - UNWRAPPED pane: the pane process itself is a shell with no children
+//     → record the pane pid (the original raw-shell-leaf case).
+//   - COORD-RUN WRAPPED pane (FLEET_LEASE_FAILOVER): the pane is `fleet
+//     coord-run`, whose intended engine is a shell child. The supervisor
+//     argv is a WRAPPER (excluded from the normal match), so without this
+//     the resolver would fall back to the pane pid = the SUPERVISOR pid,
+//     giving PID == SupervisorPID and breaking liveness (codex PR2 iter-14
+//     [P2]). Here we descend through coord-run to its shell leaf (a shell
+//     with no further children) and return THAT pid — the real engine.
+//
+// "Leaf" = a shell whose only descendants (if any) are not present, i.e.
+// it has not exec'd a deeper engine. Returns the SHELL itself, not the
+// supervisor.
+func rawShellLeafPid(procs []procEntry, panePID int) (int, bool) {
 	if panePID <= 0 || len(procs) == 0 {
-		return false
+		return 0, false
 	}
-	var paneArgs string
-	hasChildren := false
+	byPID := make(map[int]procEntry, len(procs))
+	children := make(map[int][]procEntry, len(procs))
 	for _, p := range procs {
-		if p.PID == panePID {
-			paneArgs = p.Args
+		byPID[p.PID] = p
+		children[p.PPID] = append(children[p.PPID], p)
+	}
+	pane, ok := byPID[panePID]
+	if !ok {
+		return 0, false
+	}
+	hasChild := func(pid int) bool { return len(children[pid]) > 0 }
+	// Unwrapped: pane is a shell leaf.
+	if isShellArgv(pane.Args) {
+		if !hasChild(panePID) {
+			return panePID, true
 		}
-		if p.PPID == panePID {
-			hasChildren = true
+		return 0, false // a shell WITH children -> normal sh -c wrapper, not a leaf
+	}
+	// Wrapped: pane is the coord-run supervisor. Its intended engine is a
+	// direct shell child; treat it as the leaf only if THAT shell has no
+	// further children (no deeper engine exec'd).
+	if isCoordRunArgv(pane.Args) {
+		for _, c := range children[panePID] {
+			if isShellArgv(c.Args) && !hasChild(c.PID) {
+				return c.PID, true
+			}
 		}
 	}
-	if paneArgs == "" {
-		return false
-	}
-	return isShellArgv(paneArgs) && !hasChildren
+	return 0, false
 }
 
 // argvCommandIs reports whether the first token of argv (the command
