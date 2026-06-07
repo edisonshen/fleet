@@ -794,6 +794,83 @@ func TestReapDaemonKeepMarker_AbortsOnConcurrentRespawn(t *testing.T) {
 	}
 }
 
+// TestUp_AdoptHealthy_BackfillsEmptyOwner (codex P2): a daemon enabled by
+// `fleet rc up <project>` (no --coord-id) records an empty owning_coord_id.
+// When the coord tick later adopts it with --coord-id, the healthy-adopt
+// branch must STAMP the owner so dead-owner self-heal works after a future
+// coord crash. Without the backfill the owner stays empty forever.
+func TestUp_AdoptHealthy_BackfillsEmptyOwner(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) { t.Fatalf("healthy adopt must NOT kill") })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	// Operator-enabled daemon: current version, EMPTY owner.
+	if err := WriteState(RecordedState{
+		Project: "demo", PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+		ClaudeVersion: "2.1.156", OwningCoordID: "",
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	// Coord tick adopts with a coord-id.
+	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", CoordID: "abcd1234"})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAlreadyAcquired {
+		t.Fatalf("outcome=%q want already_acquired (healthy adopt)", out)
+	}
+	got, _ := ReadState("demo")
+	if got.OwningCoordID != "abcd1234" {
+		t.Fatalf("owner backfill failed: owning_coord_id=%q want abcd1234", got.OwningCoordID)
+	}
+	if got.PID != os.Getpid() {
+		t.Fatalf("adopt must not change PID; got %d", got.PID)
+	}
+}
+
+// TestUp_AdoptHealthy_DoesNotClobberExistingOwner: the backfill is
+// idempotent — when the record ALREADY has an owner, a different coord's
+// adopt tick must NOT overwrite it (only empty owners are stamped).
+func TestUp_AdoptHealthy_DoesNotClobberExistingOwner(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	restoreKill := SetKillFnForTest(func(pid int) { t.Fatalf("healthy adopt must NOT kill") })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	if err := WriteState(RecordedState{
+		Project: "demo", PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+		ClaudeVersion: "2.1.156", OwningCoordID: "coord-live",
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	if _, err := Up("demo", UpOpts{Cwd: "/tmp/demo", CoordID: "abcd1234"}); err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	got, _ := ReadState("demo")
+	if got.OwningCoordID != "coord-live" {
+		t.Fatalf("existing owner must be preserved; owning_coord_id=%q want coord-live", got.OwningCoordID)
+	}
+}
+
 // TestSweepAllProjects_ReleasesMarkerlessOrphans (codex P2): the
 // sweeper's whole point is to release entries where rc-state.json
 // claims a live PID but the marker is gone (operator rm'd it

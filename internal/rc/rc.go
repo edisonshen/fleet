@@ -348,6 +348,23 @@ func Up(project string, opts UpOpts) (string, error) {
 								return OutcomeError, err
 							}
 						}
+						// codex P2 (owner backfill on adopt): a daemon enabled
+						// via operator `fleet rc up <project>` (no --coord-id)
+						// records an EMPTY owning_coord_id. The coord tick then
+						// adopts it here via `--respawn-only --coord-id <id>`,
+						// but without this backfill the owner stays empty
+						// forever and computeHealReason keeps SKIPPING dead-
+						// owner detection — so a crashed coord's daemon never
+						// self-heals. When the caller supplies a CoordID and the
+						// record has none, stamp it in (idempotent: only when
+						// the recorded owner is empty, so we never clobber an
+						// existing owner with a different coord's tick).
+						if opts.CoordID != "" && cur.OwningCoordID == "" {
+							cur.OwningCoordID = opts.CoordID
+							if err := WriteState(cur); err != nil {
+								return OutcomeError, err
+							}
+						}
 						return OutcomeAlreadyAcquired, nil
 					}
 					// codex P2 (resolve-before-kill): we must be able to
