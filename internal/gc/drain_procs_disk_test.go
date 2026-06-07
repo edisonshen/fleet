@@ -7,6 +7,39 @@ import (
 	"testing"
 )
 
+// killDrainGuarded with RequireFingerprint=true MUST fail closed (no
+// kill, no Gone) when no start fingerprint is available — even if the pid
+// is alive (codex iter-6 [P2]). We point it at our own live test process
+// with an empty PidStart: the guard must NOT SIGTERM us.
+func TestKillDrainGuarded_RequireFingerprint_FailsClosed(t *testing.T) {
+	res, err := killDrainGuarded(DrainKillTarget{
+		Pid: os.Getpid(), PidStart: "", RequireFingerprint: true,
+	})
+	if err != nil {
+		t.Fatalf("killDrainGuarded: %v", err)
+	}
+	if res.Killed {
+		t.Fatal("RequireFingerprint with empty PidStart must NEVER kill")
+	}
+	if res.Gone {
+		t.Fatal("a live pid with no fingerprint is AMBIGUOUS, not Gone")
+	}
+}
+
+// sameFleetExe matches the current process against itself and mismatches
+// against pid 1 (launchd/init — definitely not the test binary).
+func TestSameFleetExe(t *testing.T) {
+	if got := sameFleetExe(os.Getpid()); got != exeProbeMatch {
+		t.Fatalf("sameFleetExe(self) = %v, want match", got)
+	}
+	// pid 1 is init/launchd — a different executable from the test binary.
+	// (On the rare host where the exe is unreadable we accept Failed too,
+	// since the guard treats both non-Match outcomes as "don't kill".)
+	if got := sameFleetExe(1); got == exeProbeMatch {
+		t.Fatalf("sameFleetExe(1) must not match the test binary; got %v", got)
+	}
+}
+
 // removeDrainRunFile must NOT delete a run-record that was overwritten by
 // a NEW drain reusing the PID after classification (codex iter-4 [P2]
 // TOCTOU). It deletes only when the on-disk pid_start still matches what

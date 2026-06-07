@@ -130,6 +130,24 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 		case cur != target.PidStart:
 			return DrainKillResult{Gone: true}, nil // PID reuse — unrelated proc
 		}
+	} else if target.RequireFingerprint {
+		// Legacy path with no captured fingerprint (codex iter-6 [P2]):
+		// fail CLOSED — without a start-time to corroborate, the live PID
+		// could be a different process that reused the number. Surface,
+		// never signal.
+		return DrainKillResult{}, nil
+	}
+	// Corroborate the EXECUTABLE is the same fleet binary we are running
+	// (codex iter-6 [P2]). The argv-basename match in argvIsFleetDrain is
+	// spoofable for the legacy path (an unrelated binary/symlink named
+	// `fleet` with a `drain` arg), so before signaling we require the
+	// target's exe to resolve to the SAME path as this fleet process.
+	// Ambiguous (can't read either exe) → keep/surface, never kill.
+	switch sameFleetExe(target.Pid) {
+	case exeProbeMismatch:
+		return DrainKillResult{Gone: true}, nil // a different binary owns the PID now
+	case exeProbeFailed:
+		return DrainKillResult{}, nil // ambiguous — don't kill
 	}
 	// Corroborate the process is still a `fleet drain` (defends both
 	// paths). A probe failure is AMBIGUOUS (keep record); a clean
@@ -147,6 +165,69 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 		return DrainKillResult{}, fmt.Errorf("SIGTERM pid %d: %w", target.Pid, err)
 	}
 	return DrainKillResult{Killed: true}, nil
+}
+
+// exeProbe is the three-way outcome of comparing a target's executable
+// to the running fleet binary.
+type exeProbe int
+
+const (
+	exeProbeMatch    exeProbe = iota // same fleet binary
+	exeProbeMismatch                 // a DIFFERENT executable owns the PID
+	exeProbeFailed                   // could not read one/both exes (ambiguous)
+)
+
+// sameFleetExe compares the target pid's executable path to THIS fleet
+// process's executable (os.Executable). A match proves the target is the
+// same fleet binary (strong ownership for the legacy path, codex iter-6
+// [P2]). Linux reads /proc/<pid>/exe; darwin falls back to `ps -o comm=`
+// (full path on darwin). Any unreadable side → exeProbeFailed (don't
+// kill on ambiguity). EvalSymlinks both so a symlinked install still
+// matches its real target.
+func sameFleetExe(pid int) exeProbe {
+	self, err := os.Executable()
+	if err != nil {
+		return exeProbeFailed
+	}
+	self = resolvePath(self)
+	other, ok := procExePath(pid)
+	if !ok {
+		return exeProbeFailed
+	}
+	if resolvePath(other) == self {
+		return exeProbeMatch
+	}
+	return exeProbeMismatch
+}
+
+// procExePath returns the absolute executable path of pid. Linux:
+// readlink /proc/<pid>/exe. Darwin/other: `ps -p <pid> -o comm=` (the
+// full path on darwin). (path, false) on any failure.
+func procExePath(pid int) (string, bool) {
+	if link, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe"); err == nil && link != "" {
+		return link, true
+	}
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if err != nil {
+		return "", false
+	}
+	p := strings.TrimSpace(string(out))
+	if p == "" || !filepath.IsAbs(p) {
+		// comm can be a bare name on some platforms — not usable as an
+		// exe-path identity. Treat as unreadable (fail-closed upstream).
+		return "", false
+	}
+	return p, true
+}
+
+// resolvePath best-effort canonicalizes p via EvalSymlinks; on failure
+// it returns p unchanged (the comparison then falls back to the raw
+// path, which is still correct for a non-symlinked install).
+func resolvePath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
 }
 
 // procDrainState is a three-way argv probe for the guarded kill: probe

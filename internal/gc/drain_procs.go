@@ -109,6 +109,14 @@ type DrainKillTarget struct {
 	Pid      int
 	PidStart string
 	Exe      string
+	// RequireFingerprint fails the guard CLOSED when PidStart is empty
+	// (codex iter-6 [P2]). The legacy `ps` sweep sets this: it has no
+	// run-record proving ownership, so it must NOT signal a PID whose
+	// start fingerprint could not be captured (a reused PID could be a
+	// different process). The steady-state path leaves it false — an
+	// empty fingerprint there comes from an old run-record and falls back
+	// to a bare liveness check.
+	RequireFingerprint bool
 }
 
 // DrainKillResult is the three-way outcome of a guarded kill (codex
@@ -305,7 +313,7 @@ func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 				act.Verb = VerbSurface
 				act.Reason = fmt.Sprintf("%s; --apply requested but KillDrain dep not wired", act.Reason)
 			} else {
-				res, kerr := deps.KillDrain(DrainKillTarget{Pid: p.Pid, PidStart: p.PidStart, Exe: p.Exe})
+				res, kerr := deps.KillDrain(DrainKillTarget{Pid: p.Pid, PidStart: p.PidStart, Exe: p.Exe, RequireFingerprint: true})
 				switch {
 				case kerr != nil:
 					act.Verb = VerbSurface
