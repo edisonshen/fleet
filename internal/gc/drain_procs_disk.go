@@ -122,7 +122,8 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 	// recorded drain is gone. An unreadable fingerprint is AMBIGUOUS (we
 	// saw it alive but can't prove identity) → do NOT kill, do NOT claim
 	// gone — return the zero result so the record is kept.
-	if target.PidStart != "" {
+	recorded := target.PidStart != "" // steady-state: pid_start IS the strong identity
+	if recorded {
 		cur, err := procStartTime(target.Pid)
 		switch {
 		case err != nil:
@@ -130,24 +131,30 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 		case cur != target.PidStart:
 			return DrainKillResult{Gone: true}, nil // PID reuse — unrelated proc
 		}
+		// pid_start matched → this IS the recorded drain. Do NOT run the
+		// exe-identity gate here (codex iter-8 [P2]): a binary-path change
+		// (post-upgrade, dev build) would otherwise mis-report Gone and
+		// delete the record for a still-live drain, stranding it. The argv
+		// re-probe below is the only remaining corroboration.
 	} else if target.RequireFingerprint {
 		// Legacy path with no captured fingerprint (codex iter-6 [P2]):
 		// fail CLOSED — without a start-time to corroborate, the live PID
 		// could be a different process that reused the number. Surface,
 		// never signal.
 		return DrainKillResult{}, nil
-	}
-	// Corroborate the EXECUTABLE is the same fleet binary we are running
-	// (codex iter-6 [P2]). The argv-basename match in argvIsFleetDrain is
-	// spoofable for the legacy path (an unrelated binary/symlink named
-	// `fleet` with a `drain` arg), so before signaling we require the
-	// target's exe to resolve to the SAME path as this fleet process.
-	// Ambiguous (can't read either exe) → keep/surface, never kill.
-	switch sameFleetExe(target.Pid) {
-	case exeProbeMismatch:
-		return DrainKillResult{Gone: true}, nil // a different binary owns the PID now
-	case exeProbeFailed:
-		return DrainKillResult{}, nil // ambiguous — don't kill
+	} else {
+		// Legacy path WITH a fingerprint: argv-basename alone is spoofable
+		// (an unrelated binary/symlink named `fleet` with a `drain` arg),
+		// so require the target's executable to be the SAME fleet binary we
+		// are running before signaling (codex iter-6 [P2]). Only the legacy
+		// path needs this — the steady-state path already proved identity
+		// via pid_start above.
+		switch sameFleetExe(target.Pid) {
+		case exeProbeMismatch:
+			return DrainKillResult{Gone: true}, nil // a different binary owns the PID
+		case exeProbeFailed:
+			return DrainKillResult{}, nil // can't prove ownership — surface, don't kill
+		}
 	}
 	// Corroborate the process is still a `fleet drain` (defends both
 	// paths). A probe failure is AMBIGUOUS (keep record); a clean
@@ -177,47 +184,105 @@ const (
 	exeProbeFailed                   // could not read one/both exes (ambiguous)
 )
 
-// sameFleetExe compares the target pid's executable path to THIS fleet
+// sameFleetExe compares the target pid's executable to THIS fleet
 // process's executable (os.Executable). A match proves the target is the
-// same fleet binary (strong ownership for the legacy path, codex iter-6
-// [P2]). Linux reads /proc/<pid>/exe; darwin falls back to `ps -o comm=`
-// (full path on darwin). Any unreadable side → exeProbeFailed (don't
-// kill on ambiguity). EvalSymlinks both so a symlinked install still
-// matches its real target.
+// same fleet binary (legacy-path ownership proof, codex iter-6 [P2]).
+//
+// Resolution (codex iter-8 [P1] — darwin must actually reap): Linux reads
+// /proc/<pid>/exe; darwin tries `ps -o comm=` then `lsof` txt. When BOTH
+// sides yield absolute paths we compare them (EvalSymlinks-resolved) — a
+// strong match. When the target's path is only a basename (a PATH-launched
+// `fleet` whose comm is just "fleet"), we fall back to a basename match
+// against our own exe basename so darwin can still reap (a weaker but
+// real signal; combined with the argv `fleet drain` re-probe + pid age
+// gate, the legacy blast radius stays narrow). Unreadable target →
+// exeProbeFailed (don't kill on ambiguity).
 func sameFleetExe(pid int) exeProbe {
 	self, err := os.Executable()
 	if err != nil {
 		return exeProbeFailed
 	}
-	self = resolvePath(self)
-	other, ok := procExePath(pid)
+	other, abs, ok := procExePath(pid)
 	if !ok {
 		return exeProbeFailed
 	}
-	if resolvePath(other) == self {
+	if abs {
+		if resolvePath(other) == resolvePath(self) {
+			return exeProbeMatch
+		}
+		return exeProbeMismatch
+	}
+	// Target gave only a basename — compare basenames.
+	if filepath.Base(other) == filepath.Base(self) {
 		return exeProbeMatch
 	}
 	return exeProbeMismatch
 }
 
-// procExePath returns the absolute executable path of pid. Linux:
-// readlink /proc/<pid>/exe. Darwin/other: `ps -p <pid> -o comm=` (the
-// full path on darwin). (path, false) on any failure.
-func procExePath(pid int) (string, bool) {
+// procExePath returns the executable path of pid and whether it is
+// ABSOLUTE. Linux: readlink /proc/<pid>/exe (absolute). Darwin/other:
+// `ps -p <pid> -o comm=` (often absolute, sometimes argv0/basename), then
+// `lsof -p <pid> -Ftn` txt entry (absolute) as a stronger fallback.
+// (path, abs, false) on total failure.
+func procExePath(pid int) (path string, abs bool, ok bool) {
 	if link, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe"); err == nil && link != "" {
-		return link, true
+		return link, filepath.IsAbs(link), true
 	}
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output()
+	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=").Output(); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" {
+			if filepath.IsAbs(p) {
+				return p, true, true
+			}
+			// Bare name from comm — try lsof for an absolute path before
+			// settling for the basename.
+			if lp, lok := lsofTxtPath(pid); lok {
+				return lp, true, true
+			}
+			return p, false, true
+		}
+	}
+	if lp, lok := lsofTxtPath(pid); lok {
+		return lp, true, true
+	}
+	return "", false, false
+}
+
+// lsofTxtPath returns the absolute executable (txt) path of pid via
+// `lsof -p <pid> -Ftn`. Scans for the `t`(ype)==REG following a `txt`
+// fd marker; returns the first program-text file. (path, false) on any
+// failure / lsof-absent host.
+func lsofTxtPath(pid int) (string, bool) {
+	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-Fn").Output()
 	if err != nil {
 		return "", false
 	}
-	p := strings.TrimSpace(string(out))
-	if p == "" || !filepath.IsAbs(p) {
-		// comm can be a bare name on some platforms — not usable as an
-		// exe-path identity. Treat as unreadable (fail-closed upstream).
-		return "", false
+	// -Fn output is line-oriented; an `n`-prefixed line carries a path.
+	// The first absolute path that exists is a good exe proxy on darwin
+	// (the binary is among the earliest mapped files). We pick the first
+	// `n/...` whose basename matches our own exe basename if possible,
+	// else the first absolute path.
+	self, _ := os.Executable()
+	wantBase := ""
+	if self != "" {
+		wantBase = filepath.Base(self)
 	}
-	return p, true
+	var firstAbs string
+	for _, ln := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(ln, "n/") {
+			continue
+		}
+		p := ln[1:]
+		if firstAbs == "" {
+			firstAbs = p
+		}
+		if wantBase != "" && filepath.Base(p) == wantBase {
+			return p, true
+		}
+	}
+	if firstAbs != "" {
+		return firstAbs, true
+	}
+	return "", false
 }
 
 // resolvePath best-effort canonicalizes p via EvalSymlinks; on failure
