@@ -238,6 +238,11 @@ func acquireLease(project, agentID string, cfg leaseConfig) (*Lease, bool, error
 	const maxAttempts = 8
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		done, acquired, err := l.tryAcquireOnce()
+		if errors.Is(err, errSerializerBusy) {
+			// Transient: epoch.lock was busy this pass. Re-evaluate from a
+			// clean flock state rather than failing the whole acquire.
+			continue
+		}
 		if err != nil {
 			return nil, false, err
 		}
@@ -603,10 +608,16 @@ func (l *Lease) heartbeatLoop() {
 			return
 		case <-t.C:
 			ok, err := l.heartbeatOnce()
+			if errors.Is(err, errSerializerBusy) {
+				// Benign: another writer held epoch.lock for this whole
+				// tick. Do NOT demote — skip this tick and renew on the
+				// next one (TTL >= 3x heartbeat, so a skipped tick is safe).
+				continue
+			}
 			if err != nil || !ok {
-				// Either a write error or we were fenced — self-demote by
-				// stopping the heartbeat. The caller's Release path (and
-				// the kernel flock release on exit) finishes the demotion.
+				// A real write fault, or we were fenced (ok=false) —
+				// self-demote by stopping the heartbeat. The Release path
+				// (and the kernel flock release on exit) finishes it.
 				return
 			}
 		}
@@ -843,24 +854,48 @@ func releaseFlock(f *os.File) error {
 	return f.Close()
 }
 
+// errSerializerBusy means coordinator.epoch.lock was held by another
+// writer for the whole bounded acquire budget. It is a TRANSIENT outcome,
+// NOT a self-demotion: the heartbeat must keep renewing (skip this tick),
+// while acquire/takeover treat it as "stand down + retry on the next
+// pass". Distinguishing it from fn()'s ok=false (real demotion / fenced)
+// closes the spurious-heartbeat-stop hole (codex iter-6).
+var errSerializerBusy = errors.New("coordlock: epoch.lock serializer busy")
+
+// epochLockBudget bounds how long withEpochLock polls LOCK_NB for the
+// serializer before returning errSerializerBusy. Epoch-lock writers hold
+// it only for one fast atomic write, so a short budget reliably wins it
+// under benign contention without blocking forever. A var (not const) only
+// so a test can shrink it; production never reassigns it.
+var epochLockBudget = 2 * time.Second
+
 // withEpochLock runs fn while holding coordinator.epoch.lock (the stable
-// serializer inode, NEVER renamed). The flock is LOCK_NB: losing it means
-// another candidate/heartbeat is mid-write, so we return ok=false (stand
-// down) rather than blocking — the caller re-reads on the next pass.
+// serializer inode, NEVER renamed). The flock is LOCK_NB, polled until the
+// epochLockBudget elapses (writers hold it briefly). On budget exhaustion
+// it returns errSerializerBusy — a transient signal callers distinguish
+// from a real demotion (fn returning ok=false). It NEVER blocks forever.
 func (l *Lease) withEpochLock(fn func() (bool, error)) (bool, error) {
 	f, err := os.OpenFile(l.paths.epochLock, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return false, fmt.Errorf("open epoch.lock: %w", err)
 	}
 	defer func() { _ = f.Close() }()
-	if lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lerr != nil {
-		if lerr == syscall.EWOULDBLOCK { //nolint:errorlint // bare errno.
-			return false, nil // serializer busy -> stand down
+
+	deadline := time.Now().Add(epochLockBudget)
+	for {
+		lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if lerr == nil {
+			defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
+			return fn()
 		}
-		return false, fmt.Errorf("flock epoch.lock: %w", lerr)
+		if lerr != syscall.EWOULDBLOCK { //nolint:errorlint // bare errno.
+			return false, fmt.Errorf("flock epoch.lock: %w", lerr)
+		}
+		if !time.Now().Before(deadline) {
+			return false, errSerializerBusy
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	defer func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN) }()
-	return fn()
 }
 
 // readEpoch reads + unmarshals coordinator.epoch. Returns os.ErrNotExist
