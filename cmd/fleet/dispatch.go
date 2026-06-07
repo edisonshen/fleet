@@ -669,9 +669,13 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//   (a) coord-state.json mtime fresh AND a record exists (the
 	//       original AND-gate; steady-state signal once the coord has
 	//       ticked at least once).
-	//   (b) a live coord record (tmux session alive) exists — covers a
-	//       live coord whose coord-state.json hasn't refreshed within
-	//       the window yet (e.g. mid-boot, post-first-tick lag).
+	//   (b) a live coord record (tmux session alive on THIS socket) —
+	//       handled ABOVE by the idempotent-attach fast path, which
+	//       returns success rather than a refusal. We pass false for
+	//       this disjunct here precisely because that case already
+	//       short-circuited to attach; the disjunct lives in
+	//       coordSpawnVeto's contract (and T7 tests it) for a single
+	//       complete OR-gate, but in this call path it can't fire.
 	//   (c) a FRESH pending-spawn claim exists — the cold-start window:
 	//       dispatch #1 wrote the claim + spawned, but coord-state.json
 	//       isn't written until the first tick (3-5 min). Without (c),
@@ -690,7 +694,10 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if opts.coordSpawn {
 		stateFresh := coordStateFresh(opts.project)
 		recordExists := coordRecordExistsInList(opts.taskID, opts.project, coordRecords)
-		liveCoord := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession) != nil
+		// liveCoordRecord disjunct already handled by the attach fast
+		// path above (it returns success for any local-socket-live
+		// coord). Pass false to avoid a redundant tmux probe.
+		const liveCoord = false
 		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
 		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {
 			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).
