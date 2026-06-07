@@ -658,7 +658,23 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// no parseable line and the wrapper reports a parse failure instead of
 	// attaching. We additionally print a human attach hint to stderr (not
 	// stdout, so it can't pollute the parse target).
-	if opts.coordSpawn {
+	//
+	// Prompt-failure gate (codex iter-3 P2): require coordStateFresh — a
+	// FRESH coord-state.json proves the live session has actually ticked
+	// /coordinator at least once. Without this gate, a prior coord-spawn
+	// whose initial prompt failed to deliver (a live tmux session running
+	// plain Claude that never started /coordinator) would be caught here
+	// and reported as a clean `agent <id> spawned`; the TUI's
+	// startCoordSpawn would then see no "initial prompt not delivered"
+	// marker, set promptDelivered=true, write the coord-spawn marker, and
+	// PROMOTE a non-coordinator session as the project's coord instead of
+	// respawning. Gating on coordStateFresh routes the not-yet-ticking and
+	// prompt-failed sessions to the veto/recovery path below: a genuinely
+	// booting coord is held by the cold-start pending-claim veto (retry),
+	// and a prompt-failed session (never ticks → never writes coord-state)
+	// falls through to a fresh respawn. The fast path therefore fires only
+	// for a coord that has PROVEN it is supervising the project.
+	if opts.coordSpawn && coordStateFresh(opts.project) {
 		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"coord %s already alive for project %s; attaching to the existing session\n",

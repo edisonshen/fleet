@@ -272,6 +272,12 @@ func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
 	if werr := rec.Write(); werr != nil {
 		t.Fatalf("seed live coord record: %v", werr)
 	}
+	// Fresh coord-state.json proves the live coord has ticked — required
+	// by the prompt-failure gate (codex iter-3 P2) for the fast path to
+	// fire. A just-written file is well within coordFreshnessWindow.
+	if err := os.WriteFile(filepath.Join(pdir, "coord-state.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatalf("seed coord-state.json: %v", err)
+	}
 
 	// Report ONLY the live coord's session as alive.
 	prev := tmuxHasSession
@@ -296,6 +302,74 @@ func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
 	if got != liveID {
 		t.Fatalf("parseSpawnedAgentID(%q) = %q, want %q (attach fast path broke the spawn-output contract)",
 			out.String(), got, liveID)
+	}
+}
+
+// TestRunDispatch_AttachFastPathSkippedWhenNotTicking pins the
+// prompt-failure gate (codex iter-3 P2): a live coord record + alive tmux
+// session but NO fresh coord-state.json (the session never ticked
+// /coordinator — e.g. its initial prompt failed to deliver) must NOT take
+// the attach fast path. Promoting such a non-coordinator session as the
+// project's coord would skip the TUI's prompt-failure respawn recovery.
+// The fast path fires only when coordStateFresh proves the coord ticked.
+func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	// Empty socket → spawn fails deterministically under go test, so the
+	// test never leaks a real session and we can assert "fast path not
+	// taken" by observing the dispatch did NOT exit 0 with the live ID.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+
+	pdir, err := state.ProjectDir("nottick")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	// Live coord record + alive session, but coord-state.json ABSENT
+	// (never ticked → prompt-failed scenario).
+	const liveID = "beef5678"
+	rec := &agent.Record{
+		ID:          liveID,
+		TaskID:      CoordTaskIDPrefix + "nottick",
+		Project:     "nottick",
+		TmuxSession: "fleet-" + liveID,
+		SpawnedAt:   time.Now().UTC(),
+	}
+	if werr := rec.Write(); werr != nil {
+		t.Fatalf("seed live coord record: %v", werr)
+	}
+	if _, statErr := os.Stat(filepath.Join(pdir, "coord-state.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("precondition: coord-state.json must be absent, stat err = %v", statErr)
+	}
+
+	prev := tmuxHasSession
+	tmuxHasSession = func(s string) bool { return s == "fleet-"+liveID }
+	t.Cleanup(func() { tmuxHasSession = prev })
+
+	opts := &dispatchOpts{
+		taskID:          CoordTaskIDPrefix + "nottick",
+		project:         "nottick",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	derr := runDispatch(opts, &out)
+	// The fast path must NOT have fired: it would have exited 0 emitting
+	// `agent beef5678 spawned`. Instead the dispatch falls through to the
+	// (re)spawn path, which fails on the empty socket. Either way, the
+	// live coord's ID must NOT appear as a successful spawn line.
+	if derr == nil {
+		t.Fatalf("expected fall-through to respawn (which fails on empty socket), got nil — fast path wrongly fired")
+	}
+	if got := parseSpawnedAgentID(out.String()); got == liveID {
+		t.Fatalf("fast path promoted a non-ticking session (%q) — prompt-failure gate not enforced; out=%q", liveID, out.String())
 	}
 }
 
