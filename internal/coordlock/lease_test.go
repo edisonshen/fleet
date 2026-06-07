@@ -1481,3 +1481,58 @@ func TestSuccessorAcquiresAfterRelease(t *testing.T) {
 		t.Fatalf("successor epoch (%d) must advance past the released epoch (%d)", rec.Epoch, firstEpoch)
 	}
 }
+
+// ---- codex iter-13 [P2]: kill the fencing candidate even with no flock body ----
+
+// stampFlockBody is best-effort: the prior candidate may hold the flock
+// with a MISSING body stamp. Resume-takeover must still kill that candidate
+// (read from rec.Candidate), not only the flock-body holder, else the
+// takeover times out into fenced_not_acquired.
+func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// Hung candidate holds the flock — but we DO NOT stamp the flock body
+	// (simulate a best-effort stamp that never landed). holdFlock leaves
+	// the body empty.
+	const candPid = 5500
+	const candStart = int64(550000)
+	live.set(candPid, candStart)
+	relCand := holdFlock(t, project)
+
+	// Stale fencing record naming the dead OLD owner + the hung candidate.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: 9999, PidStart: 333333, AgentID: "old", Project: project},
+		Candidate:     identity{Pid: candPid, PidStart: candStart, AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: 0, // stalled
+	})
+
+	cfg := testCfg(clk, live)
+	var killedCand atomic.Bool
+	cfg.killStub = func(target identity) error {
+		if target.Pid == candPid {
+			killedCand.Store(true)
+			live.kill(candPid)
+			relCand()
+		}
+		return nil
+	}
+
+	clk.advance(31 * time.Second) // past TTL -> resumable
+
+	lease, acquired, err := acquireLease(project, "cand2", cfg)
+	if err != nil {
+		t.Fatalf("acquireLease (resume): %v", err)
+	}
+	if !killedCand.Load() {
+		t.Fatal("resume-takeover must kill the recorded fencing candidate even with no flock body")
+	}
+	if !acquired {
+		t.Fatal("after killing the candidate holding the flock the takeover must acquire")
+	}
+	defer lease.Release()
+}
