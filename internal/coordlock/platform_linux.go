@@ -11,6 +11,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// userHZ is the kernel's USER_HZ — the unit of /proc/<pid>/stat field 22
+// (starttime). The glibc sysconf(_SC_CLK_TCK) value is hardcoded to 100
+// in the Linux kernel ABI for this interface on every mainstream arch,
+// independent of the kernel's internal CONFIG_HZ. We hardcode it because
+// golang.org/x/sys/unix exposes no Sysconf on linux and fleet ships a
+// pure-Go single binary (no cgo). NOTE: pidStartNanos is only ever
+// compared for EQUALITY against another reading on the same boot (PID-
+// reuse safety), so even a wrong scale would not break correctness — but
+// 100 is the right value and keeps the ns figure meaningful.
+const userHZ = 100
+
 // platform_linux.go — linux-pinned liveness primitives for the lease.
 // See platform_darwin.go for the contract of each function; only the
 // OS mechanism differs.
@@ -24,16 +35,6 @@ import (
 //	monotonicNanos()    — raw CLOCK_MONOTONIC ns (T24).
 //	bootID()            — /proc/sys/kernel/random/boot_id (a UUID minted
 //	                      once per boot; ideal cross-boot guard for P3).
-
-// clkTck is the kernel's USER_HZ (clock ticks per second) used to scale
-// /proc/<pid>/stat field 22. SC_CLK_TCK is 100 on virtually every Linux,
-// but read it rather than hardcode.
-var clkTck = func() int64 {
-	if v, err := unix.Sysconf(unix.SC_CLK_TCK); err == nil && v > 0 {
-		return v
-	}
-	return 100
-}()
 
 // pidStartNanos returns pid's start time as nanoseconds since boot, or an
 // error if the process does not exist / cannot be inspected. The value is
@@ -69,9 +70,9 @@ func pidStartNanos(pid int) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("pidStartNanos: parse starttime for pid %d: %w", pid, err)
 	}
-	// ticks / clkTck = seconds since boot; scale to ns without losing the
-	// sub-second part: ticks * 1e9 / clkTck.
-	return ticks * 1_000_000_000 / clkTck, nil
+	// ticks / userHZ = seconds since boot; scale to ns without losing the
+	// sub-second part: ticks * 1e9 / userHZ.
+	return ticks * 1_000_000_000 / userHZ, nil
 }
 
 // monotonicNanos returns raw CLOCK_MONOTONIC nanoseconds (elapsed-only;
