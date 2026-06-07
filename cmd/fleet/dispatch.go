@@ -984,18 +984,24 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// coord still holds the lease and the successor must NOT be wrapped.
 		RecoverDeadCoord: oldRecord != nil,
 	})
-	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2, codex iter-5
-	// [P2]): the wrapped coord-run supervisor found a healthy leader
-	// already holding the coordinator lease, stood down, and archived its
-	// pre-launch record. There is NO live agent to prompt or attach.
-	// Report it as a clean "already running" outcome (exit 0) — NOT a
-	// successful spawn, and NOT a hard error. Mirrors the supervisor's own
-	// stand-down message + the dispatch veto's intent.
+	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2): the wrapped
+	// coord-run supervisor found a healthy leader already holding the
+	// coordinator lease, stood down, and archived its pre-launch record.
+	// There is NO live agent to prompt or attach.
+	//
+	// Return the SAME *vetoError the freshness veto uses (codex PR2
+	// iter-9 [P2]) so this maps to exit 75 (EX_TEMPFAIL) — the established
+	// "a coord is already running, retry/attach the live one" signal that
+	// the TUI's startCoordSpawn + `fleet attach`'s coord-spawn wrapper
+	// already classify correctly. Returning exit 0 with only an
+	// "already running" line made the TUI (which expects "agent <id>
+	// spawned" on a nil-error dispatch) report a spurious
+	// "missing agent ID line" error instead of attaching to the leader.
 	if errors.Is(err, spawn.ErrCoordStoodDown) {
-		_, _ = fmt.Fprintf(stdout,
-			"a coord is already running for %s (lease held by the live leader); did not spawn a duplicate\n",
-			opts.project)
-		return nil
+		return &vetoError{msg: fmt.Sprintf(
+			"a coord is already running for %s (coordinator lease held by the live leader); "+
+				"did not spawn a duplicate — attach to the live coord via TUI [a] or `fleet attach`",
+			opts.project)}
 	}
 	if err != nil {
 		return err
