@@ -475,6 +475,26 @@ func initGitRepo(t *testing.T, dir string) {
 	}
 }
 
+// bindRepo registers env.repoCwd as the project's checkout via
+// `fleet project add --project <p> <repoCwd>`, the same path the
+// operator runs. Under the Option C repo-binding contract
+// (DESIGN-coord-repo-binding-from-project.md) the launch cwd is NEVER
+// a resolution tier: the loop.py tick shells out to
+// `fleet project resolve-repo` which REFUSES when a project has no
+// meta.json pin and no corroborated worktrees. Tests that drive a tick
+// must therefore register the binding up front so the resolver maps
+// the project tag → repoCwd via meta.json::repo_path (tier 1), not cwd.
+//
+// Call AFTER initGitRepo for worktree-mode (cap>1) tests so the
+// registration stamps a git fingerprint; for cap=1 tests repoCwd is a
+// plain dir and registers as a non-git project, which resolve-repo
+// binds on directory existence. Either way the tick resolves a path
+// and proceeds.
+func (env *integrationEnv) bindRepo(t *testing.T) {
+	t.Helper()
+	env.runFleet(t, "project", "add", "--project", env.project, env.repoCwd)
+}
+
 // writeSentinelArchive writes one inbox/archive/<coord_id>-<stamp>.md
 // file containing the supplied sentinel line. Mirrors the path
 // fleet-guard's inbox.archive_after_deliver produces, so the coord
@@ -560,6 +580,8 @@ exit 0
 func TestCoordIntegration_HappyPath(t *testing.T) {
 	env := setupCoordIntegration(t, "happy-proj")
 	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	slug := env.addReadyTask(t, "happy-task", "Write a tiny README change for testing.")
 
@@ -724,6 +746,8 @@ func TestCoordIntegration_StandardsSeedAndSkillInstall(t *testing.T) {
 func TestCoordHandoffPreservesInflight(t *testing.T) {
 	env := setupCoordIntegration(t, "c1-proj")
 	env.plantCoord(t)
+	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Seed a task in the in-flight shape that survives handoff: status
 	// in-progress, worker_pid=test_pid (alive), branch + worktree set.
@@ -795,6 +819,7 @@ func TestParallelWorkerStatusIsolation(t *testing.T) {
 	env.plantCoord(t)
 	// Worktree-mode dispatch (cap>1) needs a real git repo at repoCwd.
 	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Two ready tasks → two dispatches in tick #1. Each task declares
 	// its own disjoint Files: scope so the v0.2.x conflict-aware
@@ -868,6 +893,7 @@ func TestCoordParallelDispatch_CreatesWorktrees(t *testing.T) {
 	env := setupCoordIntegration(t, "wt-proj")
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Disjoint Files: scopes so the conflict-aware dispatch loop
 	// dispatches both in the same tick (a no-files task would be
@@ -965,6 +991,10 @@ func TestCoordParallelDispatch_Cap1Mode_NoWorktreeCreated(t *testing.T) {
 	env := setupCoordIntegration(t, "wt-cap1")
 	env.plantCoord(t)
 	// initGitRepo NOT called — cap=1 mode never invokes git worktree.
+	// repoCwd registers as a non-git project; resolve-repo binds it on
+	// directory existence (Option C contract) so the tick still resolves
+	// a repo without a git checkout, exercising the no-git dispatch path.
+	env.bindRepo(t)
 
 	slug := env.addReadyTask(t, "cap1-task", "single-worker task.")
 
@@ -1005,6 +1035,7 @@ func TestCoordParallelDispatch_PrunesOrphanWorktrees(t *testing.T) {
 	env := setupCoordIntegration(t, "orphan-proj")
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Register an orphan worktree: real `git worktree add`, then nuke
 	// the directory. Git's registry entry survives.
@@ -1083,6 +1114,7 @@ func TestCoordParallelDispatch_SkipsOverlappingTasks(t *testing.T) {
 	env := setupCoordIntegration(t, "conflict-proj")
 	env.plantCoord(t)
 	initGitRepo(t, env.repoCwd)
+	env.bindRepo(t)
 
 	// Three ready tasks. Files: declarations encode the overlap matrix:
 	//   A ↔ B overlap on a.go; A ↔ C disjoint; B ↔ C disjoint.

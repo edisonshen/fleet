@@ -313,70 +313,59 @@ def tick(
             sys.stderr.write(diag + "\n")
             result.errors.append(diag)
         return result
-    # 1.5. Resolve worktree-base repo (fleet#175).
+    # 1.5. Resolve the coord's repo binding — single shared binder.
     #
-    # Sources, in order of authority:
+    # Design 3 (DESIGN-coord-repo-binding-from-project.md, Option C):
+    # Python computes NOTHING. The ONE authority on which checkout a
+    # project binds to lives in Go (`fleet project resolve-repo`). The
+    # tick shells out to it, read-only (NO --persist — the coord already
+    # bound at spawn; the tick only READS the binding, never re-derives
+    # + persists it on a poll-time signal), and obeys:
     #
-    #   1. meta.json::repo_path — set by `fleet project add`.
-    #      OPERATOR-AUTHORITATIVE. When present, wins outright;
-    #      URL heuristic is bypassed entirely. Custom-named clones,
-    #      forks, vanity URLs all work — operator's explicit
-    #      registration overrides any heuristic ambiguity.
+    #   fleet project resolve-repo --project <p>
+    #     env: FLEET_HOME=<home>   (test/custom-home/legacy coords MUST
+    #                               resolve against the right ~/.fleet)
+    #     timeout: bounded         (may touch git; never hang the tick)
+    #         │
+    #         ├─ exit 0   → cwd = stdout.strip()  (the bound checkout)
+    #         └─ exit !=0 → _refuse_stale: surface the binder's stderr
+    #                       hint, set a reason code, release the lock,
+    #                       skip the tick. NO cwd fallback — cwd is never
+    #                       a binding tier (the whole point of Design 3).
     #
-    #   2. coord-config.json::repo — set by Spawn from cwd at coord-
-    #      spawn time. Authoritative for projects NOT registered via
-    #      `fleet project add` (legacy / direct-spawn flows). URL
-    #      heuristic is the ONLY safety check here, so mismatch
-    #      REFUSES dispatch (custom-name operators register via
-    #      `fleet project add` to bypass; #175 corruption is
-    #      prevented).
+    # The pre-Design-3 Python tier ladder (its own meta.json read, a
+    # coord-config tier, and an os.getcwd() fallback) is DELETED: a
+    # Python fast-path that read/validated meta.json its own way would
+    # recreate the exact split-authority drift Go validates one way and
+    # Python validated another. coord-config.json::repo is now a
+    # write-only breadcrumb the Go binder stamps; the tick never reads
+    # it as a resolution authority.
     #
-    #   3. caller cwd / os.getcwd() — legacy fallback (pre-fleet#175
-    #      installs). Warning surfaced.
+    # OWNED CONSEQUENCE (Option C, design §4.1/§10, operator-approved
+    # 2026-06-06): a legacy project whose ONLY binding was
+    # coord-config.json::repo — no meta.json, no corroborating worktrees —
+    # now REFUSES this tick with an actionable hint instead of silently
+    # honoring the spawn-time breadcrumb. This is deliberate: the
+    # breadcrumb can be the #175 wrong-cwd value, so trusting it is the
+    # bug, not a feature. The operator runs `fleet project add --project
+    # <p> <path>` once (the binder's stderr hint spells out the exact
+    # command); existing projects with prior fleet worktrees self-heal via
+    # the binder's tier-2 derive. Re-adding a Python coord-config
+    # compatibility tier here would reintroduce the split-authority drift
+    # this whole PR removes — so we do NOT. (Re-stamping coord-config from
+    # the resolved repo on every coord spawn is the Go side's job, design
+    # §6 / PR3 — not the read-only tick's.)
     #
-    # ASCII (iter-19 final):
-    #
-    #   meta.json::repo_path present?
-    #     yes:
-    #       path missing on disk? → refuse (meta-repo-missing)
-    #       differs from coord-config.json::repo? → use meta.json +
-    #                                                divergence warning
-    #       matches (or coord-config absent)? → use meta.json silently
-    #     no:
-    #       coord-config.json::repo present?
-    #         path missing? → refuse (coord-config-repo-missing)
-    #         path not a git work tree? → refuse (coord-config-repo-not-git)
-    #         use as cwd; URL heuristic check:
-    #           empty origin (real git repo) → soft warning
-    #           heuristic mismatch → soft warning + recovery hint
-    #           match → silent
-    #       no → fallback to caller cwd + warning
-    #
-    # Heuristic semantics: soft signal only. Strict safety lives at
-    # the meta.json tier (operators wanting refuse-on-mismatch
-    # register via `fleet project add`). Codex flipped 5+ times on
-    # the heuristic refuse-vs-warn question — final call per
-    # feedback_coord_makes_engineering_calls + the operator's
-    # stated rubrics.
-    #
-    # Lives between lock acquire and _tick_locked so the refuse-paths
-    # release the lock cleanly via the local fcntl.flock_un dance.
-    cfg_path = project_dir / COORD_CONFIG_FILE
-    configured_repo = coord_config.read_repo(cfg_path)
-    meta_repo = coord_config.read_project_repo_path(project_dir)
+    # Lives between lock acquire and _tick_locked so the refuse-path
+    # releases the lock cleanly via the local fcntl.flock_un dance.
 
-    def _refuse_stale(source_name: str, repo_path: str, reason_code: str) -> "TickResult":
-        """Helper: refuse dispatch with a stale-path error message
-        and release the coord-spawn lock cleanly."""
-        msg = (
-            f"{source_name}={repo_path!r} for project {project!r} "
-            f"is not a directory (deleted, moved, or path typo) — "
-            f"refusing dispatch. Fix the source or re-spawn the coord "
-            f"from inside the correct checkout."
-        )
+    def _refuse_stale(reason_code: str, hint: str) -> "TickResult":
+        """Refuse dispatch with the binder's surfaced hint and release
+        the coord-spawn lock cleanly. cwd is NOT bound on refusal —
+        the binder is the only authority and it declined."""
         import sys as _sys
-        _sys.stderr.write(msg + "\n")
-        result.errors.append(msg)
+        _sys.stderr.write(hint + "\n")
+        result.errors.append(hint)
         result.skipped = True
         result.reason = reason_code
         result.raised += 1
@@ -386,132 +375,27 @@ def tick(
             os.close(lock_fd)
         return result
 
-    if meta_repo:
-        # OPERATOR-AUTHORITATIVE source. meta.json wins over everything.
-        if not os.path.isdir(meta_repo):
-            return _refuse_stale(
-                "meta.json::repo_path", meta_repo, "meta-repo-missing",
-            )
-        # If coord-config.json::repo disagrees, the coord was likely
-        # spawned from the wrong cwd (the #175 bug). Surface a clear
-        # warning + override with meta.json's authoritative value.
-        if configured_repo and configured_repo != meta_repo:
-            result.errors.append(
-                f"coord-config.json::repo={configured_repo!r} differs "
-                f"from meta.json::repo_path={meta_repo!r} for project "
-                f"{project!r} — using meta.json (operator-authoritative "
-                f"via `fleet project add`). Re-spawn the coord from "
-                f"{meta_repo!r} to silence this warning."
-            )
-        cwd = meta_repo
-    elif configured_repo:
-        # No meta.json — fall back to spawn-time pin. URL heuristic
-        # becomes the only sanity check; soft warning on mismatch
-        # because we lack an authoritative source to override.
-        if not os.path.isdir(configured_repo):
-            return _refuse_stale(
-                "coord-config.json::repo",
-                configured_repo,
-                "coord-config-repo-missing",
-            )
-        remote = coord_config.git_remote_origin(configured_repo)
-        if not remote:
-            # No origin URL. Two possibilities:
-            #   (a) Real git repo with no `origin` remote (local-only,
-            #       legit project shape).
-            #   (b) NOT a git work tree at all (e.g., $HOME, /tmp,
-            #       arbitrary dir).
-            #
-            # iter-17 (codex P1): distinguish via the existence of
-            # `<repo>/.git` (regular repo dir, or worktree git
-            # pointer file). If neither exists, refuse — accepting
-            # an arbitrary non-git directory as cwd defeats the #175
-            # safety goal (coord dispatched from $HOME could spawn
-            # workers anywhere).
-            if not os.path.exists(os.path.join(configured_repo, ".git")):
-                msg = (
-                    f"coord-config.json::repo={configured_repo!r} for "
-                    f"project {project!r} is not a git work tree (no "
-                    f".git directory or worktree pointer found). "
-                    f"Refusing dispatch to prevent worker creation in "
-                    f"a non-git directory. Re-spawn the coord from "
-                    f"inside the project's git checkout."
-                )
-                import sys as _sys
-                _sys.stderr.write(msg + "\n")
-                result.errors.append(msg)
-                result.skipped = True
-                result.reason = "coord-config-repo-not-git"
-                result.raised += 1
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(lock_fd)
-                return result
-            # Real git repo with no origin — local-only is supported.
-            result.errors.append(
-                f"coord-config.json::repo={configured_repo!r} for "
-                f"project {project!r} has no `origin` remote — "
-                f"skipping repo↔project validation. (Local-only "
-                f"checkouts are supported; set an origin remote OR "
-                f"run `fleet project add {configured_repo}` to "
-                f"register an authoritative path.)"
-            )
-        elif not coord_config.remote_matches_project(remote, project):
-            # Mismatch in the no-meta.json branch is a SOFT WARNING.
-            #
-            # Iter-history on this question: codex flipped between
-            # refuse-on-mismatch (iter-4/6/8/11 P1, "prevents #175
-            # corruption") and warn-only (iter-2/3/16/18 P1, "refuse
-            # breaks legitimate custom-aliased projects and
-            # custom-named clones that have no working `fleet project
-            # add` recovery path"). Both are real concerns.
-            #
-            # Final call (iter-19, codex contradiction resolved per
-            # CLAUDE.md §4 + feedback_coord_makes_engineering_calls):
-            # warn-but-proceed. The configured `repo` field is what
-            # the operator stamped at coord-spawn time; refusing to
-            # honor it on a fuzzy name-match would defeat the
-            # operator's explicit choice. The heuristic remains as
-            # a SIGNAL — operator sees the warning and can investigate
-            # — but it is NOT a gate.
-            #
-            # Strict safety (refuse on mismatch) lives at the
-            # meta.json tier: operators wanting the strict check
-            # run `fleet project add <path>` and meta.json wins over
-            # coord-config + the heuristic doesn't apply. This is the
-            # documented "use meta.json for safety" tiered authority
-            # introduced in iter-7.
-            #
-            # Real risk acknowledged: legacy/no-meta.json projects with
-            # a wrong coord-config.json::repo silently dispatch from
-            # the wrong checkout. Recovery: warning in TickResult.errors
-            # surfaces the signal; operator can detect via tick output
-            # and run `fleet project add` to register meta.json (which
-            # then takes over and refuses if the configured repo is
-            # truly wrong).
-            result.errors.append(
-                f"coord-config.json::repo={configured_repo!r} "
-                f"(origin={remote!r}) does not match the heuristic "
-                f"for project {project!r}. Proceeding because the "
-                f"`repo` field is the operator-stamped spawn-time "
-                f"value; if the configured checkout is wrong, fix "
-                f"coord-config.json or re-spawn from the correct "
-                f"directory. For strict validation, register via "
-                f"`fleet project add {configured_repo}` to write "
-                f"meta.json::repo_path (the authoritative tier)."
-            )
-        cwd = configured_repo
-    else:
-        # Neither meta.json nor coord-config.json::repo — pre-#175
-        # install. Fall through to legacy caller-cwd behavior with a
-        # warning so the operator knows to re-spawn.
-        result.errors.append(
-            f"coord-config.json::repo not set for {project!r}; "
-            f"falling back to caller cwd={cwd!r}. Re-spawn the coord "
-            f"from inside the project's git checkout, or set the field "
-            f"manually."
+    # The resolver runs AFTER the coordinator lock is acquired but BEFORE
+    # _tick_locked's try/finally. Its expected failures already come back
+    # as (None, hint) and refuse cleanly via _refuse_stale (which releases
+    # the lock). But an UNEXPECTED exception (a future resolver bug, a
+    # UnicodeDecodeError from text=True on garbage binder output, etc.)
+    # would otherwise propagate past _refuse_stale and leak the held lock
+    # — wedging every future tick on this project. Catch broadly here and
+    # convert to a refused tick so the lock is always released.
+    try:
+        resolved_repo, resolve_hint = _resolve_repo_fn(
+            project, home=home, fleet_bin=fleet_bin, cwd=cwd,
         )
+    except Exception as exc:  # noqa: BLE001 — must release the lock on ANY failure
+        return _refuse_stale(
+            "repo-unresolved",
+            f"repo resolve-repo for project {project!r} raised an "
+            f"unexpected error ({exc!r}) — refusing dispatch.",
+        )
+    if resolved_repo is None:
+        return _refuse_stale("repo-unresolved", resolve_hint)
+    cwd = resolved_repo
     # Load per-project parallelism config (cap>1 → worktree mode).
     # Caller-provided cap overrides only when it differs from
     # DEFAULT_CAP — that way tests can pin cap=2 explicitly while
@@ -5548,10 +5432,12 @@ def _reconcile_pr_watches(
             and not pr_watch_mod.watch_path(project_dir).exists():
         return
 
-    # Repo path: meta.json repo_path is authoritative (operator-set via
-    # `fleet project add`); fall back to the spawn cwd. Mirrors the
-    # worktree-base derivation in tick (#175).
-    repo_path = coord_config.read_project_repo_path(project_dir) or cwd
+    # Repo path: `cwd` is already the binder-resolved checkout (tick()
+    # set it via `fleet project resolve-repo` before calling into here).
+    # Python no longer reads meta.json on its own — that would recreate
+    # the split-authority drift Design 3 kills. Use the resolved cwd
+    # directly.
+    repo_path = cwd
     coord_owner_repo = pr_watch_mod.derive_owner_repo(repo_path)
 
     prober = _pr_watch_prober or pr_watch_mod.GhGitProber()
@@ -7399,6 +7285,99 @@ def _run_fleet(cmd: list[str], timeout_s: float = 30.0) -> None:
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"{' '.join(cmd)}: {msg or f'exit {proc.returncode}'}")
+
+
+# Bounded subprocess timeout for the read-only repo-binding resolve. The
+# binder may touch git (rev-list, remote get-url), so it is bounded the
+# same way coord_config.git_remote_origin's 5s git shell-out is — long
+# enough for a cold git invocation, short enough that a hung binder never
+# wedges the tick.
+_RESOLVE_REPO_TIMEOUT_S = 10.0
+
+
+def _resolve_repo_via_binder(
+    project: str, *, home: Path, fleet_bin: str = "fleet", cwd: str | None = None,
+) -> tuple[str | None, str]:
+    """Resolve the coord's repo binding via the single Go binder.
+
+    Shells out to `fleet project resolve-repo --project <p>` (READ-ONLY —
+    no --persist; routine ticks never mutate authoritative meta.json) and
+    returns ``(resolved_path, "")`` on success, or ``(None, hint)`` on any
+    refusal/error so the caller can refuse the tick (same shape as the
+    legacy _refuse_stale path).
+
+    FLEET_HOME is propagated from the tick's `home` arg into the
+    subprocess env — without it a custom-home / test / legacy coord would
+    resolve against the wrong ~/.fleet. A bounded timeout guards against a
+    hung binder.
+
+      ok        → (stdout.strip(), "")
+      rc != 0   → (None, stderr-hint)         # the binder's §7.1 hint
+      timeout   → (None, timeout-hint)        # refuse rather than hang
+      no binary → (None, not-found-hint)
+
+    The `cwd` arg is accepted ONLY so the `_resolve_repo_fn` test seam can
+    share this signature and echo cwd in unit tests of unrelated tick
+    behavior. PRODUCTION IGNORES IT — cwd is never a binding tier
+    (DESIGN-coord-repo-binding-from-project.md §4). The single authority
+    is the Go binder.
+    """
+    del cwd  # production never reads cwd; see docstring.
+    env = dict(os.environ)
+    env["FLEET_HOME"] = str(home)
+    cmd = [fleet_bin, "project", "resolve-repo", "--project", project]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_RESOLVE_REPO_TIMEOUT_S,
+            check=False,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return None, (
+            f"repo resolve-repo for project {project!r} timed out after "
+            f"{_RESOLVE_REPO_TIMEOUT_S:g}s — refusing dispatch (cwd is "
+            f"never a binding tier). Check the project's git checkout."
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return None, (
+            f"repo resolve-repo for project {project!r} could not run "
+            f"({exc}) — refusing dispatch. Ensure `{fleet_bin}` is on PATH."
+        )
+    if proc.returncode != 0:
+        hint = (proc.stderr or proc.stdout or "").strip()
+        if not hint:
+            hint = (
+                f"repo resolve-repo for project {project!r} failed "
+                f"(exit {proc.returncode}) — refusing dispatch."
+            )
+        return None, hint
+    # LOSSLESS parse: the binder emits exactly `<path>\n` (Go Fprintln,
+    # cmd/fleet/project.go). Strip ONLY the single trailing line
+    # terminator — NOT arbitrary whitespace via .strip() — because a
+    # POSIX checkout path can legitimately contain leading/trailing
+    # spaces. `.strip()` would map `/tmp/repo ` → `/tmp/repo`, silently
+    # rebinding the coord to a different sibling checkout if it exists.
+    raw = proc.stdout or ""
+    path = raw[:-1] if raw.endswith("\n") else raw
+    if path.endswith("\r"):  # tolerate CRLF on the off chance
+        path = path[:-1]
+    if not path:
+        return None, (
+            f"repo resolve-repo for project {project!r} returned an empty "
+            f"path (exit 0) — refusing dispatch."
+        )
+    return path, ""
+
+
+# Test seam: tick() calls the resolver through this indirection so the
+# coordinator test suite (conftest autouse) can substitute a stub that
+# echoes the test-supplied cwd, instead of every unrelated tick test
+# having to stand up a real `fleet project resolve-repo` binder + meta.json.
+# PRODUCTION binds it to the real Go-binder shell-out below.
+_resolve_repo_fn = _resolve_repo_via_binder
 
 
 # ---------- entry point for SKILL.md invocation ----------
