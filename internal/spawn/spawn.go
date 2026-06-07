@@ -1025,25 +1025,37 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// resolveEnginePid blocks up to pidResolveTimeout; on timeout it
 	// returns the pane pid as a best-effort fallback (wrong-but-live
 	// beats os.Getpid which is dead by construction).
-	disambiguator := pidResolveDisambiguator(id, execArgv)
-	engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
-	resolvedPid, _, resolveErr := resolveEnginePid(
-		session, disambiguator, engineHint,
-		pidResolveTimeout(),
-		productionResolveDeps(),
-	)
-	if resolveErr != nil {
-		// Pane pid unreachable — log a warning to stderr but DO NOT
-		// fail the spawn. The agent record will still go to disk with
-		// PID=os.Getpid (the pre-fix shape); operators can re-resolve
-		// via fleet-guard heartbeat once the agent boots and the
-		// Stop hook fires. Aborting here would orphan a live tmux
-		// session for a transient tmux probe blip.
-		_, _ = fmt.Fprintf(os.Stderr,
-			"warning: resolve engine pid for %s failed: %v (recording fleet binary pid as fallback)\n",
-			session, resolveErr)
-	} else if resolvedPid > 0 {
-		rec.PID = resolvedPid
+	// WARM STANDBY (PR3): the wrapped `coord-run --standby` supervisor does
+	// NOT launch the engine child until it acquires the lease (after the old
+	// leader exits). So the pane's process tree contains ONLY the supervisor
+	// right now — running the engine-pid resolver would block the full timeout
+	// and then fall back to the pane/supervisor pid, corrupting the
+	// PID==engine vs SupervisorPID==lease-holder split (codex PR3 iter-12
+	// [P2]). Skip it: leave rec.PID provisional; the supervisor stamps the
+	// real engine pid after it acquires + starts the engine (via the
+	// fleet-guard heartbeat / supervisor identity stamp). Non-standby spawns
+	// resolve immediately as before.
+	if !opts.Standby {
+		disambiguator := pidResolveDisambiguator(id, execArgv)
+		engineHint := pidResolveEngineHint(rec.Engine, opts.OldRecord, opts.Command)
+		resolvedPid, _, resolveErr := resolveEnginePid(
+			session, disambiguator, engineHint,
+			pidResolveTimeout(),
+			productionResolveDeps(),
+		)
+		if resolveErr != nil {
+			// Pane pid unreachable — log a warning to stderr but DO NOT
+			// fail the spawn. The agent record will still go to disk with
+			// PID=os.Getpid (the pre-fix shape); operators can re-resolve
+			// via fleet-guard heartbeat once the agent boots and the
+			// Stop hook fires. Aborting here would orphan a live tmux
+			// session for a transient tmux probe blip.
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: resolve engine pid for %s failed: %v (recording fleet binary pid as fallback)\n",
+				session, resolveErr)
+		} else if resolvedPid > 0 {
+			rec.PID = resolvedPid
+		}
 	}
 
 	// Merge back supervisor identity the coord-run process may have

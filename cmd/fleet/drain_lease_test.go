@@ -110,8 +110,11 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return true },
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
-		BarrierExists: func(string, int64) bool { return false },
-		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil }, // OLD still live
+		BarrierExists: func(string, int64) bool { return false }, // graceful producer never ran
+		// OLD stays the active owner so the poll doesn't early-break — it polls
+		// the (absent) barrier to the budget, then falls back to legacy Resume.
+		ActiveOwnerPID: func(string) (int, bool) { return 424242, true },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil }, // OLD still live
 		LockAgent: func(string) (func(), error) {
 			atomic.AddInt32(&locked, 1)
 			return func() {}, nil
@@ -120,8 +123,10 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 			atomic.AddInt32(&resumed, 1)
 			return nil
 		},
+		BarrierPoll: time.Millisecond,
 	}
-	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+	// small budget so the no-barrier poll converges fast before the fallback.
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 10, out, out, d); err != nil {
 		t.Fatalf("fallback resume returned %v, want nil", err)
 	}
 	if atomic.LoadInt32(&resumed) != 1 {
@@ -129,6 +134,39 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 	}
 	if atomic.LoadInt32(&locked) != 1 {
 		t.Errorf("fallback Resume took the per-agent lock %d times, want 1", locked)
+	}
+}
+
+// codex PR3 iter-12 [P2]: live leader + no barrier yet, but a GracefulHandoff
+// producer writes the barrier mid-poll — the drain must finish the GRACEFUL
+// path (wait for OLD's self-release), NOT spawn a second successor via legacy
+// Resume.
+func TestDrainLease_LiveLeaderBarrierAppearsMidPoll_NoDuplicateResume(t *testing.T) {
+	var resumed, barrierReads int32
+	out := &bytes.Buffer{}
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return true },
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool {
+			// Barrier appears on the 2nd poll (the producer just wrote it).
+			return atomic.AddInt32(&barrierReads, 1) >= 2
+		},
+		// After the barrier, OLD releases (active owner flips away) so the
+		// graceful self-release wait completes.
+		ActiveOwnerPID: func(string) (int, bool) { return 0, false },
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		LockAgent:   func(string) (func(), error) { return func() {}, nil },
+		BarrierPoll: time.Millisecond,
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), existingQueuePath(t), 0, 1000, out, out, d); err != nil {
+		t.Fatalf("graceful-mid-poll path returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&resumed) != 0 {
+		t.Errorf("legacy Resume ran %d times — barrier appeared, should have finished graceful path (no duplicate)", resumed)
 	}
 }
 

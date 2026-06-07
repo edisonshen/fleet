@@ -272,15 +272,15 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		//   - OLD already archived -> the handoff already completed; the queue
 		//     file is a stale leftover. STAND DOWN (clean the queue, spawn
 		//     nothing). This is the true "nothing to drain" case (T13).
-		//   - OLD still live -> a handoff was requested (the queue file exists)
-		//     but the in-process GRACEFUL producer (GracefulHandoff) has not
-		//     run to write the barrier. We must still COMPLETE the handoff
-		//     rather than strand the queue forever: fall back to the LEGACY
-		//     Resume path (the proven spawn+retire flow), under a short
-		//     per-agent lock. (When the graceful producer is the trigger — the
-		//     flag-flip is PR4 — the barrier case above handles it lock-free;
-		//     until then this fallback keeps failover-on handoffs working.)
-		return drainLiveLeaderFallback(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
+		//   - OLD still live -> a handoff was requested (the queue file exists).
+		//     The in-process GRACEFUL producer (GracefulHandoff) may have
+		//     spawned a standby and be about to write the barrier, so we POLL
+		//     (bounded) for the barrier FIRST (codex PR3 iter-12 [P2]) — racing
+		//     straight to legacy Resume here would spawn a SECOND successor
+		//     while the standby is already polling. Only if no barrier appears
+		//     within the budget (no graceful producer ran) do we fall back to
+		//     the proven legacy Resume to complete the handoff.
+		return drainLiveLeaderFallback(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 
 	case !hasEpoch:
 		// COLD recovery: failover is on but there is NO lease epoch for this
@@ -541,8 +541,8 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 // barrier yet, so complete the handoff via the LEGACY Resume path under a
 // short per-agent lock (codex PR3 iter-5 [P1]) rather than stranding the
 // queue. coldResume provides the locked Resume.
-func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
-	stdout, stderr io.Writer, d drainLeaseDeps) error {
+func drainLiveLeaderFallback(req queue.SpawnFresh, path string, deadline time.Time,
+	graceMillis, resumeTimeoutMillis int, stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	oldRec, err := d.LoadAgent(req.OldAgentID)
 	if errors.Is(err, state.ErrNotFound) {
@@ -551,6 +551,30 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, res
 			"fleet drain: coord live for %s and %s already retired; cleaning stale queue\n",
 			req.Project, req.OldAgentID)
 		return queue.Delete(path)
+	}
+
+	// POLL (bounded) for the graceful barrier before falling back (codex PR3
+	// iter-12 [P2]): a GracefulHandoff producer may have spawned a standby and
+	// be about to write handoff-complete-<epoch>.json. If it appears, finish the
+	// graceful path (which never spawns a second successor). Only on timeout do
+	// we fall back to legacy Resume.
+	for time.Now().Before(deadline) {
+		if epoch, ok := d.CurrentEpoch(req.Project); ok && d.BarrierExists(req.Project, epoch) {
+			return drainGraceful(req, path, epoch, deadline, stdout, stderr, d)
+		}
+		// Also bail early if a successor already took over (active owner != OLD).
+		if oldRec != nil && oldRec.SupervisorPID > 0 {
+			if op, ok := d.ActiveOwnerPID(req.Project); ok && op != oldRec.SupervisorPID {
+				break
+			}
+		}
+		wait := d.BarrierPoll
+		if rem := time.Until(deadline); rem < wait {
+			wait = rem
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
 	}
 	// A SUCCESSOR already leads (codex PR3 iter-6 [P2]): if the current active
 	// lease owner is NOT OLD's supervisor, a graceful standby has already
