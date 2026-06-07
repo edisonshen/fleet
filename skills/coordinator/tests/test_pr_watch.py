@@ -1488,7 +1488,8 @@ def _changes_snap(n, head="HEAD1"):
 
 def _run2(tasks, project_dir, prober, *, dispatch=None, agent_outcome=None,
           deps_done=None, owner_repo=OWNER_REPO, now="2026-06-03T08:00:00Z",
-          tick_count=1, slow=5, flips=None, enroll=None, release=None):
+          tick_count=1, slow=5, flips=None, enroll=None, release=None,
+          agent_conflicts=None):
     """reconcile_watches WITH the PR2 auto-fix seam wired."""
     def _flip(slug, pr_url=""):
         if flips is not None:
@@ -1503,6 +1504,7 @@ def _run2(tasks, project_dir, prober, *, dispatch=None, agent_outcome=None,
         agent_outcome=agent_outcome or (lambda _aid: "running"),
         deps_done=deps_done or (lambda _deps: True),
         release_action=release,
+        agent_conflicts=agent_conflicts,
     )
 
 
@@ -2668,3 +2670,574 @@ def test_raise_only_event_skips_supervisor_e2e(
     assert any("CLOSED" in e for e in result.errors)
     # ...and the supervisor was NOT entered (alert flushes immediately).
     assert sup_called["n"] == 0
+
+
+# ===========================================================================
+# DESIGN-pr-watch-autoremediate — continuous auto-remediation
+# (two-bound state machine, conflict ladder, human-approval guard, poll floor)
+# ===========================================================================
+
+
+def _dirty_snap(n, head="HEAD1", *, human_approved=False, conflicted=None,
+                checks="SUCCESS", failing=()):
+    """OPEN, mergeStateStatus DIRTY -> EVENT_DIRTY (merge conflict)."""
+    return pw.PRSnapshot(
+        number=n, pr_state="OPEN", merge_state_status="DIRTY",
+        review_decision="", checks=checks, head_ref_oid=head,
+        base_ref_name="main", human_approved=human_approved,
+        failing_checks=tuple(failing),
+    )
+
+
+def _ci_named_snap(n, head="HEAD1", *, failing=("test",)):
+    """A CI_FAILED snapshot carrying named failing checks (frontier)."""
+    return pw.PRSnapshot(
+        number=n, pr_state="OPEN", merge_state_status="UNSTABLE",
+        review_decision="", checks="FAILURE", head_ref_oid=head,
+        base_ref_name="main", failing_checks=tuple(failing),
+    )
+
+
+def _ready_snap(n, head="HEAD1"):
+    """Up-to-date + green + no review pending -> EVENT_READY (needs the
+    ancestor to read True, set up by the caller's prober)."""
+    return pw.PRSnapshot(
+        number=n, pr_state="OPEN", merge_state_status="CLEAN",
+        review_decision="", checks="SUCCESS", head_ref_oid=head,
+        base_ref_name="main",
+    )
+
+
+# --- §2.1 bound 1: per-signature attempts -----------------------------------
+
+
+def test_per_signature_bound_same_head_same_wall(tmp_path: Path) -> None:
+    """Same head + same failing-check set, fixer keeps failing -> exactly
+    max_attempts dispatches then one budget-exhausted raise; the (N+1)th is
+    never emitted."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "3"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"  # isolate bound 1
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        snaps = {195: _ci_named_snap(195, head="H1", failing=("unit",))}
+        disp = _DispatchRecorder()
+        total = 0
+        raised = 0
+        # Space ticks past the lease launch-grace (3) so a dead agent is
+        # genuinely reclaimed each pass (lease cleared, attempts NOT reset).
+        for tick in (1, 10, 20, 30, 40, 50):
+            out = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                        ancestors={("B", "H1")}), dispatch=disp,
+                        agent_outcome=lambda _a: "gone", tick_count=tick)
+            total += out.dispatched
+            raised += sum(1 for r in out.raises if "budget exhausted" in r)
+        assert total == 3, f"expected 3 dispatches, got {total}"
+        assert raised == 1, f"expected 1 budget-exhausted raise, got {raised}"
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["remediation"]["escalated"] is True
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_different_failing_set_resets_attempts(tmp_path: Path) -> None:
+    """A DIFFERENT failing-check set on the same head -> new signature ->
+    attempts resets, dispatch resumes (progress not penalized)."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "2"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # 2 attempts on {unit} -> hits bound.
+        for tick in range(1, 4):
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head="H1", failing=("unit",))},
+                fresh_base="B", ancestors={("B", "H1")}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=tick)
+        n_after_unit = len(disp.calls)
+        # NEW failing set {lint} on SAME head -> new signature -> resumes.
+        out = _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ci_named_snap(195, head="H1", failing=("lint",))},
+            fresh_base="B", ancestors={("B", "H1")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=10)
+        assert out.dispatched == 1, "new signature should re-enable dispatch"
+        assert len(disp.calls) == n_after_unit + 1
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+# --- §2.1 bound 2: per-series (head moves every time — convergent P1) -------
+
+
+def test_per_series_bound_head_moves_each_time(tmp_path: Path) -> None:
+    """A fixer that PUSHES a new head each pass but whose CI stays red with
+    the SAME failing frontier -> attempts resets each push BUT series climbs
+    -> escalates at max_series; total dispatches == max_series (NOT
+    unbounded). This is the case a single per-signature bound misses."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"  # isolate bound 2
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "4"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        total = 0
+        raised = 0
+        for tick in range(1, 10):
+            head = f"H{tick}"  # new head every pass (fixer pushed)
+            out = _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=("unit",))},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=tick)
+            total += out.dispatched
+            raised += sum(1 for r in out.raises if "budget exhausted" in r)
+        assert total == 4, f"series must cap at max_series=4, got {total}"
+        assert raised == 1
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_series_resets_on_real_progress(tmp_path: Path) -> None:
+    """A fixer whose pushes shrink the failing set (3->2->1) -> series resets
+    at each shrink, loop keeps going past max_series total dispatches."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "2"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # shrinking frontier each pass on a fresh head.
+        frontiers = [("a", "b", "c"), ("a", "b"), ("a",), ("a",)]
+        total = 0
+        for i, fail in enumerate(frontiers, start=1):
+            head = f"H{i}"
+            out = _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=fail)},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=i)
+            total += out.dispatched
+        # each shrink reset the series, so > max_series total dispatches and
+        # no escalation yet (the last two were the same {a} frontier -> 1 more).
+        assert total >= 3, f"progress should keep the loop going, got {total}"
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_ready_resets_series(tmp_path: Path) -> None:
+    """A remediation that reaches READY -> Pass A resets series/escalated; a
+    SUBSEQUENT independent failure starts from a fresh budget (no early trip)."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "3"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # 2 failing dispatches (series=2), same frontier, head moves.
+        for i in range(1, 3):
+            head = f"H{i}"
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=("x",))},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=i)
+        # Now READY (green, up-to-date).
+        _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ready_snap(195, head="HR")},
+            fresh_base="B", ancestors={("B", "HR")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=5)
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["remediation"]["series_dispatches"] == 0
+        assert w["remediation"]["escalated"] is False
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_best_signal_monotone_vs_flake(tmp_path: Path) -> None:
+    """A permanent-fail check A + a flapping check B -> best_signal latches to
+    {A} after B first clears; B re-failing does NOT raise the running minimum,
+    so the series is NOT reset on each B-clears -> bounded at max_series."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "3"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # frontiers: {A,B} -> {A} -> {A,B} -> {A} -> ... B flaps; A permanent.
+        seq = [("A", "B"), ("A",), ("A", "B"), ("A",), ("A", "B"), ("A",)]
+        total = 0
+        raised = 0
+        for i, fail in enumerate(seq, start=1):
+            head = f"H{i}"
+            out = _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=fail)},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=i)
+            total += out.dispatched
+            raised += sum(1 for r in out.raises if "budget exhausted" in r)
+        # best_signal latches to {A} (first shrink), then never shrinks again
+        # -> series climbs to the bound. The single shrink {A,B}->{A} resets
+        # once; thereafter bounded. So escalation MUST fire.
+        assert raised >= 1, "flake must not infinitely reset the series"
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+# --- §2.2 conflict ladder ----------------------------------------------------
+
+
+def test_dirty_first_time_dispatches_rebase(tmp_path: Path) -> None:
+    """A first-time DIRTY (conflict) -> step 1 is a clean rebase, not a
+    re-derive (re-derive only after the rebase reports a conflict)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _dirty_snap(195, head="H1")}
+    disp = _DispatchRecorder()
+    out = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                ancestors=set()), dispatch=disp)
+    assert out.dispatched == 1
+    assert disp.calls[0].kind == pw.ACTION_REBASE
+
+
+def test_rebase_conflict_nonterminal_advances_to_rederive(tmp_path: Path) -> None:
+    """DIRTY whose rebase CONFLICTS -> subagent reports
+    rebase_conflicted_needs_rederive (NOT blocked); the next pass dispatches
+    a RE-DERIVE step (regression: a conflict must NOT terminally block)."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _dirty_snap(195, head="H1")}
+    disp = _DispatchRecorder()
+    # tick 1: rebase dispatched.
+    out1 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                 ancestors=set()), dispatch=disp,
+                 agent_outcome=lambda _a: "running", tick_count=1)
+    assert disp.calls[0].kind == pw.ACTION_REBASE
+    # tick 2: rebase reported conflict + conflicted paths -> reclaim records
+    # nonterminal outcome; SAME head so the ladder advances to re-derive.
+    out2 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                 ancestors=set()), dispatch=disp,
+                 agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+                 agent_conflicts=lambda _a: ["cli.py"], tick_count=2)
+    rederives = [c for c in disp.calls if c.kind == pw.ACTION_REDERIVE]
+    assert len(rederives) == 1, "rebase conflict must advance to re-derive"
+    assert "cli.py" in rederives[0].conflicted_paths
+
+
+def test_human_approved_conflict_escalates_no_rederive(tmp_path: Path) -> None:
+    """A DIRTY PR with a non-bot APPROVED review whose rebase conflicts ->
+    conflict path ESCALATES (raise-hand), re-derive is NOT dispatched; the
+    reviewed diff is never silently replaced."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _dirty_snap(195, head="H1", human_approved=True)}
+    disp = _DispatchRecorder()
+    # tick 1: rebase (clean rebase of an approved PR is allowed).
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    # tick 2: rebase conflicted -> but PR is human-approved -> ESCALATE,
+    # NO re-derive.
+    out2 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                 ancestors=set()), dispatch=disp,
+                 agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+                 agent_conflicts=lambda _a: ["cli.py"], tick_count=2)
+    assert not any(c.kind == pw.ACTION_REDERIVE for c in disp.calls)
+    assert any("human APPROVED" in r for r in out2.raises)
+
+
+# --- approval detection / clean rebase reviewers ----------------------------
+
+
+def test_reviews_summary_non_bot_approved_is_human() -> None:
+    nodes = {"nodes": [
+        {"state": "APPROVED", "author": {"login": "edisonshen",
+         "__typename": "User"}, "submittedAt": "2026-06-05T00:00:00Z"},
+    ]}
+    approved, sig = pw._reviews_summary(nodes)
+    assert approved is True
+    assert "edisonshen:APPROVED" in sig
+
+
+def test_reviews_summary_bot_approved_not_human() -> None:
+    nodes = {"nodes": [
+        {"state": "APPROVED", "author": {"login": "github-actions",
+         "__typename": "Bot"}, "submittedAt": "2026-06-05T00:00:00Z"},
+    ]}
+    approved, _sig = pw._reviews_summary(nodes)
+    assert approved is False
+
+
+def test_reviews_summary_unknown_author_defaults_human() -> None:
+    # Missing/unknown typename -> NOT a bot -> approval counts (over-detect).
+    nodes = {"nodes": [{"state": "APPROVED", "author": {"login": "x"}}]}
+    approved, _ = pw._reviews_summary(nodes)
+    assert approved is True
+
+
+def test_human_approved_detected_without_reviewdecision(tmp_path: Path) -> None:
+    """A DIRTY PR on a repo WITHOUT required reviewers (reviewDecision null)
+    but with a human APPROVED review -> human_approved True on the snapshot,
+    so the conflict path escalates rather than re-deriving."""
+    snap = _dirty_snap(195, head="H1", human_approved=True)
+    assert snap.human_approved is True
+    # reviewDecision is empty (null) — detection must not depend on it.
+    assert snap.review_decision == ""
+
+
+# --- §2.1 stable detail_key / frontier helpers ------------------------------
+
+
+def test_failing_check_names_uses_stable_names() -> None:
+    rollup = [
+        {"__typename": "CheckRun", "name": "unit", "conclusion": "FAILURE"},
+        {"__typename": "CheckRun", "name": "lint", "conclusion": "TIMED_OUT"},
+        {"__typename": "CheckRun", "name": "build", "conclusion": "SUCCESS"},
+    ]
+    names = pw._failing_check_names(rollup)
+    assert names == ("lint", "unit")  # sorted, only failing, by NAME
+
+
+def test_detail_key_flake_does_not_churn() -> None:
+    # FAILURE vs TIMED_OUT on the SAME job name -> same failing-name set.
+    s1 = _ci_named_snap(195, failing=("unit",))
+    s2 = _ci_named_snap(195, failing=("unit",))
+    rem = pw._new_remediation()
+    k1 = pw._detail_key(pw.EVENT_CI_FAILED, vars(s1) if False else
+                        {"failing_checks": s1.failing_checks}, rem)
+    k2 = pw._detail_key(pw.EVENT_CI_FAILED,
+                        {"failing_checks": s2.failing_checks}, rem)
+    assert k1 == k2 == "unit"
+
+
+def test_frontier_dirty_unknown_sentinel() -> None:
+    # A freshly-detected DIRTY (no conflicted paths) -> UNKNOWN, not clean.
+    f = pw._frontier(pw.EVENT_DIRTY, {})
+    assert f == pw._FRONTIER_UNKNOWN
+    # never a strict-shrink target.
+    assert pw._frontier_strictly_shrinks("a", pw._FRONTIER_UNKNOWN) is False
+    # UNKNOWN -> concrete path set is NOT a shrink (re-baseline, not progress).
+    assert pw._frontier_strictly_shrinks(pw._FRONTIER_UNKNOWN, "a,b") is False
+
+
+def test_frontier_strict_subset_shrinks() -> None:
+    assert pw._frontier_strictly_shrinks("a", "a,b") is True
+    assert pw._frontier_strictly_shrinks("", "a") is True  # all cleared
+    assert pw._frontier_strictly_shrinks("a,b", "a") is False  # grew
+    assert pw._frontier_strictly_shrinks("c", "a,b") is False  # disjoint
+
+
+# --- §3 budget-exhausted raise suppressed while a fixer is in flight --------
+
+
+def test_budget_raise_suppressed_while_running(tmp_path: Path) -> None:
+    """attempts at the bound but a RUNNING lease exists -> ZERO raises until
+    the lease resolves (running-lease guard precedes the bound raise)."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "1"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        snaps = {195: _ci_named_snap(195, head="H1", failing=("unit",))}
+        disp = _DispatchRecorder()
+        # tick 1: 1 dispatch (attempts hits max=1), lease running.
+        _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+              ancestors={("B", "H1")}), dispatch=disp,
+              agent_outcome=lambda _a: "running", tick_count=1)
+        # tick 2: lease STILL running -> running-lease guard fires BEFORE the
+        # bound raise -> no raise.
+        out2 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                     ancestors={("B", "H1")}), dispatch=disp,
+                     agent_outcome=lambda _a: "running", tick_count=2)
+        assert not any("budget exhausted" in r for r in out2.raises)
+        # tick 3: lease resolves dead (head unchanged) -> now the bound raise
+        # fires.
+        out3 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                     ancestors={("B", "H1")}), dispatch=disp,
+                     agent_outcome=lambda _a: "gone", tick_count=10)
+        assert any("budget exhausted" in r for r in out3.raises)
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+# --- dead fixer counts against both bounds ----------------------------------
+
+
+def test_dead_fixer_counts_against_bounds(tmp_path: Path) -> None:
+    """A dead fixer (reclaim clears the lease) does NOT reset attempts/series
+    — a crash-looping fixer still converges on the bounds."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "2"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        snaps = {195: _ci_named_snap(195, head="H1", failing=("unit",))}
+        disp = _DispatchRecorder()
+        total = 0
+        # Space past the launch-grace so each dead agent is reclaimed.
+        for tick in (1, 10, 20, 30, 40):
+            out = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                        ancestors={("B", "H1")}), dispatch=disp,
+                        agent_outcome=lambda _a: "gone", tick_count=tick)
+            total += out.dispatched
+        assert total == 2, "dead fixer must still count toward the bound"
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+# --- §2.2/§2.3/§2.4 prompt builders -----------------------------------------
+
+
+def test_rederive_prompt_has_safety_rails() -> None:
+    """The re-derive prompt spells out the load-bearing guards: spec gate,
+    approval TOCTOU re-check, no conflict-marker munging, full gates +
+    codex/review, --force-with-lease only, worktree cleanup."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_REDERIVE, event=pw.EVENT_DIRTY, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="B", key="k",
+        task_slugs=("a",), conflicted_paths=("cli.py",),
+        attempt=2, max_attempts=3, series=2, max_series=6,
+    )
+    p = dispatch_mod.build_rederive_prompt(act, standards_md="S")
+    assert "SPEC GATE" in p
+    assert "APPROVAL RE-CHECK" in p          # TOCTOU
+    assert "--theirs/--ours" in p            # forbidden move named
+    assert "force-with-lease" in p
+    assert "NEVER plain --force" in p
+    assert "worktree remove" in p            # cleanup
+    assert "cli.py" in p                      # conflicted-path hint
+    assert "attempt 2/3" in p                 # bound note
+
+
+def test_rebase_prompt_conflict_is_nonterminal_and_reviews() -> None:
+    """The rebase prompt now reports rebase_conflicted_needs_rederive (NOT
+    blocked) on conflict, and runs codex/review even for a clean rebase."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_REBASE, event=pw.EVENT_DIRTY, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="B", key="k",
+        attempt=1, max_attempts=3, series=1, max_series=6,
+    )
+    p = dispatch_mod.build_rebase_prompt(act, standards_md="S")
+    assert "rebase_conflicted_needs_rederive" in p
+    assert "do NOT set" in p.lower() or "do not set" in p.lower()
+    assert "/codex review" in p and "/review" in p   # reviewers on clean rebase
+    assert "attempt 1/3" in p
+
+
+def test_fix_prompt_blocked_vs_clean_exit() -> None:
+    """The fix prompt distinguishes BLOCKED (definitive, one attempt) from a
+    clean exit without push (bounded retry)."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_FIX, event=pw.EVENT_CI_FAILED, pr_number=195,
+        pr_url=_pr_url(195), branch="worker/a", base="main",
+        head_sha="H1", base_sha="", key="k",
+        attempt=1, max_attempts=3, series=1, max_series=6,
+    )
+    p = dispatch_mod.build_fix_prompt(act, standards_md="S")
+    assert "BLOCKED vs clean-exit" in p
+    assert "Clean exit WITHOUT push" in p
+
+
+def test_bound_note_absent_without_metadata() -> None:
+    """An action carrying no bound metadata (legacy call site) -> no bound
+    note (back-compat)."""
+    import dispatch as dispatch_mod
+    act = pw.ActionDispatch(
+        kind=pw.ACTION_FIX, event=pw.EVENT_CI_FAILED, pr_number=1,
+        pr_url=_pr_url(1), branch="b", base="main", head_sha="H", base_sha="",
+        key="k",
+    )
+    assert dispatch_mod._bound_note(act) == ""
+
+
+# --- e2e: auto-remediation conflict ladder through loop.tick ----------------
+
+
+def _agent_record(it_home: Path, agent_id: str, **fields) -> None:
+    (it_home / "agents").mkdir(exist_ok=True)
+    rec = {"id": agent_id, "blocked": False}
+    rec.update(fields)
+    (it_home / "agents" / f"{agent_id}.json").write_text(json.dumps(rec))
+
+
+def test_e2e_dirty_rebase_conflict_advances_to_rederive(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """Full lifecycle through loop.tick: a DIRTY PR -> tick 1 dispatches a
+    REBASE; the rebase subagent reports rebase_conflicted_needs_rederive +
+    conflicted paths in its agent record; tick 2 advances the ladder and
+    dispatches a RE-DERIVE step (NOT a terminal block / raise). No real
+    gh/git/fleet."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="DIRTY", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main", human_approved=False)}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r1 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    # tick 1: a REBASE was dispatched.
+    assert any("pr-rebase-195" in b for b in r1.dispatch_instructions)
+    w = pw.load_watches(it_project_dir)["watches"]["195"]
+    agent_id = w["inflight_action"]["agent_id"]
+    assert w["inflight_action"]["kind"] == pw.ACTION_REBASE
+
+    # the rebase subagent reports the NONTERMINAL conflict outcome + paths.
+    _agent_record(it_home, agent_id,
+                  remediation_outcome=pw.OUTCOME_REBASE_CONFLICTED,
+                  conflicted_paths=["skills/coordinator/loop.py"])
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    # tick 2: the ladder advanced to RE-DERIVE (NOT a terminal blocked raise).
+    rederive_blocks = [b for b in r2.dispatch_instructions if "pr-rederive-195" in b]
+    assert len(rederive_blocks) == 1, "conflict must advance to re-derive, not block"
+    inbox_files = list((it_home / "inbox").glob("*.md"))
+    texts = [p.read_text() for p in inbox_files]
+    assert any("RE-DERIVE subagent for PR #195" in t for t in texts)
+    assert any("loop.py" in t for t in texts)   # conflicted-path hint carried
+
+
+def test_e2e_human_approved_conflict_escalates(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """Full lifecycle: a DIRTY + human-APPROVED PR whose rebase conflicts ->
+    tick 2 ESCALATES (raise-hand), and NO re-derive block is emitted (the
+    reviewed diff is never silently regenerated)."""
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="DIRTY", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main", human_approved=True)}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    w = pw.load_watches(it_project_dir)["watches"]["195"]
+    agent_id = w["inflight_action"]["agent_id"]
+    _agent_record(it_home, agent_id,
+                  remediation_outcome=pw.OUTCOME_REBASE_CONFLICTED,
+                  conflicted_paths=["loop.py"])
+
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    assert not any("pr-rederive-195" in b for b in r2.dispatch_instructions)
+    assert any("human APPROVED" in e for e in r2.errors)

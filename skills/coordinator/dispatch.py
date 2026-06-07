@@ -976,6 +976,28 @@ def _standards_section(standards_md: str) -> str:
     return s or "(no standards configured)"
 
 
+def _bound_note(action) -> str:
+    """A one-line note telling the fixer which attempt of the bounded
+    remediation series this is (DESIGN-pr-watch-autoremediate §2.1) — so the
+    subagent knows it is attempt K of N on this signature / dispatch M of
+    max_series, and that exceeding the bound escalates to the operator. Empty
+    when the action carries no bound metadata (back-compat)."""
+    a = getattr(action, "attempt", 0) or 0
+    ma = getattr(action, "max_attempts", 0) or 0
+    s = getattr(action, "series", 0) or 0
+    ms = getattr(action, "max_series", 0) or 0
+    if not (a and ma):
+        return ""
+    return (
+        f"This is bounded remediation attempt {a}/{ma} on this failure "
+        f"signature (dispatch {s}/{ms} since the last real progress). The "
+        f"coordinator will ESCALATE to the operator once a bound is hit — do "
+        f"NOT churn: if you cannot make real progress (shrink the failing "
+        f"set / resolve the conflict), set yourself BLOCKED rather than "
+        f"pushing a no-progress change."
+    )
+
+
 def build_rebase_prompt(action, *, standards_md: str = "") -> str:
     """Assemble the rebase subagent's first-turn prompt (§5.1c).
 
@@ -997,6 +1019,7 @@ def build_rebase_prompt(action, *, standards_md: str = "") -> str:
         f"PR but its head no longer contains the current {base} tip (stale under",
         "strict branch protection). Rebase it cleanly onto the fresh base.",
         "",
+        *( [_bound_note(action), ""] if _bound_note(action) else [] ),
         "## Read first",
         "- your engine's GLOBAL Subagent Dispatch Contract in your engine's",
         "  config dir: claude -> CLAUDE.md under ~/.claude; codex -> AGENTS.md",
@@ -1024,19 +1047,33 @@ def build_rebase_prompt(action, *, standards_md: str = "") -> str:
         f"4. Re-check PR #{pr} is still OPEN (`gh pr view {pr} --json state`).",
         "   If MERGED/CLOSED, clean up the worktree and exit (nothing to do).",
         f"5. Rebase onto the fresh base: `git rebase {action.base_sha or 'origin/' + base}`.",
-        "   On ANY conflict: `git rebase --abort`, preserve a WIP note, set",
-        "   yourself BLOCKED, raise-hand, and exit. NEVER auto-resolve a",
-        "   conflict (no --theirs/--ours, no half-resolved commits).",
+        "   On ANY conflict: `git rebase --abort` (NEVER auto-resolve — no",
+        "   --theirs/--ours, no half-resolved commits). Then DO NOT block:",
+        "   collect the conflicted paths (`git diff --name-only",
+        "   --diff-filter=U` before the abort, or from the rebase output),",
+        "   write them + the outcome `rebase_conflicted_needs_rederive` into",
+        "   your agent record / WIP note, and EXIT cleanly (do NOT set",
+        "   yourself blocked). The coordinator's next pass advances the",
+        "   ladder to a RE-DERIVE step for an unapproved PR (or escalates a",
+        "   human-approved one) — a conflict here is NONTERMINAL, not a dead",
+        "   end. Preserve the conflicted-path list so the next step is keyed",
+        "   on the right signature.",
         "6. Run the FULL project gates (a textually-clean rebase can still",
         "   break behavior): `go build ./... && go test -race -count=1 ./...`,",
         "   `gofmt -l .`, `golangci-lint run ./...`, `python3 -m pytest skills/ -q`.",
-        "   On any gate failure: do NOT push. Report BLOCKED + raise-hand.",
-        f"7. Re-check PR #{pr} is STILL OPEN, then push with a LEASE only:",
+        "   On any gate failure: do NOT push. Exit clean WITHOUT pushing",
+        "   (gates_failed) — the watch re-dispatches, bounded; reserve BLOCKED",
+        "   for a definitive no-go you can prove.",
+        "7. Run /codex review then /review until clean (CLAUDE.md §4) — EVEN",
+        "   for a clean rebase: a textually-clean rebase can still change",
+        "   behavior (a silent semantic conflict the merge didn't flag), so",
+        "   NO push that changes the branch tip is exempt from the reviewers.",
+        f"8. Re-check PR #{pr} is STILL OPEN, then push with a LEASE only:",
         f"   `git push --force-with-lease={branch}:{action.head_sha} origin {branch}`.",
         "   NEVER plain --force. If the lease push is rejected (a human merged",
         "   or pushed mid-rebase), that is a CLEAN loss — abort, do not retry,",
         "   report BLOCKED, exit. No data is destroyed.",
-        "8. Clean up: if YOU created a /tmp/fleet-rebase worktree, remove it",
+        "9. Clean up: if YOU created a /tmp/fleet-rebase worktree, remove it",
         "   (`git worktree remove`). Do NOT remove the task's own worker",
         "   worktree. Cleanup is the LAST step, on success AND failure paths.",
         "",
@@ -1074,6 +1111,7 @@ def build_fix_prompt(action, *, standards_md: str = "") -> str:
     lines = [
         f"You are a Fleet PR-watch FIX subagent for PR #{pr} ({action.pr_url}).",
         "",
+        *( [_bound_note(action), ""] if _bound_note(action) else [] ),
         "## Read first",
         "- your engine's GLOBAL Subagent Dispatch Contract in your engine's",
         "  config dir: claude -> CLAUDE.md under ~/.claude; codex -> AGENTS.md",
@@ -1126,9 +1164,17 @@ def build_fix_prompt(action, *, standards_md: str = "") -> str:
         "`golangci-lint run ./...`, `python3 -m pytest skills/ -q`.",
         "Run /codex review then /review until clean (CLAUDE.md §4).",
         "",
-        "## On BLOCKED",
-        "Set yourself blocked so the coordinator's lease latches blocked +",
-        "raises to the operator (one attempt per head; never silently re-fired).",
+        "## BLOCKED vs clean-exit (DESIGN-pr-watch-autoremediate §2.4)",
+        "Two distinct exits — pick the right one:",
+        "- BLOCKED = 'I definitively cannot do this safely' (a substantive /",
+        "  design review ask, a failure needing a product decision). This",
+        "  latches after ONE attempt + raises to the operator immediately —",
+        "  it does NOT ride out the retry bound. Use it only when you can",
+        "  PROVE it's hopeless.",
+        "- Clean exit WITHOUT push = 'this attempt didn't land but isn't",
+        "  definitively hopeless' (gates still red, fix didn't take). No",
+        "  blocked latch; the watch re-dispatches, bounded by the retry +",
+        "  series counters. Exit clean (do NOT block) in this case.",
         "",
         "## Standards",
         _standards_section(standards_md),
@@ -1140,6 +1186,103 @@ def build_fix_prompt(action, *, standards_md: str = "") -> str:
     if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
         raise PromptTooLargeError(
             f"fix prompt for PR #{pr} is "
+            f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
+        )
+    return out
+
+
+def build_rederive_prompt(action, *, standards_md: str = "") -> str:
+    """Assemble the RE-DERIVE subagent's first-turn prompt (DESIGN-pr-watch-
+    autoremediate §2.2/§2.3). Reached ONLY for an UNAPPROVED DIRTY PR whose
+    clean rebase conflicted. The subagent regenerates the change from the
+    backing task's spec on a fresh base and force-with-lease-replaces the
+    branch — it does NOT hand-edit conflict markers.
+
+    Hard safety rails (a wrong re-derive ships code the operator didn't
+    approve): re-fetch review state and REFUSE the push if a human APPROVED
+    review now exists (TOCTOU); spec-availability gate (escalate if the spec
+    is gone); full gates + codex/review before push; --force-with-lease only.
+    """
+    pr = action.pr_number
+    branch = action.branch or f"worker/pr-{pr}"
+    base = action.base or "main"
+    slugs = list(getattr(action, "task_slugs", ()) or ())
+    conflicted = list(getattr(action, "conflicted_paths", ()) or ())
+    slug_hint = ", ".join(slugs) if slugs else "(no backing task slug recorded)"
+    conflict_hint = ", ".join(conflicted) if conflicted else "(paths not recorded)"
+    lines = [
+        f"You are a Fleet PR-watch RE-DERIVE subagent for PR #{pr} ({action.pr_url}).",
+        "",
+        "A clean rebase of this PR onto fresh main hit a MERGE CONFLICT. The",
+        "coordinator confirmed this PR carries NO human approval, so the policy",
+        "is to RE-DERIVE: regenerate the change from the backing task's spec on",
+        "a clean base — NOT to textually merge conflict markers.",
+        "",
+        *( [_bound_note(action), ""] if _bound_note(action) else [] ),
+        "## Read first",
+        "- your engine's GLOBAL Subagent Dispatch Contract in your engine's",
+        "  config dir (claude -> ~/.claude/CLAUDE.md; codex -> AGENTS.md).",
+        "- the project's CLAUDE.md AND/OR AGENTS.md (whichever exists) + memory.",
+        f"- the backing task spec: `fleet tasks show {slugs[0]}`" if slugs else
+        "- the backing task spec (NONE recorded — see the SPEC GATE below).",
+        "",
+        f"Backing task slug(s): {slug_hint}",
+        f"Conflicted paths from the failed rebase: {conflict_hint}",
+        "",
+        "## SPEC GATE (DESIGN §2.2 — re-derive needs the spec)",
+        "Re-derive requires the original task spec to still be reconstructable",
+        "(the backing task row's Spec/Acceptance in tasks.md). If the backing",
+        "task is terminal/archived and its spec is GONE, re-derive is NOT",
+        "possible: set yourself BLOCKED + raise-hand and exit. Do NOT guess the",
+        "spec.",
+        "",
+        "## HARD GUARDS — a wrong re-derive ships unapproved code. Follow EXACTLY.",
+        f"1. `git fetch origin {base}` ONCE. Capture the fresh base SHA",
+        f"   (expected: {action.base_sha or 'origin/' + base}).",
+        f"2. VERIFY the head is UNCHANGED: {branch} head MUST still equal",
+        f"   {action.head_sha}. If it moved, ABORT (newer attempt / human",
+        "   pushed) — report BLOCKED, exit.",
+        f"3. Re-check PR #{pr} is still OPEN. If MERGED/CLOSED, clean up + exit.",
+        "4. APPROVAL RE-CHECK (TOCTOU, §2.3): re-fetch review state",
+        f"   (`gh pr view {pr} --json reviews,latestReviews`). If ANY non-bot",
+        "   review is now APPROVED (a human approved while you ran), REFUSE the",
+        "   re-derive: report BLOCKED + raise-hand, push NOTHING. The reviewed",
+        "   diff must never be clobbered.",
+        "5. Work in a FRESH isolated worktree off origin/" + base + ":",
+        f"   `git worktree add /tmp/fleet-rederive-{pr} -b {branch}-rederive "
+        f"origin/{base}` (or reset {branch} to origin/{base} in an isolated",
+        "   checkout). NEVER the coord's main checkout. Regenerate the change",
+        "   from the spec — re-express it on the clean base; do NOT merge or",
+        "   rebase the stale commits, and do NOT hand-edit conflict markers",
+        "   (no --theirs/--ours, no half-resolved commits).",
+        "6. Run the FULL project gates: `go build ./... && go test -race",
+        "   -count=1 ./...`, `gofmt -l .`, `golangci-lint run ./...`,",
+        "   `python3 -m pytest skills/ -q`. On any gate failure: push NOTHING,",
+        "   exit clean (gates_failed) — the watch re-dispatches, bounded.",
+        "7. Run /codex review then /review until clean (CLAUDE.md §4) — a",
+        "   regenerated diff goes through the same review discipline as a fresh",
+        "   worker PR. If the divergence of intent is genuinely AMBIGUOUS (you",
+        "   cannot produce a behavior-equivalent change that passes gates),",
+        "   report BLOCKED with a summary — fleet GUESSES NOTHING on semantics.",
+        "8. RE-CHECK head unchanged + PR OPEN + still no human APPROVED, THEN",
+        f"   replace the branch: `git push --force-with-lease={branch}:"
+        f"{action.head_sha} origin HEAD:{branch}`. NEVER plain --force. A",
+        "   rejected lease (human pushed/merged mid-flight) is a CLEAN loss —",
+        "   abort, report BLOCKED, exit. No data destroyed.",
+        f"9. Clean up: remove the /tmp/fleet-rederive-{pr} worktree",
+        "   (`git worktree remove`). Cleanup is the LAST step, on success AND",
+        "   failure paths.",
+        "",
+        "## Standards",
+        _standards_section(standards_md),
+        "",
+        "Do NOT open or merge PRs. Do NOT change the PR base. Do NOT touch any",
+        "PR other than this one. Re-derive + force-with-lease push only.",
+    ]
+    out = "\n".join(lines)
+    if len(out.encode("utf-8")) > _PROMPT_HARD_CAP_BYTES:
+        raise PromptTooLargeError(
+            f"rederive prompt for PR #{pr} is "
             f"{len(out.encode('utf-8'))}B (cap {_PROMPT_HARD_CAP_BYTES}B)",
         )
     return out

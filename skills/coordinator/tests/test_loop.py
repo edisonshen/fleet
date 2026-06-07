@@ -2597,7 +2597,15 @@ def test_parse_sentinel_ignores_narrative() -> None:
 # ---------- entry point ----------
 
 
-def test_main_with_no_project_returns_zero(capsys) -> None:
+def test_main_with_no_project_returns_zero(tmp_path, monkeypatch, capsys) -> None:
+    # Sandbox FLEET_HOME so this never touches the operator's real ~/.fleet
+    # (test-isolation: an unsandboxed loop.main() reconciled live state and
+    # could write a real dispatch journal that polluted later tests). Run
+    # from a project-less cwd so "no project set" is the genuine outcome.
+    monkeypatch.setenv("FLEET_HOME", str(tmp_path / "fleet-home"))
+    monkeypatch.delenv("FLEET_PROJECT", raising=False)
+    monkeypatch.delenv("FLEET_AGENT_ID", raising=False)
+    monkeypatch.chdir(tmp_path)
     rc = loop.main([])
     assert rc == 0
     captured = capsys.readouterr()

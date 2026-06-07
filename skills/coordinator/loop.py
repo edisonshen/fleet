@@ -1977,6 +1977,14 @@ def _run_supervisor(
             cs["last_archive_scan_ts"] = last_seen
         _save_coord_state(state_path, cs)
 
+    def pr_watch_floor_due_hook() -> bool:
+        # PR-watch ~60 s poll floor gate (DESIGN-pr-watch-autoremediate §1):
+        # True iff this coord has ANY OPEN watched PR. Read from the durable
+        # pr-watches.json (cheap fs read, no shell-out) so the floor goes
+        # inert the moment the coord has zero open watched PRs (a truly idle
+        # coord must not poll GitHub every ~60 s). Never raises.
+        return _has_open_watched_pr(project_dir)
+
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
         project=project,
@@ -1989,6 +1997,7 @@ def _run_supervisor(
         force_tick_check=force_tick_check_hook,
         force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
+        pr_watch_floor_due=pr_watch_floor_due_hook,
         coord_id=coord_id,
         # Codex iter-21 [P3]: share the single mtime baseline that
         # force_tick_check_hook closed over (force_tick_baseline["mtime"])
@@ -5381,6 +5390,21 @@ def _worktree_cleanup_context(
 _pr_watch_prober = None  # lazily defaults to pr_watch_mod.GhGitProber()
 
 
+def _has_open_watched_pr(project_dir: Path) -> bool:
+    """True iff the durable pr-watches.json has at least one OPEN watch
+    (DESIGN-pr-watch-autoremediate §1 floor gate). Cheap fs read, never
+    raises. A missing/empty file -> False (idle coord; the floor stays
+    inert so it won't poll GitHub every ~60 s)."""
+    try:
+        doc = pr_watch_mod.load_watches(project_dir)
+    except Exception:  # noqa: BLE001 — gate must never wedge the supervisor
+        return False
+    for w in (doc.get("watches") or {}).values():
+        if isinstance(w, dict) and w.get("state") == pr_watch_mod.STATE_OPEN:
+            return True
+    return False
+
+
 def _reconcile_pr_watches(
     tasks: list[parse.Task],
     *,
@@ -5525,6 +5549,16 @@ def _reconcile_pr_watches(
             return "gone"
         rec = _read_agent_record(agent_id, home=home)
         if isinstance(rec, dict):
+            # NONTERMINAL rebase-conflict (DESIGN-pr-watch-autoremediate §2.2):
+            # a rebase subagent that hit a conflict writes this outcome (NOT
+            # blocked) so the ladder advances to re-derive. Checked BEFORE the
+            # blocked flag so a subagent that set both prefers the nonterminal
+            # advance (a conflict is never a dead end when re-derive is
+            # eligible). The conflicted paths ride alongside via
+            # _agent_conflicts.
+            if str(rec.get("remediation_outcome", "") or "") == \
+                    pr_watch_mod.OUTCOME_REBASE_CONFLICTED:
+                return pr_watch_mod.OUTCOME_REBASE_CONFLICTED
             if rec.get("blocked"):
                 return "blocked"
             try:
@@ -5567,6 +5601,23 @@ def _reconcile_pr_watches(
         # the launch grace) and the action re-dispatches.
         return "gone"
 
+    def _agent_conflicts(agent_id: str) -> list:
+        # The conflicted-path set a rebase subagent reported alongside the
+        # rebase_conflicted_needs_rederive outcome (DESIGN-pr-watch-
+        # autoremediate §2.1/§2.2). Read from its agent record's
+        # `conflicted_paths`; the watch persists them onto the snapshot so the
+        # next pass's DIRTY signature/frontier reflect the real paths. Never
+        # raises.
+        if not agent_id:
+            return []
+        rec = _read_agent_record(agent_id, home=home)
+        if not isinstance(rec, dict):
+            return []
+        cp = rec.get("conflicted_paths")
+        if isinstance(cp, (list, tuple)):
+            return [str(p) for p in cp if p]
+        return []
+
     def _dispatch_action(action) -> str:
         # Mint an agent_id, render the rebase/fix prompt, acquire the
         # coord_prompt_inbox CLAIM (which creates the dispatch JOURNAL the
@@ -5594,6 +5645,8 @@ def _reconcile_pr_watches(
             label = f"pr-{action.kind}-{action.pr_number}"
             if action.kind == pr_watch_mod.ACTION_REBASE:
                 prompt = dispatch_mod.build_rebase_prompt(action, standards_md=_standards())
+            elif action.kind == pr_watch_mod.ACTION_REDERIVE:
+                prompt = dispatch_mod.build_rederive_prompt(action, standards_md=_standards())
             else:
                 prompt = dispatch_mod.build_fix_prompt(action, standards_md=_standards())
             # acquire-prompt mints the journal at ExecPending gen 0 and
@@ -5658,6 +5711,7 @@ def _reconcile_pr_watches(
         agent_outcome=_agent_outcome,
         deps_done=_deps_done,
         release_action=_release_action,
+        agent_conflicts=_agent_conflicts,
     )
 
     # reconcile_watches returned WITHOUT raising -> the watch doc (incl. the

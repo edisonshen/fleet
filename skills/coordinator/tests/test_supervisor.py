@@ -2796,3 +2796,116 @@ def test_reaper_hook_called_each_iteration(fleet_home: Path) -> None:
     assert all(n == 1 for n in reap_calls)
     # Total iterations include the empty-probes exit iteration.
     assert res.iterations >= len(reap_calls)
+
+
+# ===========================================================================
+# DESIGN-pr-watch-autoremediate §1 — the ~60-second PR-watch poll floor
+# ===========================================================================
+
+
+def _floor_harness(fleet_home: Path, *, floor_s, floor_due, n_iters=40,
+                   rng=None):
+    """Drive run_supervisor with a long stuck/periodic cadence so ONLY the
+    floor can fire the PR-watch pass, with a deterministic clock. Returns
+    (res, periodic_calls, sleeps)."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path, agent_id="aaaaaaaa",
+        tmux_session="fleet-aaaaaaaa", live_worker=True,
+    )
+    periodic_calls = {"n": 0}
+
+    def fake_periodic():
+        periodic_calls["n"] += 1
+        return None
+
+    seq = iter([[probe]] * n_iters + [[]])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    now = {"t": 0.0}
+    sleeps: list[float] = []
+
+    def fake_sleep(s):
+        sleeps.append(s)
+        now["t"] += s
+
+    res = supervisor.run_supervisor(
+        # poll_interval 10s, stuck_every 1000 -> periodic/stuck cadence is
+        # 10000s (effectively never within this test) so ONLY the floor can
+        # fire the pass.
+        cfg=_cfg(poll_interval_s=10, stuck_check_every=1000,
+                 pr_watch_poll_floor_s=floor_s),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        periodic_full_reconcile=fake_periodic,
+        pr_watch_floor_due=floor_due,
+        rng=rng,
+        log_stream=io.StringIO(),
+    )
+    return res, periodic_calls, sleeps
+
+
+def test_poll_floor_fires_pass_when_open_watch(fleet_home: Path) -> None:
+    """Floor on + at least one open watched PR -> the PR-watch PASS
+    (periodic_full_reconcile) actually fires on the ~60 s cadence, not the
+    slow stuck/periodic gate; the sleep budget is clamped to <= the floor."""
+    import random
+    res, periodic_calls, sleeps = _floor_harness(
+        fleet_home, floor_s=60, floor_due=lambda: True,
+        rng=random.Random(0),
+    )
+    assert res.pr_watch_floor_passes >= 1, "floor must fire the PR-watch pass"
+    assert periodic_calls["n"] >= 1
+    # every sleep is clamped to <= floor + jitter band (no 10000 s waits).
+    assert sleeps, "expected at least one sleep"
+    assert max(sleeps) <= 60 + 5 + 0.001
+
+
+def test_poll_floor_inert_with_no_open_watch(fleet_home: Path) -> None:
+    """Floor on but ZERO open watched PRs -> floor inert: no floored pass,
+    and the sleep budget is NOT clamped to the floor (idle coord relaxes)."""
+    res, periodic_calls, _sleeps = _floor_harness(
+        fleet_home, floor_s=60, floor_due=lambda: False, n_iters=20,
+    )
+    assert res.pr_watch_floor_passes == 0
+    # the slow periodic cadence (10000 s) never elapsed in this window.
+    assert periodic_calls["n"] == 0
+
+
+def test_poll_floor_disabled_legacy_cadence(fleet_home: Path) -> None:
+    """PR_WATCH_POLL_FLOOR_S=0 -> the floor is OFF; even with an open watch
+    the floored pass never fires (legacy: only the slow gate runs it)."""
+    res, periodic_calls, _sleeps = _floor_harness(
+        fleet_home, floor_s=0, floor_due=lambda: True, n_iters=20,
+    )
+    assert res.pr_watch_floor_passes == 0
+    assert periodic_calls["n"] == 0
+
+
+def test_poll_floor_env_default_is_60() -> None:
+    import os
+    os.environ.pop("PR_WATCH_POLL_FLOOR_S", None)
+    assert supervisor.env_pr_watch_poll_floor_s() == 60
+    os.environ["PR_WATCH_POLL_FLOOR_S"] = "0"
+    try:
+        assert supervisor.env_pr_watch_poll_floor_s() == 0
+    finally:
+        del os.environ["PR_WATCH_POLL_FLOOR_S"]
+
+
+def test_effective_floor_jitter_bounded() -> None:
+    import random
+    for seed in range(20):
+        f = supervisor._pr_watch_effective_floor_s(60.0, random.Random(seed))
+        assert 60.0 <= f < 65.0

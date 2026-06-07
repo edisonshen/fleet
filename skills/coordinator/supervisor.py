@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -109,6 +110,26 @@ def env_poll_stability_window_s() -> int:
     """Time a subagent's state must be stable before the per-probe
     cadence dilates from base to backoff. Spec default 5 min = 300 s."""
     return _env_int("FLEET_COORD_POLL_STABILITY_WINDOW_S", 300)
+
+
+def env_pr_watch_poll_floor_s() -> int:
+    """~60 s heartbeat floor for the PR-watch pass while ANY watched PR is
+    open (DESIGN-pr-watch-autoremediate §1). 0 DISABLES the floor (legacy
+    cadence: the PR-watch pass fires only on the slow stuck-check /
+    periodic-reconcile gate). Default 60. Env: PR_WATCH_POLL_FLOOR_S.
+
+    The floor lowers WHEN the PR-watch pass fires; it adds no second writer
+    and no extra GraphQL cost (the per-repo probe is one batched call
+    covering all the repo's watched PRs). It goes inert when the coord has
+    ZERO open watched PRs (a truly idle coord does not poll GitHub)."""
+    raw = os.environ.get("PR_WATCH_POLL_FLOOR_S", "")
+    if raw == "":
+        return 60
+    try:
+        n = int(raw)
+    except ValueError:
+        return 60
+    return n if n >= 0 else 60
 
 
 def env_stuck_check_every() -> int:
@@ -196,6 +217,19 @@ TERMINAL_WORKER_PHASES = frozenset({"done", "blocked", "failed"})
 # 30 s base; matches the recovery cadence default for parity.
 _PERIODIC_RECONCILE_FALLBACK_EVERY = 10
 
+# Anti phase-align jitter band for the PR-watch poll floor (§1): N coords
+# sharing one gh token must not synchronize their ~60 s passes into a
+# thundering herd against GitHub's secondary rate limit. The effective
+# floor is PR_WATCH_POLL_FLOOR_S + a small random jitter in [0, band).
+_PR_WATCH_FLOOR_JITTER_S = 5.0
+
+
+def _pr_watch_effective_floor_s(floor_s: float, rng: "random.Random | None" = None) -> float:
+    """The floor + a small jitter so passes don't phase-align across coords
+    (§1). Deterministic when a seeded rng is injected (tests)."""
+    r = rng or random
+    return float(floor_s) + r.uniform(0.0, _PR_WATCH_FLOOR_JITTER_S)
+
 
 # ---------- data classes ----------
 
@@ -259,6 +293,13 @@ class SupervisorConfig:
     poll_base_interval_s: int = 5
     poll_backoff_interval_s: int = 30
     poll_stability_window_s: int = 300
+    # PR-watch ~60 s poll floor (DESIGN-pr-watch-autoremediate §1). 0 = the
+    # floor is OFF (legacy cadence). When > 0 AND the coord has any open
+    # watched PR, the PR-watch pass is made due at least every floor and the
+    # sleep budget is clamped so the loop wakes in time. Defaulted to 0 on
+    # the dataclass so explicit-construction test sites opt in deliberately;
+    # from_env() supplies the production 60-s default.
+    pr_watch_poll_floor_s: int = 0
 
     @classmethod
     def from_env(cls) -> "SupervisorConfig":
@@ -273,6 +314,7 @@ class SupervisorConfig:
             poll_base_interval_s=env_poll_base_interval_s(),
             poll_backoff_interval_s=env_poll_backoff_interval_s(),
             poll_stability_window_s=env_poll_stability_window_s(),
+            pr_watch_poll_floor_s=env_pr_watch_poll_floor_s(),
         )
 
 
@@ -895,6 +937,10 @@ class SupervisorResult:
     iterations: int = 0
     reconcile_calls: int = 0
     stuck_check_passes: int = 0
+    # PR-watch ~60 s poll-floor passes fired this session (§1) — for tests
+    # asserting the floor actually triggers the pass, distinct from the slow
+    # periodic cadence.
+    pr_watch_floor_passes: int = 0
     nudges_sent: int = 0
     escalations: int = 0
     blocks: int = 0
@@ -1164,9 +1210,11 @@ def run_supervisor(
     force_tick_check: Callable[[], bool] | None = None,
     force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
+    pr_watch_floor_due: Callable[[], bool] | None = None,
     coord_id: str = "",
     direct_inbox_session_baseline: float | None = None,
     log_stream=None,
+    rng: "random.Random | None" = None,
 ) -> SupervisorResult:
     """Drive the smart polling loop. Returns aggregate stats.
 
@@ -1249,6 +1297,18 @@ def run_supervisor(
     # poll_interval_s is exact in that case.
     last_stuck_check_unix = now_fn()
     last_periodic_reconcile_unix = now_fn()
+    # PR-watch ~60 s poll floor (DESIGN-pr-watch-autoremediate §1). The floor
+    # fires the SAME PR-watch pass periodic_full_reconcile runs, but on a much
+    # tighter ~60 s cadence whenever the coord has ANY open watched PR — so a
+    # READY/green PR going BEHIND (an upstack merge) is caught within ~60 s,
+    # not the slow stuck-check cadence. Seeded to start so the first floor
+    # pass fires ~one floor after entry. Re-jittered each pass to anti-align N
+    # coords sharing one gh token. 0 floor (or no hook) -> inert (legacy).
+    floor_s = float(cfg.pr_watch_poll_floor_s or 0)
+    last_pr_watch_floor_unix = now_fn()
+    effective_floor_s = (
+        _pr_watch_effective_floor_s(floor_s, rng) if floor_s > 0 else 0.0
+    )
 
     probes = refresh_probes()
     for p in probes:
@@ -1324,6 +1384,25 @@ def run_supervisor(
                     last_change_ts=last_change_ts,
                     now_unix=now_fn(),
                 )
+                # PR-watch poll-floor SLEEP-BUDGET clamp (§1). When the floor
+                # is on AND the coord has any open watched PR, never sleep
+                # past the next floored PR-watch pass — so the loop wakes in
+                # time to honor the ~60 s heartbeat. Gated on the SAME
+                # "any-open-watch" predicate as the pass-trigger so an idle
+                # coord (zero open watched PRs) relaxes to the normal cadence.
+                if floor_s > 0 and pr_watch_floor_due is not None:
+                    try:
+                        floor_active = bool(pr_watch_floor_due())
+                    except Exception as exc:  # noqa: BLE001
+                        res.errors.append(f"pr_watch_floor_due: {exc}")
+                        floor_active = False
+                    if floor_active:
+                        next_floor_due = last_pr_watch_floor_unix + effective_floor_s
+                        remaining_floor = next_floor_due - now_fn()
+                        if remaining_floor < 0:
+                            remaining_floor = 0.0
+                        if remaining_floor < sleep_s:
+                            sleep_s = remaining_floor
             # loop-supervisor-sigpipe-5263 (codex iter-1 [P2]): clamp the
             # sleep to the remaining cap budget. compute_next_sleep_s can
             # return a long interval (e.g. poll_interval_s=3600s in legacy
@@ -1528,18 +1607,47 @@ def run_supervisor(
                 and periodic_target_s > 0
                 and (now_clock - last_periodic_reconcile_unix) >= periodic_target_s
             )
+            # PR-watch poll-floor PASS-TRIGGER (§1, the load-bearing change).
+            # When the floor elapses AND the coord has any open watched PR,
+            # make the PR-watch pass (= periodic_full_reconcile) DUE — not
+            # only on the slow stuck-check / periodic gate. This is what
+            # turns "~1 pass / 5 min" into "~1 pass / min" for a coord with
+            # open PRs; an idle coord (no open watched PR) stays on the slow
+            # cadence. Re-jitter the effective floor each fired pass.
+            run_pr_watch_floor = False
+            if (periodic_full_reconcile is not None and floor_s > 0
+                    and pr_watch_floor_due is not None
+                    and (now_clock - last_pr_watch_floor_unix) >= effective_floor_s):
+                try:
+                    run_pr_watch_floor = bool(pr_watch_floor_due())
+                except Exception as exc:  # noqa: BLE001
+                    res.errors.append(f"pr_watch_floor_due: {exc}")
+                    run_pr_watch_floor = False
             run_stuck = (
                 cfg.stuck_check_every > 0
                 and stuck_target_s > 0
                 and (now_clock - last_stuck_check_unix) >= stuck_target_s
             )
-            if run_periodic or run_stuck:
+            if run_periodic or run_stuck or run_pr_watch_floor:
                 # Periodic full reconcile FIRST. Running before stuck-check
                 # means a worker that just transitioned to in-review (and
                 # would otherwise be stuck-flagged on the next pass) drops
                 # out of the live-worker probe set BEFORE we evaluate it.
-                if run_periodic:
-                    last_periodic_reconcile_unix = now_clock
+                # The PR-watch poll floor (§1) fires the SAME pass on its
+                # tighter ~60 s cadence — periodic_full_reconcile runs the
+                # PR-watch reconcile, so a floored pass and a slow periodic
+                # pass are the same call; we just advance whichever
+                # timer(s) were due so neither double-fires.
+                if run_periodic or run_pr_watch_floor:
+                    if run_periodic:
+                        last_periodic_reconcile_unix = now_clock
+                    if run_pr_watch_floor:
+                        last_pr_watch_floor_unix = now_clock
+                        # re-jitter so coords don't phase-align next pass.
+                        effective_floor_s = _pr_watch_effective_floor_s(
+                            floor_s, rng,
+                        )
+                    res.pr_watch_floor_passes += 1 if run_pr_watch_floor else 0
                     try:
                         periodic_dispatched = periodic_full_reconcile()
                     except BrokenPipeError:
