@@ -305,20 +305,25 @@ func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_AttachFastPathSkippedWhenNotTicking pins the
-// prompt-failure gate (codex iter-3 P2): a live coord record + alive tmux
-// session but NO fresh coord-state.json (the session never ticked
-// /coordinator — e.g. its initial prompt failed to deliver) must NOT take
-// the attach fast path. Promoting such a non-coordinator session as the
-// project's coord would skip the TUI's prompt-failure respawn recovery.
-// The fast path fires only when coordStateFresh proves the coord ticked.
+// TestRunDispatch_AttachFastPathSkippedWhenNotTicking pins TWO invariants
+// at once for a live coord record + alive tmux session + NO fresh
+// coord-state.json (the session never ticked /coordinator — e.g. its
+// initial prompt failed to deliver, or a slow cold start):
+//
+//	(iter-3 P2) The attach fast path must NOT fire — it would exit 0 and
+//	   the TUI would PROMOTE a non-coordinator session as the coord.
+//	(iter-5 P2) The veto MUST fire (liveCoord disjunct) — returning a
+//	   typed vetoError (exit 75 retry) so a second --coord-spawn does NOT
+//	   double-spawn over the live session (split-brain).
+//
+// Net: a live-but-not-ticking coord is neither promoted nor duplicated;
+// the dispatch refuses with a retry signal and surfaces the stuck state.
 func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
-	// Empty socket → spawn fails deterministically under go test, so the
-	// test never leaks a real session and we can assert "fast path not
-	// taken" by observing the dispatch did NOT exit 0 with the live ID.
-	t.Setenv("FLEET_TMUX_SOCKET", "")
+	// Isolate tmux so even if the veto regressed and the spawn path ran,
+	// no real session leaks.
+	isolateTmuxSocket(t)
 
 	pdir, err := state.ProjectDir("nottick")
 	if err != nil {
@@ -361,13 +366,17 @@ func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	}
 	var out bytes.Buffer
 	derr := runDispatch(opts, &out)
-	// The fast path must NOT have fired: it would have exited 0 emitting
-	// `agent beef5678 spawned`. Instead the dispatch falls through to the
-	// (re)spawn path, which fails on the empty socket. Either way, the
-	// live coord's ID must NOT appear as a successful spawn line.
+	// iter-5: the veto must refuse with a typed vetoError (exit 75 retry)
+	// because a live coord session exists for the project.
 	if derr == nil {
-		t.Fatalf("expected fall-through to respawn (which fails on empty socket), got nil — fast path wrongly fired")
+		t.Fatalf("expected veto refusal over the live session, got nil — duplicate-spawn window reopened")
 	}
+	var ve *vetoError
+	if !errors.As(derr, &ve) {
+		t.Fatalf("expected *vetoError (exit 75 retry) for a live-but-not-ticking coord, got %T: %v", derr, derr)
+	}
+	// iter-3: the fast path must NOT have promoted the session — its ID
+	// must never appear as a successful `agent <id> spawned` line.
 	if got := parseSpawnedAgentID(out.String()); got == liveID {
 		t.Fatalf("fast path promoted a non-ticking session (%q) — prompt-failure gate not enforced; out=%q", liveID, out.String())
 	}

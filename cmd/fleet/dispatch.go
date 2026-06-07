@@ -695,13 +695,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//   (a) coord-state.json mtime fresh AND a record exists (the
 	//       original AND-gate; steady-state signal once the coord has
 	//       ticked at least once).
-	//   (b) a live coord record (tmux session alive on THIS socket) —
-	//       handled ABOVE by the idempotent-attach fast path, which
-	//       returns success rather than a refusal. We pass false for
-	//       this disjunct here precisely because that case already
-	//       short-circuited to attach; the disjunct lives in
-	//       coordSpawnVeto's contract (and T7 tests it) for a single
-	//       complete OR-gate, but in this call path it can't fire.
+	//   (b) a live coord record (tmux session alive on THIS socket). When
+	//       that coord has ALSO ticked (coordStateFresh), the
+	//       idempotent-attach fast path ABOVE short-circuits to success
+	//       before we get here. But a live coord that has NOT ticked yet
+	//       (slow cold start, prompt-failed session, claim missing/expired)
+	//       skips the fast path (gated on coordStateFresh, iter-3) and
+	//       reaches HERE — so we feed the real liveness signal into this
+	//       disjunct (iter-5 P2). Refusing with exit 75 (retry) over a
+	//       live session prevents a duplicate-coord split-brain; it
+	//       promotes nothing (unlike the fast path), so a genuinely-stuck
+	//       prompt-failed session surfaces as a retry loop, not a silent
+	//       wrong-coord. T7 tests this disjunct exhaustively.
 	//   (c) a FRESH pending-spawn claim exists — the cold-start window:
 	//       dispatch #1 wrote the claim + spawned, but coord-state.json
 	//       isn't written until the first tick (3-5 min). Without (c),
@@ -720,10 +725,21 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if opts.coordSpawn {
 		stateFresh := coordStateFresh(opts.project)
 		recordExists := coordRecordExistsInList(opts.taskID, opts.project, coordRecords)
-		// liveCoordRecord disjunct already handled by the attach fast
-		// path above (it returns success for any local-socket-live
-		// coord). Pass false to avoid a redundant tmux probe.
-		const liveCoord = false
+		// liveCoordRecord disjunct (codex iter-5 P2). The attach fast
+		// path above ONLY short-circuits when coordStateFresh is true
+		// (the prompt-failure gate, iter-3) — so a live coord that hasn't
+		// ticked yet (slow cold start past the 5-min budget, a coord
+		// spawned before the claim mechanism existed, or any state where
+		// the claim is missing/expired but the session is still alive)
+		// falls THROUGH to this veto. If we hardcoded false here, the
+		// veto would see no signal and ALLOW a second spawn → duplicate
+		// coord / split-brain. So we feed the real local-socket liveness
+		// result in: refusing with exit 75 (retry) over a live session is
+		// always safe — it prevents split-brain, promotes nothing, and
+		// surfaces a genuinely-stuck session to the operator (retry loop)
+		// rather than silently promoting a non-coordinator session the
+		// way the fast path would. This is the disjunct T7 already tests.
+		liveCoord := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession) != nil
 		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
 		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {
 			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).
