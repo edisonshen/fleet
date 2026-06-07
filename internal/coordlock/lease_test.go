@@ -698,8 +698,10 @@ func TestT37_FreeFlockAcquireToEpochWindowRace(t *testing.T) {
 		BootID: "test-boot-1", RenewedAtMono: clk.now(),
 	})
 
-	// A's CAS must FAIL (B advanced + is live) -> ok=false (release+retry).
-	ok, err := a.casToActiveAfterFlock(f)
+	// A observed epoch 5 at flock acquire; B advanced the on-disk epoch to
+	// 6 in the window. A's snapshot-CAS (observedEpoch=5) must FAIL ->
+	// ok=false (release+retry).
+	ok, err := a.casToActiveAfterFlock(5)
 	if err != nil {
 		t.Fatalf("casToActiveAfterFlock: %v", err)
 	}
@@ -934,4 +936,126 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ---- codex iter-3 [P2] #1: reacquire after a released flock ----
+
+// A holder that calls Release frees the flock but its still-running PID is
+// briefly recorded as the active owner. A new candidate that grabs the
+// free flock must WIN (the freed flock is proof the old holder stepped
+// down) — not loop until maxAttempts because the old PID is still alive.
+func TestReacquireAfterReleasedFlockWithLiveOldPid(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// OLD holder: PID still ALIVE, fresh renewed_at, but the flock is FREE
+	// (it called Release). The active record still names OLD.
+	const oldPid = 4242
+	const oldStart = int64(222222)
+	live.set(oldPid, oldStart)
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateActive,
+		Owner:  identity{Pid: oldPid, PidStart: oldStart, AgentID: "old", Project: project},
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+
+	lease, acquired, err := acquireLease(project, "cand", testCfg(clk, live))
+	if err != nil {
+		t.Fatalf("acquireLease must succeed on a freed flock even with a live old PID, got: %v", err)
+	}
+	if !acquired || lease == nil {
+		t.Fatalf("expected acquire on freed flock, got acquired=%v", acquired)
+	}
+	defer lease.Release()
+	rec := readEpochFor(t, project)
+	if rec.Epoch != 6 || rec.Owner.AgentID != "cand" {
+		t.Fatalf("expected cand@6 after reacquire, got %s@%d", rec.Owner.AgentID, rec.Epoch)
+	}
+}
+
+// ---- codex iter-3 [P2] #2: don't steal a fresh in-progress fencing ----
+
+// A busy flock with a FRESH fencing record (live candidate, within TTL)
+// means another candidate is mid-takeover. A new candidate must stand
+// down (acquired=false), not barge in and re-fence — that would make
+// candidates invalidate each other's CAS.
+func TestDoesNotStealFreshInProgressFencing(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// OLD holder still holds the flock (hung). A live candidate just
+	// started a takeover: fresh fencing record, candidate alive, within TTL.
+	const oldPid = 4242
+	live.set(oldPid, int64(222222))
+	holdFlock(t, project)
+	const liveCandPid = 6000
+	live.set(liveCandPid, int64(666666))
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: oldPid, PidStart: int64(222222), AgentID: "old", Project: project},
+		Candidate:     identity{Pid: liveCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(), // fresh
+	})
+
+	cfg := testCfg(clk, live)
+	var killed atomic.Bool
+	cfg.killStub = func(identity) error { killed.Store(true); return nil }
+
+	clk.advance(5 * time.Second) // still within TTL
+
+	lease, acquired, err := acquireLease(project, "cand2", cfg)
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if acquired {
+		t.Fatal("a 2nd candidate must NOT steal a fresh in-progress fencing record")
+	}
+	_ = lease
+	if killed.Load() {
+		t.Fatal("must not re-fence/kill while a live candidate's takeover is in progress")
+	}
+	// On-disk record must be untouched (still cand1's fencing @ epoch 6).
+	rec := readEpochFor(t, project)
+	if rec.Epoch != 6 || rec.Candidate.AgentID != "cand1" {
+		t.Fatalf("fresh fencing record must be untouched, got epoch=%d candidate=%s",
+			rec.Epoch, rec.Candidate.AgentID)
+	}
+}
+
+// A fencing record whose CANDIDATE is dead (but renewed_at still fresh) IS
+// resumable — the candidate crashed mid-takeover before the TTL elapsed.
+func TestResumesFencingWhenCandidateDead(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// OLD already dead: flock FREE, pid gone. Fencing record names a DEAD
+	// candidate but renewed_at is fresh (died right after writing it).
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: 9999, PidStart: 333333, AgentID: "old", Project: project},
+		Candidate:     identity{Pid: 8888, PidStart: 555555, AgentID: "deadcand", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(), // fresh, but candidate is dead
+	})
+
+	lease, acquired, err := acquireLease(project, "cand2", testCfg(clk, live))
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if !acquired {
+		t.Fatal("a fencing record with a DEAD candidate must be resumable even if fresh")
+	}
+	defer lease.Release()
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive || rec.Owner.AgentID != "cand2" {
+		t.Fatalf("expected active cand2 after resuming dead-candidate fencing, got %s/%s",
+			rec.State, rec.Owner.AgentID)
+	}
 }

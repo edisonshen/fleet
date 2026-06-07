@@ -264,19 +264,33 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 		return false, false, err
 	}
 	if gotFlock {
-		// FREE-FLOCK FAST PATH: the previous holder is gone (kernel
-		// released the flock on death). CAS the epoch to active; on ANY
-		// CAS failure, HARD-release the flock and retry (the flock is
-		// never held by a non-active owner).
-		ok, err := l.casToActiveAfterFlock(f)
+		// FREE-FLOCK FAST PATH: the previous holder is GONE — holding the
+		// flock is proof of that (the kernel releases on death, and an
+		// explicit Release() frees it; either way no other process holds
+		// the lifetime-exclusion lock now). Snapshot the epoch we observed
+		// at acquire, then CAS to active conditioned on the on-disk epoch
+		// still equalling that snapshot. The snapshot-CAS (not an owner-
+		// liveness heuristic) is what distinguishes the two cases:
+		//   - clean release/death: epoch unchanged -> CAS succeeds, even if
+		//     the recorded owner's PID is still briefly alive (it released).
+		//   - acquire-to-epoch window race (T37): a candidate bumped the
+		//     epoch via TakeOver -> snapshot mismatch -> CAS fails -> we
+		//     HARD-release the flock and retry (never held by a non-active
+		//     owner).
+		observed, rerr := readEpoch(l.paths.epoch)
+		switch {
+		case errors.Is(rerr, os.ErrNotExist):
+			observed = epochRecord{Epoch: 0} // first-ever leader
+		case rerr != nil:
+			_ = releaseFlock(f)
+			return false, false, fmt.Errorf("coordlock: read epoch snapshot: %w", rerr)
+		}
+		ok, err := l.casToActiveAfterFlock(observed.Epoch)
 		if err != nil {
 			_ = releaseFlock(f)
 			return false, false, err
 		}
 		if !ok {
-			// A candidate advanced the epoch between our flock-acquire and
-			// our CAS (e.g. it saw the brief flock-busy + still-OLD epoch
-			// and ran TakeOver). Release + retry — no engine/heartbeat.
 			_ = releaseFlock(f)
 			return false, false, nil
 		}
@@ -299,10 +313,39 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 	if l.holderHealthy(rec) {
 		return true, false, nil // healthy live leader -> stand down
 	}
-	// Hung-but-alive holder (flock still held, renewed_at frozen > TTL).
-	// Run the takeover state machine; it returns the same done/acquired
-	// contract.
+	// A transient (fencing / fenced_not_acquired) record means another
+	// candidate is mid-takeover. Do NOT barge in and re-fence a FRESH
+	// in-progress takeover whose candidate is still alive and within its
+	// retry budget — that makes multiple candidates invalidate each
+	// other's CAS and thrash. Only resume a transient record if it is
+	// STALE (renewed_at past TTL, candidate died/hung) OR its candidate
+	// PID is provably dead. Otherwise stand down and let it finish.
+	if rec.State == stateFencing || rec.State == stateFencedNotAcquired {
+		if !l.transientResumable(rec) {
+			return true, false, nil // fresh in-progress takeover -> stand down
+		}
+	}
+	// Hung-but-alive holder (flock still held, renewed_at frozen > TTL),
+	// or a stalled/abandoned transient record. Run the takeover state
+	// machine; it returns the same done/acquired contract.
 	return l.takeOver(rec)
+}
+
+// transientResumable reports whether a fencing / fenced_not_acquired
+// record may be resumed by a new candidate. True only if the in-progress
+// takeover looks abandoned: its renewed_at is past TTL (mono, same boot),
+// OR it is from a previous boot, OR its candidate PID is dead. A fresh
+// record with a live candidate within budget is NOT resumable (let the
+// first takeover complete).
+func (l *Lease) transientResumable(rec epochRecord) bool {
+	if rec.BootID != l.boot {
+		return true // previous boot -> stale
+	}
+	if l.cfg.nowMono()-rec.RenewedAtMono > int64(l.cfg.ttl) {
+		return true // stalled past TTL
+	}
+	// Fresh record: resumable only if the candidate driving it is dead.
+	return !l.pidAlive(rec.Candidate)
 }
 
 // holderHealthy reports whether the recorded holder is a healthy active
@@ -338,31 +381,26 @@ func (l *Lease) pidAlive(id identity) bool {
 	return st == id.PidStart // recycled pid -> start-time mismatch -> dead
 }
 
-// casToActiveAfterFlock writes {epoch=prev+1, state=active, owner=me}
-// under coordinator.epoch.lock, but ONLY if the epoch file still reads
-// what it read before our flock acquire (no candidate advanced it). On
-// epoch advance it returns ok=false WITHOUT writing — the caller must
-// release the flock and retry (release-on-CAS-fail).
-func (l *Lease) casToActiveAfterFlock(_ *os.File) (bool, error) {
+// casToActiveAfterFlock writes {epoch=observedEpoch+1, state=active,
+// owner=me} under coordinator.epoch.lock, but ONLY if the on-disk epoch
+// still equals observedEpoch (the value the caller read at flock acquire).
+// A mismatch means a candidate advanced the epoch in our acquire-to-CAS
+// window -> ok=false WITHOUT writing; the caller HARD-releases the flock
+// and retries (release-on-CAS-fail). Holding the flock is the proof of
+// leadership, so no owner-liveness heuristic is needed here.
+func (l *Lease) casToActiveAfterFlock(observedEpoch int64) (bool, error) {
 	return l.withEpochLock(func() (bool, error) {
-		rec, err := readEpoch(l.paths.epoch)
+		cur, err := readEpoch(l.paths.epoch)
 		switch {
 		case errors.Is(err, os.ErrNotExist):
-			// First-ever leader (no epoch file): start at epoch 1.
-			rec = epochRecord{Epoch: 0}
+			cur = epochRecord{Epoch: 0} // first-ever leader
 		case err != nil:
 			return false, err
-		default:
-			// An existing record. If it is already active+healthy+ours? It
-			// cannot be — we hold the flock, so any prior active holder is
-			// dead. But a CANDIDATE may have bumped the epoch to fencing/
-			// active in our window. If state is active with a DIFFERENT
-			// live owner, another candidate won the race -> CAS fail.
-			if rec.State == stateActive && !rec.Owner.equal(l.self) && l.pidAlive(rec.Owner) {
-				return false, nil
-			}
 		}
-		l.epoch = rec.Epoch + 1
+		if cur.Epoch != observedEpoch {
+			return false, nil // someone advanced the epoch in our window
+		}
+		l.epoch = cur.Epoch + 1
 		return true, l.writeEpochLocked(epochRecord{
 			Epoch: l.epoch,
 			State: stateActive,
