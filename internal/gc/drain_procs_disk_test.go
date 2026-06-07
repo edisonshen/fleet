@@ -78,13 +78,24 @@ func TestRemoveDrainRunFile_TOCTOU(t *testing.T) {
 		t.Fatalf("delete of already-gone record must be a no-op; got %v", err)
 	}
 
-	// Case 4: empty classified pid_start → bare delete (nothing to compare).
+	// Case 4: empty CLASSIFIED pid_start → bare delete (nothing to compare).
 	write("whatever")
 	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: ""}); err != nil {
-		t.Fatalf("removeDrainRunFile (empty pid_start): %v", err)
+		t.Fatalf("removeDrainRunFile (empty classified pid_start): %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("empty-fingerprint record should be deleted; stat err = %v", err)
+		t.Fatalf("empty-classified-fingerprint record should be deleted; stat err = %v", err)
+	}
+
+	// Case 5 (codex iter-9 [P2]): classified pid_start non-empty, but the
+	// on-disk record now has an EMPTY pid_start — a new drain that couldn't
+	// fingerprint reused the PID. Ambiguous → must KEEP.
+	write("") // new record with empty fingerprint
+	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: "OLD-classified"}); err != nil {
+		t.Fatalf("removeDrainRunFile: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("record overwritten with an empty fingerprint must be KEPT; stat err %v", err)
 	}
 }
 

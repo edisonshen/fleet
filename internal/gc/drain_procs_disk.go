@@ -122,8 +122,15 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 	// recorded drain is gone. An unreadable fingerprint is AMBIGUOUS (we
 	// saw it alive but can't prove identity) → do NOT kill, do NOT claim
 	// gone — return the zero result so the record is kept.
-	recorded := target.PidStart != "" // steady-state: pid_start IS the strong identity
-	if recorded {
+	// RequireFingerprint is the explicit LEGACY marker (codex iter-9 [P2]):
+	// distinguish steady-state from legacy by it, NOT by PidStart != ""
+	// (the legacy lister ALSO populates PidStart, so keying on it skipped
+	// the exe gate for legacy targets).
+	legacy := target.RequireFingerprint
+
+	// Start-time fingerprint check (PID-reuse defense) — runs for BOTH
+	// paths when a fingerprint is present.
+	if target.PidStart != "" {
 		cur, err := procStartTime(target.Pid)
 		switch {
 		case err != nil:
@@ -131,24 +138,19 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 		case cur != target.PidStart:
 			return DrainKillResult{Gone: true}, nil // PID reuse — unrelated proc
 		}
-		// pid_start matched → this IS the recorded drain. Do NOT run the
-		// exe-identity gate here (codex iter-8 [P2]): a binary-path change
-		// (post-upgrade, dev build) would otherwise mis-report Gone and
-		// delete the record for a still-live drain, stranding it. The argv
-		// re-probe below is the only remaining corroboration.
-	} else if target.RequireFingerprint {
-		// Legacy path with no captured fingerprint (codex iter-6 [P2]):
+	} else if legacy {
+		// Legacy path with NO captured fingerprint (codex iter-6 [P2]):
 		// fail CLOSED — without a start-time to corroborate, the live PID
-		// could be a different process that reused the number. Surface,
-		// never signal.
+		// could be a different process that reused the number.
 		return DrainKillResult{}, nil
-	} else {
-		// Legacy path WITH a fingerprint: argv-basename alone is spoofable
-		// (an unrelated binary/symlink named `fleet` with a `drain` arg),
-		// so require the target's executable to be the SAME fleet binary we
-		// are running before signaling (codex iter-6 [P2]). Only the legacy
-		// path needs this — the steady-state path already proved identity
-		// via pid_start above.
+	}
+
+	if legacy {
+		// Legacy path ALWAYS requires the executable-identity gate (codex
+		// iter-9 [P2]): argv-basename alone is spoofable (a different
+		// binary/symlink named `fleet` with a `drain` arg), and a legacy
+		// fingerprint does NOT prove the proc is OUR fleet binary. Require
+		// the target's exe to be the same fleet binary we are running.
 		switch sameFleetExe(target.Pid) {
 		case exeProbeMismatch:
 			return DrainKillResult{Gone: true}, nil // a different binary owns the PID
@@ -156,6 +158,11 @@ func killDrainGuarded(target DrainKillTarget) (DrainKillResult, error) {
 			return DrainKillResult{}, nil // can't prove ownership — surface, don't kill
 		}
 	}
+	// Steady-state path (pid_start matched above): identity is proven by
+	// the run-record fingerprint. Deliberately NO exe gate here (codex
+	// iter-8 [P2]) — a binary-path change (post-upgrade, dev build) must
+	// not mis-report Gone and delete a live drain's record. The argv
+	// re-probe below is the remaining corroboration.
 	// Corroborate the process is still a `fleet drain` (defends both
 	// paths). A probe failure is AMBIGUOUS (keep record); a clean
 	// non-match means the PID is now a different command → gone.
@@ -343,10 +350,17 @@ func removeDrainRunFile(run DrainRun) error {
 			return fmt.Errorf("re-read %s: %w", run.Path, rerr)
 		}
 		var cur DrainRun
-		if jerr := json.Unmarshal(data, &cur); jerr == nil && cur.PidStart != "" && cur.PidStart != run.PidStart {
-			// The file was overwritten by a new drain reusing the PID —
-			// do NOT delete the fresh record.
-			return nil
+		if jerr := json.Unmarshal(data, &cur); jerr == nil {
+			// Only delete when the on-disk record STILL has the exact
+			// pid_start we classified. Any other shape means the file may
+			// belong to a DIFFERENT run and must be kept:
+			//   - cur.PidStart != run.PidStart → reused-PID overwrite.
+			//   - cur.PidStart == ""           → a new drain that couldn't
+			//     read its own fingerprint reused the PID (codex iter-9
+			//     [P2]): empty is ambiguous, not "safe to delete".
+			if cur.PidStart != run.PidStart {
+				return nil
+			}
 		}
 	}
 	if err := os.Remove(run.Path); err != nil && !os.IsNotExist(err) {
