@@ -3114,6 +3114,10 @@ def test_rederive_prompt_has_safety_rails() -> None:
     # codex P2: multi-task PRs must reconstruct EVERY backing spec.
     assert "MULTIPLE tasks" in p
     assert "a, b" in p                        # both slugs listed
+    # codex P2: the local worker branch must be synced to the pushed head so
+    # a later fix/rebase doesn't block on stale local state.
+    assert "SYNC THE LOCAL WORKER BRANCH" in p
+    assert "reset --hard origin/worker/a" in p
 
 
 def test_rebase_prompt_conflict_is_nonterminal_and_reviews() -> None:
