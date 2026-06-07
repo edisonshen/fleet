@@ -163,6 +163,73 @@ func writeEpochRaw(t *testing.T, project string, rec epochRecord) {
 	}
 }
 
+// TestLeaderPresent (codex PR2 iter-11 [P2]): LeaderPresent uses the same
+// healthy/in-progress predicate AcquireLease uses, not a bare
+// state==active check. Healthy active -> true; stale active past TTL ->
+// false; fresh fencing takeover -> true; released / no record -> false.
+func TestLeaderPresent(t *testing.T) {
+	setupHome(t)
+	const project = "lp-test"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	const (
+		ownerPid   = 7000
+		ownerStart = int64(700700)
+		candPid    = 8000
+		candStart  = int64(800800)
+	)
+	live.set(ownerPid, ownerStart)
+	live.set(candPid, candStart)
+	owner := identity{Pid: ownerPid, PidStart: ownerStart, AgentID: "owner", Project: project}
+	cand := identity{Pid: candPid, PidStart: candStart, AgentID: "cand", Project: project}
+
+	// No record -> false.
+	if leaderPresentWithCfg(project, cfg) {
+		t.Error("no record: want false")
+	}
+
+	// Healthy active -> true.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 5, State: stateActive, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if !leaderPresentWithCfg(project, cfg) {
+		t.Error("healthy active: want true")
+	}
+
+	// Stale active (owner alive but renewed_at past TTL) -> false.
+	staleClk := &fakeClock{}
+	staleClk.advance(2 * cfg.ttl) // now is well past renewed_at=0
+	if leaderPresentWithCfg(project, testCfg(staleClk, live)) {
+		t.Error("stale active past TTL: want false (stealable)")
+	}
+
+	// Dead owner (pid gone) -> false even within TTL.
+	deadLive := newFakeLiveness() // owner/cand NOT set -> dead
+	if leaderPresentWithCfg(project, testCfg(clk, deadLive)) {
+		t.Error("dead owner: want false")
+	}
+
+	// Fresh fencing takeover (live candidate, in budget) -> true.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing, Owner: owner, Candidate: cand,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if !leaderPresentWithCfg(project, cfg) {
+		t.Error("fresh fencing takeover: want true")
+	}
+
+	// Released -> false.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 7, State: stateReleased, Owner: owner,
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	if leaderPresentWithCfg(project, cfg) {
+		t.Error("released: want false")
+	}
+}
+
 // ---- T1 ----
 
 // T1: NB acquire on a healthy heartbeating holder returns

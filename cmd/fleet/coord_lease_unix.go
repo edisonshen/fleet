@@ -37,18 +37,23 @@ func leaseDisabledOrUnsupported(err error) bool {
 	return errors.Is(err, coordlock.ErrFailoverDisabled)
 }
 
-// coordLeaderCheck reports whether a healthy coordinator lease leader
-// currently exists for project. Wired into spawn.Options.LeaderCheck so
-// spawn can tell a clean lease STAND-DOWN apart from a real supervisor
-// failure (codex PR2 iter-6 [P2]). Off-flag it returns false (no lease in
-// play), which makes spawn surface an early-exit as a real error rather
-// than a false stand-down.
+// coordLeaderCheck reports whether a HEALTHY coordinator lease leader (or
+// a fresh in-progress takeover) currently exists for project. Wired into
+// spawn.Options.LeaderCheck so spawn can tell a clean lease STAND-DOWN
+// apart from a real supervisor failure (codex PR2 iter-6 [P2]).
+//
+// It uses coordlock.LeaderPresent — the SAME healthy/in-progress
+// predicate AcquireLease uses (TTL + pid_start liveness + fresh-fencing),
+// NOT a bare state==active check (codex PR2 iter-11 [P2]): a stale active
+// record (dead/hung owner past TTL) must NOT read as "leader present"
+// (that would hide a recoverable coord as "already running"), and a fresh
+// fencing takeover MUST read as present (a legitimate successor is
+// acquiring). Off-flag it returns false (no lease in play).
 func coordLeaderCheck(project string) bool {
 	if !leaseFailoverEnabled() {
 		return false
 	}
-	_, ok := coordlock.CurrentActiveOwnerPID(project)
-	return ok
+	return coordlock.LeaderPresent(project)
 }
 
 // productionAcquireLease builds the real lease-acquire closure for

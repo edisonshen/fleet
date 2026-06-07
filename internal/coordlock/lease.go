@@ -1225,6 +1225,56 @@ func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
 	return rec.Owner.Pid, true
 }
 
+// LeaderPresent reports whether a coordinator lease is currently held by
+// a HEALTHY leader OR is mid a FRESH in-progress takeover for project —
+// i.e. whether a duplicate spawn should stand down. It applies the SAME
+// predicate AcquireLease uses (codex PR2 iter-11 [P2]), not a bare
+// state==active check:
+//   - state==active AND same boot AND within TTL AND owner pid+pid_start
+//     alive  -> healthy leader present, true;
+//   - state==fencing AND the candidate is fresh (live, in-budget) -> a
+//     legitimate takeover is in progress, true (the new leader is coming);
+//   - otherwise (no record, stale/expired active, dead owner, abandoned
+//     fencing, fenced_not_acquired, released) -> false (stealable / no
+//     leader).
+//
+// Read-only, takes no lock; a torn/missing read degrades to false. Used by
+// cmd/fleet's coordLeaderCheck to disambiguate a clean stand-down from a
+// real supervisor failure.
+func LeaderPresent(project string) bool {
+	return leaderPresentWithCfg(project, defaultLeaseConfig())
+}
+
+// leaderPresentWithCfg is the seam-injected core of LeaderPresent so
+// tests drive a deterministic clock / pid-liveness / boot id.
+func leaderPresentWithCfg(project string, cfg leaseConfig) bool {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return false
+	}
+	// Throwaway lease carrying the seams so holderHealthy /
+	// transientResumable apply the same logic the acquire path does. self
+	// is zero (we only read foreign records); transientResumable's
+	// "is this MY fencing record" short-circuit can never fire on a zero
+	// self vs a real candidate.
+	l := &Lease{cfg: cfg, paths: paths, boot: cfg.boot()}
+	switch rec.State {
+	case stateActive:
+		return l.holderHealthy(rec)
+	case stateFencing:
+		// A fresh, live, in-budget takeover (NOT resumable by a newcomer)
+		// means a legitimate successor is mid-acquire -> treat as present.
+		return !l.transientResumable(rec)
+	default:
+		// fenced_not_acquired / released / unknown -> no live leader.
+		return false
+	}
+}
+
 // PidStartNanos exports the platform pid-start reader so the
 // authenticated kill primitive (internal/coord.KillCoordIfIdentity-
 // Matches) and the coord-run supervisor can stamp + re-validate a
