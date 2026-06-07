@@ -22,9 +22,11 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -169,5 +171,64 @@ func TestCoordRun_Lease_Integration_RealFlockHeldThenReleased(t *testing.T) {
 	}
 	if !released {
 		t.Fatalf("flock was not released within 15s after killing supervisor pid %d", supPid)
+	}
+}
+
+// T9 end-to-end + do-not-resurrect precondition (codex PR2 iter-3 [P2]):
+// a real `fleet coord-run` that loses the lease race STANDS DOWN — it
+// prints "a coord is already running for <project>", does NOT start the
+// child, exits 0, and its coord.Cleanup ARCHIVES the pre-launch record.
+// That archive is exactly what makes spawn.Spawn's merge see ErrNotFound
+// and skip the resurrecting final write.
+func TestCoordRun_Lease_Integration_StandDownArchivesRecord(t *testing.T) {
+	bin := buildFleetBinary(t)
+
+	const (
+		agentID = "lsd1down"
+		project = "lsd-standdown"
+	)
+	fleetHome := t.TempDir()
+	t.Setenv("FLEET_HOME", fleetHome)
+	t.Setenv("FLEET_LEASE_FAILOVER", "1")
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if _, err := state.EnsureProjectInitialized(project); err != nil {
+		t.Fatalf("ensure project: %v", err)
+	}
+	// Pre-hold the lease from the test so the spawned coord-run must lose.
+	leader, acquired, err := coordlock.AcquireLease(project, "test-leader")
+	if err != nil || !acquired || leader == nil {
+		t.Fatalf("test could not pre-acquire the lease (acquired=%v err=%v)", acquired, err)
+	}
+	t.Cleanup(leader.Release)
+
+	// Pre-write the stand-down coord's record (as spawn would pre-launch).
+	rec := agent.New(agentID)
+	rec.Project = project
+	rec.TaskID = CoordTaskIDPrefix + project
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+
+	// A sentinel the child would touch IF it ran — it must NOT, because
+	// stand-down never starts the child.
+	sentinel := filepath.Join(t.TempDir(), "child-ran")
+	cmd := exec.Command(bin, "coord-run", "--agent", agentID, "--project", project,
+		"--", "sh", "-c", "touch "+sentinel)
+	cmd.Env = append(os.Environ(), "FLEET_HOME="+fleetHome, "FLEET_LEASE_FAILOVER=1")
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		t.Fatalf("coord-run stand-down should exit 0, got %v\noutput:\n%s", runErr, out)
+	}
+	if !strings.Contains(string(out), "a coord is already running for "+project) {
+		t.Errorf("expected stand-down message, got:\n%s", out)
+	}
+	if _, serr := os.Stat(sentinel); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("child MUST NOT run on stand-down; sentinel %s exists", sentinel)
+	}
+	// The record must be ARCHIVED (not live) — coord.Cleanup ran.
+	if _, lerr := agent.Load(agentID); !errors.Is(lerr, state.ErrNotFound) {
+		t.Errorf("stand-down coord record must be archived; Load err=%v", lerr)
 	}
 }

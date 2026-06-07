@@ -14,6 +14,7 @@ package spawn
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/handoff"
+	"github.com/edisonshen/fleet/internal/state"
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
@@ -900,6 +902,17 @@ func Spawn(opts Options) (*agent.Record, error) {
 	}
 
 	if err := tmux.Spawn(session, cwd, execArgv, extraEnv); err != nil {
+		// Roll back the pre-launch record (codex PR2 iter-3 [P2]): the
+		// tmux session never came up, so leaving a live record behind
+		// would advertise a coord that does not exist (confusing status /
+		// attach / recovery). fleet-owns-its-resources: clean up what we
+		// created on the failure path. Best-effort — a removal error is
+		// secondary to the spawn failure we are already returning.
+		if leaseWrapped {
+			if livePath, perr := state.AgentPath(id); perr == nil {
+				_ = os.Remove(livePath)
+			}
+		}
 		return nil, err
 	}
 	// Best-effort: pin a "Ctrl-b d to detach" hint into this session's
@@ -943,14 +956,32 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// [P1]). Our in-memory rec has empty supervisor fields; clobbering
 	// the disk record with it would erase the stamp the supervisor wrote,
 	// re-breaking STONITH authentication. Re-load + carry the three
-	// supervisor fields forward. Best-effort: a load failure leaves the
-	// fields empty (same as off-flag) rather than aborting the spawn.
+	// supervisor fields forward.
+	//
+	// DO-NOT-RESURRECT (codex PR2 iter-3 [P2]): a missing on-disk record
+	// here means the supervisor already ran its full lifecycle and
+	// archived the pre-launch record — the common case is a `acquired=
+	// false` STAND-DOWN (a healthy leader already holds the lease), where
+	// coord-run returns nil and coord.Cleanup archives the record + kills
+	// the (already-gone) session. Re-writing rec now would RESURRECT a
+	// live record for a dead coord. So on ErrNotFound: skip the final
+	// write entirely and return the in-memory rec (for the caller's
+	// stdout) WITHOUT persisting — the supervisor owns the lifecycle.
 	if leaseWrapped {
-		if onDisk, lerr := agent.Load(id); lerr == nil {
+		onDisk, lerr := agent.Load(id)
+		switch {
+		case errors.Is(lerr, state.ErrNotFound):
+			_, _ = fmt.Fprintf(os.Stderr,
+				"spawn: coord %s record already archived by its supervisor "+
+					"(stand-down or early exit); not resurrecting it\n", id)
+			return rec, nil
+		case lerr == nil:
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
 			rec.SupervisorExePath = onDisk.SupervisorExePath
 		}
+		// Any other load error: fall through to the write (best-effort —
+		// the supervisor fields stay empty, same as off-flag).
 	}
 
 	if err := rec.Write(); err != nil {
