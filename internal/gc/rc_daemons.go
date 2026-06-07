@@ -25,7 +25,6 @@ package gc
 import (
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -33,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/rc"
 	"github.com/edisonshen/fleet/internal/state"
 )
@@ -167,6 +167,16 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 			// gc must be consistent — surface it so a pre-upgrade daemon
 			// isn't classified healthy and left to live forever.
 			reason = fmt.Sprintf("legacy daemon with no recorded claude version (current %s)", curVer)
+		case matches && recorded.OwningCoordID != "" &&
+			deps.CoordRecordExists != nil && !deps.CoordRecordExists(recorded.OwningCoordID):
+			// codex P2 (dead-but-unarchived owner leak): a current-version
+			// daemon whose recorded owner has NO agent record. The rc.Up /
+			// SweepAllProjects destructive paths intentionally treat a
+			// present-record-with-dead-session as "alive" to avoid a wrong-
+			// tmux-socket false positive — but a definitively MISSING record
+			// means the coord is gone and the daemon leaks. Surface it here
+			// (this kind is surface-by-default; the operator decides).
+			reason = fmt.Sprintf("owning coord %q has no agent record (dead/unarchived owner)", recorded.OwningCoordID)
 		default:
 			continue // healthy
 		}
@@ -353,11 +363,11 @@ func currentClaudeVersionOnDisk() (string, error) {
 func killRCDaemonOnDisk(pid int, expectedCwd string) error {
 	if !pidIsRCListenerFn(pid, expectedCwd) {
 		// Process already exited, PID recycled by an unrelated process, or
-		// the live cwd no longer matches — must not signal it.
-		fmt.Fprintf(os.Stderr,
-			"gc: rc daemon PID %d no longer matches a claude remote-control listener at %q (exited, PID reuse, or cwd drift); skipping kill\n",
+		// the live cwd no longer matches — must not signal it. codex P3:
+		// return an error (not nil) so the caller records verb=surface with
+		// the skip reason instead of falsely reporting verb=killed.
+		return fmt.Errorf("skipped: PID %d no longer matches a claude remote-control listener at %q (exited, PID reuse, or cwd drift)",
 			pid, expectedCwd)
-		return nil
 	}
 	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return fmt.Errorf("SIGTERM %d: %w", pid, err)
@@ -415,6 +425,23 @@ func pidIsRCListener(pid int, expectedCwd string) bool {
 		return false
 	}
 	return cwd == expectedCwd
+}
+
+// coordRecordExistsOnDisk reports whether ~/.fleet/agents/<coordID>.json
+// exists. Used by the orphan-rc-daemons classifier to surface daemons whose
+// owning coord is gone (dead/unarchived). Only a definitively-missing record
+// (state.ErrNotFound) counts as "doesn't exist"; a corrupt / permission-
+// denied read is ambiguous and treated as "exists" so a transient error
+// never surfaces (and on --apply, never kills) a daemon with a live owner.
+func coordRecordExistsOnDisk(coordID string) bool {
+	if coordID == "" {
+		return true // empty owner → skip the dead-owner check.
+	}
+	_, err := agent.Load(coordID)
+	if err == nil {
+		return true
+	}
+	return !errors.Is(err, state.ErrNotFound)
 }
 
 // processAlive probes whether pid is still running via signal-0

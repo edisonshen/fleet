@@ -140,6 +140,9 @@ func withRCDaemonStubs(d Deps) Deps {
 	d.KillRCDaemon = func(int, string) error {
 		return errors.New("stubDeps: KillRCDaemon should not run")
 	}
+	// Default: every owning coord has a record (no spurious dead-owner
+	// surfacing). Dead-owner tests override this to return false.
+	d.CoordRecordExists = func(string) bool { return true }
 	return d
 }
 
@@ -3770,6 +3773,67 @@ func TestReconcile_OrphanRCDaemon_HealthyDaemonPreserved(t *testing.T) {
 	}
 }
 
+func TestReconcile_OrphanRCDaemon_DeadOwnerSurfaces(t *testing.T) {
+	// codex P2: a current-version daemon whose recorded OwningCoordID has no
+	// agent record (dead/unarchived coord) leaks — the rc.Up/sweep
+	// destructive paths leave it alone to avoid wrong-socket false positives.
+	// This surface-by-default gc kind must catch it.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "2.1.156", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet", OwningCoordID: "deadc0de"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	deps.CoordRecordExists = func(id string) bool { return id != "deadc0de" } // owner gone
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "1234")
+	if !ok {
+		t.Fatalf("dead-owner daemon must be surfaced; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("dead-owner dry-run verb=%q want %q", a.Verb, VerbSurface)
+	}
+	if !strings.Contains(a.Reason, "no agent record") {
+		t.Fatalf("reason must explain the dead owner; got %q", a.Reason)
+	}
+}
+
+func TestReconcile_OrphanRCDaemon_LiveOwnerNotSurfaced(t *testing.T) {
+	// Complement: a current-version daemon whose owner record EXISTS is
+	// healthy — not surfaced (guards the dead-owner branch from over-firing).
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{{PID: 1234, Version: "2.1.156", WorkingDir: "/tmp/fleet"}}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet", OwningCoordID: "livec0de"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	// default CoordRecordExists returns true → owner alive.
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanRCDaemons, "1234"); ok {
+		t.Fatalf("live-owner daemon must not be surfaced; got %+v", got.Actions)
+	}
+}
+
 func TestReconcile_OrphanRCDaemon_StaleVersionSurfaces(t *testing.T) {
 	// A daemon whose PID is recorded in rc-state.json BUT whose
 	// version disagrees with current claude is still an orphan
@@ -3838,16 +3902,20 @@ func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
 	// codex P2: the PID can exit between pgrep enumeration and the kill,
 	// and the kernel can recycle it. killRCDaemonOnDisk must re-verify the
 	// argv + cwd still match a claude remote-control listener and REFUSE to
-	// signal a recycled / unrelated PID. We stub the verifier to false and
-	// assert no signal is attempted (the call returns nil, no error).
+	// signal a recycled / unrelated PID. codex P3: on refusal it returns an
+	// ERROR (not nil) so the caller records verb=surface, not a false killed.
 	prev := pidIsRCListenerFn
 	pidIsRCListenerFn = func(int, string) bool { return false }
 	t.Cleanup(func() { pidIsRCListenerFn = prev })
 
 	// PID 1 (init) would be catastrophic to actually signal; the verifier
 	// stub returns false so the kill is refused before any syscall.Kill.
-	if err := killRCDaemonOnDisk(1, "/tmp/whatever"); err != nil {
-		t.Fatalf("killRCDaemonOnDisk must no-op (nil) when PID-reuse check fails; got %v", err)
+	err := killRCDaemonOnDisk(1, "/tmp/whatever")
+	if err == nil {
+		t.Fatalf("killRCDaemonOnDisk must return an error (not nil) when PID-reuse check fails so the caller doesn't report verb=killed")
+	}
+	if !strings.Contains(err.Error(), "skipped") {
+		t.Fatalf("error should explain the skip; got %v", err)
 	}
 }
 

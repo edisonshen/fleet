@@ -321,6 +321,15 @@ type Deps struct {
 	// fleet-coord prefix, so argv-only re-verify isn't enough — the cwd
 	// re-check fails closed). Production wiring is killRCDaemonOnDisk.
 	KillRCDaemon func(pid int, expectedCwd string) error
+	// CoordRecordExists reports whether an agent record exists for the
+	// given owning-coord ID (codex P2 dead-owner leak): a current-version
+	// RC daemon whose recorded OwningCoordID has NO agent record is a
+	// dead-but-unarchived-owner orphan — the rc.Up/sweep destructive paths
+	// deliberately leave it alone (false-positive avoidance), so this
+	// surface-by-default gc kind is the place that catches the leak. Empty
+	// coord ID → "exists" (skip the check). Production wiring is
+	// coordRecordExistsOnDisk. nil disables the dead-owner branch.
+	CoordRecordExists func(coordID string) bool
 
 	// Invalid-projects (KindInvalidProjects).
 	// ListProjectDirs enumerates EVERY ~/.fleet/projects/<name>/ entry
@@ -879,6 +888,7 @@ func DefaultDeps() Deps {
 		ListRCStates:          listRCStatesOnDisk,
 		CurrentClaudeVersion:  currentClaudeVersionOnDisk,
 		KillRCDaemon:          killRCDaemonOnDisk,
+		CoordRecordExists:     coordRecordExistsOnDisk,
 	}
 }
 
