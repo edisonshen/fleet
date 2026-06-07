@@ -341,11 +341,12 @@ func coordPendingClaimFresh(project string, budget time.Duration) (bool, coordPe
 }
 
 // clearCoordPendingClaim removes the pending-spawn claim. Idempotent:
-// removing an absent claim is a no-op. The Go side calls this only via
-// tests; production clearing happens in the coord's first tick
-// (skills/coordinator/loop.py). Defined here so the Go invariant — claim
-// removal is best-effort and never errors on absence — is unit-tested
-// against the same path constant the writer uses.
+// removing an absent claim is a no-op. Production callers: the
+// failed-spawn error path and the prompt-delivery-failure paths in
+// runDispatch (clearClaimOnPromptFailure), plus the coord's first tick
+// (skills/coordinator/loop.py) for the happy path. Defined here so the Go
+// invariant — claim removal is best-effort and never errors on absence —
+// is unit-tested against the same path constant the writer uses.
 func clearCoordPendingClaim(project string) error {
 	path, err := coordPendingClaimPath(project)
 	if err != nil {
@@ -355,6 +356,29 @@ func clearCoordPendingClaim(project string) error {
 		return err
 	}
 	return nil
+}
+
+// clearClaimOnPromptFailure removes the cold-start pending-spawn claim
+// when spawn.Spawn SUCCEEDED but the initial prompt failed to deliver
+// (send-keys errored, or typed-but-not-submitted). In that state the tmux
+// session is alive but /coordinator never started — so the coord's first
+// tick (which is what normally clears the claim) will NEVER run, and the
+// claim would otherwise veto every retry via coordPendingClaimFresh for
+// the full freshness window, blocking the operator's prompt-failure
+// recovery (re-`[a]` / re-dispatch). Clearing it here lets an immediate
+// retry respawn the coord (codex iter-4 P2). Guarded identically to the
+// claim WRITE so we only clear what we wrote; best-effort (the claim is
+// fail-open and ages out regardless, so a clear failure only costs the
+// window we're trying to avoid).
+func clearClaimOnPromptFailure(opts *dispatchOpts, preAllocatedID string) {
+	if !opts.coordSpawn || opts.project == "" || preAllocatedID == "" {
+		return
+	}
+	if clrErr := clearCoordPendingClaim(opts.project); clrErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr,
+			"warning: coord-spawn pending-claim cleanup after prompt-delivery failure failed (%v) — claim ages out in %s\n",
+			clrErr, coordFreshnessWindow)
+	}
 }
 
 // coordSpawnVeto returns a non-empty refusal reason when ANY signal

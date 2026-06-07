@@ -1146,6 +1146,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			_, _ = fmt.Fprintf(stdout,
 				"warning: initial prompt not delivered (%v) — attach to type it manually\n",
 				perr)
+			clearClaimOnPromptFailure(opts, preAllocatedID)
 		case !submitted:
 			// Codex review iter-6 P2: include the same sigil
 			// ("initial prompt not delivered") the TUI's
@@ -1158,6 +1159,7 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			// substring is the wire contract.
 			_, _ = fmt.Fprintf(stdout,
 				"warning: initial prompt not delivered (typed but Enter did not submit; still in Claude's input box after retry) — attach and press Enter manually\n")
+			clearClaimOnPromptFailure(opts, preAllocatedID)
 		default:
 			_, _ = fmt.Fprintf(stdout, "  prompt:  delivered\n")
 		}

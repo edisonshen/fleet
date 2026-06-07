@@ -373,6 +373,60 @@ func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	}
 }
 
+// ---- P2 (codex iter-4): prompt-delivery failure must clear the claim ----
+
+// When spawn.Spawn succeeds but the initial prompt fails to deliver, the
+// session is alive but /coordinator never starts, so the coord's first
+// tick (the normal claim-clearer) never runs. clearClaimOnPromptFailure
+// drops the claim so an immediate retry isn't vetoed for the full
+// freshness window. Guarded to the coord-spawn path: a non-coord-spawn
+// dispatch (worker) must never touch a coord claim.
+func TestClearClaimOnPromptFailure(t *testing.T) {
+	newPendingClaimHome(t, "promptfail")
+
+	seed := func(t *testing.T) {
+		t.Helper()
+		if err := writeCoordPendingClaim("promptfail", "agent-pf"); err != nil {
+			t.Fatalf("writeCoordPendingClaim: %v", err)
+		}
+	}
+	claimExists := func(t *testing.T) bool {
+		t.Helper()
+		path, err := coordPendingClaimPath("promptfail")
+		if err != nil {
+			t.Fatalf("coordPendingClaimPath: %v", err)
+		}
+		_, statErr := os.Stat(path)
+		return statErr == nil
+	}
+
+	// coord-spawn path → claim cleared.
+	seed(t)
+	clearClaimOnPromptFailure(&dispatchOpts{
+		project: "promptfail", coordSpawn: true,
+	}, "agent-pf")
+	if claimExists(t) {
+		t.Errorf("coord-spawn prompt-failure must clear the claim")
+	}
+
+	// non-coord-spawn path → claim untouched (worker dispatch).
+	seed(t)
+	clearClaimOnPromptFailure(&dispatchOpts{
+		project: "promptfail", coordSpawn: false,
+	}, "agent-pf")
+	if !claimExists(t) {
+		t.Errorf("non-coord-spawn dispatch must NOT clear a coord claim")
+	}
+
+	// empty preAllocatedID (defensive guard) → claim untouched.
+	clearClaimOnPromptFailure(&dispatchOpts{
+		project: "promptfail", coordSpawn: true,
+	}, "")
+	if !claimExists(t) {
+		t.Errorf("empty preAllocatedID must NOT clear the claim (guard mismatch)")
+	}
+}
+
 // ---- P2 (codex iter-1): failed spawn must clear the pending claim ----
 
 // A coord-spawn dispatch writes the pending claim immediately BEFORE
