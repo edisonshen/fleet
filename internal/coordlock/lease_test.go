@@ -1107,3 +1107,133 @@ func TestStillOwnedRejectsSelfExpiredToken(t *testing.T) {
 		t.Fatal("a token whose boot != record boot must NOT be StillOwned")
 	}
 }
+
+// ---- codex iter-5 [P2] #1: free-flock must not steal a fresh fencing ----
+
+// OLD died (flock free) but a live first candidate's FRESH fencing record
+// is on disk. A second candidate that grabs the free flock must NOT
+// promote itself to active over that healthy in-progress takeover — it
+// stands down (acquired=false) and leaves the fencing record intact.
+func TestFreeFlockDoesNotStealFreshFencing(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+
+	// Flock FREE; fresh fencing record from a LIVE candidate.
+	const liveCandPid = 6000
+	live.set(liveCandPid, int64(666666))
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: 9999, PidStart: 333333, AgentID: "old", Project: project},
+		Candidate:     identity{Pid: liveCandPid, PidStart: int64(666666), AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: clk.now(), // fresh
+	})
+
+	clk.advance(5 * time.Second) // within TTL
+
+	lease, acquired, err := acquireLease(project, "cand2", testCfg(clk, live))
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if acquired {
+		t.Fatal("free-flock path must NOT promote over a fresh live fencing candidate")
+	}
+	_ = lease
+	rec := readEpochFor(t, project)
+	if rec.State != stateFencing || rec.Candidate.AgentID != "cand1" {
+		t.Fatalf("fresh fencing record must be left intact, got state=%s candidate=%s",
+			rec.State, rec.Candidate.AgentID)
+	}
+}
+
+// ---- codex iter-5 [P2] #2: busy flock, no epoch record ----
+
+// A holder that grabbed the flock and is still FRESH in the acquire-to-
+// epoch window (no epoch file yet, flock-body stamp fresh + live) is a
+// legitimate booting coord; a candidate stands down.
+func TestBusyFlockNoEpoch_FreshHolderStandsDown(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	paths, _ := resolvePaths(project)
+
+	// Simulate a booting holder: hold the flock + stamp a FRESH body, no
+	// epoch file written yet.
+	relHolder := holdFlock(t, project)
+	_ = relHolder
+	const bootPid = 7000
+	live.set(bootPid, int64(777777))
+	body, _ := json.Marshal(flockBody{Pid: bootPid, PidStart: int64(777777), BootID: "test-boot-1", Mono: clk.now()})
+	if err := os.WriteFile(paths.flock, body, 0o644); err != nil {
+		t.Fatalf("stamp body: %v", err)
+	}
+
+	clk.advance(5 * time.Second) // within TTL
+
+	lease, acquired, err := acquireLease(project, "cand", testCfg(clk, live))
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if acquired {
+		t.Fatal("a fresh booting holder (no epoch yet) must NOT be taken over")
+	}
+	_ = lease
+}
+
+// A holder hung in the acquire-to-epoch window (no epoch file, flock-body
+// stamp older than TTL) is recoverable: the candidate enters takeover.
+// In PR1 the kill is a no-op stub and the hung holder still holds the
+// flock, so the takeover cannot acquire it -> it surfaces a
+// fenced_not_acquired escalation (NOT an indefinite silent stand-down).
+func TestBusyFlockNoEpoch_StaleHolderRecovers(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	paths, _ := resolvePaths(project)
+
+	holdFlock(t, project) // hung holder still holds the flock
+	const hungPid = 7000
+	live.set(hungPid, int64(777777))
+	// Body stamped at mono=0; we advance past TTL so it reads as hung.
+	body, _ := json.Marshal(flockBody{Pid: hungPid, PidStart: int64(777777), BootID: "test-boot-1", Mono: 0})
+	if err := os.WriteFile(paths.flock, body, 0o644); err != nil {
+		t.Fatalf("stamp body: %v", err)
+	}
+
+	cfg := testCfg(clk, live)
+	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free the flock
+	var fenced atomic.Bool
+	cfg.killStub = func(owner identity) error {
+		if owner.Pid == hungPid {
+			fenced.Store(true)
+		}
+		return nil // PR1 no-op: holder keeps the flock
+	}
+
+	clk.advance(31 * time.Second) // body now past TTL
+
+	_, acquired, err := acquireLease(project, "cand", cfg)
+	// PR1: takeover fences + kill-stub(no-op) + cannot acquire the still-
+	// held flock -> surfaces an error (escalation), never silent stand-down.
+	if acquired {
+		t.Fatal("PR1 stub cannot free a real held flock; acquire should not succeed")
+	}
+	if err == nil {
+		t.Fatal("a hung in-window holder must SURFACE (escalation), not silently stand down")
+	}
+	if !fenced.Load() {
+		t.Fatal("takeover must have fenced + targeted the flock-body holder pid")
+	}
+	// On disk: a fencing/fenced record naming the hung holder, NOT silence.
+	rec := readEpochFor(t, project)
+	if rec.State != stateFencing && rec.State != stateFencedNotAcquired {
+		t.Fatalf("expected a transient takeover record, got state=%s", rec.State)
+	}
+	if rec.Owner.Pid != hungPid {
+		t.Fatalf("transient record must name the hung flock-body holder as owner, got pid=%d", rec.Owner.Pid)
+	}
+}
