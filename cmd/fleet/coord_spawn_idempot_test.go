@@ -234,6 +234,41 @@ func TestLiveCoordForAttach_WrongProjectIgnored(t *testing.T) {
 	}
 }
 
+// uniqueLiveCoordForAttach returns the live record ONLY when exactly one
+// is live; nil for zero or for the ambiguous multi-live case (codex
+// iter-8 P2) so the fast path never promotes the wrong session in a
+// duplicate-coord state.
+func TestUniqueLiveCoordForAttach(t *testing.T) {
+	sessionAlive := func(string) bool { return true }
+	const taskID = "coord-projects-fleet"
+	const project = "projects-fleet"
+
+	// Exactly one live → returns it.
+	one := []*agent.Record{
+		{ID: "live1", TaskID: taskID, Project: project, TmuxSession: "fleet-live1"},
+	}
+	if got := uniqueLiveCoordForAttach(taskID, project, one, sessionAlive); got == nil || got.ID != "live1" {
+		t.Errorf("single live candidate: got %v, want live1", got)
+	}
+
+	// Two live → nil (ambiguous, refuse to promote).
+	two := []*agent.Record{
+		{ID: "live1", TaskID: taskID, Project: project, TmuxSession: "fleet-live1"},
+		{ID: "live2", TaskID: taskID, Project: project, TmuxSession: "fleet-live2"},
+	}
+	if got := uniqueLiveCoordForAttach(taskID, project, two, sessionAlive); got != nil {
+		t.Errorf("two live candidates must return nil (ambiguous), got %q", got.ID)
+	}
+
+	// Zero live → nil.
+	none := []*agent.Record{
+		{ID: "dead1", TaskID: taskID, Project: project, TmuxSession: "fleet-dead1"},
+	}
+	if got := uniqueLiveCoordForAttach(taskID, project, none, func(string) bool { return false }); got != nil {
+		t.Errorf("no live candidate must return nil, got %q", got.ID)
+	}
+}
+
 // ---- P2 (codex iter-2): attach fast path preserves the spawn-output contract ----
 
 // When --coord-spawn finds a live coord already supervising the project,

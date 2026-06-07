@@ -681,8 +681,17 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// booting coord is held by the cold-start pending-claim veto (retry),
 	// a prompt-failed session respawns. The fast path fires ONLY for a
 	// coord that has PROVEN it is supervising the project since it spawned.
+	//
+	// Uniqueness gate (codex iter-8 P2): only promote when there is
+	// EXACTLY ONE live candidate. With multiple live coord records the
+	// project-wide coord-state.json can't identify which one ticked, so
+	// an older real coord's mtime could vouch for a newer prompt-failed
+	// session — promoting a non-coordinator. uniqueLiveCoordForAttach
+	// returns nil for the ambiguous (>=2 live) case → fall through to the
+	// veto/recovery path, the correct handling for an already-forked
+	// project.
 	if opts.coordSpawn {
-		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil &&
+		if live := uniqueLiveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil &&
 			coordStateTickedAfter(opts.project, live.SpawnedAt) {
 			_, _ = fmt.Fprintf(os.Stderr,
 				"coord %s already alive for project %s; attaching to the existing session\n",
@@ -754,6 +763,25 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		// (TASK-PLAN non-goal: "Changing the cold-start duration"), not a
 		// new regression. T7 still exercises the (b) disjunct for contract
 		// completeness.
+		//
+		// DELIBERATE FORK (codex iter-5 demanded live-veto → iter-6
+		// demanded NO live-veto → iter-8 re-demanded live-veto): these are
+		// mutually exclusive with local-only signals. "Veto on raw live"
+		// closes a narrow duplicate window but strands prompt-failure
+		// retries (a recurring real bug). "Don't veto on raw live" keeps
+		// retries working at the cost of a residual cold-start duplicate
+		// window when the claim is unusable (write failed, corrupt, or an
+		// older binary wrote no claim) AND the coord is live-not-ticking
+		// AND a contending dispatch is on a DIFFERENT tmux socket (same-
+		// socket concurrency is already serialized by the NB-flock). We
+		// keep the claim-based design (this branch): the residual is a
+		// narrow degraded-state intersection and is strictly better than
+		// the pre-task baseline (which had NO cold-start veto at all),
+		// whereas re-stranding prompt-failure retries breaks an everyday
+		// operator path. Filed as a deferred [P2] for an operator design
+		// call (a durable per-record liveness/heartbeat signal would let
+		// the veto distinguish booting from prompt-failed and resolve the
+		// fork properly — out of this task's scope).
 		const liveCoord = false
 		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
 		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {

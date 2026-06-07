@@ -485,6 +485,44 @@ func liveCoordForAttach(taskID, project string, records []*agent.Record, session
 	return best
 }
 
+// uniqueLiveCoordForAttach returns the live coord record ONLY when there
+// is EXACTLY ONE live candidate for the task_id+project; it returns nil
+// when there are zero OR two-or-more live candidates (codex iter-8 P2).
+//
+// The fast path PROMOTES the returned record (exit 0 `agent <id>
+// spawned`). With MULTIPLE live coord records the project-wide
+// coord-state.json cannot identify WHICH coord wrote it: an older real
+// coord's tick could vouch for a newer prompt-failed session that
+// liveCoordForAttach (newest-wins) would select, promoting a
+// non-coordinator. Requiring uniqueness removes that ambiguity — when the
+// project is already in a duplicate-live-coord state, the fast path
+// promotes nobody and the dispatch falls through to the veto/recovery
+// path, which is the correct handling for an already-forked project.
+func uniqueLiveCoordForAttach(taskID, project string, records []*agent.Record, sessionAlive sessionAliveProbe) *agent.Record {
+	var found *agent.Record
+	n := 0
+	for _, r := range records {
+		if r == nil {
+			continue
+		}
+		if r.TaskID != taskID || r.Project != project {
+			continue
+		}
+		if r.TmuxSession == "" || !sessionAlive(r.TmuxSession) {
+			continue
+		}
+		found = r
+		n++
+		if n > 1 {
+			return nil // ambiguous: refuse to promote any
+		}
+	}
+	if n == 1 {
+		return found
+	}
+	return nil
+}
+
 // pidAlive is the production pidAliveFn. Mirrors workers.IsAlive (the
 // existing kill(pid, 0) probe) — duplicated here rather than imported
 // to avoid the workers → handoff dep cycle (workers already depends
