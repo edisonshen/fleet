@@ -974,6 +974,19 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		DisableAutoResume: disableAutoResume,
 		Engine:            engineName,
 	})
+	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2, codex iter-5
+	// [P2]): the wrapped coord-run supervisor found a healthy leader
+	// already holding the coordinator lease, stood down, and archived its
+	// pre-launch record. There is NO live agent to prompt or attach.
+	// Report it as a clean "already running" outcome (exit 0) — NOT a
+	// successful spawn, and NOT a hard error. Mirrors the supervisor's own
+	// stand-down message + the dispatch veto's intent.
+	if errors.Is(err, spawn.ErrCoordStoodDown) {
+		_, _ = fmt.Fprintf(stdout,
+			"a coord is already running for %s (lease held by the live leader); did not spawn a duplicate\n",
+			opts.project)
+		return nil
+	}
 	if err != nil {
 		return err
 	}

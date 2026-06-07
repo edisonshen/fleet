@@ -29,6 +29,16 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
+// ErrCoordStoodDown is returned by Spawn when a lease-wrapped coord-run
+// supervisor stood down (a healthy leader already holds the coordinator
+// lease) or exited before Spawn finished — its agent record was archived
+// by the supervisor's cleanup, so there is NO live agent to prompt or
+// attach. Callers (runDispatch) detect this with errors.Is and report a
+// clean "a coord is already running" outcome (exit 0) rather than a
+// successful-spawn message for a dead id. DESIGN-handoff-drain-storm-leak
+// PR2 (codex iter-5 [P2]).
+var ErrCoordStoodDown = errors.New("spawn: coord supervisor stood down (a coord is already running for this project)")
+
 // SendInitialPrompt timing knobs. Production needs to ride out
 // claude code's startup animation (logo + spinner before the input
 // box appears) without staking the delivery on a single fixed sleep
@@ -971,10 +981,17 @@ func Spawn(opts Options) (*agent.Record, error) {
 		onDisk, lerr := agent.Load(id)
 		switch {
 		case errors.Is(lerr, state.ErrNotFound):
+			// The supervisor already ran its full lifecycle and archived
+			// the pre-launch record — the common case is an acquired=false
+			// STAND-DOWN (a healthy leader already holds the lease). Return
+			// the typed ErrCoordStoodDown (codex PR2 iter-5 [P2]) so the
+			// caller does NOT report a successful spawn / try to prompt or
+			// attach a dead agent id. rec is returned alongside for the
+			// caller's diagnostics (id/session) but it is NOT live on disk.
 			_, _ = fmt.Fprintf(os.Stderr,
 				"spawn: coord %s record already archived by its supervisor "+
 					"(stand-down or early exit); not resurrecting it\n", id)
-			return rec, nil
+			return rec, ErrCoordStoodDown
 		case lerr == nil:
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart

@@ -320,6 +320,24 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		// flock frees first, then the record is archived). lease.Release
 		// also stops the heartbeat goroutine, so heartbeat-stop is on the
 		// same every-exit-path guarantee.
+		//
+		// SCOPE BOUNDARY (codex PR2 iter-5 [P1] — deferred to PR3/PR4 by
+		// design): this heartbeat reflects SUPERVISOR LIVENESS, not
+		// coordinator PROGRESS. While child.Wait blocks (engine process
+		// alive) the lease keeps renewing — even if the Claude
+		// /coordinator child is wedged-but-alive and no longer updating
+		// coord-state.json. A wedged engine that stays a live process is
+		// therefore NOT yet detected by this layer:
+		//   - a DEAD engine process -> child.Wait returns -> lease releases
+		//     (handled here today),
+		//   - a WEDGED-but-alive engine -> detected by the central
+		//     lease-gated mutation API rejecting its stale token (PR4) and
+		//     by the warm-standby progress poll (PR3), NOT by PR2.
+		// This is why FLEET_LEASE_FAILOVER ships OFF + unsupported until
+		// the PR3/PR4 progress layer lands (see internal/coordlock/
+		// lease.go FailoverEnvVar). Tying the heartbeat to coord-state.json
+		// freshness is PR3's job; doing it here would duplicate the
+		// progress-tracking the warm-standby owns.
 		defer lease.Release()
 		lease.Heartbeat()
 	}
