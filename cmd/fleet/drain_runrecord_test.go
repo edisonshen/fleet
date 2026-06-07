@@ -105,40 +105,56 @@ func TestDrainRunRecord_TDR2_DeleteOnFailurePath(t *testing.T) {
 }
 
 // TDR3 — the heartbeat goroutine refreshes heartbeat_at while running.
-// We drive the clock via the drainRunNow seam and a short interval is
-// not needed: instead we assert the WRITTEN record is re-written with an
-// advanced heartbeat_at by calling the heartbeat write directly through
-// a fast interval. To stay deterministic (no Sleep-timing assertion), we
-// verify the heartbeat write path is wired by checking that a manual
-// re-write via writeDrainRunRecord advances heartbeat_at on disk.
-func TestDrainRunRecord_HeartbeatWriteAdvances(t *testing.T) {
+// Beat() advances heartbeat_at to the current (seamed) clock; the
+// PROGRESS model means a drain that does NOT call Beat (wedged inside a
+// blocking section) leaves heartbeat_at frozen → the gc reaper catches
+// it. Deterministic via the drainRunNow seam (no Sleep-timing).
+func TestDrainRunRecord_BeatAdvances_NoBeatFreezes(t *testing.T) {
 	setupFleetHome(t)
-	dir, err := state.DrainRunsDir()
-	if err != nil {
-		t.Fatalf("DrainRunsDir: %v", err)
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	path := filepath.Join(dir, "12345.json")
+	prevStart := drainProcStartFn
+	drainProcStartFn = func(int) string { return "fp" }
+	t.Cleanup(func() { drainProcStartFn = prevStart })
+	prevNow := drainRunNow
+	t.Cleanup(func() { drainRunNow = prevNow })
+
 	t0 := time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)
-	if err := writeDrainRunRecord(path, drainRunRecord{Pid: 12345, PidStart: "fp", StartedAt: t0, HeartbeatAt: t0}); err != nil {
-		t.Fatalf("write: %v", err)
+	drainRunNow = func() time.Time { return t0 }
+
+	h, err := startDrainRunRecord()
+	if err != nil {
+		t.Fatalf("startDrainRunRecord: %v", err)
 	}
+	t.Cleanup(h.Stop)
+
+	rec, _ := readDrainRunRecord(t)
+	if !rec.HeartbeatAt.Equal(t0) {
+		t.Fatalf("initial heartbeat = %v, want %v", rec.HeartbeatAt, t0)
+	}
+
+	// A progress checkpoint at t0+30s advances the heartbeat.
 	t1 := t0.Add(30 * time.Second)
-	if err := writeDrainRunRecord(path, drainRunRecord{Pid: 12345, PidStart: "fp", StartedAt: t0, HeartbeatAt: t1}); err != nil {
-		t.Fatalf("rewrite: %v", err)
-	}
-	data, _ := os.ReadFile(path)
-	var rec drainRunRecord
-	if err := json.Unmarshal(data, &rec); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	drainRunNow = func() time.Time { return t1 }
+	h.Beat()
+	rec, _ = readDrainRunRecord(t)
 	if !rec.HeartbeatAt.Equal(t1) {
-		t.Fatalf("heartbeat_at = %v, want advanced to %v", rec.HeartbeatAt, t1)
+		t.Fatalf("after Beat heartbeat = %v, want %v", rec.HeartbeatAt, t1)
 	}
-	// started_at must NOT move with the heartbeat.
 	if !rec.StartedAt.Equal(t0) {
-		t.Fatalf("started_at must stay fixed; got %v", rec.StartedAt)
+		t.Fatalf("started_at must stay fixed across Beat; got %v", rec.StartedAt)
 	}
+
+	// Clock keeps advancing but NO Beat (drain wedged) → heartbeat frozen
+	// at t1, so it will go stale past the gc TTL.
+	drainRunNow = func() time.Time { return t1.Add(10 * time.Minute) }
+	rec, _ = readDrainRunRecord(t)
+	if !rec.HeartbeatAt.Equal(t1) {
+		t.Fatalf("without Beat the heartbeat must stay frozen at %v; got %v (a timer would have advanced it — that's the bug this guards)", t1, rec.HeartbeatAt)
+	}
+}
+
+// Beat on a nil handle (start-record write failed) is a safe no-op.
+func TestDrainRunRecord_BeatNilSafe(t *testing.T) {
+	var h *drainRunHandle
+	h.Beat() // must not panic
+	h.Stop() // must not panic
 }

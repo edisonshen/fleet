@@ -36,11 +36,6 @@ import (
 	"github.com/edisonshen/fleet/internal/state"
 )
 
-// drainHeartbeatInterval is how often the run-record's heartbeat_at is
-// refreshed. Must be well under the gc classifier's TTL
-// (gc.drainHeartbeatTTL = 2min) so a healthy drain never looks stale.
-const drainHeartbeatInterval = 10 * time.Second
-
 // drainRunRecord is the on-disk shape. Mirrors gc.DrainRun's serialized
 // fields (the gc package reads what this writes). pid_start is the
 // process start-time fingerprint so the reaper is PID-reuse-safe.
@@ -51,12 +46,22 @@ type drainRunRecord struct {
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 }
 
-// drainRunHandle owns one live run-record + its heartbeat goroutine.
-// Stop() (idempotent) stops the heartbeat and deletes the record.
+// drainRunHandle owns one live run-record. Beat() advances heartbeat_at
+// from a PROGRESS point; Stop() (idempotent) deletes the record.
+//
+// PROGRESS-driven, NOT a free-running timer (codex iter-5 [P2]): a
+// background goroutine ticking the heartbeat would keep a drain "fresh"
+// even while its MAIN thread is wedged forever inside a blocking
+// LockAgent / tmux call — exactly the incident this reaper exists to
+// catch. By advancing heartbeat_at only at the work loop's progress
+// checkpoints (between queue files, where the producer is provably
+// making forward progress), a drain stuck inside the long blocking
+// section stops beating, its heartbeat goes stale past the gc TTL, and
+// the steady-state classifier reaps it. The heartbeat reflects PROGRESS,
+// not mere liveness.
 type drainRunHandle struct {
 	path string
-	stop chan struct{}
-	done chan struct{}
+	rec  drainRunRecord
 	once sync.Once
 }
 
@@ -69,10 +74,11 @@ var drainRunNow = time.Now
 // bare liveness probe for an empty fingerprint).
 var drainProcStartFn = procStartTimeForSelf
 
-// startDrainRunRecord writes ~/.fleet/drain-runs/<pid>.json and starts
-// the heartbeat goroutine. Returns a handle whose Stop() deletes the
-// record. A write failure is returned but is NON-fatal at the call site
-// (the drain still runs; it just isn't gc-reapable via the record path).
+// startDrainRunRecord writes ~/.fleet/drain-runs/<pid>.json with the
+// initial heartbeat. Returns a handle whose Beat() advances the
+// heartbeat at progress points and whose Stop() deletes the record. A
+// write failure is returned but is NON-fatal at the call site (the drain
+// still runs; it just isn't gc-reapable via the record path).
 func startDrainRunRecord() (*drainRunHandle, error) {
 	dir, err := state.DrainRunsDir()
 	if err != nil {
@@ -93,45 +99,32 @@ func startDrainRunRecord() (*drainRunHandle, error) {
 	if werr := writeDrainRunRecord(path, rec); werr != nil {
 		return nil, werr
 	}
-	h := &drainRunHandle{
-		path: path,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-	}
-	go h.heartbeatLoop(rec)
-	return h, nil
+	return &drainRunHandle{path: path, rec: rec}, nil
 }
 
-// heartbeatLoop refreshes heartbeat_at every drainHeartbeatInterval
-// until Stop() closes h.stop. Best-effort: a write error is ignored (the
-// next tick retries; a persistently-failing write surfaces as a stale
-// heartbeat the gc classifier reaps — fail-safe).
-func (h *drainRunHandle) heartbeatLoop(rec drainRunRecord) {
-	defer close(h.done)
-	t := time.NewTicker(drainHeartbeatInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-h.stop:
-			return
-		case <-t.C:
-			rec.HeartbeatAt = drainRunNow()
-			_ = writeDrainRunRecord(h.path, rec)
-		}
+// Beat advances heartbeat_at to now and rewrites the record. Call it
+// from the work loop's PROGRESS checkpoints only (NOT a timer) so a drain
+// wedged inside a blocking section cannot keep itself fresh. Best-effort:
+// a write error is ignored — a persistently-failing write just freezes
+// the heartbeat, which the gc classifier reaps (fail-safe). No-op on a
+// nil handle (the start-record write failed; the drain still runs).
+func (h *drainRunHandle) Beat() {
+	if h == nil {
+		return
 	}
+	h.rec.HeartbeatAt = drainRunNow()
+	_ = writeDrainRunRecord(h.path, h.rec)
 }
 
-// Stop halts the heartbeat and deletes the run-record. Idempotent (safe
-// to call from a defer even if the caller also calls it explicitly). The
-// delete is ENOENT-tolerant. This is the LAST cleanup step of the drain
-// orchestration and runs on the failure path via defer.
+// Stop deletes the run-record. Idempotent (safe to call from a defer even
+// if the caller also calls it explicitly). The delete is ENOENT-tolerant.
+// This is the LAST cleanup step of the drain orchestration and runs on
+// the failure path via defer.
 func (h *drainRunHandle) Stop() {
 	if h == nil {
 		return
 	}
 	h.once.Do(func() {
-		close(h.stop)
-		<-h.done // wait for the heartbeat goroutine to exit (no orphan writes)
 		if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
 			// Best-effort: a failed delete leaves a record whose heartbeat
 			// is now frozen → the gc classifier reaps it on the next sweep.

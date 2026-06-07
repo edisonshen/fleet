@@ -57,16 +57,22 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 		return err
 	}
 
-	// Write the run-record + start the heartbeat, deferring the delete so
-	// it runs on the happy AND failure/panic path (fleet-owns-its-
-	// resources: cleanup is the LAST step, via defer). A drain SIGKILLed
-	// mid-flight can't run the defer — that leaked record is exactly what
-	// `fleet gc --kinds drain-procs` reaps once the heartbeat goes stale.
-	// A write failure is non-fatal: the drain still completes its work;
-	// it just isn't gc-reapable via the run-record path this run.
-	if rh, rerr := startDrainRunRecord(); rerr != nil {
+	// Write the run-record, deferring the delete so it runs on the happy
+	// AND failure/panic path (fleet-owns-its-resources: cleanup is the
+	// LAST step, via defer). A drain SIGKILLed mid-flight can't run the
+	// defer — that leaked record is exactly what `fleet gc --kinds
+	// drain-procs` reaps once the heartbeat goes stale. A write failure is
+	// non-fatal (rh stays nil; Beat/Stop no-op): the drain still completes
+	// its work; it just isn't gc-reapable via the run-record path.
+	//
+	// The heartbeat is PROGRESS-driven (rh.Beat at the loop checkpoints
+	// below), not a background timer — so a drain wedged forever inside a
+	// blocking drainOne/LockAgent stops beating and goes stale → reapable.
+	var rh *drainRunHandle
+	if h, rerr := startDrainRunRecord(); rerr != nil {
 		_, _ = fmt.Fprintf(stderr, "fleet drain: run-record: %v (continuing)\n", rerr)
 	} else {
+		rh = h
 		defer rh.Stop()
 	}
 
@@ -82,6 +88,12 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 	processed := 0
 	failed := 0
 	for _, path := range paths {
+		// Progress checkpoint: we are about to start work on the next
+		// queue file, which is forward progress. Advancing the heartbeat
+		// HERE (not from a timer) means a drain that then wedges inside
+		// drainOne's blocking LockAgent/Resume stops beating and goes
+		// stale → the gc reaper catches it (codex iter-5 [P2]).
+		rh.Beat()
 		req, perr := queue.ReadSpawnFresh(path)
 		if perr != nil {
 			// Skip rather than fail-fast — a malformed or future-schema

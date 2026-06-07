@@ -53,12 +53,19 @@ const KindDrainProcs Kind = "drain-procs"
 
 // drainHeartbeatTTL is the staleness floor for the steady-state
 // classifier. A run-record whose heartbeat_at is older than this (and
-// whose pid+pid_start is still live) is provably wedged: a healthy
-// drain heartbeats every few seconds, so a heartbeat older than 2min
-// cannot be an in-flight drain doing real work. Generous relative to
-// the heartbeat cadence so a momentarily-busy-but-progressing drain is
-// never falsely reaped.
-const drainHeartbeatTTL = 2 * time.Minute
+// whose pid+pid_start is still live) is provably wedged.
+//
+// The drain heartbeat is PROGRESS-driven (cmd/fleet/drain_runrecord.go
+// Beat is called at each queue-file checkpoint, NOT from a timer), so a
+// drain wedged forever inside a blocking LockAgent/Resume stops beating
+// and crosses this TTL — which is the whole point (codex iter-5 [P2]).
+// The floor is set ABOVE the worst-case time a single LEGITIMATE handoff
+// can spend inside Resume (tmux probes + successor spawn), so a slow-but-
+// progressing handoff is not falsely reaped; a drain blocked far longer
+// than any real handoff (the 3-day incident shape) is. The lease/bounded-
+// drain rewrite (PR1-4) shrinks Resume's worst case; until then this TTL
+// is the conservative reaping signal.
+const drainHeartbeatTTL = 5 * time.Minute
 
 // drainLegacyAgeFloor is the floor for the --legacy-drains coarse
 // sweep. The existing 81 leaked drains have no run-record (they predate
