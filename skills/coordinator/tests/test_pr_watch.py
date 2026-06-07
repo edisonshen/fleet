@@ -3369,3 +3369,47 @@ def test_rederive_ladder_persists_across_failed_launch(tmp_path: Path) -> None:
     finally:
         del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
         del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_pending_ci_open_does_not_reset_budget(tmp_path: Path) -> None:
+    """codex P1: a freshly-pushed head whose CI is PENDING reduces to
+    EVENT_OPEN — but that is NOT episode-end. The per-series budget must
+    SURVIVE the pending tick so the convergent loop (push -> pending -> fail
+    same frontier) still converges on max_series instead of resetting."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "3"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        total = 0
+        raised = 0
+        # Each "fixer push" cycle: a NEW head fails CI (same frontier) then a
+        # PENDING tick on the SAME head (CI re-running). The pending tick must
+        # NOT reset the series.
+        tick = 0
+        for i in range(1, 6):
+            head = f"H{i}"
+            tick += 1
+            out = _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=("x",))},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=tick)
+            total += out.dispatched
+            raised += sum(1 for r in out.raises if "budget exhausted" in r)
+            # PENDING tick on the same head (green-not-yet) -> EVENT_OPEN.
+            tick += 1
+            pend = pw.PRSnapshot(number=195, pr_state="OPEN",
+                                 merge_state_status="UNSTABLE",
+                                 review_decision="", checks="PENDING",
+                                 head_ref_oid=head, base_ref_name="main")
+            _run2(tasks, tmp_path, FakeProber(snaps={195: pend},
+                  fresh_base="B", ancestors={("B", head)}),
+                  dispatch=disp, agent_outcome=lambda _a: "gone",
+                  tick_count=tick)
+        # series must have converged (NOT reset by the pending ticks).
+        assert raised == 1, "pending CI must not reset the per-series bound"
+        assert total == 3
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]

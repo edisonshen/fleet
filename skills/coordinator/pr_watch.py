@@ -734,18 +734,27 @@ def account_progress(watch: dict, event: str) -> None:
     """
     rem = _remediation(watch)
     snap = watch.get("last_snapshot") or {}
-    if event == EVENT_READY or event == EVENT_OPEN:
-        # Quiescent / non-failing: the failure EPISODE is over (or never
-        # started). Re-baseline so the NEXT independent failure starts from a
-        # fresh series budget + a cleared escalation latch. READY is the
-        # canonical "merge-ready" end; plain EVENT_OPEN (green but not yet
-        # READY — required review pending, draft, green-not-yet) is ALSO
-        # quiescent: a failing PR that goes green-but-not-READY has ended its
-        # failure episode, so a later unrelated failure must NOT inherit the
-        # prior budget/escalation latch (codex P2). Both reset identically.
+    # Reset the per-series budget ONLY when the failure EPISODE has genuinely
+    # ended: READY (merge-ready), OR a GREEN EVENT_OPEN — checks SUCCESS,
+    # blocked only by a pending REQUIRED REVIEW. A PENDING-CI EVENT_OPEN is
+    # NOT episode-end (codex P1): in the convergent loop a fixer pushes a new
+    # head, CI goes pending (-> EVENT_OPEN) then fails again with the SAME
+    # frontier; resetting on the pending tick would clear the per-series bound
+    # every push and defeat the spawn-storm protection. So gate the OPEN reset
+    # on checks==SUCCESS (a green-but-review-pending PR), never on PENDING /
+    # unknown freshness.
+    episode_ended = event == EVENT_READY or (
+        event == EVENT_OPEN and str(snap.get("checks", "")).upper() == "SUCCESS"
+    )
+    if episode_ended:
         rem["series_dispatches"] = 0
         rem["escalated"] = False
         rem["best_signal"] = _FRONTIER_UNSET
+        return
+    if event == EVENT_OPEN:
+        # A non-green OPEN (PENDING CI / unknown freshness) is NOT progress
+        # and NOT episode-end: leave the counters + best_signal untouched so
+        # the bound survives the pending->fail transition.
         return
     frontier = _frontier(event, snap)
     best = rem.get("best_signal", _FRONTIER_UNSET)
