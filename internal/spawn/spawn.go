@@ -208,15 +208,22 @@ func shouldLeaseWrap(failoverOn, isCoord, liveHandoffSuccessor bool) bool {
 }
 
 // coordRunWrap builds the lease-failover exec argv: the engine argv
-// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2).
+// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2/PR3).
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
-// only the EXECUTION argv is wrapped.
+// only the EXECUTION argv is wrapped. When standby is set, `--standby` is
+// added so the supervisor POLLS a busy lease (PR3 warm standby) instead of
+// standing down.
 //
-//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,"--",<argv...>]
-func coordRunWrap(fleetBin, agentID, project string, argv []string) []string {
-	wrapped := make([]string, 0, len(argv)+7)
+//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,
+//	 ("--standby",)? "--",<argv...>]
+func coordRunWrap(fleetBin, agentID, project string, standby bool, argv []string) []string {
+	wrapped := make([]string, 0, len(argv)+8)
 	wrapped = append(wrapped, fleetBin, "coord-run",
-		"--agent", agentID, "--project", project, "--")
+		"--agent", agentID, "--project", project)
+	if standby {
+		wrapped = append(wrapped, "--standby")
+	}
+	wrapped = append(wrapped, "--")
 	return append(wrapped, argv...)
 }
 
@@ -667,6 +674,19 @@ type Options struct {
 	// recovery path; left false by internal/handoffop's live handoff
 	// (codex PR2 iter-8 [P1]). Ignored when OldRecord is nil.
 	RecoverDeadCoord bool
+
+	// Standby marks this spawn as a WARM-STANDBY coord
+	// (DESIGN-handoff-drain-storm-leak §3(A), PR3). A standby is lease-
+	// wrapped with `fleet coord-run --standby` so that — unlike a normal
+	// live handoff successor (which is spawned UNWRAPPED, see
+	// liveHandoffSuccessor) — it POLLS the busy lease until the outgoing
+	// leader exits rather than standing down. The OLD coord spawns exactly
+	// one standby at the start of a graceful handoff (internal/handoffop's
+	// GracefulHandoff), then retires; the standby's next poll acquires the
+	// kernel-released flock and becomes leader. Forces the coord-run wrap
+	// even though OldRecord is set (it is the receiving half of the
+	// lease-transfer handoff PR2 deferred). Ignored when failover is off.
+	Standby bool
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -938,7 +958,11 @@ func Spawn(opts Options) (*agent.Record, error) {
 	// A LIVE handoff successor = OldRecord present AND not a dead-coord
 	// recovery. A dead-coord recovery (RecoverDeadCoord) is a fresh leader
 	// and IS wrapped.
-	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord
+	// A WARM STANDBY (PR3) is the one OldRecord-carrying spawn that IS
+	// wrapped: it must run `coord-run --standby` so it polls the busy lease
+	// instead of standing down. So a standby is NOT a "live handoff
+	// successor" for the wrap decision even though OldRecord is set.
+	liveHandoffSuccessor := opts.OldRecord != nil && !opts.RecoverDeadCoord && !opts.Standby
 	leaseWrapped := false
 	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), liveHandoffSuccessor) {
 		switch {
@@ -946,7 +970,7 @@ func Spawn(opts Options) (*agent.Record, error) {
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
 		default:
 			if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
-				execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
+				execArgv = coordRunWrap(fleetBin, id, rec.Project, opts.Standby, execArgv)
 				leaseWrapped = true
 			} else {
 				_, _ = fmt.Fprintf(os.Stderr,

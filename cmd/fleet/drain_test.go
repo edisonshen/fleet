@@ -78,7 +78,7 @@ func TestDrain_NoQueueFilesIsNotAnError(t *testing.T) {
 	setupFleetHome(t)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "no pending handoffs") {
@@ -93,7 +93,7 @@ func TestDrain_ProcessesSkillWrittenQueue(t *testing.T) {
 	qp, req := writeSkillQueueFile(t, oldRec)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 
@@ -130,7 +130,7 @@ func TestDrain_ProcessesMultipleQueueFilesIndependently(t *testing.T) {
 	_, reqB := writeSkillQueueFile(t, oldB)
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err != nil {
+	if err := runDrain(out, out, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\n%s", err, out.String())
 	}
 	for _, id := range []string{reqA.NewAgentID, reqB.NewAgentID} {
@@ -174,7 +174,7 @@ func TestDrain_FailureIsolatedToOneFile(t *testing.T) {
 
 	out := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
-	if err := runDrain(out, stderr, 0); err != nil {
+	if err := runDrain(out, stderr, 0, 0); err != nil {
 		t.Fatalf("runDrain: %v\nstdout=%s\nstderr=%s", err, out.String(), stderr.String())
 	}
 
@@ -216,7 +216,7 @@ func TestDrain_AllFailuresReturnsError(t *testing.T) {
 	}
 
 	out := &bytes.Buffer{}
-	if err := runDrain(out, out, 0); err == nil {
+	if err := runDrain(out, out, 0, 0); err == nil {
 		t.Errorf("expected error when every file failed; got nil")
 	}
 }

@@ -56,6 +56,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -96,6 +97,26 @@ type coordRunOpts struct {
 	// production callers leave it nil. Used by the real-OS-signal test
 	// to synchronize "send the kill" with "handler is wired up".
 	notifyReady func()
+	// standby marks this supervisor as a WARM-STANDBY coord
+	// (DESIGN-handoff-drain-storm-leak §3(A)/§3(B), PR3). A normal coord
+	// stands down + exits 0 when a healthy leader already holds the lease;
+	// a standby instead POLLS — re-acquiring (LOCK_NB, which internally
+	// runs TakeOver on a hung leader) every standbyPoll until it acquires
+	// the lease (the old leader exited / was taken over) or ctx is
+	// canceled. Only AFTER acquiring does it start the engine child. This
+	// is the receiving half of a graceful handoff: the old coord spawns
+	// one standby in the background, then retires; the standby's next poll
+	// acquires the kernel-released flock and becomes leader.
+	standby bool
+	// standbyPoll is the poll interval the standby loop waits between
+	// re-acquire attempts on a busy lease. 0 = production default
+	// (defaultStandbyPoll). Test-only override so the poll loop is
+	// exercised without a wall-clock wait.
+	standbyPoll time.Duration
+	// standbyOnAcquired, when non-nil, is invoked once the standby poll
+	// loop acquires the lease (after a busy period). Test-only seam to
+	// assert the loop converged without scraping stderr.
+	standbyOnAcquired func()
 
 	// --- lease wiring (DESIGN-handoff-drain-storm-leak PR2) ---
 	//
@@ -139,12 +160,20 @@ func (o coordRunOpts) withReady(f func()) coordRunOpts {
 	return o
 }
 
+// defaultStandbyPoll is how long a warm-standby coord waits between
+// re-acquire attempts while the lease is held by a healthy leader
+// (DESIGN-handoff-drain-storm-leak §3(A): "~2-3s"). Var (not const) so a
+// test can shrink it; the cobra flag does not expose it (an operator never
+// tunes the poll cadence).
+var defaultStandbyPoll = 2 * time.Second
+
 // newCoordRunCmd builds the cobra subcommand for `fleet coord-run`.
 // Registered from cmd/fleet/main.go's newRootCmd.
 func newCoordRunCmd() *cobra.Command {
 	var (
 		agentID string
 		project string
+		standby bool
 	)
 	cmd := &cobra.Command{
 		Use:   "coord-run -- <cmd> [args...]",
@@ -176,6 +205,7 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 				project: project,
 				session: tmux.SessionName(agentID),
 				argv:    args,
+				standby: standby,
 			}
 			return notifyCoordRun(opts, cmd.OutOrStdout(), cmd.ErrOrStderr())
 		},
@@ -184,6 +214,9 @@ Required: --agent <id>, --project <name>, and a child argv after --.`,
 		"agent ID this coord belongs to (REQUIRED; matches ~/.fleet/agents/<id>.json)")
 	cmd.Flags().StringVar(&project, "project", "",
 		"project name (REQUIRED; the project whose coord-spawn-marker we own)")
+	cmd.Flags().BoolVar(&standby, "standby", false,
+		"run as a WARM-STANDBY coord: on a busy lease, POLL until the leader exits "+
+			"(graceful handoff) instead of standing down + exiting")
 	return cmd
 }
 
@@ -307,13 +340,41 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		// silently spawning an unsupervised coord.
 		return fmt.Errorf("coord-run: acquire lease for project %q: %w", opts.project, lerr)
 	case !acquired:
-		// Healthy live leader exists -> stand down. Do NOT start the child.
-		if opts.onStandDown != nil {
-			opts.onStandDown()
-		} else {
-			_, _ = fmt.Fprintf(stderr, "a coord is already running for %s\n", opts.project)
+		// A healthy live leader holds the lease. What happens next depends
+		// on whether we are a normal coord or a warm standby (PR3):
+		//
+		//   normal  -> STAND DOWN. Do NOT start the child, exit 0. A plain
+		//              coord-spawn that loses the race is not a failure.
+		//   standby -> POLL. Re-acquire (LOCK_NB, which internally runs
+		//              TakeOver on a hung leader) every standbyPoll until we
+		//              acquire the lease (the old leader exited / was taken
+		//              over) or ctx is canceled. Only then start the child.
+		//              This is the receiving half of a graceful handoff.
+		if !opts.standby {
+			if opts.onStandDown != nil {
+				opts.onStandDown()
+			} else {
+				_, _ = fmt.Fprintf(stderr, "a coord is already running for %s\n", opts.project)
+			}
+			return nil
 		}
-		return nil
+		polled, perr := standbyPollUntilAcquired(ctx, acquire, opts, stderr)
+		switch {
+		case perr != nil:
+			return fmt.Errorf("coord-run: standby acquire for project %q: %w", opts.project, perr)
+		case polled == nil:
+			// ctx canceled before we ever acquired — a clean shutdown of a
+			// standby that never led. coord.Cleanup still runs (the deferred
+			// archive of our own record); nothing else to release.
+			return nil
+		default:
+			lease = polled
+			if opts.standbyOnAcquired != nil {
+				opts.standbyOnAcquired()
+			}
+			defer lease.Release()
+			lease.Heartbeat()
+		}
 	default:
 		// acquired==true: we are the leader. Release joins the cleanup
 		// defer stack (LIFO: this defer runs BEFORE coord.Cleanup, so the
@@ -378,4 +439,70 @@ func runCoordRun(ctx context.Context, opts coordRunOpts, stdout, stderr io.Write
 		return err
 	}
 	return nil
+}
+
+// standbyPollUntilAcquired runs the warm-standby poll loop. It re-calls
+// acquire() every standbyPoll until one of:
+//
+//	acquired==true  -> returns (lease, nil): we are now the leader.
+//	ctx canceled    -> returns (nil, nil): clean shutdown, never led.
+//	real fault      -> returns (nil, err): acquire/takeover error, surface.
+//
+// A busy lease (acquired==false, err==nil) is the normal "leader still
+// alive" case — sleep and retry. The acquire seam internally runs the
+// takeover state machine (fence -> kill -> acquire) against a HUNG leader,
+// so a standby polling a wedged old coord recovers within one TTL window
+// without any lock held across slow work.
+//
+//	┌──────────────────────────────────────────────────────────────┐
+//	│ for {                                                          │
+//	│   lease, acquired, err := acquire()  ── internally TakeOver    │
+//	│   acquired -> return lease            ── become leader         │
+//	│   err      -> return err              ── surface fault         │
+//	│   else     -> select { <-ctx.Done(): return nil;               │
+//	│                        <-after(poll): continue }  ── retry     │
+//	│ }                                                              │
+//	└──────────────────────────────────────────────────────────────┘
+func standbyPollUntilAcquired(ctx context.Context, acquire func() (coordLease, bool, error),
+	opts coordRunOpts, stderr io.Writer) (coordLease, error) {
+
+	poll := opts.standbyPoll
+	if poll <= 0 {
+		poll = defaultStandbyPoll
+	}
+	_, _ = fmt.Fprintf(stderr,
+		"coord-run: standby for %s — a coord is already running; polling for the lease every %s\n",
+		opts.project, poll)
+
+	// First attempt already happened in runCoordRun (acquired==false led us
+	// here); start by waiting one interval before re-trying so we don't
+	// hot-loop on a freshly-observed busy lease.
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: standby for %s canceled before acquiring the lease (clean shutdown)\n",
+				opts.project)
+			return nil, nil
+		case <-timer.C:
+		}
+		lease, acquired, err := acquire()
+		switch {
+		case err != nil:
+			// A real acquire/takeover fault. Surface-don't-silo: do not keep
+			// silently looping on a structural error (e.g. unreadable lease
+			// dir) — bubble it so the operator sees a diagnostic.
+			return nil, err
+		case acquired:
+			_, _ = fmt.Fprintf(stderr,
+				"coord-run: standby for %s acquired the lease — taking over as leader\n",
+				opts.project)
+			return lease, nil
+		default:
+			// Still busy (healthy leader alive). Re-arm and poll again.
+			timer.Reset(poll)
+		}
+	}
 }

@@ -23,7 +23,7 @@ func TestCoordRunWrap_Shape(t *testing.T) {
 		project  = "projects-fleet"
 	)
 	engine := []string{"sh", "-c", "claude --dangerously-skip-permissions"}
-	got := coordRunWrap(fleetBin, agentID, project, engine)
+	got := coordRunWrap(fleetBin, agentID, project, false, engine)
 
 	wantHead := []string{fleetBin, "coord-run", "--agent", agentID, "--project", project, "--"}
 	if len(got) < len(wantHead) {
@@ -40,9 +40,27 @@ func TestCoordRunWrap_Shape(t *testing.T) {
 func TestCoordRunWrap_DoesNotMutateInput(t *testing.T) {
 	engine := []string{"sh", "-c", "claude"}
 	orig := append([]string(nil), engine...)
-	_ = coordRunWrap("/bin/fleet", "id1", "p1", engine)
+	_ = coordRunWrap("/bin/fleet", "id1", "p1", false, engine)
 	if !reflect.DeepEqual(engine, orig) {
 		t.Errorf("input mutated: got %v want %v", engine, orig)
+	}
+}
+
+// PR3 (warm standby): standby=true inserts `--standby` between the project
+// flag and the `--` separator so the supervisor polls the busy lease.
+func TestCoordRunWrap_StandbyInsertsFlag(t *testing.T) {
+	const (
+		fleetBin = "/usr/local/bin/fleet"
+		agentID  = "sb-deadbeef"
+		project  = "projects-fleet"
+	)
+	engine := []string{"sh", "-c", "claude"}
+	got := coordRunWrap(fleetBin, agentID, project, true, engine)
+
+	want := []string{fleetBin, "coord-run", "--agent", agentID, "--project", project, "--standby", "--"}
+	want = append(want, engine...)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("standby wrap = %v, want %v", got, want)
 	}
 }
 
