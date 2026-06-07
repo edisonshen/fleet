@@ -476,6 +476,19 @@ def _reclaim_lease(
         de = watch.setdefault("dispatched_events", {})
         if isinstance(de, dict):
             de[key] = OUTCOME_BLOCKED
+        # A BLOCKED RE-DERIVE must keep the ladder on the re-derive step
+        # (codex P2): dispatch overwrote last_outcome to RUNNING, so without
+        # restoring the breadcrumb the next DIRTY pass would select a plain
+        # REBASE key — never re-selecting the now-blocked rederive key, so the
+        # blocked latch (raise + suppress) is never surfaced and the
+        # rebase/re-derive loop churns until the budget exhausts. Restore it so
+        # the next pass re-selects the rederive key, _action_suppressed sees
+        # the BLOCKED ledger entry, raises once, and suppresses re-dispatch.
+        inflight_kind = inflight.get("kind") if isinstance(inflight, dict) else None
+        if inflight_kind == ACTION_REDERIVE:
+            rem = _remediation(watch)
+            if rem.get("last_outcome") == OUTCOME_RUNNING:
+                rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
         watch["inflight_action"] = None
         return None, None
 

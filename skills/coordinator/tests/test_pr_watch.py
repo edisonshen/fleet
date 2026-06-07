@@ -3532,3 +3532,38 @@ def test_frontier_comma_in_check_name_is_safe(tmp_path: Path) -> None:
     assert pw._frontier_strictly_shrinks(c, a) is False
     # round-trip: the encoded frontier decodes to exactly 2 elements.
     assert len(pw._frontier_set(a)) == 2
+
+
+def test_blocked_rederive_surfaces_and_does_not_loop(tmp_path: Path) -> None:
+    """codex P2: a re-derive that returns BLOCKED (spec gone / ambiguous /
+    approval-at-push) must SURFACE the block (raise once) and SUPPRESS
+    re-dispatch — not fall back to re-selecting a plain rebase and looping
+    until the budget exhausts."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _dirty_snap(195, head="H1")}
+    disp = _DispatchRecorder()
+    # tick 1: rebase (running).
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    # tick 2: rebase conflicted -> ladder advances to re-derive (dispatched).
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+          agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+    assert disp.calls[-1].kind == pw.ACTION_REDERIVE
+    n_after_rederive = len(disp.calls)
+    # tick 3: the re-derive returns BLOCKED (head unchanged).
+    out3 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                 ancestors=set()), dispatch=disp,
+                 agent_outcome=lambda _a: "blocked", tick_count=3)
+    # the block is surfaced (raise) and NO new dispatch (suppressed).
+    assert any("BLOCKED" in r for r in out3.raises)
+    assert len(disp.calls) == n_after_rederive, "no re-dispatch after blocked"
+    # tick 4: still DIRTY -> still suppressed, no rebase fallback, no churn.
+    out4 = _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B",
+                 ancestors=set()), dispatch=disp,
+                 agent_outcome=lambda _a: "gone", tick_count=4)
+    assert len(disp.calls) == n_after_rederive, \
+        "a blocked re-derive must not loop back into a rebase"
+    assert out4.dispatched == 0
