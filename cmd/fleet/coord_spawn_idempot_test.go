@@ -384,6 +384,10 @@ func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	// Empty socket → the fall-through respawn fails deterministically under
 	// go test (no real session leaks), so we can assert "fell through to
 	// respawn" by observing a NON-veto error and no live-ID promotion.
+	// This test DELIBERATELY relies on the tmux.Spawn empty-socket guard
+	// to force that failure, so it opts out of the canonical
+	// tmuxtest.RequireTmux isolation (which would set a usable socket and
+	// let the respawn actually succeed). lint-test-isolation:exempt
 	t.Setenv("FLEET_TMUX_SOCKET", "")
 
 	pdir, err := state.ProjectDir("nottick")
@@ -554,6 +558,11 @@ func TestCoordStateTickedAfter(t *testing.T) {
 func TestRunDispatch_FastPathSkipsStalePredecessorState(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
+	// Empty socket forces the downstream spawn to fail deterministically via
+	// the tmux.Spawn empty-socket guard, so the fast-path-skip assertion
+	// holds without leaking a real session. Opts out of the canonical
+	// tmuxtest.RequireTmux isolation (a usable socket would let the respawn
+	// succeed and mask the skip). lint-test-isolation:exempt
 	t.Setenv("FLEET_TMUX_SOCKET", "")
 
 	pdir, err := state.ProjectDir("staleproj")
@@ -634,7 +643,10 @@ func TestRunDispatch_FailedSpawnClearsPendingClaim(t *testing.T) {
 	// Force tmux.Spawn to fail under go test: empty FLEET_TMUX_SOCKET is
 	// the rejection trigger (the orphan-leak guard). Explicit unset so a
 	// leaked env from another test can't accidentally let the spawn
-	// succeed and leave a real tmux session behind.
+	// succeed and leave a real tmux session behind. This test depends on
+	// the guard firing, so it opts out of canonical tmuxtest.RequireTmux
+	// isolation (a usable socket would let spawn succeed and the
+	// claim-cleanup path would never run). lint-test-isolation:exempt
 	t.Setenv("FLEET_TMUX_SOCKET", "")
 
 	pdir, err := state.ProjectDir("spawnfail")
