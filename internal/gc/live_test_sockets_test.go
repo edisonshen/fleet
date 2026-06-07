@@ -151,6 +151,33 @@ func TestReconcile_LiveTestSock_LiveOwnerNotReaped(t *testing.T) {
 	}
 }
 
+// Owner-probe-failure (sentinel ownerProbeFailedPID) must SPARE the
+// server — an ambiguous probe never drives a kill (fail-safe).
+func TestReconcile_LiveTestSock_ProbeFailureSpares(t *testing.T) {
+	now := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	deps := withLiveTestSocketStubs(stubDeps(now))
+	killed := false
+	deps.ListLiveTestSockets = func() ([]LiveTestSocket, error) {
+		return []LiveTestSocket{{
+			SocketPath:  "/tmp/fleet-test-AAA.sock",
+			SessionName: "fleet-orphan",
+			OwnerPID:    ownerProbeFailedPID, // owner unknown
+		}}, nil
+	}
+	deps.KillTmuxServer = func(string) error { killed = true; return nil }
+
+	got, err := Reconcile(Options{Apply: true, Aggressive: true, Kinds: []Kind{KindOrphanTmux}}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanTmux, "fleet-orphan"); ok {
+		t.Error("server with unknown owner was reaped; ambiguous probe must spare it")
+	}
+	if killed {
+		t.Error("KillTmuxServer ran despite unknown owner")
+	}
+}
+
 // T6 — the detector only runs under the orphan-tmux kind, not under
 // sockets / other kinds. An orphan test-sock server is invisible when
 // orphan-tmux is not requested.
