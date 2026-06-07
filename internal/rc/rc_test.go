@@ -1011,6 +1011,48 @@ func TestSweepAllProjects_ProbesVersionOnce(t *testing.T) {
 	}
 }
 
+// TestSweepAllProjects_NoVersionProbeWithoutSweepWork (codex P2): the
+// version probe is LAZY — only the Class 2/3 (marker-present) self-heal path
+// needs it. An install with no rc-state files, or only markerless entries,
+// must never shell out to `claude --version`, so a slow/broken claude can't
+// stall a read-only `fleet status`.
+func TestSweepAllProjects_NoVersionProbeWithoutSweepWork(t *testing.T) {
+	withFleetHome(t)
+	var probes int
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { probes++; return "2.1.156", nil }
+	t.Cleanup(func() { claudeVersionFn = prevV })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(int, string, string) bool { return true })
+	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(int, string) bool { return true })
+	defer restoreStrict()
+	restoreKill := SetKillFnForTest(func(int) {})
+	defer restoreKill()
+
+	// Case A: no rc-state files at all.
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects (empty): %v", err)
+	}
+	if probes != 0 {
+		t.Fatalf("empty sweep must not probe claude --version; got %d", probes)
+	}
+
+	// Case B: only a markerless entry (Class 1 — no version check needed).
+	host, _ := os.Hostname()
+	if err := WriteState(RecordedState{
+		Project: "orphan", PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/orphan",
+		SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects (markerless): %v", err)
+	}
+	if probes != 0 {
+		t.Fatalf("markerless-only sweep must not probe claude --version; got %d", probes)
+	}
+}
+
 // TestSweepMarkerless_SkipsWhenCwdUnverifiable (codex P1): the markerless
 // (Class-1) sweep path runs on every read-only `fleet status`. On hosts
 // without lsof it must NOT kill a PID it can't strictly verify — a reused

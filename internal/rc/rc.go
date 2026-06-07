@@ -787,11 +787,26 @@ func SweepAllProjects() error {
 	if err != nil {
 		return fmt.Errorf("rc.SweepAllProjects: glob: %w", err)
 	}
+	if len(matches) == 0 {
+		return nil // nothing to sweep — never touch claude (codex P2).
+	}
 	host, _ := os.Hostname()
-	// codex P2: probe claude --version ONCE for the whole sweep (not per
-	// project, not again under each lock). Cost is O(1) regardless of how
-	// many projects exist, and a hung claude can't multiply the stall.
-	curVer := probeClaudeVersion()
+	// codex P2: probe claude --version LAZILY and at most ONCE. The probe
+	// is only needed for the Class 2/3 (marker-present) self-heal version
+	// check — NOT for markerless / dead / cross-host entries. On installs
+	// with no version-based sweep work, we never run `claude --version`, so
+	// a slow/broken claude can't stall a read-only `fleet status`. The
+	// closure memoizes the first probe and reuses it for the rest of the
+	// sweep + each under-lock re-check.
+	versionProbed := false
+	curVer := ""
+	getVer := func() string {
+		if !versionProbed {
+			curVer = probeClaudeVersion()
+			versionProbed = true
+		}
+		return curVer
+	}
 	for _, m := range matches {
 		// projects/<name>/rc-state.json — pull the <name> segment.
 		p := filepath.Base(filepath.Dir(m))
@@ -832,11 +847,12 @@ func SweepAllProjects() error {
 		// KEEP the marker, exactly like Up's self-heal (killFn + fresh
 		// acquire, marker never removed). Next --respawn-only tick then
 		// respawns under the current claude + fresh coord.
-		if reason := computeHealReason(cur, curVer); reason != "" {
+		ver := getVer() // probed lazily on the first Class 2/3 entry.
+		if reason := computeHealReason(cur, ver); reason != "" {
 			fmt.Fprintf(os.Stderr,
 				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d (marker preserved for respawn)\n",
 				p, reason, cur.PID)
-			reapDaemonKeepMarker(p, cur, curVer)
+			reapDaemonKeepMarker(p, cur, ver)
 		}
 	}
 	return nil
