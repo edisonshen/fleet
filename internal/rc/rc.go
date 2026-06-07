@@ -838,10 +838,20 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState) {
 			return OutcomeAlreadyAcquired, nil
 		}
 		host, _ := os.Hostname()
-		// Cross-host entries are filtered by the caller, but re-check
-		// under the lock so a racing host change can't make us signal a
-		// remote PID.
-		if cur.PID > 0 && (cur.HostID == "" || cur.HostID == host) && workers.IsAlive(cur.PID) {
+		// codex P2 (cross-host): the caller filters cross-host entries off
+		// an UNLOCKED snapshot; the state could be rewritten for another
+		// host between snapshot and this locked re-read. We must abort the
+		// ENTIRE reap (not just the kill) — falling through to RemoveState
+		// would delete another host's LIVE rc-state.json in a shared /
+		// migrated FLEET_HOME, leaving its daemon untracked. Only the local
+		// host (or an unattributed empty HostID) may be reaped here.
+		if cur.HostID != "" && cur.HostID != host {
+			fmt.Fprintf(os.Stderr,
+				"rc.reapDaemonKeepMarker: project %q rc-state.json is now owned by host %q (local %q); aborting reap (cross-host — that host's sweep will handle it)\n",
+				project, cur.HostID, host)
+			return OutcomeAlreadyAcquired, nil
+		}
+		if cur.PID > 0 && workers.IsAlive(cur.PID) {
 			prefix := cur.SessionPrefix
 			if prefix == "" {
 				prefix = SessionPrefix

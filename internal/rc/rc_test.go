@@ -871,6 +871,51 @@ func TestUp_AdoptHealthy_DoesNotClobberExistingOwner(t *testing.T) {
 	}
 }
 
+// TestReapDaemonKeepMarker_AbortsOnCrossHostState (codex P2): the caller
+// filters cross-host entries on an UNLOCKED snapshot. If state is rewritten
+// for another host before the lock, the reap must abort entirely — deleting
+// another host's live rc-state.json (shared/migrated FLEET_HOME) would leave
+// its daemon untracked. Expect: state preserved, no kill, marker preserved.
+func TestReapDaemonKeepMarker_AbortsOnCrossHostState(t *testing.T) {
+	withFleetHome(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	// Snapshot the sweeper took (looked local at the time).
+	snapshot := RecordedState{
+		Project: "demo", PID: 11111, HostID: "other-host", WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, ClaudeVersion: "2.1.146", OwningCoordID: "coord-x",
+	}
+	// On-disk state is now owned by ANOTHER host (rewritten after snapshot).
+	onDisk := RecordedState{
+		Project: "demo", PID: 11111, HostID: "other-host", WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, ClaudeVersion: "2.1.146", OwningCoordID: "coord-x",
+	}
+	if err := WriteState(onDisk); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	reapDaemonKeepMarker("demo", snapshot)
+
+	// Cross-host state must NOT be deleted, no kill issued.
+	if _, err := ReadState("demo"); err != nil {
+		t.Fatalf("cross-host state must be preserved; ReadState err=%v", err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("must not signal a cross-host PID; killed=%v", killed)
+	}
+	if !MarkerPresent("demo") {
+		t.Fatalf("marker must remain present")
+	}
+}
+
 // TestSweepAllProjects_ReleasesMarkerlessOrphans (codex P2): the
 // sweeper's whole point is to release entries where rc-state.json
 // claims a live PID but the marker is gone (operator rm'd it

@@ -3851,6 +3851,41 @@ func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
 	}
 }
 
+func TestReconcile_OrphanRCDaemon_HealthyDuplicateStateWins(t *testing.T) {
+	// codex P2: after a project rename, two rc-state.json files can share
+	// the same PID + working_dir — one stale (old version), one current. A
+	// first-match-wins scan that landed on the stale entry would classify
+	// the LIVE daemon as stale and kill it under --apply. The tiered match
+	// must prefer the current-version state, so the daemon is healthy.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "2.1.156", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		// Stale entry enumerated FIRST (Glob order), current entry second.
+		return []RCStateInfo{
+			{Project: "fleet-old", PID: 1234, ClaudeVersion: "2.1.146", WorkingDir: "/tmp/fleet"},
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	deps.KillRCDaemon = func(pid int) error {
+		t.Fatalf("must not kill: a current-version state owns PID %d", pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanRCDaemons, "1234"); ok {
+		t.Fatalf("daemon with a current-version duplicate state must be healthy; got %+v", got.Actions)
+	}
+}
+
 func TestListRCDaemonsOnDisk_MissingPgrepIsNoop(t *testing.T) {
 	// codex P3: a missing `pgrep` binary returns *exec.Error (not
 	// *exec.ExitError code 1), which the pre-fix code surfaced as an error.

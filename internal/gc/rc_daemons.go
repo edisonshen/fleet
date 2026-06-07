@@ -122,19 +122,32 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 		if d.PID <= 0 {
 			continue
 		}
-		// Find the best match among all states sharing this PID: prefer a
-		// working_dir match; fall back to any entry when either side has
-		// no working_dir recorded (best-effort probe).
+		// Find the best match among all states sharing this PID. Selection
+		// priority (codex P2: a stale duplicate must never mask a healthy
+		// owner — e.g. after a project rename leaves a stale project dir
+		// beside the current one, both with the same PID + working_dir):
+		//   1. exact working_dir match whose ClaudeVersion == curVer (healthy)
+		//   2. any exact working_dir match (stale, but the daemon is owned)
+		//   3. loose match when either side has no working_dir (best-effort)
+		// We scan ALL candidates and only fall to a lower tier if no higher
+		// one exists, so a current-version state always wins over a stale one.
 		candidates := byPID[d.PID]
 		var recorded RCStateInfo
 		matches := false
+		matchTier := 0 // 0=none, 1=loose, 2=exact-cwd, 3=exact-cwd+current
 		for _, s := range candidates {
-			if d.WorkingDir != "" && s.WorkingDir != "" && d.WorkingDir == s.WorkingDir {
-				recorded, matches = s, true
-				break // exact working_dir match wins.
+			exactCwd := d.WorkingDir != "" && s.WorkingDir != "" && d.WorkingDir == s.WorkingDir
+			loose := d.WorkingDir == "" || s.WorkingDir == ""
+			switch {
+			case exactCwd && curVer != "" && s.ClaudeVersion == curVer:
+				recorded, matches, matchTier = s, true, 3 // best possible — stop.
+			case exactCwd && matchTier < 3:
+				recorded, matches, matchTier = s, true, 2
+			case loose && matchTier < 2:
+				recorded, matches, matchTier = s, true, 1
 			}
-			if !matches && (d.WorkingDir == "" || s.WorkingDir == "") {
-				recorded, matches = s, true // tentative; keep scanning for an exact match.
+			if matchTier == 3 {
+				break
 			}
 		}
 		var reason string
