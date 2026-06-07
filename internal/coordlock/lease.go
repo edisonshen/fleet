@@ -306,9 +306,10 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 		// died (flock free) but the first candidate may not have reacquired
 		// the flock yet — its fencing record is fresh and its candidate PID
 		// alive. Promoting to active here would steal a healthy takeover and
-		// make that candidate time out. Mirror the busy-flock path: only
-		// proceed over a transient record if it is stale/abandoned.
-		if observed.State == stateFencing || observed.State == stateFencedNotAcquired {
+		// make that candidate time out. Only a FENCING record gets this
+		// gate; a fenced_not_acquired record is a gave-up escalation and the
+		// flock is free, so we simply promote (CAS to active) and recover.
+		if observed.State == stateFencing {
 			if !l.transientResumable(observed) {
 				_ = releaseFlock(f)
 				return true, false, nil // let the live candidate finish
@@ -353,26 +354,31 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 	// candidate is mid-takeover. Do NOT barge in and re-fence a FRESH
 	// in-progress takeover whose candidate is still alive and within its
 	// retry budget — that makes multiple candidates invalidate each
-	// other's CAS and thrash. Only resume a transient record if it is
-	// STALE (renewed_at past TTL, candidate died/hung) OR its candidate
-	// PID is provably dead. Otherwise stand down and let it finish.
-	if rec.State == stateFencing || rec.State == stateFencedNotAcquired {
+	// other's CAS and thrash. Only a FENCING record gets the freshness
+	// gate (let a live, in-budget takeover finish). A fenced_not_acquired
+	// record is NOT in progress: a prior candidate already GAVE UP after
+	// failing to acquire the flock, so a new candidate must immediately
+	// re-attempt recovery rather than wait out the TTL silently. So only
+	// gate stand-down on fencing; fenced_not_acquired always falls through
+	// to takeOver (which re-fences/kills/acquires or re-escalates loudly).
+	if rec.State == stateFencing {
 		if !l.transientResumable(rec) {
 			return true, false, nil // fresh in-progress takeover -> stand down
 		}
 	}
-	// Hung-but-alive holder (flock still held, renewed_at frozen > TTL),
-	// or a stalled/abandoned transient record. Run the takeover state
-	// machine; it returns the same done/acquired contract.
+	// Hung-but-alive holder (flock still held, renewed_at frozen > TTL), a
+	// stalled fencing record, or a fenced_not_acquired escalation. Run the
+	// takeover state machine; it returns the same done/acquired contract.
 	return l.takeOver(rec)
 }
 
-// transientResumable reports whether a fencing / fenced_not_acquired
-// record may be resumed by a new candidate. True only if the in-progress
-// takeover looks abandoned: its renewed_at is past TTL (mono, same boot),
-// OR it is from a previous boot, OR its candidate PID is dead. A fresh
-// record with a live candidate within budget is NOT resumable (let the
-// first takeover complete).
+// transientResumable reports whether a FENCING record may be resumed by a
+// new candidate. True only if the in-progress takeover looks abandoned:
+// its renewed_at is past TTL (mono, same boot), OR it is from a previous
+// boot, OR its candidate PID is dead. A fresh record with a live candidate
+// within budget is NOT resumable (let the first takeover complete).
+// fenced_not_acquired is handled separately (always resumable) — it is a
+// gave-up escalation, not an in-progress takeover.
 func (l *Lease) transientResumable(rec epochRecord) bool {
 	if rec.BootID != l.boot {
 		return true // previous boot -> stale
