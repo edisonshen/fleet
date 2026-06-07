@@ -3,12 +3,22 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
 )
+
+// ErrLockTimeout is wrapped into the error returned by a bounded acquire
+// that gives up at its deadline (a holder still owns the lock). Callers
+// use errors.Is to distinguish "another holder is provably running" from
+// a genuine open/path fault — the two demand different handling (the
+// worktree-GC caller skips its phase on a timeout rather than running
+// unlocked, but still surfaces a real fault). Surface-don't-silo: a
+// timeout is a first-class, inspectable outcome, not an opaque error.
+var ErrLockTimeout = errors.New("lock acquire timed out")
 
 // pollInterval is the busy-wait granularity for the bounded acquire. A
 // flock(2) LOCK_NB poll is cheap (no I/O on success/EWOULDBLOCK), so a
@@ -61,6 +71,18 @@ func LockProject(project string) (func(), error) {
 // can surface a provably-stuck holder rather than failing opaquely.
 const defaultLockTimeout = 30 * time.Second
 
+// worktreeGCLockTimeout bounds LockProjectWorktreeGC. Unlike the
+// per-record state lock (a fast critical section), the worktree-GC lock is
+// held across a whole `fleet gc --kinds=worktrees` scan -> re-check ->
+// remove window, which can legitimately run for minutes on a large repo.
+// The bound is generous so a normally-contended waiter still serializes;
+// on a genuine timeout the caller SKIPS its worktree phase (another GC is
+// provably running it) rather than proceeding unlocked — see cmd/fleet/gc.go.
+//
+// A var (not const) only so a test can shrink it to assert the
+// timeout-skip path without a 5-minute wait. Production never reassigns it.
+var worktreeGCLockTimeout = 5 * time.Minute
+
 // LockProjectState takes an exclusive flock on
 // ~/.fleet/projects/<project>/.locks/state.lock — the v0.2 single
 // state-lock per project state-dir (Q1 decision). Held briefly during
@@ -96,6 +118,16 @@ func LockProjectStateTimeout(project string, timeout time.Duration) (func(), err
 	return acquireBoundedAt(path, timeout)
 }
 
+// SetWorktreeGCLockTimeoutForTest overrides the worktree-GC lock timeout
+// and returns a restore func. TEST-ONLY: it exists so cmd/fleet's gc test
+// (a different package) can assert the timeout-skip path without a
+// 5-minute wait. Production code never calls it.
+func SetWorktreeGCLockTimeoutForTest(d time.Duration) (restore func()) {
+	prev := worktreeGCLockTimeout
+	worktreeGCLockTimeout = d
+	return func() { worktreeGCLockTimeout = prev }
+}
+
 // LockProjectWorktreeGC takes an exclusive flock on
 // ~/.fleet/projects/<project>/.locks/worktree-gc.lock — held across the
 // `fleet gc --kinds=worktrees` scan → re-check-porcelain → `git worktree
@@ -106,12 +138,16 @@ func LockProjectStateTimeout(project string, timeout time.Duration) (func(), err
 // task mutations.
 //
 // The .locks/ dir is lazily created here (mirrors LockProjectState).
+// On a contention timeout the error wraps ErrLockTimeout: the caller MUST
+// skip the worktree-GC phase (another GC is provably mid-scan) rather than
+// proceed unlocked — proceeding unlocked would reintroduce the very
+// scan/re-check/remove race this lock prevents.
 func LockProjectWorktreeGC(project string) (func(), error) {
 	path, err := ProjectWorktreeGCLockPath(project)
 	if err != nil {
 		return nil, err
 	}
-	return acquireBoundedAt(path, defaultLockTimeout)
+	return acquireBoundedAt(path, worktreeGCLockTimeout)
 }
 
 // LockAgent takes an exclusive flock on
@@ -190,12 +226,14 @@ func acquireBoundedAt(path string, timeout time.Duration) (func(), error) {
 			return nil, fmt.Errorf("flock %s: %w", path, lerr)
 		}
 		// Held by someone else. Give up immediately on a non-positive
-		// timeout, otherwise poll until the deadline.
+		// timeout, otherwise poll until the deadline. The timeout error
+		// wraps ErrLockTimeout so callers can distinguish "another holder
+		// is running" from a real fault, and names the stale holder pid.
 		if timeout <= 0 || !time.Now().Before(deadline) {
 			holder := readLockHolder(path)
 			_ = f.Close()
-			return nil, fmt.Errorf("acquire lock %s: timed out after %s waiting for holder%s",
-				path, timeout, holder)
+			return nil, fmt.Errorf("acquire lock %s: timed out after %s waiting for holder%s: %w",
+				path, timeout, holder, ErrLockTimeout)
 		}
 		time.Sleep(pollInterval)
 	}

@@ -13,6 +13,7 @@ package main
 // product spec.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -168,16 +169,31 @@ func runGC(stdout, stderr io.Writer, f *gcFlags) error {
 	// invoked run can't race the same removal. Only relevant when the
 	// worktrees kind is enabled AND a project is scoped — a host-wide
 	// sweep (no --project) is the operator's per-project reclaim and the
-	// coord always passes --project (coord-scope strict). Best-effort:
-	// a lock-acquire failure surfaces as a warning but does NOT abort the
-	// sweep (the other classifiers must still run).
+	// coord always passes --project (coord-scope strict).
+	//
+	// Two failure modes, two handlings (the lock is now bounded, not
+	// blocking-forever):
+	//   - ErrLockTimeout → another GC is provably mid-scan. SKIP the
+	//     worktrees kind (drop it from opts.Kinds) so this run does NOT
+	//     scan/re-check/remove worktrees unlocked — that would reintroduce
+	//     the exact race the lock prevents. The other classifiers still run.
+	//   - any other (open/path) fault → genuine error; surface a warning
+	//     and proceed (the worktrees pass is best-effort, the rest must run).
 	if hasKind(kinds, gc.KindWorktrees) && strings.TrimSpace(f.project) != "" {
-		if release, lerr := state.LockProjectWorktreeGC(f.project); lerr != nil {
+		release, lerr := state.LockProjectWorktreeGC(f.project)
+		switch {
+		case lerr == nil:
+			defer release()
+		case errors.Is(lerr, state.ErrLockTimeout):
+			_, _ = fmt.Fprintf(stderr,
+				"warning: worktree-gc lock for %q held by another GC: %v (skipping worktrees kind this run)\n",
+				f.project, lerr)
+			kinds = dropKind(kinds, gc.KindWorktrees)
+			opts.Kinds = kinds
+		default:
 			_, _ = fmt.Fprintf(stderr,
 				"warning: could not take worktree-gc lock for %q: %v (proceeding unlocked)\n",
 				f.project, lerr)
-		} else {
-			defer release()
 		}
 	}
 	deps := gc.DefaultDeps()
@@ -201,6 +217,19 @@ func hasKind(ks []gc.Kind, target gc.Kind) bool {
 		}
 	}
 	return false
+}
+
+// dropKind returns ks without target, preserving order. Used to skip the
+// worktrees classifier when its serialization lock is held by another GC
+// (running it unlocked would reintroduce the removal race).
+func dropKind(ks []gc.Kind, target gc.Kind) []gc.Kind {
+	out := ks[:0:0] // new backing array; never alias the caller's slice
+	for _, k := range ks {
+		if k != target {
+			out = append(out, k)
+		}
+	}
+	return out
 }
 
 // parseKindsCSV converts the --kinds flag value into a gc.Kind slice.
