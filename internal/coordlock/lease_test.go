@@ -1237,3 +1237,74 @@ func TestBusyFlockNoEpoch_StaleHolderRecovers(t *testing.T) {
 		t.Fatalf("transient record must name the hung flock-body holder as owner, got pid=%d", rec.Owner.Pid)
 	}
 }
+
+// ---- codex iter-6 [P2]: heartbeat must not demote on serializer busy ----
+
+// A healthy leader whose heartbeat tick overlaps a brief writer of
+// coordinator.epoch.lock must NOT self-demote: withEpochLock returns the
+// transient errSerializerBusy, and the heartbeat treats it as "skip this
+// tick", never a permanent stop. (Closes the spurious-TTL-expiry hole.)
+func TestHeartbeatDoesNotDemoteOnSerializerBusy(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+	paths, _ := resolvePaths(project)
+
+	// Shrink the serializer budget so the test is fast.
+	prev := epochLockBudget
+	epochLockBudget = 80 * time.Millisecond
+	t.Cleanup(func() { epochLockBudget = prev })
+
+	l := &Lease{
+		cfg: cfg, paths: paths,
+		self: identity{Pid: os.Getpid(), PidStart: selfStart, AgentID: "me", Project: project},
+		host: "h", boot: "test-boot-1", epoch: 9,
+	}
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateActive, Owner: l.self,
+		BootID: "test-boot-1", RenewedAtMono: 0,
+	})
+
+	// Hold epoch.lock from a separate fd for the whole budget window.
+	if err := os.MkdirAll(filepath.Dir(paths.epochLock), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	holder, err := os.OpenFile(paths.epochLock, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open epoch.lock: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock holder: %v", err)
+	}
+
+	ok, hbErr := l.heartbeatOnce()
+	if ok {
+		t.Fatal("heartbeatOnce should not report ok while the serializer is busy")
+	}
+	if !errorsIsSerializerBusy(hbErr) {
+		t.Fatalf("expected errSerializerBusy (transient), got: %v", hbErr)
+	}
+
+	// Release the serializer; the next heartbeat must succeed (no demotion).
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_UN); err != nil {
+		t.Fatalf("unlock holder: %v", err)
+	}
+	clk.advance(5 * time.Second)
+	ok2, err2 := l.heartbeatOnce()
+	if err2 != nil || !ok2 {
+		t.Fatalf("heartbeat should renew once the serializer frees, got ok=%v err=%v", ok2, err2)
+	}
+	rec := readEpochFor(t, project)
+	if rec.Epoch != 9 || rec.Owner.AgentID != "me" {
+		t.Fatalf("leader must still own epoch 9 after a busy tick, got %s@%d", rec.Owner.AgentID, rec.Epoch)
+	}
+}
+
+func errorsIsSerializerBusy(err error) bool {
+	// errSerializerBusy is unexported; compare via the package-internal
+	// sentinel directly (this test is in-package).
+	return err != nil && err == errSerializerBusy //nolint:errorlint // exact sentinel, never wrapped here.
+}
