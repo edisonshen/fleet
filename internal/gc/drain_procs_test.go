@@ -1,6 +1,7 @@
 package gc
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -266,6 +267,32 @@ func TestDrainProcs_AmbiguousGuard_RecordKept(t *testing.T) {
 	}
 	if len(h.removed) != 0 {
 		t.Fatalf("ambiguous guard must KEEP the record (no delete); got removed=%v", h.removed)
+	}
+}
+
+// Gone + record-delete failure (codex [P3]): when KillDrain reports Gone
+// but RemoveDrainRun errors, the action must NOT claim "removed" — it
+// surfaces the failure so the operator knows the next sweep retries.
+func TestDrainProcs_GoneButRemoveFails_SurfacesNotRemoved(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.killReturn = func(DrainKillTarget) (DrainKillResult, error) { return DrainKillResult{Gone: true}, nil }
+	h.deps.RemoveDrainRun = func(string) error { return errors.New("permission denied") }
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute),
+			Path: "/tmp/drain-runs/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb == VerbRemoved {
+		t.Fatalf("must NOT report removed when the delete failed; reason=%s", act.Reason)
+	}
+	if act.Verb != VerbSurface {
+		t.Fatalf("delete failure should SURFACE; got %s", act.Verb)
 	}
 }
 

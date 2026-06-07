@@ -321,14 +321,17 @@ func orphanCleanupHint(a gc.Action, rec *agent.Record) string {
 			return fmt.Sprintf("fleet rm %s  (preserve for dead-coord recovery; do NOT run `fleet gc --apply --kinds=orphan-agents`)", a.Target)
 		}
 		return fmt.Sprintf("fleet rm %s  (per-record; verify FLEET_TMUX_SOCKET matches agent's spawn socket before running)", a.Target)
-	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons:
+	case gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks, gc.KindWorkerRecords, gc.KindInvalidProjects, gc.KindOrphanRCDaemons, gc.KindDrainProcs:
 		// coord-locks + worker-records + invalid-projects + orphan-rc-daemons
-		// share the global-gc hint shape (sockets + worktrees) because the
-		// remove is project-scoped to the parent project's tree — no
-		// per-record FLEET_TMUX_SOCKET caveat applies. See cmd/fleet/gc.go's
-		// --kinds wiring (fleet#172 for coord-locks, fleet#177 for
-		// worker-records, invalid-project-dir-guar-d636 for invalid-projects,
-		// leak-rc-daemon-lifecycle PR-B for orphan-rc-daemons).
+		// + drain-procs share the global-gc hint shape (sockets + worktrees):
+		// the action is reaped by `fleet gc --apply --kinds=<kind>` with no
+		// per-record FLEET_TMUX_SOCKET caveat (the remove is project-scoped to
+		// the parent project's tree). See cmd/fleet/gc.go's --kinds wiring
+		// (fleet#172 coord-locks, fleet#177 worker-records,
+		// invalid-project-dir-guar-d636 invalid-projects, leak-rc-daemon-
+		// lifecycle PR-B orphan-rc-daemons, handoff-drain-storm-leak
+		// drain-procs — add --legacy-drains for the one-time reclaim of the
+		// pre-run-record 81).
 		return fmt.Sprintf("fleet gc --apply --kinds=%s", a.Kind)
 	default:
 		return "(unknown — run `fleet gc` for details)"

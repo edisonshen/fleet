@@ -210,9 +210,16 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 					// pid confirmed dead / identity changed between
 					// classification and signal (raced to exit, or PID
 					// reuse) — no kill, record is now meaningless: clean it.
-					act.Verb = VerbRemoved
-					act.Reason = fmt.Sprintf("pid=%d gone / identity changed at signal time (raced to exit or PID reuse) — record cleaned, no kill", run.Pid)
-					_ = removeDrainRunIfWired(deps, run.Path)
+					if rerr := removeDrainRunIfWired(deps, run.Path); rerr != nil {
+						// codex [P3]: don't claim "removed" when the delete
+						// failed — the stale record survives and the next
+						// sweep retries. Surface the failure honestly.
+						act.Verb = VerbSurface
+						act.Reason = fmt.Sprintf("pid=%d gone at signal time but record cleanup failed: %v — will retry next sweep", run.Pid, rerr)
+					} else {
+						act.Verb = VerbRemoved
+						act.Reason = fmt.Sprintf("pid=%d gone / identity changed at signal time (raced to exit or PID reuse) — record cleaned, no kill", run.Pid)
+					}
 				default:
 					// Guard could NOT confirm liveness/identity (e.g. a
 					// transient argv-probe failure). The pid MAY still be
