@@ -75,6 +75,7 @@ const (
 	stateActive            = "active"              // a live leader holds the flock and heartbeats
 	stateFencing           = "fencing"             // a candidate fenced the old epoch, mid-takeover
 	stateFencedNotAcquired = "fenced_not_acquired" // takeover could not kill/acquire; doctor recovery (PR6)
+	stateReleased          = "released"            // holder cleanly released; tokens invalid immediately
 )
 
 // Lease tuning. TTL >= 3x heartbeat AND >= worst-case pause + clock skew
@@ -670,9 +671,14 @@ func (l *Lease) heartbeatOnce() (bool, error) {
 	})
 }
 
-// Release stops the heartbeat and closes the flock fd (the kernel also
-// releases the flock on process death). Idempotent. Cleanup-as-last-step:
-// callers `defer lease.Release()` so it runs on every exit path.
+// Release stops the heartbeat, DEMOTES the epoch record to `released`, then
+// closes the flock fd (the kernel also releases the flock on process
+// death). Demoting the record before dropping the flock is what makes any
+// still-outstanding LeaseToken.StillOwned() return false IMMEDIATELY (the
+// state is no longer `active`) — without it a token held by a racing
+// goroutine would keep validating until TTL/successor, admitting a
+// non-holder's mutation. Idempotent. Cleanup-as-last-step: callers
+// `defer lease.Release()` so it runs on every exit path.
 func (l *Lease) Release() {
 	if l == nil {
 		return
@@ -681,6 +687,24 @@ func (l *Lease) Release() {
 		close(l.stopHB)
 		<-l.hbDone
 		l.stopHB = nil
+	}
+	// Demote the record to `released` while we still hold the flock (so a
+	// successor can't have advanced the epoch under us yet). Only if it is
+	// still exactly ours — never stomp a successor's record. Best-effort:
+	// the kernel flock release below is the hard guarantee; this just makes
+	// token invalidation immediate.
+	if l.flock != nil {
+		_, _ = l.withEpochLock(func() (bool, error) {
+			cur, err := readEpoch(l.paths.epoch)
+			if err != nil {
+				return false, err //nolint:nilerr // best-effort; flock release below is the guarantee.
+			}
+			if cur.State != stateActive || cur.Epoch != l.epoch || !cur.Owner.equal(l.self) {
+				return false, nil // not ours anymore -> leave it
+			}
+			cur.State = stateReleased
+			return true, l.writeEpochLocked(cur)
+		})
 	}
 	if l.flock != nil {
 		_ = releaseFlock(l.flock)
