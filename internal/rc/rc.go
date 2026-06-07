@@ -1,6 +1,7 @@
 package rc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -1175,12 +1176,23 @@ var claudeVersionFn = defaultClaudeVersion
 //
 // We split on whitespace and take the leading token; anything else is
 // treated as "unknown" (empty string).
+// claudeVersionProbeTimeout bounds the `claude --version` shell-out so a
+// broken/blocking claude wrapper can't hang fleet status / gc (codex P2).
+const claudeVersionProbeTimeout = 5 * time.Second
+
 func defaultClaudeVersion() (string, error) {
 	bin, err := exec.LookPath("claude")
 	if err != nil {
 		return "", fmt.Errorf("claude binary not found on PATH: %w", err)
 	}
-	out, err := exec.Command(bin, "--version").Output()
+	// codex P2: bound the probe. `fleet status` reaches this via
+	// rc.SweepAllProjects on every run; a broken `claude` wrapper that
+	// blocks on --version would otherwise hang status/JSON/coord ticks
+	// indefinitely. A timeout collapses to "unknown version" (caller treats
+	// empty as "skip version check"), which is the safe degraded behavior.
+	ctx, cancel := context.WithTimeout(context.Background(), claudeVersionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").Output()
 	if err != nil {
 		return "", fmt.Errorf("claude --version: %w", err)
 	}

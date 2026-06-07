@@ -23,6 +23,7 @@ package gc
 // kind is the operator-invoked sweep for existing leaked daemons.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -343,6 +344,11 @@ func listRCStatesOnDisk() ([]RCStateInfo, error) {
 	return out, nil
 }
 
+// claudeVersionProbeTimeout bounds the `claude --version` shell-out so a
+// broken/blocking claude wrapper can't hang `fleet gc` (codex P2). Mirrors
+// the rc-package constant of the same name.
+const claudeVersionProbeTimeout = 5 * time.Second
+
 // currentClaudeVersionOnDisk reads `claude --version` and returns the
 // leading semver token. Mirrors internal/rc/rc.go:defaultClaudeVersion;
 // duplicated here to avoid exposing the unexported helper from
@@ -353,7 +359,12 @@ func currentClaudeVersionOnDisk() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out, err := exec.Command(bin, "--version").Output()
+	// codex P2: bound the probe so a broken `claude` wrapper can't hang
+	// `fleet gc` / `fleet status`. Timeout → error → classifier skips the
+	// version branch (curVer == "" is the safe degraded answer).
+	ctx, cancel := context.WithTimeout(context.Background(), claudeVersionProbeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "--version").Output()
 	if err != nil {
 		return "", err
 	}
