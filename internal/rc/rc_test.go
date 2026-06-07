@@ -633,6 +633,8 @@ func TestSweepAllProjects_ReleasesStaleVersionDaemons(t *testing.T) {
 
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, expectedCwd string) bool { return true })
+	defer restoreStrict()
 	var killed []int
 	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
 	defer restoreKill()
@@ -690,6 +692,8 @@ func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
 	}
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, expectedCwd string) bool { return true })
+	defer restoreStrict()
 	restoreKill := SetKillFnForTest(func(pid int) {})
 	defer restoreKill()
 
@@ -868,6 +872,47 @@ func TestUp_AdoptHealthy_DoesNotClobberExistingOwner(t *testing.T) {
 	got, _ := ReadState("demo")
 	if got.OwningCoordID != "coord-live" {
 		t.Fatalf("existing owner must be preserved; owning_coord_id=%q want coord-live", got.OwningCoordID)
+	}
+}
+
+// TestReapDaemonKeepMarker_SkipsWhenCwdUnverifiable (codex P2): the auto-
+// sweep runs on every `fleet status` and is destructive. When the strict
+// cwd verifier can't confirm the recorded working_dir (lsof missing, or the
+// PID was reused by another project sharing the fleet-coord prefix), the
+// reap must skip BOTH the kill and the state removal — killing would take
+// down an unrelated listener; removing state would untrack a live foreign
+// daemon. Expect: no kill, state preserved.
+func TestReapDaemonKeepMarker_SkipsWhenCwdUnverifiable(t *testing.T) {
+	withFleetHome(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	// argv check passes (shared prefix) but strict cwd CANNOT be confirmed.
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return false })
+	defer restoreStrict()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+	rec := RecordedState{
+		Project: "demo", PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, ClaudeVersion: "2.1.146", OwningCoordID: "coord-live",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	reapDaemonKeepMarker("demo", rec)
+
+	if len(killed) != 0 {
+		t.Fatalf("must not kill when strict cwd unverifiable; killed=%v", killed)
+	}
+	if _, err := ReadState("demo"); err != nil {
+		t.Fatalf("state must be preserved when cwd unverifiable (could be a live foreign daemon); err=%v", err)
 	}
 }
 

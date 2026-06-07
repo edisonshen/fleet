@@ -856,16 +856,24 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState) {
 			if prefix == "" {
 				prefix = SessionPrefix
 			}
-			if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
-				killFn(cur.PID)
-			} else {
-				// argv/cwd mismatch — likely kernel PID reuse (possibly
-				// another project's listener). Refuse to kill; still drop
-				// the stale state below so a fresh acquire isn't blocked.
+			// codex P2 (strict cwd before destructive sweep kill): the
+			// auto-sweep runs on every `fleet status`. verifyPIDIsListener
+			// degrades to argv-only when lsof is missing, and every project
+			// shares the fleet-coord prefix — so a REUSED stale PID could
+			// pass argv-only and we'd kill another project's healthy
+			// listener. Require an EXACT cwd confirmation here. If we can't
+			// strictly verify (lsof missing, cwd unknown, or mismatch), skip
+			// BOTH the kill AND the state removal: we can't prove this PID is
+			// ours, and removing the state could untrack a live foreign
+			// daemon. Leave it for a host/tick that can verify.
+			if !verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) ||
+				!verifyPIDCwdStrictFn(cur.PID, cur.WorkingDir) {
 				fmt.Fprintf(os.Stderr,
-					"rc.reapDaemonKeepMarker: project %q recorded PID %d alive but argv/cwd does not match recorded session_prefix %q + working_dir %q; skipping kill (likely PID reuse)\n",
-					project, cur.PID, prefix, cur.WorkingDir)
+					"rc.reapDaemonKeepMarker: project %q PID %d could not be strictly verified as our listener (argv/cwd unconfirmed — likely PID reuse or lsof unavailable); skipping reap to avoid killing an unrelated process\n",
+					project, cur.PID)
+				return OutcomeAlreadyAcquired, nil
 			}
+			killFn(cur.PID)
 		}
 		_ = RemoveState(project)
 		return OutcomeReleased, nil
@@ -983,6 +991,41 @@ func psArgsVerify(pid int, sessionPrefix, expectedCwd string) bool {
 		}
 	}
 	return false
+}
+
+// verifyPIDCwdStrictFn is the test seam for the STRICT cwd verifier used
+// by the auto-sweep reap (codex P2). Production uses psCwdStrict.
+var verifyPIDCwdStrictFn = psCwdStrict
+
+// psCwdStrict confirms — via lsof ONLY — that pid's working_dir equals
+// expectedCwd. Unlike psArgsVerify it does NOT degrade to argv-only when
+// lsof is missing: it returns false. The destructive auto-sweep path
+// (`fleet status` reaping stale daemons) needs this stricter gate because
+// every project shares the fleet-coord prefix, so an argv-only match on a
+// REUSED PID could otherwise kill another project's healthy listener.
+// Empty expectedCwd → false (can't strictly verify an unknown cwd).
+func psCwdStrict(pid int, expectedCwd string) bool {
+	if pid <= 0 || expectedCwd == "" {
+		return false
+	}
+	out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
+	if err != nil {
+		return false // lsof unavailable / failed → cannot strictly verify.
+	}
+	for _, l := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(l, "n") && l[1:] == expectedCwd {
+			return true
+		}
+	}
+	return false
+}
+
+// SetVerifyPIDCwdStrictForTest swaps verifyPIDCwdStrictFn; returns a
+// restore func tests defer.
+func SetVerifyPIDCwdStrictForTest(fn func(pid int, expectedCwd string) bool) func() {
+	prev := verifyPIDCwdStrictFn
+	verifyPIDCwdStrictFn = fn
+	return func() { verifyPIDCwdStrictFn = prev }
 }
 
 // killFn is the test seam for Down's listener teardown. Production

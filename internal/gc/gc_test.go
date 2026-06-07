@@ -3886,6 +3886,46 @@ func TestReconcile_OrphanRCDaemon_HealthyDuplicateStateWins(t *testing.T) {
 	}
 }
 
+func TestReconcile_OrphanRCDaemon_LooseStaleMatch_SurfacesNotKilled(t *testing.T) {
+	// codex P2: lsof couldn't populate the daemon's working_dir, so it only
+	// matches a stale-version rc-state.json by PID (loose match). Under
+	// --apply we must NOT kill — a reused PID could be another project's
+	// HEALTHY listener. Expect the action surfaced (not killed), kill seam
+	// never invoked.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "", WorkingDir: ""}, // cwd unknown (lsof failed)
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.146", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	deps.KillRCDaemon = func(pid int) error {
+		t.Fatalf("must not kill on a loose (cwd-unconfirmed) stale match; pid=%d", pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "1234")
+	if !ok {
+		t.Fatalf("expected loose stale match to be surfaced; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("loose stale match must be surfaced not killed; verb=%q", a.Verb)
+	}
+	if !strings.Contains(a.Reason, "working_dir unconfirmed") {
+		t.Fatalf("reason must explain the surface-only downgrade; got %q", a.Reason)
+	}
+}
+
 func TestListRCDaemonsOnDisk_MissingPgrepIsNoop(t *testing.T) {
 	// codex P3: a missing `pgrep` binary returns *exec.Error (not
 	// *exec.ExitError code 1), which the pre-fix code surfaced as an error.

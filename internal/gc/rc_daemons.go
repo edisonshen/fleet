@@ -176,7 +176,25 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 			Verb:   VerbSurface,
 			Reason: reason,
 		}
+		// codex P2 (no apply-kill on unconfirmed cwd for state-matched
+		// daemons): the stale-version / legacy / recorded-version reasons all
+		// derive from a MATCHED rc-state.json. Every project shares the
+		// fleet-coord prefix and the kill seam only re-checks argv, so if that
+		// match was LOOSE (d.WorkingDir unknown because lsof couldn't populate
+		// it), a REUSED stale PID could actually be another project's HEALTHY
+		// listener — killing it would be wrong. For state-matched kills,
+		// require an EXACT working_dir match (matchTier >= 2). The pure-orphan
+		// case (!matches: no state claims this PID) is exempt: there is no
+		// competing state to mislead us, and the kill seam's argv re-verify is
+		// the defense — a genuine orphan with a probed cwd stays killable.
+		stateMatched := matches // !matches → orphan, no rc-state owns the PID.
+		cwdConfirmed := !stateMatched || (d.WorkingDir != "" && matchTier >= 2)
 		if opts.Apply {
+			if !cwdConfirmed {
+				act.Reason = reason + " — NOT killed: working_dir unconfirmed (lsof unavailable or PID-only match); surfacing only to avoid killing a reused PID"
+				r.Actions = append(r.Actions, act)
+				continue
+			}
 			if deps.KillRCDaemon == nil {
 				act.Reason = "kill seam unwired (set Deps.KillRCDaemon to apply)"
 				r.Actions = append(r.Actions, act)
