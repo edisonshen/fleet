@@ -3886,6 +3886,39 @@ func TestReconcile_OrphanRCDaemon_HealthyDuplicateStateWins(t *testing.T) {
 	}
 }
 
+func TestReconcile_OrphanRCDaemon_EmptyCwd_SurfacesNotKilled(t *testing.T) {
+	// codex P2: a pure orphan (no rc-state) whose working_dir couldn't be
+	// probed (lsof unavailable) must NOT be apply-killed. The production
+	// kill seam fails closed on an empty cwd (returns nil without
+	// signaling), so killing would falsely report verb=killed while the
+	// daemon keeps running — hiding the leak. Require a known cwd; surface
+	// otherwise.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 5678, Version: "2.1.156", WorkingDir: ""}, // cwd unknown
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) { return nil, nil } // pure orphan
+	deps.KillRCDaemon = func(pid int, _ string) error {
+		t.Fatalf("must not apply-kill an orphan with unknown cwd; pid=%d", pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "5678")
+	if !ok {
+		t.Fatalf("expected orphan with unknown cwd to be surfaced; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("orphan with unknown cwd must surface (not killed); verb=%q", a.Verb)
+	}
+}
+
 func TestReconcile_OrphanRCDaemon_LooseStaleMatch_SurfacesNotKilled(t *testing.T) {
 	// codex P2: lsof couldn't populate the daemon's working_dir, so it only
 	// matches a stale-version rc-state.json by PID (loose match). Under

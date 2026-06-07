@@ -384,6 +384,22 @@ func Up(project string, opts UpOpts) (string, error) {
 							project, healReason, cur.PID, rerr)
 					}
 					preResolvedCwd = rcwd
+					// codex P2 (strict cwd before self-heal kill): the argv
+					// check above degrades to argv-only when lsof is missing,
+					// and all projects share the fleet-coord prefix — so a
+					// stale PID reused by another project's HEALTHY listener
+					// could pass it. Before we SIGNAL, require a strict lsof
+					// cwd confirmation (same guard the status sweep uses). If
+					// we can't strictly confirm, abort the self-heal: leave
+					// the existing daemon alive rather than risk killing an
+					// unrelated listener. The version/owner drift will be
+					// retried next tick (or caught by gc once lsof is back).
+					if !verifyPIDCwdStrictFn(cur.PID, cur.WorkingDir) {
+						fmt.Fprintf(os.Stderr,
+							"rc.Up: project %q self-heal (%s) aborted — PID %d cwd could not be strictly verified (lsof unavailable or PID reuse); leaving it alive to avoid killing an unrelated listener\n",
+							project, healReason, cur.PID)
+						return OutcomeAlreadyAcquired, nil
+					}
 					// Self-heal: surface what changed so the operator can
 					// see why we respawned (version drift / dead owner).
 					fmt.Fprintf(os.Stderr,

@@ -1197,6 +1197,8 @@ func TestUp_SelfHeal_RespawnsOnStaleVersion(t *testing.T) {
 	withStubVersionAndOwner(t, "2.1.156")
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return true })
+	defer restoreStrict()
 
 	var killedPIDs []int
 	restoreKill := SetKillFnForTest(func(pid int) { killedPIDs = append(killedPIDs, pid) })
@@ -1299,6 +1301,54 @@ func TestUp_SelfHeal_AbortsWhenCwdUnresolvable(t *testing.T) {
 	}
 }
 
+// TestUp_SelfHeal_AbortsWhenCwdUnverifiable (codex P2): a stale-version
+// daemon needs respawn, cwd resolves fine, but the STRICT lsof cwd verifier
+// can't confirm the PID (lsof missing / PID reuse). Up must NOT kill — the
+// PID could be another project's healthy listener sharing the fleet-coord
+// prefix. Expect: no kill, original state preserved, outcome already_acquired.
+func TestUp_SelfHeal_AbortsWhenCwdUnverifiable(t *testing.T) {
+	withFleetHome(t)
+	stubAgentListEmpty(t)
+	withStubVersionAndOwner(t, "2.1.156")
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	// strict cwd CANNOT be confirmed.
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return false })
+	defer restoreStrict()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	oldPID := os.Getpid()
+	rec := RecordedState{
+		Project: "demo", PID: oldPID, HostID: host, WorkingDir: "/tmp/demo",
+		SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+		ClaudeVersion: "2.1.146", OwningCoordID: "coord-live",
+	}
+	if err := WriteState(rec); err != nil {
+		t.Fatalf("seed WriteState: %v", err)
+	}
+	if err := WriteMarker("demo"); err != nil {
+		t.Fatalf("WriteMarker: %v", err)
+	}
+
+	out, err := Up("demo", UpOpts{Cwd: "/tmp/demo", SkipSpawn: true, InjectedPID: 99999})
+	if err != nil {
+		t.Fatalf("Up: %v", err)
+	}
+	if out != OutcomeAlreadyAcquired {
+		t.Fatalf("outcome=%q want already_acquired (self-heal aborted)", out)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("must not kill when strict cwd unverifiable; killed=%v", killed)
+	}
+	got, _ := ReadState("demo")
+	if got.PID != oldPID {
+		t.Fatalf("original state must be preserved; got pid %d want %d", got.PID, oldPID)
+	}
+}
+
 // TestUp_SelfHeal_RespawnsOnDeadOwner (T3): recorded daemon's owning
 // coord is gone (agent record missing or tmux session dead) → killFn
 // is called once, fresh daemon spawned, state updated with new owner,
@@ -1316,6 +1366,8 @@ func TestUp_SelfHeal_RespawnsOnDeadOwner(t *testing.T) {
 
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return true })
+	defer restoreStrict()
 
 	var killedPIDs []int
 	restoreKill := SetKillFnForTest(func(pid int) { killedPIDs = append(killedPIDs, pid) })
@@ -1373,6 +1425,8 @@ func TestUp_SelfHeal_EmptyVersionForcesHeal(t *testing.T) {
 	withStubVersionAndOwner(t, "2.1.156")
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return true })
+	defer restoreStrict()
 	restoreKill := SetKillFnForTest(func(pid int) {})
 	defer restoreKill()
 

@@ -245,6 +245,17 @@ def bootstrap_remote_control(
     home = _resolve_home(fleet_home)
     marker = _marker_path(home, project, coord_id)
     if marker.exists():
+        # Already bootstrapped (inbox seeded once). BUT the respawn tick
+        # must keep firing: SweepAllProjects reaps a stale/dead-owner
+        # daemon while PRESERVING the project RC marker, expecting the next
+        # coord tick to respawn it. If we returned here unconditionally,
+        # existing coords would never re-run `fleet rc up --respawn-only
+        # --coord-id`, leaving the project marker-present/no-state until the
+        # operator runs `fleet rc up` by hand. So re-run the (idempotent,
+        # respawn-only) spawn on every post-bootstrap tick. --respawn-only
+        # is a no-op when the project RC marker is absent, so this never
+        # auto-enables RC for an opted-out project.
+        spawn_daemon_status(project, coord_id)
         return STATUS_SKIPPED_MARKER
     # Pre-check the inbox path: if an operator queued a message via
     # `fleet message <coord_id>` between dispatch and this tick, the

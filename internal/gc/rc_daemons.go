@@ -187,8 +187,15 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 		// case (!matches: no state claims this PID) is exempt: there is no
 		// competing state to mislead us, and the kill seam's argv re-verify is
 		// the defense — a genuine orphan with a probed cwd stays killable.
+		// codex P2: an apply-kill ALWAYS needs a known working_dir. The
+		// production kill seam (killRCDaemonOnDisk) re-verifies argv AND cwd
+		// and FAILS CLOSED on an empty cwd — so killing with d.WorkingDir==""
+		// is a silent no-op that would still report verb=killed, hiding the
+		// leak. Require a non-empty cwd for every apply-kill. For STATE-
+		// matched daemons additionally require an exact-cwd match (matchTier
+		// >= 2) so a loose PID-only match on a reused PID can't drive a kill.
 		stateMatched := matches // !matches → orphan, no rc-state owns the PID.
-		cwdConfirmed := !stateMatched || (d.WorkingDir != "" && matchTier >= 2)
+		cwdConfirmed := d.WorkingDir != "" && (!stateMatched || matchTier >= 2)
 		if opts.Apply {
 			if !cwdConfirmed {
 				act.Reason = reason + " — NOT killed: working_dir unconfirmed (lsof unavailable or PID-only match); surfacing only to avoid killing a reused PID"

@@ -511,6 +511,31 @@ class TestBootstrap:
         # Quiet steady-state: no bootstrap log entry written.
         assert not isolated_bootstrap_log.exists()
 
+    def test_marker_present_still_fires_respawn_tick(
+        self, fleet_home: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """leak-rc-daemon-lifecycle (codex P2): once a coord is bootstrapped
+        (marker present) the tick still re-runs `fleet rc up --respawn-only
+        --coord-id` so a daemon reaped by SweepAllProjects (marker preserved)
+        gets respawned. Without this the project sits marker-present/no-state
+        until the operator runs `fleet rc up` by hand. Returns SKIPPED_MARKER
+        (inbox not re-seeded) but the respawn shell-out MUST fire."""
+        _enable_rc_bootstrap_for_test(monkeypatch)
+        rc_calls = _stub_fleet_rc_up_success(monkeypatch)
+        proj_dir = fleet_home / "projects" / "myproj"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / ".remote-control-bootstrap-abcd1234").touch()
+
+        status = remote_control.bootstrap_remote_control(
+            "myproj", "abcd1234", fleet_home=fleet_home,
+        )
+        assert status == remote_control.STATUS_SKIPPED_MARKER
+        # The respawn-only spawn MUST have fired with the coord-id threaded.
+        up_calls = [c for c in rc_calls if c[:3] == ["fleet", "rc", "up"]]
+        assert len(up_calls) == 1, f"expected one respawn shell-out; got {rc_calls}"
+        assert "--respawn-only" in up_calls[0]
+        assert up_calls[0][-2:] == ["--coord-id", "abcd1234"]
+
     def test_per_coord_marker_isolation(
         self, fleet_home: Path, fake_popen: _FakePopen,
         monkeypatch: pytest.MonkeyPatch,
