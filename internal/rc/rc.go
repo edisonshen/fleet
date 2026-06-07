@@ -767,9 +767,15 @@ func SweepAllProjects() error {
 			continue // recorded PID gone — sweeper has nothing to kill.
 		}
 		// Class 1: marker absent. Operator opted out manually; daemon
-		// kept running.
+		// kept running. codex P1: this is the DESTRUCTIVE sweep path that
+		// now runs on every (read-only) `fleet status`. Down() degrades to
+		// argv-only PID verification when lsof is missing, and every project
+		// shares the fleet-coord prefix — so a reused stale PID could be
+		// another project's HEALTHY listener and status would kill it. Use
+		// the strict-cwd-confirmed teardown instead (removes marker + state
+		// like Down, but never signals an unverifiable PID).
 		if !MarkerPresent(p) {
-			_, _ = Down(p)
+			reapMarkerlessStrict(p, cur)
 			continue
 		}
 		// Class 2/3: marker present, daemon alive — apply the same
@@ -875,6 +881,56 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState) {
 			}
 			killFn(cur.PID)
 		}
+		_ = RemoveState(project)
+		return OutcomeReleased, nil
+	})
+}
+
+// reapMarkerlessStrict is the Class-1 (marker-absent) sweep teardown. The
+// operator opted out (removed the marker) but the daemon kept running, so
+// we remove BOTH the marker and the state (full opt-out, like Down) — BUT
+// with the same strict cwd confirmation reapDaemonKeepMarker uses, because
+// this path runs on every read-only `fleet status` (codex P1). If we can't
+// strictly verify the PID is our listener (lsof missing / cwd mismatch /
+// PID reuse), we skip the kill AND leave state alone — a reused PID could
+// be another project's healthy listener, and an informational command must
+// never terminate it.
+func reapMarkerlessStrict(project string, snapshot RecordedState) {
+	_, _ = withLock(project, func() (string, error) {
+		cur, err := ReadState(project)
+		if err != nil {
+			return OutcomeAlreadyReleased, nil
+		}
+		// Race guard: re-read under the lock; if the marker reappeared or
+		// the PID changed since the snapshot, this is no longer the same
+		// markerless-orphan case — leave it for the appropriate path.
+		if MarkerPresent(project) || cur.PID != snapshot.PID {
+			return OutcomeAlreadyAcquired, nil
+		}
+		host, _ := os.Hostname()
+		if cur.HostID != "" && cur.HostID != host {
+			fmt.Fprintf(os.Stderr,
+				"rc.reapMarkerlessStrict: project %q rc-state.json now owned by host %q (local %q); aborting reap (cross-host)\n",
+				project, cur.HostID, host)
+			return OutcomeAlreadyAcquired, nil
+		}
+		if cur.PID > 0 && workers.IsAlive(cur.PID) {
+			prefix := cur.SessionPrefix
+			if prefix == "" {
+				prefix = SessionPrefix
+			}
+			if !verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) ||
+				!verifyPIDCwdStrictFn(cur.PID, cur.WorkingDir) {
+				fmt.Fprintf(os.Stderr,
+					"rc.reapMarkerlessStrict: project %q PID %d could not be strictly verified as our listener (argv/cwd unconfirmed — likely PID reuse or lsof unavailable); skipping reap to avoid killing an unrelated process\n",
+					project, cur.PID)
+				return OutcomeAlreadyAcquired, nil
+			}
+			killFn(cur.PID)
+		}
+		// Marker already absent (Class-1 precondition); remove state. Call
+		// RemoveMarker too for idempotent full teardown (no-op if absent).
+		_ = RemoveMarker(project)
 		_ = RemoveState(project)
 		return OutcomeReleased, nil
 	})

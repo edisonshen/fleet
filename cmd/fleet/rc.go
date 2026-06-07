@@ -356,7 +356,13 @@ func emitRC(stdout io.Writer, resp rcResponse) error {
 		rc.OutcomeAlreadyAcquired,
 		rc.OutcomeReleased,
 		rc.OutcomeAlreadyReleased,
-		rc.OutcomeConnected:
+		rc.OutcomeConnected,
+		// codex P3: self-heal outcomes are successes (rcExitCode maps them
+		// to 0). They must return nil here too, or an in-process caller of
+		// runRCUp / Cobra Execute sees an error for a SUCCESSFUL respawn —
+		// inconsistent with the exit-code contract.
+		rc.OutcomeRespawnedStaleVersion,
+		rc.OutcomeRespawnedDeadOwner:
 		return nil
 	default:
 		return errRC{outcome: resp.Outcome}

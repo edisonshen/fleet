@@ -196,6 +196,8 @@ func TestRCCLI_ExitCodeMappingStable(t *testing.T) {
 		{rc.OutcomeReleased, 0},
 		{rc.OutcomeAlreadyReleased, 0},
 		{rc.OutcomeConnected, 0},
+		{rc.OutcomeRespawnedStaleVersion, 0},
+		{rc.OutcomeRespawnedDeadOwner, 0},
 		{rc.OutcomeNotEnabled, 10},
 		{rc.OutcomeNotOwned, 10},
 		{rc.OutcomeAbsent, 11},
@@ -207,6 +209,22 @@ func TestRCCLI_ExitCodeMappingStable(t *testing.T) {
 		got := rcExitCode(c.outcome)
 		if got != c.want {
 			t.Errorf("rcExitCode(%q)=%d want %d", c.outcome, got, c.want)
+		}
+	}
+}
+
+// TestRCCLI_EmitRC_SelfHealOutcomesReturnNil (codex P3): emitRC must treat
+// the self-heal respawn outcomes as successes (return nil), consistent with
+// rcExitCode mapping them to 0. Otherwise an in-process caller of
+// runRCUp/Cobra Execute sees an error for a SUCCESSFUL respawn.
+func TestRCCLI_EmitRC_SelfHealOutcomesReturnNil(t *testing.T) {
+	for _, outcome := range []string{
+		rc.OutcomeRespawnedStaleVersion,
+		rc.OutcomeRespawnedDeadOwner,
+	} {
+		var buf bytes.Buffer
+		if err := emitRC(&buf, rcResponse{Outcome: outcome, Cmd: "up", Project: "demo"}); err != nil {
+			t.Errorf("emitRC(%q) returned error %v; want nil (self-heal is a success)", outcome, err)
 		}
 	}
 }

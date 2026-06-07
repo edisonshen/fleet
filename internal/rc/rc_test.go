@@ -916,6 +916,41 @@ func TestReapDaemonKeepMarker_SkipsWhenCwdUnverifiable(t *testing.T) {
 	}
 }
 
+// TestSweepMarkerless_SkipsWhenCwdUnverifiable (codex P1): the markerless
+// (Class-1) sweep path runs on every read-only `fleet status`. On hosts
+// without lsof it must NOT kill a PID it can't strictly verify — a reused
+// stale markerless PID could be another project's healthy listener. Expect:
+// no kill, state preserved (left for a host/tick that can verify).
+func TestSweepMarkerless_SkipsWhenCwdUnverifiable(t *testing.T) {
+	withFleetHome(t)
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, cwd string) bool { return true })
+	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, cwd string) bool { return false })
+	defer restoreStrict()
+	var killed []int
+	restoreKill := SetKillFnForTest(func(pid int) { killed = append(killed, pid) })
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	// markerless orphan: state present + alive PID, NO marker.
+	if err := WriteState(RecordedState{
+		Project: "orphan", PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/orphan",
+		SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("WriteState: %v", err)
+	}
+
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects: %v", err)
+	}
+	if len(killed) != 0 {
+		t.Fatalf("markerless sweep must not kill an unverifiable PID; killed=%v", killed)
+	}
+	if _, err := ReadState("orphan"); err != nil {
+		t.Fatalf("state must be preserved when cwd unverifiable; err=%v", err)
+	}
+}
+
 // TestReapDaemonKeepMarker_AbortsOnCrossHostState (codex P2): the caller
 // filters cross-host entries on an UNLOCKED snapshot. If state is rewritten
 // for another host before the lock, the reap must abort entirely — deleting
@@ -998,10 +1033,12 @@ func TestSweepAllProjects_ReleasesMarkerlessOrphans(t *testing.T) {
 		t.Fatalf("WriteState: %v", err)
 	}
 
-	// Stub verifier so Down doesn't refuse to kill (it's our own
-	// PID).
+	// Stub verifiers so the strict-cwd markerless reap proceeds (it's our
+	// own PID); both argv + strict cwd must confirm before signaling.
 	restoreVerify := SetVerifyPIDIsListenerForTest(func(pid int, prefix, expectedCwd string) bool { return true })
 	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(pid int, expectedCwd string) bool { return true })
+	defer restoreStrict()
 	restoreKill := SetKillFnForTest(func(pid int) {})
 	defer restoreKill()
 
