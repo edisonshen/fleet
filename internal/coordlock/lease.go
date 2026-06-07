@@ -264,6 +264,9 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 		return false, false, err
 	}
 	if gotFlock {
+		// Stamp identity+clock into the flock body so a candidate can
+		// recover us if we hang before writing the epoch (P2 window).
+		l.stampFlockBody(f)
 		// FREE-FLOCK FAST PATH: the previous holder is GONE — holding the
 		// flock is proof of that (the kernel releases on death, and an
 		// explicit Release() frees it; either way no other process holds
@@ -285,6 +288,18 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 			_ = releaseFlock(f)
 			return false, false, fmt.Errorf("coordlock: read epoch snapshot: %w", rerr)
 		}
+		// Don't barge into a FRESH in-progress takeover: the old holder
+		// died (flock free) but the first candidate may not have reacquired
+		// the flock yet — its fencing record is fresh and its candidate PID
+		// alive. Promoting to active here would steal a healthy takeover and
+		// make that candidate time out. Mirror the busy-flock path: only
+		// proceed over a transient record if it is stale/abandoned.
+		if observed.State == stateFencing || observed.State == stateFencedNotAcquired {
+			if !l.transientResumable(observed) {
+				_ = releaseFlock(f)
+				return true, false, nil // let the live candidate finish
+			}
+		}
 		ok, err := l.casToActiveAfterFlock(observed.Epoch)
 		if err != nil {
 			_ = releaseFlock(f)
@@ -302,11 +317,18 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 	// healthy (stand down) vs hung (take over).
 	rec, err := readEpoch(l.paths.epoch)
 	if err != nil {
-		// No readable epoch but a live flock holder: a coord booting
-		// (acquired flock, not yet wrote epoch) — treat as a healthy
-		// in-progress holder and stand down rather than racing it.
 		if errors.Is(err, os.ErrNotExist) {
-			return true, false, nil
+			// Busy flock but NO epoch record: a holder that grabbed the
+			// flock and hasn't written the epoch yet. Don't stand down
+			// indefinitely (that would make a holder hung in this window
+			// unrecoverable). Inspect the flock-body stamp: a FRESH
+			// same-boot live holder is legitimately booting -> stand down;
+			// a stale/dead/cross-boot body is hung -> take over via a
+			// synthetic record naming the flock-body holder as owner.
+			if !l.flockHolderRecoverable() {
+				return true, false, nil
+			}
+			return l.takeOver(l.syntheticRecordFromFlockBody())
 		}
 		return false, false, fmt.Errorf("coordlock: read epoch: %w", err)
 	}
@@ -433,23 +455,35 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 		cur, rerr := readEpoch(l.paths.epoch)
 		if rerr != nil {
 			if errors.Is(rerr, os.ErrNotExist) {
-				return false, nil // epoch vanished — bail, retry from scratch
+				// No epoch file. Only the acquire-to-epoch-window takeover
+				// (synthetic rec.Epoch==0, owner=flock-body holder) may
+				// proceed here, fencing from epoch 0. Any other caller saw
+				// a record that has since vanished -> bail + retry.
+				if rec.Epoch != 0 {
+					return false, nil
+				}
+				cur = epochRecord{Epoch: 0}
+			} else {
+				return false, rerr
 			}
-			return false, rerr
 		}
 		// Another candidate/heartbeat moved the epoch past what we saw.
 		if cur.Epoch != rec.Epoch {
 			return false, nil // stand down; outer loop re-reads
 		}
-		// Holder became healthy under the lock? Stand down.
-		if l.holderHealthy(cur) {
+		// Holder became healthy under the lock? Stand down. (A real record
+		// only; the synthetic no-epoch case has no on-disk owner to vouch.)
+		if cur.State == stateActive && l.holderHealthy(cur) {
 			return false, nil
 		}
-		// Owner is always the recorded OLD holder — for a fresh active
-		// record it is the live-but-hung leader; for a resumed
-		// fencing/fenced record the two-phase rule preserved the original
-		// OLD holder (never the dead candidate). Either way: cur.Owner.
-		old = cur.Owner
+		// Owner is the recorded OLD holder — for a fresh active record the
+		// live-but-hung leader; for a resumed fencing/fenced record the
+		// two-phase rule preserved the original OLD holder (never the dead
+		// candidate). For the synthetic no-epoch case there is no on-disk
+		// owner, so fall back to the flock-body holder passed in via rec.
+		if cur.Owner.Pid != 0 {
+			old = cur.Owner
+		} // else keep `old` = rec.Owner (the flock-body holder)
 		l.epoch = cur.Epoch + 1
 		return true, l.writeEpochLocked(epochRecord{
 			Epoch:     l.epoch,
@@ -489,6 +523,7 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 				"run `fleet doctor` to recover", old.Pid, l.cfg.flockRetryBudget)
 	}
 
+	l.stampFlockBody(f) // recovery stamp before we CAS to active
 	ok, err := l.casFencingToActive(f)
 	if err != nil {
 		_ = releaseFlock(f)
@@ -683,9 +718,27 @@ func (t LeaseToken) StillOwned() bool {
 
 // --- helpers: flock, epoch I/O, identity ---
 
+// flockBody is the identity+timestamp stamped into coordinator.flock's
+// body immediately after a successful acquire. It is the recovery signal
+// for the acquire-to-epoch window: a holder that grabs the flock and then
+// hangs BEFORE writing coordinator.epoch leaves no epoch record, so the
+// only fact a candidate has is this body. A body whose Mono is older than
+// the TTL (same boot) — or whose pid is dead / from another boot — marks a
+// holder hung in the window, recoverable via takeover. A fresh body is a
+// legitimate booting holder (stand down). Best-effort: flock alone
+// enforces exclusion; the body is a recovery aid, never the lock.
+type flockBody struct {
+	Pid      int    `json:"pid"`
+	PidStart int64  `json:"pid_start"`
+	BootID   string `json:"boot_id"`
+	Mono     int64  `json:"mono"`
+}
+
 // tryFlock opens (creating if absent) path and takes a single LOCK_NB
 // exclusive flock. gotFlock=false on EWOULDBLOCK (a live holder exists).
-// The fd is returned ONLY when gotFlock=true; otherwise it is closed.
+// The fd is returned ONLY when gotFlock=true; otherwise it is closed. It
+// does NOT stamp the body — the lease methods stamp via stampFlockBody so
+// the stamp carries the lease's full identity + clock.
 func tryFlock(path string) (f *os.File, gotFlock bool, err error) {
 	f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -693,11 +746,6 @@ func tryFlock(path string) (f *os.File, gotFlock bool, err error) {
 	}
 	lerr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if lerr == nil {
-		// Stamp pid for diagnostics (best-effort, not load-bearing).
-		_ = f.Truncate(0)
-		if _, serr := f.Seek(0, 0); serr == nil {
-			_, _ = fmt.Fprintf(f, "pid=%d\n", os.Getpid())
-		}
 		return f, true, nil
 	}
 	_ = f.Close()
@@ -705,6 +753,70 @@ func tryFlock(path string) (f *os.File, gotFlock bool, err error) {
 		return nil, false, nil
 	}
 	return nil, false, fmt.Errorf("flock %s: %w", path, lerr)
+}
+
+// stampFlockBody writes this lease's identity + boot + mono into the held
+// flock fd's body, immediately after acquire (before writing the epoch).
+// Best-effort.
+func (l *Lease) stampFlockBody(f *os.File) {
+	b, err := json.Marshal(flockBody{
+		Pid: l.self.Pid, PidStart: l.self.PidStart, BootID: l.boot, Mono: l.cfg.nowMono(),
+	})
+	if err != nil {
+		return
+	}
+	if e := f.Truncate(0); e != nil {
+		return
+	}
+	if _, e := f.Seek(0, 0); e != nil {
+		return
+	}
+	_, _ = f.Write(b)
+	_ = f.Sync()
+}
+
+// syntheticRecordFromFlockBody builds the takeOver input for the
+// acquire-to-epoch-window case (busy flock, no epoch record). Epoch 0 is
+// the sentinel the fence closure recognizes to fence-from-zero; Owner is
+// the flock-body holder so the kill-step targets the right PID. A missing/
+// unparseable body yields a zero owner — takeOver will still fence + (in
+// PR2) STONITH by other means; the kill stub is a no-op in PR1.
+func (l *Lease) syntheticRecordFromFlockBody() epochRecord {
+	rec := epochRecord{Epoch: 0, State: stateFencing}
+	b, err := os.ReadFile(l.paths.flock)
+	if err != nil || len(b) == 0 {
+		return rec
+	}
+	var body flockBody
+	if json.Unmarshal(b, &body) != nil {
+		return rec
+	}
+	rec.Owner = identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project}
+	return rec
+}
+
+// flockHolderRecoverable reports whether a BUSY flock with NO epoch record
+// (a holder that hung in the acquire-to-epoch window) is recoverable via
+// takeover. It reads the flock body: recoverable if the body is missing/
+// unparseable, from another boot, its pid is dead, or its Mono is older
+// than the TTL. A fresh same-boot body with a live pid is a legitimate
+// booting holder -> NOT recoverable (stand down).
+func (l *Lease) flockHolderRecoverable() bool {
+	b, err := os.ReadFile(l.paths.flock)
+	if err != nil || len(b) == 0 {
+		return true // no body to vouch for the holder -> recoverable
+	}
+	var body flockBody
+	if json.Unmarshal(b, &body) != nil {
+		return true // unparseable stamp -> recoverable
+	}
+	if body.BootID != l.boot {
+		return true // previous boot
+	}
+	if !l.pidAlive(identity{Pid: body.Pid, PidStart: body.PidStart}) {
+		return true // holder pid dead
+	}
+	return l.cfg.nowMono()-body.Mono > int64(l.cfg.ttl) // hung past TTL
 }
 
 // retryFlock polls LOCK_NB on coordinator.flock until acquired or the
