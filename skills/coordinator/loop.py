@@ -1978,12 +1978,7 @@ def _run_supervisor(
         _save_coord_state(state_path, cs)
 
     def pr_watch_floor_due_hook() -> bool:
-        # PR-watch ~60 s poll floor gate (DESIGN-pr-watch-autoremediate §1):
-        # True iff this coord has ANY OPEN watched PR. Read from the durable
-        # pr-watches.json (cheap fs read, no shell-out) so the floor goes
-        # inert the moment the coord has zero open watched PRs (a truly idle
-        # coord must not poll GitHub every ~60 s). Never raises.
-        return _has_open_watched_pr(project_dir)
+        return _pr_watch_floor_due(project_dir, tasks_path)
 
     sup_result = supervisor_mod.run_supervisor(
         cfg=cfg,
@@ -5405,6 +5400,29 @@ def _has_open_watched_pr(project_dir: Path) -> bool:
     return False
 
 
+def _pr_watch_floor_due(project_dir: Path, tasks_path: Path) -> bool:
+    """The ~60 s PR-watch poll-floor gate (DESIGN-pr-watch-autoremediate §1):
+    True iff this coord has ANY OPEN watched PR, OR any current task carrying
+    a live (non-terminal) pr_url that has NOT been enrolled yet.
+
+    The task-side check is load-bearing (codex P2): a PR opened mid-session
+    lives in tasks.md BEFORE the next periodic_full_reconcile enrolls it into
+    pr-watches.json — without it the floor would never fire to enroll/probe
+    that fresh PR and it would wait for the slow cadence. Cheap fs reads, no
+    shell-out; never raises (the gate must not wedge the supervisor)."""
+    if _has_open_watched_pr(project_dir):
+        return True
+    try:
+        f = parse.read(str(tasks_path))
+    except Exception:  # noqa: BLE001
+        return False
+    for t in f.tasks:
+        if getattr(t, "pr_url", "") and getattr(t, "status", "") \
+                not in pr_watch_mod.TERMINAL_TASK_STATUSES:
+            return True
+    return False
+
+
 def _reconcile_pr_watches(
     tasks: list[parse.Task],
     *,
@@ -5549,30 +5567,40 @@ def _reconcile_pr_watches(
             return "gone"
         rec = _read_agent_record(agent_id, home=home)
         if isinstance(rec, dict):
+            try:
+                pid = int(rec.get("pid", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            # A recorded, STILL-ALIVE pid means the agent is genuinely in
+            # flight — suppress regardless of any outcome field it has already
+            # written (codex P2): a rebase subagent can write
+            # remediation_outcome BEFORE it exits, and consuming that while it
+            # still owns the branch checkout would clear the lease and race a
+            # re-derive agent onto the same branch. Liveness wins; only a
+            # provably-DEAD/absent-pid agent's recorded outcome is consumed.
+            if pid > 0 and _pid_alive(pid):
+                return "running"
             # NONTERMINAL rebase-conflict (DESIGN-pr-watch-autoremediate §2.2):
             # a rebase subagent that hit a conflict writes this outcome (NOT
-            # blocked) so the ladder advances to re-derive. Checked BEFORE the
-            # blocked flag so a subagent that set both prefers the nonterminal
-            # advance (a conflict is never a dead end when re-derive is
-            # eligible). The conflicted paths ride alongside via
-            # _agent_conflicts.
+            # blocked) so the ladder advances to re-derive. Consumed only now
+            # that the agent is NOT provably-alive (dead pid / no pid).
+            # Checked BEFORE the blocked flag so a subagent that set both
+            # prefers the nonterminal advance (a conflict is never a dead end
+            # when re-derive is eligible). The conflicted paths ride alongside
+            # via _agent_conflicts.
             if str(rec.get("remediation_outcome", "") or "") == \
                     pr_watch_mod.OUTCOME_REBASE_CONFLICTED:
                 return pr_watch_mod.OUTCOME_REBASE_CONFLICTED
             if rec.get("blocked"):
                 return "blocked"
-            try:
-                pid = int(rec.get("pid", 0) or 0)
-            except (TypeError, ValueError):
-                pid = 0
             if pid > 0:
-                # The agent WROTE a record with a real pid — a DEFINITIVE
-                # liveness signal. Alive -> running; dead -> "gone" (codex
+                # The agent WROTE a record with a real pid that is NOT alive
+                # (the alive case returned "running" above) -> "gone" (codex
                 # iter-25 [P2]): a recorded-then-crashed fixer must reclaim
                 # after the normal launch grace, NOT be held for the long
                 # unverified stale bound. Do NOT fall through to the journal
                 # (which would mask the dead pid as running-unverified).
-                return "running" if _pid_alive(pid) else "gone"
+                return "gone"
         # No agent record with a usable pid -> fall back to the journal (the
         # coord's own
         # durable launch signal). A launched/in-flight journal means the

@@ -3413,3 +3413,61 @@ def test_pending_ci_open_does_not_reset_budget(tmp_path: Path) -> None:
     finally:
         del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
         del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_live_rebase_agent_outcome_not_consumed_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """codex P2: a rebase subagent that wrote remediation_outcome into its
+    record but is STILL ALIVE (live pid) must NOT have the conflict outcome
+    consumed — the lease stays running, no re-derive is dispatched onto the
+    branch the live agent still owns."""
+    import os as _os
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    snaps = {195: pw.PRSnapshot(number=195, pr_state="OPEN",
+                                merge_state_status="DIRTY", checks="SUCCESS",
+                                review_decision="", head_ref_oid="H195",
+                                base_ref_name="main", human_approved=False)}
+    prober = FakeProber(snaps=snaps, fresh_base="B", ancestors=set())
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    agent_id = pw.load_watches(it_project_dir)["watches"]["195"]["inflight_action"]["agent_id"]
+    # The rebase agent wrote the conflict outcome BUT is STILL ALIVE (this
+    # process's pid). Liveness must win -> outcome NOT consumed.
+    _agent_record(it_home, agent_id,
+                  pid=_os.getpid(),
+                  remediation_outcome=pw.OUTCOME_REBASE_CONFLICTED,
+                  conflicted_paths=["x.py"])
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        r2 = loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    assert not any("pr-rederive-195" in b for b in r2.dispatch_instructions), \
+        "a live rebase agent's conflict outcome must not be consumed (race guard)"
+    w = pw.load_watches(it_project_dir)["watches"]["195"]
+    assert w["inflight_action"] is not None
+    assert w["inflight_action"]["outcome"] == pw.OUTCOME_RUNNING
+
+
+def test_floor_gate_fires_for_unenrolled_pr_task(tmp_path: Path) -> None:
+    """codex P2: the ~60 s floor gate must fire for a PR opened mid-session —
+    a current task with a live pr_url that hasn't been enrolled into
+    pr-watches.json yet — not only for an already-OPEN watch."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    tasks_path = project_dir / "tasks.md"
+    # No watch file yet (PR just opened, not enrolled).
+    assert loop._has_open_watched_pr(project_dir) is False
+    # A current in-review task carrying a live pr_url -> floor due.
+    _write_tasks(project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    assert loop._pr_watch_floor_due(project_dir, tasks_path) is True
+    # A done task with a pr_url is terminal -> NOT due (idle).
+    _write_tasks(project_dir, [_it_task("foo", status="done",
+                 pr_url=_pr_url(195), branch="worker/foo")])
+    assert loop._pr_watch_floor_due(project_dir, tasks_path) is False
+    # No tasks, no watch -> inert.
+    _write_tasks(project_dir, [])
+    assert loop._pr_watch_floor_due(project_dir, tasks_path) is False
