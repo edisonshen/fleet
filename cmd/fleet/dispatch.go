@@ -640,6 +640,24 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		coordRecords = recs
 	}
 
+	// Idempotent coord-spawn (leak-coord-spawn-idempot): if a coord is
+	// ALREADY alive for this project (a record + a live tmux session on
+	// THIS socket), don't mint a duplicate — print an attach hint and
+	// return cleanly. This is the operator-friendly fast path for a
+	// double-press / re-dispatch of an already-running coord. It runs
+	// BEFORE the veto because "attach me to the live one" is a success,
+	// not a retry-later refusal. Cross-socket live coords aren't caught
+	// here (the local probe can't see them) — those fall to the
+	// coordSpawnVeto below, which returns exit 75 retry.
+	if opts.coordSpawn {
+		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil {
+			_, _ = fmt.Fprintf(stdout,
+				"coord %s already alive for project %s; attach with `fleet attach %s`\n",
+				live.ID, opts.project, live.ID)
+			return nil
+		}
+	}
+
 	// Live-coord veto (codex review iter-12 P1 — reinstated after
 	// iter-11 briefly removed it). The Python /coordinator skill only
 	// holds coordinator.lock for a single tick before releasing it in
@@ -647,41 +665,55 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	// net at the dispatch boundary (two coords would alternate ticks,
 	// both mutating tasks/worker state — split-brain coordination).
 	//
-	// Veto when BOTH:
-	//   (a) coord-state.json mtime is fresh (something is ticking), AND
-	//   (b) an agent record exists for this project+task_id (the
-	//       record claiming to BE that something).
+	// OR-based veto (leak-coord-spawn-idempot) — refuse when ANY of:
+	//   (a) coord-state.json mtime fresh AND a record exists (the
+	//       original AND-gate; steady-state signal once the coord has
+	//       ticked at least once).
+	//   (b) a live coord record (tmux session alive) exists — covers a
+	//       live coord whose coord-state.json hasn't refreshed within
+	//       the window yet (e.g. mid-boot, post-first-tick lag).
+	//   (c) a FRESH pending-spawn claim exists — the cold-start window:
+	//       dispatch #1 wrote the claim + spawned, but coord-state.json
+	//       isn't written until the first tick (3-5 min). Without (c),
+	//       a dispatch #2 in that gap sees neither (a) nor (b) and
+	//       double-spawns. This is root cause #3 from
+	//       DESIGN-lifecycle-leak-recurrence.md (projects-spark, two
+	//       coords 18.8s apart on 2026-05-29).
 	//
-	// Both signals required to keep the dispatch-after-clean-archive
-	// case unblocked (codex iter-8 P2): after an operator hits [x] to
-	// archive the dead record, (b) fails → dispatch proceeds.
-	//
-	// Limitations we accept:
-	//   - Recently-crashed coords whose record hasn't been archived
-	//     will be vetoed for the freshness window. Operator workaround:
-	//     `fleet rm <coord-id>` first.
-	//   - Live coord on a different tmux socket: (a) and (b) both hold
-	//     correctly, veto fires, split-brain avoided. This is the
-	//     load-bearing case the veto exists for.
+	// The (a) AND-gate stays paired (not just coordStateFresh alone) so
+	// the dispatch-after-clean-archive case is unblocked (codex iter-8
+	// P2): after an operator hits [x] to archive the dead record, the
+	// record disjunct fails and — if the claim is stale and coord-state
+	// is stale — the dispatch proceeds.
 	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
-	if opts.coordSpawn && coordStateFresh(opts.project) {
-		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
+	if opts.coordSpawn {
+		stateFresh := coordStateFresh(opts.project)
+		recordExists := coordRecordExistsInList(opts.taskID, opts.project, coordRecords)
+		liveCoord := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession) != nil
+		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
+		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {
 			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).
 			// This is a RETRY signal, not a hard failure: a live coord
-			// exists on another tmux socket OR one crashed within the
-			// freshness window and may be restarting. `fleet attach`'s
-			// shared coord-spawn wrapper classifies exit 75 (via
-			// exec.ExitError.ExitCode()) as wait+retry, NOT a never-exit-
-			// violating hard exit 70 (BUG #2, attach-failover plan
-			// INVARIANT 3). Spawning over a live/restarting coord here
-			// would split-brain the project.
+			// exists on another tmux socket, one crashed within the
+			// freshness window and may be restarting, or a cold-start
+			// spawn is still booting. `fleet attach`'s shared
+			// coord-spawn wrapper classifies exit 75 (via
+			// exec.ExitError.ExitCode()) as wait+retry, NOT a
+			// never-exit-violating hard exit 70 (BUG #2, attach-failover
+			// plan INVARIANT 3). Spawning over an in-flight/live coord
+			// here would split-brain the project.
+			claimClause := ""
+			if claimFresh {
+				claimClause = fmt.Sprintf(" (pending-spawn claim age %s, agent %s)",
+					time.Since(claim.SpawnedAt).Round(time.Second), claim.AgentID)
+			}
 			return &vetoError{msg: fmt.Sprintf(
-				"refusing to spawn coord for project %q: coord-state.json mtime is recent AND a record exists. "+
-					"likely causes: (1) a live coord is on a different tmux socket, or (2) a coord just crashed within the freshness window. "+
-					"in case (2), wait %s for the freshness signal to age out, then retry — recovery will pick up in-flight worker state. "+
+				"refusing to spawn coord for project %q: %s%s. "+
+					"likely causes: (1) a live coord is on a different tmux socket, (2) a coord just crashed within the freshness window, or (3) a coord-spawn is still booting (cold start). "+
+					"wait %s for the signal to age out, then retry — recovery will pick up in-flight worker state. "+
 					"do NOT `fleet rm` the dead record first; that disables the recovery path",
-				opts.project, coordFreshnessWindow)}
+				opts.project, reason, claimClause, coordFreshnessWindow)}
 		}
 	}
 
@@ -939,6 +971,28 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 			if !sameCommand(rewritten, opts.command) {
 				rewrittenExecArgv = rewritten
 			}
+		}
+	}
+
+	// Durable pending-spawn claim (leak-coord-spawn-idempot). Written
+	// HERE — under the coord-spawn flock (held via `defer release()`
+	// for the whole runDispatch when coordSpawn), after every gate that
+	// could refuse the spawn, immediately before spawn.Spawn. The claim
+	// bridges the cold-start window: it makes a second dispatch's
+	// coordSpawnVeto (disjunct c) refuse until the new coord's first
+	// tick clears it (skills/coordinator/loop.py). Atomic .tmp+rename
+	// so a contending veto never reads a torn claim.
+	//
+	// Failure is non-fatal: if the claim write fails we log and proceed
+	// to spawn anyway — the NB-flock + coord-state veto remain as
+	// defense in depth, and refusing the spawn over a claim-write error
+	// would leave the project coord-less (worse than the narrow
+	// double-spawn race the claim closes).
+	if opts.coordSpawn && opts.project != "" && preAllocatedID != "" {
+		if cerr := writeCoordPendingClaim(opts.project, preAllocatedID); cerr != nil {
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: coord-spawn pending-claim write failed (%v) — proceeding (flock + coord-state veto still guard against double-spawn)\n",
+				cerr)
 		}
 	}
 

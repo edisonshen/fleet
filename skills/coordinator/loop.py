@@ -473,6 +473,16 @@ def _tick_locked(
     if cap > 1:
         worktree_mod.prune_worktrees(cwd)
 
+    # 1.6. Clear the cold-start pending-spawn claim (leak-coord-spawn-
+    # idempot). The Go dispatch path wrote it under the coord-spawn
+    # flock before spawning US, to veto a second cold-start dispatch
+    # during the 3-5 min window before coord-state.json exists. Now that
+    # we are ticking, the live-record / coord-state veto takes over, so
+    # we drop the claim so a future legitimately-needed respawn (after
+    # THIS coord dies) isn't blocked by a stale claim. Idempotent + fail-
+    # soft: gone after the first tick, a no-op thereafter.
+    clear_coord_spawn_pending(project_dir)
+
     # 2. Read tasks.md (read-only — coord doesn't write tasks.md
     # directly; mutations go via `fleet tasks set/note`).
     tasks_path = project_dir / "tasks.md"
@@ -2418,6 +2428,38 @@ def _read_coord_spawn_marker(project_dir: Path) -> str:
     except OSError:
         return ""
     return first.strip()
+
+
+# Filename of the durable pending-spawn claim the Go dispatch path
+# writes under the coord-spawn flock before spawning. Must match
+# coordSpawnPendingFile in cmd/fleet/dispatch_recovery.go.
+COORD_SPAWN_PENDING_FILE = "coord-spawn-pending"
+
+
+def clear_coord_spawn_pending(project_dir: Path) -> None:
+    """Remove the cold-start pending-spawn claim for this project.
+
+    The Go dispatch path writes ``<project_dir>/coord-spawn-pending``
+    under the coord-spawn flock immediately before spawning a coord, so
+    a SECOND cold-start dispatch is vetoed during the 3-5 min window
+    before this coord writes coord-state.json. Once WE are ticking, the
+    claim has served its purpose: the live-record / coord-state veto
+    paths take over, so we clear the claim to avoid blocking a
+    legitimately-needed respawn after this coord later dies.
+
+    Idempotent + fail-soft: removing an absent claim is a no-op, and any
+    OS error is swallowed (never block the tick on cleanup). Called on
+    every tick — the claim is gone after the first tick and the call is
+    a cheap no-op thereafter.
+    """
+    claim = project_dir / COORD_SPAWN_PENDING_FILE
+    try:
+        claim.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Best-effort cleanup must never crash the tick.
+        pass
 
 
 def _agent_is_project_coord(home: Path, agent_id: str, project: str) -> bool:
