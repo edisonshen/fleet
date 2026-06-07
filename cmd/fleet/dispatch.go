@@ -1016,6 +1016,22 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		Engine:            engineName,
 	})
 	if err != nil {
+		// Spawn failed → NO coord is booting, so the pending-spawn claim
+		// we wrote above is a lie. Leaving it would make every retry hit
+		// coordPendingClaimFresh and get vetoed (exit 75) for the full
+		// freshness window, blocking immediate recovery from a transient
+		// tmux/agent-write failure (codex iter-1 P2). Clear it best-
+		// effort: the claim is fail-open (a stale claim ages out in
+		// coordFreshnessWindow regardless), so a clear failure only costs
+		// the window we're trying to avoid — never correctness. Guarded
+		// identically to the write so we only clear what we wrote.
+		if opts.coordSpawn && opts.project != "" && preAllocatedID != "" {
+			if clrErr := clearCoordPendingClaim(opts.project); clrErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: coord-spawn pending-claim cleanup after failed spawn failed (%v) — claim ages out in %s\n",
+					clrErr, coordFreshnessWindow)
+			}
+		}
 		return err
 	}
 

@@ -234,6 +234,67 @@ func TestLiveCoordForAttach_WrongProjectIgnored(t *testing.T) {
 	}
 }
 
+// ---- P2 (codex iter-1): failed spawn must clear the pending claim ----
+
+// A coord-spawn dispatch writes the pending claim immediately BEFORE
+// spawn.Spawn. If spawn.Spawn then fails, NO coord is booting — so the
+// claim is a lie. Leaving it would make every retry hit
+// coordPendingClaimFresh and get vetoed for the full freshness window,
+// blocking immediate recovery from a transient spawn failure. The error
+// path must clear the claim it wrote.
+//
+// We force a deterministic spawn failure by leaving FLEET_TMUX_SOCKET
+// UNSET: tmux.Spawn refuses the default socket under `go test`, so
+// spawn.Spawn returns an error AFTER runDispatch has written the claim.
+func TestRunDispatch_FailedSpawnClearsPendingClaim(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	// Force tmux.Spawn to fail under go test: empty FLEET_TMUX_SOCKET is
+	// the rejection trigger (the orphan-leak guard). Explicit unset so a
+	// leaked env from another test can't accidentally let the spawn
+	// succeed and leave a real tmux session behind.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
+
+	pdir, err := state.ProjectDir("spawnfail")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Clean veto state: no claim, no coord-state.json, no live coord —
+	// so the dispatch passes every gate and reaches spawn.Spawn.
+	claimPath := filepath.Join(pdir, "coord-spawn-pending")
+	if _, statErr := os.Stat(claimPath); !os.IsNotExist(statErr) {
+		t.Fatalf("precondition: claim must be absent, stat err = %v", statErr)
+	}
+
+	opts := &dispatchOpts{
+		taskID:          CoordTaskIDPrefix + "spawnfail",
+		project:         "spawnfail",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	err = runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected spawn failure (no tmux socket under go test), got nil")
+	}
+	// A vetoError would mean a gate refused us before spawn — that's the
+	// wrong failure; we need to have REACHED spawn.Spawn to exercise the
+	// claim-cleanup path.
+	var ve *vetoError
+	if errors.As(err, &ve) {
+		t.Fatalf("dispatch was vetoed before spawn (%v); test cannot exercise the failed-spawn cleanup path", err)
+	}
+	// The claim written just before the failed spawn must be cleared.
+	if _, statErr := os.Stat(claimPath); !os.IsNotExist(statErr) {
+		t.Fatalf("pending claim must be cleared after a failed spawn, stat err = %v", statErr)
+	}
+}
+
 // ---- T1 (integration): cold-start double-spawn refused via pending claim ----
 
 // A fresh pending-spawn claim on disk (no coord-state.json yet — the

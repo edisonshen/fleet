@@ -4599,3 +4599,58 @@ def test_tick_retries_missed_checkpoint_via_latch(
     # And the latch is cleared after the successful publish.
     final = json.loads(sp.read_text())
     assert final.get("checkpoint_due") is False
+
+
+# ---- leak-coord-spawn-idempot: claim cleared ONLY after coord-state save ----
+
+
+def test_tick_clears_pending_claim_after_coord_state_save(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """Ordering invariant (codex iter-1 P1): the cold-start pending-spawn
+    claim must be cleared ONLY AFTER the heartbeat writes coord-state.json,
+    never before.
+
+    The claim is the sole active double-spawn veto until coord-state.json
+    lands. If the tick cleared it earlier, a cross-socket dispatch #2
+    between the early clear and the coord-state write would pass BOTH the
+    pending-claim veto AND the coordStateFresh veto, re-opening the
+    duplicate-coord window. This test drives a real tick on a cold-start
+    project (no coord-state.json yet) with a pre-seeded claim, spies on
+    _save_coord_state to capture claim-existence at save time, and asserts
+    the claim still existed when state was saved and is gone afterward.
+    """
+    _write_tasks(project_dir, [])  # no ready tasks → trivial tick
+    claim = project_dir / "coord-spawn-pending"
+    claim.write_text('{"agent_id": "abc", "spawned_at": "2026-06-06T00:00:00Z"}')
+    # Cold start: coord-state.json deliberately absent before the tick.
+    state_path = project_dir / "coord-state.json"
+    assert not state_path.exists()
+
+    saw = {"claim_present_at_first_save": None}
+    real_save = loop._save_coord_state
+
+    def spy_save(path, state):
+        if saw["claim_present_at_first_save"] is None:
+            # Record claim-existence at the moment of the FIRST save.
+            saw["claim_present_at_first_save"] = claim.exists()
+        return real_save(path, state)
+
+    monkeypatch.setattr(loop, "_save_coord_state", spy_save)
+
+    loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # The claim must NOT have been cleared before the first coord-state
+    # save (that's the whole P1 fix — clear runs strictly after the save).
+    assert saw["claim_present_at_first_save"] is True, (
+        "claim was cleared BEFORE coord-state.json was saved — re-opens "
+        "the cold-start double-spawn window"
+    )
+    # And the heartbeat wrote coord-state.json (handoff signal now live)...
+    assert state_path.exists(), "tick must write coord-state.json"
+    # ...so the claim is now safely cleared.
+    assert not claim.exists(), "claim must be cleared after the heartbeat save"

@@ -473,16 +473,6 @@ def _tick_locked(
     if cap > 1:
         worktree_mod.prune_worktrees(cwd)
 
-    # 1.6. Clear the cold-start pending-spawn claim (leak-coord-spawn-
-    # idempot). The Go dispatch path wrote it under the coord-spawn
-    # flock before spawning US, to veto a second cold-start dispatch
-    # during the 3-5 min window before coord-state.json exists. Now that
-    # we are ticking, the live-record / coord-state veto takes over, so
-    # we drop the claim so a future legitimately-needed respawn (after
-    # THIS coord dies) isn't blocked by a stale claim. Idempotent + fail-
-    # soft: gone after the first tick, a no-op thereafter.
-    clear_coord_spawn_pending(project_dir)
-
     # 2. Read tasks.md (read-only — coord doesn't write tasks.md
     # directly; mutations go via `fleet tasks set/note`).
     tasks_path = project_dir / "tasks.md"
@@ -801,6 +791,13 @@ def _tick_locked(
             result.errors.append(
                 f"coord-state save on parse-error path failed: {save_exc}"
             )
+        # Clear the cold-start pending-spawn claim on THIS bail path too:
+        # the save above made coord-state.json fresh, so the coord-state
+        # veto has taken over and the claim is safe to drop. A coord that
+        # only ever reaches the parse-error path would otherwise never
+        # clear its claim, blocking a legitimate respawn for the full
+        # freshness window once it dies. Idempotent + fail-soft.
+        clear_coord_spawn_pending(project_dir)
         return result
 
     # 5.0. dispatch-durability (#184) — tick-entry REPLAY reconcile.
@@ -1015,6 +1012,24 @@ def _tick_locked(
     # the unconditional refresh is correct. The tick_count bumped just
     # above (rolling checkpoint) is persisted here in the same write.
     _save_coord_state(state_path, state)
+
+    # Clear the cold-start pending-spawn claim (leak-coord-spawn-idempot)
+    # — ONLY AFTER the heartbeat above writes coord-state.json. The Go
+    # dispatch path wrote the claim under the coord-spawn flock before
+    # spawning US, to veto a SECOND cold-start dispatch during the 3-5
+    # min window before coord-state.json exists. The claim is the ONLY
+    # active veto signal until that file lands, so clearing it earlier
+    # (codex iter-1 P1) opened a gap: a cross-socket dispatch #2 between
+    # an early clear and the coord-state write would pass BOTH the
+    # pending-claim veto AND the coordStateFresh veto → duplicate coord,
+    # re-opening the exact window this fix closes. By draining the claim
+    # here — past the heartbeat — the live-record / coord-state veto has
+    # already taken over, so the handoff is seamless. Every early return
+    # before this point (parse error, kill-cycle bail, etc.) leaves the
+    # claim in place; the parse-error path clears it separately AFTER its
+    # own coord-state save (above). Idempotent + fail-soft: gone after
+    # the first full tick, a no-op thereafter.
+    clear_coord_spawn_pending(project_dir)
 
     # Auto-archive when tasks.md grows past the threshold. Runs at end
     # of every tick, after dispatch + heartbeat, before lock release
