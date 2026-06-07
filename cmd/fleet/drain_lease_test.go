@@ -210,7 +210,7 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver: func(project, _ string) (bool, error) {
 			tookOverProject = project
-			return false, nil // OLD fenced; flock not acquired by the drain
+			return true, nil // takeover acquired -> OLD confirmed gone
 		},
 		RecoverSpawn: func(*agent.Record, string, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
@@ -338,12 +338,14 @@ func TestDrainLease_GracefulWaitsForSelfRelease(t *testing.T) {
 func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 	out := &bytes.Buffer{}
 	var tookOver int32
+	var recovered int32
 	d := drainLeaseDeps{
 		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
 		BarrierExists:  func(string, int64) bool { return true },
 		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // never releases
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return false, nil },
+		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
+		RecoverSpawn:   func(*agent.Record, string, io.Writer, io.Writer) error { atomic.AddInt32(&recovered, 1); return nil },
 		BarrierPoll:    time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
@@ -352,6 +354,34 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 	}
 	if atomic.LoadInt32(&tookOver) != 1 {
 		t.Errorf("TakeOver ran %d times, want 1", tookOver)
+	}
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times after takeover, want 1", recovered)
+	}
+}
+
+// codex PR3 iter-9 [P1]: a takeover that does NOT acquire (acquired=false:
+// healthy OLD made AcquireLeaseWithKill stand down, or an un-killable hung OLD)
+// must NOT spawn a successor (would duplicate / shoot-over). The escalation
+// surfaces an error and leaves the queue.
+func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
+	out := &bytes.Buffer{}
+	var recovered int32
+	d := drainLeaseDeps{
+		LeaderPresent: func(string) bool { return false },
+		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
+		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
+		TakeOver:      func(string, string) (bool, error) { return false, nil }, // did NOT acquire
+		RecoverSpawn:  func(*agent.Record, string, io.Writer, io.Writer) error { atomic.AddInt32(&recovered, 1); return nil },
+		BarrierPoll:   time.Millisecond,
+	}
+	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+	if err == nil || errors.Is(err, ErrEscalatedToTakeOver) {
+		t.Fatalf("expected a 'did not confirm gone' error, got %v", err)
+	}
+	if atomic.LoadInt32(&recovered) != 0 {
+		t.Errorf("RecoverSpawn ran %d times despite takeover not acquiring — would duplicate", recovered)
 	}
 }
 
@@ -420,56 +450,6 @@ func TestDrainLease_ColdResume_HoldsPerAgentLock(t *testing.T) {
 	}
 	if atomic.LoadInt32(&released) != 1 {
 		t.Errorf("per-agent lock released %d times, want 1 (must always release)", released)
-	}
-}
-
-// codex PR3 iter-8 [P1]: a legacy Resume that HANGS past the budget must NOT
-// block the drain — coldResume escalates to the safety-net takeover + recovery
-// after --resume-timeout-ms instead of blocking forever (the drain-storm
-// failure class). The drain returns ErrEscalatedToTakeOver promptly.
-func TestDrainLease_ColdResumeHangs_EscalatesAfterBudget(t *testing.T) {
-	out := &bytes.Buffer{}
-	var tookOver, recovered int32
-	blockResume := make(chan struct{})
-	defer close(blockResume)
-
-	d := drainLeaseDeps{
-		// Live-leader fallback path: healthy leader, no barrier, OLD still live.
-		LeaderPresent:  func(string) bool { return true },
-		CurrentEpoch:   func(string) (int64, bool) { return 5, true },
-		BarrierExists:  func(string, int64) bool { return false },
-		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // OLD is the owner
-		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
-		LockAgent:      func(string) (func(), error) { return func() {}, nil },
-		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			<-blockResume // hang past the budget
-			return nil
-		},
-		TakeOver: func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return false, nil },
-		RecoverSpawn: func(*agent.Record, string, io.Writer, io.Writer) error {
-			atomic.AddInt32(&recovered, 1)
-			return nil
-		},
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		// tiny budget so the hang is detected fast (assert RETURN + escalate).
-		done <- drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, ErrEscalatedToTakeOver) {
-			t.Fatalf("hung legacy resume must escalate, got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("coldResume BLOCKED on a hung Resume — the drain-storm regression")
-	}
-	if atomic.LoadInt32(&tookOver) != 1 {
-		t.Errorf("escalation TakeOver ran %d times, want 1", tookOver)
-	}
-	if atomic.LoadInt32(&recovered) != 1 {
-		t.Errorf("escalation RecoverSpawn ran %d times, want 1", recovered)
 	}
 }
 
