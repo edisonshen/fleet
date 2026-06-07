@@ -28,8 +28,8 @@ func newDrainHarness(now time.Time) *drainHarness {
 			}
 			return DrainKillResult{Killed: true}, nil // default: killed
 		},
-		RemoveDrainRun: func(path string) error {
-			h.removed = append(h.removed, path)
+		RemoveDrainRun: func(run DrainRun) error {
+			h.removed = append(h.removed, run.Path)
 			return nil
 		},
 	}
@@ -277,7 +277,7 @@ func TestDrainProcs_GoneButRemoveFails_SurfacesNotRemoved(t *testing.T) {
 	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
 	h := newDrainHarness(now)
 	h.killReturn = func(DrainKillTarget) (DrainKillResult, error) { return DrainKillResult{Gone: true}, nil }
-	h.deps.RemoveDrainRun = func(string) error { return errors.New("permission denied") }
+	h.deps.RemoveDrainRun = func(DrainRun) error { return errors.New("permission denied") }
 	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
 		return []DrainRun{{
 			Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute),
@@ -356,6 +356,33 @@ func TestLegacyDrains_TLD2_ReapsAndIdempotent(t *testing.T) {
 	act2, _ := findAction(r2, KindDrainProcs, "drain pid=909")
 	if act2.Verb == VerbKilled {
 		t.Fatalf("2nd run must NOT report a 2nd kill of an already-dead pid; verb=%s", act2.Verb)
+	}
+}
+
+// Legacy sweep must EXCLUDE a PID that has a current run-record (codex
+// iter-4 [P1]): an old+sleeping drain that is heartbeating fresh is a
+// legitimate long recovery the steady-state pass deliberately skipped;
+// the coarse legacy heuristic must not override that and kill it.
+func TestLegacyDrains_ExcludesRecordedPid(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	// The recorded drain at pid 909 is FRESH (heartbeat now) → steady
+	// state leaves it alone.
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{Pid: 909, PidStart: "s", HeartbeatAt: now, Path: "/tmp/909.json"}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+	// The SAME pid shows up in the coarse ps sweep as old+sleeping.
+	h.deps.ListDrainProcs = func() ([]DrainProcInfo, error) {
+		return []DrainProcInfo{{Pid: 909, PidStart: "s", Exe: "fleet", Sleeping: true, Age: time.Hour}}, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: true, LegacyDrains: true}, h.deps)
+	if _, ok := findAction(r, KindDrainProcs, "drain pid=909"); ok {
+		t.Fatalf("a recorded fresh drain must be excluded from the legacy sweep")
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("recorded fresh drain must not be killed; got %+v", h.killCalls)
 	}
 }
 

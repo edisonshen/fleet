@@ -400,9 +400,15 @@ type Deps struct {
 	// rather than stranded). Never an error for the already-dead case
 	// (idempotent). Production wiring is killDrainGuarded.
 	KillDrain func(target DrainKillTarget) (DrainKillResult, error)
-	// RemoveDrainRun deletes a stale run-record file (LAST step of a reap).
-	// ENOENT-tolerant. Production wiring is removeDrainRunFile.
-	RemoveDrainRun func(path string) error
+	// RemoveDrainRun deletes a stale run-record (LAST step of a reap). It
+	// is passed the DrainRun that was CLASSIFIED so the production impl can
+	// RE-READ the file and unlink ONLY if it still carries the same
+	// pid_start (codex [P2] TOCTOU close): between ListDrainRuns and the
+	// delete, the old PID could exit and a NEW `fleet drain` could reuse
+	// the number and overwrite <pid>.json — deleting by bare path would
+	// drop the fresh drain's record. ENOENT-tolerant. Production wiring is
+	// removeDrainRunFile.
+	RemoveDrainRun func(run DrainRun) error
 	// ListDrainProcs enumerates `fleet drain` processes from the OS for the
 	// one-time --legacy-drains coarse sweep (the existing 81 predate the
 	// run-record). Yields ONLY provably-fleet-owned `fleet drain` procs

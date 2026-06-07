@@ -174,11 +174,37 @@ func procDrainState(pid int) drainProbe {
 	return drainProbeNotDrain
 }
 
-// removeDrainRunFile is the production RemoveDrainRun. ENOENT-tolerant so
-// two operators racing `fleet gc --apply` don't see spurious errors.
-func removeDrainRunFile(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove %s: %w", path, err)
+// removeDrainRunFile is the production RemoveDrainRun. RE-READS the
+// run-record and unlinks ONLY if it still carries the pid_start that was
+// classified (codex [P2] TOCTOU close): between ListDrainRuns and this
+// delete, the old PID could exit and a NEW `fleet drain` could reuse the
+// number and overwrite <pid>.json — a bare unlink would drop the fresh
+// drain's record, leaving it un-reapable if it later wedges. A pid_start
+// mismatch → skip the delete (the file now belongs to a different run).
+// ENOENT-tolerant so two operators racing `fleet gc --apply` don't see
+// spurious errors. An empty classified pid_start (legacy/unfingerprinted
+// record) falls back to a bare delete — there's nothing to compare.
+func removeDrainRunFile(run DrainRun) error {
+	if run.Path == "" {
+		return nil
+	}
+	if run.PidStart != "" {
+		data, rerr := os.ReadFile(run.Path)
+		if rerr != nil {
+			if os.IsNotExist(rerr) {
+				return nil // already gone — idempotent
+			}
+			return fmt.Errorf("re-read %s: %w", run.Path, rerr)
+		}
+		var cur DrainRun
+		if jerr := json.Unmarshal(data, &cur); jerr == nil && cur.PidStart != "" && cur.PidStart != run.PidStart {
+			// The file was overwritten by a new drain reusing the PID —
+			// do NOT delete the fresh record.
+			return nil
+		}
+	}
+	if err := os.Remove(run.Path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove %s: %w", run.Path, err)
 	}
 	return nil
 }

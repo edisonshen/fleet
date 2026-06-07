@@ -1,6 +1,59 @@
 package gc
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// removeDrainRunFile must NOT delete a run-record that was overwritten by
+// a NEW drain reusing the PID after classification (codex iter-4 [P2]
+// TOCTOU). It deletes only when the on-disk pid_start still matches what
+// was classified (or there's nothing to compare).
+func TestRemoveDrainRunFile_TOCTOU(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "4242.json")
+	write := func(pidStart string) {
+		data, _ := json.Marshal(DrainRun{Pid: 4242, PidStart: pidStart})
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	// Case 1: file now belongs to a DIFFERENT run (pid_start changed) →
+	// must be KEPT.
+	write("NEW-run-fingerprint")
+	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: "OLD-classified"}); err != nil {
+		t.Fatalf("removeDrainRunFile: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("record overwritten by a new drain must NOT be deleted; got stat err %v", err)
+	}
+
+	// Case 2: file still the classified run → deleted.
+	write("OLD-classified")
+	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: "OLD-classified"}); err != nil {
+		t.Fatalf("removeDrainRunFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("matching record should be deleted; stat err = %v", err)
+	}
+
+	// Case 3: already gone → idempotent no-op.
+	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: "OLD-classified"}); err != nil {
+		t.Fatalf("delete of already-gone record must be a no-op; got %v", err)
+	}
+
+	// Case 4: empty classified pid_start → bare delete (nothing to compare).
+	write("whatever")
+	if err := removeDrainRunFile(DrainRun{Path: path, Pid: 4242, PidStart: ""}); err != nil {
+		t.Fatalf("removeDrainRunFile (empty pid_start): %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty-fingerprint record should be deleted; stat err = %v", err)
+	}
+}
 
 // argvIsFleetDrain must match drain invocations across the root-flag
 // syntaxes fleet supports, and must NOT match other subcommands that

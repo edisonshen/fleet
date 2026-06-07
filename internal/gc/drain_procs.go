@@ -173,7 +173,7 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 				Reason: fmt.Sprintf("stale run-record (heartbeat %s ago); pid %d no longer live (start-time mismatch or gone) — cleaning record, no kill", humanDuration(age), run.Pid),
 			}
 			if opts.Apply {
-				if rerr := removeDrainRunIfWired(deps, run.Path); rerr != nil {
+				if rerr := removeDrainRunIfWired(deps, run); rerr != nil {
 					act.Reason = fmt.Sprintf("%s; remove record failed: %v", act.Reason, rerr)
 				} else {
 					act.Verb = VerbRemoved
@@ -203,14 +203,14 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 				case res.Killed:
 					act.Verb = VerbKilled
 					// LAST step of the sweep: delete the stale run-record.
-					if rerr := removeDrainRunIfWired(deps, run.Path); rerr != nil {
+					if rerr := removeDrainRunIfWired(deps, run); rerr != nil {
 						act.Reason = fmt.Sprintf("reaped pid=%d but remove record failed: %v", run.Pid, rerr)
 					}
 				case res.Gone:
 					// pid confirmed dead / identity changed between
 					// classification and signal (raced to exit, or PID
 					// reuse) — no kill, record is now meaningless: clean it.
-					if rerr := removeDrainRunIfWired(deps, run.Path); rerr != nil {
+					if rerr := removeDrainRunIfWired(deps, run); rerr != nil {
 						// codex [P3]: don't claim "removed" when the delete
 						// failed — the stale record survives and the next
 						// sweep retries. Surface the failure honestly.
@@ -244,10 +244,26 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 // Blast radius is deliberately narrow: the lister (DefaultDeps wiring)
 // only yields processes whose argv is `fleet drain` and whose exe is
 // fleet-shaped, so a non-fleet sleeping process is never in scope
-// (TLD4).
+// (TLD4). It ALSO excludes any PID that has a current run-record (codex
+// [P1]): the steady-state pass owns those — a recorded drain that is old
+// + sleeping but heartbeating fresh is a legitimate long recovery the
+// steady-state pass deliberately skipped, and the coarse age/state
+// heuristic must not override that and kill it.
 func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 	if deps.ListDrainProcs == nil {
 		return errors.New("drain-procs: ListDrainProcs dep not wired (required for --legacy-drains)")
+	}
+	// Build the exclusion set of PIDs that have a run-record — those are
+	// the steady-state pass's domain, never the legacy coarse sweep's.
+	recorded := map[int]bool{}
+	if deps.ListDrainRuns != nil {
+		runs, rerr := deps.ListDrainRuns()
+		if rerr != nil {
+			return rerr
+		}
+		for _, run := range runs {
+			recorded[run.Pid] = true
+		}
 	}
 	procs, err := deps.ListDrainProcs()
 	if err != nil {
@@ -256,6 +272,11 @@ func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 	sort.SliceStable(procs, func(i, j int) bool { return procs[i].Pid < procs[j].Pid })
 
 	for _, p := range procs {
+		// A PID with a current run-record belongs to the steady-state pass
+		// (codex [P1]) — skip it here regardless of age/state.
+		if recorded[p.Pid] {
+			continue
+		}
 		// Conservative legacy gate: sleeping AND old. A young or
 		// non-sleeping `fleet drain` is a legitimate in-flight drain
 		// (TLD3) and is left alone.
@@ -304,12 +325,14 @@ func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 
 // removeDrainRunIfWired deletes a stale run-record when the dep is
 // wired; a nil dep is tolerated (narrow unit tests that only exercise
-// classification). path == "" is a no-op.
-func removeDrainRunIfWired(deps Deps, path string) error {
-	if path == "" || deps.RemoveDrainRun == nil {
+// classification). An empty Path is a no-op. The full DrainRun is passed
+// so the production impl can re-validate pid_start before unlinking
+// (TOCTOU close, codex [P2]).
+func removeDrainRunIfWired(deps Deps, run DrainRun) error {
+	if run.Path == "" || deps.RemoveDrainRun == nil {
 		return nil
 	}
-	return deps.RemoveDrainRun(path)
+	return deps.RemoveDrainRun(run)
 }
 
 // drainTarget renders the per-action Target for a drain pid. A stable
