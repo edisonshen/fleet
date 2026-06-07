@@ -138,6 +138,56 @@ func TestDrainProcs_T17c_Idempotent(t *testing.T) {
 	}
 }
 
+// TOCTOU freshness re-check (codex [P2]): the snapshot heartbeat is stale,
+// but a re-read just before the kill shows the drain Beat()'d fresh (it
+// reached the next queue-file checkpoint). Must NOT kill, must NOT delete.
+func TestDrainProcs_RacedFreshBeat_NotKilled(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 4242, PidStart: "s",
+			HeartbeatAt: now.Add(-10 * time.Minute), // STALE snapshot
+			Path:        "/tmp/4242.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+	// Re-read shows a FRESH heartbeat (drain made progress).
+	h.deps.ReloadDrainRun = func(string) (DrainRun, bool, error) {
+		return DrainRun{Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-3 * time.Second), Path: "/tmp/4242.json"}, true, nil
+	}
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	if len(h.killCalls) != 0 {
+		t.Fatalf("a drain that Beat()'d fresh during the race must NOT be killed; got %+v", h.killCalls)
+	}
+	if len(h.removed) != 0 {
+		t.Fatalf("must NOT delete the fresh drain's record; got %v", h.removed)
+	}
+	act, _ := findAction(r, KindDrainProcs, "drain pid=4242")
+	if act.Verb != VerbSurface {
+		t.Fatalf("raced-fresh drain should SURFACE, got %s", act.Verb)
+	}
+}
+
+// Re-read still stale → the kill proceeds (the re-check doesn't block a
+// genuinely-wedged drain).
+func TestDrainProcs_RecheckStillStale_Killed(t *testing.T) {
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-10 * time.Minute), Path: "/tmp/4242.json"}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+	h.deps.ReloadDrainRun = func(string) (DrainRun, bool, error) {
+		return DrainRun{Pid: 4242, PidStart: "s", HeartbeatAt: now.Add(-9 * time.Minute), Path: "/tmp/4242.json"}, true, nil
+	}
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	if a, _ := findAction(r, KindDrainProcs, "drain pid=4242"); a.Verb != VerbKilled {
+		t.Fatalf("a still-stale drain should be killed, got %s", a.Verb)
+	}
+}
+
 // ---------------- T18: never-kill-a-good-drain guards ----------------
 
 // T18a — a fresh drain (heartbeat within TTL) is never killed.

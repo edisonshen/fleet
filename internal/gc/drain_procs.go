@@ -239,6 +239,13 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 			if deps.KillDrain == nil {
 				act.Verb = VerbSurface
 				act.Reason = fmt.Sprintf("%s; --apply requested but KillDrain dep not wired", act.Reason)
+			} else if fresh, skip := drainBeatRacedFresh(deps, run, now, ttl); skip {
+				// TOCTOU re-check (codex [P2]): the drain Beat()'d its
+				// heartbeat fresh between ListDrainRuns and now — it just
+				// made progress, so it is NOT wedged. Surface, do not kill,
+				// do not delete its fresh record.
+				act.Verb = VerbSurface
+				act.Reason = fmt.Sprintf("pid=%d heartbeat refreshed (%s ago) since classification — drain made progress, not wedged; skipping", run.Pid, humanDuration(now.Sub(fresh)))
 			} else {
 				res, kerr := deps.KillDrain(DrainKillTarget{Pid: run.Pid, PidStart: run.PidStart})
 				switch {
@@ -366,6 +373,33 @@ func reconcileLegacyDrains(r *Report, opts Options, deps Deps) error {
 		r.Actions = append(r.Actions, act)
 	}
 	return nil
+}
+
+// drainBeatRacedFresh re-reads the run-record immediately before the kill
+// and reports whether the heartbeat is now FRESH within the effective TTL
+// (codex [P2] TOCTOU): a slow-but-progressing drain may Beat() between the
+// ListDrainRuns snapshot and this kill. Returns (freshHeartbeat, skip).
+// skip=true ⇒ do not kill. When the dep is unwired, or the record is gone,
+// or the re-read errors, skip=false (fall through to the existing
+// pid_start/identity guards, which still protect against the wrong kill).
+// The pid_start must still match — a re-read of a DIFFERENT run (PID reuse
+// overwrote the file) is not treated as "our drain made progress".
+func drainBeatRacedFresh(deps Deps, run DrainRun, now time.Time, ttl time.Duration) (time.Time, bool) {
+	if deps.ReloadDrainRun == nil || run.Path == "" {
+		return time.Time{}, false
+	}
+	cur, found, err := deps.ReloadDrainRun(run.Path)
+	if err != nil || !found {
+		return time.Time{}, false
+	}
+	if cur.PidStart != run.PidStart {
+		return time.Time{}, false // different run overwrote the file — not progress
+	}
+	effTTL := ttl // ttl already includes this record's grace
+	if now.Sub(cur.HeartbeatAt) < effTTL {
+		return cur.HeartbeatAt, true // refreshed → progress → skip the kill
+	}
+	return time.Time{}, false
 }
 
 // removeDrainRunIfWired deletes a stale run-record when the dep is

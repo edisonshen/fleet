@@ -313,6 +313,25 @@ func procDrainState(pid int) drainProbe {
 	return drainProbeNotDrain
 }
 
+// reloadDrainRunOnDisk is the production ReloadDrainRun: re-read one
+// run-record by path immediately before the kill (codex [P2] TOCTOU
+// freshness re-check). (run, false, nil) when the file is gone.
+func reloadDrainRunOnDisk(path string) (DrainRun, bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DrainRun{}, false, nil
+		}
+		return DrainRun{}, false, fmt.Errorf("reload %s: %w", path, err)
+	}
+	var run DrainRun
+	if jerr := json.Unmarshal(data, &run); jerr != nil {
+		return DrainRun{}, false, fmt.Errorf("parse %s: %w", path, jerr)
+	}
+	run.Path = path
+	return run, true, nil
+}
+
 // removeDrainRunFile is the production RemoveDrainRun. RE-READS the
 // run-record and unlinks ONLY if it still carries the pid_start that was
 // classified (codex [P2] TOCTOU close): between ListDrainRuns and this

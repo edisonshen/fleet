@@ -415,6 +415,15 @@ type Deps struct {
 	// (argv-matched + fleet-shaped exe). Production wiring is
 	// listDrainProcsOnDisk.
 	ListDrainProcs func() ([]DrainProcInfo, error)
+	// ReloadDrainRun re-reads ONE run-record by path, immediately before
+	// the kill (codex [P2] TOCTOU): between ListDrainRuns and the SIGTERM a
+	// slow-but-progressing drain may Beat() its heartbeat fresh, so the
+	// classifier re-checks freshness from this fresh read and SKIPS the
+	// kill if the drain just made progress. Returns (run, found, err);
+	// found=false when the record is gone. Nil dep ⇒ the re-check is
+	// skipped (narrow unit tests that pre-date this gate). Production wiring
+	// is reloadDrainRunOnDisk.
+	ReloadDrainRun func(path string) (DrainRun, bool, error)
 }
 
 // ProjectDirInfo is one raw ~/.fleet/projects/<name>/ entry for the
@@ -963,6 +972,7 @@ func DefaultDeps() Deps {
 		KillDrain:             killDrainGuarded,
 		RemoveDrainRun:        removeDrainRunFile,
 		ListDrainProcs:        listDrainProcsOnDisk,
+		ReloadDrainRun:        reloadDrainRunOnDisk,
 	}
 }
 
