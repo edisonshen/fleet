@@ -196,6 +196,15 @@ func listRCDaemonsOnDisk() ([]RCDaemonInfo, error) {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
 			return nil, nil // no matches
 		}
+		// codex P3: a missing `pgrep` binary surfaces as *exec.Error
+		// (ErrNotFound), NOT an *exec.ExitError. The classifier is
+		// documented best-effort — on hosts without pgrep it must be a
+		// quiet no-op, not a spurious error that pollutes every
+		// `fleet status` / `fleet gc` now that this kind is in AllKinds.
+		var execErr *exec.Error
+		if errors.As(err, &execErr) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("pgrep: %w", err)
 	}
 	var infos []RCDaemonInfo

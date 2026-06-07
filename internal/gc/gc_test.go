@@ -3851,6 +3851,23 @@ func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
 	}
 }
 
+func TestListRCDaemonsOnDisk_MissingPgrepIsNoop(t *testing.T) {
+	// codex P3: a missing `pgrep` binary returns *exec.Error (not
+	// *exec.ExitError code 1), which the pre-fix code surfaced as an error.
+	// The classifier is documented best-effort — on hosts without pgrep it
+	// must be a quiet no-op (nil, nil), else every `fleet status`/`fleet gc`
+	// emits a spurious orphan-rc-daemons probe error now that this kind is
+	// in AllKinds. Force the failure by pointing PATH at an empty dir.
+	t.Setenv("PATH", t.TempDir())
+	infos, err := listRCDaemonsOnDisk()
+	if err != nil {
+		t.Fatalf("missing pgrep must be a no-op (nil err); got %v", err)
+	}
+	if infos != nil {
+		t.Fatalf("missing pgrep must return nil infos; got %v", infos)
+	}
+}
+
 func TestReconcile_OrphanRCDaemon_UnknownCurrentVersion_PreservesLegacy(t *testing.T) {
 	// Guard against over-eager reaping: when the CURRENT claude version
 	// can't be probed (curVer empty — degraded host), a legacy empty-

@@ -1051,11 +1051,26 @@ func defaultOwnerAlive(coordID string) bool {
 		// treat as alive.
 		return true
 	}
-	alive, perr := tmux.SessionAlive(rec.TmuxSession)
-	if perr != nil {
-		return true // probe failure → conservative
+	// codex P2 (wrong-socket false-positive): the agent record EXISTS, so
+	// the coord was NOT archived. We could probe tmux.SessionAlive, but it
+	// targets the CURRENT FLEET_TMUX_SOCKET and the coord may have been
+	// spawned on a DIFFERENT tmux server (env unset/changed between spawn
+	// and this probe). Its "no server / no such session" cases return
+	// (false, nil), which — taken at face value — would reap a LIVE daemon
+	// as dead-owner. Agent records don't persist the spawn socket, so a
+	// not-alive result is AMBIGUOUS, not definitive. The ONLY definitive
+	// dead-owner signal is a MISSING record (handled above via ErrNotFound).
+	// With the record present we treat the owner as alive and lean on the
+	// version-mismatch check — the load-bearing self-heal signal — rather
+	// than risk killing a healthy listener owned by a coord on another
+	// socket. Surface the ambiguity so the operator can investigate; the
+	// orphan-rc-daemons gc kind still catches genuinely stale daemons.
+	if alive, perr := tmux.SessionAlive(rec.TmuxSession); perr == nil && !alive {
+		fmt.Fprintf(os.Stderr,
+			"rc: coord %q record present but tmux session %q not found on current socket (FLEET_TMUX_SOCKET=%q); treating owner as alive (ambiguous — may be a different tmux server, not a dead owner)\n",
+			coordID, rec.TmuxSession, os.Getenv("FLEET_TMUX_SOCKET"))
 	}
-	return alive
+	return true
 }
 
 // SetClaudeVersionFnForTest / SetOwnerAliveFnForTest are exported

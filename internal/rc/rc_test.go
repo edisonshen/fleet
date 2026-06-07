@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // stubAgentListEmpty wires cwd's agent.List seam to return no records
@@ -703,6 +704,40 @@ func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
 	// RC disabled.
 	if !MarkerPresent("orphan") {
 		t.Fatalf("dead-owner project marker must be PRESERVED after self-heal reap")
+	}
+}
+
+// TestDefaultOwnerAlive_RecordMissingIsDead (codex P2 semantics): the
+// ONLY definitive dead-owner signal is a missing agent record. A present
+// record whose tmux session isn't found on the current socket is AMBIGUOUS
+// (possibly a different tmux server) and must NOT be treated as dead — else
+// `fleet status` run from the wrong socket reaps live RC daemons.
+func TestDefaultOwnerAlive_RecordMissingIsDead(t *testing.T) {
+	withFleetHome(t)
+
+	// Empty coordID → skip check → alive.
+	if !defaultOwnerAlive("") {
+		t.Fatalf("empty coordID must be treated as alive (skip dead-owner check)")
+	}
+
+	// No record on disk → definitive dead.
+	if defaultOwnerAlive("abcd1234") {
+		t.Fatalf("missing agent record must be treated as dead-owner")
+	}
+
+	// Record present, tmux session bogus (not found on current socket) →
+	// ambiguous → alive (we must not reap a live daemon owned by a coord
+	// on another server).
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("state.Bootstrap: %v", err)
+	}
+	rec := agent.New("dead5678")
+	rec.TmuxSession = "fleet-coord-nonexistent-xyz"
+	if err := rec.Write(); err != nil {
+		t.Fatalf("write agent record: %v", err)
+	}
+	if !defaultOwnerAlive("dead5678") {
+		t.Fatalf("record present + session-not-found-on-this-socket must be treated as alive (ambiguous), not reaped")
 	}
 }
 
