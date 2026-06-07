@@ -295,6 +295,11 @@ func Up(project string, opts UpOpts) (string, error) {
 			return OutcomeNotEnabled, nil
 		}
 
+		// codex P2: probe `claude --version` ONCE per Up and thread it to
+		// both the self-heal check and the fresh-acquire record — avoids
+		// multiple shell-outs (and the hang risk) per invocation.
+		curVer := probeClaudeVersion()
+
 		// (3) Idempotent re-Up: existing state.json + alive PID +
 		// matching host + argv matches session_prefix → return
 		// already_acquired. The argv check (codex round-3 P2)
@@ -334,7 +339,7 @@ func Up(project string, opts UpOpts) (string, error) {
 					// PID + argv verified — now apply the self-heal
 					// checks (version + owner). Both can short-circuit
 					// to a respawn below.
-					healReason = computeHealReason(cur)
+					healReason = computeHealReason(cur, curVer)
 					if healReason == "" {
 						// Healthy daemon — adopt.
 						// Ensure marker is present even if operator rm'd it
@@ -471,11 +476,9 @@ func Up(project string, opts UpOpts) (string, error) {
 			pid, spawnErr = activeSpawner(cwd)
 		}
 
-		// Capture current claude --version + owner ID for the new
-		// state record. Empty version is acceptable (degraded probe);
-		// the next tick will detect the empty value as stale and
-		// re-attempt the probe.
-		curVer, _ := claudeVersionFn()
+		// Reuse the once-probed claude --version (codex P2) for the new
+		// state record. Empty version is acceptable (degraded probe); the
+		// next tick will detect the empty value as stale and re-probe.
 		rec := RecordedState{
 			Schema:        SchemaVersion,
 			Project:       project,
@@ -530,10 +533,17 @@ const (
 //
 // Probe failures collapse to "healthy" (no respawn) — better to leak
 // briefly than to kill a healthy daemon on a transient probe error.
-func computeHealReason(cur RecordedState) string {
+//
+// curVer is the current `claude --version` PROBED ONCE BY THE CALLER (codex
+// P2): SweepAllProjects iterates many projects and reapDaemonKeepMarker
+// re-checks under the lock — probing per call shelled out to claude N+ times
+// per `fleet status`, and a hung claude could stall status/JSON callers.
+// The caller probes once and threads the result here. curVer == "" means
+// the probe was unavailable/empty → skip the version check (collapse to
+// healthy on that axis), exactly as the old err/empty path did.
+func computeHealReason(cur RecordedState, curVer string) string {
 	// Version check.
-	curVer, err := claudeVersionFn()
-	if err == nil && curVer != "" {
+	if curVer != "" {
 		// Legacy v1 record (empty recorded version) → force heal so the
 		// backfill happens once, on the next Up tick. Mismatch → heal.
 		if cur.ClaudeVersion == "" || cur.ClaudeVersion != curVer {
@@ -545,6 +555,17 @@ func computeHealReason(cur RecordedState) string {
 		return healReasonDeadOwner
 	}
 	return ""
+}
+
+// probeClaudeVersion runs the version probe once and collapses any error
+// to "" (unavailable). Callers pass the result into computeHealReason so a
+// single sweep/up does at most ONE claude --version shell-out.
+func probeClaudeVersion() string {
+	v, err := claudeVersionFn()
+	if err != nil {
+		return ""
+	}
+	return v
 }
 
 // Down kills the local PID Fleet owns + removes marker + removes
@@ -766,6 +787,10 @@ func SweepAllProjects() error {
 		return fmt.Errorf("rc.SweepAllProjects: glob: %w", err)
 	}
 	host, _ := os.Hostname()
+	// codex P2: probe claude --version ONCE for the whole sweep (not per
+	// project, not again under each lock). Cost is O(1) regardless of how
+	// many projects exist, and a hung claude can't multiply the stall.
+	curVer := probeClaudeVersion()
 	for _, m := range matches {
 		// projects/<name>/rc-state.json — pull the <name> segment.
 		p := filepath.Base(filepath.Dir(m))
@@ -806,11 +831,11 @@ func SweepAllProjects() error {
 		// KEEP the marker, exactly like Up's self-heal (killFn + fresh
 		// acquire, marker never removed). Next --respawn-only tick then
 		// respawns under the current claude + fresh coord.
-		if reason := computeHealReason(cur); reason != "" {
+		if reason := computeHealReason(cur, curVer); reason != "" {
 			fmt.Fprintf(os.Stderr,
 				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d (marker preserved for respawn)\n",
 				p, reason, cur.PID)
-			reapDaemonKeepMarker(p, cur)
+			reapDaemonKeepMarker(p, cur, curVer)
 		}
 	}
 	return nil
@@ -837,7 +862,7 @@ func SweepAllProjects() error {
 //
 // Best-effort: errors are swallowed (sweep is fire-and-forget across all
 // projects; one bad entry must not abort the rest).
-func reapDaemonKeepMarker(project string, snapshot RecordedState) {
+func reapDaemonKeepMarker(project string, snapshot RecordedState, curVer string) {
 	_, _ = withLock(project, func() (string, error) {
 		// Re-read under the lock. If state vanished, nothing to reap.
 		cur, err := ReadState(project)
@@ -853,7 +878,7 @@ func reapDaemonKeepMarker(project string, snapshot RecordedState) {
 				project, snapshot.PID, cur.PID)
 			return OutcomeAlreadyAcquired, nil
 		}
-		if computeHealReason(cur) == "" {
+		if computeHealReason(cur, curVer) == "" {
 			fmt.Fprintf(os.Stderr,
 				"rc.reapDaemonKeepMarker: project %q no longer stale under lock (PID %d); aborting reap\n",
 				project, cur.PID)

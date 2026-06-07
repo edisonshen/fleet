@@ -832,7 +832,7 @@ func TestReapDaemonKeepMarker_AbortsOnConcurrentRespawn(t *testing.T) {
 		t.Fatalf("WriteState fresh: %v", err)
 	}
 
-	reapDaemonKeepMarker("demo", snapshot)
+	reapDaemonKeepMarker("demo", snapshot, "2.1.156")
 
 	// Fresh state must survive untouched, no kill issued, marker preserved.
 	got, err := ReadState("demo")
@@ -958,13 +958,56 @@ func TestReapDaemonKeepMarker_SkipsWhenCwdUnverifiable(t *testing.T) {
 		t.Fatalf("WriteState: %v", err)
 	}
 
-	reapDaemonKeepMarker("demo", rec)
+	reapDaemonKeepMarker("demo", rec, "2.1.156")
 
 	if len(killed) != 0 {
 		t.Fatalf("must not kill when strict cwd unverifiable; killed=%v", killed)
 	}
 	if _, err := ReadState("demo"); err != nil {
 		t.Fatalf("state must be preserved when cwd unverifiable (could be a live foreign daemon); err=%v", err)
+	}
+}
+
+// TestSweepAllProjects_ProbesVersionOnce (codex P2): a multi-project sweep
+// must shell out to `claude --version` at most ONCE — not per project, and
+// not again under each lock. A hung claude binary would otherwise multiply
+// the stall across every project on a read-only `fleet status`.
+func TestSweepAllProjects_ProbesVersionOnce(t *testing.T) {
+	withFleetHome(t)
+	var probes int
+	prevV := claudeVersionFn
+	claudeVersionFn = func() (string, error) { probes++; return "2.1.156", nil }
+	t.Cleanup(func() { claudeVersionFn = prevV })
+	prevO := ownerAliveFn
+	ownerAliveFn = func(string) bool { return true }
+	t.Cleanup(func() { ownerAliveFn = prevO })
+	restoreVerify := SetVerifyPIDIsListenerForTest(func(int, string, string) bool { return true })
+	defer restoreVerify()
+	restoreStrict := SetVerifyPIDCwdStrictForTest(func(int, string) bool { return true })
+	defer restoreStrict()
+	restoreKill := SetKillFnForTest(func(int) {})
+	defer restoreKill()
+
+	host, _ := os.Hostname()
+	// Three projects, all stale-version (each would trigger a heal reap).
+	for _, p := range []string{"alpha", "beta", "gamma"} {
+		if err := WriteMarker(p); err != nil {
+			t.Fatalf("WriteMarker %s: %v", p, err)
+		}
+		if err := WriteState(RecordedState{
+			Project: p, PID: os.Getpid(), HostID: host, WorkingDir: "/tmp/" + p,
+			SessionPrefix: SessionPrefix, LastSpawnAt: time.Now().UTC(),
+			ClaudeVersion: "2.1.146", OwningCoordID: "coord-live",
+		}); err != nil {
+			t.Fatalf("WriteState %s: %v", p, err)
+		}
+	}
+
+	if err := SweepAllProjects(); err != nil {
+		t.Fatalf("SweepAllProjects: %v", err)
+	}
+	if probes != 1 {
+		t.Fatalf("claude --version probed %d times across a 3-project sweep; want exactly 1", probes)
 	}
 }
 
@@ -1034,7 +1077,7 @@ func TestReapDaemonKeepMarker_AbortsOnCrossHostState(t *testing.T) {
 		t.Fatalf("WriteState: %v", err)
 	}
 
-	reapDaemonKeepMarker("demo", snapshot)
+	reapDaemonKeepMarker("demo", snapshot, "2.1.156")
 
 	// Cross-host state must NOT be deleted, no kill issued.
 	if _, err := ReadState("demo"); err != nil {

@@ -25,6 +25,7 @@ package gc
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -61,6 +62,13 @@ type RCStateInfo struct {
 	ClaudeVersion string
 	WorkingDir    string
 	OwningCoordID string
+	// HostID is the host that recorded the state. codex P2: in a shared /
+	// migrated FLEET_HOME, a remote host's rc-state.json must NOT be treated
+	// as ownership for a local PID (the kernel reuses PIDs per-host) — that
+	// could drive a kill of a local listener off a remote's stale version.
+	// The classifier skips states whose HostID isn't the local host. Empty
+	// HostID is treated as local (legacy records).
+	HostID string
 }
 
 // reconcileOrphanRCDaemons enumerates live RC daemons, cross-references
@@ -113,8 +121,18 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 	// than latching onto whichever was enumerated first (codex P2: a
 	// stale entry seen before the healthy one would otherwise mask the
 	// live daemon's real state and get it killed under --apply).
+	//
+	// codex P2 (cross-host): skip states recorded by another host. In a
+	// shared/migrated FLEET_HOME a remote host's rc-state.json must never be
+	// treated as ownership for a LOCAL PID — PIDs are recycled per-host, so
+	// a remote stale-version entry could drive a kill of a local listener.
+	// Empty HostID is legacy/local. Mirrors rc.SweepAllProjects' filter.
+	localHost, _ := os.Hostname()
 	byPID := make(map[int][]RCStateInfo, len(states))
 	for _, s := range states {
+		if s.HostID != "" && s.HostID != localHost {
+			continue
+		}
 		byPID[s.PID] = append(byPID[s.PID], s)
 	}
 
@@ -319,6 +337,7 @@ func listRCStatesOnDisk() ([]RCStateInfo, error) {
 			ClaudeVersion: cur.ClaudeVersion,
 			WorkingDir:    cur.WorkingDir,
 			OwningCoordID: cur.OwningCoordID,
+			HostID:        cur.HostID,
 		})
 	}
 	return out, nil

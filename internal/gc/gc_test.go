@@ -3919,6 +3919,58 @@ func TestKillRCDaemonOnDisk_RefusesRecycledPID(t *testing.T) {
 	}
 }
 
+func TestReconcile_OrphanRCDaemon_CrossHostStateIgnored(t *testing.T) {
+	// codex P2: in a shared/migrated FLEET_HOME, a remote host's
+	// rc-state.json must NOT be treated as ownership for a LOCAL PID. Here a
+	// remote stale-version state shares the PID + cwd of a local daemon; if
+	// the classifier honored it, --apply would kill the local listener off
+	// the remote's stale version. With cross-host filtering the local daemon
+	// has no matching (local) state → classified orphan (its OWN risk),
+	// never stale-killed off a foreign record. We assert it is NOT flagged
+	// as a stale-version kill (the specific cross-host hazard).
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "2.1.156", WorkingDir: "/tmp/fleet"}, // local, current
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			// Remote host's STALE-version record (must be ignored).
+			{Project: "fleet-remote", PID: 1234, ClaudeVersion: "2.1.146", WorkingDir: "/tmp/fleet", HostID: "other-host"},
+			// Local CURRENT-version record for the same daemon.
+			{Project: "fleet", PID: 1234, ClaudeVersion: "2.1.156", WorkingDir: "/tmp/fleet", HostID: localHostForTest(t)},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+	deps.KillRCDaemon = func(pid int, _ string) error {
+		t.Fatalf("must not kill: local current-version state owns PID %d; remote stale state must be ignored", pid)
+		return nil
+	}
+
+	got, err := Reconcile(Options{Apply: true, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	// The remote stale-version record is filtered out; the local current
+	// record makes the daemon healthy → no action at all.
+	if _, ok := findAction(got, KindOrphanRCDaemons, "1234"); ok {
+		t.Fatalf("daemon with a local current-version state must be healthy (cross-host record ignored); got %+v", got.Actions)
+	}
+}
+
+// localHostForTest returns the local hostname (matches what the classifier
+// reads via os.Hostname) so a test can craft a "local" RCStateInfo.HostID.
+func localHostForTest(t *testing.T) string {
+	t.Helper()
+	h, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("os.Hostname: %v", err)
+	}
+	return h
+}
+
 func TestReconcile_OrphanRCDaemon_HealthyDuplicateStateWins(t *testing.T) {
 	// codex P2: after a project rename, two rc-state.json files can share
 	// the same PID + working_dir — one stale (old version), one current. A
