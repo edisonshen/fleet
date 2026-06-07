@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin
 
 package coordlock
 
@@ -1307,4 +1307,69 @@ func errorsIsSerializerBusy(err error) bool {
 	// errSerializerBusy is unexported; compare via the package-internal
 	// sentinel directly (this test is in-package).
 	return err != nil && err == errSerializerBusy //nolint:errorlint // exact sentinel, never wrapped here.
+}
+
+// ---- codex iter-9 [P2]: resume-takeover kills the actual flock holder ----
+
+// When resuming a STALE fencing record whose previous candidate acquired
+// coordinator.flock and stamped its body before hanging, the live flock
+// holder is that CANDIDATE, not the original `old` owner. The takeover must
+// kill the candidate (the flock-body holder), else retryFlock just times
+// out and we escalate to fenced_not_acquired instead of recovering.
+func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
+	setupHome(t)
+	const project = "rainier"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	paths, _ := resolvePaths(project)
+
+	// A hung previous CANDIDATE holds the flock and stamped its body.
+	const candPid = 5500
+	const candStart = int64(550000)
+	live.set(candPid, candStart)
+	relCand := holdFlock(t, project)
+	body, _ := json.Marshal(flockBody{Pid: candPid, PidStart: candStart, BootID: "test-boot-1", Mono: 0})
+	if err := os.WriteFile(paths.flock, body, 0o644); err != nil {
+		t.Fatalf("stamp body: %v", err)
+	}
+
+	// Stale fencing record: owner=OLD (dead), candidate=the hung candidate.
+	const oldPid = 9999 // original owner, already dead (not in live map)
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 6, State: stateFencing,
+		Owner:         identity{Pid: oldPid, PidStart: 333333, AgentID: "old", Project: project},
+		Candidate:     identity{Pid: candPid, PidStart: candStart, AgentID: "cand1", Project: project},
+		BootID:        "test-boot-1",
+		RenewedAtMono: 0, // stalled
+	})
+
+	cfg := testCfg(clk, live)
+	var killedCand atomic.Bool
+	cfg.killStub = func(target identity) error {
+		if target.Pid == candPid {
+			killedCand.Store(true)
+			// Simulate the kill freeing the flock so the takeover completes.
+			live.kill(candPid)
+			relCand()
+		}
+		return nil
+	}
+
+	clk.advance(31 * time.Second) // fencing record past TTL -> resumable
+
+	lease, acquired, err := acquireLease(project, "cand2", cfg)
+	if err != nil {
+		t.Fatalf("acquireLease (resume): %v", err)
+	}
+	if !killedCand.Load() {
+		t.Fatal("resume-takeover must kill the flock-body holder (the hung candidate), not only OLD")
+	}
+	if !acquired {
+		t.Fatal("after killing the real flock holder the takeover must acquire")
+	}
+	defer lease.Release()
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive || rec.Owner.AgentID != "cand2" {
+		t.Fatalf("expected active cand2 after resume, got %s/%s", rec.State, rec.Owner.AgentID)
+	}
 }
