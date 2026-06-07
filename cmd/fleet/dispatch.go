@@ -695,18 +695,16 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//   (a) coord-state.json mtime fresh AND a record exists (the
 	//       original AND-gate; steady-state signal once the coord has
 	//       ticked at least once).
-	//   (b) a live coord record (tmux session alive on THIS socket). When
-	//       that coord has ALSO ticked (coordStateFresh), the
-	//       idempotent-attach fast path ABOVE short-circuits to success
-	//       before we get here. But a live coord that has NOT ticked yet
-	//       (slow cold start, prompt-failed session, claim missing/expired)
-	//       skips the fast path (gated on coordStateFresh, iter-3) and
-	//       reaches HERE — so we feed the real liveness signal into this
-	//       disjunct (iter-5 P2). Refusing with exit 75 (retry) over a
-	//       live session prevents a duplicate-coord split-brain; it
-	//       promotes nothing (unlike the fast path), so a genuinely-stuck
-	//       prompt-failed session surfaces as a retry loop, not a silent
-	//       wrong-coord. T7 tests this disjunct exhaustively.
+	//   (b) a live coord record (tmux session alive on THIS socket) —
+	//       handled ABOVE by the coordStateFresh-gated idempotent-attach
+	//       fast path, which returns success for a coord that has PROVEN
+	//       it ticked. We pass false for this disjunct HERE on purpose: a
+	//       bare-live-but-not-ticking session is ambiguous (booting vs
+	//       prompt-failed) and raw liveness can't tell them apart — the
+	//       pending CLAIM (disjunct c) is the precise cold-start signal
+	//       instead (see the detailed note at the const liveCoord below).
+	//       The disjunct lives in coordSpawnVeto's contract (T7 tests it)
+	//       for a complete OR-gate, but in this call path it stays false.
 	//   (c) a FRESH pending-spawn claim exists — the cold-start window:
 	//       dispatch #1 wrote the claim + spawned, but coord-state.json
 	//       isn't written until the first tick (3-5 min). Without (c),
@@ -725,21 +723,30 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	if opts.coordSpawn {
 		stateFresh := coordStateFresh(opts.project)
 		recordExists := coordRecordExistsInList(opts.taskID, opts.project, coordRecords)
-		// liveCoordRecord disjunct (codex iter-5 P2). The attach fast
-		// path above ONLY short-circuits when coordStateFresh is true
-		// (the prompt-failure gate, iter-3) — so a live coord that hasn't
-		// ticked yet (slow cold start past the 5-min budget, a coord
-		// spawned before the claim mechanism existed, or any state where
-		// the claim is missing/expired but the session is still alive)
-		// falls THROUGH to this veto. If we hardcoded false here, the
-		// veto would see no signal and ALLOW a second spawn → duplicate
-		// coord / split-brain. So we feed the real local-socket liveness
-		// result in: refusing with exit 75 (retry) over a live session is
-		// always safe — it prevents split-brain, promotes nothing, and
-		// surfaces a genuinely-stuck session to the operator (retry loop)
-		// rather than silently promoting a non-coordinator session the
-		// way the fast path would. This is the disjunct T7 already tests.
-		liveCoord := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession) != nil
+		// liveCoordRecord disjunct stays FALSE here, and the cold-start
+		// signal is the pending CLAIM, not raw tmux liveness (codex iter-6
+		// P2 — reverting the iter-5 over-correction). A bare-live tmux
+		// session for the coord task_id is AMBIGUOUS: it is EITHER a coord
+		// genuinely booting (refuse+retry is right) OR a prompt-failed
+		// session where /coordinator never started and the TUI expects the
+		// next [a] to RESPAWN (refusing would strand recovery until a
+		// manual `fleet rm`). Raw liveness cannot tell these apart; the
+		// claim CAN:
+		//   - genuinely booting coord → fresh claim present → claimFresh
+		//     disjunct (c) below vetoes the duplicate.
+		//   - prompt-failed session → its claim was cleared on the
+		//     prompt-delivery-failure path (clearClaimOnPromptFailure,
+		//     iter-4) → no claimFresh → dispatch falls through and respawns.
+		// Feeding raw liveness into the veto (iter-5) conflated the two and
+		// re-stranded prompt-failure retries. The coordStateFresh-gated
+		// fast path ABOVE handles the proven-live-coord attach; everything
+		// else is decided by the claim. Residual: a cold start that runs
+		// PAST the 5-min claim budget without ticking can still admit a
+		// second spawn — that is the documented freshness-budget tradeoff
+		// (TASK-PLAN non-goal: "Changing the cold-start duration"), not a
+		// new regression. T7 still exercises the (b) disjunct for contract
+		// completeness.
+		const liveCoord = false
 		claimFresh, claim := coordPendingClaimFresh(opts.project, coordFreshnessWindow)
 		if reason := coordSpawnVeto(stateFresh, recordExists, liveCoord, claimFresh); reason != "" {
 			// Typed vetoError → main() maps to exit 75 (EX_TEMPFAIL).

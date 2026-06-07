@@ -305,25 +305,30 @@ func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
 	}
 }
 
-// TestRunDispatch_AttachFastPathSkippedWhenNotTicking pins TWO invariants
-// at once for a live coord record + alive tmux session + NO fresh
-// coord-state.json (the session never ticked /coordinator — e.g. its
-// initial prompt failed to deliver, or a slow cold start):
+// TestRunDispatch_AttachFastPathSkippedWhenNotTicking pins the
+// prompt-failure recovery contract for a live coord record + alive tmux
+// session + NO fresh coord-state.json + NO fresh claim (the session never
+// ticked /coordinator — e.g. its initial prompt failed to deliver and
+// clearClaimOnPromptFailure dropped the claim):
 //
 //	(iter-3 P2) The attach fast path must NOT fire — it would exit 0 and
 //	   the TUI would PROMOTE a non-coordinator session as the coord.
-//	(iter-5 P2) The veto MUST fire (liveCoord disjunct) — returning a
-//	   typed vetoError (exit 75 retry) so a second --coord-spawn does NOT
-//	   double-spawn over the live session (split-brain).
+//	(iter-6 P2) The veto must NOT fire either — with no fresh claim, the
+//	   dispatch must FALL THROUGH to a fresh respawn so the operator's
+//	   prompt-failure recovery ([a] / re-dispatch) isn't stranded. The
+//	   cold-start duplicate window is closed by the CLAIM (tested
+//	   separately in TestRunDispatch_ColdStartRefusedByPendingClaim), not
+//	   by raw tmux liveness, precisely so this recovery path stays open.
 //
-// Net: a live-but-not-ticking coord is neither promoted nor duplicated;
-// the dispatch refuses with a retry signal and surfaces the stuck state.
+// Net: a live-but-not-ticking coord with no claim is neither promoted nor
+// veto-stranded; the dispatch respawns.
 func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("FLEET_HOME", root)
-	// Isolate tmux so even if the veto regressed and the spawn path ran,
-	// no real session leaks.
-	isolateTmuxSocket(t)
+	// Empty socket → the fall-through respawn fails deterministically under
+	// go test (no real session leaks), so we can assert "fell through to
+	// respawn" by observing a NON-veto error and no live-ID promotion.
+	t.Setenv("FLEET_TMUX_SOCKET", "")
 
 	pdir, err := state.ProjectDir("nottick")
 	if err != nil {
@@ -366,14 +371,16 @@ func TestRunDispatch_AttachFastPathSkippedWhenNotTicking(t *testing.T) {
 	}
 	var out bytes.Buffer
 	derr := runDispatch(opts, &out)
-	// iter-5: the veto must refuse with a typed vetoError (exit 75 retry)
-	// because a live coord session exists for the project.
+	// iter-6: the dispatch must FALL THROUGH to respawn (which fails on the
+	// empty socket), NOT veto — otherwise prompt-failure recovery strands.
 	if derr == nil {
-		t.Fatalf("expected veto refusal over the live session, got nil — duplicate-spawn window reopened")
+		t.Fatalf("expected fall-through to respawn (fails on empty socket), got nil")
 	}
+	// It must NOT be a vetoError: a veto here would strand the recovery
+	// (iter-6 P2). The error must come from the spawn path instead.
 	var ve *vetoError
-	if !errors.As(derr, &ve) {
-		t.Fatalf("expected *vetoError (exit 75 retry) for a live-but-not-ticking coord, got %T: %v", derr, derr)
+	if errors.As(derr, &ve) {
+		t.Fatalf("dispatch vetoed a no-claim live-but-not-ticking session (%v) — strands prompt-failure recovery", derr)
 	}
 	// iter-3: the fast path must NOT have promoted the session — its ID
 	// must never appear as a successful `agent <id> spawned` line.
