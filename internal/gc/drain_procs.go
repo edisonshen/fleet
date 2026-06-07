@@ -45,13 +45,20 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/edisonshen/fleet/internal/spawn"
 )
 
 // KindDrainProcs is the eighth classifier — leaked/wedged `fleet drain`
 // process reaper.
 const KindDrainProcs Kind = "drain-procs"
 
-// drainHeartbeatTTL is the staleness floor for the steady-state
+// drainHeartbeatFloor is the minimum staleness window for the
+// steady-state classifier — never reap a drain whose heartbeat is
+// younger than this, regardless of configured spawn budgets.
+const drainHeartbeatFloor = 5 * time.Minute
+
+// drainHeartbeatTTL is the staleness threshold for the steady-state
 // classifier. A run-record whose heartbeat_at is older than this (and
 // whose pid+pid_start is still live) is provably wedged.
 //
@@ -59,13 +66,25 @@ const KindDrainProcs Kind = "drain-procs"
 // Beat is called at each queue-file checkpoint, NOT from a timer), so a
 // drain wedged forever inside a blocking LockAgent/Resume stops beating
 // and crosses this TTL — which is the whole point (codex iter-5 [P2]).
-// The floor is set ABOVE the worst-case time a single LEGITIMATE handoff
-// can spend inside Resume (tmux probes + successor spawn), so a slow-but-
-// progressing handoff is not falsely reaped; a drain blocked far longer
-// than any real handoff (the 3-day incident shape) is. The lease/bounded-
-// drain rewrite (PR1-4) shrinks Resume's worst case; until then this TTL
-// is the conservative reaping signal.
-const drainHeartbeatTTL = 5 * time.Minute
+//
+// The TTL MUST exceed the worst-case time a single LEGITIMATE handoff can
+// spend between Beats — dominated by spawn.Spawn's PID-resolution budget,
+// which the operator can raise via FLEET_PID_RESOLVE_S (codex iter-7
+// [P2]). A fixed 5min could be shorter than a configured budget and
+// falsely reap a slow-but-progressing drain. So we derive it from the
+// SAME budget the spawn path uses, mirroring the orphan-tmux freshness
+// gate: max(floor, 2 x PidResolveTimeout). The injectable seam keeps it
+// testable. The lease/bounded-drain rewrite (PR1-4) shrinks Resume's
+// worst case; until then this is the conservative reaping signal.
+var drainHeartbeatTTLFn = func() time.Duration {
+	budget := 2 * spawn.PidResolveTimeout()
+	if budget > drainHeartbeatFloor {
+		return budget
+	}
+	return drainHeartbeatFloor
+}
+
+func drainHeartbeatTTL() time.Duration { return drainHeartbeatTTLFn() }
 
 // drainLegacyAgeFloor is the floor for the --legacy-drains coarse
 // sweep. The existing 81 leaked drains have no run-record (they predate
@@ -165,9 +184,10 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 	sort.SliceStable(runs, func(i, j int) bool { return runs[i].Pid < runs[j].Pid })
 
 	now := deps.Now()
+	ttl := drainHeartbeatTTL()
 	for _, run := range runs {
 		age := now.Sub(run.HeartbeatAt)
-		if age < drainHeartbeatTTL {
+		if age < ttl {
 			// Fresh heartbeat → healthy or actively-progressing
 			// long-recovery drain. Never touched (T18a / T18b).
 			continue
@@ -201,7 +221,7 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 		act := Action{
 			Kind: KindDrainProcs, Target: drainTarget(run.Pid),
 			Verb:   VerbSurface,
-			Reason: fmt.Sprintf("WEDGED fleet drain (pid=%d, heartbeat %s ago > TTL %s); surface only — rerun with --apply to reap", run.Pid, humanDuration(age), humanDuration(drainHeartbeatTTL)),
+			Reason: fmt.Sprintf("WEDGED fleet drain (pid=%d, heartbeat %s ago > TTL %s); surface only — rerun with --apply to reap", run.Pid, humanDuration(age), humanDuration(ttl)),
 		}
 		if opts.Apply {
 			act.Verb = VerbWouldKill

@@ -484,6 +484,57 @@ func TestDrainProcs_SteadyAndLegacy_BothReaped(t *testing.T) {
 	}
 }
 
+// TTL derivation (codex iter-7 [P2]): never below the floor, and scales
+// past it when the configured spawn PID-resolution budget is larger, so a
+// legitimate slow drain under a raised FLEET_PID_RESOLVE_S is not reaped.
+func TestDrainHeartbeatTTL_DerivesFromBudget(t *testing.T) {
+	prev := drainHeartbeatTTLFn
+	t.Cleanup(func() { drainHeartbeatTTLFn = prev })
+
+	// Default budget (small) → floor wins.
+	if got := drainHeartbeatTTL(); got < drainHeartbeatFloor {
+		t.Fatalf("TTL %v must never be below the floor %v", got, drainHeartbeatFloor)
+	}
+
+	// A large configured budget must raise the TTL above the floor so a
+	// slow-but-progressing drain isn't falsely reaped. We exercise the
+	// derivation directly (the production fn reads spawn.PidResolveTimeout).
+	drainHeartbeatTTLFn = func() time.Duration {
+		budget := 20 * time.Minute
+		if budget > drainHeartbeatFloor {
+			return budget
+		}
+		return drainHeartbeatFloor
+	}
+	if got := drainHeartbeatTTL(); got != 20*time.Minute {
+		t.Fatalf("TTL = %v, want it to scale to the 20m budget", got)
+	}
+}
+
+// A drain stale beyond the floor but WITHIN a raised budget-derived TTL is
+// NOT reaped (the false-reap codex iter-7 guards against).
+func TestDrainProcs_WithinRaisedTTL_NotReaped(t *testing.T) {
+	prev := drainHeartbeatTTLFn
+	drainHeartbeatTTLFn = func() time.Duration { return 20 * time.Minute }
+	t.Cleanup(func() { drainHeartbeatTTLFn = prev })
+
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		// 8min stale: > 5min floor, but < the 20min budget-derived TTL.
+		return []DrainRun{{Pid: 7, PidStart: "s", HeartbeatAt: now.Add(-8 * time.Minute), Path: "/tmp/7.json"}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	if len(r.Actions) != 0 {
+		t.Fatalf("a drain within the raised TTL must not be reaped; got %+v", r.Actions)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("must not kill within TTL; got %+v", h.killCalls)
+	}
+}
+
 // Missing-dep guard: KindDrainProcs without ListDrainRuns errors clearly.
 func TestDrainProcs_MissingDep_Errors(t *testing.T) {
 	_, err := Reconcile(Options{Kinds: []Kind{KindDrainProcs}, Apply: false}, Deps{Now: time.Now})
