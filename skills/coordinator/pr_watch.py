@@ -114,6 +114,24 @@ _MAX_REMEDIATION_SERIES_DEFAULT = 6     # env PR_WATCH_MAX_REMEDIATION_SERIES
 # target.
 _FRONTIER_UNSET = "\x00UNSET"
 _FRONTIER_UNKNOWN = "\x00UNKNOWN"
+# Frontier/detail-key element separator. A NEWLINE — NOT a comma (codex P2):
+# a GitHub matrix check name can contain a comma (e.g. "tests (linux,
+# py3.12)"), which a comma-join+split would shred into multiple fake elements
+# and corrupt the subset/progress comparison. Newlines can't appear in a
+# check name or a git path, so the join/split round-trips faithfully.
+_FRONTIER_SEP = "\n"
+
+
+def _encode_frontier(items) -> str:
+    """Join a set of frontier elements (check names / conflicted paths) into
+    the stable, comma-safe frontier string (§2.1)."""
+    return _FRONTIER_SEP.join(sorted(str(x) for x in items))
+
+
+def _frontier_set(s: str) -> set:
+    """Decode a frontier string back to its element set (inverse of
+    _encode_frontier)."""
+    return set(s.split(_FRONTIER_SEP)) if s else set()
 
 
 def env_max_remediation_attempts() -> int:
@@ -647,7 +665,7 @@ def _frontier(event: str, snap: dict) -> str:
     if event == EVENT_CI_FAILED:
         fc = snap.get("failing_checks") if isinstance(snap, dict) else None
         if isinstance(fc, (list, tuple)) and fc:
-            return ",".join(sorted(str(c) for c in fc))
+            return _encode_frontier(fc)
         # CI failed but no named checks parsed -> a single unnamed failing
         # frontier (never empty/clean, so it can't false-shrink to "done").
         return EVENT_CI_FAILED
@@ -656,7 +674,7 @@ def _frontier(event: str, snap: dict) -> str:
         # remediation/dirty detail), else UNKNOWN until it does.
         paths = snap.get("conflicted_paths") if isinstance(snap, dict) else None
         if isinstance(paths, (list, tuple)) and paths:
-            return ",".join(sorted(str(p) for p in paths))
+            return _encode_frontier(paths)
         return _FRONTIER_UNKNOWN
     return event or ""
 
@@ -674,8 +692,8 @@ def _frontier_strictly_shrinks(new: str, best: str) -> bool:
         return False
     if new == best:
         return False
-    new_set = set(new.split(",")) if new else set()
-    best_set = set(best.split(",")) if best else set()
+    new_set = _frontier_set(new)
+    best_set = _frontier_set(best)
     # Proper-subset shrink (a failing check cleared / a conflicted path
     # resolved). An empty new_set (all cleared) is the strongest shrink.
     return new_set < best_set
@@ -706,7 +724,7 @@ def _detail_key(event: str, snap: dict, rem: dict) -> str:
     if event == EVENT_CI_FAILED:
         fc = snap.get("failing_checks") if isinstance(snap, dict) else None
         if isinstance(fc, (list, tuple)) and fc:
-            return ",".join(sorted(str(c) for c in fc))
+            return _encode_frontier(fc)
         return ""
     if event == EVENT_DIRTY:
         # "" on first detection (the coord has no conflicted index); the
@@ -714,7 +732,7 @@ def _detail_key(event: str, snap: dict, rem: dict) -> str:
         # remediation so the NEXT pass's signature reflects them.
         paths = snap.get("conflicted_paths") if isinstance(snap, dict) else None
         if isinstance(paths, (list, tuple)) and paths:
-            return ",".join(sorted(str(p) for p in paths))
+            return _encode_frontier(paths)
         return ""
     if event == EVENT_CHANGES_REQUESTED:
         # A NEW review body on the same head is a new wall; an unchanged

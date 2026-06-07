@@ -3017,14 +3017,16 @@ def test_frontier_dirty_unknown_sentinel() -> None:
     # never a strict-shrink target.
     assert pw._frontier_strictly_shrinks("a", pw._FRONTIER_UNKNOWN) is False
     # UNKNOWN -> concrete path set is NOT a shrink (re-baseline, not progress).
-    assert pw._frontier_strictly_shrinks(pw._FRONTIER_UNKNOWN, "a,b") is False
+    ab = pw._encode_frontier(["a", "b"])
+    assert pw._frontier_strictly_shrinks(pw._FRONTIER_UNKNOWN, ab) is False
 
 
 def test_frontier_strict_subset_shrinks() -> None:
-    assert pw._frontier_strictly_shrinks("a", "a,b") is True
+    ab = pw._encode_frontier(["a", "b"])
+    assert pw._frontier_strictly_shrinks("a", ab) is True
     assert pw._frontier_strictly_shrinks("", "a") is True  # all cleared
-    assert pw._frontier_strictly_shrinks("a,b", "a") is False  # grew
-    assert pw._frontier_strictly_shrinks("c", "a,b") is False  # disjoint
+    assert pw._frontier_strictly_shrinks(ab, "a") is False  # grew
+    assert pw._frontier_strictly_shrinks("c", ab) is False  # disjoint
 
 
 # --- §3 budget-exhausted raise suppressed while a fixer is in flight --------
@@ -3507,3 +3509,26 @@ def test_stale_conflict_breadcrumb_not_reused_on_new_head(tmp_path: Path) -> Non
           agent_outcome=lambda _a: "gone", tick_count=10)
     assert disp.calls[-1].kind == pw.ACTION_REBASE, \
         "a fresh head's DIRTY must try a clean rebase, not inherit a stale conflict"
+
+
+def test_frontier_comma_in_check_name_is_safe(tmp_path: Path) -> None:
+    """codex P2: a check name containing a comma (matrix job like
+    'tests (linux, py3.12)') must NOT be shredded into multiple frontier
+    elements — otherwise a later unrelated check could look like a strict
+    subset and wrongly reset the series."""
+    # Two distinct matrix checks, each name containing a comma.
+    a = pw._frontier(pw.EVENT_CI_FAILED,
+                     {"failing_checks": ("tests (linux, py3.12)",
+                                         "tests (mac, py3.11)")})
+    # The single-check frontier after one clears.
+    b = pw._frontier(pw.EVENT_CI_FAILED,
+                     {"failing_checks": ("tests (linux, py3.12)",)})
+    # b is a proper subset of a -> genuine shrink.
+    assert pw._frontier_strictly_shrinks(b, a) is True
+    # A DIFFERENT single check is NOT a subset of a -> not a shrink (the bug
+    # the comma-split caused: "py3.12)" fragment matching).
+    c = pw._frontier(pw.EVENT_CI_FAILED,
+                     {"failing_checks": ("lint",)})
+    assert pw._frontier_strictly_shrinks(c, a) is False
+    # round-trip: the encoded frontier decodes to exactly 2 elements.
+    assert len(pw._frontier_set(a)) == 2
