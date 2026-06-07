@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/edisonshen/fleet/internal/rc"
@@ -58,6 +59,60 @@ func TestRCCLI_UpEmitsJSONEnvelope(t *testing.T) {
 	}
 	if resp.Outcome != rc.OutcomeAcquired && resp.Outcome != rc.OutcomeAlreadyAcquired {
 		t.Errorf("response outcome=%q want acquired/already_acquired", resp.Outcome)
+	}
+}
+
+// TestRCCLI_UpRejectsInvalidCoordID (codex P2): a malformed --coord-id
+// must be rejected BEFORE rc.Up persists it as owning_coord_id; otherwise
+// defaultOwnerAlive treats the (missing) record as dead-owner and reaps +
+// respawns the daemon repeatedly with the same poison owner. Expect a
+// non-nil error and an error JSON envelope, with no listener spawned.
+func TestRCCLI_UpRejectsInvalidCoordID(t *testing.T) {
+	rcTestFleetHome(t)
+	spawned := false
+	restoreSpawn := rc.SetSpawnerForTest(func(workingDir string) (int, error) {
+		spawned = true
+		return os.Getpid(), nil
+	})
+	defer restoreSpawn()
+
+	out := &bytes.Buffer{}
+	err := runRCUp(out, "demo", t.TempDir(), false, false, "NOT-HEX!!")
+	if err == nil {
+		t.Fatalf("expected error for invalid --coord-id")
+	}
+	if spawned {
+		t.Fatalf("listener must NOT spawn when --coord-id is invalid")
+	}
+	var resp rcResponse
+	if jerr := json.Unmarshal(out.Bytes(), &resp); jerr != nil {
+		t.Fatalf("invalid JSON envelope: %v\nstdout:\n%s", jerr, out.String())
+	}
+	if resp.Outcome != rc.OutcomeError {
+		t.Fatalf("outcome=%q want error", resp.Outcome)
+	}
+	if !strings.Contains(resp.Error, "invalid --coord-id") {
+		t.Fatalf("error %q must mention invalid --coord-id", resp.Error)
+	}
+}
+
+// TestRCCLI_UpAcceptsValidCoordID confirms the validation gate doesn't
+// reject a legitimate 8-hex agent ID — it must reach rc.Up and acquire.
+func TestRCCLI_UpAcceptsValidCoordID(t *testing.T) {
+	rcTestFleetHome(t)
+	restoreSpawn := rc.SetSpawnerForTest(func(workingDir string) (int, error) {
+		return os.Getpid(), nil
+	})
+	defer restoreSpawn()
+
+	out := &bytes.Buffer{}
+	_ = runRCUp(out, "demo", t.TempDir(), false, false, "abcd1234")
+	var resp rcResponse
+	if jerr := json.Unmarshal(out.Bytes(), &resp); jerr != nil {
+		t.Fatalf("invalid JSON envelope: %v\nstdout:\n%s", jerr, out.String())
+	}
+	if resp.Outcome != rc.OutcomeAcquired && resp.Outcome != rc.OutcomeAlreadyAcquired {
+		t.Fatalf("valid coord-id outcome=%q want acquired/already_acquired", resp.Outcome)
 	}
 }
 

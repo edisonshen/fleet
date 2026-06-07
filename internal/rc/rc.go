@@ -316,6 +316,13 @@ func Up(project string, opts UpOpts) (string, error) {
 		// orphaned daemons (after coord crash) self-heal on the
 		// next tick instead of living forever.
 		var healReason string // non-empty triggers respawn after spawn-side prep
+		// preResolvedCwd carries the working_dir resolved during the
+		// self-heal precheck (codex P2). When non-empty, the (5) fresh-
+		// acquire path reuses it instead of resolving AGAIN — re-resolving
+		// after killFn could fail if the source (project meta / live coord
+		// record) changed concurrently, killing the old listener with no
+		// replacement. Resolve once, before the kill, and reuse.
+		var preResolvedCwd string
 		if cur, err := ReadState(project); err == nil {
 			host, _ := os.Hostname()
 			if opts.AdoptIfFleetOwned && cur.PID > 0 && workers.IsAlive(cur.PID) && cur.HostID == host {
@@ -350,11 +357,16 @@ func Up(project string, opts UpOpts) (string, error) {
 					// left rc-state.json pointing at a dead PID with no
 					// respawn. Resolve now; on failure, leave the daemon
 					// alive and surface the error so the next tick retries.
-					if _, rerr := ResolveWorkingDir(project, opts.Cwd); rerr != nil {
+					// CAPTURE the result and reuse it for (5) — re-resolving
+					// after the kill risks a concurrent source change (meta
+					// /coord record) failing the second resolve (codex P2).
+					rcwd, rerr := ResolveWorkingDir(project, opts.Cwd)
+					if rerr != nil {
 						return OutcomeError, fmt.Errorf(
 							"rc.Up: project %q self-heal (%s) aborted — cannot resolve replacement working_dir, leaving existing PID %d alive: %w",
 							project, healReason, cur.PID, rerr)
 					}
+					preResolvedCwd = rcwd
 					// Self-heal: surface what changed so the operator can
 					// see why we respawned (version drift / dead owner).
 					fmt.Fprintf(os.Stderr,
@@ -362,10 +374,9 @@ func Up(project string, opts UpOpts) (string, error) {
 						project, healReason, cur.PID)
 					killFn(cur.PID)
 					// Fall through to (5) fresh acquire path. Marker is
-					// already present; (5) re-publishes it idempotently
-					// and writes a fresh state.json with current version
-					// + new CoordID. ResolveWorkingDir runs again there;
-					// it is pure (no side effects) so re-resolving is safe.
+					// already present; (5) re-publishes it idempotently and
+					// writes a fresh state.json with current version + new
+					// CoordID, reusing preResolvedCwd (no re-resolve).
 				} else {
 					// argv/cwd mismatch — kernel PID reuse (possibly by
 					// another project's listener), external kill, or moved
@@ -378,10 +389,18 @@ func Up(project string, opts UpOpts) (string, error) {
 			}
 		}
 
-		// Resolve working_dir BEFORE we touch any state.
-		cwd, err := ResolveWorkingDir(project, opts.Cwd)
-		if err != nil {
-			return OutcomeError, err
+		// Resolve working_dir BEFORE we touch any state. The self-heal
+		// path already resolved it (and reuses that value here) so we
+		// never resolve a second time after killing the old listener
+		// (codex P2: a concurrent source change must not strand us with a
+		// dead daemon and no replacement).
+		cwd := preResolvedCwd
+		if cwd == "" {
+			var err error
+			cwd, err = ResolveWorkingDir(project, opts.Cwd)
+			if err != nil {
+				return OutcomeError, err
+			}
 		}
 
 		// (4) Duplicate-spawn refusal: marker present, state absent,

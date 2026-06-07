@@ -150,6 +150,18 @@ func runRCUp(stdout io.Writer, project, cwd string, _ bool, respawnOnly bool, co
 	if _, err := state.Bootstrap(); err != nil {
 		return emitRC(stdout, rcResponse{Outcome: rc.OutcomeError, Cmd: "up", Project: project, Error: err.Error()})
 	}
+	// codex P2: validate --coord-id before it is persisted as
+	// owning_coord_id. An invalid value has no agents/<id>.json, so
+	// defaultOwnerAlive would classify it dead-owner and reap+respawn the
+	// daemon repeatedly with the same bad owner. Reject a malformed flag
+	// outright (surface-don't-silo) rather than persist a poison value;
+	// this mirrors the Python coord tick, which drops non-canonical IDs.
+	if coordID != "" && !fleetAgentIDPattern.MatchString(coordID) {
+		return emitRC(stdout, rcResponse{
+			Outcome: rc.OutcomeError, Cmd: "up", Project: project,
+			Error: fmt.Sprintf("invalid --coord-id %q: must be a fleet agent ID (8 lowercase hex chars)", coordID),
+		})
+	}
 	out, err := rc.Up(project, rc.UpOpts{Cwd: cwd, RespawnOnly: respawnOnly, CoordID: coordID})
 	resp := rcResponse{Outcome: out, Cmd: "up", Project: project}
 	if err != nil {
