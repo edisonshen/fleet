@@ -154,6 +154,55 @@ class TestSpawnDaemonIfNeeded:
             "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
         ]
 
+    def test_passes_coord_id_when_valid(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """leak-rc-daemon-lifecycle: a valid 8-hex coord_id is threaded to
+        `fleet rc up --coord-id <id>` so the spawned daemon records its
+        owning coord. Without this the Go-side dead-owner self-heal can't
+        detect a crashed coord's orphaned daemon."""
+        calls: list[list[str]] = []
+
+        class _FakeResult:
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeResult(0)
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo", "abcd1234")
+        assert ok is True
+        assert calls[0] == [
+            "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
+            "--coord-id", "abcd1234",
+        ]
+
+    def test_drops_invalid_coord_id(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A coord_id failing the canonical 8-lowercase-hex shape is NOT
+        passed as an argument (defense in depth — never inject an
+        unvalidated value into the fleet argv). The daemon still spawns."""
+        calls: list[list[str]] = []
+
+        class _FakeResult:
+            def __init__(self, returncode: int = 0) -> None:
+                self.returncode = returncode
+
+        def _fake_run(args, **kwargs):
+            calls.append(list(args))
+            return _FakeResult(0)
+
+        monkeypatch.setattr(remote_control.subprocess, "run", _fake_run)
+        ok = remote_control.spawn_daemon_if_needed("demo", "NOT-HEX!!")
+        assert ok is True
+        assert "--coord-id" not in calls[0]
+        assert calls[0] == [
+            "fleet", "rc", "up", "demo", "--respawn-only", "--idempotent",
+        ]
+
     def test_returns_false_on_nonzero_exit(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

@@ -3800,3 +3800,64 @@ func TestReconcile_OrphanRCDaemon_StaleVersionSurfaces(t *testing.T) {
 		t.Fatalf("stale-version dry-run verb=%q want %q", a.Verb, VerbSurface)
 	}
 }
+
+func TestReconcile_OrphanRCDaemon_LegacyEmptyVersionSurfaces(t *testing.T) {
+	// codex P2: a pre-upgrade v1 rc-state.json has no recorded claude
+	// version, and the live probe couldn't read one either (both empty).
+	// rc.computeHealReason treats an empty recorded version as stale to
+	// force a one-time backfill; gc must be consistent and surface the
+	// legacy daemon rather than classify it healthy and leak it forever.
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "", WorkingDir: "/tmp/fleet"}, // probe couldn't read version
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "", WorkingDir: "/tmp/fleet"}, // legacy v1: no version
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "2.1.156", nil }
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	a, ok := findAction(got, KindOrphanRCDaemons, "1234")
+	if !ok {
+		t.Fatalf("expected legacy empty-version daemon to be surfaced; got %+v", got.Actions)
+	}
+	if a.Verb != VerbSurface {
+		t.Fatalf("legacy daemon dry-run verb=%q want %q", a.Verb, VerbSurface)
+	}
+}
+
+func TestReconcile_OrphanRCDaemon_UnknownCurrentVersion_PreservesLegacy(t *testing.T) {
+	// Guard against over-eager reaping: when the CURRENT claude version
+	// can't be probed (curVer empty — degraded host), a legacy empty-
+	// version daemon must NOT be surfaced. We can't prove it's stale, so
+	// we leave it alone (mirrors rc.computeHealReason's curVer!="" gate).
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	deps := withRCDaemonStubs(stubDeps(now))
+	deps.ListRCDaemons = func() ([]RCDaemonInfo, error) {
+		return []RCDaemonInfo{
+			{PID: 1234, Version: "", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.ListRCStates = func() ([]RCStateInfo, error) {
+		return []RCStateInfo{
+			{Project: "fleet", PID: 1234, ClaudeVersion: "", WorkingDir: "/tmp/fleet"},
+		}, nil
+	}
+	deps.CurrentClaudeVersion = func() (string, error) { return "", nil } // probe failed
+
+	got, err := Reconcile(Options{Apply: false, Kinds: rcDaemonKinds()}, deps)
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := findAction(got, KindOrphanRCDaemons, "1234"); ok {
+		t.Fatalf("legacy daemon must NOT be surfaced when current version is unknown; got %+v", got.Actions)
+	}
+}

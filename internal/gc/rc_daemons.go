@@ -133,6 +133,14 @@ func reconcileOrphanRCDaemons(r *Report, opts Options, deps Deps) error {
 		case curVer != "" && recorded.ClaudeVersion != "" && recorded.ClaudeVersion != curVer:
 			reason = fmt.Sprintf("recorded version %s differs from current %s",
 				recorded.ClaudeVersion, curVer)
+		case curVer != "" && recorded.ClaudeVersion == "" && d.Version == "":
+			// Legacy v1 rc-state.json: no recorded version, and the live
+			// probe couldn't read one either. The rc self-heal path
+			// (rc.computeHealReason) treats an empty recorded version as
+			// stale to force a one-time backfill under the current claude.
+			// gc must be consistent — surface it so a pre-upgrade daemon
+			// isn't classified healthy and left to live forever.
+			reason = fmt.Sprintf("legacy daemon with no recorded claude version (current %s)", curVer)
 		default:
 			continue // healthy
 		}

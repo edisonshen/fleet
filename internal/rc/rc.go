@@ -725,17 +725,63 @@ func SweepAllProjects() error {
 		}
 		// Class 2/3: marker present, daemon alive — apply the same
 		// self-heal rubric Up uses. A stale version or dead owner
-		// means this daemon needs replacement; Down clears it so
-		// the next Up tick respawns under the current claude +
-		// fresh coord. Reuse computeHealReason for consistency.
+		// means this daemon needs replacement.
+		//
+		// codex P1 (sweep must preserve the marker): Down() removes the
+		// project's RC marker. The coord's implicit recovery tick uses
+		// `fleet rc up --respawn-only`, which returns not_enabled when
+		// the marker is gone — so a Down here would silently DISABLE RC
+		// for an opted-in project. We reap the dead/stale daemon but
+		// KEEP the marker, exactly like Up's self-heal (killFn + fresh
+		// acquire, marker never removed). Next --respawn-only tick then
+		// respawns under the current claude + fresh coord.
 		if reason := computeHealReason(cur); reason != "" {
 			fmt.Fprintf(os.Stderr,
-				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d\n",
+				"rc.SweepAllProjects: project %q self-heal — %s; reaping PID %d (marker preserved for respawn)\n",
 				p, reason, cur.PID)
-			_, _ = Down(p)
+			reapDaemonKeepMarker(p, cur)
 		}
 	}
 	return nil
+}
+
+// reapDaemonKeepMarker kills the recorded local PID (with the same
+// PID-reuse defense Down uses) and removes rc-state.json, but DELIBERATELY
+// leaves the RC marker in place. This is the "reap for respawn" teardown:
+// the daemon is stale/orphaned and must die, but the project is still
+// opted in to RC, so the marker must survive for the coord's next
+// `fleet rc up --respawn-only` tick to bring a fresh listener back.
+//
+//	Down()                 → kill + RemoveState + RemoveMarker (opt-out)
+//	reapDaemonKeepMarker() → kill + RemoveState, marker preserved (heal)
+//
+// Best-effort: errors are swallowed (sweep is fire-and-forget across all
+// projects; one bad entry must not abort the rest).
+func reapDaemonKeepMarker(project string, cur RecordedState) {
+	_, _ = withLock(project, func() (string, error) {
+		host, _ := os.Hostname()
+		// Cross-host entries are filtered by the caller, but re-check
+		// under the lock so a racing host change can't make us signal a
+		// remote PID.
+		if cur.PID > 0 && (cur.HostID == "" || cur.HostID == host) && workers.IsAlive(cur.PID) {
+			prefix := cur.SessionPrefix
+			if prefix == "" {
+				prefix = SessionPrefix
+			}
+			if verifyPIDIsListener(cur.PID, prefix, cur.WorkingDir) {
+				killFn(cur.PID)
+			} else {
+				// argv/cwd mismatch — likely kernel PID reuse (possibly
+				// another project's listener). Refuse to kill; still drop
+				// the stale state below so a fresh acquire isn't blocked.
+				fmt.Fprintf(os.Stderr,
+					"rc.reapDaemonKeepMarker: project %q recorded PID %d alive but argv/cwd does not match recorded session_prefix %q + working_dir %q; skipping kill (likely PID reuse)\n",
+					project, cur.PID, prefix, cur.WorkingDir)
+			}
+		}
+		_ = RemoveState(project)
+		return OutcomeReleased, nil
+	})
 }
 
 // detectFleetCoordListener returns true iff a process whose argv

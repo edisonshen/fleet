@@ -647,6 +647,13 @@ func TestSweepAllProjects_ReleasesStaleVersionDaemons(t *testing.T) {
 	if len(killed) != 1 {
 		t.Fatalf("expected 1 kill for stale daemon; got %d (%v)", len(killed), killed)
 	}
+	// codex P1: marker MUST survive the Class 2/3 reap — the project is
+	// still opted in to RC, and the coord's --respawn-only tick needs the
+	// marker present to bring a fresh daemon back. Down() would remove it
+	// and silently disable RC.
+	if !MarkerPresent("stale") {
+		t.Fatalf("stale project marker must be PRESERVED after self-heal reap (else --respawn-only returns not_enabled)")
+	}
 	// Healthy: untouched.
 	if _, err := ReadState("healthy"); err != nil {
 		t.Fatalf("healthy daemon state should be preserved by Sweep; err=%v", err)
@@ -690,6 +697,12 @@ func TestSweepAllProjects_ReleasesDeadOwnerDaemons(t *testing.T) {
 	}
 	if _, err := ReadState("orphan"); !errors.Is(err, ErrStateMissing) {
 		t.Fatalf("dead-owner daemon state should be reaped; err=%v", err)
+	}
+	// codex P1: dead-owner reap also keeps the marker so the next coord's
+	// --respawn-only tick respawns under a fresh owner rather than finding
+	// RC disabled.
+	if !MarkerPresent("orphan") {
+		t.Fatalf("dead-owner project marker must be PRESERVED after self-heal reap")
 	}
 }
 
