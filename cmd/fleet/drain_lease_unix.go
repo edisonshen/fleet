@@ -445,6 +445,19 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: handoff for %s did not reach the barrier within the budget; escalating to safety-net takeover\n",
 		project)
+	return takeoverAndRecover(req, path, cachedOld, stdout, stderr, d)
+}
+
+// takeoverAndRecover runs the safety-net takeover (fence -> kill the hung OLD)
+// and then brings up a FRESH lease-wrapped successor from the CACHED old record
+// (dead-coord recovery), deleting the queue on success. It NEVER blocks and
+// holds no lock across the kill. Shared by the hung-leader escalation and the
+// Resume-timeout escalation (codex PR3 iter-7/8). Returns ErrEscalatedToTakeOver
+// on success (a non-fatal processed outcome).
+func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Record,
+	stdout, stderr io.Writer, d drainLeaseDeps) error {
+
+	project := req.Project
 	if _, err := d.TakeOver(project, req.OldAgentID); err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
 	}
@@ -524,30 +537,58 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, res
 	return coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 }
 
-// coldResume runs handoffop.Resume to spawn a successor for a STEALABLE
-// (no-epoch) coord lease. It holds a SHORT per-agent LockAgent for the
-// duration (codex PR3 iter-4 [P1]) — Resume's contract requires that lock,
-// and two concurrent drains would otherwise both spawn a replacement. This
-// does NOT reintroduce the 81-leak: that leak was holding the lock across a
-// HUNG live leader's coord swap (tmux probes / nested flock / spawn that can
-// wedge forever). A COLD spawn has no live leader to swap and no hung holder
-// — it is the fresh first-spawn path, where the per-agent lock is brief and
-// always released. The graceful/hung COORD path never calls Resume at all; it
-// kills/escalates lock-free (that is where the T40 no-lock invariant lives).
+// coldResume runs handoffop.Resume to complete a coord handoff (the live-leader
+// fallback) or cold-spawn a successor (stealable no-epoch lease). It holds a
+// SHORT per-agent LockAgent (Resume's contract; two concurrent drains must not
+// both spawn). The LockAgent itself is BOUNDED (state.acquireBoundedAt never
+// uses a bare LOCK_EX), so a contending drain times out instead of hanging —
+// the 81-leak's forever-block class is already gone at the lock layer.
 //
-// Run SYNCHRONOUSLY: `fleet drain` is a short-lived CLI, so an abandoned
-// Resume goroutine would be killed on process exit mid-spawn (codex PR3
-// iter-3 [P2]).
+// But Resume's OWN body can still hang (tmux probes / nested flock / spawn). To
+// keep THIS drain bounded (codex PR3 iter-8 [P1]) we run Resume in a goroutine
+// with the --resume-timeout-ms budget. On timeout we ESCALATE to the safety-net
+// takeover + lease-wrapped recovery (the wedged handoff is treated like a hung
+// leader): the takeover fences+kills OLD and RecoverSpawn brings up the
+// successor, so the project is never left coordless and the drain never blocks.
+// The abandoned Resume goroutine holds only the bounded per-agent lock; later
+// drains see the recovered successor leading and stand down.
 func coldResume(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	_ = resumeTimeoutMillis // the cold spawn is not abandoned on a timer
-	release, err := d.LockAgent(req.OldAgentID)
-	if err != nil {
-		return fmt.Errorf("fleet drain: lock agent %s for cold resume: %w", req.OldAgentID, err)
+	// Cache OLD before we start (for the escalation's lease-wrapped recovery —
+	// the takeover would archive it). Non-fatal on failure.
+	var cachedOld *agent.Record
+	if rec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil {
+		cachedOld = rec
 	}
-	defer release()
-	return d.Resume(req, path, graceMillis, stdout, stderr)
+
+	done := make(chan error, 1)
+	go func() {
+		release, lerr := d.LockAgent(req.OldAgentID)
+		if lerr != nil {
+			done <- fmt.Errorf("fleet drain: lock agent %s for cold resume: %w", req.OldAgentID, lerr)
+			return
+		}
+		defer release()
+		done <- d.Resume(req, path, graceMillis, stdout, stderr)
+	}()
+
+	timeout := time.Duration(resumeTimeoutMillis) * time.Millisecond
+	if timeout <= 0 {
+		// No budget configured -> wait for Resume (bounded only by its own
+		// bounded lock + internal probes). Preserves the legacy single-shot
+		// behavior when --resume-timeout-ms is 0.
+		return <-done
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: legacy resume for %s exceeded %dms; escalating to safety-net takeover (not blocking)\n",
+			req.Project, resumeTimeoutMillis)
+		return takeoverAndRecover(req, path, cachedOld, stdout, stderr, d)
+	}
 }
 
 func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
