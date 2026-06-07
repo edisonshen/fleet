@@ -57,6 +57,31 @@ func TestLeaseFailoverEnabled_Gate(t *testing.T) {
 	}
 }
 
+// codex PR2 iter-7 [P1]: only FRESH coord spawns are lease-wrapped; a
+// handoff/drain successor (hasOldRecord) is NOT, because the outgoing
+// coord still holds the lease and a wrapped successor would stand down.
+func TestShouldLeaseWrap(t *testing.T) {
+	cases := []struct {
+		name                           string
+		failoverOn, isCoord, hasOldRec bool
+		want                           bool
+	}{
+		{"fresh coord, flag on", true, true, false, true},
+		{"handoff successor, flag on", true, true, true, false},
+		{"flag off", false, true, false, false},
+		{"worker (not coord)", true, false, false, false},
+		{"handoff worker", true, false, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := shouldLeaseWrap(c.failoverOn, c.isCoord, c.hasOldRec); got != c.want {
+				t.Errorf("shouldLeaseWrap(%v,%v,%v) = %v, want %v",
+					c.failoverOn, c.isCoord, c.hasOldRec, got, c.want)
+			}
+		})
+	}
+}
+
 // W3: the idempotency guard recognizes an already-wrapped argv so a
 // re-spawn never nests coord-run inside coord-run.
 func TestAlreadyCoordRunWrapped(t *testing.T) {

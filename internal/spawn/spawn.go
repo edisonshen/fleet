@@ -192,6 +192,17 @@ func leaseFailoverEnabled() bool {
 	return v != "" && v != "0" && v != "false"
 }
 
+// shouldLeaseWrap decides whether this spawn wraps the coord in the
+// `fleet coord-run` lease supervisor (DESIGN-handoff-drain-storm-leak
+// PR2). ALL must hold: failover on; this is a coord spawn; and it is NOT
+// a handoff/drain successor. A successor (hasOldRecord) is spawned while
+// the outgoing coord still holds the lease, so wrapping it would make it
+// stand down and never start — lease-transfer handoff is PR3 (codex PR2
+// iter-7 [P1]).
+func shouldLeaseWrap(failoverOn, isCoord, hasOldRecord bool) bool {
+	return failoverOn && isCoord && !hasOldRecord
+}
+
 // coordRunWrap builds the lease-failover exec argv: the engine argv
 // supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2).
 // Pure + does not mutate argv. The persisted rec.Command stays clean;
@@ -887,25 +898,32 @@ func Spawn(opts Options) (*agent.Record, error) {
 	}
 
 	// Lease-failover supervisor wrap (DESIGN-handoff-drain-storm-leak
-	// PR2). Applied HERE — not at the dispatch call site — so EVERY
-	// coord spawn gets it: fresh `fleet dispatch --coord-spawn`, AND the
-	// handoff / drain replacements that bypass dispatch by passing
-	// oldRec.Command (codex PR2 iter-1 [P1] — otherwise the lease
-	// guarantee evaporates after the first handoff). Wrapping the
-	// EXECUTION argv only (rc-rewrite preserved as the tail) keeps the
-	// persisted rec.Command clean so the NEXT handoff re-wraps from the
-	// clean argv rather than nesting coord-run inside coord-run.
+	// PR2). Applied HERE — not at the dispatch call site — so the wrap
+	// covers the fresh `fleet dispatch --coord-spawn` path regardless of
+	// caller. Wrapping the EXECUTION argv only (rc-rewrite preserved as
+	// the tail) keeps the persisted rec.Command clean.
 	//
 	//	execArgv = ["<fleetBin>","coord-run","--agent",<id>,
 	//	            "--project",<p>,"--", <prev execArgv ...>]
-	// leaseWrapped tracks whether THIS spawn launches a coord-run
-	// supervisor — either because we wrap it here, OR because the caller
-	// already handed us a coord-run-wrapped ExecCommand (codex PR2 iter-6
-	// [P2]: an already-wrapped argv still runs a supervisor, so it needs
-	// the same pre-launch record + stand-down lifecycle handling below,
-	// not a bypass).
+	//
+	// FRESH COORDS ONLY (opts.OldRecord == nil) — codex PR2 iter-7 [P1].
+	// A handoff/drain SUCCESSOR (OldRecord != nil) is spawned while the
+	// OUTGOING coord is STILL ALIVE and holding the lease; if we wrapped
+	// the successor it would AcquireLease, see the healthy outgoing
+	// leader, STAND DOWN, and never start — so the handoff could never
+	// produce a replacement. Lease-transfer handoff (the outgoing coord
+	// releases, a warm `--standby` successor POLLS until it acquires) is
+	// PR3's job. Until PR3, a successor spawns UNWRAPPED (no lease); the
+	// dispatch veto + coord-spawn.lock remain the singleton guard for the
+	// successor, and FLEET_LEASE_FAILOVER stays OFF/unsupported (see
+	// internal/coordlock/lease.go) until that transfer path lands.
+	//
+	// leaseWrapped also stays true for an already-coord-run-wrapped
+	// ExecCommand (codex iter-6 [P2]) so the pre-launch record +
+	// stand-down lifecycle handling below still applies — but only on the
+	// fresh path; a handoff successor is never wrapped here.
 	leaseWrapped := false
-	if leaseFailoverEnabled() && isCoordSpawn(rec.TaskID, rec.Project) {
+	if shouldLeaseWrap(leaseFailoverEnabled(), isCoordSpawn(rec.TaskID, rec.Project), opts.OldRecord != nil) {
 		switch {
 		case alreadyCoordRunWrapped(execArgv):
 			leaseWrapped = true // a supervisor will run; apply lifecycle handling
