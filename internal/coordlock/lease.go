@@ -724,8 +724,14 @@ func (l *Lease) Release() {
 	// it (surface-don't-silo) rather than silently leaving a stale-active
 	// record; the TTL is then the fallback bound.
 	if l.flock != nil {
-		demoted := false
-		for attempt := 0; attempt < 5 && !demoted; attempt++ {
+		// guaranteed is true ONLY when no stale-active record of OURS
+		// remains — either we demoted it, or it was already not ours (a
+		// successor took over). A real read/write fault or exhausted retries
+		// leave the guarantee UNMET and must surface (surface-don't-silo).
+		guaranteed := false
+		var lastErr error
+	demoteLoop:
+		for attempt := 0; attempt < 5; attempt++ {
 			ok, err := l.withEpochLock(func() (bool, error) {
 				cur, rerr := readEpoch(l.paths.epoch)
 				if rerr != nil {
@@ -739,23 +745,28 @@ func (l *Lease) Release() {
 			})
 			switch {
 			case errors.Is(err, errSerializerBusy):
+				lastErr = err
 				continue // transient -> retry
 			case err != nil:
-				demoted = true // a real read/write fault: stop retrying, surface below
+				// A real read/write fault (perms, disk, corrupt epoch). The
+				// record MAY still be active -> guarantee unmet; stop
+				// retrying (a fault won't fix itself) and surface below.
+				lastErr = err
+				break demoteLoop
 			default:
-				// ok==true: demoted. ok==false: record already not ours
-				// (a successor took over) — both mean no stale-active record
-				// of OURS remains, so the token-invalidation guarantee holds.
-				demoted = true
+				// ok==true: we demoted it. ok==false: already not ours.
+				// Either way no stale-active record of OURS remains.
+				guaranteed = true
 				_ = ok
+				break demoteLoop
 			}
 		}
-		if !demoted {
+		if !guaranteed {
 			fmt.Fprintf(os.Stderr,
 				"coordlock: WARNING: could not demote released lease for project %q "+
-					"(epoch.lock contended); outstanding tokens stay valid until TTL (~%s). "+
+					"(%v); outstanding tokens may stay valid until TTL (~%s). "+
 					"agent=%s epoch=%d\n",
-				l.self.Project, l.cfg.ttl, l.self.AgentID, l.epoch)
+				l.self.Project, lastErr, l.cfg.ttl, l.self.AgentID, l.epoch)
 		}
 	}
 	if l.flock != nil {

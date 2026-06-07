@@ -4,6 +4,7 @@ package coordlock
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1671,5 +1672,45 @@ func TestReleaseDemoteRetriesPastSerializerContention(t *testing.T) {
 	}
 	if tok.StillOwned() {
 		t.Fatal("token must be invalid after a (retried) Release demote")
+	}
+}
+
+// ---- codex iter-16 [P2]: surface release demotion failure on a real fault ----
+
+// A real read/write fault during Release's demote (e.g. a corrupted epoch
+// file) must SURFACE a warning — not silently set "demoted" and skip it,
+// which would leave a possibly-active record + a still-valid token with no
+// operator-visible signal.
+func TestReleaseSurfacesDemoteFaultOnCorruptEpoch(t *testing.T) {
+	setupHome(t)
+	t.Setenv(FailoverEnvVar, "1")
+	const project = "rainier"
+
+	lease, acquired, err := acquireLease(project, "me", defaultLeaseConfig())
+	if err != nil || !acquired {
+		t.Fatalf("acquire: acquired=%v err=%v", acquired, err)
+	}
+	paths, _ := resolvePaths(project)
+
+	// Corrupt the epoch file so readEpoch fails with a real (non-NotExist)
+	// unmarshal error during the demote.
+	if werr := os.WriteFile(paths.epoch, []byte("{not valid json"), 0o644); werr != nil {
+		t.Fatalf("corrupt epoch: %v", werr)
+	}
+
+	// Capture os.Stderr around Release.
+	origStderr := os.Stderr
+	r, w, perr := os.Pipe()
+	if perr != nil {
+		t.Fatalf("pipe: %v", perr)
+	}
+	os.Stderr = w
+	lease.Release()
+	_ = w.Close()
+	os.Stderr = origStderr
+	out, _ := io.ReadAll(r)
+
+	if !contains(string(out), "could not demote released lease") {
+		t.Fatalf("Release must surface a warning on a real demote fault; stderr was:\n%s", out)
 	}
 }
