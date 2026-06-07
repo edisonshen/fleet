@@ -117,11 +117,43 @@ func TestDrainLease_LiveLeaderPendingHandoff_FallsBackToResume(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-6 [P2]: after a graceful standby already acquired the lease,
+// CurrentEpoch returns the SUCCESSOR's new epoch (so the current-epoch barrier
+// check misses OLD's barrier) and OLD's record may not be archived yet. The
+// live-leader fallback must NOT run legacy Resume (which would spawn a SECOND
+// replacement) — it must detect that the active owner != OLD and clean the
+// stale queue.
+func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
+	var resumed int32
+	out := &bytes.Buffer{}
+	d := drainLeaseDeps{
+		LeaderPresent:  func(string) bool { return true },                                 // the SUCCESSOR is healthy
+		CurrentEpoch:   func(string) (int64, bool) { return 6, true },                     // successor's new epoch
+		BarrierExists:  func(string, int64) bool { return false },                         // no barrier at epoch 6 (OLD's was epoch 5)
+		ActiveOwnerPID: func(string) (int, bool) { return 555555, true },                  // successor pid != OLD's 424242
+		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil }, // OLD not yet archived
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
+		},
+		LockAgent: func(string) (func(), error) { return func() {}, nil },
+	}
+	if err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 1000, out, out, d); err != nil {
+		t.Fatalf("successor-already-leads path returned %v, want nil", err)
+	}
+	if atomic.LoadInt32(&resumed) != 0 {
+		t.Errorf("legacy Resume ran %d times — spawned a DUPLICATE for an already-completed handoff", resumed)
+	}
+	if !strings.Contains(out.String(), "successor already leads") {
+		t.Errorf("expected successor-already-leads message, got: %q", out.String())
+	}
+}
+
 // T25: no barrier present and the leader is unresponsive (deadline passes) —
 // drain does NOT graceful-kill OLD before the barrier; it escalates instead.
 // Combined with T41 here: the escalation calls TakeOver.
 func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
-	var killed, tookOver int32
+	var killed, tookOver, resumed int32
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return false }, // hung/stealable
@@ -131,6 +163,11 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 		TakeOver: func(string, string) (bool, error) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
+		},
+		LockAgent: func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
 		},
 		BarrierPoll: time.Millisecond,
 	}
@@ -146,13 +183,18 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	if atomic.LoadInt32(&tookOver) != 1 {
 		t.Errorf("TakeOver escalation ran %d times, want 1", tookOver)
 	}
+	// codex PR3 iter-6 [P1]: a successor must be cold-spawned after the
+	// takeover so the project is not left coordless.
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("successor cold-spawn (Resume) ran %d times after takeover, want 1", resumed)
+	}
 }
 
-// T41: a HUNG OLD (no barrier, deadline passes) escalates to TakeOver and
-// never blocks. (Same escalation as T25; this asserts the typed signal +
-// that the drain returned rather than hanging.)
+// T41: a HUNG OLD (no barrier, deadline passes) escalates to TakeOver, then
+// cold-spawns a successor, and never blocks.
 func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	var tookOverProject string
+	var resumed int32
 	out := &bytes.Buffer{}
 	done := make(chan error, 1)
 	d := drainLeaseDeps{
@@ -162,6 +204,11 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 		TakeOver: func(project, _ string) (bool, error) {
 			tookOverProject = project
 			return false, nil // OLD fenced; flock not acquired by the drain
+		},
+		LockAgent: func(string) (func(), error) { return func() {}, nil },
+		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
+			atomic.AddInt32(&resumed, 1)
+			return nil
 		},
 		BarrierPoll: time.Millisecond,
 	}
@@ -178,6 +225,9 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	}
 	if tookOverProject != "projects-fleet" {
 		t.Errorf("TakeOver called for project %q, want projects-fleet", tookOverProject)
+	}
+	if atomic.LoadInt32(&resumed) != 1 {
+		t.Errorf("successor cold-spawn ran %d times after takeover, want 1 (no coordless project)", resumed)
 	}
 }
 

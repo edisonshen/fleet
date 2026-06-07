@@ -233,7 +233,7 @@ func drainOneLeaseAwareWith(req queue.SpawnFresh, path string, graceMillis, resu
 		// barrier soon) OR HUNG before the barrier (the incident). Wait
 		// BOUNDED for the barrier; if it appears -> graceful finish; if the
 		// deadline passes -> ESCALATE to the safety-net takeover (never block).
-		return drainWaitBarrierOrEscalate(req, path, deadline, stdout, stderr, d)
+		return drainWaitBarrierOrEscalate(req, path, deadline, graceMillis, resumeTimeoutMillis, stdout, stderr, d)
 	}
 }
 
@@ -339,12 +339,13 @@ func drainReapOld(oldRec *agent.Record, req queue.SpawnFresh, path string, epoch
 }
 
 // drainWaitBarrierOrEscalate polls (bounded) for the barrier. On the barrier
-// appearing -> graceful kill. On the deadline -> escalate to the safety-net
-// takeover and return ErrEscalatedToTakeOver. NEVER blocks past the deadline;
-// NEVER holds a lock. T25 (no graceful kill before barrier) + T41 (escalate
-// on a hung OLD).
+// appearing -> graceful finish. On the deadline -> escalate to the safety-net
+// takeover (fence -> kill the hung OLD), THEN cold-spawn a successor so the
+// project is not left coordless (codex PR3 iter-6 [P1]). NEVER blocks past the
+// deadline; NEVER holds a lock across the kill. T25 (no graceful kill before
+// barrier) + T41 (escalate on a hung OLD).
 func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time.Time,
-	stdout, stderr io.Writer, d drainLeaseDeps) error {
+	graceMillis, resumeTimeoutMillis int, stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
 	for {
@@ -367,19 +368,30 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	}
 
 	// Deadline passed with no barrier — OLD is slow or HUNG before the
-	// barrier. ESCALATE to the safety-net takeover (fence -> kill -> acquire),
-	// which never blocks and holds no lock across slow work. The queue file is
-	// left in place: after the takeover fences/kills OLD, a standby/successor
-	// leads and a later drain (now seeing a healthy leader / completed state)
-	// resolves the queue.
+	// barrier, and no graceful standby was ever spawned (no producer ran). The
+	// takeover (fence -> kill -> [drain releases]) reaps the hung OLD but does
+	// NOT itself bring up a replacement, so we must cold-spawn the successor
+	// after it — otherwise the project is left coordless after the kill
+	// (codex PR3 iter-6 [P1]).
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: handoff for %s did not reach the barrier within the budget; escalating to safety-net takeover\n",
 		project)
 	if _, err := d.TakeOver(project, req.OldAgentID); err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
 	}
-	// Signal (not a hard error): we escalated cleanly. The drain did not
-	// block and held no lock; the takeover handles recovery.
+	// The hung OLD is fenced + killed; the lease is now stealable. Cold-spawn
+	// the successor so the project has a coord again. coldResume runs Resume
+	// under a short per-agent lock (no lock across the prior kill).
+	_, _ = fmt.Fprintf(stderr,
+		"fleet drain: takeover fenced/killed the hung coord for %s; cold-spawning a successor\n", project)
+	if err := coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d); err != nil {
+		// Surface the spawn failure but keep the escalation signal semantics:
+		// the takeover succeeded (OLD reaped), the successor spawn is what
+		// failed — a later drain retries the now-stealable lease.
+		return fmt.Errorf("fleet drain: takeover for %s succeeded but cold-spawn failed: %w", project, err)
+	}
+	// Successor spawned after a clean takeover. Not a failure — count as
+	// processed (the queue was consumed by coldResume).
 	return ErrEscalatedToTakeOver
 }
 
@@ -393,7 +405,7 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, resumeTimeoutMillis int,
 	stdout, stderr io.Writer, d drainLeaseDeps) error {
 
-	_, err := d.LoadAgent(req.OldAgentID)
+	oldRec, err := d.LoadAgent(req.OldAgentID)
 	if errors.Is(err, state.ErrNotFound) {
 		// OLD already archived -> handoff already completed; stale queue.
 		_, _ = fmt.Fprintf(stdout,
@@ -401,7 +413,22 @@ func drainLiveLeaderFallback(req queue.SpawnFresh, path string, graceMillis, res
 			req.Project, req.OldAgentID)
 		return queue.Delete(path)
 	}
-	// OLD still present (or load error) -> complete the handoff the proven
+	// A SUCCESSOR already leads (codex PR3 iter-6 [P2]): if the current active
+	// lease owner is NOT OLD's supervisor, a graceful standby has already
+	// acquired the lease (the barrier was written at OLD's now-superseded
+	// epoch, so the current-epoch barrier check above missed it). OLD's record
+	// just hasn't been archived yet. The handoff IS complete — clean the
+	// stale queue, do NOT run legacy Resume (which would spawn a SECOND
+	// replacement for an already-done handoff).
+	if err == nil && oldRec != nil && oldRec.SupervisorPID > 0 {
+		if ownerPid, ok := d.ActiveOwnerPID(req.Project); ok && ownerPid != oldRec.SupervisorPID {
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: a successor already leads %s (active owner pid %d != old %d); handoff complete, cleaning queue\n",
+				req.Project, ownerPid, oldRec.SupervisorPID)
+			return queue.Delete(path)
+		}
+	}
+	// OLD still present and still the leader -> complete the handoff the proven
 	// way. Delegate to the LEGACY drain (LockAgent + handoffop.Resume), which
 	// is byte-identical to the flag-off path: it spawns + retires the
 	// successor exactly as production does today. The successor is therefore
