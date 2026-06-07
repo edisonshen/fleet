@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -246,6 +247,57 @@ func TestReconcile_LiveTestSock_KillFailureReported(t *testing.T) {
 	}
 	if !strings.Contains(a.Reason, "kill exploded") {
 		t.Errorf("kill error not surfaced in reason: %q", a.Reason)
+	}
+}
+
+// firstFleetSession must reject a path that is NOT a real Unix socket —
+// a regular file or a symlink in world-writable /tmp could otherwise be
+// followed into the operator's default tmux server and killed under
+// --apply --aggressive (codex iter-2 [P2] symlink guard).
+func TestFirstFleetSession_RejectsNonSocket(t *testing.T) {
+	dir := t.TempDir()
+
+	// Regular file named like a test sock — not a socket → reject.
+	regular := filepath.Join(dir, "fleet-test-regular.sock")
+	if err := os.WriteFile(regular, []byte("not a socket"), 0o600); err != nil {
+		t.Fatalf("write regular file: %v", err)
+	}
+	if _, ok := firstFleetSession(regular); ok {
+		t.Error("firstFleetSession accepted a regular file; symlink/non-socket guard bypassed")
+	}
+
+	// Symlink named like a test sock, pointing anywhere → reject without
+	// dereferencing (the target could be the operator's default server).
+	link := filepath.Join(dir, "fleet-test-link.sock")
+	if err := os.Symlink("/tmp/some-other-tmux.sock", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if _, ok := firstFleetSession(link); ok {
+		t.Error("firstFleetSession followed a symlink; could kill the operator's default server")
+	}
+
+	// Missing path → reject (no panic).
+	if _, ok := firstFleetSession(filepath.Join(dir, "absent.sock")); ok {
+		t.Error("firstFleetSession accepted a missing path")
+	}
+}
+
+// killTmuxServerOnDisk must be a no-op (and never remove the path) when
+// handed a non-socket — defense-in-depth for the symlink guard so a path
+// that became a symlink between enumeration and apply is not kill-server'd
+// or unlinked (codex iter-2 [P2]).
+func TestKillTmuxServerOnDisk_NonSocketNoOp(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "fleet-test-link.sock")
+	if err := os.Symlink("/tmp/some-other-tmux.sock", link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := killTmuxServerOnDisk(link); err != nil {
+		t.Errorf("killTmuxServerOnDisk on a symlink returned err %v; want nil no-op", err)
+	}
+	// The symlink itself must NOT be removed (we never touch non-sockets).
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("killTmuxServerOnDisk removed the symlink; want it left intact: %v", err)
 	}
 }
 

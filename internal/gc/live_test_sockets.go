@@ -180,8 +180,24 @@ func listLiveTestSocketsOnDisk() ([]LiveTestSocket, error) {
 // server bound to sock, and ok=false when no server / no fleet session
 // responds. Uses `tmux -S <sock> ls` directly (NOT tmux.ListSessions,
 // which targets FLEET_TMUX_SOCKET / the default server).
+//
+// SYMLINK GUARD (codex iter-2 [P2]): /tmp is world-writable, so a stale
+// or hostile symlink named fleet-test-*.sock could point at the
+// operator's DEFAULT tmux socket. Following it with `tmux -S` then
+// kill-server would terminate the operator's real server if it happens
+// to host a fleet-<id> session. Require the path to be an actual Unix
+// domain socket (os.ModeSocket) via Lstat (no symlink deref) before
+// probing — a regular file, dir, or symlink is rejected outright.
 func firstFleetSession(sock string) (string, bool) {
-	if _, err := os.Stat(sock); err != nil {
+	fi, err := os.Lstat(sock)
+	if err != nil {
+		return "", false
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		// Not a real socket (regular file / dir / symlink). A genuine tmux
+		// server socket is a Unix domain socket; anything else in the
+		// fleet-test-*.sock namespace is debris or an attack and must never
+		// be probed-then-killed.
 		return "", false
 	}
 	out, err := exec.Command("tmux", "-S", sock, "ls", "-F", "#{session_name}").Output()
@@ -243,16 +259,24 @@ const ownerProbeFailedPID = -1
 
 // anyGoTestRunning reports whether at least one `go test` / test-binary
 // process is alive on the host. It probes pgrep for the canonical test
-// process shapes:
+// process shapes (the needles are EREs — pgrep -f treats the pattern as
+// a regular expression, so dots etc. must be escaped/anchored, codex
+// iter-2 [P2]):
 //
-//   - "go test"  — the driver while compiling + running a package's tests
-//   - "/.test"   — a compiled `pkg.test` binary (go builds these to a temp
-//     dir and execs them; their argv[0] ends in ".test")
-//   - "compile"/"link"/"vet" toolchain processes are NOT matched: they run
-//     for plain `go build` too, so matching them would spare
-//     sockets during unrelated builds. The two shapes above
-//     bracket the entire window in which a fleet-test socket
-//     can legitimately be owned.
+//   - `go test`  — the driver while compiling + running a package's tests.
+//     The space makes it specific; no metachars to escape.
+//   - `\.test([ /]|$)` — a compiled `pkg.test` binary. go builds these to a
+//     temp dir and execs them as `/tmp/go-build.../pkg.test -test.*`, so
+//     the argv carries a path component ending in `.test` followed by a
+//     space (flags), a slash, or end-of-string. The `\.` escape + the
+//     trailing boundary class prevent the old bare `.test` ERE from
+//     matching unrelated argv like `pytest`, `latest`, or `contest`
+//     (which would pin anyGoTestRunning()==true forever and silently
+//     defeat the reaper on any host running pytest).
+//   - `compile`/`link`/`vet` toolchain processes are NOT matched: they run
+//     for plain `go build` too, so matching them would spare sockets
+//     during unrelated builds. The two shapes above bracket the entire
+//     window in which a fleet-test socket can legitimately be owned.
 //
 // Fail-safe defaults:
 //   - pgrep exit 1 ("no match") for a needle → that needle found nothing.
@@ -260,9 +284,9 @@ const ownerProbeFailedPID = -1
 //     without pgrep cannot prove quiescence, so we never reap there.
 //   - any other pgrep error → return true (spare).
 func anyGoTestRunning() bool {
-	// pgrep -f matches against the full argv. "-x" is NOT used because the
-	// argv carries package paths / flags after the needle.
-	needles := []string{"go test", ".test"}
+	// pgrep -f matches the ERE against the full argv. "-x" is NOT used
+	// because the argv carries package paths / flags after the needle.
+	needles := []string{"go test", `\.test([ /]|$)`}
 	for _, needle := range needles {
 		out, err := exec.Command("pgrep", "-f", needle).Output()
 		if err != nil {
@@ -288,6 +312,15 @@ func anyGoTestRunning() bool {
 // dangling .sock. Idempotent: a kill against an already-dead server
 // exits non-zero, which we tolerate as "already gone".
 func killTmuxServerOnDisk(sock string) error {
+	// Defense-in-depth symlink guard (codex iter-2 [P2]): firstFleetSession
+	// already rejected non-sockets at enumeration, but this kill seam is a
+	// standalone DefaultDeps hook that both signals kill-server AND removes
+	// the path. Re-verify it is a real Unix socket (no symlink deref) so a
+	// path that turned into a symlink-to-default-server between enumeration
+	// and apply can never get kill-server'd. A non-socket → no-op success.
+	if fi, err := os.Lstat(sock); err != nil || fi.Mode()&os.ModeSocket == 0 {
+		return nil
+	}
 	// Confirm a server is actually bound before signaling — mirrors
 	// tmux.Kill's pre-probe so a dead-already socket isn't reported as a
 	// kill failure.
