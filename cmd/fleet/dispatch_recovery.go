@@ -379,7 +379,17 @@ func coordPendingClaimFresh(project string, budget time.Duration) (bool, coordPe
 	if c.SpawnedAt.IsZero() {
 		return false, coordPendingClaim{}
 	}
-	if time.Since(c.SpawnedAt) > budget {
+	age := time.Since(c.SpawnedAt)
+	// A future-dated claim (age < 0) means the wall clock moved backward
+	// after the claim was written, or the file carries a bogus future
+	// spawned_at (codex iter-9 P2). Without this guard time.Since stays
+	// negative — and thus < budget — until that future instant plus the
+	// budget elapses, so the claim reads "fresh" and vetoes EVERY
+	// --coord-spawn for that whole interval even though no coord is in
+	// flight, wedging recovery. The claim's contract is fail-OPEN (never
+	// block recovery on a bad claim), so treat any non-positive age as
+	// stale: the next dispatch overwrites it with a sane timestamp.
+	if age < 0 || age > budget {
 		return false, coordPendingClaim{}
 	}
 	return true, c

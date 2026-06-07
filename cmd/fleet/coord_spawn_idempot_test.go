@@ -119,6 +119,20 @@ func TestCoordPendingClaim_CorruptIsNotFresh(t *testing.T) {
 	}
 }
 
+// A future-dated claim (clock moved backward, or bogus future spawned_at)
+// must read as NOT fresh — otherwise time.Since stays negative and the
+// claim vetoes every spawn until the future instant + budget, wedging
+// recovery (codex iter-9 P2). Fail-open: treat non-positive age as stale.
+func TestCoordPendingClaim_FutureDatedIsNotFresh(t *testing.T) {
+	pdir := newPendingClaimHome(t, "projects-fleet")
+	writeClaimAt(t, pdir, "agent-future", time.Now().UTC().Add(10*time.Minute))
+
+	fresh, _ := coordPendingClaimFresh("projects-fleet", 5*time.Minute)
+	if fresh {
+		t.Fatalf("a future-dated claim must NOT be fresh (would wedge recovery)")
+	}
+}
+
 // clearCoordPendingClaim removes the claim file (the coord's first tick
 // calls the Python equivalent). Removing an absent claim is a no-op.
 func TestCoordPendingClaim_Clear(t *testing.T) {
