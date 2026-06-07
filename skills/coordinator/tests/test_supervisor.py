@@ -2909,3 +2909,60 @@ def test_effective_floor_jitter_bounded() -> None:
     for seed in range(20):
         f = supervisor._pr_watch_effective_floor_s(60.0, random.Random(seed))
         assert 60.0 <= f < 65.0
+
+
+def test_floor_uses_pr_watch_only_pass_not_full_reconcile(fleet_home: Path) -> None:
+    """codex P2: a floor-only fire (no periodic due) must invoke the
+    PR-watch-ONLY pass (pr_watch_floor_pass), NOT periodic_full_reconcile —
+    so the tight ~60 s floor cadence doesn't drag the legacy in-flight/CI
+    sweep down to ~1 min."""
+    a_path = (
+        fleet_home / "projects" / "fleet" / "workers" / "alpha-aaaa" / "state.json"
+    )
+    _write_state_json(a_path, phase="tdd-red", updated_at="2026-01-01T00:00:00Z")
+    probe = supervisor.WorkerProbe(
+        slug="alpha-aaaa", state_path=a_path, agent_id="aaaaaaaa",
+        tmux_session="fleet-aaaaaaaa", live_worker=True,
+    )
+    periodic_calls = {"n": 0}
+    floor_calls = {"n": 0}
+
+    def fake_periodic():
+        periodic_calls["n"] += 1
+        return None
+
+    def fake_floor_pass():
+        floor_calls["n"] += 1
+        return None
+
+    seq = iter([[probe]] * 40 + [[]])
+
+    def fake_refresh():
+        try:
+            return next(seq)
+        except StopIteration:
+            return []
+
+    now = {"t": 0.0}
+
+    def fake_sleep(s):
+        now["t"] += s
+
+    res = supervisor.run_supervisor(
+        cfg=_cfg(poll_interval_s=10, stuck_check_every=1000,
+                 pr_watch_poll_floor_s=60),
+        project="fleet", home=fleet_home, fleet_bin="fleet",
+        sleep_fn=fake_sleep, now_fn=lambda: now["t"],
+        refresh_probes=fake_refresh,
+        reconcile_one=lambda p: None,
+        write_state=lambda: None,
+        periodic_full_reconcile=fake_periodic,
+        pr_watch_floor_due=lambda: True,
+        pr_watch_floor_pass=fake_floor_pass,
+        rng=__import__("random").Random(0),
+        log_stream=io.StringIO(),
+    )
+    assert res.pr_watch_floor_passes >= 1
+    # floor fired the PR-watch-ONLY pass, NOT the full periodic reconcile.
+    assert floor_calls["n"] >= 1
+    assert periodic_calls["n"] == 0, "floor must not run the full legacy reconcile"

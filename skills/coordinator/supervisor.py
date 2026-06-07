@@ -1211,6 +1211,7 @@ def run_supervisor(
     force_tick_dispatch: Callable[[], None] | None = None,
     reaper_hook: Callable[[list[WorkerProbe]], list[str] | None] | None = None,
     pr_watch_floor_due: Callable[[], bool] | None = None,
+    pr_watch_floor_pass: Callable[[], bool | None] | None = None,
     coord_id: str = "",
     direct_inbox_session_baseline: float | None = None,
     log_stream=None,
@@ -1648,8 +1649,18 @@ def run_supervisor(
                             floor_s, rng,
                         )
                     res.pr_watch_floor_passes += 1 if run_pr_watch_floor else 0
+                    # Choose the pass: a PERIODIC fire runs the FULL reconcile
+                    # (legacy in-flight/CI sweep + PR-watch). A floor-ONLY fire
+                    # (no periodic due) runs the PR-watch-ONLY pass so the tight
+                    # ~60 s cadence doesn't drag the expensive legacy sweep down
+                    # to ~1 min (codex P2). When periodic is also due, the full
+                    # reconcile subsumes the PR-watch pass — don't run both.
+                    if run_periodic or pr_watch_floor_pass is None:
+                        _pass = periodic_full_reconcile
+                    else:
+                        _pass = pr_watch_floor_pass
                     try:
-                        periodic_dispatched = periodic_full_reconcile()
+                        periodic_dispatched = bool(_pass()) if _pass else False
                     except BrokenPipeError:
                         # loop-supervisor-sigpipe-5263: never let the
                         # fail-soft `except Exception` swallow a broken

@@ -1502,25 +1502,27 @@ def _run_supervisor(
         # Durable PR-watch on the SUPERVISOR's cadence (codex iter-16 [P1]):
         # the supervisor holds the coord lock for the whole session (up to
         # 4h), so external ticks return lock-busy and _tick_locked's one-shot
-        # PR-watch never re-runs. Without this, a PR that merges / goes stale
-        # / gets changes-requested while the supervisor parks on in-review
-        # work goes untracked + un-auto-fixed until the supervisor exits. We
-        # re-read tasks.md AFTER the legacy reconcile above (it may have just
-        # cleared a red PR's pr_url) and run the SAME reconcile the primary
-        # tick runs. Fail-soft.
+        # PR-watch never re-runs. Enroll from the PRE-clear `f3.tasks` (the
+        # legacy reconcile above may have just cleared a red PR's pr_url) so a
+        # mid-session PR still gets a durable watch (codex iter-23 [P1]).
+        return _pr_watch_supervisor_pass(enroll_tasks=f3.tasks)
+
+    def _pr_watch_supervisor_pass(*, enroll_tasks=None) -> bool:
+        """Run ONLY the durable PR-watch reconcile (NOT the legacy
+        _reconcile_slugs sweep). Shared by periodic_full_reconcile and the
+        ~60 s poll floor (DESIGN-pr-watch-autoremediate §1) so the floor does
+        NOT drag the expensive legacy in-flight/CI sweep down to ~1 min
+        cadence (codex P2) — the floor is a PR-watch-only heartbeat. Returns
+        True iff it STAGED a DISPATCH block or RAISED an actionable event, so
+        the supervisor exits + flushes promptly. Fail-soft."""
         n_blocks_before = len(result.dispatch_instructions)
         n_raised_before = result.raised
         try:
             f_pw = parse.read(str(tasks_path))
-            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]).
-            # PR-watch's budgets (probe backoff, launch grace, unverified
-            # stale reclaim) all age by tick_count. During a long supervisor
-            # session external ticks are lock-busy, so a snapshot read of
-            # coord-state would keep passing the SAME tick_count and those
-            # timers would never reach threshold until the supervisor exits.
-            # Bump + persist the counter each periodic pass so the timers
-            # advance monotonically (the supervisor runs this on the
-            # stuck-check cadence — a real elapsed-time proxy).
+            # ADVANCE tick_count for this PR-watch pass (codex iter-27 [P2]) so
+            # PR-watch's tick-budget timers (probe backoff, launch grace,
+            # unverified stale reclaim) advance monotonically during a long
+            # supervisor session where external ticks are lock-busy.
             cs_pw = _load_coord_state(state_path)
             _bump_tick_counter(cs_pw)
             _save_coord_state(state_path, cs_pw)
@@ -1528,29 +1530,22 @@ def _run_supervisor(
                 f_pw.tasks, project=project, project_dir=project_dir,
                 cwd=cwd, fleet_bin=fleet_bin,
                 state=cs_pw, result=result, home=home,
-                # PRE-reconcile snapshot for ENROLLMENT (codex iter-23 [P1]):
-                # the legacy _reconcile_slugs above may have just cleared a
-                # newly-opened PR's pr_url (CI-red/not-mergeable). Mirroring
-                # the primary tick, enroll from the pre-clear `f3.tasks` so a
-                # PR opened mid-supervisor-session still gets a durable watch
-                # created (refresh/probe/auto-fix use the post-clear f_pw).
-                enroll_tasks=f3.tasks,
+                enroll_tasks=enroll_tasks if enroll_tasks is not None else f_pw.tasks,
             )
         except Exception as exc:  # noqa: BLE001 — PR-watch must never wedge the supervisor
             result.errors.append(f"supervisor pr-watch reconcile: {exc}")
-        # Signal the supervisor to exit + flush if PR-watch staged a DISPATCH
-        # block (codex iter-17 [P1]) OR raised an operator-actionable event
-        # (codex iter-28 [P2]: closed-unmerged / orphan / blocked / ambiguous
-        # rebase). Both must reach the coord promptly — a staged block's lease
-        # is running with no Agent launched, and a raise is the alert PR-watch
-        # exists to surface; holding either until the session ends defeats the
-        # feature. main() prints result.dispatch_instructions + result.errors
-        # the moment tick() returns.
-        pr_watch_dispatched = (
+        return (
             len(result.dispatch_instructions) > n_blocks_before
             or result.raised > n_raised_before
         )
-        return pr_watch_dispatched
+
+    def pr_watch_floor_pass() -> bool:
+        # The ~60 s poll-floor pass (DESIGN-pr-watch-autoremediate §1): a
+        # PR-watch-ONLY reconcile, NOT periodic_full_reconcile's legacy sweep,
+        # so the tight floor cadence doesn't multiply the legacy in-flight/CI
+        # reconcile work (codex P2). Returns True to make the supervisor exit +
+        # flush when it staged a dispatch / raised.
+        return _pr_watch_supervisor_pass()
 
     def write_state_hook():
         # Heartbeat publish. Re-load → no-op-write so any concurrent
@@ -1993,6 +1988,7 @@ def _run_supervisor(
         force_tick_dispatch=force_tick_dispatch_hook,
         reaper_hook=reaper_hook_supervisor,
         pr_watch_floor_due=pr_watch_floor_due_hook,
+        pr_watch_floor_pass=pr_watch_floor_pass,
         coord_id=coord_id,
         # Codex iter-21 [P3]: share the single mtime baseline that
         # force_tick_check_hook closed over (force_tick_baseline["mtime"])

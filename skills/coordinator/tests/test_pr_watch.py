@@ -3752,3 +3752,39 @@ def test_floor_reprobes_ready_watch_every_tick_e2e(
     with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
         loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
     assert len(prober.probe_calls) > n1, "floor must re-probe a READY watch every tick"
+
+
+def test_fix_key_includes_detail_new_review_not_suppressed(tmp_path: Path) -> None:
+    """codex P2: a CHANGES_REQUESTED fix that BLOCKED on one review must NOT
+    suppress a fix for a NEW review fingerprint on the same head — the fix
+    lease key includes the detail (review_sig), so a fresh wall gets its own
+    key and isn't latched by the prior blocked one."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    # review #1 fingerprint.
+    s1 = pw.PRSnapshot(number=195, pr_state="OPEN", merge_state_status="BLOCKED",
+                       review_decision="CHANGES_REQUESTED", checks="SUCCESS",
+                       head_ref_oid="H1", base_ref_name="main",
+                       review_sig="rev:CHANGES_REQUESTED:t1")
+    disp = _DispatchRecorder()
+    # tick 1: dispatch fix for review #1 (running).
+    _run2(tasks, tmp_path, FakeProber(snaps={195: s1}, fresh_base="B",
+          ancestors={("B", "H1")}), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    assert disp.calls[-1].kind == pw.ACTION_FIX
+    # tick 2: fix #1 BLOCKED (substantive ask) -> latched + raised once.
+    out2 = _run2(tasks, tmp_path, FakeProber(snaps={195: s1}, fresh_base="B",
+                 ancestors={("B", "H1")}), dispatch=disp,
+                 agent_outcome=lambda _a: "blocked", tick_count=2)
+    assert any("BLOCKED" in r for r in out2.raises)
+    n_after_block = len(disp.calls)
+    # tick 3: a NEW review (different fingerprint) on the SAME head -> new
+    # signature AND new fix key -> NOT suppressed by the old blocked latch.
+    s2 = pw.PRSnapshot(number=195, pr_state="OPEN", merge_state_status="BLOCKED",
+                       review_decision="CHANGES_REQUESTED", checks="SUCCESS",
+                       head_ref_oid="H1", base_ref_name="main",
+                       review_sig="rev:CHANGES_REQUESTED:t2")  # NEW fingerprint
+    out3 = _run2(tasks, tmp_path, FakeProber(snaps={195: s2}, fresh_base="B",
+                 ancestors={("B", "H1")}), dispatch=disp,
+                 agent_outcome=lambda _a: "gone", tick_count=3)
+    assert out3.dispatched == 1, "a new review fingerprint must not be suppressed"
+    assert len(disp.calls) == n_after_block + 1

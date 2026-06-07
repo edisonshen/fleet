@@ -292,17 +292,23 @@ def _succeeded_head(outcome: str) -> str | None:
     return None
 
 
-def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "") -> str:
+def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "",
+              detail_key: str = "") -> str:
     """Build the idempotency key for one action lease (§6).
 
     rebase: `rebase:<baseSHA>:<headSHA>` — one attempt per (base, head)
             pair, so a fresh base (an upstack merge moved origin/main) or
             a moved head re-enables a rebase, but the SAME pair never
             re-fires (the blocked latch is keyed on this).
-    fix:    `fix:<headSHA>:<event>` — keyed on the head + the failing
-            signal, so a NEW push (head change) re-enables a fix, and a
-            DIFFERENT event on the same head (CI-fail vs changes-requested)
-            is its own key.
+    fix:    `fix:<headSHA>:<event>:<detailKey>` — keyed on the head + the
+            failing signal + a STABLE detail (failing-check NAME set for CI,
+            review fingerprint for CHANGES_REQUESTED). A NEW push (head
+            change) re-enables a fix, a DIFFERENT event on the same head is
+            its own key, AND a NEW failing wall on the same head/event (a new
+            review fingerprint, a different failing-check set) is its OWN key
+            so a prior `blocked` latch on the OLD detail doesn't suppress the
+            fresh wall (codex P2). The head stays `parts[1]` so _lease_head /
+            _prune_dispatched_events are unaffected.
     """
     if kind == ACTION_REBASE:
         return f"{ACTION_REBASE}:{base_sha}:{head_sha}"
@@ -313,7 +319,7 @@ def lease_key(kind: str, event: str, *, head_sha: str, base_sha: str = "") -> st
         # pair (the rebase that conflicted into this re-derive used the
         # rebase key; the follow-on re-derive gets a distinct key).
         return f"{ACTION_REDERIVE}:{base_sha}:{head_sha}"
-    return f"{ACTION_FIX}:{head_sha}:{event}"
+    return f"{ACTION_FIX}:{head_sha}:{event}:{detail_key}"
 
 
 def _prune_dispatched_events(watch: dict, current_head: str) -> None:
@@ -2573,7 +2579,7 @@ def _dispatch_actions(
             # asks — keeping the "substantive -> raise-hand" guard in the
             # subagent where the review text is available.
             kind = ACTION_FIX
-            key_str = lease_key(kind, event, head_sha=head)
+            key_str = lease_key(kind, event, head_sha=head, detail_key=detail_key)
             action = ActionDispatch(
                 kind=kind, event=event, pr_number=pr_num,
                 pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
@@ -2584,7 +2590,7 @@ def _dispatch_actions(
             )
         else:  # EVENT_CI_FAILED
             kind = ACTION_FIX
-            key_str = lease_key(kind, event, head_sha=head)
+            key_str = lease_key(kind, event, head_sha=head, detail_key=detail_key)
             action = ActionDispatch(
                 kind=kind, event=event, pr_number=pr_num,
                 pr_url=w.get("pr_url", "") or "", branch=w.get("branch", "") or "",
