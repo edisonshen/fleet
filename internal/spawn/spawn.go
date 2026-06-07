@@ -1052,6 +1052,14 @@ func Spawn(opts Options) (*agent.Record, error) {
 		unlock, lkErr := state.LockAgent(id)
 		if lkErr != nil {
 			_ = tmux.Kill(session)
+			// Roll back the pre-launch record too (codex PR2 iter-12 [P2]):
+			// the lock failure means we can't finalize, so leaving the live
+			// pre-launch record would advertise a coord for the session we
+			// just killed. Best-effort, matching the other lease failure
+			// paths.
+			if livePath, perr := state.AgentPath(id); perr == nil {
+				_ = os.Remove(livePath)
+			}
 			return nil, fmt.Errorf("lock agent %s for final write (orphan tmux session killed): %w", id, lkErr)
 		}
 		onDisk, lerr := agent.Load(id)

@@ -230,6 +230,60 @@ func TestLeaderPresent(t *testing.T) {
 	}
 }
 
+// TestReleasedHolderBusyFlock_RetriesNotFenced (codex PR2 iter-12 [P2]):
+// a `released` epoch with the flock STILL briefly held (the old supervisor
+// is mid-Release/cleanup) must be RETRIED — the candidate acquires when
+// the flock frees — and must NOT STONITH the releasing supervisor.
+func TestReleasedHolderBusyFlock_RetriesNotFenced(t *testing.T) {
+	setupHome(t)
+	const project = "rel-busy"
+	clk := &fakeClock{}
+	live := newFakeLiveness()
+	cfg := testCfg(clk, live)
+
+	const oldPid = 4242
+	const oldStart = int64(424242)
+	live.set(oldPid, oldStart)
+
+	// Old holder demoted its record to `released` but still holds the flock.
+	writeEpochRaw(t, project, epochRecord{
+		Epoch: 9, State: stateReleased,
+		Owner:  identity{Pid: oldPid, PidStart: oldStart, AgentID: "old", Project: project},
+		BootID: "test-boot-1", RenewedAtMono: clk.now(),
+	})
+	releaseFlockHeld := holdFlock(t, project)
+
+	// killStub must NEVER fire — STONITH of a cleanly-releasing supervisor
+	// is exactly the bug.
+	var killed atomic.Bool
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
+
+	// Free the flock shortly after acquire starts (simulates Release()
+	// closing the fd mid-cleanup). retryFlock polls every ~20ms within its
+	// budget, so this is caught well inside the bound.
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		releaseFlockHeld()
+	}()
+
+	lease, acquired, err := acquireLease(project, "cand", cfg)
+	if err != nil {
+		t.Fatalf("acquireLease: %v", err)
+	}
+	if !acquired || lease == nil {
+		t.Fatalf("expected the candidate to acquire after the releaser drops the flock; acquired=%v", acquired)
+	}
+	defer lease.Release()
+	if killed.Load() {
+		t.Error("killStub fired — must NOT STONITH a cleanly-releasing supervisor")
+	}
+	// The candidate is now the active owner at the released epoch+1.
+	rec := readEpochFor(t, project)
+	if rec.State != stateActive {
+		t.Errorf("state = %q, want active after acquire", rec.State)
+	}
+}
+
 // ---- T1 ----
 
 // T1: NB acquire on a healthy heartbeating holder returns

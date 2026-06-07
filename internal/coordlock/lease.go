@@ -433,6 +433,40 @@ func (l *Lease) tryAcquireOnce() (done, acquired bool, err error) {
 			return true, false, nil // fresh in-progress takeover -> stand down
 		}
 	}
+	// CLEAN RELEASE in progress (codex PR2 iter-12 [P2]): the epoch reads
+	// `released` but the flock is STILL busy — the old supervisor demoted
+	// the record in Release() and is dropping the flock + running its
+	// coord.Cleanup (archive, tmux kill) right now. Do NOT takeOver/STONITH
+	// it: SIGTERMing a supervisor mid-cleanup would interrupt the exact
+	// archive/reap the design guarantees. Instead BOUNDED-RETRY the flock
+	// (the fd drops in milliseconds when Release() closes it; the kernel
+	// also frees it if the releaser then crashes). On success take the
+	// normal free-flock fast path (CAS to active conditioned on the
+	// released epoch). On budget exhaustion, fall through to takeOver — a
+	// `released` record whose holder never drops the flock is itself a hung
+	// holder.
+	if rec.State == stateReleased {
+		f2, got2, ferr := l.retryFlock()
+		if ferr != nil {
+			return false, false, ferr
+		}
+		if got2 {
+			l.stampFlockBody(f2)
+			ok, cerr := l.casToActiveAfterFlock(rec.Epoch)
+			if cerr != nil {
+				_ = releaseFlock(f2)
+				return false, false, cerr
+			}
+			if !ok {
+				_ = releaseFlock(f2)
+				return false, false, nil // epoch moved -> retry
+			}
+			l.flock = f2
+			return true, true, nil
+		}
+		// Releaser still holds the flock past the budget -> genuinely hung;
+		// fall through to takeOver below.
+	}
 	// Hung-but-alive holder (flock still held, renewed_at frozen > TTL), a
 	// stalled fencing record, or a fenced_not_acquired escalation. Run the
 	// takeover state machine; it returns the same done/acquired contract.

@@ -373,6 +373,38 @@ func TestKillCoord_P2_ExitsDuringGrace(t *testing.T) {
 	}
 }
 
+// codex PR2 iter-12 [P2]: when target.AgentID is set, the primitive
+// selects the record for THAT agent id (agreeing on the pid), NOT a STALE
+// same-project record that happens to carry the reused SupervisorPID
+// first in the list — otherwise the stale record's pid_start mismatch
+// would refuse a legitimate kill.
+func TestKillCoord_SelectsByAgentIDOverStalePidMatch(t *testing.T) {
+	const (
+		project = "proj-sel"
+		selfPid = 1000
+		pid     = 14000
+	)
+	// Stale record FIRST in the list: same project, same (reused)
+	// SupervisorPID, but a DIFFERENT pid_start (it's an old archived-ish
+	// dup) and a different agent id. The real target record is second.
+	recs := []*agent.Record{
+		coordRec("stale999", project, pid, 1111 /*stale start*/, "/usr/local/bin/fleet"),
+		coordRec("realtgt0", project, pid, 2222 /*real start*/, "/usr/local/bin/fleet"),
+	}
+	live := map[int]int64{selfPid: 111, pid: 2222 /*live == real target's start*/}
+	rec := &killRecorder{}
+	d := testKillDeps(rec, recs, live, 0, selfPid)
+
+	// Target names the REAL agent id + its start time.
+	err := killCoord(KillTarget{Pid: pid, PidStart: 2222, AgentID: "realtgt0", Project: project, FencerEpoch: 3}, d)
+	if err != nil {
+		t.Fatalf("kill should select realtgt0 and succeed, got %v", err)
+	}
+	if !rec.sentTo(pid) {
+		t.Errorf("expected the real target pid %d to be signaled", pid)
+	}
+}
+
 // isFleetCoordRunBinary classifier unit coverage (W9 helper).
 func TestIsFleetCoordRunBinary(t *testing.T) {
 	cases := map[string]bool{

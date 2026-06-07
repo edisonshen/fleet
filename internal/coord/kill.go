@@ -170,14 +170,34 @@ func killCoord(target KillTarget, d KillDeps) error {
 	if err != nil {
 		return fmt.Errorf("coord.KillCoordIfIdentityMatches: list records: %w", err)
 	}
+	// Selection (codex PR2 iter-12 [P2]): when target.AgentID is known,
+	// match THAT record first — a STALE same-project record that still
+	// carries the reused SupervisorPID could otherwise be picked ahead of
+	// the real target, and its pid_start mismatch would then refuse the
+	// STONITH against the wrong record (blocking a legitimate failover).
+	// Fall back to pid+project only when AgentID is empty (the synthetic
+	// flock-body / acquire-window takeover case has no agent id).
 	var match *agent.Record
-	for _, r := range recs {
-		if r == nil {
-			continue
+	if target.AgentID != "" {
+		// Prefer the record for THIS agent id — but only if it agrees on
+		// the pid we are about to signal (the record's SupervisorPID must
+		// equal target.Pid). If the id's record names a different pid, the
+		// target pid is not this coord's supervisor → do not select it
+		// (the pid+project fallback below, then the gates, handle it).
+		for _, r := range recs {
+			if r != nil && r.ID == target.AgentID && r.Project == target.Project &&
+				r.SupervisorPID == target.Pid {
+				match = r
+				break
+			}
 		}
-		if r.SupervisorPID == target.Pid && r.Project == target.Project {
-			match = r
-			break
+	}
+	if match == nil {
+		for _, r := range recs {
+			if r != nil && r.SupervisorPID == target.Pid && r.Project == target.Project {
+				match = r
+				break
+			}
 		}
 	}
 	if match == nil {
