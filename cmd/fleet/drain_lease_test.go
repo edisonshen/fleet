@@ -153,20 +153,22 @@ func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
 // drain does NOT graceful-kill OLD before the barrier; it escalates instead.
 // Combined with T41 here: the escalation calls TakeOver.
 func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
-	var killed, tookOver, resumed int32
+	var killed, tookOver, recovered int32
+	var recoveredFromOld *agent.Record
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return false }, // hung/stealable
 		CurrentEpoch:  func(string) (int64, bool) { return 5, true },
 		BarrierExists: func(string, int64) bool { return false }, // never
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		KillCoord:     func(coord.KillTarget) error { atomic.AddInt32(&killed, 1); return nil },
 		TakeOver: func(string, string) (bool, error) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
 		},
-		LockAgent: func(string) (func(), error) { return func() {}, nil },
-		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			atomic.AddInt32(&resumed, 1)
+		RecoverSpawn: func(oldRec *agent.Record, _ string, _, _ io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			recoveredFromOld = oldRec
 			return nil
 		},
 		BarrierPoll: time.Millisecond,
@@ -183,31 +185,35 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	if atomic.LoadInt32(&tookOver) != 1 {
 		t.Errorf("TakeOver escalation ran %d times, want 1", tookOver)
 	}
-	// codex PR3 iter-6 [P1]: a successor must be cold-spawned after the
-	// takeover so the project is not left coordless.
-	if atomic.LoadInt32(&resumed) != 1 {
-		t.Errorf("successor cold-spawn (Resume) ran %d times after takeover, want 1", resumed)
+	// codex PR3 iter-6/7 [P1]: a lease-wrapped successor must be recovered from
+	// the CACHED old record after the takeover (no coordless project; not via
+	// handoffop.Resume through the killed record).
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times after takeover, want 1", recovered)
+	}
+	if recoveredFromOld == nil || recoveredFromOld.ID != "oldcoord1" {
+		t.Errorf("RecoverSpawn was not given the cached old record, got %+v", recoveredFromOld)
 	}
 }
 
 // T41: a HUNG OLD (no barrier, deadline passes) escalates to TakeOver, then
-// cold-spawns a successor, and never blocks.
+// recovers a lease-wrapped successor from the cached record, and never blocks.
 func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	var tookOverProject string
-	var resumed int32
+	var recovered int32
 	out := &bytes.Buffer{}
 	done := make(chan error, 1)
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return false },
 		CurrentEpoch:  func(string) (int64, bool) { return 9, true },
 		BarrierExists: func(string, int64) bool { return false },
+		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver: func(project, _ string) (bool, error) {
 			tookOverProject = project
 			return false, nil // OLD fenced; flock not acquired by the drain
 		},
-		LockAgent: func(string) (func(), error) { return func() {}, nil },
-		Resume: func(queue.SpawnFresh, string, int, io.Writer, io.Writer) error {
-			atomic.AddInt32(&resumed, 1)
+		RecoverSpawn: func(*agent.Record, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
 		BarrierPoll: time.Millisecond,
@@ -226,8 +232,8 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 	if tookOverProject != "projects-fleet" {
 		t.Errorf("TakeOver called for project %q, want projects-fleet", tookOverProject)
 	}
-	if atomic.LoadInt32(&resumed) != 1 {
-		t.Errorf("successor cold-spawn ran %d times after takeover, want 1 (no coordless project)", resumed)
+	if atomic.LoadInt32(&recovered) != 1 {
+		t.Errorf("RecoverSpawn ran %d times after takeover, want 1 (no coordless project)", recovered)
 	}
 }
 

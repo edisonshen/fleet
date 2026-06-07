@@ -41,8 +41,10 @@ import (
 	"github.com/edisonshen/fleet/internal/agent"
 	"github.com/edisonshen/fleet/internal/coord"
 	"github.com/edisonshen/fleet/internal/coordlock"
+	"github.com/edisonshen/fleet/internal/coordrepo"
 	"github.com/edisonshen/fleet/internal/handoffop"
 	"github.com/edisonshen/fleet/internal/queue"
+	"github.com/edisonshen/fleet/internal/spawn"
 	"github.com/edisonshen/fleet/internal/state"
 )
 
@@ -87,17 +89,27 @@ type drainLeaseDeps struct {
 	// keep the lease (it is not the coord); it only needs the side effect of
 	// the OLD holder being fenced/killed so a standby/successor can lead.
 	TakeOver func(project, agentID string) (acquired bool, err error)
-	// Resume runs the cold-spawn fallback (no lease epoch; spawn a successor
-	// from the queue). Production: handoffop.Resume. It is run under a SHORT
-	// per-agent LockAgent (Resume's contract requires it) — but only on the
-	// COLD path, which spawns fresh and does NOT swap a hung live leader, so
-	// the forever-hold class does not apply. The graceful/hung COORD path
-	// never calls Resume; it kills/escalates lock-free.
+	// Resume runs the cold-spawn fallback for a live-leader handoff that has no
+	// barrier yet (the graceful producer hasn't run). Production: handoffop.Resume.
+	// It is run under a SHORT per-agent LockAgent (Resume's contract requires
+	// it) — but only when OLD is still the LIVE leader (no hung swap), so the
+	// forever-hold class does not apply. The graceful/hung COORD path never
+	// calls Resume; it kills/escalates lock-free.
 	Resume func(req queue.SpawnFresh, queuePath string, graceMillis int, stdout, stderr io.Writer) error
 	// LockAgent serializes the cold Resume against a concurrent drain so two
 	// drains cannot both spawn a replacement (codex PR3 iter-4 [P1]).
 	// Production: state.LockAgent. Returns a release func.
 	LockAgent func(agentID string) (func(), error)
+	// RecoverSpawn brings up a FRESH lease-wrapped successor AFTER a safety-net
+	// takeover has fenced+killed a hung OLD (codex PR3 iter-7 [P1]). It must
+	// spawn from the CACHED old record (captured BEFORE the takeover archived
+	// it) as a dead-coord RECOVERY (spawn.Options{RecoverDeadCoord:true}) so
+	// the successor is coord-run-wrapped and ACQUIRES + heartbeats the now-free
+	// lease — NOT routed through handoffop.Resume (which loads OLD by id and
+	// would race the takeover's archive + spawn an UNWRAPPED handoff
+	// successor). nil OldRec means "could not cache OLD" -> the seam surfaces a
+	// recovery instruction instead of spawning blind.
+	RecoverSpawn func(oldRec *agent.Record, docPath string, stdout, stderr io.Writer) error
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -148,11 +160,58 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 			}
 			return acquired, err
 		},
-		Resume:      handoffop.Resume,
-		LockAgent:   state.LockAgent,
-		BarrierPoll: defaultBarrierPoll,
-		Self:        os.Getpid,
+		Resume:       handoffop.Resume,
+		LockAgent:    state.LockAgent,
+		RecoverSpawn: productionRecoverSpawn,
+		BarrierPoll:  defaultBarrierPoll,
+		Self:         os.Getpid,
 	}
+}
+
+// productionRecoverSpawn brings up a FRESH lease-wrapped successor after a
+// takeover (codex PR3 iter-7 [P1]). It spawns from the CACHED old record as a
+// dead-coord RECOVERY so the successor is coord-run-wrapped and acquires the
+// now-free lease (RecoverDeadCoord=true). Coord cwd resolves through the shared
+// project-repo resolver (same as the dispatch recovery path), never the old
+// coord's stale stored Cwd. Surface-don't-silo on any gap: a missing record /
+// unresolvable repo prints a concrete recovery command rather than spawning
+// blind.
+func productionRecoverSpawn(oldRec *agent.Record, docPath string, stdout, stderr io.Writer) error {
+	if oldRec == nil {
+		_, _ = fmt.Fprintf(stderr,
+			"fleet drain: takeover reaped the hung coord but its record could not be cached; "+
+				"run `fleet dispatch --coord-spawn` (or press [a] in the TUI) to bring up a replacement\n")
+		return fmt.Errorf("fleet drain: recover-spawn: no cached old record")
+	}
+	if len(oldRec.Command) == 0 {
+		return fmt.Errorf("fleet drain: recover-spawn: old coord %s has no stored command", oldRec.ID)
+	}
+	spawnCwd := oldRec.Cwd
+	if spawn.IsCoordSpawn(oldRec.TaskID, oldRec.Project) {
+		resolved, rerr := coordrepo.ResolveProjectRepo(oldRec.Project, true)
+		if rerr != nil {
+			return fmt.Errorf("fleet drain: recover-spawn: resolve repo for project %q: %w", oldRec.Project, rerr)
+		}
+		spawnCwd = resolved
+	}
+	rec, err := spawn.Spawn(spawn.Options{
+		OldRecord:         oldRec,
+		NewDocPath:        docPath,
+		Cwd:               spawnCwd,
+		Command:           oldRec.Command,
+		DisableAutoResume: oldRec.DisableAutoResume,
+		// RecoverDeadCoord: OLD is gone (the takeover reaped it) -> the
+		// successor is a FRESH leader and MUST be lease-wrapped so it acquires
+		// + heartbeats the now-free lease.
+		RecoverDeadCoord: true,
+		LeaderCheck:      coordLeaderCheck,
+	})
+	if err != nil {
+		return fmt.Errorf("fleet drain: recover-spawn replacement for %s: %w", oldRec.ID, err)
+	}
+	_, _ = fmt.Fprintf(stdout,
+		"fleet drain: cold-spawned lease-wrapped successor %s for %s after takeover\n", rec.ID, oldRec.Project)
+	return nil
 }
 
 // drainOneLeaseAware is the production entry point for the bounded drain.
@@ -348,6 +407,16 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	graceMillis, resumeTimeoutMillis int, stdout, stderr io.Writer, d drainLeaseDeps) error {
 
 	project := req.Project
+	// Cache OLD's record BEFORE the takeover (codex PR3 iter-7 [P1]): the
+	// takeover kills OLD's coord-run, whose cleanup archives the record, so a
+	// post-takeover load would race the archive. The cached record is what the
+	// lease-wrapped recovery spawns from. A load failure here is non-fatal: we
+	// still escalate (reap the hung OLD); RecoverSpawn surfaces a recovery
+	// instruction when the record is missing.
+	var cachedOld *agent.Record
+	if rec, lerr := d.LoadAgent(req.OldAgentID); lerr == nil {
+		cachedOld = rec
+	}
 	for {
 		if epoch, ok := d.CurrentEpoch(project); ok && d.BarrierExists(project, epoch) {
 			// Barrier appeared while we waited — finish the graceful path.
@@ -379,19 +448,27 @@ func drainWaitBarrierOrEscalate(req queue.SpawnFresh, path string, deadline time
 	if _, err := d.TakeOver(project, req.OldAgentID); err != nil {
 		return fmt.Errorf("fleet drain: safety-net takeover for %s: %w", project, err)
 	}
-	// The hung OLD is fenced + killed; the lease is now stealable. Cold-spawn
-	// the successor so the project has a coord again. coldResume runs Resume
-	// under a short per-agent lock (no lock across the prior kill).
+	// The hung OLD is fenced + killed; the lease is now stealable. Bring up a
+	// FRESH lease-wrapped successor from the CACHED old record (dead-coord
+	// recovery — RecoverDeadCoord) so it acquires + heartbeats the now-free
+	// lease (codex PR3 iter-7 [P1]). We do NOT route through handoffop.Resume:
+	// that loads OLD by id (racing the archive) and would spawn an UNWRAPPED
+	// handoff successor that never acquires the lease.
 	_, _ = fmt.Fprintf(stderr,
-		"fleet drain: takeover fenced/killed the hung coord for %s; cold-spawning a successor\n", project)
-	if err := coldResume(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr, d); err != nil {
-		// Surface the spawn failure but keep the escalation signal semantics:
-		// the takeover succeeded (OLD reaped), the successor spawn is what
-		// failed — a later drain retries the now-stealable lease.
-		return fmt.Errorf("fleet drain: takeover for %s succeeded but cold-spawn failed: %w", project, err)
+		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
+	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, stdout, stderr); err != nil {
+		// Surface the recovery-spawn failure but keep the escalation semantics:
+		// the takeover succeeded (OLD reaped). Leave the queue in place so the
+		// dead-coord recovery path (next dispatch / TUI [a]) retries against
+		// the now-stealable lease.
+		return fmt.Errorf("fleet drain: takeover for %s succeeded but recover-spawn failed: %w", project, err)
 	}
-	// Successor spawned after a clean takeover. Not a failure — count as
-	// processed (the queue was consumed by coldResume).
+	// Successor recovered after a clean takeover. The queue file's handoff
+	// request is fulfilled by the recovery spawn; delete it so a later drain
+	// doesn't re-escalate.
+	if derr := queue.Delete(path); derr != nil {
+		_, _ = fmt.Fprintf(stderr, "fleet drain: recovered %s but queue delete failed: %v\n", project, derr)
+	}
 	return ErrEscalatedToTakeOver
 }
 
@@ -501,6 +578,9 @@ func fillDrainLeaseDeps(d drainLeaseDeps) drainLeaseDeps {
 	}
 	if d.LockAgent == nil {
 		d.LockAgent = def.LockAgent
+	}
+	if d.RecoverSpawn == nil {
+		d.RecoverSpawn = def.RecoverSpawn
 	}
 	if d.BarrierPoll == 0 {
 		d.BarrierPoll = def.BarrierPoll
