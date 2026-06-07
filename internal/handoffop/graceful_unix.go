@@ -64,8 +64,19 @@ type GracefulHandoffDeps struct {
 	// SpawnStandby spawns exactly ONE warm-standby coord
 	// (coord-run --standby) in the background. Production wires a closure
 	// that calls spawn.Spawn with Options{Standby: true}. It MUST be called
-	// exactly once per GracefulHandoff.
+	// exactly once per GracefulHandoff. It should return enough context (via
+	// a closure capture) for ReapStandby to tear the standby down on a
+	// post-spawn abort.
 	SpawnStandby func() error
+	// ReapStandby tears down the standby spawned by SpawnStandby. It is
+	// called ONLY when a post-spawn step fails (doc/checkpoint/drain/barrier)
+	// so a half-done graceful handoff does not leave a warm standby polling
+	// to acquire the lease WITHOUT the completed checkpoint + barrier this
+	// flow requires (codex PR3 iter-2 [P2]). nil = no reap (the caller
+	// accepts a leaked standby — discouraged). Best-effort: a reap error is
+	// surfaced to stderr but the original failure is what GracefulHandoff
+	// returns.
+	ReapStandby func() error
 	// WriteAtomic persists data to path with .tmp->fsync->rename semantics
 	// (a torn write is never renamed into place). Production: state.WriteAtomic.
 	WriteAtomic func(path string, data []byte) error
@@ -150,6 +161,36 @@ func GracefulHandoff(in GracefulHandoffInputs, d GracefulHandoffDeps) error {
 		return fmt.Errorf("handoffop.GracefulHandoff: spawn standby for project %q: %w", project, err)
 	}
 	_, _ = fmt.Fprintf(stderr, "graceful-handoff: spawned standby coord for %s (epoch %d)\n", project, epoch)
+
+	// Steps 2-5 run AFTER the standby is alive. If ANY of them fails we must
+	// REAP the standby (codex PR3 iter-2 [P2]): a standby left polling after a
+	// half-done handoff could acquire the lease WITHOUT the completed
+	// checkpoint + barrier this flow guarantees. OLD stays leader and a
+	// retry / the safety net recovers cleanly with no orphan standby.
+	if err := gracefulDurableSteps(in, d, project, epoch, stderr); err != nil {
+		if d.ReapStandby != nil {
+			if rerr := d.ReapStandby(); rerr != nil {
+				_, _ = fmt.Fprintf(stderr,
+					"graceful-handoff: WARNING — post-spawn abort AND standby reap failed for %s: %v "+
+						"(orphan standby may be polling; `fleet doctor` / gc will reap it)\n",
+					project, rerr)
+			} else {
+				_, _ = fmt.Fprintf(stderr,
+					"graceful-handoff: aborted after spawning standby for %s; reaped the standby (OLD stays leader)\n",
+					project)
+			}
+		}
+		return err
+	}
+	return nil
+}
+
+// gracefulDurableSteps runs steps 2-5 (doc, checkpoint, drain, barrier) in
+// the fixed order. The barrier is the LAST side effect and is written ONLY
+// after doc + checkpoint + drain are durable. Any failure short-circuits
+// BEFORE the barrier (so the drain path never reads a premature "all clean").
+func gracefulDurableSteps(in GracefulHandoffInputs, d GracefulHandoffDeps,
+	project string, epoch int64, stderr io.Writer) error {
 
 	// Step 2: write the handoff doc durably (atomic). Skipped when the
 	// producer already wrote it (empty DocContent).

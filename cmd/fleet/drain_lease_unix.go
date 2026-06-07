@@ -99,12 +99,9 @@ type drainLeaseDeps struct {
 	Self func() int
 }
 
-// ErrEscalatedToTakeOver is the typed signal drainOneLeaseAware returns when
-// it could not complete a graceful drain within the timeout and escalated to
-// the safety-net takeover. Callers (and tests, T12) distinguish it from a
-// hard failure: the drain did NOT block, did NOT hold a lock, and handed the
-// recovery to the lease takeover. It is informational, not an error to retry.
-var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net takeover")
+// ErrEscalatedToTakeOver is declared in drain.go (the all-platform file) so
+// runDrain can reference it on every GOOS. The lease-aware path here returns
+// it when a slow/hung handoff is handed to the safety-net takeover.
 
 const defaultBarrierPoll = 200 * time.Millisecond
 

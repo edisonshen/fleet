@@ -204,6 +204,71 @@ func TestGracefulHandoff_DrainError_NoBarrier(t *testing.T) {
 	}
 }
 
+// codex PR3 iter-2 [P2]: a post-spawn failure REAPS the standby (a standby
+// left polling after a half-done handoff could acquire the lease without the
+// completed checkpoint + barrier).
+func TestGracefulHandoff_PostSpawnAbort_ReapsStandby(t *testing.T) {
+	rec := newGracefulRecorder()
+	wantErr := errors.New("checkpoint disk full")
+	var reaped int32
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+		CheckpointPath: gracefulCheckpointPath,
+		Checkpoint:     []byte("{}"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		ReapStandby:  func() error { reaped++; return nil },
+		WriteAtomic: func(path string, data []byte) error {
+			if path == gracefulCheckpointPath {
+				return wantErr
+			}
+			return rec.write(path, data)
+		},
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+	}
+	err := GracefulHandoff(in, deps)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the post-spawn error surfaced, got %v", err)
+	}
+	if reaped != 1 {
+		t.Errorf("ReapStandby ran %d times after a post-spawn abort, want 1", reaped)
+	}
+	_, writes, _ := rec.snapshot()
+	if _, ok := writes[gracefulBarrierPath]; ok {
+		t.Errorf("barrier written despite the abort")
+	}
+}
+
+// On the SUCCESS path the standby is NOT reaped (it goes on to acquire).
+func TestGracefulHandoff_Success_DoesNotReapStandby(t *testing.T) {
+	rec := newGracefulRecorder()
+	var reaped int32
+	in := GracefulHandoffInputs{
+		OldRec:         oldRecForGraceful(),
+		HandoffDocPath: gracefulDocPath,
+		HandoffDoc:     []byte("# doc\n"),
+		CheckpointPath: gracefulCheckpointPath,
+		Checkpoint:     []byte("{}"),
+	}
+	deps := GracefulHandoffDeps{
+		SpawnStandby: func() error { rec.standbyRuns++; return nil },
+		ReapStandby:  func() error { reaped++; return nil },
+		WriteAtomic:  rec.write,
+		CurrentEpoch: func(string) (int64, bool) { return 7, true },
+		BarrierPath:  func(_ string, _ int64) (string, error) { return gracefulBarrierPath, nil },
+	}
+	if err := GracefulHandoff(in, deps); err != nil {
+		t.Fatalf("GracefulHandoff: %v", err)
+	}
+	if reaped != 0 {
+		t.Errorf("ReapStandby ran %d times on the success path, want 0", reaped)
+	}
+}
+
 // T43(c): a standby spawn failure aborts before ANY write — no doc, no
 // checkpoint, no barrier (the graceful path has no receiver).
 func TestGracefulHandoff_SpawnError_NothingWritten(t *testing.T) {

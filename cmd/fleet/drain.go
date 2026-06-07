@@ -13,6 +13,15 @@ import (
 	"github.com/edisonshen/fleet/internal/tmux"
 )
 
+// ErrEscalatedToTakeOver is the typed signal the lease-aware drain returns
+// when it could not complete a graceful drain within the budget and escalated
+// to the safety-net takeover (fence -> kill -> acquire). It is NOT a failure:
+// the drain did not block and held no lock; the takeover handles recovery.
+// runDrain counts it as processed (codex PR3 iter-2 [P2]). Declared here (the
+// all-platform file) so the loop can reference it on every GOOS; the
+// lease-aware path that returns it is linux/darwin only.
+var ErrEscalatedToTakeOver = errors.New("fleet drain: escalated to safety-net takeover")
+
 // defaultResumeTimeoutMillis bounds a single per-queue-file Resume on the
 // lease-failover drain path (FLEET_LEASE_FAILOVER on). It is the wall-clock
 // budget after which the drain STOPS waiting on a slow handoff and escalates
@@ -95,12 +104,23 @@ func runDrain(stdout, stderr io.Writer, graceMillis, resumeTimeoutMillis int) er
 			failed++
 			continue
 		}
-		if err := drainOne(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr); err != nil {
+		err := drainOne(req, path, graceMillis, resumeTimeoutMillis, stdout, stderr)
+		switch {
+		case errors.Is(err, ErrEscalatedToTakeOver):
+			// Not a failure (codex PR3 iter-2 [P2]): the bounded drain did its
+			// job — it stopped waiting on a slow/hung handoff and handed
+			// recovery to the safety-net takeover without blocking or holding a
+			// lock. Count it as processed so a queue of successful escalations
+			// does not make `fleet drain` report "every pending handoff failed".
+			_, _ = fmt.Fprintf(stdout,
+				"fleet drain: %s escalated to safety-net takeover (handoff was slow/hung)\n", req.OldAgentID)
+			processed++
+		case err != nil:
 			_, _ = fmt.Fprintf(stderr, "fleet drain: %s: %v\n", req.OldAgentID, err)
 			failed++
-			continue
+		default:
+			processed++
 		}
-		processed++
 	}
 
 	_, _ = fmt.Fprintf(stdout, "fleet drain: %d processed, %d failed\n",

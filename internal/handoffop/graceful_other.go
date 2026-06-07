@@ -36,6 +36,7 @@ type GracefulHandoffInputs struct {
 // GracefulHandoffDeps mirrors the linux/darwin definition.
 type GracefulHandoffDeps struct {
 	SpawnStandby  func() error
+	ReapStandby   func() error
 	WriteAtomic   func(path string, data []byte) error
 	DrainInFlight func() error
 	CurrentEpoch  func(project string) (int64, bool)
