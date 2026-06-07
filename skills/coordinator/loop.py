@@ -785,19 +785,26 @@ def _tick_locked(
         # finishes — exactly the orphan-tmux shape invariant 5 exists
         # to prevent. Best-effort save; swallow errors (the next tick
         # re-derives state from disk).
+        coord_state_saved = False
         try:
             _save_coord_state(state_path, state)
+            coord_state_saved = True
         except Exception as save_exc:  # noqa: BLE001
             result.errors.append(
                 f"coord-state save on parse-error path failed: {save_exc}"
             )
-        # Clear the cold-start pending-spawn claim on THIS bail path too:
-        # the save above made coord-state.json fresh, so the coord-state
-        # veto has taken over and the claim is safe to drop. A coord that
-        # only ever reaches the parse-error path would otherwise never
-        # clear its claim, blocking a legitimate respawn for the full
-        # freshness window once it dies. Idempotent + fail-soft.
-        clear_coord_spawn_pending(project_dir)
+        # Clear the cold-start pending-spawn claim on THIS bail path too —
+        # but ONLY if the save above actually wrote coord-state.json
+        # (codex iter-2 P2). The claim is the SOLE double-spawn veto until
+        # coord-state.json is fresh; if the best-effort save failed, no
+        # coord-state veto exists yet, so clearing the claim would let a
+        # second cold-start dispatch spawn a duplicate. Leaving the claim
+        # in place on a failed save keeps the veto active — it ages out in
+        # the freshness window if this coord never recovers. When the save
+        # DID succeed, the coord-state veto has taken over and dropping the
+        # claim avoids blocking a legitimate respawn. Idempotent + fail-soft.
+        if coord_state_saved:
+            clear_coord_spawn_pending(project_dir)
         return result
 
     # 5.0. dispatch-durability (#184) — tick-entry REPLAY reconcile.

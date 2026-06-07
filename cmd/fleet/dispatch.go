@@ -642,18 +642,28 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 
 	// Idempotent coord-spawn (leak-coord-spawn-idempot): if a coord is
 	// ALREADY alive for this project (a record + a live tmux session on
-	// THIS socket), don't mint a duplicate — print an attach hint and
-	// return cleanly. This is the operator-friendly fast path for a
-	// double-press / re-dispatch of an already-running coord. It runs
-	// BEFORE the veto because "attach me to the live one" is a success,
-	// not a retry-later refusal. Cross-socket live coords aren't caught
-	// here (the local probe can't see them) — those fall to the
-	// coordSpawnVeto below, which returns exit 75 retry.
+	// THIS socket), don't mint a duplicate — point the caller at the
+	// existing coord and return cleanly. This is the operator-friendly
+	// fast path for a double-press / re-dispatch of an already-running
+	// coord. It runs BEFORE the veto because "attach me to the live one"
+	// is a success, not a retry-later refusal. Cross-socket live coords
+	// aren't caught here (the local probe can't see them) — those fall to
+	// the coordSpawnVeto below, which returns exit 75 retry.
+	//
+	// Output-contract preservation (codex iter-2 P2): the wrapper callers
+	// (attach.go:doCoordSpawn parseSpawnedAgentID, TUI startCoordSpawn)
+	// parse the canonical `agent <id> spawned` line from a 0-exit dispatch
+	// to learn which session to probe+attach. We MUST emit that line with
+	// the LIVE coord's ID — otherwise an "already alive" race exits 0 with
+	// no parseable line and the wrapper reports a parse failure instead of
+	// attaching. We additionally print a human attach hint to stderr (not
+	// stdout, so it can't pollute the parse target).
 	if opts.coordSpawn {
 		if live := liveCoordForAttach(opts.taskID, opts.project, coordRecords, tmuxHasSession); live != nil {
-			_, _ = fmt.Fprintf(stdout,
-				"coord %s already alive for project %s; attach with `fleet attach %s`\n",
-				live.ID, opts.project, live.ID)
+			_, _ = fmt.Fprintf(os.Stderr,
+				"coord %s already alive for project %s; attaching to the existing session\n",
+				live.ID, opts.project)
+			_, _ = fmt.Fprintf(stdout, "agent %s spawned\n", live.ID)
 			return nil
 		}
 	}

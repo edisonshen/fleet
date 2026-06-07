@@ -4654,3 +4654,55 @@ def test_tick_clears_pending_claim_after_coord_state_save(
     assert state_path.exists(), "tick must write coord-state.json"
     # ...so the claim is now safely cleared.
     assert not claim.exists(), "claim must be cleared after the heartbeat save"
+
+
+def test_tick_keeps_claim_when_parse_error_save_fails(
+    fleet_home: Path, project_dir: Path,
+    fleet_run_recorder, dispatch_subprocess, monkeypatch,
+) -> None:
+    """codex iter-2 P2: on the tasks.md parse-error bail path, the pending
+    claim must be cleared ONLY if the best-effort coord-state save there
+    succeeded. If that save ALSO fails, no fresh coord-state.json exists,
+    so the claim is the sole double-spawn veto — clearing it would let a
+    second cold-start dispatch spawn a duplicate. The claim must survive.
+    """
+    _write_tasks(project_dir, [])
+    claim = project_dir / "coord-spawn-pending"
+    claim.write_text('{"agent_id": "abc", "spawned_at": "2026-06-06T00:00:00Z"}')
+    state_path = project_dir / "coord-state.json"
+
+    # Force the tasks.md re-read to fail → enter the parse-error bail path.
+    # The re-read happens AFTER the initial parse, so we let the first
+    # parse.read succeed (loaded at tick entry) and fail the second.
+    real_read = loop.parse.read
+    calls = {"n": 0}
+
+    def flaky_read(path):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated tasks.md re-read failure")
+        return real_read(path)
+
+    monkeypatch.setattr(loop.parse, "read", flaky_read)
+    # And make the parse-error-path coord-state save fail too.
+    monkeypatch.setattr(
+        loop, "_save_coord_state",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("simulated save failure")),
+    )
+
+    result = loop.tick(
+        "fleet", coord_id="cccccc01", cwd="/repo",
+        fleet_home=str(fleet_home),
+    )
+
+    # We must have actually hit the parse-error bail path.
+    assert any("re-read failed" in e for e in result.errors), (
+        f"test did not exercise the parse-error path; errors={result.errors}"
+    )
+    # No fresh coord-state.json (the save failed), so the claim is the only
+    # veto and MUST be preserved.
+    assert not state_path.exists(), "coord-state.json must not exist (save failed)"
+    assert claim.exists(), (
+        "pending claim must survive a failed parse-error-path save — "
+        "clearing it removes the sole cold-start double-spawn veto"
+    )

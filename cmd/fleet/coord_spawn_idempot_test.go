@@ -234,6 +234,71 @@ func TestLiveCoordForAttach_WrongProjectIgnored(t *testing.T) {
 	}
 }
 
+// ---- P2 (codex iter-2): attach fast path preserves the spawn-output contract ----
+
+// When --coord-spawn finds a live coord already supervising the project,
+// runDispatch short-circuits to the attach fast path and exits 0. The
+// wrapper callers (attach.go:doCoordSpawn → parseSpawnedAgentID, TUI
+// startCoordSpawn) parse the canonical `agent <id> spawned` line from a
+// 0-exit dispatch to learn which session to probe+attach. The fast path
+// MUST emit that line with the LIVE coord's ID — otherwise an "already
+// alive" race exits 0 with no parseable line and the wrapper reports a
+// parse failure instead of attaching (codex iter-2 P2).
+func TestRunDispatch_AttachFastPathEmitsSpawnLine(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	isolateTmuxSocket(t)
+
+	pdir, err := state.ProjectDir("aliveproj")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	// Seed a live coord record for the project's stable coord task_id.
+	if err := os.MkdirAll(filepath.Join(root, "agents"), 0o755); err != nil {
+		t.Fatalf("mkdir agents: %v", err)
+	}
+	const liveID = "abcd1234"
+	rec := &agent.Record{
+		ID:          liveID,
+		TaskID:      CoordTaskIDPrefix + "aliveproj",
+		Project:     "aliveproj",
+		TmuxSession: "fleet-" + liveID,
+		SpawnedAt:   time.Now().UTC(),
+	}
+	if werr := rec.Write(); werr != nil {
+		t.Fatalf("seed live coord record: %v", werr)
+	}
+
+	// Report ONLY the live coord's session as alive.
+	prev := tmuxHasSession
+	tmuxHasSession = func(s string) bool { return s == "fleet-"+liveID }
+	t.Cleanup(func() { tmuxHasSession = prev })
+
+	opts := &dispatchOpts{
+		taskID:          CoordTaskIDPrefix + "aliveproj",
+		project:         "aliveproj",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	if derr := runDispatch(opts, &out); derr != nil {
+		t.Fatalf("attach fast path must exit cleanly, got: %v", derr)
+	}
+	// The stdout must carry a parseable canonical spawn line so the
+	// wrapper attaches to the live coord instead of failing the parse.
+	got := parseSpawnedAgentID(out.String())
+	if got != liveID {
+		t.Fatalf("parseSpawnedAgentID(%q) = %q, want %q (attach fast path broke the spawn-output contract)",
+			out.String(), got, liveID)
+	}
+}
+
 // ---- P2 (codex iter-1): failed spawn must clear the pending claim ----
 
 // A coord-spawn dispatch writes the pending claim immediately BEFORE
