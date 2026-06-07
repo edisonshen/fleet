@@ -169,6 +169,33 @@ type Record struct {
 	PredecessorID string `json:"predecessor_id,omitempty"`
 	SuccessorID   string `json:"successor_id,omitempty"`
 	ArchivedCause string `json:"archived_cause,omitempty"`
+
+	// SupervisorPID, SupervisorPidStart, SupervisorExePath identify the
+	// `fleet coord-run` SUPERVISOR process that holds + heartbeats the
+	// coordinator lease for this coord's lifetime (DESIGN-handoff-drain-
+	// storm-leak §3(B), §B.5). They are DISTINCT from PID, which is the
+	// engine (claude) process resolved via the tmux pane child tree:
+	//
+	//	PID            -> engine child (claude)   — liveness probes, TUI
+	//	SupervisorPID  -> fleet coord-run parent  — the lease HOLDER
+	//
+	// The authenticated STONITH primitive (internal/coord.KillCoordIf-
+	// IdentityMatches) targets SupervisorPID — killing the supervisor is
+	// what releases coordinator.flock via kernel-on-death. It re-validates
+	// SupervisorPidStart (defeats PID reuse) and SupervisorExePath (must
+	// be the fleet coord-run binary, never the engine child) immediately
+	// before signaling.
+	//
+	// Stamped by `fleet coord-run` at supervisor startup (the supervisor
+	// is the only process that knows its own identity). Empty on:
+	//   - records spawned with FLEET_LEASE_FAILOVER off (coord-run not
+	//     wired) — the kill primitive refuses (no supervisor to target),
+	//   - legacy/worker records — never coords, never killed by STONITH.
+	// All three behind FLEET_LEASE_FAILOVER; omitempty keeps off-flag
+	// records byte-identical to today.
+	SupervisorPID      int    `json:"supervisor_pid,omitempty"`
+	SupervisorPidStart int64  `json:"supervisor_pid_start,omitempty"`
+	SupervisorExePath  string `json:"supervisor_exe_path,omitempty"`
 }
 
 // NewID generates a short hex agent identifier (8 chars from 4 random
@@ -206,6 +233,28 @@ func New(id string) *Record {
 		LastActivityTS: now,
 		SpawnedAt:      now,
 	}
+}
+
+// StampSupervisorIdentity load-modify-writes the agent record's
+// supervisor identity fields (the coord-run lease holder). Called by
+// `fleet coord-run` at startup — the supervisor is the only process that
+// knows its own pid/start/exe. It reads the freshest record on disk,
+// overlays the three supervisor fields, and atomically rewrites it, so a
+// field set by an earlier writer (dispatch) is preserved. A missing
+// record is NOT an error (the supervisor may start before the record is
+// fully written in a degraded path) — it logs nothing and returns
+// state.ErrNotFound for the caller to surface. Behind FLEET_LEASE_
+// FAILOVER (the caller gates it); off-flag coords never call this, so
+// off-flag records keep the supervisor fields empty (omitempty).
+func StampSupervisorIdentity(id string, pid int, pidStart int64, exePath string) error {
+	rec, err := Load(id)
+	if err != nil {
+		return err
+	}
+	rec.SupervisorPID = pid
+	rec.SupervisorPidStart = pidStart
+	rec.SupervisorExePath = exePath
+	return rec.Write()
 }
 
 // Write atomically publishes the record to ~/.fleet/agents/<id>.json.

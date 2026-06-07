@@ -86,7 +86,7 @@ func testCfg(clk *fakeClock, live *fakeLiveness) leaseConfig {
 		nowMono:          clk.now,
 		pidStart:         live.get,
 		boot:             func() string { return "test-boot-1" },
-		killStub:         func(identity) error { return nil },
+		killStub:         func(identity, int64) error { return nil },
 	}
 }
 
@@ -259,7 +259,7 @@ func TestT3_TakeoverOnTTLExpiryHungHolder(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var fenceObservedBeforeKill atomic.Bool
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		// At kill time the epoch must already be FENCING (fence-before-kill).
 		rec := readEpochFor(t, project)
 		if rec.State == stateFencing {
@@ -354,7 +354,7 @@ func TestT5_NoTakeoverOnHealthyHeartbeat(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killed atomic.Bool
-	cfg.killStub = func(identity) error { killed.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
 
 	// Advance only within TTL.
 	clk.advance(10 * time.Second)
@@ -622,7 +622,7 @@ func TestT34_TwoPhaseCrashBetweenFenceAndAcquire(t *testing.T) {
 	})
 
 	cfg := testCfg(clk, live)
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		if owner.AgentID != "old" {
 			t.Errorf("kill must target OLD owner, got %s", owner.AgentID)
 		}
@@ -1005,7 +1005,7 @@ func TestDoesNotStealFreshInProgressFencing(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killed atomic.Bool
-	cfg.killStub = func(identity) error { killed.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { killed.Store(true); return nil }
 
 	clk.advance(5 * time.Second) // still within TTL
 
@@ -1208,7 +1208,7 @@ func TestBusyFlockNoEpoch_StaleHolderRecovers(t *testing.T) {
 	cfg := testCfg(clk, live)
 	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free the flock
 	var fenced atomic.Bool
-	cfg.killStub = func(owner identity) error {
+	cfg.killStub = func(owner identity, _ int64) error {
 		if owner.Pid == hungPid {
 			fenced.Store(true)
 		}
@@ -1346,7 +1346,7 @@ func TestResumeTakeoverKillsFlockBodyHolder(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killedCand atomic.Bool
-	cfg.killStub = func(target identity) error {
+	cfg.killStub = func(target identity, _ int64) error {
 		if target.Pid == candPid {
 			killedCand.Store(true)
 			// Simulate the kill freeing the flock so the takeover completes.
@@ -1405,7 +1405,7 @@ func TestFencedNotAcquiredDoesNotSilentlyStandDown(t *testing.T) {
 	cfg := testCfg(clk, live)
 	cfg.flockRetryBudget = 100 * time.Millisecond // PR1 stub can't free a real flock
 	var fenced atomic.Bool
-	cfg.killStub = func(identity) error { fenced.Store(true); return nil }
+	cfg.killStub = func(identity, int64) error { fenced.Store(true); return nil }
 
 	clk.advance(5 * time.Second) // still within TTL
 
@@ -1514,7 +1514,7 @@ func TestResumeTakeoverKillsCandidateWithoutFlockBody(t *testing.T) {
 
 	cfg := testCfg(clk, live)
 	var killedCand atomic.Bool
-	cfg.killStub = func(target identity) error {
+	cfg.killStub = func(target identity, _ int64) error {
 		if target.Pid == candPid {
 			killedCand.Store(true)
 			live.kill(candPid)

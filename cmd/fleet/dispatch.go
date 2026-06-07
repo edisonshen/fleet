@@ -664,6 +664,18 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	//     correctly, veto fires, split-brain avoided. This is the
 	//     load-bearing case the veto exists for.
 	//
+	// DEFENSE-IN-DEPTH (DESIGN-handoff-drain-storm-leak PR2). With
+	// FLEET_LEASE_FAILOVER on, the PRIMARY singleton guarantee is the
+	// coordinator lease: the coord-run supervisor takes a kernel LOCK_NB
+	// on coordinator.flock, so a second supervisor for the same project
+	// physically cannot acquire it and stands down (exit 0). This
+	// freshness veto is no longer the load-bearing gate — it stays as a
+	// cheap belt-and-braces check that can short-circuit a dispatch
+	// before we even spawn the supervisor, and it remains the ONLY gate
+	// when the flag is off. It is deliberately NOT removed: a heuristic
+	// that occasionally over-refuses (retryable exit 75) is strictly
+	// safer than a window with no gate at all.
+	//
 	// Only fires on --coord-spawn (the auto-coord-bootstrap path).
 	if opts.coordSpawn && coordStateFresh(opts.project) {
 		if coordRecordExistsInList(opts.taskID, opts.project, coordRecords) {
@@ -942,6 +954,40 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		}
 	}
 
+	// Lease-failover wiring (DESIGN-handoff-drain-storm-leak PR2). When
+	// FLEET_LEASE_FAILOVER is on AND this is a coord-spawn whose command
+	// was NOT explicitly overridden, wrap the engine argv in the
+	// `fleet coord-run` SUPERVISOR so a Go process holds + heartbeats the
+	// coordinator lease for the coord's whole life (closing the
+	// coord.go:18-21 wiring gap). The wrap is an EXECUTION-only concern
+	// (like the rc-rewrite): the persisted agent.Record.Command stays the
+	// clean engine argv so a future handoff inheriting oldRec.Command
+	// never re-wraps. Off-flag, this block is a no-op and the resolved
+	// ExecCommand is byte-identical to today.
+	//
+	//	ExecCommand = ["fleet","coord-run","--agent",<id>,"--project",<p>,
+	//	               "--", <engine-argv (rc-rewritten if set) ...>]
+	if shouldWrapInCoordRun(leaseFailoverEnabled(), opts.coordSpawn, opts.commandExplicit, preAllocatedID) {
+		// The argv coord-run supervises: the rc-rewritten exec argv if the
+		// rc block produced one, else the clean default command.
+		engineArgv := rewrittenExecArgv
+		if engineArgv == nil {
+			engineArgv = opts.command
+		}
+		fleetBin, exeErr := os.Executable()
+		if exeErr != nil || fleetBin == "" {
+			// Without our own binary path we cannot build the coord-run
+			// wrapper. Surface-don't-silo: warn and fall back to the
+			// unwrapped (legacy) argv rather than spawning a half-wired
+			// coord. The lease is then simply not held — same as off-flag.
+			_, _ = fmt.Fprintf(os.Stderr,
+				"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
+					"spawning coord WITHOUT the coord-run lease supervisor\n", exeErr)
+		} else {
+			rewrittenExecArgv = wrapInCoordRun(fleetBin, preAllocatedID, opts.project, engineArgv)
+		}
+	}
+
 	rec, err := spawn.Spawn(spawn.Options{
 		OldRecord:         oldRecord,
 		NewDocPath:        newDocPath,
@@ -1061,6 +1107,40 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(stdout, "\nattach with: fleet attach %s\n", rec.ID)
 	return nil
+}
+
+// shouldWrapInCoordRun decides whether the coord-spawn exec argv is
+// wrapped in `fleet coord-run` (the lease supervisor). ALL must hold:
+//   - failoverOn: FLEET_LEASE_FAILOVER is set (default OFF -> no wrap, so
+//     the resolved argv is byte-identical to pre-PR2),
+//   - coordSpawn: this is a coordinator spawn (workers never get a lease),
+//   - !commandExplicit: the operator did NOT override --command (a
+//     scripted/custom argv is passed verbatim, never re-wrapped — W3),
+//   - preAllocatedID != "": the coord's agent id is known (always true on
+//     the coord-spawn path; the guard keeps the wrap correct if that
+//     invariant ever changes).
+func shouldWrapInCoordRun(failoverOn, coordSpawn, commandExplicit bool, preAllocatedID string) bool {
+	return failoverOn && coordSpawn && !commandExplicit && preAllocatedID != ""
+}
+
+// wrapInCoordRun builds the lease-failover exec argv: the engine argv
+// supervised by `fleet coord-run` (DESIGN-handoff-drain-storm-leak PR2).
+// The supervisor holds + heartbeats the coordinator lease for the coord's
+// lifetime; killing it releases coordinator.flock via kernel-on-death.
+//
+//	["<fleetBin>","coord-run","--agent",<id>,"--project",<p>,"--",
+//	 <engineArgv ...>]
+//
+// Pure + side-effect-free so W1/W2/W3 can assert the resolved shape
+// without a real tmux spawn. The persisted agent.Record.Command stays the
+// clean engineArgv — only the EXECUTION argv (Options.ExecCommand) is
+// wrapped (see the call site).
+func wrapInCoordRun(fleetBin, agentID, project string, engineArgv []string) []string {
+	wrapped := make([]string, 0, len(engineArgv)+7)
+	wrapped = append(wrapped, fleetBin, "coord-run",
+		"--agent", agentID, "--project", project, "--")
+	wrapped = append(wrapped, engineArgv...)
+	return wrapped
 }
 
 // defaultClaudeWrapperScript re-exposes spawn.DefaultClaudeWrapperScript

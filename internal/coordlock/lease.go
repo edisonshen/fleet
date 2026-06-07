@@ -136,10 +136,13 @@ type leaseConfig struct {
 	pidStart func(pid int) (int64, bool)
 	// boot returns the current boot id. Production: bootID.
 	boot func() string
-	// killStub fences-then-kills the old holder. PR1 STUB seam — default
-	// is a no-op that reports success (the kernel-flock release is what
-	// the takeover actually waits on; PR2 wires the authenticated kill).
-	killStub func(owner identity) error
+	// killStub fences-then-kills the old holder. PR1 shipped a no-op
+	// default (the kernel-flock release is what the takeover waits on);
+	// PR2 injects the authenticated KillCoordIfIdentityMatches via
+	// AcquireLeaseWithKill. fencerEpoch is the epoch the candidate fenced
+	// TO (old+1) so the kill can epoch-gate the STONITH. The no-op
+	// default ignores it.
+	killStub func(owner identity, fencerEpoch int64) error
 }
 
 func defaultLeaseConfig() leaseConfig {
@@ -156,11 +159,12 @@ func defaultLeaseConfig() leaseConfig {
 			return st, true
 		},
 		boot: bootID,
-		// PR1 stub: the real KillCoordIfIdentityMatches lands in PR2.
-		// A no-op is correct for PR1 because TakeOver's flock acquire is
-		// kernel-gated on the old holder actually dying; the stub just
-		// marks the seam. Tests override this to simulate the kill.
-		killStub: func(identity) error { return nil },
+		// Default no-op kill: correct when no authenticated kill is
+		// injected because TakeOver's flock acquire is kernel-gated on the
+		// old holder actually dying. PR2's AcquireLeaseWithKill swaps in
+		// the real KillCoordIfIdentityMatches. Tests override this to
+		// simulate the kill.
+		killStub: func(identity, int64) error { return nil },
 	}
 }
 
@@ -214,11 +218,73 @@ func failoverEnabled() bool {
 //	acquired=true,  lease!=nil  -> caller is the leader (start heartbeat)
 //	acquired=false, lease==nil  -> a healthy live leader exists; stand down
 //	err!=nil                    -> something went wrong (or failover off)
+//
+// AcquireLease uses the PR1 no-op kill stub for the takeover STONITH
+// step. PR2's coord-run supervisor calls AcquireLeaseWithKill instead so
+// a hung old holder is actually reaped via the authenticated
+// internal/coord.KillCoordIfIdentityMatches primitive. AcquireLease is
+// retained for callers (and tests) that only need the lock semantics.
 func AcquireLease(project, agentID string) (lease *Lease, acquired bool, err error) {
+	return AcquireLeaseWithKill(project, agentID, nil)
+}
+
+// KillTarget is the exported identity the takeover STONITH hands to the
+// injected kill callback. coordlock cannot import internal/coord (that
+// package imports coordlock — a cycle), so the authenticated kill
+// primitive is injected here as a callback rather than called directly.
+// The callback re-validates every field against the live agent record
+// immediately before signaling (PID-reuse + exe-path + epoch gate) — the
+// fields below are the takeover's view, not a license to kill blindly.
+type KillTarget struct {
+	// Pid + PidStart identify the OLD coord-run supervisor process the
+	// takeover fenced. The kill callback MUST confirm the live process at
+	// Pid still has start-time PidStart before signaling (PID reuse).
+	Pid      int
+	PidStart int64
+	// AgentID + Project scope the target to one project's coord. The kill
+	// callback refuses if the live agent record's project != Project.
+	AgentID string
+	Project string
+	// FencerEpoch is the epoch the takeover candidate just fenced TO
+	// (old+1). The kill callback signals only if the target's recorded
+	// epoch is absent or < FencerEpoch — an epoch-gated STONITH so a
+	// stale candidate can never shoot a newer leader.
+	FencerEpoch int64
+}
+
+// AcquireLeaseWithKill is AcquireLease plus an injected authenticated
+// kill callback for the takeover STONITH step. kill==nil falls back to
+// the PR1 no-op stub (lock-only semantics; the takeover then relies on
+// the old holder dying on its own + the kernel flock release, which is
+// the correct behavior when no real kill primitive is wired). Refuses
+// unless FLEET_LEASE_FAILOVER is on.
+//
+// The supervisor (cmd/fleet/coord.go) passes a closure that calls
+// internal/coord.KillCoordIfIdentityMatches — the single shared
+// authenticated coord-kill primitive (DESIGN §B.5). Threading it as a
+// callback (not a hard import) keeps the lease primitive free of any
+// dependency on the coord package.
+func AcquireLeaseWithKill(project, agentID string, kill func(KillTarget) error) (*Lease, bool, error) {
 	if !failoverEnabled() {
 		return nil, false, ErrFailoverDisabled
 	}
-	return acquireLease(project, agentID, defaultLeaseConfig())
+	cfg := defaultLeaseConfig()
+	if kill != nil {
+		// Adapt the exported KillTarget callback into the internal
+		// killStub seam. fencerEpoch is l.epoch — the epoch the takeover
+		// fenced TO (old+1) — so the kill primitive can epoch-gate the
+		// STONITH (signal only if the target's epoch is < ours).
+		cfg.killStub = func(target identity, fencerEpoch int64) error {
+			return kill(KillTarget{
+				Pid:         target.Pid,
+				PidStart:    target.PidStart,
+				AgentID:     target.AgentID,
+				Project:     target.Project,
+				FencerEpoch: fencerEpoch,
+			})
+		}
+	}
+	return acquireLease(project, agentID, cfg)
 }
 
 // acquireLease is the failover-gate-free core, parameterized by config so
@@ -556,9 +622,11 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 	// missing), AND the current flock-body holder — so a hung resumed
 	// candidate is reaped too (else retryFlock just times out).
 	for _, target := range l.killTargets(old, priorCandidate) {
-		if kerr := l.cfg.killStub(target); kerr != nil {
+		// l.epoch is the epoch we just fenced TO (old+1) — pass it as the
+		// fencer epoch so the injected kill can epoch-gate the STONITH.
+		if kerr := l.cfg.killStub(target, l.epoch); kerr != nil {
 			_ = l.markFencedNotAcquired(old)
-			return false, false, fmt.Errorf("coordlock.TakeOver: kill stub failed for pid=%d: %w", target.Pid, kerr)
+			return false, false, fmt.Errorf("coordlock.TakeOver: kill failed for pid=%d: %w", target.Pid, kerr)
 		}
 	}
 
@@ -1130,4 +1198,47 @@ func hostname() string {
 		return "unknown-host"
 	}
 	return h
+}
+
+// CurrentActiveOwnerPID reports the supervisor PID recorded as the
+// current ACTIVE lease owner for project, or (0,false) if there is no
+// active owner (no epoch file, or its state != active). The
+// authenticated kill primitive (internal/coord) uses it as the epoch
+// gate's executable form: a STONITH target is refused if it IS the
+// current active owner (never shoot the live leader); any other coord
+// for this project is stale by construction once we hold the lease.
+// Best-effort + read-only — it takes no lock (a torn read degrades to
+// (0,false), i.e. "no active owner", which makes the kill primitive
+// refuse rather than fire on stale data).
+func CurrentActiveOwnerPID(project string) (pid int, ok bool) {
+	paths, err := resolvePaths(project)
+	if err != nil {
+		return 0, false
+	}
+	rec, err := readEpoch(paths.epoch)
+	if err != nil {
+		return 0, false
+	}
+	if rec.State != stateActive || rec.Owner.Pid <= 0 {
+		return 0, false
+	}
+	return rec.Owner.Pid, true
+}
+
+// PidStartNanos exports the platform pid-start reader so the
+// authenticated kill primitive (internal/coord.KillCoordIfIdentity-
+// Matches) and the coord-run supervisor can stamp + re-validate a
+// supervisor identity using the SAME PID-reuse-safe start-time source the
+// lease uses internally. Two calls for one live pid return the same
+// value; a recycled pid returns a different value — equality is what
+// defeats PID reuse. The unit is platform-relative ns-since-boot
+// (Linux) / Unix ns (darwin); only ever compared for equality on the
+// same boot, never interpreted as an absolute time. ok=false means the
+// pid is dead/unreadable.
+func PidStartNanos(pid int) (start int64, ok bool) {
+	st, err := pidStartNanos(pid)
+	if err != nil {
+		return 0, false
+	}
+	return st, true
 }
