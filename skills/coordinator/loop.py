@@ -5724,6 +5724,17 @@ def _reconcile_pr_watches(
             )
 
     staged_blocks: list[str] = []
+    # PR-watch ~60 s poll floor (DESIGN-pr-watch-autoremediate §1): when the
+    # floor is ON, IT is the cadence — so every open watched PR (including a
+    # quiescent READY one) must be probe-due on every floored pass, else the
+    # slow per-watch cadence (_probe_due skips READY unless tick%N==0) would
+    # suppress 4/5 floored probes and a READY->BEHIND/merged transition would
+    # still wait ~5 min, defeating the floor (codex P2). slow_cadence_ticks=1
+    # makes READY watches probe every pass; the per-repo cost is unchanged
+    # (one batched GraphQL covers all the repo's watched PRs). When the floor
+    # is OFF (0), keep the module default slow cadence (legacy behavior).
+    floor_on = supervisor_mod.env_pr_watch_poll_floor_s() > 0
+    slow_cadence = 1 if floor_on else pr_watch_mod._SLOW_CADENCE_TICKS_DEFAULT
     outcome = pr_watch_mod.reconcile_watches(
         tasks,
         project=project,
@@ -5733,6 +5744,7 @@ def _reconcile_pr_watches(
         flip_task_done=_flip_done,
         now_iso=pr_watch_mod.utc_now_iso(),
         tick_count=tick_count,
+        slow_cadence_ticks=slow_cadence,
         repo_path=repo_path,
         enroll_tasks=enroll_tasks,
         dispatch_action=_dispatch_action,

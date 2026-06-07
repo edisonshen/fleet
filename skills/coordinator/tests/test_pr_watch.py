@@ -3707,3 +3707,48 @@ def test_rederive_breadcrumb_pinned_to_base_sha(tmp_path: Path) -> None:
           agent_outcome=lambda _a: "gone", tick_count=10)
     assert disp.calls[-1].kind == pw.ACTION_REBASE, \
         "a new base must try a clean rebase before re-derive"
+
+
+def test_probe_due_ready_every_tick_when_floor_cadence_is_one() -> None:
+    """codex P2 (unit): with the floor ON, slow_cadence_ticks=1 must make a
+    READY watch probe-due on EVERY tick (not 1-in-5), so the floored pass
+    actually re-queries a green PR for a READY->BEHIND/merged transition."""
+    ready = {"tasks": ["a"], "last_event": pw.EVENT_READY}
+    # slow cadence 5 (floor off): READY only due on tick % 5 == 0.
+    assert pw._probe_due(ready, tick_count=1, slow_cadence_ticks=5) is False
+    assert pw._probe_due(ready, tick_count=2, slow_cadence_ticks=5) is False
+    # slow cadence 1 (floor on): READY due EVERY tick.
+    assert pw._probe_due(ready, tick_count=1, slow_cadence_ticks=1) is True
+    assert pw._probe_due(ready, tick_count=2, slow_cadence_ticks=1) is True
+    assert pw._probe_due(ready, tick_count=3, slow_cadence_ticks=1) is True
+
+
+def test_floor_reprobes_ready_watch_every_tick_e2e(
+    it_home: Path, it_project_dir: Path, monkeypatch,
+) -> None:
+    """codex P2 (e2e): with PR_WATCH_POLL_FLOOR_S set, consecutive loop.tick
+    passes re-PROBE a READY watch every tick (slow_cadence=1), so a green PR
+    that goes BEHIND is caught at the floor — not the slow 5-tick cadence."""
+    monkeypatch.setenv("PR_WATCH_POLL_FLOOR_S", "60")
+    _write_tasks(it_project_dir, [_it_task("foo", pr_url=_pr_url(195), branch="worker/foo")])
+    # A READY snapshot (up-to-date + green).
+    ready = pw.PRSnapshot(number=195, pr_state="OPEN", merge_state_status="CLEAN",
+                          review_decision="", checks="SUCCESS", head_ref_oid="H195",
+                          base_ref_name="main")
+    prober = FakeProber(snaps={195: ready}, fresh_base="B", ancestors={("B", "H195")})
+    monkeypatch.setattr(loop, "_pr_watch_prober", prober)
+    monkeypatch.setattr(loop.pr_watch_mod, "derive_owner_repo", lambda *a, **k: OWNER_REPO)
+    monkeypatch.setattr(loop.dispatch_mod, "fetch_standards", lambda *a, **k: "S")
+    monkeypatch.setattr(loop.dispatch_mod, "acquire_coord_prompt_inbox",
+                        _fake_acquire_factory(it_home))
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    n1 = len(prober.probe_calls)
+    assert n1 >= 1
+    # the watch is READY now.
+    assert pw.load_watches(it_project_dir)["watches"]["195"]["last_event"] == pw.EVENT_READY
+    # SECOND consecutive tick (tick_count advances by 1) -> a READY watch must
+    # STILL be re-probed (floor cadence=1), not skipped by the slow cadence.
+    with patch.object(loop, "_run_fleet", side_effect=lambda cmd, timeout_s=30.0: None):
+        loop.tick("fleet", coord_id="cccccc01", cwd="/repo", fleet_home=str(it_home))
+    assert len(prober.probe_calls) > n1, "floor must re-probe a READY watch every tick"
