@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/edisonshen/fleet/internal/gc"
+	"github.com/edisonshen/fleet/internal/state"
 )
 
 // Pure-CLI-shell coverage for cmd/fleet/gc.go. The reconciliation
@@ -178,5 +183,83 @@ func TestRunGC_CoordLocks_NoWarning_WhenSocketUnset(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "FLEET_TMUX_SOCKET") {
 		t.Errorf("stderr should not mention FLEET_TMUX_SOCKET when unset; got:\n%s", stderr.String())
+	}
+}
+
+// dropKind unit coverage: removes the target, preserves order, and never
+// aliases the caller's backing array.
+func TestDropKind(t *testing.T) {
+	in := []gc.Kind{gc.KindSockets, gc.KindWorktrees, gc.KindCoordLocks}
+	out := dropKind(in, gc.KindWorktrees)
+	if len(out) != 2 || out[0] != gc.KindSockets || out[1] != gc.KindCoordLocks {
+		t.Fatalf("dropKind removed-or-reordered wrong: %v", out)
+	}
+	// in must be untouched (no aliasing).
+	if len(in) != 3 || in[1] != gc.KindWorktrees {
+		t.Fatalf("dropKind mutated caller's slice: %v", in)
+	}
+	// Dropping an absent kind is a no-op copy.
+	if got := dropKind([]gc.Kind{gc.KindSockets}, gc.KindWorktrees); len(got) != 1 {
+		t.Fatalf("dropKind(absent) should keep all: %v", got)
+	}
+}
+
+// Codex iter-1 [P2] regression: a worktree-GC that holds the lock longer
+// than the bound must NOT let a second GC scan/re-check/remove worktrees
+// unlocked. On an ErrLockTimeout the runGC call SKIPS the worktrees kind
+// (warning to stderr) instead of proceeding unlocked. We hold the lock
+// from a separate fd (OS-level contention) and shrink the timeout so the
+// waiter times out deterministically (no multi-minute wait, no Sleep
+// assertion).
+func TestRunGC_Worktrees_SkipsOnLockTimeout(t *testing.T) {
+	t.Setenv("FLEET_TMUX_SOCKET", "") // worktrees classifier alone never reaches tmux
+	tmp := t.TempDir()
+	t.Setenv("FLEET_HOME", tmp)
+	if _, err := state.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	const project = "rainier"
+	restore := state.SetWorktreeGCLockTimeoutForTest(150 * time.Millisecond)
+	t.Cleanup(restore)
+
+	// Hold the worktree-GC lock from a separate fd so runGC's bounded
+	// acquire times out.
+	path, err := state.ProjectWorktreeGCLockPath(project)
+	if err != nil {
+		t.Fatalf("ProjectWorktreeGCLockPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	holder, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("flock holder: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Flock(int(holder.Fd()), syscall.LOCK_UN) })
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	if err := runGC(&stdout, &stderr, &gcFlags{
+		maxAge:   gcDefaultMaxAge,
+		kindsCSV: "worktrees",
+		project:  project,
+	}); err != nil {
+		t.Fatalf("runGC: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("runGC blocked %s; bounded acquire should time out near 150ms", elapsed)
+	}
+	se := stderr.String()
+	if !strings.Contains(se, "held by another GC") || !strings.Contains(se, "skipping worktrees kind") {
+		t.Fatalf("expected skip-worktrees warning on lock timeout; got stderr:\n%s", se)
+	}
+	// It must NOT have fallen back to the unlocked path.
+	if strings.Contains(se, "proceeding unlocked") {
+		t.Fatalf("runGC must NOT proceed unlocked on a lock timeout; got:\n%s", se)
 	}
 }
