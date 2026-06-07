@@ -1,0 +1,279 @@
+package main
+
+// coord_spawn_idempot_test.go — tests for the cold-start double-spawn
+// fix (leak-coord-spawn-idempot): durable pending-spawn claim, OR-based
+// veto, and idempotent attach-if-live. Maps to T1–T7 in
+// docs/TASK-PLAN-leak-coord-spawn-idempot.md.
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/edisonshen/fleet/internal/agent"
+	"github.com/edisonshen/fleet/internal/state"
+)
+
+// newPendingClaimHome sets FLEET_HOME to a temp dir and returns the
+// per-project dir so a test can inspect / pre-seed the pending-claim
+// file directly.
+func newPendingClaimHome(t *testing.T, project string) string {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	pdir, err := state.ProjectDir(project)
+	if err != nil {
+		t.Fatalf("ProjectDir(%q): %v", project, err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir %q: %v", pdir, err)
+	}
+	return pdir
+}
+
+// T5 (Go half): writeCoordPendingClaim writes a durable, atomically
+// renamed claim file containing the agent ID + spawn timestamp; a
+// freshly written claim reads back as fresh.
+func TestCoordPendingClaim_WriteThenFresh(t *testing.T) {
+	pdir := newPendingClaimHome(t, "myproj")
+
+	if err := writeCoordPendingClaim("myproj", "agent-abc"); err != nil {
+		t.Fatalf("writeCoordPendingClaim: %v", err)
+	}
+
+	// The on-disk file lives at the documented path.
+	claimPath := filepath.Join(pdir, "coord-spawn-pending")
+	if _, err := os.Stat(claimPath); err != nil {
+		t.Fatalf("claim file not written at %q: %v", claimPath, err)
+	}
+	// No leftover .tmp from the atomic write.
+	entries, _ := os.ReadDir(pdir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" || len(e.Name()) > len("coord-spawn-pending.tmp") && e.Name()[:len("coord-spawn-pending.tmp")] == "coord-spawn-pending.tmp" {
+			t.Errorf("leftover tmp file after atomic write: %s", e.Name())
+		}
+	}
+
+	fresh, claim := coordPendingClaimFresh("myproj", 5*time.Minute)
+	if !fresh {
+		t.Fatalf("freshly written claim must read as fresh")
+	}
+	if claim.AgentID != "agent-abc" {
+		t.Errorf("claim AgentID = %q, want agent-abc", claim.AgentID)
+	}
+	if claim.SpawnedAt.IsZero() {
+		t.Errorf("claim SpawnedAt must be set")
+	}
+}
+
+// T1: a claim written ~18s ago (cold-start window) reads as fresh under
+// the 5-minute budget → veto refuses the second spawn.
+func TestCoordPendingClaim_RecentIsFresh(t *testing.T) {
+	pdir := newPendingClaimHome(t, "projects-fleet")
+	writeClaimAt(t, pdir, "agent-1", time.Now().UTC().Add(-18*time.Second))
+
+	fresh, claim := coordPendingClaimFresh("projects-fleet", 5*time.Minute)
+	if !fresh {
+		t.Fatalf("an 18s-old claim must be fresh under a 5m budget")
+	}
+	if claim.AgentID != "agent-1" {
+		t.Errorf("AgentID = %q, want agent-1", claim.AgentID)
+	}
+}
+
+// T3: a stale claim (older than budget) reads as NOT fresh → veto does
+// not block; the dispatch proceeds and overwrites the old claim.
+func TestCoordPendingClaim_StaleIsNotFresh(t *testing.T) {
+	pdir := newPendingClaimHome(t, "projects-fleet")
+	writeClaimAt(t, pdir, "agent-old", time.Now().UTC().Add(-10*time.Minute))
+
+	fresh, _ := coordPendingClaimFresh("projects-fleet", 5*time.Minute)
+	if fresh {
+		t.Fatalf("a 10m-old claim must NOT be fresh under a 5m budget")
+	}
+}
+
+// Missing claim file → not fresh (no claim ever written).
+func TestCoordPendingClaim_MissingIsNotFresh(t *testing.T) {
+	newPendingClaimHome(t, "projects-fleet")
+	fresh, _ := coordPendingClaimFresh("projects-fleet", 5*time.Minute)
+	if fresh {
+		t.Fatalf("missing claim must read as not fresh")
+	}
+}
+
+// A corrupt claim file must not be treated as fresh (fail toward
+// allowing the spawn — a corrupt claim cannot block forever).
+func TestCoordPendingClaim_CorruptIsNotFresh(t *testing.T) {
+	pdir := newPendingClaimHome(t, "projects-fleet")
+	if err := os.WriteFile(filepath.Join(pdir, "coord-spawn-pending"), []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("write corrupt claim: %v", err)
+	}
+	fresh, _ := coordPendingClaimFresh("projects-fleet", 5*time.Minute)
+	if fresh {
+		t.Fatalf("corrupt claim must NOT read as fresh")
+	}
+}
+
+// clearCoordPendingClaim removes the claim file (the coord's first tick
+// calls the Python equivalent). Removing an absent claim is a no-op.
+func TestCoordPendingClaim_Clear(t *testing.T) {
+	pdir := newPendingClaimHome(t, "myproj")
+	if err := writeCoordPendingClaim("myproj", "agent-abc"); err != nil {
+		t.Fatalf("writeCoordPendingClaim: %v", err)
+	}
+	if err := clearCoordPendingClaim("myproj"); err != nil {
+		t.Fatalf("clearCoordPendingClaim: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(pdir, "coord-spawn-pending")); !os.IsNotExist(err) {
+		t.Fatalf("claim file must be gone after clear, stat err = %v", err)
+	}
+	// Idempotent: clearing an absent claim is not an error.
+	if err := clearCoordPendingClaim("myproj"); err != nil {
+		t.Errorf("clearing an absent claim must be a no-op, got %v", err)
+	}
+}
+
+// writeClaimAt writes a claim file with an explicit spawned_at so a test
+// can simulate an aged claim without sleeping.
+func writeClaimAt(t *testing.T, pdir, agentID string, ts time.Time) {
+	t.Helper()
+	c := coordPendingClaim{AgentID: agentID, SpawnedAt: ts, PID: 4242}
+	data, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	if err := state.WriteAtomic(filepath.Join(pdir, "coord-spawn-pending"), data); err != nil {
+		t.Fatalf("write claim: %v", err)
+	}
+}
+
+// ---- T7: OR-based veto, exhaustive over the three signals ----
+
+// coordSpawnVeto returns a non-empty reason when ANY of the three
+// signals indicates a coord is (or is about to be) supervising the
+// project:
+//   - coordStateFresh && recordExists  (the original AND-gate)
+//   - a live coord record (tmux session alive) for this task_id
+//   - a fresh pending-spawn claim
+//
+// It returns "" only when ALL three are absent.
+func TestCoordSpawnVeto_ORLogic(t *testing.T) {
+	cases := []struct {
+		name        string
+		stateFresh  bool
+		recordExist bool
+		liveCoord   bool
+		claimFresh  bool
+		wantVeto    bool
+	}{
+		{"all absent", false, false, false, false, false},
+		{"coord-state only (no record)", true, false, false, false, false},
+		{"record only (state stale)", false, true, false, false, false},
+		{"coord-state AND record", true, true, false, false, true},
+		{"live coord record only", false, false, true, false, true},
+		{"pending claim only", false, false, false, true, true},
+		{"claim + state+record", true, true, false, true, true},
+		{"live coord + claim", false, false, true, true, true},
+		{"everything", true, true, true, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reason := coordSpawnVeto(tc.stateFresh, tc.recordExist, tc.liveCoord, tc.claimFresh)
+			gotVeto := reason != ""
+			if gotVeto != tc.wantVeto {
+				t.Errorf("coordSpawnVeto(stateFresh=%v, record=%v, live=%v, claim=%v) veto=%v, want %v (reason=%q)",
+					tc.stateFresh, tc.recordExist, tc.liveCoord, tc.claimFresh, gotVeto, tc.wantVeto, reason)
+			}
+		})
+	}
+}
+
+// ---- T4: idempotent attach-if-live ----
+
+// liveCoordForAttach returns the live coord record (tmux session alive)
+// matching the task_id+project, or nil. The dispatch path prints an
+// attach hint and skips the spawn when this returns non-nil.
+func TestLiveCoordForAttach_FindsLive(t *testing.T) {
+	recs := []*agent.Record{
+		{ID: "dead1", TaskID: "coord-projects-fleet", Project: "projects-fleet", TmuxSession: "fleet-dead1"},
+		{ID: "live1", TaskID: "coord-projects-fleet", Project: "projects-fleet", TmuxSession: "fleet-live1"},
+	}
+	sessionAlive := func(s string) bool { return s == "fleet-live1" }
+
+	got := liveCoordForAttach("coord-projects-fleet", "projects-fleet", recs, sessionAlive)
+	if got == nil {
+		t.Fatalf("expected the live coord record, got nil")
+	}
+	if got.ID != "live1" {
+		t.Errorf("liveCoordForAttach = %q, want live1", got.ID)
+	}
+}
+
+func TestLiveCoordForAttach_NoneLive(t *testing.T) {
+	recs := []*agent.Record{
+		{ID: "dead1", TaskID: "coord-projects-fleet", Project: "projects-fleet", TmuxSession: "fleet-dead1"},
+	}
+	sessionAlive := func(string) bool { return false }
+	if got := liveCoordForAttach("coord-projects-fleet", "projects-fleet", recs, sessionAlive); got != nil {
+		t.Errorf("expected nil when no session alive, got %q", got.ID)
+	}
+}
+
+func TestLiveCoordForAttach_WrongProjectIgnored(t *testing.T) {
+	recs := []*agent.Record{
+		{ID: "other", TaskID: "coord-projects-other", Project: "projects-other", TmuxSession: "fleet-other"},
+	}
+	sessionAlive := func(string) bool { return true }
+	if got := liveCoordForAttach("coord-projects-fleet", "projects-fleet", recs, sessionAlive); got != nil {
+		t.Errorf("expected nil for a different project, got %q", got.ID)
+	}
+}
+
+// ---- T1 (integration): cold-start double-spawn refused via pending claim ----
+
+// A fresh pending-spawn claim on disk (no coord-state.json yet — the
+// cold-start window) must make a second --coord-spawn dispatch refuse
+// with a typed vetoError, BEFORE reaching spawn.Spawn. On the parent
+// commit the pending-claim signal does not exist, so the dispatch falls
+// through the veto and proceeds to spawn — this test would fail there.
+func TestRunDispatch_ColdStartRefusedByPendingClaim(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("FLEET_HOME", root)
+	// Isolate tmux so a host with tmux installed never leaks a session
+	// if the veto regressed and the spawn path were reached.
+	isolateTmuxSocket(t)
+
+	pdir, err := state.ProjectDir("coldstart")
+	if err != nil {
+		t.Fatalf("ProjectDir: %v", err)
+	}
+	if err := os.MkdirAll(pdir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Simulate dispatch #1 having written the claim ~18s ago and spawned;
+	// coord-state.json is deliberately ABSENT (cold start).
+	writeClaimAt(t, pdir, "agent-first", time.Now().UTC().Add(-18*time.Second))
+
+	opts := &dispatchOpts{
+		taskID:          CoordTaskIDPrefix + "coldstart",
+		project:         "coldstart",
+		projectExplicit: true,
+		coordSpawn:      true,
+		command:         []string{"sleep", "30"},
+		commandExplicit: true,
+	}
+	var out bytes.Buffer
+	err = runDispatch(opts, &out)
+	if err == nil {
+		t.Fatalf("expected refusal, got nil error (a duplicate coord would have spawned)")
+	}
+	var ve *vetoError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected *vetoError (exit 75 retry signal), got %T: %v", err, err)
+	}
+}
