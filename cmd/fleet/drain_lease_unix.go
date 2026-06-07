@@ -107,9 +107,12 @@ type drainLeaseDeps struct {
 	// the successor is coord-run-wrapped and ACQUIRES + heartbeats the now-free
 	// lease — NOT routed through handoffop.Resume (which loads OLD by id and
 	// would race the takeover's archive + spawn an UNWRAPPED handoff
-	// successor). nil OldRec means "could not cache OLD" -> the seam surfaces a
-	// recovery instruction instead of spawning blind.
-	RecoverSpawn func(oldRec *agent.Record, docPath string, stdout, stderr io.Writer) error
+	// successor). preAllocatedID is the queue's pre-allocated successor id
+	// (req.NewAgentID) so journal/doc/remote-control setup keyed to it still
+	// correlates to the live replacement (codex PR3 iter-10 [P2]); empty means
+	// generate a fresh id. nil OldRec means "could not cache OLD" -> the seam
+	// surfaces a recovery instruction instead of spawning blind.
+	RecoverSpawn func(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error
 	// BarrierPoll is the interval between barrier-existence checks while
 	// waiting (bounded) for a graceful handoff to complete. 0 = default.
 	BarrierPoll time.Duration
@@ -176,7 +179,7 @@ func defaultDrainLeaseDeps() drainLeaseDeps {
 // coord's stale stored Cwd. Surface-don't-silo on any gap: a missing record /
 // unresolvable repo prints a concrete recovery command rather than spawning
 // blind.
-func productionRecoverSpawn(oldRec *agent.Record, docPath string, stdout, stderr io.Writer) error {
+func productionRecoverSpawn(oldRec *agent.Record, docPath, preAllocatedID string, stdout, stderr io.Writer) error {
 	if oldRec == nil {
 		_, _ = fmt.Fprintf(stderr,
 			"fleet drain: takeover reaped the hung coord but its record could not be cached; "+
@@ -200,6 +203,10 @@ func productionRecoverSpawn(oldRec *agent.Record, docPath string, stdout, stderr
 		Cwd:               spawnCwd,
 		Command:           oldRec.Command,
 		DisableAutoResume: oldRec.DisableAutoResume,
+		// Reuse the queue's pre-allocated successor id so any handoff
+		// journal/doc/remote-control setup keyed to it correlates to the live
+		// replacement (codex PR3 iter-10 [P2]). Empty -> spawn.Spawn allocates.
+		PreAllocatedID: preAllocatedID,
 		// RecoverDeadCoord: OLD is gone (the takeover reaped it) -> the
 		// successor is a FRESH leader and MUST be lease-wrapped so it acquires
 		// + heartbeats the now-free lease.
@@ -484,7 +491,7 @@ func takeoverAndRecover(req queue.SpawnFresh, path string, cachedOld *agent.Reco
 	// handoff successor that never acquires the lease.
 	_, _ = fmt.Fprintf(stderr,
 		"fleet drain: takeover fenced/killed the hung coord for %s; recovering a lease-wrapped successor\n", project)
-	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, stdout, stderr); err != nil {
+	if err := d.RecoverSpawn(cachedOld, req.HandoffDoc, req.NewAgentID, stdout, stderr); err != nil {
 		// Surface the recovery-spawn failure but keep the escalation semantics:
 		// the takeover succeeded (OLD reaped). Leave the queue in place so the
 		// dead-coord recovery path (next dispatch / TUI [a]) retries against

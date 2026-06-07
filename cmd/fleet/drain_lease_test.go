@@ -155,6 +155,7 @@ func TestDrainLease_SuccessorAlreadyLeads_NoDuplicateSpawn(t *testing.T) {
 func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	var killed, tookOver, recovered int32
 	var recoveredFromOld *agent.Record
+	var recoveredID string
 	out := &bytes.Buffer{}
 	d := drainLeaseDeps{
 		LeaderPresent: func(string) bool { return false }, // hung/stealable
@@ -166,16 +167,19 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 			atomic.AddInt32(&tookOver, 1)
 			return true, nil
 		},
-		RecoverSpawn: func(oldRec *agent.Record, _ string, _, _ io.Writer) error {
+		RecoverSpawn: func(oldRec *agent.Record, _, preAllocatedID string, _, _ io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			recoveredFromOld = oldRec
+			recoveredID = preAllocatedID
 			return nil
 		},
 		BarrierPoll: time.Millisecond,
 	}
 	// tiny budget so the bounded wait returns fast (not a timing assertion —
 	// we assert it RETURNS + escalates, not how long it took).
-	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
+	req := leaseDrainReq()
+	req.NewAgentID = "preallocated-succ" // codex PR3 iter-10 [P2]
+	err := drainOneLeaseAwareWith(req, "/tmp/q.json", 0, 5, out, out, d)
 	if !errors.Is(err, ErrEscalatedToTakeOver) {
 		t.Fatalf("expected ErrEscalatedToTakeOver, got %v", err)
 	}
@@ -193,6 +197,11 @@ func TestDrainLease_NoBarrierNoGracefulKill_Escalates(t *testing.T) {
 	}
 	if recoveredFromOld == nil || recoveredFromOld.ID != "oldcoord1" {
 		t.Errorf("RecoverSpawn was not given the cached old record, got %+v", recoveredFromOld)
+	}
+	// codex PR3 iter-10 [P2]: the queued successor id must be threaded into the
+	// recovery spawn so journal/doc/RC correlation holds.
+	if recoveredID != "preallocated-succ" {
+		t.Errorf("RecoverSpawn preAllocatedID = %q, want the queued successor id", recoveredID)
 	}
 }
 
@@ -212,7 +221,7 @@ func TestDrainLease_HungOldEscalatesToTakeOver(t *testing.T) {
 			tookOverProject = project
 			return true, nil // takeover acquired -> OLD confirmed gone
 		},
-		RecoverSpawn: func(*agent.Record, string, io.Writer, io.Writer) error {
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
 			atomic.AddInt32(&recovered, 1)
 			return nil
 		},
@@ -345,8 +354,11 @@ func TestDrainLease_GracefulOldHoldsLeasePastBudget_Escalates(t *testing.T) {
 		ActiveOwnerPID: func(string) (int, bool) { return 424242, true }, // never releases
 		LoadAgent:      func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:       func(string, string) (bool, error) { atomic.AddInt32(&tookOver, 1); return true, nil },
-		RecoverSpawn:   func(*agent.Record, string, io.Writer, io.Writer) error { atomic.AddInt32(&recovered, 1); return nil },
-		BarrierPoll:    time.Millisecond,
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
 	if !errors.Is(err, ErrEscalatedToTakeOver) {
@@ -373,8 +385,11 @@ func TestDrainLease_TakeoverNotAcquired_NoRecoverSpawn(t *testing.T) {
 		BarrierExists: func(string, int64) bool { return false },
 		LoadAgent:     func(string) (*agent.Record, error) { return oldCoordRec(), nil },
 		TakeOver:      func(string, string) (bool, error) { return false, nil }, // did NOT acquire
-		RecoverSpawn:  func(*agent.Record, string, io.Writer, io.Writer) error { atomic.AddInt32(&recovered, 1); return nil },
-		BarrierPoll:   time.Millisecond,
+		RecoverSpawn: func(*agent.Record, string, string, io.Writer, io.Writer) error {
+			atomic.AddInt32(&recovered, 1)
+			return nil
+		},
+		BarrierPoll: time.Millisecond,
 	}
 	err := drainOneLeaseAwareWith(leaseDrainReq(), "/tmp/q.json", 0, 5, out, out, d)
 	if err == nil || errors.Is(err, ErrEscalatedToTakeOver) {
