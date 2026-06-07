@@ -1,3 +1,12 @@
+//go:build linux || darwin
+
+// The lease primitive depends on platform_{linux,darwin}.go for
+// pid_start / monotonic-clock / boot-id reads. Gate the whole file (and
+// its tests) to those two GOOS values so non-linux/darwin Unix targets
+// (e.g. FreeBSD) don't compile a lease.go whose platform hooks are
+// undefined. PR1's failover path is dev-only behind FLEET_LEASE_FAILOVER;
+// adding more platforms is a later PR if ever needed.
+
 package coordlock
 
 // lease.go — the three-file coordinator lease primitive (PR1 of the
@@ -508,9 +517,19 @@ func (l *Lease) takeOver(rec epochRecord) (done, acquired bool, err error) {
 
 	// Phase 2: kill (PR1 stub). On stub error, leave fenced_not_acquired
 	// for doctor (PR6) — surface, don't silently stall.
-	if kerr := l.cfg.killStub(old); kerr != nil {
-		_ = l.markFencedNotAcquired(old)
-		return false, false, fmt.Errorf("coordlock.TakeOver: kill stub failed for owner pid=%d: %w", old.Pid, kerr)
+	//
+	// Whoever actually HOLDS coordinator.flock is what blocks our acquire,
+	// and that is not always `old`: when resuming a stale fencing record
+	// whose previous candidate acquired the flock + stamped it before
+	// hanging, the live flock holder is that candidate, not the original
+	// owner. Kill every distinct live identity that could be holding the
+	// flock — the recorded owner AND the current flock-body holder — so a
+	// hung resumed-candidate is reaped too (else retryFlock just times out).
+	for _, target := range l.killTargets(old) {
+		if kerr := l.cfg.killStub(target); kerr != nil {
+			_ = l.markFencedNotAcquired(old)
+			return false, false, fmt.Errorf("coordlock.TakeOver: kill stub failed for pid=%d: %w", target.Pid, kerr)
+		}
 	}
 
 	// Phase 3: acquire the (now-free) flock, then CAS to active.
@@ -804,6 +823,42 @@ func (l *Lease) syntheticRecordFromFlockBody() epochRecord {
 	}
 	rec.Owner = identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project}
 	return rec
+}
+
+// killTargets returns the distinct live identities a takeover must kill to
+// free coordinator.flock: the recorded OLD owner plus the current
+// flock-body holder (which differs from OLD when resuming a stale fencing
+// record whose candidate acquired the flock then hung). Dead/empty/self
+// identities are dropped — the kill primitive (PR2) re-validates again
+// before signaling, but we avoid handing it provably-irrelevant targets.
+func (l *Lease) killTargets(old identity) []identity {
+	targets := make([]identity, 0, 2)
+	add := func(id identity) {
+		if id.Pid <= 0 || id.Pid == l.self.Pid || !l.pidAlive(id) {
+			return
+		}
+		for _, t := range targets {
+			if t.Pid == id.Pid && t.PidStart == id.PidStart {
+				return // already queued
+			}
+		}
+		targets = append(targets, id)
+	}
+	add(old)
+	// The flock-body holder (whoever stamped coordinator.flock last).
+	if b, err := os.ReadFile(l.paths.flock); err == nil && len(b) > 0 {
+		var body flockBody
+		if json.Unmarshal(b, &body) == nil && body.Pid > 0 {
+			add(identity{Pid: body.Pid, PidStart: body.PidStart, Project: l.self.Project})
+		}
+	}
+	// If neither is live (both already dead), still hand the kill primitive
+	// the recorded owner so the PR1 stub / PR2 kill has a stable target;
+	// the flock is already free in that case so retryFlock will win anyway.
+	if len(targets) == 0 {
+		targets = append(targets, old)
+	}
+	return targets
 }
 
 // flockHolderRecoverable reports whether a BUSY flock with NO epoch record
