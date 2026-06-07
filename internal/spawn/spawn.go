@@ -628,6 +628,21 @@ type Options struct {
 	//
 	// Empty (the common case) means tmux runs Command verbatim.
 	ExecCommand []string
+
+	// LeaderCheck, when non-nil, reports whether a HEALTHY coordinator
+	// lease leader currently exists for the given project. It is the
+	// signal that disambiguates a clean lease STAND-DOWN from a real
+	// supervisor failure when a lease-wrapped coord-run's record is
+	// already archived by the time Spawn's post-launch merge runs (codex
+	// PR2 iter-6 [P2]): a healthy leader present -> stand-down (return
+	// ErrCoordStoodDown); none -> the supervisor failed and left no leader
+	// -> surface a real error instead of a false "already running". nil
+	// (off-flag / non-coord callers) collapses to the conservative
+	// stand-down report. Production wires this to
+	// coordlock.CurrentActiveOwnerPID via cmd/fleet (spawn cannot import
+	// coordlock — it is build-tagged to linux/darwin while spawn is
+	// all-platforms).
+	LeaderCheck func(project string) bool
 }
 
 // Spawn creates a fresh agent (or a handoff replacement, if
@@ -883,15 +898,26 @@ func Spawn(opts Options) (*agent.Record, error) {
 	//
 	//	execArgv = ["<fleetBin>","coord-run","--agent",<id>,
 	//	            "--project",<p>,"--", <prev execArgv ...>]
+	// leaseWrapped tracks whether THIS spawn launches a coord-run
+	// supervisor — either because we wrap it here, OR because the caller
+	// already handed us a coord-run-wrapped ExecCommand (codex PR2 iter-6
+	// [P2]: an already-wrapped argv still runs a supervisor, so it needs
+	// the same pre-launch record + stand-down lifecycle handling below,
+	// not a bypass).
 	leaseWrapped := false
-	if leaseFailoverEnabled() && isCoordSpawn(rec.TaskID, rec.Project) && !alreadyCoordRunWrapped(execArgv) {
-		if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
-			execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
-			leaseWrapped = true
-		} else {
-			_, _ = fmt.Fprintf(os.Stderr,
-				"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
-					"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
+	if leaseFailoverEnabled() && isCoordSpawn(rec.TaskID, rec.Project) {
+		switch {
+		case alreadyCoordRunWrapped(execArgv):
+			leaseWrapped = true // a supervisor will run; apply lifecycle handling
+		default:
+			if fleetBin, exeErr := os.Executable(); exeErr == nil && fleetBin != "" {
+				execArgv = coordRunWrap(fleetBin, id, rec.Project, execArgv)
+				leaseWrapped = true
+			} else {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"warning: FLEET_LEASE_FAILOVER set but os.Executable() failed (%v); "+
+						"spawning coord %s WITHOUT the coord-run lease supervisor\n", exeErr, id)
+			}
 		}
 	}
 
@@ -981,17 +1007,28 @@ func Spawn(opts Options) (*agent.Record, error) {
 		onDisk, lerr := agent.Load(id)
 		switch {
 		case errors.Is(lerr, state.ErrNotFound):
-			// The supervisor already ran its full lifecycle and archived
-			// the pre-launch record — the common case is an acquired=false
-			// STAND-DOWN (a healthy leader already holds the lease). Return
-			// the typed ErrCoordStoodDown (codex PR2 iter-5 [P2]) so the
-			// caller does NOT report a successful spawn / try to prompt or
-			// attach a dead agent id. rec is returned alongside for the
-			// caller's diagnostics (id/session) but it is NOT live on disk.
-			_, _ = fmt.Fprintf(os.Stderr,
-				"spawn: coord %s record already archived by its supervisor "+
-					"(stand-down or early exit); not resurrecting it\n", id)
-			return rec, ErrCoordStoodDown
+			// The supervisor already archived the pre-launch record before
+			// we reached the merge. This is AMBIGUOUS (codex PR2 iter-6
+			// [P2]): it is a clean STAND-DOWN only if a healthy leader now
+			// holds the lease; otherwise coord-run hit a real fault
+			// (lease-acquire error, child start failure) and its cleanup
+			// archived the record while leaving NO coord running. Use
+			// LeaderCheck to tell them apart so a failure is NOT hidden as
+			// a success.
+			//   - leader present -> clean stand-down: ErrCoordStoodDown
+			//     (caller reports "already running", exit 0).
+			//   - no leader (or no checker) -> surface a real error so the
+			//     caller does NOT print a false success for a dead coord.
+			if opts.LeaderCheck != nil && opts.LeaderCheck(rec.Project) {
+				_, _ = fmt.Fprintf(os.Stderr,
+					"spawn: coord %s stood down — a healthy leader already holds the lease "+
+						"for %q; not resurrecting its record\n", id, rec.Project)
+				return rec, ErrCoordStoodDown
+			}
+			return nil, fmt.Errorf(
+				"spawn: coord %s supervisor exited before its record was finalized and no "+
+					"healthy leader holds the lease for %q (lease-acquire or child-start "+
+					"failure); no coord is running", id, rec.Project)
 		case lerr == nil:
 			rec.SupervisorPID = onDisk.SupervisorPID
 			rec.SupervisorPidStart = onDisk.SupervisorPidStart
@@ -1006,6 +1043,16 @@ func Spawn(opts Options) (*agent.Record, error) {
 		// would see a ghost session in `tmux ls` with no `fleet status`
 		// entry. Kill the session so spawn is all-or-nothing.
 		_ = tmux.Kill(session)
+		// For a lease-wrapped coord the PRE-LAUNCH record is already on
+		// disk; an atomic rec.Write failure leaves THAT stale record
+		// behind, advertising a live coord for the session we just killed
+		// (codex PR2 iter-6 [P2]). Remove it so the failure is all-or-
+		// nothing here too. Best-effort.
+		if leaseWrapped {
+			if livePath, perr := state.AgentPath(id); perr == nil {
+				_ = os.Remove(livePath)
+			}
+		}
 		return nil, fmt.Errorf("write agent record (orphan tmux session killed): %w", err)
 	}
 

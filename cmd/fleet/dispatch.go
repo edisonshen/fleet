@@ -973,6 +973,9 @@ func runDispatch(opts *dispatchOpts, stdout io.Writer) error {
 		PreAllocatedID:    preAllocatedID,
 		DisableAutoResume: disableAutoResume,
 		Engine:            engineName,
+		// LeaderCheck lets spawn distinguish a clean lease stand-down from
+		// a supervisor failure on the lease-wrapped coord path (PR2).
+		LeaderCheck: coordLeaderCheck,
 	})
 	// Lease stand-down (DESIGN-handoff-drain-storm-leak PR2, codex iter-5
 	// [P2]): the wrapped coord-run supervisor found a healthy leader

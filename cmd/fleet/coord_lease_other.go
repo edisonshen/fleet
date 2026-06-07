@@ -35,3 +35,8 @@ func defaultAcquireLease(_ coordRunOpts, _ io.Writer) func() (coordLease, bool, 
 func leaseDisabledOrUnsupported(err error) bool {
 	return errors.Is(err, errLeaseUnsupported)
 }
+
+// coordLeaderCheck always reports "no leader" on platforms without the
+// lease primitive — the lease never runs here, so spawn never wraps a
+// coord-run and never consults this.
+func coordLeaderCheck(string) bool { return false }

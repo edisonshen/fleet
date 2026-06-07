@@ -37,6 +37,20 @@ func leaseDisabledOrUnsupported(err error) bool {
 	return errors.Is(err, coordlock.ErrFailoverDisabled)
 }
 
+// coordLeaderCheck reports whether a healthy coordinator lease leader
+// currently exists for project. Wired into spawn.Options.LeaderCheck so
+// spawn can tell a clean lease STAND-DOWN apart from a real supervisor
+// failure (codex PR2 iter-6 [P2]). Off-flag it returns false (no lease in
+// play), which makes spawn surface an early-exit as a real error rather
+// than a false stand-down.
+func coordLeaderCheck(project string) bool {
+	if !leaseFailoverEnabled() {
+		return false
+	}
+	_, ok := coordlock.CurrentActiveOwnerPID(project)
+	return ok
+}
+
 // productionAcquireLease builds the real lease-acquire closure for
 // `fleet coord-run`. It is the seam runCoordRun uses when opts.acquire-
 // Lease is nil. Steps, in order:
