@@ -3640,3 +3640,70 @@ def test_per_series_escalation_persists_across_new_signature(tmp_path: Path) -> 
     finally:
         del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
         del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_episode_end_resets_attempts_for_reflake(tmp_path: Path) -> None:
+    """codex P2: a failure episode that reaches green (READY) resets the
+    per-signature attempts + signature too — a later re-flake of the SAME
+    check on the SAME head gets a fresh attempt budget instead of an
+    immediate budget-exhausted re-escalation."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "2"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # exhaust attempts on {unit}@H1.
+        for tick in (1, 10, 20):
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head="H1", failing=("unit",))},
+                fresh_base="B", ancestors={("B", "H1")}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=tick)
+        assert pw.load_watches(tmp_path)["watches"]["195"]["remediation"]["escalated"]
+        # PR goes green (READY) -> episode over.
+        _run2(tasks, tmp_path, FakeProber(snaps={195: _ready_snap(195, head="H1")},
+              fresh_base="B", ancestors={("B", "H1")}),
+              dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=30)
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["remediation"]["attempts"] == 0
+        assert w["remediation"]["signature"] == ""
+        n_after = len(disp.calls)
+        # SAME check re-flakes on the SAME head -> fresh budget -> dispatch.
+        out = _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ci_named_snap(195, head="H1", failing=("unit",))},
+            fresh_base="B", ancestors={("B", "H1")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=40)
+        assert out.dispatched == 1, "re-flake after green must get a fresh budget"
+        assert len(disp.calls) == n_after + 1
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_rederive_breadcrumb_pinned_to_base_sha(tmp_path: Path) -> None:
+    """codex P2: a rebase conflict is recorded against a specific base SHA. If
+    `main` advances (new base) while the head is unchanged, the next DIRTY
+    must try a CLEAN REBASE against the new base first — not jump to re-derive
+    off the stale conflict that may no longer apply."""
+    tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+    snaps = {195: _dirty_snap(195, head="H1")}
+    disp = _DispatchRecorder()
+    # tick 1: rebase against base B1 (running).
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B1",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "running", tick_count=1)
+    # tick 2: rebase conflicted @ (B1, H1) -> rederive breadcrumb pinned.
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B1",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: pw.OUTCOME_REBASE_CONFLICTED,
+          agent_conflicts=lambda _a: ["x.py"], tick_count=2)
+    assert disp.calls[-1].kind == pw.ACTION_REDERIVE
+    w = pw.load_watches(tmp_path)["watches"]["195"]
+    assert w["remediation"]["rederive_for_base"] == "B1"
+    # tick 3: main ADVANCED to base B2 (head still H1, still DIRTY). The stale
+    # (B1,H1) conflict must NOT trigger re-derive against B2 -> clean rebase.
+    _run2(tasks, tmp_path, FakeProber(snaps=snaps, fresh_base="B2",
+          ancestors=set()), dispatch=disp,
+          agent_outcome=lambda _a: "gone", tick_count=10)
+    assert disp.calls[-1].kind == pw.ACTION_REBASE, \
+        "a new base must try a clean rebase before re-derive"

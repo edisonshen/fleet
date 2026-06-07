@@ -401,6 +401,19 @@ def _lease_head(key: str) -> str:
     return ""
 
 
+def _lease_base(key: str) -> str:
+    """Extract the base SHA a rebase/rederive lease key was minted against
+    (the middle segment of `rebase:<base>:<head>` / `rederive:<base>:<head>`),
+    or "" for a fix key / unparseable key."""
+    if not isinstance(key, str):
+        return ""
+    parts = key.split(":")
+    if (key.startswith(ACTION_REBASE + ":") or key.startswith(ACTION_REDERIVE + ":")) \
+            and len(parts) >= 3:
+        return parts[1]
+    return ""
+
+
 def _restore_rederive_ladder(watch: dict, inflight: dict) -> None:
     """When a RE-DERIVE lease is reclaimed WITHOUT a push (head unchanged:
     gates failed / crashed pre-push), keep the ladder on the re-derive step
@@ -504,12 +517,15 @@ def _reclaim_lease(
     if reported == OUTCOME_REBASE_CONFLICTED and not head_moved:
         rem = _remediation(watch)
         rem["last_outcome"] = OUTCOME_REBASE_CONFLICTED
-        # Key the re-derive breadcrumb to the HEAD that produced the conflict
-        # (codex P2): if the branch later moves (a human push, or a failed
-        # re-derive) the new head's DIRTY must try a CLEAN REBASE first, not
-        # inherit this stale conflict and jump straight to the more-invasive
-        # re-derive. The want_rederive gate checks this matches the live head.
+        # Key the re-derive breadcrumb to the HEAD *and BASE SHA* that
+        # produced the conflict (codex P2): if the head moves (human push /
+        # failed re-derive) OR `main` advances to a new base, the next DIRTY
+        # must try a CLEAN REBASE first — the old conflict may no longer apply
+        # against the new base. The want_rederive gate requires BOTH to match
+        # the live head + fresh base. The base SHA is the rebase key's middle
+        # segment (rebase:<base>:<head>).
         rem["rederive_for_head"] = current_head
+        rem["rederive_for_base"] = _lease_base(key)
         # Persist the conflicted paths the rebase subagent reported onto the
         # snapshot so the next pass's DIRTY signature/frontier reflect them
         # (§2.1 — the coord has no conflicted index of its own). Keyed to the
@@ -640,6 +656,7 @@ def _new_remediation() -> dict:
         "escalated": False,
         "escalated_cause": "",
         "rederive_for_head": "",
+        "rederive_for_base": "",
     }
 
 
@@ -660,6 +677,7 @@ def _remediation(watch: dict) -> dict:
     rem.setdefault("escalated", False)
     rem.setdefault("escalated_cause", "")
     rem.setdefault("rederive_for_head", "")
+    rem.setdefault("rederive_for_base", "")
     rem["max_attempts"] = env_max_remediation_attempts()
     rem["max_series"] = env_max_remediation_series()
     return rem
@@ -788,7 +806,14 @@ def account_progress(watch: dict, event: str) -> None:
         event == EVENT_OPEN and str(snap.get("checks", "")).upper() == "SUCCESS"
     )
     if episode_ended:
+        # Reset BOTH bounds + the signature (codex P2): a failure episode that
+        # reaches green is over, so a later re-flake (even the SAME failing
+        # check on the SAME head after it went green) is a NEW episode that
+        # deserves a fresh per-signature attempt budget — not an immediate
+        # budget-exhausted re-escalation off the prior episode's attempts.
         rem["series_dispatches"] = 0
+        rem["attempts"] = 0
+        rem["signature"] = ""
         rem["escalated"] = False
         rem["escalated_cause"] = ""
         rem["best_signal"] = _FRONTIER_UNSET
@@ -2489,14 +2514,16 @@ def _dispatch_actions(
             # PR is allowed but noted).
             human_approved = bool(snap.get("human_approved"))
             # want_rederive only when the recorded conflict was for the
-            # CURRENT head (codex P2): a stale rebase_conflicted_needs_rederive
-            # from an earlier head must NOT make a fresh DIRTY on a new head
-            # skip the safe clean-rebase step. rederive_for_head pins the
-            # breadcrumb to the head that produced it.
+            # CURRENT head AND the CURRENT fresh base (codex P2): a stale
+            # rebase_conflicted_needs_rederive from an earlier head OR an
+            # earlier base must NOT make a fresh DIRTY skip the safe clean
+            # rebase. If `main` advanced (new base SHA) the conflict may no
+            # longer apply, so try a clean rebase against the new base first.
             want_rederive = (
                 event == EVENT_DIRTY
                 and rem.get("last_outcome") == OUTCOME_REBASE_CONFLICTED
                 and rem.get("rederive_for_head") == head
+                and rem.get("rederive_for_base") == base_sha
             )
             if want_rederive and human_approved:
                 # Escalate, don't re-derive (§2.3 rule 1). One raise per head.
