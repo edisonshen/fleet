@@ -638,6 +638,7 @@ def _new_remediation() -> dict:
         "ladder_step": "",
         "last_outcome": "",
         "escalated": False,
+        "escalated_cause": "",
         "rederive_for_head": "",
     }
 
@@ -657,6 +658,7 @@ def _remediation(watch: dict) -> dict:
     rem.setdefault("ladder_step", "")
     rem.setdefault("last_outcome", "")
     rem.setdefault("escalated", False)
+    rem.setdefault("escalated_cause", "")
     rem.setdefault("rederive_for_head", "")
     rem["max_attempts"] = env_max_remediation_attempts()
     rem["max_series"] = env_max_remediation_series()
@@ -788,6 +790,7 @@ def account_progress(watch: dict, event: str) -> None:
     if episode_ended:
         rem["series_dispatches"] = 0
         rem["escalated"] = False
+        rem["escalated_cause"] = ""
         rem["best_signal"] = _FRONTIER_UNSET
         return
     if event == EVENT_OPEN:
@@ -804,6 +807,7 @@ def account_progress(watch: dict, event: str) -> None:
     elif _frontier_strictly_shrinks(frontier, best):
         rem["series_dispatches"] = 0                    # genuine progress
         rem["escalated"] = False
+        rem["escalated_cause"] = ""
         rem["best_signal"] = frontier                  # running minimum (only shrinks)
 
 
@@ -2384,6 +2388,19 @@ def _dispatch_actions(
             # time loop never converges).
             rem["signature"] = sig
             rem["attempts"] = 0
+            # Clear a PER-SIGNATURE escalation latch on a genuinely new wall
+            # (codex P2): if the prior escalation was the per-signature bound
+            # tripping, a different failing-check set / new review fingerprint
+            # is a NEW signature that deserves a fresh attempt budget — leaving
+            # `escalated` set would skip it forever (until READY / a frontier
+            # shrink). A PER-SERIES escalation is NOT cleared here: the series
+            # survives signature/head changes by design, so only real progress
+            # (account_progress) clears it.
+            if (rem.get("escalated")
+                    and rem.get("escalated_cause") == "attempts"
+                    and rem["series_dispatches"] < rem["max_series"]):
+                rem["escalated"] = False
+                rem["escalated_cause"] = ""
 
         # ONE in-flight action per watch (§6 4a) — BEFORE the bound raise so
         # the running fixer's outcome is seen before "exhausted". Reclaim
@@ -2403,6 +2420,13 @@ def _dispatch_actions(
         if (rem["attempts"] >= rem["max_attempts"]
                 or rem["series_dispatches"] >= rem["max_series"]):
             rem["escalated"] = True
+            # Record WHICH bound tripped so a later new signature can clear a
+            # per-signature latch while a per-series latch persists (codex P2).
+            # series takes precedence (it's the harder stop) when both trip.
+            rem["escalated_cause"] = (
+                "series" if rem["series_dispatches"] >= rem["max_series"]
+                else "attempts"
+            )
             out.raises.append(
                 f"pr-watch: PR #{pr_num} remediation budget exhausted on "
                 f"{sig!r} / frontier {rem.get('best_signal')!r} after "

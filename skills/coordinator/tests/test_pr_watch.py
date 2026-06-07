@@ -3567,3 +3567,76 @@ def test_blocked_rederive_surfaces_and_does_not_loop(tmp_path: Path) -> None:
     assert len(disp.calls) == n_after_rederive, \
         "a blocked re-derive must not loop back into a rebase"
     assert out4.dispatched == 0
+
+
+def test_per_signature_escalation_clears_on_new_signature(tmp_path: Path) -> None:
+    """codex P2: after a PER-SIGNATURE escalation (attempts bound), a NEW
+    failing-check set on the same head is a NEW signature that deserves a
+    fresh attempt budget — the escalation latch must clear so dispatch
+    resumes (it previously latched forever until READY)."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "2"
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "99"  # only sig bound trips
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # Exhaust the per-signature bound on {unit} (head fixed, dead agents).
+        for tick in (1, 10, 20):
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head="H1", failing=("unit",))},
+                fresh_base="B", ancestors={("B", "H1")}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=tick)
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["remediation"]["escalated"] is True
+        assert w["remediation"]["escalated_cause"] == "attempts"
+        n_after = len(disp.calls)
+        # NEW failing set {lint} on the SAME head -> new signature -> latch
+        # clears -> dispatch resumes.
+        out = _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ci_named_snap(195, head="H1", failing=("lint",))},
+            fresh_base="B", ancestors={("B", "H1")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=30)
+        assert out.dispatched == 1, "new signature must clear the per-sig latch"
+        assert len(disp.calls) == n_after + 1
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
+
+
+def test_per_series_escalation_persists_across_new_signature(tmp_path: Path) -> None:
+    """codex P2 (counterpart): a PER-SERIES escalation must NOT be cleared by
+    a mere signature change — the series survives head/signature changes by
+    design; only real progress (frontier shrink / READY) clears it."""
+    import os
+    os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"] = "99"  # only series trips
+    os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"] = "2"
+    try:
+        tasks = [_task("a", pr_url=_pr_url(195), branch="worker/a")]
+        disp = _DispatchRecorder()
+        # series climbs to 2 on a fixed frontier across moving heads.
+        for i in (1, 2):
+            head = f"H{i}"
+            _run2(tasks, tmp_path, FakeProber(
+                snaps={195: _ci_named_snap(195, head=head, failing=("unit",))},
+                fresh_base="B", ancestors={("B", head)}),
+                dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=i)
+        # tick 3: still failing, new head -> series bound trips -> escalate.
+        _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ci_named_snap(195, head="H3", failing=("unit",))},
+            fresh_base="B", ancestors={("B", "H3")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=3)
+        w = pw.load_watches(tmp_path)["watches"]["195"]
+        assert w["remediation"]["escalated"] is True
+        assert w["remediation"]["escalated_cause"] == "series"
+        n_after = len(disp.calls)
+        # A DIFFERENT failing set (new signature) but NO frontier shrink (it's
+        # a disjoint wall, not a subset) -> series latch persists, no dispatch.
+        out = _run2(tasks, tmp_path, FakeProber(
+            snaps={195: _ci_named_snap(195, head="H3", failing=("other",))},
+            fresh_base="B", ancestors={("B", "H3")}),
+            dispatch=disp, agent_outcome=lambda _a: "gone", tick_count=4)
+        assert out.dispatched == 0, "series latch must survive a signature change"
+        assert len(disp.calls) == n_after
+    finally:
+        del os.environ["PR_WATCH_MAX_REMEDIATION_ATTEMPTS"]
+        del os.environ["PR_WATCH_MAX_REMEDIATION_SERIES"]
