@@ -253,40 +253,37 @@ func procExePath(pid int) (path string, abs bool, ok bool) {
 	return "", false, false
 }
 
-// lsofTxtPath returns the absolute executable (txt) path of pid via
-// `lsof -p <pid> -Ftn`. Scans for the `t`(ype)==REG following a `txt`
-// fd marker; returns the first program-text file. (path, false) on any
-// failure / lsof-absent host.
+// lsofTxtPath returns the executable (program-text) path of pid via
+// `lsof -p <pid> -Ftn`. lsof `-F` output is field-per-line, grouped per
+// open file: an `f<fd>` line opens a file's records, followed by `t<type>`
+// and `n<name>`. The EXECUTABLE is the file whose fd marker is `txt`
+// (program text). Codex iter-12 [P1]: a previous version scanned bare
+// `n/` lines and returned the FIRST absolute path — but lsof emits the
+// process `cwd` (and other fds) before `txt`, so it could return the cwd
+// instead of the binary. We now track the current fd and return the `n`
+// path ONLY when the active fd is `txt`. (path, false) on any failure /
+// lsof-absent host.
 func lsofTxtPath(pid int) (string, bool) {
-	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-Fn").Output()
+	out, err := exec.Command("lsof", "-p", strconv.Itoa(pid), "-Ftn").Output()
 	if err != nil {
 		return "", false
 	}
-	// -Fn output is line-oriented; an `n`-prefixed line carries a path.
-	// The first absolute path that exists is a good exe proxy on darwin
-	// (the binary is among the earliest mapped files). We pick the first
-	// `n/...` whose basename matches our own exe basename if possible,
-	// else the first absolute path.
-	self, _ := os.Executable()
-	wantBase := ""
-	if self != "" {
-		wantBase = filepath.Base(self)
-	}
-	var firstAbs string
+	curFD := ""
 	for _, ln := range strings.Split(string(out), "\n") {
-		if !strings.HasPrefix(ln, "n/") {
+		if ln == "" {
 			continue
 		}
-		p := ln[1:]
-		if firstAbs == "" {
-			firstAbs = p
+		switch ln[0] {
+		case 'f': // fd marker — e.g. "ftxt", "fcwd", "f3"
+			curFD = ln[1:]
+		case 'n': // name line for the current fd
+			if curFD == "txt" {
+				p := ln[1:]
+				if filepath.IsAbs(p) {
+					return p, true
+				}
+			}
 		}
-		if wantBase != "" && filepath.Base(p) == wantBase {
-			return p, true
-		}
-	}
-	if firstAbs != "" {
-		return firstAbs, true
 	}
 	return "", false
 }

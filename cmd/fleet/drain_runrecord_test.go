@@ -51,7 +51,7 @@ func TestDrainRunRecord_TDR1_WriteThenDeleteOnStop(t *testing.T) {
 	drainProcStartFn = func(int) string { return "FINGERPRINT-1" }
 	t.Cleanup(func() { drainProcStartFn = prevStart })
 
-	h, err := startDrainRunRecord()
+	h, err := startDrainRunRecord(0)
 	if err != nil {
 		t.Fatalf("startDrainRunRecord: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestDrainRunRecord_TDR2_DeleteOnFailurePath(t *testing.T) {
 	t.Cleanup(func() { drainProcStartFn = prevStart })
 
 	func() {
-		h, err := startDrainRunRecord()
+		h, err := startDrainRunRecord(0)
 		if err != nil {
 			t.Fatalf("startDrainRunRecord: %v", err)
 		}
@@ -120,7 +120,7 @@ func TestDrainRunRecord_BeatAdvances_NoBeatFreezes(t *testing.T) {
 	t0 := time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)
 	drainRunNow = func() time.Time { return t0 }
 
-	h, err := startDrainRunRecord()
+	h, err := startDrainRunRecord(0)
 	if err != nil {
 		t.Fatalf("startDrainRunRecord: %v", err)
 	}
@@ -157,4 +157,44 @@ func TestDrainRunRecord_BeatNilSafe(t *testing.T) {
 	var h *drainRunHandle
 	h.Beat() // must not panic
 	h.Stop() // must not panic
+}
+
+// Empty fingerprint (codex iter-11 [P2]): if pid_start can't be captured,
+// startDrainRunRecord refuses to write a reuse-unsafe record — it returns
+// an error (non-fatal at the call site) and writes NO file.
+func TestDrainRunRecord_EmptyFingerprint_NoRecord(t *testing.T) {
+	setupFleetHome(t)
+	prevStart := drainProcStartFn
+	drainProcStartFn = func(int) string { return "" } // capture failed
+	t.Cleanup(func() { drainProcStartFn = prevStart })
+
+	h, err := startDrainRunRecord(0)
+	if err == nil {
+		t.Fatal("empty fingerprint must return an error (skip reuse-unsafe record)")
+	}
+	if h != nil {
+		t.Fatal("no handle should be returned when the record is skipped")
+	}
+	if drainRunRecordExists(t) {
+		t.Fatal("no run-record file may be written with an empty fingerprint")
+	}
+}
+
+// GraceMillis is recorded so the reaper can extend the TTL (codex iter-11
+// [P2]).
+func TestDrainRunRecord_GraceRecorded(t *testing.T) {
+	setupFleetHome(t)
+	prevStart := drainProcStartFn
+	drainProcStartFn = func(int) string { return "fp" }
+	t.Cleanup(func() { drainProcStartFn = prevStart })
+
+	h, err := startDrainRunRecord(600000) // 10min grace
+	if err != nil {
+		t.Fatalf("startDrainRunRecord: %v", err)
+	}
+	t.Cleanup(h.Stop)
+	rec, _ := readDrainRunRecord(t)
+	if rec.GraceMillis != 600000 {
+		t.Fatalf("grace_ms = %d, want 600000", rec.GraceMillis)
+	}
 }

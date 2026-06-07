@@ -103,6 +103,11 @@ type DrainRun struct {
 	PidStart    string    `json:"pid_start"`
 	StartedAt   time.Time `json:"started_at"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
+	// GraceMillis is the drain's configured /exit→Kill grace window. The
+	// classifier adds it to this record's effective TTL so a legitimately
+	// long grace sleep inside Resume (between Beats) doesn't look wedged
+	// (codex iter-11 [P2]).
+	GraceMillis int `json:"grace_ms,omitempty"`
 	// Path is the run-record file on disk (set by the lister, not
 	// serialized). RemoveDrainRun targets it after a kill.
 	Path string `json:"-"`
@@ -184,8 +189,13 @@ func reconcileDrainProcs(r *Report, opts Options, deps Deps) error {
 	sort.SliceStable(runs, func(i, j int) bool { return runs[i].Pid < runs[j].Pid })
 
 	now := deps.Now()
-	ttl := drainHeartbeatTTL()
+	baseTTL := drainHeartbeatTTL()
 	for _, run := range runs {
+		// Effective TTL extends the base by this drain's configured grace
+		// window (codex iter-11 [P2]): a long --grace-ms sleep inside
+		// Resume happens between Beats, so without this a healthy drain in
+		// a legitimately-long grace would look wedged.
+		ttl := baseTTL + time.Duration(run.GraceMillis)*time.Millisecond
 		age := now.Sub(run.HeartbeatAt)
 		if age < ttl {
 			// Fresh heartbeat → healthy or actively-progressing

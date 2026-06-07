@@ -535,6 +535,35 @@ func TestDrainProcs_WithinRaisedTTL_NotReaped(t *testing.T) {
 	}
 }
 
+// A drain with a long configured grace is NOT reaped while within
+// base-TTL + grace (codex iter-11 [P2]): a long --grace-ms sleep happens
+// between Beats, so the effective TTL must absorb it.
+func TestDrainProcs_GraceExtendsTTL(t *testing.T) {
+	prev := drainHeartbeatTTLFn
+	drainHeartbeatTTLFn = func() time.Duration { return 5 * time.Minute }
+	t.Cleanup(func() { drainHeartbeatTTLFn = prev })
+
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	h := newDrainHarness(now)
+	// 8min stale, base TTL 5min → would be wedged WITHOUT grace; with a
+	// 10min grace the effective TTL is 15min, so it's NOT reaped.
+	h.deps.ListDrainRuns = func() ([]DrainRun, error) {
+		return []DrainRun{{
+			Pid: 9, PidStart: "s", HeartbeatAt: now.Add(-8 * time.Minute),
+			GraceMillis: 600000, Path: "/tmp/9.json",
+		}}, nil
+	}
+	h.deps.DrainProcLive = func(int, string) bool { return true }
+
+	r := reconcileDrains(t, Options{Apply: true}, h.deps)
+	if len(r.Actions) != 0 {
+		t.Fatalf("a drain within base-TTL+grace must not be reaped; got %+v", r.Actions)
+	}
+	if len(h.killCalls) != 0 {
+		t.Fatalf("must not kill within grace-extended TTL; got %+v", h.killCalls)
+	}
+}
+
 // Missing-dep guard: KindDrainProcs without ListDrainRuns errors clearly.
 func TestDrainProcs_MissingDep_Errors(t *testing.T) {
 	_, err := Reconcile(Options{Kinds: []Kind{KindDrainProcs}, Apply: false}, Deps{Now: time.Now})

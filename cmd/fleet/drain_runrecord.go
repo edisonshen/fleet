@@ -44,6 +44,10 @@ type drainRunRecord struct {
 	PidStart    string    `json:"pid_start"`
 	StartedAt   time.Time `json:"started_at"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
+	// GraceMillis is the configured /exit→Kill grace window for this drain.
+	// The reaper adds it to the per-record effective TTL so a legitimately
+	// long grace sleep inside Resume doesn't look wedged (codex iter-11 [P2]).
+	GraceMillis int `json:"grace_ms,omitempty"`
 }
 
 // drainRunHandle owns one live run-record. Beat() advances heartbeat_at
@@ -75,26 +79,41 @@ var drainRunNow = time.Now
 var drainProcStartFn = procStartTimeForSelf
 
 // startDrainRunRecord writes ~/.fleet/drain-runs/<pid>.json with the
-// initial heartbeat. Returns a handle whose Beat() advances the
-// heartbeat at progress points and whose Stop() deletes the record. A
-// write failure is returned but is NON-fatal at the call site (the drain
-// still runs; it just isn't gc-reapable via the record path).
-func startDrainRunRecord() (*drainRunHandle, error) {
+// initial heartbeat. graceMillis is the per-drain /exit→Kill grace window
+// (recorded so the reaper can extend this drain's effective TTL past a
+// legitimately-long configured grace — codex iter-11 [P2]). Returns a
+// handle whose Beat() advances the heartbeat at progress points and whose
+// Stop() deletes the record.
+//
+// A write failure is returned but NON-fatal at the call site (the drain
+// still runs; it just isn't gc-reapable via the record path). An EMPTY
+// start fingerprint is treated the SAME way (codex iter-11 [P2]): a
+// reuse-unsafe record (empty pid_start → reaper falls back to bare
+// liveness) is worse than no record, so we refuse to write one and return
+// a nil handle (Beat/Stop no-op) — the drain runs un-reapable-via-record,
+// exactly as on a write failure.
+func startDrainRunRecord(graceMillis int) (*drainRunHandle, error) {
 	dir, err := state.DrainRunsDir()
 	if err != nil {
 		return nil, err
 	}
+	pid := os.Getpid()
+	fp := drainProcStartFn(pid)
+	if fp == "" {
+		// No reuse-safe identity — do not create a kill-target record.
+		return nil, fmt.Errorf("drain run-record: could not capture pid_start fingerprint for pid %d (skipping reuse-unsafe record)", pid)
+	}
 	if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
 		return nil, fmt.Errorf("mkdir %s: %w", dir, mkErr)
 	}
-	pid := os.Getpid()
 	path := filepath.Join(dir, strconv.Itoa(pid)+".json")
 	now := drainRunNow()
 	rec := drainRunRecord{
 		Pid:         pid,
-		PidStart:    drainProcStartFn(pid),
+		PidStart:    fp,
 		StartedAt:   now,
 		HeartbeatAt: now,
+		GraceMillis: graceMillis,
 	}
 	if werr := writeDrainRunRecord(path, rec); werr != nil {
 		return nil, werr

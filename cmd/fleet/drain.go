@@ -69,7 +69,7 @@ func runDrain(stdout, stderr io.Writer, graceMillis int) error {
 	// below), not a background timer — so a drain wedged forever inside a
 	// blocking drainOne/LockAgent stops beating and goes stale → reapable.
 	var rh *drainRunHandle
-	if h, rerr := startDrainRunRecord(); rerr != nil {
+	if h, rerr := startDrainRunRecord(graceMillis); rerr != nil {
 		_, _ = fmt.Fprintf(stderr, "fleet drain: run-record: %v (continuing)\n", rerr)
 	} else {
 		rh = h
